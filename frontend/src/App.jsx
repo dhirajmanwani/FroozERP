@@ -11,6 +11,11 @@ const [productName, setProductName] = useState("");
 const [sellingRate, setSellingRate] = useState("");
 const [purchaseRate, setPurchaseRate] = useState("");
 const [unit, setUnit] = useState("");
+const [supplierName, setSupplierName] = useState("");
+const [quantity, setQuantity] = useState("");
+const [purchaseRateInput, setPurchaseRateInput] = useState("");
+const [inventory, setInventory] = useState([]);
+const [showInventory, setShowInventory] = useState(false);
 
   const login = async () => {
     try {
@@ -37,6 +42,20 @@ const [unit, setUnit] = useState("");
   setShowProducts(true);
 };
 
+const loadInventory = async () => {
+  try {
+    const response = await axios.get(
+      "http://localhost:5000/inventory"
+    );
+
+    setInventory(response.data);
+    setShowInventory(true);
+
+  } catch (error) {
+    alert("Error Loading Inventory");
+  }
+};
+
 const addProduct = async () => {
   try {
     await axios.post(
@@ -54,6 +73,26 @@ const addProduct = async () => {
     loadProducts();
   } catch (error) {
     alert("Error Adding Product");
+  }
+};
+const savePurchase = async () => {
+  try {
+    await axios.post(
+      "http://localhost:5000/purchase",
+      {
+        supplier_name: supplierName,
+        product_id: 3,
+        quantity: quantity,
+        purchase_rate: purchaseRateInput,
+        branch_id: 1
+      }
+    );
+
+    alert("Purchase Saved");
+
+  } catch (error) {
+    console.error(error);
+    alert("Purchase Error");
   }
 };
 
@@ -104,11 +143,67 @@ const addProduct = async () => {
 </button>
 
 <hr />
+<h2>Purchase Entry</h2>
+
+<input
+  placeholder="Supplier Name"
+  value={supplierName}
+  onChange={(e) => setSupplierName(e.target.value)}
+/>
+
+<br /><br />
+
+<input
+  placeholder="Quantity"
+  value={quantity}
+  onChange={(e) => setQuantity(e.target.value)}
+/>
+
+<br /><br />
+
+<input
+  placeholder="Purchase Rate"
+  value={purchaseRateInput}
+  onChange={(e) => setPurchaseRateInput(e.target.value)}
+/>
+
+<br /><br />
+
+<button onClick={savePurchase}>
+  Save Purchase
+</button>
+
+<br /><br />
+<button onClick={loadInventory}>
+  Inventory
+</button>
+
+<hr />
       <button onClick={loadProducts}>
   Products
 </button>
 
 <br /><br />
+{showInventory && (
+  <div>
+    <h3>Inventory</h3>
+
+    {inventory.map((item, index) => (
+      <div key={index}>
+        <strong>{item.batch_no}</strong>
+        {" - Qty: "}
+        {item.remaining_qty}
+        {" - Rate: ₹"}
+        {item.purchase_rate}
+        {" - Supplier: "}
+        {item.supplier_name}
+
+        <br /><br />
+      </div>
+    ))}
+  </div>
+)}
+
 {showProducts && (
   <div>
     <h3>Products</h3>
