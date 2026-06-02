@@ -47,6 +47,25 @@ const getErrorMessage = (error, fallback) =>
 const toDateKey = (date) =>
   typeof date === "string" ? date.slice(0, 10) : date.toLocaleDateString("en-CA");
 
+function BrandLogo({ compact = false, invoice = false }) {
+  return (
+    <div className={`${invoice ? "brand-lockup brand-lockup-invoice" : "brand-lockup"} ${compact ? "brand-lockup-compact" : ""}`}>
+      <span className="brand-monogram">
+        <svg aria-hidden="true" viewBox="0 0 48 48">
+          <path d="M13 12h21M13 23h16M13 12v24M25 12v24M25 34h11" />
+          <path className="brand-monogram-accent" d="M34 12h4M13 36h4" />
+        </svg>
+      </span>
+      {!compact && (
+        <span className="brand-copy">
+          <strong>FEEL THE FREAKIN&apos; FROOZ</strong>
+          <small>by SRT Company</small>
+        </span>
+      )}
+    </div>
+  );
+}
+
 function Icon({ name, size = 18 }) {
   const paths = {
     grid: <><rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" /><rect x="3" y="14" width="7" height="7" /><rect x="14" y="14" width="7" height="7" /></>,
@@ -240,11 +259,7 @@ function App() {
       <main className="login-page">
         <section className="login-panel">
           <div className="login-brand">
-            <span className="brand-mark">F</span>
-            <div>
-              <strong>FROOZERP</strong>
-              <small>Fruit Retail Intelligence</small>
-            </div>
+            <BrandLogo />
           </div>
           <div className="login-copy">
             <span className="eyebrow">Business Management</span>
@@ -276,11 +291,7 @@ function App() {
     <main className="erp-shell">
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
         <div className="sidebar-brand">
-          <span className="brand-mark">F</span>
-          <div>
-            <strong>FROOZERP</strong>
-            <small>Fruit Retail Intelligence</small>
-          </div>
+          <BrandLogo />
         </div>
         <span className="sidebar-section">Main Menu</span>
         <nav className="sidebar-nav">
@@ -323,8 +334,9 @@ function App() {
             >
               <Icon name="menu" />
             </button>
+            <BrandLogo compact />
             <div>
-              <span className="eyebrow">FroozERP Workspace</span>
+              <span className="eyebrow">Retail Operations Workspace</span>
               <h1>{activeLabel}</h1>
             </div>
           </div>
@@ -339,6 +351,7 @@ function App() {
             <>
               <section className="welcome-banner">
                 <div>
+                  <BrandLogo />
                   <span className="eyebrow">Retail Intelligence</span>
                   <h2>Good to see you, {user.full_name.split(" ")[0]}.</h2>
                   <p>Monitor today's performance and keep your inventory moving.</p>
@@ -469,7 +482,7 @@ function App() {
           {futureModules[activeView] && (
             <section className="content-card empty-state">
               <div className="empty-icon"><Icon name={icons[activeView]} size={25} /></div>
-              <span className="eyebrow">FroozERP Module</span>
+              <span className="eyebrow">SRT Retail Module</span>
               <h2>{futureModules[activeView][0]}</h2>
               <p>{futureModules[activeView][1]}</p>
               <span className="coming-soon">Coming Soon</span>
@@ -801,7 +814,7 @@ function InvoiceModal({ invoice, onClose }) {
       return;
     }
     const message = [
-      "Thank you for shopping with FroozERP. Your invoice is ready.",
+      "Thank you for shopping with FEEL THE FREAKIN' FROOZ. Your invoice is ready.",
       `Invoice: ${invoice.invoice_no}`,
       `Amount: ${currency.format(Number(invoice.total_amount))}`,
       "We appreciate your business.",
@@ -827,10 +840,7 @@ function InvoiceModal({ invoice, onClose }) {
         </div>
         <article className="invoice-paper">
           <header className="invoice-header">
-            <div>
-              <strong className="invoice-logo">FROOZERP</strong>
-              <span>Fruit Retail Intelligence</span>
-            </div>
+            <BrandLogo invoice />
             <div className="invoice-meta">
               <strong>Tax Invoice</strong>
               <span>{invoice.invoice_no}</span>
@@ -839,7 +849,7 @@ function InvoiceModal({ invoice, onClose }) {
           </header>
           <section className="invoice-customer">
             <div><small>Billed To</small><strong>{invoice.customer_name || "Walk-in Customer"}</strong><span>{invoice.customer_mobile || "No mobile number"}</span></div>
-            <div><small>Payment</small><strong>{invoice.payment_mode}</strong><span>{invoice.branch_name || "FroozERP Store"}</span></div>
+            <div><small>Payment</small><strong>{invoice.payment_mode}</strong><span>{invoice.branch_name || "SRT Retail Store"}</span></div>
           </section>
           <table className="invoice-table">
             <thead><tr><th>Item</th><th>Qty</th><th>Rate</th><th>Discount</th><th>Amount</th></tr></thead>
@@ -862,9 +872,9 @@ function InvoiceModal({ invoice, onClose }) {
             <TotalLine label="Grand Total" total value={Number(invoice.total_amount)} />
           </section>
           <footer className="invoice-footer">
-            <strong>Thank you for shopping with FroozERP.</strong>
+            <strong>Thank you for shopping with FEEL THE FREAKIN&apos; FROOZ.</strong>
             <span>We appreciate your business.</span>
-            <small>GST-ready invoice · Generated by FroozERP</small>
+            <small>GST-ready invoice · Powered by SRT Company</small>
           </footer>
         </article>
       </section>

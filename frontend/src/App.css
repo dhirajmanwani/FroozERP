@@ -24,37 +24,69 @@
 }
 
 .sidebar-brand {
-  padding: 2px 6px 25px;
+  padding: 2px 4px 25px;
 }
 
-.brand-mark {
-  width: 39px;
-  height: 39px;
+.brand-lockup {
+  display: inline-flex;
+  align-items: center;
+  gap: 11px;
+}
+
+.brand-monogram {
+  width: 42px;
+  height: 42px;
   display: grid;
+  flex: 0 0 auto;
   place-items: center;
-  border-radius: 12px;
-  color: #111827;
-  background: #f59e0b;
-  box-shadow: 0 8px 25px rgba(245, 158, 11, 0.23);
-  font-size: 21px;
-  font-weight: 900;
+  border: 1px solid rgba(245, 158, 11, 0.48);
+  border-radius: 11px;
+  background: linear-gradient(145deg, rgba(245, 158, 11, 0.16), rgba(245, 158, 11, 0.03));
+  box-shadow: 0 8px 25px rgba(245, 158, 11, 0.12), inset 0 1px rgba(255, 255, 255, 0.08);
 }
 
-.sidebar-brand strong,
-.login-brand strong {
+.brand-monogram svg {
+  width: 31px;
+  height: 31px;
+  fill: none;
+  stroke: #f8fafc;
+  stroke-linecap: square;
+  stroke-linejoin: miter;
+  stroke-width: 3;
+}
+
+.brand-monogram .brand-monogram-accent {
+  stroke: #f59e0b;
+}
+
+.brand-copy {
+  min-width: 0;
+}
+
+.brand-copy strong,
+.brand-copy small {
   display: block;
+}
+
+.brand-copy strong {
   color: #f8fafc;
-  font-size: 16px;
-  letter-spacing: 1.4px;
+  font-size: 12px;
+  font-weight: 850;
+  letter-spacing: 0.8px;
+  line-height: 1.18;
 }
 
-.sidebar-brand small,
-.login-brand small {
-  display: block;
-  margin-top: 1px;
+.brand-copy small {
+  margin-top: 4px;
   color: #94a3b8;
   font-size: 9px;
-  letter-spacing: 0.25px;
+  font-weight: 650;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+.brand-lockup-compact {
+  display: none;
 }
 
 .sidebar-section,
@@ -231,6 +263,25 @@
   gap: 18px;
   padding: 24px;
   background: linear-gradient(135deg, #1e293b, #1b263a);
+}
+
+.welcome-banner .brand-lockup {
+  margin-bottom: 17px;
+}
+
+.welcome-banner .brand-monogram {
+  width: 36px;
+  height: 36px;
+}
+
+.welcome-banner .brand-monogram svg {
+  width: 27px;
+  height: 27px;
+}
+
+.welcome-banner .brand-copy strong {
+  font-size: 13px;
+  letter-spacing: 1.05px;
 }
 
 .welcome-banner h2,
@@ -768,11 +819,30 @@ tbody tr:last-child td {
   gap: 20px;
 }
 
-.invoice-logo {
-  display: block;
+.brand-lockup-invoice .brand-monogram {
+  width: 48px;
+  height: 48px;
+  border-color: #d39a29;
+  border-radius: 8px;
+  background: #0f172a;
+  box-shadow: none;
+}
+
+.brand-lockup-invoice .brand-monogram svg {
+  width: 35px;
+  height: 35px;
+}
+
+.brand-lockup-invoice .brand-copy strong {
   color: #0f172a;
-  font-size: 22px;
-  letter-spacing: 2px;
+  font-size: 16px;
+  letter-spacing: 1.2px;
+}
+
+.brand-lockup-invoice .brand-copy small {
+  color: #64748b;
+  font-size: 10px;
+  letter-spacing: 1.4px;
 }
 
 .invoice-header span,
@@ -880,13 +950,38 @@ tbody tr:last-child td {
 }
 
 .login-panel {
-  width: min(380px, 100%);
+  width: min(410px, 100%);
   padding: 30px;
   box-sizing: border-box;
   border: 1px solid rgba(148, 163, 184, 0.12);
   border-radius: 16px;
   background: #1e293b;
   box-shadow: 0 20px 60px rgba(2, 6, 23, 0.35);
+}
+
+.login-brand {
+  padding-bottom: 20px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+}
+
+.login-brand .brand-monogram {
+  width: 50px;
+  height: 50px;
+}
+
+.login-brand .brand-monogram svg {
+  width: 37px;
+  height: 37px;
+}
+
+.login-brand .brand-copy strong {
+  font-size: 15px;
+  letter-spacing: 1.2px;
+}
+
+.login-brand .brand-copy small {
+  margin-top: 5px;
+  font-size: 10px;
 }
 
 .login-copy {
@@ -953,6 +1048,21 @@ tbody tr:last-child td {
     display: grid;
     place-items: center;
     padding: 7px;
+  }
+
+  .topbar .brand-lockup-compact {
+    display: inline-flex;
+  }
+
+  .brand-lockup-compact .brand-monogram {
+    width: 33px;
+    height: 33px;
+    border-radius: 8px;
+  }
+
+  .brand-lockup-compact .brand-monogram svg {
+    width: 25px;
+    height: 25px;
   }
 
   .topbar {
@@ -1024,5 +1134,10 @@ tbody tr:last-child td {
     margin: 0;
     padding: 18px;
     box-sizing: border-box;
+  }
+
+  .brand-lockup-invoice .brand-monogram {
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
   }
 }
