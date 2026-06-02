@@ -34,18 +34,23 @@ const roundCurrency = (value) => Math.round((Number(value) + Number.EPSILON) * 1
 const roundUnitCost = (value) => Math.round((Number(value) + Number.EPSILON) * 10000) / 10000;
 const toDateKey = (value) =>
   value instanceof Date ? value.toLocaleDateString("en-CA") : String(value).slice(0, 10);
-const PURCHASE_RULES = Object.freeze({
-  mandiTaxPercentByOrigin: Object.freeze({
-    LOCAL: 2,
-    IMPORTED: 4,
-  }),
-  rebatePercentByPaymentTiming: Object.freeze({
-    SAME_DAY: 2,
-    WITHIN_3_DAYS: 1.5,
-    WITHIN_7_DAYS: 1,
-    LATER: 0,
-  }),
-});
+const RATE_MANAGER_ROLES = new Set(["Owner", "Admin"]);
+
+const requireRateManager = async (userId, client = pool) => {
+  const parsedUserId = parsePositiveInteger(userId);
+  if (!parsedUserId) return null;
+  const result = await client.query(
+    `
+    SELECT u.id, u.full_name, r.role_name
+    FROM users u
+    JOIN roles r ON r.id = u.role_id
+    WHERE u.id = $1 AND u.active = TRUE
+    `,
+    [parsedUserId]
+  );
+  const user = result.rows[0];
+  return user && RATE_MANAGER_ROLES.has(user.role_name) ? user : null;
+};
 
 const initializeDatabase = async () => {
   await pool.query(`
@@ -62,6 +67,10 @@ const initializeDatabase = async () => {
 
     ALTER TABLE products ADD COLUMN IF NOT EXISTS barcode VARCHAR(100);
     ALTER TABLE products ADD COLUMN IF NOT EXISTS origin_type VARCHAR(20) DEFAULT 'LOCAL';
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS category VARCHAR(80) DEFAULT 'Fruit';
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS selling_rate_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS selling_rate_updated_by INTEGER REFERENCES users(id);
     UPDATE products SET origin_type = 'LOCAL' WHERE origin_type IS NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS products_barcode_unique_idx
       ON products (barcode)
@@ -79,6 +88,12 @@ const initializeDatabase = async () => {
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS balance_amount NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS payment_timing VARCHAR(30) DEFAULT 'LATER';
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS effective_cost_per_unit NUMERIC(14, 4) DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS freight_charges NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS labour_charges NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS rebate_rule_id INTEGER;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS payment_due_days INTEGER DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS payment_status VARCHAR(20) DEFAULT 'PENDING';
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS payment_date DATE;
 
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS basic_amount NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS mandi_tax_amount NUMERIC(14, 2) DEFAULT 0;
@@ -86,6 +101,63 @@ const initializeDatabase = async () => {
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS rebate_amount NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS net_payable NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS effective_cost_per_unit NUMERIC(14, 4) DEFAULT 0;
+    ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS freight_charges NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS labour_charges NUMERIC(14, 2) DEFAULT 0;
+
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS effective_cost_per_unit NUMERIC(14, 4);
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS mandi_tax_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS freight_charges NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS labour_charges NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS other_charges NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS gross_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS rebate_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS net_payable NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS payment_timing VARCHAR(120);
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS balance_amount NUMERIC(14, 2) DEFAULT 0;
+    UPDATE inventory_batches SET effective_cost_per_unit = purchase_rate WHERE effective_cost_per_unit IS NULL;
+
+    CREATE TABLE IF NOT EXISTS mandi_tax_rules (
+      id SERIAL PRIMARY KEY,
+      origin_type VARCHAR(20) NOT NULL UNIQUE,
+      tax_percent NUMERIC(6, 3) NOT NULL CHECK (tax_percent >= 0),
+      active BOOLEAN DEFAULT TRUE,
+      updated_by INTEGER REFERENCES users(id),
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS rebate_rules (
+      id SERIAL PRIMARY KEY,
+      rule_name VARCHAR(120) NOT NULL,
+      pay_within_days INTEGER NOT NULL CHECK (pay_within_days >= 0),
+      rebate_percent NUMERIC(6, 3) NOT NULL CHECK (rebate_percent >= 0),
+      active BOOLEAN DEFAULT TRUE,
+      updated_by INTEGER REFERENCES users(id),
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS sale_rate_history (
+      id SERIAL PRIMARY KEY,
+      product_id INTEGER NOT NULL REFERENCES products(id),
+      old_selling_rate NUMERIC(14, 2) NOT NULL,
+      new_selling_rate NUMERIC(14, 2) NOT NULL,
+      changed_by INTEGER NOT NULL REFERENCES users(id),
+      reason TEXT,
+      changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    INSERT INTO mandi_tax_rules (origin_type, tax_percent)
+    VALUES ('LOCAL', 2), ('IMPORTED', 4)
+    ON CONFLICT (origin_type) DO NOTHING;
+
+    INSERT INTO rebate_rules (rule_name, pay_within_days, rebate_percent)
+    SELECT seed.rule_name, seed.pay_within_days, seed.rebate_percent
+    FROM (VALUES
+      ('Same Day', 0, 3::NUMERIC),
+      ('Within 3 Days', 3, 2::NUMERIC),
+      ('Within 7 Days', 7, 1::NUMERIC),
+      ('Later', 15, 0::NUMERIC)
+    ) AS seed(rule_name, pay_within_days, rebate_percent)
+    WHERE NOT EXISTS (SELECT 1 FROM rebate_rules);
 
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS invoice_no VARCHAR(40);
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS customer_name VARCHAR(120);
@@ -166,8 +238,123 @@ const initializeDatabase = async () => {
   `);
 };
 
-app.get("/purchase-rules", (req, res) => {
-  res.json(PURCHASE_RULES);
+app.get("/purchase-rules", async (req, res) => {
+  try {
+    const [mandiResult, rebateResult] = await Promise.all([
+      pool.query("SELECT * FROM mandi_tax_rules WHERE active = TRUE ORDER BY origin_type"),
+      pool.query("SELECT * FROM rebate_rules WHERE active = TRUE ORDER BY pay_within_days, id"),
+    ]);
+    return res.json({ mandiTaxRules: mandiResult.rows, rebateRules: rebateResult.rows });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Purchase Rules" });
+  }
+});
+
+app.get("/settings/purchase-rules", async (req, res) => {
+  try {
+    if (!await requireRateManager(req.query.user_id)) {
+      return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
+    }
+    const [mandiResult, rebateResult] = await Promise.all([
+      pool.query("SELECT * FROM mandi_tax_rules ORDER BY origin_type"),
+      pool.query("SELECT * FROM rebate_rules ORDER BY pay_within_days, id"),
+    ]);
+    return res.json({ mandiTaxRules: mandiResult.rows, rebateRules: rebateResult.rows });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Settings" });
+  }
+});
+
+app.put("/settings/mandi-tax-rules/:id", async (req, res) => {
+  try {
+    const ruleId = parsePositiveInteger(req.params.id);
+    const taxPercent = parseNonNegativeNumber(req.body.tax_percent);
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!ruleId || taxPercent === null || !manager) {
+      return res.status(manager ? 400 : 403).json({ message: manager ? "Enter a valid mandi tax rate" : "Only Owner or Admin can manage settings" });
+    }
+    const result = await pool.query(
+      `
+      UPDATE mandi_tax_rules
+      SET tax_percent = $1, active = $2, updated_by = $3, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $4
+      RETURNING *
+      `,
+      [taxPercent, req.body.active !== false, manager.id, ruleId]
+    );
+    return result.rows[0] ? res.json(result.rows[0]) : res.status(404).json({ message: "Mandi tax rule not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Mandi Tax Rule" });
+  }
+});
+
+app.post("/settings/rebate-rules", async (req, res) => {
+  try {
+    const { rule_name, pay_within_days, rebate_percent, active, updated_by } = req.body;
+    const parsedDays = parseNonNegativeNumber(pay_within_days);
+    const parsedPercent = parseNonNegativeNumber(rebate_percent);
+    const manager = await requireRateManager(updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
+    if (!rule_name?.trim() || !Number.isInteger(parsedDays) || parsedPercent === null) {
+      return res.status(400).json({ message: "Enter valid rebate rule details" });
+    }
+    const result = await pool.query(
+      `
+      INSERT INTO rebate_rules (rule_name, pay_within_days, rebate_percent, active, updated_by)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING *
+      `,
+      [rule_name.trim(), parsedDays, parsedPercent, active !== false, manager.id]
+    );
+    return res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Adding Rebate Rule" });
+  }
+});
+
+app.put("/settings/rebate-rules/:id", async (req, res) => {
+  try {
+    const ruleId = parsePositiveInteger(req.params.id);
+    const { rule_name, pay_within_days, rebate_percent, active, updated_by } = req.body;
+    const parsedDays = parseNonNegativeNumber(pay_within_days);
+    const parsedPercent = parseNonNegativeNumber(rebate_percent);
+    const manager = await requireRateManager(updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
+    if (!ruleId || !rule_name?.trim() || !Number.isInteger(parsedDays) || parsedPercent === null) {
+      return res.status(400).json({ message: "Enter valid rebate rule details" });
+    }
+    const result = await pool.query(
+      `
+      UPDATE rebate_rules
+      SET rule_name = $1, pay_within_days = $2, rebate_percent = $3, active = $4, updated_by = $5, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $6
+      RETURNING *
+      `,
+      [rule_name.trim(), parsedDays, parsedPercent, active !== false, manager.id, ruleId]
+    );
+    return result.rows[0] ? res.json(result.rows[0]) : res.status(404).json({ message: "Rebate rule not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Rebate Rule" });
+  }
+});
+
+app.delete("/settings/rebate-rules/:id", async (req, res) => {
+  try {
+    const ruleId = parsePositiveInteger(req.params.id);
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
+    if (!ruleId) return res.status(400).json({ message: "Invalid rebate rule" });
+    const result = await pool.query("DELETE FROM rebate_rules WHERE id = $1 RETURNING id", [ruleId]);
+    return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "Rebate rule not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Deleting Rebate Rule" });
+  }
 });
 
 app.get("/", (req, res) => {
@@ -232,22 +419,30 @@ app.get("/products", async (req, res) => {
 
 app.post("/products", async (req, res) => {
   try {
-    const { product_name, selling_rate, purchase_rate, unit, barcode, origin_type } = req.body;
+    const { product_name, selling_rate, unit, barcode, origin_type, category, minimum_stock, active, created_by } = req.body;
     const parsedSellingRate = parsePositiveNumber(selling_rate);
-    const parsedPurchaseRate = parsePositiveNumber(purchase_rate);
+    const parsedMinimumStock = parseNonNegativeNumber(minimum_stock);
     const parsedOriginType = String(origin_type || "LOCAL").toUpperCase();
+    const rateManager = await requireRateManager(created_by);
 
-    if (!product_name?.trim() || !unit?.trim() || !parsedSellingRate || !parsedPurchaseRate || !Object.hasOwn(PURCHASE_RULES.mandiTaxPercentByOrigin, parsedOriginType)) {
+    if (!rateManager) return res.status(403).json({ message: "Only Owner or Admin can create owner-approved selling rates" });
+    if (!product_name?.trim() || !unit?.trim() || !parsedSellingRate || parsedMinimumStock === null || !["LOCAL", "IMPORTED"].includes(parsedOriginType)) {
       return res.status(400).json({ message: "Enter valid product details" });
     }
 
     const result = await pool.query(
       `
-      INSERT INTO products (product_name, selling_rate, purchase_rate, unit, barcode, origin_type)
-      VALUES ($1, $2, $3, $4, $5, $6)
+      INSERT INTO products (
+        product_name, selling_rate, unit, barcode, origin_type, category,
+        minimum_stock, active, selling_rate_updated_by
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING *
       `,
-      [product_name.trim(), parsedSellingRate, parsedPurchaseRate, unit.trim(), barcode?.trim() || null, parsedOriginType]
+      [
+        product_name.trim(), parsedSellingRate, unit.trim(), barcode?.trim() || null, parsedOriginType,
+        category?.trim() || "Fruit", parsedMinimumStock, active !== false, rateManager.id,
+      ]
     );
 
     return res.status(201).json(result.rows[0]);
@@ -261,34 +456,70 @@ app.post("/products", async (req, res) => {
 });
 
 app.put("/products/:id", async (req, res) => {
+  const client = await pool.connect();
   try {
     const productId = parsePositiveInteger(req.params.id);
-    const { product_name, selling_rate, purchase_rate, unit, barcode, origin_type } = req.body;
+    const { product_name, selling_rate, unit, barcode, origin_type, category, minimum_stock, active, updated_by, rate_change_reason } = req.body;
     const parsedSellingRate = parsePositiveNumber(selling_rate);
-    const parsedPurchaseRate = parsePositiveNumber(purchase_rate);
+    const parsedMinimumStock = parseNonNegativeNumber(minimum_stock);
     const parsedOriginType = String(origin_type || "").toUpperCase();
 
-    if (!productId || !product_name?.trim() || !unit?.trim() || !parsedSellingRate || !parsedPurchaseRate || !Object.hasOwn(PURCHASE_RULES.mandiTaxPercentByOrigin, parsedOriginType)) {
+    if (!productId || !product_name?.trim() || !unit?.trim() || !parsedSellingRate || parsedMinimumStock === null || !["LOCAL", "IMPORTED"].includes(parsedOriginType)) {
       return res.status(400).json({ message: "Enter valid product details" });
     }
 
-    const result = await pool.query(
+    await client.query("BEGIN");
+    const currentResult = await client.query("SELECT * FROM products WHERE id = $1 FOR UPDATE", [productId]);
+    if (currentResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Product not found" });
+    }
+    const current = currentResult.rows[0];
+    const sellingRateChanged = Number(current.selling_rate) !== parsedSellingRate;
+    const rateManager = sellingRateChanged ? await requireRateManager(updated_by, client) : null;
+    if (sellingRateChanged && !rateManager) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ message: "Only Owner or Admin can change selling rates" });
+    }
+
+    const result = await client.query(
       `
       UPDATE products
-      SET product_name = $1, selling_rate = $2, purchase_rate = $3, unit = $4, barcode = $5, origin_type = $6
-      WHERE id = $7
+      SET
+        product_name = $1, selling_rate = $2, unit = $3, barcode = $4,
+        origin_type = $5, category = $6, minimum_stock = $7, active = $8,
+        selling_rate_updated_at = CASE WHEN selling_rate <> $2 THEN CURRENT_TIMESTAMP ELSE selling_rate_updated_at END,
+        selling_rate_updated_by = CASE WHEN selling_rate <> $2 THEN $9 ELSE selling_rate_updated_by END
+      WHERE id = $10
       RETURNING *
       `,
-      [product_name.trim(), parsedSellingRate, parsedPurchaseRate, unit.trim(), barcode?.trim() || null, parsedOriginType, productId]
+      [
+        product_name.trim(), parsedSellingRate, unit.trim(), barcode?.trim() || null,
+        parsedOriginType, category?.trim() || "Fruit", parsedMinimumStock, active !== false,
+        rateManager?.id || null, productId,
+      ]
     );
-    if (result.rows.length === 0) return res.status(404).json({ message: "Product not found" });
+
+    if (sellingRateChanged) {
+      await client.query(
+        `
+        INSERT INTO sale_rate_history (product_id, old_selling_rate, new_selling_rate, changed_by, reason)
+        VALUES ($1, $2, $3, $4, $5)
+        `,
+        [productId, current.selling_rate, parsedSellingRate, rateManager.id, rate_change_reason?.trim() || "Product Master update"]
+      );
+    }
+    await client.query("COMMIT");
     return res.json(result.rows[0]);
   } catch (error) {
+    await client.query("ROLLBACK");
     console.error(error);
     if (error.code === "23505") {
       return res.status(409).json({ message: "Barcode is already assigned to another product" });
     }
     return res.status(500).json({ message: "Error Updating Product" });
+  } finally {
+    client.release();
   }
 });
 
@@ -304,6 +535,16 @@ app.get("/inventory", async (req, res) => {
         ib.purchase_qty,
         ib.remaining_qty,
         ib.purchase_rate,
+        ib.effective_cost_per_unit,
+        ib.mandi_tax_amount,
+        ib.freight_charges,
+        ib.labour_charges,
+        ib.other_charges,
+        ib.gross_amount,
+        ib.rebate_amount,
+        ib.net_payable,
+        ib.payment_timing,
+        ib.balance_amount,
         ib.supplier_name,
         ib.purchase_date
       FROM inventory_batches ib
@@ -340,6 +581,158 @@ app.get("/stock", async (req, res) => {
   }
 });
 
+app.get("/sale-rates", async (req, res) => {
+  try {
+    if (!await requireRateManager(req.query.user_id)) {
+      return res.status(403).json({ message: "Only Owner or Admin can manage selling rates" });
+    }
+    const desiredMargin = parseNonNegativeNumber(req.query.desired_margin) ?? 25;
+    const result = await pool.query(
+      `
+      SELECT
+        p.id,
+        p.product_name,
+        p.category,
+        p.origin_type,
+        p.unit,
+        p.selling_rate,
+        p.selling_rate_updated_at,
+        u.full_name AS updated_by_name,
+        COALESCE(stock.current_stock, 0) AS current_stock,
+        COALESCE(latest.effective_cost_per_unit, 0) AS latest_effective_cost,
+        CASE
+          WHEN COALESCE(latest.effective_cost_per_unit, 0) > 0
+            THEN ROUND(latest.effective_cost_per_unit * (1 + $1 / 100.0), 0)
+          ELSE p.selling_rate
+        END AS suggested_selling_rate
+      FROM products p
+      LEFT JOIN users u ON u.id = p.selling_rate_updated_by
+      LEFT JOIN LATERAL (
+        SELECT ib.effective_cost_per_unit
+        FROM inventory_batches ib
+        WHERE ib.product_id = p.id
+        ORDER BY ib.purchase_date DESC, ib.created_at DESC, ib.id DESC
+        LIMIT 1
+      ) latest ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT SUM(ib.remaining_qty) AS current_stock
+        FROM inventory_batches ib
+        WHERE ib.product_id = p.id
+      ) stock ON TRUE
+      WHERE p.active = TRUE
+      ORDER BY p.product_name
+      `,
+      [desiredMargin]
+    );
+    return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Sale Rates" });
+  }
+});
+
+app.post("/sale-rates/bulk", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const manager = await requireRateManager(req.body.changed_by, client);
+    const updates = Array.isArray(req.body.updates) ? req.body.updates : [];
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage selling rates" });
+    if (updates.length === 0) return res.status(400).json({ message: "Add at least one selling rate update" });
+
+    await client.query("BEGIN");
+    const saved = [];
+    for (const update of updates) {
+      const productId = parsePositiveInteger(update.product_id);
+      const newRate = parsePositiveNumber(update.new_selling_rate);
+      if (!productId || !newRate) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Enter valid selling rates" });
+      }
+      const currentResult = await client.query("SELECT id, selling_rate FROM products WHERE id = $1 AND active = TRUE FOR UPDATE", [productId]);
+      if (currentResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ message: "Product not found" });
+      }
+      const oldRate = Number(currentResult.rows[0].selling_rate);
+      if (oldRate === newRate) continue;
+      const productResult = await client.query(
+        `
+        UPDATE products
+        SET selling_rate = $1, selling_rate_updated_at = CURRENT_TIMESTAMP, selling_rate_updated_by = $2
+        WHERE id = $3
+        RETURNING *
+        `,
+        [newRate, manager.id, productId]
+      );
+      await client.query(
+        `
+        INSERT INTO sale_rate_history (product_id, old_selling_rate, new_selling_rate, changed_by, reason)
+        VALUES ($1, $2, $3, $4, $5)
+        `,
+        [productId, oldRate, newRate, manager.id, update.reason?.trim() || "Daily sale rate update"]
+      );
+      saved.push(productResult.rows[0]);
+    }
+    await client.query("COMMIT");
+    return res.json({ success: true, updated_count: saved.length, products: saved });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Sale Rates" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/sale-rate-history", async (req, res) => {
+  try {
+    if (!await requireRateManager(req.query.user_id)) {
+      return res.status(403).json({ message: "Only Owner or Admin can view selling rate history" });
+    }
+    const result = await pool.query(
+      `
+      SELECT h.*, p.product_name, u.full_name AS changed_by_name
+      FROM sale_rate_history h
+      JOIN products p ON p.id = h.product_id
+      JOIN users u ON u.id = h.changed_by
+      ORDER BY h.changed_at DESC, h.id DESC
+      LIMIT 100
+      `
+    );
+    return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Sale Rate History" });
+  }
+});
+
+app.get("/supplier-ledger", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        purchase_date,
+        supplier_name,
+        gross_amount,
+        mandi_tax_amount,
+        rebate_amount,
+        net_payable,
+        paid_amount,
+        balance_amount,
+        payment_status,
+        payment_timing
+      FROM purchases
+      ORDER BY purchase_date DESC, id DESC
+      `
+    );
+    return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Supplier Ledger" });
+  }
+});
+
 app.post("/purchase", async (req, res) => {
   const client = await pool.connect();
 
@@ -349,18 +742,23 @@ app.post("/purchase", async (req, res) => {
       product_id,
       quantity,
       purchase_rate,
+      freight_charges,
+      labour_charges,
       other_charges,
       paid_amount,
-      payment_timing,
+      rebate_rule_id,
+      payment_date,
       branch_id,
       created_by,
     } = req.body;
     const parsedProductId = parsePositiveInteger(product_id);
     const parsedQuantity = parsePositiveNumber(quantity);
     const parsedPurchaseRate = parsePositiveNumber(purchase_rate);
+    const parsedFreightCharges = parseNonNegativeNumber(freight_charges);
+    const parsedLabourCharges = parseNonNegativeNumber(labour_charges);
     const parsedOtherCharges = parseNonNegativeNumber(other_charges);
     const parsedPaidAmount = parseNonNegativeNumber(paid_amount);
-    const parsedPaymentTiming = String(payment_timing || "LATER").toUpperCase();
+    const parsedRebateRuleId = parsePositiveInteger(rebate_rule_id);
     const parsedBranchId = parsePositiveInteger(branch_id);
     const parsedCreatedBy = parsePositiveInteger(created_by) || 1;
 
@@ -369,9 +767,11 @@ app.post("/purchase", async (req, res) => {
       !parsedProductId ||
       !parsedQuantity ||
       !parsedPurchaseRate ||
+      parsedFreightCharges === null ||
+      parsedLabourCharges === null ||
       parsedOtherCharges === null ||
       parsedPaidAmount === null ||
-      !Object.hasOwn(PURCHASE_RULES.rebatePercentByPaymentTiming, parsedPaymentTiming) ||
+      !parsedRebateRuleId ||
       !parsedBranchId
     ) {
       return res.status(400).json({ message: "Enter valid purchase details" });
@@ -379,7 +779,7 @@ app.post("/purchase", async (req, res) => {
 
     await client.query("BEGIN");
     const productResult = await client.query(
-      "SELECT id, product_name, origin_type FROM products WHERE id = $1 FOR SHARE",
+      "SELECT id, product_name, origin_type FROM products WHERE id = $1 AND active = TRUE FOR SHARE",
       [parsedProductId]
     );
     if (productResult.rows.length === 0) {
@@ -389,11 +789,20 @@ app.post("/purchase", async (req, res) => {
 
     const product = productResult.rows[0];
     const originType = product.origin_type || "LOCAL";
-    const mandiTaxPercent = PURCHASE_RULES.mandiTaxPercentByOrigin[originType];
-    const rebatePercent = PURCHASE_RULES.rebatePercentByPaymentTiming[parsedPaymentTiming];
+    const [mandiResult, rebateResult] = await Promise.all([
+      client.query("SELECT * FROM mandi_tax_rules WHERE origin_type = $1 AND active = TRUE", [originType]),
+      client.query("SELECT * FROM rebate_rules WHERE id = $1 AND active = TRUE", [parsedRebateRuleId]),
+    ]);
+    if (mandiResult.rows.length === 0 || rebateResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Select active mandi tax and rebate rules" });
+    }
+    const mandiTaxPercent = Number(mandiResult.rows[0].tax_percent);
+    const rebateRule = rebateResult.rows[0];
+    const rebatePercent = Number(rebateRule.rebate_percent);
     const basicAmount = roundCurrency(parsedQuantity * parsedPurchaseRate);
     const mandiTaxAmount = roundCurrency(basicAmount * mandiTaxPercent / 100);
-    const grossAmount = roundCurrency(basicAmount + mandiTaxAmount + parsedOtherCharges);
+    const grossAmount = roundCurrency(basicAmount + mandiTaxAmount + parsedFreightCharges + parsedLabourCharges + parsedOtherCharges);
     const rebateAmount = roundCurrency(grossAmount * rebatePercent / 100);
     const netPayable = roundCurrency(grossAmount - rebateAmount);
     if (parsedPaidAmount > netPayable) {
@@ -402,6 +811,7 @@ app.post("/purchase", async (req, res) => {
     }
     const balanceAmount = roundCurrency(netPayable - parsedPaidAmount);
     const effectiveCostPerUnit = roundUnitCost(netPayable / parsedQuantity);
+    const paymentStatus = balanceAmount === 0 ? "PAID" : parsedPaidAmount > 0 ? "PARTIAL" : "PENDING";
 
     const purchaseResult = await client.query(
       `
@@ -409,16 +819,18 @@ app.post("/purchase", async (req, res) => {
         supplier_name, total_amount, branch_id, created_by, basic_amount,
         mandi_tax_percent, mandi_tax_amount, other_charges, gross_amount,
         rebate_percent, rebate_amount, net_payable, paid_amount, balance_amount,
-        payment_timing, effective_cost_per_unit
+        payment_timing, effective_cost_per_unit, freight_charges, labour_charges,
+        rebate_rule_id, payment_due_days, payment_status, payment_date
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
       RETURNING *
       `,
       [
         supplier_name.trim(), netPayable, parsedBranchId, parsedCreatedBy, basicAmount,
         mandiTaxPercent, mandiTaxAmount, parsedOtherCharges, grossAmount,
         rebatePercent, rebateAmount, netPayable, parsedPaidAmount, balanceAmount,
-        parsedPaymentTiming, effectiveCostPerUnit,
+        rebateRule.rule_name, effectiveCostPerUnit, parsedFreightCharges, parsedLabourCharges,
+        rebateRule.id, rebateRule.pay_within_days, paymentStatus, payment_date || null,
       ]
     );
     const purchase = purchaseResult.rows[0];
@@ -427,13 +839,15 @@ app.post("/purchase", async (req, res) => {
       `
       INSERT INTO purchase_items (
         purchase_id, product_id, quantity, purchase_rate, amount, basic_amount,
-        mandi_tax_amount, other_charges, rebate_amount, net_payable, effective_cost_per_unit
+        mandi_tax_amount, other_charges, rebate_amount, net_payable, effective_cost_per_unit,
+        freight_charges, labour_charges
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
       `,
       [
         purchase.id, parsedProductId, parsedQuantity, parsedPurchaseRate, netPayable, basicAmount,
         mandiTaxAmount, parsedOtherCharges, rebateAmount, netPayable, effectiveCostPerUnit,
+        parsedFreightCharges, parsedLabourCharges,
       ]
     );
 
@@ -441,18 +855,30 @@ app.post("/purchase", async (req, res) => {
     await client.query(
       `
       INSERT INTO inventory_batches (
-        product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, supplier_name, branch_id
+        product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
+        supplier_name, branch_id, mandi_tax_amount, freight_charges, labour_charges,
+        other_charges, gross_amount, rebate_amount, net_payable, payment_timing, balance_amount
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
       `,
       [
         parsedProductId,
         batchNo,
         parsedQuantity,
         parsedQuantity,
+        parsedPurchaseRate,
         effectiveCostPerUnit,
         supplier_name.trim(),
         parsedBranchId,
+        mandiTaxAmount,
+        parsedFreightCharges,
+        parsedLabourCharges,
+        parsedOtherCharges,
+        grossAmount,
+        rebateAmount,
+        netPayable,
+        rebateRule.rule_name,
+        balanceAmount,
       ]
     );
 
@@ -523,7 +949,7 @@ app.post("/sales", async (req, res) => {
 
     const productIds = parsedItems.map((item) => item.productId);
     const productResult = await client.query(
-      "SELECT id, product_name, selling_rate, unit FROM products WHERE id = ANY($1::int[]) ORDER BY id FOR SHARE",
+      "SELECT id, product_name, selling_rate, unit FROM products WHERE id = ANY($1::int[]) AND active = TRUE ORDER BY id FOR SHARE",
       [productIds]
     );
     if (productResult.rows.length !== parsedItems.length) {
@@ -552,7 +978,7 @@ app.post("/sales", async (req, res) => {
 
       const batchesResult = await client.query(
         `
-        SELECT id, remaining_qty, purchase_rate
+        SELECT id, remaining_qty, COALESCE(effective_cost_per_unit, purchase_rate) AS purchase_rate
         FROM inventory_batches
         WHERE product_id = $1
           AND branch_id = $2

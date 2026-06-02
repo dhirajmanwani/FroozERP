@@ -8,14 +8,8 @@ const currency = new Intl.NumberFormat("en-IN", {
   currency: "INR",
 });
 const defaultPurchaseRules = {
-  mandiTaxPercentByOrigin: { LOCAL: 2, IMPORTED: 4 },
-  rebatePercentByPaymentTiming: { SAME_DAY: 2, WITHIN_3_DAYS: 1.5, WITHIN_7_DAYS: 1, LATER: 0 },
-};
-const paymentTimingLabels = {
-  SAME_DAY: "Paid same day",
-  WITHIN_3_DAYS: "Paid within 3 days",
-  WITHIN_7_DAYS: "Paid within 7 days",
-  LATER: "Paid later",
+  mandiTaxRules: [],
+  rebateRules: [],
 };
 
 const icons = {
@@ -29,6 +23,7 @@ const icons = {
   customers: "users",
   reports: "chart",
   settings: "settings",
+  "sale-rates": "trend",
 };
 
 const navigationItems = [
@@ -38,6 +33,7 @@ const navigationItems = [
   ["inventory", "Inventory"],
   ["sales", "POS Billing"],
   ["sales-history", "Sales History"],
+  ["sale-rates", "Sale Rate Update"],
   ["expenses", "Expenses"],
   ["customers", "Customers"],
   ["reports", "Reports"],
@@ -48,7 +44,6 @@ const futureModules = {
   expenses: ["Expenses", "Track and categorize operating costs across your business."],
   customers: ["Customers", "Manage customer profiles, activity, and account balances."],
   reports: ["Reports", "Review business performance and operational insights."],
-  settings: ["Settings", "Configure your organization, branches, and preferences."],
 };
 
 const getErrorMessage = (error, fallback) =>
@@ -129,21 +124,30 @@ function App() {
   const [inventory, setInventory] = useState([]);
   const [salesHistory, setSalesHistory] = useState([]);
   const [purchaseRules, setPurchaseRules] = useState(defaultPurchaseRules);
+  const [settingsRules, setSettingsRules] = useState(defaultPurchaseRules);
+  const [saleRates, setSaleRates] = useState([]);
+  const [saleRateHistory, setSaleRateHistory] = useState([]);
+  const [saleDesiredMargin, setSaleDesiredMargin] = useState("25");
 
   const [productName, setProductName] = useState("");
   const [sellingRate, setSellingRate] = useState("");
-  const [purchaseRate, setPurchaseRate] = useState("");
   const [productBarcode, setProductBarcode] = useState("");
   const [productOriginType, setProductOriginType] = useState("LOCAL");
+  const [productCategory, setProductCategory] = useState("Fruit");
+  const [productMinimumStock, setProductMinimumStock] = useState("");
+  const [productActive, setProductActive] = useState(true);
   const [editingProductId, setEditingProductId] = useState(null);
   const [unit, setUnit] = useState("");
   const [supplierName, setSupplierName] = useState("");
   const [purchaseProductId, setPurchaseProductId] = useState("");
   const [purchaseQuantity, setPurchaseQuantity] = useState("");
   const [purchaseRateInput, setPurchaseRateInput] = useState("");
+  const [purchaseFreightCharges, setPurchaseFreightCharges] = useState("");
+  const [purchaseLabourCharges, setPurchaseLabourCharges] = useState("");
   const [purchaseOtherCharges, setPurchaseOtherCharges] = useState("");
   const [purchasePaidAmount, setPurchasePaidAmount] = useState("");
-  const [purchasePaymentTiming, setPurchasePaymentTiming] = useState("LATER");
+  const [purchaseRebateRuleId, setPurchaseRebateRuleId] = useState("");
+  const [purchasePaymentDate, setPurchasePaymentDate] = useState("");
   const [selectedInvoice, setSelectedInvoice] = useState(null);
 
   const kpis = useMemo(() => {
@@ -152,7 +156,7 @@ function App() {
     const total = (items, key) =>
       items.reduce((sum, item) => sum + Number(item[key] || 0), 0);
     const stockValue = inventory.reduce(
-      (sum, item) => sum + Number(item.remaining_qty || 0) * Number(item.purchase_rate || 0),
+      (sum, item) => sum + Number(item.remaining_qty || 0) * Number(item.effective_cost_per_unit || item.purchase_rate || 0),
       0
     );
     const stockByProduct = inventory.reduce((stock, item) => {
@@ -180,25 +184,32 @@ function App() {
     const rate = Number(purchaseRateInput || 0);
     const otherCharges = Number(purchaseOtherCharges || 0);
     const paidAmount = Number(purchasePaidAmount || 0);
-    const mandiTaxPercent = purchaseRules.mandiTaxPercentByOrigin[selectedPurchaseProduct?.origin_type || "LOCAL"] || 0;
-    const rebatePercent = purchaseRules.rebatePercentByPaymentTiming[purchasePaymentTiming] || 0;
+    const freightCharges = Number(purchaseFreightCharges || 0);
+    const labourCharges = Number(purchaseLabourCharges || 0);
+    const mandiTaxPercent = Number(purchaseRules.mandiTaxRules.find((rule) => rule.origin_type === (selectedPurchaseProduct?.origin_type || "LOCAL"))?.tax_percent || 0);
+    const rebateRule = purchaseRules.rebateRules.find((rule) => String(rule.id) === purchaseRebateRuleId);
+    const rebatePercent = Number(rebateRule?.rebate_percent || 0);
     const basicAmount = quantity * rate;
     const mandiTaxAmount = basicAmount * mandiTaxPercent / 100;
-    const grossAmount = basicAmount + mandiTaxAmount + otherCharges;
+    const grossAmount = basicAmount + mandiTaxAmount + freightCharges + labourCharges + otherCharges;
     const rebateAmount = grossAmount * rebatePercent / 100;
     const netPayable = grossAmount - rebateAmount;
     return {
       basicAmount,
       mandiTaxPercent,
       mandiTaxAmount,
+      freightCharges,
+      labourCharges,
+      otherCharges,
       grossAmount,
       rebatePercent,
       rebateAmount,
       netPayable,
       balanceAmount: Math.max(netPayable - paidAmount, 0),
       effectiveCostPerUnit: quantity > 0 ? netPayable / quantity : 0,
+      paymentStatus: netPayable > 0 && paidAmount >= netPayable ? "Paid" : paidAmount > 0 ? "Partial" : "Pending",
     };
-  }, [purchaseOtherCharges, purchasePaidAmount, purchasePaymentTiming, purchaseQuantity, purchaseRateInput, purchaseRules, selectedPurchaseProduct]);
+  }, [purchaseFreightCharges, purchaseLabourCharges, purchaseOtherCharges, purchasePaidAmount, purchaseQuantity, purchaseRateInput, purchaseRebateRuleId, purchaseRules, selectedPurchaseProduct]);
 
   const loadProducts = async () => {
     const response = await axios.get(`${API_URL}/products`);
@@ -208,6 +219,20 @@ function App() {
   const loadPurchaseRules = async () => {
     const response = await axios.get(`${API_URL}/purchase-rules`);
     setPurchaseRules(response.data);
+  };
+
+  const loadSettingsRules = async () => {
+    const response = await axios.get(`${API_URL}/settings/purchase-rules`, { params: { user_id: user.id } });
+    setSettingsRules(response.data);
+  };
+
+  const loadSaleRates = async (desiredMargin = saleDesiredMargin) => {
+    const [ratesResponse, historyResponse] = await Promise.all([
+      axios.get(`${API_URL}/sale-rates`, { params: { user_id: user.id, desired_margin: desiredMargin } }),
+      axios.get(`${API_URL}/sale-rate-history`, { params: { user_id: user.id } }),
+    ]);
+    setSaleRates(ratesResponse.data);
+    setSaleRateHistory(historyResponse.data);
   };
 
   const loadDashboardData = async () => {
@@ -234,10 +259,14 @@ function App() {
       const payload = {
         product_name: productName,
         selling_rate: sellingRate,
-        purchase_rate: purchaseRate,
         unit,
         barcode: productBarcode,
         origin_type: productOriginType,
+        category: productCategory,
+        minimum_stock: productMinimumStock,
+        active: productActive,
+        created_by: user.id,
+        updated_by: user.id,
       };
       if (editingProductId) {
         await axios.put(`${API_URL}/products/${editingProductId}`, payload);
@@ -246,10 +275,12 @@ function App() {
       }
       setProductName("");
       setSellingRate("");
-      setPurchaseRate("");
       setUnit("");
       setProductBarcode("");
       setProductOriginType("LOCAL");
+      setProductCategory("Fruit");
+      setProductMinimumStock("");
+      setProductActive(true);
       setEditingProductId(null);
       await loadProducts();
       alert(editingProductId ? "Product Updated" : "Product Added");
@@ -265,9 +296,12 @@ function App() {
         product_id: purchaseProductId,
         quantity: purchaseQuantity,
         purchase_rate: purchaseRateInput,
+        freight_charges: purchaseFreightCharges,
+        labour_charges: purchaseLabourCharges,
         other_charges: purchaseOtherCharges,
         paid_amount: purchasePaidAmount,
-        payment_timing: purchasePaymentTiming,
+        rebate_rule_id: purchaseRebateRuleId,
+        payment_date: purchasePaymentDate || null,
         branch_id: user.branch_id,
         created_by: user.id,
       });
@@ -275,9 +309,12 @@ function App() {
       setPurchaseProductId("");
       setPurchaseQuantity("");
       setPurchaseRateInput("");
+      setPurchaseFreightCharges("");
+      setPurchaseLabourCharges("");
       setPurchaseOtherCharges("");
       setPurchasePaidAmount("");
-      setPurchasePaymentTiming("LATER");
+      setPurchaseRebateRuleId("");
+      setPurchasePaymentDate("");
       await loadDashboardData();
       alert("Purchase Saved");
     } catch (error) {
@@ -296,28 +333,31 @@ function App() {
 
   const selectPurchaseProduct = (event) => {
     const productId = event.target.value;
-    const product = products.find((item) => String(item.id) === productId);
     setPurchaseProductId(productId);
-    setPurchaseRateInput(product?.purchase_rate || "");
+    if (!productId) setPurchaseRateInput("");
   };
 
   const editProduct = (product) => {
     setProductName(product.product_name);
     setSellingRate(product.selling_rate);
-    setPurchaseRate(product.purchase_rate);
     setUnit(product.unit);
     setProductBarcode(product.barcode || "");
     setProductOriginType(product.origin_type || "LOCAL");
+    setProductCategory(product.category || "Fruit");
+    setProductMinimumStock(product.minimum_stock || "");
+    setProductActive(product.active !== false);
     setEditingProductId(product.id);
   };
 
   const cancelProductEdit = () => {
     setProductName("");
     setSellingRate("");
-    setPurchaseRate("");
     setUnit("");
     setProductBarcode("");
     setProductOriginType("LOCAL");
+    setProductCategory("Fruit");
+    setProductMinimumStock("");
+    setProductActive(true);
     setEditingProductId(null);
   };
 
@@ -334,6 +374,8 @@ function App() {
         setSalesHistory(response.data);
       }
       if (view === "dashboard") await loadDashboardData();
+      if (view === "settings") await loadSettingsRules();
+      if (view === "sale-rates") await loadSaleRates();
     } catch (error) {
       alert(getErrorMessage(error, "Error Loading Data"));
     }
@@ -371,6 +413,7 @@ function App() {
   }
 
   const activeLabel = navigationItems.find(([view]) => view === activeView)?.[1];
+  const canManageRates = ["Owner", "Admin"].includes(user.role);
 
   return (
     <main className="erp-shell">
@@ -380,7 +423,7 @@ function App() {
         </div>
         <span className="sidebar-section">Main Menu</span>
         <nav className="sidebar-nav">
-          {navigationItems.map(([view, label]) => (
+          {navigationItems.filter(([view]) => canManageRates || !["settings", "sale-rates"].includes(view)).map(([view, label]) => (
             <button
               className={activeView === view ? "nav-item nav-item-active" : "nav-item"}
               key={view}
@@ -480,29 +523,33 @@ function App() {
               <div className="form-grid">
                 <Field label="Product Name"><input value={productName} onChange={(event) => setProductName(event.target.value)} /></Field>
                 <Field label="Selling Rate"><input type="number" min="0" step="0.01" value={sellingRate} onChange={(event) => setSellingRate(event.target.value)} /></Field>
-                <Field label="Purchase Rate"><input type="number" min="0" step="0.01" value={purchaseRate} onChange={(event) => setPurchaseRate(event.target.value)} /></Field>
                 <Field label="Unit"><input value={unit} onChange={(event) => setUnit(event.target.value)} /></Field>
                 <Field label="Barcode (Optional)"><input value={productBarcode} onChange={(event) => setProductBarcode(event.target.value)} /></Field>
+                <Field label="Category"><input value={productCategory} onChange={(event) => setProductCategory(event.target.value)} /></Field>
+                <Field label="Minimum Stock"><input type="number" min="0" step="0.001" value={productMinimumStock} onChange={(event) => setProductMinimumStock(event.target.value)} /></Field>
                 <Field label="Origin Type">
                   <select value={productOriginType} onChange={(event) => setProductOriginType(event.target.value)}>
                     <option value="LOCAL">Local</option>
                     <option value="IMPORTED">Imported</option>
                   </select>
                 </Field>
+                <label className="check-field"><input type="checkbox" checked={productActive} onChange={(event) => setProductActive(event.target.checked)} /><span>Active Product</span></label>
               </div>
               <div className="button-row">
                 <button className="primary-button" onClick={addProduct}>{editingProductId ? "Update Product" : "Add Product"}</button>
                 {editingProductId && <button className="secondary-button" onClick={cancelProductEdit}>Cancel Edit</button>}
               </div>
-              <DataTable headers={["Product", "Barcode", "Origin", "Selling Rate", "Purchase Rate", "Unit", ""]}>
+              <DataTable headers={["Product", "Category", "Barcode", "Origin", "Selling Rate", "Minimum Stock", "Unit", "Status", ""]}>
                 {products.map((product) => (
                   <tr key={product.id}>
                     <td className="primary-cell">{product.product_name}</td>
+                    <td>{product.category || "Fruit"}</td>
                     <td>{product.barcode || "-"}</td>
                     <td><span className="tag">{product.origin_type || "LOCAL"}</span></td>
                     <td>{currency.format(Number(product.selling_rate))}</td>
-                    <td>{currency.format(Number(product.purchase_rate))}</td>
+                    <td>{product.minimum_stock || 0}</td>
                     <td><span className="tag">{product.unit}</span></td>
+                    <td><span className={product.active !== false ? "stock-ok" : "stock-low"}>{product.active !== false ? "Active" : "Inactive"}</span></td>
                     <td><button className="table-action" onClick={() => editProduct(product)}>Edit</button></td>
                   </tr>
                 ))}
@@ -522,13 +569,17 @@ function App() {
                 </Field>
                 <Field label="Quantity"><input type="number" min="0" step="0.001" value={purchaseQuantity} onChange={(event) => setPurchaseQuantity(event.target.value)} /></Field>
                 <Field label="Purchase Rate"><input type="number" min="0" step="0.01" value={purchaseRateInput} onChange={(event) => setPurchaseRateInput(event.target.value)} /></Field>
+                <Field label="Freight Charges"><input type="number" min="0" step="0.01" value={purchaseFreightCharges} onChange={(event) => setPurchaseFreightCharges(event.target.value)} /></Field>
+                <Field label="Labour Charges"><input type="number" min="0" step="0.01" value={purchaseLabourCharges} onChange={(event) => setPurchaseLabourCharges(event.target.value)} /></Field>
                 <Field label="Other Charges"><input type="number" min="0" step="0.01" value={purchaseOtherCharges} onChange={(event) => setPurchaseOtherCharges(event.target.value)} /></Field>
-                <Field label="Payment Timing">
-                  <select value={purchasePaymentTiming} onChange={(event) => setPurchasePaymentTiming(event.target.value)}>
-                    {Object.entries(paymentTimingLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                <Field label="Payment Timing / Rebate Rule">
+                  <select value={purchaseRebateRuleId} onChange={(event) => setPurchaseRebateRuleId(event.target.value)}>
+                    <option value="">Select rebate rule</option>
+                    {purchaseRules.rebateRules.map((rule) => <option key={rule.id} value={rule.id}>{rule.rule_name} · {rule.pay_within_days} days · {rule.rebate_percent}%</option>)}
                   </select>
                 </Field>
                 <Field label="Paid Amount"><input type="number" min="0" step="0.01" value={purchasePaidAmount} onChange={(event) => setPurchasePaidAmount(event.target.value)} /></Field>
+                <Field label="Payment Date"><input type="date" value={purchasePaymentDate} onChange={(event) => setPurchasePaymentDate(event.target.value)} /></Field>
               </div>
               <PurchaseSummary summary={purchaseSummary} />
               <button className="primary-button" onClick={savePurchase}>Save Purchase</button>
@@ -537,7 +588,7 @@ function App() {
 
           {activeView === "inventory" && (
             <ModuleCard eyebrow="Stock Control" title="Inventory Batches" subtitle="Review current quantities and batch-level purchase details.">
-              <DataTable headers={["Batch", "Product", "Purchased", "Remaining", "Landed Cost", "Supplier", "Date"]}>
+              <DataTable headers={["Batch", "Product", "Purchased", "Remaining", "Purchase Rate", "Landed Cost", "Mandi Tax", "Freight", "Labour", "Other", "Rebate", "Net Payable", "Balance", "Supplier", "Date"]}>
                 {inventory.map((item) => (
                   <tr key={item.id}>
                     <td><span className="batch-id">{item.batch_no}</span></td>
@@ -545,6 +596,14 @@ function App() {
                     <td>{item.purchase_qty}</td>
                     <td><span className={Number(item.remaining_qty) <= 5 ? "stock-low" : "stock-ok"}>{item.remaining_qty}</span></td>
                     <td>{currency.format(Number(item.purchase_rate))}</td>
+                    <td>{currency.format(Number(item.effective_cost_per_unit || item.purchase_rate))}</td>
+                    <td>{currency.format(Number(item.mandi_tax_amount || 0))}</td>
+                    <td>{currency.format(Number(item.freight_charges || 0))}</td>
+                    <td>{currency.format(Number(item.labour_charges || 0))}</td>
+                    <td>{currency.format(Number(item.other_charges || 0))}</td>
+                    <td>{currency.format(Number(item.rebate_amount || 0))}</td>
+                    <td>{currency.format(Number(item.net_payable || 0))}</td>
+                    <td>{currency.format(Number(item.balance_amount || 0))}</td>
                     <td>{item.supplier_name}</td>
                     <td>{item.purchase_date}</td>
                   </tr>
@@ -558,7 +617,7 @@ function App() {
               inventory={inventory}
               onInvoice={setSelectedInvoice}
               onSaved={loadDashboardData}
-              products={products}
+              products={products.filter((product) => product.active !== false)}
               user={user}
             />
           )}
@@ -583,6 +642,26 @@ function App() {
             </ModuleCard>
           )}
 
+          {activeView === "sale-rates" && canManageRates && (
+            <SaleRateManager
+              history={saleRateHistory}
+              onReload={async () => { await Promise.all([loadProducts(), loadSaleRates()]); }}
+              onRefresh={loadSaleRates}
+              rates={saleRates}
+              desiredMargin={saleDesiredMargin}
+              setDesiredMargin={setSaleDesiredMargin}
+              user={user}
+            />
+          )}
+
+          {activeView === "settings" && canManageRates && (
+            <PurchaseSettings
+              onReload={async () => { await Promise.all([loadSettingsRules(), loadPurchaseRules()]); }}
+              rules={settingsRules}
+              user={user}
+            />
+          )}
+
           {futureModules[activeView] && (
             <section className="content-card empty-state">
               <div className="empty-icon"><Icon name={icons[activeView]} size={25} /></div>
@@ -596,6 +675,164 @@ function App() {
       </section>
       {selectedInvoice && <InvoiceModal invoice={selectedInvoice} onClose={() => setSelectedInvoice(null)} />}
     </main>
+  );
+}
+
+function PurchaseSettings({ onReload, rules, user }) {
+  const [newRule, setNewRule] = useState({ rule_name: "", pay_within_days: "", rebate_percent: "", active: true });
+
+  const updateMandiRule = async (rule, taxPercent, active) => {
+    try {
+      await axios.put(`${API_URL}/settings/mandi-tax-rules/${rule.id}`, {
+        tax_percent: Number(taxPercent),
+        active,
+        updated_by: user.id,
+      });
+      await onReload();
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update mandi tax rule"));
+    }
+  };
+
+  const addRebateRule = async () => {
+    try {
+      await axios.post(`${API_URL}/settings/rebate-rules`, { ...newRule, updated_by: user.id });
+      setNewRule({ rule_name: "", pay_within_days: "", rebate_percent: "", active: true });
+      await onReload();
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to add rebate rule"));
+    }
+  };
+
+  return (
+    <section className="settings-layout">
+      <ModuleCard eyebrow="Tax & Charges" title="Mandi Tax Rules" subtitle="Configure origin-based mandi tax rates used for every new purchase.">
+        <DataTable headers={["Origin Type", "Tax Percentage", "Status", ""]}>
+          {rules.mandiTaxRules.map((rule) => <MandiRuleRow key={rule.id} onSave={updateMandiRule} rule={rule} />)}
+        </DataTable>
+      </ModuleCard>
+      <ModuleCard eyebrow="Tax & Charges" title="Supplier Rebate Rules" subtitle="Maintain payment-speed slabs. Purchase Entry always uses an active rule from this table.">
+        <div className="form-grid settings-add-grid">
+          <Field label="Rule Name"><input value={newRule.rule_name} onChange={(event) => setNewRule({ ...newRule, rule_name: event.target.value })} /></Field>
+          <Field label="Pay Within Days"><input min="0" type="number" value={newRule.pay_within_days} onChange={(event) => setNewRule({ ...newRule, pay_within_days: event.target.value })} /></Field>
+          <Field label="Rebate Percentage"><input min="0" step="0.001" type="number" value={newRule.rebate_percent} onChange={(event) => setNewRule({ ...newRule, rebate_percent: event.target.value })} /></Field>
+        </div>
+        <button className="primary-button" onClick={addRebateRule}>Add Rebate Rule</button>
+        <DataTable headers={["Rule", "Pay Within Days", "Rebate Percentage", "Status", ""]}>
+          {rules.rebateRules.map((rule) => <RebateRuleRow key={rule.id} onReload={onReload} rule={rule} user={user} />)}
+        </DataTable>
+      </ModuleCard>
+    </section>
+  );
+}
+
+function MandiRuleRow({ onSave, rule }) {
+  const [taxPercent, setTaxPercent] = useState(rule.tax_percent);
+  const [active, setActive] = useState(rule.active);
+  return (
+    <tr>
+      <td className="primary-cell">{rule.origin_type}</td>
+      <td><input className="table-input" min="0" step="0.001" type="number" value={taxPercent} onChange={(event) => setTaxPercent(event.target.value)} /></td>
+      <td><label className="check-field"><input checked={active} type="checkbox" onChange={(event) => setActive(event.target.checked)} /><span>{active ? "Active" : "Inactive"}</span></label></td>
+      <td><button className="table-action" onClick={() => onSave(rule, taxPercent, active)}>Save</button></td>
+    </tr>
+  );
+}
+
+function RebateRuleRow({ onReload, rule, user }) {
+  const [draft, setDraft] = useState(rule);
+  const save = async () => {
+    try {
+      await axios.put(`${API_URL}/settings/rebate-rules/${rule.id}`, { ...draft, updated_by: user.id });
+      await onReload();
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update rebate rule"));
+    }
+  };
+  const remove = async () => {
+    try {
+      await axios.delete(`${API_URL}/settings/rebate-rules/${rule.id}`, { data: { updated_by: user.id } });
+      await onReload();
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to delete rebate rule"));
+    }
+  };
+  return (
+    <tr>
+      <td><input className="settings-table-input" value={draft.rule_name} onChange={(event) => setDraft({ ...draft, rule_name: event.target.value })} /></td>
+      <td><input className="table-input" min="0" type="number" value={draft.pay_within_days} onChange={(event) => setDraft({ ...draft, pay_within_days: event.target.value })} /></td>
+      <td><input className="table-input" min="0" step="0.001" type="number" value={draft.rebate_percent} onChange={(event) => setDraft({ ...draft, rebate_percent: event.target.value })} /></td>
+      <td><label className="check-field"><input checked={draft.active} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>{draft.active ? "Active" : "Inactive"}</span></label></td>
+      <td><div className="button-row"><button className="table-action" onClick={save}>Save</button><button className="remove-button" onClick={remove}><Icon name="trash" size={15} /></button></div></td>
+    </tr>
+  );
+}
+
+function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, setDesiredMargin, user }) {
+  const [search, setSearch] = useState("");
+  const [origin, setOrigin] = useState("");
+  const [category, setCategory] = useState("");
+  const [draftRates, setDraftRates] = useState({});
+  const categories = [...new Set(rates.map((rate) => rate.category).filter(Boolean))];
+  const filteredRates = rates.filter((rate) =>
+    rate.product_name.toLowerCase().includes(search.toLowerCase()) &&
+    (!origin || rate.origin_type === origin) &&
+    (!category || rate.category === category)
+  );
+
+  const saveRates = async () => {
+    const updates = Object.entries(draftRates)
+      .filter(([, value]) => Number(value) > 0)
+      .map(([productId, value]) => ({ product_id: Number(productId), new_selling_rate: Number(value) }));
+    try {
+      await axios.post(`${API_URL}/sale-rates/bulk`, { updates, changed_by: user.id });
+      setDraftRates({});
+      await onReload();
+      alert("Selling rates updated");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update selling rates"));
+    }
+  };
+
+  return (
+    <section className="settings-layout">
+      <ModuleCard eyebrow="Owner Controls" title="Daily Sale Rate Update" subtitle="Review landed costs, suggested rates, and approve daily selling-rate changes. Suggestions never auto-apply.">
+        <div className="rate-toolbar">
+          <input placeholder="Search products" value={search} onChange={(event) => setSearch(event.target.value)} />
+          <select value={origin} onChange={(event) => setOrigin(event.target.value)}><option value="">All Origins</option><option value="LOCAL">Local</option><option value="IMPORTED">Imported</option></select>
+          <select value={category} onChange={(event) => setCategory(event.target.value)}><option value="">All Categories</option>{categories.map((item) => <option key={item}>{item}</option>)}</select>
+          <input min="0" placeholder="Desired margin %" step="0.1" type="number" value={desiredMargin} onChange={(event) => setDesiredMargin(event.target.value)} />
+          <button className="secondary-button" onClick={() => onRefresh(desiredMargin)}>Refresh Suggestions</button>
+          <button className="primary-button" onClick={saveRates}>Bulk Save Rates</button>
+        </div>
+        <DataTable headers={["Product", "Origin", "Current Rate", "Suggested Rate", "New Rate", "Latest Landed Cost", "Stock", "Margin", "Updated", "Updated By"]}>
+          {filteredRates.map((rate) => {
+            const sellingRate = Number(draftRates[rate.id] || rate.selling_rate);
+            const cost = Number(rate.latest_effective_cost || 0);
+            const margin = sellingRate > 0 ? ((sellingRate - cost) / sellingRate) * 100 : 0;
+            return (
+              <tr key={rate.id}>
+                <td className="primary-cell">{rate.product_name}<small className="cell-note">{rate.category}</small></td>
+                <td><span className="tag">{rate.origin_type}</span></td>
+                <td>{currency.format(Number(rate.selling_rate))}</td>
+                <td className="profit-cell">{currency.format(Number(rate.suggested_selling_rate))}</td>
+                <td><input className="table-input" min="0" step="0.01" type="number" value={draftRates[rate.id] || ""} onChange={(event) => setDraftRates({ ...draftRates, [rate.id]: event.target.value })} /></td>
+                <td>{currency.format(cost)}</td>
+                <td>{rate.current_stock}</td>
+                <td><span className={margin < 15 ? "stock-low" : "stock-ok"}>{margin.toFixed(1)}%</span></td>
+                <td>{rate.selling_rate_updated_at ? new Date(rate.selling_rate_updated_at).toLocaleDateString("en-IN") : "-"}</td>
+                <td>{rate.updated_by_name || "-"}</td>
+              </tr>
+            );
+          })}
+        </DataTable>
+      </ModuleCard>
+      <ModuleCard eyebrow="Audit Trail" title="Sale Rate History" subtitle="Every approved selling-rate change is stored for reporting and accountability.">
+        <DataTable headers={["Changed At", "Product", "Old Rate", "New Rate", "Changed By", "Reason"]}>
+          {history.map((item) => <tr key={item.id}><td>{new Date(item.changed_at).toLocaleString("en-IN")}</td><td className="primary-cell">{item.product_name}</td><td>{currency.format(Number(item.old_selling_rate))}</td><td className="profit-cell">{currency.format(Number(item.new_selling_rate))}</td><td>{item.changed_by_name}</td><td>{item.reason || "-"}</td></tr>)}
+        </DataTable>
+      </ModuleCard>
+    </section>
   );
 }
 
@@ -999,10 +1236,14 @@ function PurchaseSummary({ summary }) {
       <div className="purchase-summary-grid">
         <SummaryMetric label="Basic Amount" value={currency.format(summary.basicAmount)} />
         <SummaryMetric label={`Mandi Tax (${summary.mandiTaxPercent}%)`} value={currency.format(summary.mandiTaxAmount)} />
+        <SummaryMetric label="Freight Charges" value={currency.format(summary.freightCharges)} />
+        <SummaryMetric label="Labour Charges" value={currency.format(summary.labourCharges)} />
+        <SummaryMetric label="Other Charges" value={currency.format(summary.otherCharges)} />
         <SummaryMetric label="Gross Amount" value={currency.format(summary.grossAmount)} />
         <SummaryMetric label={`Supplier Rebate (${summary.rebatePercent}%)`} value={`-${currency.format(summary.rebateAmount)}`} positive />
         <SummaryMetric label="Net Payable" value={currency.format(summary.netPayable)} featured />
         <SummaryMetric label="Pending Balance" value={currency.format(summary.balanceAmount)} />
+        <SummaryMetric label="Payment Status" value={summary.paymentStatus} />
         <SummaryMetric label="Effective Cost / Unit" value={currency.format(summary.effectiveCostPerUnit)} featured />
       </div>
     </section>

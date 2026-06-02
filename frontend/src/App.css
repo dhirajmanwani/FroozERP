@@ -420,6 +420,19 @@ label {
   font-weight: 700;
 }
 
+.check-field {
+  display: inline-flex;
+  align-items: center;
+  align-self: end;
+  gap: 7px;
+  min-height: 37px;
+}
+
+.check-field input {
+  width: auto;
+  accent-color: #f59e0b;
+}
+
 input,
 select,
 textarea {
@@ -599,6 +612,26 @@ tbody tr:last-child td {
 
 .summary-metric-featured strong {
   color: #f59e0b;
+}
+
+.settings-layout {
+  display: grid;
+  gap: 17px;
+}
+
+.settings-add-grid {
+  grid-template-columns: minmax(180px, 1.5fr) minmax(130px, 0.6fr) minmax(150px, 0.7fr);
+}
+
+.settings-table-input {
+  min-width: 145px;
+  padding: 7px 8px;
+}
+
+.rate-toolbar {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) 130px 145px 130px auto auto;
+  gap: 9px;
 }
 
 .table-action,
@@ -1152,6 +1185,11 @@ tbody tr:last-child td {
   .content-area {
     padding: 18px;
   }
+
+  .rate-toolbar,
+  .settings-add-grid {
+    grid-template-columns: 1fr 1fr;
+  }
 }
 
 @media (max-width: 560px) {
@@ -1189,6 +1227,11 @@ tbody tr:last-child td {
 
   .invoice-meta {
     text-align: left;
+  }
+
+  .rate-toolbar,
+  .settings-add-grid {
+    grid-template-columns: 1fr;
   }
 }
 
