@@ -319,6 +319,12 @@
   padding: 11px 15px;
 }
 
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+}
+
 .primary-button:hover,
 .quick-action:hover {
   background: #fbbf24;
@@ -524,6 +530,75 @@ tbody tr:last-child td {
 .profit-cell {
   color: #4ade80;
   font-weight: 800;
+}
+
+.purchase-summary {
+  margin: 4px 0 18px;
+  padding: 16px;
+  border: 1px solid rgba(245, 158, 11, 0.16);
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.07), rgba(23, 32, 51, 0.82));
+}
+
+.purchase-summary-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 13px;
+}
+
+.purchase-summary h3 {
+  margin: 4px 0 0;
+  color: #f8fafc;
+  font-size: 16px;
+}
+
+.origin-rate {
+  padding: 5px 9px;
+  border-radius: 999px;
+  color: #f59e0b;
+  background: rgba(245, 158, 11, 0.1);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.purchase-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
+  gap: 8px;
+}
+
+.summary-metric {
+  padding: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.08);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.4);
+}
+
+.summary-metric span,
+.summary-metric strong {
+  display: block;
+}
+
+.summary-metric span {
+  color: #94a3b8;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.summary-metric strong {
+  margin-top: 4px;
+  color: #e2e8f0;
+  font-size: 14px;
+}
+
+.summary-metric-featured {
+  border-color: rgba(245, 158, 11, 0.26);
+}
+
+.summary-metric-featured strong {
+  color: #f59e0b;
 }
 
 .table-action,

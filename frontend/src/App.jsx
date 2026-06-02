@@ -7,6 +7,16 @@ const currency = new Intl.NumberFormat("en-IN", {
   style: "currency",
   currency: "INR",
 });
+const defaultPurchaseRules = {
+  mandiTaxPercentByOrigin: { LOCAL: 2, IMPORTED: 4 },
+  rebatePercentByPaymentTiming: { SAME_DAY: 2, WITHIN_3_DAYS: 1.5, WITHIN_7_DAYS: 1, LATER: 0 },
+};
+const paymentTimingLabels = {
+  SAME_DAY: "Paid same day",
+  WITHIN_3_DAYS: "Paid within 3 days",
+  WITHIN_7_DAYS: "Paid within 7 days",
+  LATER: "Paid later",
+};
 
 const icons = {
   dashboard: "grid",
@@ -118,16 +128,22 @@ function App() {
   const [products, setProducts] = useState([]);
   const [inventory, setInventory] = useState([]);
   const [salesHistory, setSalesHistory] = useState([]);
+  const [purchaseRules, setPurchaseRules] = useState(defaultPurchaseRules);
 
   const [productName, setProductName] = useState("");
   const [sellingRate, setSellingRate] = useState("");
   const [purchaseRate, setPurchaseRate] = useState("");
   const [productBarcode, setProductBarcode] = useState("");
+  const [productOriginType, setProductOriginType] = useState("LOCAL");
+  const [editingProductId, setEditingProductId] = useState(null);
   const [unit, setUnit] = useState("");
   const [supplierName, setSupplierName] = useState("");
   const [purchaseProductId, setPurchaseProductId] = useState("");
   const [purchaseQuantity, setPurchaseQuantity] = useState("");
   const [purchaseRateInput, setPurchaseRateInput] = useState("");
+  const [purchaseOtherCharges, setPurchaseOtherCharges] = useState("");
+  const [purchasePaidAmount, setPurchasePaidAmount] = useState("");
+  const [purchasePaymentTiming, setPurchasePaymentTiming] = useState("LATER");
   const [selectedInvoice, setSelectedInvoice] = useState(null);
 
   const kpis = useMemo(() => {
@@ -154,9 +170,44 @@ function App() {
     ];
   }, [inventory, salesHistory]);
 
+  const selectedPurchaseProduct = useMemo(
+    () => products.find((product) => String(product.id) === purchaseProductId),
+    [products, purchaseProductId]
+  );
+
+  const purchaseSummary = useMemo(() => {
+    const quantity = Number(purchaseQuantity || 0);
+    const rate = Number(purchaseRateInput || 0);
+    const otherCharges = Number(purchaseOtherCharges || 0);
+    const paidAmount = Number(purchasePaidAmount || 0);
+    const mandiTaxPercent = purchaseRules.mandiTaxPercentByOrigin[selectedPurchaseProduct?.origin_type || "LOCAL"] || 0;
+    const rebatePercent = purchaseRules.rebatePercentByPaymentTiming[purchasePaymentTiming] || 0;
+    const basicAmount = quantity * rate;
+    const mandiTaxAmount = basicAmount * mandiTaxPercent / 100;
+    const grossAmount = basicAmount + mandiTaxAmount + otherCharges;
+    const rebateAmount = grossAmount * rebatePercent / 100;
+    const netPayable = grossAmount - rebateAmount;
+    return {
+      basicAmount,
+      mandiTaxPercent,
+      mandiTaxAmount,
+      grossAmount,
+      rebatePercent,
+      rebateAmount,
+      netPayable,
+      balanceAmount: Math.max(netPayable - paidAmount, 0),
+      effectiveCostPerUnit: quantity > 0 ? netPayable / quantity : 0,
+    };
+  }, [purchaseOtherCharges, purchasePaidAmount, purchasePaymentTiming, purchaseQuantity, purchaseRateInput, purchaseRules, selectedPurchaseProduct]);
+
   const loadProducts = async () => {
     const response = await axios.get(`${API_URL}/products`);
     setProducts(response.data);
+  };
+
+  const loadPurchaseRules = async () => {
+    const response = await axios.get(`${API_URL}/purchase-rules`);
+    setPurchaseRules(response.data);
   };
 
   const loadDashboardData = async () => {
@@ -172,7 +223,7 @@ function App() {
     try {
       const response = await axios.post(`${API_URL}/login`, { username, password });
       setUser(response.data);
-      await Promise.all([loadProducts(), loadDashboardData()]);
+      await Promise.all([loadProducts(), loadDashboardData(), loadPurchaseRules()]);
     } catch (error) {
       alert(getErrorMessage(error, "Login Failed"));
     }
@@ -180,20 +231,28 @@ function App() {
 
   const addProduct = async () => {
     try {
-      await axios.post(`${API_URL}/products`, {
+      const payload = {
         product_name: productName,
         selling_rate: sellingRate,
         purchase_rate: purchaseRate,
         unit,
         barcode: productBarcode,
-      });
+        origin_type: productOriginType,
+      };
+      if (editingProductId) {
+        await axios.put(`${API_URL}/products/${editingProductId}`, payload);
+      } else {
+        await axios.post(`${API_URL}/products`, payload);
+      }
       setProductName("");
       setSellingRate("");
       setPurchaseRate("");
       setUnit("");
       setProductBarcode("");
+      setProductOriginType("LOCAL");
+      setEditingProductId(null);
       await loadProducts();
-      alert("Product Added");
+      alert(editingProductId ? "Product Updated" : "Product Added");
     } catch (error) {
       alert(getErrorMessage(error, "Error Adding Product"));
     }
@@ -206,6 +265,9 @@ function App() {
         product_id: purchaseProductId,
         quantity: purchaseQuantity,
         purchase_rate: purchaseRateInput,
+        other_charges: purchaseOtherCharges,
+        paid_amount: purchasePaidAmount,
+        payment_timing: purchasePaymentTiming,
         branch_id: user.branch_id,
         created_by: user.id,
       });
@@ -213,6 +275,9 @@ function App() {
       setPurchaseProductId("");
       setPurchaseQuantity("");
       setPurchaseRateInput("");
+      setPurchaseOtherCharges("");
+      setPurchasePaidAmount("");
+      setPurchasePaymentTiming("LATER");
       await loadDashboardData();
       alert("Purchase Saved");
     } catch (error) {
@@ -234,6 +299,26 @@ function App() {
     const product = products.find((item) => String(item.id) === productId);
     setPurchaseProductId(productId);
     setPurchaseRateInput(product?.purchase_rate || "");
+  };
+
+  const editProduct = (product) => {
+    setProductName(product.product_name);
+    setSellingRate(product.selling_rate);
+    setPurchaseRate(product.purchase_rate);
+    setUnit(product.unit);
+    setProductBarcode(product.barcode || "");
+    setProductOriginType(product.origin_type || "LOCAL");
+    setEditingProductId(product.id);
+  };
+
+  const cancelProductEdit = () => {
+    setProductName("");
+    setSellingRate("");
+    setPurchaseRate("");
+    setUnit("");
+    setProductBarcode("");
+    setProductOriginType("LOCAL");
+    setEditingProductId(null);
   };
 
   const navigate = async (view) => {
@@ -398,16 +483,27 @@ function App() {
                 <Field label="Purchase Rate"><input type="number" min="0" step="0.01" value={purchaseRate} onChange={(event) => setPurchaseRate(event.target.value)} /></Field>
                 <Field label="Unit"><input value={unit} onChange={(event) => setUnit(event.target.value)} /></Field>
                 <Field label="Barcode (Optional)"><input value={productBarcode} onChange={(event) => setProductBarcode(event.target.value)} /></Field>
+                <Field label="Origin Type">
+                  <select value={productOriginType} onChange={(event) => setProductOriginType(event.target.value)}>
+                    <option value="LOCAL">Local</option>
+                    <option value="IMPORTED">Imported</option>
+                  </select>
+                </Field>
               </div>
-              <button className="primary-button" onClick={addProduct}>Add Product</button>
-              <DataTable headers={["Product", "Barcode", "Selling Rate", "Purchase Rate", "Unit"]}>
+              <div className="button-row">
+                <button className="primary-button" onClick={addProduct}>{editingProductId ? "Update Product" : "Add Product"}</button>
+                {editingProductId && <button className="secondary-button" onClick={cancelProductEdit}>Cancel Edit</button>}
+              </div>
+              <DataTable headers={["Product", "Barcode", "Origin", "Selling Rate", "Purchase Rate", "Unit", ""]}>
                 {products.map((product) => (
                   <tr key={product.id}>
                     <td className="primary-cell">{product.product_name}</td>
                     <td>{product.barcode || "-"}</td>
+                    <td><span className="tag">{product.origin_type || "LOCAL"}</span></td>
                     <td>{currency.format(Number(product.selling_rate))}</td>
                     <td>{currency.format(Number(product.purchase_rate))}</td>
                     <td><span className="tag">{product.unit}</span></td>
+                    <td><button className="table-action" onClick={() => editProduct(product)}>Edit</button></td>
                   </tr>
                 ))}
               </DataTable>
@@ -426,14 +522,22 @@ function App() {
                 </Field>
                 <Field label="Quantity"><input type="number" min="0" step="0.001" value={purchaseQuantity} onChange={(event) => setPurchaseQuantity(event.target.value)} /></Field>
                 <Field label="Purchase Rate"><input type="number" min="0" step="0.01" value={purchaseRateInput} onChange={(event) => setPurchaseRateInput(event.target.value)} /></Field>
+                <Field label="Other Charges"><input type="number" min="0" step="0.01" value={purchaseOtherCharges} onChange={(event) => setPurchaseOtherCharges(event.target.value)} /></Field>
+                <Field label="Payment Timing">
+                  <select value={purchasePaymentTiming} onChange={(event) => setPurchasePaymentTiming(event.target.value)}>
+                    {Object.entries(paymentTimingLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                  </select>
+                </Field>
+                <Field label="Paid Amount"><input type="number" min="0" step="0.01" value={purchasePaidAmount} onChange={(event) => setPurchasePaidAmount(event.target.value)} /></Field>
               </div>
+              <PurchaseSummary summary={purchaseSummary} />
               <button className="primary-button" onClick={savePurchase}>Save Purchase</button>
             </ModuleCard>
           )}
 
           {activeView === "inventory" && (
             <ModuleCard eyebrow="Stock Control" title="Inventory Batches" subtitle="Review current quantities and batch-level purchase details.">
-              <DataTable headers={["Batch", "Product", "Purchased", "Remaining", "Purchase Rate", "Supplier", "Date"]}>
+              <DataTable headers={["Batch", "Product", "Purchased", "Remaining", "Landed Cost", "Supplier", "Date"]}>
                 {inventory.map((item) => (
                   <tr key={item.id}>
                     <td><span className="batch-id">{item.batch_no}</span></td>
@@ -878,6 +982,38 @@ function InvoiceModal({ invoice, onClose }) {
           </footer>
         </article>
       </section>
+    </div>
+  );
+}
+
+function PurchaseSummary({ summary }) {
+  return (
+    <section className="purchase-summary">
+      <div className="purchase-summary-heading">
+        <div>
+          <span className="eyebrow">Landed Cost Preview</span>
+          <h3>Purchase Calculation</h3>
+        </div>
+        <span className="origin-rate">Mandi Tax {summary.mandiTaxPercent}%</span>
+      </div>
+      <div className="purchase-summary-grid">
+        <SummaryMetric label="Basic Amount" value={currency.format(summary.basicAmount)} />
+        <SummaryMetric label={`Mandi Tax (${summary.mandiTaxPercent}%)`} value={currency.format(summary.mandiTaxAmount)} />
+        <SummaryMetric label="Gross Amount" value={currency.format(summary.grossAmount)} />
+        <SummaryMetric label={`Supplier Rebate (${summary.rebatePercent}%)`} value={`-${currency.format(summary.rebateAmount)}`} positive />
+        <SummaryMetric label="Net Payable" value={currency.format(summary.netPayable)} featured />
+        <SummaryMetric label="Pending Balance" value={currency.format(summary.balanceAmount)} />
+        <SummaryMetric label="Effective Cost / Unit" value={currency.format(summary.effectiveCostPerUnit)} featured />
+      </div>
+    </section>
+  );
+}
+
+function SummaryMetric({ featured = false, label, positive = false, value }) {
+  return (
+    <div className={featured ? "summary-metric summary-metric-featured" : "summary-metric"}>
+      <span>{label}</span>
+      <strong className={positive ? "profit-cell" : ""}>{value}</strong>
     </div>
   );
 }

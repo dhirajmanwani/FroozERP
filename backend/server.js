@@ -31,8 +31,21 @@ const parseNonNegativeNumber = (value) => {
 };
 
 const roundCurrency = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+const roundUnitCost = (value) => Math.round((Number(value) + Number.EPSILON) * 10000) / 10000;
 const toDateKey = (value) =>
   value instanceof Date ? value.toLocaleDateString("en-CA") : String(value).slice(0, 10);
+const PURCHASE_RULES = Object.freeze({
+  mandiTaxPercentByOrigin: Object.freeze({
+    LOCAL: 2,
+    IMPORTED: 4,
+  }),
+  rebatePercentByPaymentTiming: Object.freeze({
+    SAME_DAY: 2,
+    WITHIN_3_DAYS: 1.5,
+    WITHIN_7_DAYS: 1,
+    LATER: 0,
+  }),
+});
 
 const initializeDatabase = async () => {
   await pool.query(`
@@ -48,9 +61,31 @@ const initializeDatabase = async () => {
     );
 
     ALTER TABLE products ADD COLUMN IF NOT EXISTS barcode VARCHAR(100);
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS origin_type VARCHAR(20) DEFAULT 'LOCAL';
+    UPDATE products SET origin_type = 'LOCAL' WHERE origin_type IS NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS products_barcode_unique_idx
       ON products (barcode)
       WHERE barcode IS NOT NULL AND barcode <> '';
+
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS basic_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS mandi_tax_percent NUMERIC(6, 3) DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS mandi_tax_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS other_charges NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS gross_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS rebate_percent NUMERIC(6, 3) DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS rebate_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS net_payable NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS balance_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS payment_timing VARCHAR(30) DEFAULT 'LATER';
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS effective_cost_per_unit NUMERIC(14, 4) DEFAULT 0;
+
+    ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS basic_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS mandi_tax_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS other_charges NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS rebate_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS net_payable NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS effective_cost_per_unit NUMERIC(14, 4) DEFAULT 0;
 
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS invoice_no VARCHAR(40);
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS customer_name VARCHAR(120);
@@ -118,8 +153,22 @@ const initializeDatabase = async () => {
     UPDATE sale_items
     SET net_amount = amount
     WHERE net_amount IS NULL;
+
+    UPDATE purchases
+    SET
+      basic_amount = total_amount,
+      gross_amount = total_amount,
+      net_payable = total_amount,
+      balance_amount = total_amount
+    WHERE basic_amount = 0
+      AND gross_amount = 0
+      AND net_payable = 0;
   `);
 };
+
+app.get("/purchase-rules", (req, res) => {
+  res.json(PURCHASE_RULES);
+});
 
 app.get("/", (req, res) => {
   res.send("FroozERP Backend Running");
@@ -183,21 +232,22 @@ app.get("/products", async (req, res) => {
 
 app.post("/products", async (req, res) => {
   try {
-    const { product_name, selling_rate, purchase_rate, unit, barcode } = req.body;
+    const { product_name, selling_rate, purchase_rate, unit, barcode, origin_type } = req.body;
     const parsedSellingRate = parsePositiveNumber(selling_rate);
     const parsedPurchaseRate = parsePositiveNumber(purchase_rate);
+    const parsedOriginType = String(origin_type || "LOCAL").toUpperCase();
 
-    if (!product_name?.trim() || !unit?.trim() || !parsedSellingRate || !parsedPurchaseRate) {
+    if (!product_name?.trim() || !unit?.trim() || !parsedSellingRate || !parsedPurchaseRate || !Object.hasOwn(PURCHASE_RULES.mandiTaxPercentByOrigin, parsedOriginType)) {
       return res.status(400).json({ message: "Enter valid product details" });
     }
 
     const result = await pool.query(
       `
-      INSERT INTO products (product_name, selling_rate, purchase_rate, unit, barcode)
-      VALUES ($1, $2, $3, $4, $5)
+      INSERT INTO products (product_name, selling_rate, purchase_rate, unit, barcode, origin_type)
+      VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING *
       `,
-      [product_name.trim(), parsedSellingRate, parsedPurchaseRate, unit.trim(), barcode?.trim() || null]
+      [product_name.trim(), parsedSellingRate, parsedPurchaseRate, unit.trim(), barcode?.trim() || null, parsedOriginType]
     );
 
     return res.status(201).json(result.rows[0]);
@@ -207,6 +257,38 @@ app.post("/products", async (req, res) => {
       return res.status(409).json({ message: "Barcode is already assigned to another product" });
     }
     return res.status(500).json({ message: "Error Adding Product" });
+  }
+});
+
+app.put("/products/:id", async (req, res) => {
+  try {
+    const productId = parsePositiveInteger(req.params.id);
+    const { product_name, selling_rate, purchase_rate, unit, barcode, origin_type } = req.body;
+    const parsedSellingRate = parsePositiveNumber(selling_rate);
+    const parsedPurchaseRate = parsePositiveNumber(purchase_rate);
+    const parsedOriginType = String(origin_type || "").toUpperCase();
+
+    if (!productId || !product_name?.trim() || !unit?.trim() || !parsedSellingRate || !parsedPurchaseRate || !Object.hasOwn(PURCHASE_RULES.mandiTaxPercentByOrigin, parsedOriginType)) {
+      return res.status(400).json({ message: "Enter valid product details" });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE products
+      SET product_name = $1, selling_rate = $2, purchase_rate = $3, unit = $4, barcode = $5, origin_type = $6
+      WHERE id = $7
+      RETURNING *
+      `,
+      [product_name.trim(), parsedSellingRate, parsedPurchaseRate, unit.trim(), barcode?.trim() || null, parsedOriginType, productId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ message: "Product not found" });
+    return res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    if (error.code === "23505") {
+      return res.status(409).json({ message: "Barcode is already assigned to another product" });
+    }
+    return res.status(500).json({ message: "Error Updating Product" });
   }
 });
 
@@ -262,39 +344,100 @@ app.post("/purchase", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const { supplier_name, product_id, quantity, purchase_rate, branch_id, created_by } = req.body;
+    const {
+      supplier_name,
+      product_id,
+      quantity,
+      purchase_rate,
+      other_charges,
+      paid_amount,
+      payment_timing,
+      branch_id,
+      created_by,
+    } = req.body;
     const parsedProductId = parsePositiveInteger(product_id);
     const parsedQuantity = parsePositiveNumber(quantity);
     const parsedPurchaseRate = parsePositiveNumber(purchase_rate);
+    const parsedOtherCharges = parseNonNegativeNumber(other_charges);
+    const parsedPaidAmount = parseNonNegativeNumber(paid_amount);
+    const parsedPaymentTiming = String(payment_timing || "LATER").toUpperCase();
     const parsedBranchId = parsePositiveInteger(branch_id);
     const parsedCreatedBy = parsePositiveInteger(created_by) || 1;
 
-    if (!supplier_name?.trim() || !parsedProductId || !parsedQuantity || !parsedPurchaseRate || !parsedBranchId) {
+    if (
+      !supplier_name?.trim() ||
+      !parsedProductId ||
+      !parsedQuantity ||
+      !parsedPurchaseRate ||
+      parsedOtherCharges === null ||
+      parsedPaidAmount === null ||
+      !Object.hasOwn(PURCHASE_RULES.rebatePercentByPaymentTiming, parsedPaymentTiming) ||
+      !parsedBranchId
+    ) {
       return res.status(400).json({ message: "Enter valid purchase details" });
     }
 
-    const totalAmount = parsedQuantity * parsedPurchaseRate;
     await client.query("BEGIN");
+    const productResult = await client.query(
+      "SELECT id, product_name, origin_type FROM products WHERE id = $1 FOR SHARE",
+      [parsedProductId]
+    );
+    if (productResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    const product = productResult.rows[0];
+    const originType = product.origin_type || "LOCAL";
+    const mandiTaxPercent = PURCHASE_RULES.mandiTaxPercentByOrigin[originType];
+    const rebatePercent = PURCHASE_RULES.rebatePercentByPaymentTiming[parsedPaymentTiming];
+    const basicAmount = roundCurrency(parsedQuantity * parsedPurchaseRate);
+    const mandiTaxAmount = roundCurrency(basicAmount * mandiTaxPercent / 100);
+    const grossAmount = roundCurrency(basicAmount + mandiTaxAmount + parsedOtherCharges);
+    const rebateAmount = roundCurrency(grossAmount * rebatePercent / 100);
+    const netPayable = roundCurrency(grossAmount - rebateAmount);
+    if (parsedPaidAmount > netPayable) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Paid amount cannot exceed net payable amount" });
+    }
+    const balanceAmount = roundCurrency(netPayable - parsedPaidAmount);
+    const effectiveCostPerUnit = roundUnitCost(netPayable / parsedQuantity);
 
     const purchaseResult = await client.query(
       `
-      INSERT INTO purchases (supplier_name, total_amount, branch_id, created_by)
-      VALUES ($1, $2, $3, $4)
-      RETURNING id
+      INSERT INTO purchases (
+        supplier_name, total_amount, branch_id, created_by, basic_amount,
+        mandi_tax_percent, mandi_tax_amount, other_charges, gross_amount,
+        rebate_percent, rebate_amount, net_payable, paid_amount, balance_amount,
+        payment_timing, effective_cost_per_unit
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+      RETURNING *
       `,
-      [supplier_name.trim(), totalAmount, parsedBranchId, parsedCreatedBy]
+      [
+        supplier_name.trim(), netPayable, parsedBranchId, parsedCreatedBy, basicAmount,
+        mandiTaxPercent, mandiTaxAmount, parsedOtherCharges, grossAmount,
+        rebatePercent, rebateAmount, netPayable, parsedPaidAmount, balanceAmount,
+        parsedPaymentTiming, effectiveCostPerUnit,
+      ]
     );
-    const purchaseId = purchaseResult.rows[0].id;
+    const purchase = purchaseResult.rows[0];
 
     await client.query(
       `
-      INSERT INTO purchase_items (purchase_id, product_id, quantity, purchase_rate, amount)
-      VALUES ($1, $2, $3, $4, $5)
+      INSERT INTO purchase_items (
+        purchase_id, product_id, quantity, purchase_rate, amount, basic_amount,
+        mandi_tax_amount, other_charges, rebate_amount, net_payable, effective_cost_per_unit
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       `,
-      [purchaseId, parsedProductId, parsedQuantity, parsedPurchaseRate, totalAmount]
+      [
+        purchase.id, parsedProductId, parsedQuantity, parsedPurchaseRate, netPayable, basicAmount,
+        mandiTaxAmount, parsedOtherCharges, rebateAmount, netPayable, effectiveCostPerUnit,
+      ]
     );
 
-    const batchNo = `BATCH-${Date.now()}-${purchaseId}`;
+    const batchNo = `BATCH-${Date.now()}-${purchase.id}`;
     await client.query(
       `
       INSERT INTO inventory_batches (
@@ -307,7 +450,7 @@ app.post("/purchase", async (req, res) => {
         batchNo,
         parsedQuantity,
         parsedQuantity,
-        parsedPurchaseRate,
+        effectiveCostPerUnit,
         supplier_name.trim(),
         parsedBranchId,
       ]
@@ -318,11 +461,20 @@ app.post("/purchase", async (req, res) => {
       INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id)
       VALUES ($1, $2, 'IN', $3, $4, $5)
       `,
-      [parsedProductId, parsedQuantity, `Purchase #${purchaseId}`, parsedCreatedBy, parsedBranchId]
+      [parsedProductId, parsedQuantity, `Purchase #${purchase.id}`, parsedCreatedBy, parsedBranchId]
     );
 
     await client.query("COMMIT");
-    return res.status(201).json({ success: true, message: "Purchase Saved", purchase_id: purchaseId });
+    return res.status(201).json({
+      success: true,
+      message: "Purchase Saved",
+      purchase_id: purchase.id,
+      purchase: {
+        ...purchase,
+        product_name: product.product_name,
+        origin_type: originType,
+      },
+    });
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
