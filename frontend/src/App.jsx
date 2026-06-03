@@ -172,6 +172,14 @@ function App() {
   const [supplierLedger, setSupplierLedger] = useState({ suppliers: [], ledger: [] });
   const [ledgerSupplierId, setLedgerSupplierId] = useState("");
   const [supplierDashboard, setSupplierDashboard] = useState({
+    todaySales: 0,
+    todayProfit: 0,
+    stockValue: 0,
+    lowStockItems: 0,
+    transactions: 0,
+    supplierOutstanding: 0,
+    totalRebateReceived: 0,
+    todaySupplierPayments: 0,
     total_supplier_outstanding: 0,
     total_rebate_received: 0,
     todays_supplier_payments: 0,
@@ -212,16 +220,26 @@ function App() {
       return stock;
     }, new Map());
     const lowStockItems = [...stockByProduct.values()].filter((quantity) => quantity <= 5).length;
+    const metrics = {
+      todaySales: supplierDashboard.todaySales ?? total(todaysSales, "amount"),
+      todayProfit: supplierDashboard.todayProfit ?? total(todaysSales, "profit"),
+      stockValue: supplierDashboard.stockValue ?? stockValue,
+      lowStockItems: supplierDashboard.lowStockItems ?? lowStockItems,
+      transactions: supplierDashboard.transactions ?? todaysSales.length,
+      supplierOutstanding: supplierDashboard.supplierOutstanding ?? supplierDashboard.total_supplier_outstanding ?? 0,
+      totalRebateReceived: supplierDashboard.totalRebateReceived ?? supplierDashboard.total_rebate_received ?? 0,
+      todaySupplierPayments: supplierDashboard.todaySupplierPayments ?? supplierDashboard.todays_supplier_payments ?? 0,
+    };
 
     return [
-      ["Today's Sales", currency.format(total(todaysSales, "amount")), "rupee"],
-      ["Today's Profit", currency.format(total(todaysSales, "profit")), "trend"],
-      ["Stock Value", currency.format(stockValue), "layers"],
-      ["Low Stock Items", lowStockItems, "alert"],
-      ["Transactions", todaysSales.length, "receipt"],
-      ["Supplier Outstanding", currency.format(Number(supplierDashboard.total_supplier_outstanding || 0)), "wallet"],
-      ["Total Rebate Received", currency.format(Number(supplierDashboard.total_rebate_received || 0)), "trend"],
-      ["Today's Supplier Payments", currency.format(Number(supplierDashboard.todays_supplier_payments || 0)), "rupee"],
+      ["Today's Sales", currency.format(Number(metrics.todaySales || 0)), "rupee"],
+      ["Today's Profit", currency.format(Number(metrics.todayProfit || 0)), "trend"],
+      ["Stock Value", currency.format(Number(metrics.stockValue || 0)), "layers"],
+      ["Low Stock Items", Number(metrics.lowStockItems || 0), "alert"],
+      ["Transactions", Number(metrics.transactions || 0), "receipt"],
+      ["Supplier Outstanding", currency.format(Number(metrics.supplierOutstanding || 0)), "wallet"],
+      ["Total Rebate Received", currency.format(Number(metrics.totalRebateReceived || 0)), "trend"],
+      ["Today's Supplier Payments", currency.format(Number(metrics.todaySupplierPayments || 0)), "rupee"],
     ];
   }, [inventory, salesHistory, supplierDashboard]);
 
@@ -302,8 +320,9 @@ function App() {
       axios.get(`${API_URL}/suppliers`, { params }),
       axios.get(`${API_URL}/supplier-summary`),
     ]);
+    const supplierSummaryPayload = summaryResponse.data;
     setSuppliers(suppliersResponse.data);
-    setSupplierSummary(summaryResponse.data);
+    setSupplierSummary(Array.isArray(supplierSummaryPayload) ? supplierSummaryPayload : supplierSummaryPayload.suppliers || []);
   };
 
   const loadSupplierPayments = async (supplierId = "") => {

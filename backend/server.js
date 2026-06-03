@@ -417,6 +417,28 @@ const getSupplierSummaryRows = async ({ active, search, supplierId } = {}) => {
   return result.rows;
 };
 
+const buildSupplierSummaryPayload = (rows) => {
+  const totals = rows.reduce((summary, supplier) => ({
+    totalPurchases: summary.totalPurchases + Number(supplier.total_purchases || 0),
+    totalPaid: summary.totalPaid + Number(supplier.total_paid || 0),
+    totalRebateReceived: summary.totalRebateReceived + Number(supplier.total_rebate_received || 0),
+    outstandingBalance: summary.outstandingBalance + Number(supplier.outstanding_balance || 0),
+  }), {
+    totalPurchases: 0,
+    totalPaid: 0,
+    totalRebateReceived: 0,
+    outstandingBalance: 0,
+  });
+
+  return {
+    totalPurchases: roundCurrency(totals.totalPurchases),
+    totalPaid: roundCurrency(totals.totalPaid),
+    totalRebateReceived: roundCurrency(totals.totalRebateReceived),
+    outstandingBalance: roundCurrency(totals.outstandingBalance),
+    suppliers: rows,
+  };
+};
+
 const readSupplierPayload = (body) => {
   const supplierType = normalizeSupplierType(body.supplier_type);
   return {
@@ -1031,7 +1053,7 @@ app.get("/supplier-summary", async (req, res) => {
     const supplierId = req.query.supplier_id ? parsePositiveInteger(req.query.supplier_id) : null;
     if (req.query.supplier_id && !supplierId) return res.status(400).json({ message: "Invalid supplier" });
     const rows = await getSupplierSummaryRows({ supplierId });
-    return res.json(rows);
+    return res.json(buildSupplierSummaryPayload(rows));
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Supplier Summary" });
@@ -1072,22 +1094,70 @@ app.get("/dashboard-metrics", async (req, res) => {
         ) pay ON pay.supplier_id = s.id
       )
       SELECT
-        COALESCE(ROUND(SUM(outstanding_balance)::NUMERIC, 2), 0) AS total_supplier_outstanding,
+        COALESCE((SELECT SUM(total_amount) FROM sales WHERE sale_date = CURRENT_DATE), 0) AS "todaySales",
+        COALESCE((SELECT SUM(profit) FROM sales WHERE sale_date = CURRENT_DATE), 0) AS "todayProfit",
+        COALESCE((
+          SELECT SUM(remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate))
+          FROM inventory_batches
+        ), 0) AS "stockValue",
+        COALESCE((
+          SELECT COUNT(*)
+          FROM (
+            SELECT
+              p.id,
+              COALESCE(SUM(ib.remaining_qty), 0) AS current_stock,
+              COALESCE(p.minimum_stock, 5) AS minimum_stock
+            FROM products p
+            LEFT JOIN inventory_batches ib ON ib.product_id = p.id
+            WHERE p.active IS DISTINCT FROM FALSE
+            GROUP BY p.id, p.minimum_stock
+          ) stock
+          WHERE stock.current_stock <= stock.minimum_stock
+        ), 0) AS "lowStockItems",
+        COALESCE((SELECT COUNT(*) FROM sales WHERE sale_date = CURRENT_DATE), 0) AS "transactions",
+        COALESCE((SELECT ROUND(SUM(outstanding_balance)::NUMERIC, 2) FROM supplier_balances), 0) AS "supplierOutstanding",
+        COALESCE((SELECT SUM(rebate_amount) FROM purchases), 0)
+          + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments), 0) AS "totalRebateReceived",
+        COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE payment_date = CURRENT_DATE), 0)
+          + COALESCE((SELECT SUM(paid_amount) FROM purchases WHERE COALESCE(payment_date, purchase_date) = CURRENT_DATE), 0) AS "todaySupplierPayments",
+        COALESCE((SELECT ROUND(SUM(outstanding_balance)::NUMERIC, 2) FROM supplier_balances), 0) AS total_supplier_outstanding,
         COALESCE((SELECT SUM(rebate_amount) FROM purchases), 0)
           + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments), 0) AS total_rebate_received,
         COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE payment_date = CURRENT_DATE), 0)
           + COALESCE((SELECT SUM(paid_amount) FROM purchases WHERE COALESCE(payment_date, purchase_date) = CURRENT_DATE), 0) AS todays_supplier_payments,
-        (SELECT COUNT(*) FROM suppliers) AS supplier_count,
-        (SELECT COUNT(*) FROM suppliers WHERE active = TRUE) AS active_supplier_count
-      FROM supplier_balances
+        COALESCE((SELECT COUNT(*) FROM suppliers), 0) AS supplier_count,
+        COALESCE((SELECT COUNT(*) FROM suppliers WHERE active = TRUE), 0) AS active_supplier_count
       `
     );
-    return res.json(result.rows[0] || {
+    const metrics = result.rows[0] || {
+      todaySales: 0,
+      todayProfit: 0,
+      stockValue: 0,
+      lowStockItems: 0,
+      transactions: 0,
+      supplierOutstanding: 0,
+      totalRebateReceived: 0,
+      todaySupplierPayments: 0,
       total_supplier_outstanding: 0,
       total_rebate_received: 0,
       todays_supplier_payments: 0,
       supplier_count: 0,
       active_supplier_count: 0,
+    };
+    return res.json({
+      todaySales: Number(metrics.todaySales || 0),
+      todayProfit: Number(metrics.todayProfit || 0),
+      stockValue: Number(metrics.stockValue || 0),
+      lowStockItems: Number(metrics.lowStockItems || 0),
+      transactions: Number(metrics.transactions || 0),
+      supplierOutstanding: Number(metrics.supplierOutstanding || 0),
+      totalRebateReceived: Number(metrics.totalRebateReceived || 0),
+      todaySupplierPayments: Number(metrics.todaySupplierPayments || 0),
+      total_supplier_outstanding: Number(metrics.total_supplier_outstanding || metrics.supplierOutstanding || 0),
+      total_rebate_received: Number(metrics.total_rebate_received || metrics.totalRebateReceived || 0),
+      todays_supplier_payments: Number(metrics.todays_supplier_payments || metrics.todaySupplierPayments || 0),
+      supplier_count: Number(metrics.supplier_count || 0),
+      active_supplier_count: Number(metrics.active_supplier_count || 0),
     });
   } catch (error) {
     console.error(error);
