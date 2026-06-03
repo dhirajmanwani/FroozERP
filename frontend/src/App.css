@@ -1386,6 +1386,72 @@ tbody tr:last-child td {
   white-space: pre-wrap;
 }
 
+.audit-readable {
+  display: grid;
+  gap: 6px;
+  max-width: 520px;
+}
+
+.audit-readable span {
+  display: block;
+  padding: 7px 9px;
+  border: 1px solid rgba(148, 163, 184, 0.1);
+  border-radius: 8px;
+  color: #cbd5e1;
+  background: rgba(15, 23, 42, 0.45);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.report-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.report-toolbar strong {
+  color: #f8fafc;
+  font-size: 14px;
+}
+
+.report-paper {
+  display: grid;
+  gap: 14px;
+}
+
+.report-print-header {
+  display: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.report-print-header strong,
+.report-print-header span {
+  display: block;
+}
+
+.report-print-header strong {
+  color: #f8fafc;
+  font-size: 18px;
+}
+
+.report-print-header span {
+  margin-top: 4px;
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.receipt-summary {
+  display: grid;
+  gap: 8px;
+  margin: 18px 0;
+}
+
 .invoice-toolbar {
   display: flex;
   align-items: center;
@@ -1798,11 +1864,19 @@ tbody tr:last-child td {
     visibility: hidden;
   }
 
+  .print-area,
+  .print-area *,
   .invoice-paper,
   .invoice-paper * {
     visibility: visible;
   }
 
+  .no-print,
+  .no-print * {
+    display: none !important;
+  }
+
+  .print-area,
   .invoice-paper {
     position: absolute;
     inset: 0;
@@ -1810,6 +1884,46 @@ tbody tr:last-child td {
     margin: 0;
     padding: 18px;
     box-sizing: border-box;
+    color: #111827;
+    background: #ffffff;
+  }
+
+  .report-print-header {
+    display: flex;
+  }
+
+  .print-area table,
+  .print-area th,
+  .print-area td {
+    color: #111827;
+    border-color: #d1d5db;
+  }
+
+  .print-area th {
+    background: #f3f4f6;
+  }
+
+  .print-area .summary-metric,
+  .print-area .table-wrap,
+  .print-area .invoice-customer,
+  .print-area .total-line {
+    color: #111827;
+    border-color: #d1d5db;
+    background: #ffffff;
+  }
+
+  .print-area strong,
+  .print-area h2,
+  .print-area h3,
+  .print-area .primary-cell,
+  .print-area .balance-cell {
+    color: #111827;
+  }
+
+  .print-area span,
+  .print-area small,
+  .print-area p {
+    color: #374151;
   }
 
   .brand-lockup-invoice .brand-monogram {

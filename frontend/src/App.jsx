@@ -7,6 +7,7 @@ const currency = new Intl.NumberFormat("en-IN", {
   style: "currency",
   currency: "INR",
 });
+const roundUi = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 const defaultPurchaseRules = {
   mandiTaxRules: [],
   rebateRules: [],
@@ -65,7 +66,6 @@ const accountTypes = [
 const accountPaymentActions = [
   ["RECEIVE_CUSTOMER", "Receive Payment from Customer"],
   ["PAY_SUPPLIER", "Pay Supplier"],
-  ["SUPPLIER_REBATE", "Add Rebate Received from Supplier"],
 ];
 
 const ledgerModes = [
@@ -234,6 +234,7 @@ function App() {
   const [customers, setCustomers] = useState([]);
   const [accounts, setAccounts] = useState([]);
   const [accountLedger, setAccountLedger] = useState({ account: null, ledger: [] });
+  const [accountPayments, setAccountPayments] = useState([]);
   const [accountOutstanding, setAccountOutstanding] = useState({
     customerOutstanding: [],
     supplierOutstanding: [],
@@ -246,6 +247,10 @@ function App() {
     supplierOutstandingReport: [],
     customerOutstandingReport: [],
     discountReport: [],
+    expenseReport: [],
+    paymentReport: [],
+    balanceSheet: {},
+    profitLoss: {},
   });
   const [expenses, setExpenses] = useState([]);
   const [dashboardRange, setDashboardRange] = useState("7");
@@ -456,8 +461,15 @@ function App() {
     setAccountOutstanding(response.data);
   };
 
-  const loadReports = async () => {
-    const response = await axios.get(`${API_URL}/reports/summary`);
+  const loadAccountPayments = async (accountKey = "") => {
+    const response = await axios.get(`${API_URL}/accounts/payments`, {
+      params: accountKey ? { account_key: accountKey } : {},
+    });
+    setAccountPayments(response.data);
+  };
+
+  const loadReports = async (params = {}) => {
+    const response = await axios.get(`${API_URL}/reports/summary`, { params });
     setReportsData(response.data);
   };
 
@@ -523,7 +535,7 @@ function App() {
     try {
       const response = await axios.post(`${API_URL}/login`, { username, password });
       setUser(response.data);
-      await Promise.all([loadProducts(), loadDashboardData(), loadPurchaseRules(), loadSupplierData(), loadCustomerData(), loadAccounts(), loadAccountOutstanding(), loadSettingsData(response.data)]);
+      await Promise.all([loadProducts(), loadDashboardData(), loadPurchaseRules(), loadSupplierData(), loadCustomerData(), loadAccounts(), loadAccountOutstanding(), loadAccountPayments(), loadSettingsData(response.data)]);
     } catch (error) {
       alert(getErrorMessage(error, "Login Failed"));
     }
@@ -948,14 +960,17 @@ function App() {
             <AccountsModule
               accounts={accounts}
               accountLedger={accountLedger}
+              accountPayments={accountPayments}
               accountOutstanding={accountOutstanding}
               onLedgerLoad={loadAccountLedger}
+              onPaymentsLoad={loadAccountPayments}
               onReload={async () => {
                 await Promise.all([
                   loadAccounts(),
                   loadSupplierData(),
                   loadCustomerData(),
                   loadAccountOutstanding(),
+                  loadAccountPayments(),
                   loadDashboardData(),
                 ]);
               }}
@@ -1084,36 +1099,141 @@ function App() {
   );
 }
 
+function ReportToolbar({ onPrint, title }) {
+  return (
+    <div className="report-toolbar no-print">
+      <strong>{title}</strong>
+      <div className="button-row">
+        <button className="secondary-button" onClick={onPrint}><Icon name="print" /> Print</button>
+        <button className="secondary-button" onClick={onPrint}>PDF Export</button>
+      </div>
+    </div>
+  );
+}
+
+function PrintableReport({ children, title }) {
+  const printReport = () => window.print();
+  return (
+    <section className="print-section">
+      <ReportToolbar onPrint={printReport} title={title} />
+      <div className="print-area report-paper">
+        <header className="report-print-header">
+          <BrandLogo invoice />
+          <div>
+            <strong>{title}</strong>
+            <span>{new Date().toLocaleString("en-IN")}</span>
+          </div>
+        </header>
+        {children}
+      </div>
+    </section>
+  );
+}
+
 function ReportsModule({ data, onReload }) {
+  const [range, setRange] = useState("today");
+  const [customRange, setCustomRange] = useState({
+    date_from: toDateKey(new Date()),
+    date_to: toDateKey(new Date()),
+  });
+  const refreshReports = async () => {
+    const params = range === "custom" ? customRange : { range };
+    await onReload(params);
+  };
   return (
     <section className="settings-layout">
       <ModuleCard eyebrow="Reports" title="Business Reports" subtitle="Operational summaries generated from live sales, purchases, suppliers, customers and discounts.">
-        <button className="secondary-button" onClick={onReload}>Refresh Reports</button>
+        <div className="ledger-toolbar">
+          <Field label="Report Range">
+            <select value={range} onChange={(event) => setRange(event.target.value)}>
+              <option value="today">Today</option>
+              <option value="yesterday">Yesterday</option>
+              <option value="week">This Week</option>
+              <option value="month">This Month</option>
+              <option value="custom">Custom Date Range</option>
+            </select>
+          </Field>
+          {range === "custom" && (
+            <>
+              <Field label="Date From"><input type="date" value={customRange.date_from} onChange={(event) => setCustomRange({ ...customRange, date_from: event.target.value })} /></Field>
+              <Field label="Date To"><input type="date" value={customRange.date_to} onChange={(event) => setCustomRange({ ...customRange, date_to: event.target.value })} /></Field>
+            </>
+          )}
+          <button className="secondary-button" onClick={refreshReports}>Refresh Reports</button>
+        </div>
       </ModuleCard>
       <ModuleCard eyebrow="Sales Report" title="Sales by Date" subtitle="Completed invoices only; cancelled bills are excluded.">
-        <DataTable headers={["Date", "Transactions", "Sales", "Cost", "Profit"]}>
-          {(data.salesReport || []).map((row) => <tr key={row.sale_date}><td>{row.sale_date}</td><td>{row.transaction_count}</td><td>{currency.format(Number(row.total_sales || 0))}</td><td>{currency.format(Number(row.total_cost || 0))}</td><td className="profit-cell">{currency.format(Number(row.total_profit || 0))}</td></tr>)}
-        </DataTable>
+        <PrintableReport title="Sales Report">
+          <DataTable headers={["Date", "Transactions", "Sales", "Cost", "Profit"]}>
+            {(data.salesReport || []).map((row) => <tr key={row.sale_date}><td>{row.sale_date}</td><td>{row.transaction_count}</td><td>{currency.format(Number(row.total_sales || 0))}</td><td>{currency.format(Number(row.total_cost || 0))}</td><td className="profit-cell">{currency.format(Number(row.total_profit || 0))}</td></tr>)}
+          </DataTable>
+        </PrintableReport>
       </ModuleCard>
       <ModuleCard eyebrow="Purchase Report" title="Purchases by Date" subtitle="Gross purchase, rebates, net purchase cost and balance.">
-        <DataTable headers={["Date", "Bills", "Gross", "Rebate", "Net", "Paid", "Balance"]}>
-          {(data.purchaseReport || []).map((row) => <tr key={row.purchase_date}><td>{row.purchase_date}</td><td>{row.purchase_count}</td><td>{currency.format(Number(row.gross_purchase || 0))}</td><td>{currency.format(Number(row.rebate_received || 0))}</td><td>{currency.format(Number(row.net_purchase || 0))}</td><td>{currency.format(Number(row.paid_amount || 0))}</td><td className="balance-cell">{currency.format(Number(row.balance_amount || 0))}</td></tr>)}
-        </DataTable>
+        <PrintableReport title="Purchase Report">
+          <DataTable headers={["Date", "Bills", "Gross", "Rebate", "Net", "Paid", "Balance"]}>
+            {(data.purchaseReport || []).map((row) => <tr key={row.purchase_date}><td>{row.purchase_date}</td><td>{row.purchase_count}</td><td>{currency.format(Number(row.gross_purchase || 0))}</td><td>{currency.format(Number(row.rebate_received || 0))}</td><td>{currency.format(Number(row.net_purchase || 0))}</td><td>{currency.format(Number(row.paid_amount || 0))}</td><td className="balance-cell">{currency.format(Number(row.balance_amount || 0))}</td></tr>)}
+          </DataTable>
+        </PrintableReport>
+      </ModuleCard>
+      <ModuleCard eyebrow="Expense Report" title="Expenses by Date" subtitle="Daily operating costs by category and payment mode.">
+        <PrintableReport title="Expense Report">
+          <DataTable headers={["Date", "Category", "Payment", "Entries", "Amount"]}>
+            {(data.expenseReport || []).map((row) => <tr key={`${row.expense_date}-${row.category}-${row.payment_mode}`}><td>{row.expense_date}</td><td>{row.category}</td><td><span className="tag">{row.payment_mode}</span></td><td>{row.expense_count}</td><td>{currency.format(Number(row.total_expense || 0))}</td></tr>)}
+          </DataTable>
+        </PrintableReport>
+      </ModuleCard>
+      <ModuleCard eyebrow="Payment Report" title="Payments and Receipts" subtitle="Supplier payments, supplier rebates and customer receipts.">
+        <PrintableReport title="Payment Report">
+          <DataTable headers={["Date", "Type", "Party", "Payment", "Rebate", "Mode", "Status", "Reference"]}>
+            {(data.paymentReport || []).map((row, index) => <tr key={`${row.payment_date}-${row.party_name}-${index}`}><td>{row.payment_date}</td><td><span className="tag">{row.payment_type}</span></td><td className="primary-cell">{row.party_name}</td><td>{currency.format(Number(row.payment_amount || 0))}</td><td>{currency.format(Number(row.rebate_amount || 0))}</td><td>{row.payment_mode}</td><td><span className={row.cancelled ? "stock-low" : "stock-ok"}>{row.cancelled ? "Cancelled" : "Active"}</span></td><td>{row.reference_number || "-"}</td></tr>)}
+          </DataTable>
+        </PrintableReport>
       </ModuleCard>
       <ModuleCard eyebrow="Supplier Outstanding" title="Supplier Outstanding Report" subtitle="Supplier payable balances after payments and rebates.">
-        <DataTable headers={["Supplier", "Purchases", "Paid", "Rebate", "Outstanding"]}>
-          {(data.supplierOutstandingReport || []).map((row) => <tr key={row.id}><td className="primary-cell">{row.supplier_name}</td><td>{currency.format(Number(row.total_purchases || 0))}</td><td>{currency.format(Number(row.total_paid || 0))}</td><td>{currency.format(Number(row.total_rebate_received || 0))}</td><td className="balance-cell">{currency.format(Number(row.outstanding_balance || 0))}</td></tr>)}
-        </DataTable>
+        <PrintableReport title="Supplier Outstanding Report">
+          <DataTable headers={["Supplier", "Purchases", "Paid", "Rebate", "Outstanding"]}>
+            {(data.supplierOutstandingReport || []).map((row) => <tr key={row.id}><td className="primary-cell">{row.supplier_name}</td><td>{currency.format(Number(row.total_purchases || 0))}</td><td>{currency.format(Number(row.total_paid || 0))}</td><td>{currency.format(Number(row.total_rebate_received || 0))}</td><td className="balance-cell">{currency.format(Number(row.outstanding_balance || 0))}</td></tr>)}
+          </DataTable>
+        </PrintableReport>
       </ModuleCard>
       <ModuleCard eyebrow="Customer Outstanding" title="Customer Outstanding Report" subtitle="Customer receivable balances after receipts.">
-        <DataTable headers={["Customer", "Type", "Sales", "Paid", "Outstanding"]}>
-          {(data.customerOutstandingReport || []).map((row) => <tr key={row.id}><td className="primary-cell">{row.customer_name}</td><td><span className="tag">{row.customer_type}</span></td><td>{currency.format(Number(row.total_sales || 0))}</td><td>{currency.format(Number(row.total_paid || 0))}</td><td className="balance-cell">{currency.format(Number(row.outstanding_balance || 0))}</td></tr>)}
-        </DataTable>
+        <PrintableReport title="Customer Outstanding Report">
+          <DataTable headers={["Customer", "Type", "Sales", "Paid", "Outstanding"]}>
+            {(data.customerOutstandingReport || []).map((row) => <tr key={row.id}><td className="primary-cell">{row.customer_name}</td><td><span className="tag">{row.customer_type}</span></td><td>{currency.format(Number(row.total_sales || 0))}</td><td>{currency.format(Number(row.total_paid || 0))}</td><td className="balance-cell">{currency.format(Number(row.outstanding_balance || 0))}</td></tr>)}
+          </DataTable>
+        </PrintableReport>
       </ModuleCard>
       <ModuleCard eyebrow="Discount Report" title="Discounts Given" subtitle="Bill and item discounts grouped by date and payment mode.">
-        <DataTable headers={["Date", "Payment", "Invoices", "Item Discount", "Bill Discount", "Total Discount"]}>
-          {(data.discountReport || []).map((row) => <tr key={`${row.sale_date}-${row.payment_mode}`}><td>{row.sale_date}</td><td><span className="tag">{row.payment_mode}</span></td><td>{row.invoice_count}</td><td>{currency.format(Number(row.item_discount || 0))}</td><td>{currency.format(Number(row.bill_discount || 0))}</td><td className="profit-cell">{currency.format(Number(row.total_discount || 0))}</td></tr>)}
-        </DataTable>
+        <PrintableReport title="Discount Report">
+          <DataTable headers={["Date", "Payment", "Invoices", "Item Discount", "Bill Discount", "Total Discount"]}>
+            {(data.discountReport || []).map((row) => <tr key={`${row.sale_date}-${row.payment_mode}`}><td>{row.sale_date}</td><td><span className="tag">{row.payment_mode}</span></td><td>{row.invoice_count}</td><td>{currency.format(Number(row.item_discount || 0))}</td><td>{currency.format(Number(row.bill_discount || 0))}</td><td className="profit-cell">{currency.format(Number(row.total_discount || 0))}</td></tr>)}
+          </DataTable>
+        </PrintableReport>
+      </ModuleCard>
+      <ModuleCard eyebrow="Balance Sheet" title="Basic Balance Sheet" subtitle="Assets, liabilities and net position prepared from live ERP balances.">
+        <PrintableReport title="Balance Sheet">
+          <div className="purchase-summary-grid supplier-payment-preview">
+            <SummaryMetric label="Cash" value={currency.format(Number(data.balanceSheet?.cash || 0))} />
+            <SummaryMetric label="Bank" value={currency.format(Number(data.balanceSheet?.bank || 0))} />
+            <SummaryMetric label="Inventory" value={currency.format(Number(data.balanceSheet?.inventory || 0))} />
+            <SummaryMetric label="Customer Receivable" value={currency.format(Number(data.balanceSheet?.customerReceivable || 0))} />
+            <SummaryMetric label="Supplier Payable" value={currency.format(Number(data.balanceSheet?.supplierPayable || 0))} />
+            <SummaryMetric label="Net Position" value={currency.format(Number(data.balanceSheet?.netPosition || 0))} featured />
+          </div>
+        </PrintableReport>
+      </ModuleCard>
+      <ModuleCard eyebrow="Profit & Loss" title="P&L Report" subtitle="Sales less FIFO purchase cost and expenses, plus supplier rebate received.">
+        <PrintableReport title="Profit and Loss Report">
+          <div className="purchase-summary-grid supplier-payment-preview">
+            <SummaryMetric label="Sales Revenue" value={currency.format(Number(data.profitLoss?.salesRevenue || 0))} />
+            <SummaryMetric label="Purchase Cost" value={currency.format(Number(data.profitLoss?.purchaseCost || 0))} />
+            <SummaryMetric label="Expenses" value={currency.format(Number(data.profitLoss?.expenses || 0))} />
+            <SummaryMetric label="Supplier Rebate Received" value={currency.format(Number(data.profitLoss?.supplierRebateReceived || 0))} positive />
+            <SummaryMetric label="Gross Profit" value={currency.format(Number(data.profitLoss?.grossProfit || 0))} />
+            <SummaryMetric label="Net Profit" value={currency.format(Number(data.profitLoss?.netProfit || 0))} featured />
+          </div>
+        </PrintableReport>
       </ModuleCard>
     </section>
   );
@@ -1215,7 +1335,7 @@ function ExpensesModule({ expenses, onReload, user }) {
   );
 }
 
-function AccountsModule({ accounts, accountLedger, accountOutstanding, onLedgerLoad, onReload, user }) {
+function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPayments, onLedgerLoad, onPaymentsLoad, onReload, user }) {
   const emptyAccount = {
     account_name: "",
     account_type: "CUSTOMER",
@@ -1239,15 +1359,20 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, onLedgerL
   const [editingKey, setEditingKey] = useState("");
   const [ledgerMode, setLedgerMode] = useState("ANY");
   const [ledgerAccountKey, setLedgerAccountKey] = useState("");
+  const [ledgerDateRange, setLedgerDateRange] = useState({ date_from: "", date_to: "" });
   const [payment, setPayment] = useState({
     payment_action: "RECEIVE_CUSTOMER",
     account_key: "",
     payment_date: toDateKey(new Date()),
     amount: "",
+    rebate_amount: "",
     payment_mode: "CASH",
     reference_number: "",
     remarks: "",
   });
+  const [editingPaymentKey, setEditingPaymentKey] = useState("");
+  const [paymentAudit, setPaymentAudit] = useState(null);
+  const [receiptPayment, setReceiptPayment] = useState(null);
   const filteredAccounts = accounts.filter((account) =>
     account.account_name.toLowerCase().includes(search.toLowerCase()) ||
     String(account.mobile_number || "").includes(search)
@@ -1261,6 +1386,33 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, onLedgerL
     payment.payment_action === "RECEIVE_CUSTOMER"
       ? account.account_type === "CUSTOMER"
       : ["SUPPLIER", "TRANSPORT_VENDOR", "COMMISSION_AGENT"].includes(account.account_type)
+  );
+  const selectedPaymentAccount = accounts.find((account) => account.account_key === payment.account_key);
+  const isSupplierPayment = payment.payment_action !== "RECEIVE_CUSTOMER";
+  const paymentAmount = Number(payment.amount || 0);
+  const rebateAmount = isSupplierPayment ? Number(payment.rebate_amount || 0) : 0;
+  const outstandingBefore = selectedPaymentAccount
+    ? Number(isSupplierPayment ? selectedPaymentAccount.payable_balance : selectedPaymentAccount.receivable_balance)
+    : 0;
+  const outstandingAfter = Math.max(0, roundUi(outstandingBefore - paymentAmount - rebateAmount));
+  const selectedCustomerSummary = selectedPaymentAccount && selectedPaymentAccount.account_type === "CUSTOMER"
+    ? {
+      totalSales: Number(selectedPaymentAccount.total_sales || 0),
+      totalPaid: Number(selectedPaymentAccount.total_paid || 0),
+      outstanding: Number(selectedPaymentAccount.receivable_balance || 0),
+    }
+    : null;
+  const selectedSupplierSummary = selectedPaymentAccount && isSupplierPayment
+    ? {
+      totalPurchases: Number(selectedPaymentAccount.total_purchases || 0),
+      totalPaid: Number(selectedPaymentAccount.total_paid || 0),
+      totalRebate: Number(selectedPaymentAccount.total_rebate_received || 0),
+      outstanding: Number(selectedPaymentAccount.payable_balance || 0),
+    }
+    : null;
+  const printableLedgerRows = (accountLedger.ledger || []).filter((row) =>
+    (!ledgerDateRange.date_from || toDateKey(row.date) >= ledgerDateRange.date_from) &&
+    (!ledgerDateRange.date_to || toDateKey(row.date) <= ledgerDateRange.date_to)
   );
 
   const saveAccount = async () => {
@@ -1303,18 +1455,77 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, onLedgerL
   };
   const savePayment = async () => {
     try {
-      await axios.post(`${API_URL}/accounts/payments`, {
+      const payload = {
         ...payment,
         amount: Number(payment.amount || 0),
+        payment_amount: Number(payment.amount || 0),
+        rebate_amount: isSupplierPayment ? Number(payment.rebate_amount || 0) : 0,
         branch_id: user.branch_id,
         created_by: user.id,
+        edited_by: user.id,
+      };
+      let response;
+      if (editingPaymentKey) {
+        const reason = window.prompt("Enter reason for editing this payment");
+        if (!reason) return;
+        response = await axios.put(`${API_URL}/accounts/payments/${editingPaymentKey}`, { ...payload, reason });
+      } else {
+        response = await axios.post(`${API_URL}/accounts/payments`, payload);
+      }
+      setReceiptPayment({
+        ...response.data,
+        payment_key: editingPaymentKey || `${isSupplierPayment ? "SUPPLIER" : "CUSTOMER"}-${response.data.id}`,
+        payment_source: isSupplierPayment ? "SUPPLIER" : "CUSTOMER",
+        account_key: payment.account_key,
+        account_name: selectedPaymentAccount?.account_name,
+        account_type: selectedPaymentAccount?.account_type,
+        outstanding_before: outstandingBefore,
+        outstanding_after: outstandingAfter,
       });
-      setPayment((current) => ({ ...current, amount: "", reference_number: "", remarks: "" }));
+      setEditingPaymentKey("");
+      setPayment((current) => ({ ...current, amount: "", rebate_amount: "", reference_number: "", remarks: "" }));
       await onReload();
-      alert("Payment saved");
+      alert(editingPaymentKey ? "Payment updated" : "Payment saved");
     } catch (error) {
       alert(getErrorMessage(error, "Unable to save payment"));
     }
+  };
+  const editPayment = (row) => {
+    setEditingPaymentKey(row.payment_key);
+    setPayment({
+      payment_action: row.payment_source === "CUSTOMER" ? "RECEIVE_CUSTOMER" : "PAY_SUPPLIER",
+      account_key: row.account_key,
+      payment_date: toDateKey(row.payment_date),
+      amount: row.payment_amount || "",
+      rebate_amount: row.rebate_amount || "",
+      payment_mode: row.payment_mode || "CASH",
+      reference_number: row.reference_number || "",
+      remarks: row.remarks || "",
+    });
+    setTab("payments");
+  };
+  const cancelPayment = async (row) => {
+    const reason = window.prompt(`Enter cancellation reason for ${row.account_name} payment`);
+    if (!reason) return;
+    try {
+      await axios.post(`${API_URL}/accounts/payments/${row.payment_key}/cancel`, { reason, cancelled_by: user.id });
+      await onReload();
+      alert("Payment cancelled");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to cancel payment"));
+    }
+  };
+  const viewPaymentHistory = async (row) => {
+    try {
+      const response = await axios.get(`${API_URL}/accounts/payments/${row.payment_key}/audit`);
+      setPaymentAudit({ payment: row, rows: response.data });
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to load payment history"));
+    }
+  };
+  const refreshPaymentsForSelection = async (accountKey) => {
+    setPayment({ ...payment, account_key: accountKey });
+    await onPaymentsLoad(accountKey);
   };
 
   return (
@@ -1405,37 +1616,81 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, onLedgerL
             </Field>
             <button className="secondary-button" onClick={() => loadLedger(ledgerAccountKey)}>Refresh Ledger</button>
           </div>
-          <DataTable headers={["Date", "Transaction Type", "Debit", "Credit", "Balance", "Remarks"]}>
-            {(accountLedger.ledger || []).map((row, index) => (
-              <tr key={`${row.date}-${row.transaction_type}-${index}`}>
-                <td>{row.date}</td>
-                <td><span className="tag">{row.transaction_type}</span></td>
-                <td>{currency.format(Number(row.debit || 0))}</td>
-                <td>{currency.format(Number(row.credit || 0))}</td>
-                <td className="balance-cell">{currency.format(Number(row.balance || 0))}</td>
-                <td>{row.remarks || "-"}</td>
-              </tr>
-            ))}
-          </DataTable>
+          <div className="ledger-toolbar">
+            <Field label="Statement From"><input type="date" value={ledgerDateRange.date_from} onChange={(event) => setLedgerDateRange({ ...ledgerDateRange, date_from: event.target.value })} /></Field>
+            <Field label="Statement To"><input type="date" value={ledgerDateRange.date_to} onChange={(event) => setLedgerDateRange({ ...ledgerDateRange, date_to: event.target.value })} /></Field>
+            <button className="secondary-button" onClick={() => window.print()}><Icon name="print" /> Print Statement</button>
+            <button className="secondary-button" onClick={() => window.print()}>PDF Export</button>
+          </div>
+          <div className="print-area report-paper">
+            <header className="report-print-header">
+              <BrandLogo invoice />
+              <div>
+                <strong>{accountLedger.account?.account_name || accountLedger.account?.supplier_name || accountLedger.account?.customer_name || "Account Ledger"}</strong>
+                <span>Ledger Statement</span>
+              </div>
+            </header>
+            <div className="purchase-summary-grid supplier-payment-preview">
+              <SummaryMetric label="Opening Balance" value={currency.format(Number(printableLedgerRows[0]?.balance || 0) - Number(printableLedgerRows[0]?.debit || 0) + Number(printableLedgerRows[0]?.credit || 0))} />
+              <SummaryMetric label="Closing Balance" value={currency.format(Number(printableLedgerRows.at(-1)?.balance || 0))} featured />
+            </div>
+            <DataTable headers={["Date", "Transaction Type", "Debit", "Credit", "Balance", "Remarks"]}>
+              {printableLedgerRows.map((row, index) => (
+                <tr key={`${row.date}-${row.transaction_type}-${index}`}>
+                  <td>{row.date}</td>
+                  <td><span className="tag">{row.transaction_type}</span></td>
+                  <td>{currency.format(Number(row.debit || 0))}</td>
+                  <td>{currency.format(Number(row.credit || 0))}</td>
+                  <td className="balance-cell">{currency.format(Number(row.balance || 0))}</td>
+                  <td>{row.remarks || "-"}</td>
+                </tr>
+              ))}
+            </DataTable>
+          </div>
         </ModuleCard>
       )}
 
       {tab === "payments" && (
         <ModuleCard eyebrow="Payments" title="Account Payments" subtitle="Receive customer payments, pay suppliers, or record supplier rebates.">
+          <div className="purchase-summary-grid supplier-payment-preview">
+            {selectedSupplierSummary ? (
+              <>
+                <SummaryMetric label="Total Purchase" value={currency.format(selectedSupplierSummary.totalPurchases)} />
+                <SummaryMetric label="Total Paid" value={currency.format(selectedSupplierSummary.totalPaid)} />
+                <SummaryMetric label="Total Rebate Received" value={currency.format(selectedSupplierSummary.totalRebate)} positive />
+                <SummaryMetric label="Outstanding Payable" value={currency.format(selectedSupplierSummary.outstanding)} featured />
+              </>
+            ) : selectedCustomerSummary ? (
+              <>
+                <SummaryMetric label="Total Sales" value={currency.format(selectedCustomerSummary.totalSales)} />
+                <SummaryMetric label="Total Received" value={currency.format(selectedCustomerSummary.totalPaid)} />
+                <SummaryMetric label="Outstanding Receivable" value={currency.format(selectedCustomerSummary.outstanding)} featured />
+                <SummaryMetric label="Account Type" value="Customer" />
+              </>
+            ) : (
+              <>
+                <SummaryMetric label="Selected Account" value="None" />
+                <SummaryMetric label="Outstanding Before" value={currency.format(0)} />
+                <SummaryMetric label="Payment Impact" value={currency.format(0)} />
+                <SummaryMetric label="Outstanding After" value={currency.format(0)} featured />
+              </>
+            )}
+          </div>
           <div className="form-grid">
             <Field label="Payment Action">
-              <select value={payment.payment_action} onChange={(event) => setPayment({ ...payment, payment_action: event.target.value, account_key: "" })}>
+              <select value={payment.payment_action} onChange={(event) => setPayment({ ...payment, payment_action: event.target.value, account_key: "", rebate_amount: "" })}>
                 {accountPaymentActions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
               </select>
             </Field>
             <Field label="Account">
-              <select value={payment.account_key} onChange={(event) => setPayment({ ...payment, account_key: event.target.value })}>
+              <select value={payment.account_key} onChange={(event) => refreshPaymentsForSelection(event.target.value)}>
                 <option value="">Select account</option>
                 {paymentAccounts.map((account) => <option key={account.account_key} value={account.account_key}>{account.account_name} - {account.account_type}</option>)}
               </select>
             </Field>
             <Field label="Payment Date"><input type="date" value={payment.payment_date} onChange={(event) => setPayment({ ...payment, payment_date: event.target.value })} /></Field>
-            <Field label="Amount"><input min="0" step="0.01" type="number" value={payment.amount} onChange={(event) => setPayment({ ...payment, amount: event.target.value })} /></Field>
+            <Field label={isSupplierPayment ? "Payment Amount" : "Payment Amount / Receipt"}><input min="0" step="0.01" type="number" value={payment.amount} onChange={(event) => setPayment({ ...payment, amount: event.target.value })} /></Field>
+            {isSupplierPayment && <Field label="Rebate Received"><input min="0" step="0.01" type="number" value={payment.rebate_amount} onChange={(event) => setPayment({ ...payment, rebate_amount: event.target.value })} /></Field>}
             <Field label="Payment Mode">
               <select value={payment.payment_mode} onChange={(event) => setPayment({ ...payment, payment_mode: event.target.value })}>
                 {supplierPaymentModes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
@@ -1444,7 +1699,41 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, onLedgerL
             <Field label="Reference Number"><input value={payment.reference_number} onChange={(event) => setPayment({ ...payment, reference_number: event.target.value })} /></Field>
             <Field label="Remarks"><textarea value={payment.remarks} onChange={(event) => setPayment({ ...payment, remarks: event.target.value })} /></Field>
           </div>
-          <button className="primary-button" onClick={savePayment}>Save Payment</button>
+          <div className="purchase-summary-grid supplier-payment-preview">
+            <SummaryMetric label={isSupplierPayment ? "Outstanding Payable Before" : "Outstanding Receivable Before"} value={currency.format(outstandingBefore)} />
+            <SummaryMetric label="Payment Amount" value={currency.format(paymentAmount)} />
+            {isSupplierPayment && <SummaryMetric label="Rebate Received" value={currency.format(rebateAmount)} positive />}
+            <SummaryMetric label="Balance After Payment" value={currency.format(outstandingAfter)} featured />
+          </div>
+          <div className="button-row">
+            <button className="primary-button" onClick={savePayment}>{editingPaymentKey ? "Update Payment" : "Save Payment"}</button>
+            {editingPaymentKey && <button className="secondary-button" onClick={() => { setEditingPaymentKey(""); setPayment({ payment_action: "RECEIVE_CUSTOMER", account_key: "", payment_date: toDateKey(new Date()), amount: "", rebate_amount: "", payment_mode: "CASH", reference_number: "", remarks: "" }); }}>Cancel Edit</button>}
+          </div>
+          <div className="ledger-toolbar">
+            <button className="secondary-button" onClick={() => onPaymentsLoad(payment.account_key)}>Refresh Payment History</button>
+            <button className="secondary-button" onClick={() => onPaymentsLoad()}>Show All Payments</button>
+          </div>
+          <DataTable headers={["Date", "Party", "Type", "Payment", "Rebate", "Mode", "Status", "Reference", "Remarks", "Actions"]}>
+            {(accountPayments || []).map((row) => (
+              <tr key={row.payment_key}>
+                <td>{toDateKey(row.payment_date)}</td>
+                <td className="primary-cell">{row.account_name}</td>
+                <td><span className="tag">{row.payment_source}</span></td>
+                <td>{currency.format(Number(row.payment_amount || 0))}</td>
+                <td>{Number(row.rebate_amount || 0) ? currency.format(Number(row.rebate_amount || 0)) : "-"}</td>
+                <td><span className="tag">{row.payment_mode}</span></td>
+                <td><span className={row.cancelled ? "stock-low" : "stock-ok"}>{row.cancelled ? "Cancelled" : "Active"}</span></td>
+                <td>{row.reference_number || "-"}</td>
+                <td>{row.cancellation_reason || row.edit_reason || row.remarks || "-"}</td>
+                <td className="table-actions-row">
+                  <button className="table-action" disabled={row.cancelled} onClick={() => editPayment(row)}>Edit</button>
+                  <button className="remove-button" disabled={row.cancelled} onClick={() => cancelPayment(row)}>Cancel</button>
+                  <button className="table-action" onClick={() => viewPaymentHistory(row)}>History</button>
+                  <button className="table-action" onClick={() => setReceiptPayment(row)}>Print</button>
+                </td>
+              </tr>
+            ))}
+          </DataTable>
         </ModuleCard>
       )}
 
@@ -1469,6 +1758,8 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, onLedgerL
           </DataTable>
         </ModuleCard>
       )}
+      {receiptPayment && <PaymentReceiptModal payment={receiptPayment} onClose={() => setReceiptPayment(null)} />}
+      {paymentAudit && <PaymentAuditModal audit={paymentAudit} onClose={() => setPaymentAudit(null)} />}
     </section>
   );
 }
@@ -2354,6 +2645,56 @@ function SaleEditModal({ invoice, onClose, onSaved, products, user }) {
   );
 }
 
+const formatSaleAuditLines = (row) => {
+  if (row.action === "CANCEL") {
+    return [
+      "Invoice Cancelled",
+      `Reason: ${row.reason || "-"}`,
+      `Cancelled By: ${row.edited_by_name || "-"}`,
+      `Cancelled At: ${row.edited_at ? new Date(row.edited_at).toLocaleString("en-IN") : "-"}`,
+    ];
+  }
+  const oldValue = row.old_value || {};
+  const newValue = row.new_value || {};
+  const oldSale = oldValue.sale || {};
+  const newSale = newValue.sale || {};
+  const lines = [];
+  const addMoneyChange = (label, key) => {
+    if (Number(oldSale[key] || 0) !== Number(newSale[key] || 0)) {
+      lines.push(`${label}: ${currency.format(Number(oldSale[key] || 0))} -> ${currency.format(Number(newSale[key] || 0))}`);
+    }
+  };
+  if ((oldSale.customer_name || "") !== (newSale.customer_name || "")) lines.push(`Customer: ${oldSale.customer_name || "Walk-in"} -> ${newSale.customer_name || "Walk-in"}`);
+  if ((oldSale.payment_mode || "") !== (newSale.payment_mode || "")) lines.push(`Payment Mode: ${oldSale.payment_mode || "-"} -> ${newSale.payment_mode || "-"}`);
+  addMoneyChange("Gross Total", "gross_amount");
+  addMoneyChange("Discount", "invoice_discount_amount");
+  addMoneyChange("Net Amount", "total_amount");
+  const oldItems = new Map((oldValue.items || []).map((item) => [String(item.product_id), item]));
+  const newItems = new Map((newValue.items || []).map((item) => [String(item.product_id), item]));
+  for (const [productId, oldItem] of oldItems) {
+    const newItem = newItems.get(productId);
+    if (!newItem) {
+      lines.push(`Removed: Product #${productId}, ${Number(oldItem.quantity || 0)} units, ${currency.format(Number(oldItem.amount || 0))}`);
+      continue;
+    }
+    if (Number(oldItem.quantity || 0) !== Number(newItem.quantity || 0)) {
+      lines.push(`Item Product #${productId} Quantity: ${Number(oldItem.quantity || 0)} -> ${Number(newItem.quantity || 0)}`);
+    }
+    if (Number(oldItem.selling_rate || 0) !== Number(newItem.selling_rate || 0)) {
+      lines.push(`Item Product #${productId} Rate: ${currency.format(Number(oldItem.selling_rate || 0))} -> ${currency.format(Number(newItem.selling_rate || 0))}`);
+    }
+    if (Number(oldItem.net_amount || oldItem.amount || 0) !== Number(newItem.net_amount || newItem.amount || 0)) {
+      lines.push(`Item Product #${productId} Amount: ${currency.format(Number(oldItem.net_amount || oldItem.amount || 0))} -> ${currency.format(Number(newItem.net_amount || newItem.amount || 0))}`);
+    }
+  }
+  for (const [productId, newItem] of newItems) {
+    if (!oldItems.has(productId)) {
+      lines.push(`Added: Product #${productId}, ${Number(newItem.quantity || 0)} units, ${currency.format(Number(newItem.net_amount || newItem.amount || 0))}`);
+    }
+  }
+  return lines.length ? lines : ["No business fields changed."];
+};
+
 function ChangeHistoryModal({ history, onClose }) {
   return (
     <div className="modal-backdrop">
@@ -2366,20 +2707,118 @@ function ChangeHistoryModal({ history, onClose }) {
           <button aria-label="Close history" className="remove-button" onClick={onClose}><Icon name="close" /></button>
         </div>
         <div className="sale-edit-body">
-          <DataTable headers={["Action", "Edited At", "Edited By", "Reason", "Old Value", "New Value"]}>
+          <DataTable headers={["Action", "Edited At", "Edited By", "Reason", "Readable Changes"]}>
             {history.rows.map((row) => (
               <tr key={row.id}>
                 <td><span className="tag">{row.action}</span></td>
                 <td>{new Date(row.edited_at).toLocaleString("en-IN")}</td>
                 <td>{row.edited_by_name || "-"}</td>
                 <td>{row.reason}</td>
-                <td><pre className="audit-json">{JSON.stringify(row.old_value, null, 2)}</pre></td>
-                <td><pre className="audit-json">{JSON.stringify(row.new_value, null, 2)}</pre></td>
+                <td><div className="audit-readable">{formatSaleAuditLines(row).map((line) => <span key={line}>{line}</span>)}</div></td>
               </tr>
             ))}
           </DataTable>
           {history.rows.length === 0 && <div className="cart-empty">No changes recorded for this invoice.</div>}
         </div>
+      </section>
+    </div>
+  );
+}
+
+const formatPaymentAuditLines = (row) => {
+  const oldValue = row.old_value || {};
+  const newValue = row.new_value || {};
+  if (row.action === "CANCEL") {
+    return [
+      "Payment Cancelled",
+      `Reason: ${row.reason || "-"}`,
+      `Cancelled By: ${row.edited_by_name || "-"}`,
+      `Cancelled At: ${row.edited_at ? new Date(row.edited_at).toLocaleString("en-IN") : "-"}`,
+    ];
+  }
+  const fields = [
+    ["payment_date", "Date", (value) => toDateKey(value || "")],
+    ["payment_amount", "Payment Amount", (value) => currency.format(Number(value || 0))],
+    ["rebate_amount", "Rebate Amount", (value) => currency.format(Number(value || 0))],
+    ["payment_mode", "Payment Mode", (value) => value || "-"],
+    ["reference_number", "Reference", (value) => value || "-"],
+    ["remarks", "Remarks", (value) => value || "-"],
+  ];
+  const lines = fields
+    .filter(([key]) => String(oldValue[key] ?? "") !== String(newValue[key] ?? ""))
+    .map(([key, label, formatter]) => `${label}: ${formatter(oldValue[key])} -> ${formatter(newValue[key])}`);
+  return lines.length ? lines : ["No payment fields changed."];
+};
+
+function PaymentAuditModal({ audit, onClose }) {
+  return (
+    <div className="modal-backdrop">
+      <section className="invoice-modal change-history-modal">
+        <div className="invoice-toolbar">
+          <div>
+            <span className="eyebrow">Payment Audit Trail</span>
+            <strong>{audit.payment.account_name}</strong>
+          </div>
+          <button aria-label="Close payment history" className="remove-button" onClick={onClose}><Icon name="close" /></button>
+        </div>
+        <div className="sale-edit-body">
+          <DataTable headers={["Action", "Edited At", "Edited By", "Reason", "Readable Changes"]}>
+            {audit.rows.map((row) => (
+              <tr key={row.id}>
+                <td><span className="tag">{row.action}</span></td>
+                <td>{new Date(row.edited_at).toLocaleString("en-IN")}</td>
+                <td>{row.edited_by_name || "-"}</td>
+                <td>{row.reason}</td>
+                <td><div className="audit-readable">{formatPaymentAuditLines(row).map((line) => <span key={line}>{line}</span>)}</div></td>
+              </tr>
+            ))}
+          </DataTable>
+          {audit.rows.length === 0 && <div className="cart-empty">No edits or cancellations recorded for this payment.</div>}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function PaymentReceiptModal({ payment, onClose }) {
+  const paymentAmount = Number(payment.payment_amount || 0);
+  const rebateAmount = Number(payment.rebate_amount || 0);
+  const totalImpact = paymentAmount + rebateAmount;
+  return (
+    <div className="modal-backdrop">
+      <section className="invoice-modal">
+        <div className="invoice-toolbar no-print">
+          <div>
+            <span className="eyebrow">Payment Receipt</span>
+            <strong>{payment.account_name || "Account Payment"}</strong>
+          </div>
+          <div className="invoice-actions">
+            <button className="secondary-button" onClick={() => window.print()}><Icon name="print" /> Print / PDF</button>
+            <button aria-label="Close receipt" className="remove-button" onClick={onClose}><Icon name="close" /></button>
+          </div>
+        </div>
+        <article className="invoice-paper print-area">
+          <header className="invoice-header">
+            <BrandLogo invoice />
+            <div className="invoice-meta">
+              <strong>Payment Receipt</strong>
+              <span>Receipt #{payment.payment_key || payment.id}</span>
+              <span>{payment.payment_date ? new Date(payment.payment_date).toLocaleDateString("en-IN") : toDateKey(new Date())}</span>
+            </div>
+          </header>
+          <section className="invoice-customer">
+            <div><small>Party Name</small><strong>{payment.account_name || "-"}</strong><span>{payment.account_type || payment.payment_source || "-"}</span></div>
+            <div><small>Payment Mode</small><strong>{payment.payment_mode || "-"}</strong><span>{payment.reference_number || "No reference"}</span></div>
+          </section>
+          <section className="receipt-summary">
+            <TotalLine label="Outstanding Before" value={Number(payment.outstanding_before || 0)} />
+            <TotalLine label="Payment Amount" value={paymentAmount} />
+            {rebateAmount > 0 && <TotalLine label="Rebate Received" value={rebateAmount} />}
+            <TotalLine label="Total Balance Reduction" value={totalImpact} />
+            <TotalLine label="Outstanding After" value={Number(payment.outstanding_after || 0)} total />
+          </section>
+          <p className="invoice-footer">{payment.remarks || "Thank you. This receipt is generated from FroozERP Accounts."}</p>
+        </article>
       </section>
     </div>
   );
