@@ -52,6 +52,7 @@ const toDateKey = (value) =>
 const RATE_MANAGER_ROLES = new Set(["Owner", "Admin"]);
 const SUPPLIER_TYPES = new Set(["LOCAL_SUPPLIER", "IMPORTED_SUPPLIER", "COMMISSION_AGENT", "TRANSPORT_VENDOR"]);
 const SUPPLIER_PAYMENT_MODES = new Set(["CASH", "UPI", "BANK_TRANSFER", "CHEQUE"]);
+const CUSTOMER_TYPES = new Set(["RETAIL", "WHOLESALE"]);
 const DISCOUNT_TYPES = new Set(["FLAT_AMOUNT", "PERCENTAGE"]);
 const DISCOUNT_PAYMENT_MODES = new Set(["ALL", "CASH", "UPI", "CARD"]);
 const ROUNDING_RULES = new Set(["NEAREST_RUPEE", "ROUND_UP_5", "ROUND_UP_10", "NO_ROUND"]);
@@ -144,6 +145,9 @@ const initializeDatabase = async () => {
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS payment_due_days INTEGER DEFAULT 0;
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS payment_status VARCHAR(20) DEFAULT 'PENDING';
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS payment_date DATE;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS purchase_type VARCHAR(20) DEFAULT 'CREDIT';
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS payment_mode VARCHAR(30);
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS payment_reference_number VARCHAR(120);
 
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS basic_amount NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS mandi_tax_amount NUMERIC(14, 2) DEFAULT 0;
@@ -247,6 +251,72 @@ const initializeDatabase = async () => {
       branch_id INTEGER REFERENCES branches(id),
       created_by INTEGER REFERENCES users(id),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    ALTER TABLE supplier_payments ADD COLUMN IF NOT EXISTS cancelled BOOLEAN DEFAULT FALSE;
+    ALTER TABLE supplier_payments ADD COLUMN IF NOT EXISTS cancelled_by INTEGER REFERENCES users(id);
+    ALTER TABLE supplier_payments ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP;
+    ALTER TABLE supplier_payments ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
+    ALTER TABLE supplier_payments ADD COLUMN IF NOT EXISTS edited_by INTEGER REFERENCES users(id);
+    ALTER TABLE supplier_payments ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP;
+    ALTER TABLE supplier_payments ADD COLUMN IF NOT EXISTS edit_reason TEXT;
+
+    CREATE TABLE IF NOT EXISTS supplier_payment_audit (
+      id SERIAL PRIMARY KEY,
+      supplier_payment_id INTEGER NOT NULL REFERENCES supplier_payments(id),
+      action VARCHAR(30) NOT NULL,
+      old_value JSONB,
+      new_value JSONB,
+      reason TEXT NOT NULL,
+      edited_by INTEGER REFERENCES users(id),
+      edited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS customers (
+      id SERIAL PRIMARY KEY,
+      customer_name VARCHAR(160) NOT NULL,
+      customer_type VARCHAR(20) NOT NULL DEFAULT 'RETAIL',
+      mobile_number VARCHAR(20),
+      address TEXT,
+      gst_number VARCHAR(80),
+      notes TEXT,
+      opening_balance NUMERIC(14, 2) DEFAULT 0 CHECK (opening_balance >= 0),
+      active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS customer_payments (
+      id SERIAL PRIMARY KEY,
+      customer_id INTEGER NOT NULL REFERENCES customers(id),
+      payment_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      payment_amount NUMERIC(14, 2) NOT NULL CHECK (payment_amount > 0),
+      payment_mode VARCHAR(20) NOT NULL,
+      reference_number VARCHAR(120),
+      remarks TEXT,
+      branch_id INTEGER REFERENCES branches(id),
+      created_by INTEGER REFERENCES users(id),
+      cancelled BOOLEAN DEFAULT FALSE,
+      cancelled_by INTEGER REFERENCES users(id),
+      cancelled_at TIMESTAMP,
+      cancellation_reason TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS expenses (
+      id SERIAL PRIMARY KEY,
+      expense_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      category VARCHAR(120) NOT NULL,
+      amount NUMERIC(14, 2) NOT NULL CHECK (amount > 0),
+      payment_mode VARCHAR(30) NOT NULL DEFAULT 'CASH',
+      reference_number VARCHAR(120),
+      vendor_name VARCHAR(160),
+      remarks TEXT,
+      branch_id INTEGER REFERENCES branches(id),
+      created_by INTEGER REFERENCES users(id),
+      active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
     INSERT INTO business_settings (id)
@@ -398,6 +468,18 @@ const initializeDatabase = async () => {
     CREATE INDEX IF NOT EXISTS supplier_payments_supplier_date_idx
       ON supplier_payments (supplier_id, payment_date, id);
 
+    CREATE INDEX IF NOT EXISTS supplier_payment_audit_payment_idx
+      ON supplier_payment_audit (supplier_payment_id, edited_at DESC, id DESC);
+
+    CREATE INDEX IF NOT EXISTS customers_search_idx
+      ON customers (LOWER(customer_name), LOWER(COALESCE(mobile_number, '')));
+
+    CREATE INDEX IF NOT EXISTS customer_payments_customer_date_idx
+      ON customer_payments (customer_id, payment_date, id);
+
+    CREATE INDEX IF NOT EXISTS expenses_date_idx
+      ON expenses (expense_date DESC, id DESC);
+
     CREATE INDEX IF NOT EXISTS sale_discount_rules_match_idx
       ON sale_discount_rules (active, payment_mode, minimum_bill_amount, maximum_bill_amount);
 
@@ -520,6 +602,7 @@ const getSupplierSummaryRows = async ({ active, search, supplierId } = {}) => {
         SUM(payment_amount) AS total_paid,
         SUM(rebate_amount) AS payment_rebate
       FROM supplier_payments
+      WHERE cancelled = FALSE
       GROUP BY supplier_id
     )
     SELECT
@@ -589,6 +672,113 @@ const readSupplierPayload = (body) => {
     opening_balance: parseNonNegativeNumber(body.opening_balance),
     supplier_type: supplierType,
     active: body.active === undefined ? true : body.active === true || body.active === "true",
+  };
+};
+
+const normalizeCustomerType = (value) => String(value || "RETAIL").trim().toUpperCase();
+
+const readCustomerPayload = (body) => {
+  const customerType = normalizeCustomerType(body.customer_type);
+  return {
+    customer_name: cleanText(body.customer_name),
+    customer_type: customerType,
+    mobile_number: nullableText(body.mobile_number),
+    address: nullableText(body.address),
+    gst_number: nullableText(body.gst_number),
+    notes: nullableText(body.notes),
+    opening_balance: parseNonNegativeNumber(body.opening_balance),
+    active: body.active === undefined ? true : body.active === true || body.active === "true",
+  };
+};
+
+const getCustomerSummaryRows = async ({ active, search, customerId } = {}) => {
+  const filters = [];
+  const values = [];
+  if (customerId) {
+    values.push(customerId);
+    filters.push(`c.id = $${values.length}`);
+  }
+  if (typeof active === "boolean") {
+    values.push(active);
+    filters.push(`c.active = $${values.length}`);
+  }
+  if (search) {
+    values.push(`%${search.toLowerCase()}%`);
+    filters.push(`(
+      LOWER(c.customer_name) LIKE $${values.length}
+      OR LOWER(COALESCE(c.mobile_number, '')) LIKE $${values.length}
+      OR LOWER(COALESCE(c.gst_number, '')) LIKE $${values.length}
+    )`);
+  }
+  const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  const result = await pool.query(
+    `
+    WITH sale_summary AS (
+      SELECT
+        matched.customer_id,
+        SUM(CASE WHEN s.sale_status <> 'CANCELLED' THEN s.total_amount ELSE 0 END) AS total_sales,
+        SUM(CASE WHEN s.sale_status <> 'CANCELLED' THEN COALESCE(pay.total_paid, 0) ELSE 0 END) AS sale_paid,
+        SUM(CASE WHEN s.sale_status = 'CANCELLED' THEN s.total_amount ELSE 0 END) AS total_cancelled
+      FROM sales s
+      JOIN LATERAL (
+        SELECT c.id AS customer_id
+        FROM customers c
+        WHERE
+          (s.customer_mobile IS NOT NULL AND c.mobile_number = s.customer_mobile)
+          OR (
+            s.customer_mobile IS NULL
+            AND s.customer_name IS NOT NULL
+            AND LOWER(c.customer_name) = LOWER(s.customer_name)
+          )
+        ORDER BY CASE WHEN c.mobile_number = s.customer_mobile THEN 0 ELSE 1 END, c.id
+        LIMIT 1
+      ) matched ON TRUE
+      LEFT JOIN (
+        SELECT sale_id, SUM(amount) AS total_paid
+        FROM sale_payments
+        GROUP BY sale_id
+      ) pay ON pay.sale_id = s.id
+      GROUP BY matched.customer_id
+    ),
+    customer_payment_summary AS (
+      SELECT customer_id, SUM(payment_amount) AS total_customer_paid
+      FROM customer_payments
+      WHERE cancelled = FALSE
+      GROUP BY customer_id
+    )
+    SELECT
+      c.*,
+      COALESCE(ss.total_sales, 0) AS total_sales,
+      COALESCE(ss.sale_paid, 0) + COALESCE(cps.total_customer_paid, 0) AS total_paid,
+      COALESCE(ss.total_cancelled, 0) AS total_cancelled,
+      ROUND((
+        COALESCE(c.opening_balance, 0)
+        + COALESCE(ss.total_sales, 0)
+        - COALESCE(ss.sale_paid, 0)
+        - COALESCE(cps.total_customer_paid, 0)
+      )::NUMERIC, 2) AS outstanding_balance
+    FROM customers c
+    LEFT JOIN sale_summary ss ON ss.customer_id = c.id
+    LEFT JOIN customer_payment_summary cps ON cps.customer_id = c.id
+    ${whereClause}
+    ORDER BY c.active DESC, c.customer_name
+    `,
+    values
+  );
+  return result.rows;
+};
+
+const buildCustomerSummaryPayload = (rows) => {
+  const totals = rows.reduce((summary, customer) => ({
+    totalSales: summary.totalSales + Number(customer.total_sales || 0),
+    totalPaid: summary.totalPaid + Number(customer.total_paid || 0),
+    outstandingBalance: summary.outstandingBalance + Number(customer.outstanding_balance || 0),
+  }), { totalSales: 0, totalPaid: 0, outstandingBalance: 0 });
+  return {
+    totalSales: roundCurrency(totals.totalSales),
+    totalPaid: roundCurrency(totals.totalPaid),
+    outstandingBalance: roundCurrency(totals.outstandingBalance),
+    customers: rows,
   };
 };
 
@@ -1792,6 +1982,229 @@ app.get("/supplier-summary", async (req, res) => {
   }
 });
 
+app.get("/customers", async (req, res) => {
+  try {
+    const active = req.query.active === undefined ? undefined : String(req.query.active) === "true";
+    const rows = await getCustomerSummaryRows({ active, search: cleanText(req.query.search) });
+    return res.json(rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Customers" });
+  }
+});
+
+app.post("/customers", async (req, res) => {
+  try {
+    const customer = readCustomerPayload(req.body);
+    if (!customer.customer_name || !CUSTOMER_TYPES.has(customer.customer_type) || customer.opening_balance === null) {
+      return res.status(400).json({ message: "Enter valid customer details" });
+    }
+    const result = await pool.query(
+      `
+      INSERT INTO customers (customer_name, customer_type, mobile_number, address, gst_number, notes, opening_balance, active)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING *
+      `,
+      [
+        customer.customer_name, customer.customer_type, customer.mobile_number, customer.address,
+        customer.gst_number, customer.notes, customer.opening_balance, customer.active,
+      ]
+    );
+    return res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Saving Customer" });
+  }
+});
+
+app.put("/customers/:id", async (req, res) => {
+  try {
+    const customerId = parsePositiveInteger(req.params.id);
+    const customer = readCustomerPayload(req.body);
+    if (!customerId || !customer.customer_name || !CUSTOMER_TYPES.has(customer.customer_type) || customer.opening_balance === null) {
+      return res.status(400).json({ message: "Enter valid customer details" });
+    }
+    const result = await pool.query(
+      `
+      UPDATE customers
+      SET customer_name = $1, customer_type = $2, mobile_number = $3, address = $4,
+          gst_number = $5, notes = $6, opening_balance = $7, active = $8,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $9
+      RETURNING *
+      `,
+      [
+        customer.customer_name, customer.customer_type, customer.mobile_number, customer.address,
+        customer.gst_number, customer.notes, customer.opening_balance, customer.active, customerId,
+      ]
+    );
+    return result.rows[0] ? res.json(result.rows[0]) : res.status(404).json({ message: "Customer not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Customer" });
+  }
+});
+
+app.get("/customer-summary", async (req, res) => {
+  try {
+    const customerId = req.query.customer_id ? parsePositiveInteger(req.query.customer_id) : null;
+    if (req.query.customer_id && !customerId) return res.status(400).json({ message: "Invalid customer" });
+    const rows = await getCustomerSummaryRows({ customerId });
+    return res.json(buildCustomerSummaryPayload(rows));
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Customer Summary" });
+  }
+});
+
+app.post("/customer-payments", async (req, res) => {
+  try {
+    const customerId = parsePositiveInteger(req.body.customer_id);
+    const paymentAmount = parsePositiveNumber(req.body.payment_amount);
+    const paymentMode = String(req.body.payment_mode || "CASH").trim().toUpperCase();
+    const paymentDate = req.body.payment_date || toDateKey(new Date());
+    if (!customerId || !paymentAmount || !["CASH", "UPI", "CARD", "BANK_TRANSFER"].includes(paymentMode)) {
+      return res.status(400).json({ message: "Enter valid customer payment details" });
+    }
+    const customerResult = await pool.query("SELECT id FROM customers WHERE id = $1 AND active = TRUE", [customerId]);
+    if (customerResult.rows.length === 0) return res.status(400).json({ message: "Select an active customer" });
+    const result = await pool.query(
+      `
+      INSERT INTO customer_payments (
+        customer_id, payment_date, payment_amount, payment_mode, reference_number,
+        remarks, branch_id, created_by
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING *
+      `,
+      [
+        customerId, paymentDate, paymentAmount, paymentMode, nullableText(req.body.reference_number),
+        nullableText(req.body.remarks), parsePositiveInteger(req.body.branch_id), parsePositiveInteger(req.body.created_by) || 1,
+      ]
+    );
+    return res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Saving Customer Payment" });
+  }
+});
+
+app.get("/customer-ledger", async (req, res) => {
+  try {
+    const customerId = req.query.customer_id ? parsePositiveInteger(req.query.customer_id) : null;
+    if (req.query.customer_id && !customerId) return res.status(400).json({ message: "Invalid customer" });
+    const customers = await getCustomerSummaryRows({ customerId });
+    if (customerId && customers.length === 0) return res.status(404).json({ message: "Customer not found" });
+    if (customers.length === 0) return res.json({ customers: [], ledger: [] });
+    const ids = customers.map((customer) => customer.id);
+    const [salesResult, paymentResult] = await Promise.all([
+      pool.query(
+        `
+        SELECT s.*, c.id AS customer_id, COALESCE(pay.total_paid, 0) AS total_paid
+        FROM sales s
+        JOIN customers c ON (
+          (s.customer_mobile IS NOT NULL AND c.mobile_number = s.customer_mobile)
+          OR (s.customer_mobile IS NULL AND s.customer_name IS NOT NULL AND LOWER(c.customer_name) = LOWER(s.customer_name))
+        )
+        LEFT JOIN (
+          SELECT sale_id, SUM(amount) AS total_paid FROM sale_payments GROUP BY sale_id
+        ) pay ON pay.sale_id = s.id
+        WHERE c.id = ANY($1::INT[])
+        ORDER BY s.sale_date, s.created_at, s.id
+        `,
+        [ids]
+      ),
+      pool.query(
+        `
+        SELECT cp.*, c.customer_name
+        FROM customer_payments cp
+        JOIN customers c ON c.id = cp.customer_id
+        WHERE cp.customer_id = ANY($1::INT[])
+          AND cp.cancelled = FALSE
+        ORDER BY cp.payment_date, cp.created_at, cp.id
+        `,
+        [ids]
+      ),
+    ]);
+    const ledgersByCustomer = new Map(ids.map((id) => [id, []]));
+    const pushEvent = (event) => {
+      if (!ledgersByCustomer.has(event.customer_id)) ledgersByCustomer.set(event.customer_id, []);
+      ledgersByCustomer.get(event.customer_id).push(event);
+    };
+    for (const customer of customers) {
+      if (Number(customer.opening_balance || 0) > 0) {
+        pushEvent({
+          customer_id: customer.id,
+          customer_name: customer.customer_name,
+          transaction_date: toDateKey(customer.created_at),
+          sort_key: `O-${customer.id}`,
+          transaction_type: "Opening Balance",
+          debit_amount: Number(customer.opening_balance),
+          credit_amount: 0,
+          balance_delta: Number(customer.opening_balance),
+          remarks: "Opening customer receivable balance",
+        });
+      }
+    }
+    for (const sale of salesResult.rows) {
+      if (sale.sale_status !== "CANCELLED") {
+        pushEvent({
+          customer_id: sale.customer_id,
+          customer_name: sale.customer_name,
+          transaction_date: toDateKey(sale.sale_date),
+          sort_key: `S-${String(sale.id).padStart(8, "0")}-0`,
+          transaction_type: "Sale",
+          debit_amount: Number(sale.total_amount || 0),
+          credit_amount: 0,
+          balance_delta: Number(sale.total_amount || 0),
+          remarks: sale.invoice_no || `Sale #${sale.id}`,
+        });
+        if (Number(sale.total_paid || 0) > 0) {
+          pushEvent({
+            customer_id: sale.customer_id,
+            customer_name: sale.customer_name,
+            transaction_date: toDateKey(sale.sale_date),
+            sort_key: `S-${String(sale.id).padStart(8, "0")}-1`,
+            transaction_type: "Sale Payment",
+            debit_amount: 0,
+            credit_amount: Number(sale.total_paid || 0),
+            balance_delta: -Number(sale.total_paid || 0),
+            remarks: `Payment for ${sale.invoice_no || `Sale #${sale.id}`}`,
+          });
+        }
+      }
+    }
+    for (const payment of paymentResult.rows) {
+      pushEvent({
+        customer_id: payment.customer_id,
+        customer_name: payment.customer_name,
+        transaction_date: toDateKey(payment.payment_date),
+        sort_key: `CP-${String(payment.id).padStart(8, "0")}`,
+        transaction_type: "Customer Payment",
+        debit_amount: 0,
+        credit_amount: Number(payment.payment_amount || 0),
+        balance_delta: -Number(payment.payment_amount || 0),
+        remarks: payment.remarks || payment.reference_number || "Customer payment",
+      });
+    }
+    const ledger = [];
+    for (const customer of customers) {
+      let runningBalance = 0;
+      const rows = (ledgersByCustomer.get(customer.id) || []).sort((left, right) =>
+        left.transaction_date.localeCompare(right.transaction_date) || left.sort_key.localeCompare(right.sort_key)
+      );
+      for (const row of rows) {
+        runningBalance = roundCurrency(runningBalance + Number(row.balance_delta || 0));
+        ledger.push({ ...row, running_balance: runningBalance });
+      }
+    }
+    return res.json({ customers, ledger });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Customer Ledger" });
+  }
+});
+
 app.get("/dashboard-metrics", async (req, res) => {
   try {
     const result = await pool.query(
@@ -1822,6 +2235,7 @@ app.get("/dashboard-metrics", async (req, res) => {
             SUM(payment_amount) AS total_paid,
             SUM(rebate_amount) AS payment_rebate
           FROM supplier_payments
+          WHERE cancelled = FALSE
           GROUP BY supplier_id
         ) pay ON pay.supplier_id = s.id
       )
@@ -1849,13 +2263,13 @@ app.get("/dashboard-metrics", async (req, res) => {
         COALESCE((SELECT COUNT(*) FROM sales WHERE sale_date = CURRENT_DATE AND sale_status <> 'CANCELLED'), 0) AS "transactions",
         COALESCE((SELECT ROUND(SUM(outstanding_balance)::NUMERIC, 2) FROM supplier_balances), 0) AS "supplierOutstanding",
         COALESCE((SELECT SUM(rebate_amount) FROM purchases), 0)
-          + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments), 0) AS "totalRebateReceived",
-        COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE payment_date = CURRENT_DATE), 0)
+          + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE), 0) AS "totalRebateReceived",
+        COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE payment_date = CURRENT_DATE AND cancelled = FALSE), 0)
           + COALESCE((SELECT SUM(paid_amount) FROM purchases WHERE COALESCE(payment_date, purchase_date) = CURRENT_DATE), 0) AS "todaySupplierPayments",
         COALESCE((SELECT ROUND(SUM(outstanding_balance)::NUMERIC, 2) FROM supplier_balances), 0) AS total_supplier_outstanding,
         COALESCE((SELECT SUM(rebate_amount) FROM purchases), 0)
-          + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments), 0) AS total_rebate_received,
-        COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE payment_date = CURRENT_DATE), 0)
+          + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE), 0) AS total_rebate_received,
+        COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE payment_date = CURRENT_DATE AND cancelled = FALSE), 0)
           + COALESCE((SELECT SUM(paid_amount) FROM purchases WHERE COALESCE(payment_date, purchase_date) = CURRENT_DATE), 0) AS todays_supplier_payments,
         COALESCE((SELECT COUNT(*) FROM suppliers), 0) AS supplier_count,
         COALESCE((SELECT COUNT(*) FROM suppliers WHERE active = TRUE), 0) AS active_supplier_count
@@ -1894,6 +2308,157 @@ app.get("/dashboard-metrics", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Dashboard Metrics" });
+  }
+});
+
+app.get("/reports/summary", async (req, res) => {
+  try {
+    const dateFrom = req.query.date_from || "1900-01-01";
+    const dateTo = req.query.date_to || "2999-12-31";
+    const [salesResult, purchaseResult, supplierRows, customerRows, discountResult] = await Promise.all([
+      pool.query(
+        `
+        SELECT
+          sale_date,
+          COUNT(*)::INTEGER AS transaction_count,
+          SUM(total_amount) AS total_sales,
+          SUM(total_cost) AS total_cost,
+          SUM(profit) AS total_profit
+        FROM sales
+        WHERE sale_status <> 'CANCELLED'
+          AND sale_date BETWEEN $1 AND $2
+        GROUP BY sale_date
+        ORDER BY sale_date DESC
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
+          purchase_date,
+          COUNT(*)::INTEGER AS purchase_count,
+          SUM(COALESCE(NULLIF(gross_amount, 0), total_amount, 0)) AS gross_purchase,
+          SUM(COALESCE(rebate_amount, 0)) AS rebate_received,
+          SUM(COALESCE(NULLIF(net_payable, 0), total_amount, 0)) AS net_purchase,
+          SUM(COALESCE(paid_amount, 0)) AS paid_amount,
+          SUM(COALESCE(balance_amount, 0)) AS balance_amount
+        FROM purchases
+        WHERE purchase_date BETWEEN $1 AND $2
+        GROUP BY purchase_date
+        ORDER BY purchase_date DESC
+        `,
+        [dateFrom, dateTo]
+      ),
+      getSupplierSummaryRows(),
+      getCustomerSummaryRows(),
+      pool.query(
+        `
+        SELECT
+          sale_date,
+          payment_mode,
+          COUNT(*)::INTEGER AS invoice_count,
+          SUM(COALESCE(item_discount_amount, 0) + COALESCE(invoice_discount_amount, 0)) AS total_discount,
+          SUM(COALESCE(invoice_discount_amount, 0)) AS bill_discount,
+          SUM(COALESCE(item_discount_amount, 0)) AS item_discount
+        FROM sales
+        WHERE sale_status <> 'CANCELLED'
+          AND sale_date BETWEEN $1 AND $2
+        GROUP BY sale_date, payment_mode
+        ORDER BY sale_date DESC, payment_mode
+        `,
+        [dateFrom, dateTo]
+      ),
+    ]);
+    return res.json({
+      salesReport: salesResult.rows,
+      purchaseReport: purchaseResult.rows,
+      supplierOutstandingReport: supplierRows,
+      customerOutstandingReport: customerRows,
+      discountReport: discountResult.rows,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Reports" });
+  }
+});
+
+app.get("/expenses", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT e.*, u.full_name AS created_by_name
+      FROM expenses e
+      LEFT JOIN users u ON u.id = e.created_by
+      ORDER BY e.expense_date DESC, e.created_at DESC, e.id DESC
+      `
+    );
+    return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Expenses" });
+  }
+});
+
+app.post("/expenses", async (req, res) => {
+  try {
+    const amount = parsePositiveNumber(req.body.amount);
+    const category = cleanText(req.body.category);
+    const paymentMode = normalizePaymentMode(req.body.payment_mode || "CASH");
+    if (!category || !amount || !SUPPLIER_PAYMENT_MODES.has(paymentMode)) {
+      return res.status(400).json({ message: "Enter valid expense details" });
+    }
+    const result = await pool.query(
+      `
+      INSERT INTO expenses (
+        expense_date, category, amount, payment_mode, reference_number,
+        vendor_name, remarks, branch_id, created_by, active
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING *
+      `,
+      [
+        req.body.expense_date || toDateKey(new Date()), category, amount, paymentMode,
+        nullableText(req.body.reference_number), nullableText(req.body.vendor_name),
+        nullableText(req.body.remarks), parsePositiveInteger(req.body.branch_id),
+        parsePositiveInteger(req.body.created_by) || 1, req.body.active !== false,
+      ]
+    );
+    return res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Saving Expense" });
+  }
+});
+
+app.put("/expenses/:id", async (req, res) => {
+  try {
+    const expenseId = parsePositiveInteger(req.params.id);
+    const amount = parsePositiveNumber(req.body.amount);
+    const category = cleanText(req.body.category);
+    const paymentMode = normalizePaymentMode(req.body.payment_mode || "CASH");
+    if (!expenseId || !category || !amount || !SUPPLIER_PAYMENT_MODES.has(paymentMode)) {
+      return res.status(400).json({ message: "Enter valid expense details" });
+    }
+    const result = await pool.query(
+      `
+      UPDATE expenses
+      SET expense_date = $1, category = $2, amount = $3, payment_mode = $4,
+          reference_number = $5, vendor_name = $6, remarks = $7,
+          branch_id = $8, active = $9, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $10
+      RETURNING *
+      `,
+      [
+        req.body.expense_date || toDateKey(new Date()), category, amount, paymentMode,
+        nullableText(req.body.reference_number), nullableText(req.body.vendor_name),
+        nullableText(req.body.remarks), parsePositiveInteger(req.body.branch_id),
+        req.body.active !== false, expenseId,
+      ]
+    );
+    return result.rows[0] ? res.json(result.rows[0]) : res.status(404).json({ message: "Expense not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Expense" });
   }
 });
 
@@ -1965,6 +2530,114 @@ app.post("/supplier-payments", async (req, res) => {
   }
 });
 
+app.put("/supplier-payments/:id", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const paymentId = parsePositiveInteger(req.params.id);
+    const supplierId = parsePositiveInteger(req.body.supplier_id);
+    const paymentAmount = parseNonNegativeNumber(req.body.payment_amount);
+    const rebateAmount = parseNonNegativeNumber(req.body.rebate_received ?? req.body.rebate_amount);
+    const paymentMode = normalizePaymentMode(req.body.payment_mode);
+    const editedBy = parsePositiveInteger(req.body.edited_by) || parsePositiveInteger(req.body.created_by) || 1;
+    const reason = cleanText(req.body.reason);
+    const paymentDate = req.body.payment_date || toDateKey(new Date());
+    if (!paymentId || !supplierId || paymentAmount === null || rebateAmount === null || paymentAmount + rebateAmount <= 0 || !SUPPLIER_PAYMENT_MODES.has(paymentMode) || !reason) {
+      return res.status(400).json({ message: "Enter valid supplier payment edit details and reason" });
+    }
+    await client.query("BEGIN");
+    const oldResult = await client.query("SELECT * FROM supplier_payments WHERE id = $1 FOR UPDATE", [paymentId]);
+    const oldPayment = oldResult.rows[0];
+    if (!oldPayment) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Supplier payment not found" });
+    }
+    if (oldPayment.cancelled) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Cancelled supplier payments cannot be edited" });
+    }
+    const supplierResult = await client.query("SELECT id FROM suppliers WHERE id = $1 AND active = TRUE", [supplierId]);
+    if (supplierResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Select an active supplier account" });
+    }
+    const result = await client.query(
+      `
+      UPDATE supplier_payments
+      SET supplier_id = $1, payment_date = $2, payment_amount = $3, rebate_amount = $4,
+          payment_mode = $5, reference_number = $6, remarks = $7, branch_id = $8,
+          edited_by = $9, edited_at = CURRENT_TIMESTAMP, edit_reason = $10
+      WHERE id = $11
+      RETURNING *
+      `,
+      [
+        supplierId, paymentDate, paymentAmount, rebateAmount, paymentMode,
+        nullableText(req.body.reference_number), nullableText(req.body.remarks),
+        parsePositiveInteger(req.body.branch_id), editedBy, reason, paymentId,
+      ]
+    );
+    await client.query(
+      `
+      INSERT INTO supplier_payment_audit (supplier_payment_id, action, old_value, new_value, reason, edited_by)
+      VALUES ($1, 'EDIT', $2::jsonb, $3::jsonb, $4, $5)
+      `,
+      [paymentId, JSON.stringify(oldPayment), JSON.stringify(result.rows[0]), reason, editedBy]
+    );
+    await client.query("COMMIT");
+    return res.json(result.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Supplier Payment" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/supplier-payments/:id/cancel", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const paymentId = parsePositiveInteger(req.params.id);
+    const cancelledBy = parsePositiveInteger(req.body.cancelled_by) || 1;
+    const reason = cleanText(req.body.reason);
+    if (!paymentId || !reason) return res.status(400).json({ message: "Cancellation reason is required" });
+    await client.query("BEGIN");
+    const oldResult = await client.query("SELECT * FROM supplier_payments WHERE id = $1 FOR UPDATE", [paymentId]);
+    const oldPayment = oldResult.rows[0];
+    if (!oldPayment) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Supplier payment not found" });
+    }
+    if (oldPayment.cancelled) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Supplier payment is already cancelled" });
+    }
+    const result = await client.query(
+      `
+      UPDATE supplier_payments
+      SET cancelled = TRUE, cancelled_by = $1, cancelled_at = CURRENT_TIMESTAMP, cancellation_reason = $2
+      WHERE id = $3
+      RETURNING *
+      `,
+      [cancelledBy, reason, paymentId]
+    );
+    await client.query(
+      `
+      INSERT INTO supplier_payment_audit (supplier_payment_id, action, old_value, new_value, reason, edited_by)
+      VALUES ($1, 'CANCEL', $2::jsonb, $3::jsonb, $4, $5)
+      `,
+      [paymentId, JSON.stringify(oldPayment), JSON.stringify(result.rows[0]), reason, cancelledBy]
+    );
+    await client.query("COMMIT");
+    return res.json({ success: true, payment: result.rows[0] });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Cancelling Supplier Payment" });
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/supplier-ledger", async (req, res) => {
   try {
     const supplierId = req.query.supplier_id ? parsePositiveInteger(req.query.supplier_id) : null;
@@ -2007,6 +2680,7 @@ app.get("/supplier-ledger", async (req, res) => {
         FROM supplier_payments sp
         JOIN suppliers s ON s.id = sp.supplier_id
         WHERE sp.supplier_id = ANY($1::INT[])
+          AND sp.cancelled = FALSE
         ORDER BY sp.payment_date, sp.created_at, sp.id
         `,
         [supplierIds]
@@ -2148,6 +2822,9 @@ app.post("/purchase", async (req, res) => {
       paid_amount,
       rebate_rule_id,
       payment_date,
+      purchase_type,
+      payment_mode,
+      payment_reference_number,
       branch_id,
       created_by,
     } = req.body;
@@ -2158,7 +2835,9 @@ app.post("/purchase", async (req, res) => {
     const parsedFreightCharges = parseNonNegativeNumber(freight_charges);
     const parsedLabourCharges = parseNonNegativeNumber(labour_charges);
     const parsedOtherCharges = parseNonNegativeNumber(other_charges);
-    const parsedPaidAmount = parseNonNegativeNumber(paid_amount);
+    const purchaseType = String(purchase_type || "CREDIT").trim().toUpperCase();
+    const parsedPaidAmountInput = parseNonNegativeNumber(paid_amount);
+    const purchasePaymentMode = normalizePaymentMode(payment_mode);
     const parsedRebateRuleId = parsePositiveInteger(rebate_rule_id);
     const parsedBranchId = parsePositiveInteger(branch_id);
     const parsedCreatedBy = parsePositiveInteger(created_by) || 1;
@@ -2174,11 +2853,15 @@ app.post("/purchase", async (req, res) => {
       parsedFreightCharges === null ||
       parsedLabourCharges === null ||
       parsedOtherCharges === null ||
-      parsedPaidAmount === null ||
+      parsedPaidAmountInput === null ||
       !parsedRebateRuleId ||
-      !parsedBranchId
+      !parsedBranchId ||
+      !["CASH", "CREDIT"].includes(purchaseType)
     ) {
       return res.status(400).json({ message: "Enter valid purchase details" });
+    }
+    if (purchaseType === "CASH" && (!SUPPLIER_PAYMENT_MODES.has(purchasePaymentMode) || parsedPaidAmountInput <= 0)) {
+      return res.status(400).json({ message: "Cash purchase requires payment mode and paid amount" });
     }
 
     await client.query("BEGIN");
@@ -2219,6 +2902,7 @@ app.post("/purchase", async (req, res) => {
     const grossAmount = roundCurrency(basicAmount + mandiTaxAmount + parsedFreightCharges + parsedLabourCharges + parsedOtherCharges);
     const rebateAmount = roundCurrency(grossAmount * rebatePercent / 100);
     const netPayable = roundCurrency(grossAmount - rebateAmount);
+    const parsedPaidAmount = purchaseType === "CREDIT" ? 0 : parsedPaidAmountInput;
     if (parsedPaidAmount > netPayable) {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Paid amount cannot exceed net payable amount" });
@@ -2234,9 +2918,10 @@ app.post("/purchase", async (req, res) => {
         mandi_tax_percent, mandi_tax_amount, other_charges, gross_amount,
         rebate_percent, rebate_amount, net_payable, paid_amount, balance_amount,
         payment_timing, effective_cost_per_unit, freight_charges, labour_charges,
-        rebate_rule_id, payment_due_days, payment_status, payment_date
+        rebate_rule_id, payment_due_days, payment_status, payment_date,
+        purchase_type, payment_mode, payment_reference_number
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
       RETURNING *
       `,
       [
@@ -2244,7 +2929,8 @@ app.post("/purchase", async (req, res) => {
         mandiTaxPercent, mandiTaxAmount, parsedOtherCharges, grossAmount,
         rebatePercent, rebateAmount, netPayable, parsedPaidAmount, balanceAmount,
         rebateRule.rule_name, effectiveCostPerUnit, parsedFreightCharges, parsedLabourCharges,
-        rebateRule.id, rebateRule.pay_within_days, paymentStatus, payment_date || null,
+        rebateRule.id, rebateRule.pay_within_days, paymentStatus, purchaseType === "CREDIT" ? null : payment_date || null,
+        purchaseType, purchaseType === "CASH" ? purchasePaymentMode : null, purchaseType === "CASH" ? nullableText(payment_reference_number) : null,
       ]
     );
     const purchase = purchaseResult.rows[0];
