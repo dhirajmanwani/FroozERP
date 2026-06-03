@@ -72,6 +72,44 @@ const supplierPaymentModes = [
   ["CHEQUE", "Cheque"],
 ];
 
+const discountTypes = [
+  ["FLAT_AMOUNT", "Flat Amount"],
+  ["PERCENTAGE", "Percentage"],
+];
+
+const discountPaymentModes = [
+  ["ALL", "All"],
+  ["CASH", "Cash"],
+  ["UPI", "UPI"],
+  ["CARD", "Card"],
+];
+
+const roundingRules = [
+  ["NEAREST_RUPEE", "Nearest rupee"],
+  ["ROUND_UP_5", "Round up to ₹5"],
+  ["ROUND_UP_10", "Round up to ₹10"],
+  ["NO_ROUND", "No rounding"],
+];
+
+const defaultBusinessSettings = {
+  business_name: "FroozERP Retail",
+  brand_name: "FEEL THE FREAKIN' FROOZ",
+  company_name: "SRT Company",
+  address: "",
+  phone_number: "",
+  gst_number: "",
+  logo_url: "",
+  compact_logo_text: "FTF",
+  invoice_footer_text: "Thank you for shopping with FEEL THE FREAKIN' FROOZ.",
+};
+
+const defaultSaleRateSettings = {
+  desired_margin_percent: 25,
+  rounding_rule: "NEAREST_RUPEE",
+  suggestion_enabled: true,
+  notes: "",
+};
+
 const emptySupplierForm = {
   supplier_name: "",
   firm_name: "",
@@ -163,6 +201,15 @@ function App() {
   const [salesHistory, setSalesHistory] = useState([]);
   const [purchaseRules, setPurchaseRules] = useState(defaultPurchaseRules);
   const [settingsRules, setSettingsRules] = useState(defaultPurchaseRules);
+  const [settingsData, setSettingsData] = useState({
+    businessSettings: defaultBusinessSettings,
+    saleRateSettings: defaultSaleRateSettings,
+    discountRules: [],
+    roles: [],
+    backupSettings: {},
+    canManageSettings: false,
+  });
+  const [discountRules, setDiscountRules] = useState([]);
   const [saleRates, setSaleRates] = useState([]);
   const [saleRateHistory, setSaleRateHistory] = useState([]);
   const [saleDesiredMargin, setSaleDesiredMargin] = useState("25");
@@ -300,9 +347,29 @@ function App() {
     setPurchaseRules(response.data);
   };
 
-  const loadSettingsRules = async () => {
-    const response = await axios.get(`${API_URL}/settings/purchase-rules`, { params: { user_id: user.id } });
-    setSettingsRules(response.data);
+  const loadSettingsData = async (currentUser = user) => {
+    const response = await axios.get(`${API_URL}/settings`, { params: { user_id: currentUser?.id } });
+    const data = response.data;
+    const nextSaleRateSettings = { ...defaultSaleRateSettings, ...(data.saleRateSettings || {}) };
+    setSettingsData({
+      businessSettings: { ...defaultBusinessSettings, ...(data.businessSettings || {}) },
+      saleRateSettings: nextSaleRateSettings,
+      discountRules: data.discountRules || [],
+      roles: data.roles || [],
+      backupSettings: data.backupSettings || {},
+      canManageSettings: Boolean(data.canManageSettings),
+    });
+    setSettingsRules({
+      mandiTaxRules: data.mandiTaxRules || [],
+      rebateRules: data.rebateRules || [],
+    });
+    setDiscountRules((data.discountRules || []).filter((rule) => rule.active !== false));
+    setSaleDesiredMargin(String(nextSaleRateSettings.desired_margin_percent || 25));
+  };
+
+  const loadDiscountRules = async () => {
+    const response = await axios.get(`${API_URL}/settings/discount-rules`);
+    setDiscountRules(response.data);
   };
 
   const loadSaleRates = async (desiredMargin = saleDesiredMargin) => {
@@ -354,7 +421,7 @@ function App() {
     try {
       const response = await axios.post(`${API_URL}/login`, { username, password });
       setUser(response.data);
-      await Promise.all([loadProducts(), loadDashboardData(), loadPurchaseRules(), loadSupplierData()]);
+      await Promise.all([loadProducts(), loadDashboardData(), loadPurchaseRules(), loadSupplierData(), loadSettingsData(response.data)]);
     } catch (error) {
       alert(getErrorMessage(error, "Login Failed"));
     }
@@ -479,13 +546,14 @@ function App() {
         const response = await axios.get(`${API_URL}/sales`);
         setSalesHistory(response.data);
       }
+      if (view === "sales") await loadDiscountRules();
       if (["purchase", "account-manager", "supplier-payments", "supplier-ledger"].includes(view)) {
         await loadSupplierData();
       }
       if (view === "supplier-payments") await loadSupplierPayments();
       if (view === "supplier-ledger") await loadSupplierLedger(ledgerSupplierId);
       if (view === "dashboard") await loadDashboardData();
-      if (view === "settings") await loadSettingsRules();
+      if (view === "settings") await loadSettingsData();
       if (view === "sale-rates") await loadSaleRates();
     } catch (error) {
       alert(getErrorMessage(error, "Error Loading Data"));
@@ -534,7 +602,7 @@ function App() {
         </div>
         <span className="sidebar-section">Main Menu</span>
         <nav className="sidebar-nav">
-          {navigationItems.filter(([view]) => canManageRates || !["settings", "sale-rates"].includes(view)).map(([view, label]) => (
+          {navigationItems.filter(([view]) => canManageRates || view !== "sale-rates").map(([view, label]) => (
             <button
               className={activeView === view ? "nav-item nav-item-active" : "nav-item"}
               key={view}
@@ -769,6 +837,7 @@ function App() {
 
           {activeView === "sales" && (
             <PosBilling
+              discountRules={discountRules}
               inventory={inventory}
               onInvoice={setSelectedInvoice}
               onSaved={loadDashboardData}
@@ -779,7 +848,7 @@ function App() {
 
           {activeView === "sales-history" && (
             <ModuleCard eyebrow="Revenue" title="Sales History" subtitle="Review completed sales, costs, and realized profit.">
-              <DataTable headers={["Invoice", "Date", "Customer", "Items", "Payment", "Amount", "Cost", "Profit", ""]}>
+              <DataTable headers={["Invoice", "Date", "Customer", "Items", "Payment", "Gross", "Discount", "Net Amount", "Cost", "Profit", ""]}>
                 {salesHistory.map((sale) => (
                   <tr key={sale.id}>
                     <td><span className="batch-id">{sale.invoice_no || `#${sale.id}`}</span></td>
@@ -787,6 +856,8 @@ function App() {
                     <td>{sale.customer_name || "Walk-in Customer"}</td>
                     <td className="primary-cell">{sale.item_summary}</td>
                     <td><span className="tag">{sale.payment_mode}</span></td>
+                    <td>{currency.format(Number(sale.gross_amount || sale.amount))}</td>
+                    <td>{currency.format(Number(sale.item_discount_amount || 0) + Number(sale.invoice_discount_amount || 0))}</td>
                     <td>{currency.format(Number(sale.amount))}</td>
                     <td>{currency.format(Number(sale.cost_amount))}</td>
                     <td className="profit-cell">{currency.format(Number(sale.profit))}</td>
@@ -809,9 +880,11 @@ function App() {
             />
           )}
 
-          {activeView === "settings" && canManageRates && (
-            <PurchaseSettings
-              onReload={async () => { await Promise.all([loadSettingsRules(), loadPurchaseRules()]); }}
+          {activeView === "settings" && (
+            <SettingsModule
+              canManage={canManageRates}
+              onReload={async () => { await Promise.all([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()]); }}
+              settingsData={settingsData}
               rules={settingsRules}
               user={user}
             />
@@ -1139,10 +1212,189 @@ function DetailItem({ label, value }) {
   );
 }
 
-function PurchaseSettings({ onReload, rules, user }) {
-  const [newRule, setNewRule] = useState({ rule_name: "", pay_within_days: "", rebate_percent: "", active: true });
+function SettingsModule({ canManage, onReload, rules, settingsData, user }) {
+  return (
+    <section className="settings-layout">
+      <section className="settings-banner">
+        <div>
+          <span className="eyebrow">System Controls</span>
+          <h2>Settings</h2>
+          <p>{canManage ? "Owner/Admin controls are active." : "Read-only access. Owner/Admin approval is required for changes."}</p>
+        </div>
+        <span className={canManage ? "stock-ok" : "stock-low"}>{canManage ? "Manager Access" : "Read Only"}</span>
+      </section>
+      <BusinessSettingsSection businessSettings={settingsData.businessSettings} canManage={canManage} key={settingsData.businessSettings?.updated_at || "business-settings"} onReload={onReload} user={user} />
+      <MandiTaxSettings canManage={canManage} onReload={onReload} rules={rules.mandiTaxRules} user={user} />
+      <RebateSettings canManage={canManage} onReload={onReload} rules={rules.rebateRules} user={user} />
+      <SaleRateSettingsSection canManage={canManage} key={settingsData.saleRateSettings?.updated_at || "sale-rate-settings"} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />
+      <DiscountSettings canManage={canManage} discountRules={settingsData.discountRules} onReload={onReload} user={user} />
+      <PermissionSettings roles={settingsData.roles} />
+      <BackupSettings backupSettings={settingsData.backupSettings} />
+    </section>
+  );
+}
 
-  const updateMandiRule = async (rule, taxPercent, active) => {
+function BusinessSettingsSection({ businessSettings, canManage, onReload, user }) {
+  const [draft, setDraft] = useState({ ...defaultBusinessSettings, ...businessSettings });
+  const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
+  const save = async () => {
+    try {
+      await axios.put(`${API_URL}/settings/business`, { ...draft, updated_by: user.id });
+      await onReload();
+      alert("Business settings updated");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update business settings"));
+    }
+  };
+
+  return (
+    <ModuleCard eyebrow="Business Settings" title="Business Identity" subtitle="Invoice and application identity details for the retail operation.">
+      <div className="form-grid supplier-form-grid">
+        <Field label="Business Name"><input disabled={!canManage} value={draft.business_name || ""} onChange={(event) => updateDraft("business_name", event.target.value)} /></Field>
+        <Field label="Brand Name"><input disabled={!canManage} value={draft.brand_name || ""} onChange={(event) => updateDraft("brand_name", event.target.value)} /></Field>
+        <Field label="Company Name"><input disabled={!canManage} value={draft.company_name || ""} onChange={(event) => updateDraft("company_name", event.target.value)} /></Field>
+        <Field label="Phone Number"><input disabled={!canManage} value={draft.phone_number || ""} onChange={(event) => updateDraft("phone_number", event.target.value)} /></Field>
+        <Field label="GST Number"><input disabled={!canManage} value={draft.gst_number || ""} onChange={(event) => updateDraft("gst_number", event.target.value)} /></Field>
+        <Field label="Logo URL / Path"><input disabled={!canManage} value={draft.logo_url || ""} onChange={(event) => updateDraft("logo_url", event.target.value)} /></Field>
+        <Field label="Compact Logo Text"><input disabled={!canManage} value={draft.compact_logo_text || ""} onChange={(event) => updateDraft("compact_logo_text", event.target.value)} /></Field>
+        <Field label="Address"><textarea disabled={!canManage} value={draft.address || ""} onChange={(event) => updateDraft("address", event.target.value)} /></Field>
+        <Field label="Invoice Footer Text"><textarea disabled={!canManage} value={draft.invoice_footer_text || ""} onChange={(event) => updateDraft("invoice_footer_text", event.target.value)} /></Field>
+      </div>
+      <button className="primary-button" disabled={!canManage} onClick={save}>Save Business Settings</button>
+    </ModuleCard>
+  );
+}
+
+function MandiTaxSettings({ canManage, onReload, rules, user }) {
+  const [newRule, setNewRule] = useState({ origin_type: "", tax_percent: "", active: true });
+  const addRule = async () => {
+    try {
+      await axios.post(`${API_URL}/settings/mandi-tax-rules`, { ...newRule, updated_by: user.id });
+      setNewRule({ origin_type: "", tax_percent: "", active: true });
+      await onReload();
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to add mandi tax rule"));
+    }
+  };
+  return (
+    <ModuleCard eyebrow="Mandi Tax Settings" title="Origin-Based Mandi Tax" subtitle="Database-backed tax percentages for local and imported fruit purchases.">
+      <div className="form-grid settings-add-grid">
+        <Field label="Origin Type"><input disabled={!canManage} placeholder="LOCAL or IMPORTED" value={newRule.origin_type} onChange={(event) => setNewRule({ ...newRule, origin_type: event.target.value.toUpperCase() })} /></Field>
+        <Field label="Tax Percentage"><input disabled={!canManage} min="0" step="0.001" type="number" value={newRule.tax_percent} onChange={(event) => setNewRule({ ...newRule, tax_percent: event.target.value })} /></Field>
+        <label className="check-field"><input disabled={!canManage} checked={newRule.active} type="checkbox" onChange={(event) => setNewRule({ ...newRule, active: event.target.checked })} /><span>Active</span></label>
+      </div>
+      <button className="primary-button" disabled={!canManage} onClick={addRule}>Add Mandi Tax Rule</button>
+      <DataTable headers={["Origin Type", "Tax Percentage", "Status", ""]}>
+        {rules.map((rule) => <MandiRuleRow canManage={canManage} key={rule.id} onReload={onReload} rule={rule} user={user} />)}
+      </DataTable>
+    </ModuleCard>
+  );
+}
+
+function RebateSettings({ canManage, onReload, rules, user }) {
+  const [newRule, setNewRule] = useState({ rule_name: "", pay_within_days: "", rebate_percent: "", active: true });
+  const addRebateRule = async () => {
+    try {
+      await axios.post(`${API_URL}/settings/rebate-rules`, { ...newRule, updated_by: user.id });
+      setNewRule({ rule_name: "", pay_within_days: "", rebate_percent: "", active: true });
+      await onReload();
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to add rebate rule"));
+    }
+  };
+  return (
+    <ModuleCard eyebrow="Supplier Rebate Settings" title="Payment-Speed Rebate Slabs" subtitle="Owner/Admin can change payment days, rebate percentages and active status from software.">
+      <div className="form-grid settings-add-grid">
+        <Field label="Rule Name"><input disabled={!canManage} value={newRule.rule_name} onChange={(event) => setNewRule({ ...newRule, rule_name: event.target.value })} /></Field>
+        <Field label="Pay Within Days"><input disabled={!canManage} min="0" type="number" value={newRule.pay_within_days} onChange={(event) => setNewRule({ ...newRule, pay_within_days: event.target.value })} /></Field>
+        <Field label="Rebate Percentage"><input disabled={!canManage} min="0" step="0.001" type="number" value={newRule.rebate_percent} onChange={(event) => setNewRule({ ...newRule, rebate_percent: event.target.value })} /></Field>
+      </div>
+      <button className="primary-button" disabled={!canManage} onClick={addRebateRule}>Add Rebate Rule</button>
+      <DataTable headers={["Rule", "Pay Within Days", "Rebate Percentage", "Status", ""]}>
+        {rules.map((rule) => <RebateRuleRow canManage={canManage} key={rule.id} onReload={onReload} rule={rule} user={user} />)}
+      </DataTable>
+    </ModuleCard>
+  );
+}
+
+function SaleRateSettingsSection({ canManage, onReload, saleRateSettings, user }) {
+  const [draft, setDraft] = useState({ ...defaultSaleRateSettings, ...saleRateSettings });
+  const save = async () => {
+    try {
+      await axios.put(`${API_URL}/settings/sale-rate`, { ...draft, updated_by: user.id });
+      await onReload();
+      alert("Sale rate settings updated");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update sale rate settings"));
+    }
+  };
+  return (
+    <ModuleCard eyebrow="Sale Rate Settings" title="Sale Rate Suggestions" subtitle="Default margin and rounding controls used by owner-approved rate updates.">
+      <div className="form-grid settings-add-grid">
+        <Field label="Desired Margin %"><input disabled={!canManage} min="0" step="0.1" type="number" value={draft.desired_margin_percent || ""} onChange={(event) => setDraft({ ...draft, desired_margin_percent: event.target.value })} /></Field>
+        <Field label="Rounding Rule">
+          <select disabled={!canManage} value={draft.rounding_rule || "NEAREST_RUPEE"} onChange={(event) => setDraft({ ...draft, rounding_rule: event.target.value })}>
+            {roundingRules.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          </select>
+        </Field>
+        <label className="check-field"><input disabled={!canManage} checked={draft.suggestion_enabled !== false} type="checkbox" onChange={(event) => setDraft({ ...draft, suggestion_enabled: event.target.checked })} /><span>Suggestions Active</span></label>
+        <Field label="Notes"><textarea disabled={!canManage} value={draft.notes || ""} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></Field>
+      </div>
+      <button className="primary-button" disabled={!canManage} onClick={save}>Save Sale Rate Settings</button>
+    </ModuleCard>
+  );
+}
+
+function DiscountSettings({ canManage, discountRules, onReload, user }) {
+  const [newRule, setNewRule] = useState({
+    rule_name: "",
+    minimum_bill_amount: "",
+    maximum_bill_amount: "",
+    discount_type: "FLAT_AMOUNT",
+    discount_value: "",
+    payment_mode: "ALL",
+    active: true,
+  });
+  const addRule = async () => {
+    try {
+      await axios.post(`${API_URL}/settings/discount-rules`, { ...newRule, updated_by: user.id });
+      setNewRule({ rule_name: "", minimum_bill_amount: "", maximum_bill_amount: "", discount_type: "FLAT_AMOUNT", discount_value: "", payment_mode: "ALL", active: true });
+      await onReload();
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to add discount rule"));
+    }
+  };
+  return (
+    <ModuleCard eyebrow="Overall Sale Discount Settings" title="Bill-Level Discount Slabs" subtitle="Automatic POS invoice discounts based on total bill amount and optional payment mode.">
+      <div className="form-grid discount-rule-grid">
+        <Field label="Rule Name"><input disabled={!canManage} value={newRule.rule_name} onChange={(event) => setNewRule({ ...newRule, rule_name: event.target.value })} /></Field>
+        <Field label="Minimum Bill Amount"><input disabled={!canManage} min="0" step="0.01" type="number" value={newRule.minimum_bill_amount} onChange={(event) => setNewRule({ ...newRule, minimum_bill_amount: event.target.value })} /></Field>
+        <Field label="Maximum Bill Amount"><input disabled={!canManage} min="0" step="0.01" type="number" value={newRule.maximum_bill_amount} onChange={(event) => setNewRule({ ...newRule, maximum_bill_amount: event.target.value })} /></Field>
+        <Field label="Discount Type">
+          <select disabled={!canManage} value={newRule.discount_type} onChange={(event) => setNewRule({ ...newRule, discount_type: event.target.value })}>
+            {discountTypes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          </select>
+        </Field>
+        <Field label="Discount Value"><input disabled={!canManage} min="0" step="0.01" type="number" value={newRule.discount_value} onChange={(event) => setNewRule({ ...newRule, discount_value: event.target.value })} /></Field>
+        <Field label="Payment Mode">
+          <select disabled={!canManage} value={newRule.payment_mode} onChange={(event) => setNewRule({ ...newRule, payment_mode: event.target.value })}>
+            {discountPaymentModes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          </select>
+        </Field>
+        <label className="check-field"><input disabled={!canManage} checked={newRule.active} type="checkbox" onChange={(event) => setNewRule({ ...newRule, active: event.target.checked })} /><span>Active</span></label>
+      </div>
+      <button className="primary-button" disabled={!canManage} onClick={addRule}>Add Discount Slab</button>
+      <DataTable headers={["Rule", "Range", "Type", "Value", "Payment", "Status", ""]}>
+        {discountRules.map((rule) => <DiscountRuleRow canManage={canManage} key={rule.id} onReload={onReload} rule={rule} user={user} />)}
+      </DataTable>
+    </ModuleCard>
+  );
+}
+
+function MandiRuleRow({ canManage, onReload, rule, user }) {
+  const [taxPercent, setTaxPercent] = useState(rule.tax_percent);
+  const [active, setActive] = useState(rule.active);
+  const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/mandi-tax-rules/${rule.id}`, {
         tax_percent: Number(taxPercent),
@@ -1154,53 +1406,25 @@ function PurchaseSettings({ onReload, rules, user }) {
       alert(getErrorMessage(error, "Unable to update mandi tax rule"));
     }
   };
-
-  const addRebateRule = async () => {
+  const remove = async () => {
     try {
-      await axios.post(`${API_URL}/settings/rebate-rules`, { ...newRule, updated_by: user.id });
-      setNewRule({ rule_name: "", pay_within_days: "", rebate_percent: "", active: true });
+      await axios.delete(`${API_URL}/settings/mandi-tax-rules/${rule.id}`, { data: { updated_by: user.id } });
       await onReload();
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to add rebate rule"));
+      alert(getErrorMessage(error, "Unable to delete mandi tax rule"));
     }
   };
-
-  return (
-    <section className="settings-layout">
-      <ModuleCard eyebrow="Tax & Charges" title="Mandi Tax Rules" subtitle="Configure origin-based mandi tax rates used for every new purchase.">
-        <DataTable headers={["Origin Type", "Tax Percentage", "Status", ""]}>
-          {rules.mandiTaxRules.map((rule) => <MandiRuleRow key={rule.id} onSave={updateMandiRule} rule={rule} />)}
-        </DataTable>
-      </ModuleCard>
-      <ModuleCard eyebrow="Tax & Charges" title="Supplier Rebate Rules" subtitle="Maintain payment-speed slabs. Purchase Entry always uses an active rule from this table.">
-        <div className="form-grid settings-add-grid">
-          <Field label="Rule Name"><input value={newRule.rule_name} onChange={(event) => setNewRule({ ...newRule, rule_name: event.target.value })} /></Field>
-          <Field label="Pay Within Days"><input min="0" type="number" value={newRule.pay_within_days} onChange={(event) => setNewRule({ ...newRule, pay_within_days: event.target.value })} /></Field>
-          <Field label="Rebate Percentage"><input min="0" step="0.001" type="number" value={newRule.rebate_percent} onChange={(event) => setNewRule({ ...newRule, rebate_percent: event.target.value })} /></Field>
-        </div>
-        <button className="primary-button" onClick={addRebateRule}>Add Rebate Rule</button>
-        <DataTable headers={["Rule", "Pay Within Days", "Rebate Percentage", "Status", ""]}>
-          {rules.rebateRules.map((rule) => <RebateRuleRow key={rule.id} onReload={onReload} rule={rule} user={user} />)}
-        </DataTable>
-      </ModuleCard>
-    </section>
-  );
-}
-
-function MandiRuleRow({ onSave, rule }) {
-  const [taxPercent, setTaxPercent] = useState(rule.tax_percent);
-  const [active, setActive] = useState(rule.active);
   return (
     <tr>
       <td className="primary-cell">{rule.origin_type}</td>
-      <td><input className="table-input" min="0" step="0.001" type="number" value={taxPercent} onChange={(event) => setTaxPercent(event.target.value)} /></td>
-      <td><label className="check-field"><input checked={active} type="checkbox" onChange={(event) => setActive(event.target.checked)} /><span>{active ? "Active" : "Inactive"}</span></label></td>
-      <td><button className="table-action" onClick={() => onSave(rule, taxPercent, active)}>Save</button></td>
+      <td><input className="table-input" disabled={!canManage} min="0" step="0.001" type="number" value={taxPercent} onChange={(event) => setTaxPercent(event.target.value)} /></td>
+      <td><label className="check-field"><input checked={active} disabled={!canManage} type="checkbox" onChange={(event) => setActive(event.target.checked)} /><span>{active ? "Active" : "Inactive"}</span></label></td>
+      <td><div className="button-row"><button className="table-action" disabled={!canManage} onClick={save}>Save</button><button className="remove-button" disabled={!canManage} onClick={remove}><Icon name="trash" size={15} /></button></div></td>
     </tr>
   );
 }
 
-function RebateRuleRow({ onReload, rule, user }) {
+function RebateRuleRow({ canManage, onReload, rule, user }) {
   const [draft, setDraft] = useState(rule);
   const save = async () => {
     try {
@@ -1220,12 +1444,82 @@ function RebateRuleRow({ onReload, rule, user }) {
   };
   return (
     <tr>
-      <td><input className="settings-table-input" value={draft.rule_name} onChange={(event) => setDraft({ ...draft, rule_name: event.target.value })} /></td>
-      <td><input className="table-input" min="0" type="number" value={draft.pay_within_days} onChange={(event) => setDraft({ ...draft, pay_within_days: event.target.value })} /></td>
-      <td><input className="table-input" min="0" step="0.001" type="number" value={draft.rebate_percent} onChange={(event) => setDraft({ ...draft, rebate_percent: event.target.value })} /></td>
-      <td><label className="check-field"><input checked={draft.active} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>{draft.active ? "Active" : "Inactive"}</span></label></td>
-      <td><div className="button-row"><button className="table-action" onClick={save}>Save</button><button className="remove-button" onClick={remove}><Icon name="trash" size={15} /></button></div></td>
+      <td><input className="settings-table-input" disabled={!canManage} value={draft.rule_name} onChange={(event) => setDraft({ ...draft, rule_name: event.target.value })} /></td>
+      <td><input className="table-input" disabled={!canManage} min="0" type="number" value={draft.pay_within_days} onChange={(event) => setDraft({ ...draft, pay_within_days: event.target.value })} /></td>
+      <td><input className="table-input" disabled={!canManage} min="0" step="0.001" type="number" value={draft.rebate_percent} onChange={(event) => setDraft({ ...draft, rebate_percent: event.target.value })} /></td>
+      <td><label className="check-field"><input checked={draft.active} disabled={!canManage} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>{draft.active ? "Active" : "Inactive"}</span></label></td>
+      <td><div className="button-row"><button className="table-action" disabled={!canManage} onClick={save}>Save</button><button className="remove-button" disabled={!canManage} onClick={remove}><Icon name="trash" size={15} /></button></div></td>
     </tr>
+  );
+}
+
+function DiscountRuleRow({ canManage, onReload, rule, user }) {
+  const [draft, setDraft] = useState(rule);
+  const save = async () => {
+    try {
+      await axios.put(`${API_URL}/settings/discount-rules/${rule.id}`, { ...draft, updated_by: user.id });
+      await onReload();
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update discount rule"));
+    }
+  };
+  const remove = async () => {
+    try {
+      await axios.delete(`${API_URL}/settings/discount-rules/${rule.id}`, { data: { updated_by: user.id } });
+      await onReload();
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to delete discount rule"));
+    }
+  };
+  return (
+    <tr>
+      <td><input className="settings-table-input" disabled={!canManage} value={draft.rule_name} onChange={(event) => setDraft({ ...draft, rule_name: event.target.value })} /></td>
+      <td>
+        <div className="table-range-inputs">
+          <input className="table-input" disabled={!canManage} min="0" step="0.01" type="number" value={draft.minimum_bill_amount} onChange={(event) => setDraft({ ...draft, minimum_bill_amount: event.target.value })} />
+          <input className="table-input" disabled={!canManage} min="0" step="0.01" type="number" value={draft.maximum_bill_amount || ""} onChange={(event) => setDraft({ ...draft, maximum_bill_amount: event.target.value })} />
+        </div>
+      </td>
+      <td><select className="settings-table-input" disabled={!canManage} value={draft.discount_type} onChange={(event) => setDraft({ ...draft, discount_type: event.target.value })}>{discountTypes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></td>
+      <td><input className="table-input" disabled={!canManage} min="0" step="0.01" type="number" value={draft.discount_value} onChange={(event) => setDraft({ ...draft, discount_value: event.target.value })} /></td>
+      <td><select className="settings-table-input" disabled={!canManage} value={draft.payment_mode} onChange={(event) => setDraft({ ...draft, payment_mode: event.target.value })}>{discountPaymentModes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></td>
+      <td><label className="check-field"><input checked={draft.active} disabled={!canManage} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>{draft.active ? "Active" : "Inactive"}</span></label></td>
+      <td><div className="button-row"><button className="table-action" disabled={!canManage} onClick={save}>Save</button><button className="remove-button" disabled={!canManage} onClick={remove}><Icon name="trash" size={15} /></button></div></td>
+    </tr>
+  );
+}
+
+function PermissionSettings({ roles }) {
+  return (
+    <ModuleCard eyebrow="User & Permission Settings" title="Role Control Matrix" subtitle="Sensitive settings are restricted to Owner/Admin users.">
+      <div className="permission-grid">
+        {(roles.length ? roles : [
+          { role: "Owner", permissions: ["Full access"] },
+          { role: "Admin", permissions: ["Settings management"] },
+          { role: "Cashier", permissions: ["POS only"] },
+          { role: "Purchase Manager", permissions: ["Purchase and suppliers"] },
+          { role: "Inventory Manager", permissions: ["Inventory control"] },
+        ]).map((role) => (
+          <article className="permission-card" key={role.role}>
+            <strong>{role.role}</strong>
+            <span>{role.permissions.join(", ")}</span>
+          </article>
+        ))}
+      </div>
+    </ModuleCard>
+  );
+}
+
+function BackupSettings({ backupSettings }) {
+  return (
+    <ModuleCard eyebrow="Backup Settings" title="Backup Readiness" subtitle="Prepared structure for future export/import backup workflows.">
+      <div className="purchase-summary-grid">
+        <SummaryMetric label="Export Structure" value={backupSettings?.exportReady ? "Ready" : "Pending"} featured />
+        <SummaryMetric label="Import Workflow" value={backupSettings?.importReady ? "Ready" : "Future"} />
+        <SummaryMetric label="Last Backup" value={backupSettings?.lastBackupAt || "Not yet recorded"} />
+      </div>
+      <p className="form-note">{backupSettings?.note || "Backup actions will be implemented in a future release."}</p>
+    </ModuleCard>
   );
 }
 
@@ -1297,12 +1591,35 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
   );
 }
 
-function PosBilling({ inventory, onInvoice, onSaved, products, user }) {
+const calculateDiscountFromRule = (rule, subtotal) => {
+  if (!rule || subtotal <= 0) return 0;
+  const value = Number(rule.discount_value || 0);
+  const amount = rule.discount_type === "PERCENTAGE" ? subtotal * value / 100 : value;
+  return Math.min(amount, subtotal);
+};
+
+const getMatchingDiscountRule = (rules, subtotal, paymentMode) => {
+  if (subtotal <= 0) return null;
+  const matches = rules
+    .filter((rule) =>
+      rule.active !== false &&
+      Number(rule.minimum_bill_amount || 0) <= subtotal &&
+      (!rule.maximum_bill_amount || Number(rule.maximum_bill_amount) >= subtotal) &&
+      (rule.payment_mode === "ALL" || rule.payment_mode === paymentMode)
+    )
+    .sort((left, right) => {
+      if (left.payment_mode === paymentMode && right.payment_mode !== paymentMode) return -1;
+      if (right.payment_mode === paymentMode && left.payment_mode !== paymentMode) return 1;
+      return Number(right.minimum_bill_amount || 0) - Number(left.minimum_bill_amount || 0) || Number(right.discount_value || 0) - Number(left.discount_value || 0);
+    });
+  return matches[0] || null;
+};
+
+function PosBilling({ discountRules = [], inventory, onInvoice, onSaved, products, user }) {
   const [search, setSearch] = useState("");
   const [barcode, setBarcode] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
   const [cart, setCart] = useState([]);
-  const [invoiceDiscount, setInvoiceDiscount] = useState("");
   const [paymentMode, setPaymentMode] = useState("CASH");
   const [mixedPayments, setMixedPayments] = useState({ CASH: "", UPI: "", CARD: "" });
   const [customer, setCustomer] = useState({ name: "", mobile: "", notes: "" });
@@ -1333,7 +1650,9 @@ function PosBilling({ inventory, onInvoice, onSaved, products, user }) {
   const totals = useMemo(() => {
     const gross = cart.reduce((sum, item) => sum + item.quantity * Number(item.selling_rate), 0);
     const itemDiscount = cart.reduce((sum, item) => sum + Number(item.discount_amount || 0), 0);
-    const invoiceDiscountAmount = Number(invoiceDiscount || 0);
+    const subtotalAfterItemDiscounts = Math.max(gross - itemDiscount, 0);
+    const discountRule = getMatchingDiscountRule(discountRules, subtotalAfterItemDiscounts, paymentMode);
+    const invoiceDiscountAmount = calculateDiscountFromRule(discountRule, subtotalAfterItemDiscounts);
     return {
       gross,
       itemDiscount,
@@ -1341,8 +1660,9 @@ function PosBilling({ inventory, onInvoice, onSaved, products, user }) {
       discount: itemDiscount + invoiceDiscountAmount,
       total: Math.max(gross - itemDiscount - invoiceDiscountAmount, 0),
       itemCount: cart.reduce((sum, item) => sum + Number(item.quantity), 0),
+      discountRule,
     };
-  }, [cart, invoiceDiscount]);
+  }, [cart, discountRules, paymentMode]);
 
   const addProduct = (product) => {
     const availableStock = stockByProduct.get(product.id) || 0;
@@ -1431,13 +1751,13 @@ function PosBilling({ inventory, onInvoice, onSaved, products, user }) {
           discount_amount: Number(item.discount_amount || 0),
         })),
         customer,
-        invoice_discount: Number(invoiceDiscount || 0),
+        invoice_discount: Number(totals.invoiceDiscount || 0),
+        discount_rule_id: totals.discountRule?.id || null,
         payments,
         branch_id: user.branch_id,
         created_by: user.id,
       });
       setCart([]);
-      setInvoiceDiscount("");
       setMixedPayments({ CASH: "", UPI: "", CARD: "" });
       setCustomer({ name: "", mobile: "", notes: "" });
       await onSaved();
@@ -1574,7 +1894,11 @@ function PosBilling({ inventory, onInvoice, onSaved, products, user }) {
           <Field label="Notes"><textarea placeholder="Optional notes" value={customer.notes} onChange={(event) => setCustomer({ ...customer, notes: event.target.value })} /></Field>
         </div>
         <div className="checkout-section">
-          <Field label="Invoice Discount"><input min="0" step="0.01" type="number" value={invoiceDiscount} onChange={(event) => setInvoiceDiscount(event.target.value)} /></Field>
+          <div className="discount-preview">
+            <span>Automatic Bill Discount</span>
+            <strong>{currency.format(totals.invoiceDiscount)}</strong>
+            <small>{totals.discountRule ? totals.discountRule.rule_name : "No active slab matched"}</small>
+          </div>
           <Field label="Payment Mode">
             <select value={paymentMode} onChange={(event) => setPaymentMode(event.target.value)}>
               <option value="CASH">Cash</option>
@@ -1592,10 +1916,11 @@ function PosBilling({ inventory, onInvoice, onSaved, products, user }) {
           )}
         </div>
         <div className="totals">
-          <TotalLine label="Subtotal" value={totals.gross} />
-          <TotalLine label="Discount" value={-totals.discount} />
+          <TotalLine label="Gross Total" value={totals.gross} />
+          <TotalLine label="Item Discount" value={-totals.itemDiscount} />
+          <TotalLine label="Bill Discount" value={-totals.invoiceDiscount} />
           <TotalLine label="Tax" value={0} muted />
-          <TotalLine label="Payable" value={totals.total} total />
+          <TotalLine label="Net Payable" value={totals.total} total />
         </div>
         <button className="primary-button checkout-button" disabled={saving} onClick={checkout}>
           <Icon name="receipt" /> {saving ? "Saving Invoice..." : "Complete Checkout"}

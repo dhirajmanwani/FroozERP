@@ -32,16 +32,36 @@ const parseNonNegativeNumber = (value) => {
 
 const roundCurrency = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 const roundUnitCost = (value) => Math.round((Number(value) + Number.EPSILON) * 10000) / 10000;
+const applySaleRateRounding = (value, rule) => {
+  const amount = Number(value || 0);
+  if (!Number.isFinite(amount)) return 0;
+  switch (rule) {
+    case "ROUND_UP_5":
+      return Math.ceil(amount / 5) * 5;
+    case "ROUND_UP_10":
+      return Math.ceil(amount / 10) * 10;
+    case "NO_ROUND":
+      return roundCurrency(amount);
+    case "NEAREST_RUPEE":
+    default:
+      return Math.round(amount);
+  }
+};
 const toDateKey = (value) =>
   value instanceof Date ? value.toLocaleDateString("en-CA") : String(value).slice(0, 10);
 const RATE_MANAGER_ROLES = new Set(["Owner", "Admin"]);
 const SUPPLIER_TYPES = new Set(["LOCAL_SUPPLIER", "IMPORTED_SUPPLIER", "COMMISSION_AGENT", "TRANSPORT_VENDOR"]);
 const SUPPLIER_PAYMENT_MODES = new Set(["CASH", "UPI", "BANK_TRANSFER", "CHEQUE"]);
+const DISCOUNT_TYPES = new Set(["FLAT_AMOUNT", "PERCENTAGE"]);
+const DISCOUNT_PAYMENT_MODES = new Set(["ALL", "CASH", "UPI", "CARD"]);
+const ROUNDING_RULES = new Set(["NEAREST_RUPEE", "ROUND_UP_5", "ROUND_UP_10", "NO_ROUND"]);
 
 const cleanText = (value) => (typeof value === "string" ? value.trim() : "");
 const nullableText = (value) => cleanText(value) || null;
 const normalizeSupplierType = (value) => String(value || "LOCAL_SUPPLIER").toUpperCase();
 const normalizePaymentMode = (value) => String(value || "").trim().toUpperCase().replace(/\s+/g, "_");
+const normalizeDiscountType = (value) => String(value || "FLAT_AMOUNT").toUpperCase();
+const normalizeDiscountPaymentMode = (value) => String(value || "ALL").trim().toUpperCase();
 
 const requireRateManager = async (userId, client = pool) => {
   const parsedUserId = parsePositiveInteger(userId);
@@ -175,6 +195,45 @@ const initializeDatabase = async () => {
       changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS business_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+      business_name VARCHAR(180) NOT NULL DEFAULT 'FroozERP Retail',
+      brand_name VARCHAR(180) NOT NULL DEFAULT 'FEEL THE FREAKIN'' FROOZ',
+      company_name VARCHAR(180) NOT NULL DEFAULT 'SRT Company',
+      address TEXT,
+      phone_number VARCHAR(40),
+      gst_number VARCHAR(80),
+      logo_url TEXT,
+      compact_logo_text VARCHAR(40) DEFAULT 'FTF',
+      invoice_footer_text TEXT DEFAULT 'Thank you for shopping with FEEL THE FREAKIN'' FROOZ.',
+      updated_by INTEGER REFERENCES users(id),
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS sale_rate_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+      desired_margin_percent NUMERIC(6, 2) NOT NULL DEFAULT 25 CHECK (desired_margin_percent >= 0),
+      rounding_rule VARCHAR(30) NOT NULL DEFAULT 'NEAREST_RUPEE',
+      suggestion_enabled BOOLEAN DEFAULT TRUE,
+      notes TEXT,
+      updated_by INTEGER REFERENCES users(id),
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS sale_discount_rules (
+      id SERIAL PRIMARY KEY,
+      rule_name VARCHAR(140) NOT NULL,
+      minimum_bill_amount NUMERIC(14, 2) NOT NULL CHECK (minimum_bill_amount >= 0),
+      maximum_bill_amount NUMERIC(14, 2) CHECK (maximum_bill_amount IS NULL OR maximum_bill_amount >= 0),
+      discount_type VARCHAR(30) NOT NULL,
+      discount_value NUMERIC(14, 2) NOT NULL CHECK (discount_value >= 0),
+      payment_mode VARCHAR(20) NOT NULL DEFAULT 'ALL',
+      active BOOLEAN DEFAULT TRUE,
+      updated_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE TABLE IF NOT EXISTS supplier_payments (
       id SERIAL PRIMARY KEY,
       supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
@@ -188,6 +247,14 @@ const initializeDatabase = async () => {
       created_by INTEGER REFERENCES users(id),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+
+    INSERT INTO business_settings (id)
+    VALUES (1)
+    ON CONFLICT (id) DO NOTHING;
+
+    INSERT INTO sale_rate_settings (id)
+    VALUES (1)
+    ON CONFLICT (id) DO NOTHING;
 
     INSERT INTO mandi_tax_rules (origin_type, tax_percent)
     VALUES ('LOCAL', 2), ('IMPORTED', 4)
@@ -211,6 +278,11 @@ const initializeDatabase = async () => {
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS gross_amount NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS item_discount_amount NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS invoice_discount_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS discount_rule_id INTEGER;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS discount_rule_name VARCHAR(140);
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS discount_rule_type VARCHAR(30);
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS discount_rule_value NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS discount_rule_payment_mode VARCHAR(20);
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS tax_amount NUMERIC(14, 2) DEFAULT 0;
 
     CREATE UNIQUE INDEX IF NOT EXISTS sales_invoice_no_unique_idx
@@ -268,6 +340,9 @@ const initializeDatabase = async () => {
 
     CREATE INDEX IF NOT EXISTS supplier_payments_supplier_date_idx
       ON supplier_payments (supplier_id, payment_date, id);
+
+    CREATE INDEX IF NOT EXISTS sale_discount_rules_match_idx
+      ON sale_discount_rules (active, payment_mode, minimum_bill_amount, maximum_bill_amount);
 
     DO $$
     BEGIN
@@ -460,6 +535,92 @@ const readSupplierPayload = (body) => {
   };
 };
 
+const getSettingsBundle = async (userId) => {
+  const [businessResult, saleRateResult, mandiResult, rebateResult, discountResult, manager] = await Promise.all([
+    pool.query("SELECT * FROM business_settings WHERE id = 1"),
+    pool.query("SELECT * FROM sale_rate_settings WHERE id = 1"),
+    pool.query("SELECT * FROM mandi_tax_rules ORDER BY origin_type"),
+    pool.query("SELECT * FROM rebate_rules ORDER BY pay_within_days, id"),
+    pool.query("SELECT * FROM sale_discount_rules ORDER BY minimum_bill_amount, maximum_bill_amount NULLS LAST, id"),
+    userId ? requireRateManager(userId) : Promise.resolve(null),
+  ]);
+  return {
+    businessSettings: businessResult.rows[0] || {},
+    saleRateSettings: saleRateResult.rows[0] || {},
+    mandiTaxRules: mandiResult.rows,
+    rebateRules: rebateResult.rows,
+    discountRules: discountResult.rows,
+    roles: [
+      { role: "Owner", permissions: ["Business settings", "Selling rates", "Discount rules", "Mandi tax rules", "Rebate rules"] },
+      { role: "Admin", permissions: ["Business settings", "Selling rates", "Discount rules", "Mandi tax rules", "Rebate rules"] },
+      { role: "Cashier", permissions: ["POS billing", "Sales history view"] },
+      { role: "Purchase Manager", permissions: ["Purchase Entry", "Supplier accounts"] },
+      { role: "Inventory Manager", permissions: ["Inventory batches", "Stock review"] },
+    ],
+    backupSettings: {
+      exportReady: true,
+      importReady: false,
+      lastBackupAt: null,
+      note: "Backup export/import structure is reserved for a future production backup workflow.",
+    },
+    canManageSettings: Boolean(manager),
+  };
+};
+
+const readDiscountRulePayload = (body) => {
+  const minimumBillAmount = parseNonNegativeNumber(body.minimum_bill_amount);
+  const maximumBillAmount = body.maximum_bill_amount === "" || body.maximum_bill_amount === null || body.maximum_bill_amount === undefined
+    ? null
+    : parseNonNegativeNumber(body.maximum_bill_amount);
+  const discountType = normalizeDiscountType(body.discount_type);
+  const paymentMode = normalizeDiscountPaymentMode(body.payment_mode);
+  return {
+    rule_name: cleanText(body.rule_name),
+    minimum_bill_amount: minimumBillAmount,
+    maximum_bill_amount: maximumBillAmount,
+    discount_type: discountType,
+    discount_value: parseNonNegativeNumber(body.discount_value),
+    payment_mode: paymentMode,
+    active: body.active !== false,
+  };
+};
+
+const hasInvalidDiscountMaximum = (body, rule) =>
+  rule.maximum_bill_amount === null &&
+  body.maximum_bill_amount !== "" &&
+  body.maximum_bill_amount !== null &&
+  body.maximum_bill_amount !== undefined;
+
+const calculateInvoiceDiscount = (rule, subtotal) => {
+  if (!rule) return 0;
+  const value = Number(rule.discount_value || 0);
+  const amount = rule.discount_type === "PERCENTAGE"
+    ? roundCurrency(subtotal * value / 100)
+    : roundCurrency(value);
+  return Math.min(amount, subtotal);
+};
+
+const getMatchingDiscountRule = async (client, subtotal, paymentMode) => {
+  const result = await client.query(
+    `
+    SELECT *
+    FROM sale_discount_rules
+    WHERE active = TRUE
+      AND minimum_bill_amount <= $1
+      AND (maximum_bill_amount IS NULL OR maximum_bill_amount >= $1)
+      AND (payment_mode = 'ALL' OR payment_mode = $2)
+    ORDER BY
+      CASE WHEN payment_mode = $2 THEN 0 ELSE 1 END,
+      minimum_bill_amount DESC,
+      discount_value DESC,
+      id DESC
+    LIMIT 1
+    `,
+    [subtotal, paymentMode]
+  );
+  return result.rows[0] || null;
+};
+
 app.get("/purchase-rules", async (req, res) => {
   try {
     const [mandiResult, rebateResult] = await Promise.all([
@@ -475,9 +636,6 @@ app.get("/purchase-rules", async (req, res) => {
 
 app.get("/settings/purchase-rules", async (req, res) => {
   try {
-    if (!await requireRateManager(req.query.user_id)) {
-      return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
-    }
     const [mandiResult, rebateResult] = await Promise.all([
       pool.query("SELECT * FROM mandi_tax_rules ORDER BY origin_type"),
       pool.query("SELECT * FROM rebate_rules ORDER BY pay_within_days, id"),
@@ -486,6 +644,221 @@ app.get("/settings/purchase-rules", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Settings" });
+  }
+});
+
+app.get("/settings", async (req, res) => {
+  try {
+    return res.json(await getSettingsBundle(req.query.user_id));
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Settings" });
+  }
+});
+
+app.put("/settings/business", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage business settings" });
+    const result = await pool.query(
+      `
+      UPDATE business_settings
+      SET
+        business_name = $1,
+        brand_name = $2,
+        company_name = $3,
+        address = $4,
+        phone_number = $5,
+        gst_number = $6,
+        logo_url = $7,
+        compact_logo_text = $8,
+        invoice_footer_text = $9,
+        updated_by = $10,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = 1
+      RETURNING *
+      `,
+      [
+        cleanText(req.body.business_name) || "FroozERP Retail",
+        cleanText(req.body.brand_name) || "FEEL THE FREAKIN' FROOZ",
+        cleanText(req.body.company_name) || "SRT Company",
+        nullableText(req.body.address),
+        nullableText(req.body.phone_number),
+        nullableText(req.body.gst_number),
+        nullableText(req.body.logo_url),
+        nullableText(req.body.compact_logo_text) || "FTF",
+        nullableText(req.body.invoice_footer_text) || "Thank you for shopping with FEEL THE FREAKIN' FROOZ.",
+        manager.id,
+      ]
+    );
+    return res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Business Settings" });
+  }
+});
+
+app.put("/settings/sale-rate", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    const desiredMargin = parseNonNegativeNumber(req.body.desired_margin_percent);
+    const roundingRule = String(req.body.rounding_rule || "NEAREST_RUPEE").toUpperCase();
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage sale rate settings" });
+    if (desiredMargin === null || !ROUNDING_RULES.has(roundingRule)) {
+      return res.status(400).json({ message: "Enter valid sale rate settings" });
+    }
+    const result = await pool.query(
+      `
+      UPDATE sale_rate_settings
+      SET desired_margin_percent = $1, rounding_rule = $2, suggestion_enabled = $3,
+          notes = $4, updated_by = $5, updated_at = CURRENT_TIMESTAMP
+      WHERE id = 1
+      RETURNING *
+      `,
+      [desiredMargin, roundingRule, req.body.suggestion_enabled !== false, nullableText(req.body.notes), manager.id]
+    );
+    return res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Sale Rate Settings" });
+  }
+});
+
+app.get("/settings/discount-rules", async (req, res) => {
+  try {
+    const includeInactive = req.query.include_inactive === "true";
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM sale_discount_rules
+      ${includeInactive ? "" : "WHERE active = TRUE"}
+      ORDER BY minimum_bill_amount, maximum_bill_amount NULLS LAST, id
+      `
+    );
+    return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Discount Rules" });
+  }
+});
+
+app.post("/settings/discount-rules", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    const rule = readDiscountRulePayload(req.body);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage discount rules" });
+    if (
+      !rule.rule_name ||
+      rule.minimum_bill_amount === null ||
+      hasInvalidDiscountMaximum(req.body, rule) ||
+      rule.discount_value === null ||
+      !DISCOUNT_TYPES.has(rule.discount_type) ||
+      !DISCOUNT_PAYMENT_MODES.has(rule.payment_mode) ||
+      (rule.maximum_bill_amount !== null && rule.maximum_bill_amount < rule.minimum_bill_amount)
+    ) {
+      return res.status(400).json({ message: "Enter valid discount rule details" });
+    }
+    const result = await pool.query(
+      `
+      INSERT INTO sale_discount_rules (
+        rule_name, minimum_bill_amount, maximum_bill_amount, discount_type,
+        discount_value, payment_mode, active, updated_by
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING *
+      `,
+      [
+        rule.rule_name, rule.minimum_bill_amount, rule.maximum_bill_amount, rule.discount_type,
+        rule.discount_value, rule.payment_mode, rule.active, manager.id,
+      ]
+    );
+    return res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Adding Discount Rule" });
+  }
+});
+
+app.put("/settings/discount-rules/:id", async (req, res) => {
+  try {
+    const ruleId = parsePositiveInteger(req.params.id);
+    const manager = await requireRateManager(req.body.updated_by);
+    const rule = readDiscountRulePayload(req.body);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage discount rules" });
+    if (
+      !ruleId ||
+      !rule.rule_name ||
+      rule.minimum_bill_amount === null ||
+      hasInvalidDiscountMaximum(req.body, rule) ||
+      rule.discount_value === null ||
+      !DISCOUNT_TYPES.has(rule.discount_type) ||
+      !DISCOUNT_PAYMENT_MODES.has(rule.payment_mode) ||
+      (rule.maximum_bill_amount !== null && rule.maximum_bill_amount < rule.minimum_bill_amount)
+    ) {
+      return res.status(400).json({ message: "Enter valid discount rule details" });
+    }
+    const result = await pool.query(
+      `
+      UPDATE sale_discount_rules
+      SET
+        rule_name = $1,
+        minimum_bill_amount = $2,
+        maximum_bill_amount = $3,
+        discount_type = $4,
+        discount_value = $5,
+        payment_mode = $6,
+        active = $7,
+        updated_by = $8,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $9
+      RETURNING *
+      `,
+      [
+        rule.rule_name, rule.minimum_bill_amount, rule.maximum_bill_amount, rule.discount_type,
+        rule.discount_value, rule.payment_mode, rule.active, manager.id, ruleId,
+      ]
+    );
+    return result.rows[0] ? res.json(result.rows[0]) : res.status(404).json({ message: "Discount rule not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Discount Rule" });
+  }
+});
+
+app.delete("/settings/discount-rules/:id", async (req, res) => {
+  try {
+    const ruleId = parsePositiveInteger(req.params.id);
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage discount rules" });
+    if (!ruleId) return res.status(400).json({ message: "Invalid discount rule" });
+    const result = await pool.query("DELETE FROM sale_discount_rules WHERE id = $1 RETURNING id", [ruleId]);
+    return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "Discount rule not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Deleting Discount Rule" });
+  }
+});
+
+app.post("/settings/mandi-tax-rules", async (req, res) => {
+  try {
+    const taxPercent = parseNonNegativeNumber(req.body.tax_percent);
+    const originType = String(req.body.origin_type || "").toUpperCase();
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
+    if (!originType || taxPercent === null) return res.status(400).json({ message: "Enter valid mandi tax rule details" });
+    const result = await pool.query(
+      `
+      INSERT INTO mandi_tax_rules (origin_type, tax_percent, active, updated_by)
+      VALUES ($1, $2, $3, $4)
+      RETURNING *
+      `,
+      [originType, taxPercent, req.body.active !== false, manager.id]
+    );
+    return res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    if (error.code === "23505") return res.status(409).json({ message: "Mandi tax rule already exists for this origin type" });
+    return res.status(500).json({ message: "Error Adding Mandi Tax Rule" });
   }
 });
 
@@ -510,6 +883,20 @@ app.put("/settings/mandi-tax-rules/:id", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Updating Mandi Tax Rule" });
+  }
+});
+
+app.delete("/settings/mandi-tax-rules/:id", async (req, res) => {
+  try {
+    const ruleId = parsePositiveInteger(req.params.id);
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
+    if (!ruleId) return res.status(400).json({ message: "Invalid mandi tax rule" });
+    const result = await pool.query("DELETE FROM mandi_tax_rules WHERE id = $1 RETURNING id", [ruleId]);
+    return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "Mandi tax rule not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Deleting Mandi Tax Rule" });
   }
 });
 
@@ -809,7 +1196,12 @@ app.get("/sale-rates", async (req, res) => {
     if (!await requireRateManager(req.query.user_id)) {
       return res.status(403).json({ message: "Only Owner or Admin can manage selling rates" });
     }
-    const desiredMargin = parseNonNegativeNumber(req.query.desired_margin) ?? 25;
+    const settingsResult = await pool.query("SELECT * FROM sale_rate_settings WHERE id = 1");
+    const saleRateSettings = settingsResult.rows[0] || {};
+    const desiredMargin = parseNonNegativeNumber(req.query.desired_margin) ?? Number(saleRateSettings.desired_margin_percent || 25);
+    const roundingRule = ROUNDING_RULES.has(saleRateSettings.rounding_rule)
+      ? saleRateSettings.rounding_rule
+      : "NEAREST_RUPEE";
     const result = await pool.query(
       `
       SELECT
@@ -825,7 +1217,7 @@ app.get("/sale-rates", async (req, res) => {
         COALESCE(latest.effective_cost_per_unit, 0) AS latest_effective_cost,
         CASE
           WHEN COALESCE(latest.effective_cost_per_unit, 0) > 0
-            THEN ROUND(latest.effective_cost_per_unit * (1 + $1 / 100.0), 0)
+            THEN latest.effective_cost_per_unit * (1 + $1 / 100.0)
           ELSE p.selling_rate
         END AS suggested_selling_rate
       FROM products p
@@ -847,7 +1239,10 @@ app.get("/sale-rates", async (req, res) => {
       `,
       [desiredMargin]
     );
-    return res.json(result.rows);
+    return res.json(result.rows.map((row) => ({
+      ...row,
+      suggested_selling_rate: applySaleRateRounding(row.suggested_selling_rate, roundingRule),
+    })));
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Sale Rates" });
@@ -1726,18 +2121,30 @@ app.post("/sales", async (req, res) => {
     itemDiscountAmount = roundCurrency(itemDiscountAmount);
     totalCost = roundCurrency(totalCost);
     const subtotalAfterItemDiscounts = roundCurrency(grossAmount - itemDiscountAmount);
-    if (parsedInvoiceDiscount > subtotalAfterItemDiscounts) {
+
+    const requestedPaymentsInput = Array.isArray(payments) && payments.length > 0 ? payments : null;
+    const allowedPaymentModes = new Set(["CASH", "UPI", "CARD"]);
+    const paymentModes = requestedPaymentsInput
+      ? requestedPaymentsInput.map((payment) => String(payment.mode || "").toUpperCase())
+      : ["CASH"];
+    if (paymentModes.some((mode) => !allowedPaymentModes.has(mode))) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Select a valid payment mode" });
+    }
+    const paymentMode = paymentModes.length > 1 ? "MIXED" : paymentModes[0];
+    const discountRule = await getMatchingDiscountRule(client, subtotalAfterItemDiscounts, paymentMode);
+    const automaticInvoiceDiscount = calculateInvoiceDiscount(discountRule, subtotalAfterItemDiscounts);
+    const invoiceDiscountAmount = discountRule ? automaticInvoiceDiscount : parsedInvoiceDiscount;
+
+    if (invoiceDiscountAmount > subtotalAfterItemDiscounts) {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Invoice discount cannot exceed the cart subtotal" });
     }
 
     const taxAmount = 0;
-    const totalAmount = roundCurrency(subtotalAfterItemDiscounts - parsedInvoiceDiscount + taxAmount);
+    const totalAmount = roundCurrency(subtotalAfterItemDiscounts - invoiceDiscountAmount + taxAmount);
     const profit = roundCurrency(totalAmount - totalCost);
-    const requestedPayments = Array.isArray(payments) && payments.length > 0
-      ? payments
-      : [{ mode: "CASH", amount: totalAmount }];
-    const allowedPaymentModes = new Set(["CASH", "UPI", "CARD"]);
+    const requestedPayments = requestedPaymentsInput || [{ mode: "CASH", amount: totalAmount }];
     const parsedPayments = requestedPayments.map((payment) => ({
       mode: String(payment.mode || "").toUpperCase(),
       amount: parsePositiveNumber(payment.amount),
@@ -1750,22 +2157,28 @@ app.post("/sales", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Payment amounts must match the invoice total" });
     }
-    const paymentMode = parsedPayments.length > 1 ? "MIXED" : parsedPayments[0].mode;
 
     const saleResult = await client.query(
       `
       INSERT INTO sales (
         total_amount, total_cost, profit, branch_id, created_by,
         customer_name, customer_mobile, customer_notes, payment_mode,
-        gross_amount, item_discount_amount, invoice_discount_amount, tax_amount
+        gross_amount, item_discount_amount, invoice_discount_amount, tax_amount,
+        discount_rule_id, discount_rule_name, discount_rule_type, discount_rule_value,
+        discount_rule_payment_mode
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
       RETURNING *
       `,
       [
         totalAmount, totalCost, profit, parsedBranchId, parsedCreatedBy,
         customerName, customerMobile, customerNotes, paymentMode,
-        grossAmount, itemDiscountAmount, parsedInvoiceDiscount, taxAmount,
+        grossAmount, itemDiscountAmount, invoiceDiscountAmount, taxAmount,
+        discountRule?.id || null,
+        discountRule?.rule_name || null,
+        discountRule?.discount_type || null,
+        discountRule?.discount_value || 0,
+        discountRule?.payment_mode || null,
       ]
     );
     const sale = saleResult.rows[0];
@@ -1778,7 +2191,7 @@ app.post("/sales", async (req, res) => {
     for (const item of invoiceItems) {
       const invoiceDiscountShare = subtotalAfterItemDiscounts === 0
         ? 0
-        : roundCurrency(parsedInvoiceDiscount * (item.netAmount / subtotalAfterItemDiscounts));
+        : roundCurrency(invoiceDiscountAmount * (item.netAmount / subtotalAfterItemDiscounts));
       const itemProfit = roundCurrency(item.netAmount - invoiceDiscountShare - item.costAmount);
       const saleItemResult = await client.query(
         `
@@ -1836,6 +2249,7 @@ app.post("/sales", async (req, res) => {
       sale: {
         ...sale,
         invoice_no: invoiceNo,
+        discount_rule: discountRule,
         items: invoiceItems.map((item) => ({
           product_id: item.productId,
           product_name: item.product.product_name,
@@ -1872,6 +2286,11 @@ app.get("/sales", async (req, res) => {
         s.gross_amount,
         s.item_discount_amount,
         s.invoice_discount_amount,
+        s.discount_rule_id,
+        s.discount_rule_name,
+        s.discount_rule_type,
+        s.discount_rule_value,
+        s.discount_rule_payment_mode,
         s.tax_amount,
         s.total_amount AS amount,
         s.total_cost AS cost_amount,
