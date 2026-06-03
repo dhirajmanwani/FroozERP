@@ -35,6 +35,13 @@ const roundUnitCost = (value) => Math.round((Number(value) + Number.EPSILON) * 1
 const toDateKey = (value) =>
   value instanceof Date ? value.toLocaleDateString("en-CA") : String(value).slice(0, 10);
 const RATE_MANAGER_ROLES = new Set(["Owner", "Admin"]);
+const SUPPLIER_TYPES = new Set(["LOCAL_SUPPLIER", "IMPORTED_SUPPLIER", "COMMISSION_AGENT", "TRANSPORT_VENDOR"]);
+const SUPPLIER_PAYMENT_MODES = new Set(["CASH", "UPI", "BANK_TRANSFER", "CHEQUE"]);
+
+const cleanText = (value) => (typeof value === "string" ? value.trim() : "");
+const nullableText = (value) => cleanText(value) || null;
+const normalizeSupplierType = (value) => String(value || "LOCAL_SUPPLIER").toUpperCase();
+const normalizePaymentMode = (value) => String(value || "").trim().toUpperCase().replace(/\s+/g, "_");
 
 const requireRateManager = async (userId, client = pool) => {
   const parsedUserId = parsePositiveInteger(userId);
@@ -65,6 +72,27 @@ const initializeDatabase = async () => {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS suppliers (
+      id SERIAL PRIMARY KEY,
+      supplier_name VARCHAR(160) NOT NULL,
+      firm_name VARCHAR(160),
+      mobile_number VARCHAR(30),
+      alternate_number VARCHAR(30),
+      address TEXT,
+      city VARCHAR(100),
+      gst_number VARCHAR(60),
+      bank_name VARCHAR(120),
+      account_number VARCHAR(80),
+      ifsc_code VARCHAR(30),
+      upi_id VARCHAR(120),
+      notes TEXT,
+      opening_balance NUMERIC(14, 2) DEFAULT 0 CHECK (opening_balance >= 0),
+      supplier_type VARCHAR(40) NOT NULL DEFAULT 'LOCAL_SUPPLIER',
+      active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
     ALTER TABLE products ADD COLUMN IF NOT EXISTS barcode VARCHAR(100);
     ALTER TABLE products ADD COLUMN IF NOT EXISTS origin_type VARCHAR(20) DEFAULT 'LOCAL';
     ALTER TABLE products ADD COLUMN IF NOT EXISTS category VARCHAR(80) DEFAULT 'Fruit';
@@ -77,6 +105,7 @@ const initializeDatabase = async () => {
       WHERE barcode IS NOT NULL AND barcode <> '';
 
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS basic_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS supplier_id INTEGER;
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS mandi_tax_percent NUMERIC(6, 3) DEFAULT 0;
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS mandi_tax_amount NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS other_charges NUMERIC(14, 2) DEFAULT 0;
@@ -105,6 +134,7 @@ const initializeDatabase = async () => {
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS labour_charges NUMERIC(14, 2) DEFAULT 0;
 
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS effective_cost_per_unit NUMERIC(14, 4);
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS supplier_id INTEGER;
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS mandi_tax_amount NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS freight_charges NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS labour_charges NUMERIC(14, 2) DEFAULT 0;
@@ -143,6 +173,20 @@ const initializeDatabase = async () => {
       changed_by INTEGER NOT NULL REFERENCES users(id),
       reason TEXT,
       changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS supplier_payments (
+      id SERIAL PRIMARY KEY,
+      supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
+      payment_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      payment_amount NUMERIC(14, 2) NOT NULL DEFAULT 0 CHECK (payment_amount >= 0),
+      rebate_amount NUMERIC(14, 2) NOT NULL DEFAULT 0 CHECK (rebate_amount >= 0),
+      payment_mode VARCHAR(30) NOT NULL,
+      reference_number VARCHAR(120),
+      remarks TEXT,
+      branch_id INTEGER REFERENCES branches(id),
+      created_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
     INSERT INTO mandi_tax_rules (origin_type, tax_percent)
@@ -216,6 +260,30 @@ const initializeDatabase = async () => {
     CREATE INDEX IF NOT EXISTS sale_payments_sale_id_idx
       ON sale_payments (sale_id);
 
+    CREATE INDEX IF NOT EXISTS suppliers_name_search_idx
+      ON suppliers (LOWER(supplier_name), LOWER(COALESCE(firm_name, '')));
+
+    CREATE INDEX IF NOT EXISTS purchases_supplier_id_idx
+      ON purchases (supplier_id);
+
+    CREATE INDEX IF NOT EXISTS supplier_payments_supplier_date_idx
+      ON supplier_payments (supplier_id, payment_date, id);
+
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'purchases_supplier_id_fkey') THEN
+        ALTER TABLE purchases
+          ADD CONSTRAINT purchases_supplier_id_fkey
+          FOREIGN KEY (supplier_id) REFERENCES suppliers(id);
+      END IF;
+
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'inventory_batches_supplier_id_fkey') THEN
+        ALTER TABLE inventory_batches
+          ADD CONSTRAINT inventory_batches_supplier_id_fkey
+          FOREIGN KEY (supplier_id) REFERENCES suppliers(id);
+      END IF;
+    END $$;
+
     UPDATE sales
     SET gross_amount = total_amount
     WHERE gross_amount = 0
@@ -235,7 +303,139 @@ const initializeDatabase = async () => {
     WHERE basic_amount = 0
       AND gross_amount = 0
       AND net_payable = 0;
+
+    WITH legacy_suppliers AS (
+      SELECT DISTINCT TRIM(supplier_name) AS supplier_name
+      FROM purchases
+      WHERE supplier_name IS NOT NULL
+        AND TRIM(supplier_name) <> ''
+    )
+    INSERT INTO suppliers (supplier_name, firm_name, supplier_type, notes)
+    SELECT
+      supplier_name,
+      supplier_name,
+      'LOCAL_SUPPLIER',
+      'Auto-created from legacy purchase records'
+    FROM legacy_suppliers legacy
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM suppliers existing
+      WHERE LOWER(existing.supplier_name) = LOWER(legacy.supplier_name)
+    );
+
+    UPDATE purchases p
+    SET supplier_id = matched.id
+    FROM (
+      SELECT MIN(id) AS id, LOWER(supplier_name) AS supplier_key
+      FROM suppliers
+      GROUP BY LOWER(supplier_name)
+    ) matched
+    WHERE p.supplier_id IS NULL
+      AND p.supplier_name IS NOT NULL
+      AND LOWER(TRIM(p.supplier_name)) = matched.supplier_key;
+
+    UPDATE inventory_batches ib
+    SET supplier_id = matched.id
+    FROM (
+      SELECT MIN(id) AS id, LOWER(supplier_name) AS supplier_key
+      FROM suppliers
+      GROUP BY LOWER(supplier_name)
+    ) matched
+    WHERE ib.supplier_id IS NULL
+      AND ib.supplier_name IS NOT NULL
+      AND LOWER(TRIM(ib.supplier_name)) = matched.supplier_key;
   `);
+};
+
+const getSupplierSummaryRows = async ({ active, search, supplierId } = {}) => {
+  const filters = [];
+  const values = [];
+  if (supplierId) {
+    values.push(supplierId);
+    filters.push(`s.id = $${values.length}`);
+  }
+  if (typeof active === "boolean") {
+    values.push(active);
+    filters.push(`s.active = $${values.length}`);
+  }
+  if (search) {
+    values.push(`%${search.toLowerCase()}%`);
+    filters.push(`(
+      LOWER(s.supplier_name) LIKE $${values.length}
+      OR LOWER(COALESCE(s.firm_name, '')) LIKE $${values.length}
+      OR LOWER(COALESCE(s.mobile_number, '')) LIKE $${values.length}
+      OR LOWER(COALESCE(s.city, '')) LIKE $${values.length}
+      OR LOWER(COALESCE(s.gst_number, '')) LIKE $${values.length}
+    )`);
+  }
+  const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+  const result = await pool.query(
+    `
+    WITH purchase_summary AS (
+      SELECT
+        supplier_id,
+        SUM(COALESCE(NULLIF(gross_amount, 0), total_amount, 0)) AS total_purchases,
+        SUM(COALESCE(NULLIF(net_payable, 0), total_amount, 0)) AS net_purchase_cost,
+        SUM(COALESCE(rebate_amount, 0)) AS purchase_rebate,
+        SUM(COALESCE(paid_amount, 0)) AS purchase_paid
+      FROM purchases
+      WHERE supplier_id IS NOT NULL
+      GROUP BY supplier_id
+    ),
+    payment_summary AS (
+      SELECT
+        supplier_id,
+        SUM(payment_amount) AS total_paid,
+        SUM(rebate_amount) AS payment_rebate
+      FROM supplier_payments
+      GROUP BY supplier_id
+    )
+    SELECT
+      s.*,
+      COALESCE(ps.total_purchases, 0) AS total_purchases,
+      COALESCE(ps.net_purchase_cost, 0) AS net_purchase_cost,
+      COALESCE(ps.purchase_rebate, 0) AS purchase_rebate_received,
+      COALESCE(ps.purchase_paid, 0) + COALESCE(pay.total_paid, 0) AS total_paid,
+      COALESCE(pay.payment_rebate, 0) AS payment_rebate_received,
+      COALESCE(ps.purchase_rebate, 0) + COALESCE(pay.payment_rebate, 0) AS total_rebate_received,
+      ROUND((
+        COALESCE(s.opening_balance, 0)
+        + COALESCE(ps.total_purchases, 0)
+        - COALESCE(ps.purchase_rebate, 0)
+        - COALESCE(ps.purchase_paid, 0)
+        - COALESCE(pay.total_paid, 0)
+        - COALESCE(pay.payment_rebate, 0)
+      )::NUMERIC, 2) AS outstanding_balance
+    FROM suppliers s
+    LEFT JOIN purchase_summary ps ON ps.supplier_id = s.id
+    LEFT JOIN payment_summary pay ON pay.supplier_id = s.id
+    ${whereClause}
+    ORDER BY s.active DESC, s.supplier_name
+    `,
+    values
+  );
+  return result.rows;
+};
+
+const readSupplierPayload = (body) => {
+  const supplierType = normalizeSupplierType(body.supplier_type);
+  return {
+    supplier_name: cleanText(body.supplier_name),
+    firm_name: nullableText(body.firm_name),
+    mobile_number: nullableText(body.mobile_number),
+    alternate_number: nullableText(body.alternate_number),
+    address: nullableText(body.address),
+    city: nullableText(body.city),
+    gst_number: nullableText(body.gst_number),
+    bank_name: nullableText(body.bank_name),
+    account_number: nullableText(body.account_number),
+    ifsc_code: nullableText(body.ifsc_code),
+    upi_id: nullableText(body.upi_id),
+    notes: nullableText(body.notes),
+    opening_balance: parseNonNegativeNumber(body.opening_balance),
+    supplier_type: supplierType,
+    active: body.active === undefined ? true : body.active === true || body.active === "true",
+  };
 };
 
 app.get("/purchase-rules", async (req, res) => {
@@ -545,6 +745,7 @@ app.get("/inventory", async (req, res) => {
         ib.net_payable,
         ib.payment_timing,
         ib.balance_amount,
+        ib.supplier_id,
         ib.supplier_name,
         ib.purchase_date
       FROM inventory_batches ib
@@ -706,27 +907,424 @@ app.get("/sale-rate-history", async (req, res) => {
   }
 });
 
-app.get("/supplier-ledger", async (req, res) => {
+app.get("/suppliers", async (req, res) => {
+  try {
+    const active = req.query.active === undefined ? undefined : String(req.query.active) === "true";
+    const rows = await getSupplierSummaryRows({
+      active,
+      search: cleanText(req.query.search),
+    });
+    return res.json(rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Suppliers" });
+  }
+});
+
+app.post("/suppliers", async (req, res) => {
+  try {
+    const supplier = readSupplierPayload(req.body);
+    if (!supplier.supplier_name || supplier.opening_balance === null || !SUPPLIER_TYPES.has(supplier.supplier_type)) {
+      return res.status(400).json({ message: "Enter valid supplier account details" });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO suppliers (
+        supplier_name, firm_name, mobile_number, alternate_number, address, city,
+        gst_number, bank_name, account_number, ifsc_code, upi_id, notes,
+        opening_balance, supplier_type, active
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+      RETURNING *
+      `,
+      [
+        supplier.supplier_name, supplier.firm_name, supplier.mobile_number, supplier.alternate_number,
+        supplier.address, supplier.city, supplier.gst_number, supplier.bank_name, supplier.account_number,
+        supplier.ifsc_code, supplier.upi_id, supplier.notes, supplier.opening_balance, supplier.supplier_type,
+        supplier.active,
+      ]
+    );
+    return res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Saving Supplier" });
+  }
+});
+
+app.get("/suppliers/:id", async (req, res) => {
+  try {
+    const supplierId = parsePositiveInteger(req.params.id);
+    if (!supplierId) return res.status(400).json({ message: "Invalid supplier" });
+    const rows = await getSupplierSummaryRows({ supplierId });
+    return rows[0] ? res.json(rows[0]) : res.status(404).json({ message: "Supplier not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Supplier" });
+  }
+});
+
+app.put("/suppliers/:id", async (req, res) => {
+  try {
+    const supplierId = parsePositiveInteger(req.params.id);
+    const supplier = readSupplierPayload(req.body);
+    if (!supplierId || !supplier.supplier_name || supplier.opening_balance === null || !SUPPLIER_TYPES.has(supplier.supplier_type)) {
+      return res.status(400).json({ message: "Enter valid supplier account details" });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE suppliers
+      SET
+        supplier_name = $1,
+        firm_name = $2,
+        mobile_number = $3,
+        alternate_number = $4,
+        address = $5,
+        city = $6,
+        gst_number = $7,
+        bank_name = $8,
+        account_number = $9,
+        ifsc_code = $10,
+        upi_id = $11,
+        notes = $12,
+        opening_balance = $13,
+        supplier_type = $14,
+        active = $15,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $16
+      RETURNING *
+      `,
+      [
+        supplier.supplier_name, supplier.firm_name, supplier.mobile_number, supplier.alternate_number,
+        supplier.address, supplier.city, supplier.gst_number, supplier.bank_name, supplier.account_number,
+        supplier.ifsc_code, supplier.upi_id, supplier.notes, supplier.opening_balance, supplier.supplier_type,
+        supplier.active, supplierId,
+      ]
+    );
+    return result.rows[0] ? res.json(result.rows[0]) : res.status(404).json({ message: "Supplier not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Supplier" });
+  }
+});
+
+app.delete("/suppliers/:id", async (req, res) => {
+  try {
+    const supplierId = parsePositiveInteger(req.params.id);
+    if (!supplierId) return res.status(400).json({ message: "Invalid supplier" });
+    const result = await pool.query(
+      "UPDATE suppliers SET active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *",
+      [supplierId]
+    );
+    return result.rows[0]
+      ? res.json({ success: true, supplier: result.rows[0], message: "Supplier marked inactive" })
+      : res.status(404).json({ message: "Supplier not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Supplier Status" });
+  }
+});
+
+app.get("/supplier-summary", async (req, res) => {
+  try {
+    const supplierId = req.query.supplier_id ? parsePositiveInteger(req.query.supplier_id) : null;
+    if (req.query.supplier_id && !supplierId) return res.status(400).json({ message: "Invalid supplier" });
+    const rows = await getSupplierSummaryRows({ supplierId });
+    return res.json(rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Supplier Summary" });
+  }
+});
+
+app.get("/dashboard-metrics", async (req, res) => {
   try {
     const result = await pool.query(
       `
+      WITH supplier_balances AS (
+        SELECT
+          s.id,
+          COALESCE(s.opening_balance, 0)
+          + COALESCE(ps.total_purchases, 0)
+          - COALESCE(ps.purchase_rebate, 0)
+          - COALESCE(ps.purchase_paid, 0)
+          - COALESCE(pay.total_paid, 0)
+          - COALESCE(pay.payment_rebate, 0) AS outstanding_balance
+        FROM suppliers s
+        LEFT JOIN (
+          SELECT
+            supplier_id,
+            SUM(COALESCE(NULLIF(gross_amount, 0), total_amount, 0)) AS total_purchases,
+            SUM(COALESCE(rebate_amount, 0)) AS purchase_rebate,
+            SUM(COALESCE(paid_amount, 0)) AS purchase_paid
+          FROM purchases
+          WHERE supplier_id IS NOT NULL
+          GROUP BY supplier_id
+        ) ps ON ps.supplier_id = s.id
+        LEFT JOIN (
+          SELECT
+            supplier_id,
+            SUM(payment_amount) AS total_paid,
+            SUM(rebate_amount) AS payment_rebate
+          FROM supplier_payments
+          GROUP BY supplier_id
+        ) pay ON pay.supplier_id = s.id
+      )
       SELECT
-        id,
-        purchase_date,
-        supplier_name,
-        gross_amount,
-        mandi_tax_amount,
-        rebate_amount,
-        net_payable,
-        paid_amount,
-        balance_amount,
-        payment_status,
-        payment_timing
-      FROM purchases
-      ORDER BY purchase_date DESC, id DESC
+        COALESCE(ROUND(SUM(outstanding_balance)::NUMERIC, 2), 0) AS total_supplier_outstanding,
+        COALESCE((SELECT SUM(rebate_amount) FROM purchases), 0)
+          + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments), 0) AS total_rebate_received,
+        COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE payment_date = CURRENT_DATE), 0)
+          + COALESCE((SELECT SUM(paid_amount) FROM purchases WHERE COALESCE(payment_date, purchase_date) = CURRENT_DATE), 0) AS todays_supplier_payments,
+        (SELECT COUNT(*) FROM suppliers) AS supplier_count,
+        (SELECT COUNT(*) FROM suppliers WHERE active = TRUE) AS active_supplier_count
+      FROM supplier_balances
       `
     );
+    return res.json(result.rows[0] || {
+      total_supplier_outstanding: 0,
+      total_rebate_received: 0,
+      todays_supplier_payments: 0,
+      supplier_count: 0,
+      active_supplier_count: 0,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Dashboard Metrics" });
+  }
+});
+
+app.get("/supplier-payments", async (req, res) => {
+  try {
+    const supplierId = req.query.supplier_id ? parsePositiveInteger(req.query.supplier_id) : null;
+    if (req.query.supplier_id && !supplierId) return res.status(400).json({ message: "Invalid supplier" });
+    const values = supplierId ? [supplierId] : [];
+    const result = await pool.query(
+      `
+      SELECT sp.*, s.supplier_name, s.firm_name
+      FROM supplier_payments sp
+      JOIN suppliers s ON s.id = sp.supplier_id
+      ${supplierId ? "WHERE sp.supplier_id = $1" : ""}
+      ORDER BY sp.payment_date DESC, sp.created_at DESC, sp.id DESC
+      `,
+      values
+    );
     return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Supplier Payments" });
+  }
+});
+
+app.post("/supplier-payments", async (req, res) => {
+  try {
+    const supplierId = parsePositiveInteger(req.body.supplier_id);
+    const paymentAmount = parseNonNegativeNumber(req.body.payment_amount);
+    const rebateAmount = parseNonNegativeNumber(req.body.rebate_received ?? req.body.rebate_amount);
+    const paymentMode = normalizePaymentMode(req.body.payment_mode);
+    const branchId = parsePositiveInteger(req.body.branch_id);
+    const createdBy = parsePositiveInteger(req.body.created_by) || 1;
+    const paymentDate = req.body.payment_date || toDateKey(new Date());
+
+    if (
+      !supplierId ||
+      paymentAmount === null ||
+      rebateAmount === null ||
+      paymentAmount + rebateAmount <= 0 ||
+      !SUPPLIER_PAYMENT_MODES.has(paymentMode)
+    ) {
+      return res.status(400).json({ message: "Enter valid supplier payment details" });
+    }
+
+    const supplierResult = await pool.query("SELECT id FROM suppliers WHERE id = $1 AND active = TRUE", [supplierId]);
+    if (supplierResult.rows.length === 0) {
+      return res.status(400).json({ message: "Select an active supplier account" });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO supplier_payments (
+        supplier_id, payment_date, payment_amount, rebate_amount, payment_mode,
+        reference_number, remarks, branch_id, created_by
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING *
+      `,
+      [
+        supplierId, paymentDate, paymentAmount, rebateAmount, paymentMode,
+        nullableText(req.body.reference_number), nullableText(req.body.remarks), branchId, createdBy,
+      ]
+    );
+    return res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Saving Supplier Payment" });
+  }
+});
+
+app.get("/supplier-ledger", async (req, res) => {
+  try {
+    const supplierId = req.query.supplier_id ? parsePositiveInteger(req.query.supplier_id) : null;
+    if (req.query.supplier_id && !supplierId) return res.status(400).json({ message: "Invalid supplier" });
+
+    const suppliers = await getSupplierSummaryRows({ supplierId });
+    if (supplierId && suppliers.length === 0) return res.status(404).json({ message: "Supplier not found" });
+    if (suppliers.length === 0) return res.json({ suppliers: [], ledger: [] });
+
+    const supplierIds = suppliers.map((supplier) => supplier.id);
+    const [purchaseResult, paymentResult] = await Promise.all([
+      pool.query(
+        `
+        SELECT
+          p.id,
+          p.supplier_id,
+          p.supplier_name,
+          p.purchase_date,
+          p.created_at,
+          COALESCE(NULLIF(p.gross_amount, 0), p.total_amount, 0) AS gross_amount,
+          COALESCE(p.rebate_amount, 0) AS rebate_amount,
+          COALESCE(NULLIF(p.net_payable, 0), p.total_amount, 0) AS net_payable,
+          COALESCE(p.paid_amount, 0) AS paid_amount,
+          p.payment_date,
+          p.payment_status,
+          p.payment_timing,
+          STRING_AGG(pr.product_name || ' x ' || TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM pi.quantity::TEXT)), ', ' ORDER BY pi.id) AS item_summary
+        FROM purchases p
+        LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
+        LEFT JOIN products pr ON pr.id = pi.product_id
+        WHERE p.supplier_id = ANY($1::INT[])
+        GROUP BY p.id
+        ORDER BY p.purchase_date, p.created_at, p.id
+        `,
+        [supplierIds]
+      ),
+      pool.query(
+        `
+        SELECT sp.*, s.supplier_name
+        FROM supplier_payments sp
+        JOIN suppliers s ON s.id = sp.supplier_id
+        WHERE sp.supplier_id = ANY($1::INT[])
+        ORDER BY sp.payment_date, sp.created_at, sp.id
+        `,
+        [supplierIds]
+      ),
+    ]);
+
+    const ledgersBySupplier = new Map(supplierIds.map((id) => [id, []]));
+    const pushEvent = (event) => {
+      if (!ledgersBySupplier.has(event.supplier_id)) ledgersBySupplier.set(event.supplier_id, []);
+      ledgersBySupplier.get(event.supplier_id).push(event);
+    };
+
+    for (const supplier of suppliers) {
+      if (Number(supplier.opening_balance) > 0) {
+        pushEvent({
+          supplier_id: supplier.id,
+          supplier_name: supplier.supplier_name,
+          transaction_date: toDateKey(supplier.created_at),
+          sort_date: toDateKey(supplier.created_at),
+          sort_key: `0000-${supplier.id}`,
+          transaction_type: "Opening Balance",
+          purchase_amount: 0,
+          payment_amount: 0,
+          rebate_amount: 0,
+          balance_delta: Number(supplier.opening_balance),
+          remarks: "Opening supplier payable balance",
+        });
+      }
+    }
+
+    for (const purchase of purchaseResult.rows) {
+      const grossAmount = Number(purchase.gross_amount || 0);
+      const rebateAmount = Number(purchase.rebate_amount || 0);
+      const paidAmount = Number(purchase.paid_amount || 0);
+      pushEvent({
+        supplier_id: purchase.supplier_id,
+        supplier_name: purchase.supplier_name,
+        transaction_date: toDateKey(purchase.purchase_date),
+        sort_date: toDateKey(purchase.purchase_date),
+        sort_key: `P-${String(purchase.id).padStart(8, "0")}-0`,
+        transaction_type: "Purchase",
+        purchase_id: purchase.id,
+        purchase_amount: grossAmount,
+        payment_amount: 0,
+        rebate_amount: rebateAmount,
+        balance_delta: roundCurrency(grossAmount - rebateAmount),
+        remarks: `${purchase.item_summary || "Purchase"}${purchase.payment_timing ? ` - ${purchase.payment_timing}` : ""}`,
+      });
+      if (paidAmount > 0) {
+        const paidDate = purchase.payment_date || purchase.purchase_date;
+        pushEvent({
+          supplier_id: purchase.supplier_id,
+          supplier_name: purchase.supplier_name,
+          transaction_date: toDateKey(paidDate),
+          sort_date: toDateKey(paidDate),
+          sort_key: `P-${String(purchase.id).padStart(8, "0")}-1`,
+          transaction_type: "Payment",
+          purchase_id: purchase.id,
+          purchase_amount: 0,
+          payment_amount: paidAmount,
+          rebate_amount: 0,
+          balance_delta: -paidAmount,
+          remarks: `Paid during purchase #${purchase.id}`,
+        });
+      }
+    }
+
+    for (const payment of paymentResult.rows) {
+      const paymentAmount = Number(payment.payment_amount || 0);
+      const rebateAmount = Number(payment.rebate_amount || 0);
+      if (paymentAmount > 0) {
+        pushEvent({
+          supplier_id: payment.supplier_id,
+          supplier_name: payment.supplier_name,
+          transaction_date: toDateKey(payment.payment_date),
+          sort_date: toDateKey(payment.payment_date),
+          sort_key: `SP-${String(payment.id).padStart(8, "0")}-0`,
+          transaction_type: "Payment",
+          supplier_payment_id: payment.id,
+          purchase_amount: 0,
+          payment_amount: paymentAmount,
+          rebate_amount: 0,
+          balance_delta: -paymentAmount,
+          remarks: payment.remarks || payment.reference_number || "Supplier payment",
+        });
+      }
+      if (rebateAmount > 0) {
+        pushEvent({
+          supplier_id: payment.supplier_id,
+          supplier_name: payment.supplier_name,
+          transaction_date: toDateKey(payment.payment_date),
+          sort_date: toDateKey(payment.payment_date),
+          sort_key: `SP-${String(payment.id).padStart(8, "0")}-1`,
+          transaction_type: "Rebate",
+          supplier_payment_id: payment.id,
+          purchase_amount: 0,
+          payment_amount: 0,
+          rebate_amount: rebateAmount,
+          balance_delta: -rebateAmount,
+          remarks: payment.remarks || payment.reference_number || "Rebate received",
+        });
+      }
+    }
+
+    const ledger = [];
+    for (const supplier of suppliers) {
+      let runningBalance = 0;
+      const rows = (ledgersBySupplier.get(supplier.id) || []).sort((left, right) =>
+        left.sort_date.localeCompare(right.sort_date) || left.sort_key.localeCompare(right.sort_key)
+      );
+      for (const row of rows) {
+        runningBalance = roundCurrency(runningBalance + Number(row.balance_delta || 0));
+        ledger.push({
+          ...row,
+          running_balance: runningBalance,
+        });
+      }
+    }
+
+    return res.json({ suppliers, ledger });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Supplier Ledger" });
@@ -738,7 +1336,7 @@ app.post("/purchase", async (req, res) => {
 
   try {
     const {
-      supplier_name,
+      supplier_id,
       product_id,
       quantity,
       purchase_rate,
@@ -751,6 +1349,7 @@ app.post("/purchase", async (req, res) => {
       branch_id,
       created_by,
     } = req.body;
+    const parsedSupplierId = parsePositiveInteger(supplier_id);
     const parsedProductId = parsePositiveInteger(product_id);
     const parsedQuantity = parsePositiveNumber(quantity);
     const parsedPurchaseRate = parsePositiveNumber(purchase_rate);
@@ -762,8 +1361,11 @@ app.post("/purchase", async (req, res) => {
     const parsedBranchId = parsePositiveInteger(branch_id);
     const parsedCreatedBy = parsePositiveInteger(created_by) || 1;
 
+    if (!parsedSupplierId) {
+      return res.status(400).json({ message: "Add New Supplier" });
+    }
+
     if (
-      !supplier_name?.trim() ||
       !parsedProductId ||
       !parsedQuantity ||
       !parsedPurchaseRate ||
@@ -778,6 +1380,16 @@ app.post("/purchase", async (req, res) => {
     }
 
     await client.query("BEGIN");
+    const supplierResult = await client.query(
+      "SELECT id, supplier_name FROM suppliers WHERE id = $1 AND active = TRUE FOR SHARE",
+      [parsedSupplierId]
+    );
+    if (supplierResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Add New Supplier" });
+    }
+    const supplier = supplierResult.rows[0];
+
     const productResult = await client.query(
       "SELECT id, product_name, origin_type FROM products WHERE id = $1 AND active = TRUE FOR SHARE",
       [parsedProductId]
@@ -816,17 +1428,17 @@ app.post("/purchase", async (req, res) => {
     const purchaseResult = await client.query(
       `
       INSERT INTO purchases (
-        supplier_name, total_amount, branch_id, created_by, basic_amount,
+        supplier_id, supplier_name, total_amount, branch_id, created_by, basic_amount,
         mandi_tax_percent, mandi_tax_amount, other_charges, gross_amount,
         rebate_percent, rebate_amount, net_payable, paid_amount, balance_amount,
         payment_timing, effective_cost_per_unit, freight_charges, labour_charges,
         rebate_rule_id, payment_due_days, payment_status, payment_date
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
       RETURNING *
       `,
       [
-        supplier_name.trim(), netPayable, parsedBranchId, parsedCreatedBy, basicAmount,
+        supplier.id, supplier.supplier_name, netPayable, parsedBranchId, parsedCreatedBy, basicAmount,
         mandiTaxPercent, mandiTaxAmount, parsedOtherCharges, grossAmount,
         rebatePercent, rebateAmount, netPayable, parsedPaidAmount, balanceAmount,
         rebateRule.rule_name, effectiveCostPerUnit, parsedFreightCharges, parsedLabourCharges,
@@ -856,10 +1468,10 @@ app.post("/purchase", async (req, res) => {
       `
       INSERT INTO inventory_batches (
         product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
-        supplier_name, branch_id, mandi_tax_amount, freight_charges, labour_charges,
+        supplier_id, supplier_name, branch_id, mandi_tax_amount, freight_charges, labour_charges,
         other_charges, gross_amount, rebate_amount, net_payable, payment_timing, balance_amount
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
       `,
       [
         parsedProductId,
@@ -868,7 +1480,8 @@ app.post("/purchase", async (req, res) => {
         parsedQuantity,
         parsedPurchaseRate,
         effectiveCostPerUnit,
-        supplier_name.trim(),
+        supplier.id,
+        supplier.supplier_name,
         parsedBranchId,
         mandiTaxAmount,
         parsedFreightCharges,
@@ -897,6 +1510,7 @@ app.post("/purchase", async (req, res) => {
       purchase_id: purchase.id,
       purchase: {
         ...purchase,
+        supplier_name: supplier.supplier_name,
         product_name: product.product_name,
         origin_type: originType,
       },

@@ -24,15 +24,21 @@ const icons = {
   reports: "chart",
   settings: "settings",
   "sale-rates": "trend",
+  "account-manager": "users",
+  "supplier-payments": "wallet",
+  "supplier-ledger": "history",
 };
 
 const navigationItems = [
   ["dashboard", "Dashboard"],
   ["products", "Products"],
   ["purchase", "Purchase Entry"],
+  ["account-manager", "Account Manager"],
   ["inventory", "Inventory"],
   ["sales", "POS Billing"],
   ["sales-history", "Sales History"],
+  ["supplier-payments", "Supplier Payments"],
+  ["supplier-ledger", "Supplier Ledger"],
   ["sale-rates", "Sale Rate Update"],
   ["expenses", "Expenses"],
   ["customers", "Customers"],
@@ -51,6 +57,38 @@ const getErrorMessage = (error, fallback) =>
 
 const toDateKey = (date) =>
   typeof date === "string" ? date.slice(0, 10) : date.toLocaleDateString("en-CA");
+
+const supplierTypes = [
+  ["LOCAL_SUPPLIER", "Local Supplier"],
+  ["IMPORTED_SUPPLIER", "Imported Supplier"],
+  ["COMMISSION_AGENT", "Commission Agent"],
+  ["TRANSPORT_VENDOR", "Transport Vendor"],
+];
+
+const supplierPaymentModes = [
+  ["CASH", "Cash"],
+  ["UPI", "UPI"],
+  ["BANK_TRANSFER", "Bank Transfer"],
+  ["CHEQUE", "Cheque"],
+];
+
+const emptySupplierForm = {
+  supplier_name: "",
+  firm_name: "",
+  mobile_number: "",
+  alternate_number: "",
+  address: "",
+  city: "",
+  gst_number: "",
+  bank_name: "",
+  account_number: "",
+  ifsc_code: "",
+  upi_id: "",
+  notes: "",
+  opening_balance: "",
+  supplier_type: "LOCAL_SUPPLIER",
+  active: true,
+};
 
 function BrandLogo({ compact = false, invoice = false }) {
   return (
@@ -128,6 +166,16 @@ function App() {
   const [saleRates, setSaleRates] = useState([]);
   const [saleRateHistory, setSaleRateHistory] = useState([]);
   const [saleDesiredMargin, setSaleDesiredMargin] = useState("25");
+  const [suppliers, setSuppliers] = useState([]);
+  const [supplierSummary, setSupplierSummary] = useState([]);
+  const [supplierPayments, setSupplierPayments] = useState([]);
+  const [supplierLedger, setSupplierLedger] = useState({ suppliers: [], ledger: [] });
+  const [ledgerSupplierId, setLedgerSupplierId] = useState("");
+  const [supplierDashboard, setSupplierDashboard] = useState({
+    total_supplier_outstanding: 0,
+    total_rebate_received: 0,
+    todays_supplier_payments: 0,
+  });
 
   const [productName, setProductName] = useState("");
   const [sellingRate, setSellingRate] = useState("");
@@ -138,7 +186,7 @@ function App() {
   const [productActive, setProductActive] = useState(true);
   const [editingProductId, setEditingProductId] = useState(null);
   const [unit, setUnit] = useState("");
-  const [supplierName, setSupplierName] = useState("");
+  const [purchaseSupplierId, setPurchaseSupplierId] = useState("");
   const [purchaseProductId, setPurchaseProductId] = useState("");
   const [purchaseQuantity, setPurchaseQuantity] = useState("");
   const [purchaseRateInput, setPurchaseRateInput] = useState("");
@@ -171,8 +219,21 @@ function App() {
       ["Stock Value", currency.format(stockValue), "layers"],
       ["Low Stock Items", lowStockItems, "alert"],
       ["Transactions", todaysSales.length, "receipt"],
+      ["Supplier Outstanding", currency.format(Number(supplierDashboard.total_supplier_outstanding || 0)), "wallet"],
+      ["Total Rebate Received", currency.format(Number(supplierDashboard.total_rebate_received || 0)), "trend"],
+      ["Today's Supplier Payments", currency.format(Number(supplierDashboard.todays_supplier_payments || 0)), "rupee"],
     ];
-  }, [inventory, salesHistory]);
+  }, [inventory, salesHistory, supplierDashboard]);
+
+  const activeSuppliers = useMemo(
+    () => suppliers.filter((supplier) => supplier.active !== false),
+    [suppliers]
+  );
+
+  const supplierSummaryById = useMemo(
+    () => new Map(supplierSummary.map((supplier) => [String(supplier.id), supplier])),
+    [supplierSummary]
+  );
 
   const selectedPurchaseProduct = useMemo(
     () => products.find((product) => String(product.id) === purchaseProductId),
@@ -235,20 +296,46 @@ function App() {
     setSaleRateHistory(historyResponse.data);
   };
 
+  const loadSupplierData = async (search = "") => {
+    const params = search ? { search } : {};
+    const [suppliersResponse, summaryResponse] = await Promise.all([
+      axios.get(`${API_URL}/suppliers`, { params }),
+      axios.get(`${API_URL}/supplier-summary`),
+    ]);
+    setSuppliers(suppliersResponse.data);
+    setSupplierSummary(summaryResponse.data);
+  };
+
+  const loadSupplierPayments = async (supplierId = "") => {
+    const response = await axios.get(`${API_URL}/supplier-payments`, {
+      params: supplierId ? { supplier_id: supplierId } : {},
+    });
+    setSupplierPayments(response.data);
+  };
+
+  const loadSupplierLedger = async (supplierId = ledgerSupplierId) => {
+    const response = await axios.get(`${API_URL}/supplier-ledger`, {
+      params: supplierId ? { supplier_id: supplierId } : {},
+    });
+    setSupplierLedger(response.data);
+  };
+
   const loadDashboardData = async () => {
-    const [inventoryResponse, salesResponse] = await Promise.all([
+    const [inventoryResponse, salesResponse, supplierMetricsResponse] = await Promise.all([
       axios.get(`${API_URL}/inventory`),
       axios.get(`${API_URL}/sales`),
+      axios.get(`${API_URL}/dashboard-metrics`),
     ]);
     setInventory(inventoryResponse.data);
     setSalesHistory(salesResponse.data);
+    setSupplierDashboard(supplierMetricsResponse.data);
   };
 
   const login = async () => {
     try {
       const response = await axios.post(`${API_URL}/login`, { username, password });
       setUser(response.data);
-      await Promise.all([loadProducts(), loadDashboardData(), loadPurchaseRules()]);
+      await Promise.all([loadProducts(), loadDashboardData(), loadPurchaseRules(), loadSupplierData()]);
     } catch (error) {
       alert(getErrorMessage(error, "Login Failed"));
     }
@@ -292,7 +379,7 @@ function App() {
   const savePurchase = async () => {
     try {
       await axios.post(`${API_URL}/purchase`, {
-        supplier_name: supplierName,
+        supplier_id: purchaseSupplierId,
         product_id: purchaseProductId,
         quantity: purchaseQuantity,
         purchase_rate: purchaseRateInput,
@@ -305,7 +392,7 @@ function App() {
         branch_id: user.branch_id,
         created_by: user.id,
       });
-      setSupplierName("");
+      setPurchaseSupplierId("");
       setPurchaseProductId("");
       setPurchaseQuantity("");
       setPurchaseRateInput("");
@@ -315,7 +402,7 @@ function App() {
       setPurchasePaidAmount("");
       setPurchaseRebateRuleId("");
       setPurchasePaymentDate("");
-      await loadDashboardData();
+      await Promise.all([loadDashboardData(), loadSupplierData(), loadSupplierLedger(ledgerSupplierId)]);
       alert("Purchase Saved");
     } catch (error) {
       alert(getErrorMessage(error, "Purchase Error"));
@@ -373,6 +460,11 @@ function App() {
         const response = await axios.get(`${API_URL}/sales`);
         setSalesHistory(response.data);
       }
+      if (["purchase", "account-manager", "supplier-payments", "supplier-ledger"].includes(view)) {
+        await loadSupplierData();
+      }
+      if (view === "supplier-payments") await loadSupplierPayments();
+      if (view === "supplier-ledger") await loadSupplierLedger(ledgerSupplierId);
       if (view === "dashboard") await loadDashboardData();
       if (view === "settings") await loadSettingsRules();
       if (view === "sale-rates") await loadSaleRates();
@@ -507,7 +599,7 @@ function App() {
                   </div>
                 </div>
                 <div className="quick-grid">
-                  {[["sales", "POS Billing"], ["purchase", "New Purchase"], ["inventory", "View Inventory"], ["products", "Manage Products"]].map(([view, label]) => (
+                  {[["sales", "POS Billing"], ["purchase", "New Purchase"], ["account-manager", "Suppliers"], ["supplier-payments", "Supplier Payment"], ["supplier-ledger", "Supplier Ledger"], ["inventory", "View Inventory"]].map(([view, label]) => (
                     <button className="quick-action" key={view} onClick={() => navigate(view)}>
                       <Icon name={icons[view]} />
                       <span>{label}</span>
@@ -560,7 +652,16 @@ function App() {
           {activeView === "purchase" && (
             <ModuleCard eyebrow="Procurement" title="Purchase Entry" subtitle="Record incoming stock and supplier purchase details.">
               <div className="form-grid">
-                <Field label="Supplier Name"><input value={supplierName} onChange={(event) => setSupplierName(event.target.value)} /></Field>
+                <Field label="Supplier Account">
+                  <select value={purchaseSupplierId} onChange={(event) => setPurchaseSupplierId(event.target.value)}>
+                    <option value="">Select saved supplier</option>
+                    {activeSuppliers.map((supplier) => (
+                      <option key={supplier.id} value={supplier.id}>
+                        {supplier.supplier_name}{supplier.firm_name ? ` - ${supplier.firm_name}` : ""}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
                 <Field label="Product">
                   <select value={purchaseProductId} onChange={selectPurchaseProduct}>
                     <option value="">Select product</option>
@@ -575,15 +676,50 @@ function App() {
                 <Field label="Payment Timing / Rebate Rule">
                   <select value={purchaseRebateRuleId} onChange={(event) => setPurchaseRebateRuleId(event.target.value)}>
                     <option value="">Select rebate rule</option>
-                    {purchaseRules.rebateRules.map((rule) => <option key={rule.id} value={rule.id}>{rule.rule_name} · {rule.pay_within_days} days · {rule.rebate_percent}%</option>)}
+                    {purchaseRules.rebateRules.map((rule) => <option key={rule.id} value={rule.id}>{rule.rule_name} - {rule.pay_within_days} days - {rule.rebate_percent}%</option>)}
                   </select>
                 </Field>
                 <Field label="Paid Amount"><input type="number" min="0" step="0.01" value={purchasePaidAmount} onChange={(event) => setPurchasePaidAmount(event.target.value)} /></Field>
                 <Field label="Payment Date"><input type="date" value={purchasePaymentDate} onChange={(event) => setPurchasePaymentDate(event.target.value)} /></Field>
               </div>
+              {activeSuppliers.length === 0 && <p className="form-note">No active supplier accounts found. Add New Supplier before saving a purchase.</p>}
               <PurchaseSummary summary={purchaseSummary} />
-              <button className="primary-button" onClick={savePurchase}>Save Purchase</button>
+              <div className="button-row">
+                <button className="primary-button" onClick={savePurchase}>Save Purchase</button>
+                <button className="secondary-button" onClick={() => navigate("account-manager")}>Add New Supplier</button>
+              </div>
             </ModuleCard>
+          )}
+
+          {activeView === "account-manager" && (
+            <AccountManager
+              onNavigate={navigate}
+              onReload={loadSupplierData}
+              suppliers={suppliers}
+              summaryBySupplier={supplierSummaryById}
+            />
+          )}
+
+          {activeView === "supplier-payments" && (
+            <SupplierPayments
+              onReload={async () => {
+                await Promise.all([loadSupplierData(), loadSupplierPayments(), loadSupplierLedger(ledgerSupplierId), loadDashboardData()]);
+              }}
+              payments={supplierPayments}
+              suppliers={activeSuppliers}
+              summaryBySupplier={supplierSummaryById}
+              user={user}
+            />
+          )}
+
+          {activeView === "supplier-ledger" && (
+            <SupplierLedger
+              ledgerData={supplierLedger}
+              onLoad={loadSupplierLedger}
+              selectedSupplierId={ledgerSupplierId}
+              setSelectedSupplierId={setLedgerSupplierId}
+              suppliers={suppliers}
+            />
           )}
 
           {activeView === "inventory" && (
@@ -675,6 +811,312 @@ function App() {
       </section>
       {selectedInvoice && <InvoiceModal invoice={selectedInvoice} onClose={() => setSelectedInvoice(null)} />}
     </main>
+  );
+}
+
+const supplierTypeLabel = (value) =>
+  supplierTypes.find(([type]) => type === value)?.[1] || value || "-";
+
+function AccountManager({ onNavigate, onReload, suppliers, summaryBySupplier }) {
+  const [search, setSearch] = useState("");
+  const [draft, setDraft] = useState(emptySupplierForm);
+  const [editingId, setEditingId] = useState(null);
+  const [selectedSupplierId, setSelectedSupplierId] = useState("");
+  const selectedSupplier = suppliers.find((supplier) => String(supplier.id) === selectedSupplierId);
+  const selectedSummary = summaryBySupplier.get(selectedSupplierId);
+
+  const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
+
+  const resetForm = () => {
+    setDraft(emptySupplierForm);
+    setEditingId(null);
+  };
+
+  const saveSupplier = async () => {
+    try {
+      const payload = { ...draft, opening_balance: Number(draft.opening_balance || 0) };
+      if (editingId) {
+        await axios.put(`${API_URL}/suppliers/${editingId}`, payload);
+      } else {
+        await axios.post(`${API_URL}/suppliers`, payload);
+      }
+      resetForm();
+      await onReload(search);
+      alert(editingId ? "Supplier Updated" : "Supplier Added");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to save supplier"));
+    }
+  };
+
+  const editSupplier = (supplier) => {
+    setDraft({
+      ...emptySupplierForm,
+      ...supplier,
+      opening_balance: supplier.opening_balance || "",
+      active: supplier.active !== false,
+    });
+    setEditingId(supplier.id);
+    setSelectedSupplierId(String(supplier.id));
+  };
+
+  const toggleSupplierStatus = async (supplier) => {
+    try {
+      await axios.put(`${API_URL}/suppliers/${supplier.id}`, {
+        ...supplier,
+        active: supplier.active === false,
+      });
+      await onReload(search);
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update supplier status"));
+    }
+  };
+
+  return (
+    <section className="settings-layout">
+      <ModuleCard eyebrow="Supplier Account" title={editingId ? "Edit Supplier Account" : "Add Supplier Account"} subtitle="Create supplier accounts before purchases are recorded. Inactive suppliers remain preserved for transaction history.">
+        <div className="form-grid supplier-form-grid">
+          <Field label="Supplier Name"><input value={draft.supplier_name} onChange={(event) => updateDraft("supplier_name", event.target.value)} /></Field>
+          <Field label="Firm Name"><input value={draft.firm_name || ""} onChange={(event) => updateDraft("firm_name", event.target.value)} /></Field>
+          <Field label="Supplier Type">
+            <select value={draft.supplier_type} onChange={(event) => updateDraft("supplier_type", event.target.value)}>
+              {supplierTypes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+            </select>
+          </Field>
+          <Field label="Mobile Number"><input value={draft.mobile_number || ""} onChange={(event) => updateDraft("mobile_number", event.target.value)} /></Field>
+          <Field label="Alternate Number"><input value={draft.alternate_number || ""} onChange={(event) => updateDraft("alternate_number", event.target.value)} /></Field>
+          <Field label="City"><input value={draft.city || ""} onChange={(event) => updateDraft("city", event.target.value)} /></Field>
+          <Field label="GST Number"><input value={draft.gst_number || ""} onChange={(event) => updateDraft("gst_number", event.target.value)} /></Field>
+          <Field label="Bank Name"><input value={draft.bank_name || ""} onChange={(event) => updateDraft("bank_name", event.target.value)} /></Field>
+          <Field label="Account Number"><input value={draft.account_number || ""} onChange={(event) => updateDraft("account_number", event.target.value)} /></Field>
+          <Field label="IFSC Code"><input value={draft.ifsc_code || ""} onChange={(event) => updateDraft("ifsc_code", event.target.value.toUpperCase())} /></Field>
+          <Field label="UPI ID"><input value={draft.upi_id || ""} onChange={(event) => updateDraft("upi_id", event.target.value)} /></Field>
+          <Field label="Opening Balance"><input min="0" step="0.01" type="number" value={draft.opening_balance || ""} onChange={(event) => updateDraft("opening_balance", event.target.value)} /></Field>
+          <Field label="Address"><textarea value={draft.address || ""} onChange={(event) => updateDraft("address", event.target.value)} /></Field>
+          <Field label="Notes"><textarea value={draft.notes || ""} onChange={(event) => updateDraft("notes", event.target.value)} /></Field>
+          <label className="check-field"><input type="checkbox" checked={draft.active !== false} onChange={(event) => updateDraft("active", event.target.checked)} /><span>Active Supplier</span></label>
+        </div>
+        <div className="button-row">
+          <button className="primary-button" onClick={saveSupplier}>{editingId ? "Update Supplier" : "Add Supplier"}</button>
+          {editingId && <button className="secondary-button" onClick={resetForm}>Cancel Edit</button>}
+        </div>
+      </ModuleCard>
+
+      <ModuleCard eyebrow="Supplier List" title="Account Manager" subtitle="Search, review and maintain supplier account status.">
+        <div className="ledger-toolbar">
+          <label className="icon-input">
+            <Icon name="search" />
+            <input placeholder="Search supplier, firm, mobile, city or GST" value={search} onChange={(event) => setSearch(event.target.value)} onKeyDown={(event) => event.key === "Enter" && onReload(search)} />
+          </label>
+          <button className="secondary-button" onClick={() => onReload(search)}>Search</button>
+          <button className="secondary-button" onClick={() => { setSearch(""); onReload(""); }}>Clear</button>
+        </div>
+        <DataTable headers={["Supplier", "Firm", "Type", "Mobile", "City", "Outstanding", "Status", ""]}>
+          {suppliers.map((supplier) => {
+            const summary = summaryBySupplier.get(String(supplier.id)) || supplier;
+            return (
+              <tr key={supplier.id}>
+                <td className="primary-cell">{supplier.supplier_name}</td>
+                <td>{supplier.firm_name || "-"}</td>
+                <td><span className="tag">{supplierTypeLabel(supplier.supplier_type)}</span></td>
+                <td>{supplier.mobile_number || "-"}</td>
+                <td>{supplier.city || "-"}</td>
+                <td className="balance-cell">{currency.format(Number(summary.outstanding_balance || 0))}</td>
+                <td><span className={supplier.active !== false ? "stock-ok" : "stock-low"}>{supplier.active !== false ? "Active" : "Inactive"}</span></td>
+                <td>
+                  <div className="button-row">
+                    <button className="table-action" onClick={() => setSelectedSupplierId(String(supplier.id))}>View</button>
+                    <button className="table-action" onClick={() => editSupplier(supplier)}>Edit</button>
+                    <button className="secondary-button" onClick={() => toggleSupplierStatus(supplier)}>{supplier.active !== false ? "Inactive" : "Active"}</button>
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </DataTable>
+      </ModuleCard>
+
+      <ModuleCard eyebrow="Supplier Detail" title={selectedSupplier ? selectedSupplier.supplier_name : "Select Supplier"} subtitle="Supplier financial summary and account details.">
+        {selectedSupplier ? (
+          <section className="supplier-detail">
+            <div className="purchase-summary-grid">
+              <SummaryMetric label="Total Purchases" value={currency.format(Number(selectedSummary?.total_purchases || 0))} />
+              <SummaryMetric label="Total Paid" value={currency.format(Number(selectedSummary?.total_paid || 0))} />
+              <SummaryMetric label="Total Rebate" value={currency.format(Number(selectedSummary?.total_rebate_received || 0))} positive />
+              <SummaryMetric label="Outstanding Balance" value={currency.format(Number(selectedSummary?.outstanding_balance || 0))} featured />
+            </div>
+            <div className="detail-grid">
+              <DetailItem label="Firm" value={selectedSupplier.firm_name} />
+              <DetailItem label="Type" value={supplierTypeLabel(selectedSupplier.supplier_type)} />
+              <DetailItem label="Mobile" value={selectedSupplier.mobile_number} />
+              <DetailItem label="Alternate" value={selectedSupplier.alternate_number} />
+              <DetailItem label="City" value={selectedSupplier.city} />
+              <DetailItem label="GST" value={selectedSupplier.gst_number} />
+              <DetailItem label="Bank" value={selectedSupplier.bank_name} />
+              <DetailItem label="Account" value={selectedSupplier.account_number} />
+              <DetailItem label="IFSC" value={selectedSupplier.ifsc_code} />
+              <DetailItem label="UPI" value={selectedSupplier.upi_id} />
+              <DetailItem label="Address" value={selectedSupplier.address} />
+              <DetailItem label="Notes" value={selectedSupplier.notes} />
+            </div>
+            <div className="button-row">
+              <button className="primary-button" onClick={() => onNavigate("supplier-payments")}>Record Payment</button>
+              <button className="secondary-button" onClick={() => onNavigate("supplier-ledger")}>View Ledger</button>
+            </div>
+          </section>
+        ) : (
+          <p className="form-note">Select a supplier from the Account Manager table to view details.</p>
+        )}
+      </ModuleCard>
+    </section>
+  );
+}
+
+function SupplierPayments({ onReload, payments, suppliers, summaryBySupplier, user }) {
+  const [form, setForm] = useState({
+    supplier_id: "",
+    payment_date: toDateKey(new Date()),
+    payment_amount: "",
+    rebate_received: "",
+    payment_mode: "CASH",
+    reference_number: "",
+    remarks: "",
+  });
+  const selectedSummary = summaryBySupplier.get(String(form.supplier_id));
+
+  const updateForm = (field, value) => setForm((current) => ({ ...current, [field]: value }));
+
+  const savePayment = async () => {
+    try {
+      await axios.post(`${API_URL}/supplier-payments`, {
+        ...form,
+        payment_amount: Number(form.payment_amount || 0),
+        rebate_received: Number(form.rebate_received || 0),
+        branch_id: user.branch_id,
+        created_by: user.id,
+      });
+      setForm((current) => ({
+        ...current,
+        payment_amount: "",
+        rebate_received: "",
+        reference_number: "",
+        remarks: "",
+      }));
+      await onReload();
+      alert("Supplier Payment Saved");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to save supplier payment"));
+    }
+  };
+
+  return (
+    <section className="settings-layout">
+      <ModuleCard eyebrow="Supplier Payment" title="Payment Entry" subtitle="Record payments and payment-time rebates. Rebates reduce supplier payable balance immediately.">
+        <div className="form-grid">
+          <Field label="Supplier">
+            <select value={form.supplier_id} onChange={(event) => updateForm("supplier_id", event.target.value)}>
+              <option value="">Select supplier</option>
+              {suppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.supplier_name}{supplier.firm_name ? ` - ${supplier.firm_name}` : ""}</option>)}
+            </select>
+          </Field>
+          <Field label="Payment Date"><input type="date" value={form.payment_date} onChange={(event) => updateForm("payment_date", event.target.value)} /></Field>
+          <Field label="Payment Amount"><input min="0" step="0.01" type="number" value={form.payment_amount} onChange={(event) => updateForm("payment_amount", event.target.value)} /></Field>
+          <Field label="Rebate Received"><input min="0" step="0.01" type="number" value={form.rebate_received} onChange={(event) => updateForm("rebate_received", event.target.value)} /></Field>
+          <Field label="Payment Mode">
+            <select value={form.payment_mode} onChange={(event) => updateForm("payment_mode", event.target.value)}>
+              {supplierPaymentModes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+            </select>
+          </Field>
+          <Field label="Reference Number"><input value={form.reference_number} onChange={(event) => updateForm("reference_number", event.target.value)} /></Field>
+          <Field label="Remarks"><textarea value={form.remarks} onChange={(event) => updateForm("remarks", event.target.value)} /></Field>
+        </div>
+        {selectedSummary && (
+          <div className="purchase-summary-grid supplier-payment-preview">
+            <SummaryMetric label="Total Purchases" value={currency.format(Number(selectedSummary.total_purchases || 0))} />
+            <SummaryMetric label="Total Paid" value={currency.format(Number(selectedSummary.total_paid || 0))} />
+            <SummaryMetric label="Total Rebate" value={currency.format(Number(selectedSummary.total_rebate_received || 0))} positive />
+            <SummaryMetric label="Outstanding" value={currency.format(Number(selectedSummary.outstanding_balance || 0))} featured />
+          </div>
+        )}
+        <button className="primary-button" onClick={savePayment}>Save Payment</button>
+      </ModuleCard>
+
+      <ModuleCard eyebrow="Payment History" title="Recent Supplier Payments" subtitle="Payments and rebates posted through Supplier Payments.">
+        <DataTable headers={["Date", "Supplier", "Mode", "Payment", "Rebate", "Reference", "Remarks"]}>
+          {payments.map((payment) => (
+            <tr key={payment.id}>
+              <td>{payment.payment_date}</td>
+              <td className="primary-cell">{payment.supplier_name}</td>
+              <td><span className="tag">{payment.payment_mode}</span></td>
+              <td>{currency.format(Number(payment.payment_amount || 0))}</td>
+              <td className="profit-cell">{currency.format(Number(payment.rebate_amount || 0))}</td>
+              <td>{payment.reference_number || "-"}</td>
+              <td>{payment.remarks || "-"}</td>
+            </tr>
+          ))}
+        </DataTable>
+      </ModuleCard>
+    </section>
+  );
+}
+
+function SupplierLedger({ ledgerData, onLoad, selectedSupplierId, setSelectedSupplierId, suppliers }) {
+  const summaries = ledgerData.suppliers || [];
+  const rows = ledgerData.ledger || [];
+  const totals = summaries.reduce((summary, supplier) => ({
+    purchases: summary.purchases + Number(supplier.total_purchases || 0),
+    paid: summary.paid + Number(supplier.total_paid || 0),
+    rebate: summary.rebate + Number(supplier.total_rebate_received || 0),
+    outstanding: summary.outstanding + Number(supplier.outstanding_balance || 0),
+  }), { purchases: 0, paid: 0, rebate: 0, outstanding: 0 });
+
+  const changeSupplier = async (supplierId) => {
+    setSelectedSupplierId(supplierId);
+    await onLoad(supplierId);
+  };
+
+  return (
+    <section className="settings-layout">
+      <ModuleCard eyebrow="Supplier Ledger" title="Outstanding Balance" subtitle="Purchase, payment and rebate entries are combined into a running supplier balance.">
+        <div className="ledger-toolbar">
+          <Field label="Supplier">
+            <select value={selectedSupplierId} onChange={(event) => changeSupplier(event.target.value)}>
+              <option value="">All suppliers</option>
+              {suppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.supplier_name}</option>)}
+            </select>
+          </Field>
+          <button className="secondary-button" onClick={() => onLoad(selectedSupplierId)}>Refresh Ledger</button>
+        </div>
+        <div className="purchase-summary-grid">
+          <SummaryMetric label="Total Purchases" value={currency.format(totals.purchases)} />
+          <SummaryMetric label="Total Paid" value={currency.format(totals.paid)} />
+          <SummaryMetric label="Total Rebate Received" value={currency.format(totals.rebate)} positive />
+          <SummaryMetric label="Outstanding Balance" value={currency.format(totals.outstanding)} featured />
+        </div>
+        <DataTable headers={["Date", "Supplier", "Transaction", "Purchase", "Payment", "Rebate", "Running Balance", "Remarks"]}>
+          {rows.map((row, index) => (
+            <tr key={`${row.supplier_id}-${row.transaction_type}-${row.purchase_id || row.supplier_payment_id || index}-${index}`}>
+              <td>{row.transaction_date}</td>
+              <td className="primary-cell">{row.supplier_name}</td>
+              <td><span className="tag">{row.transaction_type}</span></td>
+              <td>{currency.format(Number(row.purchase_amount || 0))}</td>
+              <td>{currency.format(Number(row.payment_amount || 0))}</td>
+              <td className="profit-cell">{currency.format(Number(row.rebate_amount || 0))}</td>
+              <td className="balance-cell">{currency.format(Number(row.running_balance || 0))}</td>
+              <td>{row.remarks || "-"}</td>
+            </tr>
+          ))}
+        </DataTable>
+      </ModuleCard>
+    </section>
+  );
+}
+
+function DetailItem({ label, value }) {
+  return (
+    <div className="detail-item">
+      <span>{label}</span>
+      <strong>{value || "-"}</strong>
+    </div>
   );
 }
 
@@ -1028,7 +1470,7 @@ function PosBilling({ inventory, onInvoice, onSaved, products, user }) {
               <h2>POS Billing</h2>
               <p>Search products or scan a barcode to build the invoice.</p>
             </div>
-            <span className="shortcut-hint">F2 Search · F3 Barcode · F4 Checkout</span>
+            <span className="shortcut-hint">F2 Search - F3 Barcode - F4 Checkout</span>
           </div>
           <div className="pos-inputs">
             <label className="icon-input">
@@ -1063,7 +1505,7 @@ function PosBilling({ inventory, onInvoice, onSaved, products, user }) {
                 >
                   <span>
                     <strong>{product.product_name}</strong>
-                    <small>{product.barcode || "No barcode"} · {currency.format(Number(product.selling_rate))}/{product.unit}</small>
+                    <small>{product.barcode || "No barcode"} - {currency.format(Number(product.selling_rate))}/{product.unit}</small>
                   </span>
                   <em className={stock <= 5 ? "stock-low" : "stock-ok"}>{stock} in stock</em>
                 </button>
@@ -1215,7 +1657,7 @@ function InvoiceModal({ invoice, onClose }) {
           <footer className="invoice-footer">
             <strong>Thank you for shopping with FEEL THE FREAKIN&apos; FROOZ.</strong>
             <span>We appreciate your business.</span>
-            <small>GST-ready invoice · Powered by SRT Company</small>
+            <small>GST-ready invoice - Powered by SRT Company</small>
           </footer>
         </article>
       </section>

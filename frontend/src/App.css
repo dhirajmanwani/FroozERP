@@ -333,7 +333,7 @@
 
 .kpi-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 14px;
   margin: 17px 0;
 }
@@ -617,6 +617,71 @@ tbody tr:last-child td {
 .settings-layout {
   display: grid;
   gap: 17px;
+}
+
+.supplier-form-grid {
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+}
+
+.form-note {
+  margin: 0 0 14px;
+  color: #fbbf24;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.ledger-toolbar {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) auto auto;
+  gap: 10px;
+  align-items: end;
+  margin-bottom: 16px;
+}
+
+.supplier-detail {
+  display: grid;
+  gap: 18px;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+}
+
+.detail-item {
+  padding: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.09);
+  border-radius: 9px;
+  background: rgba(15, 23, 42, 0.35);
+}
+
+.detail-item span,
+.detail-item strong {
+  display: block;
+}
+
+.detail-item span {
+  color: #64748b;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+}
+
+.detail-item strong {
+  margin-top: 5px;
+  color: #e2e8f0;
+  font-size: 13px;
+}
+
+.supplier-payment-preview {
+  margin: 0 0 16px;
+}
+
+.balance-cell {
+  color: #f59e0b;
+  font-weight: 850;
 }
 
 .settings-add-grid {
@@ -1187,7 +1252,8 @@ tbody tr:last-child td {
   }
 
   .rate-toolbar,
-  .settings-add-grid {
+  .settings-add-grid,
+  .ledger-toolbar {
     grid-template-columns: 1fr 1fr;
   }
 }
@@ -1230,7 +1296,8 @@ tbody tr:last-child td {
   }
 
   .rate-toolbar,
-  .settings-add-grid {
+  .settings-add-grid,
+  .ledger-toolbar {
     grid-template-columns: 1fr;
   }
 }
