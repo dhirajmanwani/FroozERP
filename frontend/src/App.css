@@ -325,6 +325,10 @@
   gap: 9px;
 }
 
+.table-actions-row {
+  min-width: 250px;
+}
+
 .primary-button:hover,
 .quick-action:hover {
   background: #fbbf24;
@@ -1048,6 +1052,39 @@ tbody tr:last-child td {
   border-radius: 14px;
   background: #1e293b;
   box-shadow: 0 20px 70px rgba(2, 6, 23, 0.6);
+}
+
+.sale-edit-modal,
+.change-history-modal {
+  width: min(1040px, 100%);
+}
+
+.sale-edit-body {
+  display: grid;
+  gap: 16px;
+  padding: 0 16px 18px;
+}
+
+.sale-edit-add-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 360px);
+}
+
+.sale-edit-summary {
+  margin: 0;
+}
+
+.audit-json {
+  max-width: 300px;
+  max-height: 190px;
+  overflow: auto;
+  margin: 0;
+  padding: 10px;
+  border-radius: 8px;
+  color: #cbd5e1;
+  background: rgba(15, 23, 42, 0.62);
+  font-size: 11px;
+  white-space: pre-wrap;
 }
 
 .invoice-toolbar {

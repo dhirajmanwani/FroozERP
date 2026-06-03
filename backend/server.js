@@ -55,6 +55,7 @@ const SUPPLIER_PAYMENT_MODES = new Set(["CASH", "UPI", "BANK_TRANSFER", "CHEQUE"
 const DISCOUNT_TYPES = new Set(["FLAT_AMOUNT", "PERCENTAGE"]);
 const DISCOUNT_PAYMENT_MODES = new Set(["ALL", "CASH", "UPI", "CARD"]);
 const ROUNDING_RULES = new Set(["NEAREST_RUPEE", "ROUND_UP_5", "ROUND_UP_10", "NO_ROUND"]);
+const SALE_STATUSES = new Set(["COMPLETED", "EDITED", "CANCELLED"]);
 
 const cleanText = (value) => (typeof value === "string" ? value.trim() : "");
 const nullableText = (value) => cleanText(value) || null;
@@ -284,10 +285,30 @@ const initializeDatabase = async () => {
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS discount_rule_value NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS discount_rule_payment_mode VARCHAR(20);
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS tax_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS sale_status VARCHAR(20) DEFAULT 'COMPLETED';
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS edited_by INTEGER REFERENCES users(id);
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS edit_reason TEXT;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS cancelled_by INTEGER REFERENCES users(id);
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
+    UPDATE sales SET sale_status = 'COMPLETED' WHERE sale_status IS NULL;
 
     CREATE UNIQUE INDEX IF NOT EXISTS sales_invoice_no_unique_idx
       ON sales (invoice_no)
       WHERE invoice_no IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS sale_audit_trail (
+      id SERIAL PRIMARY KEY,
+      sale_id INTEGER NOT NULL REFERENCES sales(id),
+      action VARCHAR(30) NOT NULL,
+      field_name VARCHAR(80),
+      old_value JSONB,
+      new_value JSONB,
+      reason TEXT NOT NULL,
+      edited_by INTEGER REFERENCES users(id),
+      edited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
     CREATE TABLE IF NOT EXISTS sale_items (
       id SERIAL PRIMARY KEY,
@@ -310,6 +331,36 @@ const initializeDatabase = async () => {
       amount NUMERIC(14, 2) NOT NULL CHECK (amount > 0)
     );
 
+    CREATE TABLE IF NOT EXISTS customer_ledger (
+      id SERIAL PRIMARY KEY,
+      sale_id INTEGER REFERENCES sales(id),
+      customer_name VARCHAR(120),
+      customer_mobile VARCHAR(20),
+      transaction_type VARCHAR(30) NOT NULL,
+      debit_amount NUMERIC(14, 2) DEFAULT 0 CHECK (debit_amount >= 0),
+      credit_amount NUMERIC(14, 2) DEFAULT 0 CHECK (credit_amount >= 0),
+      balance_delta NUMERIC(14, 2) NOT NULL DEFAULT 0,
+      remarks TEXT,
+      created_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS sale_permission_settings (
+      role_name VARCHAR(80) PRIMARY KEY,
+      can_edit_sales BOOLEAN DEFAULT FALSE,
+      can_cancel_sales BOOLEAN DEFAULT FALSE,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    INSERT INTO sale_permission_settings (role_name, can_edit_sales, can_cancel_sales)
+    VALUES
+      ('Owner', TRUE, TRUE),
+      ('Admin', TRUE, TRUE),
+      ('Cashier', FALSE, FALSE),
+      ('Purchase Manager', FALSE, FALSE),
+      ('Inventory Manager', FALSE, FALSE)
+    ON CONFLICT (role_name) DO NOTHING;
+
     CREATE TABLE IF NOT EXISTS sale_batch_allocations (
       id SERIAL PRIMARY KEY,
       sale_item_id INTEGER NOT NULL REFERENCES sale_items(id) ON DELETE CASCADE,
@@ -331,6 +382,12 @@ const initializeDatabase = async () => {
 
     CREATE INDEX IF NOT EXISTS sale_payments_sale_id_idx
       ON sale_payments (sale_id);
+
+    CREATE INDEX IF NOT EXISTS sale_audit_trail_sale_id_idx
+      ON sale_audit_trail (sale_id, edited_at DESC, id DESC);
+
+    CREATE INDEX IF NOT EXISTS customer_ledger_mobile_idx
+      ON customer_ledger (customer_mobile, created_at, id);
 
     CREATE INDEX IF NOT EXISTS suppliers_name_search_idx
       ON suppliers (LOWER(supplier_name), LOWER(COALESCE(firm_name, '')));
@@ -619,6 +676,286 @@ const getMatchingDiscountRule = async (client, subtotal, paymentMode) => {
     [subtotal, paymentMode]
   );
   return result.rows[0] || null;
+};
+
+const getSalePermissionUser = async (userId, action, client = pool) => {
+  const parsedUserId = parsePositiveInteger(userId);
+  if (!parsedUserId || !["edit", "cancel"].includes(action)) return null;
+  const result = await client.query(
+    `
+    SELECT
+      u.id,
+      u.full_name,
+      r.role_name,
+      COALESCE(sp.can_edit_sales, r.role_name = 'Owner') AS can_edit_sales,
+      COALESCE(sp.can_cancel_sales, r.role_name = 'Owner') AS can_cancel_sales
+    FROM users u
+    JOIN roles r ON r.id = u.role_id
+    LEFT JOIN sale_permission_settings sp ON sp.role_name = r.role_name
+    WHERE u.id = $1 AND u.active = TRUE
+    `,
+    [parsedUserId]
+  );
+  const user = result.rows[0];
+  if (!user) return null;
+  if (user.role_name === "Owner") return user;
+  if (action === "edit" && user.can_edit_sales) return user;
+  if (action === "cancel" && user.can_cancel_sales) return user;
+  return null;
+};
+
+const getSaleSnapshot = async (client, saleId) => {
+  const saleResult = await client.query("SELECT * FROM sales WHERE id = $1", [saleId]);
+  const itemsResult = await client.query("SELECT * FROM sale_items WHERE sale_id = $1 ORDER BY id", [saleId]);
+  const paymentsResult = await client.query("SELECT * FROM sale_payments WHERE sale_id = $1 ORDER BY id", [saleId]);
+  const allocationsResult = await client.query(
+    `
+    SELECT sba.*, si.product_id
+    FROM sale_batch_allocations sba
+    JOIN sale_items si ON si.id = sba.sale_item_id
+    WHERE si.sale_id = $1
+    ORDER BY sba.id
+    `,
+    [saleId]
+  );
+  return {
+    sale: saleResult.rows[0] || null,
+    items: itemsResult.rows,
+    payments: paymentsResult.rows,
+    allocations: allocationsResult.rows,
+  };
+};
+
+const restoreSaleInventory = async (client, saleId, userId, reason, transactionType = "IN") => {
+  const allocationsResult = await client.query(
+    `
+    SELECT sba.inventory_batch_id, sba.quantity, si.product_id, s.invoice_no, s.branch_id
+    FROM sale_batch_allocations sba
+    JOIN sale_items si ON si.id = sba.sale_item_id
+    JOIN sales s ON s.id = si.sale_id
+    WHERE si.sale_id = $1
+    ORDER BY sba.id
+    FOR UPDATE
+    `,
+    [saleId]
+  );
+  for (const allocation of allocationsResult.rows) {
+    await client.query(
+      "UPDATE inventory_batches SET remaining_qty = remaining_qty + $1 WHERE id = $2",
+      [allocation.quantity, allocation.inventory_batch_id]
+    );
+    await client.query(
+      `
+      INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      `,
+      [
+        allocation.product_id,
+        allocation.quantity,
+        transactionType,
+        `${reason} ${allocation.invoice_no || `#${saleId}`}`,
+        userId,
+        allocation.branch_id,
+      ]
+    );
+  }
+};
+
+const insertCustomerLedgerEntry = async (client, sale, transactionType, amount, userId, remarks) => {
+  const ledgerAmount = roundCurrency(Math.abs(Number(amount || 0)));
+  if (!ledgerAmount && !sale.customer_mobile && !sale.customer_name) return;
+  const isCredit = ["SALE_EDIT_CREDIT", "SALE_CANCELLED"].includes(transactionType);
+  await client.query(
+    `
+    INSERT INTO customer_ledger (
+      sale_id, customer_name, customer_mobile, transaction_type,
+      debit_amount, credit_amount, balance_delta, remarks, created_by
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `,
+    [
+      sale.id,
+      sale.customer_name || null,
+      sale.customer_mobile || null,
+      transactionType,
+      isCredit ? 0 : ledgerAmount,
+      isCredit ? ledgerAmount : 0,
+      isCredit ? -ledgerAmount : ledgerAmount,
+      remarks,
+      userId,
+    ]
+  );
+};
+
+const buildSalePayload = async (client, { items, branchId, createdBy, customer, invoiceDiscount, payments, allowRateOverride }) => {
+  const parsedItems = (Array.isArray(items) ? items : []).map((item) => ({
+    productId: parsePositiveInteger(item.product_id),
+    quantity: parsePositiveNumber(item.quantity),
+    discountAmount: parseNonNegativeNumber(item.discount_amount),
+    requestedRate: parsePositiveNumber(item.selling_rate),
+  }));
+  const customerName = customer?.name?.trim() || null;
+  const customerMobile = customer?.mobile?.trim() || null;
+  const customerNotes = customer?.notes?.trim() || null;
+
+  if (
+    !branchId ||
+    parsedItems.length === 0 ||
+    parsedItems.some((item) => !item.productId || !item.quantity || item.discountAmount === null)
+  ) {
+    return { error: { status: 400, message: "Add valid products and quantities before checkout" } };
+  }
+  if (new Set(parsedItems.map((item) => item.productId)).size !== parsedItems.length) {
+    return { error: { status: 400, message: "Combine duplicate products into one cart item" } };
+  }
+  if (customerMobile && !/^\d{10,15}$/.test(customerMobile)) {
+    return { error: { status: 400, message: "Enter a valid customer mobile number" } };
+  }
+
+  const productIds = parsedItems.map((item) => item.productId);
+  const productResult = await client.query(
+    "SELECT id, product_name, selling_rate, unit FROM products WHERE id = ANY($1::int[]) AND active = TRUE ORDER BY id FOR SHARE",
+    [productIds]
+  );
+  if (productResult.rows.length !== parsedItems.length) {
+    return { error: { status: 404, message: "One or more products could not be found" } };
+  }
+
+  const productsById = new Map(productResult.rows.map((product) => [product.id, product]));
+  const invoiceItems = [];
+  let grossAmount = 0;
+  let itemDiscountAmount = 0;
+  let totalCost = 0;
+  for (const requestedItem of parsedItems) {
+    const product = productsById.get(requestedItem.productId);
+    const sellingRate = allowRateOverride && requestedItem.requestedRate
+      ? requestedItem.requestedRate
+      : Number(product.selling_rate);
+    if (!Number.isFinite(sellingRate) || sellingRate <= 0) {
+      return { error: { status: 400, message: `${product.product_name} does not have a valid selling rate` } };
+    }
+    if (!allowRateOverride && requestedItem.requestedRate && Number(requestedItem.requestedRate) !== Number(product.selling_rate)) {
+      return { error: { status: 403, message: "Only Owner can change selling rate on an edited invoice" } };
+    }
+
+    const itemGross = roundCurrency(requestedItem.quantity * sellingRate);
+    if (requestedItem.discountAmount > itemGross) {
+      return { error: { status: 400, message: `Discount cannot exceed the value of ${product.product_name}` } };
+    }
+
+    const batchesResult = await client.query(
+      `
+      SELECT id, remaining_qty, COALESCE(effective_cost_per_unit, purchase_rate) AS purchase_rate
+      FROM inventory_batches
+      WHERE product_id = $1
+        AND branch_id = $2
+        AND remaining_qty > 0
+      ORDER BY purchase_date, created_at, id
+      FOR UPDATE
+      `,
+      [requestedItem.productId, branchId]
+    );
+    const availableStock = batchesResult.rows.reduce((total, batch) => total + Number(batch.remaining_qty), 0);
+    if (availableStock < requestedItem.quantity) {
+      return {
+        error: {
+          status: 409,
+          message: `Insufficient stock for ${product.product_name}. Available quantity: ${availableStock}`,
+          product_id: requestedItem.productId,
+          available_stock: availableStock,
+        },
+      };
+    }
+
+    let quantityToDeduct = requestedItem.quantity;
+    let itemCost = 0;
+    const allocations = [];
+    for (const batch of batchesResult.rows) {
+      if (quantityToDeduct <= 0) break;
+      const deductedQuantity = Math.min(quantityToDeduct, Number(batch.remaining_qty));
+      const costAmount = roundCurrency(deductedQuantity * Number(batch.purchase_rate));
+      await client.query("UPDATE inventory_batches SET remaining_qty = remaining_qty - $1 WHERE id = $2", [deductedQuantity, batch.id]);
+      allocations.push({
+        inventoryBatchId: batch.id,
+        quantity: deductedQuantity,
+        purchaseRate: Number(batch.purchase_rate),
+        costAmount,
+      });
+      quantityToDeduct -= deductedQuantity;
+      itemCost += costAmount;
+    }
+
+    invoiceItems.push({
+      ...requestedItem,
+      product,
+      sellingRate,
+      grossAmount: itemGross,
+      netAmount: roundCurrency(itemGross - requestedItem.discountAmount),
+      costAmount: roundCurrency(itemCost),
+      allocations,
+    });
+    grossAmount += itemGross;
+    itemDiscountAmount += requestedItem.discountAmount;
+    totalCost += itemCost;
+  }
+
+  grossAmount = roundCurrency(grossAmount);
+  itemDiscountAmount = roundCurrency(itemDiscountAmount);
+  totalCost = roundCurrency(totalCost);
+  const subtotalAfterItemDiscounts = roundCurrency(grossAmount - itemDiscountAmount);
+  const requestedPaymentsInput = Array.isArray(payments) && payments.length > 0 ? payments : null;
+  const allowedPaymentModes = new Set(["CASH", "UPI", "CARD"]);
+  const paymentModes = requestedPaymentsInput
+    ? requestedPaymentsInput.map((payment) => String(payment.mode || "").toUpperCase())
+    : ["CASH"];
+  if (paymentModes.some((mode) => !allowedPaymentModes.has(mode))) {
+    return { error: { status: 400, message: "Select a valid payment mode" } };
+  }
+  const paymentMode = paymentModes.length > 1 ? "MIXED" : paymentModes[0];
+  const discountRule = await getMatchingDiscountRule(client, subtotalAfterItemDiscounts, paymentMode);
+  const parsedInvoiceDiscount = parseNonNegativeNumber(invoiceDiscount);
+  if (parsedInvoiceDiscount === null) return { error: { status: 400, message: "Enter a valid invoice discount" } };
+  const invoiceDiscountAmount = discountRule
+    ? calculateInvoiceDiscount(discountRule, subtotalAfterItemDiscounts)
+    : parsedInvoiceDiscount;
+  if (invoiceDiscountAmount > subtotalAfterItemDiscounts) {
+    return { error: { status: 400, message: "Invoice discount cannot exceed the cart subtotal" } };
+  }
+
+  const taxAmount = 0;
+  const totalAmount = roundCurrency(subtotalAfterItemDiscounts - invoiceDiscountAmount + taxAmount);
+  const profit = roundCurrency(totalAmount - totalCost);
+  const requestedPayments = requestedPaymentsInput || [{ mode: "CASH", amount: totalAmount }];
+  const parsedPayments = requestedPayments.map((payment) => ({
+    mode: String(payment.mode || "").toUpperCase(),
+    amount: parsePositiveNumber(payment.amount),
+  }));
+  const paidAmount = roundCurrency(parsedPayments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0));
+  if (
+    parsedPayments.some((payment) => !allowedPaymentModes.has(payment.mode) || !payment.amount) ||
+    Math.abs(paidAmount - totalAmount) > 0.01
+  ) {
+    return { error: { status: 400, message: "Payment amounts must match the invoice total" } };
+  }
+
+  return {
+    invoiceItems,
+    payments: parsedPayments,
+    customerName,
+    customerMobile,
+    customerNotes,
+    paymentMode,
+    grossAmount,
+    itemDiscountAmount,
+    invoiceDiscountAmount,
+    taxAmount,
+    totalAmount,
+    totalCost,
+    profit,
+    discountRule,
+    createdBy,
+    branchId,
+  };
 };
 
 app.get("/purchase-rules", async (req, res) => {
@@ -1489,8 +1826,8 @@ app.get("/dashboard-metrics", async (req, res) => {
         ) pay ON pay.supplier_id = s.id
       )
       SELECT
-        COALESCE((SELECT SUM(total_amount) FROM sales WHERE sale_date = CURRENT_DATE), 0) AS "todaySales",
-        COALESCE((SELECT SUM(profit) FROM sales WHERE sale_date = CURRENT_DATE), 0) AS "todayProfit",
+        COALESCE((SELECT SUM(total_amount) FROM sales WHERE sale_date = CURRENT_DATE AND sale_status <> 'CANCELLED'), 0) AS "todaySales",
+        COALESCE((SELECT SUM(profit) FROM sales WHERE sale_date = CURRENT_DATE AND sale_status <> 'CANCELLED'), 0) AS "todayProfit",
         COALESCE((
           SELECT SUM(remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate))
           FROM inventory_batches
@@ -1509,7 +1846,7 @@ app.get("/dashboard-metrics", async (req, res) => {
           ) stock
           WHERE stock.current_stock <= stock.minimum_stock
         ), 0) AS "lowStockItems",
-        COALESCE((SELECT COUNT(*) FROM sales WHERE sale_date = CURRENT_DATE), 0) AS "transactions",
+        COALESCE((SELECT COUNT(*) FROM sales WHERE sale_date = CURRENT_DATE AND sale_status <> 'CANCELLED'), 0) AS "transactions",
         COALESCE((SELECT ROUND(SUM(outstanding_balance)::NUMERIC, 2) FROM supplier_balances), 0) AS "supplierOutstanding",
         COALESCE((SELECT SUM(rebate_amount) FROM purchases), 0)
           + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments), 0) AS "totalRebateReceived",
@@ -2242,6 +2579,15 @@ app.post("/sales", async (req, res) => {
       );
     }
 
+    await insertCustomerLedgerEntry(
+      client,
+      { ...sale, customer_name: customerName, customer_mobile: customerMobile },
+      "SALE",
+      totalAmount,
+      parsedCreatedBy,
+      `Invoice ${invoiceNo}`
+    );
+
     await client.query("COMMIT");
     return res.status(201).json({
       success: true,
@@ -2283,6 +2629,11 @@ app.get("/sales", async (req, res) => {
         s.customer_name,
         s.customer_mobile,
         s.payment_mode,
+        s.sale_status,
+        s.cancelled_at,
+        s.cancellation_reason,
+        s.edited_at,
+        s.edit_reason,
         s.gross_amount,
         s.item_discount_amount,
         s.invoice_discount_amount,
@@ -2296,10 +2647,13 @@ app.get("/sales", async (req, res) => {
         s.total_cost AS cost_amount,
         s.profit,
         COUNT(si.id)::INTEGER AS item_count,
-        STRING_AGG(p.product_name || ' x ' || TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM si.quantity::TEXT)), ', ' ORDER BY si.id) AS item_summary
+        COALESCE(
+          STRING_AGG(p.product_name || ' x ' || TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM si.quantity::TEXT)), ', ' ORDER BY si.id),
+          'No active items'
+        ) AS item_summary
       FROM sales s
-      JOIN sale_items si ON si.sale_id = s.id
-      JOIN products p ON p.id = si.product_id
+      LEFT JOIN sale_items si ON si.sale_id = s.id
+      LEFT JOIN products p ON p.id = si.product_id
       GROUP BY s.id
       ORDER BY s.created_at DESC, s.id DESC
     `);
@@ -2308,6 +2662,283 @@ app.get("/sales", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Sales History" });
+  }
+});
+
+app.get("/sales-report/changes", async (req, res) => {
+  try {
+    const [editedResult, cancelledResult, totalsResult] = await Promise.all([
+      pool.query(
+        `
+        SELECT
+          s.id, s.invoice_no, s.sale_date, s.total_amount, s.edited_at, s.edit_reason,
+          u.full_name AS edited_by_name, s.customer_name, s.customer_mobile
+        FROM sales s
+        LEFT JOIN users u ON u.id = s.edited_by
+        WHERE s.sale_status = 'EDITED'
+        ORDER BY s.edited_at DESC NULLS LAST, s.id DESC
+        `
+      ),
+      pool.query(
+        `
+        SELECT
+          s.id, s.invoice_no, s.sale_date, s.total_amount, s.cancelled_at, s.cancellation_reason,
+          u.full_name AS cancelled_by_name, s.customer_name, s.customer_mobile
+        FROM sales s
+        LEFT JOIN users u ON u.id = s.cancelled_by
+        WHERE s.sale_status = 'CANCELLED'
+        ORDER BY s.cancelled_at DESC NULLS LAST, s.id DESC
+        `
+      ),
+      pool.query("SELECT COALESCE(SUM(total_amount), 0) AS total_cancelled_amount FROM sales WHERE sale_status = 'CANCELLED'"),
+    ]);
+    return res.json({
+      editedBills: editedResult.rows,
+      cancelledBills: cancelledResult.rows,
+      totalCancelledAmount: Number(totalsResult.rows[0]?.total_cancelled_amount || 0),
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Sale Change Report" });
+  }
+});
+
+app.get("/sales/:id/audit", async (req, res) => {
+  try {
+    const saleId = parsePositiveInteger(req.params.id);
+    if (!saleId) return res.status(400).json({ message: "Invalid invoice" });
+    const result = await pool.query(
+      `
+      SELECT sat.*, u.full_name AS edited_by_name
+      FROM sale_audit_trail sat
+      LEFT JOIN users u ON u.id = sat.edited_by
+      WHERE sat.sale_id = $1
+      ORDER BY sat.edited_at DESC, sat.id DESC
+      `,
+      [saleId]
+    );
+    return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Sale Change History" });
+  }
+});
+
+app.put("/sales/:id", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const saleId = parsePositiveInteger(req.params.id);
+    const reason = cleanText(req.body.reason);
+    const editor = await getSalePermissionUser(req.body.edited_by, "edit", client);
+    if (!saleId) return res.status(400).json({ message: "Invalid invoice" });
+    if (!reason) return res.status(400).json({ message: "Edit reason is required" });
+    if (!editor) return res.status(403).json({ message: "You do not have permission to edit completed sales" });
+
+    await client.query("BEGIN");
+    const saleLockResult = await client.query("SELECT * FROM sales WHERE id = $1 FOR UPDATE", [saleId]);
+    const currentSale = saleLockResult.rows[0];
+    if (!currentSale) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Invoice not found" });
+    }
+    if (currentSale.sale_status === "CANCELLED") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Cancelled invoices cannot be edited" });
+    }
+
+    const oldSnapshot = await getSaleSnapshot(client, saleId);
+    await restoreSaleInventory(client, saleId, editor.id, "Edit reversal for invoice", "IN");
+    await client.query("DELETE FROM sale_batch_allocations WHERE sale_item_id IN (SELECT id FROM sale_items WHERE sale_id = $1)", [saleId]);
+    await client.query("DELETE FROM sale_items WHERE sale_id = $1", [saleId]);
+    await client.query("DELETE FROM sale_payments WHERE sale_id = $1", [saleId]);
+
+    const salePayload = await buildSalePayload(client, {
+      items: req.body.items,
+      branchId: parsePositiveInteger(req.body.branch_id) || currentSale.branch_id,
+      createdBy: editor.id,
+      customer: req.body.customer,
+      invoiceDiscount: req.body.invoice_discount,
+      payments: req.body.payments,
+      allowRateOverride: editor.role_name === "Owner",
+    });
+    if (salePayload.error) {
+      await client.query("ROLLBACK");
+      return res.status(salePayload.error.status).json(salePayload.error);
+    }
+
+    const updateResult = await client.query(
+      `
+      UPDATE sales
+      SET
+        total_amount = $1,
+        total_cost = $2,
+        profit = $3,
+        branch_id = $4,
+        customer_name = $5,
+        customer_mobile = $6,
+        customer_notes = $7,
+        payment_mode = $8,
+        gross_amount = $9,
+        item_discount_amount = $10,
+        invoice_discount_amount = $11,
+        tax_amount = $12,
+        discount_rule_id = $13,
+        discount_rule_name = $14,
+        discount_rule_type = $15,
+        discount_rule_value = $16,
+        discount_rule_payment_mode = $17,
+        sale_status = 'EDITED',
+        edited_by = $18,
+        edited_at = CURRENT_TIMESTAMP,
+        edit_reason = $19
+      WHERE id = $20
+      RETURNING *
+      `,
+      [
+        salePayload.totalAmount, salePayload.totalCost, salePayload.profit, salePayload.branchId,
+        salePayload.customerName, salePayload.customerMobile, salePayload.customerNotes, salePayload.paymentMode,
+        salePayload.grossAmount, salePayload.itemDiscountAmount, salePayload.invoiceDiscountAmount, salePayload.taxAmount,
+        salePayload.discountRule?.id || null, salePayload.discountRule?.rule_name || null,
+        salePayload.discountRule?.discount_type || null, salePayload.discountRule?.discount_value || 0,
+        salePayload.discountRule?.payment_mode || null, editor.id, reason, saleId,
+      ]
+    );
+    const updatedSale = updateResult.rows[0];
+
+    for (const item of salePayload.invoiceItems) {
+      const invoiceDiscountShare = salePayload.grossAmount - salePayload.itemDiscountAmount === 0
+        ? 0
+        : roundCurrency(salePayload.invoiceDiscountAmount * (item.netAmount / (salePayload.grossAmount - salePayload.itemDiscountAmount)));
+      const itemProfit = roundCurrency(item.netAmount - invoiceDiscountShare - item.costAmount);
+      const saleItemResult = await client.query(
+        `
+        INSERT INTO sale_items (
+          sale_id, product_id, quantity, selling_rate, amount, discount_amount, net_amount, cost_amount, profit
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING id
+        `,
+        [
+          saleId, item.productId, item.quantity, item.sellingRate, item.grossAmount,
+          item.discountAmount, item.netAmount, item.costAmount, itemProfit,
+        ]
+      );
+      const saleItemId = saleItemResult.rows[0].id;
+      for (const allocation of item.allocations) {
+        await client.query(
+          `
+          INSERT INTO sale_batch_allocations (
+            sale_item_id, inventory_batch_id, quantity, purchase_rate, cost_amount
+          )
+          VALUES ($1, $2, $3, $4, $5)
+          `,
+          [saleItemId, allocation.inventoryBatchId, allocation.quantity, allocation.purchaseRate, allocation.costAmount]
+        );
+      }
+      await client.query(
+        `
+        INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id)
+        VALUES ($1, $2, 'OUT', $3, $4, $5)
+        `,
+        [item.productId, item.quantity, `Edited invoice ${updatedSale.invoice_no}`, editor.id, salePayload.branchId]
+      );
+    }
+
+    for (const payment of salePayload.payments) {
+      await client.query("INSERT INTO sale_payments (sale_id, payment_mode, amount) VALUES ($1, $2, $3)", [saleId, payment.mode, payment.amount]);
+    }
+
+    await client.query(
+      `
+      INSERT INTO sale_audit_trail (sale_id, action, field_name, old_value, new_value, reason, edited_by)
+      VALUES ($1, 'EDIT', 'invoice', $2::jsonb, $3::jsonb, $4, $5)
+      `,
+      [saleId, JSON.stringify(oldSnapshot), JSON.stringify(await getSaleSnapshot(client, saleId)), reason, editor.id]
+    );
+
+    const delta = roundCurrency(salePayload.totalAmount - Number(currentSale.total_amount || 0));
+    if (delta !== 0 || salePayload.customerMobile || salePayload.customerName) {
+      await insertCustomerLedgerEntry(
+        client,
+        updatedSale,
+        delta >= 0 ? "SALE_EDIT_DEBIT" : "SALE_EDIT_CREDIT",
+        delta,
+        editor.id,
+        `Invoice ${updatedSale.invoice_no} edited: ${reason}`
+      );
+    }
+
+    await client.query("COMMIT");
+    return res.json({ success: true, message: "Invoice Updated", sale: updatedSale });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Sale Edit Error" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/sales/:id/cancel", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const saleId = parsePositiveInteger(req.params.id);
+    const reason = cleanText(req.body.reason);
+    const canceller = await getSalePermissionUser(req.body.cancelled_by, "cancel", client);
+    if (!saleId) return res.status(400).json({ message: "Invalid invoice" });
+    if (!reason) return res.status(400).json({ message: "Cancellation reason is required" });
+    if (!canceller) return res.status(403).json({ message: "You do not have permission to cancel completed sales" });
+
+    await client.query("BEGIN");
+    const saleLockResult = await client.query("SELECT * FROM sales WHERE id = $1 FOR UPDATE", [saleId]);
+    const currentSale = saleLockResult.rows[0];
+    if (!currentSale) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Invoice not found" });
+    }
+    if (currentSale.sale_status === "CANCELLED") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Invoice is already cancelled" });
+    }
+    const oldSnapshot = await getSaleSnapshot(client, saleId);
+    await restoreSaleInventory(client, saleId, canceller.id, "Cancellation reversal for invoice", "IN");
+    await client.query("DELETE FROM sale_batch_allocations WHERE sale_item_id IN (SELECT id FROM sale_items WHERE sale_id = $1)", [saleId]);
+    const updateResult = await client.query(
+      `
+      UPDATE sales
+      SET sale_status = 'CANCELLED',
+          cancelled_by = $1,
+          cancelled_at = CURRENT_TIMESTAMP,
+          cancellation_reason = $2
+      WHERE id = $3
+      RETURNING *
+      `,
+      [canceller.id, reason, saleId]
+    );
+    const cancelledSale = updateResult.rows[0];
+    await client.query(
+      `
+      INSERT INTO sale_audit_trail (sale_id, action, field_name, old_value, new_value, reason, edited_by)
+      VALUES ($1, 'CANCEL', 'invoice', $2::jsonb, $3::jsonb, $4, $5)
+      `,
+      [saleId, JSON.stringify(oldSnapshot), JSON.stringify(await getSaleSnapshot(client, saleId)), reason, canceller.id]
+    );
+    await insertCustomerLedgerEntry(
+      client,
+      cancelledSale,
+      "SALE_CANCELLED",
+      Number(currentSale.total_amount || 0),
+      canceller.id,
+      `Invoice ${cancelledSale.invoice_no} cancelled: ${reason}`
+    );
+    await client.query("COMMIT");
+    return res.json({ success: true, message: "Invoice Cancelled", sale: cancelledSale });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Sale Cancellation Error" });
+  } finally {
+    client.release();
   }
 });
 

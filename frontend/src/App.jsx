@@ -252,6 +252,8 @@ function App() {
   const [purchaseRebateRuleId, setPurchaseRebateRuleId] = useState("");
   const [purchasePaymentDate, setPurchasePaymentDate] = useState("");
   const [selectedInvoice, setSelectedInvoice] = useState(null);
+  const [editingSale, setEditingSale] = useState(null);
+  const [changeHistory, setChangeHistory] = useState(null);
 
   const kpis = useMemo(() => {
     const today = toDateKey(new Date());
@@ -406,6 +408,11 @@ function App() {
     setSupplierLedger(response.data);
   };
 
+  const loadSalesHistory = async () => {
+    const response = await axios.get(`${API_URL}/sales`);
+    setSalesHistory(response.data);
+  };
+
   const loadDashboardData = async () => {
     const [inventoryResponse, salesResponse, supplierMetricsResponse] = await Promise.all([
       axios.get(`${API_URL}/inventory`),
@@ -504,6 +511,36 @@ function App() {
     }
   };
 
+  const loadSaleForEdit = async (saleId) => {
+    try {
+      const response = await axios.get(`${API_URL}/sales/${saleId}`);
+      setEditingSale(response.data);
+    } catch (error) {
+      alert(getErrorMessage(error, "Error Loading Invoice"));
+    }
+  };
+
+  const loadChangeHistory = async (saleId) => {
+    try {
+      const response = await axios.get(`${API_URL}/sales/${saleId}/audit`);
+      setChangeHistory({ saleId, rows: response.data });
+    } catch (error) {
+      alert(getErrorMessage(error, "Error Loading Change History"));
+    }
+  };
+
+  const cancelSale = async (sale) => {
+    const reason = window.prompt(`Enter cancellation reason for ${sale.invoice_no || `#${sale.id}`}`);
+    if (!reason?.trim()) return;
+    try {
+      await axios.post(`${API_URL}/sales/${sale.id}/cancel`, { reason, cancelled_by: user.id });
+      await Promise.all([loadSalesHistory(), loadDashboardData()]);
+      alert("Invoice cancelled");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to cancel invoice"));
+    }
+  };
+
   const selectPurchaseProduct = (event) => {
     const productId = event.target.value;
     setPurchaseProductId(productId);
@@ -543,8 +580,7 @@ function App() {
         setInventory(response.data);
       }
       if (view === "sales-history") {
-        const response = await axios.get(`${API_URL}/sales`);
-        setSalesHistory(response.data);
+        await loadSalesHistory();
       }
       if (view === "sales") await loadDiscountRules();
       if (["purchase", "account-manager", "supplier-payments", "supplier-ledger"].includes(view)) {
@@ -593,6 +629,7 @@ function App() {
 
   const activeLabel = navigationItems.find(([view]) => view === activeView)?.[1];
   const canManageRates = ["Owner", "Admin"].includes(user.role);
+  const canEditSales = ["Owner", "Admin"].includes(user.role);
 
   return (
     <main className="erp-shell">
@@ -848,11 +885,12 @@ function App() {
 
           {activeView === "sales-history" && (
             <ModuleCard eyebrow="Revenue" title="Sales History" subtitle="Review completed sales, costs, and realized profit.">
-              <DataTable headers={["Invoice", "Date", "Customer", "Items", "Payment", "Gross", "Discount", "Net Amount", "Cost", "Profit", ""]}>
+              <DataTable headers={["Invoice", "Date", "Status", "Customer", "Items", "Payment", "Gross", "Discount", "Net Amount", "Cost", "Profit", "Actions"]}>
                 {salesHistory.map((sale) => (
                   <tr key={sale.id}>
                     <td><span className="batch-id">{sale.invoice_no || `#${sale.id}`}</span></td>
                     <td>{sale.sale_date}</td>
+                    <td><span className={sale.sale_status === "CANCELLED" ? "stock-low" : sale.sale_status === "EDITED" ? "origin-rate" : "stock-ok"}>{sale.sale_status || "COMPLETED"}</span></td>
                     <td>{sale.customer_name || "Walk-in Customer"}</td>
                     <td className="primary-cell">{sale.item_summary}</td>
                     <td><span className="tag">{sale.payment_mode}</span></td>
@@ -861,7 +899,14 @@ function App() {
                     <td>{currency.format(Number(sale.amount))}</td>
                     <td>{currency.format(Number(sale.cost_amount))}</td>
                     <td className="profit-cell">{currency.format(Number(sale.profit))}</td>
-                    <td><button className="table-action" onClick={() => loadInvoice(sale.id)}>View</button></td>
+                    <td>
+                      <div className="button-row table-actions-row">
+                        <button className="table-action" onClick={() => loadInvoice(sale.id)}>View</button>
+                        <button className="table-action" disabled={!canEditSales || sale.sale_status === "CANCELLED"} onClick={() => loadSaleForEdit(sale.id)}>Edit</button>
+                        <button className="remove-button" disabled={!canEditSales || sale.sale_status === "CANCELLED"} onClick={() => cancelSale(sale)}>Cancel</button>
+                        <button className="secondary-button" onClick={() => loadChangeHistory(sale.id)}>History</button>
+                      </div>
+                    </td>
                   </tr>
                 ))}
               </DataTable>
@@ -902,6 +947,19 @@ function App() {
         </div>
       </section>
       {selectedInvoice && <InvoiceModal invoice={selectedInvoice} onClose={() => setSelectedInvoice(null)} />}
+      {editingSale && (
+        <SaleEditModal
+          invoice={editingSale}
+          onClose={() => setEditingSale(null)}
+          onSaved={async () => {
+            setEditingSale(null);
+            await Promise.all([loadSalesHistory(), loadDashboardData()]);
+          }}
+          products={products.filter((product) => product.active !== false)}
+          user={user}
+        />
+      )}
+      {changeHistory && <ChangeHistoryModal history={changeHistory} onClose={() => setChangeHistory(null)} />}
     </main>
   );
 }
@@ -1934,6 +1992,177 @@ function TotalLine({ label, muted, total, value }) {
   return <div className={`${total ? "total-line total-line-main" : "total-line"} ${muted ? "total-line-muted" : ""}`}><span>{label}</span><strong>{currency.format(value)}</strong></div>;
 }
 
+function SaleEditModal({ invoice, onClose, onSaved, products, user }) {
+  const [items, setItems] = useState(() => (invoice.items || []).map((item) => ({
+    product_id: item.product_id,
+    product_name: item.product_name,
+    unit: item.unit,
+    quantity: item.quantity,
+    selling_rate: item.selling_rate,
+    discount_amount: item.discount_amount || 0,
+  })));
+  const [customer, setCustomer] = useState({
+    name: invoice.customer_name || "",
+    mobile: invoice.customer_mobile || "",
+    notes: invoice.customer_notes || "",
+  });
+  const [paymentMode, setPaymentMode] = useState(invoice.payment_mode === "MIXED" ? "CASH" : invoice.payment_mode || "CASH");
+  const [invoiceDiscount, setInvoiceDiscount] = useState(invoice.invoice_discount_amount || 0);
+  const [reason, setReason] = useState("");
+  const [saving, setSaving] = useState(false);
+  const canChangeRate = user.role === "Owner";
+  const selectedIds = new Set(items.map((item) => Number(item.product_id)));
+  const availableProducts = products.filter((product) => !selectedIds.has(Number(product.id)));
+  const gross = items.reduce((sum, item) => sum + Number(item.quantity || 0) * Number(item.selling_rate || 0), 0);
+  const itemDiscount = items.reduce((sum, item) => sum + Number(item.discount_amount || 0), 0);
+  const netPayable = Math.max(gross - itemDiscount - Number(invoiceDiscount || 0), 0);
+
+  const updateItem = (index, field, value) => {
+    setItems((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, [field]: value } : item));
+  };
+  const addItem = (productId) => {
+    const product = products.find((item) => String(item.id) === String(productId));
+    if (!product) return;
+    setItems((current) => [...current, {
+      product_id: product.id,
+      product_name: product.product_name,
+      unit: product.unit,
+      quantity: 1,
+      selling_rate: product.selling_rate,
+      discount_amount: 0,
+    }]);
+  };
+  const removeItem = (index) => setItems((current) => current.filter((_, itemIndex) => itemIndex !== index));
+  const save = async () => {
+    if (saving) return;
+    if (!reason.trim()) {
+      alert("Edit reason is required.");
+      return;
+    }
+    if (items.length === 0) {
+      alert("Invoice must contain at least one item.");
+      return;
+    }
+    if (customer.mobile && !/^\d{10,15}$/.test(customer.mobile)) {
+      alert("Enter a valid customer mobile number.");
+      return;
+    }
+    setSaving(true);
+    try {
+      await axios.put(`${API_URL}/sales/${invoice.id}`, {
+        items: items.map((item) => ({
+          product_id: Number(item.product_id),
+          quantity: Number(item.quantity),
+          selling_rate: Number(item.selling_rate),
+          discount_amount: Number(item.discount_amount || 0),
+        })),
+        customer,
+        invoice_discount: Number(invoiceDiscount || 0),
+        payments: [{ mode: paymentMode, amount: netPayable }],
+        branch_id: invoice.branch_id || user.branch_id,
+        edited_by: user.id,
+        reason,
+      });
+      await onSaved();
+      alert("Invoice updated");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update invoice"));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop">
+      <section className="invoice-modal sale-edit-modal">
+        <div className="invoice-toolbar">
+          <div>
+            <span className="eyebrow">Edit Completed Sale</span>
+            <strong>{invoice.invoice_no}</strong>
+          </div>
+          <div className="invoice-actions">
+            <button className="primary-button" disabled={saving} onClick={save}>{saving ? "Saving..." : "Save Edit"}</button>
+            <button aria-label="Close editor" className="remove-button" onClick={onClose}><Icon name="close" /></button>
+          </div>
+        </div>
+        <div className="sale-edit-body">
+          <div className="form-grid supplier-form-grid">
+            <Field label="Customer Name"><input value={customer.name} onChange={(event) => setCustomer({ ...customer, name: event.target.value })} /></Field>
+            <Field label="Mobile Number"><input inputMode="numeric" value={customer.mobile} onChange={(event) => setCustomer({ ...customer, mobile: event.target.value.replace(/\D/g, "") })} /></Field>
+            <Field label="Payment Mode">
+              <select value={paymentMode} onChange={(event) => setPaymentMode(event.target.value)}>
+                <option value="CASH">Cash</option>
+                <option value="UPI">UPI</option>
+                <option value="CARD">Card</option>
+              </select>
+            </Field>
+            <Field label="Bill Discount"><input min="0" step="0.01" type="number" value={invoiceDiscount} onChange={(event) => setInvoiceDiscount(event.target.value)} /></Field>
+            <Field label="Customer Notes"><textarea value={customer.notes} onChange={(event) => setCustomer({ ...customer, notes: event.target.value })} /></Field>
+            <Field label="Edit Reason"><textarea value={reason} onChange={(event) => setReason(event.target.value)} /></Field>
+          </div>
+          <div className="sale-edit-add-row">
+            <select defaultValue="" onChange={(event) => { addItem(event.target.value); event.target.value = ""; }}>
+              <option value="">Add item</option>
+              {availableProducts.map((product) => <option key={product.id} value={product.id}>{product.product_name}</option>)}
+            </select>
+          </div>
+          <DataTable headers={["Product", "Qty", "Rate", "Discount", "Net", ""]}>
+            {items.map((item, index) => (
+              <tr key={`${item.product_id}-${index}`}>
+                <td className="primary-cell">{item.product_name}<small className="cell-note">{item.unit}</small></td>
+                <td><input className="table-input" min="0.001" step="0.001" type="number" value={item.quantity} onChange={(event) => updateItem(index, "quantity", event.target.value)} /></td>
+                <td><input className="settings-table-input" disabled={!canChangeRate} min="0.01" step="0.01" type="number" value={item.selling_rate} onChange={(event) => updateItem(index, "selling_rate", event.target.value)} /></td>
+                <td><input className="table-input" min="0" step="0.01" type="number" value={item.discount_amount} onChange={(event) => updateItem(index, "discount_amount", event.target.value)} /></td>
+                <td>{currency.format(Number(item.quantity || 0) * Number(item.selling_rate || 0) - Number(item.discount_amount || 0))}</td>
+                <td><button className="remove-button" onClick={() => removeItem(index)}><Icon name="trash" size={15} /></button></td>
+              </tr>
+            ))}
+          </DataTable>
+          <section className="purchase-summary sale-edit-summary">
+            <div className="purchase-summary-grid">
+              <SummaryMetric label="Gross Total" value={currency.format(gross)} />
+              <SummaryMetric label="Item Discount" value={currency.format(itemDiscount)} />
+              <SummaryMetric label="Bill Discount" value={currency.format(Number(invoiceDiscount || 0))} />
+              <SummaryMetric label="Net Payable" value={currency.format(netPayable)} featured />
+            </div>
+          </section>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ChangeHistoryModal({ history, onClose }) {
+  return (
+    <div className="modal-backdrop">
+      <section className="invoice-modal change-history-modal">
+        <div className="invoice-toolbar">
+          <div>
+            <span className="eyebrow">Sale Audit Trail</span>
+            <strong>Invoice #{history.saleId}</strong>
+          </div>
+          <button aria-label="Close history" className="remove-button" onClick={onClose}><Icon name="close" /></button>
+        </div>
+        <div className="sale-edit-body">
+          <DataTable headers={["Action", "Edited At", "Edited By", "Reason", "Old Value", "New Value"]}>
+            {history.rows.map((row) => (
+              <tr key={row.id}>
+                <td><span className="tag">{row.action}</span></td>
+                <td>{new Date(row.edited_at).toLocaleString("en-IN")}</td>
+                <td>{row.edited_by_name || "-"}</td>
+                <td>{row.reason}</td>
+                <td><pre className="audit-json">{JSON.stringify(row.old_value, null, 2)}</pre></td>
+                <td><pre className="audit-json">{JSON.stringify(row.new_value, null, 2)}</pre></td>
+              </tr>
+            ))}
+          </DataTable>
+          {history.rows.length === 0 && <div className="cart-empty">No changes recorded for this invoice.</div>}
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function InvoiceModal({ invoice, onClose }) {
   const sendWhatsApp = () => {
     if (!invoice.customer_mobile) {
@@ -1977,6 +2206,7 @@ function InvoiceModal({ invoice, onClose }) {
           <section className="invoice-customer">
             <div><small>Billed To</small><strong>{invoice.customer_name || "Walk-in Customer"}</strong><span>{invoice.customer_mobile || "No mobile number"}</span></div>
             <div><small>Payment</small><strong>{invoice.payment_mode}</strong><span>{invoice.branch_name || "SRT Retail Store"}</span></div>
+            <div><small>Status</small><strong>{invoice.sale_status || "COMPLETED"}</strong><span>{invoice.cancellation_reason || invoice.edit_reason || "No changes recorded"}</span></div>
           </section>
           <table className="invoice-table">
             <thead><tr><th>Item</th><th>Qty</th><th>Rate</th><th>Discount</th><th>Amount</th></tr></thead>
