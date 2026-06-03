@@ -79,6 +79,39 @@ const discountTypes = [
   ["PERCENTAGE", "Percentage"],
 ];
 
+const dashboardRanges = [
+  ["7", "Last 7 Days"],
+  ["15", "Last 15 Days"],
+  ["30", "Last 30 Days"],
+  ["custom", "Custom Range"],
+];
+
+const emptyDashboardAnalytics = {
+  dateFrom: "",
+  dateTo: "",
+  days: 7,
+  summary: {
+    todaySales: 0,
+    todayProfit: 0,
+    stockValue: 0,
+    lowStockItems: 0,
+    transactions: 0,
+    supplierOutstanding: 0,
+    customerOutstanding: 0,
+    todayExpenses: 0,
+    totalRebateReceived: 0,
+    todaySupplierPayments: 0,
+  },
+  salesTrend: [],
+  profitTrend: [],
+  expenseTrend: [],
+  netProfitTrend: [],
+  purchaseSalesComparison: [],
+  topSellingProducts: [],
+  lowStockItems: [],
+  insights: [],
+};
+
 const discountPaymentModes = [
   ["ALL", "All"],
   ["CASH", "Cash"],
@@ -215,6 +248,12 @@ function App() {
     discountReport: [],
   });
   const [expenses, setExpenses] = useState([]);
+  const [dashboardRange, setDashboardRange] = useState("7");
+  const [dashboardCustomRange, setDashboardCustomRange] = useState({
+    date_from: toDateKey(new Date()),
+    date_to: toDateKey(new Date()),
+  });
+  const [dashboardAnalytics, setDashboardAnalytics] = useState(emptyDashboardAnalytics);
   const [supplierDashboard, setSupplierDashboard] = useState({
     todaySales: 0,
     todayProfit: 0,
@@ -222,6 +261,8 @@ function App() {
     lowStockItems: 0,
     transactions: 0,
     supplierOutstanding: 0,
+    customerOutstanding: 0,
+    todayExpenses: 0,
     totalRebateReceived: 0,
     todaySupplierPayments: 0,
     total_supplier_outstanding: 0,
@@ -269,6 +310,7 @@ function App() {
       return stock;
     }, new Map());
     const lowStockItems = [...stockByProduct.values()].filter((quantity) => quantity <= 5).length;
+    const analyticsSummary = dashboardAnalytics.summary || {};
     const metrics = {
       todaySales: supplierDashboard.todaySales ?? total(todaysSales, "amount"),
       todayProfit: supplierDashboard.todayProfit ?? total(todaysSales, "profit"),
@@ -276,6 +318,8 @@ function App() {
       lowStockItems: supplierDashboard.lowStockItems ?? lowStockItems,
       transactions: supplierDashboard.transactions ?? todaysSales.length,
       supplierOutstanding: supplierDashboard.supplierOutstanding ?? supplierDashboard.total_supplier_outstanding ?? 0,
+      customerOutstanding: analyticsSummary.customerOutstanding ?? supplierDashboard.customerOutstanding ?? 0,
+      todayExpenses: analyticsSummary.todayExpenses ?? supplierDashboard.todayExpenses ?? 0,
       totalRebateReceived: supplierDashboard.totalRebateReceived ?? supplierDashboard.total_rebate_received ?? 0,
       todaySupplierPayments: supplierDashboard.todaySupplierPayments ?? supplierDashboard.todays_supplier_payments ?? 0,
     };
@@ -284,13 +328,15 @@ function App() {
       ["Today's Sales", currency.format(Number(metrics.todaySales || 0)), "rupee"],
       ["Today's Profit", currency.format(Number(metrics.todayProfit || 0)), "trend"],
       ["Stock Value", currency.format(Number(metrics.stockValue || 0)), "layers"],
-      ["Low Stock Items", Number(metrics.lowStockItems || 0), "alert"],
-      ["Transactions", Number(metrics.transactions || 0), "receipt"],
       ["Supplier Outstanding", currency.format(Number(metrics.supplierOutstanding || 0)), "wallet"],
+      ["Customer Outstanding", currency.format(Number(metrics.customerOutstanding || 0)), "users"],
+      ["Today's Expenses", currency.format(Number(metrics.todayExpenses || 0)), "wallet"],
       ["Total Rebate Received", currency.format(Number(metrics.totalRebateReceived || 0)), "trend"],
       ["Today's Supplier Payments", currency.format(Number(metrics.todaySupplierPayments || 0)), "rupee"],
+      ["Low Stock Items", Number(metrics.lowStockItems || 0), "alert"],
+      ["Transactions", Number(metrics.transactions || 0), "receipt"],
     ];
-  }, [inventory, salesHistory, supplierDashboard]);
+  }, [dashboardAnalytics, inventory, salesHistory, supplierDashboard]);
 
   const activeSuppliers = useMemo(
     () => suppliers.filter((supplier) =>
@@ -425,15 +471,52 @@ function App() {
     setSalesHistory(response.data);
   };
 
+  const getDashboardParams = (range = dashboardRange, customRange = dashboardCustomRange) => {
+    if (range === "custom") {
+      return customRange.date_from && customRange.date_to
+        ? { date_from: customRange.date_from, date_to: customRange.date_to }
+        : { days: 7 };
+    }
+    return { days: range };
+  };
+
+  const loadDashboardAnalytics = async (range = dashboardRange, customRange = dashboardCustomRange) => {
+    const response = await axios.get(`${API_URL}/dashboard-analytics`, {
+      params: getDashboardParams(range, customRange),
+    });
+    setDashboardAnalytics(response.data);
+    if (response.data.summary) setSupplierDashboard(response.data.summary);
+  };
+
   const loadDashboardData = async () => {
-    const [inventoryResponse, salesResponse, supplierMetricsResponse] = await Promise.all([
+    const [inventoryResponse, salesResponse, supplierMetricsResponse, analyticsResponse] = await Promise.all([
       axios.get(`${API_URL}/inventory`),
       axios.get(`${API_URL}/sales`),
       axios.get(`${API_URL}/dashboard-metrics`),
+      axios.get(`${API_URL}/dashboard-analytics`, { params: getDashboardParams() }),
     ]);
     setInventory(inventoryResponse.data);
     setSalesHistory(salesResponse.data);
     setSupplierDashboard(supplierMetricsResponse.data);
+    setDashboardAnalytics(analyticsResponse.data);
+  };
+
+  const changeDashboardRange = async (range) => {
+    try {
+      setDashboardRange(range);
+      if (range !== "custom") await loadDashboardAnalytics(range, dashboardCustomRange);
+    } catch (error) {
+      alert(getErrorMessage(error, "Dashboard analytics failed"));
+    }
+  };
+
+  const applyDashboardCustomRange = async () => {
+    try {
+      setDashboardRange("custom");
+      await loadDashboardAnalytics("custom", dashboardCustomRange);
+    } catch (error) {
+      alert(getErrorMessage(error, "Dashboard analytics failed"));
+    }
   };
 
   const login = async () => {
@@ -736,6 +819,15 @@ function App() {
                   </article>
                 ))}
               </section>
+              <DashboardAnalytics
+                analytics={dashboardAnalytics}
+                customRange={dashboardCustomRange}
+                onApplyCustomRange={applyDashboardCustomRange}
+                onCustomRangeChange={setDashboardCustomRange}
+                onNavigate={navigate}
+                onRangeChange={changeDashboardRange}
+                range={dashboardRange}
+              />
               <section className="content-card">
                 <div className="card-heading">
                   <div>
@@ -2392,6 +2484,256 @@ function PurchaseSummary({ summary }) {
         <SummaryMetric label="Payment Status" value={summary.paymentStatus} />
         <SummaryMetric label="Effective Cost / Unit" value={currency.format(summary.effectiveCostPerUnit)} featured />
       </div>
+    </section>
+  );
+}
+
+const chartSize = { width: 640, height: 250, padding: 34 };
+const chartCurrency = new Intl.NumberFormat("en-IN", {
+  maximumFractionDigits: 0,
+  notation: "compact",
+});
+
+const formatChartDate = (date) =>
+  new Date(`${date}T00:00:00`).toLocaleDateString("en-IN", { day: "2-digit", month: "short" });
+
+const formatChartMoney = (value) => `INR ${chartCurrency.format(Number(value || 0))}`;
+
+const getChartPoints = (data, valueKey, maxValue) => {
+  const innerWidth = chartSize.width - chartSize.padding * 2;
+  const innerHeight = chartSize.height - chartSize.padding * 2;
+  return data.map((row, index) => {
+    const x = chartSize.padding + (data.length > 1 ? (index / (data.length - 1)) * innerWidth : innerWidth / 2);
+    const y = chartSize.height - chartSize.padding - (Number(row[valueKey] || 0) / maxValue) * innerHeight;
+    return { x, y, value: Number(row[valueKey] || 0), date: row.date };
+  });
+};
+
+function ChartFrame({ children, empty, subtitle, title }) {
+  return (
+    <section className="chart-card">
+      <div className="chart-card-heading">
+        <div>
+          <span className="eyebrow">{subtitle}</span>
+          <h3>{title}</h3>
+        </div>
+      </div>
+      {empty ? <div className="chart-empty">No values recorded for this period.</div> : children}
+    </section>
+  );
+}
+
+function LineChart({ color = "#f59e0b", data, subtitle, title, valueKey }) {
+  const rows = data || [];
+  const maxValue = Math.max(1, ...rows.map((row) => Number(row[valueKey] || 0)));
+  const points = getChartPoints(rows, valueKey, maxValue);
+  const pointString = points.map((point) => `${point.x},${point.y}`).join(" ");
+
+  return (
+    <ChartFrame empty={!rows.length} subtitle={subtitle} title={title}>
+      <svg className="chart-svg" role="img" viewBox={`0 0 ${chartSize.width} ${chartSize.height}`}>
+        {[0.25, 0.5, 0.75].map((mark) => (
+          <line
+            className="chart-grid-line"
+            key={mark}
+            x1={chartSize.padding}
+            x2={chartSize.width - chartSize.padding}
+            y1={chartSize.padding + mark * (chartSize.height - chartSize.padding * 2)}
+            y2={chartSize.padding + mark * (chartSize.height - chartSize.padding * 2)}
+          />
+        ))}
+        <polyline className="chart-line-glow" points={pointString} style={{ stroke: color }} />
+        <polyline className="chart-line" points={pointString} style={{ stroke: color }} />
+        {points.map((point) => (
+          <circle className="chart-point" cx={point.x} cy={point.y} key={`${point.date}-${point.x}`} r="4" style={{ fill: color }}>
+            <title>{`${formatChartDate(point.date)}: ${formatChartMoney(point.value)}`}</title>
+          </circle>
+        ))}
+        <text className="chart-axis-label" x={chartSize.padding} y={chartSize.height - 8}>{rows[0] ? formatChartDate(rows[0].date) : ""}</text>
+        <text className="chart-axis-label chart-axis-label-end" x={chartSize.width - chartSize.padding} y={chartSize.height - 8}>{rows.at(-1) ? formatChartDate(rows.at(-1).date) : ""}</text>
+        <text className="chart-axis-label" x={chartSize.padding} y="20">{formatChartMoney(maxValue)}</text>
+      </svg>
+    </ChartFrame>
+  );
+}
+
+function BarChart({ color = "#f59e0b", data, subtitle, title, valueKey }) {
+  const rows = data || [];
+  const maxValue = Math.max(1, ...rows.map((row) => Number(row[valueKey] || 0)));
+  const innerWidth = chartSize.width - chartSize.padding * 2;
+  const innerHeight = chartSize.height - chartSize.padding * 2;
+  const barSlot = rows.length ? innerWidth / rows.length : innerWidth;
+  return (
+    <ChartFrame empty={!rows.length} subtitle={subtitle} title={title}>
+      <svg className="chart-svg" role="img" viewBox={`0 0 ${chartSize.width} ${chartSize.height}`}>
+        {[0.25, 0.5, 0.75].map((mark) => (
+          <line
+            className="chart-grid-line"
+            key={mark}
+            x1={chartSize.padding}
+            x2={chartSize.width - chartSize.padding}
+            y1={chartSize.padding + mark * innerHeight}
+            y2={chartSize.padding + mark * innerHeight}
+          />
+        ))}
+        {rows.map((row, index) => {
+          const value = Number(row[valueKey] || 0);
+          const height = (value / maxValue) * innerHeight;
+          const x = chartSize.padding + index * barSlot + barSlot * 0.18;
+          const y = chartSize.height - chartSize.padding - height;
+          return (
+            <rect className="chart-bar" height={Math.max(height, value > 0 ? 3 : 0)} key={row.date} rx="5" style={{ fill: color }} width={barSlot * 0.64} x={x} y={y}>
+              <title>{`${formatChartDate(row.date)}: ${formatChartMoney(value)}`}</title>
+            </rect>
+          );
+        })}
+        <text className="chart-axis-label" x={chartSize.padding} y={chartSize.height - 8}>{rows[0] ? formatChartDate(rows[0].date) : ""}</text>
+        <text className="chart-axis-label chart-axis-label-end" x={chartSize.width - chartSize.padding} y={chartSize.height - 8}>{rows.at(-1) ? formatChartDate(rows.at(-1).date) : ""}</text>
+        <text className="chart-axis-label" x={chartSize.padding} y="20">{formatChartMoney(maxValue)}</text>
+      </svg>
+    </ChartFrame>
+  );
+}
+
+function DualLineChart({ data, firstKey, firstLabel, secondKey, secondLabel, subtitle, title }) {
+  const rows = data || [];
+  const maxValue = Math.max(1, ...rows.flatMap((row) => [Number(row[firstKey] || 0), Number(row[secondKey] || 0)]));
+  const firstPoints = getChartPoints(rows, firstKey, maxValue);
+  const secondPoints = getChartPoints(rows, secondKey, maxValue);
+  return (
+    <ChartFrame empty={!rows.length} subtitle={subtitle} title={title}>
+      <div className="chart-legend">
+        <span><i className="legend-dot legend-dot-sales" />{firstLabel}</span>
+        <span><i className="legend-dot legend-dot-purchase" />{secondLabel}</span>
+      </div>
+      <svg className="chart-svg" role="img" viewBox={`0 0 ${chartSize.width} ${chartSize.height}`}>
+        {[0.25, 0.5, 0.75].map((mark) => (
+          <line
+            className="chart-grid-line"
+            key={mark}
+            x1={chartSize.padding}
+            x2={chartSize.width - chartSize.padding}
+            y1={chartSize.padding + mark * (chartSize.height - chartSize.padding * 2)}
+            y2={chartSize.padding + mark * (chartSize.height - chartSize.padding * 2)}
+          />
+        ))}
+        <polyline className="chart-line" points={firstPoints.map((point) => `${point.x},${point.y}`).join(" ")} style={{ stroke: "#f59e0b" }} />
+        <polyline className="chart-line" points={secondPoints.map((point) => `${point.x},${point.y}`).join(" ")} style={{ stroke: "#38bdf8" }} />
+        {[...firstPoints, ...secondPoints].map((point, index) => (
+          <circle className="chart-point" cx={point.x} cy={point.y} key={`${point.date}-${index}`} r="3.5" style={{ fill: index < firstPoints.length ? "#f59e0b" : "#38bdf8" }}>
+            <title>{`${formatChartDate(point.date)}: ${formatChartMoney(point.value)}`}</title>
+          </circle>
+        ))}
+        <text className="chart-axis-label" x={chartSize.padding} y={chartSize.height - 8}>{rows[0] ? formatChartDate(rows[0].date) : ""}</text>
+        <text className="chart-axis-label chart-axis-label-end" x={chartSize.width - chartSize.padding} y={chartSize.height - 8}>{rows.at(-1) ? formatChartDate(rows.at(-1).date) : ""}</text>
+        <text className="chart-axis-label" x={chartSize.padding} y="20">{formatChartMoney(maxValue)}</text>
+      </svg>
+    </ChartFrame>
+  );
+}
+
+function DashboardAnalytics({ analytics, customRange, onApplyCustomRange, onCustomRangeChange, onNavigate, onRangeChange, range }) {
+  const data = analytics || emptyDashboardAnalytics;
+  const topProducts = data.topSellingProducts || [];
+  const lowStockItems = data.lowStockItems || [];
+  const insights = data.insights || [];
+
+  return (
+    <section className="dashboard-analytics">
+      <section className="content-card analytics-toolbar">
+        <div>
+          <span className="eyebrow">Owner Analytics</span>
+          <h2>Business Graphs</h2>
+          <p>Day-wise sales, profit, expenses and stock movement from live FroozERP records.</p>
+        </div>
+        <div className="dashboard-range-controls">
+          <div className="range-buttons">
+            {dashboardRanges.map(([value, label]) => (
+              <button className={range === value ? "range-button range-button-active" : "range-button"} key={value} onClick={() => onRangeChange(value)} type="button">
+                {label}
+              </button>
+            ))}
+          </div>
+          {range === "custom" && (
+            <div className="dashboard-custom-range">
+              <input type="date" value={customRange.date_from} onChange={(event) => onCustomRangeChange((current) => ({ ...current, date_from: event.target.value }))} />
+              <input type="date" value={customRange.date_to} onChange={(event) => onCustomRangeChange((current) => ({ ...current, date_to: event.target.value }))} />
+              <button className="primary-button" onClick={onApplyCustomRange} type="button">Apply</button>
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section className="chart-grid">
+        <LineChart color="#f59e0b" data={data.salesTrend} subtitle="Revenue" title="Daily Sales Trend" valueKey="sales" />
+        <LineChart color="#22c55e" data={data.profitTrend} subtitle="FIFO Landed Cost" title="Daily Profit Trend" valueKey="grossProfit" />
+        <BarChart color="#fb7185" data={data.expenseTrend} subtitle="Operating Cost" title="Daily Expense Trend" valueKey="expenses" />
+        <LineChart color="#a78bfa" data={data.netProfitTrend} subtitle="Profit After Expenses" title="Net Profit Trend" valueKey="netProfit" />
+        <DualLineChart
+          data={data.purchaseSalesComparison}
+          firstKey="sales"
+          firstLabel="Sales"
+          secondKey="purchases"
+          secondLabel="Purchases"
+          subtitle="Movement"
+          title="Purchase vs Sales Comparison"
+        />
+      </section>
+
+      <section className="dashboard-side-grid">
+        <section className="content-card insight-panel">
+          <div className="card-heading">
+            <div>
+              <span className="eyebrow">Owner Insights</span>
+              <h2>What Changed</h2>
+            </div>
+          </div>
+          <div className="insight-list">
+            {insights.length ? insights.map((insight) => <p key={insight}>{insight}</p>) : <p>No insights available yet.</p>}
+          </div>
+        </section>
+
+        <section className="content-card">
+          <div className="card-heading">
+            <div>
+              <span className="eyebrow">Products</span>
+              <h2>Top Selling Products</h2>
+            </div>
+          </div>
+          <div className="top-product-list">
+            {topProducts.length ? topProducts.map((product) => (
+              <article className="top-product-row" key={product.product_id}>
+                <div>
+                  <strong>{product.product_name}</strong>
+                  <span>{Number(product.quantity_sold || 0).toLocaleString("en-IN")} {product.unit || "units"} sold</span>
+                </div>
+                <strong>{currency.format(Number(product.revenue || 0))}</strong>
+              </article>
+            )) : <div className="empty-inline">No product sales in this period.</div>}
+          </div>
+        </section>
+
+        <section className="content-card">
+          <div className="card-heading">
+            <div>
+              <span className="eyebrow">Inventory</span>
+              <h2>Low Stock Alerts</h2>
+            </div>
+            <button className="secondary-button" onClick={() => onNavigate("inventory")} type="button">Open Inventory</button>
+          </div>
+          <div className="low-stock-list">
+            {lowStockItems.length ? lowStockItems.map((item) => (
+              <button className="low-stock-row" key={item.product_id} onClick={() => onNavigate("inventory")} type="button">
+                <div>
+                  <strong>{item.product_name}</strong>
+                  <span>Minimum {Number(item.minimum_stock || 0).toLocaleString("en-IN")} {item.unit || ""}</span>
+                </div>
+                <strong>{Number(item.current_stock || 0).toLocaleString("en-IN")} left</strong>
+              </button>
+            )) : <div className="empty-inline">No low stock products right now.</div>}
+          </div>
+        </section>
+      </section>
     </section>
   );
 }

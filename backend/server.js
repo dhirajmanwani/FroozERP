@@ -855,6 +855,327 @@ const buildCustomerSummaryPayload = (rows) => {
   };
 };
 
+const isDateInput = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));
+
+const parseDashboardRange = (query = {}) => {
+  if (isDateInput(query.date_from) && isDateInput(query.date_to) && query.date_from <= query.date_to) {
+    return { dateFrom: query.date_from, dateTo: query.date_to, days: null };
+  }
+  const requestedDays = parsePositiveInteger(query.days);
+  const days = [7, 15, 30].includes(requestedDays) ? requestedDays : 7;
+  const endDate = new Date();
+  const startDate = new Date(endDate);
+  startDate.setDate(startDate.getDate() - days + 1);
+  return {
+    dateFrom: toDateKey(startDate),
+    dateTo: toDateKey(endDate),
+    days,
+  };
+};
+
+const getDashboardSummary = async () => {
+  const [metricsResult, supplierRows, customerRows] = await Promise.all([
+    pool.query(
+      `
+      SELECT
+        COALESCE((SELECT SUM(total_amount) FROM sales WHERE sale_date = CURRENT_DATE AND sale_status <> 'CANCELLED'), 0) AS "todaySales",
+        COALESCE((SELECT SUM(profit) FROM sales WHERE sale_date = CURRENT_DATE AND sale_status <> 'CANCELLED'), 0) AS "todayProfit",
+        COALESCE((
+          SELECT SUM(remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate))
+          FROM inventory_batches
+        ), 0) AS "stockValue",
+        COALESCE((
+          SELECT COUNT(*)
+          FROM (
+            SELECT
+              p.id,
+              COALESCE(SUM(ib.remaining_qty), 0) AS current_stock,
+              COALESCE(p.minimum_stock, 5) AS minimum_stock
+            FROM products p
+            LEFT JOIN inventory_batches ib ON ib.product_id = p.id
+            WHERE p.active IS DISTINCT FROM FALSE
+            GROUP BY p.id, p.minimum_stock
+          ) stock
+          WHERE stock.current_stock <= stock.minimum_stock
+        ), 0) AS "lowStockItems",
+        COALESCE((SELECT COUNT(*) FROM sales WHERE sale_date = CURRENT_DATE AND sale_status <> 'CANCELLED'), 0) AS "transactions",
+        COALESCE((SELECT SUM(amount) FROM expenses WHERE expense_date = CURRENT_DATE AND active IS DISTINCT FROM FALSE), 0) AS "todayExpenses",
+        COALESCE((SELECT SUM(rebate_amount) FROM purchases), 0)
+          + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE), 0) AS "totalRebateReceived",
+        COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE payment_date = CURRENT_DATE AND cancelled = FALSE), 0)
+          + COALESCE((SELECT SUM(paid_amount) FROM purchases WHERE COALESCE(payment_date, purchase_date) = CURRENT_DATE), 0) AS "todaySupplierPayments",
+        COALESCE((SELECT COUNT(*) FROM suppliers), 0) AS supplier_count,
+        COALESCE((SELECT COUNT(*) FROM suppliers WHERE active = TRUE), 0) AS active_supplier_count
+      `
+    ),
+    getSupplierSummaryRows(),
+    getCustomerSummaryRows(),
+  ]);
+  const metrics = metricsResult.rows[0] || {};
+  const supplierSummary = buildSupplierSummaryPayload(supplierRows);
+  const customerSummary = buildCustomerSummaryPayload(customerRows);
+  return {
+    todaySales: Number(metrics.todaySales || 0),
+    todayProfit: Number(metrics.todayProfit || 0),
+    stockValue: Number(metrics.stockValue || 0),
+    lowStockItems: Number(metrics.lowStockItems || 0),
+    transactions: Number(metrics.transactions || 0),
+    supplierOutstanding: Number(supplierSummary.outstandingBalance || 0),
+    customerOutstanding: Number(customerSummary.outstandingBalance || 0),
+    todayExpenses: Number(metrics.todayExpenses || 0),
+    totalRebateReceived: Number(metrics.totalRebateReceived || 0),
+    todaySupplierPayments: Number(metrics.todaySupplierPayments || 0),
+    total_supplier_outstanding: Number(supplierSummary.outstandingBalance || 0),
+    total_rebate_received: Number(metrics.totalRebateReceived || 0),
+    todays_supplier_payments: Number(metrics.todaySupplierPayments || 0),
+    supplier_count: Number(metrics.supplier_count || 0),
+    active_supplier_count: Number(metrics.active_supplier_count || 0),
+  };
+};
+
+const getDashboardSalesTrend = async (dateFrom, dateTo) => {
+  const result = await pool.query(
+    `
+    WITH days AS (
+      SELECT generate_series($1::date, $2::date, INTERVAL '1 day')::date AS day
+    ),
+    sales_by_day AS (
+      SELECT sale_date::date AS day, SUM(total_amount) AS sales
+      FROM sales
+      WHERE sale_status <> 'CANCELLED'
+        AND sale_date BETWEEN $1 AND $2
+      GROUP BY sale_date
+    )
+    SELECT TO_CHAR(days.day, 'YYYY-MM-DD') AS date, COALESCE(sales_by_day.sales, 0) AS sales
+    FROM days
+    LEFT JOIN sales_by_day ON sales_by_day.day = days.day
+    ORDER BY days.day
+    `,
+    [dateFrom, dateTo]
+  );
+  return result.rows.map((row) => ({ date: row.date, sales: Number(row.sales || 0) }));
+};
+
+const getDashboardProfitTrend = async (dateFrom, dateTo) => {
+  const result = await pool.query(
+    `
+    WITH days AS (
+      SELECT generate_series($1::date, $2::date, INTERVAL '1 day')::date AS day
+    ),
+    profit_by_day AS (
+      SELECT sale_date::date AS day, SUM(profit) AS gross_profit
+      FROM sales
+      WHERE sale_status <> 'CANCELLED'
+        AND sale_date BETWEEN $1 AND $2
+      GROUP BY sale_date
+    )
+    SELECT TO_CHAR(days.day, 'YYYY-MM-DD') AS date, COALESCE(profit_by_day.gross_profit, 0) AS "grossProfit"
+    FROM days
+    LEFT JOIN profit_by_day ON profit_by_day.day = days.day
+    ORDER BY days.day
+    `,
+    [dateFrom, dateTo]
+  );
+  return result.rows.map((row) => ({ date: row.date, grossProfit: Number(row.grossProfit || 0) }));
+};
+
+const getDashboardExpenseTrend = async (dateFrom, dateTo) => {
+  const result = await pool.query(
+    `
+    WITH days AS (
+      SELECT generate_series($1::date, $2::date, INTERVAL '1 day')::date AS day
+    ),
+    expense_by_day AS (
+      SELECT expense_date::date AS day, SUM(amount) AS expenses
+      FROM expenses
+      WHERE active IS DISTINCT FROM FALSE
+        AND expense_date BETWEEN $1 AND $2
+      GROUP BY expense_date
+    )
+    SELECT TO_CHAR(days.day, 'YYYY-MM-DD') AS date, COALESCE(expense_by_day.expenses, 0) AS expenses
+    FROM days
+    LEFT JOIN expense_by_day ON expense_by_day.day = days.day
+    ORDER BY days.day
+    `,
+    [dateFrom, dateTo]
+  );
+  return result.rows.map((row) => ({ date: row.date, expenses: Number(row.expenses || 0) }));
+};
+
+const getDashboardPurchaseSalesComparison = async (dateFrom, dateTo) => {
+  const result = await pool.query(
+    `
+    WITH days AS (
+      SELECT generate_series($1::date, $2::date, INTERVAL '1 day')::date AS day
+    ),
+    sales_by_day AS (
+      SELECT sale_date::date AS day, SUM(total_amount) AS sales
+      FROM sales
+      WHERE sale_status <> 'CANCELLED'
+        AND sale_date BETWEEN $1 AND $2
+      GROUP BY sale_date
+    ),
+    purchases_by_day AS (
+      SELECT purchase_date::date AS day, SUM(COALESCE(NULLIF(net_payable, 0), total_amount, 0)) AS purchases
+      FROM purchases
+      WHERE purchase_date BETWEEN $1 AND $2
+      GROUP BY purchase_date
+    )
+    SELECT
+      TO_CHAR(days.day, 'YYYY-MM-DD') AS date,
+      COALESCE(purchases_by_day.purchases, 0) AS purchases,
+      COALESCE(sales_by_day.sales, 0) AS sales
+    FROM days
+    LEFT JOIN purchases_by_day ON purchases_by_day.day = days.day
+    LEFT JOIN sales_by_day ON sales_by_day.day = days.day
+    ORDER BY days.day
+    `,
+    [dateFrom, dateTo]
+  );
+  return result.rows.map((row) => ({
+    date: row.date,
+    purchases: Number(row.purchases || 0),
+    sales: Number(row.sales || 0),
+  }));
+};
+
+const getDashboardTopSellingProducts = async (dateFrom, dateTo) => {
+  const result = await pool.query(
+    `
+    SELECT
+      p.id AS product_id,
+      p.product_name,
+      p.unit,
+      SUM(si.quantity) AS quantity_sold,
+      SUM(COALESCE(si.net_amount, si.amount, 0)) AS revenue
+    FROM sale_items si
+    JOIN sales s ON s.id = si.sale_id
+    JOIN products p ON p.id = si.product_id
+    WHERE s.sale_status <> 'CANCELLED'
+      AND s.sale_date BETWEEN $1 AND $2
+    GROUP BY p.id, p.product_name, p.unit
+    ORDER BY quantity_sold DESC, revenue DESC, p.product_name
+    LIMIT 8
+    `,
+    [dateFrom, dateTo]
+  );
+  return result.rows.map((row) => ({
+    product_id: row.product_id,
+    product_name: row.product_name,
+    unit: row.unit,
+    quantity_sold: Number(row.quantity_sold || 0),
+    revenue: Number(row.revenue || 0),
+  }));
+};
+
+const getDashboardLowStockItems = async () => {
+  const result = await pool.query(
+    `
+    SELECT *
+    FROM (
+      SELECT
+        p.id AS product_id,
+        p.product_name,
+        p.unit,
+        COALESCE(p.minimum_stock, 5) AS minimum_stock,
+        COALESCE(SUM(ib.remaining_qty), 0) AS current_stock
+      FROM products p
+      LEFT JOIN inventory_batches ib ON ib.product_id = p.id
+      WHERE p.active IS DISTINCT FROM FALSE
+      GROUP BY p.id, p.product_name, p.unit, p.minimum_stock
+    ) stock
+    WHERE stock.current_stock <= stock.minimum_stock
+    ORDER BY (stock.current_stock - stock.minimum_stock), stock.product_name
+    LIMIT 10
+    `
+  );
+  return result.rows.map((row) => ({
+    product_id: row.product_id,
+    product_name: row.product_name,
+    unit: row.unit,
+    minimum_stock: Number(row.minimum_stock || 0),
+    current_stock: Number(row.current_stock || 0),
+  }));
+};
+
+const buildDashboardInsights = ({ summary, salesTrend, expenseTrend, topSellingProducts }) => {
+  const insights = [];
+  const lastSales = salesTrend.at(-1)?.sales || 0;
+  const previousSales = salesTrend.at(-2)?.sales || 0;
+  const salesDiff = roundCurrency(lastSales - previousSales);
+  if (previousSales > 0) {
+    const percentage = Math.round((salesDiff / previousSales) * 100);
+    insights.push(`Sales ${salesDiff >= 0 ? "increased" : "decreased"} ${Math.abs(percentage)}% vs previous day.`);
+  } else if (lastSales > 0) {
+    insights.push(`Sales started at ${roundCurrency(lastSales).toLocaleString("en-IN")} INR for the latest day.`);
+  } else {
+    insights.push("No sales recorded for the selected period.");
+  }
+
+  const lastExpenses = expenseTrend.at(-1)?.expenses || 0;
+  const previousExpenses = expenseTrend.at(-2)?.expenses || 0;
+  const expenseDiff = roundCurrency(lastExpenses - previousExpenses);
+  if (expenseDiff !== 0) {
+    insights.push(`Expenses ${expenseDiff >= 0 ? "increased" : "reduced"} by ${roundCurrency(Math.abs(expenseDiff)).toLocaleString("en-IN")} INR vs previous day.`);
+  } else {
+    insights.push("Expenses are unchanged vs previous day.");
+  }
+
+  if (topSellingProducts.length) {
+    insights.push(`Top selling product: ${topSellingProducts[0].product_name}.`);
+  } else {
+    insights.push("No top product yet because no items were sold in this period.");
+  }
+
+  insights.push(`Supplier outstanding is ${roundCurrency(summary.supplierOutstanding || 0).toLocaleString("en-IN")} INR.`);
+  return insights;
+};
+
+const getDashboardAnalyticsPayload = async (query = {}) => {
+  const range = parseDashboardRange(query);
+  const [
+    summary,
+    salesTrend,
+    profitTrend,
+    expenseTrend,
+    purchaseSalesComparison,
+    topSellingProducts,
+    lowStockItems,
+  ] = await Promise.all([
+    getDashboardSummary(),
+    getDashboardSalesTrend(range.dateFrom, range.dateTo),
+    getDashboardProfitTrend(range.dateFrom, range.dateTo),
+    getDashboardExpenseTrend(range.dateFrom, range.dateTo),
+    getDashboardPurchaseSalesComparison(range.dateFrom, range.dateTo),
+    getDashboardTopSellingProducts(range.dateFrom, range.dateTo),
+    getDashboardLowStockItems(),
+  ]);
+  const expensesByDate = new Map(expenseTrend.map((row) => [row.date, row.expenses]));
+  const netProfitTrend = profitTrend.map((row) => {
+    const expenses = Number(expensesByDate.get(row.date) || 0);
+    return {
+      date: row.date,
+      grossProfit: row.grossProfit,
+      expenses,
+      netProfit: roundCurrency(Number(row.grossProfit || 0) - expenses),
+    };
+  });
+  return {
+    dateFrom: range.dateFrom,
+    dateTo: range.dateTo,
+    days: range.days,
+    summary,
+    salesTrend,
+    profitTrend,
+    expenseTrend,
+    netProfitTrend,
+    purchaseSalesComparison,
+    topSellingProducts,
+    lowStockItems,
+    insights: buildDashboardInsights({ summary, salesTrend, expenseTrend, topSellingProducts }),
+  };
+};
+
 const getSettingsBundle = async (userId) => {
   const [businessResult, saleRateResult, mandiResult, rebateResult, discountResult, manager] = await Promise.all([
     pool.query("SELECT * FROM business_settings WHERE id = 1"),
@@ -2703,107 +3024,49 @@ app.get("/customer-ledger", async (req, res) => {
 
 app.get("/dashboard-metrics", async (req, res) => {
   try {
-    const result = await pool.query(
-      `
-      WITH supplier_balances AS (
-        SELECT
-          s.id,
-          COALESCE(s.opening_balance, 0)
-          + COALESCE(ps.total_purchases, 0)
-          - COALESCE(ps.purchase_rebate, 0)
-          - COALESCE(ps.purchase_paid, 0)
-          - COALESCE(pay.total_paid, 0)
-          - COALESCE(pay.payment_rebate, 0) AS outstanding_balance
-        FROM suppliers s
-        LEFT JOIN (
-          SELECT
-            supplier_id,
-            SUM(COALESCE(NULLIF(gross_amount, 0), total_amount, 0)) AS total_purchases,
-            SUM(COALESCE(rebate_amount, 0)) AS purchase_rebate,
-            SUM(COALESCE(paid_amount, 0)) AS purchase_paid
-          FROM purchases
-          WHERE supplier_id IS NOT NULL
-          GROUP BY supplier_id
-        ) ps ON ps.supplier_id = s.id
-        LEFT JOIN (
-          SELECT
-            supplier_id,
-            SUM(payment_amount) AS total_paid,
-            SUM(rebate_amount) AS payment_rebate
-          FROM supplier_payments
-          WHERE cancelled = FALSE
-          GROUP BY supplier_id
-        ) pay ON pay.supplier_id = s.id
-      )
-      SELECT
-        COALESCE((SELECT SUM(total_amount) FROM sales WHERE sale_date = CURRENT_DATE AND sale_status <> 'CANCELLED'), 0) AS "todaySales",
-        COALESCE((SELECT SUM(profit) FROM sales WHERE sale_date = CURRENT_DATE AND sale_status <> 'CANCELLED'), 0) AS "todayProfit",
-        COALESCE((
-          SELECT SUM(remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate))
-          FROM inventory_batches
-        ), 0) AS "stockValue",
-        COALESCE((
-          SELECT COUNT(*)
-          FROM (
-            SELECT
-              p.id,
-              COALESCE(SUM(ib.remaining_qty), 0) AS current_stock,
-              COALESCE(p.minimum_stock, 5) AS minimum_stock
-            FROM products p
-            LEFT JOIN inventory_batches ib ON ib.product_id = p.id
-            WHERE p.active IS DISTINCT FROM FALSE
-            GROUP BY p.id, p.minimum_stock
-          ) stock
-          WHERE stock.current_stock <= stock.minimum_stock
-        ), 0) AS "lowStockItems",
-        COALESCE((SELECT COUNT(*) FROM sales WHERE sale_date = CURRENT_DATE AND sale_status <> 'CANCELLED'), 0) AS "transactions",
-        COALESCE((SELECT ROUND(SUM(outstanding_balance)::NUMERIC, 2) FROM supplier_balances), 0) AS "supplierOutstanding",
-        COALESCE((SELECT SUM(rebate_amount) FROM purchases), 0)
-          + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE), 0) AS "totalRebateReceived",
-        COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE payment_date = CURRENT_DATE AND cancelled = FALSE), 0)
-          + COALESCE((SELECT SUM(paid_amount) FROM purchases WHERE COALESCE(payment_date, purchase_date) = CURRENT_DATE), 0) AS "todaySupplierPayments",
-        COALESCE((SELECT ROUND(SUM(outstanding_balance)::NUMERIC, 2) FROM supplier_balances), 0) AS total_supplier_outstanding,
-        COALESCE((SELECT SUM(rebate_amount) FROM purchases), 0)
-          + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE), 0) AS total_rebate_received,
-        COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE payment_date = CURRENT_DATE AND cancelled = FALSE), 0)
-          + COALESCE((SELECT SUM(paid_amount) FROM purchases WHERE COALESCE(payment_date, purchase_date) = CURRENT_DATE), 0) AS todays_supplier_payments,
-        COALESCE((SELECT COUNT(*) FROM suppliers), 0) AS supplier_count,
-        COALESCE((SELECT COUNT(*) FROM suppliers WHERE active = TRUE), 0) AS active_supplier_count
-      `
-    );
-    const metrics = result.rows[0] || {
-      todaySales: 0,
-      todayProfit: 0,
-      stockValue: 0,
-      lowStockItems: 0,
-      transactions: 0,
-      supplierOutstanding: 0,
-      totalRebateReceived: 0,
-      todaySupplierPayments: 0,
-      total_supplier_outstanding: 0,
-      total_rebate_received: 0,
-      todays_supplier_payments: 0,
-      supplier_count: 0,
-      active_supplier_count: 0,
-    };
-    return res.json({
-      todaySales: Number(metrics.todaySales || 0),
-      todayProfit: Number(metrics.todayProfit || 0),
-      stockValue: Number(metrics.stockValue || 0),
-      lowStockItems: Number(metrics.lowStockItems || 0),
-      transactions: Number(metrics.transactions || 0),
-      supplierOutstanding: Number(metrics.supplierOutstanding || 0),
-      totalRebateReceived: Number(metrics.totalRebateReceived || 0),
-      todaySupplierPayments: Number(metrics.todaySupplierPayments || 0),
-      total_supplier_outstanding: Number(metrics.total_supplier_outstanding || metrics.supplierOutstanding || 0),
-      total_rebate_received: Number(metrics.total_rebate_received || metrics.totalRebateReceived || 0),
-      todays_supplier_payments: Number(metrics.todays_supplier_payments || metrics.todaySupplierPayments || 0),
-      supplier_count: Number(metrics.supplier_count || 0),
-      active_supplier_count: Number(metrics.active_supplier_count || 0),
-    });
+    return res.json(await getDashboardSummary());
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Dashboard Metrics" });
+  }
+});
+
+app.get("/dashboard-analytics", async (req, res) => {
+  try {
+    return res.json(await getDashboardAnalyticsPayload(req.query));
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Dashboard Analytics" });
+  }
+});
+
+app.get("/dashboard-sales-trend", async (req, res) => {
+  try {
+    const { dateFrom, dateTo, days } = parseDashboardRange(req.query);
+    return res.json({ dateFrom, dateTo, days, data: await getDashboardSalesTrend(dateFrom, dateTo) });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Sales Trend" });
+  }
+});
+
+app.get("/dashboard-profit-trend", async (req, res) => {
+  try {
+    const { dateFrom, dateTo, days } = parseDashboardRange(req.query);
+    return res.json({ dateFrom, dateTo, days, data: await getDashboardProfitTrend(dateFrom, dateTo) });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Profit Trend" });
+  }
+});
+
+app.get("/dashboard-expense-trend", async (req, res) => {
+  try {
+    const { dateFrom, dateTo, days } = parseDashboardRange(req.query);
+    return res.json({ dateFrom, dateTo, days, data: await getDashboardExpenseTrend(dateFrom, dateTo) });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Expense Trend" });
   }
 });
 
