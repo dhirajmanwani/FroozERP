@@ -657,6 +657,28 @@ tbody tr:last-child td {
   font-size: 13px;
 }
 
+.account-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.account-tab {
+  padding: 9px 12px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 999px;
+  color: #94a3b8;
+  background: rgba(30, 41, 59, 0.86);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.account-tab-active {
+  border-color: rgba(245, 158, 11, 0.45);
+  color: #f59e0b;
+  background: rgba(245, 158, 11, 0.1);
+}
+
 .supplier-form-grid {
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
 }

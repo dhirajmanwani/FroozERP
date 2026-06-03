@@ -53,6 +53,7 @@ const RATE_MANAGER_ROLES = new Set(["Owner", "Admin"]);
 const SUPPLIER_TYPES = new Set(["LOCAL_SUPPLIER", "IMPORTED_SUPPLIER", "COMMISSION_AGENT", "TRANSPORT_VENDOR"]);
 const SUPPLIER_PAYMENT_MODES = new Set(["CASH", "UPI", "BANK_TRANSFER", "CHEQUE"]);
 const CUSTOMER_TYPES = new Set(["RETAIL", "WHOLESALE"]);
+const ACCOUNT_TYPES = new Set(["CUSTOMER", "SUPPLIER", "TRANSPORT_VENDOR", "COMMISSION_AGENT", "STAFF", "OTHER"]);
 const DISCOUNT_TYPES = new Set(["FLAT_AMOUNT", "PERCENTAGE"]);
 const DISCOUNT_PAYMENT_MODES = new Set(["ALL", "CASH", "UPI", "CARD"]);
 const ROUNDING_RULES = new Set(["NEAREST_RUPEE", "ROUND_UP_5", "ROUND_UP_10", "NO_ROUND"]);
@@ -286,6 +287,35 @@ const initializeDatabase = async () => {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    ALTER TABLE customers ADD COLUMN IF NOT EXISTS firm_name VARCHAR(160);
+    ALTER TABLE customers ADD COLUMN IF NOT EXISTS alternate_number VARCHAR(30);
+    ALTER TABLE customers ADD COLUMN IF NOT EXISTS city VARCHAR(100);
+    ALTER TABLE customers ADD COLUMN IF NOT EXISTS bank_name VARCHAR(120);
+    ALTER TABLE customers ADD COLUMN IF NOT EXISTS account_number VARCHAR(80);
+    ALTER TABLE customers ADD COLUMN IF NOT EXISTS ifsc_code VARCHAR(30);
+    ALTER TABLE customers ADD COLUMN IF NOT EXISTS upi_id VARCHAR(120);
+
+    CREATE TABLE IF NOT EXISTS accounts (
+      id SERIAL PRIMARY KEY,
+      account_name VARCHAR(160) NOT NULL,
+      account_type VARCHAR(30) NOT NULL,
+      firm_name VARCHAR(160),
+      mobile_number VARCHAR(30),
+      alternate_number VARCHAR(30),
+      address TEXT,
+      city VARCHAR(100),
+      gst_number VARCHAR(80),
+      bank_name VARCHAR(120),
+      account_number VARCHAR(80),
+      ifsc_code VARCHAR(30),
+      upi_id VARCHAR(120),
+      opening_balance NUMERIC(14, 2) DEFAULT 0 CHECK (opening_balance >= 0),
+      active BOOLEAN DEFAULT TRUE,
+      notes TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE TABLE IF NOT EXISTS customer_payments (
       id SERIAL PRIMARY KEY,
       customer_id INTEGER NOT NULL REFERENCES customers(id),
@@ -473,6 +503,9 @@ const initializeDatabase = async () => {
 
     CREATE INDEX IF NOT EXISTS customers_search_idx
       ON customers (LOWER(customer_name), LOWER(COALESCE(mobile_number, '')));
+
+    CREATE INDEX IF NOT EXISTS accounts_search_idx
+      ON accounts (LOWER(account_name), account_type, active);
 
     CREATE INDEX IF NOT EXISTS customer_payments_customer_date_idx
       ON customer_payments (customer_id, payment_date, id);
@@ -676,18 +709,58 @@ const readSupplierPayload = (body) => {
 };
 
 const normalizeCustomerType = (value) => String(value || "RETAIL").trim().toUpperCase();
+const normalizeAccountType = (value) => String(value || "OTHER").trim().toUpperCase();
+
+const supplierTypeFromAccountType = (accountType) => ({
+  SUPPLIER: "LOCAL_SUPPLIER",
+  TRANSPORT_VENDOR: "TRANSPORT_VENDOR",
+  COMMISSION_AGENT: "COMMISSION_AGENT",
+}[accountType] || "LOCAL_SUPPLIER");
+
+const accountTypeFromSupplierType = (supplierType) => ({
+  TRANSPORT_VENDOR: "TRANSPORT_VENDOR",
+  COMMISSION_AGENT: "COMMISSION_AGENT",
+}[supplierType] || "SUPPLIER");
 
 const readCustomerPayload = (body) => {
   const customerType = normalizeCustomerType(body.customer_type);
   return {
     customer_name: cleanText(body.customer_name),
     customer_type: customerType,
+    firm_name: nullableText(body.firm_name),
     mobile_number: nullableText(body.mobile_number),
+    alternate_number: nullableText(body.alternate_number),
     address: nullableText(body.address),
+    city: nullableText(body.city),
     gst_number: nullableText(body.gst_number),
+    bank_name: nullableText(body.bank_name),
+    account_number: nullableText(body.account_number),
+    ifsc_code: nullableText(body.ifsc_code),
+    upi_id: nullableText(body.upi_id),
     notes: nullableText(body.notes),
     opening_balance: parseNonNegativeNumber(body.opening_balance),
     active: body.active === undefined ? true : body.active === true || body.active === "true",
+  };
+};
+
+const readAccountPayload = (body) => {
+  const accountType = normalizeAccountType(body.account_type);
+  return {
+    account_name: cleanText(body.account_name),
+    account_type: accountType,
+    firm_name: nullableText(body.firm_name),
+    mobile_number: nullableText(body.mobile_number),
+    alternate_number: nullableText(body.alternate_number),
+    address: nullableText(body.address),
+    city: nullableText(body.city),
+    gst_number: nullableText(body.gst_number),
+    bank_name: nullableText(body.bank_name),
+    account_number: nullableText(body.account_number),
+    ifsc_code: nullableText(body.ifsc_code),
+    upi_id: nullableText(body.upi_id),
+    opening_balance: parseNonNegativeNumber(body.opening_balance),
+    active: body.active === undefined ? true : body.active === true || body.active === "true",
+    notes: nullableText(body.notes),
   };
 };
 
@@ -1851,6 +1924,419 @@ app.get("/sale-rate-history", async (req, res) => {
   }
 });
 
+const loadUnifiedAccounts = async () => {
+  const [customerRows, supplierRows, genericRows] = await Promise.all([
+    getCustomerSummaryRows(),
+    getSupplierSummaryRows(),
+    pool.query("SELECT * FROM accounts ORDER BY active DESC, account_name"),
+  ]);
+  return [
+    ...customerRows.map((account) => ({
+      ...account,
+      account_key: `CUSTOMER-${account.id}`,
+      source: "CUSTOMER",
+      source_id: account.id,
+      account_type: "CUSTOMER",
+      account_name: account.customer_name,
+      mobile_number: account.mobile_number,
+      outstanding_balance: Number(account.outstanding_balance || 0),
+      receivable_balance: Number(account.outstanding_balance || 0),
+      payable_balance: 0,
+    })),
+    ...supplierRows.map((account) => ({
+      ...account,
+      account_key: `SUPPLIER-${account.id}`,
+      source: "SUPPLIER",
+      source_id: account.id,
+      account_type: accountTypeFromSupplierType(account.supplier_type),
+      account_name: account.supplier_name,
+      mobile_number: account.mobile_number,
+      outstanding_balance: Number(account.outstanding_balance || 0),
+      receivable_balance: 0,
+      payable_balance: Number(account.outstanding_balance || 0),
+    })),
+    ...genericRows.rows.map((account) => ({
+      ...account,
+      account_key: `ACCOUNT-${account.id}`,
+      source: "ACCOUNT",
+      source_id: account.id,
+      outstanding_balance: Number(account.opening_balance || 0),
+      receivable_balance: 0,
+      payable_balance: Number(account.opening_balance || 0),
+    })),
+  ].sort((left, right) => Number(right.active === true) - Number(left.active === true) || left.account_name.localeCompare(right.account_name));
+};
+
+app.get("/accounts", async (req, res) => {
+  try {
+    const search = cleanText(req.query.search).toLowerCase();
+    const accountType = req.query.account_type ? normalizeAccountType(req.query.account_type) : "";
+    const rows = await loadUnifiedAccounts();
+    return res.json(rows.filter((account) =>
+      (!accountType || account.account_type === accountType) &&
+      (!search || account.account_name.toLowerCase().includes(search) || String(account.mobile_number || "").includes(search))
+    ));
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Accounts" });
+  }
+});
+
+app.post("/accounts", async (req, res) => {
+  try {
+    const account = readAccountPayload(req.body);
+    if (!account.account_name || !ACCOUNT_TYPES.has(account.account_type) || account.opening_balance === null) {
+      return res.status(400).json({ message: "Enter valid account details" });
+    }
+    if (account.account_type === "CUSTOMER") {
+      const result = await pool.query(
+        `
+        INSERT INTO customers (
+          customer_name, customer_type, firm_name, mobile_number, alternate_number, address,
+          city, gst_number, bank_name, account_number, ifsc_code, upi_id, notes,
+          opening_balance, active
+        )
+        VALUES ($1, 'RETAIL', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        RETURNING id
+        `,
+        [
+          account.account_name, account.firm_name, account.mobile_number, account.alternate_number,
+          account.address, account.city, account.gst_number, account.bank_name, account.account_number,
+          account.ifsc_code, account.upi_id, account.notes, account.opening_balance, account.active,
+        ]
+      );
+      return res.status(201).json({ success: true, account_key: `CUSTOMER-${result.rows[0].id}` });
+    }
+    if (["SUPPLIER", "TRANSPORT_VENDOR", "COMMISSION_AGENT"].includes(account.account_type)) {
+      const result = await pool.query(
+        `
+        INSERT INTO suppliers (
+          supplier_name, firm_name, mobile_number, alternate_number, address, city,
+          gst_number, bank_name, account_number, ifsc_code, upi_id, notes,
+          opening_balance, supplier_type, active
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        RETURNING id
+        `,
+        [
+          account.account_name, account.firm_name, account.mobile_number, account.alternate_number,
+          account.address, account.city, account.gst_number, account.bank_name, account.account_number,
+          account.ifsc_code, account.upi_id, account.notes, account.opening_balance,
+          supplierTypeFromAccountType(account.account_type), account.active,
+        ]
+      );
+      return res.status(201).json({ success: true, account_key: `SUPPLIER-${result.rows[0].id}` });
+    }
+    const result = await pool.query(
+      `
+      INSERT INTO accounts (
+        account_name, account_type, firm_name, mobile_number, alternate_number, address, city,
+        gst_number, bank_name, account_number, ifsc_code, upi_id, opening_balance, active, notes
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+      RETURNING id
+      `,
+      [
+        account.account_name, account.account_type, account.firm_name, account.mobile_number,
+        account.alternate_number, account.address, account.city, account.gst_number,
+        account.bank_name, account.account_number, account.ifsc_code, account.upi_id,
+        account.opening_balance, account.active, account.notes,
+      ]
+    );
+    return res.status(201).json({ success: true, account_key: `ACCOUNT-${result.rows[0].id}` });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Saving Account" });
+  }
+});
+
+app.put("/accounts/:accountKey", async (req, res) => {
+  try {
+    const [source, idValue] = String(req.params.accountKey || "").split("-");
+    const sourceId = parsePositiveInteger(Number(idValue));
+    const account = readAccountPayload(req.body);
+    if (!sourceId || !account.account_name || !ACCOUNT_TYPES.has(account.account_type) || account.opening_balance === null) {
+      return res.status(400).json({ message: "Enter valid account details" });
+    }
+    if (source === "CUSTOMER") {
+      const result = await pool.query(
+        `
+        UPDATE customers
+        SET customer_name = $1, firm_name = $2, mobile_number = $3, alternate_number = $4,
+            address = $5, city = $6, gst_number = $7, bank_name = $8, account_number = $9,
+            ifsc_code = $10, upi_id = $11, opening_balance = $12, active = $13,
+            notes = $14, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $15
+        RETURNING id
+        `,
+        [
+          account.account_name, account.firm_name, account.mobile_number, account.alternate_number,
+          account.address, account.city, account.gst_number, account.bank_name, account.account_number,
+          account.ifsc_code, account.upi_id, account.opening_balance, account.active, account.notes, sourceId,
+        ]
+      );
+      return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "Account not found" });
+    }
+    if (source === "SUPPLIER") {
+      const result = await pool.query(
+        `
+        UPDATE suppliers
+        SET supplier_name = $1, firm_name = $2, mobile_number = $3, alternate_number = $4,
+            address = $5, city = $6, gst_number = $7, bank_name = $8, account_number = $9,
+            ifsc_code = $10, upi_id = $11, opening_balance = $12, supplier_type = $13,
+            active = $14, notes = $15, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $16
+        RETURNING id
+        `,
+        [
+          account.account_name, account.firm_name, account.mobile_number, account.alternate_number,
+          account.address, account.city, account.gst_number, account.bank_name, account.account_number,
+          account.ifsc_code, account.upi_id, account.opening_balance,
+          supplierTypeFromAccountType(account.account_type), account.active, account.notes, sourceId,
+        ]
+      );
+      return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "Account not found" });
+    }
+    if (source === "ACCOUNT") {
+      const result = await pool.query(
+        `
+        UPDATE accounts
+        SET account_name = $1, account_type = $2, firm_name = $3, mobile_number = $4,
+            alternate_number = $5, address = $6, city = $7, gst_number = $8,
+            bank_name = $9, account_number = $10, ifsc_code = $11, upi_id = $12,
+            opening_balance = $13, active = $14, notes = $15, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $16
+        RETURNING id
+        `,
+        [
+          account.account_name, account.account_type, account.firm_name, account.mobile_number,
+          account.alternate_number, account.address, account.city, account.gst_number,
+          account.bank_name, account.account_number, account.ifsc_code, account.upi_id,
+          account.opening_balance, account.active, account.notes, sourceId,
+        ]
+      );
+      return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "Account not found" });
+    }
+    return res.status(400).json({ message: "Invalid account" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Account" });
+  }
+});
+
+app.get("/accounts/outstanding", async (req, res) => {
+  try {
+    const accounts = await loadUnifiedAccounts();
+    const customerOutstanding = accounts.filter((account) => account.account_type === "CUSTOMER");
+    const supplierOutstanding = accounts.filter((account) => ["SUPPLIER", "TRANSPORT_VENDOR", "COMMISSION_AGENT"].includes(account.account_type));
+    return res.json({
+      customerOutstanding,
+      supplierOutstanding,
+      totalReceivable: roundCurrency(customerOutstanding.reduce((sum, account) => sum + Number(account.receivable_balance || 0), 0)),
+      totalPayable: roundCurrency(supplierOutstanding.reduce((sum, account) => sum + Number(account.payable_balance || 0), 0)),
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Account Outstanding" });
+  }
+});
+
+app.get("/accounts/ledger", async (req, res) => {
+  try {
+    const accountKey = String(req.query.account_key || "");
+    const [source, idValue] = accountKey.split("-");
+    const sourceId = parsePositiveInteger(Number(idValue));
+    if (!sourceId || !["CUSTOMER", "SUPPLIER", "ACCOUNT"].includes(source)) {
+      return res.json({ account: null, ledger: [] });
+    }
+    if (source === "CUSTOMER") {
+      const customers = await getCustomerSummaryRows({ customerId: sourceId });
+      if (customers.length === 0) return res.json({ account: null, ledger: [] });
+      const ledgerResult = await pool.query(
+        `
+        SELECT *
+        FROM (
+          SELECT s.sale_date AS date, 'Sale' AS transaction_type,
+            s.total_amount AS debit,
+            COALESCE(pay.total_paid, 0) AS credit,
+            s.total_amount - COALESCE(pay.total_paid, 0) AS delta,
+            COALESCE(s.invoice_no, 'Sale #' || s.id) AS remarks,
+            s.created_at
+          FROM sales s
+          LEFT JOIN (
+            SELECT sale_id, SUM(amount) AS total_paid
+            FROM sale_payments
+            GROUP BY sale_id
+          ) pay ON pay.sale_id = s.id
+          WHERE s.sale_status <> 'CANCELLED'
+            AND (
+              (s.customer_mobile IS NOT NULL AND s.customer_mobile = $2)
+              OR (s.customer_mobile IS NULL AND s.customer_name IS NOT NULL AND LOWER(s.customer_name) = LOWER($3))
+            )
+          UNION ALL
+          SELECT cp.payment_date AS date, 'Customer Payment' AS transaction_type,
+            0 AS debit,
+            cp.payment_amount AS credit,
+            -cp.payment_amount AS delta,
+            COALESCE(cp.remarks, cp.reference_number, 'Customer payment') AS remarks,
+            cp.created_at
+          FROM customer_payments cp
+          WHERE cp.customer_id = $1 AND cp.cancelled = FALSE
+        ) entries
+        ORDER BY date, created_at
+        `,
+        [sourceId, customers[0].mobile_number || "", customers[0].customer_name]
+      );
+      let balance = Number(customers[0].opening_balance || 0);
+      const ledger = [];
+      if (balance > 0) {
+        ledger.push({ date: toDateKey(customers[0].created_at), transaction_type: "Opening Balance", debit: balance, credit: 0, balance, remarks: "Opening customer receivable balance" });
+      }
+      for (const row of ledgerResult.rows) {
+        balance = roundCurrency(balance + Number(row.delta || 0));
+        ledger.push({
+          date: toDateKey(row.date),
+          transaction_type: row.transaction_type,
+          debit: Number(row.debit || 0),
+          credit: Number(row.credit || 0),
+          balance,
+          remarks: row.remarks || "",
+        });
+      }
+      return res.json({ account: customers[0], ledger });
+    }
+    if (source === "SUPPLIER") {
+      const supplierPayload = await pool.query("SELECT * FROM suppliers WHERE id = $1", [sourceId]);
+      if (supplierPayload.rows.length === 0) return res.json({ account: null, ledger: [] });
+      const ledgerPayload = await (async () => {
+        const suppliers = await getSupplierSummaryRows({ supplierId: sourceId });
+        const ledgerResult = await pool.query(
+          `
+          SELECT *
+          FROM (
+            SELECT p.purchase_date AS date, 'Purchase' AS transaction_type,
+              COALESCE(NULLIF(p.gross_amount, 0), p.total_amount, 0) AS debit,
+              COALESCE(p.rebate_amount, 0) + COALESCE(p.paid_amount, 0) AS credit,
+              COALESCE(NULLIF(p.gross_amount, 0), p.total_amount, 0) - COALESCE(p.rebate_amount, 0) - COALESCE(p.paid_amount, 0) AS delta,
+              p.supplier_name AS account_name,
+              COALESCE(p.payment_timing, '') AS remarks,
+              p.created_at
+            FROM purchases p
+            WHERE p.supplier_id = $1
+            UNION ALL
+            SELECT sp.payment_date AS date,
+              CASE WHEN sp.rebate_amount > 0 AND sp.payment_amount = 0 THEN 'Rebate' ELSE 'Supplier Payment' END AS transaction_type,
+              0 AS debit,
+              sp.payment_amount + sp.rebate_amount AS credit,
+              -(sp.payment_amount + sp.rebate_amount) AS delta,
+              s.supplier_name AS account_name,
+              COALESCE(sp.remarks, sp.reference_number, '') AS remarks,
+              sp.created_at
+            FROM supplier_payments sp
+            JOIN suppliers s ON s.id = sp.supplier_id
+            WHERE sp.supplier_id = $1 AND sp.cancelled = FALSE
+          ) entries
+          ORDER BY date, created_at
+          `,
+          [sourceId]
+        );
+        let balance = Number(suppliers[0]?.opening_balance || 0);
+        const ledger = [];
+        if (balance > 0) {
+          ledger.push({ date: toDateKey(suppliers[0].created_at), transaction_type: "Opening Balance", debit: balance, credit: 0, balance, remarks: "Opening supplier payable balance" });
+        }
+        for (const row of ledgerResult.rows) {
+          balance = roundCurrency(balance + Number(row.delta || 0));
+          ledger.push({
+            date: toDateKey(row.date),
+            transaction_type: row.transaction_type,
+            debit: Number(row.debit || 0),
+            credit: Number(row.credit || 0),
+            balance,
+            remarks: row.remarks || "",
+          });
+        }
+        return { account: suppliers[0] || supplierPayload.rows[0], ledger };
+      })();
+      return res.json(ledgerPayload);
+    }
+    const accountResult = await pool.query("SELECT * FROM accounts WHERE id = $1", [sourceId]);
+    const account = accountResult.rows[0];
+    if (!account) return res.json({ account: null, ledger: [] });
+    const opening = Number(account.opening_balance || 0);
+    return res.json({
+      account,
+      ledger: opening > 0 ? [{
+        date: toDateKey(account.created_at),
+        transaction_type: "Opening Balance",
+        debit: opening,
+        credit: 0,
+        balance: opening,
+        remarks: "Opening account balance",
+      }] : [],
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Account Ledger" });
+  }
+});
+
+app.post("/accounts/payments", async (req, res) => {
+  try {
+    const accountKey = String(req.body.account_key || "");
+    const [source, idValue] = accountKey.split("-");
+    const sourceId = parsePositiveInteger(Number(idValue));
+    const action = String(req.body.payment_action || "").toUpperCase();
+    const amount = parseNonNegativeNumber(req.body.amount);
+    const paymentMode = normalizePaymentMode(req.body.payment_mode || "CASH");
+    if (!sourceId || amount === null || amount <= 0 || !SUPPLIER_PAYMENT_MODES.has(paymentMode)) {
+      return res.status(400).json({ message: "Enter valid account payment details" });
+    }
+    if (action === "RECEIVE_CUSTOMER" && source === "CUSTOMER") {
+      const result = await pool.query(
+        `
+        INSERT INTO customer_payments (
+          customer_id, payment_date, payment_amount, payment_mode, reference_number,
+          remarks, branch_id, created_by
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING *
+        `,
+        [
+          sourceId, req.body.payment_date || toDateKey(new Date()), amount, paymentMode,
+          nullableText(req.body.reference_number), nullableText(req.body.remarks),
+          parsePositiveInteger(req.body.branch_id), parsePositiveInteger(req.body.created_by) || 1,
+        ]
+      );
+      return res.status(201).json(result.rows[0]);
+    }
+    if (["PAY_SUPPLIER", "SUPPLIER_REBATE"].includes(action) && source === "SUPPLIER") {
+      const result = await pool.query(
+        `
+        INSERT INTO supplier_payments (
+          supplier_id, payment_date, payment_amount, rebate_amount, payment_mode,
+          reference_number, remarks, branch_id, created_by
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING *
+        `,
+        [
+          sourceId, req.body.payment_date || toDateKey(new Date()),
+          action === "PAY_SUPPLIER" ? amount : 0,
+          action === "SUPPLIER_REBATE" ? amount : 0,
+          paymentMode, nullableText(req.body.reference_number), nullableText(req.body.remarks),
+          parsePositiveInteger(req.body.branch_id), parsePositiveInteger(req.body.created_by) || 1,
+        ]
+      );
+      return res.status(201).json(result.rows[0]);
+    }
+    return res.status(400).json({ message: "Selected account type does not match payment action" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Saving Account Payment" });
+  }
+});
+
 app.get("/suppliers", async (req, res) => {
   try {
     const active = req.query.active === undefined ? undefined : String(req.query.active) === "true";
@@ -2001,13 +2487,19 @@ app.post("/customers", async (req, res) => {
     }
     const result = await pool.query(
       `
-      INSERT INTO customers (customer_name, customer_type, mobile_number, address, gst_number, notes, opening_balance, active)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      INSERT INTO customers (
+        customer_name, customer_type, firm_name, mobile_number, alternate_number, address,
+        city, gst_number, bank_name, account_number, ifsc_code, upi_id, notes,
+        opening_balance, active
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
       RETURNING *
       `,
       [
-        customer.customer_name, customer.customer_type, customer.mobile_number, customer.address,
-        customer.gst_number, customer.notes, customer.opening_balance, customer.active,
+        customer.customer_name, customer.customer_type, customer.firm_name, customer.mobile_number,
+        customer.alternate_number, customer.address, customer.city, customer.gst_number,
+        customer.bank_name, customer.account_number, customer.ifsc_code, customer.upi_id,
+        customer.notes, customer.opening_balance, customer.active,
       ]
     );
     return res.status(201).json(result.rows[0]);
@@ -2027,15 +2519,19 @@ app.put("/customers/:id", async (req, res) => {
     const result = await pool.query(
       `
       UPDATE customers
-      SET customer_name = $1, customer_type = $2, mobile_number = $3, address = $4,
-          gst_number = $5, notes = $6, opening_balance = $7, active = $8,
+      SET customer_name = $1, customer_type = $2, firm_name = $3, mobile_number = $4,
+          alternate_number = $5, address = $6, city = $7, gst_number = $8,
+          bank_name = $9, account_number = $10, ifsc_code = $11, upi_id = $12,
+          notes = $13, opening_balance = $14, active = $15,
           updated_at = CURRENT_TIMESTAMP
-      WHERE id = $9
+      WHERE id = $16
       RETURNING *
       `,
       [
-        customer.customer_name, customer.customer_type, customer.mobile_number, customer.address,
-        customer.gst_number, customer.notes, customer.opening_balance, customer.active, customerId,
+        customer.customer_name, customer.customer_type, customer.firm_name, customer.mobile_number,
+        customer.alternate_number, customer.address, customer.city, customer.gst_number,
+        customer.bank_name, customer.account_number, customer.ifsc_code, customer.upi_id,
+        customer.notes, customer.opening_balance, customer.active, customerId,
       ]
     );
     return result.rows[0] ? res.json(result.rows[0]) : res.status(404).json({ message: "Customer not found" });
