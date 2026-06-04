@@ -18,6 +18,8 @@ const icons = {
   products: "box",
   purchase: "cart",
   inventory: "layers",
+  returns: "history",
+  waste: "alert",
   sales: "receipt",
   "sales-history": "history",
   expenses: "wallet",
@@ -33,6 +35,8 @@ const navigationItems = [
   ["purchase", "Purchase Entry"],
   ["accounts", "Accounts"],
   ["inventory", "Inventory"],
+  ["returns", "Sale Returns"],
+  ["waste", "Waste Management"],
   ["sales", "POS Billing"],
   ["sales-history", "Sales History"],
   ["sale-rates", "Sale Rate Update"],
@@ -68,6 +72,30 @@ const accountPaymentActions = [
   ["PAY_SUPPLIER", "Pay Supplier"],
 ];
 
+const defaultRolePermissions = {
+  Owner: { all: true },
+  Admin: { all: true },
+  Cashier: { dashboard: true, sales: true, "sales-history": true, accounts: true },
+  "Purchase Manager": { dashboard: true, purchase: true, accounts: true, reports: true },
+  "Inventory Manager": { dashboard: true, inventory: true, waste: true, reports: true },
+};
+
+const modulePermissionMap = {
+  dashboard: "dashboard",
+  products: "inventory",
+  purchase: "purchases",
+  accounts: "supplier_accounts",
+  inventory: "inventory",
+  returns: "billing",
+  waste: "waste_management",
+  sales: "billing",
+  "sales-history": "billing",
+  "sale-rates": "discounts",
+  expenses: "reports",
+  reports: "reports",
+  settings: "settings",
+};
+
 const ledgerModes = [
   ["ANY", "Any Account Ledger"],
   ["CUSTOMER", "Customer Ledger"],
@@ -99,6 +127,11 @@ const emptyDashboardAnalytics = {
     supplierOutstanding: 0,
     customerOutstanding: 0,
     todayExpenses: 0,
+    todayReturns: 0,
+    monthlyReturns: 0,
+    todayWaste: 0,
+    monthlyWaste: 0,
+    wastePercentage: 0,
     totalRebateReceived: 0,
     todaySupplierPayments: 0,
   },
@@ -216,6 +249,8 @@ function App() {
   const [products, setProducts] = useState([]);
   const [inventory, setInventory] = useState([]);
   const [salesHistory, setSalesHistory] = useState([]);
+  const [saleReturns, setSaleReturns] = useState([]);
+  const [wasteEntries, setWasteEntries] = useState([]);
   const [purchaseRules, setPurchaseRules] = useState(defaultPurchaseRules);
   const [settingsRules, setSettingsRules] = useState(defaultPurchaseRules);
   const [settingsData, setSettingsData] = useState({
@@ -223,6 +258,8 @@ function App() {
     saleRateSettings: defaultSaleRateSettings,
     discountRules: [],
     roles: [],
+    updateCenter: {},
+    syncSettings: {},
     backupSettings: {},
     canManageSettings: false,
   });
@@ -249,6 +286,11 @@ function App() {
     discountReport: [],
     expenseReport: [],
     paymentReport: [],
+    returnReport: [],
+    returnReasonReport: [],
+    wasteReport: [],
+    wasteProductReport: [],
+    mostWastedProducts: [],
     balanceSheet: {},
     profitLoss: {},
   });
@@ -268,6 +310,11 @@ function App() {
     supplierOutstanding: 0,
     customerOutstanding: 0,
     todayExpenses: 0,
+    todayReturns: 0,
+    monthlyReturns: 0,
+    todayWaste: 0,
+    monthlyWaste: 0,
+    wastePercentage: 0,
     totalRebateReceived: 0,
     todaySupplierPayments: 0,
     total_supplier_outstanding: 0,
@@ -301,6 +348,26 @@ function App() {
   const [editingSale, setEditingSale] = useState(null);
   const [changeHistory, setChangeHistory] = useState(null);
 
+  const rolePermissionMap = useMemo(() => {
+    const map = new Map();
+    for (const role of settingsData.roles || []) map.set(role.role_name || role.role, role.permissions || {});
+    return map;
+  }, [settingsData.roles]);
+
+  const hasModuleAccess = (view) => {
+    if (!user) return false;
+    const roleName = user.role;
+    const defaultPermissions = defaultRolePermissions[roleName] || {};
+    if (defaultPermissions.all || defaultPermissions[view]) return true;
+    const permissionKey = modulePermissionMap[view];
+    const permissions = rolePermissionMap.get(roleName);
+    if (view === "accounts" && permissions) {
+      return Boolean(permissions.customer_payments || permissions.supplier_payments || permissions.supplier_accounts);
+    }
+    if (!permissions || !permissionKey || permissionKey === "dashboard") return view === "dashboard";
+    return Boolean(permissions[permissionKey]);
+  };
+
   const kpis = useMemo(() => {
     const today = toDateKey(new Date());
     const todaysSales = salesHistory.filter((sale) => toDateKey(sale.sale_date) === today);
@@ -325,6 +392,11 @@ function App() {
       supplierOutstanding: supplierDashboard.supplierOutstanding ?? supplierDashboard.total_supplier_outstanding ?? 0,
       customerOutstanding: analyticsSummary.customerOutstanding ?? supplierDashboard.customerOutstanding ?? 0,
       todayExpenses: analyticsSummary.todayExpenses ?? supplierDashboard.todayExpenses ?? 0,
+      todayReturns: analyticsSummary.todayReturns ?? supplierDashboard.todayReturns ?? 0,
+      monthlyReturns: analyticsSummary.monthlyReturns ?? supplierDashboard.monthlyReturns ?? 0,
+      todayWaste: analyticsSummary.todayWaste ?? supplierDashboard.todayWaste ?? 0,
+      monthlyWaste: analyticsSummary.monthlyWaste ?? supplierDashboard.monthlyWaste ?? 0,
+      wastePercentage: analyticsSummary.wastePercentage ?? supplierDashboard.wastePercentage ?? 0,
       totalRebateReceived: supplierDashboard.totalRebateReceived ?? supplierDashboard.total_rebate_received ?? 0,
       todaySupplierPayments: supplierDashboard.todaySupplierPayments ?? supplierDashboard.todays_supplier_payments ?? 0,
     };
@@ -338,6 +410,11 @@ function App() {
       ["Today's Expenses", currency.format(Number(metrics.todayExpenses || 0)), "wallet"],
       ["Total Rebate Received", currency.format(Number(metrics.totalRebateReceived || 0)), "trend"],
       ["Today's Supplier Payments", currency.format(Number(metrics.todaySupplierPayments || 0)), "rupee"],
+      ["Today's Returns", currency.format(Number(metrics.todayReturns || 0)), "history"],
+      ["Monthly Returns", currency.format(Number(metrics.monthlyReturns || 0)), "history"],
+      ["Today's Waste", currency.format(Number(metrics.todayWaste || 0)), "alert"],
+      ["Monthly Waste", currency.format(Number(metrics.monthlyWaste || 0)), "alert"],
+      ["Waste Percentage", `${Number(metrics.wastePercentage || 0).toFixed(2)}%`, "chart"],
       ["Low Stock Items", Number(metrics.lowStockItems || 0), "alert"],
       ["Transactions", Number(metrics.transactions || 0), "receipt"],
     ];
@@ -407,6 +484,8 @@ function App() {
       saleRateSettings: nextSaleRateSettings,
       discountRules: data.discountRules || [],
       roles: data.roles || [],
+      updateCenter: data.updateCenter || {},
+      syncSettings: data.syncSettings || {},
       backupSettings: data.backupSettings || {},
       canManageSettings: Boolean(data.canManageSettings),
     });
@@ -483,6 +562,16 @@ function App() {
     setSalesHistory(response.data);
   };
 
+  const loadSaleReturns = async () => {
+    const response = await axios.get(`${API_URL}/sale-returns`);
+    setSaleReturns(response.data);
+  };
+
+  const loadWasteEntries = async () => {
+    const response = await axios.get(`${API_URL}/waste-entries`);
+    setWasteEntries(response.data);
+  };
+
   const getDashboardParams = (range = dashboardRange, customRange = dashboardCustomRange) => {
     if (range === "custom") {
       return customRange.date_from && customRange.date_to
@@ -535,7 +624,7 @@ function App() {
     try {
       const response = await axios.post(`${API_URL}/login`, { username, password });
       setUser(response.data);
-      await Promise.all([loadProducts(), loadDashboardData(), loadPurchaseRules(), loadSupplierData(), loadCustomerData(), loadAccounts(), loadAccountOutstanding(), loadAccountPayments(), loadSettingsData(response.data)]);
+      await Promise.all([loadProducts(), loadDashboardData(), loadPurchaseRules(), loadSupplierData(), loadCustomerData(), loadAccounts(), loadAccountOutstanding(), loadAccountPayments(), loadSaleReturns(), loadWasteEntries(), loadSettingsData(response.data)]);
     } catch (error) {
       alert(getErrorMessage(error, "Login Failed"));
     }
@@ -685,6 +774,10 @@ function App() {
   };
 
   const navigate = async (view) => {
+    if (!hasModuleAccess(view)) {
+      alert("Your role does not have access to this module.");
+      return;
+    }
     setSidebarOpen(false);
     setActiveView(view);
     try {
@@ -704,6 +797,8 @@ function App() {
       }
       if (view === "reports") await loadReports();
       if (view === "expenses") await loadExpenses();
+      if (view === "returns") await loadSaleReturns();
+      if (view === "waste") await loadWasteEntries();
       if (view === "dashboard") await loadDashboardData();
       if (view === "settings") await loadSettingsData();
       if (view === "sale-rates") await loadSaleRates();
@@ -755,7 +850,7 @@ function App() {
         </div>
         <span className="sidebar-section">Main Menu</span>
         <nav className="sidebar-nav">
-          {navigationItems.filter(([view]) => canManageRates || view !== "sale-rates").map(([view, label]) => (
+          {navigationItems.filter(([view]) => hasModuleAccess(view) && (canManageRates || view !== "sale-rates")).map(([view, label]) => (
             <button
               className={activeView === view ? "nav-item nav-item-active" : "nav-item"}
               key={view}
@@ -1004,6 +1099,29 @@ function App() {
             </ModuleCard>
           )}
 
+          {activeView === "returns" && (
+            <SaleReturnModule
+              onReload={async () => {
+                await Promise.all([loadSaleReturns(), loadDashboardData(), loadSalesHistory()]);
+              }}
+              returns={saleReturns}
+              salesHistory={salesHistory}
+              user={user}
+            />
+          )}
+
+          {activeView === "waste" && (
+            <WasteManagementModule
+              entries={wasteEntries}
+              inventory={inventory}
+              onReload={async () => {
+                await Promise.all([loadWasteEntries(), loadDashboardData()]);
+              }}
+              products={products}
+              user={user}
+            />
+          )}
+
           {activeView === "sales" && (
             <PosBilling
               customers={customers.filter((customer) => customer.active !== false)}
@@ -1190,6 +1308,34 @@ function ReportsModule({ data, onReload }) {
           </DataTable>
         </PrintableReport>
       </ModuleCard>
+      <ModuleCard eyebrow="Return Report" title="Sale Returns" subtitle="Return value, return quantity and return counts by date.">
+        <PrintableReport title="Sale Return Report">
+          <DataTable headers={["Date", "Returns", "Return Quantity", "Return Value"]}>
+            {(data.returnReport || []).map((row) => <tr key={row.return_date}><td>{row.return_date}</td><td>{row.return_count}</td><td>{Number(row.return_quantity || 0).toLocaleString("en-IN")}</td><td>{currency.format(Number(row.return_value || 0))}</td></tr>)}
+          </DataTable>
+        </PrintableReport>
+      </ModuleCard>
+      <ModuleCard eyebrow="Reason Analysis" title="Return Reason Analysis" subtitle="Reasons driving product returns.">
+        <PrintableReport title="Return Reason Analysis">
+          <DataTable headers={["Reason", "Returns", "Return Value"]}>
+            {(data.returnReasonReport || []).map((row) => <tr key={row.return_reason}><td className="primary-cell">{row.return_reason}</td><td>{row.return_count}</td><td>{currency.format(Number(row.return_value || 0))}</td></tr>)}
+          </DataTable>
+        </PrintableReport>
+      </ModuleCard>
+      <ModuleCard eyebrow="Waste Report" title="Daily and Monthly Waste" subtitle="Waste quantity and FIFO cost by date and waste type.">
+        <PrintableReport title="Waste Report">
+          <DataTable headers={["Date", "Waste Type", "Entries", "Quantity", "Cost"]}>
+            {(data.wasteReport || []).map((row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td><span className="tag">{row.waste_type}</span></td><td>{row.entry_count}</td><td>{Number(row.waste_quantity || 0).toLocaleString("en-IN")}</td><td>{currency.format(Number(row.waste_cost || 0))}</td></tr>)}
+          </DataTable>
+        </PrintableReport>
+      </ModuleCard>
+      <ModuleCard eyebrow="Product Wise Waste" title="Most Wasted Products" subtitle="Product wise waste quantity and cost.">
+        <PrintableReport title="Product Wise Waste Report">
+          <DataTable headers={["Product", "Quantity", "Cost"]}>
+            {(data.wasteProductReport || []).map((row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{Number(row.waste_quantity || 0).toLocaleString("en-IN")}</td><td>{currency.format(Number(row.waste_cost || 0))}</td></tr>)}
+          </DataTable>
+        </PrintableReport>
+      </ModuleCard>
       <ModuleCard eyebrow="Supplier Outstanding" title="Supplier Outstanding Report" subtitle="Supplier payable balances after payments and rebates.">
         <PrintableReport title="Supplier Outstanding Report">
           <DataTable headers={["Supplier", "Purchases", "Paid", "Rebate", "Outstanding"]}>
@@ -1234,6 +1380,214 @@ function ReportsModule({ data, onReload }) {
             <SummaryMetric label="Net Profit" value={currency.format(Number(data.profitLoss?.netProfit || 0))} featured />
           </div>
         </PrintableReport>
+      </ModuleCard>
+    </section>
+  );
+}
+
+function SaleReturnModule({ onReload, returns, salesHistory, user }) {
+  const [invoiceId, setInvoiceId] = useState("");
+  const [returnOptions, setReturnOptions] = useState({ sale: null, items: [] });
+  const [returnDate, setReturnDate] = useState(toDateKey(new Date()));
+  const [refundType, setRefundType] = useState("CASH_REFUND");
+  const [returnReason, setReturnReason] = useState("");
+  const [quantities, setQuantities] = useState({});
+  const activeInvoices = salesHistory.filter((sale) => sale.sale_status !== "CANCELLED");
+
+  const loadReturnOptions = async (saleId) => {
+    setInvoiceId(saleId);
+    setQuantities({});
+    if (!saleId) {
+      setReturnOptions({ sale: null, items: [] });
+      return;
+    }
+    const response = await axios.get(`${API_URL}/sale-returns/options/${saleId}`);
+    setReturnOptions(response.data);
+  };
+
+  const selectedItems = returnOptions.items
+    .map((item) => ({ ...item, return_quantity: Number(quantities[item.sale_item_id] || 0) }))
+    .filter((item) => item.return_quantity > 0);
+  const totalReturnValue = selectedItems.reduce((sum, item) => (
+    sum + (Number(item.net_amount || 0) / Number(item.sold_quantity || 1)) * Number(item.return_quantity || 0)
+  ), 0);
+
+  const saveReturn = async () => {
+    try {
+      await axios.post(`${API_URL}/sale-returns`, {
+        sale_id: Number(invoiceId),
+        customer_name: returnOptions.sale?.customer_name,
+        customer_mobile: returnOptions.sale?.customer_mobile,
+        return_date: returnDate,
+        refund_type: refundType,
+        return_reason: returnReason,
+        branch_id: user.branch_id,
+        created_by: user.id,
+        items: selectedItems.map((item) => ({
+          sale_item_id: item.sale_item_id,
+          return_quantity: item.return_quantity,
+        })),
+      });
+      setInvoiceId("");
+      setReturnOptions({ sale: null, items: [] });
+      setReturnReason("");
+      setQuantities({});
+      await onReload();
+      alert("Sale return saved and inventory restored");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to save sale return"));
+    }
+  };
+
+  return (
+    <section className="settings-layout">
+      <ModuleCard eyebrow="Sale Return / Refund" title="Return Entry" subtitle="Create a separate return record without editing the original invoice.">
+        <div className="form-grid supplier-form-grid">
+          <Field label="Select Invoice">
+            <select value={invoiceId} onChange={(event) => loadReturnOptions(event.target.value)}>
+              <option value="">Select invoice</option>
+              {activeInvoices.map((sale) => <option key={sale.id} value={sale.id}>{sale.invoice_no || `Invoice #${sale.id}`} - {sale.customer_name || "Walk-in"} - {currency.format(Number(sale.amount || 0))}</option>)}
+            </select>
+          </Field>
+          <Field label="Customer"><input readOnly value={returnOptions.sale?.customer_name || ""} /></Field>
+          <Field label="Return Date"><input type="date" value={returnDate} onChange={(event) => setReturnDate(event.target.value)} /></Field>
+          <Field label="Refund Option">
+            <select value={refundType} onChange={(event) => setRefundType(event.target.value)}>
+              <option value="CASH_REFUND">Cash Refund</option>
+              <option value="UPI_REFUND">UPI Refund</option>
+              <option value="CREDIT_NOTE">Credit Note</option>
+              <option value="FUTURE_ADJUSTMENT">Adjustment Against Future Sale</option>
+            </select>
+          </Field>
+          <Field label="Return Reason"><textarea value={returnReason} onChange={(event) => setReturnReason(event.target.value)} /></Field>
+        </div>
+        <DataTable headers={["Product", "Sold", "Already Returned", "Returnable", "Return Quantity", "Rate", "Return Value"]}>
+          {returnOptions.items.map((item) => {
+            const quantity = Number(quantities[item.sale_item_id] || 0);
+            const value = (Number(item.net_amount || 0) / Number(item.sold_quantity || 1)) * quantity;
+            return (
+              <tr key={item.sale_item_id}>
+                <td className="primary-cell">{item.product_name}<small className="cell-note">{item.unit}</small></td>
+                <td>{Number(item.sold_quantity || 0).toLocaleString("en-IN")}</td>
+                <td>{Number(item.returned_quantity || 0).toLocaleString("en-IN")}</td>
+                <td>{Number(item.returnable_quantity || 0).toLocaleString("en-IN")}</td>
+                <td><input className="table-input" min="0" max={Number(item.returnable_quantity || 0)} step="0.001" type="number" value={quantities[item.sale_item_id] || ""} onChange={(event) => setQuantities({ ...quantities, [item.sale_item_id]: event.target.value })} /></td>
+                <td>{currency.format(Number(item.selling_rate || 0))}</td>
+                <td>{currency.format(value)}</td>
+              </tr>
+            );
+          })}
+        </DataTable>
+        <div className="purchase-summary-grid supplier-payment-preview">
+          <SummaryMetric label="Selected Items" value={selectedItems.length} />
+          <SummaryMetric label="Return Value" value={currency.format(totalReturnValue)} featured />
+          <SummaryMetric label="Refund Mode" value={refundType.replaceAll("_", " ")} />
+        </div>
+        <button className="primary-button" onClick={saveReturn}>Save Return / Refund</button>
+      </ModuleCard>
+      <ModuleCard eyebrow="Return History" title="Sale Return History" subtitle="Returned goods, refund modes and reasons remain separate from original invoices.">
+        <DataTable headers={["Return No", "Date", "Invoice", "Customer", "Refund", "Value", "Reason", "Items"]}>
+          {returns.map((entry) => (
+            <tr key={entry.id}>
+              <td><span className="batch-id">{entry.return_no}</span></td>
+              <td>{toDateKey(entry.return_date)}</td>
+              <td>{entry.invoice_no}</td>
+              <td className="primary-cell">{entry.customer_name || "Walk-in"}</td>
+              <td><span className="tag">{entry.refund_type}</span></td>
+              <td>{currency.format(Number(entry.total_return_amount || 0))}</td>
+              <td>{entry.return_reason}</td>
+              <td>{(entry.items || []).map((item) => `${item.product_name} x ${item.return_quantity}`).join(", ")}</td>
+            </tr>
+          ))}
+        </DataTable>
+      </ModuleCard>
+    </section>
+  );
+}
+
+function WasteManagementModule({ entries, inventory, onReload, products, user }) {
+  const [draft, setDraft] = useState({
+    product_id: "",
+    quantity: "",
+    waste_type: "DAAGI",
+    waste_date: toDateKey(new Date()),
+    remarks: "",
+  });
+  const stockByProduct = inventory.reduce((stock, item) => {
+    stock.set(Number(item.product_id), (stock.get(Number(item.product_id)) || 0) + Number(item.remaining_qty || 0));
+    return stock;
+  }, new Map());
+  const mostWasted = [...entries].reduce((map, entry) => {
+    const current = map.get(entry.product_name) || { product_name: entry.product_name, quantity: 0, cost: 0 };
+    current.quantity += Number(entry.quantity || 0);
+    current.cost += Number(entry.cost_amount || 0);
+    map.set(entry.product_name, current);
+    return map;
+  }, new Map());
+  const mostWastedProducts = [...mostWasted.values()].sort((left, right) => right.quantity - left.quantity).slice(0, 5);
+  const saveWaste = async () => {
+    try {
+      await axios.post(`${API_URL}/waste-entries`, {
+        ...draft,
+        product_id: Number(draft.product_id),
+        quantity: Number(draft.quantity || 0),
+        branch_id: user.branch_id,
+        created_by: user.id,
+      });
+      setDraft({ product_id: "", quantity: "", waste_type: "DAAGI", waste_date: toDateKey(new Date()), remarks: "" });
+      await onReload();
+      alert("Waste entry saved and stock reduced");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to save waste entry"));
+    }
+  };
+  return (
+    <section className="settings-layout">
+      <ModuleCard eyebrow="Waste Management" title="Waste Entry" subtitle="Record Daagi, sampling, personal use and other fruit waste with automatic FIFO stock reduction.">
+        <div className="form-grid supplier-form-grid">
+          <Field label="Product">
+            <select value={draft.product_id} onChange={(event) => setDraft({ ...draft, product_id: event.target.value })}>
+              <option value="">Select product</option>
+              {products.filter((product) => product.active !== false).map((product) => <option key={product.id} value={product.id}>{product.product_name} - Stock {stockByProduct.get(Number(product.id)) || 0}</option>)}
+            </select>
+          </Field>
+          <Field label="Quantity"><input min="0" step="0.001" type="number" value={draft.quantity} onChange={(event) => setDraft({ ...draft, quantity: event.target.value })} /></Field>
+          <Field label="Waste Type">
+            <select value={draft.waste_type} onChange={(event) => setDraft({ ...draft, waste_type: event.target.value })}>
+              <option value="DAAGI">Daagi</option>
+              <option value="SAMPLING">Sampling</option>
+              <option value="PERSONAL_USE">Personal Use</option>
+              <option value="OTHER">Other</option>
+            </select>
+          </Field>
+          <Field label="Date"><input type="date" value={draft.waste_date} onChange={(event) => setDraft({ ...draft, waste_date: event.target.value })} /></Field>
+          <Field label="Remarks"><textarea value={draft.remarks} onChange={(event) => setDraft({ ...draft, remarks: event.target.value })} /></Field>
+        </div>
+        <button className="primary-button" onClick={saveWaste}>Save Waste Entry</button>
+      </ModuleCard>
+      <ModuleCard eyebrow="Business Intelligence" title="Most Wasted Products" subtitle="Highlights products causing the highest waste quantity.">
+        <div className="top-product-list">
+          {mostWastedProducts.length ? mostWastedProducts.map((item) => (
+            <article className="top-product-row" key={item.product_name}>
+              <div><strong>{item.product_name}</strong><span>{item.quantity.toLocaleString("en-IN")} quantity wasted</span></div>
+              <strong>{currency.format(item.cost)}</strong>
+            </article>
+          )) : <div className="empty-inline">No waste entries yet.</div>}
+        </div>
+      </ModuleCard>
+      <ModuleCard eyebrow="Waste History" title="Waste Register" subtitle="Waste quantity and FIFO cost are stored for daily and monthly reporting.">
+        <DataTable headers={["Date", "Product", "Type", "Quantity", "Cost", "Remarks"]}>
+          {entries.map((entry) => (
+            <tr key={entry.id}>
+              <td>{toDateKey(entry.waste_date)}</td>
+              <td className="primary-cell">{entry.product_name}<small className="cell-note">{entry.unit}</small></td>
+              <td><span className="tag">{entry.waste_type}</span></td>
+              <td>{Number(entry.quantity || 0).toLocaleString("en-IN")}</td>
+              <td>{currency.format(Number(entry.cost_amount || 0))}</td>
+              <td>{entry.remarks || "-"}</td>
+            </tr>
+          ))}
+        </DataTable>
       </ModuleCard>
     </section>
   );
@@ -1353,7 +1707,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
     active: true,
     notes: "",
   };
-  const [tab, setTab] = useState("master");
+  const [tab, setTab] = useState(() => (["Owner", "Admin", "Purchase Manager"].includes(user.role) ? "master" : "payments"));
   const [search, setSearch] = useState("");
   const [draft, setDraft] = useState(emptyAccount);
   const [editingKey, setEditingKey] = useState("");
@@ -1361,7 +1715,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
   const [ledgerAccountKey, setLedgerAccountKey] = useState("");
   const [ledgerDateRange, setLedgerDateRange] = useState({ date_from: "", date_to: "" });
   const [payment, setPayment] = useState({
-    payment_action: "RECEIVE_CUSTOMER",
+    payment_action: user.role === "Purchase Manager" ? "PAY_SUPPLIER" : "RECEIVE_CUSTOMER",
     account_key: "",
     payment_date: toDateKey(new Date()),
     amount: "",
@@ -1373,6 +1727,18 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
   const [editingPaymentKey, setEditingPaymentKey] = useState("");
   const [paymentAudit, setPaymentAudit] = useState(null);
   const [receiptPayment, setReceiptPayment] = useState(null);
+  const canManageAllAccounts = ["Owner", "Admin"].includes(user.role);
+  const canUseSupplierPayments = canManageAllAccounts || user.role === "Purchase Manager";
+  const canUseCustomerPayments = canManageAllAccounts || user.role === "Cashier";
+  const accountTabs = [
+    ...(canManageAllAccounts || user.role === "Purchase Manager" ? [["master", "Account Master"]] : []),
+    ["ledger", "Ledger"],
+    ["payments", "Payments"],
+    ...(canManageAllAccounts || user.role === "Purchase Manager" ? [["outstanding", "Outstanding"]] : []),
+  ];
+  const paymentActionOptions = accountPaymentActions.filter(([value]) =>
+    value === "RECEIVE_CUSTOMER" ? canUseCustomerPayments : canUseSupplierPayments
+  );
   const filteredAccounts = accounts.filter((account) =>
     account.account_name.toLowerCase().includes(search.toLowerCase()) ||
     String(account.mobile_number || "").includes(search)
@@ -1538,12 +1904,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
         </div>
       </section>
       <div className="account-tabs">
-        {[
-          ["master", "Account Master"],
-          ["ledger", "Ledger"],
-          ["payments", "Payments"],
-          ["outstanding", "Outstanding"],
-        ].map(([value, label]) => (
+        {accountTabs.map(([value, label]) => (
           <button className={tab === value ? "account-tab account-tab-active" : "account-tab"} key={value} onClick={() => setTab(value)}>{label}</button>
         ))}
       </div>
@@ -1679,7 +2040,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
           <div className="form-grid">
             <Field label="Payment Action">
               <select value={payment.payment_action} onChange={(event) => setPayment({ ...payment, payment_action: event.target.value, account_key: "", rebate_amount: "" })}>
-                {accountPaymentActions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                {paymentActionOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
               </select>
             </Field>
             <Field label="Account">
@@ -1780,7 +2141,9 @@ function SettingsModule({ canManage, onReload, rules, settingsData, user }) {
       <RebateSettings canManage={canManage} onReload={onReload} rules={rules.rebateRules} user={user} />
       <SaleRateSettingsSection canManage={canManage} key={settingsData.saleRateSettings?.updated_at || "sale-rate-settings"} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />
       <DiscountSettings canManage={canManage} discountRules={settingsData.discountRules} onReload={onReload} user={user} />
-      <PermissionSettings roles={settingsData.roles} />
+      <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />
+      <UpdateCenterSection canManage={canManage} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
+      <SyncSettingsSection canManage={canManage} key={settingsData.syncSettings?.updated_at || "sync-settings"} onReload={onReload} syncSettings={settingsData.syncSettings} user={user} />
       <BackupSettings backupSettings={settingsData.backupSettings} />
     </section>
   );
@@ -2041,23 +2404,134 @@ function DiscountRuleRow({ canManage, onReload, rule, user }) {
   );
 }
 
-function PermissionSettings({ roles }) {
+const permissionLabels = [
+  ["settings", "Settings"],
+  ["discounts", "Discounts"],
+  ["mandi_tax", "Mandi Tax"],
+  ["rebate_rules", "Rebate Rules"],
+  ["supplier_payments", "Supplier Payments"],
+  ["customer_payments", "Customer Payments"],
+  ["sale_edit", "Sale Edit"],
+  ["invoice_cancellation", "Invoice Cancellation"],
+  ["reports", "Reports"],
+  ["purchases", "Purchases"],
+  ["supplier_accounts", "Supplier Accounts"],
+  ["inventory", "Inventory"],
+  ["waste_management", "Waste Management"],
+  ["billing", "Billing"],
+];
+
+function PermissionSettings({ canManage, onReload, roles, user }) {
+  const [drafts, setDrafts] = useState(() => {
+    const next = {};
+    for (const role of roles || []) next[role.role_name] = role.permissions || {};
+    return next;
+  });
+  const toggle = (roleName, key) => {
+    setDrafts((current) => ({
+      ...current,
+      [roleName]: { ...(current[roleName] || {}), [key]: !current[roleName]?.[key] },
+    }));
+  };
+  const saveRole = async (roleName) => {
+    try {
+      await axios.put(`${API_URL}/settings/role-permissions/${encodeURIComponent(roleName)}`, {
+        permissions: drafts[roleName] || {},
+        updated_by: user.id,
+      });
+      await onReload();
+      alert("Role permissions updated");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update role permissions"));
+    }
+  };
   return (
-    <ModuleCard eyebrow="User & Permission Settings" title="Role Control Matrix" subtitle="Sensitive settings are restricted to Owner/Admin users.">
-      <div className="permission-grid">
-        {(roles.length ? roles : [
-          { role: "Owner", permissions: ["Full access"] },
-          { role: "Admin", permissions: ["Settings management"] },
-          { role: "Cashier", permissions: ["POS only"] },
-          { role: "Purchase Manager", permissions: ["Purchase and suppliers"] },
-          { role: "Inventory Manager", permissions: ["Inventory control"] },
-        ]).map((role) => (
-          <article className="permission-card" key={role.role}>
-            <strong>{role.role}</strong>
-            <span>{role.permissions.join(", ")}</span>
-          </article>
+    <ModuleCard eyebrow="Role Management" title="Permission Matrix" subtitle="Owner/Admin can control access to billing, settings, tax, rebates, payments, reports and inventory functions.">
+      <DataTable headers={["Role", ...permissionLabels.map(([, label]) => label), ""]}>
+        {(roles || []).map((role) => (
+          <tr key={role.role_name}>
+            <td className="primary-cell">{role.role_name}</td>
+            {permissionLabels.map(([key]) => (
+              <td key={key}>
+                <input checked={Boolean(drafts[role.role_name]?.[key])} disabled={!canManage || role.role_name === "Owner"} type="checkbox" onChange={() => toggle(role.role_name, key)} />
+              </td>
+            ))}
+            <td><button className="table-action" disabled={!canManage || role.role_name === "Owner"} onClick={() => saveRole(role.role_name)}>Save</button></td>
+          </tr>
         ))}
+      </DataTable>
+    </ModuleCard>
+  );
+}
+
+function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
+  const [draft, setDraft] = useState(updateCenter || {});
+  const save = async (status) => {
+    try {
+      await axios.put(`${API_URL}/settings/update-center`, {
+        ...draft,
+        update_status: status || draft.update_status,
+        updated_by: user.id,
+      });
+      await onReload();
+      alert("Update center saved");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update update center"));
+    }
+  };
+  return (
+    <ModuleCard eyebrow="Updates" title="Update Center" subtitle="Future-ready local update metadata. Online delivery is intentionally not enabled yet.">
+      <div className="purchase-summary-grid supplier-payment-preview">
+        <SummaryMetric label="Current Version" value={draft.current_version || "1.0.0"} featured />
+        <SummaryMetric label="Release Date" value={draft.release_date ? toDateKey(draft.release_date) : toDateKey(new Date())} />
+        <SummaryMetric label="Status" value={draft.update_status || "READY_FOR_FUTURE_UPDATES"} />
       </div>
+      <div className="form-grid supplier-form-grid">
+        <Field label="Current Version"><input disabled={!canManage} value={draft.current_version || ""} onChange={(event) => setDraft({ ...draft, current_version: event.target.value })} /></Field>
+        <Field label="Release Date"><input disabled={!canManage} type="date" value={toDateKey(draft.release_date || new Date())} onChange={(event) => setDraft({ ...draft, release_date: event.target.value })} /></Field>
+        <Field label="Changelog"><textarea disabled={!canManage} value={draft.changelog || ""} onChange={(event) => setDraft({ ...draft, changelog: event.target.value })} /></Field>
+      </div>
+      <div className="button-row">
+        <button className="secondary-button" disabled={!canManage} onClick={() => save("CHECKED_LOCAL_METADATA")}>Check for Updates</button>
+        <button className="secondary-button" disabled={!canManage} onClick={() => save("DOWNLOAD_READY_FUTURE")}>Download Update</button>
+        <button className="primary-button" disabled={!canManage} onClick={() => save("INSTALL_READY_FUTURE")}>Install Update</button>
+      </div>
+    </ModuleCard>
+  );
+}
+
+function SyncSettingsSection({ canManage, onReload, syncSettings, user }) {
+  const [draft, setDraft] = useState(syncSettings || {});
+  const save = async () => {
+    try {
+      await axios.put(`${API_URL}/settings/sync-status`, { ...draft, updated_by: user.id });
+      await onReload();
+      alert("Sync settings saved");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update sync settings"));
+    }
+  };
+  return (
+    <ModuleCard eyebrow="Sync Settings" title="Offline Sync Architecture" subtitle="Local database, sync queue and status indicator are prepared. Cloud sync delivery is not enabled yet.">
+      <div className="purchase-summary-grid supplier-payment-preview">
+        <SummaryMetric label="Sync Status" value={draft.sync_status || "OFFLINE_READY"} featured />
+        <SummaryMetric label="Pending Queue" value={Number(draft.pending_count || 0)} />
+        <SummaryMetric label="Last Sync Time" value={draft.last_sync_at ? new Date(draft.last_sync_at).toLocaleString("en-IN") : "Not synced"} />
+      </div>
+      <div className="form-grid supplier-form-grid">
+        <Field label="Device ID"><input disabled={!canManage} value={draft.device_id || ""} onChange={(event) => setDraft({ ...draft, device_id: event.target.value })} /></Field>
+        <Field label="Status">
+          <select disabled={!canManage} value={draft.sync_status || "OFFLINE_READY"} onChange={(event) => setDraft({ ...draft, sync_status: event.target.value })}>
+            <option value="ONLINE">Online</option>
+            <option value="OFFLINE">Offline</option>
+            <option value="SYNC_PENDING">Sync Pending</option>
+            <option value="OFFLINE_READY">Offline Ready</option>
+          </select>
+        </Field>
+        <label className="check-field"><input checked={draft.sync_enabled === true} disabled={!canManage} type="checkbox" onChange={(event) => setDraft({ ...draft, sync_enabled: event.target.checked })} /><span>Enable future sync</span></label>
+        <Field label="Notes"><textarea disabled={!canManage} value={draft.notes || ""} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></Field>
+      </div>
+      <button className="primary-button" disabled={!canManage} onClick={save}>Save Sync Settings</button>
     </ModuleCard>
   );
 }

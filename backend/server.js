@@ -58,6 +58,24 @@ const DISCOUNT_TYPES = new Set(["FLAT_AMOUNT", "PERCENTAGE"]);
 const DISCOUNT_PAYMENT_MODES = new Set(["ALL", "CASH", "UPI", "CARD"]);
 const ROUNDING_RULES = new Set(["NEAREST_RUPEE", "ROUND_UP_5", "ROUND_UP_10", "NO_ROUND"]);
 const SALE_STATUSES = new Set(["COMPLETED", "EDITED", "CANCELLED"]);
+const REFUND_TYPES = new Set(["CASH_REFUND", "UPI_REFUND", "CREDIT_NOTE", "FUTURE_ADJUSTMENT"]);
+const WASTE_TYPES = new Set(["DAAGI", "SAMPLING", "PERSONAL_USE", "OTHER"]);
+const PERMISSION_KEYS = [
+  "settings",
+  "discounts",
+  "mandi_tax",
+  "rebate_rules",
+  "supplier_payments",
+  "customer_payments",
+  "sale_edit",
+  "invoice_cancellation",
+  "reports",
+  "purchases",
+  "supplier_accounts",
+  "inventory",
+  "waste_management",
+  "billing",
+];
 
 const cleanText = (value) => (typeof value === "string" ? value.trim() : "");
 const nullableText = (value) => cleanText(value) || null;
@@ -65,6 +83,8 @@ const normalizeSupplierType = (value) => String(value || "LOCAL_SUPPLIER").toUpp
 const normalizePaymentMode = (value) => String(value || "").trim().toUpperCase().replace(/\s+/g, "_");
 const normalizeDiscountType = (value) => String(value || "FLAT_AMOUNT").toUpperCase();
 const normalizeDiscountPaymentMode = (value) => String(value || "ALL").trim().toUpperCase();
+const normalizeRefundType = (value) => String(value || "CASH_REFUND").trim().toUpperCase();
+const normalizeWasteType = (value) => String(value || "DAAGI").trim().toUpperCase();
 
 const requireRateManager = async (userId, client = pool) => {
   const parsedUserId = parsePositiveInteger(userId);
@@ -348,6 +368,85 @@ const initializeDatabase = async () => {
       edited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS sale_returns (
+      id SERIAL PRIMARY KEY,
+      return_no VARCHAR(40) UNIQUE,
+      sale_id INTEGER NOT NULL REFERENCES sales(id),
+      customer_name VARCHAR(120),
+      customer_mobile VARCHAR(20),
+      return_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      refund_type VARCHAR(30) NOT NULL,
+      return_reason TEXT NOT NULL,
+      total_return_amount NUMERIC(14, 2) NOT NULL DEFAULT 0 CHECK (total_return_amount >= 0),
+      total_cost_amount NUMERIC(14, 2) NOT NULL DEFAULT 0 CHECK (total_cost_amount >= 0),
+      branch_id INTEGER REFERENCES branches(id),
+      created_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS sale_return_items (
+      id SERIAL PRIMARY KEY,
+      sale_return_id INTEGER NOT NULL REFERENCES sale_returns(id) ON DELETE CASCADE,
+      sale_item_id INTEGER NOT NULL REFERENCES sale_items(id),
+      product_id INTEGER NOT NULL REFERENCES products(id),
+      return_quantity NUMERIC(14, 3) NOT NULL CHECK (return_quantity > 0),
+      selling_rate NUMERIC(14, 2) NOT NULL DEFAULT 0,
+      return_amount NUMERIC(14, 2) NOT NULL DEFAULT 0,
+      cost_amount NUMERIC(14, 2) NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS waste_entries (
+      id SERIAL PRIMARY KEY,
+      product_id INTEGER NOT NULL REFERENCES products(id),
+      waste_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      quantity NUMERIC(14, 3) NOT NULL CHECK (quantity > 0),
+      waste_type VARCHAR(30) NOT NULL,
+      remarks TEXT,
+      cost_amount NUMERIC(14, 2) NOT NULL DEFAULT 0,
+      branch_id INTEGER REFERENCES branches(id),
+      created_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS role_permission_settings (
+      role_name VARCHAR(80) PRIMARY KEY,
+      permissions JSONB NOT NULL DEFAULT '{}'::jsonb,
+      updated_by INTEGER REFERENCES users(id),
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS update_center (
+      id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+      current_version VARCHAR(40) NOT NULL DEFAULT '1.0.0',
+      release_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      changelog TEXT NOT NULL DEFAULT 'Initial local FroozERP release channel prepared.',
+      update_status VARCHAR(40) NOT NULL DEFAULT 'READY_FOR_FUTURE_UPDATES',
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS sync_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+      sync_enabled BOOLEAN DEFAULT FALSE,
+      sync_status VARCHAR(40) NOT NULL DEFAULT 'OFFLINE_READY',
+      last_sync_at TIMESTAMP,
+      pending_count INTEGER NOT NULL DEFAULT 0 CHECK (pending_count >= 0),
+      device_id VARCHAR(120) DEFAULT 'LOCAL-STORE',
+      notes TEXT DEFAULT 'Cloud sync architecture prepared. Online sync delivery is not enabled yet.',
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS sync_queue (
+      id SERIAL PRIMARY KEY,
+      entity_type VARCHAR(80) NOT NULL,
+      entity_id INTEGER,
+      operation VARCHAR(30) NOT NULL,
+      payload JSONB,
+      sync_status VARCHAR(40) NOT NULL DEFAULT 'PENDING',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      synced_at TIMESTAMP,
+      error_message TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS expenses (
       id SERIAL PRIMARY KEY,
       expense_date DATE NOT NULL DEFAULT CURRENT_DATE,
@@ -371,6 +470,23 @@ const initializeDatabase = async () => {
     INSERT INTO sale_rate_settings (id)
     VALUES (1)
     ON CONFLICT (id) DO NOTHING;
+
+    INSERT INTO update_center (id)
+    VALUES (1)
+    ON CONFLICT (id) DO NOTHING;
+
+    INSERT INTO sync_settings (id)
+    VALUES (1)
+    ON CONFLICT (id) DO NOTHING;
+
+    INSERT INTO role_permission_settings (role_name, permissions)
+    VALUES
+      ('Owner', '{"settings":true,"discounts":true,"mandi_tax":true,"rebate_rules":true,"supplier_payments":true,"customer_payments":true,"sale_edit":true,"invoice_cancellation":true,"reports":true,"purchases":true,"supplier_accounts":true,"inventory":true,"waste_management":true,"billing":true}'::jsonb),
+      ('Admin', '{"settings":true,"discounts":true,"mandi_tax":true,"rebate_rules":true,"supplier_payments":true,"customer_payments":true,"sale_edit":true,"invoice_cancellation":true,"reports":true,"purchases":true,"supplier_accounts":true,"inventory":true,"waste_management":true,"billing":true}'::jsonb),
+      ('Cashier', '{"billing":true,"customer_payments":true,"settings":false,"invoice_cancellation":false,"sale_edit":false,"discounts":false,"mandi_tax":false,"rebate_rules":false,"supplier_payments":false,"reports":false,"purchases":false,"supplier_accounts":false,"inventory":false,"waste_management":false}'::jsonb),
+      ('Purchase Manager', '{"purchases":true,"supplier_payments":true,"supplier_accounts":true,"reports":true,"settings":false,"discounts":false,"mandi_tax":false,"rebate_rules":false,"customer_payments":false,"sale_edit":false,"invoice_cancellation":false,"inventory":false,"waste_management":false,"billing":false}'::jsonb),
+      ('Inventory Manager', '{"inventory":true,"waste_management":true,"reports":true,"settings":false,"discounts":false,"mandi_tax":false,"rebate_rules":false,"supplier_payments":false,"customer_payments":false,"sale_edit":false,"invoice_cancellation":false,"purchases":false,"supplier_accounts":false,"billing":false}'::jsonb)
+    ON CONFLICT (role_name) DO NOTHING;
 
     INSERT INTO mandi_tax_rules (origin_type, tax_percent)
     VALUES ('LOCAL', 2), ('IMPORTED', 4)
@@ -527,6 +643,18 @@ const initializeDatabase = async () => {
 
     CREATE INDEX IF NOT EXISTS expenses_date_idx
       ON expenses (expense_date DESC, id DESC);
+
+    CREATE INDEX IF NOT EXISTS sale_returns_sale_date_idx
+      ON sale_returns (sale_id, return_date DESC, id DESC);
+
+    CREATE INDEX IF NOT EXISTS sale_return_items_product_idx
+      ON sale_return_items (product_id, sale_item_id);
+
+    CREATE INDEX IF NOT EXISTS waste_entries_date_product_idx
+      ON waste_entries (waste_date DESC, product_id, id DESC);
+
+    CREATE INDEX IF NOT EXISTS sync_queue_status_idx
+      ON sync_queue (sync_status, created_at);
 
     CREATE INDEX IF NOT EXISTS sale_discount_rules_match_idx
       ON sale_discount_rules (active, payment_mode, minimum_bill_amount, maximum_bill_amount);
@@ -915,6 +1043,11 @@ const getDashboardSummary = async () => {
         ), 0) AS "lowStockItems",
         COALESCE((SELECT COUNT(*) FROM sales WHERE sale_date = CURRENT_DATE AND sale_status <> 'CANCELLED'), 0) AS "transactions",
         COALESCE((SELECT SUM(amount) FROM expenses WHERE expense_date = CURRENT_DATE AND active IS DISTINCT FROM FALSE), 0) AS "todayExpenses",
+        COALESCE((SELECT SUM(total_return_amount) FROM sale_returns WHERE return_date = CURRENT_DATE), 0) AS "todayReturns",
+        COALESCE((SELECT SUM(total_return_amount) FROM sale_returns WHERE return_date >= DATE_TRUNC('month', CURRENT_DATE)::date), 0) AS "monthlyReturns",
+        COALESCE((SELECT SUM(cost_amount) FROM waste_entries WHERE waste_date = CURRENT_DATE), 0) AS "todayWaste",
+        COALESCE((SELECT SUM(cost_amount) FROM waste_entries WHERE waste_date >= DATE_TRUNC('month', CURRENT_DATE)::date), 0) AS "monthlyWaste",
+        COALESCE((SELECT SUM(quantity) FROM waste_entries WHERE waste_date >= DATE_TRUNC('month', CURRENT_DATE)::date), 0) AS "monthlyWasteQuantity",
         COALESCE((SELECT SUM(rebate_amount) FROM purchases), 0)
           + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE), 0) AS "totalRebateReceived",
         COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE payment_date = CURRENT_DATE AND cancelled = FALSE), 0)
@@ -938,6 +1071,14 @@ const getDashboardSummary = async () => {
     supplierOutstanding: Number(supplierSummary.outstandingBalance || 0),
     customerOutstanding: Number(customerSummary.outstandingBalance || 0),
     todayExpenses: Number(metrics.todayExpenses || 0),
+    todayReturns: Number(metrics.todayReturns || 0),
+    monthlyReturns: Number(metrics.monthlyReturns || 0),
+    todayWaste: Number(metrics.todayWaste || 0),
+    monthlyWaste: Number(metrics.monthlyWaste || 0),
+    monthlyWasteQuantity: Number(metrics.monthlyWasteQuantity || 0),
+    wastePercentage: Number(metrics.stockValue || 0) > 0
+      ? roundCurrency((Number(metrics.monthlyWaste || 0) / (Number(metrics.stockValue || 0) + Number(metrics.monthlyWaste || 0))) * 100)
+      : 0,
     totalRebateReceived: Number(metrics.totalRebateReceived || 0),
     todaySupplierPayments: Number(metrics.todaySupplierPayments || 0),
     total_supplier_outstanding: Number(supplierSummary.outstandingBalance || 0),
@@ -1192,27 +1333,31 @@ const getDashboardAnalyticsPayload = async (query = {}) => {
 };
 
 const getSettingsBundle = async (userId) => {
-  const [businessResult, saleRateResult, mandiResult, rebateResult, discountResult, manager] = await Promise.all([
+  const [businessResult, saleRateResult, mandiResult, rebateResult, discountResult, roleResult, updateResult, syncResult, syncQueueResult, manager] = await Promise.all([
     pool.query("SELECT * FROM business_settings WHERE id = 1"),
     pool.query("SELECT * FROM sale_rate_settings WHERE id = 1"),
     pool.query("SELECT * FROM mandi_tax_rules ORDER BY origin_type"),
     pool.query("SELECT * FROM rebate_rules ORDER BY pay_within_days, id"),
     pool.query("SELECT * FROM sale_discount_rules ORDER BY minimum_bill_amount, maximum_bill_amount NULLS LAST, id"),
+    pool.query("SELECT * FROM role_permission_settings ORDER BY CASE role_name WHEN 'Owner' THEN 1 WHEN 'Admin' THEN 2 WHEN 'Cashier' THEN 3 WHEN 'Purchase Manager' THEN 4 WHEN 'Inventory Manager' THEN 5 ELSE 6 END"),
+    pool.query("SELECT * FROM update_center WHERE id = 1"),
+    pool.query("SELECT * FROM sync_settings WHERE id = 1"),
+    pool.query("SELECT COUNT(*)::INTEGER AS pending_count FROM sync_queue WHERE sync_status = 'PENDING'"),
     userId ? requireRateManager(userId) : Promise.resolve(null),
   ]);
+  const syncSettings = syncResult.rows[0] || {};
   return {
     businessSettings: businessResult.rows[0] || {},
     saleRateSettings: saleRateResult.rows[0] || {},
     mandiTaxRules: mandiResult.rows,
     rebateRules: rebateResult.rows,
     discountRules: discountResult.rows,
-    roles: [
-      { role: "Owner", permissions: ["Business settings", "Selling rates", "Discount rules", "Mandi tax rules", "Rebate rules"] },
-      { role: "Admin", permissions: ["Business settings", "Selling rates", "Discount rules", "Mandi tax rules", "Rebate rules"] },
-      { role: "Cashier", permissions: ["POS billing", "Sales history view"] },
-      { role: "Purchase Manager", permissions: ["Purchase Entry", "Supplier accounts"] },
-      { role: "Inventory Manager", permissions: ["Inventory batches", "Stock review"] },
-    ],
+    roles: roleResult.rows,
+    updateCenter: updateResult.rows[0] || {},
+    syncSettings: {
+      ...syncSettings,
+      pending_count: Number(syncQueueResult.rows[0]?.pending_count || syncSettings.pending_count || 0),
+    },
     backupSettings: {
       exportReady: true,
       importReady: false,
@@ -1589,6 +1734,127 @@ app.get("/settings", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Settings" });
+  }
+});
+
+app.get("/settings/role-permissions", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM role_permission_settings ORDER BY role_name");
+    return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Role Permissions" });
+  }
+});
+
+app.put("/settings/role-permissions/:roleName", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage role permissions" });
+    const roleName = cleanText(req.params.roleName);
+    const permissions = req.body.permissions && typeof req.body.permissions === "object" ? req.body.permissions : {};
+    const normalized = PERMISSION_KEYS.reduce((payload, key) => ({ ...payload, [key]: Boolean(permissions[key]) }), {});
+    const result = await pool.query(
+      `
+      INSERT INTO role_permission_settings (role_name, permissions, updated_by, updated_at)
+      VALUES ($1, $2::jsonb, $3, CURRENT_TIMESTAMP)
+      ON CONFLICT (role_name)
+      DO UPDATE SET permissions = EXCLUDED.permissions, updated_by = EXCLUDED.updated_by, updated_at = CURRENT_TIMESTAMP
+      RETURNING *
+      `,
+      [roleName, JSON.stringify(normalized), manager.id]
+    );
+    await pool.query(
+      `
+      INSERT INTO sale_permission_settings (role_name, can_edit_sales, can_cancel_sales, updated_at)
+      VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+      ON CONFLICT (role_name)
+      DO UPDATE SET can_edit_sales = EXCLUDED.can_edit_sales, can_cancel_sales = EXCLUDED.can_cancel_sales, updated_at = CURRENT_TIMESTAMP
+      `,
+      [roleName, Boolean(normalized.sale_edit), Boolean(normalized.invoice_cancellation)]
+    );
+    return res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Role Permissions" });
+  }
+});
+
+app.get("/settings/update-center", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM update_center WHERE id = 1");
+    return res.json(result.rows[0] || {});
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Update Center" });
+  }
+});
+
+app.put("/settings/update-center", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage update settings" });
+    const result = await pool.query(
+      `
+      UPDATE update_center
+      SET current_version = $1, release_date = $2, changelog = $3, update_status = $4, updated_at = CURRENT_TIMESTAMP
+      WHERE id = 1
+      RETURNING *
+      `,
+      [
+        cleanText(req.body.current_version) || "1.0.0",
+        req.body.release_date || toDateKey(new Date()),
+        cleanText(req.body.changelog) || "Future update channel prepared.",
+        cleanText(req.body.update_status) || "READY_FOR_FUTURE_UPDATES",
+      ]
+    );
+    return res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Update Center" });
+  }
+});
+
+app.get("/settings/sync-status", async (req, res) => {
+  try {
+    const [settingsResult, queueResult] = await Promise.all([
+      pool.query("SELECT * FROM sync_settings WHERE id = 1"),
+      pool.query("SELECT sync_status, COUNT(*)::INTEGER AS count FROM sync_queue GROUP BY sync_status"),
+    ]);
+    const pending = queueResult.rows.find((row) => row.sync_status === "PENDING")?.count || 0;
+    return res.json({
+      ...(settingsResult.rows[0] || {}),
+      pending_count: Number(pending),
+      queue: queueResult.rows,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Sync Status" });
+  }
+});
+
+app.put("/settings/sync-status", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage sync settings" });
+    const result = await pool.query(
+      `
+      UPDATE sync_settings
+      SET sync_enabled = $1, sync_status = $2, device_id = $3, notes = $4, updated_at = CURRENT_TIMESTAMP
+      WHERE id = 1
+      RETURNING *
+      `,
+      [
+        req.body.sync_enabled === true,
+        cleanText(req.body.sync_status) || "OFFLINE_READY",
+        cleanText(req.body.device_id) || "LOCAL-STORE",
+        cleanText(req.body.notes) || "Cloud sync architecture prepared.",
+      ]
+    );
+    return res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Sync Settings" });
   }
 });
 
@@ -3441,7 +3707,21 @@ app.get("/reports/summary", async (req, res) => {
     const reportRange = getReportDateRange(req.query);
     const dateFrom = req.query.date_from || reportRange.dateFrom || "1900-01-01";
     const dateTo = req.query.date_to || reportRange.dateTo || "2999-12-31";
-    const [salesResult, purchaseResult, supplierRows, customerRows, discountResult, expenseResult, paymentResult, balanceSheetResult, profitLossResult] = await Promise.all([
+    const [
+      salesResult,
+      purchaseResult,
+      supplierRows,
+      customerRows,
+      discountResult,
+      expenseResult,
+      paymentResult,
+      returnResult,
+      returnReasonResult,
+      wasteResult,
+      wasteProductResult,
+      balanceSheetResult,
+      profitLossResult,
+    ] = await Promise.all([
       pool.query(
         `
         SELECT
@@ -3549,6 +3829,69 @@ app.get("/reports/summary", async (req, res) => {
       pool.query(
         `
         SELECT
+          sr.return_date,
+          COUNT(*)::INTEGER AS return_count,
+          SUM(sr.total_return_amount) AS return_value,
+          SUM(item_summary.return_quantity) AS return_quantity
+        FROM sale_returns sr
+        LEFT JOIN (
+          SELECT sale_return_id, SUM(return_quantity) AS return_quantity
+          FROM sale_return_items
+          GROUP BY sale_return_id
+        ) item_summary ON item_summary.sale_return_id = sr.id
+        WHERE sr.return_date BETWEEN $1 AND $2
+        GROUP BY sr.return_date
+        ORDER BY sr.return_date DESC
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
+          return_reason,
+          COUNT(*)::INTEGER AS return_count,
+          SUM(total_return_amount) AS return_value
+        FROM sale_returns
+        WHERE return_date BETWEEN $1 AND $2
+        GROUP BY return_reason
+        ORDER BY return_count DESC, return_value DESC
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
+          waste_date,
+          waste_type,
+          COUNT(*)::INTEGER AS entry_count,
+          SUM(quantity) AS waste_quantity,
+          SUM(cost_amount) AS waste_cost
+        FROM waste_entries
+        WHERE waste_date BETWEEN $1 AND $2
+        GROUP BY waste_date, waste_type
+        ORDER BY waste_date DESC, waste_type
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
+          p.product_name,
+          p.unit,
+          SUM(we.quantity) AS waste_quantity,
+          SUM(we.cost_amount) AS waste_cost
+        FROM waste_entries we
+        JOIN products p ON p.id = we.product_id
+        WHERE we.waste_date BETWEEN $1 AND $2
+        GROUP BY p.product_name, p.unit
+        ORDER BY waste_quantity DESC, waste_cost DESC
+        LIMIT 20
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
           COALESCE((SELECT SUM(amount) FROM sale_payments sp JOIN sales s ON s.id = sp.sale_id WHERE s.sale_status <> 'CANCELLED'), 0)
             + COALESCE((SELECT SUM(payment_amount) FROM customer_payments WHERE cancelled = FALSE), 0)
             - COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE cancelled = FALSE), 0)
@@ -3608,6 +3951,11 @@ app.get("/reports/summary", async (req, res) => {
       discountReport: discountResult.rows,
       expenseReport: expenseResult.rows,
       paymentReport: paymentResult.rows,
+      returnReport: returnResult.rows,
+      returnReasonReport: returnReasonResult.rows,
+      wasteReport: wasteResult.rows,
+      wasteProductReport: wasteProductResult.rows,
+      mostWastedProducts: wasteProductResult.rows.slice(0, 5),
       balanceSheet: {
         cash: roundCurrency(Number(balanceSheet.cash_bank || 0)),
         bank: 0,
@@ -4635,6 +4983,309 @@ app.get("/sales-report/changes", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Sale Change Report" });
+  }
+});
+
+app.get("/sale-returns", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        sr.*,
+        s.invoice_no,
+        u.full_name AS created_by_name,
+        COALESCE(
+          JSON_AGG(
+            JSON_BUILD_OBJECT(
+              'id', sri.id,
+              'product_id', sri.product_id,
+              'product_name', p.product_name,
+              'unit', p.unit,
+              'return_quantity', sri.return_quantity,
+              'selling_rate', sri.selling_rate,
+              'return_amount', sri.return_amount,
+              'cost_amount', sri.cost_amount
+            ) ORDER BY sri.id
+          ) FILTER (WHERE sri.id IS NOT NULL),
+          '[]'
+        ) AS items
+      FROM sale_returns sr
+      JOIN sales s ON s.id = sr.sale_id
+      LEFT JOIN sale_return_items sri ON sri.sale_return_id = sr.id
+      LEFT JOIN products p ON p.id = sri.product_id
+      LEFT JOIN users u ON u.id = sr.created_by
+      GROUP BY sr.id, s.invoice_no, u.full_name
+      ORDER BY sr.return_date DESC, sr.created_at DESC, sr.id DESC
+      `
+    );
+    return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Sale Returns" });
+  }
+});
+
+app.get("/sale-returns/options/:saleId", async (req, res) => {
+  try {
+    const saleId = parsePositiveInteger(req.params.saleId);
+    if (!saleId) return res.status(400).json({ message: "Invalid invoice" });
+    const [saleResult, itemsResult] = await Promise.all([
+      pool.query("SELECT id, invoice_no, customer_name, customer_mobile, sale_date, total_amount, sale_status FROM sales WHERE id = $1", [saleId]),
+      pool.query(
+        `
+        SELECT
+          si.id AS sale_item_id,
+          si.product_id,
+          p.product_name,
+          p.unit,
+          si.quantity AS sold_quantity,
+          COALESCE(returned.returned_quantity, 0) AS returned_quantity,
+          si.quantity - COALESCE(returned.returned_quantity, 0) AS returnable_quantity,
+          si.selling_rate,
+          COALESCE(si.net_amount, si.amount) AS net_amount,
+          si.cost_amount
+        FROM sale_items si
+        JOIN products p ON p.id = si.product_id
+        LEFT JOIN (
+          SELECT sale_item_id, SUM(return_quantity) AS returned_quantity
+          FROM sale_return_items
+          GROUP BY sale_item_id
+        ) returned ON returned.sale_item_id = si.id
+        WHERE si.sale_id = $1
+        ORDER BY si.id
+        `,
+        [saleId]
+      ),
+    ]);
+    const sale = saleResult.rows[0];
+    if (!sale) return res.status(404).json({ message: "Invoice not found" });
+    return res.json({ sale, items: itemsResult.rows });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Return Options" });
+  }
+});
+
+app.post("/sale-returns", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const saleId = parsePositiveInteger(req.body.sale_id);
+    const refundType = normalizeRefundType(req.body.refund_type);
+    const returnReason = cleanText(req.body.return_reason);
+    const createdBy = parsePositiveInteger(req.body.created_by) || 1;
+    const branchId = parsePositiveInteger(req.body.branch_id);
+    const items = Array.isArray(req.body.items) ? req.body.items : [];
+    if (!saleId || !REFUND_TYPES.has(refundType) || !returnReason || items.length === 0) {
+      return res.status(400).json({ message: "Select invoice, products, refund type and return reason" });
+    }
+    await client.query("BEGIN");
+    const saleResult = await client.query("SELECT * FROM sales WHERE id = $1 FOR SHARE", [saleId]);
+    const sale = saleResult.rows[0];
+    if (!sale || sale.sale_status === "CANCELLED") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Select an active invoice for return" });
+    }
+    const returnNo = `RET-${Date.now()}`;
+    const returnResult = await client.query(
+      `
+      INSERT INTO sale_returns (
+        return_no, sale_id, customer_name, customer_mobile, return_date,
+        refund_type, return_reason, total_return_amount, total_cost_amount,
+        branch_id, created_by
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, $8, $9)
+      RETURNING *
+      `,
+      [
+        returnNo, saleId, nullableText(req.body.customer_name) || sale.customer_name,
+        nullableText(req.body.customer_mobile) || sale.customer_mobile,
+        req.body.return_date || toDateKey(new Date()), refundType, returnReason,
+        branchId || sale.branch_id, createdBy,
+      ]
+    );
+    const saleReturn = returnResult.rows[0];
+    let totalReturnAmount = 0;
+    let totalCostAmount = 0;
+    for (const requested of items) {
+      const saleItemId = parsePositiveInteger(requested.sale_item_id);
+      const returnQuantity = parsePositiveNumber(requested.return_quantity);
+      if (!saleItemId || !returnQuantity) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Enter valid return quantities" });
+      }
+      const itemResult = await client.query(
+        `
+        SELECT
+          si.*,
+          p.product_name,
+          COALESCE(returned.returned_quantity, 0) AS returned_quantity
+        FROM sale_items si
+        JOIN products p ON p.id = si.product_id
+        LEFT JOIN (
+          SELECT sale_item_id, SUM(return_quantity) AS returned_quantity
+          FROM sale_return_items
+          GROUP BY sale_item_id
+        ) returned ON returned.sale_item_id = si.id
+        WHERE si.id = $1 AND si.sale_id = $2
+        FOR SHARE
+        `,
+        [saleItemId, saleId]
+      );
+      const saleItem = itemResult.rows[0];
+      const returnable = Number(saleItem?.quantity || 0) - Number(saleItem?.returned_quantity || 0);
+      if (!saleItem || returnQuantity > returnable) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: `${saleItem?.product_name || "Item"} return quantity exceeds returnable quantity` });
+      }
+      const returnAmount = roundCurrency((Number(saleItem.net_amount || saleItem.amount || 0) / Number(saleItem.quantity)) * returnQuantity);
+      let quantityToRestore = returnQuantity;
+      let costAmount = 0;
+      const allocations = await client.query(
+        `
+        SELECT *
+        FROM sale_batch_allocations
+        WHERE sale_item_id = $1
+        ORDER BY id
+        FOR SHARE
+        `,
+        [saleItemId]
+      );
+      for (const allocation of allocations.rows) {
+        if (quantityToRestore <= 0) break;
+        const restoreQuantity = Math.min(quantityToRestore, Number(allocation.quantity));
+        await client.query("UPDATE inventory_batches SET remaining_qty = remaining_qty + $1 WHERE id = $2", [restoreQuantity, allocation.inventory_batch_id]);
+        costAmount += roundCurrency(restoreQuantity * Number(allocation.purchase_rate));
+        quantityToRestore -= restoreQuantity;
+      }
+      if (quantityToRestore > 0.0001) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Unable to map return quantity to original inventory batch" });
+      }
+      await client.query(
+        `
+        INSERT INTO sale_return_items (
+          sale_return_id, sale_item_id, product_id, return_quantity,
+          selling_rate, return_amount, cost_amount
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `,
+        [saleReturn.id, saleItemId, saleItem.product_id, returnQuantity, saleItem.selling_rate, returnAmount, roundCurrency(costAmount)]
+      );
+      await client.query(
+        `
+        INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id)
+        VALUES ($1, $2, 'IN', $3, $4, $5)
+        `,
+        [saleItem.product_id, returnQuantity, `Sale return ${returnNo}: ${returnReason}`, createdBy, branchId || sale.branch_id]
+      );
+      totalReturnAmount += returnAmount;
+      totalCostAmount += costAmount;
+    }
+    const updateResult = await client.query(
+      `
+      UPDATE sale_returns
+      SET total_return_amount = $1, total_cost_amount = $2
+      WHERE id = $3
+      RETURNING *
+      `,
+      [roundCurrency(totalReturnAmount), roundCurrency(totalCostAmount), saleReturn.id]
+    );
+    await client.query("COMMIT");
+    return res.status(201).json(updateResult.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Saving Sale Return" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/waste-entries", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT we.*, p.product_name, p.unit, u.full_name AS created_by_name
+      FROM waste_entries we
+      JOIN products p ON p.id = we.product_id
+      LEFT JOIN users u ON u.id = we.created_by
+      ORDER BY we.waste_date DESC, we.created_at DESC, we.id DESC
+      `
+    );
+    return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Waste Entries" });
+  }
+});
+
+app.post("/waste-entries", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const productId = parsePositiveInteger(req.body.product_id);
+    const quantity = parsePositiveNumber(req.body.quantity);
+    const wasteType = normalizeWasteType(req.body.waste_type);
+    const branchId = parsePositiveInteger(req.body.branch_id);
+    const createdBy = parsePositiveInteger(req.body.created_by) || 1;
+    if (!productId || !quantity || !branchId || !WASTE_TYPES.has(wasteType)) {
+      return res.status(400).json({ message: "Enter valid waste details" });
+    }
+    await client.query("BEGIN");
+    const batchesResult = await client.query(
+      `
+      SELECT id, remaining_qty, COALESCE(effective_cost_per_unit, purchase_rate) AS purchase_rate
+      FROM inventory_batches
+      WHERE product_id = $1
+        AND branch_id = $2
+        AND remaining_qty > 0
+      ORDER BY purchase_date, created_at, id
+      FOR UPDATE
+      `,
+      [productId, branchId]
+    );
+    const availableStock = batchesResult.rows.reduce((sum, batch) => sum + Number(batch.remaining_qty), 0);
+    if (availableStock < quantity) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ message: `Insufficient stock for waste entry. Available quantity: ${availableStock}` });
+    }
+    let quantityToDeduct = quantity;
+    let costAmount = 0;
+    for (const batch of batchesResult.rows) {
+      if (quantityToDeduct <= 0) break;
+      const deductedQuantity = Math.min(quantityToDeduct, Number(batch.remaining_qty));
+      await client.query("UPDATE inventory_batches SET remaining_qty = remaining_qty - $1 WHERE id = $2", [deductedQuantity, batch.id]);
+      costAmount += roundCurrency(deductedQuantity * Number(batch.purchase_rate));
+      quantityToDeduct -= deductedQuantity;
+    }
+    const result = await client.query(
+      `
+      INSERT INTO waste_entries (
+        product_id, waste_date, quantity, waste_type, remarks,
+        cost_amount, branch_id, created_by
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING *
+      `,
+      [
+        productId, req.body.waste_date || toDateKey(new Date()), quantity, wasteType,
+        nullableText(req.body.remarks), roundCurrency(costAmount), branchId, createdBy,
+      ]
+    );
+    await client.query(
+      `
+      INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id)
+      VALUES ($1, $2, 'OUT', $3, $4, $5)
+      `,
+      [productId, quantity, `Waste entry ${wasteType}`, createdBy, branchId]
+    );
+    await client.query("COMMIT");
+    return res.status(201).json(result.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Saving Waste Entry" });
+  } finally {
+    client.release();
   }
 });
 
