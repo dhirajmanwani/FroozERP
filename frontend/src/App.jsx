@@ -24,6 +24,7 @@ const icons = {
   dashboard: "grid",
   products: "box",
   purchase: "cart",
+  "pending-purchases": "alert",
   inventory: "layers",
   returns: "history",
   waste: "alert",
@@ -40,6 +41,7 @@ const navigationItems = [
   ["dashboard", "Dashboard"],
   ["products", "Products"],
   ["purchase", "Purchase Entry"],
+  ["pending-purchases", "Pending Purchase Bills"],
   ["accounts", "Accounts"],
   ["inventory", "Inventory"],
   ["returns", "Sale Returns"],
@@ -83,7 +85,7 @@ const defaultRolePermissions = {
   Owner: { all: true },
   Admin: { all: true },
   Cashier: { dashboard: true, sales: true, "sales-history": true, accounts: true },
-  "Purchase Manager": { dashboard: true, purchase: true, accounts: true, reports: true },
+  "Purchase Manager": { dashboard: true, purchase: true, "pending-purchases": true, accounts: true, reports: true },
   "Inventory Manager": { dashboard: true, inventory: true, waste: true, reports: true },
 };
 
@@ -91,6 +93,7 @@ const modulePermissionMap = {
   dashboard: "dashboard",
   products: "inventory",
   purchase: "purchases",
+  "pending-purchases": "purchases",
   accounts: "supplier_accounts",
   inventory: "inventory",
   returns: "billing",
@@ -940,9 +943,42 @@ function App() {
     if (editingPurchaseItemIndex === index) resetPurchaseItemFields();
   };
 
+  const validatePurchaseBeforeSave = () => {
+    if (!purchaseSupplierId) return "Please select supplier";
+    if (editingPurchaseId) {
+      const productName = selectedPurchaseProduct?.product_name || "selected item";
+      if (!purchaseProductId) return "Please select product";
+      if (Number(purchaseQuantity || 0) <= 0) return `Please enter quantity for ${productName}`;
+      if (purchaseBillStatus === "BILL_COMPLETED") {
+        if (Number(purchaseRateInput || 0) <= 0) return `Please enter purchase rate for ${productName}`;
+        if (!purchaseRebateRuleId) return "Please select rebate rule";
+        if (purchaseType === "CASH" && Number(purchasePaidAmount || 0) <= 0) return "Please enter paid amount";
+      }
+      if (purchaseBillStatus === "BILL_PENDING" && Number(temporarySaleRate || 0) <= 0) return `Please enter temporary sale rate for ${productName}`;
+      return "";
+    }
+    if (purchaseCart.length === 0) return "Please add at least one item";
+    if (purchaseBillStatus === "BILL_COMPLETED") {
+      const missingRate = purchaseCart.find((item) => Number(item.purchase_rate || 0) <= 0);
+      if (missingRate) return `Please enter purchase rate for ${missingRate.product_name}`;
+      if (!purchaseRebateRuleId) return "Please select rebate rule";
+      if (purchaseType === "CASH" && Number(purchasePaidAmount || 0) <= 0) return "Please enter paid amount";
+    }
+    if (purchaseBillStatus === "BILL_PENDING") {
+      const missingTempRate = purchaseCart.find((item) => Number(item.temporary_sale_rate || 0) <= 0);
+      if (missingTempRate) return `Please enter temporary sale rate for ${missingTempRate.product_name}`;
+    }
+    return "";
+  };
+
   const savePurchase = async () => {
     try {
       const wasEditing = Boolean(editingPurchaseId);
+      const validationMessage = validatePurchaseBeforeSave();
+      if (validationMessage) {
+        alert(validationMessage);
+        return;
+      }
       const reason = editingPurchaseId ? window.prompt("Enter purchase edit reason") : "";
       if (editingPurchaseId && !reason?.trim()) return;
       const payload = {
@@ -1226,10 +1262,10 @@ function App() {
         await loadSalesHistory();
       }
       if (view === "sales") await loadDiscountRules();
-      if (["purchase", "accounts"].includes(view)) {
+      if (["purchase", "pending-purchases", "accounts"].includes(view)) {
         await loadSupplierData();
       }
-      if (view === "purchase") await loadPurchases();
+      if (["purchase", "pending-purchases"].includes(view)) await loadPurchases();
       if (view === "accounts") {
         await Promise.all([loadAccounts(), loadCustomerData(), loadSupplierData(), loadAccountOutstanding()]);
       }
@@ -1610,6 +1646,16 @@ function App() {
             </section>
           )}
 
+          {activeView === "pending-purchases" && (
+            <PendingPurchaseBillsModule
+              onCancelPurchase={cancelPurchase}
+              onCompletePurchase={completePendingPurchase}
+              onEditPurchase={editPurchase}
+              onOpenPurchaseAmendment={openPurchaseAmendment}
+              purchases={purchases}
+            />
+          )}
+
           {activeView === "accounts" && (
             <AccountsModule
               accounts={accounts}
@@ -1898,6 +1944,102 @@ function PrintableReport({ beforePdfExport, beforePrint, children, title }) {
   );
 }
 
+function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenPurchaseAmendment, purchases }) {
+  const [selectedSupplierKey, setSelectedSupplierKey] = useState("");
+  const pendingRows = purchases.filter((purchase) =>
+    purchase.purchase_status !== "CANCELLED" &&
+    purchase.purchase_bill_status === "BILL_PENDING"
+  );
+  const narration = (purchase) => {
+    const product = purchase.product_name || "Item";
+    const qty = Number(purchase.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 });
+    const unit = String(purchase.unit || "").toLowerCase();
+    const rate = Number(purchase.expected_purchase_rate || purchase.purchase_rate || 0);
+    return `${product} ${qty}${unit} @ ${receiptCurrency.format(rate)} = ${receiptCurrency.format(Number(purchase.quantity || 0) * rate)}`;
+  };
+  const estimatedValue = (purchase) => Number(purchase.quantity || 0) * Number(purchase.expected_purchase_rate || purchase.purchase_rate || 0);
+  const supplierSummaries = [...pendingRows.reduce((map, purchase) => {
+    const key = String(purchase.supplier_id || purchase.supplier_name || "UNKNOWN");
+    const summary = map.get(key) || {
+      key,
+      supplier_id: purchase.supplier_id,
+      supplier_name: purchase.supplier_name || "Unknown Supplier",
+      from: toDateKey(purchase.purchase_date),
+      to: toDateKey(purchase.purchase_date),
+      billCount: 0,
+      itemCount: 0,
+      estimatedValue: 0,
+      rows: [],
+    };
+    const date = toDateKey(purchase.purchase_date);
+    summary.from = date < summary.from ? date : summary.from;
+    summary.to = date > summary.to ? date : summary.to;
+    summary.billCount += 1;
+    summary.itemCount += 1;
+    summary.estimatedValue += estimatedValue(purchase);
+    summary.rows.push(purchase);
+    map.set(key, summary);
+    return map;
+  }, new Map()).values()].sort((left, right) => left.supplier_name.localeCompare(right.supplier_name));
+  const selectedSupplier = supplierSummaries.find((summary) => summary.key === selectedSupplierKey);
+  const selectedRows = selectedSupplier?.rows || [];
+
+  return (
+    <section className="settings-layout">
+      <ModuleCard eyebrow="Pending Purchase Bills" title="Supplier-Wise Pending Bills" subtitle="Operational queue for stock received before supplier bill completion.">
+        <div className="purchase-summary-grid supplier-payment-preview">
+          <SummaryMetric label="Pending Suppliers" value={supplierSummaries.length} featured />
+          <SummaryMetric label="Pending Bills" value={pendingRows.length} />
+          <SummaryMetric label="Estimated Value" value={currency.format(pendingRows.reduce((sum, row) => sum + estimatedValue(row), 0))} />
+        </div>
+        <DataTable headers={["Supplier Name", "Pending From Date", "Pending To Date", "Pending Bill Count", "Total Pending Items", "Estimated Value", "Action"]}>
+          {supplierSummaries.map((summary) => (
+            <tr key={summary.key}>
+              <td className="primary-cell">{summary.supplier_name}</td>
+              <td>{summary.from}</td>
+              <td>{summary.to}</td>
+              <td>{summary.billCount} bills</td>
+              <td>{summary.itemCount} items</td>
+              <td>{currency.format(summary.estimatedValue)}</td>
+              <td><button className="table-action" onClick={() => setSelectedSupplierKey(summary.key)}>View</button></td>
+            </tr>
+          ))}
+        </DataTable>
+        {supplierSummaries.length === 0 && <div className="cart-empty">No pending purchase bills.</div>}
+      </ModuleCard>
+
+      {selectedSupplier && (
+        <ModuleCard eyebrow="Supplier Drill-Down" title={selectedSupplier.supplier_name} subtitle="Complete, edit or safely cancel pending bill entries for this supplier.">
+          <DataTable headers={["Date", "Items Narration", "Estimated Total", "Status", "Action"]}>
+            {selectedRows.map((purchase) => (
+              <tr key={purchase.id}>
+                <td>{toDateKey(purchase.purchase_date)}</td>
+                <td className="primary-cell purchase-items-cell" onDoubleClick={() => onOpenPurchaseAmendment(purchase)}>
+                  <span title={narration(purchase)}>{narration(purchase)}</span>
+                  <small className="cell-note">Double-click to open Add/Edit Purchase</small>
+                </td>
+                <td>{currency.format(estimatedValue(purchase))}</td>
+                <td><span className="origin-rate">Pending Bill</span></td>
+                <td>
+                  <div className="button-row table-actions-row">
+                    <button className="primary-button" onClick={() => onCompletePurchase(purchase)}>Complete Bill</button>
+                    <button className="table-action" onClick={() => onEditPurchase(purchase)}>Edit Pending Entry</button>
+                    <button className="remove-button" onClick={() => onCancelPurchase(purchase)}>Cancel Pending Entry</button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </DataTable>
+          <div className="button-row">
+            <button className="secondary-button" onClick={() => onOpenPurchaseAmendment(selectedRows[0])}>Add Forgotten Item</button>
+            <button className="secondary-button" onClick={() => setSelectedSupplierKey("")}>Back to Supplier Summary</button>
+          </div>
+        </ModuleCard>
+      )}
+    </section>
+  );
+}
+
 function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenPurchaseAmendment, onOpenSupplierLedger, onReload }) {
   const [range, setRange] = useState("today");
   const [search, setSearch] = useState("");
@@ -1949,7 +2091,9 @@ function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEdit
   const cancelledBills = salesChanges.filter((row) => row.sale_status === "CANCELLED" || row.cancelled_at);
   const purchaseChanges = filterRows(data.purchaseChangeReport);
   const wasteProductRows = filterRows(data.wasteProductReport);
-  const purchaseHistoryRawRows = filterRows(data.purchaseHistoryReport);
+  const purchaseHistoryRawRows = filterRows(data.purchaseHistoryReport).filter((row) =>
+    row.purchase_status === "CANCELLED" || row.purchase_bill_status === "BILL_COMPLETED"
+  );
   const purchaseSuppliers = [...new Map(purchaseHistoryRawRows.map((row) => [String(row.supplier_id || row.supplier_name), row])).values()];
   const purchaseProducts = [...new Map(purchaseHistoryRawRows.map((row) => [String(row.product_id || row.product_name), row])).values()];
   const purchaseStatusLabel = (row) => {
@@ -1977,7 +2121,6 @@ function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEdit
     if (purchaseFilters.paymentType && row.purchase_type !== purchaseFilters.paymentType) return false;
     if (purchaseFilters.date && toDateKey(row.purchase_date) !== purchaseFilters.date) return false;
     if (purchaseFilters.status === "CANCELLED") return row.purchase_status === "CANCELLED";
-    if (purchaseFilters.status === "BILL_PENDING") return row.purchase_status !== "CANCELLED" && row.purchase_bill_status === "BILL_PENDING";
     if (purchaseFilters.status === "BILL_COMPLETED") return row.purchase_status !== "CANCELLED" && row.purchase_bill_status === "BILL_COMPLETED";
     return row.purchase_status !== "CANCELLED";
   });
@@ -2384,7 +2527,6 @@ function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEdit
           <Field label="Status">
             <select value={purchaseFilters.status} onChange={(event) => setPurchaseFilters({ ...purchaseFilters, status: event.target.value })}>
               <option value="ACTIVE">Active Bills</option>
-              <option value="BILL_PENDING">Pending Bill</option>
               <option value="BILL_COMPLETED">Completed Bill</option>
               <option value="CANCELLED">Cancelled</option>
             </select>

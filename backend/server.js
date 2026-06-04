@@ -4556,6 +4556,10 @@ app.get("/reports/summary", async (req, res) => {
         LEFT JOIN products pr ON pr.id = pi.product_id
         LEFT JOIN inventory_batches ib ON ib.purchase_id = p.id
         WHERE p.purchase_date BETWEEN $1 AND $2
+          AND (
+            COALESCE(p.purchase_status, 'ACTIVE') = 'CANCELLED'
+            OR COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
+          )
         ORDER BY p.purchase_date DESC, p.supplier_name, p.id DESC
         `,
         [dateFrom, dateTo]
@@ -5630,28 +5634,26 @@ const readPurchaseEntryPayload = (body) => {
 };
 
 const validatePurchaseEntry = (entry) => {
-  if (!entry.supplierId) return "Add New Supplier";
+  if (!entry.supplierId) return "Please select supplier";
   if (!PURCHASE_BILL_STATUSES.has(entry.purchaseBillStatus)) return "Select a valid purchase bill status";
   if (entry.purchaseBillStatus === "BILL_PENDING") {
-    if (!entry.productId || !entry.quantity || !entry.branchId || !entry.temporarySaleRate || entry.expectedPurchaseRate === null) {
-      return "Enter supplier, product, quantity, arrival date and temporary sale rate";
-    }
+    if (!entry.productId) return "Please select product";
+    if (!entry.quantity) return "Please enter quantity";
+    if (!entry.branchId) return "Please select branch";
+    if (!entry.temporarySaleRate) return "Please enter temporary sale rate";
+    if (entry.expectedPurchaseRate === null) return "Please enter expected purchase rate";
     return "";
   }
-  if (
-    !entry.productId ||
-    !entry.quantity ||
-    !entry.purchaseRate ||
-    entry.freightCharges === null ||
-    entry.labourCharges === null ||
-    entry.otherCharges === null ||
-    entry.paidAmountInput === null ||
-    !entry.rebateRuleId ||
-    !entry.branchId ||
-    !["CASH", "CREDIT"].includes(entry.purchaseType)
-  ) {
-    return "Enter valid purchase details";
-  }
+  if (!entry.productId) return "Please select product";
+  if (!entry.quantity) return "Please enter quantity";
+  if (!entry.purchaseRate) return "Please enter purchase rate";
+  if (entry.freightCharges === null) return "Please enter freight charges";
+  if (entry.labourCharges === null) return "Please enter labour charges";
+  if (entry.otherCharges === null) return "Please enter other charges";
+  if (entry.paidAmountInput === null) return "Please enter paid amount";
+  if (!entry.rebateRuleId) return "Please select rebate rule";
+  if (!entry.branchId) return "Please select branch";
+  if (!["CASH", "CREDIT"].includes(entry.purchaseType)) return "Please select Cash or Credit purchase";
   if (entry.purchaseType === "CASH" && (!SUPPLIER_PAYMENT_MODES.has(entry.paymentMode) || entry.paidAmountInput <= 0)) {
     return "Cash purchase requires payment mode and paid amount";
   }
