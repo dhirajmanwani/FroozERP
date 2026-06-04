@@ -392,6 +392,7 @@ function App() {
   const [editingSale, setEditingSale] = useState(null);
   const [changeHistory, setChangeHistory] = useState(null);
   const [profileOpen, setProfileOpen] = useState(false);
+  const [accountLedgerFocusKey, setAccountLedgerFocusKey] = useState("");
 
   const rolePermissionMap = useMemo(() => {
     const map = new Map();
@@ -1109,6 +1110,18 @@ function App() {
     }
   };
 
+  const openSupplierLedgerFromReport = async (purchase) => {
+    const supplierId = Number(purchase.supplier_id || 0);
+    if (!supplierId) {
+      alert("Supplier account is not linked to this purchase.");
+      return;
+    }
+    const accountKey = `SUPPLIER-${supplierId}`;
+    setAccountLedgerFocusKey(accountKey);
+    setActiveView("accounts");
+    await loadAccountLedger(accountKey);
+  };
+
   const navigate = async (view) => {
     if (!hasModuleAccess(view)) {
       alert("Your role does not have access to this module.");
@@ -1466,6 +1479,7 @@ function App() {
               accountLedger={accountLedger}
               accountPayments={accountPayments}
               accountOutstanding={accountOutstanding}
+              ledgerFocusKey={accountLedgerFocusKey}
               onLedgerLoad={loadAccountLedger}
               onPaymentsLoad={loadAccountPayments}
               onReload={async () => {
@@ -1604,6 +1618,7 @@ function App() {
               onCancelPurchase={cancelPurchase}
               onCompletePurchase={completePendingPurchase}
               onEditPurchase={editPurchase}
+              onOpenSupplierLedger={openSupplierLedgerFromReport}
               onReload={loadReports}
             />
           )}
@@ -1636,13 +1651,13 @@ function App() {
   );
 }
 
-function ReportToolbar({ onPrint, title }) {
+function ReportToolbar({ onPdfExport, onPrint, title }) {
   return (
     <div className="report-toolbar no-print">
       <strong>{title}</strong>
       <div className="button-row">
         <button className="secondary-button" onClick={onPrint}><Icon name="print" /> Print</button>
-        <button className="secondary-button" onClick={onPrint}>PDF Export</button>
+        <button className="secondary-button" onClick={onPdfExport || onPrint}>PDF Export</button>
       </div>
     </div>
   );
@@ -1705,9 +1720,18 @@ function UserProfilePanel({ onClose, onLogout, user }) {
   );
 }
 
-function PrintableReport({ children, title }) {
+function PrintableReport({ beforePdfExport, beforePrint, children, title }) {
   const [printTarget, setPrintTarget] = useState(false);
   const printReport = () => {
+    if (beforePrint && beforePrint() === false) return;
+    setPrintTarget(true);
+    setTimeout(() => {
+      window.print();
+      setTimeout(() => setPrintTarget(false), 250);
+    }, 50);
+  };
+  const exportReport = () => {
+    if (beforePdfExport && beforePdfExport() === false) return;
     setPrintTarget(true);
     setTimeout(() => {
       window.print();
@@ -1716,7 +1740,7 @@ function PrintableReport({ children, title }) {
   };
   return (
     <section className={`print-section ${printTarget ? "print-target" : ""}`}>
-      <ReportToolbar onPrint={printReport} title={title} />
+      <ReportToolbar onPdfExport={exportReport} onPrint={printReport} title={title} />
       <div className="print-area report-paper">
         <header className="report-print-header">
           <BrandLogo invoice />
@@ -1731,11 +1755,20 @@ function PrintableReport({ children, title }) {
   );
 }
 
-function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onReload }) {
+function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenSupplierLedger, onReload }) {
   const [range, setRange] = useState("today");
   const [search, setSearch] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
   const [selectedReport, setSelectedReport] = useState("");
+  const [clubPurchaseItems, setClubPurchaseItems] = useState(false);
+  const [purchasePrintNarration, setPurchasePrintNarration] = useState(false);
+  const [purchaseFilters, setPurchaseFilters] = useState({
+    supplier: "",
+    product: "",
+    status: "ACTIVE",
+    paymentType: "",
+    date: "",
+  });
   const [customRange, setCustomRange] = useState({
     date_from: toDateKey(new Date()),
     date_to: toDateKey(new Date()),
@@ -1772,6 +1805,100 @@ function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEdit
   const cancelledBills = salesChanges.filter((row) => row.sale_status === "CANCELLED" || row.cancelled_at);
   const purchaseChanges = filterRows(data.purchaseChangeReport);
   const wasteProductRows = filterRows(data.wasteProductReport);
+  const purchaseHistoryRawRows = filterRows(data.purchaseHistoryReport);
+  const purchaseSuppliers = [...new Map(purchaseHistoryRawRows.map((row) => [String(row.supplier_id || row.supplier_name), row])).values()];
+  const purchaseProducts = [...new Map(purchaseHistoryRawRows.map((row) => [String(row.product_id || row.product_name), row])).values()];
+  const purchaseStatusLabel = (row) => {
+    if (row.purchase_status === "CANCELLED") return "Cancelled";
+    if (row.purchase_bill_status === "BILL_PENDING") return "Pending Bill";
+    return "Completed Bill";
+  };
+  const purchaseCharges = (row) => (
+    Number(row.mandi_tax_amount || 0) +
+    Number(row.freight_charges || 0) +
+    Number(row.labour_charges || 0) +
+    Number(row.other_charges || 0)
+  );
+  const purchaseItemBasic = (row) => Number(row.item_basic_amount || 0) || Number(row.quantity || 0) * Number(row.purchase_rate || row.expected_purchase_rate || 0);
+  const purchaseItemNarration = (row) => {
+    const product = row.product_name || "Item";
+    const qty = Number(row.quantity || 0).toLocaleString("en-IN");
+    const unit = row.unit || "";
+    const rate = Number(row.purchase_rate || row.expected_purchase_rate || 0);
+    return `${product} ${qty}${unit ? ` ${unit}` : ""} @ ${money(rate)} = ${money(purchaseItemBasic(row))}`;
+  };
+  const filteredPurchaseHistoryRows = purchaseHistoryRawRows.filter((row) => {
+    if (purchaseFilters.supplier && String(row.supplier_id || "") !== purchaseFilters.supplier) return false;
+    if (purchaseFilters.product && String(row.product_id || "") !== purchaseFilters.product) return false;
+    if (purchaseFilters.paymentType && row.purchase_type !== purchaseFilters.paymentType) return false;
+    if (purchaseFilters.date && toDateKey(row.purchase_date) !== purchaseFilters.date) return false;
+    if (purchaseFilters.status === "CANCELLED") return row.purchase_status === "CANCELLED";
+    if (purchaseFilters.status === "BILL_PENDING") return row.purchase_status !== "CANCELLED" && row.purchase_bill_status === "BILL_PENDING";
+    if (purchaseFilters.status === "BILL_COMPLETED") return row.purchase_status !== "CANCELLED" && row.purchase_bill_status === "BILL_COMPLETED";
+    return row.purchase_status !== "CANCELLED";
+  });
+  const groupedPurchaseHistoryRows = (() => {
+    if (!clubPurchaseItems) return filteredPurchaseHistoryRows.map((row) => ({
+      ...row,
+      display_key: `item-${row.id}-${row.item_id || row.product_id}`,
+      item_summary: purchaseItemNarration(row),
+      item_narration: purchaseItemNarration(row),
+      gross_total: Number(row.gross_amount || 0) || purchaseItemBasic(row) + purchaseCharges(row),
+      charges_total: purchaseCharges(row),
+      rebate_total: Number(row.rebate_amount || 0),
+      net_total: Number(row.net_payable || row.item_net_payable || 0),
+      paid_total: Number(row.paid_amount || 0),
+      balance_total: Number(row.balance_amount || 0),
+      status_label: purchaseStatusLabel(row),
+      source_rows: [row],
+    }));
+    const groups = new Map();
+    for (const row of filteredPurchaseHistoryRows) {
+      const key = `${toDateKey(row.purchase_date)}-${row.supplier_id || row.supplier_name}`;
+      const existing = groups.get(key) || {
+        ...row,
+        display_key: `club-${key}`,
+        quantity: 0,
+        gross_total: 0,
+        charges_total: 0,
+        rebate_total: 0,
+        net_total: 0,
+        paid_total: 0,
+        balance_total: 0,
+        source_rows: [],
+      };
+      existing.source_rows.push(row);
+      existing.gross_total += Number(row.gross_amount || 0) || purchaseItemBasic(row) + purchaseCharges(row);
+      existing.charges_total += purchaseCharges(row);
+      existing.rebate_total += Number(row.rebate_amount || 0);
+      existing.net_total += Number(row.net_payable || row.item_net_payable || 0);
+      existing.paid_total += Number(row.paid_amount || 0);
+      existing.balance_total += Number(row.balance_amount || 0);
+      groups.set(key, existing);
+    }
+    return [...groups.values()].map((group) => {
+      const itemSummary = group.source_rows
+        .slice(0, 3)
+        .map((row) => `${row.product_name} ${Number(row.quantity || 0).toLocaleString("en-IN")}${row.unit ? row.unit.toLowerCase() : ""}`)
+        .join(", ");
+      const extraCount = Math.max(group.source_rows.length - 3, 0);
+      const statuses = new Set(group.source_rows.map(purchaseStatusLabel));
+      return {
+        ...group,
+        item_summary: `${itemSummary}${extraCount ? ` +${extraCount} more` : ""}`,
+        item_narration: group.source_rows.map(purchaseItemNarration).join("\n"),
+        status_label: statuses.size > 1 ? "Mixed" : [...statuses][0],
+      };
+    });
+  })();
+  const purchaseDateTotals = groupedPurchaseHistoryRows.reduce((totals, row) => {
+    const date = toDateKey(row.purchase_date);
+    const current = totals.get(date) || { net: 0, gross: 0 };
+    current.net += row.status_label === "Cancelled" ? 0 : Number(row.net_total || 0);
+    current.gross += row.status_label === "Cancelled" ? 0 : Number(row.gross_total || 0);
+    totals.set(date, current);
+    return totals;
+  }, new Map());
   const reports = {
     salesByDate: {
       title: "Sales by Date",
@@ -1859,26 +1986,34 @@ function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEdit
     },
     purchaseHistory: {
       title: "Purchase History",
-      rows: filterRows(data.purchaseHistoryReport),
-      summary: (rows) => [["Purchases", rows.length, true], ["Net Payable", money(totalOf(rows, "net_payable"))], ["Balance", money(totalOf(rows, "balance_amount"))]],
-      headers: ["Purchase", "Date", "Supplier", "Status", "Bill", "Item", "Qty", "Rate", "Net", "Batch", "Actions"],
+      rows: groupedPurchaseHistoryRows,
+      summary: (rows) => [
+        ["Rows", rows.length, true],
+        ["Gross Total", money(rows.filter((row) => row.status_label !== "Cancelled").reduce((sum, row) => sum + Number(row.gross_total || 0), 0))],
+        ["Net Total", money(rows.filter((row) => row.status_label !== "Cancelled").reduce((sum, row) => sum + Number(row.net_total || 0), 0))],
+        ["Balance", money(rows.filter((row) => row.status_label !== "Cancelled").reduce((sum, row) => sum + Number(row.balance_total || 0), 0))],
+      ],
+      headers: ["Date", "Supplier / Firm Name", "Items", "Gross Total", "Charges", "Rebate", "Net Total", "Paid", "Balance", "Status", "Actions"],
       render: (row) => (
-        <tr key={row.id} onDoubleClick={() => onEditPurchase?.(row)}>
-          <td><span className="batch-id">#{row.id}</span></td>
-          <td onDoubleClick={() => onEditPurchase?.(row)}>{row.purchase_date}</td>
-          <td className="primary-cell">{row.supplier_name}</td>
-          <td><span className={row.purchase_status === "CANCELLED" ? "stock-low" : row.purchase_status === "EDITED" ? "origin-rate" : "stock-ok"}>{row.purchase_status || "ACTIVE"}</span></td>
-          <td><span className={row.purchase_bill_status === "BILL_PENDING" ? "stock-low" : "stock-ok"}>{row.purchase_bill_status === "BILL_PENDING" ? "Bill Pending" : "Bill Completed"}</span></td>
-          <td className="primary-cell" onDoubleClick={() => onEditPurchase?.(row)}>{row.product_name || "-"}<small className="cell-note">{row.unit || ""}</small></td>
-          <td>{number(row.quantity)}</td>
-          <td>{money(row.purchase_rate)}</td>
-          <td>{money(row.net_payable)}</td>
-          <td><span className="batch-id">{row.batch_no || "-"}</span></td>
+        <tr key={row.display_key}>
+          <td className="primary-cell" onDoubleClick={() => setPurchaseFilters((current) => ({ ...current, date: toDateKey(row.purchase_date) }))}>{toDateKey(row.purchase_date)}</td>
+          <td className="primary-cell" onDoubleClick={() => onOpenSupplierLedger?.(row)}>{row.supplier_name}<small className="cell-note">{row.firm_name || "Double-click for supplier ledger"}</small></td>
+          <td className="primary-cell purchase-items-cell" onDoubleClick={() => onEditPurchase?.(row.source_rows?.[0] || row)}>
+            <span title={row.item_narration}>{row.item_summary}</span>
+            <small className="cell-note">{clubPurchaseItems ? `${row.source_rows.length} item${row.source_rows.length === 1 ? "" : "s"}` : `${number(row.quantity)} ${row.unit || ""}`}</small>
+          </td>
+          <td>{money(row.gross_total)}</td>
+          <td>{money(row.charges_total)}</td>
+          <td>{money(row.rebate_total)}</td>
+          <td>{money(row.net_total)}</td>
+          <td>{money(row.paid_total)}</td>
+          <td className="balance-cell">{money(row.balance_total)}</td>
+          <td><span className={row.status_label === "Cancelled" ? "stock-low" : row.status_label === "Pending Bill" ? "origin-rate" : "stock-ok"}>{row.status_label}</span></td>
           <td>
             <div className="button-row table-actions-row">
-              <button className="table-action" disabled={row.purchase_status === "CANCELLED"} onClick={() => onEditPurchase?.(row)}>Add / Edit Purchase</button>
-              {row.purchase_bill_status === "BILL_PENDING" && <button className="primary-button" disabled={row.purchase_status === "CANCELLED"} onClick={() => onCompletePurchase?.(row)}>Complete Bill</button>}
-              <button className="remove-button" disabled={row.purchase_status === "CANCELLED"} onClick={() => onCancelPurchase?.(row)}>Cancel</button>
+              <button className="table-action" disabled={row.status_label === "Cancelled"} onClick={() => onEditPurchase?.(row.source_rows?.[0] || row)}>Add / Edit Purchase</button>
+              {row.status_label === "Pending Bill" && <button className="primary-button" disabled={clubPurchaseItems} onClick={() => onCompletePurchase?.(row.source_rows?.[0] || row)}>Complete Bill</button>}
+              <button className="remove-button" disabled={row.status_label === "Cancelled" || clubPurchaseItems} onClick={() => onCancelPurchase?.(row.source_rows?.[0] || row)}>Cancel</button>
             </div>
           </td>
         </tr>
@@ -2069,7 +2204,7 @@ function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEdit
   };
   const categories = [
     { id: "sales", title: "Sales Reports", icon: "receipt", description: "Invoices, products, customers, discounts and bill changes.", reports: ["salesByDate", "salesByProduct", "salesByCustomer", "salesHistory", "editedBills", "cancelledBills", "provisionalProfitSales", "discountReport"] },
-    { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Purchase value, supplier buying, outstanding and purchase changes.", reports: ["purchasesByDate", "purchaseHistory", "purchasesByProduct", "purchasesBySupplier", "purchaseOutstanding", "pendingPurchaseBills", "stockWithoutBill", "purchaseEditCancel"] },
+    { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Unified purchase history with item narration, bill status, payments and amendment actions.", reports: ["purchaseHistory"] },
     { id: "accounts", title: "Accounts & Ledger", icon: "users", description: "Customer ledger, supplier ledger, statements, payments and balances.", reports: ["customerLedger", "supplierLedger", "accountStatement", "paymentReport", "paymentModeSummary", "receivableReport", "payableReport"] },
     { id: "returns", title: "Sale Returns", icon: "history", description: "Return history, value and reason analysis.", reports: ["returnHistory", "returnValue", "returnReason"] },
     { id: "waste", title: "Waste Management", icon: "alert", description: "Daily, monthly, product-wise and cost-focused waste analysis.", reports: ["dailyWaste", "monthlyWaste", "productWiseWaste", "mostWastedProducts", "wasteCost"] },
@@ -2079,7 +2214,7 @@ function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEdit
   const currentCategory = categories.find((category) => category.id === selectedCategory);
   const currentReport = reports[selectedReport];
   const renderFilters = () => (
-    <div className="ledger-toolbar">
+    <div className={selectedReport === "purchaseHistory" ? "ledger-toolbar purchase-history-toolbar" : "ledger-toolbar"}>
       <Field label="Report Range">
         <select value={range} onChange={(event) => setRange(event.target.value)}>
           <option value="today">Today</option>
@@ -2096,11 +2231,76 @@ function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEdit
         </>
       )}
       <Field label="Search / Filter"><input placeholder="Search this report" value={search} onChange={(event) => setSearch(event.target.value)} /></Field>
+      {selectedReport === "purchaseHistory" && (
+        <>
+          <Field label="Supplier">
+            <select value={purchaseFilters.supplier} onChange={(event) => setPurchaseFilters({ ...purchaseFilters, supplier: event.target.value })}>
+              <option value="">All suppliers</option>
+              {purchaseSuppliers.map((row) => <option key={row.supplier_id || row.supplier_name} value={row.supplier_id || ""}>{row.supplier_name}{row.firm_name ? ` - ${row.firm_name}` : ""}</option>)}
+            </select>
+          </Field>
+          <Field label="Product">
+            <select value={purchaseFilters.product} onChange={(event) => setPurchaseFilters({ ...purchaseFilters, product: event.target.value })}>
+              <option value="">All products</option>
+              {purchaseProducts.map((row) => <option key={row.product_id || row.product_name} value={row.product_id || ""}>{row.product_name}</option>)}
+            </select>
+          </Field>
+          <Field label="Status">
+            <select value={purchaseFilters.status} onChange={(event) => setPurchaseFilters({ ...purchaseFilters, status: event.target.value })}>
+              <option value="ACTIVE">Active Bills</option>
+              <option value="BILL_PENDING">Pending Bill</option>
+              <option value="BILL_COMPLETED">Completed Bill</option>
+              <option value="CANCELLED">Cancelled</option>
+            </select>
+          </Field>
+          <Field label="Payment Type">
+            <select value={purchaseFilters.paymentType} onChange={(event) => setPurchaseFilters({ ...purchaseFilters, paymentType: event.target.value })}>
+              <option value="">All payment types</option>
+              <option value="CASH">Cash</option>
+              <option value="CREDIT">Credit</option>
+              <option value="PENDING_BILL">Pending Bill</option>
+            </select>
+          </Field>
+          <Field label="Exact Date">
+            <input type="date" value={purchaseFilters.date} onChange={(event) => setPurchaseFilters({ ...purchaseFilters, date: event.target.value })} />
+          </Field>
+          <label className="check-field report-check-field">
+            <input checked={clubPurchaseItems} type="checkbox" onChange={(event) => setClubPurchaseItems(event.target.checked)} />
+            <span>Club Items</span>
+          </label>
+          <button className="secondary-button" onClick={() => setPurchaseFilters({ supplier: "", product: "", status: "ACTIVE", paymentType: "", date: "" })}>Clear Purchase Filters</button>
+        </>
+      )}
       <button className="secondary-button" onClick={refreshReports}>Refresh</button>
     </div>
   );
   if (currentReport) {
     const rows = currentReport.rows || [];
+    const handlePurchaseReportPrintOption = () => {
+      if (selectedReport !== "purchaseHistory") return true;
+      setPurchasePrintNarration(window.confirm("Print narration/details also?"));
+      return true;
+    };
+    const renderPurchaseHistoryRows = () => {
+      const renderedRows = [];
+      rows.forEach((row, index) => {
+        const date = toDateKey(row.purchase_date);
+        const nextDate = rows[index + 1] ? toDateKey(rows[index + 1].purchase_date) : "";
+        renderedRows.push(currentReport.render(row, index));
+        if (date !== nextDate) {
+          const total = purchaseDateTotals.get(date) || { net: 0, gross: 0 };
+          renderedRows.push(
+            <tr className="date-total-row" key={`date-total-${date}`}>
+              <td colSpan="6">Net Purchase Total for {date}</td>
+              <td>{money(total.gross)}</td>
+              <td colSpan="2" className="balance-cell">{money(total.net)}</td>
+              <td colSpan="2">Cancelled purchases excluded</td>
+            </tr>
+          );
+        }
+      });
+      return renderedRows;
+    };
     return (
       <section className="settings-layout">
         <ModuleCard eyebrow="Report View" title={currentReport.title} subtitle="Single report workspace with filters, summary, print and export controls.">
@@ -2111,13 +2311,24 @@ function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEdit
           {renderFilters()}
         </ModuleCard>
         <ModuleCard eyebrow={currentCategory?.title || "Reports"} title={currentReport.title} subtitle={`${rows.length} row${rows.length === 1 ? "" : "s"} found.`}>
-          <PrintableReport title={currentReport.title}>
+          <PrintableReport beforePdfExport={handlePurchaseReportPrintOption} beforePrint={handlePurchaseReportPrintOption} title={currentReport.title}>
             <div className="purchase-summary-grid supplier-payment-preview">
               {(currentReport.summary?.(rows) || []).map(([label, value, featured]) => <SummaryMetric featured={featured} key={label} label={label} value={value} />)}
             </div>
             <DataTable headers={currentReport.headers}>
-              {rows.map((row, index) => currentReport.render(row, index))}
+              {selectedReport === "purchaseHistory" ? renderPurchaseHistoryRows() : rows.map((row, index) => currentReport.render(row, index))}
             </DataTable>
+            {selectedReport === "purchaseHistory" && purchasePrintNarration && (
+              <section className="purchase-print-narration">
+                <h3>Purchase Item Narration</h3>
+                {rows.map((row) => (
+                  <article key={`narration-${row.display_key}`}>
+                    <strong>{toDateKey(row.purchase_date)} - {row.supplier_name}</strong>
+                    <pre>{row.item_narration}</pre>
+                  </article>
+                ))}
+              </section>
+            )}
             {rows.length === 0 && <div className="cart-empty">No records found for the selected filters.</div>}
           </PrintableReport>
         </ModuleCard>
@@ -2475,7 +2686,7 @@ function ExpensesModule({ expenses, onReload, user }) {
   );
 }
 
-function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPayments, onLedgerLoad, onPaymentsLoad, onReload, user }) {
+function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPayments, ledgerFocusKey, onLedgerLoad, onPaymentsLoad, onReload, user }) {
   const emptyAccount = {
     account_name: "",
     account_type: "CUSTOMER",
@@ -2626,6 +2837,13 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
     setLedgerAccountKey(accountKey);
     await onLedgerLoad(accountKey);
   };
+
+  useEffect(() => {
+    if (!ledgerFocusKey) return;
+    setTab("ledger");
+    setLedgerMode(ledgerFocusKey.startsWith("SUPPLIER-") ? "SUPPLIER" : "ANY");
+    setLedgerAccountKey(ledgerFocusKey);
+  }, [ledgerFocusKey]);
   const savePayment = async () => {
     try {
       const payload = {

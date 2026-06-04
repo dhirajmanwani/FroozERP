@@ -4521,11 +4521,15 @@ app.get("/reports/summary", async (req, res) => {
           p.payment_reference_number,
           p.bill_number,
           p.bill_date,
+          s.firm_name,
           p.temporary_sale_rate,
           p.expected_purchase_rate,
+          p.gross_amount,
+          p.mandi_tax_amount,
           p.freight_charges,
           p.labour_charges,
           p.other_charges,
+          p.rebate_amount,
           p.rebate_rule_id,
           p.net_payable,
           p.paid_amount,
@@ -4535,6 +4539,8 @@ app.get("/reports/summary", async (req, res) => {
           pi.product_id,
           pi.quantity,
           pi.purchase_rate,
+          pi.basic_amount AS item_basic_amount,
+          pi.net_payable AS item_net_payable,
           pi.effective_cost_per_unit,
           pr.product_name,
           pr.unit,
@@ -4545,6 +4551,7 @@ app.get("/reports/summary", async (req, res) => {
           ib.remaining_qty AS batch_remaining_qty,
           ib.batch_status
         FROM purchases p
+        LEFT JOIN suppliers s ON s.id = p.supplier_id
         LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
         LEFT JOIN products pr ON pr.id = pi.product_id
         LEFT JOIN inventory_batches ib ON ib.purchase_id = p.id

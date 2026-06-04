@@ -461,6 +461,65 @@
   background: rgba(245, 158, 11, 0.12);
 }
 
+.purchase-history-toolbar {
+  grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+}
+
+.report-check-field {
+  align-self: end;
+  min-height: 42px;
+}
+
+.purchase-items-cell span {
+  cursor: help;
+  text-decoration: underline dotted rgba(245, 158, 11, 0.45);
+  text-underline-offset: 4px;
+}
+
+.date-total-row td {
+  border-top: 1px solid rgba(245, 158, 11, 0.28);
+  color: #f8fafc;
+  background: rgba(245, 158, 11, 0.08);
+  font-weight: 850;
+}
+
+.purchase-print-narration {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid rgba(245, 158, 11, 0.16);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.purchase-print-narration h3 {
+  margin: 0;
+  color: #f8fafc;
+  font-size: 15px;
+}
+
+.purchase-print-narration article {
+  padding: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.1);
+  border-radius: 9px;
+  background: rgba(30, 41, 59, 0.54);
+}
+
+.purchase-print-narration strong {
+  display: block;
+  margin-bottom: 6px;
+  color: #fbbf24;
+}
+
+.purchase-print-narration pre {
+  margin: 0;
+  color: #cbd5e1;
+  white-space: pre-wrap;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .content-card {
   padding: 22px;
 }
