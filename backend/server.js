@@ -1094,6 +1094,7 @@ const getDashboardSummary = async () => {
         COALESCE((
           SELECT SUM(remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate))
           FROM inventory_batches
+          WHERE COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'
         ), 0) AS "stockValue",
         COALESCE((
           SELECT COUNT(*)
@@ -1104,6 +1105,7 @@ const getDashboardSummary = async () => {
               COALESCE(p.minimum_stock, 5) AS minimum_stock
             FROM products p
             LEFT JOIN inventory_batches ib ON ib.product_id = p.id
+              AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
             WHERE p.active IS DISTINCT FROM FALSE
             GROUP BY p.id, p.minimum_stock
           ) stock
@@ -1306,6 +1308,7 @@ const getDashboardLowStockItems = async () => {
         COALESCE(SUM(ib.remaining_qty), 0) AS current_stock
       FROM products p
       LEFT JOIN inventory_batches ib ON ib.product_id = p.id
+        AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
       WHERE p.active IS DISTINCT FROM FALSE
       GROUP BY p.id, p.product_name, p.unit, p.minimum_stock
     ) stock
@@ -1663,6 +1666,7 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
       WHERE product_id = $1
         AND branch_id = $2
         AND remaining_qty > 0
+        AND COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'
       ORDER BY purchase_date, created_at, id
       FOR UPDATE
       `,
@@ -2496,6 +2500,7 @@ app.get("/inventory", async (req, res) => {
         ib.purchase_date
       FROM inventory_batches ib
       JOIN products p ON p.id = ib.product_id
+      WHERE COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
       ORDER BY ib.purchase_date, ib.created_at, ib.id
     `);
 
@@ -2517,6 +2522,7 @@ app.get("/stock", async (req, res) => {
         COALESCE(SUM(ib.remaining_qty), 0) AS current_stock
       FROM products p
       LEFT JOIN inventory_batches ib ON ib.product_id = p.id
+        AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
       GROUP BY p.id, p.product_name, p.unit
       ORDER BY p.product_name
     `);
@@ -2563,6 +2569,7 @@ app.get("/sale-rates", async (req, res) => {
         SELECT ib.effective_cost_per_unit
         FROM inventory_batches ib
         WHERE ib.product_id = p.id
+          AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
         ORDER BY ib.purchase_date DESC, ib.created_at DESC, ib.id DESC
         LIMIT 1
       ) latest ON TRUE
@@ -2570,6 +2577,7 @@ app.get("/sale-rates", async (req, res) => {
         SELECT SUM(ib.remaining_qty) AS current_stock
         FROM inventory_batches ib
         WHERE ib.product_id = p.id
+          AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
       ) stock ON TRUE
       WHERE p.active = TRUE
       ORDER BY p.product_name
@@ -3935,6 +3943,9 @@ app.get("/reports/summary", async (req, res) => {
       returnReasonResult,
       wasteResult,
       wasteProductResult,
+      stockResult,
+      ledgerResult,
+      dayToDayResult,
       balanceSheetResult,
       profitLossResult,
     ] = await Promise.all([
@@ -4109,11 +4120,133 @@ app.get("/reports/summary", async (req, res) => {
       pool.query(
         `
         SELECT
+          p.id AS product_id,
+          p.product_name,
+          p.category,
+          p.unit,
+          p.minimum_stock,
+          COALESCE(SUM(ib.remaining_qty), 0) AS current_stock,
+          COALESCE(SUM(ib.remaining_qty * COALESCE(ib.effective_cost_per_unit, ib.purchase_rate)), 0) AS stock_value
+        FROM products p
+        LEFT JOIN inventory_batches ib ON ib.product_id = p.id
+          AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+        WHERE p.active IS DISTINCT FROM FALSE
+        GROUP BY p.id
+        ORDER BY p.product_name
+        `
+      ),
+      pool.query(
+        `
+        SELECT *
+        FROM (
+          SELECT p.purchase_date AS date, 'Supplier Purchase' AS transaction_type,
+            p.supplier_name AS party_name,
+            COALESCE(NULLIF(p.gross_amount, 0), p.total_amount, 0) AS debit,
+            COALESCE(p.paid_amount, 0) + COALESCE(p.rebate_amount, 0) AS credit,
+            COALESCE(p.payment_status, '') AS status,
+            COALESCE(p.remarks, 'Purchase #' || p.id) AS remarks
+          FROM purchases p
+          WHERE p.purchase_date BETWEEN $1 AND $2
+            AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
+          UNION ALL
+          SELECT sp.payment_date AS date, 'Supplier Payment' AS transaction_type,
+            s.supplier_name AS party_name,
+            0 AS debit,
+            sp.payment_amount + sp.rebate_amount AS credit,
+            CASE WHEN sp.cancelled THEN 'CANCELLED' ELSE 'ACTIVE' END AS status,
+            COALESCE(sp.remarks, sp.reference_number, 'Supplier payment') AS remarks
+          FROM supplier_payments sp
+          JOIN suppliers s ON s.id = sp.supplier_id
+          WHERE sp.payment_date BETWEEN $1 AND $2
+          UNION ALL
+          SELECT s.sale_date AS date, 'Customer Sale' AS transaction_type,
+            COALESCE(s.customer_name, 'Walk-in Customer') AS party_name,
+            s.total_amount AS debit,
+            COALESCE(pay.total_paid, 0) AS credit,
+            COALESCE(s.sale_status, 'COMPLETED') AS status,
+            COALESCE(s.invoice_no, 'Sale #' || s.id) AS remarks
+          FROM sales s
+          LEFT JOIN (SELECT sale_id, SUM(amount) AS total_paid FROM sale_payments GROUP BY sale_id) pay ON pay.sale_id = s.id
+          WHERE s.sale_date BETWEEN $1 AND $2
+            AND s.sale_status <> 'CANCELLED'
+          UNION ALL
+          SELECT cp.payment_date AS date, 'Customer Payment' AS transaction_type,
+            c.customer_name AS party_name,
+            0 AS debit,
+            cp.payment_amount AS credit,
+            CASE WHEN cp.cancelled THEN 'CANCELLED' ELSE 'ACTIVE' END AS status,
+            COALESCE(cp.remarks, cp.reference_number, 'Customer payment') AS remarks
+          FROM customer_payments cp
+          JOIN customers c ON c.id = cp.customer_id
+          WHERE cp.payment_date BETWEEN $1 AND $2
+        ) ledger
+        ORDER BY date DESC, transaction_type, party_name
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        WITH days AS (
+          SELECT generate_series($1::date, $2::date, INTERVAL '1 day')::date AS day
+        ),
+        sales_by_day AS (
+          SELECT sale_date::date AS day, SUM(total_amount) AS sales, SUM(profit) AS profit, COUNT(*) AS transactions
+          FROM sales
+          WHERE sale_status <> 'CANCELLED' AND sale_date BETWEEN $1 AND $2
+          GROUP BY sale_date
+        ),
+        purchases_by_day AS (
+          SELECT purchase_date::date AS day, SUM(COALESCE(NULLIF(net_payable, 0), total_amount, 0)) AS purchases
+          FROM purchases
+          WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date BETWEEN $1 AND $2
+          GROUP BY purchase_date
+        ),
+        expenses_by_day AS (
+          SELECT expense_date::date AS day, SUM(amount) AS expenses
+          FROM expenses
+          WHERE active IS DISTINCT FROM FALSE AND expense_date BETWEEN $1 AND $2
+          GROUP BY expense_date
+        ),
+        returns_by_day AS (
+          SELECT return_date::date AS day, SUM(total_return_amount) AS returns
+          FROM sale_returns
+          WHERE return_date BETWEEN $1 AND $2
+          GROUP BY return_date
+        ),
+        waste_by_day AS (
+          SELECT waste_date::date AS day, SUM(cost_amount) AS waste
+          FROM waste_entries
+          WHERE waste_date BETWEEN $1 AND $2
+          GROUP BY waste_date
+        )
+        SELECT
+          TO_CHAR(days.day, 'YYYY-MM-DD') AS date,
+          COALESCE(sales_by_day.sales, 0) AS sales,
+          COALESCE(sales_by_day.profit, 0) AS profit,
+          COALESCE(sales_by_day.transactions, 0)::INTEGER AS transactions,
+          COALESCE(purchases_by_day.purchases, 0) AS purchases,
+          COALESCE(expenses_by_day.expenses, 0) AS expenses,
+          COALESCE(returns_by_day.returns, 0) AS returns,
+          COALESCE(waste_by_day.waste, 0) AS waste,
+          COALESCE(sales_by_day.profit, 0) - COALESCE(expenses_by_day.expenses, 0) - COALESCE(waste_by_day.waste, 0) AS net_profit
+        FROM days
+        LEFT JOIN sales_by_day ON sales_by_day.day = days.day
+        LEFT JOIN purchases_by_day ON purchases_by_day.day = days.day
+        LEFT JOIN expenses_by_day ON expenses_by_day.day = days.day
+        LEFT JOIN returns_by_day ON returns_by_day.day = days.day
+        LEFT JOIN waste_by_day ON waste_by_day.day = days.day
+        ORDER BY days.day DESC
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
           COALESCE((SELECT SUM(amount) FROM sale_payments sp JOIN sales s ON s.id = sp.sale_id WHERE s.sale_status <> 'CANCELLED'), 0)
             + COALESCE((SELECT SUM(payment_amount) FROM customer_payments WHERE cancelled = FALSE), 0)
             - COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE cancelled = FALSE), 0)
             - COALESCE((SELECT SUM(amount) FROM expenses WHERE active IS DISTINCT FROM FALSE), 0) AS cash_bank,
-          COALESCE((SELECT SUM(remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate)) FROM inventory_batches), 0) AS inventory_value,
+          COALESCE((SELECT SUM(remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate)) FROM inventory_batches WHERE COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'), 0) AS inventory_value,
           COALESCE((SELECT SUM(outstanding_balance) FROM (
             SELECT c.id, COALESCE(c.opening_balance, 0) + COALESCE(ss.total_sales, 0) - COALESCE(ss.sale_paid, 0) - COALESCE(cp.total_paid, 0) AS outstanding_balance
             FROM customers c
@@ -4173,6 +4306,9 @@ app.get("/reports/summary", async (req, res) => {
       wasteReport: wasteResult.rows,
       wasteProductReport: wasteProductResult.rows,
       mostWastedProducts: wasteProductResult.rows.slice(0, 5),
+      stockReport: stockResult.rows,
+      ledgerReport: ledgerResult.rows,
+      dayToDayReport: dayToDayResult.rows,
       balanceSheet: {
         cash: roundCurrency(Number(balanceSheet.cash_bank || 0)),
         bank: 0,
@@ -5110,7 +5246,7 @@ app.post("/purchase/:id/cancel", async (req, res) => {
     const soldQuantity = roundUnitCost(purchaseQty - remainingQty);
     if (soldQuantity > 0) {
       await client.query("ROLLBACK");
-      return res.status(409).json({ message: `Cannot cancel purchase because ${soldQuantity} units from this batch are already sold.` });
+      return res.status(409).json({ message: "This purchase cannot be cancelled because stock from this batch has already been sold." });
     }
     const oldSnapshot = { purchase, item, batch };
     const updatedPurchase = await client.query(
@@ -5226,11 +5362,12 @@ app.post("/sales", async (req, res) => {
       const batchesResult = await client.query(
         `
         SELECT id, remaining_qty, COALESCE(effective_cost_per_unit, purchase_rate) AS purchase_rate
-        FROM inventory_batches
-        WHERE product_id = $1
-          AND branch_id = $2
-          AND remaining_qty > 0
-        ORDER BY purchase_date, created_at, id
+          FROM inventory_batches
+          WHERE product_id = $1
+            AND branch_id = $2
+            AND remaining_qty > 0
+            AND COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'
+          ORDER BY purchase_date, created_at, id
         FOR UPDATE
         `,
         [requestedItem.productId, parsedBranchId]
@@ -5786,6 +5923,7 @@ app.post("/waste-entries", async (req, res) => {
       WHERE product_id = $1
         AND branch_id = $2
         AND remaining_qty > 0
+        AND COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'
       ORDER BY purchase_date, created_at, id
       FOR UPDATE
       `,

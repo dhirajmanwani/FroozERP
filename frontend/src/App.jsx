@@ -1153,7 +1153,7 @@ function App() {
                     <td>
                       <div className="button-row table-actions-row">
                         <button className="table-action" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => editPurchase(purchase)}>Edit</button>
-                        <button className="remove-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => cancelPurchase(purchase)}>Cancel</button>
+                        <button className="remove-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => cancelPurchase(purchase)}>Cancel/Delete</button>
                       </div>
                     </td>
                   </tr>
@@ -1342,9 +1342,16 @@ function ReportToolbar({ onPrint, title }) {
 }
 
 function PrintableReport({ children, title }) {
-  const printReport = () => window.print();
+  const [printTarget, setPrintTarget] = useState(false);
+  const printReport = () => {
+    setPrintTarget(true);
+    setTimeout(() => {
+      window.print();
+      setTimeout(() => setPrintTarget(false), 250);
+    }, 50);
+  };
   return (
-    <section className="print-section">
+    <section className={`print-section ${printTarget ? "print-target" : ""}`}>
       <ReportToolbar onPrint={printReport} title={title} />
       <div className="print-area report-paper">
         <header className="report-print-header">
@@ -1362,6 +1369,7 @@ function PrintableReport({ children, title }) {
 
 function ReportsModule({ data, onReload }) {
   const [range, setRange] = useState("today");
+  const [search, setSearch] = useState("");
   const [customRange, setCustomRange] = useState({
     date_from: toDateKey(new Date()),
     date_to: toDateKey(new Date()),
@@ -1370,6 +1378,19 @@ function ReportsModule({ data, onReload }) {
     const params = range === "custom" ? customRange : { range };
     await onReload(params);
   };
+  const matchesSearch = (row) => !search.trim() || Object.values(row || {}).some((value) =>
+    String(value ?? "").toLowerCase().includes(search.trim().toLowerCase())
+  );
+  const salesRows = (data.salesReport || []).filter(matchesSearch);
+  const purchaseRows = (data.purchaseReport || []).filter(matchesSearch);
+  const expenseRows = (data.expenseReport || []).filter(matchesSearch);
+  const paymentRows = (data.paymentReport || []).filter(matchesSearch);
+  const returnRows = (data.returnReport || []).filter(matchesSearch);
+  const wasteRows = (data.wasteReport || []).filter(matchesSearch);
+  const stockRows = (data.stockReport || []).filter(matchesSearch);
+  const ledgerRows = (data.ledgerReport || []).filter(matchesSearch);
+  const dayRows = (data.dayToDayReport || []).filter(matchesSearch);
+  const totalOf = (rows, key) => rows.reduce((sum, row) => sum + Number(row[key] || 0), 0);
   return (
     <section className="settings-layout">
       <ModuleCard eyebrow="Reports" title="Business Reports" subtitle="Operational summaries generated from live sales, purchases, suppliers, customers and discounts.">
@@ -1389,41 +1410,100 @@ function ReportsModule({ data, onReload }) {
               <Field label="Date To"><input type="date" value={customRange.date_to} onChange={(event) => setCustomRange({ ...customRange, date_to: event.target.value })} /></Field>
             </>
           )}
+          <Field label="Search / Filter"><input placeholder="Search reports" value={search} onChange={(event) => setSearch(event.target.value)} /></Field>
           <button className="secondary-button" onClick={refreshReports}>Refresh Reports</button>
         </div>
       </ModuleCard>
       <ModuleCard eyebrow="Sales Report" title="Sales by Date" subtitle="Completed invoices only; cancelled bills are excluded.">
         <PrintableReport title="Sales Report">
+          <div className="purchase-summary-grid supplier-payment-preview">
+            <SummaryMetric label="Sales" value={currency.format(totalOf(salesRows, "total_sales"))} featured />
+            <SummaryMetric label="Transactions" value={totalOf(salesRows, "transaction_count")} />
+            <SummaryMetric label="Profit" value={currency.format(totalOf(salesRows, "total_profit"))} />
+          </div>
           <DataTable headers={["Date", "Transactions", "Sales", "Cost", "Profit"]}>
-            {(data.salesReport || []).map((row) => <tr key={row.sale_date}><td>{row.sale_date}</td><td>{row.transaction_count}</td><td>{currency.format(Number(row.total_sales || 0))}</td><td>{currency.format(Number(row.total_cost || 0))}</td><td className="profit-cell">{currency.format(Number(row.total_profit || 0))}</td></tr>)}
+            {salesRows.map((row) => <tr key={row.sale_date}><td>{row.sale_date}</td><td>{row.transaction_count}</td><td>{currency.format(Number(row.total_sales || 0))}</td><td>{currency.format(Number(row.total_cost || 0))}</td><td className="profit-cell">{currency.format(Number(row.total_profit || 0))}</td></tr>)}
           </DataTable>
         </PrintableReport>
       </ModuleCard>
       <ModuleCard eyebrow="Purchase Report" title="Purchases by Date" subtitle="Gross purchase, rebates, net purchase cost and balance.">
         <PrintableReport title="Purchase Report">
+          <div className="purchase-summary-grid supplier-payment-preview">
+            <SummaryMetric label="Net Purchases" value={currency.format(totalOf(purchaseRows, "net_purchase"))} featured />
+            <SummaryMetric label="Rebate" value={currency.format(totalOf(purchaseRows, "rebate_received"))} />
+            <SummaryMetric label="Balance" value={currency.format(totalOf(purchaseRows, "balance_amount"))} />
+          </div>
           <DataTable headers={["Date", "Bills", "Gross", "Rebate", "Net", "Paid", "Balance"]}>
-            {(data.purchaseReport || []).map((row) => <tr key={row.purchase_date}><td>{row.purchase_date}</td><td>{row.purchase_count}</td><td>{currency.format(Number(row.gross_purchase || 0))}</td><td>{currency.format(Number(row.rebate_received || 0))}</td><td>{currency.format(Number(row.net_purchase || 0))}</td><td>{currency.format(Number(row.paid_amount || 0))}</td><td className="balance-cell">{currency.format(Number(row.balance_amount || 0))}</td></tr>)}
+            {purchaseRows.map((row) => <tr key={row.purchase_date}><td>{row.purchase_date}</td><td>{row.purchase_count}</td><td>{currency.format(Number(row.gross_purchase || 0))}</td><td>{currency.format(Number(row.rebate_received || 0))}</td><td>{currency.format(Number(row.net_purchase || 0))}</td><td>{currency.format(Number(row.paid_amount || 0))}</td><td className="balance-cell">{currency.format(Number(row.balance_amount || 0))}</td></tr>)}
           </DataTable>
         </PrintableReport>
       </ModuleCard>
       <ModuleCard eyebrow="Expense Report" title="Expenses by Date" subtitle="Daily operating costs by category and payment mode.">
         <PrintableReport title="Expense Report">
+          <div className="purchase-summary-grid supplier-payment-preview">
+            <SummaryMetric label="Total Expenses" value={currency.format(totalOf(expenseRows, "total_expense"))} featured />
+            <SummaryMetric label="Entries" value={totalOf(expenseRows, "expense_count")} />
+          </div>
           <DataTable headers={["Date", "Category", "Payment", "Entries", "Amount"]}>
-            {(data.expenseReport || []).map((row) => <tr key={`${row.expense_date}-${row.category}-${row.payment_mode}`}><td>{row.expense_date}</td><td>{row.category}</td><td><span className="tag">{row.payment_mode}</span></td><td>{row.expense_count}</td><td>{currency.format(Number(row.total_expense || 0))}</td></tr>)}
+            {expenseRows.map((row) => <tr key={`${row.expense_date}-${row.category}-${row.payment_mode}`}><td>{row.expense_date}</td><td>{row.category}</td><td><span className="tag">{row.payment_mode}</span></td><td>{row.expense_count}</td><td>{currency.format(Number(row.total_expense || 0))}</td></tr>)}
           </DataTable>
         </PrintableReport>
       </ModuleCard>
       <ModuleCard eyebrow="Payment Report" title="Payments and Receipts" subtitle="Supplier payments, supplier rebates and customer receipts.">
         <PrintableReport title="Payment Report">
+          <div className="purchase-summary-grid supplier-payment-preview">
+            <SummaryMetric label="Payments" value={currency.format(totalOf(paymentRows, "payment_amount"))} featured />
+            <SummaryMetric label="Rebates" value={currency.format(totalOf(paymentRows, "rebate_amount"))} />
+          </div>
           <DataTable headers={["Date", "Type", "Party", "Payment", "Rebate", "Mode", "Status", "Reference"]}>
-            {(data.paymentReport || []).map((row, index) => <tr key={`${row.payment_date}-${row.party_name}-${index}`}><td>{row.payment_date}</td><td><span className="tag">{row.payment_type}</span></td><td className="primary-cell">{row.party_name}</td><td>{currency.format(Number(row.payment_amount || 0))}</td><td>{currency.format(Number(row.rebate_amount || 0))}</td><td>{row.payment_mode}</td><td><span className={row.cancelled ? "stock-low" : "stock-ok"}>{row.cancelled ? "Cancelled" : "Active"}</span></td><td>{row.reference_number || "-"}</td></tr>)}
+            {paymentRows.map((row, index) => <tr key={`${row.payment_date}-${row.party_name}-${index}`}><td>{row.payment_date}</td><td><span className="tag">{row.payment_type}</span></td><td className="primary-cell">{row.party_name}</td><td>{currency.format(Number(row.payment_amount || 0))}</td><td>{currency.format(Number(row.rebate_amount || 0))}</td><td>{row.payment_mode}</td><td><span className={row.cancelled ? "stock-low" : "stock-ok"}>{row.cancelled ? "Cancelled" : "Active"}</span></td><td>{row.reference_number || "-"}</td></tr>)}
+          </DataTable>
+        </PrintableReport>
+      </ModuleCard>
+      <ModuleCard eyebrow="Stock Report" title="Current Stock Valuation" subtitle="Active inventory batches only; cancelled purchase batches are excluded.">
+        <PrintableReport title="Stock Report">
+          <div className="purchase-summary-grid supplier-payment-preview">
+            <SummaryMetric label="Stock Value" value={currency.format(totalOf(stockRows, "stock_value"))} featured />
+            <SummaryMetric label="Products" value={stockRows.length} />
+            <SummaryMetric label="Low Stock Items" value={stockRows.filter((row) => Number(row.current_stock || 0) <= Number(row.minimum_stock || 0)).length} />
+          </div>
+          <DataTable headers={["Product", "Category", "Stock", "Minimum", "Unit", "Value"]}>
+            {stockRows.map((row) => <tr key={row.product_id}><td className="primary-cell">{row.product_name}</td><td>{row.category}</td><td>{Number(row.current_stock || 0).toLocaleString("en-IN")}</td><td>{row.minimum_stock || 0}</td><td>{row.unit}</td><td>{currency.format(Number(row.stock_value || 0))}</td></tr>)}
+          </DataTable>
+        </PrintableReport>
+      </ModuleCard>
+      <ModuleCard eyebrow="Ledger Report" title="Customer and Supplier Ledger" subtitle="Purchases, supplier payments, customer sales and receipts within the selected range.">
+        <PrintableReport title="Ledger Report">
+          <div className="purchase-summary-grid supplier-payment-preview">
+            <SummaryMetric label="Debits" value={currency.format(totalOf(ledgerRows, "debit"))} featured />
+            <SummaryMetric label="Credits" value={currency.format(totalOf(ledgerRows, "credit"))} />
+            <SummaryMetric label="Rows" value={ledgerRows.length} />
+          </div>
+          <DataTable headers={["Date", "Type", "Party", "Debit", "Credit", "Status", "Remarks"]}>
+            {ledgerRows.map((row, index) => <tr key={`${row.date}-${row.transaction_type}-${index}`}><td>{row.date}</td><td><span className="tag">{row.transaction_type}</span></td><td className="primary-cell">{row.party_name}</td><td>{currency.format(Number(row.debit || 0))}</td><td>{currency.format(Number(row.credit || 0))}</td><td>{row.status || "-"}</td><td>{row.remarks || "-"}</td></tr>)}
+          </DataTable>
+        </PrintableReport>
+      </ModuleCard>
+      <ModuleCard eyebrow="Day-to-Day Report" title="Daily Business Position" subtitle="Daily sales, purchase, expense, return and waste performance.">
+        <PrintableReport title="Day-to-Day Report">
+          <div className="purchase-summary-grid supplier-payment-preview">
+            <SummaryMetric label="Sales" value={currency.format(totalOf(dayRows, "sales"))} featured />
+            <SummaryMetric label="Expenses" value={currency.format(totalOf(dayRows, "expenses"))} />
+            <SummaryMetric label="Net Profit" value={currency.format(totalOf(dayRows, "net_profit"))} />
+          </div>
+          <DataTable headers={["Date", "Transactions", "Sales", "Purchases", "Expenses", "Returns", "Waste", "Net Profit"]}>
+            {dayRows.map((row) => <tr key={row.date}><td>{row.date}</td><td>{row.transactions}</td><td>{currency.format(Number(row.sales || 0))}</td><td>{currency.format(Number(row.purchases || 0))}</td><td>{currency.format(Number(row.expenses || 0))}</td><td>{currency.format(Number(row.returns || 0))}</td><td>{currency.format(Number(row.waste || 0))}</td><td className="profit-cell">{currency.format(Number(row.net_profit || 0))}</td></tr>)}
           </DataTable>
         </PrintableReport>
       </ModuleCard>
       <ModuleCard eyebrow="Return Report" title="Sale Returns" subtitle="Return value, return quantity and return counts by date.">
         <PrintableReport title="Sale Return Report">
+          <div className="purchase-summary-grid supplier-payment-preview">
+            <SummaryMetric label="Return Value" value={currency.format(totalOf(returnRows, "return_value"))} featured />
+            <SummaryMetric label="Return Quantity" value={totalOf(returnRows, "return_quantity")} />
+          </div>
           <DataTable headers={["Date", "Returns", "Return Quantity", "Return Value"]}>
-            {(data.returnReport || []).map((row) => <tr key={row.return_date}><td>{row.return_date}</td><td>{row.return_count}</td><td>{Number(row.return_quantity || 0).toLocaleString("en-IN")}</td><td>{currency.format(Number(row.return_value || 0))}</td></tr>)}
+            {returnRows.map((row) => <tr key={row.return_date}><td>{row.return_date}</td><td>{row.return_count}</td><td>{Number(row.return_quantity || 0).toLocaleString("en-IN")}</td><td>{currency.format(Number(row.return_value || 0))}</td></tr>)}
           </DataTable>
         </PrintableReport>
       </ModuleCard>
@@ -1436,8 +1516,12 @@ function ReportsModule({ data, onReload }) {
       </ModuleCard>
       <ModuleCard eyebrow="Waste Report" title="Daily and Monthly Waste" subtitle="Waste quantity and FIFO cost by date and waste type.">
         <PrintableReport title="Waste Report">
+          <div className="purchase-summary-grid supplier-payment-preview">
+            <SummaryMetric label="Waste Cost" value={currency.format(totalOf(wasteRows, "waste_cost"))} featured />
+            <SummaryMetric label="Waste Quantity" value={totalOf(wasteRows, "waste_quantity")} />
+          </div>
           <DataTable headers={["Date", "Waste Type", "Entries", "Quantity", "Cost"]}>
-            {(data.wasteReport || []).map((row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td><span className="tag">{row.waste_type}</span></td><td>{row.entry_count}</td><td>{Number(row.waste_quantity || 0).toLocaleString("en-IN")}</td><td>{currency.format(Number(row.waste_cost || 0))}</td></tr>)}
+            {wasteRows.map((row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td><span className="tag">{row.waste_type}</span></td><td>{row.entry_count}</td><td>{Number(row.waste_quantity || 0).toLocaleString("en-IN")}</td><td>{currency.format(Number(row.waste_cost || 0))}</td></tr>)}
           </DataTable>
         </PrintableReport>
       </ModuleCard>
@@ -2612,15 +2696,22 @@ function PermissionSettings({ canManage, onReload, roles, user }) {
 
 function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
   const [draft, setDraft] = useState(updateCenter || {});
+  const [message, setMessage] = useState("");
+  const status = draft.update_status || "READY_FOR_FUTURE_UPDATES";
+  const updateAvailable = ["UPDATE_AVAILABLE", "DOWNLOAD_READY_FUTURE", "DOWNLOADED"].includes(status);
+  const updateDownloaded = ["DOWNLOADED", "INSTALL_READY_FUTURE"].includes(status);
   const save = async (status) => {
     try {
-      await axios.put(`${API_URL}/settings/update-center`, {
+      const response = await axios.put(`${API_URL}/settings/update-center`, {
         ...draft,
         update_status: status || draft.update_status,
         updated_by: user.id,
       });
+      setDraft(response.data);
       await onReload();
-      alert("Update center saved");
+      const nextMessage = status === "NO_UPDATE_AVAILABLE" ? "No update available" : "Update center saved";
+      setMessage(nextMessage);
+      alert(nextMessage);
     } catch (error) {
       alert(getErrorMessage(error, "Unable to update update center"));
     }
@@ -2630,17 +2721,18 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
       <div className="purchase-summary-grid supplier-payment-preview">
         <SummaryMetric label="Current Version" value={draft.current_version || "1.0.0"} featured />
         <SummaryMetric label="Release Date" value={draft.release_date ? toDateKey(draft.release_date) : toDateKey(new Date())} />
-        <SummaryMetric label="Status" value={draft.update_status || "READY_FOR_FUTURE_UPDATES"} />
+        <SummaryMetric label="Status" value={status} />
       </div>
+      {!updateAvailable && <p className="form-note">{message || "No update available"}</p>}
       <div className="form-grid supplier-form-grid">
         <Field label="Current Version"><input disabled={!canManage} value={draft.current_version || ""} onChange={(event) => setDraft({ ...draft, current_version: event.target.value })} /></Field>
         <Field label="Release Date"><input disabled={!canManage} type="date" value={toDateKey(draft.release_date || new Date())} onChange={(event) => setDraft({ ...draft, release_date: event.target.value })} /></Field>
         <Field label="Changelog"><textarea disabled={!canManage} value={draft.changelog || ""} onChange={(event) => setDraft({ ...draft, changelog: event.target.value })} /></Field>
       </div>
       <div className="button-row">
-        <button className="secondary-button" disabled={!canManage} onClick={() => save("CHECKED_LOCAL_METADATA")}>Check for Updates</button>
-        <button className="secondary-button" disabled={!canManage} onClick={() => save("DOWNLOAD_READY_FUTURE")}>Download Update</button>
-        <button className="primary-button" disabled={!canManage} onClick={() => save("INSTALL_READY_FUTURE")}>Install Update</button>
+        <button className="secondary-button" disabled={!canManage} onClick={() => save("NO_UPDATE_AVAILABLE")}>Check for Updates</button>
+        <button className="secondary-button" disabled={!canManage || !updateAvailable || updateDownloaded} onClick={() => save("DOWNLOADED")}>Download Update</button>
+        {updateDownloaded && <button className="primary-button" disabled={!canManage} onClick={() => save("INSTALL_READY_FUTURE")}>Install Update</button>}
       </div>
     </ModuleCard>
   );
@@ -2648,12 +2740,22 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
 
 function SyncSettingsSection({ canManage, onReload, syncSettings, user }) {
   const [draft, setDraft] = useState(syncSettings || {});
+  const [statusMessage, setStatusMessage] = useState("");
   const save = async () => {
     try {
-      await axios.put(`${API_URL}/settings/sync-status`, { ...draft, updated_by: user.id });
+      const response = await axios.put(`${API_URL}/settings/sync-status`, {
+        sync_enabled: draft.sync_enabled === true,
+        sync_status: draft.sync_status || "OFFLINE_READY",
+        device_id: draft.device_id || "LOCAL-STORE",
+        notes: draft.notes || "",
+        updated_by: user.id,
+      });
+      setDraft((current) => ({ ...current, ...response.data }));
       await onReload();
+      setStatusMessage("Sync settings saved");
       alert("Sync settings saved");
     } catch (error) {
+      setStatusMessage(getErrorMessage(error, "Unable to update sync settings"));
       alert(getErrorMessage(error, "Unable to update sync settings"));
     }
   };
@@ -2664,6 +2766,7 @@ function SyncSettingsSection({ canManage, onReload, syncSettings, user }) {
         <SummaryMetric label="Pending Queue" value={Number(draft.pending_count || 0)} />
         <SummaryMetric label="Last Sync Time" value={draft.last_sync_at ? new Date(draft.last_sync_at).toLocaleString("en-IN") : "Not synced"} />
       </div>
+      {statusMessage && <p className="form-note">{statusMessage}</p>}
       <div className="form-grid supplier-form-grid">
         <Field label="Device ID"><input disabled={!canManage} value={draft.device_id || ""} onChange={(event) => setDraft({ ...draft, device_id: event.target.value })} /></Field>
         <Field label="Status">
@@ -2701,6 +2804,7 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
   const [category, setCategory] = useState("");
   const [draftRates, setDraftRates] = useState({});
   const [selectedSuggested, setSelectedSuggested] = useState({});
+  const [confirmUpdates, setConfirmUpdates] = useState(null);
   const categories = [...new Set(rates.map((rate) => rate.category).filter(Boolean))];
   const filteredRates = rates.filter((rate) =>
     rate.product_name.toLowerCase().includes(search.toLowerCase()) &&
@@ -2708,16 +2812,50 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
     (!category || rate.category === category)
   );
 
+  const buildRateUpdates = () => Object.entries(draftRates)
+    .map(([productId, value]) => {
+      const rate = rates.find((item) => String(item.id) === String(productId));
+      return rate ? {
+        product_id: Number(productId),
+        product_name: rate.product_name,
+        old_rate: Number(rate.selling_rate || 0),
+        new_selling_rate: Number(value),
+      } : null;
+    })
+    .filter(Boolean);
+
+  const requestSaveRates = () => {
+    const updates = buildRateUpdates();
+    if (updates.length === 0) {
+      alert("Select at least one product rate to update.");
+      return;
+    }
+    const invalid = updates.find((update) => !Number.isFinite(update.new_selling_rate) || update.new_selling_rate <= 0);
+    if (invalid) {
+      alert("New Rate must be greater than 0 for every selected product.");
+      return;
+    }
+    setConfirmUpdates(updates);
+  };
+
   const saveRates = async () => {
-    const updates = Object.entries(draftRates)
-      .filter(([, value]) => Number(value) > 0)
-      .map(([productId, value]) => ({ product_id: Number(productId), new_selling_rate: Number(value) }));
+    const updates = confirmUpdates || buildRateUpdates();
+    const invalid = updates.find((update) => !Number.isFinite(update.new_selling_rate) || update.new_selling_rate <= 0);
+    if (updates.length === 0 || invalid) {
+      alert("Select valid rates before saving.");
+      return;
+    }
+    const payloadUpdates = updates.map((update) => ({
+      product_id: update.product_id,
+      new_selling_rate: update.new_selling_rate,
+    }));
     try {
-      await axios.post(`${API_URL}/sale-rates/bulk`, { updates, changed_by: user.id });
+      await axios.post(`${API_URL}/sale-rates/bulk`, { updates: payloadUpdates, changed_by: user.id });
       setDraftRates({});
       setSelectedSuggested({});
+      setConfirmUpdates(null);
       await onReload();
-      alert("Selling rates updated");
+      alert(`${updates.length} selling rate${updates.length === 1 ? "" : "s"} updated successfully.`);
     } catch (error) {
       alert(getErrorMessage(error, "Unable to update selling rates"));
     }
@@ -2744,6 +2882,17 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
     setDraftRates((current) => ({ ...current, ...drafts }));
   };
 
+  const allVisibleSelected = filteredRates.length > 0 && filteredRates.every((rate) => Boolean(selectedSuggested[rate.id]));
+  const toggleAllVisible = (checked) => {
+    if (checked) {
+      selectVisibleSuggestedRates();
+      return;
+    }
+    const visibleIds = new Set(filteredRates.map((rate) => String(rate.id)));
+    setSelectedSuggested((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !visibleIds.has(String(id)))));
+    setDraftRates((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !visibleIds.has(String(id)))));
+  };
+
   return (
     <section className="settings-layout">
       <ModuleCard eyebrow="Owner Controls" title="Daily Sale Rate Update" subtitle="Review landed costs, suggested rates, and approve daily selling-rate changes. Suggestions never auto-apply.">
@@ -2754,9 +2903,12 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
           <input min="0" placeholder="Desired margin %" step="0.1" type="number" value={desiredMargin} onChange={(event) => setDesiredMargin(event.target.value)} />
           <button className="secondary-button" onClick={() => onRefresh(desiredMargin)}>Refresh Suggestions</button>
           <button className="secondary-button" onClick={selectVisibleSuggestedRates}>Select Visible Suggestions</button>
-          <button className="primary-button" onClick={saveRates}>Bulk Save Selected Rates</button>
+          <button className="primary-button" onClick={requestSaveRates}>Save Rates</button>
         </div>
-        <DataTable headers={["Select Suggested", "Product", "Origin", "Current Rate", "Suggested Rate", "New Rate", "Latest Purchase Cost", "Stock", "Margin %", "Updated", "Updated By"]}>
+        <DataTable headers={[
+          <label className="table-check-label"><input checked={allVisibleSelected} type="checkbox" onChange={(event) => toggleAllVisible(event.target.checked)} /> Select All Suggested Rates</label>,
+          "Product", "Origin", "Current Rate", "Suggested Rate", "New Rate", "Latest Purchase Cost", "Stock", "Margin %", "Updated", "Updated By",
+        ]}>
           {filteredRates.map((rate) => {
             const sellingRate = Number(draftRates[rate.id] || rate.selling_rate);
             const cost = Number(rate.latest_effective_cost || 0);
@@ -2784,6 +2936,37 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
           {history.map((item) => <tr key={item.id}><td>{new Date(item.changed_at).toLocaleString("en-IN")}</td><td className="primary-cell">{item.product_name}</td><td>{currency.format(Number(item.old_selling_rate))}</td><td className="profit-cell">{currency.format(Number(item.new_selling_rate))}</td><td>{item.changed_by_name}</td><td>{item.reason || "-"}</td></tr>)}
         </DataTable>
       </ModuleCard>
+      {confirmUpdates && (
+        <div className="modal-backdrop">
+          <section className="invoice-modal change-history-modal">
+            <div className="invoice-toolbar">
+              <div>
+                <span className="eyebrow">Confirm Sale Rate Update</span>
+                <strong>Are you sure you want to update selected sale rates?</strong>
+              </div>
+              <button aria-label="Close confirmation" className="remove-button" onClick={() => setConfirmUpdates(null)}><Icon name="close" /></button>
+            </div>
+            <div className="sale-edit-body">
+              <div className="purchase-summary-grid supplier-payment-preview">
+                <SummaryMetric label="Selected Products" value={confirmUpdates.length} featured />
+              </div>
+              <DataTable headers={["Product", "Old Rate", "New Rate"]}>
+                {confirmUpdates.map((update) => (
+                  <tr key={update.product_id}>
+                    <td className="primary-cell">{update.product_name}</td>
+                    <td>{currency.format(update.old_rate)}</td>
+                    <td className="profit-cell">{currency.format(update.new_selling_rate)}</td>
+                  </tr>
+                ))}
+              </DataTable>
+              <div className="button-row">
+                <button className="primary-button" onClick={saveRates}>Confirm Save Rates</button>
+                <button className="secondary-button" onClick={() => setConfirmUpdates(null)}>Cancel</button>
+              </div>
+            </div>
+          </section>
+        </div>
+      )}
     </section>
   );
 }
@@ -2824,6 +3007,7 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
   const [lastInvoice, setLastInvoice] = useState(null);
   const searchRef = useRef(null);
   const barcodeRef = useRef(null);
+  const quantityRefs = useRef({});
 
   useEffect(() => {
     searchRef.current?.focus();
@@ -2884,7 +3068,11 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
     );
     setSearch("");
     setHighlightedIndex(0);
-    searchRef.current?.focus();
+    setTimeout(() => {
+      const input = quantityRefs.current[product.id];
+      input?.focus();
+      input?.select();
+    }, 0);
   };
 
   const updateCartItem = (productId, field, value) => {
@@ -2897,6 +3085,14 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
     setCart((items) => items.map((item) => item.product_id === productId ? { ...item, [field]: value } : item));
   };
 
+  const completeQuantityEntry = (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    setSearch("");
+    setHighlightedIndex(0);
+    searchRef.current?.focus();
+  };
+
   const removeCartItem = (productId) => {
     setCart((items) => items.filter((item) => item.product_id !== productId));
   };
@@ -2907,11 +3103,11 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
     const product = products.find((item) => item.barcode === code);
     if (!product) {
       alert(`No product is assigned to barcode ${code}`);
+      barcodeRef.current?.focus();
     } else {
       addProduct(product);
     }
     setBarcode("");
-    barcodeRef.current?.focus();
   };
 
   const selectCustomer = (customerId) => {
@@ -3096,7 +3292,7 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
                     <tr key={item.product_id}>
                       <td className="primary-cell">{item.product_name}<small className="cell-note">{stockByProduct.get(item.product_id) || 0} {item.unit} available</small></td>
                       <td>{currency.format(item.selling_rate)}</td>
-                      <td><input className="table-input" min="0.001" step="0.001" type="number" value={item.quantity} onChange={(event) => updateCartItem(item.product_id, "quantity", event.target.value)} /></td>
+                      <td><input className="table-input" min="0.001" ref={(node) => { quantityRefs.current[item.product_id] = node; }} step="0.001" type="number" value={item.quantity} onChange={(event) => updateCartItem(item.product_id, "quantity", event.target.value)} onKeyDown={completeQuantityEntry} /></td>
                       <td><input className="table-input" min="0" step="0.01" type="number" value={item.discount_amount} onChange={(event) => updateCartItem(item.product_id, "discount_amount", event.target.value)} /></td>
                       <td className="primary-cell">{currency.format(item.quantity * item.selling_rate - Number(item.discount_amount || 0))}</td>
                       <td><button aria-label={`Remove ${item.product_name}`} className="remove-button" onClick={() => removeCartItem(item.product_id)}><Icon name="trash" size={16} /></button></td>
@@ -3493,6 +3689,12 @@ function PaymentReceiptModal({ payment, onClose }) {
 }
 
 function InvoiceModal({ invoice, onClose, printSettings = {} }) {
+  const [printMode, setPrintMode] = useState(printSettings.default_printer_type === "A4" ? "A4" : "THERMAL");
+  const activePrintMode = printMode === "A4" ? "A4" : "THERMAL";
+  const printWithMode = (mode) => {
+    setPrintMode(mode);
+    setTimeout(() => window.print(), 100);
+  };
   const sendWhatsApp = () => {
     if (!invoice.customer_mobile) {
       alert("Add a customer mobile number to send this invoice on WhatsApp.");
@@ -3518,17 +3720,19 @@ function InvoiceModal({ invoice, onClose, printSettings = {} }) {
             <strong>{invoice.invoice_no}</strong>
           </div>
           <div className="invoice-actions">
-            <button className="secondary-button" onClick={() => window.print()}><Icon name="print" /> Print Invoice</button>
-            <button className="secondary-button" onClick={() => window.print()}>Save PDF</button>
+            <button className="secondary-button" onClick={() => printWithMode("THERMAL")}><Icon name="print" /> POS Thermal Print</button>
+            <button className="secondary-button" onClick={() => printWithMode("A4")}><Icon name="print" /> A4 Invoice Print</button>
+            <button className="secondary-button" onClick={() => printWithMode("A4")}>PDF Export</button>
             <button className="whatsapp-button" onClick={sendWhatsApp}><Icon name="message" /> Send on WhatsApp</button>
             <button aria-label="Close invoice" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
-        <article className={`invoice-paper ${printSettings.default_printer_type === "A4" ? "invoice-a4" : "invoice-thermal"} ${printSettings.receipt_width === "58MM" ? "invoice-58mm" : "invoice-80mm"}`}>
+        <article className={`invoice-paper ${activePrintMode === "A4" ? "invoice-a4" : "invoice-thermal"} ${printSettings.receipt_width === "58MM" ? "invoice-58mm" : "invoice-80mm"}`}>
           <header className="invoice-header">
             <BrandLogo invoice />
             <div className="invoice-meta">
               <strong>Tax Invoice</strong>
+              <span>{printSettings.business_name || "FroozERP Retail"}</span>
               <span>{invoice.invoice_no}</span>
               <span>{new Date(invoice.created_at).toLocaleString("en-IN")}</span>
             </div>
@@ -3878,7 +4082,7 @@ function DataTable({ children, headers }) {
   return (
     <div className="table-wrap">
       <table>
-        <thead><tr>{headers.map((header) => <th key={header}>{header}</th>)}</tr></thead>
+        <thead><tr>{headers.map((header, index) => <th key={typeof header === "string" ? header : index}>{header}</th>)}</tr></thead>
         <tbody>{children}</tbody>
       </table>
     </div>

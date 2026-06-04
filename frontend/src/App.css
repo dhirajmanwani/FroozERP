@@ -1860,15 +1860,36 @@ tbody tr:last-child td {
 }
 
 @media print {
+  @page {
+    margin: 0;
+  }
+
+  html,
+  body {
+    margin: 0 !important;
+    padding: 0 !important;
+    background: #ffffff !important;
+  }
+
   body * {
-    visibility: hidden;
+    visibility: hidden !important;
   }
 
   .print-area,
   .print-area *,
   .invoice-paper,
   .invoice-paper * {
-    visibility: visible;
+    visibility: visible !important;
+  }
+
+  .print-section .print-area,
+  .print-section .print-area * {
+    visibility: hidden !important;
+  }
+
+  .print-section.print-target .print-area,
+  .print-section.print-target .print-area * {
+    visibility: visible !important;
   }
 
   .no-print,
@@ -1878,22 +1899,31 @@ tbody tr:last-child td {
 
   .print-area,
   .invoice-paper {
-    position: absolute;
-    inset: 0;
+    position: fixed;
+    left: 0;
+    top: 0;
     width: 100%;
     margin: 0;
     padding: 18px;
     box-sizing: border-box;
     color: #111827;
     background: #ffffff;
+    border: 0 !important;
+    box-shadow: none !important;
+    page-break-after: avoid;
   }
 
   .invoice-paper.invoice-thermal {
-    inset: auto;
     left: 0;
     top: 0;
     max-width: none;
-    padding: 10px;
+    min-height: auto !important;
+    height: auto !important;
+    padding: 4mm 3mm;
+    overflow: hidden;
+    font-family: Arial, Helvetica, sans-serif;
+    font-size: 11px;
+    line-height: 1.25;
   }
 
   .invoice-paper.invoice-80mm {
@@ -1907,15 +1937,49 @@ tbody tr:last-child td {
   .invoice-paper.invoice-thermal .invoice-header,
   .invoice-paper.invoice-thermal .invoice-customer {
     display: block;
+    margin: 0 0 6px;
+    padding: 0;
   }
 
   .invoice-paper.invoice-thermal .brand-copy strong,
   .invoice-paper.invoice-thermal .invoice-meta strong {
-    font-size: 12px;
+    color: #111827;
+    font-size: 13px;
+    font-weight: 800;
   }
 
   .invoice-paper.invoice-thermal .invoice-table {
-    font-size: 10px;
+    width: 100%;
+    margin: 6px 0;
+    border-collapse: collapse;
+    font-size: 10.5px;
+  }
+
+  .invoice-paper.invoice-thermal .invoice-table th,
+  .invoice-paper.invoice-thermal .invoice-table td {
+    padding: 3px 2px;
+    border-bottom: 1px solid #d1d5db;
+  }
+
+  .invoice-paper.invoice-thermal .invoice-total-box {
+    margin-top: 6px;
+    padding-top: 4px;
+    border-top: 1px solid #111827;
+  }
+
+  .invoice-paper.invoice-thermal .total-line {
+    padding: 2px 0;
+    font-size: 11px;
+  }
+
+  .invoice-paper.invoice-thermal .total-line-main {
+    font-size: 13px;
+  }
+
+  .invoice-paper.invoice-thermal .invoice-footer {
+    margin-top: 8px;
+    padding-top: 6px;
+    text-align: center;
   }
 
   .report-print-header {
