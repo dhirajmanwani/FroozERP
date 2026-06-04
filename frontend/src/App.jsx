@@ -384,6 +384,9 @@ function App() {
   const [purchaseRebateRuleId, setPurchaseRebateRuleId] = useState("");
   const [purchasePaymentDate, setPurchasePaymentDate] = useState("");
   const [purchaseRemarks, setPurchaseRemarks] = useState("");
+  const [purchaseItemRemarks, setPurchaseItemRemarks] = useState("");
+  const [purchaseCart, setPurchaseCart] = useState([]);
+  const [editingPurchaseItemIndex, setEditingPurchaseItemIndex] = useState(null);
   const [editingPurchaseId, setEditingPurchaseId] = useState(null);
   const [selectedInvoice, setSelectedInvoice] = useState(null);
   const [editingSale, setEditingSale] = useState(null);
@@ -524,6 +527,75 @@ function App() {
       paymentStatus: netPayable > 0 && paidAmount >= netPayable ? "Paid" : paidAmount > 0 ? "Partial" : "Pending",
     };
   }, [expectedPurchaseRate, purchaseBillStatus, purchaseFreightCharges, purchaseLabourCharges, purchaseOtherCharges, purchasePaidAmount, purchaseQuantity, purchaseRateInput, purchaseRebateRuleId, purchaseRules, purchaseType, selectedPurchaseProduct]);
+
+  const purchaseCartSummary = useMemo(() => {
+    const items = editingPurchaseId ? [{
+      quantity: Number(purchaseQuantity || 0),
+      purchase_rate: Number(purchaseRateInput || 0),
+      expected_purchase_rate: Number(expectedPurchaseRate || 0),
+      origin_type: selectedPurchaseProduct?.origin_type || "LOCAL",
+    }] : purchaseCart;
+    const itemCount = items.length;
+    const receivedQuantity = items.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+    if (purchaseBillStatus === "BILL_PENDING") {
+      const provisionalCost = items.reduce(
+        (sum, item) => sum + Number(item.quantity || 0) * Number(item.expected_purchase_rate || 0),
+        0
+      );
+      return {
+        itemCount,
+        receivedQuantity,
+        basicAmount: provisionalCost,
+        mandiTaxPercent: 0,
+        mandiTaxAmount: 0,
+        freightCharges: 0,
+        labourCharges: 0,
+        otherCharges: 0,
+        grossAmount: provisionalCost,
+        rebatePercent: 0,
+        rebateAmount: 0,
+        netPayable: 0,
+        balanceAmount: 0,
+        effectiveCostPerUnit: receivedQuantity > 0 ? provisionalCost / receivedQuantity : 0,
+        paymentStatus: "Bill Pending",
+      };
+    }
+    const basicAmount = items.reduce(
+      (sum, item) => sum + Number(item.quantity || 0) * Number(item.purchase_rate || 0),
+      0
+    );
+    const mandiTaxAmount = items.reduce((sum, item) => {
+      const origin = item.origin_type || "LOCAL";
+      const rule = purchaseRules.mandiTaxRules.find((taxRule) => taxRule.origin_type === origin);
+      return sum + Number(item.quantity || 0) * Number(item.purchase_rate || 0) * Number(rule?.tax_percent || 0) / 100;
+    }, 0);
+    const freightCharges = Number(purchaseFreightCharges || 0);
+    const labourCharges = Number(purchaseLabourCharges || 0);
+    const otherCharges = Number(purchaseOtherCharges || 0);
+    const grossAmount = basicAmount + mandiTaxAmount + freightCharges + labourCharges + otherCharges;
+    const rebateRule = purchaseRules.rebateRules.find((rule) => String(rule.id) === purchaseRebateRuleId);
+    const rebatePercent = Number(rebateRule?.rebate_percent || 0);
+    const rebateAmount = grossAmount * rebatePercent / 100;
+    const netPayable = grossAmount - rebateAmount;
+    const paidAmount = purchaseType === "CASH" ? Number(purchasePaidAmount || 0) : 0;
+    return {
+      itemCount,
+      receivedQuantity,
+      basicAmount,
+      mandiTaxPercent: "Mixed",
+      mandiTaxAmount,
+      freightCharges,
+      labourCharges,
+      otherCharges,
+      grossAmount,
+      rebatePercent,
+      rebateAmount,
+      netPayable,
+      balanceAmount: Math.max(netPayable - paidAmount, 0),
+      effectiveCostPerUnit: receivedQuantity > 0 ? netPayable / receivedQuantity : 0,
+      paymentStatus: netPayable > 0 && paidAmount >= netPayable ? "Paid" : paidAmount > 0 ? "Partial" : "Pending",
+    };
+  }, [editingPurchaseId, expectedPurchaseRate, purchaseBillStatus, purchaseCart, purchaseFreightCharges, purchaseLabourCharges, purchaseOtherCharges, purchasePaidAmount, purchaseQuantity, purchaseRateInput, purchaseRebateRuleId, purchaseRules, purchaseType, selectedPurchaseProduct]);
 
   const loadProducts = async () => {
     const response = await axios.get(`${API_URL}/products`);
@@ -764,7 +836,92 @@ function App() {
     setPurchaseRebateRuleId("");
     setPurchasePaymentDate("");
     setPurchaseRemarks("");
+    setPurchaseItemRemarks("");
+    setPurchaseCart([]);
+    setEditingPurchaseItemIndex(null);
     setEditingPurchaseId(null);
+  };
+
+  const resetPurchaseItemFields = () => {
+    setPurchaseProductId("");
+    setPurchaseQuantity("");
+    setPurchaseRateInput("");
+    setTemporarySaleRate("");
+    setExpectedPurchaseRate("");
+    setPurchaseItemRemarks("");
+    setEditingPurchaseItemIndex(null);
+  };
+
+  const addPurchaseCartItem = () => {
+    if (editingPurchaseId) return;
+    const product = selectedPurchaseProduct;
+    const quantity = Number(purchaseQuantity || 0);
+    const purchaseRate = Number(purchaseRateInput || 0);
+    const temporaryRate = Number(temporarySaleRate || 0);
+    const expectedRate = Number(expectedPurchaseRate || 0);
+    if (!purchaseSupplierId) {
+      alert("Select supplier before adding purchase items.");
+      return;
+    }
+    if (!product || quantity <= 0) {
+      alert("Select product and enter quantity.");
+      return;
+    }
+    if (purchaseBillStatus === "BILL_PENDING" && temporaryRate <= 0) {
+      alert("Pending bill stock requires a temporary sale rate.");
+      return;
+    }
+    if (purchaseBillStatus === "BILL_COMPLETED" && purchaseRate <= 0) {
+      alert("Completed bill items require a purchase rate.");
+      return;
+    }
+    const item = {
+      product_id: product.id,
+      product_name: product.product_name,
+      unit: product.unit,
+      origin_type: product.origin_type || "LOCAL",
+      quantity,
+      purchase_rate: purchaseBillStatus === "BILL_PENDING" ? expectedRate : purchaseRate,
+      temporary_sale_rate: temporaryRate,
+      expected_purchase_rate: expectedRate,
+      remarks: purchaseItemRemarks,
+    };
+    setPurchaseCart((currentCart) => {
+      const nextCart = [...currentCart];
+      if (editingPurchaseItemIndex !== null) {
+        nextCart[editingPurchaseItemIndex] = item;
+      } else {
+        const existingIndex = nextCart.findIndex((cartItem) => Number(cartItem.product_id) === Number(item.product_id));
+        if (existingIndex >= 0) {
+          nextCart[existingIndex] = {
+            ...nextCart[existingIndex],
+            ...item,
+            quantity: Number(nextCart[existingIndex].quantity || 0) + quantity,
+          };
+        } else {
+          nextCart.push(item);
+        }
+      }
+      return nextCart;
+    });
+    resetPurchaseItemFields();
+  };
+
+  const editPurchaseCartItem = (index) => {
+    const item = purchaseCart[index];
+    if (!item) return;
+    setEditingPurchaseItemIndex(index);
+    setPurchaseProductId(String(item.product_id));
+    setPurchaseQuantity(String(item.quantity || ""));
+    setPurchaseRateInput(String(item.purchase_rate || ""));
+    setTemporarySaleRate(String(item.temporary_sale_rate || ""));
+    setExpectedPurchaseRate(String(item.expected_purchase_rate || ""));
+    setPurchaseItemRemarks(item.remarks || "");
+  };
+
+  const removePurchaseCartItem = (index) => {
+    setPurchaseCart((currentCart) => currentCart.filter((_, itemIndex) => itemIndex !== index));
+    if (editingPurchaseItemIndex === index) resetPurchaseItemFields();
   };
 
   const savePurchase = async () => {
@@ -783,27 +940,31 @@ function App() {
         expected_purchase_rate: expectedPurchaseRate,
         freight_charges: purchaseFreightCharges,
         labour_charges: purchaseLabourCharges,
-      other_charges: purchaseOtherCharges,
-      paid_amount: purchaseType === "CASH" ? purchasePaidAmount : 0,
-      rebate_rule_id: purchaseRebateRuleId,
-      payment_date: purchasePaymentDate || null,
-      purchase_type: purchaseType,
-      payment_mode: purchaseType === "CASH" ? purchasePaymentMode : null,
-      payment_reference_number: purchaseType === "CASH" ? purchasePaymentReference : null,
-      bill_number: purchaseBillNumber,
-      bill_date: purchaseBillDate || null,
-      branch_id: user.branch_id,
-      created_by: user.id,
-      edited_by: user.id,
-      reason,
-      remarks: purchaseRemarks,
+        other_charges: purchaseOtherCharges,
+        paid_amount: purchaseType === "CASH" ? purchasePaidAmount : 0,
+        rebate_rule_id: purchaseRebateRuleId,
+        payment_date: purchasePaymentDate || null,
+        purchase_type: purchaseType,
+        payment_mode: purchaseType === "CASH" ? purchasePaymentMode : null,
+        payment_reference_number: purchaseType === "CASH" ? purchasePaymentReference : null,
+        bill_number: purchaseBillNumber,
+        bill_date: purchaseBillDate || null,
+        branch_id: user.branch_id,
+        created_by: user.id,
+        edited_by: user.id,
+        reason,
+        remarks: purchaseRemarks,
       };
       if (editingPurchaseId && purchaseBillStatus === "BILL_COMPLETED" && purchases.find((purchase) => Number(purchase.id) === Number(editingPurchaseId))?.purchase_bill_status === "BILL_PENDING") {
         await axios.post(`${API_URL}/purchase/${editingPurchaseId}/complete-bill`, payload);
       } else if (editingPurchaseId) {
         await axios.put(`${API_URL}/purchase/${editingPurchaseId}`, payload);
       } else {
-        await axios.post(`${API_URL}/purchase`, payload);
+        if (purchaseCart.length === 0) {
+          alert("Add at least one purchase item before saving.");
+          return;
+        }
+        await axios.post(`${API_URL}/purchase-bill`, { ...payload, items: purchaseCart });
       }
       resetPurchaseForm();
       await Promise.all([loadDashboardData(), loadPurchases(), loadSupplierData(), loadAccounts(), loadAccountOutstanding()]);
@@ -916,6 +1077,10 @@ function App() {
     setPurchaseBillNumber(purchase.bill_number || "");
     setPurchaseBillDate(purchase.bill_date ? toDateKey(purchase.bill_date) : "");
     setPurchaseRemarks(purchase.remarks || "");
+    setPurchaseItemRemarks(purchase.item_remarks || "");
+    setPurchaseCart([]);
+    setEditingPurchaseItemIndex(null);
+    setActiveView("purchase");
   };
 
   const completePendingPurchase = (purchase) => {
@@ -1171,42 +1336,88 @@ function App() {
           )}
 
           {activeView === "purchase" && (
-            <ModuleCard eyebrow="Procurement" title="Purchase Entry" subtitle="Record incoming stock and supplier purchase details.">
-              <div className="form-grid">
-                <Field label="Entry Type">
-                  <select value={purchaseBillStatus} onChange={(event) => setPurchaseBillStatus(event.target.value)}>
-                    <option value="BILL_COMPLETED">Purchase Bill Completed</option>
-                    <option value="BILL_PENDING">Stock Arrival / Pending Bill Entry</option>
-                  </select>
-                </Field>
-                <Field label="Supplier Account">
-                  <select value={purchaseSupplierId} onChange={(event) => setPurchaseSupplierId(event.target.value)}>
-                    <option value="">Select saved supplier</option>
-                    {activeSuppliers.map((supplier) => (
-                      <option key={supplier.id} value={supplier.id}>
-                        {supplier.supplier_name}{supplier.firm_name ? ` - ${supplier.firm_name}` : ""}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
-                <Field label="Product">
-                  <select value={purchaseProductId} onChange={selectPurchaseProduct}>
-                    <option value="">Select product</option>
-                    {products.map((product) => <option key={product.id} value={product.id}>{product.product_name}</option>)}
-                  </select>
-                </Field>
-                <Field label="Quantity"><input type="number" min="0" step="0.001" value={purchaseQuantity} onChange={(event) => setPurchaseQuantity(event.target.value)} /></Field>
-                <Field label={purchaseBillStatus === "BILL_PENDING" ? "Arrival Date" : "Purchase Date"}><input type="date" value={purchaseDate} onChange={(event) => setPurchaseDate(event.target.value)} /></Field>
-                {purchaseBillStatus === "BILL_PENDING" ? (
-                  <>
-                    <Field label="Temporary Sale Rate"><input type="number" min="0" step="0.01" value={temporarySaleRate} onChange={(event) => setTemporarySaleRate(event.target.value)} /></Field>
-                    <Field label="Expected Purchase Rate (Optional)"><input type="number" min="0" step="0.01" value={expectedPurchaseRate} onChange={(event) => setExpectedPurchaseRate(event.target.value)} /></Field>
-                  </>
-                ) : (
-                  <>
+            <section className="settings-layout">
+              <ModuleCard eyebrow="Procurement" title={editingPurchaseId ? `Add / Edit Purchase #${editingPurchaseId}` : "Purchase Entry"} subtitle={editingPurchaseId ? "Amend one historical purchase item with inventory protection." : "Select supplier once, add multiple fruit items, then save one purchase workflow."}>
+                <div className="form-grid supplier-form-grid">
+                  <Field label="Entry Type">
+                    <select value={purchaseBillStatus} onChange={(event) => setPurchaseBillStatus(event.target.value)} disabled={Boolean(editingPurchaseId && purchases.find((purchase) => Number(purchase.id) === Number(editingPurchaseId))?.purchase_bill_status !== "BILL_PENDING")}>
+                      <option value="BILL_COMPLETED">Completed Bill</option>
+                      <option value="BILL_PENDING">Stock Arrival / Pending Bill</option>
+                    </select>
+                  </Field>
+                  <Field label="Supplier Account">
+                    <select value={purchaseSupplierId} onChange={(event) => setPurchaseSupplierId(event.target.value)}>
+                      <option value="">Select saved supplier</option>
+                      {activeSuppliers.map((supplier) => (
+                        <option key={supplier.id} value={supplier.id}>
+                          {supplier.supplier_name}{supplier.firm_name ? ` - ${supplier.firm_name}` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                  <Field label={purchaseBillStatus === "BILL_PENDING" ? "Arrival Date" : "Purchase Date"}><input type="date" value={purchaseDate} onChange={(event) => setPurchaseDate(event.target.value)} /></Field>
+                  {purchaseBillStatus === "BILL_COMPLETED" && (
+                    <>
+                      <Field label="Bill Number"><input value={purchaseBillNumber} onChange={(event) => setPurchaseBillNumber(event.target.value)} /></Field>
+                      <Field label="Bill Date"><input type="date" value={purchaseBillDate} onChange={(event) => setPurchaseBillDate(event.target.value)} /></Field>
+                    </>
+                  )}
+                </div>
+              </ModuleCard>
+
+              <ModuleCard eyebrow={editingPurchaseId ? "Purchase Item Amendment" : "Purchase Cart"} title={editingPurchaseId ? "Edit Purchase Item" : "Add Fruit Items"} subtitle={editingPurchaseId ? "Quantity reductions are blocked if stock from this batch has already been sold." : "Add all products from this supplier before saving the bill."}>
+                <div className="form-grid supplier-form-grid">
+                  <Field label="Product">
+                    <select value={purchaseProductId} onChange={selectPurchaseProduct}>
+                      <option value="">Select product</option>
+                      {products.filter((product) => product.active !== false).map((product) => <option key={product.id} value={product.id}>{product.product_name} ({product.unit})</option>)}
+                    </select>
+                  </Field>
+                  <Field label="Quantity"><input type="number" min="0" step="0.001" value={purchaseQuantity} onChange={(event) => setPurchaseQuantity(event.target.value)} /></Field>
+                  {purchaseBillStatus === "BILL_PENDING" ? (
+                    <>
+                      <Field label="Temporary Sale Rate"><input type="number" min="0" step="0.01" value={temporarySaleRate} onChange={(event) => setTemporarySaleRate(event.target.value)} /></Field>
+                      <Field label="Expected Purchase Rate"><input type="number" min="0" step="0.01" value={expectedPurchaseRate} onChange={(event) => setExpectedPurchaseRate(event.target.value)} /></Field>
+                    </>
+                  ) : (
                     <Field label="Purchase Rate"><input type="number" min="0" step="0.01" value={purchaseRateInput} onChange={(event) => setPurchaseRateInput(event.target.value)} /></Field>
-                    <Field label="Bill Number"><input value={purchaseBillNumber} onChange={(event) => setPurchaseBillNumber(event.target.value)} /></Field>
-                    <Field label="Bill Date"><input type="date" value={purchaseBillDate} onChange={(event) => setPurchaseBillDate(event.target.value)} /></Field>
+                  )}
+                  <Field label="Origin Type"><input value={selectedPurchaseProduct?.origin_type || "Select product"} readOnly /></Field>
+                  <Field label="Item Remarks"><input value={purchaseItemRemarks} onChange={(event) => setPurchaseItemRemarks(event.target.value)} /></Field>
+                </div>
+                {!editingPurchaseId && (
+                  <div className="button-row">
+                    <button className="secondary-button" onClick={addPurchaseCartItem}>{editingPurchaseItemIndex !== null ? "Update Item" : "Add Item"}</button>
+                    {editingPurchaseItemIndex !== null && <button className="secondary-button" onClick={resetPurchaseItemFields}>Cancel Item Edit</button>}
+                  </div>
+                )}
+                {!editingPurchaseId && (
+                  <DataTable headers={["Product", "Qty", "Unit", "Origin", "Purchase / Expected Rate", "Temp Sale Rate", "Remarks", "Actions"]}>
+                    {purchaseCart.map((item, index) => (
+                      <tr key={`${item.product_id}-${index}`}>
+                        <td className="primary-cell">{item.product_name}</td>
+                        <td>{item.quantity}</td>
+                        <td>{item.unit}</td>
+                        <td><span className="origin-rate">{item.origin_type}</span></td>
+                        <td>{currency.format(Number(item.purchase_rate || item.expected_purchase_rate || 0))}</td>
+                        <td>{item.temporary_sale_rate ? currency.format(Number(item.temporary_sale_rate)) : "-"}</td>
+                        <td>{item.remarks || "-"}</td>
+                        <td>
+                          <div className="button-row table-actions-row">
+                            <button className="table-action" onClick={() => editPurchaseCartItem(index)}>Edit</button>
+                            <button className="remove-button" onClick={() => removePurchaseCartItem(index)}>Remove</button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </DataTable>
+                )}
+                {!editingPurchaseId && purchaseCart.length === 0 && <div className="cart-empty">No purchase items added yet.</div>}
+              </ModuleCard>
+
+              <ModuleCard eyebrow="Bill Details" title="Charges, Rebate and Payment" subtitle="These values are allocated across items by value when the bill is saved.">
+                {purchaseBillStatus === "BILL_COMPLETED" && (
+                  <div className="form-grid supplier-form-grid">
                     <Field label="Freight Charges"><input type="number" min="0" step="0.01" value={purchaseFreightCharges} onChange={(event) => setPurchaseFreightCharges(event.target.value)} /></Field>
                     <Field label="Labour Charges"><input type="number" min="0" step="0.01" value={purchaseLabourCharges} onChange={(event) => setPurchaseLabourCharges(event.target.value)} /></Field>
                     <Field label="Other Charges"><input type="number" min="0" step="0.01" value={purchaseOtherCharges} onChange={(event) => setPurchaseOtherCharges(event.target.value)} /></Field>
@@ -1216,7 +1427,7 @@ function App() {
                         {purchaseRules.rebateRules.map((rule) => <option key={rule.id} value={rule.id}>{rule.rule_name} - {rule.pay_within_days} days - {rule.rebate_percent}%</option>)}
                       </select>
                     </Field>
-                    <Field label="Purchase Type">
+                    <Field label="Payment Type">
                       <select value={purchaseType} onChange={(event) => setPurchaseType(event.target.value)}>
                         <option value="CREDIT">Credit Purchase</option>
                         <option value="CASH">Cash Purchase</option>
@@ -1224,55 +1435,29 @@ function App() {
                     </Field>
                     {purchaseType === "CASH" && (
                       <>
-                    <Field label="Payment Mode">
-                      <select value={purchasePaymentMode} onChange={(event) => setPurchasePaymentMode(event.target.value)}>
-                        {supplierPaymentModes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-                      </select>
-                    </Field>
-                    <Field label="Paid Amount"><input type="number" min="0" step="0.01" value={purchasePaidAmount} onChange={(event) => setPurchasePaidAmount(event.target.value)} /></Field>
-                    <Field label="Payment Reference"><input value={purchasePaymentReference} onChange={(event) => setPurchasePaymentReference(event.target.value)} /></Field>
-                    <Field label="Payment Date"><input type="date" value={purchasePaymentDate} onChange={(event) => setPurchasePaymentDate(event.target.value)} /></Field>
-                  </>
+                        <Field label="Payment Mode">
+                          <select value={purchasePaymentMode} onChange={(event) => setPurchasePaymentMode(event.target.value)}>
+                            {supplierPaymentModes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                          </select>
+                        </Field>
+                        <Field label="Paid Amount"><input type="number" min="0" step="0.01" value={purchasePaidAmount} onChange={(event) => setPurchasePaidAmount(event.target.value)} /></Field>
+                        <Field label="Payment Reference"><input value={purchasePaymentReference} onChange={(event) => setPurchasePaymentReference(event.target.value)} /></Field>
+                        <Field label="Payment Date"><input type="date" value={purchasePaymentDate} onChange={(event) => setPurchasePaymentDate(event.target.value)} /></Field>
+                      </>
                     )}
-                  </>
+                  </div>
                 )}
-                <Field label="Remarks"><textarea value={purchaseRemarks} onChange={(event) => setPurchaseRemarks(event.target.value)} /></Field>
-              </div>
-              {activeSuppliers.length === 0 && <p className="form-note">No active supplier accounts found. Add New Supplier before saving a purchase.</p>}
-              {purchaseBillStatus === "BILL_PENDING" && <p className="form-note">Purchase bill pending. Inventory will increase immediately and profit from this stock will be provisional until the bill is completed.</p>}
-              <PurchaseSummary summary={purchaseSummary} />
-              <div className="button-row">
-                <button className="primary-button" onClick={savePurchase}>{purchaseBillStatus === "BILL_PENDING" ? editingPurchaseId ? "Update Arrival Entry" : "Save Stock Arrival" : editingPurchaseId ? "Complete / Update Purchase" : "Save Purchase"}</button>
-                {editingPurchaseId && <button className="secondary-button" onClick={resetPurchaseForm}>Cancel Edit</button>}
-                <button className="secondary-button" onClick={() => navigate("accounts")}>Add New Supplier</button>
-              </div>
-              <DataTable headers={["Purchase", "Date", "Status", "Bill", "Supplier", "Product", "Qty", "Rate", "Temp Sale Rate", "Net Payable", "Paid", "Balance", "Batch", "Actions"]}>
-                {purchases.map((purchase) => (
-                  <tr key={purchase.id}>
-                    <td><span className="batch-id">#{purchase.id}</span></td>
-                    <td>{purchase.purchase_date}</td>
-                    <td><span className={purchase.purchase_status === "CANCELLED" ? "stock-low" : purchase.purchase_status === "EDITED" ? "origin-rate" : "stock-ok"}>{purchase.purchase_status || "ACTIVE"}</span></td>
-                    <td><span className={purchase.purchase_bill_status === "BILL_PENDING" ? "stock-low" : "stock-ok"}>{purchase.purchase_bill_status === "BILL_PENDING" ? "Bill Pending" : "Bill Completed"}</span></td>
-                    <td>{purchase.supplier_name}</td>
-                    <td className="primary-cell">{purchase.product_name}</td>
-                    <td>{purchase.quantity}</td>
-                    <td>{currency.format(Number(purchase.purchase_rate || 0))}</td>
-                    <td>{purchase.temporary_sale_rate ? currency.format(Number(purchase.temporary_sale_rate)) : "-"}</td>
-                    <td>{currency.format(Number(purchase.net_payable || purchase.total_amount || 0))}</td>
-                    <td>{currency.format(Number(purchase.paid_amount || 0))}</td>
-                    <td>{currency.format(Number(purchase.balance_amount || 0))}</td>
-                    <td><span className="batch-id">{purchase.batch_no || "-"}</span></td>
-                    <td>
-                      <div className="button-row table-actions-row">
-                        <button className="table-action" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => editPurchase(purchase)}>Edit</button>
-                        {purchase.purchase_bill_status === "BILL_PENDING" && <button className="primary-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => completePendingPurchase(purchase)}>Complete Bill</button>}
-                        <button className="remove-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => cancelPurchase(purchase)}>Cancel/Delete</button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </DataTable>
-            </ModuleCard>
+                <Field label="Bill Remarks"><textarea value={purchaseRemarks} onChange={(event) => setPurchaseRemarks(event.target.value)} /></Field>
+                {activeSuppliers.length === 0 && <p className="form-note">No active supplier accounts found. Add New Supplier before saving a purchase.</p>}
+                {purchaseBillStatus === "BILL_PENDING" && <p className="form-note">Purchase bill pending. Inventory will increase immediately and profit from this stock will be provisional until the bill is completed.</p>}
+                <PurchaseSummary summary={editingPurchaseId ? purchaseSummary : purchaseCartSummary} />
+                <div className="button-row">
+                  <button className="primary-button" onClick={savePurchase}>{purchaseBillStatus === "BILL_PENDING" ? editingPurchaseId ? "Update Arrival Entry" : "Save Stock Arrival" : editingPurchaseId ? "Complete / Update Purchase" : "Save Purchase"}</button>
+                  {editingPurchaseId && <button className="secondary-button" onClick={resetPurchaseForm}>Cancel Amendment</button>}
+                  <button className="secondary-button" onClick={() => navigate("accounts")}>Add New Supplier</button>
+                </div>
+              </ModuleCard>
+            </section>
           )}
 
           {activeView === "accounts" && (
@@ -1414,7 +1599,13 @@ function App() {
           )}
 
           {activeView === "reports" && (
-            <ReportsModule data={reportsData} onReload={loadReports} />
+            <ReportsModule
+              data={reportsData}
+              onCancelPurchase={cancelPurchase}
+              onCompletePurchase={completePendingPurchase}
+              onEditPurchase={editPurchase}
+              onReload={loadReports}
+            />
           )}
 
           {activeView === "expenses" && (
@@ -1540,7 +1731,7 @@ function PrintableReport({ children, title }) {
   );
 }
 
-function ReportsModule({ data, onReload }) {
+function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onReload }) {
   const [range, setRange] = useState("today");
   const [search, setSearch] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
@@ -1556,7 +1747,18 @@ function ReportsModule({ data, onReload }) {
   const matchesSearch = (row) => !search.trim() || Object.values(row || {}).some((value) =>
     String(value ?? "").toLowerCase().includes(search.trim().toLowerCase())
   );
-  const filterRows = (rows) => (rows || []).filter(matchesSearch);
+  const filterRows = (rows) => {
+    const safeRows = Array.isArray(rows)
+      ? rows
+      : Array.isArray(rows?.data)
+        ? rows.data
+        : Array.isArray(rows?.rows)
+          ? rows.rows
+          : Array.isArray(rows?.items)
+            ? rows.items
+            : [];
+    return safeRows.filter(matchesSearch);
+  };
   const totalOf = (rows, key) => rows.reduce((sum, row) => sum + Number(row[key] || 0), 0);
   const money = (value) => currency.format(Number(value || 0));
   const number = (value) => Number(value || 0).toLocaleString("en-IN");
@@ -1654,6 +1856,33 @@ function ReportsModule({ data, onReload }) {
       summary: (rows) => [["Outstanding", money(totalOf(rows, "outstanding_balance")), true], ["Purchases", money(totalOf(rows, "total_purchases"))], ["Paid", money(totalOf(rows, "total_paid"))]],
       headers: ["Supplier", "Purchases", "Paid", "Rebate", "Outstanding"],
       render: (row) => <tr key={row.id}><td className="primary-cell">{row.supplier_name}</td><td>{money(row.total_purchases)}</td><td>{money(row.total_paid)}</td><td>{money(row.total_rebate_received)}</td><td className="balance-cell">{money(row.outstanding_balance)}</td></tr>,
+    },
+    purchaseHistory: {
+      title: "Purchase History",
+      rows: filterRows(data.purchaseHistoryReport),
+      summary: (rows) => [["Purchases", rows.length, true], ["Net Payable", money(totalOf(rows, "net_payable"))], ["Balance", money(totalOf(rows, "balance_amount"))]],
+      headers: ["Purchase", "Date", "Supplier", "Status", "Bill", "Item", "Qty", "Rate", "Net", "Batch", "Actions"],
+      render: (row) => (
+        <tr key={row.id} onDoubleClick={() => onEditPurchase?.(row)}>
+          <td><span className="batch-id">#{row.id}</span></td>
+          <td onDoubleClick={() => onEditPurchase?.(row)}>{row.purchase_date}</td>
+          <td className="primary-cell">{row.supplier_name}</td>
+          <td><span className={row.purchase_status === "CANCELLED" ? "stock-low" : row.purchase_status === "EDITED" ? "origin-rate" : "stock-ok"}>{row.purchase_status || "ACTIVE"}</span></td>
+          <td><span className={row.purchase_bill_status === "BILL_PENDING" ? "stock-low" : "stock-ok"}>{row.purchase_bill_status === "BILL_PENDING" ? "Bill Pending" : "Bill Completed"}</span></td>
+          <td className="primary-cell" onDoubleClick={() => onEditPurchase?.(row)}>{row.product_name || "-"}<small className="cell-note">{row.unit || ""}</small></td>
+          <td>{number(row.quantity)}</td>
+          <td>{money(row.purchase_rate)}</td>
+          <td>{money(row.net_payable)}</td>
+          <td><span className="batch-id">{row.batch_no || "-"}</span></td>
+          <td>
+            <div className="button-row table-actions-row">
+              <button className="table-action" disabled={row.purchase_status === "CANCELLED"} onClick={() => onEditPurchase?.(row)}>Add / Edit Purchase</button>
+              {row.purchase_bill_status === "BILL_PENDING" && <button className="primary-button" disabled={row.purchase_status === "CANCELLED"} onClick={() => onCompletePurchase?.(row)}>Complete Bill</button>}
+              <button className="remove-button" disabled={row.purchase_status === "CANCELLED"} onClick={() => onCancelPurchase?.(row)}>Cancel</button>
+            </div>
+          </td>
+        </tr>
+      ),
     },
     purchaseEditCancel: {
       title: "Purchase Edit / Cancel Report",
@@ -1840,7 +2069,7 @@ function ReportsModule({ data, onReload }) {
   };
   const categories = [
     { id: "sales", title: "Sales Reports", icon: "receipt", description: "Invoices, products, customers, discounts and bill changes.", reports: ["salesByDate", "salesByProduct", "salesByCustomer", "salesHistory", "editedBills", "cancelledBills", "provisionalProfitSales", "discountReport"] },
-    { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Purchase value, supplier buying, outstanding and purchase changes.", reports: ["purchasesByDate", "purchasesByProduct", "purchasesBySupplier", "purchaseOutstanding", "pendingPurchaseBills", "stockWithoutBill", "purchaseEditCancel"] },
+    { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Purchase value, supplier buying, outstanding and purchase changes.", reports: ["purchasesByDate", "purchaseHistory", "purchasesByProduct", "purchasesBySupplier", "purchaseOutstanding", "pendingPurchaseBills", "stockWithoutBill", "purchaseEditCancel"] },
     { id: "accounts", title: "Accounts & Ledger", icon: "users", description: "Customer ledger, supplier ledger, statements, payments and balances.", reports: ["customerLedger", "supplierLedger", "accountStatement", "paymentReport", "paymentModeSummary", "receivableReport", "payableReport"] },
     { id: "returns", title: "Sale Returns", icon: "history", description: "Return history, value and reason analysis.", reports: ["returnHistory", "returnValue", "returnReason"] },
     { id: "waste", title: "Waste Management", icon: "alert", description: "Daily, monthly, product-wise and cost-focused waste analysis.", reports: ["dailyWaste", "monthlyWaste", "productWiseWaste", "mostWastedProducts", "wasteCost"] },
@@ -1904,13 +2133,17 @@ function ReportsModule({ data, onReload }) {
           </div>
         </ModuleCard>
         <section className="report-center-grid">
-          {currentCategory.reports.map((reportId) => (
-            <button className="report-menu-card" key={reportId} onClick={() => { setSearch(""); setSelectedReport(reportId); }}>
-              <Icon name={currentCategory.icon} size={22} />
-              <strong>{reports[reportId].title}</strong>
-              <span>Open report workspace</span>
-            </button>
-          ))}
+          {currentCategory.reports.map((reportId) => {
+            const report = reports[reportId];
+            if (!report) return null;
+            return (
+              <button className="report-menu-card" key={reportId} onClick={() => { setSearch(""); setSelectedReport(reportId); }}>
+                <Icon name={currentCategory.icon} size={22} />
+                <strong>{report.title}</strong>
+                <span>Open report workspace</span>
+              </button>
+            );
+          })}
         </section>
       </section>
     );

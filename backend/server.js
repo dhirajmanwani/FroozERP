@@ -4345,7 +4345,11 @@ app.get("/reports/summary", async (req, res) => {
     const dateTo = req.query.date_to || reportRange.dateTo || "2999-12-31";
     const [
       salesResult,
+      pendingPurchaseResult,
+      stockWithoutBillResult,
+      provisionalSalesResult,
       purchaseResult,
+      purchaseHistoryResult,
       supplierRows,
       customerRows,
       discountResult,
@@ -4365,9 +4369,6 @@ app.get("/reports/summary", async (req, res) => {
       purchaseProductResult,
       purchaseSupplierResult,
       purchaseChangeResult,
-      pendingPurchaseResult,
-      stockWithoutBillResult,
-      provisionalSalesResult,
       returnHistoryResult,
       stockMovementResult,
       balanceSheetResult,
@@ -4503,6 +4504,52 @@ app.get("/reports/summary", async (req, res) => {
           AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
         GROUP BY purchase_date
         ORDER BY purchase_date DESC
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
+          p.id,
+          p.purchase_date,
+          p.supplier_id,
+          p.supplier_name,
+          p.purchase_status,
+          p.purchase_bill_status,
+          p.purchase_type,
+          p.payment_mode,
+          p.payment_reference_number,
+          p.bill_number,
+          p.bill_date,
+          p.temporary_sale_rate,
+          p.expected_purchase_rate,
+          p.freight_charges,
+          p.labour_charges,
+          p.other_charges,
+          p.rebate_rule_id,
+          p.net_payable,
+          p.paid_amount,
+          p.balance_amount,
+          p.remarks,
+          pi.id AS item_id,
+          pi.product_id,
+          pi.quantity,
+          pi.purchase_rate,
+          pi.effective_cost_per_unit,
+          pr.product_name,
+          pr.unit,
+          pr.origin_type,
+          ib.id AS inventory_batch_id,
+          ib.batch_no,
+          ib.purchase_qty AS batch_purchase_qty,
+          ib.remaining_qty AS batch_remaining_qty,
+          ib.batch_status
+        FROM purchases p
+        LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
+        LEFT JOIN products pr ON pr.id = pi.product_id
+        LEFT JOIN inventory_batches ib ON ib.purchase_id = p.id
+        WHERE p.purchase_date BETWEEN $1 AND $2
+        ORDER BY p.purchase_date DESC, p.supplier_name, p.id DESC
         `,
         [dateFrom, dateTo]
       ),
@@ -5084,6 +5131,7 @@ app.get("/reports/summary", async (req, res) => {
       salesCustomerReport: salesCustomerResult.rows,
       salesHistoryReport: salesHistoryResult.rows,
       salesChangeReport: salesChangeResult.rows,
+      purchaseHistoryReport: purchaseHistoryResult.rows,
       purchaseProductReport: purchaseProductResult.rows,
       purchaseSupplierReport: purchaseSupplierResult.rows,
       purchaseChangeReport: purchaseChangeResult.rows,
@@ -5971,6 +6019,271 @@ app.post("/purchase", async (req, res) => {
     await client.query("ROLLBACK");
     console.error(error);
     return res.status(500).json({ message: "Purchase Error" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/purchase-bill", async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const baseEntry = readPurchaseEntryPayload(req.body);
+    const rawItems = Array.isArray(req.body.items) ? req.body.items : [];
+    if (!baseEntry.supplierId) return res.status(400).json({ message: "Add New Supplier" });
+    if (!baseEntry.branchId) return res.status(400).json({ message: "Select branch before saving purchase" });
+    if (!PURCHASE_BILL_STATUSES.has(baseEntry.purchaseBillStatus)) {
+      return res.status(400).json({ message: "Select a valid purchase bill status" });
+    }
+    if (rawItems.length === 0) return res.status(400).json({ message: "Add at least one purchase item" });
+    if (baseEntry.purchaseBillStatus === "BILL_COMPLETED" && !["CASH", "CREDIT"].includes(baseEntry.purchaseType)) {
+      return res.status(400).json({ message: "Select Cash or Credit purchase" });
+    }
+    if (baseEntry.purchaseBillStatus === "BILL_COMPLETED" && !baseEntry.rebateRuleId) {
+      return res.status(400).json({ message: "Select active mandi tax and rebate rules" });
+    }
+    if (
+      baseEntry.purchaseType === "CASH" &&
+      baseEntry.purchaseBillStatus === "BILL_COMPLETED" &&
+      (!SUPPLIER_PAYMENT_MODES.has(baseEntry.paymentMode) || !baseEntry.paidAmountInput)
+    ) {
+      return res.status(400).json({ message: "Cash purchase requires payment mode and paid amount" });
+    }
+
+    const entries = rawItems.map((item) => readPurchaseEntryPayload({
+      ...req.body,
+      product_id: item.product_id,
+      quantity: item.quantity,
+      purchase_rate: item.purchase_rate,
+      expected_purchase_rate: item.expected_purchase_rate,
+      temporary_sale_rate: item.temporary_sale_rate,
+      remarks: cleanText(item.remarks) || baseEntry.remarks,
+      paid_amount: 0,
+      purchase_type: baseEntry.purchaseBillStatus === "BILL_COMPLETED" ? "CREDIT" : "PENDING_BILL",
+    }));
+
+    const validationMessages = entries.map(validatePurchaseEntry).filter(Boolean);
+    if (validationMessages.length) return res.status(400).json({ message: validationMessages[0] });
+
+    await client.query("BEGIN");
+    if (baseEntry.purchaseBillStatus === "BILL_PENDING") {
+      const manager = await requireRateManager(baseEntry.actorId, client);
+      if (!manager) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ message: "Only Owner or Admin can set temporary sale rates for pending stock" });
+      }
+
+      const createdPurchases = [];
+      for (const entry of entries) {
+        const arrival = await getPurchasePartiesForArrival(client, entry);
+        if (arrival.error) {
+          await client.query("ROLLBACK");
+          return res.status(arrival.status || 400).json({ message: arrival.error });
+        }
+        const provisionalCost = Number(entry.expectedPurchaseRate || 0);
+        const provisionalAmount = roundCurrency(entry.quantity * provisionalCost);
+        const purchaseResult = await client.query(
+          `
+          INSERT INTO purchases (
+            supplier_id, supplier_name, total_amount, branch_id, created_by,
+            basic_amount, gross_amount, net_payable, paid_amount, balance_amount,
+            effective_cost_per_unit, purchase_type, payment_status, purchase_date,
+            remarks, purchase_bill_status, temporary_sale_rate, expected_purchase_rate,
+            bill_number, bill_date
+          )
+          VALUES ($1, $2, 0, $3, $4, 0, 0, 0, 0, 0, $5, 'PENDING_BILL', 'BILL_PENDING', $6, $7, 'BILL_PENDING', $8, $9, $10, $11)
+          RETURNING *
+          `,
+          [
+            arrival.supplier.id, arrival.supplier.supplier_name, entry.branchId, entry.actorId,
+            provisionalCost, entry.purchaseDate, entry.remarks, entry.temporarySaleRate, provisionalCost,
+            entry.billNumber, entry.billDate,
+          ]
+        );
+        const purchase = purchaseResult.rows[0];
+        await client.query(
+          `
+          INSERT INTO purchase_items (
+            purchase_id, product_id, quantity, purchase_rate, amount, basic_amount,
+            net_payable, effective_cost_per_unit
+          )
+          VALUES ($1, $2, $3, $4, $5, 0, 0, $4)
+          `,
+          [purchase.id, entry.productId, entry.quantity, provisionalCost, provisionalAmount]
+        );
+        const batchNo = `PENDING-${Date.now()}-${purchase.id}`;
+        await client.query(
+          `
+          INSERT INTO inventory_batches (
+            product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
+            supplier_id, supplier_name, branch_id, gross_amount, net_payable, balance_amount,
+            purchase_id, batch_status, purchase_bill_status, temporary_sale_rate
+          )
+          VALUES ($1, $2, $3, $3, $4, $4, $5, $6, $7, 0, 0, 0, $8, 'ACTIVE', 'BILL_PENDING', $9)
+          `,
+          [
+            entry.productId, batchNo, entry.quantity, provisionalCost, arrival.supplier.id,
+            arrival.supplier.supplier_name, entry.branchId, purchase.id, entry.temporarySaleRate,
+          ]
+        );
+        await client.query(
+          "UPDATE products SET selling_rate = $1, selling_rate_updated_at = CURRENT_TIMESTAMP, selling_rate_updated_by = $2 WHERE id = $3",
+          [entry.temporarySaleRate, manager.id, entry.productId]
+        );
+        await client.query(
+          "INSERT INTO sale_rate_history (product_id, old_selling_rate, new_selling_rate, changed_by, reason) VALUES ($1, $2, $3, $4, $5)",
+          [entry.productId, arrival.product.selling_rate || 0, entry.temporarySaleRate, manager.id, `Temporary sale rate for pending purchase #${purchase.id}`]
+        );
+        await client.query(
+          "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, 'IN', $3, $4, $5)",
+          [entry.productId, entry.quantity, `Stock arrival pending bill #${purchase.id}`, entry.actorId, entry.branchId]
+        );
+        await client.query(
+          "INSERT INTO purchase_audit_trail (purchase_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'ADDED_ITEM', NULL, $2::jsonb, $3, $4)",
+          [purchase.id, JSON.stringify({ purchase, product_name: arrival.product.product_name }), "Purchase cart item added", manager.id]
+        );
+        createdPurchases.push({ ...purchase, product_name: arrival.product.product_name });
+      }
+      await client.query("COMMIT");
+      return res.status(201).json({
+        success: true,
+        message: "Stock Arrival Saved - Bill Pending",
+        purchase_ids: createdPurchases.map((purchase) => purchase.id),
+        purchases: createdPurchases,
+      });
+    }
+
+    const completedEntries = [];
+    const itemBasicTotal = entries.reduce((sum, entry) => sum + Number(entry.quantity || 0) * Number(entry.purchaseRate || 0), 0);
+    if (itemBasicTotal <= 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Completed purchase items require valid purchase rates" });
+    }
+    let usedFreight = 0;
+    let usedLabour = 0;
+    let usedOther = 0;
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      const itemBasic = Number(entry.quantity || 0) * Number(entry.purchaseRate || 0);
+      const isLast = index === entries.length - 1;
+      const freight = isLast ? roundCurrency(baseEntry.freightCharges - usedFreight) : roundCurrency(baseEntry.freightCharges * itemBasic / itemBasicTotal);
+      const labour = isLast ? roundCurrency(baseEntry.labourCharges - usedLabour) : roundCurrency(baseEntry.labourCharges * itemBasic / itemBasicTotal);
+      const other = isLast ? roundCurrency(baseEntry.otherCharges - usedOther) : roundCurrency(baseEntry.otherCharges * itemBasic / itemBasicTotal);
+      usedFreight = roundCurrency(usedFreight + freight);
+      usedLabour = roundCurrency(usedLabour + labour);
+      usedOther = roundCurrency(usedOther + other);
+      const itemEntry = { ...entry, freightCharges: freight, labourCharges: labour, otherCharges: other, purchaseType: "CREDIT", paidAmountInput: 0 };
+      const calculation = await buildPurchaseFinancials(client, itemEntry);
+      if (calculation.error) {
+        await client.query("ROLLBACK");
+        return res.status(calculation.status || 400).json({ message: calculation.error });
+      }
+      completedEntries.push({ entry: itemEntry, ...calculation });
+    }
+
+    const netTotal = roundCurrency(completedEntries.reduce((sum, item) => sum + Number(item.financials.netPayable || 0), 0));
+    if (baseEntry.purchaseType === "CASH" && baseEntry.paidAmountInput > netTotal) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Paid amount cannot exceed net payable amount" });
+    }
+    let usedPaid = 0;
+    const createdPurchases = [];
+    for (let index = 0; index < completedEntries.length; index += 1) {
+      const item = completedEntries[index];
+      const { entry, supplier, product, originType, rebateRule } = item;
+      const isLast = index === completedEntries.length - 1;
+      const paidAmount = baseEntry.purchaseType === "CASH"
+        ? isLast
+          ? roundCurrency(baseEntry.paidAmountInput - usedPaid)
+          : roundCurrency(baseEntry.paidAmountInput * Number(item.financials.netPayable || 0) / netTotal)
+        : 0;
+      usedPaid = roundCurrency(usedPaid + paidAmount);
+      const balanceAmount = roundCurrency(Number(item.financials.netPayable || 0) - paidAmount);
+      const financials = {
+        ...item.financials,
+        paidAmount,
+        balanceAmount,
+        paymentStatus: balanceAmount === 0 ? "PAID" : paidAmount > 0 ? "PARTIAL" : "PENDING",
+      };
+      const purchaseResult = await client.query(
+        `
+        INSERT INTO purchases (
+          supplier_id, supplier_name, total_amount, branch_id, created_by, basic_amount,
+          mandi_tax_percent, mandi_tax_amount, other_charges, gross_amount,
+          rebate_percent, rebate_amount, net_payable, paid_amount, balance_amount,
+          payment_timing, effective_cost_per_unit, freight_charges, labour_charges,
+          rebate_rule_id, payment_due_days, payment_status, payment_date,
+          purchase_type, payment_mode, payment_reference_number, remarks, purchase_bill_status, bill_number, bill_date
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, 'BILL_COMPLETED', $28, $29)
+        RETURNING *
+        `,
+        [
+          supplier.id, supplier.supplier_name, financials.netPayable, entry.branchId, entry.actorId, financials.basicAmount,
+          financials.mandiTaxPercent, financials.mandiTaxAmount, entry.otherCharges, financials.grossAmount,
+          financials.rebatePercent, financials.rebateAmount, financials.netPayable, financials.paidAmount, financials.balanceAmount,
+          rebateRule.rule_name, financials.effectiveCostPerUnit, entry.freightCharges, entry.labourCharges,
+          rebateRule.id, rebateRule.pay_within_days, financials.paymentStatus, baseEntry.purchaseType === "CREDIT" ? null : baseEntry.paymentDate,
+          baseEntry.purchaseType, baseEntry.purchaseType === "CASH" ? baseEntry.paymentMode : null, baseEntry.purchaseType === "CASH" ? baseEntry.paymentReferenceNumber : null,
+          entry.remarks, entry.billNumber, entry.billDate,
+        ]
+      );
+      const purchase = purchaseResult.rows[0];
+      await client.query(
+        `
+        INSERT INTO purchase_items (
+          purchase_id, product_id, quantity, purchase_rate, amount, basic_amount,
+          mandi_tax_amount, other_charges, rebate_amount, net_payable, effective_cost_per_unit,
+          freight_charges, labour_charges
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        `,
+        [
+          purchase.id, entry.productId, entry.quantity, entry.purchaseRate, financials.netPayable, financials.basicAmount,
+          financials.mandiTaxAmount, entry.otherCharges, financials.rebateAmount, financials.netPayable, financials.effectiveCostPerUnit,
+          entry.freightCharges, entry.labourCharges,
+        ]
+      );
+      const batchNo = `BATCH-${Date.now()}-${purchase.id}`;
+      await client.query(
+        `
+        INSERT INTO inventory_batches (
+          product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
+          supplier_id, supplier_name, branch_id, mandi_tax_amount, freight_charges, labour_charges,
+          other_charges, gross_amount, rebate_amount, net_payable, payment_timing, balance_amount,
+          purchase_id, batch_status, purchase_bill_status
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'ACTIVE', 'BILL_COMPLETED')
+        `,
+        [
+          entry.productId, batchNo, entry.quantity, entry.quantity, entry.purchaseRate, financials.effectiveCostPerUnit,
+          supplier.id, supplier.supplier_name, entry.branchId, financials.mandiTaxAmount, entry.freightCharges, entry.labourCharges,
+          entry.otherCharges, financials.grossAmount, financials.rebateAmount, financials.netPayable, rebateRule.rule_name,
+          financials.balanceAmount, purchase.id,
+        ]
+      );
+      await client.query(
+        "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, 'IN', $3, $4, $5)",
+        [entry.productId, entry.quantity, `Purchase #${purchase.id}`, entry.actorId, entry.branchId]
+      );
+      await client.query(
+        "INSERT INTO purchase_audit_trail (purchase_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'ADDED_ITEM', NULL, $2::jsonb, $3, $4)",
+        [purchase.id, JSON.stringify({ purchase, product_name: product.product_name, origin_type: originType }), "Purchase cart item added", entry.actorId]
+      );
+      createdPurchases.push({ ...purchase, product_name: product.product_name, origin_type: originType });
+    }
+
+    await client.query("COMMIT");
+    return res.status(201).json({
+      success: true,
+      message: "Purchase Saved",
+      purchase_ids: createdPurchases.map((purchase) => purchase.id),
+      purchases: createdPurchases,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Purchase Bill Error" });
   } finally {
     client.release();
   }
