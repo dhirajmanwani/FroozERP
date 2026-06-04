@@ -471,9 +471,13 @@
 }
 
 .purchase-items-cell span {
+  display: block;
+  max-width: 460px;
   cursor: help;
   text-decoration: underline dotted rgba(245, 158, 11, 0.45);
   text-underline-offset: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .date-total-row td {
@@ -2118,6 +2122,88 @@ tbody tr:last-child td {
     box-shadow: none !important;
     page-break-after: avoid;
     break-after: avoid;
+  }
+
+  .print-section.print-target .report-paper {
+    position: absolute !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    padding: 10mm !important;
+    overflow: visible !important;
+    font-size: 9px !important;
+    line-height: 1.25 !important;
+  }
+
+  .print-section.print-target .report-print-header {
+    display: flex !important;
+  }
+
+  .print-section.print-target .data-table,
+  .print-section.print-target table {
+    width: 100% !important;
+    table-layout: fixed !important;
+    border-collapse: collapse !important;
+    page-break-inside: auto !important;
+  }
+
+  .print-section.print-target th,
+  .print-section.print-target td {
+    padding: 4px 5px !important;
+    color: #111827 !important;
+    background: #ffffff !important;
+    border: 1px solid #d1d5db !important;
+    font-size: 8.5px !important;
+    line-height: 1.25 !important;
+    white-space: normal !important;
+    word-break: break-word !important;
+    vertical-align: top !important;
+  }
+
+  .print-section.print-target th:nth-child(1),
+  .print-section.print-target td:nth-child(1) {
+    width: 11% !important;
+  }
+
+  .print-section.print-target th:nth-child(2),
+  .print-section.print-target td:nth-child(2) {
+    width: 17% !important;
+  }
+
+  .print-section.print-target th:nth-child(3),
+  .print-section.print-target td:nth-child(3) {
+    width: 40% !important;
+  }
+
+  .print-section.print-target th:nth-child(4),
+  .print-section.print-target td:nth-child(4),
+  .print-section.print-target th:nth-child(5),
+  .print-section.print-target td:nth-child(5) {
+    width: 13% !important;
+  }
+
+  .print-section.print-target th:nth-child(6),
+  .print-section.print-target td:nth-child(6) {
+    width: 10% !important;
+  }
+
+  .print-section.print-target .purchase-items-cell span {
+    max-width: none !important;
+    color: #111827 !important;
+    text-decoration: none !important;
+    white-space: pre-wrap !important;
+    word-break: break-word !important;
+  }
+
+  .print-section.print-target .cell-note,
+  .print-section.print-target .purchase-summary-grid,
+  .print-section.print-target .date-total-row td:last-child {
+    display: none !important;
+  }
+
+  .print-section.print-target .date-total-row td {
+    color: #111827 !important;
+    background: #f3f4f6 !important;
+    font-weight: 800 !important;
   }
 
   body:has(.invoice-paper) .erp-shell {
