@@ -1376,6 +1376,8 @@ function PrintableReport({ children, title }) {
 function ReportsModule({ data, onReload }) {
   const [range, setRange] = useState("today");
   const [search, setSearch] = useState("");
+  const [selectedCategory, setSelectedCategory] = useState("");
+  const [selectedReport, setSelectedReport] = useState("");
   const [customRange, setCustomRange] = useState({
     date_from: toDateKey(new Date()),
     date_to: toDateKey(new Date()),
@@ -1387,202 +1389,356 @@ function ReportsModule({ data, onReload }) {
   const matchesSearch = (row) => !search.trim() || Object.values(row || {}).some((value) =>
     String(value ?? "").toLowerCase().includes(search.trim().toLowerCase())
   );
-  const salesRows = (data.salesReport || []).filter(matchesSearch);
-  const purchaseRows = (data.purchaseReport || []).filter(matchesSearch);
-  const expenseRows = (data.expenseReport || []).filter(matchesSearch);
-  const paymentRows = (data.paymentReport || []).filter(matchesSearch);
-  const returnRows = (data.returnReport || []).filter(matchesSearch);
-  const wasteRows = (data.wasteReport || []).filter(matchesSearch);
-  const stockRows = (data.stockReport || []).filter(matchesSearch);
-  const ledgerRows = (data.ledgerReport || []).filter(matchesSearch);
-  const dayRows = (data.dayToDayReport || []).filter(matchesSearch);
+  const filterRows = (rows) => (rows || []).filter(matchesSearch);
   const totalOf = (rows, key) => rows.reduce((sum, row) => sum + Number(row[key] || 0), 0);
+  const money = (value) => currency.format(Number(value || 0));
+  const number = (value) => Number(value || 0).toLocaleString("en-IN");
+  const stockRows = filterRows(data.stockReport);
+  const lowStockRows = stockRows.filter((row) => Number(row.current_stock || 0) <= Number(row.minimum_stock || 0));
+  const ledgerRows = filterRows(data.ledgerReport);
+  const customerLedgerRows = ledgerRows.filter((row) => String(row.transaction_type || "").includes("Customer"));
+  const supplierLedgerRows = ledgerRows.filter((row) => String(row.transaction_type || "").includes("Supplier"));
+  const salesChanges = filterRows(data.salesChangeReport);
+  const editedBills = salesChanges.filter((row) => row.sale_status === "EDITED" || row.edited_at);
+  const cancelledBills = salesChanges.filter((row) => row.sale_status === "CANCELLED" || row.cancelled_at);
+  const purchaseChanges = filterRows(data.purchaseChangeReport);
+  const wasteProductRows = filterRows(data.wasteProductReport);
+  const reports = {
+    salesByDate: {
+      title: "Sales by Date",
+      rows: filterRows(data.salesReport),
+      summary: (rows) => [["Sales", money(totalOf(rows, "total_sales")), true], ["Transactions", number(totalOf(rows, "transaction_count"))], ["Profit", money(totalOf(rows, "total_profit"))]],
+      headers: ["Date", "Transactions", "Sales", "Cost", "Profit"],
+      render: (row) => <tr key={row.sale_date}><td>{row.sale_date}</td><td>{row.transaction_count}</td><td>{money(row.total_sales)}</td><td>{money(row.total_cost)}</td><td className="profit-cell">{money(row.total_profit)}</td></tr>,
+    },
+    salesByProduct: {
+      title: "Sales by Product",
+      rows: filterRows(data.salesProductReport),
+      summary: (rows) => [["Revenue", money(totalOf(rows, "revenue")), true], ["Quantity Sold", number(totalOf(rows, "quantity_sold"))], ["Profit", money(totalOf(rows, "profit"))]],
+      headers: ["Product", "Quantity", "Revenue", "Cost", "Profit"],
+      render: (row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{number(row.quantity_sold)}</td><td>{money(row.revenue)}</td><td>{money(row.cost)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
+    },
+    salesByCustomer: {
+      title: "Sales by Customer",
+      rows: filterRows(data.salesCustomerReport),
+      summary: (rows) => [["Sales", money(totalOf(rows, "total_sales")), true], ["Invoices", number(totalOf(rows, "invoice_count"))], ["Profit", money(totalOf(rows, "total_profit"))]],
+      headers: ["Customer", "Mobile", "Invoices", "Sales", "Profit"],
+      render: (row) => <tr key={`${row.customer_name}-${row.customer_mobile}`}><td className="primary-cell">{row.customer_name}</td><td>{row.customer_mobile || "-"}</td><td>{row.invoice_count}</td><td>{money(row.total_sales)}</td><td className="profit-cell">{money(row.total_profit)}</td></tr>,
+    },
+    salesHistory: {
+      title: "Sales History",
+      rows: filterRows(data.salesHistoryReport),
+      summary: (rows) => [["Net Sales", money(totalOf(rows, "total_amount")), true], ["Invoices", rows.length], ["Profit", money(totalOf(rows, "profit"))]],
+      headers: ["Invoice", "Date", "Status", "Customer", "Payment", "Gross", "Discount", "Net", "Profit"],
+      render: (row) => <tr key={row.id}><td><span className="batch-id">{row.invoice_no || `#${row.id}`}</span></td><td>{row.sale_date}</td><td>{row.sale_status}</td><td>{row.customer_name}</td><td>{row.payment_mode}</td><td>{money(row.gross_amount)}</td><td>{money(row.discount_amount)}</td><td>{money(row.total_amount)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
+    },
+    editedBills: {
+      title: "Edited Bills",
+      rows: editedBills,
+      summary: (rows) => [["Edited Bills", rows.length, true], ["Total Amount", money(totalOf(rows, "total_amount"))]],
+      headers: ["Invoice", "Date", "Amount", "Edited By", "Edited At", "Reason"],
+      render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{row.sale_date}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || "-"}</td><td>{row.edited_at ? new Date(row.edited_at).toLocaleString("en-IN") : "-"}</td><td>{row.edit_reason || "-"}</td></tr>,
+    },
+    cancelledBills: {
+      title: "Cancelled Bills",
+      rows: cancelledBills,
+      summary: (rows) => [["Cancelled Bills", rows.length, true], ["Cancelled Amount", money(totalOf(rows, "total_amount"))]],
+      headers: ["Invoice", "Date", "Amount", "Cancelled By", "Cancelled At", "Reason"],
+      render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{row.sale_date}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || "-"}</td><td>{row.cancelled_at ? new Date(row.cancelled_at).toLocaleString("en-IN") : "-"}</td><td>{row.cancellation_reason || "-"}</td></tr>,
+    },
+    discountReport: {
+      title: "Discount Report",
+      rows: filterRows(data.discountReport),
+      summary: (rows) => [["Total Discount", money(totalOf(rows, "total_discount")), true], ["Bill Discount", money(totalOf(rows, "bill_discount"))], ["Invoices", number(totalOf(rows, "invoice_count"))]],
+      headers: ["Date", "Payment", "Invoices", "Item Discount", "Bill Discount", "Total Discount"],
+      render: (row) => <tr key={`${row.sale_date}-${row.payment_mode}`}><td>{row.sale_date}</td><td>{row.payment_mode}</td><td>{row.invoice_count}</td><td>{money(row.item_discount)}</td><td>{money(row.bill_discount)}</td><td className="profit-cell">{money(row.total_discount)}</td></tr>,
+    },
+    purchasesByDate: {
+      title: "Purchases by Date",
+      rows: filterRows(data.purchaseReport),
+      summary: (rows) => [["Net Purchases", money(totalOf(rows, "net_purchase")), true], ["Paid", money(totalOf(rows, "paid_amount"))], ["Balance", money(totalOf(rows, "balance_amount"))]],
+      headers: ["Date", "Bills", "Gross", "Rebate", "Net", "Paid", "Balance"],
+      render: (row) => <tr key={row.purchase_date}><td>{row.purchase_date}</td><td>{row.purchase_count}</td><td>{money(row.gross_purchase)}</td><td>{money(row.rebate_received)}</td><td>{money(row.net_purchase)}</td><td>{money(row.paid_amount)}</td><td className="balance-cell">{money(row.balance_amount)}</td></tr>,
+    },
+    purchasesByProduct: {
+      title: "Purchases by Product",
+      rows: filterRows(data.purchaseProductReport),
+      summary: (rows) => [["Net Purchases", money(totalOf(rows, "net_purchase")), true], ["Quantity", number(totalOf(rows, "quantity_purchased"))], ["Mandi Tax", money(totalOf(rows, "mandi_tax"))]],
+      headers: ["Product", "Quantity", "Net Purchase", "Mandi Tax", "Rebate"],
+      render: (row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{number(row.quantity_purchased)}</td><td>{money(row.net_purchase)}</td><td>{money(row.mandi_tax)}</td><td>{money(row.rebate)}</td></tr>,
+    },
+    purchasesBySupplier: {
+      title: "Purchases by Supplier",
+      rows: filterRows(data.purchaseSupplierReport),
+      summary: (rows) => [["Net Purchases", money(totalOf(rows, "net_purchase")), true], ["Purchases", number(totalOf(rows, "purchase_count"))], ["Balance", money(totalOf(rows, "balance_amount"))]],
+      headers: ["Supplier", "Bills", "Gross", "Rebate", "Net", "Paid", "Balance"],
+      render: (row) => <tr key={row.supplier_name}><td className="primary-cell">{row.supplier_name}</td><td>{row.purchase_count}</td><td>{money(row.gross_purchase)}</td><td>{money(row.rebate_received)}</td><td>{money(row.net_purchase)}</td><td>{money(row.paid_amount)}</td><td className="balance-cell">{money(row.balance_amount)}</td></tr>,
+    },
+    purchaseOutstanding: {
+      title: "Purchase Outstanding",
+      rows: filterRows(data.supplierOutstandingReport),
+      summary: (rows) => [["Outstanding", money(totalOf(rows, "outstanding_balance")), true], ["Purchases", money(totalOf(rows, "total_purchases"))], ["Paid", money(totalOf(rows, "total_paid"))]],
+      headers: ["Supplier", "Purchases", "Paid", "Rebate", "Outstanding"],
+      render: (row) => <tr key={row.id}><td className="primary-cell">{row.supplier_name}</td><td>{money(row.total_purchases)}</td><td>{money(row.total_paid)}</td><td>{money(row.total_rebate_received)}</td><td className="balance-cell">{money(row.outstanding_balance)}</td></tr>,
+    },
+    purchaseEditCancel: {
+      title: "Purchase Edit / Cancel Report",
+      rows: purchaseChanges,
+      summary: (rows) => [["Changed Purchases", rows.length, true], ["Cancelled", rows.filter((row) => row.purchase_status === "CANCELLED").length], ["Edited", rows.filter((row) => row.purchase_status === "EDITED").length]],
+      headers: ["Purchase", "Date", "Supplier", "Status", "Amount", "Changed By", "Reason"],
+      render: (row) => <tr key={row.id}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td>{row.purchase_status}</td><td>{money(row.net_payable)}</td><td>{row.changed_by_name || "-"}</td><td>{row.cancellation_reason || row.edit_reason || "-"}</td></tr>,
+    },
+    customerLedger: {
+      title: "Customer Ledger",
+      rows: customerLedgerRows,
+      summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
+      headers: ["Date", "Type", "Customer", "Debit", "Credit", "Status", "Remarks"],
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{row.date}</td><td>{row.transaction_type}</td><td className="primary-cell">{row.party_name}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td>{row.status || "-"}</td><td>{row.remarks || "-"}</td></tr>,
+    },
+    supplierLedger: {
+      title: "Supplier Ledger",
+      rows: supplierLedgerRows,
+      summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
+      headers: ["Date", "Type", "Supplier", "Debit", "Credit", "Status", "Remarks"],
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{row.date}</td><td>{row.transaction_type}</td><td className="primary-cell">{row.party_name}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td>{row.status || "-"}</td><td>{row.remarks || "-"}</td></tr>,
+    },
+    accountStatement: {
+      title: "Account Statement",
+      rows: ledgerRows,
+      summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
+      headers: ["Date", "Type", "Account", "Debit", "Credit", "Status", "Remarks"],
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{row.date}</td><td>{row.transaction_type}</td><td className="primary-cell">{row.party_name}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td>{row.status || "-"}</td><td>{row.remarks || "-"}</td></tr>,
+    },
+    paymentReport: {
+      title: "Payment Report",
+      rows: filterRows(data.paymentReport),
+      summary: (rows) => [["Payments", money(totalOf(rows, "payment_amount")), true], ["Rebates", money(totalOf(rows, "rebate_amount"))], ["Entries", rows.length]],
+      headers: ["Date", "Type", "Party", "Payment", "Rebate", "Mode", "Status", "Reference"],
+      render: (row, index) => <tr key={`${row.payment_date}-${index}`}><td>{row.payment_date}</td><td>{row.payment_type}</td><td className="primary-cell">{row.party_name}</td><td>{money(row.payment_amount)}</td><td>{money(row.rebate_amount)}</td><td>{row.payment_mode}</td><td>{row.cancelled ? "Cancelled" : "Active"}</td><td>{row.reference_number || "-"}</td></tr>,
+    },
+    receivableReport: {
+      title: "Receivable Report",
+      rows: filterRows(data.customerOutstandingReport),
+      summary: (rows) => [["Receivable", money(totalOf(rows, "outstanding_balance")), true], ["Sales", money(totalOf(rows, "total_sales"))], ["Paid", money(totalOf(rows, "total_paid"))]],
+      headers: ["Customer", "Type", "Sales", "Paid", "Outstanding"],
+      render: (row) => <tr key={row.id}><td className="primary-cell">{row.customer_name}</td><td>{row.customer_type}</td><td>{money(row.total_sales)}</td><td>{money(row.total_paid)}</td><td className="balance-cell">{money(row.outstanding_balance)}</td></tr>,
+    },
+    payableReport: {
+      title: "Payable Report",
+      rows: filterRows(data.supplierOutstandingReport),
+      summary: (rows) => [["Payable", money(totalOf(rows, "outstanding_balance")), true], ["Purchases", money(totalOf(rows, "total_purchases"))], ["Paid", money(totalOf(rows, "total_paid"))]],
+      headers: ["Supplier", "Purchases", "Paid", "Rebate", "Outstanding"],
+      render: (row) => <tr key={row.id}><td className="primary-cell">{row.supplier_name}</td><td>{money(row.total_purchases)}</td><td>{money(row.total_paid)}</td><td>{money(row.total_rebate_received)}</td><td className="balance-cell">{money(row.outstanding_balance)}</td></tr>,
+    },
+    returnHistory: {
+      title: "Sale Return History",
+      rows: filterRows(data.returnHistoryReport),
+      summary: (rows) => [["Return Value", money(totalOf(rows, "total_return_amount")), true], ["Returns", rows.length]],
+      headers: ["Return No", "Date", "Invoice", "Customer", "Refund", "Value", "Reason", "Items"],
+      render: (row) => <tr key={row.return_no}><td>{row.return_no}</td><td>{row.return_date}</td><td>{row.invoice_no || "-"}</td><td>{row.customer_name}</td><td>{row.refund_type}</td><td>{money(row.total_return_amount)}</td><td>{row.return_reason}</td><td>{row.items || "-"}</td></tr>,
+    },
+    returnValue: {
+      title: "Return Value Report",
+      rows: filterRows(data.returnReport),
+      summary: (rows) => [["Return Value", money(totalOf(rows, "return_value")), true], ["Return Quantity", number(totalOf(rows, "return_quantity"))], ["Returns", number(totalOf(rows, "return_count"))]],
+      headers: ["Date", "Returns", "Return Quantity", "Return Value"],
+      render: (row) => <tr key={row.return_date}><td>{row.return_date}</td><td>{row.return_count}</td><td>{number(row.return_quantity)}</td><td>{money(row.return_value)}</td></tr>,
+    },
+    returnReason: {
+      title: "Return Reason Analysis",
+      rows: filterRows(data.returnReasonReport),
+      summary: (rows) => [["Return Value", money(totalOf(rows, "return_value")), true], ["Returns", number(totalOf(rows, "return_count"))]],
+      headers: ["Reason", "Returns", "Return Value"],
+      render: (row) => <tr key={row.return_reason}><td className="primary-cell">{row.return_reason}</td><td>{row.return_count}</td><td>{money(row.return_value)}</td></tr>,
+    },
+    dailyWaste: {
+      title: "Daily Waste",
+      rows: filterRows(data.wasteReport),
+      summary: (rows) => [["Waste Cost", money(totalOf(rows, "waste_cost")), true], ["Waste Quantity", number(totalOf(rows, "waste_quantity"))], ["Entries", number(totalOf(rows, "entry_count"))]],
+      headers: ["Date", "Type", "Entries", "Quantity", "Cost"],
+      render: (row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td>{row.waste_type}</td><td>{row.entry_count}</td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
+    },
+    monthlyWaste: {
+      title: "Monthly Waste",
+      rows: filterRows(data.wasteReport),
+      summary: (rows) => [["Waste Cost", money(totalOf(rows, "waste_cost")), true], ["Waste Quantity", number(totalOf(rows, "waste_quantity"))], ["Entries", number(totalOf(rows, "entry_count"))]],
+      headers: ["Date", "Type", "Entries", "Quantity", "Cost"],
+      render: (row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td>{row.waste_type}</td><td>{row.entry_count}</td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
+    },
+    productWiseWaste: {
+      title: "Product Wise Waste",
+      rows: wasteProductRows,
+      summary: (rows) => [["Waste Cost", money(totalOf(rows, "waste_cost")), true], ["Waste Quantity", number(totalOf(rows, "waste_quantity"))], ["Products", rows.length]],
+      headers: ["Product", "Quantity", "Cost"],
+      render: (row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
+    },
+    mostWastedProducts: {
+      title: "Most Wasted Products",
+      rows: wasteProductRows.slice(0, 10),
+      summary: (rows) => [["Waste Cost", money(totalOf(rows, "waste_cost")), true], ["Waste Quantity", number(totalOf(rows, "waste_quantity"))], ["Products", rows.length]],
+      headers: ["Product", "Quantity", "Cost"],
+      render: (row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
+    },
+    wasteCost: {
+      title: "Waste Cost Report",
+      rows: filterRows(data.wasteReport),
+      summary: (rows) => [["Waste Cost", money(totalOf(rows, "waste_cost")), true], ["Waste Quantity", number(totalOf(rows, "waste_quantity"))]],
+      headers: ["Date", "Type", "Quantity", "Cost"],
+      render: (row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td>{row.waste_type}</td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
+    },
+    currentStock: {
+      title: "Current Stock",
+      rows: stockRows,
+      summary: (rows) => [["Stock Value", money(totalOf(rows, "stock_value")), true], ["Products", rows.length], ["Low Stock", lowStockRows.length]],
+      headers: ["Product", "Category", "Stock", "Minimum", "Unit", "Value"],
+      render: (row) => <tr key={row.product_id}><td className="primary-cell">{row.product_name}</td><td>{row.category}</td><td>{number(row.current_stock)}</td><td>{row.minimum_stock || 0}</td><td>{row.unit}</td><td>{money(row.stock_value)}</td></tr>,
+    },
+    lowStock: {
+      title: "Low Stock",
+      rows: lowStockRows,
+      summary: (rows) => [["Low Stock Items", rows.length, true], ["Stock Value", money(totalOf(rows, "stock_value"))]],
+      headers: ["Product", "Category", "Stock", "Minimum", "Unit", "Value"],
+      render: (row) => <tr key={row.product_id}><td className="primary-cell">{row.product_name}</td><td>{row.category}</td><td className="stock-low">{number(row.current_stock)}</td><td>{row.minimum_stock || 0}</td><td>{row.unit}</td><td>{money(row.stock_value)}</td></tr>,
+    },
+    stockMovement: {
+      title: "Stock Movement",
+      rows: filterRows(data.stockMovementReport),
+      summary: (rows) => [["Quantity", number(totalOf(rows, "quantity")), true], ["Movements", number(totalOf(rows, "movement_count"))]],
+      headers: ["Date", "Product", "Type", "Quantity", "Count", "Remarks"],
+      render: (row, index) => <tr key={`${row.movement_date}-${row.product_name}-${row.transaction_type}-${index}`}><td>{row.movement_date}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{row.transaction_type}</td><td>{number(row.quantity)}</td><td>{row.movement_count}</td><td>{row.remarks || "-"}</td></tr>,
+    },
+    stockValuation: {
+      title: "Stock Valuation",
+      rows: stockRows,
+      summary: (rows) => [["Stock Value", money(totalOf(rows, "stock_value")), true], ["Products", rows.length]],
+      headers: ["Product", "Stock", "Unit", "Value"],
+      render: (row) => <tr key={row.product_id}><td className="primary-cell">{row.product_name}</td><td>{number(row.current_stock)}</td><td>{row.unit}</td><td>{money(row.stock_value)}</td></tr>,
+    },
+    profitLoss: {
+      title: "Profit & Loss",
+      rows: [data.profitLoss || {}].filter(matchesSearch),
+      summary: (rows) => [["Net Profit", money(rows[0]?.netProfit), true], ["Gross Profit", money(rows[0]?.grossProfit)], ["Expenses", money(rows[0]?.expenses)]],
+      headers: ["Sales Revenue", "Purchase Cost", "Expenses", "Rebate", "Gross Profit", "Net Profit"],
+      render: (row) => <tr key="profit-loss"><td>{money(row.salesRevenue)}</td><td>{money(row.purchaseCost)}</td><td>{money(row.expenses)}</td><td>{money(row.supplierRebateReceived)}</td><td>{money(row.grossProfit)}</td><td className="profit-cell">{money(row.netProfit)}</td></tr>,
+    },
+    balanceSheet: {
+      title: "Balance Sheet",
+      rows: [data.balanceSheet || {}].filter(matchesSearch),
+      summary: (rows) => [["Net Position", money(rows[0]?.netPosition), true], ["Inventory", money(rows[0]?.inventory)], ["Supplier Payable", money(rows[0]?.supplierPayable)]],
+      headers: ["Cash", "Bank", "Inventory", "Customer Receivable", "Supplier Payable", "Net Position"],
+      render: (row) => <tr key="balance-sheet"><td>{money(row.cash)}</td><td>{money(row.bank)}</td><td>{money(row.inventory)}</td><td>{money(row.customerReceivable)}</td><td>{money(row.supplierPayable)}</td><td className="profit-cell">{money(row.netPosition)}</td></tr>,
+    },
+    dayToDay: {
+      title: "Day-to-Day Transaction Report",
+      rows: filterRows(data.dayToDayReport),
+      summary: (rows) => [["Sales", money(totalOf(rows, "sales")), true], ["Expenses", money(totalOf(rows, "expenses"))], ["Net Profit", money(totalOf(rows, "net_profit"))]],
+      headers: ["Date", "Transactions", "Sales", "Purchases", "Expenses", "Returns", "Waste", "Net Profit"],
+      render: (row) => <tr key={row.date}><td>{row.date}</td><td>{row.transactions}</td><td>{money(row.sales)}</td><td>{money(row.purchases)}</td><td>{money(row.expenses)}</td><td>{money(row.returns)}</td><td>{money(row.waste)}</td><td className="profit-cell">{money(row.net_profit)}</td></tr>,
+    },
+    expenseReport: {
+      title: "Expense Report",
+      rows: filterRows(data.expenseReport),
+      summary: (rows) => [["Expenses", money(totalOf(rows, "total_expense")), true], ["Entries", number(totalOf(rows, "expense_count"))]],
+      headers: ["Date", "Category", "Payment", "Entries", "Amount"],
+      render: (row) => <tr key={`${row.expense_date}-${row.category}-${row.payment_mode}`}><td>{row.expense_date}</td><td>{row.category}</td><td>{row.payment_mode}</td><td>{row.expense_count}</td><td>{money(row.total_expense)}</td></tr>,
+    },
+  };
+  const categories = [
+    { id: "sales", title: "Sales Reports", icon: "receipt", description: "Invoices, products, customers, discounts and bill changes.", reports: ["salesByDate", "salesByProduct", "salesByCustomer", "salesHistory", "editedBills", "cancelledBills", "discountReport"] },
+    { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Purchase value, supplier buying, outstanding and purchase changes.", reports: ["purchasesByDate", "purchasesByProduct", "purchasesBySupplier", "purchaseOutstanding", "purchaseEditCancel"] },
+    { id: "accounts", title: "Accounts & Ledger", icon: "users", description: "Customer ledger, supplier ledger, statements, payments and balances.", reports: ["customerLedger", "supplierLedger", "accountStatement", "paymentReport", "receivableReport", "payableReport"] },
+    { id: "returns", title: "Sale Returns", icon: "history", description: "Return history, value and reason analysis.", reports: ["returnHistory", "returnValue", "returnReason"] },
+    { id: "waste", title: "Waste Management", icon: "alert", description: "Daily, monthly, product-wise and cost-focused waste analysis.", reports: ["dailyWaste", "monthlyWaste", "productWiseWaste", "mostWastedProducts", "wasteCost"] },
+    { id: "inventory", title: "Inventory", icon: "layers", description: "Current stock, low stock, movement and valuation.", reports: ["currentStock", "lowStock", "stockMovement", "stockValuation"] },
+    { id: "financial", title: "Financial Reports", icon: "wallet", description: "Profit and loss, balance sheet, day-to-day and expense reports.", reports: ["profitLoss", "balanceSheet", "dayToDay", "expenseReport"] },
+  ];
+  const currentCategory = categories.find((category) => category.id === selectedCategory);
+  const currentReport = reports[selectedReport];
+  const renderFilters = () => (
+    <div className="ledger-toolbar">
+      <Field label="Report Range">
+        <select value={range} onChange={(event) => setRange(event.target.value)}>
+          <option value="today">Today</option>
+          <option value="yesterday">Yesterday</option>
+          <option value="week">This Week</option>
+          <option value="month">This Month</option>
+          <option value="custom">Custom Date Range</option>
+        </select>
+      </Field>
+      {range === "custom" && (
+        <>
+          <Field label="Date From"><input type="date" value={customRange.date_from} onChange={(event) => setCustomRange({ ...customRange, date_from: event.target.value })} /></Field>
+          <Field label="Date To"><input type="date" value={customRange.date_to} onChange={(event) => setCustomRange({ ...customRange, date_to: event.target.value })} /></Field>
+        </>
+      )}
+      <Field label="Search / Filter"><input placeholder="Search this report" value={search} onChange={(event) => setSearch(event.target.value)} /></Field>
+      <button className="secondary-button" onClick={refreshReports}>Refresh</button>
+    </div>
+  );
+  if (currentReport) {
+    const rows = currentReport.rows || [];
+    return (
+      <section className="settings-layout">
+        <ModuleCard eyebrow="Report View" title={currentReport.title} subtitle="Single report workspace with filters, summary, print and export controls.">
+          <div className="button-row">
+            <button className="secondary-button" onClick={() => setSelectedReport("")}>Back to {currentCategory?.title || "Report List"}</button>
+            <button className="secondary-button" onClick={() => { setSelectedReport(""); setSelectedCategory(""); }}>Back to Report Center</button>
+          </div>
+          {renderFilters()}
+        </ModuleCard>
+        <ModuleCard eyebrow={currentCategory?.title || "Reports"} title={currentReport.title} subtitle={`${rows.length} row${rows.length === 1 ? "" : "s"} found.`}>
+          <PrintableReport title={currentReport.title}>
+            <div className="purchase-summary-grid supplier-payment-preview">
+              {(currentReport.summary?.(rows) || []).map(([label, value, featured]) => <SummaryMetric featured={featured} key={label} label={label} value={value} />)}
+            </div>
+            <DataTable headers={currentReport.headers}>
+              {rows.map((row, index) => currentReport.render(row, index))}
+            </DataTable>
+            {rows.length === 0 && <div className="cart-empty">No records found for the selected filters.</div>}
+          </PrintableReport>
+        </ModuleCard>
+      </section>
+    );
+  }
+  if (currentCategory) {
+    return (
+      <section className="settings-layout">
+        <ModuleCard eyebrow="Report Category" title={currentCategory.title} subtitle={currentCategory.description}>
+          <div className="button-row">
+            <button className="secondary-button" onClick={() => setSelectedCategory("")}>Back to Report Center</button>
+          </div>
+        </ModuleCard>
+        <section className="report-center-grid">
+          {currentCategory.reports.map((reportId) => (
+            <button className="report-menu-card" key={reportId} onClick={() => { setSearch(""); setSelectedReport(reportId); }}>
+              <Icon name={currentCategory.icon} size={22} />
+              <strong>{reports[reportId].title}</strong>
+              <span>Open report workspace</span>
+            </button>
+          ))}
+        </section>
+      </section>
+    );
+  }
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow="Reports" title="Business Reports" subtitle="Operational summaries generated from live sales, purchases, suppliers, customers and discounts.">
-        <div className="ledger-toolbar">
-          <Field label="Report Range">
-            <select value={range} onChange={(event) => setRange(event.target.value)}>
-              <option value="today">Today</option>
-              <option value="yesterday">Yesterday</option>
-              <option value="week">This Week</option>
-              <option value="month">This Month</option>
-              <option value="custom">Custom Date Range</option>
-            </select>
-          </Field>
-          {range === "custom" && (
-            <>
-              <Field label="Date From"><input type="date" value={customRange.date_from} onChange={(event) => setCustomRange({ ...customRange, date_from: event.target.value })} /></Field>
-              <Field label="Date To"><input type="date" value={customRange.date_to} onChange={(event) => setCustomRange({ ...customRange, date_to: event.target.value })} /></Field>
-            </>
-          )}
-          <Field label="Search / Filter"><input placeholder="Search reports" value={search} onChange={(event) => setSearch(event.target.value)} /></Field>
-          <button className="secondary-button" onClick={refreshReports}>Refresh Reports</button>
+      <ModuleCard eyebrow="Report Center" title="Business Report Center" subtitle="Choose a report category first. Each report opens in its own focused workspace.">
+        <div className="purchase-summary-grid supplier-payment-preview">
+          <SummaryMetric label="Categories" value={categories.length} featured />
+          <SummaryMetric label="Available Reports" value={Object.keys(reports).length} />
+          <SummaryMetric label="Current Range" value={range === "custom" ? "Custom" : range} />
         </div>
       </ModuleCard>
-      <ModuleCard eyebrow="Sales Report" title="Sales by Date" subtitle="Completed invoices only; cancelled bills are excluded.">
-        <PrintableReport title="Sales Report">
-          <div className="purchase-summary-grid supplier-payment-preview">
-            <SummaryMetric label="Sales" value={currency.format(totalOf(salesRows, "total_sales"))} featured />
-            <SummaryMetric label="Transactions" value={totalOf(salesRows, "transaction_count")} />
-            <SummaryMetric label="Profit" value={currency.format(totalOf(salesRows, "total_profit"))} />
-          </div>
-          <DataTable headers={["Date", "Transactions", "Sales", "Cost", "Profit"]}>
-            {salesRows.map((row) => <tr key={row.sale_date}><td>{row.sale_date}</td><td>{row.transaction_count}</td><td>{currency.format(Number(row.total_sales || 0))}</td><td>{currency.format(Number(row.total_cost || 0))}</td><td className="profit-cell">{currency.format(Number(row.total_profit || 0))}</td></tr>)}
-          </DataTable>
-        </PrintableReport>
-      </ModuleCard>
-      <ModuleCard eyebrow="Purchase Report" title="Purchases by Date" subtitle="Gross purchase, rebates, net purchase cost and balance.">
-        <PrintableReport title="Purchase Report">
-          <div className="purchase-summary-grid supplier-payment-preview">
-            <SummaryMetric label="Net Purchases" value={currency.format(totalOf(purchaseRows, "net_purchase"))} featured />
-            <SummaryMetric label="Rebate" value={currency.format(totalOf(purchaseRows, "rebate_received"))} />
-            <SummaryMetric label="Balance" value={currency.format(totalOf(purchaseRows, "balance_amount"))} />
-          </div>
-          <DataTable headers={["Date", "Bills", "Gross", "Rebate", "Net", "Paid", "Balance"]}>
-            {purchaseRows.map((row) => <tr key={row.purchase_date}><td>{row.purchase_date}</td><td>{row.purchase_count}</td><td>{currency.format(Number(row.gross_purchase || 0))}</td><td>{currency.format(Number(row.rebate_received || 0))}</td><td>{currency.format(Number(row.net_purchase || 0))}</td><td>{currency.format(Number(row.paid_amount || 0))}</td><td className="balance-cell">{currency.format(Number(row.balance_amount || 0))}</td></tr>)}
-          </DataTable>
-        </PrintableReport>
-      </ModuleCard>
-      <ModuleCard eyebrow="Expense Report" title="Expenses by Date" subtitle="Daily operating costs by category and payment mode.">
-        <PrintableReport title="Expense Report">
-          <div className="purchase-summary-grid supplier-payment-preview">
-            <SummaryMetric label="Total Expenses" value={currency.format(totalOf(expenseRows, "total_expense"))} featured />
-            <SummaryMetric label="Entries" value={totalOf(expenseRows, "expense_count")} />
-          </div>
-          <DataTable headers={["Date", "Category", "Payment", "Entries", "Amount"]}>
-            {expenseRows.map((row) => <tr key={`${row.expense_date}-${row.category}-${row.payment_mode}`}><td>{row.expense_date}</td><td>{row.category}</td><td><span className="tag">{row.payment_mode}</span></td><td>{row.expense_count}</td><td>{currency.format(Number(row.total_expense || 0))}</td></tr>)}
-          </DataTable>
-        </PrintableReport>
-      </ModuleCard>
-      <ModuleCard eyebrow="Payment Report" title="Payments and Receipts" subtitle="Supplier payments, supplier rebates and customer receipts.">
-        <PrintableReport title="Payment Report">
-          <div className="purchase-summary-grid supplier-payment-preview">
-            <SummaryMetric label="Payments" value={currency.format(totalOf(paymentRows, "payment_amount"))} featured />
-            <SummaryMetric label="Rebates" value={currency.format(totalOf(paymentRows, "rebate_amount"))} />
-          </div>
-          <DataTable headers={["Date", "Type", "Party", "Payment", "Rebate", "Mode", "Status", "Reference"]}>
-            {paymentRows.map((row, index) => <tr key={`${row.payment_date}-${row.party_name}-${index}`}><td>{row.payment_date}</td><td><span className="tag">{row.payment_type}</span></td><td className="primary-cell">{row.party_name}</td><td>{currency.format(Number(row.payment_amount || 0))}</td><td>{currency.format(Number(row.rebate_amount || 0))}</td><td>{row.payment_mode}</td><td><span className={row.cancelled ? "stock-low" : "stock-ok"}>{row.cancelled ? "Cancelled" : "Active"}</span></td><td>{row.reference_number || "-"}</td></tr>)}
-          </DataTable>
-        </PrintableReport>
-      </ModuleCard>
-      <ModuleCard eyebrow="Stock Report" title="Current Stock Valuation" subtitle="Active inventory batches only; cancelled purchase batches are excluded.">
-        <PrintableReport title="Stock Report">
-          <div className="purchase-summary-grid supplier-payment-preview">
-            <SummaryMetric label="Stock Value" value={currency.format(totalOf(stockRows, "stock_value"))} featured />
-            <SummaryMetric label="Products" value={stockRows.length} />
-            <SummaryMetric label="Low Stock Items" value={stockRows.filter((row) => Number(row.current_stock || 0) <= Number(row.minimum_stock || 0)).length} />
-          </div>
-          <DataTable headers={["Product", "Category", "Stock", "Minimum", "Unit", "Value"]}>
-            {stockRows.map((row) => <tr key={row.product_id}><td className="primary-cell">{row.product_name}</td><td>{row.category}</td><td>{Number(row.current_stock || 0).toLocaleString("en-IN")}</td><td>{row.minimum_stock || 0}</td><td>{row.unit}</td><td>{currency.format(Number(row.stock_value || 0))}</td></tr>)}
-          </DataTable>
-        </PrintableReport>
-      </ModuleCard>
-      <ModuleCard eyebrow="Ledger Report" title="Customer and Supplier Ledger" subtitle="Purchases, supplier payments, customer sales and receipts within the selected range.">
-        <PrintableReport title="Ledger Report">
-          <div className="purchase-summary-grid supplier-payment-preview">
-            <SummaryMetric label="Debits" value={currency.format(totalOf(ledgerRows, "debit"))} featured />
-            <SummaryMetric label="Credits" value={currency.format(totalOf(ledgerRows, "credit"))} />
-            <SummaryMetric label="Rows" value={ledgerRows.length} />
-          </div>
-          <DataTable headers={["Date", "Type", "Party", "Debit", "Credit", "Status", "Remarks"]}>
-            {ledgerRows.map((row, index) => <tr key={`${row.date}-${row.transaction_type}-${index}`}><td>{row.date}</td><td><span className="tag">{row.transaction_type}</span></td><td className="primary-cell">{row.party_name}</td><td>{currency.format(Number(row.debit || 0))}</td><td>{currency.format(Number(row.credit || 0))}</td><td>{row.status || "-"}</td><td>{row.remarks || "-"}</td></tr>)}
-          </DataTable>
-        </PrintableReport>
-      </ModuleCard>
-      <ModuleCard eyebrow="Day-to-Day Report" title="Daily Business Position" subtitle="Daily sales, purchase, expense, return and waste performance.">
-        <PrintableReport title="Day-to-Day Report">
-          <div className="purchase-summary-grid supplier-payment-preview">
-            <SummaryMetric label="Sales" value={currency.format(totalOf(dayRows, "sales"))} featured />
-            <SummaryMetric label="Expenses" value={currency.format(totalOf(dayRows, "expenses"))} />
-            <SummaryMetric label="Net Profit" value={currency.format(totalOf(dayRows, "net_profit"))} />
-          </div>
-          <DataTable headers={["Date", "Transactions", "Sales", "Purchases", "Expenses", "Returns", "Waste", "Net Profit"]}>
-            {dayRows.map((row) => <tr key={row.date}><td>{row.date}</td><td>{row.transactions}</td><td>{currency.format(Number(row.sales || 0))}</td><td>{currency.format(Number(row.purchases || 0))}</td><td>{currency.format(Number(row.expenses || 0))}</td><td>{currency.format(Number(row.returns || 0))}</td><td>{currency.format(Number(row.waste || 0))}</td><td className="profit-cell">{currency.format(Number(row.net_profit || 0))}</td></tr>)}
-          </DataTable>
-        </PrintableReport>
-      </ModuleCard>
-      <ModuleCard eyebrow="Return Report" title="Sale Returns" subtitle="Return value, return quantity and return counts by date.">
-        <PrintableReport title="Sale Return Report">
-          <div className="purchase-summary-grid supplier-payment-preview">
-            <SummaryMetric label="Return Value" value={currency.format(totalOf(returnRows, "return_value"))} featured />
-            <SummaryMetric label="Return Quantity" value={totalOf(returnRows, "return_quantity")} />
-          </div>
-          <DataTable headers={["Date", "Returns", "Return Quantity", "Return Value"]}>
-            {returnRows.map((row) => <tr key={row.return_date}><td>{row.return_date}</td><td>{row.return_count}</td><td>{Number(row.return_quantity || 0).toLocaleString("en-IN")}</td><td>{currency.format(Number(row.return_value || 0))}</td></tr>)}
-          </DataTable>
-        </PrintableReport>
-      </ModuleCard>
-      <ModuleCard eyebrow="Reason Analysis" title="Return Reason Analysis" subtitle="Reasons driving product returns.">
-        <PrintableReport title="Return Reason Analysis">
-          <DataTable headers={["Reason", "Returns", "Return Value"]}>
-            {(data.returnReasonReport || []).map((row) => <tr key={row.return_reason}><td className="primary-cell">{row.return_reason}</td><td>{row.return_count}</td><td>{currency.format(Number(row.return_value || 0))}</td></tr>)}
-          </DataTable>
-        </PrintableReport>
-      </ModuleCard>
-      <ModuleCard eyebrow="Waste Report" title="Daily and Monthly Waste" subtitle="Waste quantity and FIFO cost by date and waste type.">
-        <PrintableReport title="Waste Report">
-          <div className="purchase-summary-grid supplier-payment-preview">
-            <SummaryMetric label="Waste Cost" value={currency.format(totalOf(wasteRows, "waste_cost"))} featured />
-            <SummaryMetric label="Waste Quantity" value={totalOf(wasteRows, "waste_quantity")} />
-          </div>
-          <DataTable headers={["Date", "Waste Type", "Entries", "Quantity", "Cost"]}>
-            {wasteRows.map((row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td><span className="tag">{row.waste_type}</span></td><td>{row.entry_count}</td><td>{Number(row.waste_quantity || 0).toLocaleString("en-IN")}</td><td>{currency.format(Number(row.waste_cost || 0))}</td></tr>)}
-          </DataTable>
-        </PrintableReport>
-      </ModuleCard>
-      <ModuleCard eyebrow="Product Wise Waste" title="Most Wasted Products" subtitle="Product wise waste quantity and cost.">
-        <PrintableReport title="Product Wise Waste Report">
-          <DataTable headers={["Product", "Quantity", "Cost"]}>
-            {(data.wasteProductReport || []).map((row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{Number(row.waste_quantity || 0).toLocaleString("en-IN")}</td><td>{currency.format(Number(row.waste_cost || 0))}</td></tr>)}
-          </DataTable>
-        </PrintableReport>
-      </ModuleCard>
-      <ModuleCard eyebrow="Supplier Outstanding" title="Supplier Outstanding Report" subtitle="Supplier payable balances after payments and rebates.">
-        <PrintableReport title="Supplier Outstanding Report">
-          <DataTable headers={["Supplier", "Purchases", "Paid", "Rebate", "Outstanding"]}>
-            {(data.supplierOutstandingReport || []).map((row) => <tr key={row.id}><td className="primary-cell">{row.supplier_name}</td><td>{currency.format(Number(row.total_purchases || 0))}</td><td>{currency.format(Number(row.total_paid || 0))}</td><td>{currency.format(Number(row.total_rebate_received || 0))}</td><td className="balance-cell">{currency.format(Number(row.outstanding_balance || 0))}</td></tr>)}
-          </DataTable>
-        </PrintableReport>
-      </ModuleCard>
-      <ModuleCard eyebrow="Customer Outstanding" title="Customer Outstanding Report" subtitle="Customer receivable balances after receipts.">
-        <PrintableReport title="Customer Outstanding Report">
-          <DataTable headers={["Customer", "Type", "Sales", "Paid", "Outstanding"]}>
-            {(data.customerOutstandingReport || []).map((row) => <tr key={row.id}><td className="primary-cell">{row.customer_name}</td><td><span className="tag">{row.customer_type}</span></td><td>{currency.format(Number(row.total_sales || 0))}</td><td>{currency.format(Number(row.total_paid || 0))}</td><td className="balance-cell">{currency.format(Number(row.outstanding_balance || 0))}</td></tr>)}
-          </DataTable>
-        </PrintableReport>
-      </ModuleCard>
-      <ModuleCard eyebrow="Discount Report" title="Discounts Given" subtitle="Bill and item discounts grouped by date and payment mode.">
-        <PrintableReport title="Discount Report">
-          <DataTable headers={["Date", "Payment", "Invoices", "Item Discount", "Bill Discount", "Total Discount"]}>
-            {(data.discountReport || []).map((row) => <tr key={`${row.sale_date}-${row.payment_mode}`}><td>{row.sale_date}</td><td><span className="tag">{row.payment_mode}</span></td><td>{row.invoice_count}</td><td>{currency.format(Number(row.item_discount || 0))}</td><td>{currency.format(Number(row.bill_discount || 0))}</td><td className="profit-cell">{currency.format(Number(row.total_discount || 0))}</td></tr>)}
-          </DataTable>
-        </PrintableReport>
-      </ModuleCard>
-      <ModuleCard eyebrow="Balance Sheet" title="Basic Balance Sheet" subtitle="Assets, liabilities and net position prepared from live ERP balances.">
-        <PrintableReport title="Balance Sheet">
-          <div className="purchase-summary-grid supplier-payment-preview">
-            <SummaryMetric label="Cash" value={currency.format(Number(data.balanceSheet?.cash || 0))} />
-            <SummaryMetric label="Bank" value={currency.format(Number(data.balanceSheet?.bank || 0))} />
-            <SummaryMetric label="Inventory" value={currency.format(Number(data.balanceSheet?.inventory || 0))} />
-            <SummaryMetric label="Customer Receivable" value={currency.format(Number(data.balanceSheet?.customerReceivable || 0))} />
-            <SummaryMetric label="Supplier Payable" value={currency.format(Number(data.balanceSheet?.supplierPayable || 0))} />
-            <SummaryMetric label="Net Position" value={currency.format(Number(data.balanceSheet?.netPosition || 0))} featured />
-          </div>
-        </PrintableReport>
-      </ModuleCard>
-      <ModuleCard eyebrow="Profit & Loss" title="P&L Report" subtitle="Sales less FIFO purchase cost and expenses, plus supplier rebate received.">
-        <PrintableReport title="Profit and Loss Report">
-          <div className="purchase-summary-grid supplier-payment-preview">
-            <SummaryMetric label="Sales Revenue" value={currency.format(Number(data.profitLoss?.salesRevenue || 0))} />
-            <SummaryMetric label="Purchase Cost" value={currency.format(Number(data.profitLoss?.purchaseCost || 0))} />
-            <SummaryMetric label="Expenses" value={currency.format(Number(data.profitLoss?.expenses || 0))} />
-            <SummaryMetric label="Supplier Rebate Received" value={currency.format(Number(data.profitLoss?.supplierRebateReceived || 0))} positive />
-            <SummaryMetric label="Gross Profit" value={currency.format(Number(data.profitLoss?.grossProfit || 0))} />
-            <SummaryMetric label="Net Profit" value={currency.format(Number(data.profitLoss?.netProfit || 0))} featured />
-          </div>
-        </PrintableReport>
-      </ModuleCard>
+      <section className="report-center-grid">
+        {categories.map((category) => (
+          <button className="report-category-card" key={category.id} onClick={() => setSelectedCategory(category.id)}>
+            <span className="report-category-icon"><Icon name={category.icon} size={24} /></span>
+            <strong>{category.title}</strong>
+            <span>{category.description}</span>
+            <em>{category.reports.length} reports</em>
+          </button>
+        ))}
+      </section>
     </section>
   );
 }

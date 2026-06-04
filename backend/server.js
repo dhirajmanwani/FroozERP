@@ -3946,6 +3946,15 @@ app.get("/reports/summary", async (req, res) => {
       stockResult,
       ledgerResult,
       dayToDayResult,
+      salesProductResult,
+      salesCustomerResult,
+      salesHistoryResult,
+      salesChangeResult,
+      purchaseProductResult,
+      purchaseSupplierResult,
+      purchaseChangeResult,
+      returnHistoryResult,
+      stockMovementResult,
       balanceSheetResult,
       profitLossResult,
     ] = await Promise.all([
@@ -4242,6 +4251,182 @@ app.get("/reports/summary", async (req, res) => {
       pool.query(
         `
         SELECT
+          p.product_name,
+          p.unit,
+          SUM(si.quantity) AS quantity_sold,
+          SUM(si.net_amount) AS revenue,
+          SUM(si.cost_amount) AS cost,
+          SUM(si.profit) AS profit
+        FROM sale_items si
+        JOIN sales s ON s.id = si.sale_id
+        JOIN products p ON p.id = si.product_id
+        WHERE s.sale_status <> 'CANCELLED'
+          AND s.sale_date BETWEEN $1 AND $2
+        GROUP BY p.product_name, p.unit
+        ORDER BY quantity_sold DESC, revenue DESC
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
+          COALESCE(customer_name, 'Walk-in Customer') AS customer_name,
+          COALESCE(customer_mobile, '') AS customer_mobile,
+          COUNT(*)::INTEGER AS invoice_count,
+          SUM(total_amount) AS total_sales,
+          SUM(profit) AS total_profit
+        FROM sales
+        WHERE sale_status <> 'CANCELLED'
+          AND sale_date BETWEEN $1 AND $2
+        GROUP BY COALESCE(customer_name, 'Walk-in Customer'), COALESCE(customer_mobile, '')
+        ORDER BY total_sales DESC, invoice_count DESC
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
+          s.id,
+          s.invoice_no,
+          s.sale_date,
+          s.created_at,
+          s.sale_status,
+          COALESCE(s.customer_name, 'Walk-in Customer') AS customer_name,
+          s.customer_mobile,
+          s.payment_mode,
+          s.gross_amount,
+          COALESCE(s.item_discount_amount, 0) + COALESCE(s.invoice_discount_amount, 0) AS discount_amount,
+          s.total_amount,
+          s.total_cost,
+          s.profit
+        FROM sales s
+        WHERE s.sale_date BETWEEN $1 AND $2
+        ORDER BY s.sale_date DESC, s.created_at DESC, s.id DESC
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
+          s.id,
+          s.invoice_no,
+          s.sale_date,
+          s.sale_status,
+          s.total_amount,
+          s.cancelled_at,
+          s.cancellation_reason,
+          s.edit_reason,
+          u.full_name AS changed_by_name,
+          s.edited_at
+        FROM sales s
+        LEFT JOIN users u ON u.id = COALESCE(s.cancelled_by, s.edited_by)
+        WHERE (s.sale_status IN ('EDITED', 'CANCELLED') OR s.edited_at IS NOT NULL OR s.cancelled_at IS NOT NULL)
+          AND s.sale_date BETWEEN $1 AND $2
+        ORDER BY COALESCE(s.cancelled_at, s.edited_at, s.created_at) DESC
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
+          p.product_name,
+          p.unit,
+          SUM(pi.quantity) AS quantity_purchased,
+          SUM(pi.net_payable) AS net_purchase,
+          SUM(pi.mandi_tax_amount) AS mandi_tax,
+          SUM(pi.rebate_amount) AS rebate
+        FROM purchase_items pi
+        JOIN purchases pur ON pur.id = pi.purchase_id
+        JOIN products p ON p.id = pi.product_id
+        WHERE COALESCE(pur.purchase_status, 'ACTIVE') <> 'CANCELLED'
+          AND pur.purchase_date BETWEEN $1 AND $2
+        GROUP BY p.product_name, p.unit
+        ORDER BY quantity_purchased DESC, net_purchase DESC
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
+          supplier_name,
+          COUNT(*)::INTEGER AS purchase_count,
+          SUM(COALESCE(NULLIF(gross_amount, 0), total_amount, 0)) AS gross_purchase,
+          SUM(COALESCE(rebate_amount, 0)) AS rebate_received,
+          SUM(COALESCE(NULLIF(net_payable, 0), total_amount, 0)) AS net_purchase,
+          SUM(COALESCE(paid_amount, 0)) AS paid_amount,
+          SUM(COALESCE(balance_amount, 0)) AS balance_amount
+        FROM purchases
+        WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
+          AND purchase_date BETWEEN $1 AND $2
+        GROUP BY supplier_name
+        ORDER BY net_purchase DESC
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
+          p.id,
+          p.purchase_date,
+          p.supplier_name,
+          p.purchase_status,
+          p.net_payable,
+          p.cancelled_at,
+          p.cancellation_reason,
+          p.edited_at,
+          p.edit_reason,
+          u.full_name AS changed_by_name
+        FROM purchases p
+        LEFT JOIN users u ON u.id = COALESCE(p.cancelled_by, p.edited_by)
+        WHERE (p.purchase_status IN ('EDITED', 'CANCELLED') OR p.edited_at IS NOT NULL OR p.cancelled_at IS NOT NULL)
+          AND p.purchase_date BETWEEN $1 AND $2
+        ORDER BY COALESCE(p.cancelled_at, p.edited_at, p.created_at) DESC
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
+          sr.return_no,
+          sr.return_date,
+          s.invoice_no,
+          COALESCE(sr.customer_name, 'Walk-in Customer') AS customer_name,
+          sr.customer_mobile,
+          sr.refund_type,
+          sr.total_return_amount,
+          sr.return_reason,
+          STRING_AGG(p.product_name || ' x ' || sri.return_quantity, ', ' ORDER BY sri.id) AS items
+        FROM sale_returns sr
+        LEFT JOIN sales s ON s.id = sr.sale_id
+        LEFT JOIN sale_return_items sri ON sri.sale_return_id = sr.id
+        LEFT JOIN products p ON p.id = sri.product_id
+        WHERE sr.return_date BETWEEN $1 AND $2
+        GROUP BY sr.id, s.invoice_no
+        ORDER BY sr.return_date DESC, sr.id DESC
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
+          st.created_at::date AS movement_date,
+          p.product_name,
+          p.unit,
+          st.transaction_type,
+          SUM(st.quantity) AS quantity,
+          COUNT(*)::INTEGER AS movement_count,
+          STRING_AGG(DISTINCT COALESCE(st.remarks, ''), ', ') AS remarks
+        FROM stock_transactions st
+        JOIN products p ON p.id = st.product_id
+        WHERE st.created_at::date BETWEEN $1 AND $2
+        GROUP BY st.created_at::date, p.product_name, p.unit, st.transaction_type
+        ORDER BY movement_date DESC, p.product_name, st.transaction_type
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
           COALESCE((SELECT SUM(amount) FROM sale_payments sp JOIN sales s ON s.id = sp.sale_id WHERE s.sale_status <> 'CANCELLED'), 0)
             + COALESCE((SELECT SUM(payment_amount) FROM customer_payments WHERE cancelled = FALSE), 0)
             - COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE cancelled = FALSE), 0)
@@ -4309,6 +4494,15 @@ app.get("/reports/summary", async (req, res) => {
       stockReport: stockResult.rows,
       ledgerReport: ledgerResult.rows,
       dayToDayReport: dayToDayResult.rows,
+      salesProductReport: salesProductResult.rows,
+      salesCustomerReport: salesCustomerResult.rows,
+      salesHistoryReport: salesHistoryResult.rows,
+      salesChangeReport: salesChangeResult.rows,
+      purchaseProductReport: purchaseProductResult.rows,
+      purchaseSupplierReport: purchaseSupplierResult.rows,
+      purchaseChangeReport: purchaseChangeResult.rows,
+      returnHistoryReport: returnHistoryResult.rows,
+      stockMovementReport: stockMovementResult.rows,
       balanceSheet: {
         cash: roundCurrency(Number(balanceSheet.cash_bank || 0)),
         bank: 0,
