@@ -7,6 +7,12 @@ const currency = new Intl.NumberFormat("en-IN", {
   style: "currency",
   currency: "INR",
 });
+const receiptCurrency = new Intl.NumberFormat("en-IN", {
+  style: "currency",
+  currency: "INR",
+  minimumFractionDigits: 0,
+  maximumFractionDigits: 2,
+});
 const roundUi = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 const defaultPurchaseRules = {
   mandiTaxRules: [],
@@ -3368,6 +3374,10 @@ function TotalLine({ label, muted, total, value }) {
   return <div className={`${total ? "total-line total-line-main" : "total-line"} ${muted ? "total-line-muted" : ""}`}><span>{label}</span><strong>{currency.format(value)}</strong></div>;
 }
 
+function ThermalTotalLine({ label, total, value }) {
+  return <div className={total ? "total-line total-line-main" : "total-line"}><span>{label}</span><strong>{receiptCurrency.format(value)}</strong></div>;
+}
+
 function SaleEditModal({ invoice, onClose, onSaved, products, user }) {
   const [items, setItems] = useState(() => (invoice.items || []).map((item) => ({
     product_id: item.product_id,
@@ -3749,18 +3759,18 @@ function InvoiceModal({ invoice, onClose, printSettings = {} }) {
                 <tr key={item.product_id || item.id}>
                   <td>{item.product_name}</td>
                   <td>{item.quantity} {item.unit}</td>
-                  <td>{currency.format(Number(item.selling_rate))}</td>
-                  <td>{currency.format(Number(item.discount_amount || 0))}</td>
-                  <td>{currency.format(Number(item.net_amount))}</td>
+                  <td>{receiptCurrency.format(Number(item.selling_rate))}</td>
+                  <td>{receiptCurrency.format(Number(item.discount_amount || 0))}</td>
+                  <td>{receiptCurrency.format(Number(item.net_amount))}</td>
                 </tr>
               ))}
             </tbody>
           </table>
           <section className="invoice-total-box">
-            <TotalLine label="Subtotal" value={Number(invoice.gross_amount)} />
-            <TotalLine label="Discount" value={-(Number(invoice.item_discount_amount) + Number(invoice.invoice_discount_amount))} />
-            <TotalLine label="Tax" value={Number(invoice.tax_amount || 0)} />
-            <TotalLine label="Grand Total" total value={Number(invoice.total_amount)} />
+            <ThermalTotalLine label="Gross Total" value={Number(invoice.gross_amount)} />
+            <ThermalTotalLine label="Discount" value={-(Number(invoice.item_discount_amount) + Number(invoice.invoice_discount_amount))} />
+            <ThermalTotalLine label="Tax" value={Number(invoice.tax_amount || 0)} />
+            <ThermalTotalLine label="Net Payable" total value={Number(invoice.total_amount)} />
           </section>
           <footer className="invoice-footer">
             <strong>Thank you for shopping with FEEL THE FREAKIN&apos; FROOZ.</strong>
