@@ -143,6 +143,8 @@ const initializeDatabase = async () => {
     ALTER TABLE products ADD COLUMN IF NOT EXISTS selling_rate_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS selling_rate_updated_by INTEGER REFERENCES users(id);
     UPDATE products SET origin_type = 'LOCAL' WHERE origin_type IS NULL;
+    CREATE INDEX IF NOT EXISTS products_name_search_lower_idx
+      ON products (LOWER(product_name));
     CREATE UNIQUE INDEX IF NOT EXISTS products_barcode_unique_idx
       ON products (barcode)
       WHERE barcode IS NOT NULL AND barcode <> '';
@@ -169,6 +171,15 @@ const initializeDatabase = async () => {
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS purchase_type VARCHAR(20) DEFAULT 'CREDIT';
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS payment_mode VARCHAR(30);
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS payment_reference_number VARCHAR(120);
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS purchase_status VARCHAR(20) DEFAULT 'ACTIVE';
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS remarks TEXT;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS edited_by INTEGER REFERENCES users(id);
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS edit_reason TEXT;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS cancelled_by INTEGER REFERENCES users(id);
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
+    UPDATE purchases SET purchase_status = 'ACTIVE' WHERE purchase_status IS NULL;
 
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS basic_amount NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS mandi_tax_amount NUMERIC(14, 2) DEFAULT 0;
@@ -190,6 +201,9 @@ const initializeDatabase = async () => {
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS net_payable NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS payment_timing VARCHAR(120);
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS balance_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS purchase_id INTEGER;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS batch_status VARCHAR(20) DEFAULT 'ACTIVE';
+    UPDATE inventory_batches SET batch_status = 'ACTIVE' WHERE batch_status IS NULL;
     UPDATE inventory_batches SET effective_cost_per_unit = purchase_rate WHERE effective_cost_per_unit IS NULL;
 
     CREATE TABLE IF NOT EXISTS mandi_tax_rules (
@@ -221,6 +235,28 @@ const initializeDatabase = async () => {
       changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS product_audit_trail (
+      id SERIAL PRIMARY KEY,
+      product_id INTEGER NOT NULL REFERENCES products(id),
+      action VARCHAR(30) NOT NULL,
+      old_value JSONB,
+      new_value JSONB,
+      reason TEXT NOT NULL,
+      edited_by INTEGER REFERENCES users(id),
+      edited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS purchase_audit_trail (
+      id SERIAL PRIMARY KEY,
+      purchase_id INTEGER NOT NULL REFERENCES purchases(id),
+      action VARCHAR(30) NOT NULL,
+      old_value JSONB,
+      new_value JSONB,
+      reason TEXT NOT NULL,
+      edited_by INTEGER REFERENCES users(id),
+      edited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE TABLE IF NOT EXISTS business_settings (
       id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
       business_name VARCHAR(180) NOT NULL DEFAULT 'FroozERP Retail',
@@ -232,9 +268,15 @@ const initializeDatabase = async () => {
       logo_url TEXT,
       compact_logo_text VARCHAR(40) DEFAULT 'FTF',
       invoice_footer_text TEXT DEFAULT 'Thank you for shopping with FEEL THE FREAKIN'' FROOZ.',
+      default_printer_type VARCHAR(20) DEFAULT 'THERMAL',
+      receipt_width VARCHAR(10) DEFAULT '80MM',
+      auto_print_after_billing BOOLEAN DEFAULT FALSE,
       updated_by INTEGER REFERENCES users(id),
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS default_printer_type VARCHAR(20) DEFAULT 'THERMAL';
+    ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS receipt_width VARCHAR(10) DEFAULT '80MM';
+    ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS auto_print_after_billing BOOLEAN DEFAULT FALSE;
 
     CREATE TABLE IF NOT EXISTS sale_rate_settings (
       id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -314,6 +356,8 @@ const initializeDatabase = async () => {
     ALTER TABLE customers ADD COLUMN IF NOT EXISTS account_number VARCHAR(80);
     ALTER TABLE customers ADD COLUMN IF NOT EXISTS ifsc_code VARCHAR(30);
     ALTER TABLE customers ADD COLUMN IF NOT EXISTS upi_id VARCHAR(120);
+    CREATE INDEX IF NOT EXISTS customers_name_mobile_search_lower_idx
+      ON customers (LOWER(customer_name), COALESCE(mobile_number, ''));
 
     CREATE TABLE IF NOT EXISTS accounts (
       id SERIAL PRIMARY KEY,
@@ -335,6 +379,8 @@ const initializeDatabase = async () => {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE INDEX IF NOT EXISTS accounts_name_mobile_search_lower_idx
+      ON accounts (LOWER(account_name), COALESCE(mobile_number, ''));
 
     CREATE TABLE IF NOT EXISTS customer_payments (
       id SERIAL PRIMARY KEY,
@@ -623,8 +669,17 @@ const initializeDatabase = async () => {
     CREATE INDEX IF NOT EXISTS suppliers_name_search_idx
       ON suppliers (LOWER(supplier_name), LOWER(COALESCE(firm_name, '')));
 
+    CREATE INDEX IF NOT EXISTS suppliers_name_firm_search_lower_idx
+      ON suppliers (LOWER(supplier_name), LOWER(COALESCE(firm_name, '')));
+
     CREATE INDEX IF NOT EXISTS purchases_supplier_id_idx
       ON purchases (supplier_id);
+
+    CREATE INDEX IF NOT EXISTS purchase_audit_purchase_idx
+      ON purchase_audit_trail (purchase_id, edited_at DESC, id DESC);
+
+    CREATE INDEX IF NOT EXISTS product_audit_product_idx
+      ON product_audit_trail (product_id, edited_at DESC, id DESC);
 
     CREATE INDEX IF NOT EXISTS supplier_payments_supplier_date_idx
       ON supplier_payments (supplier_id, payment_date, id);
@@ -671,6 +726,12 @@ const initializeDatabase = async () => {
         ALTER TABLE inventory_batches
           ADD CONSTRAINT inventory_batches_supplier_id_fkey
           FOREIGN KEY (supplier_id) REFERENCES suppliers(id);
+      END IF;
+
+      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'inventory_batches_purchase_id_fkey') THEN
+        ALTER TABLE inventory_batches
+          ADD CONSTRAINT inventory_batches_purchase_id_fkey
+          FOREIGN KEY (purchase_id) REFERENCES purchases(id);
       END IF;
     END $$;
 
@@ -734,6 +795,12 @@ const initializeDatabase = async () => {
     WHERE ib.supplier_id IS NULL
       AND ib.supplier_name IS NOT NULL
       AND LOWER(TRIM(ib.supplier_name)) = matched.supplier_key;
+
+    UPDATE inventory_batches ib
+    SET purchase_id = matched.id
+    FROM purchases matched
+    WHERE ib.purchase_id IS NULL
+      AND ib.batch_no LIKE ('%-' || matched.id::TEXT);
   `);
 };
 
@@ -770,6 +837,7 @@ const getSupplierSummaryRows = async ({ active, search, supplierId } = {}) => {
         SUM(COALESCE(paid_amount, 0)) AS purchase_paid
       FROM purchases
       WHERE supplier_id IS NOT NULL
+        AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
       GROUP BY supplier_id
     ),
     payment_summary AS (
@@ -1048,10 +1116,10 @@ const getDashboardSummary = async () => {
         COALESCE((SELECT SUM(cost_amount) FROM waste_entries WHERE waste_date = CURRENT_DATE), 0) AS "todayWaste",
         COALESCE((SELECT SUM(cost_amount) FROM waste_entries WHERE waste_date >= DATE_TRUNC('month', CURRENT_DATE)::date), 0) AS "monthlyWaste",
         COALESCE((SELECT SUM(quantity) FROM waste_entries WHERE waste_date >= DATE_TRUNC('month', CURRENT_DATE)::date), 0) AS "monthlyWasteQuantity",
-        COALESCE((SELECT SUM(rebate_amount) FROM purchases), 0)
+        COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0)
           + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE), 0) AS "totalRebateReceived",
         COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE payment_date = CURRENT_DATE AND cancelled = FALSE), 0)
-          + COALESCE((SELECT SUM(paid_amount) FROM purchases WHERE COALESCE(payment_date, purchase_date) = CURRENT_DATE), 0) AS "todaySupplierPayments",
+          + COALESCE((SELECT SUM(paid_amount) FROM purchases WHERE COALESCE(payment_date, purchase_date) = CURRENT_DATE AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0) AS "todaySupplierPayments",
         COALESCE((SELECT COUNT(*) FROM suppliers), 0) AS supplier_count,
         COALESCE((SELECT COUNT(*) FROM suppliers WHERE active = TRUE), 0) AS active_supplier_count
       `
@@ -1175,6 +1243,7 @@ const getDashboardPurchaseSalesComparison = async (dateFrom, dateTo) => {
       SELECT purchase_date::date AS day, SUM(COALESCE(NULLIF(net_payable, 0), total_amount, 0)) AS purchases
       FROM purchases
       WHERE purchase_date BETWEEN $1 AND $2
+        AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
       GROUP BY purchase_date
     )
     SELECT
@@ -1875,7 +1944,10 @@ app.put("/settings/business", async (req, res) => {
         logo_url = $7,
         compact_logo_text = $8,
         invoice_footer_text = $9,
-        updated_by = $10,
+        default_printer_type = $10,
+        receipt_width = $11,
+        auto_print_after_billing = $12,
+        updated_by = $13,
         updated_at = CURRENT_TIMESTAMP
       WHERE id = 1
       RETURNING *
@@ -1890,6 +1962,9 @@ app.put("/settings/business", async (req, res) => {
         nullableText(req.body.logo_url),
         nullableText(req.body.compact_logo_text) || "FTF",
         nullableText(req.body.invoice_footer_text) || "Thank you for shopping with FEEL THE FREAKIN' FROOZ.",
+        cleanText(req.body.default_printer_type).toUpperCase() === "A4" ? "A4" : "THERMAL",
+        cleanText(req.body.receipt_width).toUpperCase() === "58MM" ? "58MM" : "80MM",
+        req.body.auto_print_after_billing === true,
         manager.id,
       ]
     );
@@ -2240,6 +2315,8 @@ app.post("/products", async (req, res) => {
     if (!product_name?.trim() || !unit?.trim() || !parsedSellingRate || parsedMinimumStock === null || !["LOCAL", "IMPORTED"].includes(parsedOriginType)) {
       return res.status(400).json({ message: "Enter valid product details" });
     }
+    const duplicateResult = await pool.query("SELECT id FROM products WHERE LOWER(product_name) = LOWER($1) LIMIT 1", [product_name.trim()]);
+    if (duplicateResult.rows.length > 0) return res.status(409).json({ message: "This product already exists." });
 
     const result = await pool.query(
       `
@@ -2260,7 +2337,7 @@ app.post("/products", async (req, res) => {
   } catch (error) {
     console.error(error);
     if (error.code === "23505") {
-      return res.status(409).json({ message: "Barcode is already assigned to another product" });
+      return res.status(409).json({ message: "This product already exists." });
     }
     return res.status(500).json({ message: "Error Adding Product" });
   }
@@ -2286,6 +2363,11 @@ app.put("/products/:id", async (req, res) => {
       return res.status(404).json({ message: "Product not found" });
     }
     const current = currentResult.rows[0];
+    const duplicateResult = await client.query("SELECT id FROM products WHERE LOWER(product_name) = LOWER($1) AND id <> $2 LIMIT 1", [product_name.trim(), productId]);
+    if (duplicateResult.rows.length > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ message: "This product already exists." });
+    }
     const sellingRateChanged = Number(current.selling_rate) !== parsedSellingRate;
     const rateManager = sellingRateChanged ? await requireRateManager(updated_by, client) : null;
     if (sellingRateChanged && !rateManager) {
@@ -2320,15 +2402,68 @@ app.put("/products/:id", async (req, res) => {
         [productId, current.selling_rate, parsedSellingRate, rateManager.id, rate_change_reason?.trim() || "Product Master update"]
       );
     }
+    await client.query(
+      `
+      INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by)
+      VALUES ($1, 'EDIT', $2::jsonb, $3::jsonb, $4, $5)
+      `,
+      [productId, JSON.stringify(current), JSON.stringify(result.rows[0]), rate_change_reason?.trim() || "Product master update", parsePositiveInteger(updated_by) || rateManager?.id || null]
+    );
     await client.query("COMMIT");
     return res.json(result.rows[0]);
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
     if (error.code === "23505") {
-      return res.status(409).json({ message: "Barcode is already assigned to another product" });
+      return res.status(409).json({ message: "This product already exists." });
     }
     return res.status(500).json({ message: "Error Updating Product" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/products/:id/cancel", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const productId = parsePositiveInteger(req.params.id);
+    const userId = parsePositiveInteger(req.body.cancelled_by) || parsePositiveInteger(req.body.updated_by);
+    const reason = cleanText(req.body.reason);
+    const manager = await requireRateManager(userId, client);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can deactivate products" });
+    if (!productId || !reason) return res.status(400).json({ message: "Reason is required" });
+    await client.query("BEGIN");
+    const productResult = await client.query("SELECT * FROM products WHERE id = $1 FOR UPDATE", [productId]);
+    const product = productResult.rows[0];
+    if (!product) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Product not found" });
+    }
+    const usageResult = await client.query(
+      `
+      SELECT
+        COALESCE((SELECT COUNT(*) FROM purchase_items WHERE product_id = $1), 0)
+        + COALESCE((SELECT COUNT(*) FROM sale_items WHERE product_id = $1), 0)
+        + COALESCE((SELECT COUNT(*) FROM inventory_batches WHERE product_id = $1), 0)
+        + COALESCE((SELECT COUNT(*) FROM sale_return_items WHERE product_id = $1), 0)
+        + COALESCE((SELECT COUNT(*) FROM waste_entries WHERE product_id = $1), 0) AS usage_count
+      `,
+      [productId]
+    );
+    const result = await client.query("UPDATE products SET active = FALSE WHERE id = $1 RETURNING *", [productId]);
+    await client.query(
+      `
+      INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by)
+      VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, $6)
+      `,
+      [productId, Number(usageResult.rows[0].usage_count || 0) > 0 ? "DEACTIVATE" : "CANCEL", JSON.stringify(product), JSON.stringify(result.rows[0]), reason, manager.id]
+    );
+    await client.query("COMMIT");
+    return res.json({ success: true, product: result.rows[0], had_transactions: Number(usageResult.rows[0].usage_count || 0) > 0 });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Cancelling Product" });
   } finally {
     client.release();
   }
@@ -2699,6 +2834,11 @@ app.post("/accounts", async (req, res) => {
       return res.status(400).json({ message: "Enter valid account details" });
     }
     if (account.account_type === "CUSTOMER") {
+      const duplicate = await pool.query(
+        "SELECT id FROM customers WHERE LOWER(customer_name) = LOWER($1) AND COALESCE(mobile_number, '') = COALESCE($2, '') LIMIT 1",
+        [account.account_name, account.mobile_number]
+      );
+      if (duplicate.rows.length) return res.status(409).json({ message: "This customer already exists." });
       const result = await pool.query(
         `
         INSERT INTO customers (
@@ -2718,6 +2858,17 @@ app.post("/accounts", async (req, res) => {
       return res.status(201).json({ success: true, account_key: `CUSTOMER-${result.rows[0].id}` });
     }
     if (["SUPPLIER", "TRANSPORT_VENDOR", "COMMISSION_AGENT"].includes(account.account_type)) {
+      const duplicate = await pool.query(
+        `
+        SELECT id
+        FROM suppliers
+        WHERE LOWER(supplier_name) = LOWER($1)
+           OR ($2::TEXT IS NOT NULL AND LOWER(COALESCE(firm_name, '')) = LOWER($2))
+        LIMIT 1
+        `,
+        [account.account_name, account.firm_name]
+      );
+      if (duplicate.rows.length) return res.status(409).json({ message: "This supplier already exists." });
       const result = await pool.query(
         `
         INSERT INTO suppliers (
@@ -2756,6 +2907,9 @@ app.post("/accounts", async (req, res) => {
     return res.status(201).json({ success: true, account_key: `ACCOUNT-${result.rows[0].id}` });
   } catch (error) {
     console.error(error);
+    if (error.code === "23505") {
+      return res.status(409).json({ message: "This customer/supplier already exists." });
+    }
     return res.status(500).json({ message: "Error Saving Account" });
   }
 });
@@ -2769,6 +2923,11 @@ app.put("/accounts/:accountKey", async (req, res) => {
       return res.status(400).json({ message: "Enter valid account details" });
     }
     if (source === "CUSTOMER") {
+      const duplicate = await pool.query(
+        "SELECT id FROM customers WHERE id <> $3 AND LOWER(customer_name) = LOWER($1) AND COALESCE(mobile_number, '') = COALESCE($2, '') LIMIT 1",
+        [account.account_name, account.mobile_number, sourceId]
+      );
+      if (duplicate.rows.length) return res.status(409).json({ message: "This customer already exists." });
       const result = await pool.query(
         `
         UPDATE customers
@@ -2788,6 +2947,20 @@ app.put("/accounts/:accountKey", async (req, res) => {
       return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "Account not found" });
     }
     if (source === "SUPPLIER") {
+      const duplicate = await pool.query(
+        `
+        SELECT id
+        FROM suppliers
+        WHERE id <> $3
+          AND (
+            LOWER(supplier_name) = LOWER($1)
+            OR ($2::TEXT IS NOT NULL AND LOWER(COALESCE(firm_name, '')) = LOWER($2))
+          )
+        LIMIT 1
+        `,
+        [account.account_name, account.firm_name, sourceId]
+      );
+      if (duplicate.rows.length) return res.status(409).json({ message: "This supplier already exists." });
       const result = await pool.query(
         `
         UPDATE suppliers
@@ -2830,6 +3003,9 @@ app.put("/accounts/:accountKey", async (req, res) => {
     return res.status(400).json({ message: "Invalid account" });
   } catch (error) {
     console.error(error);
+    if (error.code === "23505") {
+      return res.status(409).json({ message: "This customer/supplier already exists." });
+    }
     return res.status(500).json({ message: "Error Updating Account" });
   }
 });
@@ -2933,6 +3109,7 @@ app.get("/accounts/ledger", async (req, res) => {
               p.created_at
             FROM purchases p
             WHERE p.supplier_id = $1
+              AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
             UNION ALL
             SELECT sp.payment_date AS date,
               CASE WHEN sp.rebate_amount > 0 AND sp.payment_amount = 0 THEN 'Rebate' ELSE 'Supplier Payment' END AS transaction_type,
@@ -3310,6 +3487,17 @@ app.post("/suppliers", async (req, res) => {
     if (!supplier.supplier_name || supplier.opening_balance === null || !SUPPLIER_TYPES.has(supplier.supplier_type)) {
       return res.status(400).json({ message: "Enter valid supplier account details" });
     }
+    const duplicate = await pool.query(
+      `
+      SELECT id
+      FROM suppliers
+      WHERE LOWER(supplier_name) = LOWER($1)
+         OR ($2::TEXT IS NOT NULL AND LOWER(COALESCE(firm_name, '')) = LOWER($2))
+      LIMIT 1
+      `,
+      [supplier.supplier_name, supplier.firm_name]
+    );
+    if (duplicate.rows.length) return res.status(409).json({ message: "This supplier already exists." });
 
     const result = await pool.query(
       `
@@ -3331,6 +3519,7 @@ app.post("/suppliers", async (req, res) => {
     return res.status(201).json(result.rows[0]);
   } catch (error) {
     console.error(error);
+    if (error.code === "23505") return res.status(409).json({ message: "This supplier already exists." });
     return res.status(500).json({ message: "Error Saving Supplier" });
   }
 });
@@ -3354,6 +3543,20 @@ app.put("/suppliers/:id", async (req, res) => {
     if (!supplierId || !supplier.supplier_name || supplier.opening_balance === null || !SUPPLIER_TYPES.has(supplier.supplier_type)) {
       return res.status(400).json({ message: "Enter valid supplier account details" });
     }
+    const duplicate = await pool.query(
+      `
+      SELECT id
+      FROM suppliers
+      WHERE id <> $3
+        AND (
+          LOWER(supplier_name) = LOWER($1)
+          OR ($2::TEXT IS NOT NULL AND LOWER(COALESCE(firm_name, '')) = LOWER($2))
+        )
+      LIMIT 1
+      `,
+      [supplier.supplier_name, supplier.firm_name, supplierId]
+    );
+    if (duplicate.rows.length) return res.status(409).json({ message: "This supplier already exists." });
 
     const result = await pool.query(
       `
@@ -3388,6 +3591,7 @@ app.put("/suppliers/:id", async (req, res) => {
     return result.rows[0] ? res.json(result.rows[0]) : res.status(404).json({ message: "Supplier not found" });
   } catch (error) {
     console.error(error);
+    if (error.code === "23505") return res.status(409).json({ message: "This supplier already exists." });
     return res.status(500).json({ message: "Error Updating Supplier" });
   }
 });
@@ -3438,6 +3642,11 @@ app.post("/customers", async (req, res) => {
     if (!customer.customer_name || !CUSTOMER_TYPES.has(customer.customer_type) || customer.opening_balance === null) {
       return res.status(400).json({ message: "Enter valid customer details" });
     }
+    const duplicate = await pool.query(
+      "SELECT id FROM customers WHERE LOWER(customer_name) = LOWER($1) AND COALESCE(mobile_number, '') = COALESCE($2, '') LIMIT 1",
+      [customer.customer_name, customer.mobile_number]
+    );
+    if (duplicate.rows.length) return res.status(409).json({ message: "This customer already exists." });
     const result = await pool.query(
       `
       INSERT INTO customers (
@@ -3458,6 +3667,7 @@ app.post("/customers", async (req, res) => {
     return res.status(201).json(result.rows[0]);
   } catch (error) {
     console.error(error);
+    if (error.code === "23505") return res.status(409).json({ message: "This customer already exists." });
     return res.status(500).json({ message: "Error Saving Customer" });
   }
 });
@@ -3469,6 +3679,11 @@ app.put("/customers/:id", async (req, res) => {
     if (!customerId || !customer.customer_name || !CUSTOMER_TYPES.has(customer.customer_type) || customer.opening_balance === null) {
       return res.status(400).json({ message: "Enter valid customer details" });
     }
+    const duplicate = await pool.query(
+      "SELECT id FROM customers WHERE id <> $3 AND LOWER(customer_name) = LOWER($1) AND COALESCE(mobile_number, '') = COALESCE($2, '') LIMIT 1",
+      [customer.customer_name, customer.mobile_number, customerId]
+    );
+    if (duplicate.rows.length) return res.status(409).json({ message: "This customer already exists." });
     const result = await pool.query(
       `
       UPDATE customers
@@ -3490,6 +3705,7 @@ app.put("/customers/:id", async (req, res) => {
     return result.rows[0] ? res.json(result.rows[0]) : res.status(404).json({ message: "Customer not found" });
   } catch (error) {
     console.error(error);
+    if (error.code === "23505") return res.status(409).json({ message: "This customer already exists." });
     return res.status(500).json({ message: "Error Updating Customer" });
   }
 });
@@ -3750,6 +3966,7 @@ app.get("/reports/summary", async (req, res) => {
           SUM(COALESCE(balance_amount, 0)) AS balance_amount
         FROM purchases
         WHERE purchase_date BETWEEN $1 AND $2
+          AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
         GROUP BY purchase_date
         ORDER BY purchase_date DESC
         `,
@@ -3914,7 +4131,7 @@ app.get("/reports/summary", async (req, res) => {
             FROM suppliers s
             LEFT JOIN (
               SELECT supplier_id, SUM(COALESCE(NULLIF(gross_amount, 0), total_amount, 0)) AS total_purchases, SUM(COALESCE(rebate_amount, 0)) AS purchase_rebate, SUM(COALESCE(paid_amount, 0)) AS purchase_paid
-              FROM purchases WHERE supplier_id IS NOT NULL GROUP BY supplier_id
+              FROM purchases WHERE supplier_id IS NOT NULL AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' GROUP BY supplier_id
             ) ps ON ps.supplier_id = s.id
             LEFT JOIN (
               SELECT supplier_id, SUM(payment_amount) AS total_paid, SUM(rebate_amount) AS payment_rebate
@@ -3929,7 +4146,7 @@ app.get("/reports/summary", async (req, res) => {
           COALESCE((SELECT SUM(total_amount) FROM sales WHERE sale_status <> 'CANCELLED' AND sale_date BETWEEN $1 AND $2), 0) AS sales_revenue,
           COALESCE((SELECT SUM(total_cost) FROM sales WHERE sale_status <> 'CANCELLED' AND sale_date BETWEEN $1 AND $2), 0) AS purchase_cost,
           COALESCE((SELECT SUM(amount) FROM expenses WHERE active IS DISTINCT FROM FALSE AND expense_date BETWEEN $1 AND $2), 0) AS expenses,
-          COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE purchase_date BETWEEN $1 AND $2), 0)
+          COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0)
             + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE AND payment_date BETWEEN $1 AND $2), 0) AS supplier_rebate_received
         `,
         [dateFrom, dateTo]
@@ -4266,6 +4483,7 @@ app.get("/supplier-ledger", async (req, res) => {
         LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
         LEFT JOIN products pr ON pr.id = pi.product_id
         WHERE p.supplier_id = ANY($1::INT[])
+          AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
         GROUP BY p.id
         ORDER BY p.purchase_date, p.created_at, p.id
         `,
@@ -4404,109 +4622,155 @@ app.get("/supplier-ledger", async (req, res) => {
   }
 });
 
+const readPurchaseEntryPayload = (body) => {
+  const purchaseType = String(body.purchase_type || "CREDIT").trim().toUpperCase();
+  return {
+    supplierId: parsePositiveInteger(body.supplier_id),
+    productId: parsePositiveInteger(body.product_id),
+    quantity: parsePositiveNumber(body.quantity),
+    purchaseRate: parsePositiveNumber(body.purchase_rate),
+    freightCharges: parseNonNegativeNumber(body.freight_charges),
+    labourCharges: parseNonNegativeNumber(body.labour_charges),
+    otherCharges: parseNonNegativeNumber(body.other_charges),
+    paidAmountInput: parseNonNegativeNumber(body.paid_amount),
+    rebateRuleId: parsePositiveInteger(body.rebate_rule_id),
+    paymentDate: isDateInput(body.payment_date) ? body.payment_date : null,
+    purchaseType,
+    paymentMode: normalizePaymentMode(body.payment_mode),
+    paymentReferenceNumber: nullableText(body.payment_reference_number),
+    branchId: parsePositiveInteger(body.branch_id),
+    actorId: parsePositiveInteger(body.created_by || body.edited_by) || 1,
+    remarks: nullableText(body.remarks),
+  };
+};
+
+const validatePurchaseEntry = (entry) => {
+  if (!entry.supplierId) return "Add New Supplier";
+  if (
+    !entry.productId ||
+    !entry.quantity ||
+    !entry.purchaseRate ||
+    entry.freightCharges === null ||
+    entry.labourCharges === null ||
+    entry.otherCharges === null ||
+    entry.paidAmountInput === null ||
+    !entry.rebateRuleId ||
+    !entry.branchId ||
+    !["CASH", "CREDIT"].includes(entry.purchaseType)
+  ) {
+    return "Enter valid purchase details";
+  }
+  if (entry.purchaseType === "CASH" && (!SUPPLIER_PAYMENT_MODES.has(entry.paymentMode) || entry.paidAmountInput <= 0)) {
+    return "Cash purchase requires payment mode and paid amount";
+  }
+  return "";
+};
+
+const buildPurchaseFinancials = async (client, entry) => {
+  const supplierResult = await client.query(
+    "SELECT id, supplier_name FROM suppliers WHERE id = $1 AND active = TRUE FOR SHARE",
+    [entry.supplierId]
+  );
+  if (supplierResult.rows.length === 0) return { error: "Add New Supplier" };
+
+  const productResult = await client.query(
+    "SELECT id, product_name, origin_type FROM products WHERE id = $1 AND active = TRUE FOR SHARE",
+    [entry.productId]
+  );
+  if (productResult.rows.length === 0) return { error: "Product not found", status: 404 };
+
+  const supplier = supplierResult.rows[0];
+  const product = productResult.rows[0];
+  const originType = product.origin_type || "LOCAL";
+  const [mandiResult, rebateResult] = await Promise.all([
+    client.query("SELECT * FROM mandi_tax_rules WHERE origin_type = $1 AND active = TRUE", [originType]),
+    client.query("SELECT * FROM rebate_rules WHERE id = $1 AND active = TRUE", [entry.rebateRuleId]),
+  ]);
+  if (mandiResult.rows.length === 0 || rebateResult.rows.length === 0) {
+    return { error: "Select active mandi tax and rebate rules" };
+  }
+
+  const mandiTaxPercent = Number(mandiResult.rows[0].tax_percent);
+  const rebateRule = rebateResult.rows[0];
+  const rebatePercent = Number(rebateRule.rebate_percent);
+  const basicAmount = roundCurrency(entry.quantity * entry.purchaseRate);
+  const mandiTaxAmount = roundCurrency(basicAmount * mandiTaxPercent / 100);
+  const grossAmount = roundCurrency(basicAmount + mandiTaxAmount + entry.freightCharges + entry.labourCharges + entry.otherCharges);
+  const rebateAmount = roundCurrency(grossAmount * rebatePercent / 100);
+  const netPayable = roundCurrency(grossAmount - rebateAmount);
+  const paidAmount = entry.purchaseType === "CREDIT" ? 0 : entry.paidAmountInput;
+  if (paidAmount > netPayable) return { error: "Paid amount cannot exceed net payable amount" };
+  const balanceAmount = roundCurrency(netPayable - paidAmount);
+  const effectiveCostPerUnit = roundUnitCost(netPayable / entry.quantity);
+  const paymentStatus = balanceAmount === 0 ? "PAID" : paidAmount > 0 ? "PARTIAL" : "PENDING";
+
+  return {
+    supplier,
+    product,
+    originType,
+    rebateRule,
+    financials: {
+      mandiTaxPercent,
+      rebatePercent,
+      basicAmount,
+      mandiTaxAmount,
+      grossAmount,
+      rebateAmount,
+      netPayable,
+      paidAmount,
+      balanceAmount,
+      effectiveCostPerUnit,
+      paymentStatus,
+    },
+  };
+};
+
+app.get("/purchases", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        p.*,
+        pi.product_id,
+        pi.quantity,
+        pi.purchase_rate,
+        pr.product_name,
+        pr.unit,
+        ib.id AS inventory_batch_id,
+        ib.batch_no,
+        ib.purchase_qty AS batch_purchase_qty,
+        ib.remaining_qty AS batch_remaining_qty,
+        ib.batch_status
+      FROM purchases p
+      LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
+      LEFT JOIN products pr ON pr.id = pi.product_id
+      LEFT JOIN inventory_batches ib ON ib.purchase_id = p.id
+      ORDER BY p.purchase_date DESC, p.created_at DESC, p.id DESC
+      LIMIT 250
+      `
+    );
+    return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Purchases" });
+  }
+});
+
 app.post("/purchase", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const {
-      supplier_id,
-      product_id,
-      quantity,
-      purchase_rate,
-      freight_charges,
-      labour_charges,
-      other_charges,
-      paid_amount,
-      rebate_rule_id,
-      payment_date,
-      purchase_type,
-      payment_mode,
-      payment_reference_number,
-      branch_id,
-      created_by,
-    } = req.body;
-    const parsedSupplierId = parsePositiveInteger(supplier_id);
-    const parsedProductId = parsePositiveInteger(product_id);
-    const parsedQuantity = parsePositiveNumber(quantity);
-    const parsedPurchaseRate = parsePositiveNumber(purchase_rate);
-    const parsedFreightCharges = parseNonNegativeNumber(freight_charges);
-    const parsedLabourCharges = parseNonNegativeNumber(labour_charges);
-    const parsedOtherCharges = parseNonNegativeNumber(other_charges);
-    const purchaseType = String(purchase_type || "CREDIT").trim().toUpperCase();
-    const parsedPaidAmountInput = parseNonNegativeNumber(paid_amount);
-    const purchasePaymentMode = normalizePaymentMode(payment_mode);
-    const parsedRebateRuleId = parsePositiveInteger(rebate_rule_id);
-    const parsedBranchId = parsePositiveInteger(branch_id);
-    const parsedCreatedBy = parsePositiveInteger(created_by) || 1;
-
-    if (!parsedSupplierId) {
-      return res.status(400).json({ message: "Add New Supplier" });
-    }
-
-    if (
-      !parsedProductId ||
-      !parsedQuantity ||
-      !parsedPurchaseRate ||
-      parsedFreightCharges === null ||
-      parsedLabourCharges === null ||
-      parsedOtherCharges === null ||
-      parsedPaidAmountInput === null ||
-      !parsedRebateRuleId ||
-      !parsedBranchId ||
-      !["CASH", "CREDIT"].includes(purchaseType)
-    ) {
-      return res.status(400).json({ message: "Enter valid purchase details" });
-    }
-    if (purchaseType === "CASH" && (!SUPPLIER_PAYMENT_MODES.has(purchasePaymentMode) || parsedPaidAmountInput <= 0)) {
-      return res.status(400).json({ message: "Cash purchase requires payment mode and paid amount" });
-    }
+    const entry = readPurchaseEntryPayload(req.body);
+    const validationMessage = validatePurchaseEntry(entry);
+    if (validationMessage) return res.status(400).json({ message: validationMessage });
 
     await client.query("BEGIN");
-    const supplierResult = await client.query(
-      "SELECT id, supplier_name FROM suppliers WHERE id = $1 AND active = TRUE FOR SHARE",
-      [parsedSupplierId]
-    );
-    if (supplierResult.rows.length === 0) {
+    const calculation = await buildPurchaseFinancials(client, entry);
+    if (calculation.error) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ message: "Add New Supplier" });
+      return res.status(calculation.status || 400).json({ message: calculation.error });
     }
-    const supplier = supplierResult.rows[0];
-
-    const productResult = await client.query(
-      "SELECT id, product_name, origin_type FROM products WHERE id = $1 AND active = TRUE FOR SHARE",
-      [parsedProductId]
-    );
-    if (productResult.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({ message: "Product not found" });
-    }
-
-    const product = productResult.rows[0];
-    const originType = product.origin_type || "LOCAL";
-    const [mandiResult, rebateResult] = await Promise.all([
-      client.query("SELECT * FROM mandi_tax_rules WHERE origin_type = $1 AND active = TRUE", [originType]),
-      client.query("SELECT * FROM rebate_rules WHERE id = $1 AND active = TRUE", [parsedRebateRuleId]),
-    ]);
-    if (mandiResult.rows.length === 0 || rebateResult.rows.length === 0) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ message: "Select active mandi tax and rebate rules" });
-    }
-    const mandiTaxPercent = Number(mandiResult.rows[0].tax_percent);
-    const rebateRule = rebateResult.rows[0];
-    const rebatePercent = Number(rebateRule.rebate_percent);
-    const basicAmount = roundCurrency(parsedQuantity * parsedPurchaseRate);
-    const mandiTaxAmount = roundCurrency(basicAmount * mandiTaxPercent / 100);
-    const grossAmount = roundCurrency(basicAmount + mandiTaxAmount + parsedFreightCharges + parsedLabourCharges + parsedOtherCharges);
-    const rebateAmount = roundCurrency(grossAmount * rebatePercent / 100);
-    const netPayable = roundCurrency(grossAmount - rebateAmount);
-    const parsedPaidAmount = purchaseType === "CREDIT" ? 0 : parsedPaidAmountInput;
-    if (parsedPaidAmount > netPayable) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ message: "Paid amount cannot exceed net payable amount" });
-    }
-    const balanceAmount = roundCurrency(netPayable - parsedPaidAmount);
-    const effectiveCostPerUnit = roundUnitCost(netPayable / parsedQuantity);
-    const paymentStatus = balanceAmount === 0 ? "PAID" : parsedPaidAmount > 0 ? "PARTIAL" : "PENDING";
+    const { supplier, product, originType, rebateRule, financials } = calculation;
 
     const purchaseResult = await client.query(
       `
@@ -4516,18 +4780,19 @@ app.post("/purchase", async (req, res) => {
         rebate_percent, rebate_amount, net_payable, paid_amount, balance_amount,
         payment_timing, effective_cost_per_unit, freight_charges, labour_charges,
         rebate_rule_id, payment_due_days, payment_status, payment_date,
-        purchase_type, payment_mode, payment_reference_number
+        purchase_type, payment_mode, payment_reference_number, remarks
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
       RETURNING *
       `,
       [
-        supplier.id, supplier.supplier_name, netPayable, parsedBranchId, parsedCreatedBy, basicAmount,
-        mandiTaxPercent, mandiTaxAmount, parsedOtherCharges, grossAmount,
-        rebatePercent, rebateAmount, netPayable, parsedPaidAmount, balanceAmount,
-        rebateRule.rule_name, effectiveCostPerUnit, parsedFreightCharges, parsedLabourCharges,
-        rebateRule.id, rebateRule.pay_within_days, paymentStatus, purchaseType === "CREDIT" ? null : payment_date || null,
-        purchaseType, purchaseType === "CASH" ? purchasePaymentMode : null, purchaseType === "CASH" ? nullableText(payment_reference_number) : null,
+        supplier.id, supplier.supplier_name, financials.netPayable, entry.branchId, entry.actorId, financials.basicAmount,
+        financials.mandiTaxPercent, financials.mandiTaxAmount, entry.otherCharges, financials.grossAmount,
+        financials.rebatePercent, financials.rebateAmount, financials.netPayable, financials.paidAmount, financials.balanceAmount,
+        rebateRule.rule_name, financials.effectiveCostPerUnit, entry.freightCharges, entry.labourCharges,
+        rebateRule.id, rebateRule.pay_within_days, financials.paymentStatus, entry.purchaseType === "CREDIT" ? null : entry.paymentDate,
+        entry.purchaseType, entry.purchaseType === "CASH" ? entry.paymentMode : null, entry.purchaseType === "CASH" ? entry.paymentReferenceNumber : null,
+        entry.remarks,
       ]
     );
     const purchase = purchaseResult.rows[0];
@@ -4542,9 +4807,9 @@ app.post("/purchase", async (req, res) => {
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
       `,
       [
-        purchase.id, parsedProductId, parsedQuantity, parsedPurchaseRate, netPayable, basicAmount,
-        mandiTaxAmount, parsedOtherCharges, rebateAmount, netPayable, effectiveCostPerUnit,
-        parsedFreightCharges, parsedLabourCharges,
+        purchase.id, entry.productId, entry.quantity, entry.purchaseRate, financials.netPayable, financials.basicAmount,
+        financials.mandiTaxAmount, entry.otherCharges, financials.rebateAmount, financials.netPayable, financials.effectiveCostPerUnit,
+        entry.freightCharges, entry.labourCharges,
       ]
     );
 
@@ -4554,29 +4819,31 @@ app.post("/purchase", async (req, res) => {
       INSERT INTO inventory_batches (
         product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
         supplier_id, supplier_name, branch_id, mandi_tax_amount, freight_charges, labour_charges,
-        other_charges, gross_amount, rebate_amount, net_payable, payment_timing, balance_amount
+        other_charges, gross_amount, rebate_amount, net_payable, payment_timing, balance_amount,
+        purchase_id, batch_status
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'ACTIVE')
       `,
       [
-        parsedProductId,
+        entry.productId,
         batchNo,
-        parsedQuantity,
-        parsedQuantity,
-        parsedPurchaseRate,
-        effectiveCostPerUnit,
+        entry.quantity,
+        entry.quantity,
+        entry.purchaseRate,
+        financials.effectiveCostPerUnit,
         supplier.id,
         supplier.supplier_name,
-        parsedBranchId,
-        mandiTaxAmount,
-        parsedFreightCharges,
-        parsedLabourCharges,
-        parsedOtherCharges,
-        grossAmount,
-        rebateAmount,
-        netPayable,
+        entry.branchId,
+        financials.mandiTaxAmount,
+        entry.freightCharges,
+        entry.labourCharges,
+        entry.otherCharges,
+        financials.grossAmount,
+        financials.rebateAmount,
+        financials.netPayable,
         rebateRule.rule_name,
-        balanceAmount,
+        financials.balanceAmount,
+        purchase.id,
       ]
     );
 
@@ -4585,7 +4852,7 @@ app.post("/purchase", async (req, res) => {
       INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id)
       VALUES ($1, $2, 'IN', $3, $4, $5)
       `,
-      [parsedProductId, parsedQuantity, `Purchase #${purchase.id}`, parsedCreatedBy, parsedBranchId]
+      [entry.productId, entry.quantity, `Purchase #${purchase.id}`, entry.actorId, entry.branchId]
     );
 
     await client.query("COMMIT");
@@ -4604,6 +4871,287 @@ app.post("/purchase", async (req, res) => {
     await client.query("ROLLBACK");
     console.error(error);
     return res.status(500).json({ message: "Purchase Error" });
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/purchase/:id", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const purchaseId = parsePositiveInteger(Number(req.params.id));
+    const reason = cleanText(req.body.reason);
+    const entry = readPurchaseEntryPayload(req.body);
+    const validationMessage = validatePurchaseEntry(entry);
+    if (!purchaseId) return res.status(400).json({ message: "Invalid purchase" });
+    if (!reason) return res.status(400).json({ message: "Edit reason is required" });
+    if (validationMessage) return res.status(400).json({ message: validationMessage });
+
+    await client.query("BEGIN");
+    const manager = await requireRateManager(req.body.edited_by || entry.actorId, client);
+    if (!manager) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ message: "Only Owner or Admin can edit purchases" });
+    }
+
+    const oldPurchaseResult = await client.query("SELECT * FROM purchases WHERE id = $1 FOR UPDATE", [purchaseId]);
+    const oldPurchase = oldPurchaseResult.rows[0];
+    if (!oldPurchase) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Purchase not found" });
+    }
+    if (oldPurchase.purchase_status === "CANCELLED") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Cancelled purchase cannot be edited" });
+    }
+
+    const oldItemResult = await client.query("SELECT * FROM purchase_items WHERE purchase_id = $1 ORDER BY id LIMIT 1 FOR UPDATE", [purchaseId]);
+    const oldItem = oldItemResult.rows[0];
+    if (!oldItem) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Purchase item not found" });
+    }
+
+    const batchResult = await client.query(
+      `
+      SELECT *
+      FROM inventory_batches
+      WHERE purchase_id = $1 OR (purchase_id IS NULL AND batch_no LIKE $2)
+      ORDER BY purchase_id NULLS LAST, id
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [purchaseId, `%-${purchaseId}`]
+    );
+    const batch = batchResult.rows[0];
+    if (!batch) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Linked inventory batch not found" });
+    }
+
+    const oldQuantity = Number(batch.purchase_qty || oldItem.quantity || 0);
+    const oldRemaining = Number(batch.remaining_qty || 0);
+    const soldQuantity = roundUnitCost(oldQuantity - oldRemaining);
+    const productChanged = Number(oldItem.product_id) !== Number(entry.productId);
+    if (productChanged && soldQuantity > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ message: "This purchase batch has already been sold. Product cannot be changed safely." });
+    }
+    if (entry.quantity < soldQuantity) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ message: `Quantity cannot be less than already sold quantity (${soldQuantity}).` });
+    }
+    const nextRemaining = productChanged ? entry.quantity : roundUnitCost(oldRemaining + (entry.quantity - oldQuantity));
+    if (nextRemaining < 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ message: "Inventory would become negative. Reduce sold stock first." });
+    }
+
+    const calculation = await buildPurchaseFinancials(client, entry);
+    if (calculation.error) {
+      await client.query("ROLLBACK");
+      return res.status(calculation.status || 400).json({ message: calculation.error });
+    }
+    const { supplier, product, originType, rebateRule, financials } = calculation;
+    const oldSnapshot = { purchase: oldPurchase, item: oldItem, batch };
+
+    const purchaseResult = await client.query(
+      `
+      UPDATE purchases
+      SET supplier_id = $1, supplier_name = $2, total_amount = $3, branch_id = $4,
+          basic_amount = $5, mandi_tax_percent = $6, mandi_tax_amount = $7,
+          other_charges = $8, gross_amount = $9, rebate_percent = $10,
+          rebate_amount = $11, net_payable = $12, paid_amount = $13,
+          balance_amount = $14, payment_timing = $15, effective_cost_per_unit = $16,
+          freight_charges = $17, labour_charges = $18, rebate_rule_id = $19,
+          payment_due_days = $20, payment_status = $21, payment_date = $22,
+          purchase_type = $23, payment_mode = $24, payment_reference_number = $25,
+          remarks = $26, purchase_status = 'EDITED', edited_by = $27,
+          edited_at = CURRENT_TIMESTAMP, edit_reason = $28
+      WHERE id = $29
+      RETURNING *
+      `,
+      [
+        supplier.id, supplier.supplier_name, financials.netPayable, entry.branchId,
+        financials.basicAmount, financials.mandiTaxPercent, financials.mandiTaxAmount,
+        entry.otherCharges, financials.grossAmount, financials.rebatePercent,
+        financials.rebateAmount, financials.netPayable, financials.paidAmount,
+        financials.balanceAmount, rebateRule.rule_name, financials.effectiveCostPerUnit,
+        entry.freightCharges, entry.labourCharges, rebateRule.id,
+        rebateRule.pay_within_days, financials.paymentStatus,
+        entry.purchaseType === "CREDIT" ? null : entry.paymentDate,
+        entry.purchaseType, entry.purchaseType === "CASH" ? entry.paymentMode : null,
+        entry.purchaseType === "CASH" ? entry.paymentReferenceNumber : null,
+        entry.remarks, manager.id, reason, purchaseId,
+      ]
+    );
+
+    await client.query(
+      `
+      UPDATE purchase_items
+      SET product_id = $1, quantity = $2, purchase_rate = $3, amount = $4,
+          basic_amount = $5, mandi_tax_amount = $6, other_charges = $7,
+          rebate_amount = $8, net_payable = $9, effective_cost_per_unit = $10,
+          freight_charges = $11, labour_charges = $12
+      WHERE id = $13
+      `,
+      [
+        entry.productId, entry.quantity, entry.purchaseRate, financials.netPayable,
+        financials.basicAmount, financials.mandiTaxAmount, entry.otherCharges,
+        financials.rebateAmount, financials.netPayable, financials.effectiveCostPerUnit,
+        entry.freightCharges, entry.labourCharges, oldItem.id,
+      ]
+    );
+
+    const batchUpdateResult = await client.query(
+      `
+      UPDATE inventory_batches
+      SET purchase_id = $1, product_id = $2, purchase_qty = $3, remaining_qty = $4,
+          purchase_rate = $5, effective_cost_per_unit = $6, supplier_id = $7,
+          supplier_name = $8, branch_id = $9, mandi_tax_amount = $10,
+          freight_charges = $11, labour_charges = $12, other_charges = $13,
+          gross_amount = $14, rebate_amount = $15, net_payable = $16,
+          payment_timing = $17, balance_amount = $18, batch_status = 'ACTIVE'
+      WHERE id = $19
+      RETURNING *
+      `,
+      [
+        purchaseId, entry.productId, entry.quantity, nextRemaining, entry.purchaseRate,
+        financials.effectiveCostPerUnit, supplier.id, supplier.supplier_name, entry.branchId,
+        financials.mandiTaxAmount, entry.freightCharges, entry.labourCharges, entry.otherCharges,
+        financials.grossAmount, financials.rebateAmount, financials.netPayable,
+        rebateRule.rule_name, financials.balanceAmount, batch.id,
+      ]
+    );
+
+    if (productChanged) {
+      await client.query(
+        "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, 'OUT', $3, $4, $5), ($6, $7, 'IN', $8, $4, $5)",
+        [oldItem.product_id, oldRemaining, `Purchase #${purchaseId} product changed`, manager.id, entry.branchId, entry.productId, entry.quantity, `Purchase #${purchaseId} product changed`]
+      );
+    } else if (entry.quantity !== oldQuantity) {
+      const delta = roundUnitCost(entry.quantity - oldQuantity);
+      await client.query(
+        "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, $3, $4, $5, $6)",
+        [entry.productId, Math.abs(delta), delta > 0 ? "IN" : "OUT", `Purchase #${purchaseId} edited`, manager.id, entry.branchId]
+      );
+    }
+
+    const newSnapshot = {
+      purchase: purchaseResult.rows[0],
+      item: { ...oldItem, product_id: entry.productId, quantity: entry.quantity, purchase_rate: entry.purchaseRate },
+      batch: batchUpdateResult.rows[0],
+      product_name: product.product_name,
+      origin_type: originType,
+    };
+    await client.query(
+      `
+      INSERT INTO purchase_audit_trail (purchase_id, action, old_value, new_value, reason, edited_by)
+      VALUES ($1, 'EDIT', $2::jsonb, $3::jsonb, $4, $5)
+      `,
+      [purchaseId, JSON.stringify(oldSnapshot), JSON.stringify(newSnapshot), reason, manager.id]
+    );
+
+    await client.query("COMMIT");
+    return res.json({ success: true, purchase: newSnapshot.purchase });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Purchase" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/purchase/:id/cancel", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const purchaseId = parsePositiveInteger(Number(req.params.id));
+    const reason = cleanText(req.body.reason);
+    const cancelledBy = parsePositiveInteger(req.body.cancelled_by);
+    if (!purchaseId || !reason) return res.status(400).json({ message: "Cancellation reason is required" });
+
+    await client.query("BEGIN");
+    const manager = await requireRateManager(cancelledBy, client);
+    if (!manager) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ message: "Only Owner or Admin can cancel purchases" });
+    }
+    const purchaseResult = await client.query("SELECT * FROM purchases WHERE id = $1 FOR UPDATE", [purchaseId]);
+    const purchase = purchaseResult.rows[0];
+    if (!purchase) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Purchase not found" });
+    }
+    if (purchase.purchase_status === "CANCELLED") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Purchase is already cancelled" });
+    }
+    const itemResult = await client.query("SELECT * FROM purchase_items WHERE purchase_id = $1 ORDER BY id LIMIT 1 FOR UPDATE", [purchaseId]);
+    const item = itemResult.rows[0];
+    const batchResult = await client.query(
+      `
+      SELECT *
+      FROM inventory_batches
+      WHERE purchase_id = $1 OR (purchase_id IS NULL AND batch_no LIKE $2)
+      ORDER BY purchase_id NULLS LAST, id
+      LIMIT 1
+      FOR UPDATE
+      `,
+      [purchaseId, `%-${purchaseId}`]
+    );
+    const batch = batchResult.rows[0];
+    if (!item || !batch) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Linked purchase inventory not found" });
+    }
+    const purchaseQty = Number(batch.purchase_qty || item.quantity || 0);
+    const remainingQty = Number(batch.remaining_qty || 0);
+    const soldQuantity = roundUnitCost(purchaseQty - remainingQty);
+    if (soldQuantity > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ message: `Cannot cancel purchase because ${soldQuantity} units from this batch are already sold.` });
+    }
+    const oldSnapshot = { purchase, item, batch };
+    const updatedPurchase = await client.query(
+      `
+      UPDATE purchases
+      SET purchase_status = 'CANCELLED', cancelled_by = $1, cancelled_at = CURRENT_TIMESTAMP,
+          cancellation_reason = $2, balance_amount = 0, payment_status = 'CANCELLED'
+      WHERE id = $3
+      RETURNING *
+      `,
+      [manager.id, reason, purchaseId]
+    );
+    const updatedBatch = await client.query(
+      `
+      UPDATE inventory_batches
+      SET remaining_qty = 0, batch_status = 'CANCELLED', purchase_id = $1
+      WHERE id = $2
+      RETURNING *
+      `,
+      [purchaseId, batch.id]
+    );
+    if (remainingQty > 0) {
+      await client.query(
+        "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, 'OUT', $3, $4, $5)",
+        [item.product_id, remainingQty, `Purchase #${purchaseId} cancelled`, manager.id, purchase.branch_id]
+      );
+    }
+    const newSnapshot = { purchase: updatedPurchase.rows[0], item, batch: updatedBatch.rows[0] };
+    await client.query(
+      `
+      INSERT INTO purchase_audit_trail (purchase_id, action, old_value, new_value, reason, edited_by)
+      VALUES ($1, 'CANCEL', $2::jsonb, $3::jsonb, $4, $5)
+      `,
+      [purchaseId, JSON.stringify(oldSnapshot), JSON.stringify(newSnapshot), reason, manager.id]
+    );
+    await client.query("COMMIT");
+    return res.json({ success: true, purchase: updatedPurchase.rows[0] });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Cancelling Purchase" });
   } finally {
     client.release();
   }

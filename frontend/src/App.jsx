@@ -169,6 +169,9 @@ const defaultBusinessSettings = {
   logo_url: "",
   compact_logo_text: "FTF",
   invoice_footer_text: "Thank you for shopping with FEEL THE FREAKIN' FROOZ.",
+  default_printer_type: "THERMAL",
+  receipt_width: "80MM",
+  auto_print_after_billing: false,
 };
 
 const defaultSaleRateSettings = {
@@ -269,6 +272,7 @@ function App() {
   const [saleDesiredMargin, setSaleDesiredMargin] = useState("25");
   const [suppliers, setSuppliers] = useState([]);
   const [customers, setCustomers] = useState([]);
+  const [purchases, setPurchases] = useState([]);
   const [accounts, setAccounts] = useState([]);
   const [accountLedger, setAccountLedger] = useState({ account: null, ledger: [] });
   const [accountPayments, setAccountPayments] = useState([]);
@@ -344,6 +348,8 @@ function App() {
   const [purchasePaymentReference, setPurchasePaymentReference] = useState("");
   const [purchaseRebateRuleId, setPurchaseRebateRuleId] = useState("");
   const [purchasePaymentDate, setPurchasePaymentDate] = useState("");
+  const [purchaseRemarks, setPurchaseRemarks] = useState("");
+  const [editingPurchaseId, setEditingPurchaseId] = useState(null);
   const [selectedInvoice, setSelectedInvoice] = useState(null);
   const [editingSale, setEditingSale] = useState(null);
   const [changeHistory, setChangeHistory] = useState(null);
@@ -473,6 +479,11 @@ function App() {
   const loadPurchaseRules = async () => {
     const response = await axios.get(`${API_URL}/purchase-rules`);
     setPurchaseRules(response.data);
+  };
+
+  const loadPurchases = async () => {
+    const response = await axios.get(`${API_URL}/purchases`);
+    setPurchases(response.data);
   };
 
   const loadSettingsData = async (currentUser = user) => {
@@ -624,7 +635,7 @@ function App() {
     try {
       const response = await axios.post(`${API_URL}/login`, { username, password });
       setUser(response.data);
-      await Promise.all([loadProducts(), loadDashboardData(), loadPurchaseRules(), loadSupplierData(), loadCustomerData(), loadAccounts(), loadAccountOutstanding(), loadAccountPayments(), loadSaleReturns(), loadWasteEntries(), loadSettingsData(response.data)]);
+      await Promise.all([loadProducts(), loadDashboardData(), loadPurchaseRules(), loadPurchases(), loadSupplierData(), loadCustomerData(), loadAccounts(), loadAccountOutstanding(), loadAccountPayments(), loadSaleReturns(), loadWasteEntries(), loadSettingsData(response.data)]);
     } catch (error) {
       alert(getErrorMessage(error, "Login Failed"));
     }
@@ -632,6 +643,16 @@ function App() {
 
   const addProduct = async () => {
     try {
+      const wasEditing = Boolean(editingProductId);
+      const normalizedName = productName.trim().toLowerCase();
+      const duplicateProduct = products.find((product) =>
+        product.product_name?.trim().toLowerCase() === normalizedName &&
+        Number(product.id) !== Number(editingProductId || 0)
+      );
+      if (duplicateProduct) {
+        alert("This product already exists.");
+        return;
+      }
       const payload = {
         product_name: productName,
         selling_rate: sellingRate,
@@ -659,15 +680,36 @@ function App() {
       setProductActive(true);
       setEditingProductId(null);
       await loadProducts();
-      alert(editingProductId ? "Product Updated" : "Product Added");
+      alert(wasEditing ? "Product Updated" : "Product Added");
     } catch (error) {
       alert(getErrorMessage(error, "Error Adding Product"));
     }
   };
 
+  const resetPurchaseForm = () => {
+    setPurchaseSupplierId("");
+    setPurchaseProductId("");
+    setPurchaseQuantity("");
+    setPurchaseRateInput("");
+    setPurchaseFreightCharges("");
+    setPurchaseLabourCharges("");
+    setPurchaseOtherCharges("");
+    setPurchasePaidAmount("");
+    setPurchaseType("CREDIT");
+    setPurchasePaymentMode("CASH");
+    setPurchasePaymentReference("");
+    setPurchaseRebateRuleId("");
+    setPurchasePaymentDate("");
+    setPurchaseRemarks("");
+    setEditingPurchaseId(null);
+  };
+
   const savePurchase = async () => {
     try {
-      await axios.post(`${API_URL}/purchase`, {
+      const wasEditing = Boolean(editingPurchaseId);
+      const reason = editingPurchaseId ? window.prompt("Enter purchase edit reason") : "";
+      if (editingPurchaseId && !reason?.trim()) return;
+      const payload = {
         supplier_id: purchaseSupplierId,
         product_id: purchaseProductId,
         quantity: purchaseQuantity,
@@ -683,22 +725,18 @@ function App() {
       payment_reference_number: purchaseType === "CASH" ? purchasePaymentReference : null,
       branch_id: user.branch_id,
       created_by: user.id,
-      });
-      setPurchaseSupplierId("");
-      setPurchaseProductId("");
-      setPurchaseQuantity("");
-      setPurchaseRateInput("");
-      setPurchaseFreightCharges("");
-      setPurchaseLabourCharges("");
-      setPurchaseOtherCharges("");
-      setPurchasePaidAmount("");
-      setPurchaseType("CREDIT");
-      setPurchasePaymentMode("CASH");
-      setPurchasePaymentReference("");
-      setPurchaseRebateRuleId("");
-      setPurchasePaymentDate("");
-      await Promise.all([loadDashboardData(), loadSupplierData(), loadAccounts(), loadAccountOutstanding()]);
-      alert("Purchase Saved");
+      edited_by: user.id,
+      reason,
+      remarks: purchaseRemarks,
+      };
+      if (editingPurchaseId) {
+        await axios.put(`${API_URL}/purchase/${editingPurchaseId}`, payload);
+      } else {
+        await axios.post(`${API_URL}/purchase`, payload);
+      }
+      resetPurchaseForm();
+      await Promise.all([loadDashboardData(), loadPurchases(), loadSupplierData(), loadAccounts(), loadAccountOutstanding()]);
+      alert(wasEditing ? "Purchase Updated" : "Purchase Saved");
     } catch (error) {
       alert(getErrorMessage(error, "Purchase Error"));
     }
@@ -773,6 +811,48 @@ function App() {
     setEditingProductId(null);
   };
 
+  const deactivateProduct = async (product) => {
+    const reason = window.prompt(`Enter reason to deactivate/cancel ${product.product_name}`);
+    if (!reason?.trim()) return;
+    try {
+      await axios.post(`${API_URL}/products/${product.id}/cancel`, { reason, cancelled_by: user.id });
+      await Promise.all([loadProducts(), loadDashboardData()]);
+      alert("Product marked inactive");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update product status"));
+    }
+  };
+
+  const editPurchase = (purchase) => {
+    setEditingPurchaseId(purchase.id);
+    setPurchaseSupplierId(String(purchase.supplier_id || ""));
+    setPurchaseProductId(String(purchase.product_id || ""));
+    setPurchaseQuantity(String(purchase.quantity || ""));
+    setPurchaseRateInput(String(purchase.purchase_rate || ""));
+    setPurchaseFreightCharges(String(purchase.freight_charges || 0));
+    setPurchaseLabourCharges(String(purchase.labour_charges || 0));
+    setPurchaseOtherCharges(String(purchase.other_charges || 0));
+    setPurchasePaidAmount(String(purchase.paid_amount || ""));
+    setPurchaseType(purchase.purchase_type || "CREDIT");
+    setPurchasePaymentMode(purchase.payment_mode || "CASH");
+    setPurchasePaymentReference(purchase.payment_reference_number || "");
+    setPurchaseRebateRuleId(String(purchase.rebate_rule_id || ""));
+    setPurchasePaymentDate(purchase.payment_date ? toDateKey(purchase.payment_date) : "");
+    setPurchaseRemarks(purchase.remarks || "");
+  };
+
+  const cancelPurchase = async (purchase) => {
+    const reason = window.prompt(`Enter cancellation reason for Purchase #${purchase.id}`);
+    if (!reason?.trim()) return;
+    try {
+      await axios.post(`${API_URL}/purchase/${purchase.id}/cancel`, { reason, cancelled_by: user.id });
+      await Promise.all([loadPurchases(), loadDashboardData(), loadSupplierData(), loadAccounts(), loadAccountOutstanding()]);
+      alert("Purchase cancelled");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to cancel purchase"));
+    }
+  };
+
   const navigate = async (view) => {
     if (!hasModuleAccess(view)) {
       alert("Your role does not have access to this module.");
@@ -792,6 +872,7 @@ function App() {
       if (["purchase", "accounts"].includes(view)) {
         await loadSupplierData();
       }
+      if (view === "purchase") await loadPurchases();
       if (view === "accounts") {
         await Promise.all([loadAccounts(), loadCustomerData(), loadSupplierData(), loadAccountOutstanding()]);
       }
@@ -986,7 +1067,12 @@ function App() {
                     <td>{product.minimum_stock || 0}</td>
                     <td><span className="tag">{product.unit}</span></td>
                     <td><span className={product.active !== false ? "stock-ok" : "stock-low"}>{product.active !== false ? "Active" : "Inactive"}</span></td>
-                    <td><button className="table-action" onClick={() => editProduct(product)}>Edit</button></td>
+                    <td>
+                      <div className="button-row table-actions-row">
+                        <button className="table-action" onClick={() => editProduct(product)}>Edit</button>
+                        <button className="remove-button" disabled={product.active === false} onClick={() => deactivateProduct(product)}>Deactivate</button>
+                      </div>
+                    </td>
                   </tr>
                 ))}
               </DataTable>
@@ -1041,13 +1127,38 @@ function App() {
                     <Field label="Payment Date"><input type="date" value={purchasePaymentDate} onChange={(event) => setPurchasePaymentDate(event.target.value)} /></Field>
                   </>
                 )}
+                <Field label="Remarks"><textarea value={purchaseRemarks} onChange={(event) => setPurchaseRemarks(event.target.value)} /></Field>
               </div>
               {activeSuppliers.length === 0 && <p className="form-note">No active supplier accounts found. Add New Supplier before saving a purchase.</p>}
               <PurchaseSummary summary={purchaseSummary} />
               <div className="button-row">
-                <button className="primary-button" onClick={savePurchase}>Save Purchase</button>
+                <button className="primary-button" onClick={savePurchase}>{editingPurchaseId ? "Update Purchase" : "Save Purchase"}</button>
+                {editingPurchaseId && <button className="secondary-button" onClick={resetPurchaseForm}>Cancel Edit</button>}
                 <button className="secondary-button" onClick={() => navigate("accounts")}>Add New Supplier</button>
               </div>
+              <DataTable headers={["Purchase", "Date", "Status", "Supplier", "Product", "Qty", "Rate", "Net Payable", "Paid", "Balance", "Batch", "Actions"]}>
+                {purchases.map((purchase) => (
+                  <tr key={purchase.id}>
+                    <td><span className="batch-id">#{purchase.id}</span></td>
+                    <td>{purchase.purchase_date}</td>
+                    <td><span className={purchase.purchase_status === "CANCELLED" ? "stock-low" : purchase.purchase_status === "EDITED" ? "origin-rate" : "stock-ok"}>{purchase.purchase_status || "ACTIVE"}</span></td>
+                    <td>{purchase.supplier_name}</td>
+                    <td className="primary-cell">{purchase.product_name}</td>
+                    <td>{purchase.quantity}</td>
+                    <td>{currency.format(Number(purchase.purchase_rate || 0))}</td>
+                    <td>{currency.format(Number(purchase.net_payable || purchase.total_amount || 0))}</td>
+                    <td>{currency.format(Number(purchase.paid_amount || 0))}</td>
+                    <td>{currency.format(Number(purchase.balance_amount || 0))}</td>
+                    <td><span className="batch-id">{purchase.batch_no || "-"}</span></td>
+                    <td>
+                      <div className="button-row table-actions-row">
+                        <button className="table-action" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => editPurchase(purchase)}>Edit</button>
+                        <button className="remove-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => cancelPurchase(purchase)}>Cancel</button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </DataTable>
             </ModuleCard>
           )}
 
@@ -1129,6 +1240,7 @@ function App() {
               inventory={inventory}
               onInvoice={setSelectedInvoice}
               onSaved={loadDashboardData}
+              printSettings={settingsData.businessSettings}
               products={products.filter((product) => product.active !== false)}
               user={user}
             />
@@ -1199,7 +1311,7 @@ function App() {
           )}
         </div>
       </section>
-      {selectedInvoice && <InvoiceModal invoice={selectedInvoice} onClose={() => setSelectedInvoice(null)} />}
+      {selectedInvoice && <InvoiceModal invoice={selectedInvoice} onClose={() => setSelectedInvoice(null)} printSettings={settingsData.businessSettings} />}
       {editingSale && (
         <SaleEditModal
           invoice={editingSale}
@@ -1784,6 +1896,27 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
   const saveAccount = async () => {
     try {
       const payload = { ...draft, opening_balance: Number(draft.opening_balance || 0) };
+      const normalizedName = payload.account_name.trim().toLowerCase();
+      const normalizedMobile = String(payload.mobile_number || "");
+      const normalizedFirm = String(payload.firm_name || "").trim().toLowerCase();
+      const duplicate = accounts.find((account) => {
+        if (account.account_key === editingKey) return false;
+        if (payload.account_type === "CUSTOMER") {
+          return account.account_type === "CUSTOMER" &&
+            account.account_name.trim().toLowerCase() === normalizedName &&
+            String(account.mobile_number || "") === normalizedMobile;
+        }
+        if (["SUPPLIER", "TRANSPORT_VENDOR", "COMMISSION_AGENT"].includes(payload.account_type)) {
+          return ["SUPPLIER", "TRANSPORT_VENDOR", "COMMISSION_AGENT"].includes(account.account_type) &&
+            (account.account_name.trim().toLowerCase() === normalizedName ||
+              (normalizedFirm && String(account.firm_name || "").trim().toLowerCase() === normalizedFirm));
+        }
+        return false;
+      });
+      if (duplicate) {
+        alert(payload.account_type === "CUSTOMER" ? "This customer already exists." : "This supplier already exists.");
+        return;
+      }
       if (editingKey) await axios.put(`${API_URL}/accounts/${editingKey}`, payload);
       else await axios.post(`${API_URL}/accounts`, payload);
       setDraft(emptyAccount);
@@ -2172,6 +2305,19 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
         <Field label="GST Number"><input disabled={!canManage} value={draft.gst_number || ""} onChange={(event) => updateDraft("gst_number", event.target.value)} /></Field>
         <Field label="Logo URL / Path"><input disabled={!canManage} value={draft.logo_url || ""} onChange={(event) => updateDraft("logo_url", event.target.value)} /></Field>
         <Field label="Compact Logo Text"><input disabled={!canManage} value={draft.compact_logo_text || ""} onChange={(event) => updateDraft("compact_logo_text", event.target.value)} /></Field>
+        <Field label="Default Printer Type">
+          <select disabled={!canManage} value={draft.default_printer_type || "THERMAL"} onChange={(event) => updateDraft("default_printer_type", event.target.value)}>
+            <option value="THERMAL">POS / Thermal</option>
+            <option value="A4">A4</option>
+          </select>
+        </Field>
+        <Field label="Receipt Width">
+          <select disabled={!canManage} value={draft.receipt_width || "80MM"} onChange={(event) => updateDraft("receipt_width", event.target.value)}>
+            <option value="58MM">58mm</option>
+            <option value="80MM">80mm</option>
+          </select>
+        </Field>
+        <label className="check-field"><input checked={draft.auto_print_after_billing === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("auto_print_after_billing", event.target.checked)} /><span>Auto print after billing</span></label>
         <Field label="Address"><textarea disabled={!canManage} value={draft.address || ""} onChange={(event) => updateDraft("address", event.target.value)} /></Field>
         <Field label="Invoice Footer Text"><textarea disabled={!canManage} value={draft.invoice_footer_text || ""} onChange={(event) => updateDraft("invoice_footer_text", event.target.value)} /></Field>
       </div>
@@ -2554,6 +2700,7 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
   const [origin, setOrigin] = useState("");
   const [category, setCategory] = useState("");
   const [draftRates, setDraftRates] = useState({});
+  const [selectedSuggested, setSelectedSuggested] = useState({});
   const categories = [...new Set(rates.map((rate) => rate.category).filter(Boolean))];
   const filteredRates = rates.filter((rate) =>
     rate.product_name.toLowerCase().includes(search.toLowerCase()) &&
@@ -2568,11 +2715,33 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
     try {
       await axios.post(`${API_URL}/sale-rates/bulk`, { updates, changed_by: user.id });
       setDraftRates({});
+      setSelectedSuggested({});
       await onReload();
       alert("Selling rates updated");
     } catch (error) {
       alert(getErrorMessage(error, "Unable to update selling rates"));
     }
+  };
+
+  const toggleSuggestedRate = (rate, checked) => {
+    setSelectedSuggested((current) => ({ ...current, [rate.id]: checked }));
+    setDraftRates((current) => {
+      const next = { ...current };
+      if (checked) next[rate.id] = Number(rate.suggested_selling_rate || 0);
+      else delete next[rate.id];
+      return next;
+    });
+  };
+
+  const selectVisibleSuggestedRates = () => {
+    const selected = {};
+    const drafts = {};
+    for (const rate of filteredRates) {
+      selected[rate.id] = true;
+      drafts[rate.id] = Number(rate.suggested_selling_rate || 0);
+    }
+    setSelectedSuggested((current) => ({ ...current, ...selected }));
+    setDraftRates((current) => ({ ...current, ...drafts }));
   };
 
   return (
@@ -2584,15 +2753,17 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
           <select value={category} onChange={(event) => setCategory(event.target.value)}><option value="">All Categories</option>{categories.map((item) => <option key={item}>{item}</option>)}</select>
           <input min="0" placeholder="Desired margin %" step="0.1" type="number" value={desiredMargin} onChange={(event) => setDesiredMargin(event.target.value)} />
           <button className="secondary-button" onClick={() => onRefresh(desiredMargin)}>Refresh Suggestions</button>
-          <button className="primary-button" onClick={saveRates}>Bulk Save Rates</button>
+          <button className="secondary-button" onClick={selectVisibleSuggestedRates}>Select Visible Suggestions</button>
+          <button className="primary-button" onClick={saveRates}>Bulk Save Selected Rates</button>
         </div>
-        <DataTable headers={["Product", "Origin", "Current Rate", "Suggested Rate", "New Rate", "Latest Landed Cost", "Stock", "Margin", "Updated", "Updated By"]}>
+        <DataTable headers={["Select Suggested", "Product", "Origin", "Current Rate", "Suggested Rate", "New Rate", "Latest Purchase Cost", "Stock", "Margin %", "Updated", "Updated By"]}>
           {filteredRates.map((rate) => {
             const sellingRate = Number(draftRates[rate.id] || rate.selling_rate);
             const cost = Number(rate.latest_effective_cost || 0);
             const margin = sellingRate > 0 ? ((sellingRate - cost) / sellingRate) * 100 : 0;
             return (
               <tr key={rate.id}>
+                <td><input checked={Boolean(selectedSuggested[rate.id])} type="checkbox" onChange={(event) => toggleSuggestedRate(rate, event.target.checked)} /></td>
                 <td className="primary-cell">{rate.product_name}<small className="cell-note">{rate.category}</small></td>
                 <td><span className="tag">{rate.origin_type}</span></td>
                 <td>{currency.format(Number(rate.selling_rate))}</td>
@@ -2641,7 +2812,7 @@ const getMatchingDiscountRule = (rules, subtotal, paymentMode) => {
   return matches[0] || null;
 };
 
-function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, onSaved, products, user }) {
+function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, onSaved, printSettings = {}, products, user }) {
   const [search, setSearch] = useState("");
   const [barcode, setBarcode] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
@@ -2650,6 +2821,7 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
   const [mixedPayments, setMixedPayments] = useState({ CASH: "", UPI: "", CARD: "" });
   const [customer, setCustomer] = useState({ name: "", mobile: "", notes: "" });
   const [saving, setSaving] = useState(false);
+  const [lastInvoice, setLastInvoice] = useState(null);
   const searchRef = useRef(null);
   const barcodeRef = useRef(null);
 
@@ -2755,7 +2927,7 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
     });
   };
 
-  const checkout = async () => {
+  const checkout = async (printAfterSave = false) => {
     if (saving) return;
     if (cart.length === 0) {
       alert("Add at least one product before checkout.");
@@ -2800,7 +2972,11 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
       setMixedPayments({ CASH: "", UPI: "", CARD: "" });
       setCustomer({ name: "", mobile: "", notes: "" });
       await onSaved();
+      setLastInvoice(response.data.sale);
       onInvoice(response.data.sale);
+      if (printAfterSave || printSettings.auto_print_after_billing === true) {
+        setTimeout(() => window.print(), 250);
+      }
     } catch (error) {
       alert(getErrorMessage(error, "Unable to complete checkout"));
     } finally {
@@ -2834,8 +3010,17 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
     }
     if (event.key === "F4") {
       event.preventDefault();
-      checkout();
+      checkout(true);
     }
+  };
+
+  const printLastInvoice = () => {
+    if (!lastInvoice) {
+      alert("Save a bill before printing.");
+      return;
+    }
+    onInvoice(lastInvoice);
+    setTimeout(() => window.print(), 250);
   };
 
   return (
@@ -2967,9 +3152,17 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
           <TotalLine label="Tax" value={0} muted />
           <TotalLine label="Net Payable" value={totals.total} total />
         </div>
-        <button className="primary-button checkout-button" disabled={saving} onClick={checkout}>
-          <Icon name="receipt" /> {saving ? "Saving Invoice..." : "Complete Checkout"}
-        </button>
+        <div className="button-row checkout-actions">
+          <button className="primary-button checkout-button" disabled={saving} onClick={() => checkout(false)}>
+            <Icon name="receipt" /> {saving ? "Saving..." : "Save Bill"}
+          </button>
+          <button className="secondary-button" disabled={!lastInvoice || saving} onClick={printLastInvoice}>
+            <Icon name="print" /> Print Bill
+          </button>
+          <button className="primary-button" disabled={saving} onClick={() => checkout(true)}>
+            <Icon name="print" /> Save & Print
+          </button>
+        </div>
       </aside>
     </section>
   );
@@ -3267,7 +3460,8 @@ function PaymentReceiptModal({ payment, onClose }) {
             <strong>{payment.account_name || "Account Payment"}</strong>
           </div>
           <div className="invoice-actions">
-            <button className="secondary-button" onClick={() => window.print()}><Icon name="print" /> Print / PDF</button>
+            <button className="secondary-button" onClick={() => window.print()}><Icon name="print" /> Print Receipt</button>
+            <button className="secondary-button" onClick={() => window.print()}>Save PDF</button>
             <button aria-label="Close receipt" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
@@ -3298,7 +3492,7 @@ function PaymentReceiptModal({ payment, onClose }) {
   );
 }
 
-function InvoiceModal({ invoice, onClose }) {
+function InvoiceModal({ invoice, onClose, printSettings = {} }) {
   const sendWhatsApp = () => {
     if (!invoice.customer_mobile) {
       alert("Add a customer mobile number to send this invoice on WhatsApp.");
@@ -3324,12 +3518,13 @@ function InvoiceModal({ invoice, onClose }) {
             <strong>{invoice.invoice_no}</strong>
           </div>
           <div className="invoice-actions">
-            <button className="secondary-button" onClick={() => window.print()}><Icon name="print" /> Print / Save PDF</button>
+            <button className="secondary-button" onClick={() => window.print()}><Icon name="print" /> Print Invoice</button>
+            <button className="secondary-button" onClick={() => window.print()}>Save PDF</button>
             <button className="whatsapp-button" onClick={sendWhatsApp}><Icon name="message" /> Send on WhatsApp</button>
             <button aria-label="Close invoice" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
-        <article className="invoice-paper">
+        <article className={`invoice-paper ${printSettings.default_printer_type === "A4" ? "invoice-a4" : "invoice-thermal"} ${printSettings.receipt_width === "58MM" ? "invoice-58mm" : "invoice-80mm"}`}>
           <header className="invoice-header">
             <BrandLogo invoice />
             <div className="invoice-meta">

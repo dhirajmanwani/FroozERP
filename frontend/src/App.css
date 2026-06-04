@@ -1888,6 +1888,36 @@ tbody tr:last-child td {
     background: #ffffff;
   }
 
+  .invoice-paper.invoice-thermal {
+    inset: auto;
+    left: 0;
+    top: 0;
+    max-width: none;
+    padding: 10px;
+  }
+
+  .invoice-paper.invoice-80mm {
+    width: 80mm;
+  }
+
+  .invoice-paper.invoice-58mm {
+    width: 58mm;
+  }
+
+  .invoice-paper.invoice-thermal .invoice-header,
+  .invoice-paper.invoice-thermal .invoice-customer {
+    display: block;
+  }
+
+  .invoice-paper.invoice-thermal .brand-copy strong,
+  .invoice-paper.invoice-thermal .invoice-meta strong {
+    font-size: 12px;
+  }
+
+  .invoice-paper.invoice-thermal .invoice-table {
+    font-size: 10px;
+  }
+
   .report-print-header {
     display: flex;
   }
