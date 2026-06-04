@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
+import QRCode from "qrcode";
 import "./App.css";
 
 const API_URL = "http://localhost:5000";
@@ -187,6 +188,20 @@ const defaultSaleRateSettings = {
   notes: "",
 };
 
+const defaultPosSettings = {
+  enable_weighing_scale: false,
+  scale_connection_type: "MANUAL_FALLBACK",
+  scale_com_port: "",
+  scale_baud_rate: 9600,
+  scale_auto_read: false,
+};
+
+const defaultPaymentSettings = {
+  business_upi_id: "",
+  upi_payee_name: "FEEL THE FREAKIN' FROOZ",
+  enable_upi_qr_on_invoice: false,
+};
+
 function BrandLogo({ compact = false, invoice = false }) {
   return (
     <div className={`${invoice ? "brand-lockup brand-lockup-invoice" : "brand-lockup"} ${compact ? "brand-lockup-compact" : ""}`}>
@@ -265,8 +280,11 @@ function App() {
   const [settingsData, setSettingsData] = useState({
     businessSettings: defaultBusinessSettings,
     saleRateSettings: defaultSaleRateSettings,
+    posSettings: defaultPosSettings,
+    paymentSettings: defaultPaymentSettings,
     discountRules: [],
     roles: [],
+    users: [],
     updateCenter: {},
     syncSettings: {},
     backupSettings: {},
@@ -296,6 +314,7 @@ function App() {
     discountReport: [],
     expenseReport: [],
     paymentReport: [],
+    paymentModeSummary: [],
     returnReport: [],
     returnReasonReport: [],
     wasteReport: [],
@@ -359,6 +378,7 @@ function App() {
   const [selectedInvoice, setSelectedInvoice] = useState(null);
   const [editingSale, setEditingSale] = useState(null);
   const [changeHistory, setChangeHistory] = useState(null);
+  const [profileOpen, setProfileOpen] = useState(false);
 
   const rolePermissionMap = useMemo(() => {
     const map = new Map();
@@ -499,8 +519,11 @@ function App() {
     setSettingsData({
       businessSettings: { ...defaultBusinessSettings, ...(data.businessSettings || {}) },
       saleRateSettings: nextSaleRateSettings,
+      posSettings: { ...defaultPosSettings, ...(data.posSettings || {}) },
+      paymentSettings: { ...defaultPaymentSettings, ...(data.paymentSettings || {}) },
       discountRules: data.discountRules || [],
       roles: data.roles || [],
+      users: data.users || [],
       updateCenter: data.updateCenter || {},
       syncSettings: data.syncSettings || {},
       backupSettings: data.backupSettings || {},
@@ -948,13 +971,13 @@ function App() {
             </button>
           ))}
         </nav>
-        <div className="sidebar-profile">
+        <div className="sidebar-profile" onClick={() => setProfileOpen(true)} role="button" tabIndex={0} onKeyDown={(event) => event.key === "Enter" && setProfileOpen(true)}>
           <div className="user-avatar">{user.full_name.charAt(0)}</div>
           <div>
             <strong>{user.full_name}</strong>
             <small>{user.role}</small>
           </div>
-          <button aria-label="Log out" className="logout-button" onClick={() => setUser(null)}>
+          <button aria-label="Log out" className="logout-button" onClick={(event) => { event.stopPropagation(); setUser(null); }}>
             <Icon name="logout" size={17} />
           </button>
         </div>
@@ -1246,6 +1269,8 @@ function App() {
               inventory={inventory}
               onInvoice={setSelectedInvoice}
               onSaved={loadDashboardData}
+              paymentSettings={settingsData.paymentSettings}
+              posSettings={settingsData.posSettings}
               printSettings={settingsData.businessSettings}
               products={products.filter((product) => product.active !== false)}
               user={user}
@@ -1317,7 +1342,7 @@ function App() {
           )}
         </div>
       </section>
-      {selectedInvoice && <InvoiceModal invoice={selectedInvoice} onClose={() => setSelectedInvoice(null)} printSettings={settingsData.businessSettings} />}
+      {selectedInvoice && <InvoiceModal invoice={selectedInvoice} onClose={() => setSelectedInvoice(null)} paymentSettings={settingsData.paymentSettings} printSettings={settingsData.businessSettings} />}
       {editingSale && (
         <SaleEditModal
           invoice={editingSale}
@@ -1331,6 +1356,7 @@ function App() {
         />
       )}
       {changeHistory && <ChangeHistoryModal history={changeHistory} onClose={() => setChangeHistory(null)} />}
+      {profileOpen && <UserProfilePanel onClose={() => setProfileOpen(false)} onLogout={() => setUser(null)} user={user} />}
     </main>
   );
 }
@@ -1343,6 +1369,63 @@ function ReportToolbar({ onPrint, title }) {
         <button className="secondary-button" onClick={onPrint}><Icon name="print" /> Print</button>
         <button className="secondary-button" onClick={onPrint}>PDF Export</button>
       </div>
+    </div>
+  );
+}
+
+function UserProfilePanel({ onClose, onLogout, user }) {
+  const [passwordDraft, setPasswordDraft] = useState({ password: "", confirm_password: "" });
+  const [showPasswordForm, setShowPasswordForm] = useState(false);
+  const savePassword = async () => {
+    try {
+      await axios.put(`${API_URL}/users/${user.id}/password`, {
+        ...passwordDraft,
+        updated_by: user.id,
+      });
+      setPasswordDraft({ password: "", confirm_password: "" });
+      setShowPasswordForm(false);
+      alert("Password changed");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to change password"));
+    }
+  };
+  return (
+    <div className="modal-backdrop">
+      <section className="invoice-modal profile-panel">
+        <div className="invoice-toolbar">
+          <div>
+            <span className="eyebrow">User Profile</span>
+            <strong>{user.full_name}</strong>
+          </div>
+          <button aria-label="Close profile" className="remove-button" onClick={onClose}><Icon name="close" /></button>
+        </div>
+        <div className="sale-edit-body">
+          <div className="purchase-summary-grid supplier-payment-preview">
+            <SummaryMetric label="Role" value={user.role} featured />
+            <SummaryMetric label="Branch" value={user.branch || "Main Branch"} />
+            <SummaryMetric label="Last Login" value={user.last_login_at ? new Date(user.last_login_at).toLocaleString("en-IN") : "Not recorded"} />
+            <SummaryMetric label="Device" value="Local Counter" />
+          </div>
+          <div className="form-grid supplier-form-grid">
+            <Field label="Username"><input disabled value={user.username || ""} /></Field>
+            <Field label="Mobile"><input disabled value={user.mobile_number || ""} /></Field>
+            <Field label="Email"><input disabled value={user.email || ""} /></Field>
+            <Field label="Joining Date"><input disabled value={user.joining_date ? toDateKey(user.joining_date) : ""} /></Field>
+            <Field label="Notes"><textarea disabled value={user.notes || ""} /></Field>
+          </div>
+          {showPasswordForm && (
+            <div className="form-grid settings-add-grid">
+              <Field label="New Password"><input type="password" value={passwordDraft.password} onChange={(event) => setPasswordDraft({ ...passwordDraft, password: event.target.value })} /></Field>
+              <Field label="Confirm Password"><input type="password" value={passwordDraft.confirm_password} onChange={(event) => setPasswordDraft({ ...passwordDraft, confirm_password: event.target.value })} /></Field>
+            </div>
+          )}
+          <div className="button-row">
+            <button className="secondary-button" onClick={() => setShowPasswordForm((visible) => !visible)}>{showPasswordForm ? "Cancel Password Change" : "Change Password"}</button>
+            {showPasswordForm && <button className="primary-button" onClick={savePassword}>Save Password</button>}
+            <button className="remove-button" onClick={onLogout}>Logout</button>
+          </div>
+        </div>
+      </section>
     </div>
   );
 }
@@ -1407,9 +1490,9 @@ function ReportsModule({ data, onReload }) {
     salesByDate: {
       title: "Sales by Date",
       rows: filterRows(data.salesReport),
-      summary: (rows) => [["Sales", money(totalOf(rows, "total_sales")), true], ["Transactions", number(totalOf(rows, "transaction_count"))], ["Profit", money(totalOf(rows, "total_profit"))]],
-      headers: ["Date", "Transactions", "Sales", "Cost", "Profit"],
-      render: (row) => <tr key={row.sale_date}><td>{row.sale_date}</td><td>{row.transaction_count}</td><td>{money(row.total_sales)}</td><td>{money(row.total_cost)}</td><td className="profit-cell">{money(row.total_profit)}</td></tr>,
+      summary: (rows) => [["Sales", money(totalOf(rows, "total_sales")), true], ["Cash", money(totalOf(rows, "cash_sales"))], ["UPI", money(totalOf(rows, "upi_sales"))], ["Profit", money(totalOf(rows, "total_profit"))]],
+      headers: ["Date", "Transactions", "Sales", "Cash", "UPI", "Bank/Card", "Cost", "Profit"],
+      render: (row) => <tr key={row.sale_date}><td>{row.sale_date}</td><td>{row.transaction_count}</td><td>{money(row.total_sales)}</td><td>{money(row.cash_sales)}</td><td>{money(row.upi_sales)}</td><td>{money(row.bank_card_sales)}</td><td>{money(row.total_cost)}</td><td className="profit-cell">{money(row.total_profit)}</td></tr>,
     },
     salesByProduct: {
       title: "Sales by Product",
@@ -1516,6 +1599,13 @@ function ReportsModule({ data, onReload }) {
       headers: ["Date", "Type", "Party", "Payment", "Rebate", "Mode", "Status", "Reference"],
       render: (row, index) => <tr key={`${row.payment_date}-${index}`}><td>{row.payment_date}</td><td>{row.payment_type}</td><td className="primary-cell">{row.party_name}</td><td>{money(row.payment_amount)}</td><td>{money(row.rebate_amount)}</td><td>{row.payment_mode}</td><td>{row.cancelled ? "Cancelled" : "Active"}</td><td>{row.reference_number || "-"}</td></tr>,
     },
+    paymentModeSummary: {
+      title: "Payment Mode Summary",
+      rows: filterRows(data.paymentModeSummary),
+      summary: (rows) => [["Total Amount", money(totalOf(rows, "total_amount")), true], ["Transactions", number(totalOf(rows, "transaction_count"))], ["Modes", new Set(rows.map((row) => row.payment_mode)).size]],
+      headers: ["Date", "Source", "Payment Mode", "Transactions", "Total Amount"],
+      render: (row, index) => <tr key={`${row.transaction_date}-${row.source}-${row.payment_mode}-${index}`}><td>{row.transaction_date}</td><td>{row.source}</td><td><span className="tag">{row.payment_mode}</span></td><td>{row.transaction_count}</td><td className="primary-cell">{money(row.total_amount)}</td></tr>,
+    },
     receivableReport: {
       title: "Receivable Report",
       rows: filterRows(data.customerOutstandingReport),
@@ -1618,8 +1708,8 @@ function ReportsModule({ data, onReload }) {
       title: "Profit & Loss",
       rows: [data.profitLoss || {}].filter(matchesSearch),
       summary: (rows) => [["Net Profit", money(rows[0]?.netProfit), true], ["Gross Profit", money(rows[0]?.grossProfit)], ["Expenses", money(rows[0]?.expenses)]],
-      headers: ["Sales Revenue", "Purchase Cost", "Expenses", "Rebate", "Gross Profit", "Net Profit"],
-      render: (row) => <tr key="profit-loss"><td>{money(row.salesRevenue)}</td><td>{money(row.purchaseCost)}</td><td>{money(row.expenses)}</td><td>{money(row.supplierRebateReceived)}</td><td>{money(row.grossProfit)}</td><td className="profit-cell">{money(row.netProfit)}</td></tr>,
+      headers: ["Sales Revenue", "Cash Sales", "UPI Sales", "Bank/Card Sales", "Purchase Cost", "Expenses", "Rebate", "Gross Profit", "Net Profit"],
+      render: (row) => <tr key="profit-loss"><td>{money(row.salesRevenue)}</td><td>{money(row.cashSales)}</td><td>{money(row.upiSales)}</td><td>{money(row.bankCardSales)}</td><td>{money(row.purchaseCost)}</td><td>{money(row.expenses)}</td><td>{money(row.supplierRebateReceived)}</td><td>{money(row.grossProfit)}</td><td className="profit-cell">{money(row.netProfit)}</td></tr>,
     },
     balanceSheet: {
       title: "Balance Sheet",
@@ -1631,9 +1721,9 @@ function ReportsModule({ data, onReload }) {
     dayToDay: {
       title: "Day-to-Day Transaction Report",
       rows: filterRows(data.dayToDayReport),
-      summary: (rows) => [["Sales", money(totalOf(rows, "sales")), true], ["Expenses", money(totalOf(rows, "expenses"))], ["Net Profit", money(totalOf(rows, "net_profit"))]],
-      headers: ["Date", "Transactions", "Sales", "Purchases", "Expenses", "Returns", "Waste", "Net Profit"],
-      render: (row) => <tr key={row.date}><td>{row.date}</td><td>{row.transactions}</td><td>{money(row.sales)}</td><td>{money(row.purchases)}</td><td>{money(row.expenses)}</td><td>{money(row.returns)}</td><td>{money(row.waste)}</td><td className="profit-cell">{money(row.net_profit)}</td></tr>,
+      summary: (rows) => [["Sales", money(totalOf(rows, "sales")), true], ["Cash Sales", money(totalOf(rows, "cash_sales"))], ["UPI Sales", money(totalOf(rows, "upi_sales"))], ["Net Profit", money(totalOf(rows, "net_profit"))]],
+      headers: ["Date", "Transactions", "Sales", "Cash", "UPI", "Bank/Card", "Customer Receipts", "Supplier Payments", "Purchases", "Expenses", "Returns", "Waste", "Net Profit"],
+      render: (row) => <tr key={row.date}><td>{row.date}</td><td>{row.transactions}</td><td>{money(row.sales)}</td><td>{money(row.cash_sales)}</td><td>{money(row.upi_sales)}</td><td>{money(row.bank_card_sales)}</td><td>{money(Number(row.customer_cash_receipts || 0) + Number(row.customer_upi_receipts || 0) + Number(row.customer_bank_card_receipts || 0))}</td><td>{money(Number(row.supplier_cash_payments || 0) + Number(row.supplier_upi_payments || 0) + Number(row.supplier_bank_payments || 0))}</td><td>{money(row.purchases)}</td><td>{money(row.expenses)}</td><td>{money(row.returns)}</td><td>{money(row.waste)}</td><td className="profit-cell">{money(row.net_profit)}</td></tr>,
     },
     expenseReport: {
       title: "Expense Report",
@@ -1646,7 +1736,7 @@ function ReportsModule({ data, onReload }) {
   const categories = [
     { id: "sales", title: "Sales Reports", icon: "receipt", description: "Invoices, products, customers, discounts and bill changes.", reports: ["salesByDate", "salesByProduct", "salesByCustomer", "salesHistory", "editedBills", "cancelledBills", "discountReport"] },
     { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Purchase value, supplier buying, outstanding and purchase changes.", reports: ["purchasesByDate", "purchasesByProduct", "purchasesBySupplier", "purchaseOutstanding", "purchaseEditCancel"] },
-    { id: "accounts", title: "Accounts & Ledger", icon: "users", description: "Customer ledger, supplier ledger, statements, payments and balances.", reports: ["customerLedger", "supplierLedger", "accountStatement", "paymentReport", "receivableReport", "payableReport"] },
+    { id: "accounts", title: "Accounts & Ledger", icon: "users", description: "Customer ledger, supplier ledger, statements, payments and balances.", reports: ["customerLedger", "supplierLedger", "accountStatement", "paymentReport", "paymentModeSummary", "receivableReport", "payableReport"] },
     { id: "returns", title: "Sale Returns", icon: "history", description: "Return history, value and reason analysis.", reports: ["returnHistory", "returnValue", "returnReason"] },
     { id: "waste", title: "Waste Management", icon: "alert", description: "Daily, monthly, product-wise and cost-focused waste analysis.", reports: ["dailyWaste", "monthlyWaste", "productWiseWaste", "mostWastedProducts", "wasteCost"] },
     { id: "inventory", title: "Inventory", icon: "layers", description: "Current stock, low stock, movement and valuation.", reports: ["currentStock", "lowStock", "stockMovement", "stockValuation"] },
@@ -2516,11 +2606,14 @@ function SettingsModule({ canManage, onReload, rules, settingsData, user }) {
         <span className={canManage ? "stock-ok" : "stock-low"}>{canManage ? "Manager Access" : "Read Only"}</span>
       </section>
       <BusinessSettingsSection businessSettings={settingsData.businessSettings} canManage={canManage} key={settingsData.businessSettings?.updated_at || "business-settings"} onReload={onReload} user={user} />
+      <PosSettingsSection canManage={canManage} key={settingsData.posSettings?.updated_at || "pos-settings"} onReload={onReload} posSettings={settingsData.posSettings} user={user} />
+      <PaymentSettingsSection canManage={canManage} key={settingsData.paymentSettings?.updated_at || "payment-settings"} onReload={onReload} paymentSettings={settingsData.paymentSettings} user={user} />
       <MandiTaxSettings canManage={canManage} onReload={onReload} rules={rules.mandiTaxRules} user={user} />
       <RebateSettings canManage={canManage} onReload={onReload} rules={rules.rebateRules} user={user} />
       <SaleRateSettingsSection canManage={canManage} key={settingsData.saleRateSettings?.updated_at || "sale-rate-settings"} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />
       <DiscountSettings canManage={canManage} discountRules={settingsData.discountRules} onReload={onReload} user={user} />
       <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />
+      <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />
       <UpdateCenterSection canManage={canManage} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
       <SyncSettingsSection canManage={canManage} key={settingsData.syncSettings?.updated_at || "sync-settings"} onReload={onReload} syncSettings={settingsData.syncSettings} user={user} />
       <BackupSettings backupSettings={settingsData.backupSettings} />
@@ -2568,6 +2661,64 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
         <Field label="Invoice Footer Text"><textarea disabled={!canManage} value={draft.invoice_footer_text || ""} onChange={(event) => updateDraft("invoice_footer_text", event.target.value)} /></Field>
       </div>
       <button className="primary-button" disabled={!canManage} onClick={save}>Save Business Settings</button>
+    </ModuleCard>
+  );
+}
+
+function PosSettingsSection({ canManage, onReload, posSettings, user }) {
+  const [draft, setDraft] = useState({ ...defaultPosSettings, ...posSettings });
+  const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
+  const save = async () => {
+    try {
+      await axios.put(`${API_URL}/settings/pos`, { ...draft, updated_by: user.id });
+      await onReload();
+      alert("POS settings updated");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update POS settings"));
+    }
+  };
+  return (
+    <ModuleCard eyebrow="POS Settings" title="Weighing Scale Integration" subtitle="Hardware integration foundation for USB, serial, Bluetooth and manual fallback billing.">
+      <div className="form-grid supplier-form-grid">
+        <label className="check-field"><input checked={draft.enable_weighing_scale === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enable_weighing_scale", event.target.checked)} /><span>Enable weighing scale mode</span></label>
+        <Field label="Connection Type">
+          <select disabled={!canManage} value={draft.scale_connection_type || "MANUAL_FALLBACK"} onChange={(event) => updateDraft("scale_connection_type", event.target.value)}>
+            <option value="USB">USB</option>
+            <option value="SERIAL">Serial</option>
+            <option value="BLUETOOTH">Bluetooth</option>
+            <option value="MANUAL_FALLBACK">Manual Fallback</option>
+          </select>
+        </Field>
+        <Field label="COM Port"><input disabled={!canManage} placeholder="Example: COM3" value={draft.scale_com_port || ""} onChange={(event) => updateDraft("scale_com_port", event.target.value)} /></Field>
+        <Field label="Baud Rate"><input disabled={!canManage} min="1" type="number" value={draft.scale_baud_rate || 9600} onChange={(event) => updateDraft("scale_baud_rate", event.target.value)} /></Field>
+        <label className="check-field"><input checked={draft.scale_auto_read === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("scale_auto_read", event.target.checked)} /><span>Auto-read weight when hardware support is available</span></label>
+      </div>
+      <p className="form-note">Browser-based hardware reading is prepared but not enabled until a supported local bridge or Web Serial workflow is connected. Manual quantity entry remains available.</p>
+      <button className="primary-button" disabled={!canManage} onClick={save}>Save POS Settings</button>
+    </ModuleCard>
+  );
+}
+
+function PaymentSettingsSection({ canManage, onReload, paymentSettings, user }) {
+  const [draft, setDraft] = useState({ ...defaultPaymentSettings, ...paymentSettings });
+  const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
+  const save = async () => {
+    try {
+      await axios.put(`${API_URL}/settings/payment`, { ...draft, updated_by: user.id });
+      await onReload();
+      alert("Payment settings updated");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update payment settings"));
+    }
+  };
+  return (
+    <ModuleCard eyebrow="Payment Settings" title="UPI QR on Invoice" subtitle="Database-backed UPI configuration used by POS invoices, receipts, print and WhatsApp workflows.">
+      <div className="form-grid supplier-form-grid">
+        <Field label="Business UPI ID"><input disabled={!canManage} placeholder="name@bank" value={draft.business_upi_id || ""} onChange={(event) => updateDraft("business_upi_id", event.target.value)} /></Field>
+        <Field label="Payee Name"><input disabled={!canManage} value={draft.upi_payee_name || ""} onChange={(event) => updateDraft("upi_payee_name", event.target.value)} /></Field>
+        <label className="check-field"><input checked={draft.enable_upi_qr_on_invoice === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enable_upi_qr_on_invoice", event.target.checked)} /><span>Enable UPI QR on UPI invoices</span></label>
+      </div>
+      <button className="primary-button" disabled={!canManage} onClick={save}>Save Payment Settings</button>
     </ModuleCard>
   );
 }
@@ -2856,6 +3007,148 @@ function PermissionSettings({ canManage, onReload, roles, user }) {
   );
 }
 
+function UserManagementSection({ canManage, onReload, roles = [], user, users = [] }) {
+  const emptyForm = {
+    full_name: "",
+    username: "",
+    mobile_number: "",
+    email: "",
+    role: "Cashier",
+    password: "",
+    confirm_password: "",
+    joining_date: toDateKey(new Date()),
+    active: true,
+    notes: "",
+  };
+  const [draft, setDraft] = useState(emptyForm);
+  const [editingId, setEditingId] = useState(null);
+  const [passwordTarget, setPasswordTarget] = useState(null);
+  const roleNames = (roles || []).map((role) => role.role_name).filter(Boolean);
+  const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
+  const startEdit = (item) => {
+    setEditingId(item.id);
+    setDraft({
+      full_name: item.full_name || "",
+      username: item.username || "",
+      mobile_number: item.mobile_number || "",
+      email: item.email || "",
+      role: item.role || "Cashier",
+      password: "",
+      confirm_password: "",
+      joining_date: toDateKey(item.joining_date || new Date()),
+      active: item.active !== false,
+      notes: item.notes || "",
+    });
+  };
+  const resetForm = () => {
+    setEditingId(null);
+    setDraft(emptyForm);
+  };
+  const saveUser = async () => {
+    try {
+      const payload = { ...draft, updated_by: user.id };
+      if (editingId) await axios.put(`${API_URL}/users/${editingId}`, payload);
+      else await axios.post(`${API_URL}/users`, payload);
+      resetForm();
+      await onReload();
+      alert(editingId ? "User updated" : "User added");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to save user"));
+    }
+  };
+  const changePassword = async () => {
+    if (!passwordTarget) return;
+    try {
+      await axios.put(`${API_URL}/users/${passwordTarget.id}/password`, {
+        password: passwordTarget.password,
+        confirm_password: passwordTarget.confirm_password,
+        updated_by: user.id,
+      });
+      setPasswordTarget(null);
+      alert("Password updated");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update password"));
+    }
+  };
+  const userAction = async (item, action) => {
+    try {
+      if (action === "delete") {
+        const response = await axios.delete(`${API_URL}/users/${item.id}`, { data: { updated_by: user.id } });
+        alert(response.data.message || "User removed");
+      } else {
+        await axios.post(`${API_URL}/users/${item.id}/${action}`, { updated_by: user.id });
+      }
+      await onReload();
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update user status"));
+    }
+  };
+  return (
+    <ModuleCard eyebrow="User Management" title="Owner User Administration" subtitle="Add, edit, reset password, deactivate and protect user records with transaction history.">
+      <div className="form-grid supplier-form-grid">
+        <Field label="Full Name"><input disabled={!canManage} value={draft.full_name} onChange={(event) => updateDraft("full_name", event.target.value)} /></Field>
+        <Field label="Username"><input disabled={!canManage} value={draft.username} onChange={(event) => updateDraft("username", event.target.value)} /></Field>
+        <Field label="Mobile"><input disabled={!canManage} value={draft.mobile_number} onChange={(event) => updateDraft("mobile_number", event.target.value)} /></Field>
+        <Field label="Email"><input disabled={!canManage} type="email" value={draft.email} onChange={(event) => updateDraft("email", event.target.value)} /></Field>
+        <Field label="Role">
+          <select disabled={!canManage} value={draft.role} onChange={(event) => updateDraft("role", event.target.value)}>
+            {(roleNames.length ? roleNames : ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"]).map((role) => <option key={role} value={role}>{role}</option>)}
+          </select>
+        </Field>
+        <Field label="Joining Date"><input disabled={!canManage} type="date" value={draft.joining_date} onChange={(event) => updateDraft("joining_date", event.target.value)} /></Field>
+        {!editingId && <Field label="Password"><input disabled={!canManage} type="password" value={draft.password} onChange={(event) => updateDraft("password", event.target.value)} /></Field>}
+        {!editingId && <Field label="Confirm Password"><input disabled={!canManage} type="password" value={draft.confirm_password} onChange={(event) => updateDraft("confirm_password", event.target.value)} /></Field>}
+        <label className="check-field"><input checked={draft.active} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("active", event.target.checked)} /><span>Active user</span></label>
+        <Field label="Notes"><textarea disabled={!canManage} value={draft.notes} onChange={(event) => updateDraft("notes", event.target.value)} /></Field>
+      </div>
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage} onClick={saveUser}>{editingId ? "Update User" : "Add User"}</button>
+        {editingId && <button className="secondary-button" onClick={resetForm}>Cancel Edit</button>}
+      </div>
+      <DataTable headers={["Name", "Username", "Role", "Mobile", "Last Login", "Status", "Actions"]}>
+        {users.map((item) => (
+          <tr key={item.id}>
+            <td className="primary-cell">{item.full_name}<small className="cell-note">{item.email || "No email"}</small></td>
+            <td>{item.username}</td>
+            <td><span className="tag">{item.role}</span></td>
+            <td>{item.mobile_number || "-"}</td>
+            <td>{item.last_login_at ? new Date(item.last_login_at).toLocaleString("en-IN") : "Not recorded"}</td>
+            <td><span className={item.active ? "stock-ok" : "stock-low"}>{item.active ? "Active" : "Inactive"}</span></td>
+            <td>
+              <div className="button-row table-actions-row">
+                <button className="table-action" disabled={!canManage} onClick={() => startEdit(item)}>Edit</button>
+                <button className="table-action" disabled={!canManage} onClick={() => setPasswordTarget({ id: item.id, name: item.full_name, password: "", confirm_password: "" })}>Password</button>
+                {item.active ? <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => userAction(item, "deactivate")}>Deactivate</button> : <button className="secondary-button" disabled={!canManage} onClick={() => userAction(item, "reactivate")}>Reactivate</button>}
+                <button className="remove-button" disabled={!canManage || item.id === user.id} onClick={() => userAction(item, "delete")}><Icon name="trash" size={15} /></button>
+              </div>
+            </td>
+          </tr>
+        ))}
+      </DataTable>
+      {passwordTarget && (
+        <div className="modal-backdrop">
+          <section className="invoice-modal change-history-modal">
+            <div className="invoice-toolbar">
+              <div>
+                <span className="eyebrow">Reset Password</span>
+                <strong>{passwordTarget.name}</strong>
+              </div>
+              <button aria-label="Close password reset" className="remove-button" onClick={() => setPasswordTarget(null)}><Icon name="close" /></button>
+            </div>
+            <div className="sale-edit-body">
+              <div className="form-grid settings-add-grid">
+                <Field label="New Password"><input type="password" value={passwordTarget.password} onChange={(event) => setPasswordTarget({ ...passwordTarget, password: event.target.value })} /></Field>
+                <Field label="Confirm Password"><input type="password" value={passwordTarget.confirm_password} onChange={(event) => setPasswordTarget({ ...passwordTarget, confirm_password: event.target.value })} /></Field>
+              </div>
+              <button className="primary-button" onClick={changePassword}>Save Password</button>
+            </div>
+          </section>
+        </div>
+      )}
+    </ModuleCard>
+  );
+}
+
 function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
   const [draft, setDraft] = useState(updateCenter || {});
   const [message, setMessage] = useState("");
@@ -2902,47 +3195,50 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
 
 function SyncSettingsSection({ canManage, onReload, syncSettings, user }) {
   const [draft, setDraft] = useState(syncSettings || {});
+  const [online, setOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
   const [statusMessage, setStatusMessage] = useState("");
+  useEffect(() => {
+    const updateOnlineStatus = () => setOnline(navigator.onLine);
+    window.addEventListener("online", updateOnlineStatus);
+    window.addEventListener("offline", updateOnlineStatus);
+    return () => {
+      window.removeEventListener("online", updateOnlineStatus);
+      window.removeEventListener("offline", updateOnlineStatus);
+    };
+  }, []);
   const save = async () => {
     try {
       const response = await axios.put(`${API_URL}/settings/sync-status`, {
-        sync_enabled: draft.sync_enabled === true,
-        sync_status: draft.sync_status || "OFFLINE_READY",
-        device_id: draft.device_id || "LOCAL-STORE",
-        notes: draft.notes || "",
+        device_display_name: draft.device_display_name || "Main Counter Device",
         updated_by: user.id,
       });
       setDraft((current) => ({ ...current, ...response.data }));
       await onReload();
-      setStatusMessage("Sync settings saved");
-      alert("Sync settings saved");
+      setStatusMessage("Device display name saved");
+      alert("Device display name saved");
     } catch (error) {
-      setStatusMessage(getErrorMessage(error, "Unable to update sync settings"));
-      alert(getErrorMessage(error, "Unable to update sync settings"));
+      setStatusMessage(getErrorMessage(error, "Unable to save device display name"));
+      alert(getErrorMessage(error, "Unable to save device display name"));
     }
   };
+  const pending = Number(draft.pending_count || 0);
+  const autoStatus = pending > 0 ? "Sync Pending" : online ? "Online" : "Offline";
   return (
     <ModuleCard eyebrow="Sync Settings" title="Offline Sync Architecture" subtitle="Local database, sync queue and status indicator are prepared. Cloud sync delivery is not enabled yet.">
       <div className="purchase-summary-grid supplier-payment-preview">
-        <SummaryMetric label="Sync Status" value={draft.sync_status || "OFFLINE_READY"} featured />
-        <SummaryMetric label="Pending Queue" value={Number(draft.pending_count || 0)} />
+        <SummaryMetric label="Auto Sync Status" value={autoStatus} featured />
+        <SummaryMetric label="Pending Queue" value={pending} />
         <SummaryMetric label="Last Sync Time" value={draft.last_sync_at ? new Date(draft.last_sync_at).toLocaleString("en-IN") : "Not synced"} />
       </div>
       {statusMessage && <p className="form-note">{statusMessage}</p>}
       <div className="form-grid supplier-form-grid">
-        <Field label="Device ID"><input disabled={!canManage} value={draft.device_id || ""} onChange={(event) => setDraft({ ...draft, device_id: event.target.value })} /></Field>
-        <Field label="Status">
-          <select disabled={!canManage} value={draft.sync_status || "OFFLINE_READY"} onChange={(event) => setDraft({ ...draft, sync_status: event.target.value })}>
-            <option value="ONLINE">Online</option>
-            <option value="OFFLINE">Offline</option>
-            <option value="SYNC_PENDING">Sync Pending</option>
-            <option value="OFFLINE_READY">Offline Ready</option>
-          </select>
-        </Field>
-        <label className="check-field"><input checked={draft.sync_enabled === true} disabled={!canManage} type="checkbox" onChange={(event) => setDraft({ ...draft, sync_enabled: event.target.checked })} /><span>Enable future sync</span></label>
-        <Field label="Notes"><textarea disabled={!canManage} value={draft.notes || ""} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></Field>
+        <Field label="Device ID"><input disabled value={draft.device_id || "LOCAL-STORE"} /></Field>
+        <Field label="Device Display Name"><input disabled={!canManage} value={draft.device_display_name || ""} onChange={(event) => setDraft({ ...draft, device_display_name: event.target.value })} /></Field>
+        <label className="check-field"><input checked={draft.sync_enabled === true} disabled type="checkbox" /><span>Enable future sync option is view-only until cloud sync is enabled</span></label>
+        <Field label="Notes"><textarea disabled value={draft.notes || "Cloud sync is prepared but not enabled yet."} /></Field>
       </div>
-      <button className="primary-button" disabled={!canManage} onClick={save}>Save Sync Settings</button>
+      <p className="form-note">Cloud sync is prepared but not enabled yet. Status, pending queue and last sync time are maintained by the system.</p>
+      <button className="primary-button" disabled={!canManage} onClick={save}>Save Device Name</button>
     </ModuleCard>
   );
 }
@@ -3157,12 +3453,14 @@ const getMatchingDiscountRule = (rules, subtotal, paymentMode) => {
   return matches[0] || null;
 };
 
-function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, onSaved, printSettings = {}, products, user }) {
+function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, onSaved, paymentSettings = {}, posSettings = {}, printSettings = {}, products, user }) {
   const [search, setSearch] = useState("");
   const [barcode, setBarcode] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
   const [cart, setCart] = useState([]);
   const [paymentMode, setPaymentMode] = useState("CASH");
+  const [quantityMode, setQuantityMode] = useState(posSettings.enable_weighing_scale ? "SCALE" : "MANUAL");
+  const [scaleMessage, setScaleMessage] = useState("");
   const [mixedPayments, setMixedPayments] = useState({ CASH: "", UPI: "", CARD: "" });
   const [customer, setCustomer] = useState({ name: "", mobile: "", notes: "" });
   const [saving, setSaving] = useState(false);
@@ -3174,6 +3472,8 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
   useEffect(() => {
     searchRef.current?.focus();
   }, []);
+
+  const effectiveQuantityMode = posSettings.enable_weighing_scale ? quantityMode : "MANUAL";
 
   const stockByProduct = useMemo(
     () => inventory.reduce((stock, batch) => {
@@ -3270,6 +3570,16 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
       addProduct(product);
     }
     setBarcode("");
+  };
+
+  const readScaleWeight = () => {
+    setScaleMessage("Scale not connected - enter quantity manually.");
+    const lastItem = cart.at(-1);
+    if (lastItem) {
+      const input = quantityRefs.current[lastItem.product_id];
+      input?.focus();
+      input?.select();
+    }
   };
 
   const selectCustomer = (customerId) => {
@@ -3393,6 +3703,18 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
             </div>
             <span className="shortcut-hint">F2 Search - F3 Barcode - F4 Checkout</span>
           </div>
+          <div className="pos-mode-panel">
+            <Field label="Quantity Mode">
+              <select value={effectiveQuantityMode} onChange={(event) => setQuantityMode(event.target.value)}>
+                <option value="MANUAL">Manual</option>
+                <option disabled={!posSettings.enable_weighing_scale} value="SCALE">Weighing Scale Mode</option>
+              </select>
+            </Field>
+            <button className="secondary-button" disabled={effectiveQuantityMode !== "SCALE"} onClick={readScaleWeight}>Read Weight</button>
+            <span className={effectiveQuantityMode === "SCALE" ? "stock-low" : "stock-ok"}>
+              {effectiveQuantityMode === "SCALE" ? (scaleMessage || "Scale mode ready - manual fallback active") : "Manual quantity entry"}
+            </span>
+          </div>
           <div className="pos-inputs">
             <label className="icon-input">
               <Icon name="search" />
@@ -3495,6 +3817,9 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
               <option value="MIXED">Mixed Payment</option>
             </select>
           </Field>
+          {paymentSettings.enable_upi_qr_on_invoice && paymentSettings.business_upi_id && ["UPI", "MIXED"].includes(paymentMode) && (
+            <p className="form-note">UPI QR will be printed for {paymentSettings.business_upi_id} on this invoice.</p>
+          )}
           {paymentMode === "MIXED" && (
             <div className="mixed-grid">
               {Object.keys(mixedPayments).map((mode) => (
@@ -3854,9 +4179,32 @@ function PaymentReceiptModal({ payment, onClose }) {
   );
 }
 
-function InvoiceModal({ invoice, onClose, printSettings = {} }) {
+function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = {} }) {
   const [printMode, setPrintMode] = useState(printSettings.default_printer_type === "A4" ? "A4" : "THERMAL");
+  const [upiQrDataUrl, setUpiQrDataUrl] = useState("");
   const activePrintMode = printMode === "A4" ? "A4" : "THERMAL";
+  const invoicePayments = invoice.payments || [];
+  const hasUpiPayment = invoice.payment_mode === "UPI" || invoice.payment_mode === "MIXED" || invoicePayments.some((payment) => (payment.mode || payment.payment_mode) === "UPI");
+  const shouldShowUpiQr = paymentSettings.enable_upi_qr_on_invoice === true && paymentSettings.business_upi_id && hasUpiPayment;
+  const upiPayload = shouldShowUpiQr ? [
+    "upi://pay?",
+    `pa=${encodeURIComponent(paymentSettings.business_upi_id)}`,
+    `&pn=${encodeURIComponent(paymentSettings.upi_payee_name || "FEEL THE FREAKIN' FROOZ")}`,
+    `&am=${encodeURIComponent(Number(invoice.total_amount || 0).toFixed(2))}`,
+    "&cu=INR",
+    `&tr=${encodeURIComponent(invoice.invoice_no || `SALE-${invoice.id}`)}`,
+    `&tn=${encodeURIComponent(`FroozERP invoice ${invoice.invoice_no || invoice.id}`)}`,
+  ].join("") : "";
+  useEffect(() => {
+    let active = true;
+    if (!upiPayload) return undefined;
+    QRCode.toDataURL(upiPayload, { errorCorrectionLevel: "M", margin: 1, width: activePrintMode === "THERMAL" ? 120 : 160 })
+      .then((url) => active && setUpiQrDataUrl(url))
+      .catch(() => active && setUpiQrDataUrl(""));
+    return () => {
+      active = false;
+    };
+  }, [activePrintMode, upiPayload]);
   const printWithMode = (mode) => {
     setPrintMode(mode);
     setTimeout(() => window.print(), 100);
@@ -3928,6 +4276,16 @@ function InvoiceModal({ invoice, onClose, printSettings = {} }) {
             <ThermalTotalLine label="Tax" value={Number(invoice.tax_amount || 0)} />
             <ThermalTotalLine label="Net Payable" total value={Number(invoice.total_amount)} />
           </section>
+          {shouldShowUpiQr && upiQrDataUrl && (
+            <section className="upi-qr-box">
+              <img alt="UPI payment QR" src={upiQrDataUrl} />
+              <div>
+                <strong>Scan to pay</strong>
+                <span>{paymentSettings.business_upi_id}</span>
+                <small>{receiptCurrency.format(Number(invoice.total_amount || 0))} - {invoice.invoice_no}</small>
+              </div>
+            </section>
+          )}
           <footer className="invoice-footer">
             <strong>Thank you for shopping with FEEL THE FREAKIN&apos; FROOZ.</strong>
             <span>We appreciate your business.</span>

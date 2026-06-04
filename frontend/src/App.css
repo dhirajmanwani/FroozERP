@@ -145,6 +145,7 @@
   margin-top: auto;
   padding: 13px 5px 0;
   border-top: 1px solid rgba(148, 163, 184, 0.12);
+  cursor: pointer;
 }
 
 .sidebar-profile strong,
@@ -182,6 +183,10 @@
 .logout-button {
   margin-left: auto;
   padding: 5px;
+}
+
+.sidebar-profile:hover {
+  color: #f8fafc;
 }
 
 .content-shell {
@@ -1197,6 +1202,23 @@ tbody tr:last-child td {
   gap: 11px;
 }
 
+.pos-mode-panel {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 11px;
+  border: 1px solid rgba(148, 163, 184, 0.1);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.35);
+}
+
+.pos-mode-panel label {
+  min-width: 210px;
+  margin: 0;
+}
+
 .icon-input {
   position: relative;
 }
@@ -1663,6 +1685,46 @@ tbody tr:last-child td {
 .invoice-total-box .total-line-main,
 .invoice-total-box .total-line-main strong {
   color: #0f172a;
+}
+
+.upi-qr-box {
+  width: min(280px, 100%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 16px 0 0 auto;
+  padding: 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  color: #0f172a;
+  background: #fff;
+}
+
+.upi-qr-box img {
+  width: 92px;
+  height: 92px;
+  flex: 0 0 auto;
+}
+
+.upi-qr-box strong,
+.upi-qr-box span,
+.upi-qr-box small {
+  display: block;
+  color: #0f172a;
+}
+
+.upi-qr-box strong {
+  font-size: 12px;
+}
+
+.upi-qr-box span,
+.upi-qr-box small {
+  margin-top: 3px;
+  font-size: 10px;
+}
+
+.profile-panel {
+  max-width: 780px;
 }
 
 .invoice-footer {
@@ -2196,6 +2258,38 @@ tbody tr:last-child td {
     padding-top: 3px;
     border-top: 1px solid #111827;
     font-size: 15px;
+  }
+
+  .invoice-paper.invoice-thermal .upi-qr-box {
+    width: 100%;
+    display: flex;
+    justify-content: center;
+    gap: 6px;
+    margin: 5px 0 0;
+    padding: 3px 0;
+    border: 0;
+    color: #111827 !important;
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+
+  .invoice-paper.invoice-thermal .upi-qr-box img {
+    width: 24mm;
+    height: 24mm;
+  }
+
+  .invoice-paper.invoice-thermal.invoice-58mm .upi-qr-box img {
+    width: 21mm;
+    height: 21mm;
+  }
+
+  .invoice-paper.invoice-thermal .upi-qr-box strong,
+  .invoice-paper.invoice-thermal .upi-qr-box span,
+  .invoice-paper.invoice-thermal .upi-qr-box small {
+    color: #111827 !important;
+    font-size: 10px;
+    font-weight: 800;
+    line-height: 1.12;
   }
 
   .invoice-paper.invoice-thermal .invoice-footer {

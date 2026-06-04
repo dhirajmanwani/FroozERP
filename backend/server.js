@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const crypto = require("crypto");
 const { Pool } = require("pg");
 
 const app = express();
@@ -32,6 +33,13 @@ const parseNonNegativeNumber = (value) => {
 
 const roundCurrency = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 const roundUnitCost = (value) => Math.round((Number(value) + Number.EPSILON) * 10000) / 10000;
+const hashPassword = (password) =>
+  crypto.createHash("sha256").update(String(password || ""), "utf8").digest("hex");
+const passwordMatches = (password, storedHash) => {
+  const stored = cleanText(storedHash);
+  if (!stored) return false;
+  return stored === hashPassword(password) || stored === String(password || "");
+};
 const applySaleRateRounding = (value, rule) => {
   const amount = Number(value || 0);
   if (!Number.isFinite(amount)) return 0;
@@ -104,6 +112,42 @@ const requireRateManager = async (userId, client = pool) => {
 
 const initializeDatabase = async () => {
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS branches (
+      id SERIAL PRIMARY KEY,
+      branch_name VARCHAR(120) NOT NULL DEFAULT 'Main Branch',
+      location VARCHAR(160),
+      active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    ALTER TABLE branches ADD COLUMN IF NOT EXISTS location VARCHAR(160);
+    ALTER TABLE branches ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE;
+    ALTER TABLE branches ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+    CREATE TABLE IF NOT EXISTS roles (
+      id SERIAL PRIMARY KEY,
+      role_name VARCHAR(80) UNIQUE NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      full_name VARCHAR(140) NOT NULL,
+      username VARCHAR(80) UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role_id INTEGER REFERENCES roles(id),
+      branch_id INTEGER REFERENCES branches(id),
+      active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS mobile_number VARCHAR(30);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(140);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS joining_date DATE DEFAULT CURRENT_DATE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS notes TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+    CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_unique_idx
+      ON users (LOWER(username));
+
     CREATE TABLE IF NOT EXISTS sales (
       id SERIAL PRIMARY KEY,
       total_amount NUMERIC(14, 2) NOT NULL,
@@ -284,6 +328,26 @@ const initializeDatabase = async () => {
       rounding_rule VARCHAR(30) NOT NULL DEFAULT 'NEAREST_RUPEE',
       suggestion_enabled BOOLEAN DEFAULT TRUE,
       notes TEXT,
+      updated_by INTEGER REFERENCES users(id),
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS pos_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+      enable_weighing_scale BOOLEAN DEFAULT FALSE,
+      scale_connection_type VARCHAR(30) DEFAULT 'MANUAL_FALLBACK',
+      scale_com_port VARCHAR(40),
+      scale_baud_rate INTEGER DEFAULT 9600,
+      scale_auto_read BOOLEAN DEFAULT FALSE,
+      updated_by INTEGER REFERENCES users(id),
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS payment_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+      business_upi_id VARCHAR(160),
+      upi_payee_name VARCHAR(180),
+      enable_upi_qr_on_invoice BOOLEAN DEFAULT FALSE,
       updated_by INTEGER REFERENCES users(id),
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
@@ -480,6 +544,7 @@ const initializeDatabase = async () => {
       notes TEXT DEFAULT 'Cloud sync architecture prepared. Online sync delivery is not enabled yet.',
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    ALTER TABLE sync_settings ADD COLUMN IF NOT EXISTS device_display_name VARCHAR(160) DEFAULT 'Main Counter Device';
 
     CREATE TABLE IF NOT EXISTS sync_queue (
       id SERIAL PRIMARY KEY,
@@ -517,6 +582,14 @@ const initializeDatabase = async () => {
     VALUES (1)
     ON CONFLICT (id) DO NOTHING;
 
+    INSERT INTO pos_settings (id)
+    VALUES (1)
+    ON CONFLICT (id) DO NOTHING;
+
+    INSERT INTO payment_settings (id)
+    VALUES (1)
+    ON CONFLICT (id) DO NOTHING;
+
     INSERT INTO update_center (id)
     VALUES (1)
     ON CONFLICT (id) DO NOTHING;
@@ -533,6 +606,20 @@ const initializeDatabase = async () => {
       ('Purchase Manager', '{"purchases":true,"supplier_payments":true,"supplier_accounts":true,"reports":true,"settings":false,"discounts":false,"mandi_tax":false,"rebate_rules":false,"customer_payments":false,"sale_edit":false,"invoice_cancellation":false,"inventory":false,"waste_management":false,"billing":false}'::jsonb),
       ('Inventory Manager', '{"inventory":true,"waste_management":true,"reports":true,"settings":false,"discounts":false,"mandi_tax":false,"rebate_rules":false,"supplier_payments":false,"customer_payments":false,"sale_edit":false,"invoice_cancellation":false,"purchases":false,"supplier_accounts":false,"billing":false}'::jsonb)
     ON CONFLICT (role_name) DO NOTHING;
+
+    INSERT INTO branches (id, branch_name, location)
+    VALUES (1, 'Main Branch', 'Primary Store')
+    ON CONFLICT (id) DO NOTHING;
+
+    INSERT INTO roles (role_name)
+    VALUES ('Owner'), ('Admin'), ('Cashier'), ('Purchase Manager'), ('Inventory Manager')
+    ON CONFLICT (role_name) DO NOTHING;
+
+    INSERT INTO users (full_name, username, password_hash, role_id, branch_id, active)
+    SELECT 'Owner', 'owner', '${hashPassword("owner123")}', r.id, 1, TRUE
+    FROM roles r
+    WHERE r.role_name = 'Owner'
+      AND NOT EXISTS (SELECT 1 FROM users);
 
     INSERT INTO mandi_tax_rules (origin_type, tax_percent)
     VALUES ('LOCAL', 2), ('IMPORTED', 4)
@@ -1405,7 +1492,7 @@ const getDashboardAnalyticsPayload = async (query = {}) => {
 };
 
 const getSettingsBundle = async (userId) => {
-  const [businessResult, saleRateResult, mandiResult, rebateResult, discountResult, roleResult, updateResult, syncResult, syncQueueResult, manager] = await Promise.all([
+  const [businessResult, saleRateResult, mandiResult, rebateResult, discountResult, roleResult, updateResult, syncResult, syncQueueResult, posResult, paymentResult, manager] = await Promise.all([
     pool.query("SELECT * FROM business_settings WHERE id = 1"),
     pool.query("SELECT * FROM sale_rate_settings WHERE id = 1"),
     pool.query("SELECT * FROM mandi_tax_rules ORDER BY origin_type"),
@@ -1415,16 +1502,33 @@ const getSettingsBundle = async (userId) => {
     pool.query("SELECT * FROM update_center WHERE id = 1"),
     pool.query("SELECT * FROM sync_settings WHERE id = 1"),
     pool.query("SELECT COUNT(*)::INTEGER AS pending_count FROM sync_queue WHERE sync_status = 'PENDING'"),
+    pool.query("SELECT * FROM pos_settings WHERE id = 1"),
+    pool.query("SELECT * FROM payment_settings WHERE id = 1"),
     userId ? requireRateManager(userId) : Promise.resolve(null),
   ]);
+  const usersResult = manager ? await pool.query(
+    `
+    SELECT
+      u.id, u.full_name, u.username, u.mobile_number, u.email, u.active,
+      u.joining_date, u.notes, u.last_login_at, u.created_at, u.updated_at,
+      r.role_name AS role, b.branch_name AS branch
+    FROM users u
+    LEFT JOIN roles r ON r.id = u.role_id
+    LEFT JOIN branches b ON b.id = u.branch_id
+    ORDER BY u.active DESC, u.full_name
+    `
+  ) : { rows: [] };
   const syncSettings = syncResult.rows[0] || {};
   return {
     businessSettings: businessResult.rows[0] || {},
     saleRateSettings: saleRateResult.rows[0] || {},
+    posSettings: posResult.rows[0] || {},
+    paymentSettings: paymentResult.rows[0] || {},
     mandiTaxRules: mandiResult.rows,
     rebateRules: rebateResult.rows,
     discountRules: discountResult.rows,
     roles: roleResult.rows,
+    users: usersResult.rows,
     updateCenter: updateResult.rows[0] || {},
     syncSettings: {
       ...syncSettings,
@@ -1913,21 +2017,81 @@ app.put("/settings/sync-status", async (req, res) => {
     const result = await pool.query(
       `
       UPDATE sync_settings
-      SET sync_enabled = $1, sync_status = $2, device_id = $3, notes = $4, updated_at = CURRENT_TIMESTAMP
+      SET device_display_name = $1, updated_at = CURRENT_TIMESTAMP
       WHERE id = 1
       RETURNING *
       `,
-      [
-        req.body.sync_enabled === true,
-        cleanText(req.body.sync_status) || "OFFLINE_READY",
-        cleanText(req.body.device_id) || "LOCAL-STORE",
-        cleanText(req.body.notes) || "Cloud sync architecture prepared.",
-      ]
+      [cleanText(req.body.device_display_name) || "Main Counter Device"]
     );
     return res.json(result.rows[0]);
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Updating Sync Settings" });
+  }
+});
+
+app.put("/settings/pos", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage POS settings" });
+    const connectionType = cleanText(req.body.scale_connection_type).toUpperCase();
+    const allowedConnections = new Set(["USB", "SERIAL", "BLUETOOTH", "MANUAL_FALLBACK"]);
+    const baudRate = parsePositiveInteger(req.body.scale_baud_rate) || 9600;
+    const result = await pool.query(
+      `
+      UPDATE pos_settings
+      SET enable_weighing_scale = $1,
+          scale_connection_type = $2,
+          scale_com_port = $3,
+          scale_baud_rate = $4,
+          scale_auto_read = $5,
+          updated_by = $6,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = 1
+      RETURNING *
+      `,
+      [
+        req.body.enable_weighing_scale === true,
+        allowedConnections.has(connectionType) ? connectionType : "MANUAL_FALLBACK",
+        nullableText(req.body.scale_com_port),
+        baudRate,
+        req.body.scale_auto_read === true,
+        manager.id,
+      ]
+    );
+    return res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating POS Settings" });
+  }
+});
+
+app.put("/settings/payment", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage payment settings" });
+    const result = await pool.query(
+      `
+      UPDATE payment_settings
+      SET business_upi_id = $1,
+          upi_payee_name = $2,
+          enable_upi_qr_on_invoice = $3,
+          updated_by = $4,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = 1
+      RETURNING *
+      `,
+      [
+        nullableText(req.body.business_upi_id),
+        nullableText(req.body.upi_payee_name),
+        req.body.enable_upi_qr_on_invoice === true,
+        manager.id,
+      ]
+    );
+    return res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Payment Settings" });
   }
 });
 
@@ -2002,6 +2166,194 @@ app.put("/settings/sale-rate", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Updating Sale Rate Settings" });
+  }
+});
+
+const readUserPayload = (body) => ({
+  full_name: cleanText(body.full_name),
+  username: cleanText(body.username),
+  mobile_number: nullableText(body.mobile_number),
+  email: nullableText(body.email),
+  role: cleanText(body.role || "Cashier"),
+  active: body.active !== false,
+  joining_date: body.joining_date || toDateKey(new Date()),
+  notes: nullableText(body.notes),
+});
+
+const getRoleIdByName = async (roleName, client = pool) => {
+  const result = await client.query("SELECT id FROM roles WHERE role_name = $1", [roleName]);
+  return result.rows[0]?.id || null;
+};
+
+const getUserTransactionCount = async (userId) => {
+  const result = await pool.query(
+    `
+    SELECT
+      COALESCE((SELECT COUNT(*) FROM sales WHERE created_by = $1), 0)
+      + COALESCE((SELECT COUNT(*) FROM purchases WHERE created_by = $1), 0)
+      + COALESCE((SELECT COUNT(*) FROM supplier_payments WHERE created_by = $1), 0)
+      + COALESCE((SELECT COUNT(*) FROM customer_payments WHERE created_by = $1), 0)
+      + COALESCE((SELECT COUNT(*) FROM expenses WHERE created_by = $1), 0)
+      + COALESCE((SELECT COUNT(*) FROM sale_returns WHERE created_by = $1), 0)
+      + COALESCE((SELECT COUNT(*) FROM waste_entries WHERE created_by = $1), 0) AS transaction_count
+    `,
+    [userId]
+  );
+  return Number(result.rows[0]?.transaction_count || 0);
+};
+
+app.get("/users", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.query.updated_by || req.query.user_id);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can view users" });
+    const result = await pool.query(
+      `
+      SELECT
+        u.id, u.full_name, u.username, u.mobile_number, u.email, u.active,
+        u.joining_date, u.notes, u.last_login_at, u.created_at, u.updated_at,
+        r.role_name AS role, b.branch_name AS branch
+      FROM users u
+      LEFT JOIN roles r ON r.id = u.role_id
+      LEFT JOIN branches b ON b.id = u.branch_id
+      ORDER BY u.active DESC, u.full_name
+      `
+    );
+    return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Users" });
+  }
+});
+
+app.post("/users", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can add users" });
+    const payload = readUserPayload(req.body);
+    const password = String(req.body.password || "");
+    const confirmPassword = String(req.body.confirm_password || "");
+    const roleId = await getRoleIdByName(payload.role);
+    if (!payload.full_name || !payload.username || !roleId || password.length < 4 || password !== confirmPassword) {
+      return res.status(400).json({ message: "Enter valid user details and matching password" });
+    }
+    const duplicate = await pool.query("SELECT id FROM users WHERE LOWER(username) = LOWER($1)", [payload.username]);
+    if (duplicate.rows.length) return res.status(409).json({ message: "This username already exists." });
+    const result = await pool.query(
+      `
+      INSERT INTO users (
+        full_name, username, password_hash, role_id, branch_id, active,
+        mobile_number, email, joining_date, notes, updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
+      RETURNING id, full_name, username, mobile_number, email, active, joining_date, notes, created_at, updated_at
+      `,
+      [
+        payload.full_name, payload.username, hashPassword(password), roleId,
+        parsePositiveInteger(req.body.branch_id) || manager.branch_id || 1,
+        payload.active, payload.mobile_number, payload.email, payload.joining_date, payload.notes,
+      ]
+    );
+    return res.status(201).json({ ...result.rows[0], role: payload.role });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Saving User" });
+  }
+});
+
+app.put("/users/:id", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    const userId = parsePositiveInteger(req.params.id);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can edit users" });
+    if (!userId) return res.status(400).json({ message: "Invalid user" });
+    const payload = readUserPayload(req.body);
+    const roleId = await getRoleIdByName(payload.role);
+    if (!payload.full_name || !payload.username || !roleId) {
+      return res.status(400).json({ message: "Enter valid user details" });
+    }
+    const duplicate = await pool.query("SELECT id FROM users WHERE LOWER(username) = LOWER($1) AND id <> $2", [payload.username, userId]);
+    if (duplicate.rows.length) return res.status(409).json({ message: "This username already exists." });
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET full_name = $1, username = $2, role_id = $3, active = $4,
+          mobile_number = $5, email = $6, joining_date = $7, notes = $8,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $9
+      RETURNING id, full_name, username, mobile_number, email, active, joining_date, notes, last_login_at, created_at, updated_at
+      `,
+      [payload.full_name, payload.username, roleId, payload.active, payload.mobile_number, payload.email, payload.joining_date, payload.notes, userId]
+    );
+    return result.rows[0] ? res.json({ ...result.rows[0], role: payload.role }) : res.status(404).json({ message: "User not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating User" });
+  }
+});
+
+app.put("/users/:id/password", async (req, res) => {
+  try {
+    const userId = parsePositiveInteger(req.params.id);
+    const actorId = parsePositiveInteger(req.body.updated_by);
+    const manager = await requireRateManager(actorId);
+    const password = String(req.body.password || "");
+    const confirmPassword = String(req.body.confirm_password || "");
+    if (!userId || (!manager && actorId !== userId)) return res.status(403).json({ message: "Not allowed to change this password" });
+    if (password.length < 4 || password !== confirmPassword) return res.status(400).json({ message: "Enter matching password with at least 4 characters" });
+    const result = await pool.query(
+      "UPDATE users SET password_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING id",
+      [hashPassword(password), userId]
+    );
+    return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "User not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Password" });
+  }
+});
+
+app.post("/users/:id/deactivate", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    const userId = parsePositiveInteger(req.params.id);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can deactivate users" });
+    if (!userId || userId === manager.id) return res.status(400).json({ message: "Invalid user deactivation request" });
+    const result = await pool.query("UPDATE users SET active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING id", [userId]);
+    return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "User not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Deactivating User" });
+  }
+});
+
+app.post("/users/:id/reactivate", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    const userId = parsePositiveInteger(req.params.id);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can reactivate users" });
+    const result = await pool.query("UPDATE users SET active = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING id", [userId]);
+    return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "User not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Reactivating User" });
+  }
+});
+
+app.delete("/users/:id", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    const userId = parsePositiveInteger(req.params.id);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can delete users" });
+    if (!userId || userId === manager.id) return res.status(400).json({ message: "Invalid user delete request" });
+    const transactionCount = await getUserTransactionCount(userId);
+    if (transactionCount > 0) {
+      await pool.query("UPDATE users SET active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $1", [userId]);
+      return res.json({ success: true, deactivated: true, message: "User has transaction history and was deactivated instead of deleted." });
+    }
+    const result = await pool.query("DELETE FROM users WHERE id = $1 RETURNING id", [userId]);
+    return result.rows[0] ? res.json({ success: true, deleted: true }) : res.status(404).json({ message: "User not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Deleting User" });
   }
 });
 
@@ -2262,6 +2614,11 @@ app.post("/login", async (req, res) => {
         u.full_name,
         u.username,
         u.password_hash,
+        u.mobile_number,
+        u.email,
+        u.joining_date,
+        u.notes,
+        u.last_login_at,
         u.branch_id,
         r.role_name,
         b.branch_name
@@ -2279,9 +2636,14 @@ app.post("/login", async (req, res) => {
     }
 
     const user = result.rows[0];
-    if (user.password_hash !== password) {
+    if (!passwordMatches(password, user.password_hash)) {
       return res.status(401).json({ message: "Invalid password" });
     }
+    const hashed = hashPassword(password);
+    await pool.query(
+      "UPDATE users SET password_hash = $1, last_login_at = CURRENT_TIMESTAMP WHERE id = $2",
+      [hashed, user.id]
+    );
 
     return res.json({
       id: user.id,
@@ -2290,6 +2652,11 @@ app.post("/login", async (req, res) => {
       role: user.role_name,
       branch_id: user.branch_id,
       branch: user.branch_name,
+      mobile_number: user.mobile_number,
+      email: user.email,
+      joining_date: user.joining_date,
+      notes: user.notes,
+      last_login_at: new Date().toISOString(),
     });
   } catch (error) {
     console.error(error);
@@ -3957,6 +4324,7 @@ app.get("/reports/summary", async (req, res) => {
       stockMovementResult,
       balanceSheetResult,
       profitLossResult,
+      paymentModeSummaryResult,
     ] = await Promise.all([
       pool.query(
         `
@@ -3965,11 +4333,35 @@ app.get("/reports/summary", async (req, res) => {
           COUNT(*)::INTEGER AS transaction_count,
           SUM(total_amount) AS total_sales,
           SUM(total_cost) AS total_cost,
-          SUM(profit) AS total_profit
-        FROM sales
-        WHERE sale_status <> 'CANCELLED'
-          AND sale_date BETWEEN $1 AND $2
-        GROUP BY sale_date
+          SUM(profit) AS total_profit,
+          COALESCE((
+            SELECT SUM(sp.amount)
+            FROM sale_payments sp
+            JOIN sales sx ON sx.id = sp.sale_id
+            WHERE sx.sale_status <> 'CANCELLED'
+              AND sx.sale_date = s.sale_date
+              AND sp.payment_mode = 'CASH'
+          ), 0) AS cash_sales,
+          COALESCE((
+            SELECT SUM(sp.amount)
+            FROM sale_payments sp
+            JOIN sales sx ON sx.id = sp.sale_id
+            WHERE sx.sale_status <> 'CANCELLED'
+              AND sx.sale_date = s.sale_date
+              AND sp.payment_mode = 'UPI'
+          ), 0) AS upi_sales,
+          COALESCE((
+            SELECT SUM(sp.amount)
+            FROM sale_payments sp
+            JOIN sales sx ON sx.id = sp.sale_id
+            WHERE sx.sale_status <> 'CANCELLED'
+              AND sx.sale_date = s.sale_date
+              AND sp.payment_mode IN ('CARD', 'BANK_TRANSFER')
+          ), 0) AS bank_card_sales
+        FROM sales s
+        WHERE s.sale_status <> 'CANCELLED'
+          AND s.sale_date BETWEEN $1 AND $2
+        GROUP BY s.sale_date
         ORDER BY sale_date DESC
         `,
         [dateFrom, dateTo]
@@ -4216,6 +4608,34 @@ app.get("/reports/summary", async (req, res) => {
           WHERE active IS DISTINCT FROM FALSE AND expense_date BETWEEN $1 AND $2
           GROUP BY expense_date
         ),
+        sales_payments_by_day AS (
+          SELECT s.sale_date::date AS day,
+            SUM(CASE WHEN sp.payment_mode = 'CASH' THEN sp.amount ELSE 0 END) AS cash_sales,
+            SUM(CASE WHEN sp.payment_mode = 'UPI' THEN sp.amount ELSE 0 END) AS upi_sales,
+            SUM(CASE WHEN sp.payment_mode IN ('CARD', 'BANK_TRANSFER') THEN sp.amount ELSE 0 END) AS bank_card_sales
+          FROM sale_payments sp
+          JOIN sales s ON s.id = sp.sale_id
+          WHERE s.sale_status <> 'CANCELLED' AND s.sale_date BETWEEN $1 AND $2
+          GROUP BY s.sale_date
+        ),
+        customer_receipts_by_day AS (
+          SELECT payment_date::date AS day,
+            SUM(CASE WHEN payment_mode = 'CASH' THEN payment_amount ELSE 0 END) AS cash_receipts,
+            SUM(CASE WHEN payment_mode = 'UPI' THEN payment_amount ELSE 0 END) AS upi_receipts,
+            SUM(CASE WHEN payment_mode IN ('CARD', 'BANK_TRANSFER') THEN payment_amount ELSE 0 END) AS bank_card_receipts
+          FROM customer_payments
+          WHERE cancelled = FALSE AND payment_date BETWEEN $1 AND $2
+          GROUP BY payment_date
+        ),
+        supplier_payments_by_day AS (
+          SELECT payment_date::date AS day,
+            SUM(CASE WHEN payment_mode = 'CASH' THEN payment_amount ELSE 0 END) AS cash_supplier_payments,
+            SUM(CASE WHEN payment_mode = 'UPI' THEN payment_amount ELSE 0 END) AS upi_supplier_payments,
+            SUM(CASE WHEN payment_mode IN ('BANK_TRANSFER', 'CHEQUE') THEN payment_amount ELSE 0 END) AS bank_supplier_payments
+          FROM supplier_payments
+          WHERE cancelled = FALSE AND payment_date BETWEEN $1 AND $2
+          GROUP BY payment_date
+        ),
         returns_by_day AS (
           SELECT return_date::date AS day, SUM(total_return_amount) AS returns
           FROM sale_returns
@@ -4235,6 +4655,15 @@ app.get("/reports/summary", async (req, res) => {
           COALESCE(sales_by_day.transactions, 0)::INTEGER AS transactions,
           COALESCE(purchases_by_day.purchases, 0) AS purchases,
           COALESCE(expenses_by_day.expenses, 0) AS expenses,
+          COALESCE(sales_payments_by_day.cash_sales, 0) AS cash_sales,
+          COALESCE(sales_payments_by_day.upi_sales, 0) AS upi_sales,
+          COALESCE(sales_payments_by_day.bank_card_sales, 0) AS bank_card_sales,
+          COALESCE(customer_receipts_by_day.cash_receipts, 0) AS customer_cash_receipts,
+          COALESCE(customer_receipts_by_day.upi_receipts, 0) AS customer_upi_receipts,
+          COALESCE(customer_receipts_by_day.bank_card_receipts, 0) AS customer_bank_card_receipts,
+          COALESCE(supplier_payments_by_day.cash_supplier_payments, 0) AS supplier_cash_payments,
+          COALESCE(supplier_payments_by_day.upi_supplier_payments, 0) AS supplier_upi_payments,
+          COALESCE(supplier_payments_by_day.bank_supplier_payments, 0) AS supplier_bank_payments,
           COALESCE(returns_by_day.returns, 0) AS returns,
           COALESCE(waste_by_day.waste, 0) AS waste,
           COALESCE(sales_by_day.profit, 0) - COALESCE(expenses_by_day.expenses, 0) - COALESCE(waste_by_day.waste, 0) AS net_profit
@@ -4242,6 +4671,9 @@ app.get("/reports/summary", async (req, res) => {
         LEFT JOIN sales_by_day ON sales_by_day.day = days.day
         LEFT JOIN purchases_by_day ON purchases_by_day.day = days.day
         LEFT JOIN expenses_by_day ON expenses_by_day.day = days.day
+        LEFT JOIN sales_payments_by_day ON sales_payments_by_day.day = days.day
+        LEFT JOIN customer_receipts_by_day ON customer_receipts_by_day.day = days.day
+        LEFT JOIN supplier_payments_by_day ON supplier_payments_by_day.day = days.day
         LEFT JOIN returns_by_day ON returns_by_day.day = days.day
         LEFT JOIN waste_by_day ON waste_by_day.day = days.day
         ORDER BY days.day DESC
@@ -4469,6 +4901,37 @@ app.get("/reports/summary", async (req, res) => {
         `,
         [dateFrom, dateTo]
       ),
+      pool.query(
+        `
+        SELECT
+          transaction_date,
+          source,
+          payment_mode,
+          COUNT(*)::INTEGER AS transaction_count,
+          SUM(amount) AS total_amount
+        FROM (
+          SELECT s.sale_date AS transaction_date, 'Sales' AS source, sp.payment_mode, sp.amount
+          FROM sale_payments sp
+          JOIN sales s ON s.id = sp.sale_id
+          WHERE s.sale_status <> 'CANCELLED' AND s.sale_date BETWEEN $1 AND $2
+          UNION ALL
+          SELECT cp.payment_date AS transaction_date, 'Customer Receipt' AS source, cp.payment_mode, cp.payment_amount AS amount
+          FROM customer_payments cp
+          WHERE cp.cancelled = FALSE AND cp.payment_date BETWEEN $1 AND $2
+          UNION ALL
+          SELECT sp.payment_date AS transaction_date, 'Supplier Payment' AS source, sp.payment_mode, sp.payment_amount AS amount
+          FROM supplier_payments sp
+          WHERE sp.cancelled = FALSE AND sp.payment_date BETWEEN $1 AND $2
+          UNION ALL
+          SELECT e.expense_date AS transaction_date, 'Expense' AS source, e.payment_mode, e.amount
+          FROM expenses e
+          WHERE e.active IS DISTINCT FROM FALSE AND e.expense_date BETWEEN $1 AND $2
+        ) mode_rows
+        GROUP BY transaction_date, source, payment_mode
+        ORDER BY transaction_date DESC, source, payment_mode
+        `,
+        [dateFrom, dateTo]
+      ),
     ]);
     const balanceSheet = balanceSheetResult.rows[0] || {};
     const profitLoss = profitLossResult.rows[0] || {};
@@ -4486,6 +4949,7 @@ app.get("/reports/summary", async (req, res) => {
       discountReport: discountResult.rows,
       expenseReport: expenseResult.rows,
       paymentReport: paymentResult.rows,
+      paymentModeSummary: paymentModeSummaryResult.rows,
       returnReport: returnResult.rows,
       returnReasonReport: returnReasonResult.rows,
       wasteReport: wasteResult.rows,
@@ -4516,6 +4980,9 @@ app.get("/reports/summary", async (req, res) => {
         purchaseCost: roundCurrency(Number(profitLoss.purchase_cost || 0)),
         expenses: roundCurrency(Number(profitLoss.expenses || 0)),
         supplierRebateReceived: roundCurrency(Number(profitLoss.supplier_rebate_received || 0)),
+        cashSales: roundCurrency(paymentModeSummaryResult.rows.filter((row) => row.source === "Sales" && row.payment_mode === "CASH").reduce((sum, row) => sum + Number(row.total_amount || 0), 0)),
+        upiSales: roundCurrency(paymentModeSummaryResult.rows.filter((row) => row.source === "Sales" && row.payment_mode === "UPI").reduce((sum, row) => sum + Number(row.total_amount || 0), 0)),
+        bankCardSales: roundCurrency(paymentModeSummaryResult.rows.filter((row) => row.source === "Sales" && ["CARD", "BANK_TRANSFER"].includes(row.payment_mode)).reduce((sum, row) => sum + Number(row.total_amount || 0), 0)),
         grossProfit: roundCurrency(grossProfit),
         netProfit: roundCurrency(netProfit),
       },
