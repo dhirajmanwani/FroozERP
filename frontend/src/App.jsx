@@ -200,6 +200,7 @@ const defaultPaymentSettings = {
   business_upi_id: "",
   upi_payee_name: "FEEL THE FREAKIN' FROOZ",
   enable_upi_qr_on_invoice: false,
+  show_upi_qr_on_all_bills: false,
 };
 
 function BrandLogo({ compact = false, invoice = false }) {
@@ -320,6 +321,9 @@ function App() {
     wasteReport: [],
     wasteProductReport: [],
     mostWastedProducts: [],
+    pendingPurchaseBillsReport: [],
+    stockWithoutBillReport: [],
+    provisionalProfitSalesReport: [],
     balanceSheet: {},
     profitLoss: {},
   });
@@ -368,6 +372,12 @@ function App() {
   const [purchaseLabourCharges, setPurchaseLabourCharges] = useState("");
   const [purchaseOtherCharges, setPurchaseOtherCharges] = useState("");
   const [purchasePaidAmount, setPurchasePaidAmount] = useState("");
+  const [purchaseBillStatus, setPurchaseBillStatus] = useState("BILL_COMPLETED");
+  const [purchaseDate, setPurchaseDate] = useState(toDateKey(new Date()));
+  const [temporarySaleRate, setTemporarySaleRate] = useState("");
+  const [expectedPurchaseRate, setExpectedPurchaseRate] = useState("");
+  const [purchaseBillNumber, setPurchaseBillNumber] = useState("");
+  const [purchaseBillDate, setPurchaseBillDate] = useState("");
   const [purchaseType, setPurchaseType] = useState("CREDIT");
   const [purchasePaymentMode, setPurchasePaymentMode] = useState("CASH");
   const [purchasePaymentReference, setPurchasePaymentReference] = useState("");
@@ -468,6 +478,24 @@ function App() {
   const purchaseSummary = useMemo(() => {
     const quantity = Number(purchaseQuantity || 0);
     const rate = Number(purchaseRateInput || 0);
+    if (purchaseBillStatus === "BILL_PENDING") {
+      const expectedRate = Number(expectedPurchaseRate || 0);
+      return {
+        basicAmount: quantity * expectedRate,
+        mandiTaxPercent: 0,
+        mandiTaxAmount: 0,
+        freightCharges: 0,
+        labourCharges: 0,
+        otherCharges: 0,
+        grossAmount: quantity * expectedRate,
+        rebatePercent: 0,
+        rebateAmount: 0,
+        netPayable: 0,
+        balanceAmount: 0,
+        effectiveCostPerUnit: expectedRate,
+        paymentStatus: "Bill Pending",
+      };
+    }
     const otherCharges = Number(purchaseOtherCharges || 0);
     const paidAmount = purchaseType === "CASH" ? Number(purchasePaidAmount || 0) : 0;
     const freightCharges = Number(purchaseFreightCharges || 0);
@@ -495,7 +523,7 @@ function App() {
       effectiveCostPerUnit: quantity > 0 ? netPayable / quantity : 0,
       paymentStatus: netPayable > 0 && paidAmount >= netPayable ? "Paid" : paidAmount > 0 ? "Partial" : "Pending",
     };
-  }, [purchaseFreightCharges, purchaseLabourCharges, purchaseOtherCharges, purchasePaidAmount, purchaseQuantity, purchaseRateInput, purchaseRebateRuleId, purchaseRules, purchaseType, selectedPurchaseProduct]);
+  }, [expectedPurchaseRate, purchaseBillStatus, purchaseFreightCharges, purchaseLabourCharges, purchaseOtherCharges, purchasePaidAmount, purchaseQuantity, purchaseRateInput, purchaseRebateRuleId, purchaseRules, purchaseType, selectedPurchaseProduct]);
 
   const loadProducts = async () => {
     const response = await axios.get(`${API_URL}/products`);
@@ -724,6 +752,12 @@ function App() {
     setPurchaseLabourCharges("");
     setPurchaseOtherCharges("");
     setPurchasePaidAmount("");
+    setPurchaseBillStatus("BILL_COMPLETED");
+    setPurchaseDate(toDateKey(new Date()));
+    setTemporarySaleRate("");
+    setExpectedPurchaseRate("");
+    setPurchaseBillNumber("");
+    setPurchaseBillDate("");
     setPurchaseType("CREDIT");
     setPurchasePaymentMode("CASH");
     setPurchasePaymentReference("");
@@ -743,6 +777,10 @@ function App() {
         product_id: purchaseProductId,
         quantity: purchaseQuantity,
         purchase_rate: purchaseRateInput,
+        purchase_bill_status: purchaseBillStatus,
+        purchase_date: purchaseDate,
+        temporary_sale_rate: temporarySaleRate,
+        expected_purchase_rate: expectedPurchaseRate,
         freight_charges: purchaseFreightCharges,
         labour_charges: purchaseLabourCharges,
       other_charges: purchaseOtherCharges,
@@ -752,20 +790,24 @@ function App() {
       purchase_type: purchaseType,
       payment_mode: purchaseType === "CASH" ? purchasePaymentMode : null,
       payment_reference_number: purchaseType === "CASH" ? purchasePaymentReference : null,
+      bill_number: purchaseBillNumber,
+      bill_date: purchaseBillDate || null,
       branch_id: user.branch_id,
       created_by: user.id,
       edited_by: user.id,
       reason,
       remarks: purchaseRemarks,
       };
-      if (editingPurchaseId) {
+      if (editingPurchaseId && purchaseBillStatus === "BILL_COMPLETED" && purchases.find((purchase) => Number(purchase.id) === Number(editingPurchaseId))?.purchase_bill_status === "BILL_PENDING") {
+        await axios.post(`${API_URL}/purchase/${editingPurchaseId}/complete-bill`, payload);
+      } else if (editingPurchaseId) {
         await axios.put(`${API_URL}/purchase/${editingPurchaseId}`, payload);
       } else {
         await axios.post(`${API_URL}/purchase`, payload);
       }
       resetPurchaseForm();
       await Promise.all([loadDashboardData(), loadPurchases(), loadSupplierData(), loadAccounts(), loadAccountOutstanding()]);
-      alert(wasEditing ? "Purchase Updated" : "Purchase Saved");
+      alert(purchaseBillStatus === "BILL_PENDING" ? "Stock Arrival Saved - Bill Pending" : wasEditing ? "Purchase Updated" : "Purchase Saved");
     } catch (error) {
       alert(getErrorMessage(error, "Purchase Error"));
     }
@@ -854,10 +896,14 @@ function App() {
 
   const editPurchase = (purchase) => {
     setEditingPurchaseId(purchase.id);
+    setPurchaseBillStatus(purchase.purchase_bill_status || "BILL_COMPLETED");
+    setPurchaseDate(toDateKey(purchase.purchase_date || new Date()));
     setPurchaseSupplierId(String(purchase.supplier_id || ""));
     setPurchaseProductId(String(purchase.product_id || ""));
     setPurchaseQuantity(String(purchase.quantity || ""));
     setPurchaseRateInput(String(purchase.purchase_rate || ""));
+    setTemporarySaleRate(String(purchase.temporary_sale_rate || ""));
+    setExpectedPurchaseRate(String(purchase.expected_purchase_rate || purchase.purchase_rate || ""));
     setPurchaseFreightCharges(String(purchase.freight_charges || 0));
     setPurchaseLabourCharges(String(purchase.labour_charges || 0));
     setPurchaseOtherCharges(String(purchase.other_charges || 0));
@@ -867,7 +913,23 @@ function App() {
     setPurchasePaymentReference(purchase.payment_reference_number || "");
     setPurchaseRebateRuleId(String(purchase.rebate_rule_id || ""));
     setPurchasePaymentDate(purchase.payment_date ? toDateKey(purchase.payment_date) : "");
+    setPurchaseBillNumber(purchase.bill_number || "");
+    setPurchaseBillDate(purchase.bill_date ? toDateKey(purchase.bill_date) : "");
     setPurchaseRemarks(purchase.remarks || "");
+  };
+
+  const completePendingPurchase = (purchase) => {
+    editPurchase({
+      ...purchase,
+      purchase_bill_status: "BILL_COMPLETED",
+      purchase_rate: purchase.expected_purchase_rate || purchase.purchase_rate || "",
+    });
+    setPurchaseBillStatus("BILL_COMPLETED");
+    setPurchaseType("CREDIT");
+    setPurchasePaidAmount("");
+    setPurchasePaymentMode("CASH");
+    setPurchasePaymentReference("");
+    setPurchaseBillDate(toDateKey(new Date()));
   };
 
   const cancelPurchase = async (purchase) => {
@@ -1111,6 +1173,12 @@ function App() {
           {activeView === "purchase" && (
             <ModuleCard eyebrow="Procurement" title="Purchase Entry" subtitle="Record incoming stock and supplier purchase details.">
               <div className="form-grid">
+                <Field label="Entry Type">
+                  <select value={purchaseBillStatus} onChange={(event) => setPurchaseBillStatus(event.target.value)}>
+                    <option value="BILL_COMPLETED">Purchase Bill Completed</option>
+                    <option value="BILL_PENDING">Stock Arrival / Pending Bill Entry</option>
+                  </select>
+                </Field>
                 <Field label="Supplier Account">
                   <select value={purchaseSupplierId} onChange={(event) => setPurchaseSupplierId(event.target.value)}>
                     <option value="">Select saved supplier</option>
@@ -1128,24 +1196,34 @@ function App() {
                   </select>
                 </Field>
                 <Field label="Quantity"><input type="number" min="0" step="0.001" value={purchaseQuantity} onChange={(event) => setPurchaseQuantity(event.target.value)} /></Field>
-                <Field label="Purchase Rate"><input type="number" min="0" step="0.01" value={purchaseRateInput} onChange={(event) => setPurchaseRateInput(event.target.value)} /></Field>
-                <Field label="Freight Charges"><input type="number" min="0" step="0.01" value={purchaseFreightCharges} onChange={(event) => setPurchaseFreightCharges(event.target.value)} /></Field>
-                <Field label="Labour Charges"><input type="number" min="0" step="0.01" value={purchaseLabourCharges} onChange={(event) => setPurchaseLabourCharges(event.target.value)} /></Field>
-                <Field label="Other Charges"><input type="number" min="0" step="0.01" value={purchaseOtherCharges} onChange={(event) => setPurchaseOtherCharges(event.target.value)} /></Field>
-                <Field label="Payment Timing / Rebate Rule">
-                  <select value={purchaseRebateRuleId} onChange={(event) => setPurchaseRebateRuleId(event.target.value)}>
-                    <option value="">Select rebate rule</option>
-                    {purchaseRules.rebateRules.map((rule) => <option key={rule.id} value={rule.id}>{rule.rule_name} - {rule.pay_within_days} days - {rule.rebate_percent}%</option>)}
-                  </select>
-                </Field>
-                <Field label="Purchase Type">
-                  <select value={purchaseType} onChange={(event) => setPurchaseType(event.target.value)}>
-                    <option value="CREDIT">Credit Purchase</option>
-                    <option value="CASH">Cash Purchase</option>
-                  </select>
-                </Field>
-                {purchaseType === "CASH" && (
+                <Field label={purchaseBillStatus === "BILL_PENDING" ? "Arrival Date" : "Purchase Date"}><input type="date" value={purchaseDate} onChange={(event) => setPurchaseDate(event.target.value)} /></Field>
+                {purchaseBillStatus === "BILL_PENDING" ? (
                   <>
+                    <Field label="Temporary Sale Rate"><input type="number" min="0" step="0.01" value={temporarySaleRate} onChange={(event) => setTemporarySaleRate(event.target.value)} /></Field>
+                    <Field label="Expected Purchase Rate (Optional)"><input type="number" min="0" step="0.01" value={expectedPurchaseRate} onChange={(event) => setExpectedPurchaseRate(event.target.value)} /></Field>
+                  </>
+                ) : (
+                  <>
+                    <Field label="Purchase Rate"><input type="number" min="0" step="0.01" value={purchaseRateInput} onChange={(event) => setPurchaseRateInput(event.target.value)} /></Field>
+                    <Field label="Bill Number"><input value={purchaseBillNumber} onChange={(event) => setPurchaseBillNumber(event.target.value)} /></Field>
+                    <Field label="Bill Date"><input type="date" value={purchaseBillDate} onChange={(event) => setPurchaseBillDate(event.target.value)} /></Field>
+                    <Field label="Freight Charges"><input type="number" min="0" step="0.01" value={purchaseFreightCharges} onChange={(event) => setPurchaseFreightCharges(event.target.value)} /></Field>
+                    <Field label="Labour Charges"><input type="number" min="0" step="0.01" value={purchaseLabourCharges} onChange={(event) => setPurchaseLabourCharges(event.target.value)} /></Field>
+                    <Field label="Other Charges"><input type="number" min="0" step="0.01" value={purchaseOtherCharges} onChange={(event) => setPurchaseOtherCharges(event.target.value)} /></Field>
+                    <Field label="Payment Timing / Rebate Rule">
+                      <select value={purchaseRebateRuleId} onChange={(event) => setPurchaseRebateRuleId(event.target.value)}>
+                        <option value="">Select rebate rule</option>
+                        {purchaseRules.rebateRules.map((rule) => <option key={rule.id} value={rule.id}>{rule.rule_name} - {rule.pay_within_days} days - {rule.rebate_percent}%</option>)}
+                      </select>
+                    </Field>
+                    <Field label="Purchase Type">
+                      <select value={purchaseType} onChange={(event) => setPurchaseType(event.target.value)}>
+                        <option value="CREDIT">Credit Purchase</option>
+                        <option value="CASH">Cash Purchase</option>
+                      </select>
+                    </Field>
+                    {purchaseType === "CASH" && (
+                      <>
                     <Field label="Payment Mode">
                       <select value={purchasePaymentMode} onChange={(event) => setPurchasePaymentMode(event.target.value)}>
                         {supplierPaymentModes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
@@ -1155,26 +1233,31 @@ function App() {
                     <Field label="Payment Reference"><input value={purchasePaymentReference} onChange={(event) => setPurchasePaymentReference(event.target.value)} /></Field>
                     <Field label="Payment Date"><input type="date" value={purchasePaymentDate} onChange={(event) => setPurchasePaymentDate(event.target.value)} /></Field>
                   </>
+                    )}
+                  </>
                 )}
                 <Field label="Remarks"><textarea value={purchaseRemarks} onChange={(event) => setPurchaseRemarks(event.target.value)} /></Field>
               </div>
               {activeSuppliers.length === 0 && <p className="form-note">No active supplier accounts found. Add New Supplier before saving a purchase.</p>}
+              {purchaseBillStatus === "BILL_PENDING" && <p className="form-note">Purchase bill pending. Inventory will increase immediately and profit from this stock will be provisional until the bill is completed.</p>}
               <PurchaseSummary summary={purchaseSummary} />
               <div className="button-row">
-                <button className="primary-button" onClick={savePurchase}>{editingPurchaseId ? "Update Purchase" : "Save Purchase"}</button>
+                <button className="primary-button" onClick={savePurchase}>{purchaseBillStatus === "BILL_PENDING" ? editingPurchaseId ? "Update Arrival Entry" : "Save Stock Arrival" : editingPurchaseId ? "Complete / Update Purchase" : "Save Purchase"}</button>
                 {editingPurchaseId && <button className="secondary-button" onClick={resetPurchaseForm}>Cancel Edit</button>}
                 <button className="secondary-button" onClick={() => navigate("accounts")}>Add New Supplier</button>
               </div>
-              <DataTable headers={["Purchase", "Date", "Status", "Supplier", "Product", "Qty", "Rate", "Net Payable", "Paid", "Balance", "Batch", "Actions"]}>
+              <DataTable headers={["Purchase", "Date", "Status", "Bill", "Supplier", "Product", "Qty", "Rate", "Temp Sale Rate", "Net Payable", "Paid", "Balance", "Batch", "Actions"]}>
                 {purchases.map((purchase) => (
                   <tr key={purchase.id}>
                     <td><span className="batch-id">#{purchase.id}</span></td>
                     <td>{purchase.purchase_date}</td>
                     <td><span className={purchase.purchase_status === "CANCELLED" ? "stock-low" : purchase.purchase_status === "EDITED" ? "origin-rate" : "stock-ok"}>{purchase.purchase_status || "ACTIVE"}</span></td>
+                    <td><span className={purchase.purchase_bill_status === "BILL_PENDING" ? "stock-low" : "stock-ok"}>{purchase.purchase_bill_status === "BILL_PENDING" ? "Bill Pending" : "Bill Completed"}</span></td>
                     <td>{purchase.supplier_name}</td>
                     <td className="primary-cell">{purchase.product_name}</td>
                     <td>{purchase.quantity}</td>
                     <td>{currency.format(Number(purchase.purchase_rate || 0))}</td>
+                    <td>{purchase.temporary_sale_rate ? currency.format(Number(purchase.temporary_sale_rate)) : "-"}</td>
                     <td>{currency.format(Number(purchase.net_payable || purchase.total_amount || 0))}</td>
                     <td>{currency.format(Number(purchase.paid_amount || 0))}</td>
                     <td>{currency.format(Number(purchase.balance_amount || 0))}</td>
@@ -1182,6 +1265,7 @@ function App() {
                     <td>
                       <div className="button-row table-actions-row">
                         <button className="table-action" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => editPurchase(purchase)}>Edit</button>
+                        {purchase.purchase_bill_status === "BILL_PENDING" && <button className="primary-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => completePendingPurchase(purchase)}>Complete Bill</button>}
                         <button className="remove-button" disabled={purchase.purchase_status === "CANCELLED"} onClick={() => cancelPurchase(purchase)}>Cancel/Delete</button>
                       </div>
                     </td>
@@ -1529,6 +1613,13 @@ function ReportsModule({ data, onReload }) {
       headers: ["Invoice", "Date", "Amount", "Cancelled By", "Cancelled At", "Reason"],
       render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{row.sale_date}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || "-"}</td><td>{row.cancelled_at ? new Date(row.cancelled_at).toLocaleString("en-IN") : "-"}</td><td>{row.cancellation_reason || "-"}</td></tr>,
     },
+    provisionalProfitSales: {
+      title: "Provisional Profit Sales",
+      rows: filterRows(data.provisionalProfitSalesReport),
+      summary: (rows) => [["Sales", money(totalOf(rows, "total_amount")), true], ["Provisional Profit", money(totalOf(rows, "profit"))], ["Invoices", rows.length]],
+      headers: ["Invoice", "Date", "Customer", "Payment", "Products", "Amount", "Cost", "Provisional Profit"],
+      render: (row) => <tr key={row.id}><td>{row.invoice_no}</td><td>{row.sale_date}</td><td>{row.customer_name}</td><td>{row.payment_mode}</td><td>{row.products || "-"}</td><td>{money(row.total_amount)}</td><td>{money(row.total_cost)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
+    },
     discountReport: {
       title: "Discount Report",
       rows: filterRows(data.discountReport),
@@ -1570,6 +1661,20 @@ function ReportsModule({ data, onReload }) {
       summary: (rows) => [["Changed Purchases", rows.length, true], ["Cancelled", rows.filter((row) => row.purchase_status === "CANCELLED").length], ["Edited", rows.filter((row) => row.purchase_status === "EDITED").length]],
       headers: ["Purchase", "Date", "Supplier", "Status", "Amount", "Changed By", "Reason"],
       render: (row) => <tr key={row.id}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td>{row.purchase_status}</td><td>{money(row.net_payable)}</td><td>{row.changed_by_name || "-"}</td><td>{row.cancellation_reason || row.edit_reason || "-"}</td></tr>,
+    },
+    pendingPurchaseBills: {
+      title: "Pending Purchase Bills",
+      rows: filterRows(data.pendingPurchaseBillsReport),
+      summary: (rows) => [["Pending Bills", rows.length, true], ["Quantity", number(totalOf(rows, "quantity"))], ["Remaining", number(totalOf(rows, "remaining_qty"))]],
+      headers: ["Purchase", "Date", "Supplier", "Product", "Qty", "Remaining", "Temp Sale Rate", "Expected Rate", "Remarks"],
+      render: (row) => <tr key={row.id}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{number(row.quantity)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.temporary_sale_rate)}</td><td>{money(row.expected_purchase_rate)}</td><td>{row.remarks || "-"}</td></tr>,
+    },
+    stockWithoutBill: {
+      title: "Stock Received Without Bill",
+      rows: filterRows(data.stockWithoutBillReport),
+      summary: (rows) => [["Batches", rows.length, true], ["Received Qty", number(totalOf(rows, "purchase_qty"))], ["Remaining Qty", number(totalOf(rows, "remaining_qty"))]],
+      headers: ["Arrival Date", "Batch", "Supplier", "Product", "Received", "Remaining", "Temp Sale Rate", "Expected Rate"],
+      render: (row) => <tr key={row.id}><td>{row.arrival_date}</td><td><span className="batch-id">{row.batch_no}</span></td><td>{row.supplier_name}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{number(row.purchase_qty)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.temporary_sale_rate)}</td><td>{money(row.expected_purchase_rate)}</td></tr>,
     },
     customerLedger: {
       title: "Customer Ledger",
@@ -1734,8 +1839,8 @@ function ReportsModule({ data, onReload }) {
     },
   };
   const categories = [
-    { id: "sales", title: "Sales Reports", icon: "receipt", description: "Invoices, products, customers, discounts and bill changes.", reports: ["salesByDate", "salesByProduct", "salesByCustomer", "salesHistory", "editedBills", "cancelledBills", "discountReport"] },
-    { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Purchase value, supplier buying, outstanding and purchase changes.", reports: ["purchasesByDate", "purchasesByProduct", "purchasesBySupplier", "purchaseOutstanding", "purchaseEditCancel"] },
+    { id: "sales", title: "Sales Reports", icon: "receipt", description: "Invoices, products, customers, discounts and bill changes.", reports: ["salesByDate", "salesByProduct", "salesByCustomer", "salesHistory", "editedBills", "cancelledBills", "provisionalProfitSales", "discountReport"] },
+    { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Purchase value, supplier buying, outstanding and purchase changes.", reports: ["purchasesByDate", "purchasesByProduct", "purchasesBySupplier", "purchaseOutstanding", "pendingPurchaseBills", "stockWithoutBill", "purchaseEditCancel"] },
     { id: "accounts", title: "Accounts & Ledger", icon: "users", description: "Customer ledger, supplier ledger, statements, payments and balances.", reports: ["customerLedger", "supplierLedger", "accountStatement", "paymentReport", "paymentModeSummary", "receivableReport", "payableReport"] },
     { id: "returns", title: "Sale Returns", icon: "history", description: "Return history, value and reason analysis.", reports: ["returnHistory", "returnValue", "returnReason"] },
     { id: "waste", title: "Waste Management", icon: "alert", description: "Daily, monthly, product-wise and cost-focused waste analysis.", reports: ["dailyWaste", "monthlyWaste", "productWiseWaste", "mostWastedProducts", "wasteCost"] },
@@ -2717,6 +2822,7 @@ function PaymentSettingsSection({ canManage, onReload, paymentSettings, user }) 
         <Field label="Business UPI ID"><input disabled={!canManage} placeholder="name@bank" value={draft.business_upi_id || ""} onChange={(event) => updateDraft("business_upi_id", event.target.value)} /></Field>
         <Field label="Payee Name"><input disabled={!canManage} value={draft.upi_payee_name || ""} onChange={(event) => updateDraft("upi_payee_name", event.target.value)} /></Field>
         <label className="check-field"><input checked={draft.enable_upi_qr_on_invoice === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enable_upi_qr_on_invoice", event.target.checked)} /><span>Enable UPI QR on UPI invoices</span></label>
+        <label className="check-field"><input checked={draft.show_upi_qr_on_all_bills === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("show_upi_qr_on_all_bills", event.target.checked)} /><span>Show UPI QR on all bills</span></label>
       </div>
       <button className="primary-button" disabled={!canManage} onClick={save}>Save Payment Settings</button>
     </ModuleCard>
@@ -3046,6 +3152,28 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
   };
   const saveUser = async () => {
     try {
+      const duplicate = users.find((item) =>
+        Number(item.id) !== Number(editingId || 0) &&
+        (
+          item.username?.trim().toLowerCase() === draft.username.trim().toLowerCase() ||
+          (draft.mobile_number && item.mobile_number === draft.mobile_number) ||
+          (draft.email && item.email?.trim().toLowerCase() === draft.email.trim().toLowerCase())
+        )
+      );
+      if (duplicate) {
+        if (duplicate.username?.trim().toLowerCase() === draft.username.trim().toLowerCase()) alert("This username already exists.");
+        else if (draft.mobile_number && duplicate.mobile_number === draft.mobile_number) alert("This mobile number already exists.");
+        else alert("This email already exists.");
+        return;
+      }
+      if (!draft.full_name.trim() || !draft.username.trim() || !draft.role) {
+        alert("Enter full name, username and role.");
+        return;
+      }
+      if (!editingId && (draft.password.length < 4 || draft.password !== draft.confirm_password)) {
+        alert("Enter matching password with at least 4 characters.");
+        return;
+      }
       const payload = { ...draft, updated_by: user.id };
       if (editingId) await axios.put(`${API_URL}/users/${editingId}`, payload);
       else await axios.post(`${API_URL}/users`, payload);
@@ -3365,7 +3493,7 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
         </div>
         <DataTable headers={[
           <label className="table-check-label"><input checked={allVisibleSelected} type="checkbox" onChange={(event) => toggleAllVisible(event.target.checked)} /> Select All Suggested Rates</label>,
-          "Product", "Origin", "Current Rate", "Suggested Rate", "New Rate", "Latest Purchase Cost", "Stock", "Margin %", "Updated", "Updated By",
+          "Product", "Origin", "Current Rate", "Suggested Rate", "New Rate", "Latest Purchase Cost", "Stock", "Pending Bill Stock", "Margin %", "Updated", "Updated By",
         ]}>
           {filteredRates.map((rate) => {
             const sellingRate = Number(draftRates[rate.id] || rate.selling_rate);
@@ -3381,6 +3509,7 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
                 <td><input className="table-input" min="0" step="0.01" type="number" value={draftRates[rate.id] || ""} onChange={(event) => setDraftRates({ ...draftRates, [rate.id]: event.target.value })} /></td>
                 <td>{currency.format(cost)}</td>
                 <td>{rate.current_stock}</td>
+                <td>{Number(rate.pending_bill_stock || 0) > 0 ? <span className="stock-low">{rate.pending_bill_stock} - provisional profit</span> : "-"}</td>
                 <td><span className={margin < 15 ? "stock-low" : "stock-ok"}>{margin.toFixed(1)}%</span></td>
                 <td>{rate.selling_rate_updated_at ? new Date(rate.selling_rate_updated_at).toLocaleDateString("en-IN") : "-"}</td>
                 <td>{rate.updated_by_name || "-"}</td>
@@ -4185,15 +4314,14 @@ function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = 
   const activePrintMode = printMode === "A4" ? "A4" : "THERMAL";
   const invoicePayments = invoice.payments || [];
   const hasUpiPayment = invoice.payment_mode === "UPI" || invoice.payment_mode === "MIXED" || invoicePayments.some((payment) => (payment.mode || payment.payment_mode) === "UPI");
-  const shouldShowUpiQr = paymentSettings.enable_upi_qr_on_invoice === true && paymentSettings.business_upi_id && hasUpiPayment;
+  const shouldShowUpiQr = paymentSettings.enable_upi_qr_on_invoice === true && paymentSettings.business_upi_id && (hasUpiPayment || paymentSettings.show_upi_qr_on_all_bills === true);
   const upiPayload = shouldShowUpiQr ? [
     "upi://pay?",
     `pa=${encodeURIComponent(paymentSettings.business_upi_id)}`,
     `&pn=${encodeURIComponent(paymentSettings.upi_payee_name || "FEEL THE FREAKIN' FROOZ")}`,
     `&am=${encodeURIComponent(Number(invoice.total_amount || 0).toFixed(2))}`,
     "&cu=INR",
-    `&tr=${encodeURIComponent(invoice.invoice_no || `SALE-${invoice.id}`)}`,
-    `&tn=${encodeURIComponent(`FroozERP invoice ${invoice.invoice_no || invoice.id}`)}`,
+    `&tn=${encodeURIComponent(`FroozERP-Invoice-${invoice.invoice_no || invoice.id}`)}`,
   ].join("") : "";
   useEffect(() => {
     let active = true;

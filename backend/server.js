@@ -68,6 +68,7 @@ const ROUNDING_RULES = new Set(["NEAREST_RUPEE", "ROUND_UP_5", "ROUND_UP_10", "N
 const SALE_STATUSES = new Set(["COMPLETED", "EDITED", "CANCELLED"]);
 const REFUND_TYPES = new Set(["CASH_REFUND", "UPI_REFUND", "CREDIT_NOTE", "FUTURE_ADJUSTMENT"]);
 const WASTE_TYPES = new Set(["DAAGI", "SAMPLING", "PERSONAL_USE", "OTHER"]);
+const PURCHASE_BILL_STATUSES = new Set(["BILL_PENDING", "BILL_COMPLETED"]);
 const PERMISSION_KEYS = [
   "settings",
   "discounts",
@@ -223,6 +224,11 @@ const initializeDatabase = async () => {
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS cancelled_by INTEGER REFERENCES users(id);
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP;
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS purchase_bill_status VARCHAR(30) DEFAULT 'BILL_COMPLETED';
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS temporary_sale_rate NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS expected_purchase_rate NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS bill_number VARCHAR(120);
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS bill_date DATE;
     UPDATE purchases SET purchase_status = 'ACTIVE' WHERE purchase_status IS NULL;
 
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS basic_amount NUMERIC(14, 2) DEFAULT 0;
@@ -247,6 +253,8 @@ const initializeDatabase = async () => {
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS balance_amount NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS purchase_id INTEGER;
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS batch_status VARCHAR(20) DEFAULT 'ACTIVE';
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS purchase_bill_status VARCHAR(30) DEFAULT 'BILL_COMPLETED';
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS temporary_sale_rate NUMERIC(14, 2) DEFAULT 0;
     UPDATE inventory_batches SET batch_status = 'ACTIVE' WHERE batch_status IS NULL;
     UPDATE inventory_batches SET effective_cost_per_unit = purchase_rate WHERE effective_cost_per_unit IS NULL;
 
@@ -348,9 +356,11 @@ const initializeDatabase = async () => {
       business_upi_id VARCHAR(160),
       upi_payee_name VARCHAR(180),
       enable_upi_qr_on_invoice BOOLEAN DEFAULT FALSE,
+      show_upi_qr_on_all_bills BOOLEAN DEFAULT FALSE,
       updated_by INTEGER REFERENCES users(id),
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS show_upi_qr_on_all_bills BOOLEAN DEFAULT FALSE;
 
     CREATE TABLE IF NOT EXISTS sale_discount_rules (
       id SERIAL PRIMARY KEY,
@@ -656,6 +666,7 @@ const initializeDatabase = async () => {
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS cancelled_by INTEGER REFERENCES users(id);
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS profit_status VARCHAR(30) DEFAULT 'FINAL';
     UPDATE sales SET sale_status = 'COMPLETED' WHERE sale_status IS NULL;
 
     CREATE UNIQUE INDEX IF NOT EXISTS sales_invoice_no_unique_idx
@@ -687,6 +698,7 @@ const initializeDatabase = async () => {
 
     ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS discount_amount NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS net_amount NUMERIC(14, 2);
+    ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS cost_status VARCHAR(30) DEFAULT 'FINAL';
 
     CREATE TABLE IF NOT EXISTS sale_payments (
       id SERIAL PRIMARY KEY,
@@ -925,6 +937,7 @@ const getSupplierSummaryRows = async ({ active, search, supplierId } = {}) => {
       FROM purchases
       WHERE supplier_id IS NOT NULL
         AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
+        AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
       GROUP BY supplier_id
     ),
     payment_summary AS (
@@ -1205,10 +1218,10 @@ const getDashboardSummary = async () => {
         COALESCE((SELECT SUM(cost_amount) FROM waste_entries WHERE waste_date = CURRENT_DATE), 0) AS "todayWaste",
         COALESCE((SELECT SUM(cost_amount) FROM waste_entries WHERE waste_date >= DATE_TRUNC('month', CURRENT_DATE)::date), 0) AS "monthlyWaste",
         COALESCE((SELECT SUM(quantity) FROM waste_entries WHERE waste_date >= DATE_TRUNC('month', CURRENT_DATE)::date), 0) AS "monthlyWasteQuantity",
-        COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0)
+        COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'), 0)
           + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE), 0) AS "totalRebateReceived",
         COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE payment_date = CURRENT_DATE AND cancelled = FALSE), 0)
-          + COALESCE((SELECT SUM(paid_amount) FROM purchases WHERE COALESCE(payment_date, purchase_date) = CURRENT_DATE AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0) AS "todaySupplierPayments",
+          + COALESCE((SELECT SUM(paid_amount) FROM purchases WHERE COALESCE(payment_date, purchase_date) = CURRENT_DATE AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'), 0) AS "todaySupplierPayments",
         COALESCE((SELECT COUNT(*) FROM suppliers), 0) AS supplier_count,
         COALESCE((SELECT COUNT(*) FROM suppliers WHERE active = TRUE), 0) AS active_supplier_count
       `
@@ -1333,6 +1346,7 @@ const getDashboardPurchaseSalesComparison = async (dateFrom, dateTo) => {
       FROM purchases
       WHERE purchase_date BETWEEN $1 AND $2
         AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
+        AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
       GROUP BY purchase_date
     )
     SELECT
@@ -2076,7 +2090,8 @@ app.put("/settings/payment", async (req, res) => {
       SET business_upi_id = $1,
           upi_payee_name = $2,
           enable_upi_qr_on_invoice = $3,
-          updated_by = $4,
+          show_upi_qr_on_all_bills = $4,
+          updated_by = $5,
           updated_at = CURRENT_TIMESTAMP
       WHERE id = 1
       RETURNING *
@@ -2085,6 +2100,7 @@ app.put("/settings/payment", async (req, res) => {
         nullableText(req.body.business_upi_id),
         nullableText(req.body.upi_payee_name),
         req.body.enable_upi_qr_on_invoice === true,
+        req.body.show_upi_qr_on_all_bills === true,
         manager.id,
       ]
     );
@@ -2180,6 +2196,29 @@ const readUserPayload = (body) => ({
   notes: nullableText(body.notes),
 });
 
+const findDuplicateUser = async ({ username, mobile_number, email, userId = null }) => {
+  const result = await pool.query(
+    `
+    SELECT id, username, mobile_number, email
+    FROM users
+    WHERE ($1::INT IS NULL OR id <> $1)
+      AND (
+        LOWER(username) = LOWER($2)
+        OR ($3::TEXT IS NOT NULL AND mobile_number IS NOT NULL AND mobile_number = $3)
+        OR ($4::TEXT IS NOT NULL AND email IS NOT NULL AND LOWER(email) = LOWER($4))
+      )
+    LIMIT 1
+    `,
+    [userId, username, mobile_number, email]
+  );
+  const duplicate = result.rows[0];
+  if (!duplicate) return "";
+  if (duplicate.username?.toLowerCase() === username.toLowerCase()) return "This username already exists.";
+  if (mobile_number && duplicate.mobile_number === mobile_number) return "This mobile number already exists.";
+  if (email && duplicate.email?.toLowerCase() === email.toLowerCase()) return "This email already exists.";
+  return "This user already exists.";
+};
+
 const getRoleIdByName = async (roleName, client = pool) => {
   const result = await client.query("SELECT id FROM roles WHERE role_name = $1", [roleName]);
   return result.rows[0]?.id || null;
@@ -2236,8 +2275,8 @@ app.post("/users", async (req, res) => {
     if (!payload.full_name || !payload.username || !roleId || password.length < 4 || password !== confirmPassword) {
       return res.status(400).json({ message: "Enter valid user details and matching password" });
     }
-    const duplicate = await pool.query("SELECT id FROM users WHERE LOWER(username) = LOWER($1)", [payload.username]);
-    if (duplicate.rows.length) return res.status(409).json({ message: "This username already exists." });
+    const duplicateMessage = await findDuplicateUser(payload);
+    if (duplicateMessage) return res.status(409).json({ message: duplicateMessage });
     const result = await pool.query(
       `
       INSERT INTO users (
@@ -2271,8 +2310,8 @@ app.put("/users/:id", async (req, res) => {
     if (!payload.full_name || !payload.username || !roleId) {
       return res.status(400).json({ message: "Enter valid user details" });
     }
-    const duplicate = await pool.query("SELECT id FROM users WHERE LOWER(username) = LOWER($1) AND id <> $2", [payload.username, userId]);
-    if (duplicate.rows.length) return res.status(409).json({ message: "This username already exists." });
+    const duplicateMessage = await findDuplicateUser({ ...payload, userId });
+    if (duplicateMessage) return res.status(409).json({ message: duplicateMessage });
     const result = await pool.query(
       `
       UPDATE users
@@ -2924,6 +2963,8 @@ app.get("/sale-rates", async (req, res) => {
         p.selling_rate_updated_at,
         u.full_name AS updated_by_name,
         COALESCE(stock.current_stock, 0) AS current_stock,
+        COALESCE(stock.pending_bill_stock, 0) AS pending_bill_stock,
+        COALESCE(stock.temporary_sale_rate, 0) AS temporary_sale_rate,
         COALESCE(latest.effective_cost_per_unit, 0) AS latest_effective_cost,
         CASE
           WHEN COALESCE(latest.effective_cost_per_unit, 0) > 0
@@ -2941,7 +2982,10 @@ app.get("/sale-rates", async (req, res) => {
         LIMIT 1
       ) latest ON TRUE
       LEFT JOIN LATERAL (
-        SELECT SUM(ib.remaining_qty) AS current_stock
+        SELECT
+          SUM(ib.remaining_qty) AS current_stock,
+          SUM(CASE WHEN COALESCE(ib.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_PENDING' THEN ib.remaining_qty ELSE 0 END) AS pending_bill_stock,
+          MAX(CASE WHEN COALESCE(ib.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_PENDING' THEN ib.temporary_sale_rate ELSE 0 END) AS temporary_sale_rate
         FROM inventory_batches ib
         WHERE ib.product_id = p.id
           AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
@@ -3485,6 +3529,7 @@ app.get("/accounts/ledger", async (req, res) => {
             FROM purchases p
             WHERE p.supplier_id = $1
               AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
+              AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
             UNION ALL
             SELECT sp.payment_date AS date,
               CASE WHEN sp.rebate_amount > 0 AND sp.payment_amount = 0 THEN 'Rebate' ELSE 'Supplier Payment' END AS transaction_type,
@@ -4320,6 +4365,9 @@ app.get("/reports/summary", async (req, res) => {
       purchaseProductResult,
       purchaseSupplierResult,
       purchaseChangeResult,
+      pendingPurchaseResult,
+      stockWithoutBillResult,
+      provisionalSalesResult,
       returnHistoryResult,
       stockMovementResult,
       balanceSheetResult,
@@ -4369,6 +4417,79 @@ app.get("/reports/summary", async (req, res) => {
       pool.query(
         `
         SELECT
+          p.id,
+          p.purchase_date,
+          p.supplier_name,
+          p.temporary_sale_rate,
+          p.expected_purchase_rate,
+          p.remarks,
+          pi.product_id,
+          pr.product_name,
+          pr.unit,
+          pi.quantity,
+          ib.batch_no,
+          ib.remaining_qty
+        FROM purchases p
+        LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
+        LEFT JOIN products pr ON pr.id = pi.product_id
+        LEFT JOIN inventory_batches ib ON ib.purchase_id = p.id
+        WHERE COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
+          AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_PENDING'
+          AND p.purchase_date BETWEEN $1 AND $2
+        ORDER BY p.purchase_date DESC, p.id DESC
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
+          ib.id,
+          ib.batch_no,
+          ib.purchase_id,
+          ib.supplier_name,
+          p.product_name,
+          p.unit,
+          ib.purchase_qty,
+          ib.remaining_qty,
+          ib.temporary_sale_rate,
+          ib.purchase_rate AS expected_purchase_rate,
+          ib.created_at::date AS arrival_date
+        FROM inventory_batches ib
+        JOIN products p ON p.id = ib.product_id
+        WHERE COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+          AND COALESCE(ib.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_PENDING'
+          AND ib.created_at::date BETWEEN $1 AND $2
+        ORDER BY ib.created_at DESC, ib.id DESC
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
+          s.id,
+          s.invoice_no,
+          s.sale_date,
+          COALESCE(s.customer_name, 'Walk-in Customer') AS customer_name,
+          s.payment_mode,
+          s.total_amount,
+          s.total_cost,
+          s.profit,
+          s.profit_status,
+          STRING_AGG(DISTINCT p.product_name, ', ' ORDER BY p.product_name) AS products
+        FROM sales s
+        JOIN sale_items si ON si.sale_id = s.id
+        JOIN products p ON p.id = si.product_id
+        WHERE s.sale_status <> 'CANCELLED'
+          AND COALESCE(s.profit_status, 'FINAL') = 'PROVISIONAL'
+          AND s.sale_date BETWEEN $1 AND $2
+        GROUP BY s.id
+        ORDER BY s.sale_date DESC, s.id DESC
+        `,
+        [dateFrom, dateTo]
+      ),
+      pool.query(
+        `
+        SELECT
           purchase_date,
           COUNT(*)::INTEGER AS purchase_count,
           SUM(COALESCE(NULLIF(gross_amount, 0), total_amount, 0)) AS gross_purchase,
@@ -4379,6 +4500,7 @@ app.get("/reports/summary", async (req, res) => {
         FROM purchases
         WHERE purchase_date BETWEEN $1 AND $2
           AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
+          AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
         GROUP BY purchase_date
         ORDER BY purchase_date DESC
         `,
@@ -4965,6 +5087,9 @@ app.get("/reports/summary", async (req, res) => {
       purchaseProductReport: purchaseProductResult.rows,
       purchaseSupplierReport: purchaseSupplierResult.rows,
       purchaseChangeReport: purchaseChangeResult.rows,
+      pendingPurchaseBillsReport: pendingPurchaseResult.rows,
+      stockWithoutBillReport: stockWithoutBillResult.rows,
+      provisionalProfitSalesReport: provisionalSalesResult.rows,
       returnHistoryReport: returnHistoryResult.rows,
       stockMovementReport: stockMovementResult.rows,
       balanceSheet: {
@@ -5281,6 +5406,7 @@ app.get("/supplier-ledger", async (req, res) => {
         LEFT JOIN products pr ON pr.id = pi.product_id
         WHERE p.supplier_id = ANY($1::INT[])
           AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
+          AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
         GROUP BY p.id
         ORDER BY p.purchase_date, p.created_at, p.id
         `,
@@ -5421,11 +5547,14 @@ app.get("/supplier-ledger", async (req, res) => {
 
 const readPurchaseEntryPayload = (body) => {
   const purchaseType = String(body.purchase_type || "CREDIT").trim().toUpperCase();
+  const purchaseBillStatus = String(body.purchase_bill_status || "BILL_COMPLETED").trim().toUpperCase();
   return {
     supplierId: parsePositiveInteger(body.supplier_id),
     productId: parsePositiveInteger(body.product_id),
     quantity: parsePositiveNumber(body.quantity),
     purchaseRate: parsePositiveNumber(body.purchase_rate),
+    expectedPurchaseRate: parseNonNegativeNumber(body.expected_purchase_rate),
+    temporarySaleRate: parsePositiveNumber(body.temporary_sale_rate),
     freightCharges: parseNonNegativeNumber(body.freight_charges),
     labourCharges: parseNonNegativeNumber(body.labour_charges),
     otherCharges: parseNonNegativeNumber(body.other_charges),
@@ -5433,8 +5562,12 @@ const readPurchaseEntryPayload = (body) => {
     rebateRuleId: parsePositiveInteger(body.rebate_rule_id),
     paymentDate: isDateInput(body.payment_date) ? body.payment_date : null,
     purchaseType,
+    purchaseBillStatus,
     paymentMode: normalizePaymentMode(body.payment_mode),
     paymentReferenceNumber: nullableText(body.payment_reference_number),
+    purchaseDate: isDateInput(body.purchase_date || body.arrival_date) ? (body.purchase_date || body.arrival_date) : toDateKey(new Date()),
+    billNumber: nullableText(body.bill_number),
+    billDate: isDateInput(body.bill_date) ? body.bill_date : null,
     branchId: parsePositiveInteger(body.branch_id),
     actorId: parsePositiveInteger(body.created_by || body.edited_by) || 1,
     remarks: nullableText(body.remarks),
@@ -5443,6 +5576,13 @@ const readPurchaseEntryPayload = (body) => {
 
 const validatePurchaseEntry = (entry) => {
   if (!entry.supplierId) return "Add New Supplier";
+  if (!PURCHASE_BILL_STATUSES.has(entry.purchaseBillStatus)) return "Select a valid purchase bill status";
+  if (entry.purchaseBillStatus === "BILL_PENDING") {
+    if (!entry.productId || !entry.quantity || !entry.branchId || !entry.temporarySaleRate || entry.expectedPurchaseRate === null) {
+      return "Enter supplier, product, quantity, arrival date and temporary sale rate";
+    }
+    return "";
+  }
   if (
     !entry.productId ||
     !entry.quantity ||
@@ -5522,6 +5662,91 @@ const buildPurchaseFinancials = async (client, entry) => {
   };
 };
 
+const getPurchasePartiesForArrival = async (client, entry) => {
+  const [supplierResult, productResult] = await Promise.all([
+    client.query("SELECT id, supplier_name FROM suppliers WHERE id = $1 AND active = TRUE FOR SHARE", [entry.supplierId]),
+    client.query("SELECT id, product_name, origin_type, selling_rate FROM products WHERE id = $1 AND active = TRUE FOR SHARE", [entry.productId]),
+  ]);
+  if (supplierResult.rows.length === 0) return { error: "Add New Supplier" };
+  if (productResult.rows.length === 0) return { error: "Product not found", status: 404 };
+  return { supplier: supplierResult.rows[0], product: productResult.rows[0] };
+};
+
+const recalculateSalesForBatch = async (client, batchId) => {
+  const saleRows = await client.query(
+    `
+    SELECT DISTINCT si.sale_id
+    FROM sale_batch_allocations sba
+    JOIN sale_items si ON si.id = sba.sale_item_id
+    WHERE sba.inventory_batch_id = $1
+    `,
+    [batchId]
+  );
+  for (const row of saleRows.rows) {
+    const saleId = row.sale_id;
+    await client.query(
+      `
+      WITH item_costs AS (
+        SELECT
+          si.id,
+          COALESCE(SUM(sba.cost_amount), 0) AS cost_amount,
+          BOOL_OR(COALESCE(ib.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_PENDING') AS provisional
+        FROM sale_items si
+        LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
+        LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
+        WHERE si.sale_id = $1
+        GROUP BY si.id
+      ),
+      sale_subtotal AS (
+        SELECT sale_id, SUM(COALESCE(net_amount, amount)) AS subtotal
+        FROM sale_items
+        WHERE sale_id = $1
+        GROUP BY sale_id
+      )
+      UPDATE sale_items si
+      SET
+        cost_amount = item_costs.cost_amount,
+        cost_status = CASE WHEN item_costs.provisional THEN 'PROVISIONAL' ELSE 'FINAL' END,
+        profit = ROUND((
+          COALESCE(si.net_amount, si.amount)
+          - CASE
+              WHEN sale_subtotal.subtotal > 0
+              THEN COALESCE(s.invoice_discount_amount, 0) * (COALESCE(si.net_amount, si.amount) / sale_subtotal.subtotal)
+              ELSE 0
+            END
+          - item_costs.cost_amount
+        )::NUMERIC, 2)
+      FROM item_costs, sales s, sale_subtotal
+      WHERE si.id = item_costs.id
+        AND s.id = si.sale_id
+        AND sale_subtotal.sale_id = si.sale_id
+        AND si.sale_id = $1
+      `,
+      [saleId]
+    );
+    await client.query(
+      `
+      UPDATE sales s
+      SET
+        total_cost = COALESCE(costs.total_cost, 0),
+        profit = ROUND((s.total_amount - COALESCE(costs.total_cost, 0))::NUMERIC, 2),
+        profit_status = CASE WHEN COALESCE(costs.has_provisional, FALSE) THEN 'PROVISIONAL' ELSE 'FINAL' END
+      FROM (
+        SELECT
+          sale_id,
+          SUM(cost_amount) AS total_cost,
+          BOOL_OR(cost_status = 'PROVISIONAL') AS has_provisional
+        FROM sale_items
+        WHERE sale_id = $1
+        GROUP BY sale_id
+      ) costs
+      WHERE s.id = costs.sale_id
+      `,
+      [saleId]
+    );
+  }
+};
+
 app.get("/purchases", async (req, res) => {
   try {
     const result = await pool.query(
@@ -5562,6 +5787,82 @@ app.post("/purchase", async (req, res) => {
     if (validationMessage) return res.status(400).json({ message: validationMessage });
 
     await client.query("BEGIN");
+    if (entry.purchaseBillStatus === "BILL_PENDING") {
+      const manager = await requireRateManager(entry.actorId, client);
+      if (!manager) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ message: "Only Owner or Admin can set temporary sale rates for pending stock" });
+      }
+      const arrival = await getPurchasePartiesForArrival(client, entry);
+      if (arrival.error) {
+        await client.query("ROLLBACK");
+        return res.status(arrival.status || 400).json({ message: arrival.error });
+      }
+      const provisionalCost = Number(entry.expectedPurchaseRate || 0);
+      const provisionalAmount = roundCurrency(entry.quantity * provisionalCost);
+      const purchaseResult = await client.query(
+        `
+        INSERT INTO purchases (
+          supplier_id, supplier_name, total_amount, branch_id, created_by,
+          basic_amount, gross_amount, net_payable, paid_amount, balance_amount,
+          effective_cost_per_unit, purchase_type, payment_status, purchase_date,
+          remarks, purchase_bill_status, temporary_sale_rate, expected_purchase_rate
+        )
+        VALUES ($1, $2, 0, $3, $4, 0, 0, 0, 0, 0, $5, 'PENDING_BILL', 'BILL_PENDING', $6, $7, 'BILL_PENDING', $8, $9)
+        RETURNING *
+        `,
+        [
+          arrival.supplier.id, arrival.supplier.supplier_name, entry.branchId, entry.actorId,
+          provisionalCost, entry.purchaseDate, entry.remarks, entry.temporarySaleRate, provisionalCost,
+        ]
+      );
+      const purchase = purchaseResult.rows[0];
+      await client.query(
+        `
+        INSERT INTO purchase_items (
+          purchase_id, product_id, quantity, purchase_rate, amount, basic_amount,
+          net_payable, effective_cost_per_unit
+        )
+        VALUES ($1, $2, $3, $4, $5, 0, 0, $4)
+        `,
+        [purchase.id, entry.productId, entry.quantity, provisionalCost, provisionalAmount]
+      );
+      const batchNo = `PENDING-${Date.now()}-${purchase.id}`;
+      await client.query(
+        `
+        INSERT INTO inventory_batches (
+          product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
+          supplier_id, supplier_name, branch_id, gross_amount, net_payable, balance_amount,
+          purchase_id, batch_status, purchase_bill_status, temporary_sale_rate
+        )
+        VALUES ($1, $2, $3, $3, $4, $4, $5, $6, $7, 0, 0, 0, $8, 'ACTIVE', 'BILL_PENDING', $9)
+        `,
+        [
+          entry.productId, batchNo, entry.quantity, provisionalCost, arrival.supplier.id,
+          arrival.supplier.supplier_name, entry.branchId, purchase.id, entry.temporarySaleRate,
+        ]
+      );
+      await client.query(
+        "UPDATE products SET selling_rate = $1, selling_rate_updated_at = CURRENT_TIMESTAMP, selling_rate_updated_by = $2 WHERE id = $3",
+        [entry.temporarySaleRate, manager.id, entry.productId]
+      );
+      await client.query(
+        "INSERT INTO sale_rate_history (product_id, old_selling_rate, new_selling_rate, changed_by, reason) VALUES ($1, $2, $3, $4, $5)",
+        [entry.productId, arrival.product.selling_rate || 0, entry.temporarySaleRate, manager.id, `Temporary sale rate for pending purchase #${purchase.id}`]
+      );
+      await client.query(
+        "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, 'IN', $3, $4, $5)",
+        [entry.productId, entry.quantity, `Stock arrival pending bill #${purchase.id}`, entry.actorId, entry.branchId]
+      );
+      await client.query("COMMIT");
+      return res.status(201).json({
+        success: true,
+        message: "Stock Arrival Saved - Bill Pending",
+        purchase_id: purchase.id,
+        purchase: { ...purchase, product_name: arrival.product.product_name },
+      });
+    }
+
     const calculation = await buildPurchaseFinancials(client, entry);
     if (calculation.error) {
       await client.query("ROLLBACK");
@@ -5577,9 +5878,9 @@ app.post("/purchase", async (req, res) => {
         rebate_percent, rebate_amount, net_payable, paid_amount, balance_amount,
         payment_timing, effective_cost_per_unit, freight_charges, labour_charges,
         rebate_rule_id, payment_due_days, payment_status, payment_date,
-        purchase_type, payment_mode, payment_reference_number, remarks
+        purchase_type, payment_mode, payment_reference_number, remarks, purchase_bill_status, bill_number, bill_date
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, 'BILL_COMPLETED', $28, $29)
       RETURNING *
       `,
       [
@@ -5590,6 +5891,8 @@ app.post("/purchase", async (req, res) => {
         rebateRule.id, rebateRule.pay_within_days, financials.paymentStatus, entry.purchaseType === "CREDIT" ? null : entry.paymentDate,
         entry.purchaseType, entry.purchaseType === "CASH" ? entry.paymentMode : null, entry.purchaseType === "CASH" ? entry.paymentReferenceNumber : null,
         entry.remarks,
+        entry.billNumber,
+        entry.billDate,
       ]
     );
     const purchase = purchaseResult.rows[0];
@@ -5617,9 +5920,9 @@ app.post("/purchase", async (req, res) => {
         product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
         supplier_id, supplier_name, branch_id, mandi_tax_amount, freight_charges, labour_charges,
         other_charges, gross_amount, rebate_amount, net_payable, payment_timing, balance_amount,
-        purchase_id, batch_status
+        purchase_id, batch_status, purchase_bill_status
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'ACTIVE')
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'ACTIVE', 'BILL_COMPLETED')
       `,
       [
         entry.productId,
@@ -5730,6 +6033,96 @@ app.put("/purchase/:id", async (req, res) => {
     const oldRemaining = Number(batch.remaining_qty || 0);
     const soldQuantity = roundUnitCost(oldQuantity - oldRemaining);
     const productChanged = Number(oldItem.product_id) !== Number(entry.productId);
+    if (entry.purchaseBillStatus === "BILL_PENDING") {
+      if (oldPurchase.purchase_bill_status !== "BILL_PENDING") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Only pending bill arrivals can be edited as pending entries" });
+      }
+      const managerForRate = await requireRateManager(entry.actorId, client);
+      if (!managerForRate) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ message: "Only Owner or Admin can update temporary sale rates" });
+      }
+      if (productChanged && soldQuantity > 0) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ message: "This purchase batch has already been sold. Product cannot be changed safely." });
+      }
+      if (entry.quantity < soldQuantity) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ message: `Quantity cannot be less than already sold quantity (${soldQuantity}).` });
+      }
+      const arrival = await getPurchasePartiesForArrival(client, entry);
+      if (arrival.error) {
+        await client.query("ROLLBACK");
+        return res.status(arrival.status || 400).json({ message: arrival.error });
+      }
+      const nextRemainingForPending = productChanged ? entry.quantity : roundUnitCost(oldRemaining + (entry.quantity - oldQuantity));
+      const provisionalCost = Number(entry.expectedPurchaseRate || 0);
+      const oldSnapshot = { purchase: oldPurchase, item: oldItem, batch };
+      const purchaseResult = await client.query(
+        `
+        UPDATE purchases
+        SET supplier_id = $1, supplier_name = $2, branch_id = $3, purchase_date = $4,
+            remarks = $5, temporary_sale_rate = $6, expected_purchase_rate = $7,
+            effective_cost_per_unit = $7, edited_by = $8, edited_at = CURRENT_TIMESTAMP,
+            edit_reason = $9
+        WHERE id = $10
+        RETURNING *
+        `,
+        [
+          arrival.supplier.id, arrival.supplier.supplier_name, entry.branchId, entry.purchaseDate,
+          entry.remarks, entry.temporarySaleRate, provisionalCost, manager.id, reason, purchaseId,
+        ]
+      );
+      await client.query(
+        `
+        UPDATE purchase_items
+        SET product_id = $1, quantity = $2, purchase_rate = $3,
+            amount = $4, effective_cost_per_unit = $3
+        WHERE id = $5
+        `,
+        [entry.productId, entry.quantity, provisionalCost, roundCurrency(entry.quantity * provisionalCost), oldItem.id]
+      );
+      const batchUpdateResult = await client.query(
+        `
+        UPDATE inventory_batches
+        SET product_id = $1, purchase_qty = $2, remaining_qty = $3,
+            purchase_rate = $4, effective_cost_per_unit = $4,
+            supplier_id = $5, supplier_name = $6, branch_id = $7,
+            purchase_bill_status = 'BILL_PENDING', temporary_sale_rate = $8
+        WHERE id = $9
+        RETURNING *
+        `,
+        [
+          entry.productId, entry.quantity, nextRemainingForPending, provisionalCost,
+          arrival.supplier.id, arrival.supplier.supplier_name, entry.branchId,
+          entry.temporarySaleRate, batch.id,
+        ]
+      );
+      await client.query(
+        "UPDATE products SET selling_rate = $1, selling_rate_updated_at = CURRENT_TIMESTAMP, selling_rate_updated_by = $2 WHERE id = $3",
+        [entry.temporarySaleRate, managerForRate.id, entry.productId]
+      );
+      if (productChanged) {
+        await client.query(
+          "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, 'OUT', $3, $4, $5), ($6, $7, 'IN', $8, $4, $5)",
+          [oldItem.product_id, oldRemaining, `Pending arrival #${purchaseId} product changed`, manager.id, entry.branchId, entry.productId, entry.quantity, `Pending arrival #${purchaseId} product changed`]
+        );
+      } else if (entry.quantity !== oldQuantity) {
+        const delta = roundUnitCost(entry.quantity - oldQuantity);
+        await client.query(
+          "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, $3, $4, $5, $6)",
+          [entry.productId, Math.abs(delta), delta > 0 ? "IN" : "OUT", `Pending arrival #${purchaseId} edited`, manager.id, entry.branchId]
+        );
+      }
+      const newSnapshot = { purchase: purchaseResult.rows[0], batch: batchUpdateResult.rows[0] };
+      await client.query(
+        "INSERT INTO purchase_audit_trail (purchase_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'EDIT_PENDING_ARRIVAL', $2::jsonb, $3::jsonb, $4, $5)",
+        [purchaseId, JSON.stringify(oldSnapshot), JSON.stringify(newSnapshot), reason, manager.id]
+      );
+      await client.query("COMMIT");
+      return res.json({ success: true, purchase: purchaseResult.rows[0] });
+    }
     if (productChanged && soldQuantity > 0) {
       await client.query("ROLLBACK");
       return res.status(409).json({ message: "This purchase batch has already been sold. Product cannot be changed safely." });
@@ -5764,8 +6157,9 @@ app.put("/purchase/:id", async (req, res) => {
           payment_due_days = $20, payment_status = $21, payment_date = $22,
           purchase_type = $23, payment_mode = $24, payment_reference_number = $25,
           remarks = $26, purchase_status = 'EDITED', edited_by = $27,
-          edited_at = CURRENT_TIMESTAMP, edit_reason = $28
-      WHERE id = $29
+          edited_at = CURRENT_TIMESTAMP, edit_reason = $28,
+          purchase_bill_status = 'BILL_COMPLETED', bill_number = $29, bill_date = $30
+      WHERE id = $31
       RETURNING *
       `,
       [
@@ -5779,7 +6173,7 @@ app.put("/purchase/:id", async (req, res) => {
         entry.purchaseType === "CREDIT" ? null : entry.paymentDate,
         entry.purchaseType, entry.purchaseType === "CASH" ? entry.paymentMode : null,
         entry.purchaseType === "CASH" ? entry.paymentReferenceNumber : null,
-        entry.remarks, manager.id, reason, purchaseId,
+        entry.remarks, manager.id, reason, entry.billNumber, entry.billDate, purchaseId,
       ]
     );
 
@@ -5808,7 +6202,8 @@ app.put("/purchase/:id", async (req, res) => {
           supplier_name = $8, branch_id = $9, mandi_tax_amount = $10,
           freight_charges = $11, labour_charges = $12, other_charges = $13,
           gross_amount = $14, rebate_amount = $15, net_payable = $16,
-          payment_timing = $17, balance_amount = $18, batch_status = 'ACTIVE'
+          payment_timing = $17, balance_amount = $18, batch_status = 'ACTIVE',
+          purchase_bill_status = 'BILL_COMPLETED'
       WHERE id = $19
       RETURNING *
       `,
@@ -5855,6 +6250,158 @@ app.put("/purchase/:id", async (req, res) => {
     await client.query("ROLLBACK");
     console.error(error);
     return res.status(500).json({ message: "Error Updating Purchase" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/purchase/:id/complete-bill", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const purchaseId = parsePositiveInteger(Number(req.params.id));
+    const entry = readPurchaseEntryPayload({ ...req.body, purchase_bill_status: "BILL_COMPLETED" });
+    const validationMessage = validatePurchaseEntry(entry);
+    if (!purchaseId) return res.status(400).json({ message: "Invalid purchase" });
+    if (validationMessage) return res.status(400).json({ message: validationMessage });
+
+    await client.query("BEGIN");
+    const manager = await requireRateManager(req.body.edited_by || entry.actorId, client);
+    if (!manager) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ message: "Only Owner or Admin can complete pending purchase bills" });
+    }
+    const oldPurchaseResult = await client.query("SELECT * FROM purchases WHERE id = $1 FOR UPDATE", [purchaseId]);
+    const oldPurchase = oldPurchaseResult.rows[0];
+    if (!oldPurchase) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Purchase not found" });
+    }
+    if (oldPurchase.purchase_status === "CANCELLED") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Cancelled purchase cannot be completed" });
+    }
+    if (oldPurchase.purchase_bill_status !== "BILL_PENDING") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Only pending purchase bills can be completed" });
+    }
+    const oldItemResult = await client.query("SELECT * FROM purchase_items WHERE purchase_id = $1 ORDER BY id LIMIT 1 FOR UPDATE", [purchaseId]);
+    const oldItem = oldItemResult.rows[0];
+    const batchResult = await client.query("SELECT * FROM inventory_batches WHERE purchase_id = $1 ORDER BY id LIMIT 1 FOR UPDATE", [purchaseId]);
+    const batch = batchResult.rows[0];
+    if (!oldItem || !batch) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Linked pending inventory batch not found" });
+    }
+    const oldQuantity = Number(batch.purchase_qty || oldItem.quantity || 0);
+    const oldRemaining = Number(batch.remaining_qty || 0);
+    const soldQuantity = roundUnitCost(oldQuantity - oldRemaining);
+    if (Number(oldItem.product_id) !== Number(entry.productId) && soldQuantity > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ message: "This pending arrival has already been sold. Product cannot be changed while completing the bill." });
+    }
+    if (entry.quantity < soldQuantity) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ message: `Quantity cannot be less than already sold quantity (${soldQuantity}).` });
+    }
+    const nextRemaining = roundUnitCost(oldRemaining + (entry.quantity - oldQuantity));
+    const calculation = await buildPurchaseFinancials(client, entry);
+    if (calculation.error) {
+      await client.query("ROLLBACK");
+      return res.status(calculation.status || 400).json({ message: calculation.error });
+    }
+    const { supplier, rebateRule, financials } = calculation;
+    const oldSnapshot = { purchase: oldPurchase, item: oldItem, batch };
+    const purchaseResult = await client.query(
+      `
+      UPDATE purchases
+      SET supplier_id = $1, supplier_name = $2, total_amount = $3, branch_id = $4,
+          basic_amount = $5, mandi_tax_percent = $6, mandi_tax_amount = $7,
+          other_charges = $8, gross_amount = $9, rebate_percent = $10,
+          rebate_amount = $11, net_payable = $12, paid_amount = $13,
+          balance_amount = $14, payment_timing = $15, effective_cost_per_unit = $16,
+          freight_charges = $17, labour_charges = $18, rebate_rule_id = $19,
+          payment_due_days = $20, payment_status = $21, payment_date = $22,
+          purchase_type = $23, payment_mode = $24, payment_reference_number = $25,
+          remarks = $26, purchase_status = 'ACTIVE', purchase_bill_status = 'BILL_COMPLETED',
+          bill_number = $27, bill_date = $28, edited_by = $29,
+          edited_at = CURRENT_TIMESTAMP, edit_reason = $30
+      WHERE id = $31
+      RETURNING *
+      `,
+      [
+        supplier.id, supplier.supplier_name, financials.netPayable, entry.branchId,
+        financials.basicAmount, financials.mandiTaxPercent, financials.mandiTaxAmount,
+        entry.otherCharges, financials.grossAmount, financials.rebatePercent,
+        financials.rebateAmount, financials.netPayable, financials.paidAmount,
+        financials.balanceAmount, rebateRule.rule_name, financials.effectiveCostPerUnit,
+        entry.freightCharges, entry.labourCharges, rebateRule.id,
+        rebateRule.pay_within_days, financials.paymentStatus,
+        entry.purchaseType === "CREDIT" ? null : entry.paymentDate,
+        entry.purchaseType, entry.purchaseType === "CASH" ? entry.paymentMode : null,
+        entry.purchaseType === "CASH" ? entry.paymentReferenceNumber : null,
+        entry.remarks, entry.billNumber, entry.billDate, manager.id,
+        cleanText(req.body.reason) || "Pending purchase bill completed", purchaseId,
+      ]
+    );
+    await client.query(
+      `
+      UPDATE purchase_items
+      SET product_id = $1, quantity = $2, purchase_rate = $3, amount = $4,
+          basic_amount = $5, mandi_tax_amount = $6, other_charges = $7,
+          rebate_amount = $8, net_payable = $9, effective_cost_per_unit = $10,
+          freight_charges = $11, labour_charges = $12
+      WHERE id = $13
+      `,
+      [
+        entry.productId, entry.quantity, entry.purchaseRate, financials.netPayable,
+        financials.basicAmount, financials.mandiTaxAmount, entry.otherCharges,
+        financials.rebateAmount, financials.netPayable, financials.effectiveCostPerUnit,
+        entry.freightCharges, entry.labourCharges, oldItem.id,
+      ]
+    );
+    const batchUpdateResult = await client.query(
+      `
+      UPDATE inventory_batches
+      SET product_id = $1, purchase_qty = $2, remaining_qty = $3,
+          purchase_rate = $4, effective_cost_per_unit = $5, supplier_id = $6,
+          supplier_name = $7, branch_id = $8, mandi_tax_amount = $9,
+          freight_charges = $10, labour_charges = $11, other_charges = $12,
+          gross_amount = $13, rebate_amount = $14, net_payable = $15,
+          payment_timing = $16, balance_amount = $17, purchase_bill_status = 'BILL_COMPLETED',
+          temporary_sale_rate = 0
+      WHERE id = $18
+      RETURNING *
+      `,
+      [
+        entry.productId, entry.quantity, nextRemaining, entry.purchaseRate, financials.effectiveCostPerUnit,
+        supplier.id, supplier.supplier_name, entry.branchId, financials.mandiTaxAmount,
+        entry.freightCharges, entry.labourCharges, entry.otherCharges, financials.grossAmount,
+        financials.rebateAmount, financials.netPayable, rebateRule.rule_name, financials.balanceAmount, batch.id,
+      ]
+    );
+    await client.query(
+      "UPDATE sale_batch_allocations SET purchase_rate = $1, cost_amount = ROUND((quantity * $1)::NUMERIC, 2) WHERE inventory_batch_id = $2",
+      [financials.effectiveCostPerUnit, batch.id]
+    );
+    await recalculateSalesForBatch(client, batch.id);
+    if (entry.quantity !== oldQuantity) {
+      const delta = roundUnitCost(entry.quantity - oldQuantity);
+      await client.query(
+        "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, $3, $4, $5, $6)",
+        [entry.productId, Math.abs(delta), delta > 0 ? "IN" : "OUT", `Pending bill #${purchaseId} completed quantity adjustment`, manager.id, entry.branchId]
+      );
+    }
+    const newSnapshot = { purchase: purchaseResult.rows[0], batch: batchUpdateResult.rows[0] };
+    await client.query(
+      "INSERT INTO purchase_audit_trail (purchase_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'COMPLETE_BILL', $2::jsonb, $3::jsonb, $4, $5)",
+      [purchaseId, JSON.stringify(oldSnapshot), JSON.stringify(newSnapshot), cleanText(req.body.reason) || "Pending purchase bill completed", manager.id]
+    );
+    await client.query("COMMIT");
+    return res.json({ success: true, purchase: purchaseResult.rows[0] });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Completing Pending Purchase Bill" });
   } finally {
     client.release();
   }
@@ -5907,7 +6454,11 @@ app.post("/purchase/:id/cancel", async (req, res) => {
     const soldQuantity = roundUnitCost(purchaseQty - remainingQty);
     if (soldQuantity > 0) {
       await client.query("ROLLBACK");
-      return res.status(409).json({ message: "This purchase cannot be cancelled because stock from this batch has already been sold." });
+      return res.status(409).json({
+        message: purchase.purchase_bill_status === "BILL_PENDING"
+          ? "Cannot cancel. Stock from this arrival has already been sold."
+          : "This purchase cannot be cancelled because stock from this batch has already been sold.",
+      });
     }
     const oldSnapshot = { purchase, item, batch };
     const updatedPurchase = await client.query(
@@ -6022,7 +6573,11 @@ app.post("/sales", async (req, res) => {
 
       const batchesResult = await client.query(
         `
-        SELECT id, remaining_qty, COALESCE(effective_cost_per_unit, purchase_rate) AS purchase_rate
+        SELECT
+          id,
+          remaining_qty,
+          COALESCE(effective_cost_per_unit, purchase_rate) AS purchase_rate,
+          COALESCE(purchase_bill_status, 'BILL_COMPLETED') AS purchase_bill_status
           FROM inventory_batches
           WHERE product_id = $1
             AND branch_id = $2
@@ -6064,6 +6619,7 @@ app.post("/sales", async (req, res) => {
           quantity: deductedQuantity,
           purchaseRate: Number(batch.purchase_rate),
           costAmount,
+          costStatus: batch.purchase_bill_status === "BILL_PENDING" ? "PROVISIONAL" : "FINAL",
         });
         quantityToDeduct -= deductedQuantity;
         itemCost += costAmount;
@@ -6076,6 +6632,7 @@ app.post("/sales", async (req, res) => {
         grossAmount: itemGross,
         netAmount: roundCurrency(itemGross - requestedItem.discountAmount),
         costAmount: roundCurrency(itemCost),
+        costStatus: allocations.some((allocation) => allocation.costStatus === "PROVISIONAL") ? "PROVISIONAL" : "FINAL",
         allocations,
       });
       grossAmount += itemGross;
@@ -6110,6 +6667,7 @@ app.post("/sales", async (req, res) => {
     const taxAmount = 0;
     const totalAmount = roundCurrency(subtotalAfterItemDiscounts - invoiceDiscountAmount + taxAmount);
     const profit = roundCurrency(totalAmount - totalCost);
+    const profitStatus = invoiceItems.some((item) => item.costStatus === "PROVISIONAL") ? "PROVISIONAL" : "FINAL";
     const requestedPayments = requestedPaymentsInput || [{ mode: "CASH", amount: totalAmount }];
     const parsedPayments = requestedPayments.map((payment) => ({
       mode: String(payment.mode || "").toUpperCase(),
@@ -6131,9 +6689,9 @@ app.post("/sales", async (req, res) => {
         customer_name, customer_mobile, customer_notes, payment_mode,
         gross_amount, item_discount_amount, invoice_discount_amount, tax_amount,
         discount_rule_id, discount_rule_name, discount_rule_type, discount_rule_value,
-        discount_rule_payment_mode
+        discount_rule_payment_mode, profit_status
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
       RETURNING *
       `,
       [
@@ -6145,6 +6703,7 @@ app.post("/sales", async (req, res) => {
         discountRule?.discount_type || null,
         discountRule?.discount_value || 0,
         discountRule?.payment_mode || null,
+        profitStatus,
       ]
     );
     const sale = saleResult.rows[0];
@@ -6162,14 +6721,14 @@ app.post("/sales", async (req, res) => {
       const saleItemResult = await client.query(
         `
         INSERT INTO sale_items (
-          sale_id, product_id, quantity, selling_rate, amount, discount_amount, net_amount, cost_amount, profit
+          sale_id, product_id, quantity, selling_rate, amount, discount_amount, net_amount, cost_amount, profit, cost_status
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING id
         `,
         [
           sale.id, item.productId, item.quantity, item.sellingRate, item.grossAmount,
-          item.discountAmount, item.netAmount, item.costAmount, itemProfit,
+          item.discountAmount, item.netAmount, item.costAmount, itemProfit, item.costStatus,
         ]
       );
       const saleItemId = saleItemResult.rows[0].id;
@@ -6258,6 +6817,7 @@ app.get("/sales", async (req, res) => {
         s.customer_name,
         s.customer_mobile,
         s.payment_mode,
+        s.profit_status,
         s.sale_status,
         s.cancelled_at,
         s.cancellation_reason,
@@ -6900,7 +7460,7 @@ app.get("/sales/:id", async (req, res) => {
         SELECT
           si.id, si.product_id, p.product_name, p.unit, si.quantity, si.selling_rate,
           si.amount, si.discount_amount, COALESCE(si.net_amount, si.amount) AS net_amount,
-          si.cost_amount, si.profit
+          si.cost_amount, si.profit, si.cost_status
         FROM sale_items si
         JOIN products p ON p.id = si.product_id
         WHERE si.sale_id = $1
