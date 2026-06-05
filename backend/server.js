@@ -605,6 +605,28 @@ const initializeDatabase = async () => {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    ALTER TABLE expenses ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'ACTIVE';
+    ALTER TABLE expenses ADD COLUMN IF NOT EXISTS paid_to VARCHAR(160);
+    ALTER TABLE expenses ADD COLUMN IF NOT EXISTS edited_by INTEGER REFERENCES users(id);
+    ALTER TABLE expenses ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP;
+    ALTER TABLE expenses ADD COLUMN IF NOT EXISTS edit_reason TEXT;
+    ALTER TABLE expenses ADD COLUMN IF NOT EXISTS cancelled_by INTEGER REFERENCES users(id);
+    ALTER TABLE expenses ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP;
+    ALTER TABLE expenses ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
+    UPDATE expenses SET status = CASE WHEN active IS DISTINCT FROM FALSE THEN 'ACTIVE' ELSE 'CANCELLED' END WHERE status IS NULL;
+    UPDATE expenses SET paid_to = vendor_name WHERE paid_to IS NULL AND vendor_name IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS expense_audit_trail (
+      id SERIAL PRIMARY KEY,
+      expense_id INTEGER NOT NULL REFERENCES expenses(id),
+      action VARCHAR(30) NOT NULL,
+      old_value JSONB,
+      new_value JSONB,
+      reason TEXT NOT NULL,
+      changed_by INTEGER REFERENCES users(id),
+      changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
     INSERT INTO business_settings (id)
     VALUES (1)
     ON CONFLICT (id) DO NOTHING;
@@ -4690,16 +4712,30 @@ app.get("/reports/summary", async (req, res) => {
       pool.query(
         `
         SELECT
-          expense_date,
+          e.id,
+          e.expense_date,
           category,
           payment_mode,
-          COUNT(*)::INTEGER AS expense_count,
-          SUM(amount) AS total_expense
-        FROM expenses
-        WHERE active IS DISTINCT FROM FALSE
-          AND expense_date BETWEEN $1 AND $2
-        GROUP BY expense_date, category, payment_mode
-        ORDER BY expense_date DESC, category
+          amount,
+          COALESCE(e.paid_to, e.vendor_name, '') AS paid_to,
+          e.vendor_name,
+          e.reference_number,
+          e.remarks,
+          COALESCE(e.status, CASE WHEN e.active IS DISTINCT FROM FALSE THEN 'ACTIVE' ELSE 'CANCELLED' END) AS status,
+          e.active,
+          e.cancelled_at,
+          e.cancellation_reason,
+          e.edited_at,
+          e.edit_reason,
+          u.full_name AS created_by_name,
+          eu.full_name AS edited_by_name,
+          cu.full_name AS cancelled_by_name
+        FROM expenses e
+        LEFT JOIN users u ON u.id = e.created_by
+        LEFT JOIN users eu ON eu.id = e.edited_by
+        LEFT JOIN users cu ON cu.id = e.cancelled_by
+        WHERE e.expense_date BETWEEN $1 AND $2
+        ORDER BY e.expense_date DESC, e.created_at DESC, e.id DESC
         `,
         [dateFrom, dateTo]
       ),
@@ -4826,45 +4862,184 @@ app.get("/reports/summary", async (req, res) => {
         FROM (
           SELECT p.purchase_date AS date, 'Supplier Purchase' AS transaction_type,
             p.supplier_name AS party_name,
-            COALESCE(NULLIF(p.gross_amount, 0), p.total_amount, 0) AS debit,
-            COALESCE(p.paid_amount, 0) + COALESCE(p.rebate_amount, 0) AS credit,
+            'SUPPLIER' AS account_type,
+            'SUPPLIER-' || COALESCE(p.supplier_id, 0) AS account_key,
+            'Purchase' AS voucher_type,
+            COALESCE(p.bill_number, 'PUR-' || p.id) AS voucher_no,
+            COALESCE(p.payment_mode, '') AS payment_mode,
+            0::NUMERIC AS debit,
+            COALESCE(NULLIF(p.net_payable, 0), NULLIF(p.gross_amount, 0), p.total_amount, 0) AS credit,
             COALESCE(p.payment_status, '') AS status,
-            COALESCE(p.remarks, 'Purchase #' || p.id) AS remarks
+            COALESCE(p.remarks, 'Purchase #' || p.id) AS remarks,
+            COALESCE(
+              STRING_AGG(pr.product_name || ' ' || TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM pi.quantity::TEXT)) || COALESCE(pr.unit, '') || ' @ ' || pi.purchase_rate || ' = ' || pi.basic_amount, E'\n' ORDER BY pi.id),
+              COALESCE(p.remarks, 'Purchase #' || p.id)
+            ) AS narration
+          FROM purchases p
+          LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
+          LEFT JOIN products pr ON pr.id = pi.product_id
+          WHERE p.purchase_date BETWEEN $1 AND $2
+            AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
+          GROUP BY p.id
+          UNION ALL
+          SELECT p.purchase_date AS date, 'Supplier Rebate' AS transaction_type,
+            p.supplier_name AS party_name,
+            'SUPPLIER' AS account_type,
+            'SUPPLIER-' || COALESCE(p.supplier_id, 0) AS account_key,
+            'Rebate' AS voucher_type,
+            COALESCE(p.bill_number, 'PUR-' || p.id) AS voucher_no,
+            COALESCE(p.payment_mode, '') AS payment_mode,
+            COALESCE(p.rebate_amount, 0) AS debit,
+            0::NUMERIC AS credit,
+            COALESCE(p.payment_status, '') AS status,
+            COALESCE(p.remarks, 'Supplier rebate') AS remarks,
+            'Rebate received against ' || COALESCE(p.bill_number, 'Purchase #' || p.id) AS narration
           FROM purchases p
           WHERE p.purchase_date BETWEEN $1 AND $2
             AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
+            AND COALESCE(p.rebate_amount, 0) > 0
+          UNION ALL
+          SELECT p.cancelled_at::date AS date, 'Supplier Purchase Cancellation' AS transaction_type,
+            p.supplier_name AS party_name,
+            'SUPPLIER' AS account_type,
+            'SUPPLIER-' || COALESCE(p.supplier_id, 0) AS account_key,
+            'Purchase Cancellation' AS voucher_type,
+            COALESCE(p.bill_number, 'PUR-' || p.id) AS voucher_no,
+            COALESCE(p.payment_mode, '') AS payment_mode,
+            COALESCE(NULLIF(p.net_payable, 0), NULLIF(p.gross_amount, 0), p.total_amount, 0) AS debit,
+            0::NUMERIC AS credit,
+            'CANCELLED' AS status,
+            COALESCE(p.cancellation_reason, 'Purchase cancelled') AS remarks,
+            COALESCE(p.cancellation_reason, 'Purchase cancelled') AS narration
+          FROM purchases p
+          WHERE p.cancelled_at::date BETWEEN $1 AND $2
+            AND COALESCE(p.purchase_status, 'ACTIVE') = 'CANCELLED'
           UNION ALL
           SELECT sp.payment_date AS date, 'Supplier Payment' AS transaction_type,
             s.supplier_name AS party_name,
-            0 AS debit,
-            sp.payment_amount + sp.rebate_amount AS credit,
+            'SUPPLIER' AS account_type,
+            'SUPPLIER-' || s.id AS account_key,
+            'Payment' AS voucher_type,
+            COALESCE(sp.reference_number, 'SP-' || sp.id) AS voucher_no,
+            sp.payment_mode,
+            sp.payment_amount + sp.rebate_amount AS debit,
+            0::NUMERIC AS credit,
             CASE WHEN sp.cancelled THEN 'CANCELLED' ELSE 'ACTIVE' END AS status,
-            COALESCE(sp.remarks, sp.reference_number, 'Supplier payment') AS remarks
+            COALESCE(sp.remarks, sp.reference_number, 'Supplier payment') AS remarks,
+            COALESCE(sp.remarks, 'Supplier payment') || CASE WHEN COALESCE(sp.rebate_amount, 0) > 0 THEN ' | Rebate ' || sp.rebate_amount ELSE '' END AS narration
           FROM supplier_payments sp
           JOIN suppliers s ON s.id = sp.supplier_id
           WHERE sp.payment_date BETWEEN $1 AND $2
           UNION ALL
           SELECT s.sale_date AS date, 'Customer Sale' AS transaction_type,
             COALESCE(s.customer_name, c.customer_name, 'Walk-in Customer') AS party_name,
+            'CUSTOMER' AS account_type,
+            'CUSTOMER-' || COALESCE(s.customer_id, c.id, 0) AS account_key,
+            'Sale' AS voucher_type,
+            COALESCE(s.invoice_no, 'SALE-' || s.id) AS voucher_no,
+            s.payment_mode,
             s.total_amount AS debit,
             COALESCE(pay.total_paid, 0) AS credit,
             COALESCE(s.sale_status, 'COMPLETED') AS status,
-            COALESCE(s.invoice_no, 'Sale #' || s.id) AS remarks
+            COALESCE(s.invoice_no, 'Sale #' || s.id) AS remarks,
+            COALESCE(
+              STRING_AGG(pr.product_name || ' ' || TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM si.quantity::TEXT)) || COALESCE(pr.unit, '') || ' @ ' || si.selling_rate || ' = ' || si.amount, E'\n' ORDER BY si.id),
+              COALESCE(s.invoice_no, 'Sale #' || s.id)
+            ) AS narration
           FROM sales s
           LEFT JOIN customers c ON c.id = s.customer_id
           LEFT JOIN (SELECT sale_id, SUM(amount) AS total_paid FROM sale_payments GROUP BY sale_id) pay ON pay.sale_id = s.id
+          LEFT JOIN sale_items si ON si.sale_id = s.id
+          LEFT JOIN products pr ON pr.id = si.product_id
           WHERE s.sale_date BETWEEN $1 AND $2
             AND s.sale_status <> 'CANCELLED'
+          GROUP BY s.id, c.id, c.customer_name, pay.total_paid
+          UNION ALL
+          SELECT s.cancelled_at::date AS date, 'Customer Sale Cancellation' AS transaction_type,
+            COALESCE(s.customer_name, c.customer_name, 'Walk-in Customer') AS party_name,
+            'CUSTOMER' AS account_type,
+            'CUSTOMER-' || COALESCE(s.customer_id, c.id, 0) AS account_key,
+            'Sale Cancellation' AS voucher_type,
+            COALESCE(s.invoice_no, 'SALE-' || s.id) AS voucher_no,
+            s.payment_mode,
+            0::NUMERIC AS debit,
+            s.total_amount AS credit,
+            'CANCELLED' AS status,
+            COALESCE(s.cancellation_reason, 'Invoice cancelled') AS remarks,
+            COALESCE(s.cancellation_reason, 'Invoice cancelled') AS narration
+          FROM sales s
+          LEFT JOIN customers c ON c.id = s.customer_id
+          WHERE s.cancelled_at::date BETWEEN $1 AND $2
+            AND s.sale_status = 'CANCELLED'
           UNION ALL
           SELECT cp.payment_date AS date, 'Customer Payment' AS transaction_type,
             c.customer_name AS party_name,
-            0 AS debit,
+            'CUSTOMER' AS account_type,
+            'CUSTOMER-' || c.id AS account_key,
+            'Receipt' AS voucher_type,
+            COALESCE(cp.reference_number, 'CP-' || cp.id) AS voucher_no,
+            cp.payment_mode,
+            0::NUMERIC AS debit,
             cp.payment_amount AS credit,
             CASE WHEN cp.cancelled THEN 'CANCELLED' ELSE 'ACTIVE' END AS status,
-            COALESCE(cp.remarks, cp.reference_number, 'Customer payment') AS remarks
+            COALESCE(cp.remarks, cp.reference_number, 'Customer payment') AS remarks,
+            COALESCE(cp.remarks, 'Customer payment received') AS narration
           FROM customer_payments cp
           JOIN customers c ON c.id = cp.customer_id
           WHERE cp.payment_date BETWEEN $1 AND $2
+          UNION ALL
+          SELECT e.expense_date AS date, 'Expense' AS transaction_type,
+            COALESCE(e.paid_to, e.vendor_name, e.category) AS party_name,
+            'EXPENSE_VENDOR' AS account_type,
+            'EXPENSE-' || e.id AS account_key,
+            'Expense' AS voucher_type,
+            COALESCE(e.reference_number, 'EXP-' || e.id) AS voucher_no,
+            e.payment_mode,
+            e.amount AS debit,
+            0::NUMERIC AS credit,
+            COALESCE(e.status, CASE WHEN e.active IS DISTINCT FROM FALSE THEN 'ACTIVE' ELSE 'CANCELLED' END) AS status,
+            COALESCE(e.remarks, e.category) AS remarks,
+            e.category || CASE WHEN COALESCE(e.paid_to, e.vendor_name, '') <> '' THEN ' paid to ' || COALESCE(e.paid_to, e.vendor_name) ELSE '' END AS narration
+          FROM expenses e
+          WHERE e.expense_date BETWEEN $1 AND $2
+          UNION ALL
+          SELECT sr.return_date AS date, 'Sale Return' AS transaction_type,
+            COALESCE(sr.customer_name, 'Walk-in Customer') AS party_name,
+            'CUSTOMER' AS account_type,
+            'CUSTOMER-' || COALESCE(s.customer_id, 0) AS account_key,
+            'Sale Return' AS voucher_type,
+            COALESCE(sr.return_no, 'RET-' || sr.id) AS voucher_no,
+            sr.refund_type AS payment_mode,
+            0::NUMERIC AS debit,
+            sr.total_return_amount AS credit,
+            'ACTIVE' AS status,
+            COALESCE(sr.return_reason, 'Sale return') AS remarks,
+            COALESCE(
+              STRING_AGG(pr.product_name || ' ' || TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM sri.return_quantity::TEXT)) || COALESCE(pr.unit, '') || ' @ ' || sri.selling_rate || ' = ' || sri.return_amount, E'\n' ORDER BY sri.id),
+              COALESCE(sr.return_reason, 'Sale return')
+            ) AS narration
+          FROM sale_returns sr
+          LEFT JOIN sales s ON s.id = sr.sale_id
+          LEFT JOIN sale_return_items sri ON sri.sale_return_id = sr.id
+          LEFT JOIN products pr ON pr.id = sri.product_id
+          WHERE sr.return_date BETWEEN $1 AND $2
+          GROUP BY sr.id, s.customer_id
+          UNION ALL
+          SELECT we.waste_date AS date, 'Waste' AS transaction_type,
+            p.product_name AS party_name,
+            'OTHER' AS account_type,
+            'WASTE-' || we.id AS account_key,
+            'Waste' AS voucher_type,
+            'WST-' || we.id AS voucher_no,
+            '' AS payment_mode,
+            we.cost_amount AS debit,
+            0::NUMERIC AS credit,
+            'ACTIVE' AS status,
+            COALESCE(we.remarks, we.waste_type) AS remarks,
+            p.product_name || ' ' || TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM we.quantity::TEXT)) || COALESCE(p.unit, '') || ' wasted: ' || we.waste_type AS narration
+          FROM waste_entries we
+          JOIN products p ON p.id = we.product_id
+          WHERE we.waste_date BETWEEN $1 AND $2
         ) ledger
         ORDER BY date DESC, transaction_type, party_name
         `,
@@ -5223,9 +5398,24 @@ app.get("/reports/summary", async (req, res) => {
         SELECT
           COALESCE((SELECT SUM(total_amount) FROM sales WHERE sale_status <> 'CANCELLED' AND sale_date BETWEEN $1 AND $2), 0) AS sales_revenue,
           COALESCE((SELECT SUM(total_cost) FROM sales WHERE sale_status <> 'CANCELLED' AND sale_date BETWEEN $1 AND $2), 0) AS purchase_cost,
-          COALESCE((SELECT SUM(amount) FROM expenses WHERE active IS DISTINCT FROM FALSE AND expense_date BETWEEN $1 AND $2), 0) AS expenses,
+          COALESCE((SELECT SUM(mandi_tax_amount) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0) AS mandi_tax,
+          COALESCE((SELECT SUM(freight_charges) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0) AS freight_charges,
+          COALESCE((SELECT SUM(labour_charges) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0) AS labour_charges,
+          COALESCE((SELECT SUM(other_charges) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0) AS other_purchase_charges,
+          COALESCE((SELECT SUM(amount) FROM expenses WHERE active IS DISTINCT FROM FALSE AND COALESCE(status, 'ACTIVE') <> 'CANCELLED' AND expense_date BETWEEN $1 AND $2), 0) AS expenses,
           COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE purchase_date BETWEEN $1 AND $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0)
-            + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE AND payment_date BETWEEN $1 AND $2), 0) AS supplier_rebate_received
+            + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE AND payment_date BETWEEN $1 AND $2), 0) AS supplier_rebate_received,
+          COALESCE((
+            SELECT JSON_AGG(JSON_BUILD_OBJECT('category', category, 'amount', total_amount) ORDER BY category)
+            FROM (
+              SELECT category, SUM(amount) AS total_amount
+              FROM expenses
+              WHERE active IS DISTINCT FROM FALSE
+                AND COALESCE(status, 'ACTIVE') <> 'CANCELLED'
+                AND expense_date BETWEEN $1 AND $2
+              GROUP BY category
+            ) expense_categories
+          ), '[]'::json) AS expense_categories
         `,
         [dateFrom, dateTo]
       ),
@@ -5263,10 +5453,20 @@ app.get("/reports/summary", async (req, res) => {
     ]);
     const balanceSheet = balanceSheetResult.rows[0] || {};
     const profitLoss = profitLossResult.rows[0] || {};
-    const grossProfit = Number(profitLoss.sales_revenue || 0) - Number(profitLoss.purchase_cost || 0);
-    const netProfit = grossProfit - Number(profitLoss.expenses || 0) + Number(profitLoss.supplier_rebate_received || 0);
-    const assets = Number(balanceSheet.cash_bank || 0) + Number(balanceSheet.inventory_value || 0) + Number(balanceSheet.customer_receivable || 0);
-    const liabilities = Number(balanceSheet.supplier_payable || 0);
+    const customerReceivable = customerRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0);
+    const supplierPayable = supplierRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0);
+    const purchaseCost = Number(profitLoss.purchase_cost || 0);
+    const mandiTax = Number(profitLoss.mandi_tax || 0);
+    const freightCharges = Number(profitLoss.freight_charges || 0);
+    const labourCharges = Number(profitLoss.labour_charges || 0);
+    const otherPurchaseCharges = Number(profitLoss.other_purchase_charges || 0);
+    const supplierRebateReceived = Number(profitLoss.supplier_rebate_received || 0);
+    const costOfGoodsSold = purchaseCost + mandiTax + freightCharges + labourCharges + otherPurchaseCharges - supplierRebateReceived;
+    const grossProfit = Number(profitLoss.sales_revenue || 0) - costOfGoodsSold;
+    const netProfit = grossProfit - Number(profitLoss.expenses || 0);
+    const assets = Number(balanceSheet.cash_bank || 0) + Number(balanceSheet.inventory_value || 0) + customerReceivable;
+    const liabilities = supplierPayable;
+    const ownerCapitalAdjustment = roundCurrency(assets - liabilities - netProfit);
     return res.json({
       dateFrom,
       dateTo,
@@ -5285,7 +5485,7 @@ app.get("/reports/summary", async (req, res) => {
       mostWastedProducts: wasteProductResult.rows.slice(0, 5),
       stockReport: stockResult.rows,
       ledgerReport: ledgerResult.rows,
-      dayToDayReport: dayToDayResult.rows,
+      dayToDayReport: ledgerResult.rows,
       salesProductReport: salesProductResult.rows,
       salesCustomerReport: salesCustomerResult.rows,
       salesHistoryReport: salesHistoryResult.rows,
@@ -5303,15 +5503,25 @@ app.get("/reports/summary", async (req, res) => {
         cash: roundCurrency(Number(balanceSheet.cash_bank || 0)),
         bank: 0,
         inventory: roundCurrency(Number(balanceSheet.inventory_value || 0)),
-        customerReceivable: roundCurrency(Number(balanceSheet.customer_receivable || 0)),
-        supplierPayable: roundCurrency(liabilities),
+        customerReceivable: roundCurrency(customerReceivable),
+        supplierPayable: roundCurrency(supplierPayable),
+        netProfit: roundCurrency(netProfit),
+        ownerCapital: ownerCapitalAdjustment,
         netPosition: roundCurrency(assets - liabilities),
+        totalAssets: roundCurrency(assets),
+        totalLiabilities: roundCurrency(liabilities + netProfit + ownerCapitalAdjustment),
       },
       profitLoss: {
         salesRevenue: roundCurrency(Number(profitLoss.sales_revenue || 0)),
-        purchaseCost: roundCurrency(Number(profitLoss.purchase_cost || 0)),
+        purchaseCost: roundCurrency(purchaseCost),
+        mandiTax: roundCurrency(mandiTax),
+        freightCharges: roundCurrency(freightCharges),
+        labourCharges: roundCurrency(labourCharges),
+        otherPurchaseCharges: roundCurrency(otherPurchaseCharges),
+        supplierRebateReceived: roundCurrency(supplierRebateReceived),
+        costOfGoodsSold: roundCurrency(costOfGoodsSold),
         expenses: roundCurrency(Number(profitLoss.expenses || 0)),
-        supplierRebateReceived: roundCurrency(Number(profitLoss.supplier_rebate_received || 0)),
+        expenseCategories: Array.isArray(profitLoss.expense_categories) ? profitLoss.expense_categories : [],
         cashSales: roundCurrency(paymentModeSummaryResult.rows.filter((row) => row.source === "Sales" && row.payment_mode === "CASH").reduce((sum, row) => sum + Number(row.total_amount || 0), 0)),
         upiSales: roundCurrency(paymentModeSummaryResult.rows.filter((row) => row.source === "Sales" && row.payment_mode === "UPI").reduce((sum, row) => sum + Number(row.total_amount || 0), 0)),
         bankCardSales: roundCurrency(paymentModeSummaryResult.rows.filter((row) => row.source === "Sales" && ["CARD", "BANK_TRANSFER"].includes(row.payment_mode)).reduce((sum, row) => sum + Number(row.total_amount || 0), 0)),
@@ -5327,13 +5537,50 @@ app.get("/reports/summary", async (req, res) => {
 
 app.get("/expenses", async (req, res) => {
   try {
+    const filters = [];
+    const values = [];
+    if (req.query.date_from) {
+      values.push(req.query.date_from);
+      filters.push(`e.expense_date >= $${values.length}`);
+    }
+    if (req.query.date_to) {
+      values.push(req.query.date_to);
+      filters.push(`e.expense_date <= $${values.length}`);
+    }
+    if (req.query.category) {
+      values.push(cleanText(req.query.category));
+      filters.push(`LOWER(e.category) = LOWER($${values.length})`);
+    }
+    if (req.query.payment_mode) {
+      values.push(normalizePaymentMode(req.query.payment_mode));
+      filters.push(`e.payment_mode = $${values.length}`);
+    }
+    if (req.query.status) {
+      values.push(String(req.query.status).toUpperCase());
+      filters.push(`COALESCE(e.status, CASE WHEN e.active IS DISTINCT FROM FALSE THEN 'ACTIVE' ELSE 'CANCELLED' END) = $${values.length}`);
+    }
+    if (req.query.search) {
+      values.push(`%${cleanText(req.query.search).toLowerCase()}%`);
+      filters.push(`(
+        LOWER(e.category) LIKE $${values.length}
+        OR LOWER(COALESCE(e.vendor_name, e.paid_to, '')) LIKE $${values.length}
+        OR LOWER(COALESCE(e.reference_number, '')) LIKE $${values.length}
+        OR LOWER(COALESCE(e.remarks, '')) LIKE $${values.length}
+      )`);
+    }
+    const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
     const result = await pool.query(
       `
-      SELECT e.*, u.full_name AS created_by_name
+      SELECT e.*, COALESCE(e.paid_to, e.vendor_name) AS paid_to, u.full_name AS created_by_name,
+             eu.full_name AS edited_by_name, cu.full_name AS cancelled_by_name
       FROM expenses e
       LEFT JOIN users u ON u.id = e.created_by
+      LEFT JOIN users eu ON eu.id = e.edited_by
+      LEFT JOIN users cu ON cu.id = e.cancelled_by
+      ${whereClause}
       ORDER BY e.expense_date DESC, e.created_at DESC, e.id DESC
-      `
+      `,
+      values
     );
     return res.json(result.rows);
   } catch (error) {
@@ -5354,14 +5601,15 @@ app.post("/expenses", async (req, res) => {
       `
       INSERT INTO expenses (
         expense_date, category, amount, payment_mode, reference_number,
-        vendor_name, remarks, branch_id, created_by, active
+        vendor_name, paid_to, remarks, branch_id, created_by, active, status
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'ACTIVE')
       RETURNING *
       `,
       [
         req.body.expense_date || toDateKey(new Date()), category, amount, paymentMode,
-        nullableText(req.body.reference_number), nullableText(req.body.vendor_name),
+        nullableText(req.body.reference_number), nullableText(req.body.vendor_name || req.body.paid_to),
+        nullableText(req.body.paid_to || req.body.vendor_name),
         nullableText(req.body.remarks), parsePositiveInteger(req.body.branch_id),
         parsePositiveInteger(req.body.created_by) || 1, req.body.active !== false,
       ]
@@ -5374,6 +5622,7 @@ app.post("/expenses", async (req, res) => {
 });
 
 app.put("/expenses/:id", async (req, res) => {
+  const client = await pool.connect();
   try {
     const expenseId = parsePositiveInteger(req.params.id);
     const amount = parsePositiveNumber(req.body.amount);
@@ -5382,26 +5631,100 @@ app.put("/expenses/:id", async (req, res) => {
     if (!expenseId || !category || !amount || !SUPPLIER_PAYMENT_MODES.has(paymentMode)) {
       return res.status(400).json({ message: "Enter valid expense details" });
     }
-    const result = await pool.query(
+    await client.query("BEGIN");
+    const oldResult = await client.query("SELECT * FROM expenses WHERE id = $1 FOR UPDATE", [expenseId]);
+    const oldExpense = oldResult.rows[0];
+    if (!oldExpense) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Expense not found" });
+    }
+    if (oldExpense.status === "CANCELLED" || oldExpense.active === false) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Cancelled expenses cannot be edited" });
+    }
+    const editorId = parsePositiveInteger(req.body.edited_by) || parsePositiveInteger(req.body.created_by) || 1;
+    const reason = cleanText(req.body.reason || req.body.edit_reason || "Expense updated");
+    const result = await client.query(
       `
       UPDATE expenses
       SET expense_date = $1, category = $2, amount = $3, payment_mode = $4,
-          reference_number = $5, vendor_name = $6, remarks = $7,
-          branch_id = $8, active = $9, updated_at = CURRENT_TIMESTAMP
-      WHERE id = $10
+          reference_number = $5, vendor_name = $6, paid_to = $7, remarks = $8,
+          branch_id = $9, active = TRUE, status = 'ACTIVE',
+          edited_by = $10, edited_at = CURRENT_TIMESTAMP, edit_reason = $11,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $12
       RETURNING *
       `,
       [
         req.body.expense_date || toDateKey(new Date()), category, amount, paymentMode,
-        nullableText(req.body.reference_number), nullableText(req.body.vendor_name),
+        nullableText(req.body.reference_number), nullableText(req.body.vendor_name || req.body.paid_to),
+        nullableText(req.body.paid_to || req.body.vendor_name),
         nullableText(req.body.remarks), parsePositiveInteger(req.body.branch_id),
-        req.body.active !== false, expenseId,
+        editorId, reason, expenseId,
       ]
     );
-    return result.rows[0] ? res.json(result.rows[0]) : res.status(404).json({ message: "Expense not found" });
+    await client.query(
+      `
+      INSERT INTO expense_audit_trail (expense_id, action, old_value, new_value, reason, changed_by)
+      VALUES ($1, 'EDIT', $2::jsonb, $3::jsonb, $4, $5)
+      `,
+      [expenseId, JSON.stringify(oldExpense), JSON.stringify(result.rows[0]), reason, editorId]
+    );
+    await client.query("COMMIT");
+    return res.json(result.rows[0]);
   } catch (error) {
+    await client.query("ROLLBACK");
     console.error(error);
     return res.status(500).json({ message: "Error Updating Expense" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/expenses/:id/cancel", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const expenseId = parsePositiveInteger(req.params.id);
+    const reason = cleanText(req.body.reason);
+    const cancelledBy = parsePositiveInteger(req.body.cancelled_by) || 1;
+    if (!expenseId || !reason) return res.status(400).json({ message: "Cancellation reason is required" });
+    await client.query("BEGIN");
+    const oldResult = await client.query("SELECT * FROM expenses WHERE id = $1 FOR UPDATE", [expenseId]);
+    const oldExpense = oldResult.rows[0];
+    if (!oldExpense) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Expense not found" });
+    }
+    if (oldExpense.status === "CANCELLED" || oldExpense.active === false) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Expense is already cancelled" });
+    }
+    const result = await client.query(
+      `
+      UPDATE expenses
+      SET active = FALSE, status = 'CANCELLED',
+          cancelled_by = $1, cancelled_at = CURRENT_TIMESTAMP, cancellation_reason = $2,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $3
+      RETURNING *
+      `,
+      [cancelledBy, reason, expenseId]
+    );
+    await client.query(
+      `
+      INSERT INTO expense_audit_trail (expense_id, action, old_value, new_value, reason, changed_by)
+      VALUES ($1, 'CANCEL', $2::jsonb, $3::jsonb, $4, $5)
+      `,
+      [expenseId, JSON.stringify(oldExpense), JSON.stringify(result.rows[0]), reason, cancelledBy]
+    );
+    await client.query("COMMIT");
+    return res.json({ success: true, expense: result.rows[0] });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Cancelling Expense" });
+  } finally {
+    client.release();
   }
 });
 

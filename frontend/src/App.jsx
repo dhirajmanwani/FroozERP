@@ -2098,6 +2098,15 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
     date: "",
     status: "ACTIVE",
   });
+  const [accountReportFilters, setAccountReportFilters] = useState({
+    accountType: "",
+    accountName: "",
+    voucherType: "",
+    paymentMode: "",
+  });
+  const [clubLedgerEntries, setClubLedgerEntries] = useState(false);
+  const [ledgerPrintNarration, setLedgerPrintNarration] = useState(false);
+  const ledgerPrintNarrationRef = useRef(false);
   const [purchaseFilters, setPurchaseFilters] = useState({
     supplier: "",
     product: "",
@@ -2135,8 +2144,50 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
   const stockRows = filterRows(data.stockReport);
   const lowStockRows = stockRows.filter((row) => Number(row.current_stock || 0) <= Number(row.minimum_stock || 0));
   const ledgerRows = filterRows(data.ledgerReport);
-  const customerLedgerRows = ledgerRows.filter((row) => String(row.transaction_type || "").includes("Customer"));
-  const supplierLedgerRows = ledgerRows.filter((row) => String(row.transaction_type || "").includes("Supplier"));
+  const accountNames = [...new Set(ledgerRows.map((row) => row.party_name).filter(Boolean))].sort();
+  const voucherTypes = [...new Set(ledgerRows.map((row) => row.voucher_type).filter(Boolean))].sort();
+  const filteredLedgerRows = ledgerRows.filter((row) => {
+    if (accountReportFilters.accountType && row.account_type !== accountReportFilters.accountType) return false;
+    if (accountReportFilters.accountName && row.party_name !== accountReportFilters.accountName) return false;
+    if (accountReportFilters.voucherType && row.voucher_type !== accountReportFilters.voucherType) return false;
+    if (accountReportFilters.paymentMode && row.payment_mode !== accountReportFilters.paymentMode) return false;
+    return true;
+  });
+  const clubRowsByDateAccount = (rows) => {
+    if (!clubLedgerEntries) return rows;
+    const groups = new Map();
+    for (const row of rows) {
+      const key = `${toDateKey(row.date)}-${row.party_name}-${row.voucher_type || row.transaction_type}`;
+      const current = groups.get(key) || {
+        ...row,
+        voucher_no: "Multiple",
+        debit: 0,
+        credit: 0,
+        narration: "",
+        remarks: "",
+      };
+      current.debit += Number(row.debit || 0);
+      current.credit += Number(row.credit || 0);
+      current.narration = [current.narration, row.narration || row.remarks].filter(Boolean).join("\n");
+      current.remarks = [current.remarks, row.remarks].filter(Boolean).join("; ");
+      groups.set(key, current);
+    }
+    return [...groups.values()];
+  };
+  const withRunningBalance = (rows, mode = "RECEIVABLE") => {
+    let balance = 0;
+    return [...rows]
+      .sort((left, right) => toDateKey(left.date).localeCompare(toDateKey(right.date)) || String(left.voucher_no || "").localeCompare(String(right.voucher_no || "")))
+      .map((row) => {
+        balance = roundUi(balance + (mode === "PAYABLE" ? Number(row.credit || 0) - Number(row.debit || 0) : Number(row.debit || 0) - Number(row.credit || 0)));
+        return { ...row, running_balance: balance };
+      })
+      .sort((left, right) => toDateKey(right.date).localeCompare(toDateKey(left.date)) || String(right.voucher_no || "").localeCompare(String(left.voucher_no || "")));
+  };
+  const ledgerNarration = (row) => ledgerPrintNarration || ledgerPrintNarrationRef.current ? row.narration || row.remarks || "-" : row.remarks || row.narration || "-";
+  const customerLedgerRows = withRunningBalance(clubRowsByDateAccount(filteredLedgerRows.filter((row) => row.account_type === "CUSTOMER")));
+  const supplierLedgerRows = withRunningBalance(clubRowsByDateAccount(filteredLedgerRows.filter((row) => row.account_type === "SUPPLIER")), "PAYABLE");
+  const accountStatementRows = withRunningBalance(clubRowsByDateAccount(filteredLedgerRows));
   const salesChanges = filterRows(data.salesChangeReport);
   const editedBills = salesChanges.filter((row) => row.sale_status === "EDITED" || row.edited_at);
   const cancelledBills = salesChanges.filter((row) => row.sale_status === "CANCELLED" || row.cancelled_at);
@@ -2490,22 +2541,22 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       title: "Customer Ledger",
       rows: customerLedgerRows,
       summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
-      headers: ["Date", "Type", "Customer", "Debit", "Credit", "Status", "Remarks"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{row.date}</td><td>{row.transaction_type}</td><td className="primary-cell">{row.party_name}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td>{row.status || "-"}</td><td>{row.remarks || "-"}</td></tr>,
+      headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{toDateKey(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
     },
     supplierLedger: {
       title: "Supplier Ledger",
       rows: supplierLedgerRows,
       summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
-      headers: ["Date", "Type", "Supplier", "Debit", "Credit", "Status", "Remarks"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{row.date}</td><td>{row.transaction_type}</td><td className="primary-cell">{row.party_name}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td>{row.status || "-"}</td><td>{row.remarks || "-"}</td></tr>,
+      headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{toDateKey(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Cr" : "Dr"}</td></tr>,
     },
     accountStatement: {
       title: "Account Statement",
-      rows: ledgerRows,
+      rows: accountStatementRows,
       summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
-      headers: ["Date", "Type", "Account", "Debit", "Credit", "Status", "Remarks"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{row.date}</td><td>{row.transaction_type}</td><td className="primary-cell">{row.party_name}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td>{row.status || "-"}</td><td>{row.remarks || "-"}</td></tr>,
+      headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{toDateKey(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name} - {row.account_type}</small></td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
     },
     paymentReport: {
       title: "Payment Report",
@@ -2621,31 +2672,50 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
     },
     profitLoss: {
       title: "Profit & Loss",
-      rows: [data.profitLoss || {}].filter(matchesSearch),
-      summary: (rows) => [["Net Profit", money(rows[0]?.netProfit), true], ["Gross Profit", money(rows[0]?.grossProfit)], ["Expenses", money(rows[0]?.expenses)]],
-      headers: ["Sales Revenue", "Cash Sales", "UPI Sales", "Bank/Card Sales", "Purchase Cost", "Expenses", "Rebate", "Gross Profit", "Net Profit"],
-      render: (row) => <tr key="profit-loss"><td>{money(row.salesRevenue)}</td><td>{money(row.cashSales)}</td><td>{money(row.upiSales)}</td><td>{money(row.bankCardSales)}</td><td>{money(row.purchaseCost)}</td><td>{money(row.expenses)}</td><td>{money(row.supplierRebateReceived)}</td><td>{money(row.grossProfit)}</td><td className="profit-cell">{money(row.netProfit)}</td></tr>,
+      rows: [
+        { section: "Income", particular: "Sales Revenue", amount: Number(data.profitLoss?.salesRevenue || 0), emphasis: true },
+        { section: "Income", particular: "Other Income", amount: 0 },
+        { section: "Cost of Goods Sold", particular: "Purchase Cost", amount: -Number(data.profitLoss?.purchaseCost || 0) },
+        { section: "Cost of Goods Sold", particular: "Mandi Tax", amount: -Number(data.profitLoss?.mandiTax || 0) },
+        { section: "Cost of Goods Sold", particular: "Freight", amount: -Number(data.profitLoss?.freightCharges || 0) },
+        { section: "Cost of Goods Sold", particular: "Labour", amount: -Number(data.profitLoss?.labourCharges || 0) },
+        { section: "Cost of Goods Sold", particular: "Other Purchase Charges", amount: -Number(data.profitLoss?.otherPurchaseCharges || 0) },
+        { section: "Cost of Goods Sold", particular: "Less Supplier Rebate Received", amount: Number(data.profitLoss?.supplierRebateReceived || 0) },
+        { section: "Result", particular: "Gross Profit", amount: Number(data.profitLoss?.grossProfit || 0), emphasis: true },
+        ...(Array.isArray(data.profitLoss?.expenseCategories) ? data.profitLoss.expenseCategories : []).map((row) => ({ section: "Expenses", particular: row.category, amount: -Number(row.amount || 0) })),
+        { section: "Result", particular: Number(data.profitLoss?.netProfit || 0) < 0 ? "Net Loss" : "Net Profit", amount: Number(data.profitLoss?.netProfit || 0), emphasis: true },
+      ].filter(matchesSearch),
+      summary: () => [["Net Profit", money(data.profitLoss?.netProfit), true], ["Gross Profit", money(data.profitLoss?.grossProfit)], ["Total Expenses", money(data.profitLoss?.expenses)]],
+      headers: ["Section", "Particulars", "Amount"],
+      render: (row, index) => <tr className={row.emphasis ? "date-total-row" : ""} key={`${row.section}-${row.particular}-${index}`}><td>{row.section}</td><td className="primary-cell">{row.particular}</td><td className={row.amount < 0 ? "stock-low" : "profit-cell"}>{money(Math.abs(row.amount))}{row.amount < 0 ? " Dr" : ""}</td></tr>,
     },
     balanceSheet: {
       title: "Balance Sheet",
-      rows: [data.balanceSheet || {}].filter(matchesSearch),
-      summary: (rows) => [["Net Position", money(rows[0]?.netPosition), true], ["Inventory", money(rows[0]?.inventory)], ["Supplier Payable", money(rows[0]?.supplierPayable)]],
-      headers: ["Cash", "Bank", "Inventory", "Customer Receivable", "Supplier Payable", "Net Position"],
-      render: (row) => <tr key="balance-sheet"><td>{money(row.cash)}</td><td>{money(row.bank)}</td><td>{money(row.inventory)}</td><td>{money(row.customerReceivable)}</td><td>{money(row.supplierPayable)}</td><td className="profit-cell">{money(row.netPosition)}</td></tr>,
+      rows: [
+        { liability: "Capital / Owner Equity", liabilityAmount: Number(data.balanceSheet?.ownerCapital || 0), asset: "Cash in Hand", assetAmount: Number(data.balanceSheet?.cash || 0) },
+        { liability: Number(data.balanceSheet?.netProfit || 0) < 0 ? "Net Loss" : "Net Profit", liabilityAmount: Number(data.balanceSheet?.netProfit || 0), asset: "Cash at Bank / Bank Balance", assetAmount: Number(data.balanceSheet?.bank || 0) },
+        { liability: "Supplier Payables / Trade Creditors", liabilityAmount: Number(data.balanceSheet?.supplierPayable || 0), asset: "Inventory / Closing Stock", assetAmount: Number(data.balanceSheet?.inventory || 0) },
+        { liability: "Loans / Credit Balances", liabilityAmount: 0, asset: "Customer Receivables / Sundry Debtors", assetAmount: Number(data.balanceSheet?.customerReceivable || 0) },
+        { liability: "Other Liabilities", liabilityAmount: 0, asset: "Other Assets", assetAmount: 0 },
+        { liability: "Total Liabilities", liabilityAmount: Number(data.balanceSheet?.totalLiabilities || 0), asset: "Total Assets", assetAmount: Number(data.balanceSheet?.totalAssets || 0), total: true },
+      ].filter(matchesSearch),
+      summary: () => [["Total Assets", money(data.balanceSheet?.totalAssets), true], ["Total Liabilities", money(data.balanceSheet?.totalLiabilities)], ["Inventory", money(data.balanceSheet?.inventory)]],
+      headers: ["Liabilities", "Amount", "Assets", "Amount"],
+      render: (row, index) => <tr className={row.total ? "date-total-row" : ""} key={`${row.liability}-${index}`}><td className="primary-cell">{row.liability}</td><td>{money(row.liabilityAmount)}</td><td className="primary-cell">{row.asset}</td><td>{money(row.assetAmount)}</td></tr>,
     },
     dayToDay: {
-      title: "Day-to-Day Transaction Report",
-      rows: filterRows(data.dayToDayReport),
-      summary: (rows) => [["Sales", money(totalOf(rows, "sales")), true], ["Cash Sales", money(totalOf(rows, "cash_sales"))], ["UPI Sales", money(totalOf(rows, "upi_sales"))], ["Net Profit", money(totalOf(rows, "net_profit"))]],
-      headers: ["Date", "Transactions", "Sales", "Cash", "UPI", "Bank/Card", "Customer Receipts", "Supplier Payments", "Purchases", "Expenses", "Returns", "Waste", "Net Profit"],
-      render: (row) => <tr key={row.date}><td>{row.date}</td><td>{row.transactions}</td><td>{money(row.sales)}</td><td>{money(row.cash_sales)}</td><td>{money(row.upi_sales)}</td><td>{money(row.bank_card_sales)}</td><td>{money(Number(row.customer_cash_receipts || 0) + Number(row.customer_upi_receipts || 0) + Number(row.customer_bank_card_receipts || 0))}</td><td>{money(Number(row.supplier_cash_payments || 0) + Number(row.supplier_upi_payments || 0) + Number(row.supplier_bank_payments || 0))}</td><td>{money(row.purchases)}</td><td>{money(row.expenses)}</td><td>{money(row.returns)}</td><td>{money(row.waste)}</td><td className="profit-cell">{money(row.net_profit)}</td></tr>,
+      title: "Day Book / Day-to-Day Transactions",
+      rows: clubRowsByDateAccount(filterRows(data.dayToDayReport)),
+      summary: (rows) => [["Debit", money(totalOf(rows, "debit")), true], ["Credit", money(totalOf(rows, "credit"))], ["Vouchers", rows.length]],
+      headers: ["Date", "Particulars", "Voucher Type", "Voucher No.", "Debit Amount", "Credit Amount", "Narration"],
+      render: (row, index) => <tr key={`${row.date}-${row.voucher_no}-${index}`}><td>{toDateKey(row.date)}</td><td className="primary-cell">{row.party_name}</td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span></td></tr>,
     },
     expenseReport: {
       title: "Expense Report",
       rows: filterRows(data.expenseReport),
-      summary: (rows) => [["Expenses", money(totalOf(rows, "total_expense")), true], ["Entries", number(totalOf(rows, "expense_count"))]],
-      headers: ["Date", "Category", "Payment", "Entries", "Amount"],
-      render: (row) => <tr key={`${row.expense_date}-${row.category}-${row.payment_mode}`}><td>{row.expense_date}</td><td>{row.category}</td><td>{row.payment_mode}</td><td>{row.expense_count}</td><td>{money(row.total_expense)}</td></tr>,
+      summary: (rows) => [["Total Expenses", money(totalOf(rows.filter((row) => row.status !== "CANCELLED"), "amount")), true], ["Cash", money(totalOf(rows.filter((row) => row.payment_mode === "CASH" && row.status !== "CANCELLED"), "amount"))], ["UPI", money(totalOf(rows.filter((row) => row.payment_mode === "UPI" && row.status !== "CANCELLED"), "amount"))], ["Cancelled", money(totalOf(rows.filter((row) => row.status === "CANCELLED"), "amount"))]],
+      headers: ["Date", "Category", "Paid To", "Payment Mode", "Amount", "Reference", "Remarks", "Status"],
+      render: (row) => <tr className={row.status === "CANCELLED" ? "muted-row" : ""} key={row.id}><td>{toDateKey(row.expense_date)}</td><td className="primary-cell">{row.category}</td><td>{row.paid_to || row.vendor_name || "-"}</td><td>{row.payment_mode}</td><td>{money(row.amount)}</td><td>{row.reference_number || "-"}</td><td>{row.remarks || row.cancellation_reason || "-"}</td><td><span className={row.status === "CANCELLED" ? "stock-low" : "stock-ok"}>{row.status || "ACTIVE"}</span></td></tr>,
     },
   };
   const categories = [
@@ -2677,6 +2747,47 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
         </>
       )}
       <Field label="Search / Filter"><input placeholder="Search this report" value={search} onChange={(event) => setSearch(event.target.value)} /></Field>
+      {["customerLedger", "supplierLedger", "accountStatement", "dayToDay"].includes(selectedReport) && (
+        <>
+          <Field label="Account Type">
+            <select value={accountReportFilters.accountType} onChange={(event) => setAccountReportFilters({ ...accountReportFilters, accountType: event.target.value })}>
+              <option value="">All account types</option>
+              <option value="CUSTOMER">Customer</option>
+              <option value="SUPPLIER">Supplier</option>
+              <option value="EXPENSE_VENDOR">Expense Vendor</option>
+              <option value="STAFF">Staff</option>
+              <option value="OTHER">Other</option>
+            </select>
+          </Field>
+          <Field label="Account">
+            <select value={accountReportFilters.accountName} onChange={(event) => setAccountReportFilters({ ...accountReportFilters, accountName: event.target.value })}>
+              <option value="">All accounts</option>
+              {accountNames.map((name) => <option key={name} value={name}>{name}</option>)}
+            </select>
+          </Field>
+          <Field label="Voucher Type">
+            <select value={accountReportFilters.voucherType} onChange={(event) => setAccountReportFilters({ ...accountReportFilters, voucherType: event.target.value })}>
+              <option value="">All vouchers</option>
+              {voucherTypes.map((type) => <option key={type} value={type}>{type}</option>)}
+            </select>
+          </Field>
+          <Field label="Payment Mode">
+            <select value={accountReportFilters.paymentMode} onChange={(event) => setAccountReportFilters({ ...accountReportFilters, paymentMode: event.target.value })}>
+              <option value="">All modes</option>
+              <option value="CASH">Cash</option>
+              <option value="UPI">UPI</option>
+              <option value="CARD">Card</option>
+              <option value="BANK_TRANSFER">Bank</option>
+              <option value="CHEQUE">Cheque</option>
+            </select>
+          </Field>
+          <label className="check-field report-check-field">
+            <input checked={clubLedgerEntries} type="checkbox" onChange={(event) => setClubLedgerEntries(event.target.checked)} />
+            <span>Club Entries</span>
+          </label>
+          <button className="secondary-button" onClick={() => setAccountReportFilters({ accountType: "", accountName: "", voucherType: "", paymentMode: "" })}>Clear Ledger Filters</button>
+        </>
+      )}
       {selectedReport === "salesHistory" && (
         <>
           <Field label="Exact Date">
@@ -2751,6 +2862,11 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
         const includeNarration = window.confirm("Print narration/details?");
         salesPrintNarrationRef.current = includeNarration;
         setSalesPrintNarration(includeNarration);
+      }
+      if (["customerLedger", "supplierLedger", "accountStatement", "dayToDay"].includes(selectedReport)) {
+        const includeNarration = window.confirm("Print narration/details also?");
+        ledgerPrintNarrationRef.current = includeNarration;
+        setLedgerPrintNarration(includeNarration);
       }
       return true;
     };
@@ -3059,9 +3175,10 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
 }
 
 function ExpensesModule({ expenses, onReload, user }) {
+  const expenseCategories = ["Rent", "Staff Salary", "Electricity", "Transport", "Loading / Hamali", "Packing Material", "Repair & Maintenance", "Food / Tea / Misc", "Other"];
   const emptyExpense = {
     expense_date: toDateKey(new Date()),
-    category: "",
+    category: "Other",
     amount: "",
     payment_mode: "CASH",
     reference_number: "",
@@ -3071,8 +3188,20 @@ function ExpensesModule({ expenses, onReload, user }) {
   };
   const [draft, setDraft] = useState(emptyExpense);
   const [editingId, setEditingId] = useState(null);
-  const totalActiveExpenses = expenses
-    .filter((expense) => expense.active !== false)
+  const [filters, setFilters] = useState({ search: "", category: "", payment_mode: "", status: "", date_from: "", date_to: "" });
+  const filteredExpenses = expenses.filter((expense) => {
+    const status = expense.status || (expense.active !== false ? "ACTIVE" : "CANCELLED");
+    const searchText = `${expense.category || ""} ${expense.vendor_name || ""} ${expense.paid_to || ""} ${expense.reference_number || ""} ${expense.remarks || ""}`.toLowerCase();
+    if (filters.search && !searchText.includes(filters.search.toLowerCase())) return false;
+    if (filters.category && expense.category !== filters.category) return false;
+    if (filters.payment_mode && expense.payment_mode !== filters.payment_mode) return false;
+    if (filters.status && status !== filters.status) return false;
+    if (filters.date_from && toDateKey(expense.expense_date) < filters.date_from) return false;
+    if (filters.date_to && toDateKey(expense.expense_date) > filters.date_to) return false;
+    return true;
+  });
+  const totalActiveExpenses = filteredExpenses
+    .filter((expense) => expense.active !== false && expense.status !== "CANCELLED")
     .reduce((sum, expense) => sum + Number(expense.amount || 0), 0);
 
   const saveExpense = async () => {
@@ -3080,10 +3209,16 @@ function ExpensesModule({ expenses, onReload, user }) {
       const payload = {
         ...draft,
         amount: Number(draft.amount || 0),
+        paid_to: draft.paid_to || draft.vendor_name,
         branch_id: user.branch_id,
         created_by: user.id,
+        edited_by: user.id,
       };
-      if (editingId) await axios.put(`${API_URL}/expenses/${editingId}`, payload);
+      if (editingId) {
+        const reason = window.prompt("Enter reason for editing this expense", "Expense updated");
+        if (!reason) return;
+        await axios.put(`${API_URL}/expenses/${editingId}`, { ...payload, reason });
+      }
       else await axios.post(`${API_URL}/expenses`, payload);
       setDraft(emptyExpense);
       setEditingId(null);
@@ -3101,10 +3236,21 @@ function ExpensesModule({ expenses, onReload, user }) {
       amount: expense.amount || "",
       payment_mode: expense.payment_mode || "CASH",
       reference_number: expense.reference_number || "",
-      vendor_name: expense.vendor_name || "",
+      vendor_name: expense.vendor_name || expense.paid_to || "",
       remarks: expense.remarks || "",
       active: expense.active !== false,
     });
+  };
+  const cancelExpense = async (expense) => {
+    const reason = window.prompt(`Enter cancellation reason for ${expense.category}`);
+    if (!reason) return;
+    try {
+      await axios.post(`${API_URL}/expenses/${expense.id}/cancel`, { reason, cancelled_by: user.id });
+      await onReload();
+      alert("Expense cancelled");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to cancel expense"));
+    }
   };
 
   return (
@@ -3116,15 +3262,21 @@ function ExpensesModule({ expenses, onReload, user }) {
         </div>
         <div className="form-grid supplier-form-grid">
           <Field label="Expense Date"><input type="date" value={draft.expense_date} onChange={(event) => setDraft({ ...draft, expense_date: event.target.value })} /></Field>
-          <Field label="Category"><input value={draft.category} onChange={(event) => setDraft({ ...draft, category: event.target.value })} /></Field>
+          <Field label="Category">
+            <select value={draft.category} onChange={(event) => setDraft({ ...draft, category: event.target.value })}>
+              {expenseCategories.map((category) => <option key={category} value={category}>{category}</option>)}
+            </select>
+          </Field>
           <Field label="Amount"><input min="0" step="0.01" type="number" value={draft.amount} onChange={(event) => setDraft({ ...draft, amount: event.target.value })} /></Field>
           <Field label="Payment Mode">
             <select value={draft.payment_mode} onChange={(event) => setDraft({ ...draft, payment_mode: event.target.value })}>
-              {supplierPaymentModes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+              <option value="CASH">Cash</option>
+              <option value="UPI">UPI</option>
+              <option value="BANK_TRANSFER">Bank</option>
             </select>
           </Field>
           <Field label="Reference Number"><input value={draft.reference_number} onChange={(event) => setDraft({ ...draft, reference_number: event.target.value })} /></Field>
-          <Field label="Vendor Name"><input value={draft.vendor_name} onChange={(event) => setDraft({ ...draft, vendor_name: event.target.value })} /></Field>
+          <Field label="Paid To / Vendor Name"><input value={draft.vendor_name} onChange={(event) => setDraft({ ...draft, vendor_name: event.target.value })} /></Field>
           <label className="check-field"><input checked={draft.active} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>Active</span></label>
           <Field label="Remarks"><textarea value={draft.remarks} onChange={(event) => setDraft({ ...draft, remarks: event.target.value })} /></Field>
         </div>
@@ -3134,21 +3286,56 @@ function ExpensesModule({ expenses, onReload, user }) {
         </div>
       </ModuleCard>
       <ModuleCard eyebrow="Expense Register" title="Recent Expenses" subtitle="Expense rows remain available for reporting and review.">
+        <div className="ledger-toolbar">
+          <Field label="Search"><input placeholder="Search category, paid to, reference" value={filters.search} onChange={(event) => setFilters({ ...filters, search: event.target.value })} /></Field>
+          <Field label="Category">
+            <select value={filters.category} onChange={(event) => setFilters({ ...filters, category: event.target.value })}>
+              <option value="">All categories</option>
+              {expenseCategories.map((category) => <option key={category} value={category}>{category}</option>)}
+            </select>
+          </Field>
+          <Field label="Payment Mode">
+            <select value={filters.payment_mode} onChange={(event) => setFilters({ ...filters, payment_mode: event.target.value })}>
+              <option value="">All modes</option>
+              <option value="CASH">Cash</option>
+              <option value="UPI">UPI</option>
+              <option value="BANK_TRANSFER">Bank</option>
+            </select>
+          </Field>
+          <Field label="Status">
+            <select value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })}>
+              <option value="">All</option>
+              <option value="ACTIVE">Active</option>
+              <option value="CANCELLED">Cancelled</option>
+            </select>
+          </Field>
+          <Field label="From"><input type="date" value={filters.date_from} onChange={(event) => setFilters({ ...filters, date_from: event.target.value })} /></Field>
+          <Field label="To"><input type="date" value={filters.date_to} onChange={(event) => setFilters({ ...filters, date_to: event.target.value })} /></Field>
+          <button className="secondary-button" onClick={onReload}>Refresh</button>
+        </div>
         <DataTable headers={["Date", "Category", "Vendor", "Mode", "Amount", "Status", "Reference", "Remarks", ""]}>
-          {expenses.map((expense) => (
-            <tr key={expense.id}>
+          {filteredExpenses.map((expense) => {
+            const status = expense.status || (expense.active !== false ? "ACTIVE" : "CANCELLED");
+            return (
+            <tr className={status === "CANCELLED" ? "muted-row" : ""} key={expense.id}>
               <td>{expense.expense_date}</td>
               <td className="primary-cell">{expense.category}</td>
-              <td>{expense.vendor_name || "-"}</td>
+              <td>{expense.paid_to || expense.vendor_name || "-"}</td>
               <td><span className="tag">{expense.payment_mode}</span></td>
               <td>{currency.format(Number(expense.amount || 0))}</td>
-              <td><span className={expense.active !== false ? "stock-ok" : "stock-low"}>{expense.active !== false ? "Active" : "Inactive"}</span></td>
+              <td><span className={status === "ACTIVE" ? "stock-ok" : "stock-low"}>{status}</span></td>
               <td>{expense.reference_number || "-"}</td>
-              <td>{expense.remarks || "-"}</td>
-              <td><button className="table-action" onClick={() => editExpense(expense)}>Edit</button></td>
+              <td>{expense.remarks || expense.cancellation_reason || "-"}</td>
+              <td>
+                <div className="button-row table-actions-row">
+                  <button className="table-action" disabled={status === "CANCELLED"} onClick={() => editExpense(expense)}>Edit</button>
+                  <button className="remove-button" disabled={status === "CANCELLED"} onClick={() => cancelExpense(expense)}>Cancel</button>
+                </div>
+              </td>
             </tr>
-          ))}
+          );})}
         </DataTable>
+        {filteredExpenses.length === 0 && <div className="cart-empty">No records found for selected filters.</div>}
       </ModuleCard>
     </section>
   );
