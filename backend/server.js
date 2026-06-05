@@ -430,6 +430,27 @@ const initializeDatabase = async () => {
     ALTER TABLE customers ADD COLUMN IF NOT EXISTS account_number VARCHAR(80);
     ALTER TABLE customers ADD COLUMN IF NOT EXISTS ifsc_code VARCHAR(30);
     ALTER TABLE customers ADD COLUMN IF NOT EXISTS upi_id VARCHAR(120);
+    ALTER TABLE customers ADD COLUMN IF NOT EXISTS system_account BOOLEAN DEFAULT FALSE;
+    INSERT INTO customers (
+      customer_name, customer_type, mobile_number, notes, opening_balance, active, system_account
+    )
+    SELECT 'Walk-in Customer', 'RETAIL', NULL, 'System account for POS bills without a saved customer.', 0, TRUE, TRUE
+    WHERE NOT EXISTS (
+      SELECT 1 FROM customers WHERE system_account = TRUE OR LOWER(customer_name) = LOWER('Walk-in Customer')
+    );
+    UPDATE customers
+    SET customer_name = 'Walk-in Customer',
+        customer_type = 'RETAIL',
+        active = TRUE,
+        system_account = TRUE,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = (
+      SELECT id
+      FROM customers
+      WHERE system_account = TRUE OR LOWER(customer_name) = LOWER('Walk-in Customer')
+      ORDER BY system_account DESC, id
+      LIMIT 1
+    );
     CREATE INDEX IF NOT EXISTS customers_name_mobile_search_lower_idx
       ON customers (LOWER(customer_name), COALESCE(mobile_number, ''));
 
@@ -647,6 +668,7 @@ const initializeDatabase = async () => {
 
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS invoice_no VARCHAR(40);
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS customer_name VARCHAR(120);
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS customer_id INTEGER REFERENCES customers(id);
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS customer_mobile VARCHAR(20);
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS customer_notes TEXT;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS payment_mode VARCHAR(20) DEFAULT 'CASH';
@@ -667,6 +689,15 @@ const initializeDatabase = async () => {
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS profit_status VARCHAR(30) DEFAULT 'FINAL';
+    UPDATE sales
+    SET customer_id = (
+      SELECT id FROM customers WHERE system_account = TRUE ORDER BY id LIMIT 1
+    )
+    WHERE customer_id IS NULL
+      AND (
+        customer_name IS NULL
+        OR LOWER(COALESCE(customer_name, '')) LIKE '%walk-in%'
+      );
     UPDATE sales SET sale_status = 'COMPLETED' WHERE sale_status IS NULL;
 
     CREATE UNIQUE INDEX IF NOT EXISTS sales_invoice_no_unique_idx
@@ -1108,13 +1139,24 @@ const getCustomerSummaryRows = async ({ active, search, customerId } = {}) => {
         SELECT c.id AS customer_id
         FROM customers c
         WHERE
-          (s.customer_mobile IS NOT NULL AND c.mobile_number = s.customer_mobile)
+          s.customer_id = c.id
+          OR (s.customer_id IS NULL AND s.customer_mobile IS NOT NULL AND c.mobile_number = s.customer_mobile)
           OR (
-            s.customer_mobile IS NULL
+            s.customer_id IS NULL
+            AND c.system_account = TRUE
+            AND (
+              s.customer_name IS NULL
+              OR LOWER(COALESCE(s.customer_name, '')) LIKE '%walk-in%'
+            )
+          )
+          OR (
+            s.customer_id IS NULL
+            AND c.system_account IS DISTINCT FROM TRUE
+            AND s.customer_mobile IS NULL
             AND s.customer_name IS NOT NULL
             AND LOWER(c.customer_name) = LOWER(s.customer_name)
           )
-        ORDER BY CASE WHEN c.mobile_number = s.customer_mobile THEN 0 ELSE 1 END, c.id
+        ORDER BY CASE WHEN s.customer_id = c.id THEN 0 WHEN c.mobile_number = s.customer_mobile THEN 1 ELSE 2 END, c.id
         LIMIT 1
       ) matched ON TRUE
       LEFT JOIN (
@@ -1164,6 +1206,19 @@ const buildCustomerSummaryPayload = (rows) => {
     outstandingBalance: roundCurrency(totals.outstandingBalance),
     customers: rows,
   };
+};
+
+const getWalkInCustomer = async (client = pool) => {
+  const result = await client.query(
+    `
+    SELECT *
+    FROM customers
+    WHERE system_account = TRUE OR LOWER(customer_name) = LOWER('Walk-in Customer')
+    ORDER BY system_account DESC, id
+    LIMIT 1
+    `
+  );
+  return result.rows[0] || null;
 };
 
 const isDateInput = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));
@@ -1728,7 +1783,8 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
     discountAmount: parseNonNegativeNumber(item.discount_amount),
     requestedRate: parsePositiveNumber(item.selling_rate),
   }));
-  const customerName = customer?.name?.trim() || null;
+  const selectedCustomerId = parsePositiveInteger(customer?.account_id || customer?.customer_id);
+  const typedCustomerName = customer?.name?.trim() || null;
   const customerMobile = customer?.mobile?.trim() || null;
   const customerNotes = customer?.notes?.trim() || null;
 
@@ -1745,6 +1801,22 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
   if (customerMobile && !/^\d{10,15}$/.test(customerMobile)) {
     return { error: { status: 400, message: "Enter a valid customer mobile number" } };
   }
+
+  let customerAccount;
+  if (selectedCustomerId) {
+    const customerResult = await client.query("SELECT * FROM customers WHERE id = $1 AND active = TRUE FOR SHARE", [selectedCustomerId]);
+    if (customerResult.rows.length === 0) {
+      return { error: { status: 400, message: "Selected customer account is not active" } };
+    }
+    customerAccount = customerResult.rows[0];
+  } else {
+    customerAccount = await getWalkInCustomer(client);
+    if (!customerAccount) {
+      return { error: { status: 500, message: "Walk-in Customer account is not configured" } };
+    }
+  }
+  const customerId = customerAccount.id;
+  const customerName = typedCustomerName || customerAccount.customer_name || "Walk-in Customer";
 
   const productIds = parsedItems.map((item) => item.productId);
   const productResult = await client.query(
@@ -1876,6 +1948,7 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
   return {
     invoiceItems,
     payments: parsedPayments,
+    customerId,
     customerName,
     customerMobile,
     customerNotes,
@@ -3342,6 +3415,10 @@ app.put("/accounts/:accountKey", async (req, res) => {
       return res.status(400).json({ message: "Enter valid account details" });
     }
     if (source === "CUSTOMER") {
+      const existingCustomer = await pool.query("SELECT id, system_account FROM customers WHERE id = $1", [sourceId]);
+      if (existingCustomer.rows[0]?.system_account === true && (account.account_name !== "Walk-in Customer" || account.active !== true)) {
+        return res.status(400).json({ message: "Walk-in Customer is a protected system account." });
+      }
       const duplicate = await pool.query(
         "SELECT id FROM customers WHERE id <> $3 AND LOWER(customer_name) = LOWER($1) AND COALESCE(mobile_number, '') = COALESCE($2, '') LIMIT 1",
         [account.account_name, account.mobile_number, sourceId]
@@ -3462,12 +3539,16 @@ app.get("/accounts/ledger", async (req, res) => {
         SELECT *
         FROM (
           SELECT s.sale_date AS date, 'Sale' AS transaction_type,
+            COALESCE(s.invoice_no, 'Sale #' || s.id) AS invoice_no,
+            s.total_amount AS sale_amount,
+            s.payment_mode,
             s.total_amount AS debit,
             COALESCE(pay.total_paid, 0) AS credit,
             s.total_amount - COALESCE(pay.total_paid, 0) AS delta,
-            COALESCE(s.invoice_no, 'Sale #' || s.id) AS remarks,
+            COALESCE(s.customer_name, c.customer_name, 'Walk-in Customer') || ' - ' || COALESCE(s.invoice_no, 'Sale #' || s.id) AS remarks,
             s.created_at
           FROM sales s
+          JOIN customers c ON c.id = $1
           LEFT JOIN (
             SELECT sale_id, SUM(amount) AS total_paid
             FROM sale_payments
@@ -3475,11 +3556,16 @@ app.get("/accounts/ledger", async (req, res) => {
           ) pay ON pay.sale_id = s.id
           WHERE s.sale_status <> 'CANCELLED'
             AND (
-              (s.customer_mobile IS NOT NULL AND s.customer_mobile = $2)
-              OR (s.customer_mobile IS NULL AND s.customer_name IS NOT NULL AND LOWER(s.customer_name) = LOWER($3))
+              s.customer_id = $1
+              OR (s.customer_id IS NULL AND s.customer_mobile IS NOT NULL AND s.customer_mobile = $2)
+              OR (s.customer_id IS NULL AND c.system_account = TRUE AND (s.customer_name IS NULL OR LOWER(COALESCE(s.customer_name, '')) LIKE '%walk-in%'))
+              OR (s.customer_id IS NULL AND c.system_account IS DISTINCT FROM TRUE AND s.customer_mobile IS NULL AND s.customer_name IS NOT NULL AND LOWER(s.customer_name) = LOWER($3))
             )
           UNION ALL
           SELECT cp.payment_date AS date, 'Customer Payment' AS transaction_type,
+            COALESCE(cp.reference_number, '') AS invoice_no,
+            0::NUMERIC AS sale_amount,
+            cp.payment_mode,
             0 AS debit,
             cp.payment_amount AS credit,
             -cp.payment_amount AS delta,
@@ -3501,7 +3587,10 @@ app.get("/accounts/ledger", async (req, res) => {
         balance = roundCurrency(balance + Number(row.delta || 0));
         ledger.push({
           date: toDateKey(row.date),
+          invoice_no: row.invoice_no || "",
           transaction_type: row.transaction_type,
+          sale_amount: Number(row.sale_amount || 0),
+          payment_mode: row.payment_mode || "",
           debit: Number(row.debit || 0),
           credit: Number(row.credit || 0),
           balance,
@@ -4099,6 +4188,10 @@ app.put("/customers/:id", async (req, res) => {
     if (!customerId || !customer.customer_name || !CUSTOMER_TYPES.has(customer.customer_type) || customer.opening_balance === null) {
       return res.status(400).json({ message: "Enter valid customer details" });
     }
+    const existingCustomer = await pool.query("SELECT id, system_account FROM customers WHERE id = $1", [customerId]);
+    if (existingCustomer.rows[0]?.system_account === true && (customer.customer_name !== "Walk-in Customer" || customer.active !== true)) {
+      return res.status(400).json({ message: "Walk-in Customer is a protected system account." });
+    }
     const duplicate = await pool.query(
       "SELECT id FROM customers WHERE id <> $3 AND LOWER(customer_name) = LOWER($1) AND COALESCE(mobile_number, '') = COALESCE($2, '') LIMIT 1",
       [customer.customer_name, customer.mobile_number, customerId]
@@ -4188,8 +4281,10 @@ app.get("/customer-ledger", async (req, res) => {
         SELECT s.*, c.id AS customer_id, COALESCE(pay.total_paid, 0) AS total_paid
         FROM sales s
         JOIN customers c ON (
-          (s.customer_mobile IS NOT NULL AND c.mobile_number = s.customer_mobile)
-          OR (s.customer_mobile IS NULL AND s.customer_name IS NOT NULL AND LOWER(c.customer_name) = LOWER(s.customer_name))
+          s.customer_id = c.id
+          OR (s.customer_id IS NULL AND s.customer_mobile IS NOT NULL AND c.mobile_number = s.customer_mobile)
+          OR (s.customer_id IS NULL AND c.system_account = TRUE AND (s.customer_name IS NULL OR LOWER(COALESCE(s.customer_name, '')) LIKE '%walk-in%'))
+          OR (s.customer_id IS NULL AND c.system_account IS DISTINCT FROM TRUE AND s.customer_mobile IS NULL AND s.customer_name IS NOT NULL AND LOWER(c.customer_name) = LOWER(s.customer_name))
         )
         LEFT JOIN (
           SELECT sale_id, SUM(amount) AS total_paid FROM sale_payments GROUP BY sale_id
@@ -4239,10 +4334,13 @@ app.get("/customer-ledger", async (req, res) => {
           transaction_date: toDateKey(sale.sale_date),
           sort_key: `S-${String(sale.id).padStart(8, "0")}-0`,
           transaction_type: "Sale",
+          invoice_no: sale.invoice_no || `Sale #${sale.id}`,
+          sale_amount: Number(sale.total_amount || 0),
+          payment_mode: sale.payment_mode || "",
           debit_amount: Number(sale.total_amount || 0),
           credit_amount: 0,
           balance_delta: Number(sale.total_amount || 0),
-          remarks: sale.invoice_no || `Sale #${sale.id}`,
+          remarks: `${sale.customer_name || "Walk-in Customer"} - ${sale.invoice_no || `Sale #${sale.id}`}`,
         });
         if (Number(sale.total_paid || 0) > 0) {
           pushEvent({
@@ -4251,6 +4349,9 @@ app.get("/customer-ledger", async (req, res) => {
             transaction_date: toDateKey(sale.sale_date),
             sort_key: `S-${String(sale.id).padStart(8, "0")}-1`,
             transaction_type: "Sale Payment",
+            invoice_no: sale.invoice_no || `Sale #${sale.id}`,
+            sale_amount: 0,
+            payment_mode: sale.payment_mode || "",
             debit_amount: 0,
             credit_amount: Number(sale.total_paid || 0),
             balance_delta: -Number(sale.total_paid || 0),
@@ -4266,6 +4367,9 @@ app.get("/customer-ledger", async (req, res) => {
         transaction_date: toDateKey(payment.payment_date),
         sort_key: `CP-${String(payment.id).padStart(8, "0")}`,
         transaction_type: "Customer Payment",
+        invoice_no: payment.reference_number || "",
+        sale_amount: 0,
+        payment_mode: payment.payment_mode || "",
         debit_amount: 0,
         credit_amount: Number(payment.payment_amount || 0),
         balance_delta: -Number(payment.payment_amount || 0),
@@ -4741,12 +4845,13 @@ app.get("/reports/summary", async (req, res) => {
           WHERE sp.payment_date BETWEEN $1 AND $2
           UNION ALL
           SELECT s.sale_date AS date, 'Customer Sale' AS transaction_type,
-            COALESCE(s.customer_name, 'Walk-in Customer') AS party_name,
+            COALESCE(s.customer_name, c.customer_name, 'Walk-in Customer') AS party_name,
             s.total_amount AS debit,
             COALESCE(pay.total_paid, 0) AS credit,
             COALESCE(s.sale_status, 'COMPLETED') AS status,
             COALESCE(s.invoice_no, 'Sale #' || s.id) AS remarks
           FROM sales s
+          LEFT JOIN customers c ON c.id = s.customer_id
           LEFT JOIN (SELECT sale_id, SUM(amount) AS total_paid FROM sale_payments GROUP BY sale_id) pay ON pay.sale_id = s.id
           WHERE s.sale_date BETWEEN $1 AND $2
             AND s.sale_status <> 'CANCELLED'
@@ -4882,15 +4987,17 @@ app.get("/reports/summary", async (req, res) => {
       pool.query(
         `
         SELECT
-          COALESCE(customer_name, 'Walk-in Customer') AS customer_name,
-          COALESCE(customer_mobile, '') AS customer_mobile,
+          COALESCE(c.customer_name, NULLIF(s.customer_name, ''), 'Walk-in Customer') AS customer_name,
+          COALESCE(c.mobile_number, s.customer_mobile, '') AS customer_mobile,
+          COALESCE(s.customer_id, c.id) AS customer_id,
           COUNT(*)::INTEGER AS invoice_count,
-          SUM(total_amount) AS total_sales,
-          SUM(profit) AS total_profit
-        FROM sales
-        WHERE sale_status <> 'CANCELLED'
-          AND sale_date BETWEEN $1 AND $2
-        GROUP BY COALESCE(customer_name, 'Walk-in Customer'), COALESCE(customer_mobile, '')
+          SUM(s.total_amount) AS total_sales,
+          SUM(s.profit) AS total_profit
+        FROM sales s
+        LEFT JOIN customers c ON c.id = s.customer_id
+        WHERE s.sale_status <> 'CANCELLED'
+          AND s.sale_date BETWEEN $1 AND $2
+        GROUP BY COALESCE(c.customer_name, NULLIF(s.customer_name, ''), 'Walk-in Customer'), COALESCE(c.mobile_number, s.customer_mobile, ''), COALESCE(s.customer_id, c.id)
         ORDER BY total_sales DESC, invoice_count DESC
         `,
         [dateFrom, dateTo]
@@ -4903,7 +5010,8 @@ app.get("/reports/summary", async (req, res) => {
           s.sale_date,
           s.created_at,
           s.sale_status,
-          COALESCE(s.customer_name, 'Walk-in Customer') AS customer_name,
+          s.customer_id,
+          COALESCE(s.customer_name, c.customer_name, 'Walk-in Customer') AS customer_name,
           s.customer_mobile,
           s.payment_mode,
           s.gross_amount,
@@ -4932,6 +5040,7 @@ app.get("/reports/summary", async (req, res) => {
             '[]'::json
           ) AS items
         FROM sales s
+        LEFT JOIN customers c ON c.id = s.customer_id
         LEFT JOIN sale_items si ON si.sale_id = s.id
         LEFT JOIN products p ON p.id = si.product_id
         WHERE s.sale_date BETWEEN $1 AND $2
@@ -4941,7 +5050,9 @@ app.get("/reports/summary", async (req, res) => {
           s.sale_date,
           s.created_at,
           s.sale_status,
+          s.customer_id,
           s.customer_name,
+          c.customer_name,
           s.customer_mobile,
           s.payment_mode,
           s.gross_amount,
@@ -6880,7 +6991,8 @@ app.post("/sales", async (req, res) => {
       quantity: parsePositiveNumber(item.quantity),
       discountAmount: parseNonNegativeNumber(item.discount_amount),
     }));
-    const customerName = customer?.name?.trim() || null;
+    const selectedCustomerId = parsePositiveInteger(customer?.account_id || customer?.customer_id);
+    const typedCustomerName = customer?.name?.trim() || null;
     const customerMobile = customer?.mobile?.trim() || null;
     const customerNotes = customer?.notes?.trim() || null;
 
@@ -6900,6 +7012,24 @@ app.post("/sales", async (req, res) => {
     }
 
     await client.query("BEGIN");
+
+    let customerAccount;
+    if (selectedCustomerId) {
+      const customerResult = await client.query("SELECT * FROM customers WHERE id = $1 AND active = TRUE FOR SHARE", [selectedCustomerId]);
+      if (customerResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Selected customer account is not active" });
+      }
+      customerAccount = customerResult.rows[0];
+    } else {
+      customerAccount = await getWalkInCustomer(client);
+      if (!customerAccount) {
+        await client.query("ROLLBACK");
+        return res.status(500).json({ message: "Walk-in Customer account is not configured" });
+      }
+    }
+    const customerId = customerAccount.id;
+    const customerName = typedCustomerName || customerAccount.customer_name || "Walk-in Customer";
 
     const productIds = parsedItems.map((item) => item.productId);
     const productResult = await client.query(
@@ -7044,17 +7174,17 @@ app.post("/sales", async (req, res) => {
     const saleResult = await client.query(
       `
       INSERT INTO sales (
-        total_amount, total_cost, profit, branch_id, created_by,
+        total_amount, total_cost, profit, branch_id, created_by, customer_id,
         customer_name, customer_mobile, customer_notes, payment_mode,
         gross_amount, item_discount_amount, invoice_discount_amount, tax_amount,
         discount_rule_id, discount_rule_name, discount_rule_type, discount_rule_value,
         discount_rule_payment_mode, profit_status
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
       RETURNING *
       `,
       [
-        totalAmount, totalCost, profit, parsedBranchId, parsedCreatedBy,
+        totalAmount, totalCost, profit, parsedBranchId, parsedCreatedBy, customerId,
         customerName, customerMobile, customerNotes, paymentMode,
         grossAmount, itemDiscountAmount, invoiceDiscountAmount, taxAmount,
         discountRule?.id || null,
@@ -7173,7 +7303,8 @@ app.get("/sales", async (req, res) => {
         s.invoice_no,
         s.sale_date,
         s.created_at,
-        s.customer_name,
+        s.customer_id,
+        COALESCE(s.customer_name, c.customer_name, 'Walk-in Customer') AS customer_name,
         s.customer_mobile,
         s.payment_mode,
         s.profit_status,
@@ -7200,9 +7331,10 @@ app.get("/sales", async (req, res) => {
           'No active items'
         ) AS item_summary
       FROM sales s
+      LEFT JOIN customers c ON c.id = s.customer_id
       LEFT JOIN sale_items si ON si.sale_id = s.id
       LEFT JOIN products p ON p.id = si.product_id
-      GROUP BY s.id
+      GROUP BY s.id, c.customer_name
       ORDER BY s.created_at DESC, s.id DESC
     `);
 
@@ -7626,29 +7758,30 @@ app.put("/sales/:id", async (req, res) => {
         total_cost = $2,
         profit = $3,
         branch_id = $4,
-        customer_name = $5,
-        customer_mobile = $6,
-        customer_notes = $7,
-        payment_mode = $8,
-        gross_amount = $9,
-        item_discount_amount = $10,
-        invoice_discount_amount = $11,
-        tax_amount = $12,
-        discount_rule_id = $13,
-        discount_rule_name = $14,
-        discount_rule_type = $15,
-        discount_rule_value = $16,
-        discount_rule_payment_mode = $17,
+        customer_id = $5,
+        customer_name = $6,
+        customer_mobile = $7,
+        customer_notes = $8,
+        payment_mode = $9,
+        gross_amount = $10,
+        item_discount_amount = $11,
+        invoice_discount_amount = $12,
+        tax_amount = $13,
+        discount_rule_id = $14,
+        discount_rule_name = $15,
+        discount_rule_type = $16,
+        discount_rule_value = $17,
+        discount_rule_payment_mode = $18,
         sale_status = 'EDITED',
-        edited_by = $18,
+        edited_by = $19,
         edited_at = CURRENT_TIMESTAMP,
-        edit_reason = $19
-      WHERE id = $20
+        edit_reason = $20
+      WHERE id = $21
       RETURNING *
       `,
       [
         salePayload.totalAmount, salePayload.totalCost, salePayload.profit, salePayload.branchId,
-        salePayload.customerName, salePayload.customerMobile, salePayload.customerNotes, salePayload.paymentMode,
+        salePayload.customerId, salePayload.customerName, salePayload.customerMobile, salePayload.customerNotes, salePayload.paymentMode,
         salePayload.grossAmount, salePayload.itemDiscountAmount, salePayload.invoiceDiscountAmount, salePayload.taxAmount,
         salePayload.discountRule?.id || null, salePayload.discountRule?.rule_name || null,
         salePayload.discountRule?.discount_type || null, salePayload.discountRule?.discount_value || 0,

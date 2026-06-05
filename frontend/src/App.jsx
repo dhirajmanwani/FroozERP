@@ -1253,12 +1253,15 @@ function App() {
       customerRows = response.data;
       setCustomers(response.data);
     }
+    const saleCustomerId = Number(sale.customer_id || 0);
     const saleMobile = String(sale.customer_mobile || "").trim();
     const saleName = String(sale.customer_name || "").trim().toLowerCase();
     const customer = customerRows.find((item) => {
+      if (saleCustomerId && Number(item.id) === saleCustomerId) return true;
       const mobileMatches = saleMobile && String(item.mobile_number || "").trim() === saleMobile;
       const nameMatches = saleName && String(item.customer_name || "").trim().toLowerCase() === saleName;
-      return mobileMatches || nameMatches;
+      const walkInMatches = saleName.includes("walk-in") && item.system_account === true;
+      return mobileMatches || nameMatches || walkInMatches;
     });
     if (!customer?.id) {
       alert("Customer account is not linked to this sale.");
@@ -3436,14 +3439,17 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
             <DataTable headers={["Account", "Type", "Mobile", "Opening", "Receivable", "Payable", "Status", ""]}>
               {filteredAccounts.map((account) => (
                 <tr key={account.account_key}>
-                  <td className="primary-cell">{account.account_name}<small className="cell-note">{account.firm_name || account.city || account.address || "-"}</small></td>
+                  <td className="primary-cell">
+                    {account.account_name}
+                    <small className="cell-note">{account.system_account ? "System Account" : account.firm_name || account.city || account.address || "-"}</small>
+                  </td>
                   <td><span className="tag">{account.account_type}</span></td>
                   <td>{account.mobile_number || "-"}</td>
                   <td>{currency.format(Number(account.opening_balance || 0))}</td>
                   <td>{currency.format(Number(account.receivable_balance || 0))}</td>
                   <td>{currency.format(Number(account.payable_balance || 0))}</td>
                   <td><span className={account.active !== false ? "stock-ok" : "stock-low"}>{account.active !== false ? "Active" : "Inactive"}</span></td>
-                  <td><button className="table-action" onClick={() => editAccount(account)}>Edit</button></td>
+                  <td><button className="table-action" disabled={account.system_account === true} onClick={() => editAccount(account)}>{account.system_account ? "Protected" : "Edit"}</button></td>
                 </tr>
               ))}
             </DataTable>
@@ -3485,11 +3491,14 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
               <SummaryMetric label="Opening Balance" value={currency.format(Number(printableLedgerRows[0]?.balance || 0) - Number(printableLedgerRows[0]?.debit || 0) + Number(printableLedgerRows[0]?.credit || 0))} />
               <SummaryMetric label="Closing Balance" value={currency.format(Number(printableLedgerRows.at(-1)?.balance || 0))} featured />
             </div>
-            <DataTable headers={["Date", "Transaction Type", "Debit", "Credit", "Balance", "Remarks"]}>
+            <DataTable headers={["Date", "Invoice Number", "Transaction Type", "Sale Amount", "Payment Mode", "Debit", "Credit", "Balance", "Narration"]}>
               {printableLedgerRows.map((row, index) => (
                 <tr key={`${row.date}-${row.transaction_type}-${index}`}>
                   <td>{row.date}</td>
+                  <td>{row.invoice_no || "-"}</td>
                   <td><span className="tag">{row.transaction_type}</span></td>
+                  <td>{row.sale_amount ? currency.format(Number(row.sale_amount || 0)) : "-"}</td>
+                  <td>{row.payment_mode || "-"}</td>
                   <td>{currency.format(Number(row.debit || 0))}</td>
                   <td>{currency.format(Number(row.credit || 0))}</td>
                   <td className="balance-cell">{currency.format(Number(row.balance || 0))}</td>
@@ -4507,7 +4516,7 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
   const [quantityMode, setQuantityMode] = useState(posSettings.enable_weighing_scale ? "SCALE" : "MANUAL");
   const [scaleMessage, setScaleMessage] = useState("");
   const [mixedPayments, setMixedPayments] = useState({ CASH: "", UPI: "", CARD: "" });
-  const [customer, setCustomer] = useState({ name: "", mobile: "", notes: "" });
+  const [customer, setCustomer] = useState({ account_id: "", name: "", mobile: "", notes: "" });
   const [saving, setSaving] = useState(false);
   const [lastInvoice, setLastInvoice] = useState(null);
   const searchRef = useRef(null);
@@ -4630,10 +4639,11 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
   const selectCustomer = (customerId) => {
     const selected = customers.find((item) => String(item.id) === String(customerId));
     if (!selected) {
-      setCustomer({ name: "", mobile: "", notes: "" });
+      setCustomer({ account_id: "", name: "", mobile: "", notes: "" });
       return;
     }
     setCustomer({
+      account_id: selected.id,
       name: selected.customer_name || "",
       mobile: selected.mobile_number || "",
       notes: selected.notes || "",
@@ -4683,7 +4693,7 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
       });
       setCart([]);
       setMixedPayments({ CASH: "", UPI: "", CARD: "" });
-      setCustomer({ name: "", mobile: "", notes: "" });
+      setCustomer({ account_id: "", name: "", mobile: "", notes: "" });
       await onSaved();
       setLastInvoice(response.data.sale);
       onInvoice(response.data.sale);
@@ -4839,7 +4849,7 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
         <h2>Invoice Summary</h2>
         <div className="checkout-section">
           <Field label="Saved Customer Account">
-            <select onChange={(event) => selectCustomer(event.target.value)} defaultValue="">
+            <select value={customer.account_id || ""} onChange={(event) => selectCustomer(event.target.value)}>
               <option value="">Walk-in Customer</option>
               {customers.map((item) => <option key={item.id} value={item.id}>{item.customer_name}{item.mobile_number ? ` - ${item.mobile_number}` : ""}</option>)}
             </select>
@@ -4914,6 +4924,7 @@ function SaleEditModal({ invoice, onClose, onSaved, products, user }) {
     discount_amount: item.discount_amount || 0,
   })));
   const [customer, setCustomer] = useState({
+    account_id: invoice.customer_id || "",
     name: invoice.customer_name || "",
     mobile: invoice.customer_mobile || "",
     notes: invoice.customer_notes || "",
