@@ -1246,6 +1246,43 @@ function App() {
     await loadAccountLedger(accountKey);
   };
 
+  const openCustomerLedgerFromReport = async (sale) => {
+    let customerRows = customers;
+    if (!customerRows.length) {
+      const response = await axios.get(`${API_URL}/customers`);
+      customerRows = response.data;
+      setCustomers(response.data);
+    }
+    const saleMobile = String(sale.customer_mobile || "").trim();
+    const saleName = String(sale.customer_name || "").trim().toLowerCase();
+    const customer = customerRows.find((item) => {
+      const mobileMatches = saleMobile && String(item.mobile_number || "").trim() === saleMobile;
+      const nameMatches = saleName && String(item.customer_name || "").trim().toLowerCase() === saleName;
+      return mobileMatches || nameMatches;
+    });
+    if (!customer?.id) {
+      alert("Customer account is not linked to this sale.");
+      return;
+    }
+    const accountKey = `CUSTOMER-${customer.id}`;
+    setAccountLedgerFocusKey(accountKey);
+    setActiveView("accounts");
+    await loadAccountLedger(accountKey);
+  };
+
+  const openSaleForEditFromReport = async (sale) => {
+    if (!canEditSales) {
+      alert("Your role cannot edit completed sales.");
+      return;
+    }
+    const saleId = Number(sale.sale_id || sale.id || 0);
+    if (!saleId) {
+      alert("Sale invoice not found.");
+      return;
+    }
+    await loadSaleForEdit(saleId);
+  };
+
   const navigate = async (view) => {
     if (!hasModuleAccess(view)) {
       alert("Your role does not have access to this module.");
@@ -1797,12 +1834,15 @@ function App() {
 
           {activeView === "reports" && (
             <ReportsModule
+              canEditSales={canEditSales}
               data={reportsData}
               onCancelPurchase={cancelPurchase}
               onCompletePurchase={completePendingPurchase}
               onEditPurchase={editPurchase}
+              onOpenCustomerLedger={openCustomerLedgerFromReport}
               onOpenBlankPurchaseAmendment={openBlankPurchaseAmendment}
               onOpenPurchaseAmendment={openPurchaseAmendment}
+              onOpenSaleForEdit={openSaleForEditFromReport}
               onOpenSupplierLedger={openSupplierLedgerFromReport}
               onReload={loadReports}
             />
@@ -1905,7 +1945,7 @@ function UserProfilePanel({ onClose, onLogout, user }) {
   );
 }
 
-function PrintableReport({ beforePdfExport, beforePrint, children, title }) {
+function PrintableReport({ beforePdfExport, beforePrint, children, reportClassName = "", title }) {
   const [printTarget, setPrintTarget] = useState(false);
   const printReport = () => {
     if (beforePrint && beforePrint() === false) return;
@@ -1928,7 +1968,7 @@ function PrintableReport({ beforePdfExport, beforePrint, children, title }) {
     }, 0);
   };
   return (
-    <section className={`print-section ${printTarget ? "print-target" : ""}`}>
+    <section className={`print-section ${reportClassName} ${printTarget ? "print-target" : ""}`}>
       <ReportToolbar onPdfExport={exportReport} onPrint={printReport} title={title} />
       <div className="print-area report-paper">
         <header className="report-print-header">
@@ -2040,14 +2080,21 @@ function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEd
   );
 }
 
-function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenPurchaseAmendment, onOpenSupplierLedger, onReload }) {
+function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSupplierLedger, onReload }) {
   const [range, setRange] = useState("today");
   const [search, setSearch] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
   const [selectedReport, setSelectedReport] = useState("");
+  const [clubSalesItems, setClubSalesItems] = useState(false);
+  const [salesPrintNarration, setSalesPrintNarration] = useState(false);
+  const salesPrintNarrationRef = useRef(false);
   const [clubPurchaseItems, setClubPurchaseItems] = useState(false);
   const [purchasePrintNarration, setPurchasePrintNarration] = useState(false);
   const purchasePrintNarrationRef = useRef(false);
+  const [salesFilters, setSalesFilters] = useState({
+    date: "",
+    status: "ACTIVE",
+  });
   const [purchaseFilters, setPurchaseFilters] = useState({
     supplier: "",
     product: "",
@@ -2063,9 +2110,10 @@ function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEdit
     const params = range === "custom" ? customRange : { range };
     await onReload(params);
   };
-  const matchesSearch = (row) => !search.trim() || Object.values(row || {}).some((value) =>
-    String(value ?? "").toLowerCase().includes(search.trim().toLowerCase())
-  );
+  const matchesSearch = (row) => !search.trim() || Object.values(row || {}).some((value) => {
+    const text = typeof value === "object" && value !== null ? JSON.stringify(value) : String(value ?? "");
+    return text.toLowerCase().includes(search.trim().toLowerCase());
+  });
   const filterRows = (rows) => {
     const safeRows = Array.isArray(rows)
       ? rows
@@ -2189,6 +2237,98 @@ function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEdit
   const purchaseNarrationDisplay = (row) => (
     purchasePrintNarration || purchasePrintNarrationRef.current ? row.item_narration : row.item_summary
   );
+  const salesHistoryRawRows = filterRows(data.salesHistoryReport);
+  const saleItems = (row) => {
+    if (Array.isArray(row.items)) return row.items;
+    if (typeof row.items === "string") {
+      try {
+        const parsed = JSON.parse(row.items);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    }
+    return [];
+  };
+  const saleStatusLabel = (row) => row.sale_status === "CANCELLED" ? "Cancelled" : row.sale_status === "EDITED" ? "Edited" : "Completed";
+  const saleItemGross = (item) => Number(item.gross_amount ?? item.amount ?? 0) || Number(item.quantity || 0) * Number(item.selling_rate || 0);
+  const saleItemDiscount = (item) => Number(item.discount_amount || 0);
+  const saleItemNetBeforeInvoiceDiscount = (item) => Number(item.net_amount ?? (saleItemGross(item) - saleItemDiscount(item)));
+  const saleItemNarration = (item) => {
+    const product = item.product_name || "Item";
+    const qty = Number(item.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 });
+    const unit = String(item.unit || "").toLowerCase();
+    const rate = Number(item.selling_rate || 0);
+    return `${product} ${qty}${unit} @ ${money(rate)} = ${money(saleItemGross(item))}`;
+  };
+  const saleNarrationPreview = (items) => {
+    const summary = items
+      .slice(0, 2)
+      .map((item) => `${item.product_name || "Item"} ${Number(item.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}${String(item.unit || "").toLowerCase()}`)
+      .join(", ");
+    const extraCount = Math.max(items.length - 2, 0);
+    return `${summary || "No item detail"}${extraCount ? ` +${extraCount} more` : ""}`;
+  };
+  const filteredSalesHistoryRows = salesHistoryRawRows.filter((row) => {
+    if (salesFilters.date && toDateKey(row.sale_date) !== salesFilters.date) return false;
+    if (salesFilters.status === "CANCELLED") return row.sale_status === "CANCELLED";
+    if (salesFilters.status === "EDITED") return row.sale_status === "EDITED";
+    if (salesFilters.status === "ACTIVE") return row.sale_status !== "CANCELLED";
+    return true;
+  });
+  const salesHistoryRows = (() => {
+    if (clubSalesItems) {
+      return filteredSalesHistoryRows.map((row) => {
+        const items = saleItems(row);
+        return {
+          ...row,
+          sale_id: row.id,
+          display_key: `sale-${row.id}`,
+          item_summary: saleNarrationPreview(items),
+          item_narration: items.map(saleItemNarration).join("\n") || "No item detail available",
+          gross_total: Number(row.gross_amount || 0),
+          discount_total: Number(row.discount_amount || 0),
+          net_total: Number(row.total_amount || 0),
+          status_label: saleStatusLabel(row),
+        };
+      });
+    }
+    return filteredSalesHistoryRows.flatMap((row) => {
+      const items = saleItems(row);
+      const safeItems = items.length ? items : [{
+        id: "invoice",
+        product_name: row.invoice_no || `Invoice #${row.id}`,
+        quantity: 1,
+        unit: "",
+        selling_rate: Number(row.gross_amount || 0),
+        gross_amount: Number(row.gross_amount || 0),
+        discount_amount: Number(row.discount_amount || 0),
+        net_amount: Number(row.total_amount || 0),
+      }];
+      const itemDiscountTotal = safeItems.reduce((sum, item) => sum + saleItemDiscount(item), 0);
+      const invoiceDiscount = Math.max(Number(row.discount_amount || 0) - itemDiscountTotal, 0);
+      const itemNetTotal = safeItems.reduce((sum, item) => sum + saleItemNetBeforeInvoiceDiscount(item), 0);
+      return safeItems.map((item) => {
+        const netBeforeInvoiceDiscount = saleItemNetBeforeInvoiceDiscount(item);
+        const invoiceDiscountShare = itemNetTotal ? invoiceDiscount * (netBeforeInvoiceDiscount / itemNetTotal) : 0;
+        return {
+          ...row,
+          sale_id: row.id,
+          item_id: item.id,
+          display_key: `sale-${row.id}-item-${item.id}`,
+          item_summary: saleItemNarration(item),
+          item_narration: saleItemNarration(item),
+          gross_total: saleItemGross(item),
+          discount_total: saleItemDiscount(item) + invoiceDiscountShare,
+          net_total: netBeforeInvoiceDiscount - invoiceDiscountShare,
+          status_label: saleStatusLabel(row),
+        };
+      });
+    });
+  })();
+  const salesNarrationDisplay = (row) => (
+    salesPrintNarration || salesPrintNarrationRef.current ? row.item_narration : row.item_summary
+  );
   const reports = {
     salesByDate: {
       title: "Sales by Date",
@@ -2213,10 +2353,34 @@ function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEdit
     },
     salesHistory: {
       title: "Sales History",
-      rows: filterRows(data.salesHistoryReport),
-      summary: (rows) => [["Net Sales", money(totalOf(rows, "total_amount")), true], ["Invoices", rows.length], ["Profit", money(totalOf(rows, "profit"))]],
-      headers: ["Invoice", "Date", "Status", "Customer", "Payment", "Gross", "Discount", "Net", "Profit"],
-      render: (row) => <tr key={row.id}><td><span className="batch-id">{row.invoice_no || `#${row.id}`}</span></td><td>{row.sale_date}</td><td>{row.sale_status}</td><td>{row.customer_name}</td><td>{row.payment_mode}</td><td>{money(row.gross_amount)}</td><td>{money(row.discount_amount)}</td><td>{money(row.total_amount)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
+      rows: salesHistoryRows,
+      summary: (rows) => {
+        const activeRows = rows.filter((row) => row.status_label !== "Cancelled");
+        const invoiceCount = new Set(activeRows.map((row) => row.sale_id)).size;
+        return [["Net Sales", money(totalOf(activeRows, "net_total")), true], ["Invoices", invoiceCount], ["Discount", money(totalOf(activeRows, "discount_total"))]];
+      },
+      headers: ["Date", "Customer", "Narration", "Gross Total", "Discount", "Net Total", "Payment Mode", "Status"],
+      render: (row) => (
+        <tr className={row.status_label === "Cancelled" ? "muted-row" : ""} key={row.display_key}>
+          <td className="primary-cell" onDoubleClick={() => setSalesFilters({ ...salesFilters, date: toDateKey(row.sale_date) })}>
+            {toDateKey(row.sale_date)}
+            <small className="cell-note">{row.invoice_no || `#${row.sale_id}`}</small>
+          </td>
+          <td className="primary-cell" onDoubleClick={() => onOpenCustomerLedger?.(row)}>
+            {row.customer_name || "Walk-in Customer"}
+            <small className="cell-note">{row.customer_mobile || "Double-click for ledger"}</small>
+          </td>
+          <td className="primary-cell purchase-items-cell sales-items-cell" onDoubleClick={() => onOpenSaleForEdit?.(row)}>
+            <span title={row.item_narration}>{salesNarrationDisplay(row)}</span>
+            <small className="cell-note">{canEditSales ? "Double-click to open POS bill" : "Edit restricted by role"}</small>
+          </td>
+          <td>{money(row.gross_total)}</td>
+          <td>{money(row.discount_total)}</td>
+          <td>{money(row.net_total)}</td>
+          <td>{row.payment_mode || "-"}</td>
+          <td>{row.status_label}</td>
+        </tr>
+      ),
     },
     editedBills: {
       title: "Edited Bills",
@@ -2482,7 +2646,7 @@ function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEdit
     },
   };
   const categories = [
-    { id: "sales", title: "Sales Reports", icon: "receipt", description: "Invoices, products, customers, discounts and bill changes.", reports: ["salesByDate", "salesByProduct", "salesByCustomer", "salesHistory", "editedBills", "cancelledBills", "provisionalProfitSales", "discountReport"] },
+    { id: "sales", title: "Sales Reports", icon: "receipt", description: "Unified sales history with item narration, discounts, payments and bill status.", reports: ["salesHistory"] },
     { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Unified purchase history with item narration, bill status, payments and amendment actions.", reports: ["purchaseHistory"] },
     { id: "accounts", title: "Accounts & Ledger", icon: "users", description: "Customer ledger, supplier ledger, statements, payments and balances.", reports: ["customerLedger", "supplierLedger", "accountStatement", "paymentReport", "paymentModeSummary", "receivableReport", "payableReport"] },
     { id: "returns", title: "Sale Returns", icon: "history", description: "Return history, value and reason analysis.", reports: ["returnHistory", "returnValue", "returnReason"] },
@@ -2510,6 +2674,26 @@ function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEdit
         </>
       )}
       <Field label="Search / Filter"><input placeholder="Search this report" value={search} onChange={(event) => setSearch(event.target.value)} /></Field>
+      {selectedReport === "salesHistory" && (
+        <>
+          <Field label="Exact Date">
+            <input type="date" value={salesFilters.date} onChange={(event) => setSalesFilters({ ...salesFilters, date: event.target.value })} />
+          </Field>
+          <Field label="Status">
+            <select value={salesFilters.status} onChange={(event) => setSalesFilters({ ...salesFilters, status: event.target.value })}>
+              <option value="ACTIVE">Active Bills</option>
+              <option value="ALL">All Bills</option>
+              <option value="EDITED">Edited</option>
+              <option value="CANCELLED">Cancelled</option>
+            </select>
+          </Field>
+          <label className="check-field report-check-field">
+            <input checked={clubSalesItems} type="checkbox" onChange={(event) => setClubSalesItems(event.target.checked)} />
+            <span>Club Items</span>
+          </label>
+          <button className="secondary-button" onClick={() => setSalesFilters({ date: "", status: "ACTIVE" })}>Clear Sales Filters</button>
+        </>
+      )}
       {selectedReport === "purchaseHistory" && (
         <>
           <Field label="Supplier">
@@ -2554,11 +2738,17 @@ function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEdit
   );
   if (currentReport) {
     const rows = currentReport.rows || [];
-    const handlePurchaseReportPrintOption = () => {
-      if (selectedReport !== "purchaseHistory") return true;
-      const includeNarration = window.confirm("Print narration/details?");
-      purchasePrintNarrationRef.current = includeNarration;
-      setPurchasePrintNarration(includeNarration);
+    const handleReportPrintOption = () => {
+      if (selectedReport === "purchaseHistory") {
+        const includeNarration = window.confirm("Print narration/details?");
+        purchasePrintNarrationRef.current = includeNarration;
+        setPurchasePrintNarration(includeNarration);
+      }
+      if (selectedReport === "salesHistory") {
+        const includeNarration = window.confirm("Print narration/details?");
+        salesPrintNarrationRef.current = includeNarration;
+        setSalesPrintNarration(includeNarration);
+      }
       return true;
     };
     const renderPurchaseHistoryRows = () => {
@@ -2592,7 +2782,12 @@ function ReportsModule({ data = {}, onCancelPurchase, onCompletePurchase, onEdit
           {renderFilters()}
         </ModuleCard>
         <ModuleCard eyebrow={currentCategory?.title || "Reports"} title={currentReport.title} subtitle={`${rows.length} row${rows.length === 1 ? "" : "s"} found.`}>
-          <PrintableReport beforePdfExport={handlePurchaseReportPrintOption} beforePrint={handlePurchaseReportPrintOption} title={currentReport.title}>
+          <PrintableReport
+            beforePdfExport={handleReportPrintOption}
+            beforePrint={handleReportPrintOption}
+            reportClassName={selectedReport === "salesHistory" ? "sales-history-print-report" : selectedReport === "purchaseHistory" ? "purchase-history-print-report" : ""}
+            title={currentReport.title}
+          >
             <div className="purchase-summary-grid supplier-payment-preview">
               {(currentReport.summary?.(rows) || []).map(([label, value, featured]) => <SummaryMetric featured={featured} key={label} label={label} value={value} />)}
             </div>

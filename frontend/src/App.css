@@ -480,6 +480,11 @@
   word-break: break-word;
 }
 
+.muted-row td {
+  color: #94a3b8;
+  background: rgba(15, 23, 42, 0.32);
+}
+
 .date-total-row td {
   border-top: 1px solid rgba(245, 158, 11, 0.28);
   color: #f8fafc;
@@ -2192,6 +2197,46 @@ tbody tr:last-child td {
     text-decoration: none !important;
     white-space: pre-wrap !important;
     word-break: break-word !important;
+  }
+
+  .print-section.sales-history-print-report.print-target th,
+  .print-section.sales-history-print-report.print-target td {
+    font-size: 8px !important;
+    padding: 3px 4px !important;
+  }
+
+  .print-section.sales-history-print-report.print-target th:nth-child(1),
+  .print-section.sales-history-print-report.print-target td:nth-child(1) {
+    width: 11% !important;
+  }
+
+  .print-section.sales-history-print-report.print-target th:nth-child(2),
+  .print-section.sales-history-print-report.print-target td:nth-child(2) {
+    width: 16% !important;
+  }
+
+  .print-section.sales-history-print-report.print-target th:nth-child(3),
+  .print-section.sales-history-print-report.print-target td:nth-child(3) {
+    width: 34% !important;
+  }
+
+  .print-section.sales-history-print-report.print-target th:nth-child(4),
+  .print-section.sales-history-print-report.print-target td:nth-child(4),
+  .print-section.sales-history-print-report.print-target th:nth-child(5),
+  .print-section.sales-history-print-report.print-target td:nth-child(5),
+  .print-section.sales-history-print-report.print-target th:nth-child(6),
+  .print-section.sales-history-print-report.print-target td:nth-child(6) {
+    width: 10% !important;
+  }
+
+  .print-section.sales-history-print-report.print-target th:nth-child(7),
+  .print-section.sales-history-print-report.print-target td:nth-child(7) {
+    width: 9% !important;
+  }
+
+  .print-section.sales-history-print-report.print-target th:nth-child(8),
+  .print-section.sales-history-print-report.print-target td:nth-child(8) {
+    display: none !important;
   }
 
   .print-section.print-target .cell-note,

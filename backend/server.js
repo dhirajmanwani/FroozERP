@@ -4910,9 +4910,46 @@ app.get("/reports/summary", async (req, res) => {
           COALESCE(s.item_discount_amount, 0) + COALESCE(s.invoice_discount_amount, 0) AS discount_amount,
           s.total_amount,
           s.total_cost,
-          s.profit
+          s.profit,
+          COALESCE(
+            JSON_AGG(
+              JSON_BUILD_OBJECT(
+                'id', si.id,
+                'product_id', si.product_id,
+                'product_name', p.product_name,
+                'unit', p.unit,
+                'quantity', si.quantity,
+                'selling_rate', si.selling_rate,
+                'gross_amount', si.amount,
+                'discount_amount', COALESCE(si.discount_amount, 0),
+                'net_amount', COALESCE(si.net_amount, si.amount - COALESCE(si.discount_amount, 0)),
+                'cost_amount', si.cost_amount,
+                'profit', si.profit,
+                'cost_status', si.cost_status
+              )
+              ORDER BY si.id
+            ) FILTER (WHERE si.id IS NOT NULL),
+            '[]'::json
+          ) AS items
         FROM sales s
+        LEFT JOIN sale_items si ON si.sale_id = s.id
+        LEFT JOIN products p ON p.id = si.product_id
         WHERE s.sale_date BETWEEN $1 AND $2
+        GROUP BY
+          s.id,
+          s.invoice_no,
+          s.sale_date,
+          s.created_at,
+          s.sale_status,
+          s.customer_name,
+          s.customer_mobile,
+          s.payment_mode,
+          s.gross_amount,
+          s.item_discount_amount,
+          s.invoice_discount_amount,
+          s.total_amount,
+          s.total_cost,
+          s.profit
         ORDER BY s.sale_date DESC, s.created_at DESC, s.id DESC
         `,
         [dateFrom, dateTo]
