@@ -182,12 +182,17 @@ const defaultBusinessSettings = {
   default_printer_type: "THERMAL",
   receipt_width: "80MM",
   auto_print_after_billing: false,
+  show_item_discount_column_pos: true,
+  show_item_discount_column_receipt: true,
+  show_bill_discount_row_receipt: true,
+  hide_zero_discount_rows: true,
 };
 
 const defaultSaleRateSettings = {
   desired_margin_percent: 25,
   rounding_rule: "NEAREST_RUPEE",
   suggestion_enabled: true,
+  bill_level_slab_discount_enabled: true,
   notes: "",
 };
 
@@ -1779,13 +1784,14 @@ function App() {
               posSettings={settingsData.posSettings}
               printSettings={settingsData.businessSettings}
               products={products.filter((product) => product.active !== false)}
+              saleRateSettings={settingsData.saleRateSettings}
               user={user}
             />
           )}
 
           {activeView === "sales-history" && (
             <ModuleCard eyebrow="Revenue" title="Sales History" subtitle="Review completed sales, costs, and realized profit.">
-              <DataTable headers={["Invoice", "Date", "Status", "Customer", "Items", "Payment", "Gross", "Discount", "Net Amount", "Cost", "Profit", "Actions"]}>
+              <DataTable headers={["Invoice", "Date", "Status", "Customer", "Items", "Payment", "Gross", "Item Discount", "Bill Discount", "Net Amount", "Cost", "Profit", "Actions"]}>
                 {salesHistory.map((sale) => (
                   <tr key={sale.id}>
                     <td><span className="batch-id">{sale.invoice_no || `#${sale.id}`}</span></td>
@@ -1795,7 +1801,8 @@ function App() {
                     <td className="primary-cell">{sale.item_summary}</td>
                     <td><span className="tag">{sale.payment_mode}</span></td>
                     <td>{currency.format(Number(sale.gross_amount || sale.amount))}</td>
-                    <td>{currency.format(Number(sale.item_discount_amount || 0) + Number(sale.invoice_discount_amount || 0))}</td>
+                    <td>{currency.format(Number(sale.item_discount_amount || 0))}</td>
+                    <td>{currency.format(Number(sale.invoice_discount_amount || 0))}</td>
                     <td>{currency.format(Number(sale.amount))}</td>
                     <td>{currency.format(Number(sale.cost_amount))}</td>
                     <td className="profit-cell">{currency.format(Number(sale.profit))}</td>
@@ -2341,6 +2348,8 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
           item_summary: saleNarrationPreview(items),
           item_narration: items.map(saleItemNarration).join("\n") || "No item detail available",
           gross_total: Number(row.gross_amount || 0),
+          item_discount_total: Number(row.item_discount_amount || 0),
+          bill_discount_total: Number(row.invoice_discount_amount || 0),
           discount_total: Number(row.discount_amount || 0),
           net_total: Number(row.total_amount || 0),
           status_label: saleStatusLabel(row),
@@ -2373,6 +2382,8 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
           item_summary: saleItemNarration(item),
           item_narration: saleItemNarration(item),
           gross_total: saleItemGross(item),
+          item_discount_total: saleItemDiscount(item),
+          bill_discount_total: invoiceDiscountShare,
           discount_total: saleItemDiscount(item) + invoiceDiscountShare,
           net_total: netBeforeInvoiceDiscount - invoiceDiscountShare,
           status_label: saleStatusLabel(row),
@@ -2411,9 +2422,9 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       summary: (rows) => {
         const activeRows = rows.filter((row) => row.status_label !== "Cancelled");
         const invoiceCount = new Set(activeRows.map((row) => row.sale_id)).size;
-        return [["Net Sales", money(totalOf(activeRows, "net_total")), true], ["Invoices", invoiceCount], ["Discount", money(totalOf(activeRows, "discount_total"))]];
+        return [["Net Sales", money(totalOf(activeRows, "net_total")), true], ["Invoices", invoiceCount], ["Item Discount", money(totalOf(activeRows, "item_discount_total"))], ["Bill Discount", money(totalOf(activeRows, "bill_discount_total"))]];
       },
-      headers: ["Date", "Customer", "Narration", "Gross Total", "Discount", "Net Total", "Payment Mode", "Status"],
+      headers: ["Date", "Customer", "Narration", "Gross Total", "Item Discount", "Bill Discount", "Net Total", "Payment Mode", "Status"],
       render: (row) => (
         <tr className={row.status_label === "Cancelled" ? "muted-row" : ""} key={row.display_key}>
           <td className="primary-cell" onDoubleClick={() => setSalesFilters({ ...salesFilters, date: toDateKey(row.sale_date) })}>
@@ -2429,7 +2440,8 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
             <small className="cell-note">{canEditSales ? "Double-click to open POS bill" : "Edit restricted by role"}</small>
           </td>
           <td>{money(row.gross_total)}</td>
-          <td>{money(row.discount_total)}</td>
+          <td>{money(row.item_discount_total)}</td>
+          <td>{money(row.bill_discount_total)}</td>
           <td>{money(row.net_total)}</td>
           <td>{row.payment_mode || "-"}</td>
           <td>{row.status_label}</td>
@@ -3828,7 +3840,7 @@ function SettingsModule({ canManage, onReload, rules, settingsData, user }) {
       <MandiTaxSettings canManage={canManage} onReload={onReload} rules={rules.mandiTaxRules} user={user} />
       <RebateSettings canManage={canManage} onReload={onReload} rules={rules.rebateRules} user={user} />
       <SaleRateSettingsSection canManage={canManage} key={settingsData.saleRateSettings?.updated_at || "sale-rate-settings"} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />
-      <DiscountSettings canManage={canManage} discountRules={settingsData.discountRules} onReload={onReload} user={user} />
+      <DiscountSettings canManage={canManage} discountRules={settingsData.discountRules} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />
       <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />
       <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />
       <UpdateCenterSection canManage={canManage} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
@@ -3874,6 +3886,10 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
           </select>
         </Field>
         <label className="check-field"><input checked={draft.auto_print_after_billing === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("auto_print_after_billing", event.target.checked)} /><span>Auto print after billing</span></label>
+        <label className="check-field"><input checked={draft.show_item_discount_column_pos !== false} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("show_item_discount_column_pos", event.target.checked)} /><span>Show Item Discount Column on POS</span></label>
+        <label className="check-field"><input checked={draft.show_item_discount_column_receipt !== false} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("show_item_discount_column_receipt", event.target.checked)} /><span>Show Item Discount Column on Receipt</span></label>
+        <label className="check-field"><input checked={draft.show_bill_discount_row_receipt !== false} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("show_bill_discount_row_receipt", event.target.checked)} /><span>Show Bill Discount Row on Receipt</span></label>
+        <label className="check-field"><input checked={draft.hide_zero_discount_rows !== false} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("hide_zero_discount_rows", event.target.checked)} /><span>Hide Zero Discount Rows</span></label>
         <Field label="Address"><textarea disabled={!canManage} value={draft.address || ""} onChange={(event) => updateDraft("address", event.target.value)} /></Field>
         <Field label="Invoice Footer Text"><textarea disabled={!canManage} value={draft.invoice_footer_text || ""} onChange={(event) => updateDraft("invoice_footer_text", event.target.value)} /></Field>
       </div>
@@ -4021,7 +4037,8 @@ function SaleRateSettingsSection({ canManage, onReload, saleRateSettings, user }
   );
 }
 
-function DiscountSettings({ canManage, discountRules, onReload, user }) {
+function DiscountSettings({ canManage, discountRules, onReload, saleRateSettings = {}, user }) {
+  const [calculationEnabled, setCalculationEnabled] = useState(saleRateSettings.bill_level_slab_discount_enabled !== false);
   const [newRule, setNewRule] = useState({
     rule_name: "",
     minimum_bill_amount: "",
@@ -4040,8 +4057,30 @@ function DiscountSettings({ canManage, discountRules, onReload, user }) {
       alert(getErrorMessage(error, "Unable to add discount rule"));
     }
   };
+  const saveCalculationToggle = async () => {
+    try {
+      await axios.put(`${API_URL}/settings/sale-rate`, {
+        ...defaultSaleRateSettings,
+        ...saleRateSettings,
+        bill_level_slab_discount_enabled: calculationEnabled,
+        updated_by: user.id,
+      });
+      await onReload();
+      alert("Discount calculation setting updated");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update discount calculation setting"));
+    }
+  };
   return (
     <ModuleCard eyebrow="Overall Sale Discount Settings" title="Bill-Level Discount Slabs" subtitle="Automatic POS invoice discounts based on total bill amount and optional payment mode.">
+      <div className="purchase-summary-grid supplier-payment-preview">
+        <SummaryMetric featured label="Discount Calculation" value={calculationEnabled ? "Enabled" : "Disabled"} />
+        <SummaryMetric label="Active Slabs" value={discountRules.filter((rule) => rule.active !== false).length} />
+      </div>
+      <div className="button-row">
+        <label className="check-field"><input checked={calculationEnabled} disabled={!canManage} type="checkbox" onChange={(event) => setCalculationEnabled(event.target.checked)} /><span>Enable Bill-Level Slab Discount</span></label>
+        <button className="secondary-button" disabled={!canManage} onClick={saveCalculationToggle}>Save Calculation Setting</button>
+      </div>
       <div className="form-grid discount-rule-grid">
         <Field label="Rule Name"><input disabled={!canManage} value={newRule.rule_name} onChange={(event) => setNewRule({ ...newRule, rule_name: event.target.value })} /></Field>
         <Field label="Minimum Bill Amount"><input disabled={!canManage} min="0" step="0.01" type="number" value={newRule.minimum_bill_amount} onChange={(event) => setNewRule({ ...newRule, minimum_bill_amount: event.target.value })} /></Field>
@@ -4694,7 +4733,7 @@ const getMatchingDiscountRule = (rules, subtotal, paymentMode) => {
   return matches[0] || null;
 };
 
-function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, onSaved, paymentSettings = {}, posSettings = {}, printSettings = {}, products, user }) {
+function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, onSaved, paymentSettings = {}, posSettings = {}, printSettings = {}, products, saleRateSettings = {}, user }) {
   const [search, setSearch] = useState("");
   const [barcode, setBarcode] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
@@ -4736,8 +4775,8 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
     const gross = cart.reduce((sum, item) => sum + item.quantity * Number(item.selling_rate), 0);
     const itemDiscount = cart.reduce((sum, item) => sum + Number(item.discount_amount || 0), 0);
     const subtotalAfterItemDiscounts = Math.max(gross - itemDiscount, 0);
-    const discountRule = getMatchingDiscountRule(discountRules, subtotalAfterItemDiscounts, paymentMode);
-    const invoiceDiscountAmount = calculateDiscountFromRule(discountRule, subtotalAfterItemDiscounts);
+    const discountRule = saleRateSettings.bill_level_slab_discount_enabled === false ? null : getMatchingDiscountRule(discountRules, gross, paymentMode);
+    const invoiceDiscountAmount = Math.min(calculateDiscountFromRule(discountRule, gross), subtotalAfterItemDiscounts);
     return {
       gross,
       itemDiscount,
@@ -4747,7 +4786,7 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
       itemCount: cart.reduce((sum, item) => sum + Number(item.quantity), 0),
       discountRule,
     };
-  }, [cart, discountRules, paymentMode]);
+  }, [cart, discountRules, paymentMode, saleRateSettings.bill_level_slab_discount_enabled]);
 
   const addProduct = (product) => {
     const availableStock = stockByProduct.get(product.id) || 0;
@@ -5012,14 +5051,14 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
           ) : (
             <div className="table-wrap cart-table">
               <table>
-                <thead><tr><th>Product</th><th>Rate</th><th>Qty</th><th>Item Discount</th><th>Total</th><th /></tr></thead>
+                <thead><tr><th>Product</th><th>Rate</th><th>Qty</th>{printSettings.show_item_discount_column_pos !== false && <th>Item Discount</th>}<th>Total</th><th /></tr></thead>
                 <tbody>
                   {cart.map((item) => (
                     <tr key={item.product_id}>
                       <td className="primary-cell">{item.product_name}<small className="cell-note">{stockByProduct.get(item.product_id) || 0} {item.unit} available</small></td>
                       <td>{currency.format(item.selling_rate)}</td>
                       <td><input className="table-input" min="0.001" ref={(node) => { quantityRefs.current[item.product_id] = node; }} step="0.001" type="number" value={item.quantity} onChange={(event) => updateCartItem(item.product_id, "quantity", event.target.value)} onKeyDown={completeQuantityEntry} /></td>
-                      <td><input className="table-input" min="0" step="0.01" type="number" value={item.discount_amount} onChange={(event) => updateCartItem(item.product_id, "discount_amount", event.target.value)} /></td>
+                      {printSettings.show_item_discount_column_pos !== false && <td><input className="table-input" min="0" step="0.01" type="number" value={item.discount_amount} onChange={(event) => updateCartItem(item.product_id, "discount_amount", event.target.value)} /></td>}
                       <td className="primary-cell">{currency.format(item.quantity * item.selling_rate - Number(item.discount_amount || 0))}</td>
                       <td><button aria-label={`Remove ${item.product_name}`} className="remove-button" onClick={() => removeCartItem(item.product_id)}><Icon name="trash" size={16} /></button></td>
                     </tr>
@@ -5427,6 +5466,11 @@ function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = 
   const [upiQrDataUrl, setUpiQrDataUrl] = useState("");
   const activePrintMode = printMode === "A4" ? "A4" : "THERMAL";
   const invoicePayments = invoice.payments || [];
+  const showItemDiscountOnReceipt = printSettings.show_item_discount_column_receipt !== false;
+  const showBillDiscountRow = printSettings.show_bill_discount_row_receipt !== false;
+  const hideZeroDiscountRows = printSettings.hide_zero_discount_rows !== false;
+  const billDiscountAmount = Number(invoice.invoice_discount_amount || 0);
+  const shouldRenderBillDiscountRow = showBillDiscountRow && (billDiscountAmount > 0 || !hideZeroDiscountRows);
   const hasUpiPayment = invoice.payment_mode === "UPI" || invoice.payment_mode === "MIXED" || invoicePayments.some((payment) => (payment.mode || payment.payment_mode) === "UPI");
   const shouldShowUpiQr = paymentSettings.enable_upi_qr_on_invoice === true && paymentSettings.business_upi_id && (hasUpiPayment || paymentSettings.show_upi_qr_on_all_bills === true);
   const upiPayload = shouldShowUpiQr ? [
@@ -5499,14 +5543,14 @@ function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = 
             <div><small>Status</small><strong>{invoice.sale_status || "COMPLETED"}</strong><span>{invoice.cancellation_reason || invoice.edit_reason || "No changes recorded"}</span></div>
           </section>
           <table className="invoice-table">
-            <thead><tr><th>Item</th><th>Qty</th><th>Rate</th><th>Discount</th><th>Amount</th></tr></thead>
+            <thead><tr><th>Item</th><th>Qty</th><th>Rate</th>{showItemDiscountOnReceipt && <th>Item Discount</th>}<th>Amount</th></tr></thead>
             <tbody>
               {invoice.items?.map((item) => (
                 <tr key={item.product_id || item.id}>
                   <td>{item.product_name}</td>
                   <td>{item.quantity} {item.unit}</td>
                   <td>{receiptCurrency.format(Number(item.selling_rate))}</td>
-                  <td>{receiptCurrency.format(Number(item.discount_amount || 0))}</td>
+                  {showItemDiscountOnReceipt && <td>{receiptCurrency.format(Number(item.discount_amount || 0))}</td>}
                   <td>{receiptCurrency.format(Number(item.net_amount))}</td>
                 </tr>
               ))}
@@ -5514,7 +5558,7 @@ function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = 
           </table>
           <section className="invoice-total-box">
             <ThermalTotalLine label="Gross Total" value={Number(invoice.gross_amount)} />
-            <ThermalTotalLine label="Discount" value={-(Number(invoice.item_discount_amount) + Number(invoice.invoice_discount_amount))} />
+            {shouldRenderBillDiscountRow && <ThermalTotalLine label="Bill Discount" value={-billDiscountAmount} />}
             <ThermalTotalLine label="Tax" value={Number(invoice.tax_amount || 0)} />
             <ThermalTotalLine label="Net Payable" total value={Number(invoice.total_amount)} />
           </section>

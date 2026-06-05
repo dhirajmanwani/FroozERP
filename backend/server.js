@@ -329,6 +329,10 @@ const initializeDatabase = async () => {
     ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS default_printer_type VARCHAR(20) DEFAULT 'THERMAL';
     ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS receipt_width VARCHAR(10) DEFAULT '80MM';
     ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS auto_print_after_billing BOOLEAN DEFAULT FALSE;
+    ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS show_item_discount_column_pos BOOLEAN DEFAULT TRUE;
+    ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS show_item_discount_column_receipt BOOLEAN DEFAULT TRUE;
+    ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS show_bill_discount_row_receipt BOOLEAN DEFAULT TRUE;
+    ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS hide_zero_discount_rows BOOLEAN DEFAULT TRUE;
 
     CREATE TABLE IF NOT EXISTS sale_rate_settings (
       id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -339,6 +343,7 @@ const initializeDatabase = async () => {
       updated_by INTEGER REFERENCES users(id),
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    ALTER TABLE sale_rate_settings ADD COLUMN IF NOT EXISTS bill_level_slab_discount_enabled BOOLEAN DEFAULT TRUE;
 
     CREATE TABLE IF NOT EXISTS pos_settings (
       id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -1669,6 +1674,8 @@ const calculateInvoiceDiscount = (rule, subtotal) => {
 };
 
 const getMatchingDiscountRule = async (client, subtotal, paymentMode) => {
+  const settingsResult = await client.query("SELECT bill_level_slab_discount_enabled FROM sale_rate_settings WHERE id = 1");
+  if (settingsResult.rows[0]?.bill_level_slab_discount_enabled === false) return null;
   const result = await client.query(
     `
     SELECT *
@@ -1941,11 +1948,11 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
     return { error: { status: 400, message: "Select a valid payment mode" } };
   }
   const paymentMode = paymentModes.length > 1 ? "MIXED" : paymentModes[0];
-  const discountRule = await getMatchingDiscountRule(client, subtotalAfterItemDiscounts, paymentMode);
+  const discountRule = await getMatchingDiscountRule(client, grossAmount, paymentMode);
   const parsedInvoiceDiscount = parseNonNegativeNumber(invoiceDiscount);
   if (parsedInvoiceDiscount === null) return { error: { status: 400, message: "Enter a valid invoice discount" } };
   const invoiceDiscountAmount = discountRule
-    ? calculateInvoiceDiscount(discountRule, subtotalAfterItemDiscounts)
+    ? Math.min(calculateInvoiceDiscount(discountRule, grossAmount), subtotalAfterItemDiscounts)
     : parsedInvoiceDiscount;
   if (invoiceDiscountAmount > subtotalAfterItemDiscounts) {
     return { error: { status: 400, message: "Invoice discount cannot exceed the cart subtotal" } };
@@ -2226,7 +2233,11 @@ app.put("/settings/business", async (req, res) => {
         default_printer_type = $10,
         receipt_width = $11,
         auto_print_after_billing = $12,
-        updated_by = $13,
+        show_item_discount_column_pos = $13,
+        show_item_discount_column_receipt = $14,
+        show_bill_discount_row_receipt = $15,
+        hide_zero_discount_rows = $16,
+        updated_by = $17,
         updated_at = CURRENT_TIMESTAMP
       WHERE id = 1
       RETURNING *
@@ -2244,6 +2255,10 @@ app.put("/settings/business", async (req, res) => {
         cleanText(req.body.default_printer_type).toUpperCase() === "A4" ? "A4" : "THERMAL",
         cleanText(req.body.receipt_width).toUpperCase() === "58MM" ? "58MM" : "80MM",
         req.body.auto_print_after_billing === true,
+        req.body.show_item_discount_column_pos !== false,
+        req.body.show_item_discount_column_receipt !== false,
+        req.body.show_bill_discount_row_receipt !== false,
+        req.body.hide_zero_discount_rows !== false,
         manager.id,
       ]
     );
@@ -2267,11 +2282,12 @@ app.put("/settings/sale-rate", async (req, res) => {
       `
       UPDATE sale_rate_settings
       SET desired_margin_percent = $1, rounding_rule = $2, suggestion_enabled = $3,
-          notes = $4, updated_by = $5, updated_at = CURRENT_TIMESTAMP
+          bill_level_slab_discount_enabled = $4,
+          notes = $5, updated_by = $6, updated_at = CURRENT_TIMESTAMP
       WHERE id = 1
       RETURNING *
       `,
-      [desiredMargin, roundingRule, req.body.suggestion_enabled !== false, nullableText(req.body.notes), manager.id]
+      [desiredMargin, roundingRule, req.body.suggestion_enabled !== false, req.body.bill_level_slab_discount_enabled !== false, nullableText(req.body.notes), manager.id]
     );
     return res.json(result.rows[0]);
   } catch (error) {
@@ -5190,6 +5206,8 @@ app.get("/reports/summary", async (req, res) => {
           s.customer_mobile,
           s.payment_mode,
           s.gross_amount,
+          COALESCE(s.item_discount_amount, 0) AS item_discount_amount,
+          COALESCE(s.invoice_discount_amount, 0) AS invoice_discount_amount,
           COALESCE(s.item_discount_amount, 0) + COALESCE(s.invoice_discount_amount, 0) AS discount_amount,
           s.total_amount,
           s.total_cost,
@@ -7467,8 +7485,8 @@ app.post("/sales", async (req, res) => {
       return res.status(400).json({ message: "Select a valid payment mode" });
     }
     const paymentMode = paymentModes.length > 1 ? "MIXED" : paymentModes[0];
-    const discountRule = await getMatchingDiscountRule(client, subtotalAfterItemDiscounts, paymentMode);
-    const automaticInvoiceDiscount = calculateInvoiceDiscount(discountRule, subtotalAfterItemDiscounts);
+    const discountRule = await getMatchingDiscountRule(client, grossAmount, paymentMode);
+    const automaticInvoiceDiscount = Math.min(calculateInvoiceDiscount(discountRule, grossAmount), subtotalAfterItemDiscounts);
     const invoiceDiscountAmount = discountRule ? automaticInvoiceDiscount : parsedInvoiceDiscount;
 
     if (invoiceDiscountAmount > subtotalAfterItemDiscounts) {

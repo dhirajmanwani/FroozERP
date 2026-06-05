@@ -2230,12 +2230,14 @@ tbody tr:last-child td {
   }
 
   .print-section.sales-history-print-report.print-target th:nth-child(7),
-  .print-section.sales-history-print-report.print-target td:nth-child(7) {
+  .print-section.sales-history-print-report.print-target td:nth-child(7),
+  .print-section.sales-history-print-report.print-target th:nth-child(8),
+  .print-section.sales-history-print-report.print-target td:nth-child(8) {
     width: 9% !important;
   }
 
-  .print-section.sales-history-print-report.print-target th:nth-child(8),
-  .print-section.sales-history-print-report.print-target td:nth-child(8) {
+  .print-section.sales-history-print-report.print-target th:nth-child(9),
+  .print-section.sales-history-print-report.print-target td:nth-child(9) {
     display: none !important;
   }
 
