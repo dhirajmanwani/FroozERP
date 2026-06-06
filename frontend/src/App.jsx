@@ -280,6 +280,7 @@ function App() {
   const [activeView, setActiveView] = useState("dashboard");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [products, setProducts] = useState([]);
+  const [productCategories, setProductCategories] = useState([]);
   const [inventory, setInventory] = useState([]);
   const [salesHistory, setSalesHistory] = useState([]);
   const [saleReturns, setSaleReturns] = useState([]);
@@ -332,6 +333,7 @@ function App() {
     pendingPurchaseBillsReport: [],
     stockWithoutBillReport: [],
     provisionalProfitSalesReport: [],
+    stockLotReport: [],
     balanceSheet: {},
     profitLoss: {},
   });
@@ -368,8 +370,23 @@ function App() {
   const [productBarcode, setProductBarcode] = useState("");
   const [productOriginType, setProductOriginType] = useState("LOCAL");
   const [productCategory, setProductCategory] = useState("Fruit");
+  const [productCategoryId, setProductCategoryId] = useState("");
+  const [newProductCategoryName, setNewProductCategoryName] = useState("");
   const [productMinimumStock, setProductMinimumStock] = useState("");
   const [productActive, setProductActive] = useState(true);
+  const [productRemarks, setProductRemarks] = useState("");
+  const [addOpeningStock, setAddOpeningStock] = useState(false);
+  const [openingStockLots, setOpeningStockLots] = useState([]);
+  const [openingStockDraft, setOpeningStockDraft] = useState({
+    lot_name: "",
+    lot_size: "",
+    quantity: "",
+    purchase_rate: "",
+    sale_rate: "",
+    opening_stock_date: toDateKey(new Date()),
+    supplier_id: "",
+    remarks: "",
+  });
   const [editingProductId, setEditingProductId] = useState(null);
   const [unit, setUnit] = useState("");
   const [purchaseSupplierId, setPurchaseSupplierId] = useState("");
@@ -393,6 +410,8 @@ function App() {
   const [purchasePaymentDate, setPurchasePaymentDate] = useState("");
   const [purchaseRemarks, setPurchaseRemarks] = useState("");
   const [purchaseItemRemarks, setPurchaseItemRemarks] = useState("");
+  const [purchaseLotName, setPurchaseLotName] = useState("");
+  const [purchaseLotSize, setPurchaseLotSize] = useState("");
   const [purchaseCart, setPurchaseCart] = useState([]);
   const [editingPurchaseItemIndex, setEditingPurchaseItemIndex] = useState(null);
   const [editingPurchaseId, setEditingPurchaseId] = useState(null);
@@ -623,6 +642,10 @@ function App() {
     const response = await axios.get(`${API_URL}/products`);
     setProducts(response.data);
   };
+  const loadProductCategories = async () => {
+    const response = await axios.get(`${API_URL}/product-categories`);
+    setProductCategories(response.data);
+  };
 
   const loadPurchaseRules = async () => {
     const response = await axios.get(`${API_URL}/purchase-rules`);
@@ -710,8 +733,11 @@ function App() {
   };
 
   const loadReports = async (params = {}) => {
-    const response = await axios.get(`${API_URL}/reports/summary`, { params });
-    setReportsData(response.data);
+    const [response, inventoryResponse] = await Promise.all([
+      axios.get(`${API_URL}/reports/summary`, { params }),
+      axios.get(`${API_URL}/inventory`),
+    ]);
+    setReportsData({ ...response.data, stockLotReport: inventoryResponse.data });
   };
 
   const loadExpenses = async () => {
@@ -786,7 +812,7 @@ function App() {
     try {
       const response = await axios.post(`${API_URL}/login`, { username, password });
       setUser(response.data);
-      await Promise.all([loadProducts(), loadDashboardData(), loadPurchaseRules(), loadPurchases(), loadSupplierData(), loadCustomerData(), loadAccounts(), loadAccountOutstanding(), loadAccountPayments(), loadSaleReturns(), loadWasteEntries(), loadSettingsData(response.data)]);
+      await Promise.all([loadProducts(), loadProductCategories(), loadDashboardData(), loadPurchaseRules(), loadPurchases(), loadSupplierData(), loadCustomerData(), loadAccounts(), loadAccountOutstanding(), loadAccountPayments(), loadSaleReturns(), loadWasteEntries(), loadSettingsData(response.data)]);
     } catch (error) {
       alert(getErrorMessage(error, "Login Failed"));
     }
@@ -795,6 +821,8 @@ function App() {
   const addProduct = async () => {
     try {
       const wasEditing = Boolean(editingProductId);
+      const selectedCategory = productCategories.find((category) => String(category.id) === String(productCategoryId));
+      const finalCategoryName = selectedCategory?.category_name || newProductCategoryName.trim() || productCategory.trim();
       const normalizedName = productName.trim().toLowerCase();
       const duplicateProduct = products.find((product) =>
         product.product_name?.trim().toLowerCase() === normalizedName &&
@@ -804,37 +832,164 @@ function App() {
         alert("This product already exists.");
         return;
       }
+      if (!finalCategoryName) {
+        alert("Please select or add product category.");
+        return;
+      }
+      if (addOpeningStock && openingStockLots.length === 0) {
+        alert("Please add at least one opening stock lot.");
+        return;
+      }
       const payload = {
         product_name: productName,
         selling_rate: sellingRate,
         unit,
         barcode: productBarcode,
         origin_type: productOriginType,
-        category: productCategory,
+        category: finalCategoryName,
+        category_id: productCategoryId || null,
         minimum_stock: productMinimumStock,
         active: productActive,
+        remarks: productRemarks,
+        branch_id: user.branch_id,
         created_by: user.id,
         updated_by: user.id,
+        opening_stock_lots: addOpeningStock && !editingProductId ? openingStockLots : [],
       };
       if (editingProductId) {
         await axios.put(`${API_URL}/products/${editingProductId}`, payload);
+        if (addOpeningStock && openingStockLots.length > 0) {
+          await axios.post(`${API_URL}/products/${editingProductId}/opening-stock`, {
+            opening_stock_lots: openingStockLots,
+            branch_id: user.branch_id,
+            created_by: user.id,
+          });
+        }
       } else {
         await axios.post(`${API_URL}/products`, payload);
       }
-      setProductName("");
-      setSellingRate("");
-      setUnit("");
-      setProductBarcode("");
-      setProductOriginType("LOCAL");
-      setProductCategory("Fruit");
-      setProductMinimumStock("");
-      setProductActive(true);
-      setEditingProductId(null);
-      await loadProducts();
+      resetProductForm();
+      await Promise.all([loadProducts(), loadProductCategories(), loadDashboardData()]);
       alert(wasEditing ? "Product Updated" : "Product Added");
     } catch (error) {
       alert(getErrorMessage(error, "Error Adding Product"));
     }
+  };
+
+  const resetProductForm = () => {
+    setProductName("");
+    setSellingRate("");
+    setUnit("");
+    setProductBarcode("");
+    setProductOriginType("LOCAL");
+    setProductCategory("Fruit");
+    setProductCategoryId("");
+    setNewProductCategoryName("");
+    setProductMinimumStock("");
+    setProductActive(true);
+    setProductRemarks("");
+    setAddOpeningStock(false);
+    setOpeningStockLots([]);
+    setOpeningStockDraft({
+      lot_name: "",
+      lot_size: "",
+      quantity: "",
+      purchase_rate: "",
+      sale_rate: "",
+      opening_stock_date: toDateKey(new Date()),
+      supplier_id: "",
+      remarks: "",
+    });
+    setEditingProductId(null);
+  };
+
+  const saveProductCategory = async () => {
+    try {
+      const categoryName = newProductCategoryName.trim();
+      if (!categoryName) {
+        alert("Please enter category name.");
+        return;
+      }
+      const duplicate = productCategories.find((category) => category.category_name?.trim().toLowerCase() === categoryName.toLowerCase());
+      if (duplicate) {
+        alert("Category already exists.");
+        setProductCategoryId(String(duplicate.id));
+        setProductCategory(duplicate.category_name);
+        return;
+      }
+      const response = await axios.post(`${API_URL}/product-categories`, {
+        category_name: categoryName,
+        created_by: user.id,
+      });
+      await loadProductCategories();
+      setProductCategoryId(String(response.data.id));
+      setProductCategory(response.data.category_name);
+      setNewProductCategoryName("");
+      alert("Category saved");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to save category"));
+    }
+  };
+
+  const editProductCategory = async (category) => {
+    const nextName = window.prompt("Edit category name", category.category_name);
+    if (!nextName?.trim()) return;
+    try {
+      await axios.put(`${API_URL}/product-categories/${category.id}`, {
+        category_name: nextName,
+        active: category.active !== false,
+        remarks: category.remarks || "",
+        updated_by: user.id,
+        reason: "Category renamed from Product Master",
+      });
+      await Promise.all([loadProductCategories(), loadProducts()]);
+      alert("Category updated");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update category"));
+    }
+  };
+
+  const deactivateProductCategory = async (category) => {
+    const reason = window.prompt(`Enter reason to remove/deactivate ${category.category_name}`);
+    if (!reason?.trim()) return;
+    try {
+      await axios.delete(`${API_URL}/product-categories/${category.id}`, {
+        data: { updated_by: user.id, reason },
+      });
+      await loadProductCategories();
+      alert("Category removed");
+    } catch (error) {
+      await loadProductCategories();
+      alert(getErrorMessage(error, "This category has items or transactions. It can only be deactivated."));
+    }
+  };
+
+  const addOpeningStockLot = () => {
+    const quantity = Number(openingStockDraft.quantity || 0);
+    const purchaseRate = Number(openingStockDraft.purchase_rate || 0);
+    if (!openingStockDraft.lot_name.trim()) {
+      alert("Please enter lot name / size.");
+      return;
+    }
+    if (quantity <= 0) {
+      alert("Please enter lot quantity.");
+      return;
+    }
+    if (purchaseRate <= 0) {
+      alert("Please enter opening stock rate.");
+      return;
+    }
+    setOpeningStockLots((current) => [...current, { ...openingStockDraft, sale_rate: openingStockDraft.sale_rate || sellingRate }]);
+    setOpeningStockDraft({
+      lot_name: "",
+      lot_size: "",
+      quantity: "",
+      purchase_rate: "",
+      sale_rate: sellingRate,
+      opening_stock_date: toDateKey(new Date()),
+      supplier_id: "",
+      remarks: "",
+    });
   };
 
   const resetPurchaseForm = () => {
@@ -859,6 +1014,8 @@ function App() {
     setPurchasePaymentDate("");
     setPurchaseRemarks("");
     setPurchaseItemRemarks("");
+    setPurchaseLotName("");
+    setPurchaseLotSize("");
     setPurchaseCart([]);
     setEditingPurchaseItemIndex(null);
     setEditingPurchaseId(null);
@@ -874,6 +1031,8 @@ function App() {
     setTemporarySaleRate("");
     setExpectedPurchaseRate("");
     setPurchaseItemRemarks("");
+    setPurchaseLotName("");
+    setPurchaseLotSize("");
     setEditingPurchaseItemIndex(null);
   };
 
@@ -889,6 +1048,10 @@ function App() {
     }
     if (!product || quantity <= 0) {
       alert("Select product and enter quantity.");
+      return;
+    }
+    if (!purchaseLotName.trim()) {
+      alert("Please enter lot name / size.");
       return;
     }
     if (purchaseBillStatus === "BILL_PENDING" && temporaryRate <= 0) {
@@ -908,6 +1071,8 @@ function App() {
       purchase_rate: purchaseBillStatus === "BILL_PENDING" ? expectedRate : purchaseRate,
       temporary_sale_rate: temporaryRate,
       expected_purchase_rate: expectedRate,
+      lot_name: purchaseLotName,
+      lot_size: purchaseLotSize,
       remarks: purchaseItemRemarks,
     };
     setPurchaseCart((currentCart) => {
@@ -940,6 +1105,8 @@ function App() {
     setPurchaseRateInput(String(item.purchase_rate || ""));
     setTemporarySaleRate(String(item.temporary_sale_rate || ""));
     setExpectedPurchaseRate(String(item.expected_purchase_rate || ""));
+    setPurchaseLotName(item.lot_name || "");
+    setPurchaseLotSize(item.lot_size || "");
     setPurchaseItemRemarks(item.remarks || "");
   };
 
@@ -1006,6 +1173,8 @@ function App() {
         payment_reference_number: purchaseType === "CASH" ? purchasePaymentReference : null,
         bill_number: purchaseBillNumber,
         bill_date: purchaseBillDate || null,
+        lot_name: purchaseLotName,
+        lot_size: purchaseLotSize,
         branch_id: user.branch_id,
         created_by: user.id,
         edited_by: user.id,
@@ -1088,21 +1257,17 @@ function App() {
     setProductBarcode(product.barcode || "");
     setProductOriginType(product.origin_type || "LOCAL");
     setProductCategory(product.category || "Fruit");
+    setProductCategoryId(product.category_id ? String(product.category_id) : "");
     setProductMinimumStock(product.minimum_stock || "");
     setProductActive(product.active !== false);
+    setProductRemarks(product.remarks || "");
+    setAddOpeningStock(false);
+    setOpeningStockLots([]);
     setEditingProductId(product.id);
   };
 
   const cancelProductEdit = () => {
-    setProductName("");
-    setSellingRate("");
-    setUnit("");
-    setProductBarcode("");
-    setProductOriginType("LOCAL");
-    setProductCategory("Fruit");
-    setProductMinimumStock("");
-    setProductActive(true);
-    setEditingProductId(null);
+    resetProductForm();
   };
 
   const deactivateProduct = async (product) => {
@@ -1143,6 +1308,8 @@ function App() {
     setPurchaseBillDate(purchase.bill_date ? toDateKey(purchase.bill_date) : "");
     setPurchaseRemarks(purchase.remarks || "");
     setPurchaseItemRemarks(purchase.item_remarks || "");
+    setPurchaseLotName(purchase.lot_name || purchase.item_lot_name || "");
+    setPurchaseLotSize(purchase.lot_size || purchase.item_lot_size || "");
     setPurchaseCart([]);
     setEditingPurchaseItemIndex(null);
     setActiveView("purchase");
@@ -1303,6 +1470,9 @@ function App() {
         const response = await axios.get(`${API_URL}/inventory`);
         setInventory(response.data);
       }
+      if (view === "products") {
+        await Promise.all([loadProducts(), loadProductCategories(), loadSupplierData(), loadDashboardData()]);
+      }
       if (view === "sales-history") {
         await loadSalesHistory();
       }
@@ -1360,6 +1530,25 @@ function App() {
   const activeLabel = navigationItems.find(([view]) => view === activeView)?.[1];
   const canManageRates = ["Owner", "Admin"].includes(user.role);
   const canEditSales = ["Owner", "Admin"].includes(user.role);
+  const inventoryGroups = [...inventory.reduce((groups, batch) => {
+    const key = String(batch.product_id);
+    const current = groups.get(key) || {
+      product_id: batch.product_id,
+      category: batch.category || "Fruit",
+      product_name: batch.product_name,
+      unit: batch.unit || "",
+      total_stock: 0,
+      stock_value: 0,
+      lots: [],
+    };
+    const remaining = Number(batch.remaining_qty || 0);
+    const cost = Number(batch.effective_cost_per_unit || batch.purchase_rate || 0);
+    current.total_stock += remaining;
+    current.stock_value += remaining * cost;
+    current.lots.push(batch);
+    groups.set(key, current);
+    return groups;
+  }, new Map()).values()].sort((left, right) => `${left.category}-${left.product_name}`.localeCompare(`${right.category}-${right.product_name}`));
 
   return (
     <main className="erp-shell">
@@ -1474,47 +1663,147 @@ function App() {
           )}
 
           {activeView === "products" && (
-            <ModuleCard eyebrow="Catalog" title="Product Management" subtitle="Add retail products and maintain pricing details.">
-              <div className="form-grid">
-                <Field label="Product Name"><input value={productName} onChange={(event) => setProductName(event.target.value)} /></Field>
-                <Field label="Selling Rate"><input type="number" min="0" step="0.01" value={sellingRate} onChange={(event) => setSellingRate(event.target.value)} /></Field>
-                <Field label="Unit"><input value={unit} onChange={(event) => setUnit(event.target.value)} /></Field>
-                <Field label="Barcode (Optional)"><input value={productBarcode} onChange={(event) => setProductBarcode(event.target.value)} /></Field>
-                <Field label="Category"><input value={productCategory} onChange={(event) => setProductCategory(event.target.value)} /></Field>
-                <Field label="Minimum Stock"><input type="number" min="0" step="0.001" value={productMinimumStock} onChange={(event) => setProductMinimumStock(event.target.value)} /></Field>
-                <Field label="Origin Type">
-                  <select value={productOriginType} onChange={(event) => setProductOriginType(event.target.value)}>
-                    <option value="LOCAL">Local</option>
-                    <option value="IMPORTED">Imported</option>
-                  </select>
-                </Field>
-                <label className="check-field"><input type="checkbox" checked={productActive} onChange={(event) => setProductActive(event.target.checked)} /><span>Active Product</span></label>
-              </div>
-              <div className="button-row">
-                <button className="primary-button" onClick={addProduct}>{editingProductId ? "Update Product" : "Add Product"}</button>
-                {editingProductId && <button className="secondary-button" onClick={cancelProductEdit}>Cancel Edit</button>}
-              </div>
-              <DataTable headers={["Product", "Category", "Barcode", "Origin", "Selling Rate", "Minimum Stock", "Unit", "Status", ""]}>
-                {products.map((product) => (
-                  <tr key={product.id}>
-                    <td className="primary-cell">{product.product_name}</td>
-                    <td>{product.category || "Fruit"}</td>
-                    <td>{product.barcode || "-"}</td>
-                    <td><span className="tag">{product.origin_type || "LOCAL"}</span></td>
-                    <td>{currency.format(Number(product.selling_rate))}</td>
-                    <td>{product.minimum_stock || 0}</td>
-                    <td><span className="tag">{product.unit}</span></td>
-                    <td><span className={product.active !== false ? "stock-ok" : "stock-low"}>{product.active !== false ? "Active" : "Inactive"}</span></td>
-                    <td>
-                      <div className="button-row table-actions-row">
-                        <button className="table-action" onClick={() => editProduct(product)}>Edit</button>
-                        <button className="remove-button" disabled={product.active === false} onClick={() => deactivateProduct(product)}>Deactivate</button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </DataTable>
-            </ModuleCard>
+            <section className="settings-layout">
+              <ModuleCard eyebrow="Product Master" title="Category, Item, Lot & Opening Stock" subtitle="Manage fruit categories, item masters and opening stock lots without disturbing FIFO inventory.">
+                <div className="purchase-summary-grid supplier-payment-preview">
+                  <SummaryMetric featured label="Categories" value={productCategories.length} />
+                  <SummaryMetric label="Items" value={products.length} />
+                  <SummaryMetric label="Active Items" value={products.filter((product) => product.active !== false).length} />
+                  <SummaryMetric label="Inventory Lots" value={inventory.length} />
+                </div>
+              </ModuleCard>
+
+              <ModuleCard eyebrow="Category Management" title="Fruit Categories" subtitle="Add, edit or deactivate categories. Categories with items are protected from hard deletion.">
+                <div className="form-grid supplier-form-grid">
+                  <Field label="Add New Category"><input value={newProductCategoryName} onChange={(event) => setNewProductCategoryName(event.target.value)} placeholder="Example: Mango" /></Field>
+                  <Field label="Select Existing Category">
+                    <select value={productCategoryId} onChange={(event) => {
+                      const selected = productCategories.find((category) => String(category.id) === event.target.value);
+                      setProductCategoryId(event.target.value);
+                      setProductCategory(selected?.category_name || "");
+                    }}>
+                      <option value="">Select category</option>
+                      {productCategories.filter((category) => category.active !== false).map((category) => <option key={category.id} value={category.id}>{category.category_name}</option>)}
+                    </select>
+                  </Field>
+                  <button className="primary-button" onClick={saveProductCategory}>Save Category</button>
+                </div>
+                <DataTable headers={["Category", "Items", "Status", "Actions"]}>
+                  {productCategories.map((category) => (
+                    <tr key={category.id}>
+                      <td className="primary-cell">{category.category_name}</td>
+                      <td>{category.item_count || 0}</td>
+                      <td><span className={category.active !== false ? "stock-ok" : "stock-low"}>{category.active !== false ? "Active" : "Inactive"}</span></td>
+                      <td>
+                        <div className="button-row table-actions-row">
+                          <button className="table-action" onClick={() => editProductCategory(category)}>Edit</button>
+                          <button className="remove-button" disabled={category.active === false} onClick={() => deactivateProductCategory(category)}>Remove / Deactivate</button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </DataTable>
+              </ModuleCard>
+
+              <ModuleCard eyebrow="Item Management" title={editingProductId ? "Edit Item" : "Add Item Inside Category"} subtitle="Items are products used by POS, purchase, inventory, reports and FIFO costing.">
+                <div className="form-grid supplier-form-grid">
+                  <Field label="Category">
+                    <select value={productCategoryId} onChange={(event) => {
+                      const selected = productCategories.find((category) => String(category.id) === event.target.value);
+                      setProductCategoryId(event.target.value);
+                      setProductCategory(selected?.category_name || "");
+                    }}>
+                      <option value="">Select existing category</option>
+                      {productCategories.filter((category) => category.active !== false).map((category) => <option key={category.id} value={category.id}>{category.category_name}</option>)}
+                    </select>
+                  </Field>
+                  <Field label="Item Name"><input value={productName} onChange={(event) => setProductName(event.target.value)} placeholder="Example: Kesar" /></Field>
+                  <Field label="Unit">
+                    <select value={unit} onChange={(event) => setUnit(event.target.value)}>
+                      <option value="">Select unit</option>
+                      <option value="KG">KG</option>
+                      <option value="BOX">Box</option>
+                      <option value="PIECE">Piece</option>
+                      <option value="DOZEN">Dozen</option>
+                    </select>
+                  </Field>
+                  <Field label="Default Sale Rate"><input type="number" min="0" step="0.01" value={sellingRate} onChange={(event) => setSellingRate(event.target.value)} /></Field>
+                  <Field label="Barcode (Optional)"><input value={productBarcode} onChange={(event) => setProductBarcode(event.target.value)} /></Field>
+                  <Field label="Minimum Stock"><input type="number" min="0" step="0.001" value={productMinimumStock} onChange={(event) => setProductMinimumStock(event.target.value)} /></Field>
+                  <Field label="Origin Type">
+                    <select value={productOriginType} onChange={(event) => setProductOriginType(event.target.value)}>
+                      <option value="LOCAL">Local</option>
+                      <option value="IMPORTED">Imported</option>
+                    </select>
+                  </Field>
+                  <label className="check-field"><input type="checkbox" checked={productActive} onChange={(event) => setProductActive(event.target.checked)} /><span>Active Item</span></label>
+                </div>
+                <Field label="Remarks"><textarea value={productRemarks} onChange={(event) => setProductRemarks(event.target.value)} /></Field>
+                <label className="check-field"><input type="checkbox" checked={addOpeningStock} onChange={(event) => setAddOpeningStock(event.target.checked)} /><span>Add Opening Stock</span></label>
+                {addOpeningStock && (
+                  <div className="lot-entry-panel">
+                    <div className="form-grid supplier-form-grid">
+                      <Field label="Supplier (Optional)">
+                        <select value={openingStockDraft.supplier_id} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, supplier_id: event.target.value })}>
+                          <option value="">No supplier payable</option>
+                          {activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.supplier_name}</option>)}
+                        </select>
+                      </Field>
+                      <Field label="Lot Name / Number"><input value={openingStockDraft.lot_name} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_name: event.target.value })} placeholder="Lot A" /></Field>
+                      <Field label="Size / Grade"><input value={openingStockDraft.lot_size} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_size: event.target.value })} placeholder="Small / Premium" /></Field>
+                      <Field label="Quantity"><input type="number" min="0" step="0.001" value={openingStockDraft.quantity} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, quantity: event.target.value })} /></Field>
+                      <Field label="Purchase Rate / Opening Cost"><input type="number" min="0" step="0.01" value={openingStockDraft.purchase_rate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, purchase_rate: event.target.value })} /></Field>
+                      <Field label="Sale Rate"><input type="number" min="0" step="0.01" value={openingStockDraft.sale_rate || sellingRate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, sale_rate: event.target.value })} /></Field>
+                      <Field label="Opening Stock Date"><input type="date" value={openingStockDraft.opening_stock_date} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, opening_stock_date: event.target.value })} /></Field>
+                      <Field label="Lot Remarks"><input value={openingStockDraft.remarks} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, remarks: event.target.value })} /></Field>
+                    </div>
+                    <button className="secondary-button" onClick={addOpeningStockLot}>Add Opening Stock Lot</button>
+                    <DataTable headers={["Lot", "Size", "Qty", "Cost", "Sale Rate", "Date", "Actions"]}>
+                      {openingStockLots.map((lot, index) => (
+                        <tr key={`${lot.lot_name}-${index}`}>
+                          <td className="primary-cell">{lot.lot_name}</td>
+                          <td>{lot.lot_size || "-"}</td>
+                          <td>{lot.quantity}</td>
+                          <td>{currency.format(Number(lot.purchase_rate || 0))}</td>
+                          <td>{currency.format(Number(lot.sale_rate || sellingRate || 0))}</td>
+                          <td>{lot.opening_stock_date}</td>
+                          <td><button className="remove-button" onClick={() => setOpeningStockLots((current) => current.filter((_, lotIndex) => lotIndex !== index))}>Remove</button></td>
+                        </tr>
+                      ))}
+                    </DataTable>
+                  </div>
+                )}
+                <div className="button-row">
+                  <button className="primary-button" onClick={addProduct}>{editingProductId ? "Update Item" : "Add Item"}</button>
+                  {editingProductId && <button className="secondary-button" onClick={cancelProductEdit}>Cancel Edit</button>}
+                </div>
+              </ModuleCard>
+
+              <ModuleCard eyebrow="Item List" title="Category-Wise Items" subtitle="Inactive items stay in history but are hidden from POS by default.">
+                <DataTable headers={["Category", "Item", "Barcode", "Origin", "Sale Rate", "Min Stock", "Stock", "Lots", "Unit", "Status", "Actions"]}>
+                  {products.map((product) => (
+                    <tr key={product.id}>
+                      <td>{product.category_name || product.category || "Fruit"}</td>
+                      <td className="primary-cell">{product.product_name}<small className="cell-note">{product.remarks || ""}</small></td>
+                      <td>{product.barcode || "-"}</td>
+                      <td><span className="tag">{product.origin_type || "LOCAL"}</span></td>
+                      <td>{currency.format(Number(product.selling_rate))}</td>
+                      <td>{product.minimum_stock || 0}</td>
+                      <td>{Number(product.current_stock || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
+                      <td>{product.lot_count || 0}</td>
+                      <td><span className="tag">{product.unit}</span></td>
+                      <td><span className={product.active !== false ? "stock-ok" : "stock-low"}>{product.active !== false ? "Active" : "Inactive"}</span></td>
+                      <td>
+                        <div className="button-row table-actions-row">
+                          <button className="table-action" onClick={() => editProduct(product)}>Edit</button>
+                          <button className="remove-button" disabled={product.active === false} onClick={() => deactivateProduct(product)}>Deactivate</button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </DataTable>
+              </ModuleCard>
+            </section>
           )}
 
           {activeView === "purchase" && (
@@ -1601,9 +1890,11 @@ function App() {
                   <Field label="Product">
                     <select value={purchaseProductId} onChange={selectPurchaseProduct}>
                       <option value="">Select product</option>
-                      {products.filter((product) => product.active !== false).map((product) => <option key={product.id} value={product.id}>{product.product_name} ({product.unit})</option>)}
+                      {products.filter((product) => product.active !== false).map((product) => <option key={product.id} value={product.id}>{product.category || "Fruit"} - {product.product_name} ({product.unit})</option>)}
                     </select>
                   </Field>
+                  <Field label="Lot Name / Number"><input value={purchaseLotName} onChange={(event) => setPurchaseLotName(event.target.value)} placeholder="Lot A / Supplier Bill Lot" /></Field>
+                  <Field label="Size / Grade"><input value={purchaseLotSize} onChange={(event) => setPurchaseLotSize(event.target.value)} placeholder="Small / Premium" /></Field>
                   <Field label="Quantity"><input type="number" min="0" step="0.001" value={purchaseQuantity} onChange={(event) => setPurchaseQuantity(event.target.value)} /></Field>
                   {purchaseBillStatus === "BILL_PENDING" ? (
                     <>
@@ -1623,10 +1914,11 @@ function App() {
                   </div>
                 )}
                 {!editingPurchaseId && (
-                  <DataTable headers={["Product", "Qty", "Unit", "Origin", "Purchase / Expected Rate", "Temp Sale Rate", "Remarks", "Actions"]}>
+                  <DataTable headers={["Product", "Lot / Size", "Qty", "Unit", "Origin", "Purchase / Expected Rate", "Temp Sale Rate", "Remarks", "Actions"]}>
                     {purchaseCart.map((item, index) => (
                       <tr key={`${item.product_id}-${index}`}>
                         <td className="primary-cell">{item.product_name}</td>
+                        <td>{item.lot_name || "-"}{item.lot_size ? ` / ${item.lot_size}` : ""}</td>
                         <td>{item.quantity}</td>
                         <td>{item.unit}</td>
                         <td><span className="origin-rate">{item.origin_type}</span></td>
@@ -1725,25 +2017,40 @@ function App() {
           )}
 
           {activeView === "inventory" && (
-            <ModuleCard eyebrow="Stock Control" title="Inventory Batches" subtitle="Review current quantities and batch-level purchase details.">
-              <DataTable headers={["Batch", "Product", "Purchased", "Remaining", "Purchase Rate", "Landed Cost", "Mandi Tax", "Freight", "Labour", "Other", "Rebate", "Net Payable", "Balance", "Supplier", "Date"]}>
+            <ModuleCard eyebrow="Stock Control" title="Inventory Summary & Lot Details" subtitle="Product-wise stock with expandable lot-level purchase, opening stock and FIFO costing details.">
+              <DataTable headers={["Category / Item", "Total Stock", "Avg Cost", "Stock Value", "Lot Details"]}>
+                {inventoryGroups.map((group) => {
+                  const averageCost = group.total_stock > 0 ? group.stock_value / group.total_stock : 0;
+                  return (
+                    <tr key={group.product_id}>
+                      <td className="primary-cell">{group.category} - {group.product_name}<small className="cell-note">{group.unit}</small></td>
+                      <td><span className={Number(group.total_stock) <= 5 ? "stock-low" : "stock-ok"}>{group.total_stock.toLocaleString("en-IN", { maximumFractionDigits: 3 })}</span></td>
+                      <td>{currency.format(Number(averageCost || 0))}</td>
+                      <td>{currency.format(Number(group.stock_value || 0))}</td>
+                      <td className="primary-cell purchase-items-cell">
+                        <span title={group.lots.map((lot) => `${lot.lot_name || lot.batch_no}${lot.lot_size ? ` / ${lot.lot_size}` : ""} | ${lot.stock_source || "PURCHASE"} | Received ${lot.purchase_qty} | Balance ${lot.remaining_qty} | Cost ${currency.format(Number(lot.effective_cost_per_unit || lot.purchase_rate || 0))}`).join("\n")}>
+                          {group.lots.slice(0, 3).map((lot) => `${lot.lot_name || lot.batch_no}${lot.lot_size ? ` / ${lot.lot_size}` : ""}: ${lot.remaining_qty}`).join(", ")}
+                          {group.lots.length > 3 ? ` +${group.lots.length - 3} more` : ""}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </DataTable>
+              <DataTable headers={["Lot", "Category", "Item", "Supplier", "Date", "Source", "Received", "Balance", "Cost", "Sale Rate", "Status"]}>
                 {inventory.map((item) => (
                   <tr key={item.id}>
-                    <td><span className="batch-id">{item.batch_no}</span></td>
+                    <td><span className="batch-id">{item.lot_name || item.batch_no}{item.lot_size ? ` / ${item.lot_size}` : ""}</span></td>
+                    <td>{item.category || "Fruit"}</td>
                     <td className="primary-cell">{item.product_name}</td>
+                    <td>{item.supplier_name || "-"}</td>
+                    <td>{item.purchase_date}</td>
+                    <td><span className="tag">{item.stock_source || "PURCHASE"}</span></td>
                     <td>{item.purchase_qty}</td>
                     <td><span className={Number(item.remaining_qty) <= 5 ? "stock-low" : "stock-ok"}>{item.remaining_qty}</span></td>
-                    <td>{currency.format(Number(item.purchase_rate))}</td>
                     <td>{currency.format(Number(item.effective_cost_per_unit || item.purchase_rate))}</td>
-                    <td>{currency.format(Number(item.mandi_tax_amount || 0))}</td>
-                    <td>{currency.format(Number(item.freight_charges || 0))}</td>
-                    <td>{currency.format(Number(item.labour_charges || 0))}</td>
-                    <td>{currency.format(Number(item.other_charges || 0))}</td>
-                    <td>{currency.format(Number(item.rebate_amount || 0))}</td>
-                    <td>{currency.format(Number(item.net_payable || 0))}</td>
-                    <td>{currency.format(Number(item.balance_amount || 0))}</td>
-                    <td>{item.supplier_name}</td>
-                    <td>{item.purchase_date}</td>
+                    <td>{currency.format(Number(item.temporary_sale_rate || 0))}</td>
+                    <td>{item.batch_status || "ACTIVE"}</td>
                   </tr>
                 ))}
               </DataTable>
@@ -2219,10 +2526,11 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
   const purchaseItemBasic = (row) => Number(row.item_basic_amount || 0) || Number(row.quantity || 0) * Number(row.purchase_rate || row.expected_purchase_rate || 0);
   const purchaseItemNarration = (row) => {
     const product = row.product_name || "Item";
+    const lotText = row.lot_name ? ` (${row.lot_name}${row.lot_size ? ` / ${row.lot_size}` : ""})` : "";
     const qty = Number(row.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 });
     const unit = String(row.unit || "").toLowerCase();
     const rate = Number(row.purchase_rate || row.expected_purchase_rate || 0);
-    return `${product} ${qty}${unit} @ ${money(rate)} = ${money(purchaseItemBasic(row))}`;
+    return `${product}${lotText} ${qty}${unit} @ ${money(rate)} = ${money(purchaseItemBasic(row))}`;
   };
   const filteredPurchaseHistoryRows = purchaseHistoryRawRows.filter((row) => {
     if (purchaseFilters.supplier && String(row.supplier_id || "") !== purchaseFilters.supplier) return false;
@@ -2275,7 +2583,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
     return [...groups.values()].map((group) => {
       const itemSummary = group.source_rows
         .slice(0, 3)
-        .map((row) => `${row.product_name} ${Number(row.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}${String(row.unit || "").toLowerCase()}`)
+        .map((row) => `${row.product_name}${row.lot_name ? ` ${row.lot_name}` : ""} ${Number(row.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}${String(row.unit || "").toLowerCase()}`)
         .join(", ");
       const extraCount = Math.max(group.source_rows.length - 3, 0);
       const statuses = new Set(group.source_rows.map(purchaseStatusLabel));
@@ -2682,6 +2990,13 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       headers: ["Product", "Stock", "Unit", "Value"],
       render: (row) => <tr key={row.product_id}><td className="primary-cell">{row.product_name}</td><td>{number(row.current_stock)}</td><td>{row.unit}</td><td>{money(row.stock_value)}</td></tr>,
     },
+    lotWiseStock: {
+      title: "Lot Wise Stock",
+      rows: filterRows(data.stockLotReport),
+      summary: (rows) => [["Lot Stock Value", money(rows.reduce((sum, row) => sum + Number(row.remaining_qty || 0) * Number(row.effective_cost_per_unit || row.purchase_rate || 0), 0)), true], ["Lots", rows.length], ["Categories", new Set(rows.map((row) => row.category || "Fruit")).size]],
+      headers: ["Category", "Item", "Lot / Size", "Source", "Supplier", "Received", "Balance", "Cost", "Value"],
+      render: (row) => <tr key={row.id}><td>{row.category || "Fruit"}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{row.lot_name || row.batch_no}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td><span className="tag">{row.stock_source || "PURCHASE"}</span></td><td>{row.supplier_name || "-"}</td><td>{number(row.purchase_qty)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.effective_cost_per_unit || row.purchase_rate)}</td><td>{money(Number(row.remaining_qty || 0) * Number(row.effective_cost_per_unit || row.purchase_rate || 0))}</td></tr>,
+    },
     profitLoss: {
       title: "Profit & Loss",
       rows: [
@@ -2741,7 +3056,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
     { id: "accounts", title: "Accounts & Ledger", icon: "users", description: "Customer ledger, supplier ledger, statements, payments and balances.", reports: ["customerLedger", "supplierLedger", "accountStatement", "paymentReport", "paymentModeSummary", "receivableReport", "payableReport"] },
     { id: "returns", title: "Sale Returns", icon: "history", description: "Return history, value and reason analysis.", reports: ["returnHistory", "returnValue", "returnReason"] },
     { id: "waste", title: "Waste Management", icon: "alert", description: "Daily, monthly, product-wise and cost-focused waste analysis.", reports: ["dailyWaste", "monthlyWaste", "productWiseWaste", "mostWastedProducts", "wasteCost"] },
-    { id: "inventory", title: "Inventory", icon: "layers", description: "Current stock, low stock, movement and valuation.", reports: ["currentStock", "lowStock", "stockMovement", "stockValuation"] },
+    { id: "inventory", title: "Inventory", icon: "layers", description: "Current stock, low stock, movement and valuation.", reports: ["currentStock", "lowStock", "stockMovement", "stockValuation", "lotWiseStock"] },
     { id: "financial", title: "Financial Reports", icon: "wallet", description: "Profit and loss, balance sheet, day-to-day and expense reports.", reports: ["profitLoss", "balanceSheet", "dayToDay", "expenseReport"] },
   ];
   const currentCategory = categories.find((category) => category.id === selectedCategory);

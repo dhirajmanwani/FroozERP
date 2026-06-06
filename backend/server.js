@@ -69,6 +69,7 @@ const SALE_STATUSES = new Set(["COMPLETED", "EDITED", "CANCELLED"]);
 const REFUND_TYPES = new Set(["CASH_REFUND", "UPI_REFUND", "CREDIT_NOTE", "FUTURE_ADJUSTMENT"]);
 const WASTE_TYPES = new Set(["DAAGI", "SAMPLING", "PERSONAL_USE", "OTHER"]);
 const PURCHASE_BILL_STATUSES = new Set(["BILL_PENDING", "BILL_COMPLETED"]);
+const PRODUCT_UNITS = new Set(["KG", "BOX", "PIECE", "DOZEN"]);
 const PERMISSION_KEYS = [
   "settings",
   "discounts",
@@ -94,6 +95,10 @@ const normalizeDiscountType = (value) => String(value || "FLAT_AMOUNT").toUpperC
 const normalizeDiscountPaymentMode = (value) => String(value || "ALL").trim().toUpperCase();
 const normalizeRefundType = (value) => String(value || "CASH_REFUND").trim().toUpperCase();
 const normalizeWasteType = (value) => String(value || "DAAGI").trim().toUpperCase();
+const normalizeProductUnit = (value) => {
+  const unit = String(value || "").trim().toUpperCase();
+  return PRODUCT_UNITS.has(unit) ? unit : unit;
+};
 
 const requireRateManager = async (userId, client = pool) => {
   const parsedUserId = parsePositiveInteger(userId);
@@ -181,18 +186,52 @@ const initializeDatabase = async () => {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS product_categories (
+      id SERIAL PRIMARY KEY,
+      category_name VARCHAR(120) NOT NULL,
+      active BOOLEAN DEFAULT TRUE,
+      remarks TEXT,
+      created_by INTEGER REFERENCES users(id),
+      updated_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS product_categories_name_lower_unique_idx
+      ON product_categories (LOWER(category_name));
+
+    CREATE TABLE IF NOT EXISTS products (
+      id SERIAL PRIMARY KEY,
+      product_name VARCHAR(160) NOT NULL,
+      selling_rate NUMERIC(14, 2) NOT NULL,
+      unit VARCHAR(30) NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS category_id INTEGER REFERENCES product_categories(id);
     ALTER TABLE products ADD COLUMN IF NOT EXISTS barcode VARCHAR(100);
     ALTER TABLE products ADD COLUMN IF NOT EXISTS origin_type VARCHAR(20) DEFAULT 'LOCAL';
     ALTER TABLE products ADD COLUMN IF NOT EXISTS category VARCHAR(80) DEFAULT 'Fruit';
     ALTER TABLE products ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS remarks TEXT;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS selling_rate_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS selling_rate_updated_by INTEGER REFERENCES users(id);
     UPDATE products SET origin_type = 'LOCAL' WHERE origin_type IS NULL;
     CREATE INDEX IF NOT EXISTS products_name_search_lower_idx
       ON products (LOWER(product_name));
+    CREATE UNIQUE INDEX IF NOT EXISTS products_category_name_lower_unique_idx
+      ON products (LOWER(COALESCE(category, 'Fruit')), LOWER(product_name));
     CREATE UNIQUE INDEX IF NOT EXISTS products_barcode_unique_idx
       ON products (barcode)
       WHERE barcode IS NOT NULL AND barcode <> '';
+    INSERT INTO product_categories (category_name, active)
+    SELECT DISTINCT COALESCE(NULLIF(TRIM(category), ''), 'Fruit'), TRUE
+    FROM products
+    ON CONFLICT DO NOTHING;
+    UPDATE products p
+    SET category_id = pc.id,
+        category = pc.category_name
+    FROM product_categories pc
+    WHERE p.category_id IS NULL
+      AND LOWER(pc.category_name) = LOWER(COALESCE(NULLIF(TRIM(p.category), ''), 'Fruit'));
 
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS basic_amount NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS supplier_id INTEGER;
@@ -229,6 +268,9 @@ const initializeDatabase = async () => {
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS expected_purchase_rate NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS bill_number VARCHAR(120);
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS bill_date DATE;
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS lot_name VARCHAR(120);
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS lot_size VARCHAR(120);
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS stock_source VARCHAR(40) DEFAULT 'PURCHASE';
     UPDATE purchases SET purchase_status = 'ACTIVE' WHERE purchase_status IS NULL;
 
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS basic_amount NUMERIC(14, 2) DEFAULT 0;
@@ -239,6 +281,8 @@ const initializeDatabase = async () => {
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS effective_cost_per_unit NUMERIC(14, 4) DEFAULT 0;
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS freight_charges NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS labour_charges NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS lot_name VARCHAR(120);
+    ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS lot_size VARCHAR(120);
 
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS effective_cost_per_unit NUMERIC(14, 4);
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS supplier_id INTEGER;
@@ -255,6 +299,10 @@ const initializeDatabase = async () => {
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS batch_status VARCHAR(20) DEFAULT 'ACTIVE';
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS purchase_bill_status VARCHAR(30) DEFAULT 'BILL_COMPLETED';
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS temporary_sale_rate NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS lot_name VARCHAR(120);
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS lot_size VARCHAR(120);
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS stock_source VARCHAR(40) DEFAULT 'PURCHASE';
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS remarks TEXT;
     UPDATE inventory_batches SET batch_status = 'ACTIVE' WHERE batch_status IS NULL;
     UPDATE inventory_batches SET effective_cost_per_unit = purchase_rate WHERE effective_cost_per_unit IS NULL;
 
@@ -290,6 +338,17 @@ const initializeDatabase = async () => {
     CREATE TABLE IF NOT EXISTS product_audit_trail (
       id SERIAL PRIMARY KEY,
       product_id INTEGER NOT NULL REFERENCES products(id),
+      action VARCHAR(30) NOT NULL,
+      old_value JSONB,
+      new_value JSONB,
+      reason TEXT NOT NULL,
+      edited_by INTEGER REFERENCES users(id),
+      edited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS product_category_audit_trail (
+      id SERIAL PRIMARY KEY,
+      category_id INTEGER REFERENCES product_categories(id),
       action VARCHAR(30) NOT NULL,
       old_value JSONB,
       new_value JSONB,
@@ -2814,9 +2873,182 @@ app.post("/login", async (req, res) => {
   }
 });
 
+app.get("/product-categories", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        pc.*,
+        COUNT(p.id)::INTEGER AS item_count,
+        COALESCE(SUM(CASE WHEN p.active IS DISTINCT FROM FALSE THEN 1 ELSE 0 END), 0)::INTEGER AS active_item_count
+      FROM product_categories pc
+      LEFT JOIN products p ON p.category_id = pc.id
+      GROUP BY pc.id
+      ORDER BY pc.active DESC, pc.category_name
+      `
+    );
+    return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Database Error" });
+  }
+});
+
+app.post("/product-categories", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const manager = await requireRateManager(req.body.created_by || req.body.updated_by, client);
+    const categoryName = cleanText(req.body.category_name);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage categories" });
+    if (!categoryName) return res.status(400).json({ message: "Please enter category name." });
+    await client.query("BEGIN");
+    const duplicate = await findCategoryByName(client, categoryName);
+    if (duplicate) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ message: "Category already exists." });
+    }
+    const result = await client.query(
+      `
+      INSERT INTO product_categories (category_name, active, remarks, created_by, updated_by)
+      VALUES ($1, $2, $3, $4, $4)
+      RETURNING *
+      `,
+      [categoryName, req.body.active !== false, nullableText(req.body.remarks), manager.id]
+    );
+    await client.query(
+      `
+      INSERT INTO product_category_audit_trail (category_id, action, old_value, new_value, reason, edited_by)
+      VALUES ($1, 'CREATE', NULL, $2::jsonb, $3, $4)
+      `,
+      [result.rows[0].id, JSON.stringify(result.rows[0]), cleanText(req.body.reason) || "Category created", manager.id]
+    );
+    await client.query("COMMIT");
+    return res.status(201).json(result.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    if (error.code === "23505") return res.status(409).json({ message: "Category already exists." });
+    return res.status(500).json({ message: "Error Saving Category" });
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/product-categories/:id", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const categoryId = parsePositiveInteger(req.params.id);
+    const manager = await requireRateManager(req.body.updated_by, client);
+    const categoryName = cleanText(req.body.category_name);
+    const reason = cleanText(req.body.reason) || "Category updated";
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage categories" });
+    if (!categoryId || !categoryName) return res.status(400).json({ message: "Please enter category name." });
+    await client.query("BEGIN");
+    const currentResult = await client.query("SELECT * FROM product_categories WHERE id = $1 FOR UPDATE", [categoryId]);
+    const current = currentResult.rows[0];
+    if (!current) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Category not found" });
+    }
+    const duplicate = await client.query("SELECT id FROM product_categories WHERE LOWER(category_name) = LOWER($1) AND id <> $2 LIMIT 1", [categoryName, categoryId]);
+    if (duplicate.rows.length > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ message: "Category already exists." });
+    }
+    const result = await client.query(
+      `
+      UPDATE product_categories
+      SET category_name = $1, active = $2, remarks = $3, updated_by = $4, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $5
+      RETURNING *
+      `,
+      [categoryName, req.body.active !== false, nullableText(req.body.remarks), manager.id, categoryId]
+    );
+    await client.query("UPDATE products SET category = $1 WHERE category_id = $2", [categoryName, categoryId]);
+    await client.query(
+      `
+      INSERT INTO product_category_audit_trail (category_id, action, old_value, new_value, reason, edited_by)
+      VALUES ($1, 'EDIT', $2::jsonb, $3::jsonb, $4, $5)
+      `,
+      [categoryId, JSON.stringify(current), JSON.stringify(result.rows[0]), reason, manager.id]
+    );
+    await client.query("COMMIT");
+    return res.json(result.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    if (error.code === "23505") return res.status(409).json({ message: "Category already exists." });
+    return res.status(500).json({ message: "Error Updating Category" });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/product-categories/:id", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const categoryId = parsePositiveInteger(req.params.id);
+    const manager = await requireRateManager(req.body?.updated_by || req.query.updated_by, client);
+    const reason = cleanText(req.body?.reason || req.query.reason) || "Category removed";
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage categories" });
+    if (!categoryId) return res.status(400).json({ message: "Invalid category" });
+    await client.query("BEGIN");
+    const currentResult = await client.query("SELECT * FROM product_categories WHERE id = $1 FOR UPDATE", [categoryId]);
+    const current = currentResult.rows[0];
+    if (!current) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Category not found" });
+    }
+    const usageResult = await client.query("SELECT COUNT(*)::INTEGER AS usage_count FROM products WHERE category_id = $1", [categoryId]);
+    if (Number(usageResult.rows[0].usage_count || 0) > 0) {
+      const result = await client.query("UPDATE product_categories SET active = FALSE, updated_by = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *", [manager.id, categoryId]);
+      await client.query(
+        `
+        INSERT INTO product_category_audit_trail (category_id, action, old_value, new_value, reason, edited_by)
+        VALUES ($1, 'DEACTIVATE', $2::jsonb, $3::jsonb, $4, $5)
+        `,
+        [categoryId, JSON.stringify(current), JSON.stringify(result.rows[0]), "This category has items or transactions. It can only be deactivated.", manager.id]
+      );
+      await client.query("COMMIT");
+      return res.status(409).json({ message: "This category has items or transactions. It can only be deactivated.", category: result.rows[0] });
+    }
+    await client.query("DELETE FROM product_categories WHERE id = $1", [categoryId]);
+    await client.query(
+      `
+      INSERT INTO product_category_audit_trail (category_id, action, old_value, new_value, reason, edited_by)
+      VALUES ($1, 'DELETE', $2::jsonb, NULL, $3, $4)
+      `,
+      [null, JSON.stringify(current), reason, manager.id]
+    );
+    await client.query("COMMIT");
+    return res.json({ success: true });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Removing Category" });
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/products", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM products ORDER BY product_name");
+    const result = await pool.query(`
+      SELECT
+        p.*,
+        pc.category_name,
+        COALESCE(stock.current_stock, 0) AS current_stock,
+        COALESCE(stock.lot_count, 0) AS lot_count
+      FROM products p
+      LEFT JOIN product_categories pc ON pc.id = p.category_id
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::INTEGER AS lot_count, SUM(remaining_qty) AS current_stock
+        FROM inventory_batches ib
+        WHERE ib.product_id = p.id
+          AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+      ) stock ON TRUE
+      ORDER BY COALESCE(pc.category_name, p.category, 'Fruit'), p.product_name
+    `);
     return res.json(result.rows);
   } catch (error) {
     console.error(error);
@@ -2825,42 +3057,90 @@ app.get("/products", async (req, res) => {
 });
 
 app.post("/products", async (req, res) => {
+  const client = await pool.connect();
   try {
-    const { product_name, selling_rate, unit, barcode, origin_type, category, minimum_stock, active, created_by } = req.body;
+    const { product_name, selling_rate, unit, barcode, origin_type, category, category_id, minimum_stock, active, created_by, remarks, branch_id } = req.body;
     const parsedSellingRate = parsePositiveNumber(selling_rate);
     const parsedMinimumStock = parseNonNegativeNumber(minimum_stock);
     const parsedOriginType = String(origin_type || "LOCAL").toUpperCase();
-    const rateManager = await requireRateManager(created_by);
+    const parsedUnit = normalizeProductUnit(unit);
+    const rateManager = await requireRateManager(created_by, client);
 
     if (!rateManager) return res.status(403).json({ message: "Only Owner or Admin can create owner-approved selling rates" });
-    if (!product_name?.trim() || !unit?.trim() || !parsedSellingRate || parsedMinimumStock === null || !["LOCAL", "IMPORTED"].includes(parsedOriginType)) {
+    if (!product_name?.trim() || !parsedUnit || !parsedSellingRate || parsedMinimumStock === null || !["LOCAL", "IMPORTED"].includes(parsedOriginType)) {
       return res.status(400).json({ message: "Enter valid product details" });
     }
-    const duplicateResult = await pool.query("SELECT id FROM products WHERE LOWER(product_name) = LOWER($1) LIMIT 1", [product_name.trim()]);
-    if (duplicateResult.rows.length > 0) return res.status(409).json({ message: "This product already exists." });
+    await client.query("BEGIN");
+    let selectedCategory = await getCategoryById(client, parsePositiveInteger(category_id));
+    if (!selectedCategory) {
+      selectedCategory = await findCategoryByName(client, category || "Fruit");
+    }
+    if (!selectedCategory) {
+      const categoryResult = await client.query(
+        "INSERT INTO product_categories (category_name, active, created_by, updated_by) VALUES ($1, TRUE, $2, $2) RETURNING *",
+        [cleanText(category || "Fruit"), rateManager.id]
+      );
+      selectedCategory = categoryResult.rows[0];
+    }
+    if (selectedCategory.active === false) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Selected category is inactive." });
+    }
+    const duplicateResult = await client.query("SELECT id FROM products WHERE LOWER(product_name) = LOWER($1) LIMIT 1", [product_name.trim()]);
+    if (duplicateResult.rows.length > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ message: "This product already exists." });
+    }
 
-    const result = await pool.query(
+    const result = await client.query(
       `
       INSERT INTO products (
-        product_name, selling_rate, unit, barcode, origin_type, category,
-        minimum_stock, active, selling_rate_updated_by
+        product_name, selling_rate, unit, barcode, origin_type, category, category_id,
+        minimum_stock, active, remarks, selling_rate_updated_by
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       RETURNING *
       `,
       [
-        product_name.trim(), parsedSellingRate, unit.trim(), barcode?.trim() || null, parsedOriginType,
-        category?.trim() || "Fruit", parsedMinimumStock, active !== false, rateManager.id,
+        product_name.trim(), parsedSellingRate, parsedUnit, barcode?.trim() || null, parsedOriginType,
+        selectedCategory.category_name, selectedCategory.id, parsedMinimumStock, active !== false,
+        nullableText(remarks), rateManager.id,
       ]
     );
-
-    return res.status(201).json(result.rows[0]);
+    const product = result.rows[0];
+    await client.query(
+      `
+      INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by)
+      VALUES ($1, 'CREATE', NULL, $2::jsonb, $3, $4)
+      `,
+      [product.id, JSON.stringify(product), "Product item created", rateManager.id]
+    );
+    const openingLots = Array.isArray(req.body.opening_stock_lots) ? req.body.opening_stock_lots : [];
+    const createdLots = [];
+    for (const lot of openingLots) {
+      const lotResult = await insertOpeningStockLot(client, {
+        product,
+        lot,
+        actorId: rateManager.id,
+        branchId: parsePositiveInteger(branch_id) || 1,
+      });
+      if (lotResult.error) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: lotResult.error });
+      }
+      createdLots.push(lotResult.batch);
+    }
+    await client.query("COMMIT");
+    return res.status(201).json({ ...product, opening_stock_lots: createdLots });
   } catch (error) {
+    await client.query("ROLLBACK");
     console.error(error);
     if (error.code === "23505") {
       return res.status(409).json({ message: "This product already exists." });
     }
     return res.status(500).json({ message: "Error Adding Product" });
+  } finally {
+    client.release();
   }
 });
 
@@ -2868,12 +3148,13 @@ app.put("/products/:id", async (req, res) => {
   const client = await pool.connect();
   try {
     const productId = parsePositiveInteger(req.params.id);
-    const { product_name, selling_rate, unit, barcode, origin_type, category, minimum_stock, active, updated_by, rate_change_reason } = req.body;
+    const { product_name, selling_rate, unit, barcode, origin_type, category, category_id, minimum_stock, active, updated_by, rate_change_reason, remarks } = req.body;
     const parsedSellingRate = parsePositiveNumber(selling_rate);
     const parsedMinimumStock = parseNonNegativeNumber(minimum_stock);
     const parsedOriginType = String(origin_type || "").toUpperCase();
+    const parsedUnit = normalizeProductUnit(unit);
 
-    if (!productId || !product_name?.trim() || !unit?.trim() || !parsedSellingRate || parsedMinimumStock === null || !["LOCAL", "IMPORTED"].includes(parsedOriginType)) {
+    if (!productId || !product_name?.trim() || !parsedUnit || !parsedSellingRate || parsedMinimumStock === null || !["LOCAL", "IMPORTED"].includes(parsedOriginType)) {
       return res.status(400).json({ message: "Enter valid product details" });
     }
 
@@ -2884,6 +3165,14 @@ app.put("/products/:id", async (req, res) => {
       return res.status(404).json({ message: "Product not found" });
     }
     const current = currentResult.rows[0];
+    let selectedCategory = await getCategoryById(client, parsePositiveInteger(category_id));
+    if (!selectedCategory) {
+      selectedCategory = await findCategoryByName(client, category || current.category || "Fruit");
+    }
+    if (!selectedCategory || selectedCategory.active === false) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Selected category is inactive or missing." });
+    }
     const duplicateResult = await client.query("SELECT id FROM products WHERE LOWER(product_name) = LOWER($1) AND id <> $2 LIMIT 1", [product_name.trim(), productId]);
     if (duplicateResult.rows.length > 0) {
       await client.query("ROLLBACK");
@@ -2901,16 +3190,17 @@ app.put("/products/:id", async (req, res) => {
       UPDATE products
       SET
         product_name = $1, selling_rate = $2, unit = $3, barcode = $4,
-        origin_type = $5, category = $6, minimum_stock = $7, active = $8,
+        origin_type = $5, category = $6, category_id = $7, minimum_stock = $8, active = $9,
+        remarks = $10,
         selling_rate_updated_at = CASE WHEN selling_rate <> $2 THEN CURRENT_TIMESTAMP ELSE selling_rate_updated_at END,
-        selling_rate_updated_by = CASE WHEN selling_rate <> $2 THEN $9 ELSE selling_rate_updated_by END
-      WHERE id = $10
+        selling_rate_updated_by = CASE WHEN selling_rate <> $2 THEN $11 ELSE selling_rate_updated_by END
+      WHERE id = $12
       RETURNING *
       `,
       [
-        product_name.trim(), parsedSellingRate, unit.trim(), barcode?.trim() || null,
-        parsedOriginType, category?.trim() || "Fruit", parsedMinimumStock, active !== false,
-        rateManager?.id || null, productId,
+        product_name.trim(), parsedSellingRate, parsedUnit, barcode?.trim() || null,
+        parsedOriginType, selectedCategory.category_name, selectedCategory.id, parsedMinimumStock, active !== false,
+        nullableText(remarks), rateManager?.id || null, productId,
       ]
     );
 
@@ -2939,6 +3229,46 @@ app.put("/products/:id", async (req, res) => {
       return res.status(409).json({ message: "This product already exists." });
     }
     return res.status(500).json({ message: "Error Updating Product" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/products/:id/opening-stock", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const productId = parsePositiveInteger(req.params.id);
+    const manager = await requireRateManager(req.body.created_by || req.body.updated_by, client);
+    const lots = Array.isArray(req.body.opening_stock_lots) ? req.body.opening_stock_lots : [req.body];
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can add opening stock" });
+    if (!productId || lots.length === 0) return res.status(400).json({ message: "Please add opening stock lots." });
+    await client.query("BEGIN");
+    const productResult = await client.query("SELECT * FROM products WHERE id = $1 AND active IS DISTINCT FROM FALSE FOR UPDATE", [productId]);
+    const product = productResult.rows[0];
+    if (!product) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Product not found" });
+    }
+    const createdLots = [];
+    for (const lot of lots) {
+      const lotResult = await insertOpeningStockLot(client, {
+        product,
+        lot,
+        actorId: manager.id,
+        branchId: parsePositiveInteger(req.body.branch_id) || 1,
+      });
+      if (lotResult.error) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: lotResult.error });
+      }
+      createdLots.push(lotResult.batch);
+    }
+    await client.query("COMMIT");
+    return res.status(201).json({ success: true, lots: createdLots });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Adding Opening Stock" });
   } finally {
     client.release();
   }
@@ -2997,8 +3327,14 @@ app.get("/inventory", async (req, res) => {
         ib.id,
         ib.product_id,
         p.product_name,
+        p.category,
+        p.category_id,
+        p.unit,
         p.barcode,
         ib.batch_no,
+        ib.lot_name,
+        ib.lot_size,
+        ib.stock_source,
         ib.purchase_qty,
         ib.remaining_qty,
         ib.purchase_rate,
@@ -3014,6 +3350,7 @@ app.get("/inventory", async (req, res) => {
         ib.balance_amount,
         ib.supplier_id,
         ib.supplier_name,
+        ib.remarks,
         ib.purchase_date
       FROM inventory_batches ib
       JOIN products p ON p.id = ib.product_id
@@ -3034,6 +3371,8 @@ app.get("/stock", async (req, res) => {
       SELECT
         p.id,
         p.product_name,
+        p.category,
+        p.category_id,
         p.barcode,
         p.unit,
         COALESCE(SUM(ib.remaining_qty), 0) AS current_stock
@@ -4568,9 +4907,13 @@ app.get("/reports/summary", async (req, res) => {
           p.remarks,
           pi.product_id,
           pr.product_name,
+          pr.category,
           pr.unit,
           pi.quantity,
+          COALESCE(pi.lot_name, p.lot_name, ib.lot_name) AS lot_name,
+          COALESCE(pi.lot_size, p.lot_size, ib.lot_size) AS lot_size,
           ib.batch_no,
+          ib.stock_source,
           ib.remaining_qty
         FROM purchases p
         LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
@@ -4591,7 +4934,11 @@ app.get("/reports/summary", async (req, res) => {
           ib.purchase_id,
           ib.supplier_name,
           p.product_name,
+          p.category,
           p.unit,
+          ib.lot_name,
+          ib.lot_size,
+          ib.stock_source,
           ib.purchase_qty,
           ib.remaining_qty,
           ib.temporary_sale_rate,
@@ -4681,14 +5028,18 @@ app.get("/reports/summary", async (req, res) => {
           pi.product_id,
           pi.quantity,
           pi.purchase_rate,
+          COALESCE(pi.lot_name, p.lot_name, ib.lot_name) AS lot_name,
+          COALESCE(pi.lot_size, p.lot_size, ib.lot_size) AS lot_size,
           pi.basic_amount AS item_basic_amount,
           pi.net_payable AS item_net_payable,
           pi.effective_cost_per_unit,
           pr.product_name,
+          pr.category,
           pr.unit,
           pr.origin_type,
           ib.id AS inventory_batch_id,
           ib.batch_no,
+          ib.stock_source,
           ib.purchase_qty AS batch_purchase_qty,
           ib.remaining_qty AS batch_remaining_qty,
           ib.batch_status
@@ -5282,6 +5633,7 @@ app.get("/reports/summary", async (req, res) => {
       pool.query(
         `
         SELECT
+          p.category,
           p.product_name,
           p.unit,
           SUM(pi.quantity) AS quantity_purchased,
@@ -5293,7 +5645,7 @@ app.get("/reports/summary", async (req, res) => {
         JOIN products p ON p.id = pi.product_id
         WHERE COALESCE(pur.purchase_status, 'ACTIVE') <> 'CANCELLED'
           AND pur.purchase_date BETWEEN $1 AND $2
-        GROUP BY p.product_name, p.unit
+        GROUP BY p.category, p.product_name, p.unit
         ORDER BY quantity_purchased DESC, net_purchase DESC
         `,
         [dateFrom, dateTo]
@@ -6116,6 +6468,8 @@ const readPurchaseEntryPayload = (body) => {
     purchaseDate: isDateInput(body.purchase_date || body.arrival_date) ? (body.purchase_date || body.arrival_date) : toDateKey(new Date()),
     billNumber: nullableText(body.bill_number),
     billDate: isDateInput(body.bill_date) ? body.bill_date : null,
+    lotName: nullableText(body.lot_name || body.lot_number),
+    lotSize: nullableText(body.lot_size || body.size_grade || body.size),
     branchId: parsePositiveInteger(body.branch_id),
     actorId: parsePositiveInteger(body.created_by || body.edited_by) || 1,
     remarks: nullableText(body.remarks),
@@ -6206,6 +6560,93 @@ const buildPurchaseFinancials = async (client, entry) => {
       paymentStatus,
     },
   };
+};
+
+const getCategoryById = async (client, categoryId) => {
+  if (!categoryId) return null;
+  const result = await client.query("SELECT * FROM product_categories WHERE id = $1 AND active = TRUE", [categoryId]);
+  return result.rows[0] || null;
+};
+
+const findCategoryByName = async (client, categoryName) => {
+  const name = cleanText(categoryName);
+  if (!name) return null;
+  const result = await client.query("SELECT * FROM product_categories WHERE LOWER(category_name) = LOWER($1)", [name]);
+  return result.rows[0] || null;
+};
+
+const insertOpeningStockLot = async (client, { product, lot, actorId, branchId }) => {
+  const quantity = parsePositiveNumber(lot.quantity);
+  const purchaseRate = parsePositiveNumber(lot.purchase_rate || lot.opening_cost);
+  const saleRate = parsePositiveNumber(lot.sale_rate) || Number(product.selling_rate || 0);
+  const lotName = cleanText(lot.lot_name || lot.lot_number || "Opening Stock Lot");
+  const lotSize = nullableText(lot.lot_size || lot.size_grade || lot.size);
+  const openingDate = isDateInput(lot.opening_stock_date || lot.purchase_date) ? (lot.opening_stock_date || lot.purchase_date) : toDateKey(new Date());
+  const supplierId = parsePositiveInteger(lot.supplier_id);
+  const supplierName = nullableText(lot.supplier_name);
+  const remarks = nullableText(lot.remarks) || "Opening stock";
+  if (!quantity) return { error: "Please enter lot quantity." };
+  if (!purchaseRate) return { error: "Please enter opening stock rate." };
+  if (!lotName) return { error: "Please enter lot name / size." };
+
+  const duplicateResult = await client.query(
+    `
+    SELECT id
+    FROM inventory_batches
+    WHERE product_id = $1
+      AND LOWER(COALESCE(lot_name, '')) = LOWER($2)
+      AND COALESCE(purchase_date, created_at::date) = $3
+      AND COALESCE(supplier_id, 0) = COALESCE($4, 0)
+      AND COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'
+    LIMIT 1
+    `,
+    [product.id, lotName, openingDate, supplierId]
+  );
+  if (duplicateResult.rows.length > 0) return { error: "Duplicate lot name already exists for this item/date/supplier." };
+
+  const batchNo = `OPEN-${Date.now()}-${product.id}-${Math.floor(Math.random() * 10000)}`;
+  const netPayable = roundCurrency(quantity * purchaseRate);
+  const batchResult = await client.query(
+    `
+    INSERT INTO inventory_batches (
+      product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
+      supplier_id, supplier_name, branch_id, gross_amount, net_payable, balance_amount,
+      batch_status, purchase_bill_status, temporary_sale_rate, lot_name, lot_size,
+      stock_source, remarks, purchase_date
+    )
+    VALUES ($1, $2, $3, $3, $4, $4, $5, $6, $7, $8, $8, 0, 'ACTIVE', 'BILL_COMPLETED', $9, $10, $11, 'OPENING_STOCK', $12, $13)
+    RETURNING *
+    `,
+    [
+      product.id, batchNo, quantity, purchaseRate, supplierId, supplierName,
+      branchId || 1, netPayable, saleRate, lotName, lotSize, remarks, openingDate,
+    ]
+  );
+  await client.query(
+    `
+    INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id)
+    VALUES ($1, $2, 'IN', $3, $4, $5)
+    `,
+    [product.id, quantity, `Opening stock ${lotName}`, actorId || null, branchId || 1]
+  );
+  if (saleRate > 0 && Number(product.selling_rate || 0) !== saleRate) {
+    await client.query(
+      "UPDATE products SET selling_rate = $1, selling_rate_updated_at = CURRENT_TIMESTAMP, selling_rate_updated_by = $2 WHERE id = $3",
+      [saleRate, actorId || null, product.id]
+    );
+    await client.query(
+      "INSERT INTO sale_rate_history (product_id, old_selling_rate, new_selling_rate, changed_by, reason) VALUES ($1, $2, $3, $4, $5)",
+      [product.id, product.selling_rate || 0, saleRate, actorId || 1, `Opening stock sale rate for ${lotName}`]
+    );
+  }
+  await client.query(
+    `
+    INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by)
+    VALUES ($1, 'OPENING_STOCK', NULL, $2::jsonb, $3, $4)
+    `,
+    [product.id, JSON.stringify(batchResult.rows[0]), remarks, actorId || null]
+  );
+  return { batch: batchResult.rows[0] };
 };
 
 const getPurchasePartiesForArrival = async (client, entry) => {
@@ -6302,10 +6743,17 @@ app.get("/purchases", async (req, res) => {
         pi.product_id,
         pi.quantity,
         pi.purchase_rate,
+        pi.lot_name AS item_lot_name,
+        pi.lot_size AS item_lot_size,
         pr.product_name,
+        pr.category,
+        pr.category_id,
         pr.unit,
         ib.id AS inventory_batch_id,
         ib.batch_no,
+        ib.lot_name,
+        ib.lot_size,
+        ib.stock_source,
         ib.purchase_qty AS batch_purchase_qty,
         ib.remaining_qty AS batch_remaining_qty,
         ib.batch_status
@@ -6555,6 +7003,8 @@ app.post("/purchase-bill", async (req, res) => {
       purchase_rate: item.purchase_rate,
       expected_purchase_rate: item.expected_purchase_rate,
       temporary_sale_rate: item.temporary_sale_rate,
+      lot_name: item.lot_name,
+      lot_size: item.lot_size,
       remarks: cleanText(item.remarks) || baseEntry.remarks,
       paid_amount: 0,
       purchase_type: baseEntry.purchaseBillStatus === "BILL_COMPLETED" ? "CREDIT" : "PENDING_BILL",
@@ -6587,15 +7037,15 @@ app.post("/purchase-bill", async (req, res) => {
             basic_amount, gross_amount, net_payable, paid_amount, balance_amount,
             effective_cost_per_unit, purchase_type, payment_status, purchase_date,
             remarks, purchase_bill_status, temporary_sale_rate, expected_purchase_rate,
-            bill_number, bill_date
+            bill_number, bill_date, lot_name, lot_size, stock_source
           )
-          VALUES ($1, $2, 0, $3, $4, 0, 0, 0, 0, 0, $5, 'PENDING_BILL', 'BILL_PENDING', $6, $7, 'BILL_PENDING', $8, $9, $10, $11)
+          VALUES ($1, $2, 0, $3, $4, 0, 0, 0, 0, 0, $5, 'PENDING_BILL', 'BILL_PENDING', $6, $7, 'BILL_PENDING', $8, $9, $10, $11, $12, $13, 'PURCHASE')
           RETURNING *
           `,
           [
             arrival.supplier.id, arrival.supplier.supplier_name, entry.branchId, entry.actorId,
             provisionalCost, entry.purchaseDate, entry.remarks, entry.temporarySaleRate, provisionalCost,
-            entry.billNumber, entry.billDate,
+            entry.billNumber, entry.billDate, entry.lotName, entry.lotSize,
           ]
         );
         const purchase = purchaseResult.rows[0];
@@ -6603,11 +7053,11 @@ app.post("/purchase-bill", async (req, res) => {
           `
           INSERT INTO purchase_items (
             purchase_id, product_id, quantity, purchase_rate, amount, basic_amount,
-            net_payable, effective_cost_per_unit
+            net_payable, effective_cost_per_unit, lot_name, lot_size
           )
-          VALUES ($1, $2, $3, $4, $5, 0, 0, $4)
+          VALUES ($1, $2, $3, $4, $5, 0, 0, $4, $6, $7)
           `,
-          [purchase.id, entry.productId, entry.quantity, provisionalCost, provisionalAmount]
+          [purchase.id, entry.productId, entry.quantity, provisionalCost, provisionalAmount, entry.lotName, entry.lotSize]
         );
         const batchNo = `PENDING-${Date.now()}-${purchase.id}`;
         await client.query(
@@ -6615,13 +7065,15 @@ app.post("/purchase-bill", async (req, res) => {
           INSERT INTO inventory_batches (
             product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
             supplier_id, supplier_name, branch_id, gross_amount, net_payable, balance_amount,
-            purchase_id, batch_status, purchase_bill_status, temporary_sale_rate
+            purchase_id, batch_status, purchase_bill_status, temporary_sale_rate, lot_name, lot_size,
+            stock_source, remarks, purchase_date
           )
-          VALUES ($1, $2, $3, $3, $4, $4, $5, $6, $7, 0, 0, 0, $8, 'ACTIVE', 'BILL_PENDING', $9)
+          VALUES ($1, $2, $3, $3, $4, $4, $5, $6, $7, 0, 0, 0, $8, 'ACTIVE', 'BILL_PENDING', $9, $10, $11, 'PURCHASE', $12, $13)
           `,
           [
             entry.productId, batchNo, entry.quantity, provisionalCost, arrival.supplier.id,
             arrival.supplier.supplier_name, entry.branchId, purchase.id, entry.temporarySaleRate,
+            entry.lotName, entry.lotSize, entry.remarks, entry.purchaseDate,
           ]
         );
         await client.query(
@@ -6711,9 +7163,10 @@ app.post("/purchase-bill", async (req, res) => {
           rebate_percent, rebate_amount, net_payable, paid_amount, balance_amount,
           payment_timing, effective_cost_per_unit, freight_charges, labour_charges,
           rebate_rule_id, payment_due_days, payment_status, payment_date,
-          purchase_type, payment_mode, payment_reference_number, remarks, purchase_bill_status, bill_number, bill_date
+          purchase_type, payment_mode, payment_reference_number, remarks, purchase_bill_status, bill_number, bill_date,
+          lot_name, lot_size, stock_source
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, 'BILL_COMPLETED', $28, $29)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, 'BILL_COMPLETED', $28, $29, $30, $31, 'PURCHASE')
         RETURNING *
         `,
         [
@@ -6723,7 +7176,7 @@ app.post("/purchase-bill", async (req, res) => {
           rebateRule.rule_name, financials.effectiveCostPerUnit, entry.freightCharges, entry.labourCharges,
           rebateRule.id, rebateRule.pay_within_days, financials.paymentStatus, baseEntry.purchaseType === "CREDIT" ? null : baseEntry.paymentDate,
           baseEntry.purchaseType, baseEntry.purchaseType === "CASH" ? baseEntry.paymentMode : null, baseEntry.purchaseType === "CASH" ? baseEntry.paymentReferenceNumber : null,
-          entry.remarks, entry.billNumber, entry.billDate,
+          entry.remarks, entry.billNumber, entry.billDate, entry.lotName, entry.lotSize,
         ]
       );
       const purchase = purchaseResult.rows[0];
@@ -6732,14 +7185,14 @@ app.post("/purchase-bill", async (req, res) => {
         INSERT INTO purchase_items (
           purchase_id, product_id, quantity, purchase_rate, amount, basic_amount,
           mandi_tax_amount, other_charges, rebate_amount, net_payable, effective_cost_per_unit,
-          freight_charges, labour_charges
+          freight_charges, labour_charges, lot_name, lot_size
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         `,
         [
           purchase.id, entry.productId, entry.quantity, entry.purchaseRate, financials.netPayable, financials.basicAmount,
           financials.mandiTaxAmount, entry.otherCharges, financials.rebateAmount, financials.netPayable, financials.effectiveCostPerUnit,
-          entry.freightCharges, entry.labourCharges,
+          entry.freightCharges, entry.labourCharges, entry.lotName, entry.lotSize,
         ]
       );
       const batchNo = `BATCH-${Date.now()}-${purchase.id}`;
@@ -6749,15 +7202,15 @@ app.post("/purchase-bill", async (req, res) => {
           product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
           supplier_id, supplier_name, branch_id, mandi_tax_amount, freight_charges, labour_charges,
           other_charges, gross_amount, rebate_amount, net_payable, payment_timing, balance_amount,
-          purchase_id, batch_status, purchase_bill_status
+          purchase_id, batch_status, purchase_bill_status, lot_name, lot_size, stock_source, remarks, purchase_date
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'ACTIVE', 'BILL_COMPLETED')
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'ACTIVE', 'BILL_COMPLETED', $20, $21, 'PURCHASE', $22, $23)
         `,
         [
           entry.productId, batchNo, entry.quantity, entry.quantity, entry.purchaseRate, financials.effectiveCostPerUnit,
           supplier.id, supplier.supplier_name, entry.branchId, financials.mandiTaxAmount, entry.freightCharges, entry.labourCharges,
           entry.otherCharges, financials.grossAmount, financials.rebateAmount, financials.netPayable, rebateRule.rule_name,
-          financials.balanceAmount, purchase.id,
+          financials.balanceAmount, purchase.id, entry.lotName, entry.lotSize, entry.remarks, entry.purchaseDate,
         ]
       );
       await client.query(
@@ -6876,23 +7329,24 @@ app.put("/purchase/:id", async (req, res) => {
         SET supplier_id = $1, supplier_name = $2, branch_id = $3, purchase_date = $4,
             remarks = $5, temporary_sale_rate = $6, expected_purchase_rate = $7,
             effective_cost_per_unit = $7, edited_by = $8, edited_at = CURRENT_TIMESTAMP,
-            edit_reason = $9
+            edit_reason = $9, lot_name = $11, lot_size = $12
         WHERE id = $10
         RETURNING *
         `,
         [
           arrival.supplier.id, arrival.supplier.supplier_name, entry.branchId, entry.purchaseDate,
           entry.remarks, entry.temporarySaleRate, provisionalCost, manager.id, reason, purchaseId,
+          entry.lotName, entry.lotSize,
         ]
       );
       await client.query(
         `
         UPDATE purchase_items
         SET product_id = $1, quantity = $2, purchase_rate = $3,
-            amount = $4, effective_cost_per_unit = $3
+            amount = $4, effective_cost_per_unit = $3, lot_name = $6, lot_size = $7
         WHERE id = $5
         `,
-        [entry.productId, entry.quantity, provisionalCost, roundCurrency(entry.quantity * provisionalCost), oldItem.id]
+        [entry.productId, entry.quantity, provisionalCost, roundCurrency(entry.quantity * provisionalCost), oldItem.id, entry.lotName, entry.lotSize]
       );
       const batchUpdateResult = await client.query(
         `
@@ -6900,14 +7354,15 @@ app.put("/purchase/:id", async (req, res) => {
         SET product_id = $1, purchase_qty = $2, remaining_qty = $3,
             purchase_rate = $4, effective_cost_per_unit = $4,
             supplier_id = $5, supplier_name = $6, branch_id = $7,
-            purchase_bill_status = 'BILL_PENDING', temporary_sale_rate = $8
+            purchase_bill_status = 'BILL_PENDING', temporary_sale_rate = $8,
+            lot_name = $10, lot_size = $11, remarks = $12, purchase_date = $13
         WHERE id = $9
         RETURNING *
         `,
         [
           entry.productId, entry.quantity, nextRemainingForPending, provisionalCost,
           arrival.supplier.id, arrival.supplier.supplier_name, entry.branchId,
-          entry.temporarySaleRate, batch.id,
+          entry.temporarySaleRate, batch.id, entry.lotName, entry.lotSize, entry.remarks, entry.purchaseDate,
         ]
       );
       await client.query(
@@ -6969,7 +7424,8 @@ app.put("/purchase/:id", async (req, res) => {
           purchase_type = $23, payment_mode = $24, payment_reference_number = $25,
           remarks = $26, purchase_status = 'EDITED', edited_by = $27,
           edited_at = CURRENT_TIMESTAMP, edit_reason = $28,
-          purchase_bill_status = 'BILL_COMPLETED', bill_number = $29, bill_date = $30
+          purchase_bill_status = 'BILL_COMPLETED', bill_number = $29, bill_date = $30,
+          lot_name = $32, lot_size = $33, stock_source = 'PURCHASE'
       WHERE id = $31
       RETURNING *
       `,
@@ -6985,6 +7441,7 @@ app.put("/purchase/:id", async (req, res) => {
         entry.purchaseType, entry.purchaseType === "CASH" ? entry.paymentMode : null,
         entry.purchaseType === "CASH" ? entry.paymentReferenceNumber : null,
         entry.remarks, manager.id, reason, entry.billNumber, entry.billDate, purchaseId,
+        entry.lotName, entry.lotSize,
       ]
     );
 
@@ -6994,14 +7451,14 @@ app.put("/purchase/:id", async (req, res) => {
       SET product_id = $1, quantity = $2, purchase_rate = $3, amount = $4,
           basic_amount = $5, mandi_tax_amount = $6, other_charges = $7,
           rebate_amount = $8, net_payable = $9, effective_cost_per_unit = $10,
-          freight_charges = $11, labour_charges = $12
+          freight_charges = $11, labour_charges = $12, lot_name = $14, lot_size = $15
       WHERE id = $13
       `,
       [
         entry.productId, entry.quantity, entry.purchaseRate, financials.netPayable,
         financials.basicAmount, financials.mandiTaxAmount, entry.otherCharges,
         financials.rebateAmount, financials.netPayable, financials.effectiveCostPerUnit,
-        entry.freightCharges, entry.labourCharges, oldItem.id,
+        entry.freightCharges, entry.labourCharges, oldItem.id, entry.lotName, entry.lotSize,
       ]
     );
 
@@ -7014,7 +7471,8 @@ app.put("/purchase/:id", async (req, res) => {
           freight_charges = $11, labour_charges = $12, other_charges = $13,
           gross_amount = $14, rebate_amount = $15, net_payable = $16,
           payment_timing = $17, balance_amount = $18, batch_status = 'ACTIVE',
-          purchase_bill_status = 'BILL_COMPLETED'
+          purchase_bill_status = 'BILL_COMPLETED', lot_name = $20, lot_size = $21,
+          stock_source = 'PURCHASE', remarks = $22, purchase_date = $23
       WHERE id = $19
       RETURNING *
       `,
@@ -7024,6 +7482,7 @@ app.put("/purchase/:id", async (req, res) => {
         financials.mandiTaxAmount, entry.freightCharges, entry.labourCharges, entry.otherCharges,
         financials.grossAmount, financials.rebateAmount, financials.netPayable,
         rebateRule.rule_name, financials.balanceAmount, batch.id,
+        entry.lotName, entry.lotSize, entry.remarks, entry.purchaseDate,
       ]
     );
 
@@ -7135,7 +7594,8 @@ app.post("/purchase/:id/complete-bill", async (req, res) => {
           purchase_type = $23, payment_mode = $24, payment_reference_number = $25,
           remarks = $26, purchase_status = 'ACTIVE', purchase_bill_status = 'BILL_COMPLETED',
           bill_number = $27, bill_date = $28, edited_by = $29,
-          edited_at = CURRENT_TIMESTAMP, edit_reason = $30
+          edited_at = CURRENT_TIMESTAMP, edit_reason = $30,
+          lot_name = $32, lot_size = $33, stock_source = 'PURCHASE'
       WHERE id = $31
       RETURNING *
       `,
@@ -7152,6 +7612,7 @@ app.post("/purchase/:id/complete-bill", async (req, res) => {
         entry.purchaseType === "CASH" ? entry.paymentReferenceNumber : null,
         entry.remarks, entry.billNumber, entry.billDate, manager.id,
         cleanText(req.body.reason) || "Pending purchase bill completed", purchaseId,
+        entry.lotName, entry.lotSize,
       ]
     );
     await client.query(
@@ -7160,14 +7621,14 @@ app.post("/purchase/:id/complete-bill", async (req, res) => {
       SET product_id = $1, quantity = $2, purchase_rate = $3, amount = $4,
           basic_amount = $5, mandi_tax_amount = $6, other_charges = $7,
           rebate_amount = $8, net_payable = $9, effective_cost_per_unit = $10,
-          freight_charges = $11, labour_charges = $12
+          freight_charges = $11, labour_charges = $12, lot_name = $14, lot_size = $15
       WHERE id = $13
       `,
       [
         entry.productId, entry.quantity, entry.purchaseRate, financials.netPayable,
         financials.basicAmount, financials.mandiTaxAmount, entry.otherCharges,
         financials.rebateAmount, financials.netPayable, financials.effectiveCostPerUnit,
-        entry.freightCharges, entry.labourCharges, oldItem.id,
+        entry.freightCharges, entry.labourCharges, oldItem.id, entry.lotName, entry.lotSize,
       ]
     );
     const batchUpdateResult = await client.query(
@@ -7179,7 +7640,8 @@ app.post("/purchase/:id/complete-bill", async (req, res) => {
           freight_charges = $10, labour_charges = $11, other_charges = $12,
           gross_amount = $13, rebate_amount = $14, net_payable = $15,
           payment_timing = $16, balance_amount = $17, purchase_bill_status = 'BILL_COMPLETED',
-          temporary_sale_rate = 0
+          temporary_sale_rate = 0, lot_name = $19, lot_size = $20,
+          stock_source = 'PURCHASE', remarks = $21, purchase_date = $22
       WHERE id = $18
       RETURNING *
       `,
@@ -7188,6 +7650,7 @@ app.post("/purchase/:id/complete-bill", async (req, res) => {
         supplier.id, supplier.supplier_name, entry.branchId, financials.mandiTaxAmount,
         entry.freightCharges, entry.labourCharges, entry.otherCharges, financials.grossAmount,
         financials.rebateAmount, financials.netPayable, rebateRule.rule_name, financials.balanceAmount, batch.id,
+        entry.lotName, entry.lotSize, entry.remarks, entry.purchaseDate,
       ]
     );
     await client.query(
