@@ -96,6 +96,7 @@ const PERMISSION_KEYS = [
   "billing",
   "manual_pos_rate_override",
   "pos_date_override",
+  "sale_date_edit",
 ];
 
 const cleanText = (value) => (typeof value === "string" ? value.trim() : "");
@@ -507,6 +508,9 @@ const initializeDatabase = async () => {
     ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS default_printer_type VARCHAR(20) DEFAULT 'THERMAL';
     ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS receipt_width VARCHAR(10) DEFAULT '80MM';
     ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS auto_print_after_billing BOOLEAN DEFAULT FALSE;
+    ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS default_invoice_print VARCHAR(30) DEFAULT 'THERMAL_RECEIPT';
+    ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS default_report_print VARCHAR(30) DEFAULT 'A4_REPORT';
+    ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS show_print_preview_before_print BOOLEAN DEFAULT TRUE;
     ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS show_item_discount_column_pos BOOLEAN DEFAULT TRUE;
     ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS show_item_discount_column_receipt BOOLEAN DEFAULT TRUE;
     ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS show_bill_discount_row_receipt BOOLEAN DEFAULT TRUE;
@@ -848,6 +852,10 @@ const initializeDatabase = async () => {
     WHERE role_name IN ('Owner', 'Admin');
 
     UPDATE role_permission_settings
+    SET permissions = permissions || '{"sale_date_edit":true}'::jsonb
+    WHERE role_name IN ('Owner', 'Admin');
+
+    UPDATE role_permission_settings
     SET permissions = permissions || '{"manual_pos_rate_override":false}'::jsonb
     WHERE role_name IN ('Cashier', 'Purchase Manager', 'Inventory Manager')
       AND NOT (permissions ? 'manual_pos_rate_override');
@@ -856,6 +864,11 @@ const initializeDatabase = async () => {
     SET permissions = permissions || '{"pos_date_override":false}'::jsonb
     WHERE role_name IN ('Cashier', 'Purchase Manager', 'Inventory Manager')
       AND NOT (permissions ? 'pos_date_override');
+
+    UPDATE role_permission_settings
+    SET permissions = permissions || '{"sale_date_edit":false}'::jsonb
+    WHERE role_name IN ('Cashier', 'Purchase Manager', 'Inventory Manager')
+      AND NOT (permissions ? 'sale_date_edit');
 
     INSERT INTO branches (id, branch_name, location)
     VALUES (1, 'Main Branch', 'Primary Store')
@@ -2454,7 +2467,10 @@ app.put("/settings/business", async (req, res) => {
         show_item_discount_column_receipt = $14,
         show_bill_discount_row_receipt = $15,
         hide_zero_discount_rows = $16,
-        updated_by = $17,
+        default_invoice_print = $17,
+        default_report_print = $18,
+        show_print_preview_before_print = $19,
+        updated_by = $20,
         updated_at = CURRENT_TIMESTAMP
       WHERE id = 1
       RETURNING *
@@ -2476,6 +2492,9 @@ app.put("/settings/business", async (req, res) => {
         req.body.show_item_discount_column_receipt !== false,
         req.body.show_bill_discount_row_receipt !== false,
         req.body.hide_zero_discount_rows !== false,
+        cleanText(req.body.default_invoice_print).toUpperCase() === "A4_INVOICE" ? "A4_INVOICE" : "THERMAL_RECEIPT",
+        "A4_REPORT",
+        req.body.show_print_preview_before_print !== false,
         manager.id,
       ]
     );
@@ -8852,6 +8871,17 @@ app.put("/sales/:id", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Cancelled invoices cannot be edited" });
     }
+    const requestedSaleDate = req.body.bill_date || req.body.sale_date
+      ? toBusinessDateKey(req.body.bill_date || req.body.sale_date)
+      : toDateKey(currentSale.sale_date);
+    if (requestedSaleDate !== toDateKey(currentSale.sale_date)) {
+      const dateEditor = await getPermissionUser(editor.id, "sale_date_edit", ["Owner", "Admin"], client);
+      if (!dateEditor) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ message: "You do not have permission to edit bill date" });
+      }
+    }
+    const editedInvoiceNo = `FZ-${requestedSaleDate.replaceAll("-", "")}-${String(saleId).padStart(6, "0")}`;
 
     const oldSnapshot = await getSaleSnapshot(client, saleId);
     await restoreSaleInventory(client, saleId, editor.id, "Edit reversal for invoice", "IN");
@@ -8895,11 +8925,15 @@ app.put("/sales/:id", async (req, res) => {
         discount_rule_type = $16,
         discount_rule_value = $17,
         discount_rule_payment_mode = $18,
+        sale_date = $19,
+        transaction_date = $19,
+        bill_datetime = COALESCE($22::timestamp, bill_datetime),
+        invoice_no = $24,
         sale_status = 'EDITED',
-        edited_by = $19,
+        edited_by = $20,
         edited_at = CURRENT_TIMESTAMP,
-        edit_reason = $20
-      WHERE id = $21
+        edit_reason = $21
+      WHERE id = $23
       RETURNING *
       `,
       [
@@ -8908,7 +8942,13 @@ app.put("/sales/:id", async (req, res) => {
         salePayload.grossAmount, salePayload.itemDiscountAmount, salePayload.invoiceDiscountAmount, salePayload.taxAmount,
         salePayload.discountRule?.id || null, salePayload.discountRule?.rule_name || null,
         salePayload.discountRule?.discount_type || null, salePayload.discountRule?.discount_value || 0,
-        salePayload.discountRule?.payment_mode || null, editor.id, reason, saleId,
+        salePayload.discountRule?.payment_mode || null,
+        requestedSaleDate,
+        editor.id,
+        reason,
+        req.body.bill_datetime || `${requestedSaleDate}T00:00`,
+        saleId,
+        editedInvoiceNo,
       ]
     );
     const updatedSale = updateResult.rows[0];

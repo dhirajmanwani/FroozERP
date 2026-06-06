@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
+import html2canvas from "html2canvas";
+import { jsPDF } from "jspdf";
 import QRCode from "qrcode";
 import "./App.css";
 
@@ -59,6 +61,47 @@ const getErrorMessage = (error, fallback) =>
 
 const toDateKey = (date) =>
   typeof date === "string" ? date.slice(0, 10) : date.toLocaleDateString("en-CA");
+const formatDisplayDate = (dateValue) => {
+  const key = toDateKey(dateValue || "");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(key)) return key || "-";
+  const [year, month, day] = key.split("-");
+  return `${day}/${month}/${year}`;
+};
+const formatFileDate = (dateValue) => formatDisplayDate(dateValue).replaceAll("/", "-");
+const safeFileName = (value) =>
+  String(value || "FroozERP_Document")
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "")
+    .replace(/\s+/g, "_")
+    .replace(/_+/g, "_")
+    .slice(0, 140);
+const withDocumentTitle = (fileName, action) => {
+  const previousTitle = document.title;
+  document.title = safeFileName(fileName).replace(/\.pdf$/i, "");
+  action();
+  setTimeout(() => {
+    document.title = previousTitle;
+  }, 1000);
+};
+const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth = "80MM", save = true }) => {
+  if (!element) throw new Error("Nothing to export");
+  const canvas = await html2canvas(element, {
+    backgroundColor: "#ffffff",
+    scale: 2,
+    useCORS: true,
+    scrollX: 0,
+    scrollY: -window.scrollY,
+  });
+  const imgData = canvas.toDataURL("image/png");
+  const isThermal = mode === "THERMAL";
+  const pageWidth = isThermal ? (receiptWidth === "58MM" ? 58 : 80) : 210;
+  const pageHeight = isThermal ? Math.max(120, (canvas.height * pageWidth) / canvas.width) : 297;
+  const pdf = new jsPDF("p", "mm", isThermal ? [pageWidth, pageHeight] : "a4");
+  const imgHeight = (canvas.height * pageWidth) / canvas.width;
+  pdf.addImage(imgData, "PNG", 0, 0, pageWidth, imgHeight);
+  const finalFileName = safeFileName(fileName).replace(/\.pdf$/i, "") + ".pdf";
+  if (save) pdf.save(finalFileName);
+  return { blob: pdf.output("blob"), fileName: finalFileName, pdf };
+};
 
 const supplierPaymentModes = [
   ["CASH", "Cash"],
@@ -182,6 +225,9 @@ const defaultBusinessSettings = {
   default_printer_type: "THERMAL",
   receipt_width: "80MM",
   auto_print_after_billing: false,
+  default_invoice_print: "THERMAL_RECEIPT",
+  default_report_print: "A4_REPORT",
+  show_print_preview_before_print: true,
   show_item_discount_column_pos: true,
   show_item_discount_column_receipt: true,
   show_bill_discount_row_receipt: true,
@@ -2154,7 +2200,7 @@ function App() {
                 {salesHistory.map((sale) => (
                   <tr key={sale.id}>
                     <td><span className="batch-id">{sale.invoice_no || `#${sale.id}`}</span></td>
-                    <td>{sale.sale_date}</td>
+                    <td>{formatDisplayDate(sale.sale_date)}</td>
                     <td><span className={sale.sale_status === "CANCELLED" ? "stock-low" : sale.sale_status === "EDITED" ? "origin-rate" : "stock-ok"}>{sale.sale_status || "COMPLETED"}</span></td>
                     <td>{sale.customer_name || "Walk-in Customer"}</td>
                     <td className="primary-cell">
@@ -2239,6 +2285,7 @@ function App() {
             await Promise.all([loadSalesHistory(), loadDashboardData()]);
           }}
           products={products.filter((product) => product.active !== false)}
+          canSaleDateEdit={hasRolePermission("sale_date_edit")}
           user={user}
         />
       )}
@@ -2248,13 +2295,13 @@ function App() {
   );
 }
 
-function ReportToolbar({ onPdfExport, onPrint, title }) {
+function ReportToolbar({ exporting = false, onPdfExport, onPrint, title }) {
   return (
     <div className="report-toolbar no-print">
       <strong>{title}</strong>
       <div className="button-row">
         <button className="secondary-button" onClick={onPrint}><Icon name="print" /> Print</button>
-        <button className="secondary-button" onClick={onPdfExport || onPrint}>PDF Export</button>
+        <button className="secondary-button" disabled={exporting} onClick={onPdfExport || onPrint}>{exporting ? "Exporting..." : "PDF Export"}</button>
       </div>
     </div>
   );
@@ -2317,32 +2364,42 @@ function UserProfilePanel({ onClose, onLogout, user }) {
   );
 }
 
-function PrintableReport({ beforePdfExport, beforePrint, children, reportClassName = "", title }) {
+function PrintableReport({ beforePdfExport, beforePrint, children, fileName, reportClassName = "", title }) {
   const [printTarget, setPrintTarget] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const reportRef = useRef(null);
   const printReport = () => {
     if (beforePrint && beforePrint() === false) return;
     setTimeout(() => {
       setPrintTarget(true);
       setTimeout(() => {
-        window.print();
+        withDocumentTitle(fileName || title, () => window.print());
         setTimeout(() => setPrintTarget(false), 250);
       }, 50);
     }, 0);
   };
-  const exportReport = () => {
+  const exportReport = async () => {
     if (beforePdfExport && beforePdfExport() === false) return;
-    setTimeout(() => {
-      setPrintTarget(true);
-      setTimeout(() => {
-        window.print();
-        setTimeout(() => setPrintTarget(false), 250);
-      }, 50);
-    }, 0);
+    setPrintTarget(true);
+    setExporting(true);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      await exportElementToPdf({
+        element: reportRef.current,
+        fileName: fileName || `${title}.pdf`,
+        mode: "A4",
+      });
+    } catch (error) {
+      alert(`Unable to export PDF: ${error.message}`);
+    } finally {
+      setExporting(false);
+      setPrintTarget(false);
+    }
   };
   return (
     <section className={`print-section ${reportClassName} ${printTarget ? "print-target" : ""}`}>
-      <ReportToolbar onPdfExport={exportReport} onPrint={printReport} title={title} />
-      <div className="print-area report-paper">
+      <ReportToolbar exporting={exporting} onPdfExport={exportReport} onPrint={printReport} title={title} />
+      <div ref={reportRef} className="print-area report-paper">
         <header className="report-print-header">
           <BrandLogo invoice />
           <div>
@@ -2408,8 +2465,8 @@ function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEd
           {supplierSummaries.map((summary) => (
             <tr key={summary.key}>
               <td className="primary-cell">{summary.supplier_name}</td>
-              <td>{summary.from}</td>
-              <td>{summary.to}</td>
+              <td>{formatDisplayDate(summary.from)}</td>
+              <td>{formatDisplayDate(summary.to)}</td>
               <td>{summary.billCount} bills</td>
               <td>{summary.itemCount} items</td>
               <td>{currency.format(summary.estimatedValue)}</td>
@@ -2425,7 +2482,7 @@ function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEd
           <DataTable headers={["Date", "Items Narration", "Estimated Total", "Status", "Action"]}>
             {selectedRows.map((purchase) => (
               <tr key={purchase.id}>
-                <td>{toDateKey(purchase.purchase_date)}</td>
+                <td>{formatDisplayDate(purchase.purchase_date)}</td>
                 <td className="primary-cell purchase-items-cell" onDoubleClick={() => onOpenPurchaseAmendment(purchase)}>
                   <span title={narration(purchase)}>{narration(purchase)}</span>
                   <small className="cell-note">Double-click to open Add/Edit Purchase</small>
@@ -2765,7 +2822,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       rows: filterRows(data.salesReport),
       summary: (rows) => [["Sales", money(totalOf(rows, "total_sales")), true], ["Cash", money(totalOf(rows, "cash_sales"))], ["UPI", money(totalOf(rows, "upi_sales"))], ["Profit", money(totalOf(rows, "total_profit"))]],
       headers: ["Date", "Transactions", "Sales", "Cash", "UPI", "Bank/Card", "Cost", "Profit"],
-      render: (row) => <tr key={row.sale_date}><td>{row.sale_date}</td><td>{row.transaction_count}</td><td>{money(row.total_sales)}</td><td>{money(row.cash_sales)}</td><td>{money(row.upi_sales)}</td><td>{money(row.bank_card_sales)}</td><td>{money(row.total_cost)}</td><td className="profit-cell">{money(row.total_profit)}</td></tr>,
+      render: (row) => <tr key={row.sale_date}><td>{formatDisplayDate(row.sale_date)}</td><td>{row.transaction_count}</td><td>{money(row.total_sales)}</td><td>{money(row.cash_sales)}</td><td>{money(row.upi_sales)}</td><td>{money(row.bank_card_sales)}</td><td>{money(row.total_cost)}</td><td className="profit-cell">{money(row.total_profit)}</td></tr>,
     },
     salesByProduct: {
       title: "Sales by Product",
@@ -2793,7 +2850,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       render: (row) => (
         <tr className={row.status_label === "Cancelled" ? "muted-row" : ""} key={row.display_key}>
           <td className="primary-cell" onDoubleClick={() => setSalesFilters({ ...salesFilters, date: toDateKey(row.sale_date) })}>
-            {toDateKey(row.sale_date)}
+            {formatDisplayDate(row.sale_date)}
             <small className="cell-note">{row.invoice_no || `#${row.sale_id}`}</small>
           </td>
           <td className="primary-cell" onDoubleClick={() => onOpenCustomerLedger?.(row)}>
@@ -2819,28 +2876,28 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       rows: editedBills,
       summary: (rows) => [["Edited Bills", rows.length, true], ["Total Amount", money(totalOf(rows, "total_amount"))]],
       headers: ["Invoice", "Date", "Amount", "Edited By", "Edited At", "Reason"],
-      render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{row.sale_date}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || "-"}</td><td>{row.edited_at ? new Date(row.edited_at).toLocaleString("en-IN") : "-"}</td><td>{row.edit_reason || "-"}</td></tr>,
+      render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || "-"}</td><td>{row.edited_at ? new Date(row.edited_at).toLocaleString("en-IN") : "-"}</td><td>{row.edit_reason || "-"}</td></tr>,
     },
     cancelledBills: {
       title: "Cancelled Bills",
       rows: cancelledBills,
       summary: (rows) => [["Cancelled Bills", rows.length, true], ["Cancelled Amount", money(totalOf(rows, "total_amount"))]],
       headers: ["Invoice", "Date", "Amount", "Cancelled By", "Cancelled At", "Reason"],
-      render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{row.sale_date}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || "-"}</td><td>{row.cancelled_at ? new Date(row.cancelled_at).toLocaleString("en-IN") : "-"}</td><td>{row.cancellation_reason || "-"}</td></tr>,
+      render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || "-"}</td><td>{row.cancelled_at ? new Date(row.cancelled_at).toLocaleString("en-IN") : "-"}</td><td>{row.cancellation_reason || "-"}</td></tr>,
     },
     provisionalProfitSales: {
       title: "Provisional Profit Sales",
       rows: filterRows(data.provisionalProfitSalesReport),
       summary: (rows) => [["Sales", money(totalOf(rows, "total_amount")), true], ["Provisional Profit", money(totalOf(rows, "profit"))], ["Invoices", rows.length]],
       headers: ["Invoice", "Date", "Customer", "Payment", "Products", "Amount", "Cost", "Provisional Profit"],
-      render: (row) => <tr key={row.id}><td>{row.invoice_no}</td><td>{row.sale_date}</td><td>{row.customer_name}</td><td>{row.payment_mode}</td><td>{row.products || "-"}</td><td>{money(row.total_amount)}</td><td>{money(row.total_cost)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
+      render: (row) => <tr key={row.id}><td>{row.invoice_no}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{row.customer_name}</td><td>{row.payment_mode}</td><td>{row.products || "-"}</td><td>{money(row.total_amount)}</td><td>{money(row.total_cost)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
     },
     discountReport: {
       title: "Discount Report",
       rows: filterRows(data.discountReport),
       summary: (rows) => [["Total Discount", money(totalOf(rows, "total_discount")), true], ["Bill Discount", money(totalOf(rows, "bill_discount"))], ["Invoices", number(totalOf(rows, "invoice_count"))]],
       headers: ["Date", "Payment", "Invoices", "Item Discount", "Bill Discount", "Total Discount"],
-      render: (row) => <tr key={`${row.sale_date}-${row.payment_mode}`}><td>{row.sale_date}</td><td>{row.payment_mode}</td><td>{row.invoice_count}</td><td>{money(row.item_discount)}</td><td>{money(row.bill_discount)}</td><td className="profit-cell">{money(row.total_discount)}</td></tr>,
+      render: (row) => <tr key={`${row.sale_date}-${row.payment_mode}`}><td>{formatDisplayDate(row.sale_date)}</td><td>{row.payment_mode}</td><td>{row.invoice_count}</td><td>{money(row.item_discount)}</td><td>{money(row.bill_discount)}</td><td className="profit-cell">{money(row.total_discount)}</td></tr>,
     },
     purchasesByDate: {
       title: "Purchases by Date",
@@ -2882,7 +2939,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       headers: ["Date", "Supplier", "Narration", "Gross Total", "Net Total", "Status"],
       render: (row) => (
         <tr key={row.display_key}>
-          <td className="primary-cell" onDoubleClick={() => setPurchaseFilters((current) => ({ ...current, date: toDateKey(row.purchase_date) }))}>{toDateKey(row.purchase_date)}</td>
+          <td className="primary-cell" onDoubleClick={() => setPurchaseFilters((current) => ({ ...current, date: toDateKey(row.purchase_date) }))}>{formatDisplayDate(row.purchase_date)}</td>
           <td className="primary-cell" onDoubleClick={() => onOpenSupplierLedger?.(row)}>{row.supplier_name}<small className="cell-note">{row.firm_name || "Double-click for supplier ledger"}</small></td>
           <td className="primary-cell purchase-items-cell" onDoubleClick={() => onOpenPurchaseAmendment?.(row.source_rows?.[0] || row)}>
             <span title={row.item_narration}>{purchaseNarrationDisplay(row)}</span>
@@ -2920,21 +2977,21 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       rows: customerLedgerRows,
       summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
       headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{toDateKey(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
     },
     supplierLedger: {
       title: "Supplier Ledger",
       rows: supplierLedgerRows,
       summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
       headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{toDateKey(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Cr" : "Dr"}</td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Cr" : "Dr"}</td></tr>,
     },
     accountStatement: {
       title: "Account Statement",
       rows: accountStatementRows,
       summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
       headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{toDateKey(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name} - {row.account_type}</small></td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name} - {row.account_type}</small></td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
     },
     paymentReport: {
       title: "Payment Report",
@@ -2948,7 +3005,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       rows: filterRows(data.paymentModeSummary),
       summary: (rows) => [["Total Amount", money(totalOf(rows, "total_amount")), true], ["Transactions", number(totalOf(rows, "transaction_count"))], ["Modes", new Set(rows.map((row) => row.payment_mode)).size]],
       headers: ["Date", "Source", "Payment Mode", "Transactions", "Total Amount"],
-      render: (row, index) => <tr key={`${row.transaction_date}-${row.source}-${row.payment_mode}-${index}`}><td>{row.transaction_date}</td><td>{row.source}</td><td><span className="tag">{row.payment_mode}</span></td><td>{row.transaction_count}</td><td className="primary-cell">{money(row.total_amount)}</td></tr>,
+      render: (row, index) => <tr key={`${row.transaction_date}-${row.source}-${row.payment_mode}-${index}`}><td>{formatDisplayDate(row.transaction_date)}</td><td>{row.source}</td><td><span className="tag">{row.payment_mode}</span></td><td>{row.transaction_count}</td><td className="primary-cell">{money(row.total_amount)}</td></tr>,
     },
     receivableReport: {
       title: "Receivable Report",
@@ -3098,14 +3155,14 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       rows: clubRowsByDateAccount(filterRows(data.dayToDayReport)),
       summary: (rows) => [["Debit", money(totalOf(rows, "debit")), true], ["Credit", money(totalOf(rows, "credit"))], ["Vouchers", rows.length]],
       headers: ["Date", "Particulars", "Voucher Type", "Voucher No.", "Debit Amount", "Credit Amount", "Narration"],
-      render: (row, index) => <tr key={`${row.date}-${row.voucher_no}-${index}`}><td>{toDateKey(row.date)}</td><td className="primary-cell">{row.party_name}</td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span></td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${row.voucher_no}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell">{row.party_name}</td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span></td></tr>,
     },
     expenseReport: {
       title: "Expense Report",
       rows: filterRows(data.expenseReport),
       summary: (rows) => [["Total Expenses", money(totalOf(rows.filter((row) => row.status !== "CANCELLED"), "amount")), true], ["Cash", money(totalOf(rows.filter((row) => row.payment_mode === "CASH" && row.status !== "CANCELLED"), "amount"))], ["UPI", money(totalOf(rows.filter((row) => row.payment_mode === "UPI" && row.status !== "CANCELLED"), "amount"))], ["Cancelled", money(totalOf(rows.filter((row) => row.status === "CANCELLED"), "amount"))]],
       headers: ["Date", "Category", "Paid To", "Payment Mode", "Amount", "Reference", "Remarks", "Status"],
-      render: (row) => <tr className={row.status === "CANCELLED" ? "muted-row" : ""} key={row.id}><td>{toDateKey(row.expense_date)}</td><td className="primary-cell">{row.category}</td><td>{row.paid_to || row.vendor_name || "-"}</td><td>{row.payment_mode}</td><td>{money(row.amount)}</td><td>{row.reference_number || "-"}</td><td>{row.remarks || row.cancellation_reason || "-"}</td><td><span className={row.status === "CANCELLED" ? "stock-low" : "stock-ok"}>{row.status || "ACTIVE"}</span></td></tr>,
+      render: (row) => <tr className={row.status === "CANCELLED" ? "muted-row" : ""} key={row.id}><td>{formatDisplayDate(row.expense_date)}</td><td className="primary-cell">{row.category}</td><td>{row.paid_to || row.vendor_name || "-"}</td><td>{row.payment_mode}</td><td>{money(row.amount)}</td><td>{row.reference_number || "-"}</td><td>{row.remarks || row.cancellation_reason || "-"}</td><td><span className={row.status === "CANCELLED" ? "stock-low" : "stock-ok"}>{row.status || "ACTIVE"}</span></td></tr>,
     },
   };
   const categories = [
@@ -3365,7 +3422,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
           const total = purchaseDateTotals.get(date) || { net: 0, gross: 0 };
           renderedRows.push(
             <tr className="date-total-row" key={`date-total-${date}`}>
-              <td colSpan="3">Net Purchase Total for {date}</td>
+              <td colSpan="3">Net Purchase Total for {formatDisplayDate(date)}</td>
               <td>{money(total.gross)}</td>
               <td className="balance-cell">{money(total.net)}</td>
               <td>Cancelled excluded</td>
@@ -3375,6 +3432,14 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       });
       return renderedRows;
     };
+    const reportFileName = (() => {
+      const from = formatFileDate(data.dateFrom || customRange.date_from);
+      const to = formatFileDate(data.dateTo || customRange.date_to);
+      const title = safeFileName(currentReport.title);
+      if (selectedReport === "balanceSheet") return `Balance_Sheet_As_At_${to}.pdf`;
+      if (selectedReport === "dayToDay") return `Day_Book_${to}.pdf`;
+      return `${title}_${from}_to_${to}.pdf`;
+    })();
     return (
       <section className="settings-layout">
         <ModuleCard eyebrow="Report View" title={currentReport.title} subtitle="Single report workspace with filters, summary, print and export controls.">
@@ -3389,6 +3454,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
           <PrintableReport
             beforePdfExport={handleReportPrintOption}
             beforePrint={handleReportPrintOption}
+            fileName={reportFileName}
             reportClassName={selectedReport === "salesHistory" ? "sales-history-print-report" : selectedReport === "purchaseHistory" ? "purchase-history-print-report" : selectedReport === "profitLoss" ? "profit-loss-print-report" : ""}
             title={currentReport.title}
           >
@@ -4352,8 +4418,19 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
         <Field label="Compact Logo Text"><input disabled={!canManage} value={draft.compact_logo_text || ""} onChange={(event) => updateDraft("compact_logo_text", event.target.value)} /></Field>
         <Field label="Default Printer Type">
           <select disabled={!canManage} value={draft.default_printer_type || "THERMAL"} onChange={(event) => updateDraft("default_printer_type", event.target.value)}>
-            <option value="THERMAL">POS / Thermal</option>
+            <option value="THERMAL">Thermal 80mm / 58mm</option>
             <option value="A4">A4</option>
+          </select>
+        </Field>
+        <Field label="Default Invoice Print">
+          <select disabled={!canManage} value={draft.default_invoice_print || "THERMAL_RECEIPT"} onChange={(event) => updateDraft("default_invoice_print", event.target.value)}>
+            <option value="A4_INVOICE">A4 Invoice</option>
+            <option value="THERMAL_RECEIPT">Thermal Receipt</option>
+          </select>
+        </Field>
+        <Field label="Default Report Print">
+          <select disabled={!canManage} value={draft.default_report_print || "A4_REPORT"} onChange={(event) => updateDraft("default_report_print", event.target.value)}>
+            <option value="A4_REPORT">A4 Report</option>
           </select>
         </Field>
         <Field label="Receipt Width">
@@ -4363,6 +4440,7 @@ function BusinessSettingsSection({ businessSettings, canManage, onReload, user }
           </select>
         </Field>
         <label className="check-field"><input checked={draft.auto_print_after_billing === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("auto_print_after_billing", event.target.checked)} /><span>Auto print after billing</span></label>
+        <label className="check-field"><input checked={draft.show_print_preview_before_print !== false} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("show_print_preview_before_print", event.target.checked)} /><span>Show print preview before print</span></label>
         <label className="check-field"><input checked={draft.show_item_discount_column_pos !== false} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("show_item_discount_column_pos", event.target.checked)} /><span>Show Item Discount Column on POS</span></label>
         <label className="check-field"><input checked={draft.show_item_discount_column_receipt !== false} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("show_item_discount_column_receipt", event.target.checked)} /><span>Show Item Discount Column on Receipt</span></label>
         <label className="check-field"><input checked={draft.show_bill_discount_row_receipt !== false} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("show_bill_discount_row_receipt", event.target.checked)} /><span>Show Bill Discount Row on Receipt</span></label>
@@ -4698,6 +4776,7 @@ const permissionLabels = [
   ["billing", "Billing"],
   ["manual_pos_rate_override", "Manual POS Rate Override"],
   ["pos_date_override", "POS Bill Date Override"],
+  ["sale_date_edit", "Sale Bill Date Edit"],
 ];
 
 function PermissionSettings({ canManage, onReload, roles, user }) {
@@ -5748,7 +5827,7 @@ function ThermalTotalLine({ label, total, value }) {
   return <div className={total ? "total-line total-line-main" : "total-line"}><span>{label}</span><strong>{receiptCurrency.format(value)}</strong></div>;
 }
 
-function SaleEditModal({ invoice, onClose, onSaved, products, user }) {
+function SaleEditModal({ canSaleDateEdit = false, invoice, onClose, onSaved, products, user }) {
   const [items, setItems] = useState(() => (invoice.items || []).map((item) => ({
     product_id: item.product_id,
     product_name: item.product_name,
@@ -5764,6 +5843,7 @@ function SaleEditModal({ invoice, onClose, onSaved, products, user }) {
     notes: invoice.customer_notes || "",
   });
   const [paymentMode, setPaymentMode] = useState(invoice.payment_mode === "MIXED" ? "CASH" : invoice.payment_mode || "CASH");
+  const [billDate, setBillDate] = useState(toDateKey(invoice.sale_date || invoice.transaction_date || new Date()));
   const [invoiceDiscount, setInvoiceDiscount] = useState(invoice.invoice_discount_amount || 0);
   const [reason, setReason] = useState("");
   const [saving, setSaving] = useState(false);
@@ -5818,6 +5898,8 @@ function SaleEditModal({ invoice, onClose, onSaved, products, user }) {
         payments: [{ mode: paymentMode, amount: netPayable }],
         branch_id: invoice.branch_id || user.branch_id,
         edited_by: user.id,
+        bill_date: billDate,
+        bill_datetime: `${billDate}T00:00`,
         reason,
       });
       await onSaved();
@@ -5844,6 +5926,7 @@ function SaleEditModal({ invoice, onClose, onSaved, products, user }) {
         </div>
         <div className="sale-edit-body">
           <div className="form-grid supplier-form-grid">
+            <Field label="Bill Date"><input disabled={!canSaleDateEdit} type="date" value={billDate} onChange={(event) => setBillDate(event.target.value)} /></Field>
             <Field label="Customer Name"><input value={customer.name} onChange={(event) => setCustomer({ ...customer, name: event.target.value })} /></Field>
             <Field label="Mobile Number"><input inputMode="numeric" value={customer.mobile} onChange={(event) => setCustomer({ ...customer, mobile: event.target.value.replace(/\D/g, "") })} /></Field>
             <Field label="Payment Mode">
@@ -5909,6 +5992,7 @@ const formatSaleAuditLines = (row) => {
     }
   };
   if ((oldSale.customer_name || "") !== (newSale.customer_name || "")) lines.push(`Customer: ${oldSale.customer_name || "Walk-in"} -> ${newSale.customer_name || "Walk-in"}`);
+  if (toDateKey(oldSale.sale_date || "") !== toDateKey(newSale.sale_date || "")) lines.push(`Bill Date: ${formatDisplayDate(oldSale.sale_date)} -> ${formatDisplayDate(newSale.sale_date)}`);
   if ((oldSale.payment_mode || "") !== (newSale.payment_mode || "")) lines.push(`Payment Mode: ${oldSale.payment_mode || "-"} -> ${newSale.payment_mode || "-"}`);
   addMoneyChange("Gross Total", "gross_amount");
   addMoneyChange("Discount", "invoice_discount_amount");
@@ -6070,8 +6154,10 @@ function PaymentReceiptModal({ payment, onClose }) {
 }
 
 function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = {} }) {
-  const [printMode, setPrintMode] = useState(printSettings.default_printer_type === "A4" ? "A4" : "THERMAL");
+  const [printMode, setPrintMode] = useState(printSettings.default_invoice_print === "A4_INVOICE" || printSettings.default_printer_type === "A4" ? "A4" : "THERMAL");
   const [upiQrDataUrl, setUpiQrDataUrl] = useState("");
+  const [exporting, setExporting] = useState(false);
+  const invoiceRef = useRef(null);
   const activePrintMode = printMode === "A4" ? "A4" : "THERMAL";
   const invoicePayments = invoice.payments || [];
   const showItemDiscountOnReceipt = printSettings.show_item_discount_column_receipt !== false;
@@ -6099,23 +6185,52 @@ function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = 
       active = false;
     };
   }, [activePrintMode, upiPayload]);
+  const invoiceDateKey = toDateKey(invoice.sale_date || invoice.transaction_date || invoice.created_at);
+  const invoiceFileName = () => `FroozERP_POS_Invoice_${invoice.invoice_no || `SALE-${invoice.id}`}_${formatFileDate(invoiceDateKey)}.pdf`;
   const printWithMode = (mode) => {
     setPrintMode(mode);
-    setTimeout(() => window.print(), 100);
+    withDocumentTitle(invoiceFileName(), () => setTimeout(() => window.print(), 100));
   };
-  const sendWhatsApp = () => {
+  const exportInvoicePdf = async (mode = activePrintMode, save = true) => {
+    setPrintMode(mode);
+    setExporting(true);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      return await exportElementToPdf({
+        element: invoiceRef.current,
+        fileName: invoiceFileName(),
+        mode,
+        receiptWidth: printSettings.receipt_width || "80MM",
+        save,
+      });
+    } finally {
+      setExporting(false);
+    }
+  };
+  const sendWhatsApp = async () => {
     if (!invoice.customer_mobile) {
       alert("Add a customer mobile number to send this invoice on WhatsApp.");
       return;
     }
+    const pdfFile = await exportInvoicePdf(activePrintMode, false);
     const message = [
       "Thank you for shopping with FEEL THE FREAKIN' FROOZ. Your invoice is ready.",
       `Invoice: ${invoice.invoice_no}`,
+      `Bill Date: ${formatDisplayDate(invoiceDateKey)}`,
       `Amount: ${currency.format(Number(invoice.total_amount))}`,
       "We appreciate your business.",
-      "",
-      "Please attach the saved invoice PDF to this chat.",
     ].join("\n");
+    const file = new File([pdfFile.blob], pdfFile.fileName, { type: "application/pdf" });
+    if (navigator.canShare?.({ files: [file] }) && navigator.share) {
+      try {
+        await navigator.share({ files: [file], title: invoice.invoice_no, text: message });
+        return;
+      } catch (error) {
+        if (error.name === "AbortError") return;
+      }
+    }
+    await exportInvoicePdf(activePrintMode, true);
+    alert("PDF has been generated. Attach the downloaded PDF if WhatsApp Web does not allow automatic attachment.");
     window.open(`https://wa.me/${invoice.customer_mobile}?text=${encodeURIComponent(message)}`, "_blank", "noopener,noreferrer");
   };
 
@@ -6130,19 +6245,19 @@ function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = 
           <div className="invoice-actions">
             <button className="secondary-button" onClick={() => printWithMode("THERMAL")}><Icon name="print" /> POS Thermal Print</button>
             <button className="secondary-button" onClick={() => printWithMode("A4")}><Icon name="print" /> A4 Invoice Print</button>
-            <button className="secondary-button" onClick={() => printWithMode("A4")}>PDF Export</button>
-            <button className="whatsapp-button" onClick={sendWhatsApp}><Icon name="message" /> Send on WhatsApp</button>
+            <button className="secondary-button" disabled={exporting} onClick={() => exportInvoicePdf(activePrintMode, true)}>{exporting ? "Exporting..." : "PDF Export"}</button>
+            <button className="whatsapp-button" disabled={exporting} onClick={sendWhatsApp}><Icon name="message" /> Send on WhatsApp</button>
             <button aria-label="Close invoice" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
-        <article className={`invoice-paper ${activePrintMode === "A4" ? "invoice-a4" : "invoice-thermal"} ${printSettings.receipt_width === "58MM" ? "invoice-58mm" : "invoice-80mm"}`}>
+        <article ref={invoiceRef} className={`invoice-paper ${activePrintMode === "A4" ? "invoice-a4" : "invoice-thermal"} ${printSettings.receipt_width === "58MM" ? "invoice-58mm" : "invoice-80mm"}`}>
           <header className="invoice-header">
             <BrandLogo invoice />
             <div className="invoice-meta">
               <strong>Tax Invoice</strong>
               <span>{printSettings.business_name || "FroozERP Retail"}</span>
               <span>{invoice.invoice_no}</span>
-              <span>Bill Date: {toDateKey(invoice.sale_date || invoice.transaction_date || invoice.created_at)}</span>
+              <span>Bill Date: {formatDisplayDate(invoiceDateKey)}</span>
               <span>Entry Time: {new Date(invoice.created_at).toLocaleString("en-IN")}</span>
             </div>
           </header>
