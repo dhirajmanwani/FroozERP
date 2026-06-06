@@ -1,7 +1,9 @@
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
-const { Pool } = require("pg");
+const { Pool, types } = require("pg");
+
+types.setTypeParser(1082, (value) => value);
 
 const app = express();
 app.use(cors());
@@ -57,6 +59,13 @@ const applySaleRateRounding = (value, rule) => {
 };
 const toDateKey = (value) =>
   value instanceof Date ? value.toLocaleDateString("en-CA") : String(value).slice(0, 10);
+const toBusinessDateKey = (value) => {
+  const text = cleanText(value);
+  if (!text) return toDateKey(new Date());
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (match) return `${match[1]}-${match[2]}-${match[3]}`;
+  return toDateKey(new Date(text));
+};
 const RATE_MANAGER_ROLES = new Set(["Owner", "Admin"]);
 const SUPPLIER_TYPES = new Set(["LOCAL_SUPPLIER", "IMPORTED_SUPPLIER", "COMMISSION_AGENT", "TRANSPORT_VENDOR"]);
 const SUPPLIER_PAYMENT_MODES = new Set(["CASH", "UPI", "BANK_TRANSFER", "CHEQUE"]);
@@ -7984,12 +7993,13 @@ app.post("/sales", async (req, res) => {
     const parsedBranchId = parsePositiveInteger(branch_id);
     const parsedCreatedBy = parsePositiveInteger(created_by) || 1;
     const parsedInvoiceDiscount = parseNonNegativeNumber(invoice_discount);
-    const rawBillDateTime = cleanText(bill_datetime || bill_date || "");
-    const requestedBillDateTime = rawBillDateTime ? new Date(rawBillDateTime) : new Date();
-    if (Number.isNaN(requestedBillDateTime.getTime())) {
+    const rawBillDateTime = cleanText(bill_datetime || "");
+    const rawBillDate = cleanText(bill_date || rawBillDateTime || "");
+    const transactionDate = toBusinessDateKey(rawBillDate);
+    const requestedBillDateTime = rawBillDateTime || `${transactionDate}T00:00`;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(transactionDate)) {
       return res.status(400).json({ message: "Select a valid bill date" });
     }
-    const transactionDate = toDateKey(requestedBillDateTime);
     const todayDate = toDateKey(new Date());
     const isBackdatedBill = transactionDate < todayDate;
     const isFutureBill = transactionDate > todayDate;

@@ -5214,8 +5214,12 @@ const getMatchingDiscountRule = (rules, subtotal, paymentMode) => {
 
 const currentDateTimeLocal = () => {
   const date = new Date();
-  date.setMinutes(date.getMinutes() - date.getTimezoneOffset());
-  return date.toISOString().slice(0, 16);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${year}-${month}-${day}T${hours}:${minutes}`;
 };
 
 function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, customers = [], discountRules = [], inventory, onInvoice, onSaved, paymentSettings = {}, posSettings = {}, printSettings = {}, products, saleRateSettings = {}, user }) {
@@ -5463,6 +5467,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
         payments,
         branch_id: user.branch_id,
         created_by: user.id,
+        bill_date: selectedBillDate,
         bill_datetime: billDateTime,
         date_override_reason: dateOverrideReason,
         backdate_confirmed: confirmations.backdate_confirmed || dateConfirmations.backdate_confirmed || false,
