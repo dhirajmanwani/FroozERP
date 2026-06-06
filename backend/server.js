@@ -212,13 +212,71 @@ const initializeDatabase = async () => {
     ALTER TABLE products ADD COLUMN IF NOT EXISTS category VARCHAR(80) DEFAULT 'Fruit';
     ALTER TABLE products ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS remarks TEXT;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS archived_duplicate_of INTEGER;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS archive_reason TEXT;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS selling_rate_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS selling_rate_updated_by INTEGER REFERENCES users(id);
     UPDATE products SET origin_type = 'LOCAL' WHERE origin_type IS NULL;
     CREATE INDEX IF NOT EXISTS products_name_search_lower_idx
       ON products (LOWER(product_name));
-    CREATE UNIQUE INDEX IF NOT EXISTS products_category_name_lower_unique_idx
-      ON products (LOWER(COALESCE(category, 'Fruit')), LOWER(product_name));
+    CREATE TABLE IF NOT EXISTS product_duplicate_archive_log (
+      id SERIAL PRIMARY KEY,
+      duplicate_product_id INTEGER NOT NULL REFERENCES products(id),
+      kept_product_id INTEGER NOT NULL REFERENCES products(id),
+      category_key TEXT NOT NULL,
+      product_name_key TEXT NOT NULL,
+      archive_reason TEXT NOT NULL,
+      archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (duplicate_product_id)
+    );
+    WITH ranked_products AS (
+      SELECT
+        id,
+        LOWER(COALESCE(NULLIF(TRIM(category), ''), 'Fruit')) AS category_key,
+        LOWER(TRIM(product_name)) AS product_name_key,
+        FIRST_VALUE(id) OVER (
+          PARTITION BY LOWER(COALESCE(NULLIF(TRIM(category), ''), 'Fruit')), LOWER(TRIM(product_name))
+          ORDER BY CASE WHEN active IS DISTINCT FROM FALSE THEN 0 ELSE 1 END, COALESCE(created_at, '1970-01-01'::timestamp), id
+        ) AS kept_product_id,
+        COUNT(*) OVER (
+          PARTITION BY LOWER(COALESCE(NULLIF(TRIM(category), ''), 'Fruit')), LOWER(TRIM(product_name))
+        ) AS duplicate_count
+      FROM products
+      WHERE product_name IS NOT NULL AND TRIM(product_name) <> ''
+    ),
+    archived_products AS (
+      UPDATE products p
+      SET active = FALSE,
+          archived_duplicate_of = ranked_products.kept_product_id,
+          archived_at = COALESCE(p.archived_at, CURRENT_TIMESTAMP),
+          archive_reason = COALESCE(p.archive_reason, 'Archived duplicate product during startup migration'),
+          remarks = CONCAT_WS(E'\n', NULLIF(p.remarks, ''), 'Archived duplicate product. Kept product ID: ' || ranked_products.kept_product_id)
+      FROM ranked_products
+      WHERE p.id = ranked_products.id
+        AND ranked_products.duplicate_count > 1
+        AND ranked_products.id <> ranked_products.kept_product_id
+      RETURNING
+        p.id AS duplicate_product_id,
+        ranked_products.kept_product_id,
+        ranked_products.category_key,
+        ranked_products.product_name_key
+    )
+    INSERT INTO product_duplicate_archive_log (
+      duplicate_product_id, kept_product_id, category_key, product_name_key, archive_reason
+    )
+    SELECT
+      duplicate_product_id,
+      kept_product_id,
+      category_key,
+      product_name_key,
+      'Archived duplicate product during startup migration'
+    FROM archived_products
+    ON CONFLICT (duplicate_product_id) DO NOTHING;
+    DROP INDEX IF EXISTS products_category_name_lower_unique_idx;
+    CREATE UNIQUE INDEX products_category_name_lower_unique_idx
+      ON products (LOWER(COALESCE(category, 'Fruit')), LOWER(product_name))
+      WHERE active IS DISTINCT FROM FALSE;
     CREATE UNIQUE INDEX IF NOT EXISTS products_barcode_unique_idx
       ON products (barcode)
       WHERE barcode IS NOT NULL AND barcode <> '';
@@ -344,6 +402,29 @@ const initializeDatabase = async () => {
       reason TEXT NOT NULL,
       edited_by INTEGER REFERENCES users(id),
       edited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by)
+    SELECT
+      log.duplicate_product_id,
+      'ARCHIVE_DUPLICATE',
+      JSONB_BUILD_OBJECT(
+        'duplicate_product_id', log.duplicate_product_id,
+        'category_key', log.category_key,
+        'product_name_key', log.product_name_key
+      ),
+      JSONB_BUILD_OBJECT(
+        'active', FALSE,
+        'archived_duplicate_of', log.kept_product_id,
+        'archived_at', log.archived_at
+      ),
+      log.archive_reason,
+      NULL
+    FROM product_duplicate_archive_log log
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM product_audit_trail audit
+      WHERE audit.product_id = log.duplicate_product_id
+        AND audit.action = 'ARCHIVE_DUPLICATE'
     );
 
     CREATE TABLE IF NOT EXISTS product_category_audit_trail (
@@ -3031,6 +3112,34 @@ app.delete("/product-categories/:id", async (req, res) => {
   }
 });
 
+app.get("/product-duplicate-archive-log", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        log.*,
+        archived.product_name AS archived_product_name,
+        archived.category AS archived_category,
+        kept.product_name AS kept_product_name,
+        kept.category AS kept_category
+      FROM product_duplicate_archive_log log
+      LEFT JOIN products archived ON archived.id = log.duplicate_product_id
+      LEFT JOIN products kept ON kept.id = log.kept_product_id
+      ORDER BY log.archived_at DESC, log.id DESC
+      LIMIT 50
+      `
+    );
+    return res.json({
+      count: result.rows.length,
+      message: result.rows.length ? "Duplicate products were archived. Review product master." : "",
+      rows: result.rows,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Product Duplicate Archive Log" });
+  }
+});
+
 app.get("/products", async (req, res) => {
   try {
     const result = await pool.query(`
@@ -3086,7 +3195,10 @@ app.post("/products", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Selected category is inactive." });
     }
-    const duplicateResult = await client.query("SELECT id FROM products WHERE LOWER(product_name) = LOWER($1) LIMIT 1", [product_name.trim()]);
+    const duplicateResult = await client.query(
+      "SELECT id FROM products WHERE LOWER(product_name) = LOWER($1) AND active IS DISTINCT FROM FALSE LIMIT 1",
+      [product_name.trim()]
+    );
     if (duplicateResult.rows.length > 0) {
       await client.query("ROLLBACK");
       return res.status(409).json({ message: "This product already exists." });
@@ -3173,7 +3285,10 @@ app.put("/products/:id", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Selected category is inactive or missing." });
     }
-    const duplicateResult = await client.query("SELECT id FROM products WHERE LOWER(product_name) = LOWER($1) AND id <> $2 LIMIT 1", [product_name.trim(), productId]);
+    const duplicateResult = await client.query(
+      "SELECT id FROM products WHERE LOWER(product_name) = LOWER($1) AND id <> $2 AND active IS DISTINCT FROM FALSE LIMIT 1",
+      [product_name.trim(), productId]
+    );
     if (duplicateResult.rows.length > 0) {
       await client.query("ROLLBACK");
       return res.status(409).json({ message: "This product already exists." });

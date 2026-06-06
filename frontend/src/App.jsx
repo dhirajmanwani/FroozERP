@@ -281,6 +281,7 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [products, setProducts] = useState([]);
   const [productCategories, setProductCategories] = useState([]);
+  const [productDuplicateWarning, setProductDuplicateWarning] = useState("");
   const [inventory, setInventory] = useState([]);
   const [salesHistory, setSalesHistory] = useState([]);
   const [saleReturns, setSaleReturns] = useState([]);
@@ -639,8 +640,12 @@ function App() {
   }, [editingPurchaseId, expectedPurchaseRate, purchaseBillStatus, purchaseCart, purchaseFreightCharges, purchaseLabourCharges, purchaseOtherCharges, purchasePaidAmount, purchaseQuantity, purchaseRateInput, purchaseRebateRuleId, purchaseRules, purchaseType, selectedPurchaseProduct]);
 
   const loadProducts = async () => {
-    const response = await axios.get(`${API_URL}/products`);
+    const [response, duplicateLogResponse] = await Promise.all([
+      axios.get(`${API_URL}/products`),
+      axios.get(`${API_URL}/product-duplicate-archive-log`).catch(() => ({ data: { message: "" } })),
+    ]);
     setProducts(response.data);
+    setProductDuplicateWarning(duplicateLogResponse.data?.message || "");
   };
   const loadProductCategories = async () => {
     const response = await axios.get(`${API_URL}/product-categories`);
@@ -1665,6 +1670,7 @@ function App() {
           {activeView === "products" && (
             <section className="settings-layout">
               <ModuleCard eyebrow="Product Master" title="Category, Item, Lot & Opening Stock" subtitle="Manage fruit categories, item masters and opening stock lots without disturbing FIFO inventory.">
+                {productDuplicateWarning && <div className="cart-empty">{productDuplicateWarning}</div>}
                 <div className="purchase-summary-grid supplier-payment-preview">
                   <SummaryMetric featured label="Categories" value={productCategories.length} />
                   <SummaryMetric label="Items" value={products.length} />
