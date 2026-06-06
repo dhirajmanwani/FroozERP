@@ -445,6 +445,16 @@ function App() {
     return Boolean(permissions[permissionKey]);
   };
 
+  const hasRolePermission = (permissionKey) => {
+    if (!user) return false;
+    if (user.role === "Owner") return true;
+    const permissions = rolePermissionMap.get(user.role);
+    if (permissions && Object.prototype.hasOwnProperty.call(permissions, permissionKey)) {
+      return Boolean(permissions[permissionKey]);
+    }
+    return ["Admin"].includes(user.role) && ["manual_pos_rate_override", "pos_date_override"].includes(permissionKey);
+  };
+
   const kpis = useMemo(() => {
     const today = toDateKey(new Date());
     const todaysSales = salesHistory.filter((sale) => toDateKey(sale.sale_date) === today);
@@ -2132,6 +2142,8 @@ function App() {
               printSettings={settingsData.businessSettings}
               products={products.filter((product) => product.active !== false)}
               saleRateSettings={settingsData.saleRateSettings}
+              canManualRateOverride={hasRolePermission("manual_pos_rate_override")}
+              canPosDateOverride={hasRolePermission("pos_date_override")}
               user={user}
             />
           )}
@@ -2145,7 +2157,10 @@ function App() {
                     <td>{sale.sale_date}</td>
                     <td><span className={sale.sale_status === "CANCELLED" ? "stock-low" : sale.sale_status === "EDITED" ? "origin-rate" : "stock-ok"}>{sale.sale_status || "COMPLETED"}</span></td>
                     <td>{sale.customer_name || "Walk-in Customer"}</td>
-                    <td className="primary-cell">{sale.item_summary}</td>
+                    <td className="primary-cell">
+                      {sale.item_summary}
+                      {sale.manual_rate_override_applied && <small className="cell-note profit-cell">Manual rate override applied</small>}
+                    </td>
                     <td><span className="tag">{sale.payment_mode}</span></td>
                     <td>{currency.format(Number(sale.gross_amount || sale.amount))}</td>
                     <td>{currency.format(Number(sale.item_discount_amount || 0))}</td>
@@ -2668,7 +2683,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
     const qty = Number(item.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 });
     const unit = String(item.unit || "").toLowerCase();
     const rate = Number(item.selling_rate || 0);
-    return `${product} ${qty}${unit} @ ${money(rate)} = ${money(saleItemGross(item))}`;
+    return `${product} ${qty}${unit} @ ${money(rate)} = ${money(saleItemGross(item))}${item.manual_rate_override ? " (Manual rate override applied)" : ""}`;
   };
   const saleNarrationPreview = (items) => {
     const summary = items
@@ -2701,6 +2716,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
           discount_total: Number(row.discount_amount || 0),
           net_total: Number(row.total_amount || 0),
           status_label: saleStatusLabel(row),
+          manual_rate_override: items.some((item) => item.manual_rate_override),
         };
       });
     }
@@ -2735,6 +2751,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
           discount_total: saleItemDiscount(item) + invoiceDiscountShare,
           net_total: netBeforeInvoiceDiscount - invoiceDiscountShare,
           status_label: saleStatusLabel(row),
+          manual_rate_override: Boolean(item.manual_rate_override),
         };
       });
     });
@@ -2785,6 +2802,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
           </td>
           <td className="primary-cell purchase-items-cell sales-items-cell" onDoubleClick={() => onOpenSaleForEdit?.(row)}>
             <span title={row.item_narration}>{salesNarrationDisplay(row)}</span>
+            {row.manual_rate_override && <small className="cell-note profit-cell">Manual rate override applied</small>}
             <small className="cell-note">{canEditSales ? "Double-click to open POS bill" : "Edit restricted by role"}</small>
           </td>
           <td>{money(row.gross_total)}</td>
@@ -4678,6 +4696,8 @@ const permissionLabels = [
   ["inventory", "Inventory"],
   ["waste_management", "Waste Management"],
   ["billing", "Billing"],
+  ["manual_pos_rate_override", "Manual POS Rate Override"],
+  ["pos_date_override", "POS Bill Date Override"],
 ];
 
 function PermissionSettings({ canManage, onReload, roles, user }) {
@@ -5192,7 +5212,13 @@ const getMatchingDiscountRule = (rules, subtotal, paymentMode) => {
   return matches[0] || null;
 };
 
-function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, onSaved, paymentSettings = {}, posSettings = {}, printSettings = {}, products, saleRateSettings = {}, user }) {
+const currentDateTimeLocal = () => {
+  const date = new Date();
+  date.setMinutes(date.getMinutes() - date.getTimezoneOffset());
+  return date.toISOString().slice(0, 16);
+};
+
+function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, customers = [], discountRules = [], inventory, onInvoice, onSaved, paymentSettings = {}, posSettings = {}, printSettings = {}, products, saleRateSettings = {}, user }) {
   const [search, setSearch] = useState("");
   const [barcode, setBarcode] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
@@ -5202,6 +5228,7 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
   const [scaleMessage, setScaleMessage] = useState("");
   const [mixedPayments, setMixedPayments] = useState({ CASH: "", UPI: "", CARD: "" });
   const [customer, setCustomer] = useState({ account_id: "", name: "", mobile: "", notes: "" });
+  const [billDateTime, setBillDateTime] = useState(currentDateTimeLocal);
   const [saving, setSaving] = useState(false);
   const [lastInvoice, setLastInvoice] = useState(null);
   const searchRef = useRef(null);
@@ -5218,6 +5245,15 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
     () => inventory.reduce((stock, batch) => {
       stock.set(batch.product_id, (stock.get(batch.product_id) || 0) + Number(batch.remaining_qty || 0));
       return stock;
+    }, new Map()),
+    [inventory]
+  );
+
+  const costByProduct = useMemo(
+    () => inventory.reduce((costs, batch) => {
+      const current = costs.get(batch.product_id);
+      const cost = Number(batch.effective_cost_per_unit || batch.purchase_rate || 0);
+      return costs.set(batch.product_id, current === undefined ? cost : Math.max(current, cost));
     }, new Map()),
     [inventory]
   );
@@ -5262,6 +5298,7 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
         product_id: product.id,
         product_name: product.product_name,
         unit: product.unit,
+        default_selling_rate: Number(product.selling_rate),
         selling_rate: Number(product.selling_rate),
         quantity: 1,
         discount_amount: 0,
@@ -5279,6 +5316,10 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
   const updateCartItem = (productId, field, value) => {
     const number = Number(value);
     if (!Number.isFinite(number) || number < 0) return;
+    if (field === "selling_rate" && !canManualRateOverride) {
+      alert("You do not have permission to change sale rate.");
+      return;
+    }
     if (field === "quantity" && number > (stockByProduct.get(productId) || 0)) {
       alert(`Only ${stockByProduct.get(productId) || 0} units are available.`);
       return;
@@ -5335,15 +5376,61 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
     });
   };
 
-  const checkout = async (printAfterSave = false) => {
-    if (saving) return;
+  const checkout = async (printAfterSave = false, confirmations = {}) => {
+    if (saving && !confirmations.retry) return;
     if (cart.length === 0) {
       alert("Add at least one product before checkout.");
       return;
     }
+    const today = toDateKey(new Date());
+    const selectedBillDate = billDateTime ? billDateTime.slice(0, 10) : today;
+    if (!canPosDateOverride && selectedBillDate !== today) {
+      alert("You do not have permission to change bill date.");
+      return;
+    }
+    const dateConfirmations = {};
+    let dateOverrideReason = confirmations.date_override_reason || "";
+    if (selectedBillDate < today && !confirmations.backdate_confirmed) {
+      if (!window.confirm(`You are creating a backdated POS bill for ${selectedBillDate}. Continue?`)) return;
+      dateOverrideReason = window.prompt("Reason for backdated bill (optional)", "Backdated POS bill created") || "Backdated POS bill created";
+      dateConfirmations.backdate_confirmed = true;
+    }
+    if (selectedBillDate > today && !confirmations.future_date_confirmed) {
+      if (!["Owner", "Admin"].includes(user.role)) {
+        alert("Only Owner/Admin can confirm a future bill date.");
+        return;
+      }
+      if (!window.confirm(`You are creating a future-dated POS bill for ${selectedBillDate}. Continue?`)) return;
+      dateOverrideReason = window.prompt("Reason for future bill date (optional)", "Future-dated POS bill created") || "Future-dated POS bill created";
+      dateConfirmations.future_date_confirmed = true;
+    }
     if (customer.mobile && !/^\d{10,15}$/.test(customer.mobile)) {
       alert("Enter a valid customer mobile number.");
       return;
+    }
+    let zeroRateConfirmed = confirmations.zero_rate_confirmed === true;
+    let belowCostConfirmed = confirmations.below_cost_confirmed === true;
+    for (const item of cart) {
+      const rate = Number(item.selling_rate);
+      const defaultRate = Number(item.default_selling_rate ?? item.selling_rate);
+      const rateChanged = roundUi(rate) !== roundUi(defaultRate);
+      if (!Number.isFinite(rate) || rate < 0) {
+        alert(`Enter a valid sale rate for ${item.product_name}.`);
+        return;
+      }
+      if (rateChanged && !canManualRateOverride) {
+        alert("You do not have permission to change sale rate.");
+        return;
+      }
+      if (rateChanged && rate === 0 && !zeroRateConfirmed) {
+        if (!["Owner", "Admin"].includes(user.role) || !window.confirm(`Sale rate for ${item.product_name} is zero. Continue?`)) return;
+        zeroRateConfirmed = true;
+      }
+      const estimatedCost = Number(costByProduct.get(item.product_id) || 0);
+      if (rateChanged && estimatedCost > 0 && rate < estimatedCost && !belowCostConfirmed) {
+        if (!["Owner", "Admin"].includes(user.role) || !window.confirm(`This rate is below cost for ${item.product_name}. Continue?`)) return;
+        belowCostConfirmed = true;
+      }
     }
     if (totals.invoiceDiscount > totals.gross - totals.itemDiscount) {
       alert("Invoice discount cannot exceed the cart subtotal.");
@@ -5367,6 +5454,7 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
         items: cart.map((item) => ({
           product_id: item.product_id,
           quantity: Number(item.quantity),
+          selling_rate: Number(item.selling_rate),
           discount_amount: Number(item.discount_amount || 0),
         })),
         customer,
@@ -5375,10 +5463,17 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
         payments,
         branch_id: user.branch_id,
         created_by: user.id,
+        bill_datetime: billDateTime,
+        date_override_reason: dateOverrideReason,
+        backdate_confirmed: confirmations.backdate_confirmed || dateConfirmations.backdate_confirmed || false,
+        future_date_confirmed: confirmations.future_date_confirmed || dateConfirmations.future_date_confirmed || false,
+        below_cost_confirmed: belowCostConfirmed,
+        zero_rate_confirmed: zeroRateConfirmed,
       });
       setCart([]);
       setMixedPayments({ CASH: "", UPI: "", CARD: "" });
       setCustomer({ account_id: "", name: "", mobile: "", notes: "" });
+      setBillDateTime(currentDateTimeLocal());
       await onSaved();
       setLastInvoice(response.data.sale);
       onInvoice(response.data.sale);
@@ -5386,6 +5481,31 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
         setTimeout(() => window.print(), 250);
       }
     } catch (error) {
+      const responseData = error.response?.data || {};
+      if (error.response?.status === 409) {
+        if (responseData.requires_below_cost_confirmation && window.confirm(responseData.message || "This rate is below cost. Continue?")) {
+          setSaving(false);
+          setTimeout(() => checkout(printAfterSave, { ...confirmations, below_cost_confirmed: true, retry: true }), 0);
+          return;
+        }
+        if (responseData.requires_zero_rate_confirmation && window.confirm(responseData.message || "Zero sale rate requires confirmation. Continue?")) {
+          setSaving(false);
+          setTimeout(() => checkout(printAfterSave, { ...confirmations, zero_rate_confirmed: true, retry: true }), 0);
+          return;
+        }
+        if (responseData.requires_backdate_confirmation && window.confirm(responseData.message || "Backdated bill requires confirmation. Continue?")) {
+          const reason = window.prompt("Reason for backdated bill (optional)", "Backdated POS bill created") || "Backdated POS bill created";
+          setSaving(false);
+          setTimeout(() => checkout(printAfterSave, { ...confirmations, backdate_confirmed: true, date_override_reason: reason, retry: true }), 0);
+          return;
+        }
+        if (responseData.requires_future_date_confirmation && window.confirm(responseData.message || "Future bill date requires confirmation. Continue?")) {
+          const reason = window.prompt("Reason for future bill date (optional)", "Future-dated POS bill created") || "Future-dated POS bill created";
+          setSaving(false);
+          setTimeout(() => checkout(printAfterSave, { ...confirmations, future_date_confirmed: true, date_override_reason: reason, retry: true }), 0);
+          return;
+        }
+      }
       alert(getErrorMessage(error, "Unable to complete checkout"));
     } finally {
       setSaving(false);
@@ -5514,8 +5634,23 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
                 <tbody>
                   {cart.map((item) => (
                     <tr key={item.product_id}>
-                      <td className="primary-cell">{item.product_name}<small className="cell-note">{stockByProduct.get(item.product_id) || 0} {item.unit} available</small></td>
-                      <td>{currency.format(item.selling_rate)}</td>
+                      <td className="primary-cell">
+                        {item.product_name}
+                        <small className="cell-note">{stockByProduct.get(item.product_id) || 0} {item.unit} available</small>
+                        {roundUi(item.selling_rate) !== roundUi(item.default_selling_rate) && <small className="cell-note profit-cell">Manual Rate</small>}
+                      </td>
+                      <td>
+                        <input
+                          className="table-input"
+                          min="0"
+                          readOnly={!canManualRateOverride}
+                          step="0.01"
+                          title={canManualRateOverride ? "Owner/Admin can override POS sale rate" : "You do not have permission to change sale rate"}
+                          type="number"
+                          value={item.selling_rate}
+                          onChange={(event) => updateCartItem(item.product_id, "selling_rate", event.target.value)}
+                        />
+                      </td>
                       <td><input className="table-input" min="0.001" ref={(node) => { quantityRefs.current[item.product_id] = node; }} step="0.001" type="number" value={item.quantity} onChange={(event) => updateCartItem(item.product_id, "quantity", event.target.value)} onKeyDown={completeQuantityEntry} /></td>
                       {printSettings.show_item_discount_column_pos !== false && <td><input className="table-input" min="0" step="0.01" type="number" value={item.discount_amount} onChange={(event) => updateCartItem(item.product_id, "discount_amount", event.target.value)} /></td>}
                       <td className="primary-cell">{currency.format(item.quantity * item.selling_rate - Number(item.discount_amount || 0))}</td>
@@ -5533,6 +5668,15 @@ function PosBilling({ customers = [], discountRules = [], inventory, onInvoice, 
         <span className="eyebrow">Checkout</span>
         <h2>Invoice Summary</h2>
         <div className="checkout-section">
+          <Field label="Bill Date">
+            <input
+              disabled={!canPosDateOverride}
+              type="datetime-local"
+              value={billDateTime}
+              onChange={(event) => setBillDateTime(event.target.value)}
+            />
+          </Field>
+          <p className="form-note">{canPosDateOverride ? "Owner/Admin can select a previous or custom bill date." : "Bill date is locked for your role."}</p>
           <Field label="Saved Customer Account">
             <select value={customer.account_id || ""} onChange={(event) => selectCustomer(event.target.value)}>
               <option value="">Walk-in Customer</option>
@@ -5993,7 +6137,8 @@ function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = 
               <strong>Tax Invoice</strong>
               <span>{printSettings.business_name || "FroozERP Retail"}</span>
               <span>{invoice.invoice_no}</span>
-              <span>{new Date(invoice.created_at).toLocaleString("en-IN")}</span>
+              <span>Bill Date: {toDateKey(invoice.sale_date || invoice.transaction_date || invoice.created_at)}</span>
+              <span>Entry Time: {new Date(invoice.created_at).toLocaleString("en-IN")}</span>
             </div>
           </header>
           <section className="invoice-customer">
@@ -6006,7 +6151,7 @@ function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = 
             <tbody>
               {invoice.items?.map((item) => (
                 <tr key={item.product_id || item.id}>
-                  <td>{item.product_name}</td>
+                  <td>{item.product_name}{item.manual_rate_override && <small className="cell-note">Manual Rate</small>}</td>
                   <td>{item.quantity} {item.unit}</td>
                   <td>{receiptCurrency.format(Number(item.selling_rate))}</td>
                   {showItemDiscountOnReceipt && <td>{receiptCurrency.format(Number(item.discount_amount || 0))}</td>}

@@ -85,6 +85,8 @@ const PERMISSION_KEYS = [
   "inventory",
   "waste_management",
   "billing",
+  "manual_pos_rate_override",
+  "pos_date_override",
 ];
 
 const cleanText = (value) => (typeof value === "string" ? value.trim() : "");
@@ -114,6 +116,33 @@ const requireRateManager = async (userId, client = pool) => {
   );
   const user = result.rows[0];
   return user && RATE_MANAGER_ROLES.has(user.role_name) ? user : null;
+};
+
+const getPermissionUser = async (userId, permissionKey, defaultRoles = [], client = pool) => {
+  const parsedUserId = parsePositiveInteger(userId);
+  if (!parsedUserId || !PERMISSION_KEYS.includes(permissionKey)) return null;
+  const result = await client.query(
+    `
+    SELECT
+      u.id,
+      u.full_name,
+      r.role_name,
+      COALESCE(rps.permissions, '{}'::jsonb) AS permissions
+    FROM users u
+    JOIN roles r ON r.id = u.role_id
+    LEFT JOIN role_permission_settings rps ON rps.role_name = r.role_name
+    WHERE u.id = $1 AND u.active = TRUE
+    `,
+    [parsedUserId]
+  );
+  const user = result.rows[0];
+  if (!user) return null;
+  if (user.role_name === "Owner") return user;
+  const storedPermission = user.permissions?.[permissionKey];
+  if (storedPermission === true || (storedPermission === undefined && defaultRoles.includes(user.role_name))) {
+    return user;
+  }
+  return null;
 };
 
 const initializeDatabase = async () => {
@@ -805,6 +834,20 @@ const initializeDatabase = async () => {
       ('Inventory Manager', '{"inventory":true,"waste_management":true,"reports":true,"settings":false,"discounts":false,"mandi_tax":false,"rebate_rules":false,"supplier_payments":false,"customer_payments":false,"sale_edit":false,"invoice_cancellation":false,"purchases":false,"supplier_accounts":false,"billing":false}'::jsonb)
     ON CONFLICT (role_name) DO NOTHING;
 
+    UPDATE role_permission_settings
+    SET permissions = permissions || '{"manual_pos_rate_override":true,"pos_date_override":true}'::jsonb
+    WHERE role_name IN ('Owner', 'Admin');
+
+    UPDATE role_permission_settings
+    SET permissions = permissions || '{"manual_pos_rate_override":false}'::jsonb
+    WHERE role_name IN ('Cashier', 'Purchase Manager', 'Inventory Manager')
+      AND NOT (permissions ? 'manual_pos_rate_override');
+
+    UPDATE role_permission_settings
+    SET permissions = permissions || '{"pos_date_override":false}'::jsonb
+    WHERE role_name IN ('Cashier', 'Purchase Manager', 'Inventory Manager')
+      AND NOT (permissions ? 'pos_date_override');
+
     INSERT INTO branches (id, branch_name, location)
     VALUES (1, 'Main Branch', 'Primary Store')
     ON CONFLICT (id) DO NOTHING;
@@ -856,6 +899,12 @@ const initializeDatabase = async () => {
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS profit_status VARCHAR(30) DEFAULT 'FINAL';
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS transaction_date DATE;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS bill_datetime TIMESTAMP;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS backdated_bill BOOLEAN DEFAULT FALSE;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS backdate_reason TEXT;
+    UPDATE sales SET transaction_date = sale_date WHERE transaction_date IS NULL;
+    UPDATE sales SET bill_datetime = COALESCE(sale_date::timestamp, created_at) WHERE bill_datetime IS NULL;
     UPDATE sales
     SET customer_id = (
       SELECT id FROM customers WHERE system_account = TRUE ORDER BY id LIMIT 1
@@ -897,6 +946,23 @@ const initializeDatabase = async () => {
     ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS discount_amount NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS net_amount NUMERIC(14, 2);
     ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS cost_status VARCHAR(30) DEFAULT 'FINAL';
+    ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS default_selling_rate NUMERIC(14, 2);
+    ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS manual_rate_override BOOLEAN DEFAULT FALSE;
+    UPDATE sale_items SET default_selling_rate = selling_rate WHERE default_selling_rate IS NULL;
+
+    CREATE TABLE IF NOT EXISTS pos_rate_override_audit (
+      id SERIAL PRIMARY KEY,
+      sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+      sale_item_id INTEGER REFERENCES sale_items(id) ON DELETE SET NULL,
+      product_id INTEGER NOT NULL REFERENCES products(id),
+      product_name VARCHAR(160) NOT NULL,
+      default_rate NUMERIC(14, 2) NOT NULL,
+      manual_rate NUMERIC(14, 2) NOT NULL,
+      changed_by INTEGER REFERENCES users(id),
+      changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      invoice_no VARCHAR(40),
+      reason TEXT
+    );
 
     CREATE TABLE IF NOT EXISTS sale_payments (
       id SERIAL PRIMARY KEY,
@@ -918,6 +984,7 @@ const initializeDatabase = async () => {
       created_by INTEGER REFERENCES users(id),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    ALTER TABLE customer_ledger ADD COLUMN IF NOT EXISTS transaction_date DATE;
 
     CREATE TABLE IF NOT EXISTS sale_permission_settings (
       role_name VARCHAR(80) PRIMARY KEY,
@@ -1927,9 +1994,9 @@ const insertCustomerLedgerEntry = async (client, sale, transactionType, amount, 
     `
     INSERT INTO customer_ledger (
       sale_id, customer_name, customer_mobile, transaction_type,
-      debit_amount, credit_amount, balance_delta, remarks, created_by
+      debit_amount, credit_amount, balance_delta, remarks, created_by, transaction_date
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
     `,
     [
       sale.id,
@@ -1941,6 +2008,7 @@ const insertCustomerLedgerEntry = async (client, sale, transactionType, amount, 
       isCredit ? -ledgerAmount : ledgerAmount,
       remarks,
       userId,
+      sale.sale_date || sale.transaction_date || toDateKey(new Date()),
     ]
   );
 };
@@ -5692,7 +5760,9 @@ app.get("/reports/summary", async (req, res) => {
                 'net_amount', COALESCE(si.net_amount, si.amount - COALESCE(si.discount_amount, 0)),
                 'cost_amount', si.cost_amount,
                 'profit', si.profit,
-                'cost_status', si.cost_status
+                'cost_status', si.cost_status,
+                'default_selling_rate', si.default_selling_rate,
+                'manual_rate_override', COALESCE(si.manual_rate_override, FALSE)
               )
               ORDER BY si.id
             ) FILTER (WHERE si.id IS NOT NULL),
@@ -7898,10 +7968,56 @@ app.post("/sales", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const { product_id, quantity, branch_id, created_by, customer, invoice_discount, payments } = req.body;
+    const {
+      product_id,
+      quantity,
+      branch_id,
+      created_by,
+      customer,
+      invoice_discount,
+      payments,
+      bill_datetime,
+      bill_date,
+      date_override_reason,
+      backdate_reason,
+    } = req.body;
     const parsedBranchId = parsePositiveInteger(branch_id);
     const parsedCreatedBy = parsePositiveInteger(created_by) || 1;
     const parsedInvoiceDiscount = parseNonNegativeNumber(invoice_discount);
+    const rawBillDateTime = cleanText(bill_datetime || bill_date || "");
+    const requestedBillDateTime = rawBillDateTime ? new Date(rawBillDateTime) : new Date();
+    if (Number.isNaN(requestedBillDateTime.getTime())) {
+      return res.status(400).json({ message: "Select a valid bill date" });
+    }
+    const transactionDate = toDateKey(requestedBillDateTime);
+    const todayDate = toDateKey(new Date());
+    const isBackdatedBill = transactionDate < todayDate;
+    const isFutureBill = transactionDate > todayDate;
+    if (transactionDate !== todayDate) {
+      const dateOverrideUser = await getPermissionUser(parsedCreatedBy, "pos_date_override", ["Owner", "Admin"], client);
+      if (!dateOverrideUser) {
+        return res.status(403).json({ message: "You do not have permission to change bill date" });
+      }
+      if (isBackdatedBill && req.body.backdate_confirmed !== true) {
+        return res.status(409).json({
+          message: `You are creating a backdated POS bill for ${transactionDate}. Continue?`,
+          requires_backdate_confirmation: true,
+          bill_date: transactionDate,
+        });
+      }
+      if (isFutureBill) {
+        if (!["Owner", "Admin"].includes(dateOverrideUser.role_name)) {
+          return res.status(403).json({ message: "Only Owner/Admin can confirm a future bill date" });
+        }
+        if (req.body.future_date_confirmed !== true) {
+          return res.status(409).json({
+            message: `You are creating a future-dated POS bill for ${transactionDate}. Continue?`,
+            requires_future_date_confirmation: true,
+            bill_date: transactionDate,
+          });
+        }
+      }
+    }
     const requestedItems = Array.isArray(req.body.items)
       ? req.body.items
       : [{ product_id, quantity, discount_amount: 0 }];
@@ -7909,6 +8025,10 @@ app.post("/sales", async (req, res) => {
       productId: parsePositiveInteger(item.product_id),
       quantity: parsePositiveNumber(item.quantity),
       discountAmount: parseNonNegativeNumber(item.discount_amount),
+      hasRequestedRate: item.selling_rate !== undefined && item.selling_rate !== null && String(item.selling_rate).trim() !== "",
+      requestedRate: item.selling_rate !== undefined && item.selling_rate !== null && String(item.selling_rate).trim() !== ""
+        ? parseNonNegativeNumber(item.selling_rate)
+        : null,
     }));
     const selectedCustomerId = parsePositiveInteger(customer?.account_id || customer?.customer_id);
     const typedCustomerName = customer?.name?.trim() || null;
@@ -7919,7 +8039,7 @@ app.post("/sales", async (req, res) => {
       !parsedBranchId ||
       parsedInvoiceDiscount === null ||
       parsedItems.length === 0 ||
-      parsedItems.some((item) => !item.productId || !item.quantity || item.discountAmount === null)
+      parsedItems.some((item) => !item.productId || !item.quantity || item.discountAmount === null || (item.hasRequestedRate && item.requestedRate === null))
     ) {
       return res.status(400).json({ message: "Add valid products and quantities before checkout" });
     }
@@ -7965,10 +8085,30 @@ app.post("/sales", async (req, res) => {
     let grossAmount = 0;
     let itemDiscountAmount = 0;
     let totalCost = 0;
+    let rateOverrideUser = null;
     for (const requestedItem of parsedItems) {
       const product = productsById.get(requestedItem.productId);
-      const sellingRate = Number(product.selling_rate);
-      if (!Number.isFinite(sellingRate) || sellingRate <= 0) {
+      const defaultSellingRate = Number(product.selling_rate);
+      const manualRateOverride = requestedItem.hasRequestedRate && roundCurrency(requestedItem.requestedRate) !== roundCurrency(defaultSellingRate);
+      if (manualRateOverride && !rateOverrideUser) {
+        rateOverrideUser = await getPermissionUser(parsedCreatedBy, "manual_pos_rate_override", ["Owner", "Admin"], client);
+      }
+      if (manualRateOverride && !rateOverrideUser) {
+        await client.query("ROLLBACK");
+        return res.status(403).json({ message: "You do not have permission to change sale rate" });
+      }
+      if (manualRateOverride && requestedItem.requestedRate === 0) {
+        if (!["Owner", "Admin"].includes(rateOverrideUser.role_name) || req.body.zero_rate_confirmed !== true) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            message: "Zero sale rate requires Owner/Admin confirmation",
+            requires_zero_rate_confirmation: true,
+            product_name: product.product_name,
+          });
+        }
+      }
+      const sellingRate = manualRateOverride ? Number(requestedItem.requestedRate) : defaultSellingRate;
+      if (!Number.isFinite(sellingRate) || sellingRate < 0 || (sellingRate === 0 && !(manualRateOverride && req.body.zero_rate_confirmed === true))) {
         await client.query("ROLLBACK");
         return res.status(400).json({ message: `${product.product_name} does not have a valid selling rate` });
       }
@@ -8033,10 +8173,30 @@ app.post("/sales", async (req, res) => {
         itemCost += costAmount;
       }
 
+      const costPerUnit = requestedItem.quantity > 0 ? itemCost / requestedItem.quantity : 0;
+      if (manualRateOverride && sellingRate < costPerUnit) {
+        if (!["Owner", "Admin"].includes(rateOverrideUser.role_name)) {
+          await client.query("ROLLBACK");
+          return res.status(403).json({ message: "Only Owner/Admin can confirm below-cost sale" });
+        }
+        if (req.body.below_cost_confirmed !== true) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            message: `This rate is below cost for ${product.product_name}. Continue?`,
+            requires_below_cost_confirmation: true,
+            product_name: product.product_name,
+            cost_per_unit: roundCurrency(costPerUnit),
+            selling_rate: sellingRate,
+          });
+        }
+      }
+
       invoiceItems.push({
         ...requestedItem,
         product,
         sellingRate,
+        defaultSellingRate,
+        manualRateOverride,
         grossAmount: itemGross,
         netAmount: roundCurrency(itemGross - requestedItem.discountAmount),
         costAmount: roundCurrency(itemCost),
@@ -8097,9 +8257,10 @@ app.post("/sales", async (req, res) => {
         customer_name, customer_mobile, customer_notes, payment_mode,
         gross_amount, item_discount_amount, invoice_discount_amount, tax_amount,
         discount_rule_id, discount_rule_name, discount_rule_type, discount_rule_value,
-        discount_rule_payment_mode, profit_status
+        discount_rule_payment_mode, profit_status, sale_date, transaction_date,
+        bill_datetime, backdated_bill, backdate_reason
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
       RETURNING *
       `,
       [
@@ -8112,6 +8273,11 @@ app.post("/sales", async (req, res) => {
         discountRule?.discount_value || 0,
         discountRule?.payment_mode || null,
         profitStatus,
+        transactionDate,
+        transactionDate,
+        requestedBillDateTime,
+        isBackdatedBill,
+        cleanText(date_override_reason || backdate_reason) || (isBackdatedBill ? "Backdated POS bill created" : null),
       ]
     );
     const sale = saleResult.rows[0];
@@ -8129,17 +8295,42 @@ app.post("/sales", async (req, res) => {
       const saleItemResult = await client.query(
         `
         INSERT INTO sale_items (
-          sale_id, product_id, quantity, selling_rate, amount, discount_amount, net_amount, cost_amount, profit, cost_status
+          sale_id, product_id, quantity, selling_rate, amount, discount_amount, net_amount,
+          cost_amount, profit, cost_status, default_selling_rate, manual_rate_override
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         RETURNING id
         `,
         [
           sale.id, item.productId, item.quantity, item.sellingRate, item.grossAmount,
           item.discountAmount, item.netAmount, item.costAmount, itemProfit, item.costStatus,
+          item.defaultSellingRate, item.manualRateOverride,
         ]
       );
       const saleItemId = saleItemResult.rows[0].id;
+
+      if (item.manualRateOverride) {
+        await client.query(
+          `
+          INSERT INTO pos_rate_override_audit (
+            sale_id, sale_item_id, product_id, product_name, default_rate,
+            manual_rate, changed_by, invoice_no, reason
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          `,
+          [
+            sale.id,
+            saleItemId,
+            item.productId,
+            item.product.product_name,
+            item.defaultSellingRate,
+            item.sellingRate,
+            parsedCreatedBy,
+            invoiceNo,
+            cleanText(item.rate_override_reason || req.body.rate_override_reason) || null,
+          ]
+        );
+      }
 
       for (const allocation of item.allocations) {
         await client.query(
@@ -8198,6 +8389,8 @@ app.post("/sales", async (req, res) => {
           unit: item.product.unit,
           quantity: item.quantity,
           selling_rate: item.sellingRate,
+          default_selling_rate: item.defaultSellingRate,
+          manual_rate_override: item.manualRateOverride,
           amount: item.grossAmount,
           discount_amount: item.discountAmount,
           net_amount: item.netAmount,
@@ -8245,6 +8438,7 @@ app.get("/sales", async (req, res) => {
         s.total_cost AS cost_amount,
         s.profit,
         COUNT(si.id)::INTEGER AS item_count,
+        COALESCE(BOOL_OR(COALESCE(si.manual_rate_override, FALSE)), FALSE) AS manual_rate_override_applied,
         COALESCE(
           STRING_AGG(p.product_name || ' x ' || TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM si.quantity::TEXT)), ', ' ORDER BY si.id),
           'No active items'
@@ -8871,7 +9065,7 @@ app.get("/sales/:id", async (req, res) => {
         SELECT
           si.id, si.product_id, p.product_name, p.unit, si.quantity, si.selling_rate,
           si.amount, si.discount_amount, COALESCE(si.net_amount, si.amount) AS net_amount,
-          si.cost_amount, si.profit, si.cost_status
+          si.cost_amount, si.profit, si.cost_status, si.default_selling_rate, si.manual_rate_override
         FROM sale_items si
         JOIN products p ON p.id = si.product_id
         WHERE si.sale_id = $1
