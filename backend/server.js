@@ -544,10 +544,12 @@ const initializeDatabase = async () => {
       upi_payee_name VARCHAR(180),
       enable_upi_qr_on_invoice BOOLEAN DEFAULT FALSE,
       show_upi_qr_on_all_bills BOOLEAN DEFAULT FALSE,
+      qr_display_size VARCHAR(20) DEFAULT 'MEDIUM',
       updated_by INTEGER REFERENCES users(id),
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS show_upi_qr_on_all_bills BOOLEAN DEFAULT FALSE;
+    ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS qr_display_size VARCHAR(20) DEFAULT 'MEDIUM';
 
     CREATE TABLE IF NOT EXISTS sale_discount_rules (
       id SERIAL PRIMARY KEY,
@@ -2423,7 +2425,8 @@ app.put("/settings/payment", async (req, res) => {
           upi_payee_name = $2,
           enable_upi_qr_on_invoice = $3,
           show_upi_qr_on_all_bills = $4,
-          updated_by = $5,
+          qr_display_size = $5,
+          updated_by = $6,
           updated_at = CURRENT_TIMESTAMP
       WHERE id = 1
       RETURNING *
@@ -2433,6 +2436,7 @@ app.put("/settings/payment", async (req, res) => {
         nullableText(req.body.upi_payee_name),
         req.body.enable_upi_qr_on_invoice === true,
         req.body.show_upi_qr_on_all_bills === true,
+        ["SMALL", "MEDIUM", "LARGE"].includes(cleanText(req.body.qr_display_size).toUpperCase()) ? cleanText(req.body.qr_display_size).toUpperCase() : "MEDIUM",
         manager.id,
       ]
     );

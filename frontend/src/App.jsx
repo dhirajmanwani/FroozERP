@@ -255,6 +255,7 @@ const defaultPaymentSettings = {
   upi_payee_name: "FEEL THE FREAKIN' FROOZ",
   enable_upi_qr_on_invoice: false,
   show_upi_qr_on_all_bills: false,
+  qr_display_size: "MEDIUM",
 };
 
 function BrandLogo({ compact = false, invoice = false }) {
@@ -2205,7 +2206,6 @@ function App() {
                     <td>{sale.customer_name || "Walk-in Customer"}</td>
                     <td className="primary-cell">
                       {sale.item_summary}
-                      {sale.manual_rate_override_applied && <small className="cell-note profit-cell">Manual rate override applied</small>}
                     </td>
                     <td><span className="tag">{sale.payment_mode}</span></td>
                     <td>{currency.format(Number(sale.gross_amount || sale.amount))}</td>
@@ -2740,7 +2740,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
     const qty = Number(item.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 });
     const unit = String(item.unit || "").toLowerCase();
     const rate = Number(item.selling_rate || 0);
-    return `${product} ${qty}${unit} @ ${money(rate)} = ${money(saleItemGross(item))}${item.manual_rate_override ? " (Manual rate override applied)" : ""}`;
+    return `${product} ${qty}${unit} @ ${money(rate)} = ${money(saleItemGross(item))}`;
   };
   const saleNarrationPreview = (items) => {
     const summary = items
@@ -2859,7 +2859,6 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
           </td>
           <td className="primary-cell purchase-items-cell sales-items-cell" onDoubleClick={() => onOpenSaleForEdit?.(row)}>
             <span title={row.item_narration}>{salesNarrationDisplay(row)}</span>
-            {row.manual_rate_override && <small className="cell-note profit-cell">Manual rate override applied</small>}
             <small className="cell-note">{canEditSales ? "Double-click to open POS bill" : "Edit restricted by role"}</small>
           </td>
           <td>{money(row.gross_total)}</td>
@@ -4504,8 +4503,16 @@ function PaymentSettingsSection({ canManage, onReload, paymentSettings, user }) 
       <div className="form-grid supplier-form-grid">
         <Field label="Business UPI ID"><input disabled={!canManage} placeholder="name@bank" value={draft.business_upi_id || ""} onChange={(event) => updateDraft("business_upi_id", event.target.value)} /></Field>
         <Field label="Payee Name"><input disabled={!canManage} value={draft.upi_payee_name || ""} onChange={(event) => updateDraft("upi_payee_name", event.target.value)} /></Field>
-        <label className="check-field"><input checked={draft.enable_upi_qr_on_invoice === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enable_upi_qr_on_invoice", event.target.checked)} /><span>Enable UPI QR on UPI invoices</span></label>
+        <Field label="QR Display Size">
+          <select disabled={!canManage} value={draft.qr_display_size || "MEDIUM"} onChange={(event) => updateDraft("qr_display_size", event.target.value)}>
+            <option value="SMALL">Small</option>
+            <option value="MEDIUM">Medium</option>
+            <option value="LARGE">Large</option>
+          </select>
+        </Field>
+        <label className="check-field"><input checked={draft.enable_upi_qr_on_invoice === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enable_upi_qr_on_invoice", event.target.checked)} /><span>Enable UPI QR on Invoice</span></label>
         <label className="check-field"><input checked={draft.show_upi_qr_on_all_bills === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("show_upi_qr_on_all_bills", event.target.checked)} /><span>Show UPI QR on all bills</span></label>
+        {draft.enable_upi_qr_on_invoice === true && !draft.business_upi_id && <p className="form-note stock-low">Please add UPI ID in Settings to show QR code.</p>}
       </div>
       <button className="primary-button" disabled={!canManage} onClick={save}>Save Payment Settings</button>
     </ModuleCard>
@@ -5721,7 +5728,6 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
                       <td className="primary-cell">
                         {item.product_name}
                         <small className="cell-note">{stockByProduct.get(item.product_id) || 0} {item.unit} available</small>
-                        {roundUi(item.selling_rate) !== roundUi(item.default_selling_rate) && <small className="cell-note profit-cell">Manual Rate</small>}
                       </td>
                       <td>
                         <input
@@ -6166,7 +6172,14 @@ function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = 
   const billDiscountAmount = Number(invoice.invoice_discount_amount || 0);
   const shouldRenderBillDiscountRow = showBillDiscountRow && (billDiscountAmount > 0 || !hideZeroDiscountRows);
   const hasUpiPayment = invoice.payment_mode === "UPI" || invoice.payment_mode === "MIXED" || invoicePayments.some((payment) => (payment.mode || payment.payment_mode) === "UPI");
-  const shouldShowUpiQr = paymentSettings.enable_upi_qr_on_invoice === true && paymentSettings.business_upi_id && (hasUpiPayment || paymentSettings.show_upi_qr_on_all_bills === true);
+  const qrSizeMap = { SMALL: 110, MEDIUM: 145, LARGE: 180 };
+  const qrDisplaySize = String(paymentSettings.qr_display_size || "MEDIUM").toUpperCase();
+  const qrCodeWidth = activePrintMode === "THERMAL"
+    ? Math.min(qrSizeMap[qrDisplaySize] || 145, printSettings.receipt_width === "58MM" ? 118 : 145)
+    : (qrSizeMap[qrDisplaySize] || 145);
+  const isUpiQrEnabled = paymentSettings.enable_upi_qr_on_invoice === true;
+  const shouldShowUpiQr = isUpiQrEnabled && Boolean(paymentSettings.business_upi_id) && (hasUpiPayment || paymentSettings.show_upi_qr_on_all_bills === true || isUpiQrEnabled);
+  const shouldShowUpiWarning = isUpiQrEnabled && !paymentSettings.business_upi_id;
   const upiPayload = shouldShowUpiQr ? [
     "upi://pay?",
     `pa=${encodeURIComponent(paymentSettings.business_upi_id)}`,
@@ -6177,14 +6190,17 @@ function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = 
   ].join("") : "";
   useEffect(() => {
     let active = true;
-    if (!upiPayload) return undefined;
-    QRCode.toDataURL(upiPayload, { errorCorrectionLevel: "M", margin: 1, width: activePrintMode === "THERMAL" ? 120 : 160 })
+    if (!upiPayload) {
+      setUpiQrDataUrl("");
+      return undefined;
+    }
+    QRCode.toDataURL(upiPayload, { errorCorrectionLevel: "M", margin: 1, width: qrCodeWidth })
       .then((url) => active && setUpiQrDataUrl(url))
       .catch(() => active && setUpiQrDataUrl(""));
     return () => {
       active = false;
     };
-  }, [activePrintMode, upiPayload]);
+  }, [qrCodeWidth, upiPayload]);
   const invoiceDateKey = toDateKey(invoice.sale_date || invoice.transaction_date || invoice.created_at);
   const invoiceFileName = () => `FroozERP_POS_Invoice_${invoice.invoice_no || `SALE-${invoice.id}`}_${formatFileDate(invoiceDateKey)}.pdf`;
   const printWithMode = (mode) => {
@@ -6195,7 +6211,7 @@ function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = 
     setPrintMode(mode);
     setExporting(true);
     try {
-      await new Promise((resolve) => setTimeout(resolve, 80));
+      await new Promise((resolve) => setTimeout(resolve, upiPayload && !upiQrDataUrl ? 250 : 80));
       return await exportElementToPdf({
         element: invoiceRef.current,
         fileName: invoiceFileName(),
@@ -6271,7 +6287,7 @@ function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = 
             <tbody>
               {invoice.items?.map((item) => (
                 <tr key={item.product_id || item.id}>
-                  <td>{item.product_name}{item.manual_rate_override && <small className="cell-note">Manual Rate</small>}</td>
+                  <td>{item.product_name}</td>
                   <td>{item.quantity} {item.unit}</td>
                   <td>{receiptCurrency.format(Number(item.selling_rate))}</td>
                   {showItemDiscountOnReceipt && <td>{receiptCurrency.format(Number(item.discount_amount || 0))}</td>}
@@ -6286,9 +6302,10 @@ function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = 
             <ThermalTotalLine label="Tax" value={Number(invoice.tax_amount || 0)} />
             <ThermalTotalLine label="Net Payable" total value={Number(invoice.total_amount)} />
           </section>
+          {shouldShowUpiWarning && <p className="form-note stock-low">Please add UPI ID in Settings to show QR code.</p>}
           {shouldShowUpiQr && upiQrDataUrl && (
             <section className="upi-qr-box">
-              <img alt="UPI payment QR" src={upiQrDataUrl} />
+              <img alt="UPI payment QR" src={upiQrDataUrl} style={{ width: `${qrCodeWidth}px`, height: `${qrCodeWidth}px` }} />
               <div>
                 <strong>Scan to pay</strong>
                 <span>{paymentSettings.business_upi_id}</span>
