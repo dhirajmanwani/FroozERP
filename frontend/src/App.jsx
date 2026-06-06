@@ -2697,7 +2697,12 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
         ...(Array.isArray(data.profitLoss?.expenseCategories) ? data.profitLoss.expenseCategories : []).map((row) => ({ section: "Expenses", particular: row.category, amount: -Number(row.amount || 0) })),
         { section: "Result", particular: Number(data.profitLoss?.netProfit || 0) < 0 ? "Net Loss" : "Net Profit", amount: Number(data.profitLoss?.netProfit || 0), emphasis: true },
       ].filter(matchesSearch),
-      summary: () => [["Net Profit", money(data.profitLoss?.netProfit), true], ["Gross Profit", money(data.profitLoss?.grossProfit)], ["Total Expenses", money(data.profitLoss?.expenses)]],
+      summary: () => [
+        ["Sales Revenue", money(data.profitLoss?.salesRevenue), true],
+        ["Gross Profit", money(data.profitLoss?.grossProfit)],
+        ["Total Expenses", money(data.profitLoss?.expenses)],
+        [Number(data.profitLoss?.netProfit || 0) < 0 ? "Net Loss" : "Net Profit", money(Math.abs(Number(data.profitLoss?.netProfit || 0)))],
+      ],
       headers: ["Section", "Particulars", "Amount"],
       render: (row, index) => <tr className={row.emphasis ? "date-total-row" : ""} key={`${row.section}-${row.particular}-${index}`}><td>{row.section}</td><td className="primary-cell">{row.particular}</td><td className={row.amount < 0 ? "stock-low" : "profit-cell"}>{money(Math.abs(row.amount))}{row.amount < 0 ? " Dr" : ""}</td></tr>,
     },
@@ -2741,6 +2746,101 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
   ];
   const currentCategory = categories.find((category) => category.id === selectedCategory);
   const currentReport = reports[selectedReport];
+  const profitLossLine = (label, value, options = {}) => {
+    const numericValue = Number(value || 0);
+    const amountClass = numericValue < 0 ? "pl-negative" : options.positive ? "pl-positive" : "";
+    const formattedAmount = numericValue < 0 ? `(${money(Math.abs(numericValue))})` : money(numericValue);
+    return (
+      <div className={`pl-line ${options.indent ? "pl-line-indent" : ""} ${options.total ? "pl-line-total" : ""} ${options.highlight ? "pl-line-highlight" : ""}`} key={label}>
+        <span>{label}</span>
+        <strong className={amountClass}>{formattedAmount}</strong>
+      </div>
+    );
+  };
+  const renderProfitLossStatement = () => {
+    const pl = data.profitLoss || {};
+    const amount = (field) => Number(pl[field] || 0);
+    const salesRevenue = amount("salesRevenue");
+    const otherIncome = amount("otherIncome");
+    const totalIncome = salesRevenue + otherIncome;
+    const purchaseCost = amount("purchaseCost");
+    const mandiTax = amount("mandiTax");
+    const freightCharges = amount("freightCharges");
+    const labourCharges = amount("labourCharges");
+    const otherPurchaseCharges = amount("otherPurchaseCharges");
+    const supplierRebateReceived = amount("supplierRebateReceived");
+    const cogs = Number(pl.costOfGoodsSold ?? (purchaseCost + mandiTax + freightCharges + labourCharges + otherPurchaseCharges - supplierRebateReceived));
+    const grossProfit = Number(pl.grossProfit ?? (totalIncome - cogs));
+    const totalExpenses = amount("expenses");
+    const netProfit = Number(pl.netProfit ?? (grossProfit - totalExpenses));
+    const expenseCategories = Array.isArray(pl.expenseCategories) ? pl.expenseCategories : [];
+    const knownExpenseLabels = [
+      ["Rent", ["rent"]],
+      ["Staff Salary", ["staff salary", "salary", "wages"]],
+      ["Electricity", ["electricity", "power"]],
+      ["Transport", ["transport", "transportation"]],
+      ["Loading / Hamali", ["loading", "hamali", "labour"]],
+      ["Packing", ["packing", "packaging"]],
+      ["Repair", ["repair", "maintenance"]],
+      ["Food / Tea / Misc", ["food", "tea", "misc"]],
+    ];
+    const matchedExpenseIndexes = new Set();
+    const expenseRows = knownExpenseLabels.map(([label, needles]) => {
+      const total = expenseCategories.reduce((sum, row, index) => {
+        const category = String(row.category || "").toLowerCase();
+        if (needles.some((needle) => category.includes(needle))) {
+          matchedExpenseIndexes.add(index);
+          return sum + Number(row.amount || 0);
+        }
+        return sum;
+      }, 0);
+      return { category: label, amount: total };
+    }).filter((row) => row.amount > 0);
+    const otherExpenses = expenseCategories.reduce((sum, row, index) => matchedExpenseIndexes.has(index) ? sum : sum + Number(row.amount || 0), 0);
+    if (otherExpenses > 0) {
+      expenseRows.push({ category: "Other Expenses", amount: otherExpenses });
+    }
+    const hasTransactions = [salesRevenue, otherIncome, purchaseCost, mandiTax, freightCharges, labourCharges, otherPurchaseCharges, supplierRebateReceived, totalExpenses].some((value) => Math.abs(Number(value || 0)) > 0);
+    const periodFrom = data.dateFrom || customRange.date_from || "-";
+    const periodTo = data.dateTo || customRange.date_to || "-";
+    return (
+      <div className="profit-loss-statement">
+        <div className="pl-title-block">
+          <span>Financial Report</span>
+          <h2>PROFIT &amp; LOSS STATEMENT</h2>
+          <p>For Period: {periodFrom} to {periodTo}</p>
+        </div>
+        {!hasTransactions && <div className="pl-empty-note">No transactions found for selected period.</div>}
+        <section className="pl-section">
+          <h3>INCOME</h3>
+          {profitLossLine("Sales Revenue", salesRevenue, { indent: true })}
+          {profitLossLine("Other Income", otherIncome, { indent: true })}
+          {profitLossLine("TOTAL INCOME", totalIncome, { total: true })}
+        </section>
+        <section className="pl-section">
+          <h3>LESS: COST OF GOODS SOLD</h3>
+          {profitLossLine("Purchase Cost", purchaseCost, { indent: true })}
+          {profitLossLine("Mandi Tax", mandiTax, { indent: true })}
+          {profitLossLine("Freight", freightCharges, { indent: true })}
+          {profitLossLine("Labour", labourCharges, { indent: true })}
+          {profitLossLine("Other Purchase Charges", otherPurchaseCharges, { indent: true })}
+          {profitLossLine("Less Supplier Rebate Received", -supplierRebateReceived, { indent: true })}
+          {profitLossLine("TOTAL COGS", cogs, { total: true })}
+        </section>
+        <section className="pl-section pl-result-section">
+          {profitLossLine("GROSS PROFIT", grossProfit, { highlight: true, positive: grossProfit >= 0 })}
+        </section>
+        <section className="pl-section">
+          <h3>LESS: EXPENSES</h3>
+          {expenseRows.length > 0 ? expenseRows.map((row) => profitLossLine(row.category, row.amount, { indent: true })) : <div className="pl-empty-note">No expenses recorded for this period.</div>}
+          {profitLossLine("TOTAL EXPENSES", totalExpenses, { total: true })}
+        </section>
+        <section className={`pl-section pl-net-section ${netProfit >= 0 ? "pl-net-profit" : "pl-net-loss"}`}>
+          {profitLossLine(netProfit >= 0 ? "NET PROFIT" : "NET LOSS", netProfit, { highlight: true, positive: netProfit >= 0 })}
+        </section>
+      </div>
+    );
+  };
   const renderFilters = () => (
     <div className={selectedReport === "purchaseHistory" ? "ledger-toolbar purchase-history-toolbar" : "ledger-toolbar"}>
       <Field label="Report Range">
@@ -2916,16 +3016,20 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
           <PrintableReport
             beforePdfExport={handleReportPrintOption}
             beforePrint={handleReportPrintOption}
-            reportClassName={selectedReport === "salesHistory" ? "sales-history-print-report" : selectedReport === "purchaseHistory" ? "purchase-history-print-report" : ""}
+            reportClassName={selectedReport === "salesHistory" ? "sales-history-print-report" : selectedReport === "purchaseHistory" ? "purchase-history-print-report" : selectedReport === "profitLoss" ? "profit-loss-print-report" : ""}
             title={currentReport.title}
           >
             <div className="purchase-summary-grid supplier-payment-preview">
               {(currentReport.summary?.(rows) || []).map(([label, value, featured]) => <SummaryMetric featured={featured} key={label} label={label} value={value} />)}
             </div>
-            <DataTable headers={currentReport.headers}>
-              {selectedReport === "purchaseHistory" ? renderPurchaseHistoryRows() : rows.map((row, index) => currentReport.render(row, index))}
-            </DataTable>
-            {rows.length === 0 && <div className="cart-empty">No records found for the selected filters.</div>}
+            {selectedReport === "profitLoss" ? renderProfitLossStatement() : (
+              <>
+                <DataTable headers={currentReport.headers}>
+                  {selectedReport === "purchaseHistory" ? renderPurchaseHistoryRows() : rows.map((row, index) => currentReport.render(row, index))}
+                </DataTable>
+                {rows.length === 0 && <div className="cart-empty">No records found for the selected filters.</div>}
+              </>
+            )}
           </PrintableReport>
         </ModuleCard>
       </section>
