@@ -814,14 +814,48 @@ function App() {
   };
 
   const login = async () => {
-    try {
-      const response = await axios.post(`${API_URL}/login`, { username, password });
-      setUser(response.data);
-      await Promise.all([loadProducts(), loadProductCategories(), loadDashboardData(), loadPurchaseRules(), loadPurchases(), loadSupplierData(), loadCustomerData(), loadAccounts(), loadAccountOutstanding(), loadAccountPayments(), loadSaleReturns(), loadWasteEntries(), loadSettingsData(response.data)]);
-    } catch (error) {
-      alert(getErrorMessage(error, "Login Failed"));
-    }
-  };
+  try {
+    const response = await axios.post(`${API_URL}/login`, { username, password });
+    setUser(response.data);
+  } catch (error) {
+    alert(
+  getErrorMessage(
+    error,
+    `Login successful, but data loading failed: ${error?.response?.config?.url || error?.message}`
+  )
+);
+    return;
+  }
+
+  try {
+  const results = await Promise.allSettled([
+    loadProducts(),
+    loadProductCategories(),
+    loadDashboardData(),
+  ]);
+
+  const failedLoads = results
+    .map((result, index) => {
+      const names = ["Products", "Product Categories", "Dashboard Data"];
+      return result.status === "rejected"
+        ? `${names[index]} failed: ${
+            result.reason?.response?.config?.url ||
+            result.reason?.response?.data?.message ||
+            result.reason?.message ||
+            "Unknown error"
+          }`
+        : null;
+    })
+    .filter(Boolean);
+
+  if (failedLoads.length > 0) {
+    alert(`Login successful, but these failed:\n\n${failedLoads.join("\n")}`);
+    console.error("Data loading failures:", results);
+  }
+} catch (error) {
+  alert(getErrorMessage(error, "Login successful, but data loading failed"));
+}
+};
 
   const addProduct = async () => {
     try {
