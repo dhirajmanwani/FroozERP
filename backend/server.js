@@ -7019,15 +7019,22 @@ const insertOpeningStockLot = async (client, { product, lot, actorId, branchId }
   const quantity = parsePositiveNumber(lot.quantity);
   const purchaseRate = parsePositiveNumber(lot.purchase_rate || lot.opening_cost);
   const saleRate = parsePositiveNumber(lot.sale_rate) || Number(product.selling_rate || 0);
-  const lotName = cleanText(lot.lot_name || lot.lot_number || "Opening Stock Lot");
   const lotSize = nullableText(lot.lot_size || lot.size_grade || lot.size);
+  let lotName = cleanText(lot.lot_name || lot.lot_number);
+  if (!lotName) {
+    const countResult = await client.query(
+      "SELECT COUNT(*)::INTEGER AS lot_count FROM inventory_batches WHERE product_id = $1 AND stock_source = 'OPENING_STOCK'",
+      [product.id]
+    );
+    lotName = `Opening Lot ${Number(countResult.rows[0]?.lot_count || 0) + 1}`;
+  }
   const openingDate = isDateInput(lot.opening_stock_date || lot.purchase_date) ? (lot.opening_stock_date || lot.purchase_date) : toDateKey(new Date());
   const supplierId = parsePositiveInteger(lot.supplier_id);
   const supplierName = nullableText(lot.supplier_name);
   const remarks = nullableText(lot.remarks) || "Opening stock";
+  const allowDuplicateLot = lot.allow_duplicate_lot === true || lot.allow_duplicate_lot === "true";
   if (!quantity) return { error: "Please enter lot quantity." };
   if (!purchaseRate) return { error: "Please enter opening stock rate." };
-  if (!lotName) return { error: "Please enter lot name / size." };
 
   const duplicateResult = await client.query(
     `
@@ -7037,12 +7044,15 @@ const insertOpeningStockLot = async (client, { product, lot, actorId, branchId }
       AND LOWER(COALESCE(lot_name, '')) = LOWER($2)
       AND COALESCE(purchase_date, created_at::date) = $3
       AND COALESCE(supplier_id, 0) = COALESCE($4, 0)
+      AND LOWER(COALESCE(lot_size, '')) = LOWER(COALESCE($5, ''))
       AND COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'
     LIMIT 1
     `,
-    [product.id, lotName, openingDate, supplierId]
+    [product.id, lotName, openingDate, supplierId, lotSize]
   );
-  if (duplicateResult.rows.length > 0) return { error: "Duplicate lot name already exists for this item/date/supplier." };
+  if (duplicateResult.rows.length > 0 && !allowDuplicateLot) {
+    return { error: "This lot already exists. Add as separate lot anyway?" };
+  }
 
   const batchNo = `OPEN-${Date.now()}-${product.id}-${Math.floor(Math.random() * 10000)}`;
   const netPayable = roundCurrency(quantity * purchaseRate);

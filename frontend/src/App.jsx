@@ -950,7 +950,7 @@ function App() {
         alert("Please select or add product category.");
         return;
       }
-      if (addOpeningStock && openingStockLots.length === 0) {
+      if (addOpeningStock && !editingProductId && openingStockLots.length === 0) {
         alert("Please add at least one opening stock lot.");
         return;
       }
@@ -1082,13 +1082,23 @@ function App() {
     }
   };
 
+  const getSupplierLabel = (supplierId) => {
+    const supplier = activeSuppliers.find((item) => String(item.id) === String(supplierId));
+    return supplier?.supplier_name || "";
+  };
+
+  const getOpeningLotName = (draft, nextIndex) => draft.lot_name.trim() || `Opening Lot ${nextIndex}`;
+
+  const isSameOpeningLot = (left, right) =>
+    String(left.product_id || editingProductId || "").toLowerCase() === String(right.product_id || editingProductId || "").toLowerCase() &&
+    String(left.lot_name || "").trim().toLowerCase() === String(right.lot_name || "").trim().toLowerCase() &&
+    String(left.supplier_id || "").trim() === String(right.supplier_id || "").trim() &&
+    String(left.opening_stock_date || left.purchase_date || "").slice(0, 10) === String(right.opening_stock_date || right.purchase_date || "").slice(0, 10) &&
+    String(left.lot_size || "").trim().toLowerCase() === String(right.lot_size || "").trim().toLowerCase();
+
   const addOpeningStockLot = () => {
     const quantity = Number(openingStockDraft.quantity || 0);
     const purchaseRate = Number(openingStockDraft.purchase_rate || 0);
-    if (!openingStockDraft.lot_name.trim()) {
-      alert("Please enter lot name / size.");
-      return;
-    }
     if (quantity <= 0) {
       alert("Please enter lot quantity.");
       return;
@@ -1097,7 +1107,20 @@ function App() {
       alert("Please enter opening stock rate.");
       return;
     }
-    setOpeningStockLots((current) => [...current, { ...openingStockDraft, sale_rate: openingStockDraft.sale_rate || sellingRate }]);
+    const nextLotName = getOpeningLotName(openingStockDraft, productLots.length + openingStockLots.length + 1);
+    const nextLot = {
+      ...openingStockDraft,
+      lot_name: nextLotName,
+      supplier_name: getSupplierLabel(openingStockDraft.supplier_id),
+      sale_rate: openingStockDraft.sale_rate || sellingRate,
+    };
+    const duplicateLot = [...productLots, ...openingStockLots].find((lot) => isSameOpeningLot(lot, nextLot));
+    if (duplicateLot) {
+      const confirmed = window.confirm("This lot already exists. Add as separate lot anyway?");
+      if (!confirmed) return;
+      nextLot.allow_duplicate_lot = true;
+    }
+    setOpeningStockLots((current) => [...current, nextLot]);
     setOpeningStockDraft({
       lot_name: "",
       lot_size: "",
@@ -2028,18 +2051,21 @@ function App() {
                       <Field label="Lot Remarks"><input value={openingStockDraft.remarks} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, remarks: event.target.value })} /></Field>
                     </div>
                     <button className="secondary-button" onClick={addOpeningStockLot}>Add Opening Stock Lot</button>
-                    <DataTable headers={["Lot", "Size", "Qty", "Cost", "Sale Rate", "Date", "Actions"]}>
+                    <DataTable headers={["Supplier", "Lot", "Size", "Qty", "Cost", "Sale Rate", "Date", "Remarks", "Actions"]}>
                       {openingStockLots.map((lot, index) => (
-                        <tr key={`${lot.lot_name}-${index}`}>
+                        <tr key={`${lot.lot_name}-${lot.opening_stock_date}-${index}`}>
+                          <td>{lot.supplier_name || "-"}</td>
                           <td className="primary-cell">{lot.lot_name}</td>
                           <td>{lot.lot_size || "-"}</td>
                           <td>{lot.quantity}</td>
                           <td>{currency.format(Number(lot.purchase_rate || 0))}</td>
                           <td>{currency.format(Number(lot.sale_rate || sellingRate || 0))}</td>
                           <td>{lot.opening_stock_date}</td>
+                          <td>{lot.remarks || "-"}</td>
                           <td><button className="remove-button" onClick={() => setOpeningStockLots((current) => current.filter((_, lotIndex) => lotIndex !== index))}>Remove</button></td>
                         </tr>
                       ))}
+                      {openingStockLots.length === 0 && <tr><td colSpan="9" className="empty-cell">Add one or more opening stock lots before saving.</td></tr>}
                     </DataTable>
                   </div>
                 )}
@@ -2079,6 +2105,9 @@ function App() {
                         <tr><td colSpan="11" className="empty-cell">No lots found for this product.</td></tr>
                       )}
                     </DataTable>
+                    <div className="button-row">
+                      <button className="secondary-button" onClick={() => setAddOpeningStock(true)}>Add New Opening Stock Lot</button>
+                    </div>
                     {productLotAudit.length > 0 && (
                       <div className="lot-audit-panel">
                         <h3>Lot Audit Trail</h3>
