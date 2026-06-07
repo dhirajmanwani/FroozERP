@@ -2952,6 +2952,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
   const [balanceSheetDetail, setBalanceSheetDetail] = useState(null);
   const [balanceSheetDetailLoading, setBalanceSheetDetailLoading] = useState(false);
   const [balanceSheetDetailError, setBalanceSheetDetailError] = useState("");
+  const [dayBookDetail, setDayBookDetail] = useState(null);
   const [purchaseFilters, setPurchaseFilters] = useState({
     supplier: "",
     product: "",
@@ -2963,13 +2964,13 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
     date_from: toDateKey(new Date()),
     date_to: toDateKey(new Date()),
   });
+  const currentReportParams = () => range === "custom" ? customRange : { range };
   const refreshReports = async () => {
-    const params = range === "custom" ? customRange : { range };
-    await onReload(params);
+    await onReload(currentReportParams());
   };
   const clearLedgerFilters = async () => {
     setAccountReportFilters({ accountType: "", accountName: "", voucherType: "", paymentMode: "" });
-    await onReload(range === "custom" ? customRange : { range });
+    await onReload(currentReportParams());
   };
   const openBalanceSheetDetail = async (lineKey) => {
     if (!lineKey) return;
@@ -2977,7 +2978,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
     setBalanceSheetDetailError("");
     setBalanceSheetDetail(null);
     try {
-      const response = await axios.get(`${API_URL}/reports/balance-sheet/details/${lineKey}`);
+      const response = await axios.get(`${API_URL}/reports/balance-sheet/details/${lineKey}`, { params: currentReportParams() });
       setBalanceSheetDetail(response.data);
     } catch (error) {
       setBalanceSheetDetailError(getErrorMessage(error, "Unable to load Balance Sheet detail"));
@@ -3007,6 +3008,21 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
   const stockRows = filterRows(data.stockReport);
   const lowStockRows = stockRows.filter((row) => Number(row.current_stock || 0) <= Number(row.minimum_stock || 0));
   const ledgerRows = filterRows(data.ledgerReport);
+  const dayBookVoucherType = (row) => {
+    const raw = String(row.transaction_type || row.voucher_type || "").toLowerCase();
+    if (raw.includes("sale return")) return "Sale Return";
+    if (raw.includes("customer sale") || raw === "sale" || raw.includes("pos sale")) return "POS Sale";
+    if (raw.includes("supplier purchase") || raw === "purchase") return "Purchase";
+    if (raw.includes("supplier payment")) return "Supplier Payment";
+    if (raw.includes("customer payment") || raw.includes("customer receipt") || raw === "receipt") return "Customer Receipt";
+    if (raw.includes("expense")) return "Expense";
+    if (raw.includes("waste")) return "Waste";
+    if (raw.includes("opening")) return "Opening Stock";
+    if (raw.includes("adjust")) return "Stock Adjustment";
+    if (raw.includes("capital")) return "Owner Capital";
+    if (raw.includes("drawing")) return "Drawings";
+    return row.transaction_type || row.voucher_type || "-";
+  };
   const accountNames = [...new Set(ledgerRows.map((row) => row.party_name).filter(Boolean))].sort();
   const voucherTypes = [
     "POS Sale",
@@ -3016,11 +3032,11 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
     "Expense",
     "Sale Return",
     "Waste",
-    "Adjustment",
+    "Stock Adjustment",
     "Opening Stock",
     "Owner Capital",
     "Drawings",
-    ...new Set(ledgerRows.map((row) => row.transaction_type || row.voucher_type).filter(Boolean)),
+    ...new Set(ledgerRows.map(dayBookVoucherType).filter(Boolean)),
   ].filter((type, index, list) => list.indexOf(type) === index).sort();
   const filteredLedgerRows = ledgerRows.filter((row) => {
     if (accountReportFilters.accountType === "CASH" && row.payment_mode !== "CASH") return false;
@@ -3028,17 +3044,20 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
     if (accountReportFilters.accountType === "EXPENSE" && !["EXPENSE", "EXPENSE_VENDOR"].includes(row.account_type)) return false;
     if (accountReportFilters.accountType && !["CASH", "BANK", "EXPENSE"].includes(accountReportFilters.accountType) && row.account_type !== accountReportFilters.accountType) return false;
     if (accountReportFilters.accountName && row.party_name !== accountReportFilters.accountName) return false;
-    if (accountReportFilters.voucherType && row.voucher_type !== accountReportFilters.voucherType && row.transaction_type !== accountReportFilters.voucherType) return false;
-    if (accountReportFilters.paymentMode && row.payment_mode !== accountReportFilters.paymentMode) return false;
+    if (accountReportFilters.voucherType && dayBookVoucherType(row) !== accountReportFilters.voucherType) return false;
+    if (accountReportFilters.paymentMode === "OTHER" && ["CASH", "UPI", "CARD", "BANK_TRANSFER", "CREDIT", "CHEQUE"].includes(row.payment_mode)) return false;
+    if (accountReportFilters.paymentMode && accountReportFilters.paymentMode !== "OTHER" && row.payment_mode !== accountReportFilters.paymentMode) return false;
     return true;
   });
   const clubRowsByDateAccount = (rows) => {
     if (!clubLedgerEntries) return rows;
     const groups = new Map();
     for (const row of rows) {
-      const key = `${toDateKey(row.date)}-${row.voucher_type || row.transaction_type}-${row.party_name}-${row.payment_mode || "NONE"}`;
+      const voucherType = dayBookVoucherType(row);
+      const key = `${toDateKey(row.date)}-${voucherType}-${row.party_name}-${row.payment_mode || "NONE"}`;
       const current = groups.get(key) || {
         ...row,
+        display_voucher_type: voucherType,
         voucher_no: "Multiple",
         debit: 0,
         credit: 0,
@@ -3051,7 +3070,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       current.transaction_count += 1;
       current.narration = [current.narration, row.narration || row.remarks].filter(Boolean).join("\n");
       current.remarks = [current.remarks, row.remarks].filter(Boolean).join("; ");
-      current.narration_summary = `${row.transaction_type || row.voucher_type} - ${current.transaction_count} ${current.transaction_count === 1 ? "entry" : "entries"}${row.payment_mode ? ` - ${row.payment_mode}` : ""}`;
+      current.narration_summary = `${voucherType} - ${current.transaction_count} ${current.transaction_count === 1 ? "entry" : "entries"}${row.payment_mode ? ` - ${row.payment_mode}` : ""}`;
       groups.set(key, current);
     }
     return [...groups.values()];
@@ -3617,7 +3636,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       rows: dayBookRows,
       summary: (rows) => [["Debit", money(totalOf(rows, "debit")), true], ["Credit", money(totalOf(rows, "credit"))], ["Vouchers", rows.length]],
       headers: ["Date", "Particulars", "Voucher Type", "Voucher No.", "Debit Amount", "Credit Amount", "Narration"],
-      render: (row, index) => <tr key={`${row.date}-${row.voucher_no}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell">{row.party_name}</td><td>{row.transaction_type || row.voucher_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="purchase-items-cell"><span title={row.narration || row.remarks}>{clubLedgerEntries ? row.narration_summary || ledgerNarration(row) : ledgerNarration(row)}</span></td></tr>,
+      render: (row, index) => <tr onDoubleClick={() => setDayBookDetail(row)} key={`${row.date}-${row.voucher_no}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell">{row.party_name}</td><td>{row.display_voucher_type || dayBookVoucherType(row)}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="purchase-items-cell"><span title={row.narration || row.remarks}>{clubLedgerEntries ? row.narration_summary || ledgerNarration(row) : ledgerNarration(row)}</span></td></tr>,
     },
     expenseReport: {
       title: "Expense Report",
@@ -3911,7 +3930,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
             <div>
               <span className="eyebrow">Balance Sheet Drilldown</span>
               <h2>{balanceSheetDetail?.title || "Loading Detail"}</h2>
-              <p>{balanceSheetDetail ? `Summary amount: ${money(balanceSheetDetail.amount)}` : "Fetching source transactions..."}</p>
+              <p>{balanceSheetDetail ? `${formatDisplayDate(balanceSheetDetail.dateFrom)} to ${formatDisplayDate(balanceSheetDetail.dateTo)} | Closing as at ${formatDisplayDate(balanceSheetDetail.asAtDate || balanceSheetDetail.dateTo)}` : "Fetching source transactions..."}</p>
             </div>
             <button className="secondary-button" onClick={() => { setBalanceSheetDetail(null); setBalanceSheetDetailError(""); }}>Close</button>
           </div>
@@ -3920,8 +3939,18 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
           {balanceSheetDetail && (
             <>
               <div className="purchase-summary-grid supplier-payment-preview">
-                {(balanceSheetDetail.breakdown || []).map((item) => <SummaryMetric key={item.label} label={item.label} value={money(item.value)} />)}
+                {[
+                  ["Opening Balance", balanceSheetDetail.openingBalance],
+                  ["Debit During Range", balanceSheetDetail.debitDuringRange],
+                  ["Credit During Range", balanceSheetDetail.creditDuringRange],
+                  ["Closing Balance", balanceSheetDetail.closingBalance ?? balanceSheetDetail.amount],
+                ].map(([label, value], index) => <SummaryMetric featured={index === 3} key={label} label={label} value={money(value)} />)}
               </div>
+              {Array.isArray(balanceSheetDetail.breakdown) && balanceSheetDetail.breakdown.length > 0 && (
+                <div className="balance-detail-breakdown">
+                  {balanceSheetDetail.breakdown.map((item) => <span key={item.label}>{item.label}: <strong>{money(item.value)}</strong></span>)}
+                </div>
+              )}
               <DataTable headers={columns}>
                 {rows.map((row, index) => (
                   <tr key={`${balanceSheetDetail.lineKey}-${index}`}>
@@ -3932,6 +3961,35 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
               {rows.length === 0 && <div className="cart-empty">No source transactions found for this line.</div>}
             </>
           )}
+        </section>
+      </div>
+    );
+  };
+  const renderDayBookDetailModal = () => {
+    if (!dayBookDetail) return null;
+    return (
+      <div className="modal-backdrop">
+        <section className="invoice-modal change-history-modal">
+          <div className="invoice-modal-header">
+            <div>
+              <span className="eyebrow">Day Book Detail</span>
+              <h2>{dayBookDetail.display_voucher_type || dayBookVoucherType(dayBookDetail)}</h2>
+              <p>{formatDisplayDate(dayBookDetail.date)} | {dayBookDetail.party_name || "-"}</p>
+            </div>
+            <button className="secondary-button" onClick={() => setDayBookDetail(null)}>Close</button>
+          </div>
+          <div className="purchase-summary-grid supplier-payment-preview">
+            <SummaryMetric label="Voucher No." value={dayBookDetail.voucher_no || "-"} />
+            <SummaryMetric label="Payment Mode" value={dayBookDetail.payment_mode || "-"} />
+            <SummaryMetric label="Debit" value={money(dayBookDetail.debit)} />
+            <SummaryMetric featured label="Credit" value={money(dayBookDetail.credit)} />
+          </div>
+          <div className="audit-readable">
+            {(dayBookDetail.narration || dayBookDetail.remarks || dayBookDetail.narration_summary || "No narration available")
+              .split("\n")
+              .filter(Boolean)
+              .map((line, index) => <span key={`${line}-${index}`}>{line}</span>)}
+          </div>
         </section>
       </div>
     );
@@ -4021,6 +4079,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
           </ModuleCard>
         </section>
         {renderBalanceSheetDetailModal()}
+        {renderDayBookDetailModal()}
       </>
     );
   }

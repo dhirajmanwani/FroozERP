@@ -1194,9 +1194,17 @@ const initializeDatabase = async () => {
   `);
 };
 
-const getSupplierSummaryRows = async ({ active, search, supplierId } = {}) => {
+const previousDateKey = (dateValue) => {
+  const date = new Date(`${toDateKey(dateValue)}T00:00:00`);
+  date.setDate(date.getDate() - 1);
+  return toDateKey(date);
+};
+
+const getSupplierSummaryRows = async ({ active, search, supplierId, dateTo } = {}) => {
   const filters = [];
   const values = [];
+  const purchaseDateFilter = isDateInput(dateTo) ? `AND purchase_date <= $${values.push(dateTo)}` : "";
+  const paymentDateFilter = isDateInput(dateTo) ? `AND payment_date <= $${values.length}` : "";
   if (supplierId) {
     values.push(supplierId);
     filters.push(`s.id = $${values.length}`);
@@ -1229,6 +1237,7 @@ const getSupplierSummaryRows = async ({ active, search, supplierId } = {}) => {
       WHERE supplier_id IS NOT NULL
         AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
         AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
+        ${purchaseDateFilter}
       GROUP BY supplier_id
     ),
     payment_summary AS (
@@ -1238,6 +1247,7 @@ const getSupplierSummaryRows = async ({ active, search, supplierId } = {}) => {
         SUM(rebate_amount) AS payment_rebate
       FROM supplier_payments
       WHERE cancelled = FALSE
+        ${paymentDateFilter}
       GROUP BY supplier_id
     )
     SELECT
@@ -1366,9 +1376,11 @@ const readAccountPayload = (body) => {
   };
 };
 
-const getCustomerSummaryRows = async ({ active, search, customerId } = {}) => {
+const getCustomerSummaryRows = async ({ active, search, customerId, dateTo } = {}) => {
   const filters = [];
   const values = [];
+  const saleDateFilter = isDateInput(dateTo) ? `AND s.sale_date <= $${values.push(dateTo)}` : "";
+  const customerPaymentDateFilter = isDateInput(dateTo) ? `AND payment_date <= $${values.length}` : "";
   if (customerId) {
     values.push(customerId);
     filters.push(`c.id = $${values.length}`);
@@ -1424,12 +1436,15 @@ const getCustomerSummaryRows = async ({ active, search, customerId } = {}) => {
         FROM sale_payments
         GROUP BY sale_id
       ) pay ON pay.sale_id = s.id
+      WHERE 1 = 1
+        ${saleDateFilter}
       GROUP BY matched.customer_id
     ),
     customer_payment_summary AS (
       SELECT customer_id, SUM(payment_amount) AS total_customer_paid
       FROM customer_payments
       WHERE cancelled = FALSE
+        ${customerPaymentDateFilter}
       GROUP BY customer_id
     )
     SELECT
@@ -1468,7 +1483,8 @@ const buildCustomerSummaryPayload = (rows) => {
   };
 };
 
-const getBalanceSheetSnapshot = async () => {
+const getBalanceSheetSnapshot = async ({ dateTo = toDateKey(new Date()) } = {}) => {
+  const asAtDate = isDateInput(dateTo) ? dateTo : toDateKey(new Date());
   const bankModesSql = BANK_PAYMENT_MODES.map((mode) => `'${mode}'`).join(", ");
   const [cashResult, inventoryResult, profitLossResult, supplierRows, customerRows] = await Promise.all([
     pool.query(
@@ -1480,18 +1496,21 @@ const getBalanceSheetSnapshot = async () => {
           JOIN sales s ON s.id = sp.sale_id
           WHERE s.sale_status <> 'CANCELLED'
             AND sp.payment_mode = 'CASH'
+            AND s.sale_date <= $1
         ), 0)
         + COALESCE((
           SELECT SUM(payment_amount)
           FROM customer_payments
           WHERE cancelled = FALSE
             AND payment_mode = 'CASH'
+            AND payment_date <= $1
         ), 0)
         - COALESCE((
           SELECT SUM(payment_amount)
           FROM supplier_payments
           WHERE cancelled = FALSE
             AND payment_mode = 'CASH'
+            AND payment_date <= $1
         ), 0)
         - COALESCE((
           SELECT SUM(COALESCE(paid_amount, 0))
@@ -1499,6 +1518,7 @@ const getBalanceSheetSnapshot = async () => {
           WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
             AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
             AND COALESCE(payment_mode, '') = 'CASH'
+            AND purchase_date <= $1
         ), 0)
         - COALESCE((
           SELECT SUM(amount)
@@ -1506,6 +1526,7 @@ const getBalanceSheetSnapshot = async () => {
           WHERE active IS DISTINCT FROM FALSE
             AND COALESCE(status, 'ACTIVE') <> 'CANCELLED'
             AND payment_mode = 'CASH'
+            AND expense_date <= $1
         ), 0) AS cash_in_hand,
         COALESCE((
           SELECT SUM(sp.amount)
@@ -1513,18 +1534,21 @@ const getBalanceSheetSnapshot = async () => {
           JOIN sales s ON s.id = sp.sale_id
           WHERE s.sale_status <> 'CANCELLED'
             AND sp.payment_mode IN (${bankModesSql})
+            AND s.sale_date <= $1
         ), 0)
         + COALESCE((
           SELECT SUM(payment_amount)
           FROM customer_payments
           WHERE cancelled = FALSE
             AND payment_mode IN (${bankModesSql})
+            AND payment_date <= $1
         ), 0)
         - COALESCE((
           SELECT SUM(payment_amount)
           FROM supplier_payments
           WHERE cancelled = FALSE
             AND payment_mode IN (${bankModesSql})
+            AND payment_date <= $1
         ), 0)
         - COALESCE((
           SELECT SUM(COALESCE(paid_amount, 0))
@@ -1532,6 +1556,7 @@ const getBalanceSheetSnapshot = async () => {
           WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
             AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
             AND COALESCE(payment_mode, '') IN (${bankModesSql})
+            AND purchase_date <= $1
         ), 0)
         - COALESCE((
           SELECT SUM(amount)
@@ -1539,32 +1564,37 @@ const getBalanceSheetSnapshot = async () => {
           WHERE active IS DISTINCT FROM FALSE
             AND COALESCE(status, 'ACTIVE') <> 'CANCELLED'
             AND payment_mode IN (${bankModesSql})
+            AND expense_date <= $1
         ), 0) AS cash_at_bank
-      `
+      `,
+      [asAtDate]
     ),
     pool.query(
       `
       SELECT COALESCE(SUM(remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate)), 0) AS inventory_value
       FROM inventory_batches
       WHERE COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'
-      `
+        AND created_at::date <= $1
+      `,
+      [asAtDate]
     ),
     pool.query(
       `
       SELECT
-        COALESCE((SELECT SUM(total_amount) FROM sales WHERE sale_status <> 'CANCELLED'), 0) AS sales_revenue,
-        COALESCE((SELECT SUM(total_cost) FROM sales WHERE sale_status <> 'CANCELLED'), 0) AS purchase_cost,
-        COALESCE((SELECT SUM(mandi_tax_amount) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0) AS mandi_tax,
-        COALESCE((SELECT SUM(freight_charges) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0) AS freight_charges,
-        COALESCE((SELECT SUM(labour_charges) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0) AS labour_charges,
-        COALESCE((SELECT SUM(other_charges) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0) AS other_purchase_charges,
-        COALESCE((SELECT SUM(amount) FROM expenses WHERE active IS DISTINCT FROM FALSE AND COALESCE(status, 'ACTIVE') <> 'CANCELLED'), 0) AS expenses,
-        COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0)
-          + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE), 0) AS supplier_rebate_received
-      `
+        COALESCE((SELECT SUM(total_amount) FROM sales WHERE sale_status <> 'CANCELLED' AND sale_date <= $1), 0) AS sales_revenue,
+        COALESCE((SELECT SUM(total_cost) FROM sales WHERE sale_status <> 'CANCELLED' AND sale_date <= $1), 0) AS purchase_cost,
+        COALESCE((SELECT SUM(mandi_tax_amount) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0) AS mandi_tax,
+        COALESCE((SELECT SUM(freight_charges) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0) AS freight_charges,
+        COALESCE((SELECT SUM(labour_charges) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0) AS labour_charges,
+        COALESCE((SELECT SUM(other_charges) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0) AS other_purchase_charges,
+        COALESCE((SELECT SUM(amount) FROM expenses WHERE active IS DISTINCT FROM FALSE AND COALESCE(status, 'ACTIVE') <> 'CANCELLED' AND expense_date <= $1), 0) AS expenses,
+        COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0)
+          + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE AND payment_date <= $1), 0) AS supplier_rebate_received
+      `,
+      [asAtDate]
     ),
-    getSupplierSummaryRows(),
-    getCustomerSummaryRows(),
+    getSupplierSummaryRows({ dateTo: asAtDate }),
+    getCustomerSummaryRows({ dateTo: asAtDate }),
   ]);
 
   const cash = cashResult.rows[0] || {};
@@ -1587,6 +1617,7 @@ const getBalanceSheetSnapshot = async () => {
   const ownerCapital = roundCurrency(totalAssets - supplierPayable - netProfit);
 
   return {
+    asAtDate,
     cash: roundCurrency(cashInHand),
     bank: roundCurrency(cashAtBank),
     inventory: roundCurrency(inventoryValue),
@@ -5455,10 +5486,16 @@ app.get("/dashboard-expense-trend", async (req, res) => {
   }
 });
 
-app.get("/reports/balance-sheet", async (_req, res) => {
+app.get("/reports/balance-sheet", async (req, res) => {
   try {
-    const snapshot = await getBalanceSheetSnapshot();
+    const reportRange = getReportDateRange(req.query);
+    const dateFrom = req.query.date_from || reportRange.dateFrom;
+    const dateTo = req.query.date_to || reportRange.dateTo;
+    const snapshot = await getBalanceSheetSnapshot({ dateTo });
     return res.json({
+      dateFrom,
+      dateTo,
+      asAtDate: snapshot.asAtDate,
       cash: snapshot.cash,
       bank: snapshot.bank,
       inventory: snapshot.inventory,
@@ -5479,7 +5516,10 @@ app.get("/reports/balance-sheet", async (_req, res) => {
 app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
   try {
     const lineKey = String(req.params.lineKey || "").toLowerCase();
-    const snapshot = await getBalanceSheetSnapshot();
+    const reportRange = getReportDateRange(req.query);
+    const dateFrom = req.query.date_from || reportRange.dateFrom;
+    const dateTo = req.query.date_to || reportRange.dateTo;
+    const snapshot = await getBalanceSheetSnapshot({ dateTo });
     const bankModesSql = BANK_PAYMENT_MODES.map((mode) => `'${mode}'`).join(", ");
     const titles = {
       cash_in_hand: "Cash in Hand Detail",
@@ -5513,6 +5553,7 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
           JOIN sales s ON s.id = sp.sale_id
           WHERE s.sale_status <> 'CANCELLED'
             AND sp.payment_mode ${paymentCondition}
+            AND s.sale_date <= $1
           UNION ALL
           SELECT cp.payment_date AS transaction_date, 'Customer Receipt' AS voucher_type,
             COALESCE(cp.reference_number, 'CP-' || cp.id) AS voucher_no,
@@ -5523,6 +5564,7 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
           JOIN customers c ON c.id = cp.customer_id
           WHERE cp.cancelled = FALSE
             AND cp.payment_mode ${paymentCondition}
+            AND cp.payment_date <= $1
           UNION ALL
           SELECT sp.payment_date AS transaction_date, 'Supplier Payment' AS voucher_type,
             COALESCE(sp.reference_number, 'SP-' || sp.id) AS voucher_no,
@@ -5533,6 +5575,7 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
           JOIN suppliers s ON s.id = sp.supplier_id
           WHERE sp.cancelled = FALSE
             AND sp.payment_mode ${paymentCondition}
+            AND sp.payment_date <= $1
           UNION ALL
           SELECT p.purchase_date AS transaction_date, 'Purchase Payment' AS voucher_type,
             COALESCE(p.bill_number, 'PUR-' || p.id) AS voucher_no,
@@ -5545,6 +5588,7 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
             AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
             AND COALESCE(p.paid_amount, 0) > 0
             AND p.payment_mode ${paymentCondition}
+            AND p.purchase_date <= $1
           UNION ALL
           SELECT e.expense_date AS transaction_date, 'Expense' AS voucher_type,
             COALESCE(e.reference_number, 'EXP-' || e.id) AS voucher_no,
@@ -5555,22 +5599,44 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
           WHERE e.active IS DISTINCT FROM FALSE
             AND COALESCE(e.status, 'ACTIVE') <> 'CANCELLED'
             AND e.payment_mode ${paymentCondition}
+            AND e.expense_date <= $1
         ) rows
         ORDER BY transaction_date, voucher_type, voucher_no
-        `
+        `,
+        [dateTo]
       );
-      let balance = 0;
-      const rows = result.rows.map((row) => {
+      const allRows = result.rows.map((row) => ({ ...row, date_key: toDateKey(row.transaction_date) }));
+      const openingBalance = roundCurrency(allRows
+        .filter((row) => row.date_key < dateFrom)
+        .reduce((sum, row) => sum + Number(row.debit || 0) - Number(row.credit || 0), 0));
+      const movementRows = allRows.filter((row) => row.date_key >= dateFrom && row.date_key <= dateTo);
+      const debitDuringRange = roundCurrency(movementRows.reduce((sum, row) => sum + Number(row.debit || 0), 0));
+      const creditDuringRange = roundCurrency(movementRows.reduce((sum, row) => sum + Number(row.credit || 0), 0));
+      let balance = openingBalance;
+      const rows = movementRows.map((row) => {
         balance = roundCurrency(balance + Number(row.debit || 0) - Number(row.credit || 0));
         return { ...row, balance };
-      }).reverse();
+      });
+      const closingBalance = roundCurrency(openingBalance + debitDuringRange - creditDuringRange);
       return res.json({
         lineKey,
         title: titles[lineKey],
         amount,
+        dateFrom,
+        dateTo,
+        asAtDate: snapshot.asAtDate,
+        openingBalance,
+        debitDuringRange,
+        creditDuringRange,
+        closingBalance,
         columns: ["Date", "Voucher Type", "Voucher No", "Party", "Payment Mode", "Debit", "Credit", "Balance", "Narration"],
         rows,
-        breakdown: [{ label: titles[lineKey], value: amount }],
+        breakdown: [
+          { label: `Opening Balance before ${dateFrom}`, value: openingBalance },
+          { label: "Debit during range", value: debitDuringRange },
+          { label: "Credit during range", value: creditDuringRange },
+          { label: `Closing Balance as at ${dateTo}`, value: closingBalance },
+        ],
       });
     }
 
@@ -5589,24 +5655,44 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
         JOIN products p ON p.id = ib.product_id
         WHERE COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
           AND COALESCE(ib.remaining_qty, 0) <> 0
+          AND ib.created_at::date <= $1
         ORDER BY p.product_name, ib.created_at, ib.id
-        `
+        `,
+        [dateTo]
       );
       return res.json({
         lineKey,
         title: titles[lineKey],
         amount: snapshot.inventory,
+        dateFrom,
+        dateTo,
+        asAtDate: snapshot.asAtDate,
+        openingBalance: 0,
+        debitDuringRange: 0,
+        creditDuringRange: 0,
+        closingBalance: snapshot.inventory,
         columns: ["Product", "Lot", "Size", "Qty", "Cost", "Value", "Supplier"],
         rows: result.rows,
-        breakdown: [{ label: "Closing stock valuation", value: snapshot.inventory }],
+        breakdown: [{ label: `Closing stock valuation as at ${dateTo}`, value: snapshot.inventory }],
       });
     }
 
     if (lineKey === "supplier_payables") {
+      const openingRows = await getSupplierSummaryRows({ dateTo: previousDateKey(dateFrom) });
+      const openingBalance = roundCurrency(openingRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0));
+      const debitDuringRange = roundCurrency(Math.max(0, openingBalance - snapshot.supplierPayable));
+      const creditDuringRange = roundCurrency(Math.max(0, snapshot.supplierPayable - openingBalance));
       return res.json({
         lineKey,
         title: titles[lineKey],
         amount: snapshot.supplierPayable,
+        dateFrom,
+        dateTo,
+        asAtDate: snapshot.asAtDate,
+        openingBalance,
+        debitDuringRange,
+        creditDuringRange,
+        closingBalance: snapshot.supplierPayable,
         columns: ["Supplier", "Opening", "Purchases", "Payments", "Rebates", "Balance"],
         rows: snapshot.supplierRows.map((row) => ({
           supplier_name: row.supplier_name,
@@ -5616,15 +5702,29 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
           rebates: row.total_rebate_received,
           balance: row.outstanding_balance,
         })),
-        breakdown: [{ label: "Supplier outstanding", value: snapshot.supplierPayable }],
+        breakdown: [
+          { label: `Opening Payable before ${dateFrom}`, value: openingBalance },
+          { label: `Closing Payable as at ${dateTo}`, value: snapshot.supplierPayable },
+        ],
       });
     }
 
     if (lineKey === "customer_receivables") {
+      const openingRows = await getCustomerSummaryRows({ dateTo: previousDateKey(dateFrom) });
+      const openingBalance = roundCurrency(openingRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0));
+      const debitDuringRange = roundCurrency(Math.max(0, snapshot.customerReceivable - openingBalance));
+      const creditDuringRange = roundCurrency(Math.max(0, openingBalance - snapshot.customerReceivable));
       return res.json({
         lineKey,
         title: titles[lineKey],
         amount: snapshot.customerReceivable,
+        dateFrom,
+        dateTo,
+        asAtDate: snapshot.asAtDate,
+        openingBalance,
+        debitDuringRange,
+        creditDuringRange,
+        closingBalance: snapshot.customerReceivable,
         columns: ["Customer", "Opening", "Credit Sales", "Receipts", "Returns", "Balance"],
         rows: snapshot.customerRows.map((row) => ({
           customer_name: row.customer_name,
@@ -5634,15 +5734,29 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
           returns: row.total_cancelled,
           balance: row.outstanding_balance,
         })),
-        breakdown: [{ label: "Customer receivables", value: snapshot.customerReceivable }],
+        breakdown: [
+          { label: `Opening Receivable before ${dateFrom}`, value: openingBalance },
+          { label: `Closing Receivable as at ${dateTo}`, value: snapshot.customerReceivable },
+        ],
       });
     }
 
     if (lineKey === "net_profit") {
+      const openingSnapshot = await getBalanceSheetSnapshot({ dateTo: previousDateKey(dateFrom) });
+      const openingBalance = openingSnapshot.netProfit;
+      const debitDuringRange = roundCurrency(Math.max(0, openingBalance - snapshot.netProfit));
+      const creditDuringRange = roundCurrency(Math.max(0, snapshot.netProfit - openingBalance));
       return res.json({
         lineKey,
         title: titles[lineKey],
         amount: snapshot.netProfit,
+        dateFrom,
+        dateTo,
+        asAtDate: snapshot.asAtDate,
+        openingBalance,
+        debitDuringRange,
+        creditDuringRange,
+        closingBalance: snapshot.netProfit,
         columns: ["Particular", "Amount"],
         rows: [
           { particular: "Sales Revenue", amount: snapshot.profitLoss.salesRevenue },
@@ -5661,10 +5775,21 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
     }
 
     if (lineKey === "owner_equity") {
+      const openingSnapshot = await getBalanceSheetSnapshot({ dateTo: previousDateKey(dateFrom) });
+      const openingBalance = openingSnapshot.ownerCapital;
+      const debitDuringRange = roundCurrency(Math.max(0, openingBalance - snapshot.ownerCapital));
+      const creditDuringRange = roundCurrency(Math.max(0, snapshot.ownerCapital - openingBalance));
       return res.json({
         lineKey,
         title: titles[lineKey],
         amount: snapshot.ownerCapital,
+        dateFrom,
+        dateTo,
+        asAtDate: snapshot.asAtDate,
+        openingBalance,
+        debitDuringRange,
+        creditDuringRange,
+        closingBalance: snapshot.ownerCapital,
         columns: ["Particular", "Amount"],
         rows: [
           { particular: "Total Assets", amount: snapshot.totalAssets },
@@ -5685,6 +5810,13 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
       lineKey,
       title: titles[lineKey],
       amount: 0,
+      dateFrom,
+      dateTo,
+      asAtDate: snapshot.asAtDate,
+      openingBalance: 0,
+      debitDuringRange: 0,
+      creditDuringRange: 0,
+      closingBalance: 0,
       columns: ["Particular", "Amount"],
       rows: [],
       breakdown: [{ label: "No source transactions configured yet", value: 0 }],
@@ -5692,6 +5824,183 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Balance Sheet Details" });
+  }
+});
+
+app.get("/reports/day-book", async (req, res) => {
+  try {
+    const reportRange = getReportDateRange(req.query);
+    const dateFrom = req.query.date_from || reportRange.dateFrom;
+    const dateTo = req.query.date_to || reportRange.dateTo;
+    const search = cleanText(req.query.search).toLowerCase();
+    const accountType = req.query.account_type ? normalizeAccountType(req.query.account_type) : "";
+    const voucherType = cleanText(req.query.voucher_type);
+    const paymentMode = normalizePaymentMode(req.query.payment_mode || "");
+    const clubbed = String(req.query.clubbed || "").toLowerCase() === "true";
+    const bankModes = new Set(BANK_PAYMENT_MODES);
+    const canonicalVoucher = (row) => {
+      const raw = String(row.transaction_type || row.voucher_type || "").toLowerCase();
+      if (raw.includes("sale return")) return "Sale Return";
+      if (raw.includes("customer sale") || raw === "sale" || raw.includes("pos sale")) return "POS Sale";
+      if (raw.includes("supplier purchase") || raw === "purchase") return "Purchase";
+      if (raw.includes("supplier payment")) return "Supplier Payment";
+      if (raw.includes("customer payment") || raw.includes("customer receipt") || raw === "receipt") return "Customer Receipt";
+      if (raw.includes("expense")) return "Expense";
+      if (raw.includes("waste")) return "Waste";
+      if (raw.includes("opening")) return "Opening Stock";
+      if (raw.includes("adjust")) return "Stock Adjustment";
+      if (raw.includes("capital")) return "Owner Capital";
+      if (raw.includes("drawing")) return "Drawings";
+      return row.transaction_type || row.voucher_type || "";
+    };
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM (
+        SELECT s.sale_date AS date, 'POS Sale' AS transaction_type,
+          COALESCE(s.customer_name, 'Walk-in Customer') AS party_name,
+          'CUSTOMER' AS account_type,
+          COALESCE(s.invoice_no, 'SALE-' || s.id) AS voucher_no,
+          sp.payment_mode,
+          CASE WHEN sp.payment_mode = 'CREDIT' THEN s.total_amount ELSE 0 END AS debit,
+          CASE WHEN sp.payment_mode = 'CREDIT' THEN 0 ELSE sp.amount END AS credit,
+          COALESCE(s.invoice_no, 'POS sale') AS narration
+        FROM sales s
+        LEFT JOIN sale_payments sp ON sp.sale_id = s.id
+        WHERE s.sale_status <> 'CANCELLED' AND s.sale_date BETWEEN $1 AND $2
+        UNION ALL
+        SELECT p.purchase_date AS date, 'Purchase' AS transaction_type,
+          COALESCE(s.supplier_name, p.supplier_name, 'Supplier') AS party_name,
+          'SUPPLIER' AS account_type,
+          COALESCE(p.bill_number, 'PUR-' || p.id) AS voucher_no,
+          COALESCE(p.payment_mode, CASE WHEN p.purchase_type = 'CREDIT' THEN 'CREDIT' ELSE '' END) AS payment_mode,
+          COALESCE(NULLIF(p.net_payable, 0), p.total_amount, 0) AS debit,
+          CASE WHEN p.purchase_type = 'CREDIT' THEN COALESCE(NULLIF(p.net_payable, 0), p.total_amount, 0) ELSE 0 END AS credit,
+          COALESCE(p.remarks, 'Purchase') AS narration
+        FROM purchases p
+        LEFT JOIN suppliers s ON s.id = p.supplier_id
+        WHERE COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
+          AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
+          AND p.purchase_date BETWEEN $1 AND $2
+        UNION ALL
+        SELECT sp.payment_date AS date, 'Supplier Payment' AS transaction_type,
+          s.supplier_name AS party_name,
+          'SUPPLIER' AS account_type,
+          COALESCE(sp.reference_number, 'SP-' || sp.id) AS voucher_no,
+          sp.payment_mode,
+          sp.payment_amount + sp.rebate_amount AS debit,
+          0::NUMERIC AS credit,
+          COALESCE(sp.remarks, 'Supplier payment') AS narration
+        FROM supplier_payments sp
+        JOIN suppliers s ON s.id = sp.supplier_id
+        WHERE sp.cancelled = FALSE AND sp.payment_date BETWEEN $1 AND $2
+        UNION ALL
+        SELECT cp.payment_date AS date, 'Customer Receipt' AS transaction_type,
+          c.customer_name AS party_name,
+          'CUSTOMER' AS account_type,
+          COALESCE(cp.reference_number, 'CP-' || cp.id) AS voucher_no,
+          cp.payment_mode,
+          0::NUMERIC AS debit,
+          cp.payment_amount AS credit,
+          COALESCE(cp.remarks, 'Customer receipt') AS narration
+        FROM customer_payments cp
+        JOIN customers c ON c.id = cp.customer_id
+        WHERE cp.cancelled = FALSE AND cp.payment_date BETWEEN $1 AND $2
+        UNION ALL
+        SELECT e.expense_date AS date, 'Expense' AS transaction_type,
+          COALESCE(e.paid_to, e.vendor_name, e.category) AS party_name,
+          'EXPENSE' AS account_type,
+          COALESCE(e.reference_number, 'EXP-' || e.id) AS voucher_no,
+          e.payment_mode,
+          e.amount AS debit,
+          0::NUMERIC AS credit,
+          COALESCE(e.remarks, e.category) AS narration
+        FROM expenses e
+        WHERE e.active IS DISTINCT FROM FALSE
+          AND COALESCE(e.status, 'ACTIVE') <> 'CANCELLED'
+          AND e.expense_date BETWEEN $1 AND $2
+        UNION ALL
+        SELECT sr.return_date AS date, 'Sale Return' AS transaction_type,
+          COALESCE(sr.customer_name, 'Walk-in Customer') AS party_name,
+          'CUSTOMER' AS account_type,
+          COALESCE(sr.return_no, 'RET-' || sr.id) AS voucher_no,
+          sr.refund_type AS payment_mode,
+          0::NUMERIC AS debit,
+          sr.total_return_amount AS credit,
+          COALESCE(sr.return_reason, 'Sale return') AS narration
+        FROM sale_returns sr
+        WHERE sr.return_date BETWEEN $1 AND $2
+        UNION ALL
+        SELECT we.waste_date AS date, 'Waste' AS transaction_type,
+          p.product_name AS party_name,
+          'INVENTORY' AS account_type,
+          'WST-' || we.id AS voucher_no,
+          '' AS payment_mode,
+          we.cost_amount AS debit,
+          0::NUMERIC AS credit,
+          COALESCE(we.remarks, we.waste_type) AS narration
+        FROM waste_entries we
+        JOIN products p ON p.id = we.product_id
+        WHERE we.waste_date BETWEEN $1 AND $2
+        UNION ALL
+        SELECT ib.created_at::date AS date, 'Opening Stock' AS transaction_type,
+          p.product_name AS party_name,
+          'INVENTORY' AS account_type,
+          COALESCE(ib.batch_no, 'OPEN-' || ib.id) AS voucher_no,
+          '' AS payment_mode,
+          ib.purchase_qty * COALESCE(ib.effective_cost_per_unit, ib.purchase_rate, 0) AS debit,
+          0::NUMERIC AS credit,
+          COALESCE(ib.remarks, 'Opening stock') AS narration
+        FROM inventory_batches ib
+        JOIN products p ON p.id = ib.product_id
+        WHERE ib.stock_source = 'OPENING_STOCK'
+          AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+          AND ib.created_at::date BETWEEN $1 AND $2
+      ) rows
+      ORDER BY date DESC, transaction_type, party_name
+      `,
+      [dateFrom, dateTo]
+    );
+    const matches = (row) => {
+      const rowVoucherType = canonicalVoucher(row);
+      if (accountType === "CASH" && row.payment_mode !== "CASH") return false;
+      if (accountType === "BANK" && !bankModes.has(row.payment_mode)) return false;
+      if (accountType && !["CASH", "BANK"].includes(accountType) && row.account_type !== accountType) return false;
+      if (voucherType && rowVoucherType !== voucherType) return false;
+      if (paymentMode === "OTHER" && ["CASH", "UPI", "CARD", "BANK_TRANSFER", "CREDIT", "CHEQUE"].includes(row.payment_mode)) return false;
+      if (paymentMode && paymentMode !== "OTHER" && row.payment_mode !== paymentMode) return false;
+      if (search) {
+        const haystack = Object.values(row).join(" ").toLowerCase();
+        if (!haystack.includes(search)) return false;
+      }
+      return true;
+    };
+    const rows = result.rows.filter(matches).map((row) => ({ ...row, voucher_type: canonicalVoucher(row) }));
+    const finalRows = clubbed ? [...rows.reduce((groups, row) => {
+      const key = `${toDateKey(row.date)}-${row.voucher_type}-${row.party_name}-${row.payment_mode || ""}`;
+      const current = groups.get(key) || { ...row, voucher_no: "Multiple", debit: 0, credit: 0, transaction_count: 0, narration: "" };
+      current.debit += Number(row.debit || 0);
+      current.credit += Number(row.credit || 0);
+      current.transaction_count += 1;
+      current.narration = [current.narration, row.narration].filter(Boolean).join("\n");
+      current.narration_summary = `${row.voucher_type} - ${current.transaction_count} ${current.transaction_count === 1 ? "entry" : "entries"}${row.payment_mode ? ` - ${row.payment_mode}` : ""}`;
+      groups.set(key, current);
+      return groups;
+    }, new Map()).values()] : rows;
+    return res.json({
+      dateFrom,
+      dateTo,
+      filters: { account_type: accountType, voucher_type: voucherType, payment_mode: paymentMode, search, clubbed },
+      rows: finalRows,
+      summary: {
+        debit: roundCurrency(finalRows.reduce((sum, row) => sum + Number(row.debit || 0), 0)),
+        credit: roundCurrency(finalRows.reduce((sum, row) => sum + Number(row.credit || 0), 0)),
+        rows: finalRows.length,
+      },
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Day Book" });
   }
 });
 
@@ -6679,7 +6988,7 @@ app.get("/reports/summary", async (req, res) => {
         [dateFrom, dateTo]
       ),
     ]);
-    const balanceSheetSnapshot = await getBalanceSheetSnapshot();
+    const balanceSheetSnapshot = await getBalanceSheetSnapshot({ dateTo });
     const profitLoss = profitLossResult.rows[0] || {};
     const customerReceivable = customerRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0);
     const supplierPayable = supplierRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0);
