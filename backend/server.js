@@ -1641,6 +1641,283 @@ const getBalanceSheetSnapshot = async ({ dateTo = toDateKey(new Date()) } = {}) 
   };
 };
 
+const cashBookModeGroup = (paymentMode) => {
+  const mode = normalizePaymentMode(paymentMode);
+  if (mode === "CASH" || mode === "CASH_REFUND") return "CASH";
+  if (BANK_PAYMENT_MODES.includes(mode) || mode === "UPI_REFUND" || mode === "CARD_REFUND" || mode === "BANK_REFUND") return "BANK";
+  return "";
+};
+
+const getCashBookReport = async ({
+  dateFrom = toDateKey(new Date()),
+  dateTo = toDateKey(new Date()),
+  paymentMode = "",
+  accountFilter = "",
+  search = "",
+  groupByDate = false,
+  lineKey = "",
+} = {}) => {
+  const from = isDateInput(dateFrom) ? dateFrom : toDateKey(new Date());
+  const to = isDateInput(dateTo) ? dateTo : from;
+  const normalizedPaymentMode = normalizePaymentMode(paymentMode || "");
+  const normalizedAccountFilter = String(accountFilter || "").trim().toUpperCase();
+  const searchText = cleanText(search).toLowerCase();
+  const result = await pool.query(
+    `
+    WITH sale_item_summary AS (
+      SELECT
+        si.sale_id,
+        STRING_AGG(
+          DISTINCT p.product_name
+            || COALESCE(' ' || NULLIF(ib.lot_name, ''), '')
+            || ' ' || TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM si.quantity::TEXT))
+            || COALESCE(' ' || p.unit, '')
+            || ' @ ' || si.selling_rate,
+          ', '
+        ) AS item_summary
+      FROM sale_items si
+      JOIN products p ON p.id = si.product_id
+      LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
+      LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
+      GROUP BY si.sale_id
+    ),
+    purchase_item_summary AS (
+      SELECT
+        pi.purchase_id,
+        STRING_AGG(
+          DISTINCT pr.product_name
+            || COALESCE(' ' || NULLIF(pi.lot_name, ''), '')
+            || ' ' || TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM pi.quantity::TEXT))
+            || COALESCE(' ' || pr.unit, ''),
+          ', '
+        ) AS item_summary
+      FROM purchase_items pi
+      JOIN products pr ON pr.id = pi.product_id
+      GROUP BY pi.purchase_id
+    )
+    SELECT *
+    FROM (
+      SELECT
+        s.sale_date AS date,
+        s.created_at AS entry_time,
+        'Customer A/c - ' || COALESCE(c.customer_name, s.customer_name, 'Walk-in Customer') AS account_name,
+        'CUSTOMER' AS account_type,
+        COALESCE(c.customer_name, s.customer_name, 'Walk-in Customer') AS party_name,
+        'POS Invoice ' || COALESCE(s.invoice_no, 'SALE-' || s.id) || ' | ' || COALESCE(c.customer_name, s.customer_name, 'Walk-in Customer') || COALESCE(' | Items: ' || sis.item_summary, '') AS narration,
+        sp.payment_mode,
+        'RECEIPT' AS direction,
+        sp.amount,
+        COALESCE(s.invoice_no, 'SALE-' || s.id) AS reference_no,
+        'POS Sale' AS source_type,
+        s.id AS source_id
+      FROM sale_payments sp
+      JOIN sales s ON s.id = sp.sale_id
+      LEFT JOIN customers c ON c.id = s.customer_id
+      LEFT JOIN sale_item_summary sis ON sis.sale_id = s.id
+      WHERE s.sale_status <> 'CANCELLED'
+        AND s.sale_date <= $1
+        AND sp.payment_mode <> 'CREDIT'
+      UNION ALL
+      SELECT
+        cp.payment_date AS date,
+        cp.created_at AS entry_time,
+        'Customer A/c - ' || c.customer_name AS account_name,
+        'CUSTOMER' AS account_type,
+        c.customer_name AS party_name,
+        'Received from ' || c.customer_name || ' | Against ledger balance | ' || cp.payment_mode || COALESCE(' | ' || cp.remarks, '') AS narration,
+        cp.payment_mode,
+        'RECEIPT' AS direction,
+        cp.payment_amount AS amount,
+        COALESCE(cp.reference_number, 'CP-' || cp.id) AS reference_no,
+        'Customer Receipt' AS source_type,
+        cp.id AS source_id
+      FROM customer_payments cp
+      JOIN customers c ON c.id = cp.customer_id
+      WHERE cp.cancelled = FALSE
+        AND cp.payment_date <= $1
+      UNION ALL
+      SELECT
+        p.purchase_date AS date,
+        p.created_at AS entry_time,
+        'Supplier A/c - ' || COALESCE(s.supplier_name, p.supplier_name, 'Supplier') AS account_name,
+        'SUPPLIER' AS account_type,
+        COALESCE(s.supplier_name, p.supplier_name, 'Supplier') AS party_name,
+        COALESCE(p.payment_mode, 'CASH') || ' Purchase from ' || COALESCE(s.supplier_name, p.supplier_name, 'Supplier') || COALESCE(' | Items: ' || pis.item_summary, '') || COALESCE(' | ' || p.remarks, '') AS narration,
+        p.payment_mode,
+        'PAYMENT' AS direction,
+        COALESCE(p.paid_amount, 0) AS amount,
+        COALESCE(p.bill_number, p.payment_reference_number, 'PUR-' || p.id) AS reference_no,
+        'Purchase Payment' AS source_type,
+        p.id AS source_id
+      FROM purchases p
+      LEFT JOIN suppliers s ON s.id = p.supplier_id
+      LEFT JOIN purchase_item_summary pis ON pis.purchase_id = p.id
+      WHERE COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
+        AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
+        AND COALESCE(p.paid_amount, 0) > 0
+        AND p.purchase_date <= $1
+        AND COALESCE(p.payment_mode, '') <> ''
+      UNION ALL
+      SELECT
+        sp.payment_date AS date,
+        sp.created_at AS entry_time,
+        'Supplier A/c - ' || s.supplier_name AS account_name,
+        'SUPPLIER' AS account_type,
+        s.supplier_name AS party_name,
+        'Payment to ' || s.supplier_name || ' | Against pending purchase bills | ' || sp.payment_mode || COALESCE(' | ' || sp.remarks, '') AS narration,
+        sp.payment_mode,
+        'PAYMENT' AS direction,
+        sp.payment_amount AS amount,
+        COALESCE(sp.reference_number, 'SP-' || sp.id) AS reference_no,
+        'Supplier Payment' AS source_type,
+        sp.id AS source_id
+      FROM supplier_payments sp
+      JOIN suppliers s ON s.id = sp.supplier_id
+      WHERE sp.cancelled = FALSE
+        AND sp.payment_date <= $1
+      UNION ALL
+      SELECT
+        e.expense_date AS date,
+        e.created_at AS entry_time,
+        e.category || ' Expense - ' || COALESCE(e.paid_to, e.vendor_name, e.category) AS account_name,
+        CASE WHEN LOWER(e.category) LIKE '%salary%' OR LOWER(COALESCE(e.paid_to, e.vendor_name, '')) LIKE '%salary%' THEN 'EMPLOYEE' ELSE 'EXPENSE' END AS account_type,
+        COALESCE(e.paid_to, e.vendor_name, e.category) AS party_name,
+        e.category || ' paid to ' || COALESCE(e.paid_to, e.vendor_name, e.category) || ' | ' || e.payment_mode || COALESCE(' | ' || e.remarks, '') AS narration,
+        e.payment_mode,
+        'PAYMENT' AS direction,
+        e.amount,
+        COALESCE(e.reference_number, 'EXP-' || e.id) AS reference_no,
+        'Expense' AS source_type,
+        e.id AS source_id
+      FROM expenses e
+      WHERE e.active IS DISTINCT FROM FALSE
+        AND COALESCE(e.status, 'ACTIVE') <> 'CANCELLED'
+        AND e.expense_date <= $1
+      UNION ALL
+      SELECT
+        sr.return_date AS date,
+        sr.created_at AS entry_time,
+        'Customer A/c - ' || COALESCE(sr.customer_name, 'Walk-in Customer') AS account_name,
+        'CUSTOMER' AS account_type,
+        COALESCE(sr.customer_name, 'Walk-in Customer') AS party_name,
+        'Refund to ' || COALESCE(sr.customer_name, 'Walk-in Customer') || ' | Return ' || COALESCE(sr.return_no, 'RET-' || sr.id) || ' | ' || sr.refund_type || COALESCE(' | ' || sr.return_reason, '') AS narration,
+        sr.refund_type AS payment_mode,
+        'PAYMENT' AS direction,
+        sr.total_return_amount AS amount,
+        COALESCE(sr.return_no, 'RET-' || sr.id) AS reference_no,
+        'Sale Return Refund' AS source_type,
+        sr.id AS source_id
+      FROM sale_returns sr
+      WHERE sr.return_date <= $1
+        AND sr.refund_type IN ('CASH_REFUND', 'UPI_REFUND')
+    ) cash_rows
+    ORDER BY date, entry_time, reference_no
+    `,
+    [to]
+  );
+
+  const filteredRows = result.rows
+    .map((row) => {
+      const modeGroup = cashBookModeGroup(row.payment_mode);
+      const amount = Number(row.amount || 0);
+      return {
+        ...row,
+        date: toDateKey(row.date),
+        date_key: toDateKey(row.date),
+        mode_group: modeGroup,
+        receipt_cash: row.direction === "RECEIPT" && modeGroup === "CASH" ? amount : 0,
+        receipt_bank: row.direction === "RECEIPT" && modeGroup === "BANK" ? amount : 0,
+        payment_cash: row.direction === "PAYMENT" && modeGroup === "CASH" ? amount : 0,
+        payment_bank: row.direction === "PAYMENT" && modeGroup === "BANK" ? amount : 0,
+      };
+    })
+    .filter((row) => row.mode_group)
+    .filter((row) => {
+      if (lineKey === "cash_in_hand" && row.mode_group !== "CASH") return false;
+      if (lineKey === "cash_at_bank" && row.mode_group !== "BANK") return false;
+      if (normalizedPaymentMode && normalizePaymentMode(row.payment_mode) !== normalizedPaymentMode) return false;
+      if (normalizedAccountFilter && normalizedAccountFilter !== "ALL" && row.account_type !== normalizedAccountFilter && row.mode_group !== normalizedAccountFilter) return false;
+      if (searchText) {
+        const haystack = [
+          row.account_name, row.party_name, row.narration, row.payment_mode,
+          row.reference_no, row.source_type, row.amount,
+        ].join(" ").toLowerCase();
+        if (!haystack.includes(searchText)) return false;
+      }
+      return true;
+    });
+
+  const openingRows = filteredRows.filter((row) => row.date_key < from);
+  const movementRows = filteredRows.filter((row) => row.date_key >= from && row.date_key <= to);
+  const openingCash = roundCurrency(openingRows.reduce((sum, row) => sum + row.receipt_cash - row.payment_cash, 0));
+  const openingBank = roundCurrency(openingRows.reduce((sum, row) => sum + row.receipt_bank - row.payment_bank, 0));
+
+  const detailRows = groupByDate
+    ? [...movementRows.reduce((groups, row) => {
+      const current = groups.get(row.date_key) || {
+        date: row.date_key,
+        entry_time: row.date_key,
+        account_name: `Date Summary - ${row.date_key}`,
+        account_type: "SUMMARY",
+        party_name: "Date Summary",
+        narration: "",
+        payment_mode: "ALL",
+        receipt_cash: 0,
+        receipt_bank: 0,
+        payment_cash: 0,
+        payment_bank: 0,
+        reference_no: "Grouped",
+        source_type: "Cash Book Date Summary",
+        source_id: row.date_key,
+        source_rows: [],
+      };
+      current.receipt_cash += row.receipt_cash;
+      current.receipt_bank += row.receipt_bank;
+      current.payment_cash += row.payment_cash;
+      current.payment_bank += row.payment_bank;
+      current.source_rows.push(row);
+      current.narration = `${current.source_rows.length} cash/bank transaction${current.source_rows.length === 1 ? "" : "s"} on ${row.date_key}`;
+      groups.set(row.date_key, current);
+      return groups;
+    }, new Map()).values()]
+    : movementRows;
+
+  let cashBalance = openingCash;
+  let bankBalance = openingBank;
+  const rows = detailRows.map((row) => {
+    cashBalance = roundCurrency(cashBalance + Number(row.receipt_cash || 0) - Number(row.payment_cash || 0));
+    bankBalance = roundCurrency(bankBalance + Number(row.receipt_bank || 0) - Number(row.payment_bank || 0));
+    return {
+      ...row,
+      cash_balance: cashBalance,
+      bank_balance: bankBalance,
+      total_balance: roundCurrency(cashBalance + bankBalance),
+    };
+  });
+
+  const cashReceipts = roundCurrency(rows.reduce((sum, row) => sum + Number(row.receipt_cash || 0), 0));
+  const bankReceipts = roundCurrency(rows.reduce((sum, row) => sum + Number(row.receipt_bank || 0), 0));
+  const cashPayments = roundCurrency(rows.reduce((sum, row) => sum + Number(row.payment_cash || 0), 0));
+  const bankPayments = roundCurrency(rows.reduce((sum, row) => sum + Number(row.payment_bank || 0), 0));
+  const closingCash = roundCurrency(openingCash + cashReceipts - cashPayments);
+  const closingBank = roundCurrency(openingBank + bankReceipts - bankPayments);
+
+  return {
+    dateFrom: from,
+    dateTo: to,
+    opening_cash: openingCash,
+    opening_bank: openingBank,
+    cash_receipts: cashReceipts,
+    bank_receipts: bankReceipts,
+    cash_payments: cashPayments,
+    bank_payments: bankPayments,
+    closing_cash: closingCash,
+    closing_bank: closingBank,
+    total_closing: roundCurrency(closingCash + closingBank),
+    rows,
+  };
+};
+
 const getWalkInCustomer = async (client = pool) => {
   const result = await client.query(
     `
@@ -5513,6 +5790,26 @@ app.get("/reports/balance-sheet", async (req, res) => {
   }
 });
 
+app.get("/reports/cash-book", async (req, res) => {
+  try {
+    const reportRange = getReportDateRange(req.query);
+    const dateFrom = req.query.date_from || reportRange.dateFrom;
+    const dateTo = req.query.date_to || reportRange.dateTo;
+    const report = await getCashBookReport({
+      dateFrom,
+      dateTo,
+      paymentMode: req.query.payment_mode,
+      accountFilter: req.query.account_filter,
+      search: req.query.search,
+      groupByDate: String(req.query.group_by_date || "").toLowerCase() === "true",
+    });
+    return res.json(report);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Cash Book" });
+  }
+});
+
 app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
   try {
     const lineKey = String(req.params.lineKey || "").toLowerCase();
@@ -5520,7 +5817,6 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
     const dateFrom = req.query.date_from || reportRange.dateFrom;
     const dateTo = req.query.date_to || reportRange.dateTo;
     const snapshot = await getBalanceSheetSnapshot({ dateTo });
-    const bankModesSql = BANK_PAYMENT_MODES.map((mode) => `'${mode}'`).join(", ");
     const titles = {
       cash_in_hand: "Cash in Hand Detail",
       cash_at_bank: "Cash at Bank / Bank Balance Detail",
@@ -5538,90 +5834,28 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
     }
 
     if (lineKey === "cash_in_hand" || lineKey === "cash_at_bank") {
-      const paymentCondition = lineKey === "cash_in_hand" ? "= 'CASH'" : `IN (${bankModesSql})`;
-      const amount = lineKey === "cash_in_hand" ? snapshot.cash : snapshot.bank;
-      const result = await pool.query(
-        `
-        SELECT *
-        FROM (
-          SELECT s.sale_date AS transaction_date, 'POS Sale' AS voucher_type,
-            COALESCE(s.invoice_no, 'SALE-' || s.id) AS voucher_no,
-            COALESCE(s.customer_name, 'Walk-in Customer') AS party_name,
-            sp.payment_mode, sp.amount AS debit, 0::NUMERIC AS credit,
-            COALESCE(s.invoice_no, 'POS sale receipt') AS narration
-          FROM sale_payments sp
-          JOIN sales s ON s.id = sp.sale_id
-          WHERE s.sale_status <> 'CANCELLED'
-            AND sp.payment_mode ${paymentCondition}
-            AND s.sale_date <= $1
-          UNION ALL
-          SELECT cp.payment_date AS transaction_date, 'Customer Receipt' AS voucher_type,
-            COALESCE(cp.reference_number, 'CP-' || cp.id) AS voucher_no,
-            c.customer_name AS party_name,
-            cp.payment_mode, cp.payment_amount AS debit, 0::NUMERIC AS credit,
-            COALESCE(cp.remarks, 'Customer payment received') AS narration
-          FROM customer_payments cp
-          JOIN customers c ON c.id = cp.customer_id
-          WHERE cp.cancelled = FALSE
-            AND cp.payment_mode ${paymentCondition}
-            AND cp.payment_date <= $1
-          UNION ALL
-          SELECT sp.payment_date AS transaction_date, 'Supplier Payment' AS voucher_type,
-            COALESCE(sp.reference_number, 'SP-' || sp.id) AS voucher_no,
-            s.supplier_name AS party_name,
-            sp.payment_mode, 0::NUMERIC AS debit, sp.payment_amount AS credit,
-            COALESCE(sp.remarks, 'Supplier payment') AS narration
-          FROM supplier_payments sp
-          JOIN suppliers s ON s.id = sp.supplier_id
-          WHERE sp.cancelled = FALSE
-            AND sp.payment_mode ${paymentCondition}
-            AND sp.payment_date <= $1
-          UNION ALL
-          SELECT p.purchase_date AS transaction_date, 'Purchase Payment' AS voucher_type,
-            COALESCE(p.bill_number, 'PUR-' || p.id) AS voucher_no,
-            COALESCE(s.supplier_name, p.supplier_name, 'Supplier') AS party_name,
-            p.payment_mode, 0::NUMERIC AS debit, COALESCE(p.paid_amount, 0) AS credit,
-            COALESCE(p.remarks, 'Purchase paid during entry') AS narration
-          FROM purchases p
-          LEFT JOIN suppliers s ON s.id = p.supplier_id
-          WHERE COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
-            AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
-            AND COALESCE(p.paid_amount, 0) > 0
-            AND p.payment_mode ${paymentCondition}
-            AND p.purchase_date <= $1
-          UNION ALL
-          SELECT e.expense_date AS transaction_date, 'Expense' AS voucher_type,
-            COALESCE(e.reference_number, 'EXP-' || e.id) AS voucher_no,
-            COALESCE(e.paid_to, e.vendor_name, e.category) AS party_name,
-            e.payment_mode, 0::NUMERIC AS debit, e.amount AS credit,
-            COALESCE(e.remarks, e.category) AS narration
-          FROM expenses e
-          WHERE e.active IS DISTINCT FROM FALSE
-            AND COALESCE(e.status, 'ACTIVE') <> 'CANCELLED'
-            AND e.payment_mode ${paymentCondition}
-            AND e.expense_date <= $1
-        ) rows
-        ORDER BY transaction_date, voucher_type, voucher_no
-        `,
-        [dateTo]
-      );
-      const allRows = result.rows.map((row) => ({ ...row, date_key: toDateKey(row.transaction_date) }));
-      const openingBalance = roundCurrency(allRows
-        .filter((row) => row.date_key < dateFrom)
-        .reduce((sum, row) => sum + Number(row.debit || 0) - Number(row.credit || 0), 0));
-      const movementRows = allRows.filter((row) => row.date_key >= dateFrom && row.date_key <= dateTo);
-      const debitDuringRange = roundCurrency(movementRows.reduce((sum, row) => sum + Number(row.debit || 0), 0));
-      const creditDuringRange = roundCurrency(movementRows.reduce((sum, row) => sum + Number(row.credit || 0), 0));
-      let balance = openingBalance;
-      const rows = movementRows.map((row) => {
-        balance = roundCurrency(balance + Number(row.debit || 0) - Number(row.credit || 0));
-        return { ...row, balance };
-      });
-      const closingBalance = roundCurrency(openingBalance + debitDuringRange - creditDuringRange);
+      const cashBook = await getCashBookReport({ dateFrom, dateTo, lineKey });
+      const isCash = lineKey === "cash_in_hand";
+      const openingBalance = isCash ? cashBook.opening_cash : cashBook.opening_bank;
+      const debitDuringRange = isCash ? cashBook.cash_receipts : cashBook.bank_receipts;
+      const creditDuringRange = isCash ? cashBook.cash_payments : cashBook.bank_payments;
+      const closingBalance = isCash ? cashBook.closing_cash : cashBook.closing_bank;
+      const rows = cashBook.rows.map((row) => ({
+        transaction_date: row.date,
+        voucher_type: row.source_type,
+        voucher_no: row.reference_no,
+        party_name: row.party_name,
+        payment_mode: row.payment_mode,
+        debit: isCash ? row.receipt_cash : row.receipt_bank,
+        credit: isCash ? row.payment_cash : row.payment_bank,
+        balance: isCash ? row.cash_balance : row.bank_balance,
+        narration: row.narration,
+        date_key: row.date,
+      }));
       return res.json({
         lineKey,
         title: titles[lineKey],
-        amount,
+        amount: closingBalance,
         dateFrom,
         dateTo,
         asAtDate: snapshot.asAtDate,

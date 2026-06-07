@@ -816,11 +816,12 @@ function App() {
   };
 
   const loadReports = async (params = {}) => {
-    const [response, inventoryResponse] = await Promise.all([
+    const [response, inventoryResponse, cashBookResponse] = await Promise.all([
       axios.get(`${API_URL}/reports/summary`, { params }),
       axios.get(`${API_URL}/inventory`),
+      axios.get(`${API_URL}/reports/cash-book`, { params }),
     ]);
-    setReportsData({ ...response.data, stockLotReport: inventoryResponse.data });
+    setReportsData({ ...response.data, stockLotReport: inventoryResponse.data, cashBookReport: cashBookResponse.data });
   };
 
   const loadExpenses = async () => {
@@ -2952,7 +2953,9 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
   const [balanceSheetDetail, setBalanceSheetDetail] = useState(null);
   const [balanceSheetDetailLoading, setBalanceSheetDetailLoading] = useState(false);
   const [balanceSheetDetailError, setBalanceSheetDetailError] = useState("");
-  const [dayBookDetail, setDayBookDetail] = useState(null);
+  const [cashBookDetail, setCashBookDetail] = useState(null);
+  const [cashBookFilters, setCashBookFilters] = useState({ paymentMode: "", accountFilter: "" });
+  const [groupCashBookByDate, setGroupCashBookByDate] = useState(false);
   const [purchaseFilters, setPurchaseFilters] = useState({
     supplier: "",
     product: "",
@@ -2965,8 +2968,22 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
     date_to: toDateKey(new Date()),
   });
   const currentReportParams = () => range === "custom" ? customRange : { range };
+  const currentCashBookParams = (overrides = {}) => {
+    const nextFilters = { ...cashBookFilters, ...(overrides.filters || {}) };
+    const nextGroupByDate = overrides.groupByDate ?? groupCashBookByDate;
+    return {
+      ...currentReportParams(),
+      payment_mode: nextFilters.paymentMode,
+      account_filter: nextFilters.accountFilter,
+      search,
+      group_by_date: nextGroupByDate ? "true" : "",
+    };
+  };
   const refreshReports = async () => {
-    await onReload(currentReportParams());
+    await onReload(selectedReport === "cashBook" ? currentCashBookParams() : currentReportParams());
+  };
+  const reloadCashBook = async (filters = cashBookFilters, groupByDate = groupCashBookByDate) => {
+    await onReload(currentCashBookParams({ filters, groupByDate }));
   };
   const clearLedgerFilters = async () => {
     setAccountReportFilters({ accountType: "", accountName: "", voucherType: "", paymentMode: "" });
@@ -3090,6 +3107,8 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
   const supplierLedgerRows = withRunningBalance(clubRowsByDateAccount(filteredLedgerRows.filter((row) => row.account_type === "SUPPLIER")), "PAYABLE");
   const accountStatementRows = withRunningBalance(clubRowsByDateAccount(filteredLedgerRows));
   const dayBookRows = clubRowsByDateAccount(filteredLedgerRows);
+  const cashBookData = data.cashBookReport || {};
+  const cashBookRows = filterRows(cashBookData.rows);
   const salesChanges = filterRows(data.salesChangeReport);
   const editedBills = salesChanges.filter((row) => row.sale_status === "EDITED" || row.edited_at);
   const cancelledBills = salesChanges.filter((row) => row.sale_status === "CANCELLED" || row.cancelled_at);
@@ -3631,12 +3650,22 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
         <td>{money(row.assetAmount)}</td>
       </tr>,
     },
-    dayToDay: {
-      title: "Day Book / Day-to-Day Transactions",
-      rows: dayBookRows,
-      summary: (rows) => [["Debit", money(totalOf(rows, "debit")), true], ["Credit", money(totalOf(rows, "credit"))], ["Vouchers", rows.length]],
-      headers: ["Date", "Particulars", "Voucher Type", "Voucher No.", "Debit Amount", "Credit Amount", "Narration"],
-      render: (row, index) => <tr onDoubleClick={() => setDayBookDetail(row)} key={`${row.date}-${row.voucher_no}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell">{row.party_name}</td><td>{row.display_voucher_type || dayBookVoucherType(row)}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="purchase-items-cell"><span title={row.narration || row.remarks}>{clubLedgerEntries ? row.narration_summary || ledgerNarration(row) : ledgerNarration(row)}</span></td></tr>,
+    cashBook: {
+      title: "Cash Book / Bank Book",
+      rows: cashBookRows,
+      summary: () => [
+        ["Opening Cash", money(cashBookData.opening_cash), true],
+        ["Opening Bank/UPI/Card", money(cashBookData.opening_bank)],
+        ["Cash Receipts", money(cashBookData.cash_receipts)],
+        ["Bank Receipts", money(cashBookData.bank_receipts)],
+        ["Cash Payments", money(cashBookData.cash_payments)],
+        ["Bank Payments", money(cashBookData.bank_payments)],
+        ["Closing Cash", money(cashBookData.closing_cash)],
+        ["Closing Bank/UPI/Card", money(cashBookData.closing_bank)],
+        ["Total Closing", money(cashBookData.total_closing), true],
+      ],
+      headers: ["Date", "Particulars / Account", "Narration", "Receipt Cash", "Receipt Bank/UPI/Card", "Payment Cash", "Payment Bank/UPI/Card", "Cash Balance", "Bank Balance", "Total Balance", "Reference / Bill No"],
+      render: (row, index) => <tr onDoubleClick={() => setCashBookDetail(row)} key={`${row.date}-${row.reference_no}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell">{row.account_name || row.party_name}</td><td className="purchase-items-cell"><span title={row.narration}>{row.narration || "-"}</span></td><td>{money(row.receipt_cash)}</td><td>{money(row.receipt_bank)}</td><td>{money(row.payment_cash)}</td><td>{money(row.payment_bank)}</td><td>{money(row.cash_balance)}</td><td>{money(row.bank_balance)}</td><td className="profit-cell">{money(row.total_balance)}</td><td>{row.reference_no || "-"}</td></tr>,
     },
     expenseReport: {
       title: "Expense Report",
@@ -3653,7 +3682,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
     { id: "returns", title: "Sale Returns", icon: "history", description: "Return history, value and reason analysis.", reports: ["returnHistory", "returnValue", "returnReason"] },
     { id: "waste", title: "Waste Management", icon: "alert", description: "Daily, monthly, product-wise and cost-focused waste analysis.", reports: ["dailyWaste", "monthlyWaste", "productWiseWaste", "mostWastedProducts", "wasteCost"] },
     { id: "inventory", title: "Inventory", icon: "layers", description: "Current stock, low stock, movement and valuation.", reports: ["currentStock", "lowStock", "stockMovement", "stockValuation", "lotWiseStock"] },
-    { id: "financial", title: "Financial Reports", icon: "wallet", description: "Profit and loss, balance sheet, day-to-day and expense reports.", reports: ["profitLoss", "balanceSheet", "dayToDay", "expenseReport"] },
+    { id: "financial", title: "Financial Reports", icon: "wallet", description: "Profit and loss, balance sheet, cash book and expense reports.", reports: ["profitLoss", "balanceSheet", "cashBook", "expenseReport"] },
   ];
   const currentCategory = categories.find((category) => category.id === selectedCategory);
   const currentReport = reports[selectedReport];
@@ -3770,7 +3799,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
         </>
       )}
       <Field label="Search / Filter"><input placeholder="Search this report" value={search} onChange={(event) => setSearch(event.target.value)} /></Field>
-      {["customerLedger", "supplierLedger", "accountStatement", "dayToDay"].includes(selectedReport) && (
+      {["customerLedger", "supplierLedger", "accountStatement"].includes(selectedReport) && (
         <>
           <Field label="Account Type">
             <select value={accountReportFilters.accountType} onChange={(event) => setAccountReportFilters({ ...accountReportFilters, accountType: event.target.value })}>
@@ -3817,6 +3846,52 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
             <span>Club Entries</span>
           </label>
           <button className="secondary-button" onClick={clearLedgerFilters}>Clear Ledger Filters</button>
+        </>
+      )}
+      {selectedReport === "cashBook" && (
+        <>
+          <Field label="Payment Mode">
+            <select value={cashBookFilters.paymentMode} onChange={(event) => {
+              const next = { ...cashBookFilters, paymentMode: event.target.value };
+              setCashBookFilters(next);
+              reloadCashBook(next, groupCashBookByDate);
+            }}>
+              <option value="">All modes</option>
+              <option value="CASH">Cash</option>
+              <option value="UPI">UPI</option>
+              <option value="CARD">Card</option>
+              <option value="BANK_TRANSFER">Bank Transfer</option>
+            </select>
+          </Field>
+          <Field label="Account / Party">
+            <select value={cashBookFilters.accountFilter} onChange={(event) => {
+              const next = { ...cashBookFilters, accountFilter: event.target.value };
+              setCashBookFilters(next);
+              reloadCashBook(next, groupCashBookByDate);
+            }}>
+              <option value="">All accounts</option>
+              <option value="CUSTOMER">Customer</option>
+              <option value="SUPPLIER">Supplier</option>
+              <option value="EXPENSE">Expense</option>
+              <option value="EMPLOYEE">Employee</option>
+              <option value="OWNER">Owner</option>
+              <option value="BANK">Bank</option>
+            </select>
+          </Field>
+          <label className="check-field report-check-field">
+            <input checked={groupCashBookByDate} type="checkbox" onChange={(event) => {
+              const next = event.target.checked;
+              setGroupCashBookByDate(next);
+              reloadCashBook(cashBookFilters, next);
+            }} />
+            <span>Group by Date</span>
+          </label>
+          <button className="secondary-button" onClick={() => {
+            const next = { paymentMode: "", accountFilter: "" };
+            setCashBookFilters(next);
+            setGroupCashBookByDate(false);
+            reloadCashBook(next, false);
+          }}>Clear Cash Book Filters</button>
         </>
       )}
       {selectedReport === "salesHistory" && (
@@ -3965,27 +4040,27 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       </div>
     );
   };
-  const renderDayBookDetailModal = () => {
-    if (!dayBookDetail) return null;
+  const renderCashBookDetailModal = () => {
+    if (!cashBookDetail) return null;
     return (
       <div className="modal-backdrop">
         <section className="invoice-modal change-history-modal">
           <div className="invoice-modal-header">
             <div>
-              <span className="eyebrow">Day Book Detail</span>
-              <h2>{dayBookDetail.display_voucher_type || dayBookVoucherType(dayBookDetail)}</h2>
-              <p>{formatDisplayDate(dayBookDetail.date)} | {dayBookDetail.party_name || "-"}</p>
+              <span className="eyebrow">Cash Book Detail</span>
+              <h2>{cashBookDetail.source_type || "Cash / Bank Movement"}</h2>
+              <p>{formatDisplayDate(cashBookDetail.date)} | {cashBookDetail.party_name || "-"}</p>
             </div>
-            <button className="secondary-button" onClick={() => setDayBookDetail(null)}>Close</button>
+            <button className="secondary-button" onClick={() => setCashBookDetail(null)}>Close</button>
           </div>
           <div className="purchase-summary-grid supplier-payment-preview">
-            <SummaryMetric label="Voucher No." value={dayBookDetail.voucher_no || "-"} />
-            <SummaryMetric label="Payment Mode" value={dayBookDetail.payment_mode || "-"} />
-            <SummaryMetric label="Debit" value={money(dayBookDetail.debit)} />
-            <SummaryMetric featured label="Credit" value={money(dayBookDetail.credit)} />
+            <SummaryMetric label="Reference" value={cashBookDetail.reference_no || "-"} />
+            <SummaryMetric label="Payment Mode" value={cashBookDetail.payment_mode || "-"} />
+            <SummaryMetric label="Cash Movement" value={money(Number(cashBookDetail.receipt_cash || 0) - Number(cashBookDetail.payment_cash || 0))} />
+            <SummaryMetric featured label="Bank Movement" value={money(Number(cashBookDetail.receipt_bank || 0) - Number(cashBookDetail.payment_bank || 0))} />
           </div>
           <div className="audit-readable">
-            {(dayBookDetail.narration || dayBookDetail.remarks || dayBookDetail.narration_summary || "No narration available")
+            {(cashBookDetail.narration || "No narration available")
               .split("\n")
               .filter(Boolean)
               .map((line, index) => <span key={`${line}-${index}`}>{line}</span>)}
@@ -4007,7 +4082,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
         salesPrintNarrationRef.current = includeNarration;
         setSalesPrintNarration(includeNarration);
       }
-      if (["customerLedger", "supplierLedger", "accountStatement", "dayToDay"].includes(selectedReport)) {
+      if (["customerLedger", "supplierLedger", "accountStatement"].includes(selectedReport)) {
         const includeNarration = window.confirm("Print narration/details also?");
         ledgerPrintNarrationRef.current = includeNarration;
         setLedgerPrintNarration(includeNarration);
@@ -4039,9 +4114,9 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       const to = formatFileDate(data.dateTo || customRange.date_to);
       const title = safeFileName(currentReport.title);
       if (selectedReport === "balanceSheet") return `Balance_Sheet_As_At_${to}.pdf`;
-      if (selectedReport === "dayToDay") {
+      if (selectedReport === "cashBook") {
         const mode = accountReportFilters.paymentMode || "All";
-        return `Day_Book_${mode}_${from}_to_${to}.pdf`;
+        return `Cash_Book_${cashBookFilters.paymentMode || mode}_${from}_to_${to}.pdf`;
       }
       return `${title}_${from}_to_${to}.pdf`;
     })();
@@ -4079,7 +4154,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
           </ModuleCard>
         </section>
         {renderBalanceSheetDetailModal()}
-        {renderDayBookDetailModal()}
+        {renderCashBookDetailModal()}
       </>
     );
   }
