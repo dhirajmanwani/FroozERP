@@ -438,6 +438,7 @@ function App() {
   const [lotPanelProduct, setLotPanelProduct] = useState(null);
   const [productLots, setProductLots] = useState([]);
   const [productLotAudit, setProductLotAudit] = useState([]);
+  const [showOpeningLotForm, setShowOpeningLotForm] = useState(false);
   const [lotAction, setLotAction] = useState(null);
   const [lotDraft, setLotDraft] = useState({
     lot_name: "",
@@ -1017,6 +1018,7 @@ function App() {
     setLotPanelProduct(null);
     setProductLots([]);
     setProductLotAudit([]);
+    setShowOpeningLotForm(false);
     setLotAction(null);
     setEditingProductId(null);
   };
@@ -1096,31 +1098,7 @@ function App() {
     String(left.opening_stock_date || left.purchase_date || "").slice(0, 10) === String(right.opening_stock_date || right.purchase_date || "").slice(0, 10) &&
     String(left.lot_size || "").trim().toLowerCase() === String(right.lot_size || "").trim().toLowerCase();
 
-  const addOpeningStockLot = () => {
-    const quantity = Number(openingStockDraft.quantity || 0);
-    const purchaseRate = Number(openingStockDraft.purchase_rate || 0);
-    if (quantity <= 0) {
-      alert("Please enter lot quantity.");
-      return;
-    }
-    if (purchaseRate <= 0) {
-      alert("Please enter opening stock rate.");
-      return;
-    }
-    const nextLotName = getOpeningLotName(openingStockDraft, productLots.length + openingStockLots.length + 1);
-    const nextLot = {
-      ...openingStockDraft,
-      lot_name: nextLotName,
-      supplier_name: getSupplierLabel(openingStockDraft.supplier_id),
-      sale_rate: openingStockDraft.sale_rate || sellingRate,
-    };
-    const duplicateLot = [...productLots, ...openingStockLots].find((lot) => isSameOpeningLot(lot, nextLot));
-    if (duplicateLot) {
-      const confirmed = window.confirm("This lot already exists. Add as separate lot anyway?");
-      if (!confirmed) return;
-      nextLot.allow_duplicate_lot = true;
-    }
-    setOpeningStockLots((current) => [...current, nextLot]);
+  const resetOpeningStockDraft = () => {
     setOpeningStockDraft({
       lot_name: "",
       lot_size: "",
@@ -1131,6 +1109,77 @@ function App() {
       supplier_id: "",
       remarks: "",
     });
+  };
+
+  const buildOpeningStockLotFromDraft = () => {
+    const quantity = Number(openingStockDraft.quantity || 0);
+    const purchaseRate = Number(openingStockDraft.purchase_rate || 0);
+    const saleRate = Number(openingStockDraft.sale_rate || sellingRate || 0);
+    if (quantity <= 0) {
+      alert("Please enter lot quantity.");
+      return null;
+    }
+    if (purchaseRate <= 0) {
+      alert("Please enter opening stock rate.");
+      return null;
+    }
+    if (saleRate <= 0) {
+      alert("Please enter sale rate.");
+      return null;
+    }
+    const nextLotName = getOpeningLotName(openingStockDraft, productLots.length + openingStockLots.length + 1);
+    const nextLot = {
+      ...openingStockDraft,
+      lot_name: nextLotName,
+      supplier_name: getSupplierLabel(openingStockDraft.supplier_id),
+      sale_rate: saleRate,
+    };
+    const duplicateLot = [...productLots, ...openingStockLots].find((lot) => isSameOpeningLot(lot, nextLot));
+    if (duplicateLot) {
+      const confirmed = window.confirm("This lot already exists. Add as separate lot anyway?");
+      if (!confirmed) return null;
+      nextLot.allow_duplicate_lot = true;
+    }
+    return nextLot;
+  };
+
+  const addOpeningStockLot = () => {
+    const nextLot = buildOpeningStockLotFromDraft();
+    if (!nextLot) return;
+    setOpeningStockLots((current) => [...current, nextLot]);
+    resetOpeningStockDraft();
+  };
+
+  const saveNewOpeningStockLot = async () => {
+    if (!editingProductId) return;
+    const nextLot = buildOpeningStockLotFromDraft();
+    if (!nextLot) return;
+    try {
+      const payload = {
+        ...nextLot,
+        opening_cost: nextLot.purchase_rate,
+        size_grade: nextLot.lot_size,
+        created_by: user.id,
+        branch_id: user.branch_id,
+      };
+      try {
+        await axios.post(`${API_URL}/products/${editingProductId}/opening-stock-lots`, payload);
+      } catch (error) {
+        const message = getErrorMessage(error, "Unable to add opening stock lot");
+        if (message.includes("Add as separate lot anyway?") && window.confirm("This lot already exists. Add as separate lot anyway?")) {
+          await axios.post(`${API_URL}/products/${editingProductId}/opening-stock-lots`, { ...payload, allow_duplicate_lot: true });
+        } else {
+          throw error;
+        }
+      }
+      resetOpeningStockDraft();
+      setShowOpeningLotForm(false);
+      setAddOpeningStock(false);
+      await refreshLotContext(lotPanelProduct || { id: editingProductId, product_name: productName });
+      alert("Opening stock lot added");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to add opening stock lot"));
+    }
   };
 
   const loadProductLots = async (product, showPanel = true) => {
@@ -1554,6 +1603,7 @@ function App() {
     setProductRemarks(product.remarks || "");
     setAddOpeningStock(false);
     setOpeningStockLots([]);
+    setShowOpeningLotForm(false);
     setEditingProductId(product.id);
     loadProductLots(product, true);
   };
@@ -2032,8 +2082,8 @@ function App() {
                   <label className="check-field"><input type="checkbox" checked={productActive} onChange={(event) => setProductActive(event.target.checked)} /><span>Active Item</span></label>
                 </div>
                 <Field label="Remarks"><textarea value={productRemarks} onChange={(event) => setProductRemarks(event.target.value)} /></Field>
-                <label className="check-field"><input type="checkbox" checked={addOpeningStock} onChange={(event) => setAddOpeningStock(event.target.checked)} /><span>Add Opening Stock</span></label>
-                {addOpeningStock && (
+                {!editingProductId && <label className="check-field"><input type="checkbox" checked={addOpeningStock} onChange={(event) => setAddOpeningStock(event.target.checked)} /><span>Add Opening Stock</span></label>}
+                {addOpeningStock && !editingProductId && (
                   <div className="lot-entry-panel">
                     <div className="form-grid supplier-form-grid">
                       <Field label="Supplier (Optional)">
@@ -2079,22 +2129,22 @@ function App() {
                       </div>
                       <button className="secondary-button" onClick={() => loadProductLots(lotPanelProduct, true)}>Refresh Lots</button>
                     </div>
-                    <DataTable headers={["Lot Name", "Size/Grade", "Supplier", "Opening Date", "Opening Qty", "Sold Qty", "Balance Qty", "Cost Rate", "Sale Rate", "Status", "Actions"]}>
+                    <DataTable headers={["Supplier", "Lot", "Size/Grade", "Opening Date", "Opening Qty", "Sold Qty", "Balance Qty", "Cost", "Sale Rate", "Remarks", "Actions"]}>
                       {productLots.length ? productLots.map((lot) => (
                         <tr key={lot.id}>
-                          <td className="primary-cell">{lot.lot_name || lot.batch_no || `Lot #${lot.id}`}<small className="cell-note">{lot.remarks || ""}</small></td>
+                          <td>{lot.supplier_name || "No supplier payable"}</td>
+                          <td className="primary-cell">{lot.lot_name || lot.batch_no || `Lot #${lot.id}`}<small className="cell-note">{lot.batch_status || "ACTIVE"}</small></td>
                           <td>{lot.lot_size || "-"}</td>
-                          <td>{lot.supplier_name || "-"}</td>
                           <td>{formatDisplayDate(lot.purchase_date)}</td>
                           <td>{Number(lot.purchase_qty || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
                           <td>{Number(lot.sold_qty || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
                           <td>{Number(lot.balance_qty ?? lot.remaining_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
                           <td>{currency.format(Number(lot.purchase_rate || lot.effective_cost_per_unit || 0))}</td>
                           <td>{currency.format(Number(lot.temporary_sale_rate || lot.selling_rate || 0))}</td>
-                          <td><span className={lot.batch_status === "CANCELLED" ? "stock-low" : "stock-ok"}>{lot.batch_status || "ACTIVE"}</span></td>
+                          <td>{lot.remarks || "-"}</td>
                           <td>
                             <div className="button-row table-actions-row">
-                              <button className="table-action" onClick={() => openLotAction("edit", lot)}>Edit Lot</button>
+                              <button className="table-action" onClick={() => openLotAction("edit", lot)}>Edit</button>
                               <button className="table-action" disabled={lot.batch_status === "CANCELLED"} onClick={() => openLotAction("add", lot)}>Add Quantity</button>
                               <button className="table-action" disabled={lot.batch_status === "CANCELLED"} onClick={() => openLotAction("adjust", lot)}>Adjust</button>
                               <button className="remove-button" disabled={lot.batch_status === "CANCELLED"} onClick={() => openLotAction("deactivate", lot)}>Deactivate</button>
@@ -2106,8 +2156,46 @@ function App() {
                       )}
                     </DataTable>
                     <div className="button-row">
-                      <button className="secondary-button" onClick={() => setAddOpeningStock(true)}>Add New Opening Stock Lot</button>
+                      <button className="secondary-button" onClick={() => {
+                        resetOpeningStockDraft();
+                        setAddOpeningStock(true);
+                        setShowOpeningLotForm(true);
+                      }}>Add New Opening Stock Lot</button>
                     </div>
+                    {showOpeningLotForm && (
+                      <div className="lot-entry-panel">
+                        <div className="report-toolbar">
+                          <div>
+                            <span className="eyebrow">New Opening Lot</span>
+                            <h3>Add lot for {lotPanelProduct.product_name}</h3>
+                            <p className="form-note">This creates a separate opening stock batch for the same item. Existing lots are not overwritten or merged.</p>
+                          </div>
+                        </div>
+                        <div className="form-grid supplier-form-grid">
+                          <Field label="Supplier / Supplier Payable">
+                            <select value={openingStockDraft.supplier_id} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, supplier_id: event.target.value })}>
+                              <option value="">No supplier payable</option>
+                              {activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.supplier_name}</option>)}
+                            </select>
+                          </Field>
+                          <Field label="Lot Name / Number"><input value={openingStockDraft.lot_name} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_name: event.target.value })} placeholder="Opening Lot 1" /></Field>
+                          <Field label="Size / Grade"><input value={openingStockDraft.lot_size} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_size: event.target.value })} placeholder="Small / Medium / Premium" /></Field>
+                          <Field label="Quantity"><input type="number" min="0" step="0.001" value={openingStockDraft.quantity} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, quantity: event.target.value })} /></Field>
+                          <Field label="Purchase Rate / Opening Cost"><input type="number" min="0" step="0.01" value={openingStockDraft.purchase_rate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, purchase_rate: event.target.value })} /></Field>
+                          <Field label="Sale Rate"><input type="number" min="0" step="0.01" value={openingStockDraft.sale_rate || sellingRate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, sale_rate: event.target.value })} /></Field>
+                          <Field label="Opening Stock Date"><input type="date" value={openingStockDraft.opening_stock_date} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, opening_stock_date: event.target.value })} /></Field>
+                          <Field label="Lot Remarks"><input value={openingStockDraft.remarks} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, remarks: event.target.value })} /></Field>
+                        </div>
+                        <div className="button-row">
+                          <button className="primary-button" onClick={saveNewOpeningStockLot}>Save Lot</button>
+                          <button className="secondary-button" onClick={() => {
+                            resetOpeningStockDraft();
+                            setShowOpeningLotForm(false);
+                            setAddOpeningStock(false);
+                          }}>Cancel</button>
+                        </div>
+                      </div>
+                    )}
                     {productLotAudit.length > 0 && (
                       <div className="lot-audit-panel">
                         <h3>Lot Audit Trail</h3>

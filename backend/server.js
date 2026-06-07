@@ -3449,10 +3449,10 @@ app.put("/products/:id", async (req, res) => {
   }
 });
 
-app.post("/products/:id/opening-stock", async (req, res) => {
+const addOpeningStockLotsForProduct = async (req, res, productIdParam = "id") => {
   const client = await pool.connect();
   try {
-    const productId = parsePositiveInteger(req.params.id);
+    const productId = parsePositiveInteger(req.params[productIdParam]);
     const manager = await requireRateManager(req.body.created_by || req.body.updated_by, client);
     const lots = Array.isArray(req.body.opening_stock_lots) ? req.body.opening_stock_lots : [req.body];
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can add opening stock" });
@@ -3487,7 +3487,11 @@ app.post("/products/:id/opening-stock", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+
+app.post("/products/:id/opening-stock", (req, res) => addOpeningStockLotsForProduct(req, res, "id"));
+
+app.post("/products/:productId/opening-stock-lots", (req, res) => addOpeningStockLotsForProduct(req, res, "productId"));
 
 const lotUsage = (lot) => Math.max(0, Number(lot.purchase_qty || 0) - Number(lot.remaining_qty || 0));
 
@@ -3517,7 +3521,7 @@ app.get("/products/:id/lots", async (req, res) => {
         FROM product_audit_trail pat
         LEFT JOIN users u ON u.id = pat.edited_by
         WHERE pat.product_id = $1
-          AND pat.action IN ('OPENING_STOCK', 'INVENTORY_LOT_EDIT', 'INVENTORY_LOT_ADD_QTY', 'INVENTORY_LOT_ADJUST', 'INVENTORY_LOT_DEACTIVATE')
+          AND pat.action IN ('OPENING_STOCK', 'OPENING_STOCK_LOT_ADDED', 'INVENTORY_LOT_EDIT', 'INVENTORY_LOT_ADD_QTY', 'INVENTORY_LOT_ADJUST', 'INVENTORY_LOT_DEACTIVATE')
         ORDER BY pat.edited_at DESC, pat.id DESC
         LIMIT 50
         `,
@@ -7035,6 +7039,7 @@ const insertOpeningStockLot = async (client, { product, lot, actorId, branchId }
   const allowDuplicateLot = lot.allow_duplicate_lot === true || lot.allow_duplicate_lot === "true";
   if (!quantity) return { error: "Please enter lot quantity." };
   if (!purchaseRate) return { error: "Please enter opening stock rate." };
+  if (!saleRate || saleRate <= 0) return { error: "Please enter sale rate." };
 
   const duplicateResult = await client.query(
     `
@@ -7092,9 +7097,24 @@ const insertOpeningStockLot = async (client, { product, lot, actorId, branchId }
   await client.query(
     `
     INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by)
-    VALUES ($1, 'OPENING_STOCK', NULL, $2::jsonb, $3, $4)
+    VALUES ($1, 'OPENING_STOCK_LOT_ADDED', NULL, $2::jsonb, $3, $4)
     `,
-    [product.id, JSON.stringify(batchResult.rows[0]), remarks, actorId || null]
+    [
+      product.id,
+      JSON.stringify({
+        ...batchResult.rows[0],
+        product_name: product.product_name,
+        supplier_name: supplierName,
+        lot_name: lotName,
+        lot_size: lotSize,
+        quantity,
+        cost_rate: purchaseRate,
+        sale_rate: saleRate,
+        opening_stock_date: openingDate,
+      }),
+      remarks,
+      actorId || null,
+    ]
   );
   return { batch: batchResult.rows[0] };
 };
