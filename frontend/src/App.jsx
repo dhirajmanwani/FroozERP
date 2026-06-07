@@ -109,6 +109,7 @@ const supplierPaymentModes = [
   ["BANK_TRANSFER", "Bank Transfer"],
   ["CHEQUE", "Cheque"],
 ];
+const bankPaymentModes = new Set(["UPI", "CARD", "BANK_TRANSFER", "BANK", "CHEQUE"]);
 
 const accountTypes = [
   ["CUSTOMER", "Customer"],
@@ -2948,6 +2949,9 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
   const [clubLedgerEntries, setClubLedgerEntries] = useState(false);
   const [ledgerPrintNarration, setLedgerPrintNarration] = useState(false);
   const ledgerPrintNarrationRef = useRef(false);
+  const [balanceSheetDetail, setBalanceSheetDetail] = useState(null);
+  const [balanceSheetDetailLoading, setBalanceSheetDetailLoading] = useState(false);
+  const [balanceSheetDetailError, setBalanceSheetDetailError] = useState("");
   const [purchaseFilters, setPurchaseFilters] = useState({
     supplier: "",
     product: "",
@@ -2962,6 +2966,24 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
   const refreshReports = async () => {
     const params = range === "custom" ? customRange : { range };
     await onReload(params);
+  };
+  const clearLedgerFilters = async () => {
+    setAccountReportFilters({ accountType: "", accountName: "", voucherType: "", paymentMode: "" });
+    await onReload(range === "custom" ? customRange : { range });
+  };
+  const openBalanceSheetDetail = async (lineKey) => {
+    if (!lineKey) return;
+    setBalanceSheetDetailLoading(true);
+    setBalanceSheetDetailError("");
+    setBalanceSheetDetail(null);
+    try {
+      const response = await axios.get(`${API_URL}/reports/balance-sheet/details/${lineKey}`);
+      setBalanceSheetDetail(response.data);
+    } catch (error) {
+      setBalanceSheetDetailError(getErrorMessage(error, "Unable to load Balance Sheet detail"));
+    } finally {
+      setBalanceSheetDetailLoading(false);
+    }
   };
   const matchesSearch = (row) => !search.trim() || Object.values(row || {}).some((value) => {
     const text = typeof value === "object" && value !== null ? JSON.stringify(value) : String(value ?? "");
@@ -2986,11 +3008,27 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
   const lowStockRows = stockRows.filter((row) => Number(row.current_stock || 0) <= Number(row.minimum_stock || 0));
   const ledgerRows = filterRows(data.ledgerReport);
   const accountNames = [...new Set(ledgerRows.map((row) => row.party_name).filter(Boolean))].sort();
-  const voucherTypes = [...new Set(ledgerRows.map((row) => row.voucher_type).filter(Boolean))].sort();
+  const voucherTypes = [
+    "POS Sale",
+    "Purchase",
+    "Supplier Payment",
+    "Customer Receipt",
+    "Expense",
+    "Sale Return",
+    "Waste",
+    "Adjustment",
+    "Opening Stock",
+    "Owner Capital",
+    "Drawings",
+    ...new Set(ledgerRows.map((row) => row.transaction_type || row.voucher_type).filter(Boolean)),
+  ].filter((type, index, list) => list.indexOf(type) === index).sort();
   const filteredLedgerRows = ledgerRows.filter((row) => {
-    if (accountReportFilters.accountType && row.account_type !== accountReportFilters.accountType) return false;
+    if (accountReportFilters.accountType === "CASH" && row.payment_mode !== "CASH") return false;
+    if (accountReportFilters.accountType === "BANK" && !bankPaymentModes.has(row.payment_mode)) return false;
+    if (accountReportFilters.accountType === "EXPENSE" && !["EXPENSE", "EXPENSE_VENDOR"].includes(row.account_type)) return false;
+    if (accountReportFilters.accountType && !["CASH", "BANK", "EXPENSE"].includes(accountReportFilters.accountType) && row.account_type !== accountReportFilters.accountType) return false;
     if (accountReportFilters.accountName && row.party_name !== accountReportFilters.accountName) return false;
-    if (accountReportFilters.voucherType && row.voucher_type !== accountReportFilters.voucherType) return false;
+    if (accountReportFilters.voucherType && row.voucher_type !== accountReportFilters.voucherType && row.transaction_type !== accountReportFilters.voucherType) return false;
     if (accountReportFilters.paymentMode && row.payment_mode !== accountReportFilters.paymentMode) return false;
     return true;
   });
@@ -2998,7 +3036,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
     if (!clubLedgerEntries) return rows;
     const groups = new Map();
     for (const row of rows) {
-      const key = `${toDateKey(row.date)}-${row.party_name}-${row.voucher_type || row.transaction_type}`;
+      const key = `${toDateKey(row.date)}-${row.voucher_type || row.transaction_type}-${row.party_name}-${row.payment_mode || "NONE"}`;
       const current = groups.get(key) || {
         ...row,
         voucher_no: "Multiple",
@@ -3006,11 +3044,14 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
         credit: 0,
         narration: "",
         remarks: "",
+        transaction_count: 0,
       };
       current.debit += Number(row.debit || 0);
       current.credit += Number(row.credit || 0);
+      current.transaction_count += 1;
       current.narration = [current.narration, row.narration || row.remarks].filter(Boolean).join("\n");
       current.remarks = [current.remarks, row.remarks].filter(Boolean).join("; ");
+      current.narration_summary = `${row.transaction_type || row.voucher_type} - ${current.transaction_count} ${current.transaction_count === 1 ? "entry" : "entries"}${row.payment_mode ? ` - ${row.payment_mode}` : ""}`;
       groups.set(key, current);
     }
     return [...groups.values()];
@@ -3029,6 +3070,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
   const customerLedgerRows = withRunningBalance(clubRowsByDateAccount(filteredLedgerRows.filter((row) => row.account_type === "CUSTOMER")));
   const supplierLedgerRows = withRunningBalance(clubRowsByDateAccount(filteredLedgerRows.filter((row) => row.account_type === "SUPPLIER")), "PAYABLE");
   const accountStatementRows = withRunningBalance(clubRowsByDateAccount(filteredLedgerRows));
+  const dayBookRows = clubRowsByDateAccount(filteredLedgerRows);
   const salesChanges = filterRows(data.salesChangeReport);
   const editedBills = salesChanges.filter((row) => row.sale_status === "EDITED" || row.edited_at);
   const cancelledBills = salesChanges.filter((row) => row.sale_status === "CANCELLED" || row.cancelled_at);
@@ -3554,23 +3596,28 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
     balanceSheet: {
       title: "Balance Sheet",
       rows: [
-        { liability: "Capital / Owner Equity", liabilityAmount: Number(data.balanceSheet?.ownerCapital || 0), asset: "Cash in Hand", assetAmount: Number(data.balanceSheet?.cash || 0) },
-        { liability: Number(data.balanceSheet?.netProfit || 0) < 0 ? "Net Loss" : "Net Profit", liabilityAmount: Number(data.balanceSheet?.netProfit || 0), asset: "Cash at Bank / Bank Balance", assetAmount: Number(data.balanceSheet?.bank || 0) },
-        { liability: "Supplier Payables / Trade Creditors", liabilityAmount: Number(data.balanceSheet?.supplierPayable || 0), asset: "Inventory / Closing Stock", assetAmount: Number(data.balanceSheet?.inventory || 0) },
-        { liability: "Loans / Credit Balances", liabilityAmount: 0, asset: "Customer Receivables / Sundry Debtors", assetAmount: Number(data.balanceSheet?.customerReceivable || 0) },
-        { liability: "Other Liabilities", liabilityAmount: 0, asset: "Other Assets", assetAmount: 0 },
+        { liability: "Capital / Owner Equity", liabilityKey: "owner_equity", liabilityAmount: Number(data.balanceSheet?.ownerCapital || 0), asset: "Cash in Hand", assetKey: "cash_in_hand", assetAmount: Number(data.balanceSheet?.cash || 0) },
+        { liability: Number(data.balanceSheet?.netProfit || 0) < 0 ? "Net Loss" : "Net Profit", liabilityKey: "net_profit", liabilityAmount: Number(data.balanceSheet?.netProfit || 0), asset: "Cash at Bank / Bank Balance", assetKey: "cash_at_bank", assetAmount: Number(data.balanceSheet?.bank || 0) },
+        { liability: "Supplier Payables / Trade Creditors", liabilityKey: "supplier_payables", liabilityAmount: Number(data.balanceSheet?.supplierPayable || 0), asset: "Inventory / Closing Stock", assetKey: "inventory", assetAmount: Number(data.balanceSheet?.inventory || 0) },
+        { liability: "Loans / Credit Balances", liabilityKey: "loans", liabilityAmount: 0, asset: "Customer Receivables / Sundry Debtors", assetKey: "customer_receivables", assetAmount: Number(data.balanceSheet?.customerReceivable || 0) },
+        { liability: "Other Liabilities", liabilityKey: "other_liabilities", liabilityAmount: 0, asset: "Other Assets", assetKey: "other_assets", assetAmount: 0 },
         { liability: "Total Liabilities", liabilityAmount: Number(data.balanceSheet?.totalLiabilities || 0), asset: "Total Assets", assetAmount: Number(data.balanceSheet?.totalAssets || 0), total: true },
       ].filter(matchesSearch),
       summary: () => [["Total Assets", money(data.balanceSheet?.totalAssets), true], ["Total Liabilities", money(data.balanceSheet?.totalLiabilities)], ["Inventory", money(data.balanceSheet?.inventory)]],
       headers: ["Liabilities", "Amount", "Assets", "Amount"],
-      render: (row, index) => <tr className={row.total ? "date-total-row" : ""} key={`${row.liability}-${index}`}><td className="primary-cell">{row.liability}</td><td>{money(row.liabilityAmount)}</td><td className="primary-cell">{row.asset}</td><td>{money(row.assetAmount)}</td></tr>,
+      render: (row, index) => <tr className={row.total ? "date-total-row" : ""} key={`${row.liability}-${index}`}>
+        <td className="primary-cell">{row.total ? row.liability : <button className="table-link-button" onClick={() => openBalanceSheetDetail(row.liabilityKey)}>{row.liability}</button>}</td>
+        <td>{money(row.liabilityAmount)}</td>
+        <td className="primary-cell">{row.total ? row.asset : <button className="table-link-button" onClick={() => openBalanceSheetDetail(row.assetKey)}>{row.asset}</button>}</td>
+        <td>{money(row.assetAmount)}</td>
+      </tr>,
     },
     dayToDay: {
       title: "Day Book / Day-to-Day Transactions",
-      rows: clubRowsByDateAccount(filterRows(data.dayToDayReport)),
+      rows: dayBookRows,
       summary: (rows) => [["Debit", money(totalOf(rows, "debit")), true], ["Credit", money(totalOf(rows, "credit"))], ["Vouchers", rows.length]],
       headers: ["Date", "Particulars", "Voucher Type", "Voucher No.", "Debit Amount", "Credit Amount", "Narration"],
-      render: (row, index) => <tr key={`${row.date}-${row.voucher_no}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell">{row.party_name}</td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span></td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${row.voucher_no}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell">{row.party_name}</td><td>{row.transaction_type || row.voucher_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="purchase-items-cell"><span title={row.narration || row.remarks}>{clubLedgerEntries ? row.narration_summary || ledgerNarration(row) : ledgerNarration(row)}</span></td></tr>,
     },
     expenseReport: {
       title: "Expense Report",
@@ -3711,8 +3758,14 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
               <option value="">All account types</option>
               <option value="CUSTOMER">Customer</option>
               <option value="SUPPLIER">Supplier</option>
-              <option value="EXPENSE_VENDOR">Expense Vendor</option>
-              <option value="STAFF">Staff</option>
+              <option value="CASH">Cash</option>
+              <option value="BANK">Bank</option>
+              <option value="EXPENSE">Expense</option>
+              <option value="INCOME">Income</option>
+              <option value="INVENTORY">Inventory</option>
+              <option value="CAPITAL">Capital</option>
+              <option value="LIABILITY">Liability</option>
+              <option value="ASSET">Asset</option>
               <option value="OTHER">Other</option>
             </select>
           </Field>
@@ -3734,7 +3787,9 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
               <option value="CASH">Cash</option>
               <option value="UPI">UPI</option>
               <option value="CARD">Card</option>
-              <option value="BANK_TRANSFER">Bank</option>
+              <option value="BANK_TRANSFER">Bank Transfer</option>
+              <option value="CREDIT">Credit</option>
+              <option value="OTHER">Other</option>
               <option value="CHEQUE">Cheque</option>
             </select>
           </Field>
@@ -3742,7 +3797,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
             <input checked={clubLedgerEntries} type="checkbox" onChange={(event) => setClubLedgerEntries(event.target.checked)} />
             <span>Club Entries</span>
           </label>
-          <button className="secondary-button" onClick={() => setAccountReportFilters({ accountType: "", accountName: "", voucherType: "", paymentMode: "" })}>Clear Ledger Filters</button>
+          <button className="secondary-button" onClick={clearLedgerFilters}>Clear Ledger Filters</button>
         </>
       )}
       {selectedReport === "salesHistory" && (
@@ -3807,6 +3862,80 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       <button className="secondary-button" onClick={refreshReports}>Refresh</button>
     </div>
   );
+  const balanceDetailColumnValue = (row, column) => {
+    const keyMap = {
+      Date: "transaction_date",
+      "Voucher Type": "voucher_type",
+      "Voucher No": "voucher_no",
+      Party: "party_name",
+      "Payment Mode": "payment_mode",
+      Debit: "debit",
+      Credit: "credit",
+      Balance: "balance",
+      Narration: "narration",
+      Product: "product_name",
+      Lot: "lot",
+      Size: "lot_size",
+      Qty: "quantity",
+      Cost: "cost_rate",
+      Value: "value",
+      Supplier: "supplier_name",
+      Opening: "opening_balance",
+      Purchases: "purchases",
+      Payments: "payments",
+      Rebates: "rebates",
+      Customer: "customer_name",
+      "Credit Sales": "credit_sales",
+      Receipts: "receipts",
+      Returns: "returns",
+      Particular: "particular",
+      Amount: "amount",
+    };
+    const key = keyMap[column] || column.toLowerCase().replace(/\s+/g, "_");
+    const value = row?.[key];
+    if (["Debit", "Credit", "Balance", "Cost", "Value", "Opening", "Purchases", "Payments", "Rebates", "Credit Sales", "Receipts", "Returns", "Amount"].includes(column)) {
+      return money(value);
+    }
+    if (column === "Date") return formatDisplayDate(value);
+    if (column === "Qty") return number(value);
+    return value || "-";
+  };
+  const renderBalanceSheetDetailModal = () => {
+    if (!balanceSheetDetail && !balanceSheetDetailLoading && !balanceSheetDetailError) return null;
+    const columns = Array.isArray(balanceSheetDetail?.columns) ? balanceSheetDetail.columns : ["Particular", "Amount"];
+    const rows = Array.isArray(balanceSheetDetail?.rows) ? balanceSheetDetail.rows : [];
+    return (
+      <div className="modal-backdrop">
+        <section className="invoice-modal change-history-modal balance-detail-modal">
+          <div className="invoice-modal-header">
+            <div>
+              <span className="eyebrow">Balance Sheet Drilldown</span>
+              <h2>{balanceSheetDetail?.title || "Loading Detail"}</h2>
+              <p>{balanceSheetDetail ? `Summary amount: ${money(balanceSheetDetail.amount)}` : "Fetching source transactions..."}</p>
+            </div>
+            <button className="secondary-button" onClick={() => { setBalanceSheetDetail(null); setBalanceSheetDetailError(""); }}>Close</button>
+          </div>
+          {balanceSheetDetailLoading && <div className="cart-empty">Loading balance sheet detail...</div>}
+          {balanceSheetDetailError && <div className="error-banner">{balanceSheetDetailError}</div>}
+          {balanceSheetDetail && (
+            <>
+              <div className="purchase-summary-grid supplier-payment-preview">
+                {(balanceSheetDetail.breakdown || []).map((item) => <SummaryMetric key={item.label} label={item.label} value={money(item.value)} />)}
+              </div>
+              <DataTable headers={columns}>
+                {rows.map((row, index) => (
+                  <tr key={`${balanceSheetDetail.lineKey}-${index}`}>
+                    {columns.map((column) => <td key={column}>{balanceDetailColumnValue(row, column)}</td>)}
+                  </tr>
+                ))}
+              </DataTable>
+              {rows.length === 0 && <div className="cart-empty">No source transactions found for this line.</div>}
+            </>
+          )}
+        </section>
+      </div>
+    );
+  };
   if (currentReport) {
     const rows = currentReport.rows || [];
     const handleReportPrintOption = () => {
@@ -3852,41 +3981,47 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       const to = formatFileDate(data.dateTo || customRange.date_to);
       const title = safeFileName(currentReport.title);
       if (selectedReport === "balanceSheet") return `Balance_Sheet_As_At_${to}.pdf`;
-      if (selectedReport === "dayToDay") return `Day_Book_${to}.pdf`;
+      if (selectedReport === "dayToDay") {
+        const mode = accountReportFilters.paymentMode || "All";
+        return `Day_Book_${mode}_${from}_to_${to}.pdf`;
+      }
       return `${title}_${from}_to_${to}.pdf`;
     })();
     return (
-      <section className="settings-layout">
-        <ModuleCard eyebrow="Report View" title={currentReport.title} subtitle="Single report workspace with filters, summary, print and export controls.">
-          <div className="button-row">
-            <button className="secondary-button" onClick={() => setSelectedReport("")}>Back to {currentCategory?.title || "Report List"}</button>
-            <button className="secondary-button" onClick={() => { setSelectedReport(""); setSelectedCategory(""); }}>Back to Report Center</button>
-            {selectedReport === "purchaseHistory" && <button className="primary-button" onClick={onOpenBlankPurchaseAmendment}>Add/Edit Purchase</button>}
-          </div>
-          {renderFilters()}
-        </ModuleCard>
-        <ModuleCard eyebrow={currentCategory?.title || "Reports"} title={currentReport.title} subtitle={`${rows.length} row${rows.length === 1 ? "" : "s"} found.`}>
-          <PrintableReport
-            beforePdfExport={handleReportPrintOption}
-            beforePrint={handleReportPrintOption}
-            fileName={reportFileName}
-            reportClassName={selectedReport === "salesHistory" ? "sales-history-print-report" : selectedReport === "purchaseHistory" ? "purchase-history-print-report" : selectedReport === "profitLoss" ? "profit-loss-print-report" : ""}
-            title={currentReport.title}
-          >
-            <div className="purchase-summary-grid supplier-payment-preview">
-              {(currentReport.summary?.(rows) || []).map(([label, value, featured]) => <SummaryMetric featured={featured} key={label} label={label} value={value} />)}
+      <>
+        <section className="settings-layout">
+          <ModuleCard eyebrow="Report View" title={currentReport.title} subtitle="Single report workspace with filters, summary, print and export controls.">
+            <div className="button-row">
+              <button className="secondary-button" onClick={() => setSelectedReport("")}>Back to {currentCategory?.title || "Report List"}</button>
+              <button className="secondary-button" onClick={() => { setSelectedReport(""); setSelectedCategory(""); }}>Back to Report Center</button>
+              {selectedReport === "purchaseHistory" && <button className="primary-button" onClick={onOpenBlankPurchaseAmendment}>Add/Edit Purchase</button>}
             </div>
-            {selectedReport === "profitLoss" ? renderProfitLossStatement() : (
-              <>
-                <DataTable headers={currentReport.headers}>
-                  {selectedReport === "purchaseHistory" ? renderPurchaseHistoryRows() : rows.map((row, index) => currentReport.render(row, index))}
-                </DataTable>
-                {rows.length === 0 && <div className="cart-empty">No records found for the selected filters.</div>}
-              </>
-            )}
-          </PrintableReport>
-        </ModuleCard>
-      </section>
+            {renderFilters()}
+          </ModuleCard>
+          <ModuleCard eyebrow={currentCategory?.title || "Reports"} title={currentReport.title} subtitle={`${rows.length} row${rows.length === 1 ? "" : "s"} found.`}>
+            <PrintableReport
+              beforePdfExport={handleReportPrintOption}
+              beforePrint={handleReportPrintOption}
+              fileName={reportFileName}
+              reportClassName={selectedReport === "salesHistory" ? "sales-history-print-report" : selectedReport === "purchaseHistory" ? "purchase-history-print-report" : selectedReport === "profitLoss" ? "profit-loss-print-report" : ""}
+              title={currentReport.title}
+            >
+              <div className="purchase-summary-grid supplier-payment-preview">
+                {(currentReport.summary?.(rows) || []).map(([label, value, featured]) => <SummaryMetric featured={featured} key={label} label={label} value={value} />)}
+              </div>
+              {selectedReport === "profitLoss" ? renderProfitLossStatement() : (
+                <>
+                  <DataTable headers={currentReport.headers}>
+                    {selectedReport === "purchaseHistory" ? renderPurchaseHistoryRows() : rows.map((row, index) => currentReport.render(row, index))}
+                  </DataTable>
+                  {rows.length === 0 && <div className="cart-empty">No records found for the selected filters.</div>}
+                </>
+              )}
+            </PrintableReport>
+          </ModuleCard>
+        </section>
+        {renderBalanceSheetDetailModal()}
+      </>
     );
   }
   if (currentCategory) {

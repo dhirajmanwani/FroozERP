@@ -69,6 +69,7 @@ const toBusinessDateKey = (value) => {
 const RATE_MANAGER_ROLES = new Set(["Owner", "Admin"]);
 const SUPPLIER_TYPES = new Set(["LOCAL_SUPPLIER", "IMPORTED_SUPPLIER", "COMMISSION_AGENT", "TRANSPORT_VENDOR"]);
 const SUPPLIER_PAYMENT_MODES = new Set(["CASH", "UPI", "BANK_TRANSFER", "CHEQUE"]);
+const BANK_PAYMENT_MODES = ["UPI", "CARD", "BANK_TRANSFER", "BANK", "CHEQUE"];
 const CUSTOMER_TYPES = new Set(["RETAIL", "WHOLESALE"]);
 const ACCOUNT_TYPES = new Set(["CUSTOMER", "SUPPLIER", "TRANSPORT_VENDOR", "COMMISSION_AGENT", "STAFF", "OTHER"]);
 const DISCOUNT_TYPES = new Set(["FLAT_AMOUNT", "PERCENTAGE"]);
@@ -1464,6 +1465,148 @@ const buildCustomerSummaryPayload = (rows) => {
     totalPaid: roundCurrency(totals.totalPaid),
     outstandingBalance: roundCurrency(totals.outstandingBalance),
     customers: rows,
+  };
+};
+
+const getBalanceSheetSnapshot = async () => {
+  const bankModesSql = BANK_PAYMENT_MODES.map((mode) => `'${mode}'`).join(", ");
+  const [cashResult, inventoryResult, profitLossResult, supplierRows, customerRows] = await Promise.all([
+    pool.query(
+      `
+      SELECT
+        COALESCE((
+          SELECT SUM(sp.amount)
+          FROM sale_payments sp
+          JOIN sales s ON s.id = sp.sale_id
+          WHERE s.sale_status <> 'CANCELLED'
+            AND sp.payment_mode = 'CASH'
+        ), 0)
+        + COALESCE((
+          SELECT SUM(payment_amount)
+          FROM customer_payments
+          WHERE cancelled = FALSE
+            AND payment_mode = 'CASH'
+        ), 0)
+        - COALESCE((
+          SELECT SUM(payment_amount)
+          FROM supplier_payments
+          WHERE cancelled = FALSE
+            AND payment_mode = 'CASH'
+        ), 0)
+        - COALESCE((
+          SELECT SUM(COALESCE(paid_amount, 0))
+          FROM purchases
+          WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
+            AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
+            AND COALESCE(payment_mode, '') = 'CASH'
+        ), 0)
+        - COALESCE((
+          SELECT SUM(amount)
+          FROM expenses
+          WHERE active IS DISTINCT FROM FALSE
+            AND COALESCE(status, 'ACTIVE') <> 'CANCELLED'
+            AND payment_mode = 'CASH'
+        ), 0) AS cash_in_hand,
+        COALESCE((
+          SELECT SUM(sp.amount)
+          FROM sale_payments sp
+          JOIN sales s ON s.id = sp.sale_id
+          WHERE s.sale_status <> 'CANCELLED'
+            AND sp.payment_mode IN (${bankModesSql})
+        ), 0)
+        + COALESCE((
+          SELECT SUM(payment_amount)
+          FROM customer_payments
+          WHERE cancelled = FALSE
+            AND payment_mode IN (${bankModesSql})
+        ), 0)
+        - COALESCE((
+          SELECT SUM(payment_amount)
+          FROM supplier_payments
+          WHERE cancelled = FALSE
+            AND payment_mode IN (${bankModesSql})
+        ), 0)
+        - COALESCE((
+          SELECT SUM(COALESCE(paid_amount, 0))
+          FROM purchases
+          WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
+            AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
+            AND COALESCE(payment_mode, '') IN (${bankModesSql})
+        ), 0)
+        - COALESCE((
+          SELECT SUM(amount)
+          FROM expenses
+          WHERE active IS DISTINCT FROM FALSE
+            AND COALESCE(status, 'ACTIVE') <> 'CANCELLED'
+            AND payment_mode IN (${bankModesSql})
+        ), 0) AS cash_at_bank
+      `
+    ),
+    pool.query(
+      `
+      SELECT COALESCE(SUM(remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate)), 0) AS inventory_value
+      FROM inventory_batches
+      WHERE COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'
+      `
+    ),
+    pool.query(
+      `
+      SELECT
+        COALESCE((SELECT SUM(total_amount) FROM sales WHERE sale_status <> 'CANCELLED'), 0) AS sales_revenue,
+        COALESCE((SELECT SUM(total_cost) FROM sales WHERE sale_status <> 'CANCELLED'), 0) AS purchase_cost,
+        COALESCE((SELECT SUM(mandi_tax_amount) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0) AS mandi_tax,
+        COALESCE((SELECT SUM(freight_charges) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0) AS freight_charges,
+        COALESCE((SELECT SUM(labour_charges) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0) AS labour_charges,
+        COALESCE((SELECT SUM(other_charges) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0) AS other_purchase_charges,
+        COALESCE((SELECT SUM(amount) FROM expenses WHERE active IS DISTINCT FROM FALSE AND COALESCE(status, 'ACTIVE') <> 'CANCELLED'), 0) AS expenses,
+        COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'), 0)
+          + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE), 0) AS supplier_rebate_received
+      `
+    ),
+    getSupplierSummaryRows(),
+    getCustomerSummaryRows(),
+  ]);
+
+  const cash = cashResult.rows[0] || {};
+  const profitLoss = profitLossResult.rows[0] || {};
+  const inventoryValue = Number(inventoryResult.rows[0]?.inventory_value || 0);
+  const customerReceivable = customerRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0);
+  const supplierPayable = supplierRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0);
+  const purchaseCost = Number(profitLoss.purchase_cost || 0);
+  const costOfGoodsSold = purchaseCost
+    + Number(profitLoss.mandi_tax || 0)
+    + Number(profitLoss.freight_charges || 0)
+    + Number(profitLoss.labour_charges || 0)
+    + Number(profitLoss.other_purchase_charges || 0)
+    - Number(profitLoss.supplier_rebate_received || 0);
+  const grossProfit = Number(profitLoss.sales_revenue || 0) - costOfGoodsSold;
+  const netProfit = grossProfit - Number(profitLoss.expenses || 0);
+  const cashInHand = Number(cash.cash_in_hand || 0);
+  const cashAtBank = Number(cash.cash_at_bank || 0);
+  const totalAssets = cashInHand + cashAtBank + inventoryValue + customerReceivable;
+  const ownerCapital = roundCurrency(totalAssets - supplierPayable - netProfit);
+
+  return {
+    cash: roundCurrency(cashInHand),
+    bank: roundCurrency(cashAtBank),
+    inventory: roundCurrency(inventoryValue),
+    customerReceivable: roundCurrency(customerReceivable),
+    supplierPayable: roundCurrency(supplierPayable),
+    netProfit: roundCurrency(netProfit),
+    ownerCapital,
+    netPosition: roundCurrency(totalAssets - supplierPayable),
+    totalAssets: roundCurrency(totalAssets),
+    totalLiabilities: roundCurrency(supplierPayable + netProfit + ownerCapital),
+    profitLoss: {
+      salesRevenue: roundCurrency(Number(profitLoss.sales_revenue || 0)),
+      purchaseCost: roundCurrency(purchaseCost),
+      costOfGoodsSold: roundCurrency(costOfGoodsSold),
+      grossProfit: roundCurrency(grossProfit),
+      expenses: roundCurrency(Number(profitLoss.expenses || 0)),
+      netProfit: roundCurrency(netProfit),
+    },
+    supplierRows,
+    customerRows,
   };
 };
 
@@ -5312,6 +5455,246 @@ app.get("/dashboard-expense-trend", async (req, res) => {
   }
 });
 
+app.get("/reports/balance-sheet", async (_req, res) => {
+  try {
+    const snapshot = await getBalanceSheetSnapshot();
+    return res.json({
+      cash: snapshot.cash,
+      bank: snapshot.bank,
+      inventory: snapshot.inventory,
+      customerReceivable: snapshot.customerReceivable,
+      supplierPayable: snapshot.supplierPayable,
+      netProfit: snapshot.netProfit,
+      ownerCapital: snapshot.ownerCapital,
+      netPosition: snapshot.netPosition,
+      totalAssets: snapshot.totalAssets,
+      totalLiabilities: snapshot.totalLiabilities,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Balance Sheet" });
+  }
+});
+
+app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
+  try {
+    const lineKey = String(req.params.lineKey || "").toLowerCase();
+    const snapshot = await getBalanceSheetSnapshot();
+    const bankModesSql = BANK_PAYMENT_MODES.map((mode) => `'${mode}'`).join(", ");
+    const titles = {
+      cash_in_hand: "Cash in Hand Detail",
+      cash_at_bank: "Cash at Bank / Bank Balance Detail",
+      inventory: "Inventory / Closing Stock Detail",
+      customer_receivables: "Customer Receivables / Sundry Debtors Detail",
+      supplier_payables: "Supplier Payables / Trade Creditors Detail",
+      net_profit: "Net Profit Detail",
+      owner_equity: "Capital / Owner Equity Detail",
+      loans: "Loans / Credit Balances Detail",
+      other_liabilities: "Other Liabilities Detail",
+      other_assets: "Other Assets Detail",
+    };
+    if (!titles[lineKey]) {
+      return res.status(404).json({ message: "Balance Sheet line not found" });
+    }
+
+    if (lineKey === "cash_in_hand" || lineKey === "cash_at_bank") {
+      const paymentCondition = lineKey === "cash_in_hand" ? "= 'CASH'" : `IN (${bankModesSql})`;
+      const amount = lineKey === "cash_in_hand" ? snapshot.cash : snapshot.bank;
+      const result = await pool.query(
+        `
+        SELECT *
+        FROM (
+          SELECT s.sale_date AS transaction_date, 'POS Sale' AS voucher_type,
+            COALESCE(s.invoice_no, 'SALE-' || s.id) AS voucher_no,
+            COALESCE(s.customer_name, 'Walk-in Customer') AS party_name,
+            sp.payment_mode, sp.amount AS debit, 0::NUMERIC AS credit,
+            COALESCE(s.invoice_no, 'POS sale receipt') AS narration
+          FROM sale_payments sp
+          JOIN sales s ON s.id = sp.sale_id
+          WHERE s.sale_status <> 'CANCELLED'
+            AND sp.payment_mode ${paymentCondition}
+          UNION ALL
+          SELECT cp.payment_date AS transaction_date, 'Customer Receipt' AS voucher_type,
+            COALESCE(cp.reference_number, 'CP-' || cp.id) AS voucher_no,
+            c.customer_name AS party_name,
+            cp.payment_mode, cp.payment_amount AS debit, 0::NUMERIC AS credit,
+            COALESCE(cp.remarks, 'Customer payment received') AS narration
+          FROM customer_payments cp
+          JOIN customers c ON c.id = cp.customer_id
+          WHERE cp.cancelled = FALSE
+            AND cp.payment_mode ${paymentCondition}
+          UNION ALL
+          SELECT sp.payment_date AS transaction_date, 'Supplier Payment' AS voucher_type,
+            COALESCE(sp.reference_number, 'SP-' || sp.id) AS voucher_no,
+            s.supplier_name AS party_name,
+            sp.payment_mode, 0::NUMERIC AS debit, sp.payment_amount AS credit,
+            COALESCE(sp.remarks, 'Supplier payment') AS narration
+          FROM supplier_payments sp
+          JOIN suppliers s ON s.id = sp.supplier_id
+          WHERE sp.cancelled = FALSE
+            AND sp.payment_mode ${paymentCondition}
+          UNION ALL
+          SELECT p.purchase_date AS transaction_date, 'Purchase Payment' AS voucher_type,
+            COALESCE(p.bill_number, 'PUR-' || p.id) AS voucher_no,
+            COALESCE(s.supplier_name, p.supplier_name, 'Supplier') AS party_name,
+            p.payment_mode, 0::NUMERIC AS debit, COALESCE(p.paid_amount, 0) AS credit,
+            COALESCE(p.remarks, 'Purchase paid during entry') AS narration
+          FROM purchases p
+          LEFT JOIN suppliers s ON s.id = p.supplier_id
+          WHERE COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
+            AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
+            AND COALESCE(p.paid_amount, 0) > 0
+            AND p.payment_mode ${paymentCondition}
+          UNION ALL
+          SELECT e.expense_date AS transaction_date, 'Expense' AS voucher_type,
+            COALESCE(e.reference_number, 'EXP-' || e.id) AS voucher_no,
+            COALESCE(e.paid_to, e.vendor_name, e.category) AS party_name,
+            e.payment_mode, 0::NUMERIC AS debit, e.amount AS credit,
+            COALESCE(e.remarks, e.category) AS narration
+          FROM expenses e
+          WHERE e.active IS DISTINCT FROM FALSE
+            AND COALESCE(e.status, 'ACTIVE') <> 'CANCELLED'
+            AND e.payment_mode ${paymentCondition}
+        ) rows
+        ORDER BY transaction_date, voucher_type, voucher_no
+        `
+      );
+      let balance = 0;
+      const rows = result.rows.map((row) => {
+        balance = roundCurrency(balance + Number(row.debit || 0) - Number(row.credit || 0));
+        return { ...row, balance };
+      }).reverse();
+      return res.json({
+        lineKey,
+        title: titles[lineKey],
+        amount,
+        columns: ["Date", "Voucher Type", "Voucher No", "Party", "Payment Mode", "Debit", "Credit", "Balance", "Narration"],
+        rows,
+        breakdown: [{ label: titles[lineKey], value: amount }],
+      });
+    }
+
+    if (lineKey === "inventory") {
+      const result = await pool.query(
+        `
+        SELECT
+          p.product_name,
+          COALESCE(ib.lot_name, ib.batch_no) AS lot,
+          ib.lot_size,
+          ib.remaining_qty AS quantity,
+          COALESCE(ib.effective_cost_per_unit, ib.purchase_rate, 0) AS cost_rate,
+          ib.remaining_qty * COALESCE(ib.effective_cost_per_unit, ib.purchase_rate, 0) AS value,
+          ib.supplier_name
+        FROM inventory_batches ib
+        JOIN products p ON p.id = ib.product_id
+        WHERE COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+          AND COALESCE(ib.remaining_qty, 0) <> 0
+        ORDER BY p.product_name, ib.created_at, ib.id
+        `
+      );
+      return res.json({
+        lineKey,
+        title: titles[lineKey],
+        amount: snapshot.inventory,
+        columns: ["Product", "Lot", "Size", "Qty", "Cost", "Value", "Supplier"],
+        rows: result.rows,
+        breakdown: [{ label: "Closing stock valuation", value: snapshot.inventory }],
+      });
+    }
+
+    if (lineKey === "supplier_payables") {
+      return res.json({
+        lineKey,
+        title: titles[lineKey],
+        amount: snapshot.supplierPayable,
+        columns: ["Supplier", "Opening", "Purchases", "Payments", "Rebates", "Balance"],
+        rows: snapshot.supplierRows.map((row) => ({
+          supplier_name: row.supplier_name,
+          opening_balance: row.opening_balance,
+          purchases: row.total_purchases,
+          payments: row.total_paid,
+          rebates: row.total_rebate_received,
+          balance: row.outstanding_balance,
+        })),
+        breakdown: [{ label: "Supplier outstanding", value: snapshot.supplierPayable }],
+      });
+    }
+
+    if (lineKey === "customer_receivables") {
+      return res.json({
+        lineKey,
+        title: titles[lineKey],
+        amount: snapshot.customerReceivable,
+        columns: ["Customer", "Opening", "Credit Sales", "Receipts", "Returns", "Balance"],
+        rows: snapshot.customerRows.map((row) => ({
+          customer_name: row.customer_name,
+          opening_balance: row.opening_balance,
+          credit_sales: row.total_sales,
+          receipts: row.total_paid,
+          returns: row.total_cancelled,
+          balance: row.outstanding_balance,
+        })),
+        breakdown: [{ label: "Customer receivables", value: snapshot.customerReceivable }],
+      });
+    }
+
+    if (lineKey === "net_profit") {
+      return res.json({
+        lineKey,
+        title: titles[lineKey],
+        amount: snapshot.netProfit,
+        columns: ["Particular", "Amount"],
+        rows: [
+          { particular: "Sales Revenue", amount: snapshot.profitLoss.salesRevenue },
+          { particular: "Cost of Goods Sold", amount: -snapshot.profitLoss.costOfGoodsSold },
+          { particular: "Gross Profit", amount: snapshot.profitLoss.grossProfit },
+          { particular: "Expenses", amount: -snapshot.profitLoss.expenses },
+          { particular: "Net Profit", amount: snapshot.netProfit },
+        ],
+        breakdown: [
+          { label: "Sales Revenue", value: snapshot.profitLoss.salesRevenue },
+          { label: "Cost of Goods Sold", value: snapshot.profitLoss.costOfGoodsSold },
+          { label: "Expenses", value: snapshot.profitLoss.expenses },
+          { label: "Net Profit", value: snapshot.netProfit },
+        ],
+      });
+    }
+
+    if (lineKey === "owner_equity") {
+      return res.json({
+        lineKey,
+        title: titles[lineKey],
+        amount: snapshot.ownerCapital,
+        columns: ["Particular", "Amount"],
+        rows: [
+          { particular: "Total Assets", amount: snapshot.totalAssets },
+          { particular: "Less Supplier Payables", amount: -snapshot.supplierPayable },
+          { particular: "Less Net Profit", amount: -snapshot.netProfit },
+          { particular: "Balancing Owner Equity", amount: snapshot.ownerCapital },
+        ],
+        breakdown: [
+          { label: "Total Assets", value: snapshot.totalAssets },
+          { label: "Supplier Payables", value: snapshot.supplierPayable },
+          { label: "Net Profit", value: snapshot.netProfit },
+          { label: "Owner Equity / Balancing Figure", value: snapshot.ownerCapital },
+        ],
+      });
+    }
+
+    return res.json({
+      lineKey,
+      title: titles[lineKey],
+      amount: 0,
+      columns: ["Particular", "Amount"],
+      rows: [],
+      breakdown: [{ label: "No source transactions configured yet", value: 0 }],
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Balance Sheet Details" });
+  }
+});
+
 app.get("/reports/summary", async (req, res) => {
   try {
     const reportRange = getReportDateRange(req.query);
@@ -5345,7 +5728,6 @@ app.get("/reports/summary", async (req, res) => {
       purchaseChangeResult,
       returnHistoryResult,
       stockMovementResult,
-      balanceSheetResult,
       profitLossResult,
       paymentModeSummaryResult,
     ] = await Promise.all([
@@ -6236,42 +6618,8 @@ app.get("/reports/summary", async (req, res) => {
         WHERE st.created_at::date BETWEEN $1 AND $2
         GROUP BY st.created_at::date, p.product_name, p.unit, st.transaction_type
         ORDER BY movement_date DESC, p.product_name, st.transaction_type
-        `,
+      `,
         [dateFrom, dateTo]
-      ),
-      pool.query(
-        `
-        SELECT
-          COALESCE((SELECT SUM(amount) FROM sale_payments sp JOIN sales s ON s.id = sp.sale_id WHERE s.sale_status <> 'CANCELLED'), 0)
-            + COALESCE((SELECT SUM(payment_amount) FROM customer_payments WHERE cancelled = FALSE), 0)
-            - COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE cancelled = FALSE), 0)
-            - COALESCE((SELECT SUM(amount) FROM expenses WHERE active IS DISTINCT FROM FALSE), 0) AS cash_bank,
-          COALESCE((SELECT SUM(remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate)) FROM inventory_batches WHERE COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'), 0) AS inventory_value,
-          COALESCE((SELECT SUM(outstanding_balance) FROM (
-            SELECT c.id, COALESCE(c.opening_balance, 0) + COALESCE(ss.total_sales, 0) - COALESCE(ss.sale_paid, 0) - COALESCE(cp.total_paid, 0) AS outstanding_balance
-            FROM customers c
-            LEFT JOIN (
-              SELECT s.customer_mobile, s.customer_name, SUM(s.total_amount) AS total_sales, SUM(COALESCE(pay.total_paid, 0)) AS sale_paid
-              FROM sales s
-              LEFT JOIN (SELECT sale_id, SUM(amount) AS total_paid FROM sale_payments GROUP BY sale_id) pay ON pay.sale_id = s.id
-              WHERE s.sale_status <> 'CANCELLED'
-              GROUP BY s.customer_mobile, s.customer_name
-            ) ss ON ss.customer_mobile = c.mobile_number OR LOWER(ss.customer_name) = LOWER(c.customer_name)
-            LEFT JOIN (SELECT customer_id, SUM(payment_amount) AS total_paid FROM customer_payments WHERE cancelled = FALSE GROUP BY customer_id) cp ON cp.customer_id = c.id
-          ) customer_balances), 0) AS customer_receivable,
-          COALESCE((SELECT SUM(outstanding_balance) FROM (
-            SELECT s.id, COALESCE(s.opening_balance, 0) + COALESCE(ps.total_purchases, 0) - COALESCE(ps.purchase_rebate, 0) - COALESCE(ps.purchase_paid, 0) - COALESCE(pay.total_paid, 0) - COALESCE(pay.payment_rebate, 0) AS outstanding_balance
-            FROM suppliers s
-            LEFT JOIN (
-              SELECT supplier_id, SUM(COALESCE(NULLIF(gross_amount, 0), total_amount, 0)) AS total_purchases, SUM(COALESCE(rebate_amount, 0)) AS purchase_rebate, SUM(COALESCE(paid_amount, 0)) AS purchase_paid
-              FROM purchases WHERE supplier_id IS NOT NULL AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' GROUP BY supplier_id
-            ) ps ON ps.supplier_id = s.id
-            LEFT JOIN (
-              SELECT supplier_id, SUM(payment_amount) AS total_paid, SUM(rebate_amount) AS payment_rebate
-              FROM supplier_payments WHERE cancelled = FALSE GROUP BY supplier_id
-            ) pay ON pay.supplier_id = s.id
-          ) supplier_balances), 0) AS supplier_payable
-        `
       ),
       pool.query(
         `
@@ -6331,7 +6679,7 @@ app.get("/reports/summary", async (req, res) => {
         [dateFrom, dateTo]
       ),
     ]);
-    const balanceSheet = balanceSheetResult.rows[0] || {};
+    const balanceSheetSnapshot = await getBalanceSheetSnapshot();
     const profitLoss = profitLossResult.rows[0] || {};
     const customerReceivable = customerRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0);
     const supplierPayable = supplierRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0);
@@ -6344,9 +6692,6 @@ app.get("/reports/summary", async (req, res) => {
     const costOfGoodsSold = purchaseCost + mandiTax + freightCharges + labourCharges + otherPurchaseCharges - supplierRebateReceived;
     const grossProfit = Number(profitLoss.sales_revenue || 0) - costOfGoodsSold;
     const netProfit = grossProfit - Number(profitLoss.expenses || 0);
-    const assets = Number(balanceSheet.cash_bank || 0) + Number(balanceSheet.inventory_value || 0) + customerReceivable;
-    const liabilities = supplierPayable;
-    const ownerCapitalAdjustment = roundCurrency(assets - liabilities - netProfit);
     return res.json({
       dateFrom,
       dateTo,
@@ -6380,16 +6725,16 @@ app.get("/reports/summary", async (req, res) => {
       returnHistoryReport: returnHistoryResult.rows,
       stockMovementReport: stockMovementResult.rows,
       balanceSheet: {
-        cash: roundCurrency(Number(balanceSheet.cash_bank || 0)),
-        bank: 0,
-        inventory: roundCurrency(Number(balanceSheet.inventory_value || 0)),
-        customerReceivable: roundCurrency(customerReceivable),
-        supplierPayable: roundCurrency(supplierPayable),
-        netProfit: roundCurrency(netProfit),
-        ownerCapital: ownerCapitalAdjustment,
-        netPosition: roundCurrency(assets - liabilities),
-        totalAssets: roundCurrency(assets),
-        totalLiabilities: roundCurrency(liabilities + netProfit + ownerCapitalAdjustment),
+        cash: balanceSheetSnapshot.cash,
+        bank: balanceSheetSnapshot.bank,
+        inventory: balanceSheetSnapshot.inventory,
+        customerReceivable: balanceSheetSnapshot.customerReceivable,
+        supplierPayable: balanceSheetSnapshot.supplierPayable,
+        netProfit: balanceSheetSnapshot.netProfit,
+        ownerCapital: balanceSheetSnapshot.ownerCapital,
+        netPosition: balanceSheetSnapshot.netPosition,
+        totalAssets: balanceSheetSnapshot.totalAssets,
+        totalLiabilities: balanceSheetSnapshot.totalLiabilities,
       },
       profitLoss: {
         salesRevenue: roundCurrency(Number(profitLoss.sales_revenue || 0)),
