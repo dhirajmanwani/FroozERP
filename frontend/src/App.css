@@ -1372,6 +1372,29 @@ tbody tr:last-child td {
   text-align: center;
 }
 
+.empty-cell {
+  padding: 28px 12px;
+  color: #64748b;
+  text-align: center;
+}
+
+.lot-entry-panel,
+.lot-audit-panel {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 14px;
+  background: rgba(15, 23, 42, 0.36);
+}
+
+.lot-audit-panel h3,
+.lot-entry-panel h3 {
+  margin: 0;
+  color: #f8fafc;
+}
+
 .cart-table {
   margin-top: 16px;
 }

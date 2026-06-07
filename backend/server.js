@@ -3489,6 +3489,229 @@ app.post("/products/:id/opening-stock", async (req, res) => {
   }
 });
 
+const lotUsage = (lot) => Math.max(0, Number(lot.purchase_qty || 0) - Number(lot.remaining_qty || 0));
+
+app.get("/products/:id/lots", async (req, res) => {
+  try {
+    const productId = parsePositiveInteger(req.params.id);
+    if (!productId) return res.status(400).json({ message: "Invalid product" });
+    const [lotsResult, auditResult] = await Promise.all([
+      pool.query(
+        `
+        SELECT
+          ib.*,
+          p.product_name,
+          p.unit,
+          COALESCE(ib.purchase_qty, 0) - COALESCE(ib.remaining_qty, 0) AS sold_qty,
+          COALESCE(ib.remaining_qty, 0) AS balance_qty
+        FROM inventory_batches ib
+        JOIN products p ON p.id = ib.product_id
+        WHERE ib.product_id = $1
+        ORDER BY COALESCE(ib.purchase_date, ib.created_at::date), ib.created_at, ib.id
+        `,
+        [productId]
+      ),
+      pool.query(
+        `
+        SELECT pat.*, u.full_name AS edited_by_name
+        FROM product_audit_trail pat
+        LEFT JOIN users u ON u.id = pat.edited_by
+        WHERE pat.product_id = $1
+          AND pat.action IN ('OPENING_STOCK', 'INVENTORY_LOT_EDIT', 'INVENTORY_LOT_ADD_QTY', 'INVENTORY_LOT_ADJUST', 'INVENTORY_LOT_DEACTIVATE')
+        ORDER BY pat.edited_at DESC, pat.id DESC
+        LIMIT 50
+        `,
+        [productId]
+      ),
+    ]);
+    return res.json({ lots: lotsResult.rows, audit: auditResult.rows });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Product Lots" });
+  }
+});
+
+app.put("/inventory-lots/:lotId", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const lotId = parsePositiveInteger(req.params.lotId);
+    const manager = await requireRateManager(req.body.updated_by || req.body.edited_by, client);
+    const newQuantity = parseNonNegativeNumber(req.body.purchase_qty ?? req.body.quantity);
+    const purchaseRate = parsePositiveNumber(req.body.purchase_rate || req.body.opening_cost);
+    const saleRate = parsePositiveNumber(req.body.sale_rate);
+    const reason = cleanText(req.body.reason || "Opening stock lot edited");
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can edit opening stock lots" });
+    if (!lotId || newQuantity === null || !purchaseRate) return res.status(400).json({ message: "Enter valid lot quantity and cost rate" });
+    await client.query("BEGIN");
+    const lotResult = await client.query("SELECT * FROM inventory_batches WHERE id = $1 FOR UPDATE", [lotId]);
+    const lot = lotResult.rows[0];
+    if (!lot) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Inventory lot not found" });
+    }
+    const usedQty = lotUsage(lot);
+    if (newQuantity < usedQty) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: `Cannot reduce quantity below already used stock. Minimum allowed quantity is ${usedQty}.` });
+    }
+    const remainingQty = newQuantity - usedQty;
+    const supplierId = parsePositiveInteger(req.body.supplier_id);
+    const supplierName = supplierId ? nullableText(req.body.supplier_name) || lot.supplier_name : null;
+    const lotName = cleanText(req.body.lot_name || req.body.lot_number || lot.lot_name || "Opening Stock Lot");
+    const lotSize = nullableText(req.body.lot_size || req.body.size_grade || req.body.size);
+    const purchaseDate = isDateInput(req.body.opening_stock_date || req.body.purchase_date) ? (req.body.opening_stock_date || req.body.purchase_date) : toDateKey(lot.purchase_date || new Date());
+    const remarks = nullableText(req.body.remarks);
+    const netPayable = roundCurrency(newQuantity * purchaseRate);
+    const updateResult = await client.query(
+      `
+      UPDATE inventory_batches
+      SET lot_name = $1, lot_size = $2, supplier_id = $3, supplier_name = $4,
+          purchase_qty = $5, remaining_qty = $6, purchase_rate = $7,
+          effective_cost_per_unit = $7, gross_amount = $8, net_payable = $8,
+          balance_amount = 0, temporary_sale_rate = COALESCE($9, temporary_sale_rate),
+          purchase_date = $10, remarks = $11
+      WHERE id = $12
+      RETURNING *
+      `,
+      [
+        lotName, lotSize, supplierId || null, supplierName,
+        newQuantity, remainingQty, purchaseRate, netPayable, saleRate || null,
+        purchaseDate, remarks, lotId,
+      ]
+    );
+    const quantityDiff = newQuantity - Number(lot.purchase_qty || 0);
+    if (quantityDiff !== 0) {
+      await client.query(
+        "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, $3, $4, $5, $6)",
+        [lot.product_id, Math.abs(quantityDiff), quantityDiff > 0 ? "IN" : "OUT", reason, manager.id, lot.branch_id || 1]
+      );
+    }
+    if (saleRate && Number(saleRate) !== Number(lot.temporary_sale_rate || 0)) {
+      await client.query("UPDATE products SET selling_rate = $1, selling_rate_updated_at = CURRENT_TIMESTAMP, selling_rate_updated_by = $2 WHERE id = $3", [saleRate, manager.id, lot.product_id]);
+    }
+    await client.query(
+      "INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'INVENTORY_LOT_EDIT', $2::jsonb, $3::jsonb, $4, $5)",
+      [lot.product_id, JSON.stringify(lot), JSON.stringify(updateResult.rows[0]), reason, manager.id]
+    );
+    await client.query("COMMIT");
+    return res.json(updateResult.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Inventory Lot" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/inventory-lots/:lotId/add-quantity", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const lotId = parsePositiveInteger(req.params.lotId);
+    const quantity = parsePositiveNumber(req.body.quantity);
+    const manager = await requireRateManager(req.body.updated_by || req.body.created_by, client);
+    const reason = cleanText(req.body.reason || "Quantity added to lot");
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can add lot quantity" });
+    if (!lotId || !quantity) return res.status(400).json({ message: "Enter quantity to add" });
+    await client.query("BEGIN");
+    const lotResult = await client.query("SELECT * FROM inventory_batches WHERE id = $1 FOR UPDATE", [lotId]);
+    const lot = lotResult.rows[0];
+    if (!lot) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Inventory lot not found" });
+    }
+    const updateResult = await client.query(
+      "UPDATE inventory_batches SET purchase_qty = purchase_qty + $1, remaining_qty = remaining_qty + $1, gross_amount = ROUND(((purchase_qty + $1) * purchase_rate)::NUMERIC, 2), net_payable = ROUND(((purchase_qty + $1) * purchase_rate)::NUMERIC, 2) WHERE id = $2 RETURNING *",
+      [quantity, lotId]
+    );
+    await client.query("INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, 'IN', $3, $4, $5)", [lot.product_id, quantity, reason, manager.id, lot.branch_id || 1]);
+    await client.query("INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'INVENTORY_LOT_ADD_QTY', $2::jsonb, $3::jsonb, $4, $5)", [lot.product_id, JSON.stringify(lot), JSON.stringify(updateResult.rows[0]), reason, manager.id]);
+    await client.query("COMMIT");
+    return res.json(updateResult.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Adding Lot Quantity" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/inventory-lots/:lotId/adjust", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const lotId = parsePositiveInteger(req.params.lotId);
+    const newQuantity = parseNonNegativeNumber(req.body.new_quantity ?? req.body.quantity);
+    const manager = await requireRateManager(req.body.updated_by || req.body.created_by, client);
+    const reason = cleanText(req.body.reason);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can adjust lot quantity" });
+    if (!lotId || newQuantity === null || !reason) return res.status(400).json({ message: "Enter new quantity and adjustment reason" });
+    await client.query("BEGIN");
+    const lotResult = await client.query("SELECT * FROM inventory_batches WHERE id = $1 FOR UPDATE", [lotId]);
+    const lot = lotResult.rows[0];
+    if (!lot) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Inventory lot not found" });
+    }
+    const usedQty = lotUsage(lot);
+    if (newQuantity < usedQty) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: `Cannot reduce quantity below already used stock. Minimum allowed quantity is ${usedQty}.` });
+    }
+    const oldQty = Number(lot.purchase_qty || 0);
+    const diff = newQuantity - oldQty;
+    const updateResult = await client.query("UPDATE inventory_batches SET purchase_qty = $1, remaining_qty = $2 WHERE id = $3 RETURNING *", [newQuantity, newQuantity - usedQty, lotId]);
+    if (diff !== 0) {
+      await client.query("INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, $3, $4, $5, $6)", [lot.product_id, Math.abs(diff), diff > 0 ? "IN" : "OUT", reason, manager.id, lot.branch_id || 1]);
+    }
+    await client.query("INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'INVENTORY_LOT_ADJUST', $2::jsonb, $3::jsonb, $4, $5)", [lot.product_id, JSON.stringify(lot), JSON.stringify(updateResult.rows[0]), reason, manager.id]);
+    await client.query("COMMIT");
+    return res.json(updateResult.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Adjusting Inventory Lot" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/inventory-lots/:lotId/deactivate", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const lotId = parsePositiveInteger(req.params.lotId);
+    const manager = await requireRateManager(req.body.updated_by || req.body.deactivated_by, client);
+    const reason = cleanText(req.body.reason);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can deactivate lots" });
+    if (!lotId || !reason) return res.status(400).json({ message: "Reason is required" });
+    await client.query("BEGIN");
+    const lotResult = await client.query("SELECT * FROM inventory_batches WHERE id = $1 FOR UPDATE", [lotId]);
+    const lot = lotResult.rows[0];
+    if (!lot) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Inventory lot not found" });
+    }
+    const usedQty = lotUsage(lot);
+    if (usedQty > 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Cannot deactivate this lot because stock from this lot has already been used." });
+    }
+    const updateResult = await client.query("UPDATE inventory_batches SET batch_status = 'CANCELLED', remaining_qty = 0 WHERE id = $1 RETURNING *", [lotId]);
+    if (Number(lot.remaining_qty || 0) > 0) {
+      await client.query("INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, 'OUT', $3, $4, $5)", [lot.product_id, Number(lot.remaining_qty), reason, manager.id, lot.branch_id || 1]);
+    }
+    await client.query("INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'INVENTORY_LOT_DEACTIVATE', $2::jsonb, $3::jsonb, $4, $5)", [lot.product_id, JSON.stringify(lot), JSON.stringify(updateResult.rows[0]), reason, manager.id]);
+    await client.query("COMMIT");
+    return res.json(updateResult.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Deactivating Inventory Lot" });
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/products/:id/cancel", async (req, res) => {
   const client = await pool.connect();
   try {

@@ -435,6 +435,24 @@ function App() {
     supplier_id: "",
     remarks: "",
   });
+  const [lotPanelProduct, setLotPanelProduct] = useState(null);
+  const [productLots, setProductLots] = useState([]);
+  const [productLotAudit, setProductLotAudit] = useState([]);
+  const [lotAction, setLotAction] = useState(null);
+  const [lotDraft, setLotDraft] = useState({
+    lot_name: "",
+    lot_size: "",
+    supplier_id: "",
+    purchase_qty: "",
+    purchase_rate: "",
+    sale_rate: "",
+    opening_stock_date: "",
+    remarks: "",
+    quantity: "",
+    new_quantity: "",
+    adjustment_date: toDateKey(new Date()),
+    reason: "",
+  });
   const [editingProductId, setEditingProductId] = useState(null);
   const [unit, setUnit] = useState("");
   const [purchaseSupplierId, setPurchaseSupplierId] = useState("");
@@ -996,6 +1014,10 @@ function App() {
       supplier_id: "",
       remarks: "",
     });
+    setLotPanelProduct(null);
+    setProductLots([]);
+    setProductLotAudit([]);
+    setLotAction(null);
     setEditingProductId(null);
   };
 
@@ -1086,6 +1108,156 @@ function App() {
       supplier_id: "",
       remarks: "",
     });
+  };
+
+  const loadProductLots = async (product, showPanel = true) => {
+    try {
+      const response = await axios.get(`${API_URL}/products/${product.id}/lots`);
+      setProductLots(response.data.lots || []);
+      setProductLotAudit(response.data.audit || []);
+      if (showPanel) setLotPanelProduct(product);
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to load product lots"));
+    }
+  };
+
+  const openLotAction = (type, lot) => {
+    setLotAction({ type, lot });
+    setLotDraft({
+      lot_name: lot.lot_name || lot.batch_no || "",
+      lot_size: lot.lot_size || "",
+      supplier_id: lot.supplier_id ? String(lot.supplier_id) : "",
+      purchase_qty: String(lot.purchase_qty || ""),
+      purchase_rate: String(lot.purchase_rate || lot.effective_cost_per_unit || ""),
+      sale_rate: String(lot.temporary_sale_rate || lot.selling_rate || ""),
+      opening_stock_date: toDateKey(lot.purchase_date || new Date()),
+      remarks: lot.remarks || "",
+      quantity: "",
+      new_quantity: String(lot.purchase_qty || ""),
+      adjustment_date: toDateKey(new Date()),
+      reason: "",
+    });
+  };
+
+  const closeLotAction = () => {
+    setLotAction(null);
+    setLotDraft({
+      lot_name: "",
+      lot_size: "",
+      supplier_id: "",
+      purchase_qty: "",
+      purchase_rate: "",
+      sale_rate: "",
+      opening_stock_date: "",
+      remarks: "",
+      quantity: "",
+      new_quantity: "",
+      adjustment_date: toDateKey(new Date()),
+      reason: "",
+    });
+  };
+
+  const refreshLotContext = async (product = lotPanelProduct) => {
+    await Promise.all([loadProducts(), loadDashboardData()]);
+    if (product?.id) await loadProductLots(product, true);
+  };
+
+  const saveLotAction = async () => {
+    if (!lotAction?.lot?.id) return;
+    try {
+      const selectedSupplier = activeSuppliers.find((supplier) => String(supplier.id) === String(lotDraft.supplier_id));
+      const basePayload = {
+        updated_by: user.id,
+        branch_id: user.branch_id,
+        reason: lotDraft.reason,
+      };
+      if (lotAction.type === "edit") {
+        const usedQty = Number(lotAction.lot.sold_qty ?? (Number(lotAction.lot.purchase_qty || 0) - Number(lotAction.lot.remaining_qty || 0)));
+        const nextQty = Number(lotDraft.purchase_qty || 0);
+        const nextCost = Number(lotDraft.purchase_rate || 0);
+        if (!lotDraft.lot_name.trim()) {
+          alert("Please enter lot name / number.");
+          return;
+        }
+        if (!Number.isFinite(nextQty) || nextQty < 0) {
+          alert("Please enter a valid opening quantity.");
+          return;
+        }
+        if (!Number.isFinite(nextCost) || nextCost <= 0) {
+          alert("Please enter a valid opening cost / purchase rate.");
+          return;
+        }
+        if (nextQty < usedQty) {
+          alert(`Cannot reduce quantity below already used stock. Minimum allowed quantity is ${usedQty}.`);
+          return;
+        }
+        await axios.put(`${API_URL}/inventory-lots/${lotAction.lot.id}`, {
+          ...basePayload,
+          lot_name: lotDraft.lot_name,
+          lot_size: lotDraft.lot_size,
+          supplier_id: lotDraft.supplier_id || null,
+          supplier_name: selectedSupplier?.supplier_name || null,
+          purchase_qty: lotDraft.purchase_qty,
+          purchase_rate: lotDraft.purchase_rate,
+          sale_rate: lotDraft.sale_rate,
+          opening_stock_date: lotDraft.opening_stock_date,
+          remarks: lotDraft.remarks,
+          reason: lotDraft.reason || "Opening stock lot edited",
+        });
+        alert("Lot updated");
+      }
+      if (lotAction.type === "add") {
+        if (Number(lotDraft.quantity || 0) <= 0) {
+          alert("Enter quantity to add.");
+          return;
+        }
+        await axios.post(`${API_URL}/inventory-lots/${lotAction.lot.id}/add-quantity`, {
+          ...basePayload,
+          quantity: lotDraft.quantity,
+          reason: lotDraft.reason || "Quantity added to opening stock lot",
+        });
+        alert("Quantity added");
+      }
+      if (lotAction.type === "adjust") {
+        const usedQty = Number(lotAction.lot.sold_qty ?? (Number(lotAction.lot.purchase_qty || 0) - Number(lotAction.lot.remaining_qty || 0)));
+        const nextQty = Number(lotDraft.new_quantity || 0);
+        if (!lotDraft.reason.trim()) {
+          alert("Adjustment reason is required.");
+          return;
+        }
+        if (!Number.isFinite(nextQty) || nextQty < 0) {
+          alert("Please enter a valid new quantity.");
+          return;
+        }
+        if (nextQty < usedQty) {
+          alert(`Cannot reduce quantity below already used stock. Minimum allowed quantity is ${usedQty}.`);
+          return;
+        }
+        await axios.post(`${API_URL}/inventory-lots/${lotAction.lot.id}/adjust`, {
+          ...basePayload,
+          new_quantity: lotDraft.new_quantity,
+          adjustment_date: lotDraft.adjustment_date,
+          reason: lotDraft.reason,
+        });
+        alert("Lot adjusted");
+      }
+      if (lotAction.type === "deactivate") {
+        if (!lotDraft.reason.trim()) {
+          alert("Reason is required to deactivate a lot.");
+          return;
+        }
+        await axios.post(`${API_URL}/inventory-lots/${lotAction.lot.id}/deactivate`, {
+          ...basePayload,
+          reason: lotDraft.reason,
+          deactivated_by: user.id,
+        });
+        alert("Lot deactivated");
+      }
+      closeLotAction();
+      await refreshLotContext();
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update lot"));
+    }
   };
 
   const resetPurchaseForm = () => {
@@ -1360,6 +1532,7 @@ function App() {
     setAddOpeningStock(false);
     setOpeningStockLots([]);
     setEditingProductId(product.id);
+    loadProductLots(product, true);
   };
 
   const cancelProductEdit = () => {
@@ -1870,6 +2043,59 @@ function App() {
                     </DataTable>
                   </div>
                 )}
+                {lotPanelProduct && (
+                  <div className="lot-entry-panel">
+                    <div className="report-toolbar">
+                      <div>
+                        <span className="eyebrow">Opening Stock / Lots</span>
+                        <h3>{lotPanelProduct.product_name}</h3>
+                        <p className="form-note">Existing inventory lots are editable here. Quantity cannot be reduced below stock already sold, wasted or otherwise used.</p>
+                      </div>
+                      <button className="secondary-button" onClick={() => loadProductLots(lotPanelProduct, true)}>Refresh Lots</button>
+                    </div>
+                    <DataTable headers={["Lot Name", "Size/Grade", "Supplier", "Opening Date", "Opening Qty", "Sold Qty", "Balance Qty", "Cost Rate", "Sale Rate", "Status", "Actions"]}>
+                      {productLots.length ? productLots.map((lot) => (
+                        <tr key={lot.id}>
+                          <td className="primary-cell">{lot.lot_name || lot.batch_no || `Lot #${lot.id}`}<small className="cell-note">{lot.remarks || ""}</small></td>
+                          <td>{lot.lot_size || "-"}</td>
+                          <td>{lot.supplier_name || "-"}</td>
+                          <td>{formatDisplayDate(lot.purchase_date)}</td>
+                          <td>{Number(lot.purchase_qty || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
+                          <td>{Number(lot.sold_qty || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
+                          <td>{Number(lot.balance_qty ?? lot.remaining_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
+                          <td>{currency.format(Number(lot.purchase_rate || lot.effective_cost_per_unit || 0))}</td>
+                          <td>{currency.format(Number(lot.temporary_sale_rate || lot.selling_rate || 0))}</td>
+                          <td><span className={lot.batch_status === "CANCELLED" ? "stock-low" : "stock-ok"}>{lot.batch_status || "ACTIVE"}</span></td>
+                          <td>
+                            <div className="button-row table-actions-row">
+                              <button className="table-action" onClick={() => openLotAction("edit", lot)}>Edit Lot</button>
+                              <button className="table-action" disabled={lot.batch_status === "CANCELLED"} onClick={() => openLotAction("add", lot)}>Add Quantity</button>
+                              <button className="table-action" disabled={lot.batch_status === "CANCELLED"} onClick={() => openLotAction("adjust", lot)}>Adjust</button>
+                              <button className="remove-button" disabled={lot.batch_status === "CANCELLED"} onClick={() => openLotAction("deactivate", lot)}>Deactivate</button>
+                            </div>
+                          </td>
+                        </tr>
+                      )) : (
+                        <tr><td colSpan="11" className="empty-cell">No lots found for this product.</td></tr>
+                      )}
+                    </DataTable>
+                    {productLotAudit.length > 0 && (
+                      <div className="lot-audit-panel">
+                        <h3>Lot Audit Trail</h3>
+                        <DataTable headers={["Action", "Edited At", "Edited By", "Reason"]}>
+                          {productLotAudit.map((entry) => (
+                            <tr key={entry.id}>
+                              <td className="primary-cell">{entry.action}</td>
+                              <td>{formatDisplayDate(entry.edited_at)}</td>
+                              <td>{entry.edited_by_name || entry.edited_by || "-"}</td>
+                              <td>{entry.reason || "-"}</td>
+                            </tr>
+                          ))}
+                        </DataTable>
+                      </div>
+                    )}
+                  </div>
+                )}
                 <div className="button-row">
                   <button className="primary-button" onClick={addProduct}>{editingProductId ? "Update Item" : "Add Item"}</button>
                   {editingProductId && <button className="secondary-button" onClick={cancelProductEdit}>Cancel Edit</button>}
@@ -1893,6 +2119,7 @@ function App() {
                       <td>
                         <div className="button-row table-actions-row">
                           <button className="table-action" onClick={() => editProduct(product)}>Edit</button>
+                          <button className="table-action" onClick={() => loadProductLots(product, true)}>View Lots / Edit Lots</button>
                           <button className="remove-button" disabled={product.active === false} onClick={() => deactivateProduct(product)}>Deactivate</button>
                         </div>
                       </td>
@@ -2290,6 +2517,76 @@ function App() {
         />
       )}
       {changeHistory && <ChangeHistoryModal history={changeHistory} onClose={() => setChangeHistory(null)} />}
+      {lotAction && (
+        <div className="modal-backdrop">
+          <section className="invoice-modal change-history-modal">
+            <div className="invoice-toolbar">
+              <div>
+                <span className="eyebrow">Opening Stock Lot</span>
+                <strong>
+                  {lotAction.type === "edit" && "Edit Lot"}
+                  {lotAction.type === "add" && "Add Quantity"}
+                  {lotAction.type === "adjust" && "Adjust Quantity"}
+                  {lotAction.type === "deactivate" && "Deactivate Lot"}
+                </strong>
+              </div>
+              <button aria-label="Close lot editor" className="remove-button" onClick={closeLotAction}><Icon name="close" /></button>
+            </div>
+            <div className="sale-edit-body">
+              <div className="purchase-summary-grid supplier-payment-preview">
+                <SummaryMetric label="Product" value={lotAction.lot.product_name || lotPanelProduct?.product_name || "-"} />
+                <SummaryMetric label="Lot" value={lotAction.lot.lot_name || lotAction.lot.batch_no || `#${lotAction.lot.id}`} />
+                <SummaryMetric label="Opening Qty" value={Number(lotAction.lot.purchase_qty || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })} />
+                <SummaryMetric label="Used Qty" value={Number(lotAction.lot.sold_qty ?? (Number(lotAction.lot.purchase_qty || 0) - Number(lotAction.lot.remaining_qty || 0))).toLocaleString("en-IN", { maximumFractionDigits: 3 })} />
+                <SummaryMetric label="Balance Qty" value={Number(lotAction.lot.balance_qty ?? lotAction.lot.remaining_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })} featured />
+              </div>
+
+              {lotAction.type === "edit" && (
+                <div className="form-grid supplier-form-grid">
+                  <Field label="Lot Name / Number"><input value={lotDraft.lot_name} onChange={(event) => setLotDraft({ ...lotDraft, lot_name: event.target.value })} /></Field>
+                  <Field label="Size / Grade"><input value={lotDraft.lot_size} onChange={(event) => setLotDraft({ ...lotDraft, lot_size: event.target.value })} /></Field>
+                  <Field label="Supplier (Optional)">
+                    <select value={lotDraft.supplier_id} onChange={(event) => setLotDraft({ ...lotDraft, supplier_id: event.target.value })}>
+                      <option value="">No supplier</option>
+                      {activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.supplier_name}</option>)}
+                    </select>
+                  </Field>
+                  <Field label="Opening Quantity"><input min="0" step="0.001" type="number" value={lotDraft.purchase_qty} onChange={(event) => setLotDraft({ ...lotDraft, purchase_qty: event.target.value })} /></Field>
+                  <Field label="Opening Cost / Purchase Rate"><input min="0" step="0.01" type="number" value={lotDraft.purchase_rate} onChange={(event) => setLotDraft({ ...lotDraft, purchase_rate: event.target.value })} /></Field>
+                  <Field label="Sale Rate"><input min="0" step="0.01" type="number" value={lotDraft.sale_rate} onChange={(event) => setLotDraft({ ...lotDraft, sale_rate: event.target.value })} /></Field>
+                  <Field label="Opening Stock Date"><input type="date" value={lotDraft.opening_stock_date} onChange={(event) => setLotDraft({ ...lotDraft, opening_stock_date: event.target.value })} /></Field>
+                  <Field label="Remarks"><input value={lotDraft.remarks} onChange={(event) => setLotDraft({ ...lotDraft, remarks: event.target.value })} /></Field>
+                  <Field label="Reason"><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Reason for audit trail" /></Field>
+                </div>
+              )}
+
+              {lotAction.type === "add" && (
+                <div className="form-grid supplier-form-grid">
+                  <Field label="Quantity To Add"><input min="0" step="0.001" type="number" value={lotDraft.quantity} onChange={(event) => setLotDraft({ ...lotDraft, quantity: event.target.value })} /></Field>
+                  <Field label="Reason"><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Example: missed opening stock count" /></Field>
+                </div>
+              )}
+
+              {lotAction.type === "adjust" && (
+                <div className="form-grid supplier-form-grid">
+                  <Field label="New Opening Quantity"><input min="0" step="0.001" type="number" value={lotDraft.new_quantity} onChange={(event) => setLotDraft({ ...lotDraft, new_quantity: event.target.value })} /></Field>
+                  <Field label="Adjustment Date"><input type="date" value={lotDraft.adjustment_date} onChange={(event) => setLotDraft({ ...lotDraft, adjustment_date: event.target.value })} /></Field>
+                  <Field label="Reason"><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Reason is mandatory" /></Field>
+                </div>
+              )}
+
+              {lotAction.type === "deactivate" && (
+                <Field label="Reason"><textarea value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Reason is mandatory. Lots with used stock cannot be deactivated." /></Field>
+              )}
+
+              <div className="button-row">
+                <button className="primary-button" onClick={saveLotAction}>Save Lot Changes</button>
+                <button className="secondary-button" onClick={closeLotAction}>Cancel</button>
+              </div>
+            </div>
+          </section>
+        </div>
+      )}
       {profileOpen && <UserProfilePanel onClose={() => setProfileOpen(false)} onLogout={() => setUser(null)} user={user} />}
     </main>
   );
