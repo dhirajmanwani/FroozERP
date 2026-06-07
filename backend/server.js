@@ -526,6 +526,7 @@ const initializeDatabase = async () => {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     ALTER TABLE sale_rate_settings ADD COLUMN IF NOT EXISTS bill_level_slab_discount_enabled BOOLEAN DEFAULT TRUE;
+    ALTER TABLE sale_rate_settings ADD COLUMN IF NOT EXISTS pos_lot_selection_mode VARCHAR(30) DEFAULT 'ASK_MULTIPLE';
 
     CREATE TABLE IF NOT EXISTS pos_settings (
       id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -2040,6 +2041,7 @@ const insertCustomerLedgerEntry = async (client, sale, transactionType, amount, 
 const buildSalePayload = async (client, { items, branchId, createdBy, customer, invoiceDiscount, payments, allowRateOverride }) => {
   const parsedItems = (Array.isArray(items) ? items : []).map((item) => ({
     productId: parsePositiveInteger(item.product_id),
+    inventoryBatchId: parsePositiveInteger(item.inventory_batch_id),
     quantity: parsePositiveNumber(item.quantity),
     discountAmount: parseNonNegativeNumber(item.discount_amount),
     requestedRate: parsePositiveNumber(item.selling_rate),
@@ -2056,8 +2058,9 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
   ) {
     return { error: { status: 400, message: "Add valid products and quantities before checkout" } };
   }
-  if (new Set(parsedItems.map((item) => item.productId)).size !== parsedItems.length) {
-    return { error: { status: 400, message: "Combine duplicate products into one cart item" } };
+  const itemKeys = parsedItems.map((item) => `${item.productId}-${item.inventoryBatchId || "FIFO"}`);
+  if (new Set(itemKeys).size !== itemKeys.length) {
+    return { error: { status: 400, message: "Combine duplicate product lots into one cart item" } };
   }
   if (customerMobile && !/^\d{10,15}$/.test(customerMobile)) {
     return { error: { status: 400, message: "Enter a valid customer mobile number" } };
@@ -2079,12 +2082,12 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
   const customerId = customerAccount.id;
   const customerName = typedCustomerName || customerAccount.customer_name || "Walk-in Customer";
 
-  const productIds = parsedItems.map((item) => item.productId);
+  const productIds = [...new Set(parsedItems.map((item) => item.productId))];
   const productResult = await client.query(
     "SELECT id, product_name, selling_rate, unit FROM products WHERE id = ANY($1::int[]) AND active = TRUE ORDER BY id FOR SHARE",
     [productIds]
   );
-  if (productResult.rows.length !== parsedItems.length) {
+  if (productResult.rows.length !== productIds.length) {
     return { error: { status: 404, message: "One or more products could not be found" } };
   }
 
@@ -2110,25 +2113,32 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
       return { error: { status: 400, message: `Discount cannot exceed the value of ${product.product_name}` } };
     }
 
+    const batchParams = [requestedItem.productId, branchId];
+    let batchFilter = "";
+    if (requestedItem.inventoryBatchId) {
+      batchParams.push(requestedItem.inventoryBatchId);
+      batchFilter = `AND id = $${batchParams.length}`;
+    }
     const batchesResult = await client.query(
       `
-      SELECT id, remaining_qty, COALESCE(effective_cost_per_unit, purchase_rate) AS purchase_rate
+      SELECT id, remaining_qty, COALESCE(effective_cost_per_unit, purchase_rate) AS purchase_rate, lot_name, lot_size
       FROM inventory_batches
       WHERE product_id = $1
         AND branch_id = $2
+        ${batchFilter}
         AND remaining_qty > 0
         AND COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'
       ORDER BY purchase_date, created_at, id
       FOR UPDATE
       `,
-      [requestedItem.productId, branchId]
+      batchParams
     );
     const availableStock = batchesResult.rows.reduce((total, batch) => total + Number(batch.remaining_qty), 0);
     if (availableStock < requestedItem.quantity) {
       return {
         error: {
           status: 409,
-          message: `Insufficient stock for ${product.product_name}. Available quantity: ${availableStock}`,
+          message: requestedItem.inventoryBatchId ? "Selected lot does not have enough stock." : `Insufficient stock for ${product.product_name}. Available quantity: ${availableStock}`,
           product_id: requestedItem.productId,
           available_stock: availableStock,
         },
@@ -2148,6 +2158,8 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
         quantity: deductedQuantity,
         purchaseRate: Number(batch.purchase_rate),
         costAmount,
+        lotName: batch.lot_name,
+        lotSize: batch.lot_size,
       });
       quantityToDeduct -= deductedQuantity;
       itemCost += costAmount;
@@ -2160,6 +2172,9 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
       grossAmount: itemGross,
       netAmount: roundCurrency(itemGross - requestedItem.discountAmount),
       costAmount: roundCurrency(itemCost),
+      inventoryBatchId: requestedItem.inventoryBatchId || allocations[0]?.inventoryBatchId || null,
+      lotName: allocations[0]?.lotName || null,
+      lotSize: allocations[0]?.lotSize || null,
       allocations,
     });
     grossAmount += itemGross;
@@ -2518,16 +2533,20 @@ app.put("/settings/sale-rate", async (req, res) => {
     if (desiredMargin === null || !ROUNDING_RULES.has(roundingRule)) {
       return res.status(400).json({ message: "Enter valid sale rate settings" });
     }
+    const lotSelectionMode = ["AUTO_FIFO", "MANUAL", "ASK_MULTIPLE"].includes(String(req.body.pos_lot_selection_mode || "ASK_MULTIPLE").toUpperCase())
+      ? String(req.body.pos_lot_selection_mode || "ASK_MULTIPLE").toUpperCase()
+      : "ASK_MULTIPLE";
     const result = await pool.query(
       `
       UPDATE sale_rate_settings
       SET desired_margin_percent = $1, rounding_rule = $2, suggestion_enabled = $3,
           bill_level_slab_discount_enabled = $4,
-          notes = $5, updated_by = $6, updated_at = CURRENT_TIMESTAMP
+          pos_lot_selection_mode = $5,
+          notes = $6, updated_by = $7, updated_at = CURRENT_TIMESTAMP
       WHERE id = 1
       RETURNING *
       `,
-      [desiredMargin, roundingRule, req.body.suggestion_enabled !== false, req.body.bill_level_slab_discount_enabled !== false, nullableText(req.body.notes), manager.id]
+      [desiredMargin, roundingRule, req.body.suggestion_enabled !== false, req.body.bill_level_slab_discount_enabled !== false, lotSelectionMode, nullableText(req.body.notes), manager.id]
     );
     return res.json(result.rows[0]);
   } catch (error) {
@@ -3781,6 +3800,7 @@ app.get("/inventory", async (req, res) => {
         ib.remaining_qty,
         ib.purchase_rate,
         ib.effective_cost_per_unit,
+        ib.temporary_sale_rate,
         ib.mandi_tax_amount,
         ib.freight_charges,
         ib.labour_charges,
@@ -3846,25 +3866,32 @@ app.get("/sale-rates", async (req, res) => {
     const result = await pool.query(
       `
       SELECT
-        p.id,
+        CASE WHEN ib.id IS NULL THEN -p.id ELSE ib.id END AS id,
+        p.id AS product_id,
+        ib.id AS inventory_batch_id,
         p.product_name,
         p.category,
         p.origin_type,
         p.unit,
-        p.selling_rate,
+        COALESCE(NULLIF(ib.temporary_sale_rate, 0), p.selling_rate) AS selling_rate,
+        ib.lot_name,
+        ib.lot_size,
         p.selling_rate_updated_at,
         u.full_name AS updated_by_name,
-        COALESCE(stock.current_stock, 0) AS current_stock,
-        COALESCE(stock.pending_bill_stock, 0) AS pending_bill_stock,
-        COALESCE(stock.temporary_sale_rate, 0) AS temporary_sale_rate,
-        COALESCE(latest.effective_cost_per_unit, 0) AS latest_effective_cost,
+        COALESCE(ib.remaining_qty, stock.current_stock, 0) AS current_stock,
+        CASE WHEN COALESCE(ib.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_PENDING' THEN COALESCE(ib.remaining_qty, 0) ELSE 0 END AS pending_bill_stock,
+        COALESCE(ib.temporary_sale_rate, 0) AS temporary_sale_rate,
+        COALESCE(ib.effective_cost_per_unit, latest.effective_cost_per_unit, 0) AS latest_effective_cost,
         CASE
-          WHEN COALESCE(latest.effective_cost_per_unit, 0) > 0
-            THEN latest.effective_cost_per_unit * (1 + $1 / 100.0)
-          ELSE p.selling_rate
+          WHEN COALESCE(ib.effective_cost_per_unit, latest.effective_cost_per_unit, 0) > 0
+            THEN COALESCE(ib.effective_cost_per_unit, latest.effective_cost_per_unit, 0) * (1 + $1 / 100.0)
+          ELSE COALESCE(NULLIF(ib.temporary_sale_rate, 0), p.selling_rate)
         END AS suggested_selling_rate
       FROM products p
       LEFT JOIN users u ON u.id = p.selling_rate_updated_by
+      LEFT JOIN inventory_batches ib ON ib.product_id = p.id
+        AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+        AND ib.remaining_qty > 0
       LEFT JOIN LATERAL (
         SELECT ib.effective_cost_per_unit
         FROM inventory_batches ib
@@ -3883,7 +3910,7 @@ app.get("/sale-rates", async (req, res) => {
           AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
       ) stock ON TRUE
       WHERE p.active = TRUE
-      ORDER BY p.product_name
+      ORDER BY p.product_name, ib.purchase_date, ib.created_at, ib.id
       `,
       [desiredMargin]
     );
@@ -3909,10 +3936,34 @@ app.post("/sale-rates/bulk", async (req, res) => {
     const saved = [];
     for (const update of updates) {
       const productId = parsePositiveInteger(update.product_id);
+      const inventoryBatchId = parsePositiveInteger(update.inventory_batch_id);
       const newRate = parsePositiveNumber(update.new_selling_rate);
       if (!productId || !newRate) {
         await client.query("ROLLBACK");
         return res.status(400).json({ message: "Enter valid selling rates" });
+      }
+      if (inventoryBatchId) {
+        const batchResult = await client.query(
+          "SELECT ib.*, p.product_name, p.selling_rate AS product_selling_rate FROM inventory_batches ib JOIN products p ON p.id = ib.product_id WHERE ib.id = $1 AND ib.product_id = $2 AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED' FOR UPDATE",
+          [inventoryBatchId, productId]
+        );
+        if (batchResult.rows.length === 0) {
+          await client.query("ROLLBACK");
+          return res.status(404).json({ message: "Inventory lot not found" });
+        }
+        const batch = batchResult.rows[0];
+        const oldRate = Number(batch.temporary_sale_rate || batch.product_selling_rate || 0);
+        if (oldRate === newRate) continue;
+        const updatedBatch = await client.query(
+          "UPDATE inventory_batches SET temporary_sale_rate = $1 WHERE id = $2 RETURNING *",
+          [newRate, inventoryBatchId]
+        );
+        await client.query(
+          "INSERT INTO sale_rate_history (product_id, old_selling_rate, new_selling_rate, changed_by, reason) VALUES ($1, $2, $3, $4, $5)",
+          [productId, oldRate, newRate, manager.id, update.reason?.trim() || `Lot rate update ${batch.lot_name || batch.batch_no}`]
+        );
+        saved.push({ ...updatedBatch.rows[0], product_name: batch.product_name });
+        continue;
       }
       const currentResult = await client.query("SELECT id, selling_rate FROM products WHERE id = $1 AND active = TRUE FOR UPDATE", [productId]);
       if (currentResult.rows.length === 0) {
@@ -5957,13 +6008,17 @@ app.get("/reports/summary", async (req, res) => {
           SUM(si.quantity) AS quantity_sold,
           SUM(si.net_amount) AS revenue,
           SUM(si.cost_amount) AS cost,
-          SUM(si.profit) AS profit
+          SUM(si.profit) AS profit,
+          ib.lot_name,
+          ib.lot_size
         FROM sale_items si
         JOIN sales s ON s.id = si.sale_id
         JOIN products p ON p.id = si.product_id
+        LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
+        LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
         WHERE s.sale_status <> 'CANCELLED'
           AND s.sale_date BETWEEN $1 AND $2
-        GROUP BY p.product_name, p.unit
+        GROUP BY p.product_name, p.unit, ib.lot_name, ib.lot_size
         ORDER BY quantity_sold DESC, revenue DESC
         `,
         [dateFrom, dateTo]
@@ -6011,6 +6066,9 @@ app.get("/reports/summary", async (req, res) => {
                 'id', si.id,
                 'product_id', si.product_id,
                 'product_name', p.product_name,
+                'inventory_batch_id', sba.inventory_batch_id,
+                'lot_name', ib.lot_name,
+                'lot_size', ib.lot_size,
                 'unit', p.unit,
                 'quantity', si.quantity,
                 'selling_rate', si.selling_rate,
@@ -6031,6 +6089,14 @@ app.get("/reports/summary", async (req, res) => {
         LEFT JOIN customers c ON c.id = s.customer_id
         LEFT JOIN sale_items si ON si.sale_id = s.id
         LEFT JOIN products p ON p.id = si.product_id
+        LEFT JOIN LATERAL (
+          SELECT inventory_batch_id
+          FROM sale_batch_allocations
+          WHERE sale_item_id = si.id
+          ORDER BY id
+          LIMIT 1
+        ) sba ON TRUE
+        LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
         WHERE s.sale_date BETWEEN $1 AND $2
         GROUP BY
           s.id,
@@ -8309,6 +8375,7 @@ app.post("/sales", async (req, res) => {
       : [{ product_id, quantity, discount_amount: 0 }];
     const parsedItems = requestedItems.map((item) => ({
       productId: parsePositiveInteger(item.product_id),
+      inventoryBatchId: parsePositiveInteger(item.inventory_batch_id),
       quantity: parsePositiveNumber(item.quantity),
       discountAmount: parseNonNegativeNumber(item.discount_amount),
       hasRequestedRate: item.selling_rate !== undefined && item.selling_rate !== null && String(item.selling_rate).trim() !== "",
@@ -8329,8 +8396,9 @@ app.post("/sales", async (req, res) => {
     ) {
       return res.status(400).json({ message: "Add valid products and quantities before checkout" });
     }
-    if (new Set(parsedItems.map((item) => item.productId)).size !== parsedItems.length) {
-      return res.status(400).json({ message: "Combine duplicate products into one cart item" });
+    const itemKeys = parsedItems.map((item) => `${item.productId}-${item.inventoryBatchId || "FIFO"}`);
+    if (new Set(itemKeys).size !== itemKeys.length) {
+      return res.status(400).json({ message: "Combine duplicate product lots into one cart item" });
     }
     if (customerMobile && !/^\d{10,15}$/.test(customerMobile)) {
       return res.status(400).json({ message: "Enter a valid customer mobile number" });
@@ -8356,12 +8424,12 @@ app.post("/sales", async (req, res) => {
     const customerId = customerAccount.id;
     const customerName = typedCustomerName || customerAccount.customer_name || "Walk-in Customer";
 
-    const productIds = parsedItems.map((item) => item.productId);
+    const productIds = [...new Set(parsedItems.map((item) => item.productId))];
     const productResult = await client.query(
       "SELECT id, product_name, selling_rate, unit FROM products WHERE id = ANY($1::int[]) AND active = TRUE ORDER BY id FOR SHARE",
       [productIds]
     );
-    if (productResult.rows.length !== parsedItems.length) {
+    if (productResult.rows.length !== productIds.length) {
       await client.query("ROLLBACK");
       return res.status(404).json({ message: "One or more products could not be found" });
     }
@@ -8374,7 +8442,40 @@ app.post("/sales", async (req, res) => {
     let rateOverrideUser = null;
     for (const requestedItem of parsedItems) {
       const product = productsById.get(requestedItem.productId);
-      const defaultSellingRate = Number(product.selling_rate);
+      const batchParams = [requestedItem.productId, parsedBranchId];
+      let batchFilter = "";
+      if (requestedItem.inventoryBatchId) {
+        batchParams.push(requestedItem.inventoryBatchId);
+        batchFilter = `AND id = $${batchParams.length}`;
+      }
+      const batchesResult = await client.query(
+        `
+        SELECT
+          id,
+          remaining_qty,
+          COALESCE(effective_cost_per_unit, purchase_rate) AS purchase_rate,
+          COALESCE(purchase_bill_status, 'BILL_COMPLETED') AS purchase_bill_status,
+          COALESCE(temporary_sale_rate, 0) AS temporary_sale_rate,
+          lot_name,
+          lot_size
+          FROM inventory_batches
+          WHERE product_id = $1
+            AND branch_id = $2
+            ${batchFilter}
+            AND remaining_qty > 0
+            AND COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'
+          ORDER BY purchase_date, created_at, id
+        FOR UPDATE
+        `,
+        batchParams
+      );
+      if (requestedItem.inventoryBatchId && batchesResult.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ message: "Selected lot does not have enough stock." });
+      }
+      const defaultSellingRate = Number(requestedItem.inventoryBatchId && Number(batchesResult.rows[0]?.temporary_sale_rate || 0) > 0
+        ? batchesResult.rows[0].temporary_sale_rate
+        : product.selling_rate);
       const manualRateOverride = requestedItem.hasRequestedRate && roundCurrency(requestedItem.requestedRate) !== roundCurrency(defaultSellingRate);
       if (manualRateOverride && !rateOverrideUser) {
         rateOverrideUser = await getPermissionUser(parsedCreatedBy, "manual_pos_rate_override", ["Owner", "Admin"], client);
@@ -8405,24 +8506,6 @@ app.post("/sales", async (req, res) => {
         return res.status(400).json({ message: `Discount cannot exceed the value of ${product.product_name}` });
       }
 
-      const batchesResult = await client.query(
-        `
-        SELECT
-          id,
-          remaining_qty,
-          COALESCE(effective_cost_per_unit, purchase_rate) AS purchase_rate,
-          COALESCE(purchase_bill_status, 'BILL_COMPLETED') AS purchase_bill_status
-          FROM inventory_batches
-          WHERE product_id = $1
-            AND branch_id = $2
-            AND remaining_qty > 0
-            AND COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'
-          ORDER BY purchase_date, created_at, id
-        FOR UPDATE
-        `,
-        [requestedItem.productId, parsedBranchId]
-      );
-
       const availableStock = batchesResult.rows.reduce(
         (total, batch) => total + Number(batch.remaining_qty),
         0
@@ -8430,7 +8513,9 @@ app.post("/sales", async (req, res) => {
       if (availableStock < requestedItem.quantity) {
         await client.query("ROLLBACK");
         return res.status(409).json({
-          message: `Insufficient stock for ${product.product_name}. Available quantity: ${availableStock}`,
+          message: requestedItem.inventoryBatchId
+            ? "Selected lot does not have enough stock."
+            : `Insufficient stock for ${product.product_name}. Available quantity: ${availableStock}`,
           product_id: requestedItem.productId,
           available_stock: availableStock,
         });
@@ -8454,6 +8539,8 @@ app.post("/sales", async (req, res) => {
           purchaseRate: Number(batch.purchase_rate),
           costAmount,
           costStatus: batch.purchase_bill_status === "BILL_PENDING" ? "PROVISIONAL" : "FINAL",
+          lotName: batch.lot_name,
+          lotSize: batch.lot_size,
         });
         quantityToDeduct -= deductedQuantity;
         itemCost += costAmount;
@@ -8483,6 +8570,9 @@ app.post("/sales", async (req, res) => {
         sellingRate,
         defaultSellingRate,
         manualRateOverride,
+        inventoryBatchId: requestedItem.inventoryBatchId || allocations[0]?.inventoryBatchId || null,
+        lotName: allocations[0]?.lotName || null,
+        lotSize: allocations[0]?.lotSize || null,
         grossAmount: itemGross,
         netAmount: roundCurrency(itemGross - requestedItem.discountAmount),
         costAmount: roundCurrency(itemCost),
@@ -8677,6 +8767,9 @@ app.post("/sales", async (req, res) => {
           selling_rate: item.sellingRate,
           default_selling_rate: item.defaultSellingRate,
           manual_rate_override: item.manualRateOverride,
+          inventory_batch_id: item.inventoryBatchId,
+          lot_name: item.lotName,
+          lot_size: item.lotSize,
           amount: item.grossAmount,
           discount_amount: item.discountAmount,
           net_amount: item.netAmount,
@@ -8726,13 +8819,20 @@ app.get("/sales", async (req, res) => {
         COUNT(si.id)::INTEGER AS item_count,
         COALESCE(BOOL_OR(COALESCE(si.manual_rate_override, FALSE)), FALSE) AS manual_rate_override_applied,
         COALESCE(
-          STRING_AGG(p.product_name || ' x ' || TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM si.quantity::TEXT)), ', ' ORDER BY si.id),
+          STRING_AGG(
+            p.product_name ||
+            COALESCE(' ' || NULLIF(TRIM(CONCAT(ib.lot_name, CASE WHEN ib.lot_size IS NOT NULL THEN ' / ' || ib.lot_size ELSE '' END)), ''), '') ||
+            ' x ' || TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM si.quantity::TEXT)),
+            ', ' ORDER BY si.id
+          ),
           'No active items'
         ) AS item_summary
       FROM sales s
       LEFT JOIN customers c ON c.id = s.customer_id
       LEFT JOIN sale_items si ON si.sale_id = s.id
       LEFT JOIN products p ON p.id = si.product_id
+      LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
+      LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
       GROUP BY s.id, c.customer_name
       ORDER BY s.created_at DESC, s.id DESC
     `);
@@ -9371,10 +9471,19 @@ app.get("/sales/:id", async (req, res) => {
         `
         SELECT
           si.id, si.product_id, p.product_name, p.unit, si.quantity, si.selling_rate,
+          sba.inventory_batch_id, ib.lot_name, ib.lot_size,
           si.amount, si.discount_amount, COALESCE(si.net_amount, si.amount) AS net_amount,
           si.cost_amount, si.profit, si.cost_status, si.default_selling_rate, si.manual_rate_override
         FROM sale_items si
         JOIN products p ON p.id = si.product_id
+        LEFT JOIN LATERAL (
+          SELECT inventory_batch_id
+          FROM sale_batch_allocations
+          WHERE sale_item_id = si.id
+          ORDER BY id
+          LIMIT 1
+        ) sba ON TRUE
+        LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
         WHERE si.sale_id = $1
         ORDER BY si.id
         `,

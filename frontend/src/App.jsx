@@ -239,6 +239,7 @@ const defaultSaleRateSettings = {
   rounding_rule: "NEAREST_RUPEE",
   suggestion_enabled: true,
   bill_level_slab_discount_enabled: true,
+  pos_lot_selection_mode: "ASK_MULTIPLE",
   notes: "",
 };
 
@@ -3151,15 +3152,16 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
   const saleItemNetBeforeInvoiceDiscount = (item) => Number(item.net_amount ?? (saleItemGross(item) - saleItemDiscount(item)));
   const saleItemNarration = (item) => {
     const product = item.product_name || "Item";
+    const lot = [item.lot_name, item.lot_size].filter(Boolean).join(" / ");
     const qty = Number(item.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 });
     const unit = String(item.unit || "").toLowerCase();
     const rate = Number(item.selling_rate || 0);
-    return `${product} ${qty}${unit} @ ${money(rate)} = ${money(saleItemGross(item))}`;
+    return `${product}${lot ? ` ${lot}` : ""} ${qty}${unit} @ ${money(rate)} = ${money(saleItemGross(item))}`;
   };
   const saleNarrationPreview = (items) => {
     const summary = items
       .slice(0, 2)
-      .map((item) => `${item.product_name || "Item"} ${Number(item.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}${String(item.unit || "").toLowerCase()}`)
+      .map((item) => `${item.product_name || "Item"}${item.lot_name ? ` ${item.lot_name}` : ""} ${Number(item.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}${String(item.unit || "").toLowerCase()}`)
       .join(", ");
     const extraCount = Math.max(items.length - 2, 0);
     return `${summary || "No item detail"}${extraCount ? ` +${extraCount} more` : ""}`;
@@ -3242,8 +3244,8 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       title: "Sales by Product",
       rows: filterRows(data.salesProductReport),
       summary: (rows) => [["Revenue", money(totalOf(rows, "revenue")), true], ["Quantity Sold", number(totalOf(rows, "quantity_sold"))], ["Profit", money(totalOf(rows, "profit"))]],
-      headers: ["Product", "Quantity", "Revenue", "Cost", "Profit"],
-      render: (row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{number(row.quantity_sold)}</td><td>{money(row.revenue)}</td><td>{money(row.cost)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
+      headers: ["Product", "Lot", "Quantity", "Rate", "Revenue", "Cost", "Profit"],
+      render: (row) => <tr key={`${row.product_name}-${row.lot_name || "default"}-${row.lot_size || ""}`}><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{[row.lot_name, row.lot_size].filter(Boolean).join(" / ") || "-"}</td><td>{number(row.quantity_sold)}</td><td>{money(Number(row.quantity_sold || 0) ? Number(row.revenue || 0) / Number(row.quantity_sold || 1) : 0)}</td><td>{money(row.revenue)}</td><td>{money(row.cost)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
     },
     salesByCustomer: {
       title: "Sales by Customer",
@@ -5005,6 +5007,13 @@ function SaleRateSettingsSection({ canManage, onReload, saleRateSettings, user }
             {roundingRules.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
           </select>
         </Field>
+        <Field label="POS Lot Selection Mode">
+          <select disabled={!canManage} value={draft.pos_lot_selection_mode || "ASK_MULTIPLE"} onChange={(event) => setDraft({ ...draft, pos_lot_selection_mode: event.target.value })}>
+            <option value="ASK_MULTIPLE">Ask When Multiple Lots Exist</option>
+            <option value="AUTO_FIFO">Auto FIFO</option>
+            <option value="MANUAL">Manual Lot Selection</option>
+          </select>
+        </Field>
         <label className="check-field"><input disabled={!canManage} checked={draft.suggestion_enabled !== false} type="checkbox" onChange={(event) => setDraft({ ...draft, suggestion_enabled: event.target.checked })} /><span>Suggestions Active</span></label>
         <Field label="Notes"><textarea disabled={!canManage} value={draft.notes || ""} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></Field>
       </div>
@@ -5529,11 +5538,14 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
   );
 
   const buildRateUpdates = () => Object.entries(draftRates)
-    .map(([productId, value]) => {
-      const rate = rates.find((item) => String(item.id) === String(productId));
+    .map(([rowId, value]) => {
+      const rate = rates.find((item) => String(item.id) === String(rowId));
       return rate ? {
-        product_id: Number(productId),
+        product_id: Number(rate.product_id || rate.id),
+        inventory_batch_id: rate.inventory_batch_id || null,
         product_name: rate.product_name,
+        lot_name: rate.lot_name,
+        lot_size: rate.lot_size,
         old_rate: Number(rate.selling_rate || 0),
         new_selling_rate: Number(value),
       } : null;
@@ -5563,6 +5575,7 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
     }
     const payloadUpdates = updates.map((update) => ({
       product_id: update.product_id,
+      inventory_batch_id: update.inventory_batch_id || null,
       new_selling_rate: update.new_selling_rate,
     }));
     try {
@@ -5623,7 +5636,7 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
         </div>
         <DataTable headers={[
           <label className="table-check-label"><input checked={allVisibleSelected} type="checkbox" onChange={(event) => toggleAllVisible(event.target.checked)} /> Select All Suggested Rates</label>,
-          "Product", "Origin", "Current Rate", "Suggested Rate", "New Rate", "Latest Purchase Cost", "Stock", "Pending Bill Stock", "Margin %", "Updated", "Updated By",
+          "Product", "Lot", "Size", "Origin", "Current Lot Sale Rate", "Suggested Rate", "New Rate", "Latest Purchase Cost", "Stock", "Pending Bill Stock", "Margin %", "Updated", "Updated By",
         ]}>
           {filteredRates.map((rate) => {
             const sellingRate = Number(draftRates[rate.id] || rate.selling_rate);
@@ -5633,6 +5646,8 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
               <tr key={rate.id}>
                 <td><input checked={Boolean(selectedSuggested[rate.id])} type="checkbox" onChange={(event) => toggleSuggestedRate(rate, event.target.checked)} /></td>
                 <td className="primary-cell">{rate.product_name}<small className="cell-note">{rate.category}</small></td>
+                <td>{rate.lot_name || (rate.inventory_batch_id ? `Lot #${rate.inventory_batch_id}` : "Product default")}</td>
+                <td>{rate.lot_size || "-"}</td>
                 <td><span className="tag">{rate.origin_type}</span></td>
                 <td>{currency.format(Number(rate.selling_rate))}</td>
                 <td className="profit-cell">{currency.format(Number(rate.suggested_selling_rate))}</td>
@@ -5670,7 +5685,7 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
               <DataTable headers={["Product", "Old Rate", "New Rate"]}>
                 {confirmUpdates.map((update) => (
                   <tr key={update.product_id}>
-                    <td className="primary-cell">{update.product_name}</td>
+                    <td className="primary-cell">{update.product_name}<small className="cell-note">{[update.lot_name, update.lot_size].filter(Boolean).join(" / ") || "Product default"}</small></td>
                     <td>{currency.format(update.old_rate)}</td>
                     <td className="profit-cell">{currency.format(update.new_selling_rate)}</td>
                   </tr>
@@ -5744,11 +5759,23 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
   }, []);
 
   const effectiveQuantityMode = posSettings.enable_weighing_scale ? quantityMode : "MANUAL";
+  const lotSelectionMode = String(saleRateSettings.pos_lot_selection_mode || "ASK_MULTIPLE").toUpperCase();
 
   const stockByProduct = useMemo(
     () => inventory.reduce((stock, batch) => {
       stock.set(batch.product_id, (stock.get(batch.product_id) || 0) + Number(batch.remaining_qty || 0));
       return stock;
+    }, new Map()),
+    [inventory]
+  );
+
+  const lotsByProduct = useMemo(
+    () => inventory.reduce((lots, batch) => {
+      if (Number(batch.remaining_qty || 0) <= 0) return lots;
+      const rows = lots.get(batch.product_id) || [];
+      rows.push(batch);
+      lots.set(batch.product_id, rows);
+      return lots;
     }, new Map()),
     [inventory]
   );
@@ -5764,11 +5791,17 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
 
   const searchResults = useMemo(() => {
     const query = search.trim().toLowerCase();
-    if (!query) return products.slice(0, 8);
-    return products
-      .filter((product) => product.product_name.toLowerCase().includes(query))
-      .slice(0, 8);
-  }, [products, search]);
+    const matchedProducts = (query
+      ? products.filter((product) => product.product_name.toLowerCase().includes(query))
+      : products
+    ).slice(0, 8);
+    return matchedProducts.flatMap((product) => {
+      const lots = lotsByProduct.get(product.id) || [];
+      if (lotSelectionMode === "AUTO_FIFO") return [{ key: `product-${product.id}`, product, lot: null }];
+      if (lots.length <= 1 && lotSelectionMode !== "MANUAL") return [{ key: `product-${product.id}`, product, lot: lots[0] || null }];
+      return lots.map((lot) => ({ key: `lot-${lot.id}`, product, lot }));
+    }).slice(0, 12);
+  }, [lotSelectionMode, lotsByProduct, products, search]);
 
   const totals = useMemo(() => {
     const gross = cart.reduce((sum, item) => sum + item.quantity * Number(item.selling_rate), 0);
@@ -5787,23 +5820,39 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     };
   }, [cart, discountRules, paymentMode, saleRateSettings.bill_level_slab_discount_enabled]);
 
-  const addProduct = (product) => {
-    const availableStock = stockByProduct.get(product.id) || 0;
-    const currentItem = cart.find((item) => item.product_id === product.id);
-    const nextQuantity = Number(currentItem?.quantity || 0) + 1;
-    if (availableStock < nextQuantity) {
-      alert(`Insufficient stock for ${product.product_name}. Available quantity: ${availableStock}`);
+  const getLotLabel = (lot) => lot ? [lot.lot_name || lot.batch_no, lot.lot_size].filter(Boolean).join(" / ") : "Auto FIFO";
+
+  const addProduct = (product, selectedLot = null) => {
+    const productLots = lotsByProduct.get(product.id) || [];
+    if (!selectedLot && productLots.length > 1 && lotSelectionMode !== "AUTO_FIFO") {
+      alert("Please select lot for this item.");
       return;
     }
+    const lot = selectedLot || (lotSelectionMode === "AUTO_FIFO" ? null : productLots[0]) || null;
+    const cartKey = `${product.id}-${lot?.id || "FIFO"}`;
+    const availableStock = lot ? Number(lot.remaining_qty || 0) : (stockByProduct.get(product.id) || 0);
+    const currentItem = cart.find((item) => item.cart_key === cartKey);
+    const nextQuantity = Number(currentItem?.quantity || 0) + 1;
+    if (availableStock < nextQuantity) {
+      alert(lot ? "Selected lot does not have enough stock." : `Insufficient stock for ${product.product_name}. Available quantity: ${availableStock}`);
+      return;
+    }
+    const lotSaleRate = Number(lot?.temporary_sale_rate || 0);
+    const defaultRate = lotSaleRate > 0 ? lotSaleRate : Number(product.selling_rate);
 
     setCart((items) => currentItem
-      ? items.map((item) => item.product_id === product.id ? { ...item, quantity: nextQuantity } : item)
+      ? items.map((item) => item.cart_key === cartKey ? { ...item, quantity: nextQuantity } : item)
       : [...items, {
+        cart_key: cartKey,
         product_id: product.id,
+        inventory_batch_id: lot?.id || null,
         product_name: product.product_name,
+        lot_name: lot?.lot_name || lot?.batch_no || "",
+        lot_size: lot?.lot_size || "",
         unit: product.unit,
-        default_selling_rate: Number(product.selling_rate),
-        selling_rate: Number(product.selling_rate),
+        available_qty: availableStock,
+        default_selling_rate: defaultRate,
+        selling_rate: defaultRate,
         quantity: 1,
         discount_amount: 0,
       }]
@@ -5811,24 +5860,25 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     setSearch("");
     setHighlightedIndex(0);
     setTimeout(() => {
-      const input = quantityRefs.current[product.id];
+      const input = quantityRefs.current[cartKey];
       input?.focus();
       input?.select();
     }, 0);
   };
 
-  const updateCartItem = (productId, field, value) => {
+  const updateCartItem = (cartKey, field, value) => {
     const number = Number(value);
     if (!Number.isFinite(number) || number < 0) return;
     if (field === "selling_rate" && !canManualRateOverride) {
       alert("You do not have permission to change sale rate.");
       return;
     }
-    if (field === "quantity" && number > (stockByProduct.get(productId) || 0)) {
-      alert(`Only ${stockByProduct.get(productId) || 0} units are available.`);
+    const currentItem = cart.find((item) => item.cart_key === cartKey);
+    if (field === "quantity" && currentItem && number > Number(currentItem.available_qty || 0)) {
+      alert(currentItem.inventory_batch_id ? "Selected lot does not have enough stock." : `Only ${currentItem.available_qty || 0} units are available.`);
       return;
     }
-    setCart((items) => items.map((item) => item.product_id === productId ? { ...item, [field]: value } : item));
+    setCart((items) => items.map((item) => item.cart_key === cartKey ? { ...item, [field]: value } : item));
   };
 
   const completeQuantityEntry = (event) => {
@@ -5840,7 +5890,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
   };
 
   const removeCartItem = (productId) => {
-    setCart((items) => items.filter((item) => item.product_id !== productId));
+    setCart((items) => items.filter((item) => item.cart_key !== productId));
   };
 
   const scanBarcode = () => {
@@ -5957,6 +6007,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
       const response = await axios.post(`${API_URL}/sales`, {
         items: cart.map((item) => ({
           product_id: item.product_id,
+          inventory_batch_id: item.inventory_batch_id,
           quantity: Number(item.quantity),
           selling_rate: Number(item.selling_rate),
           discount_amount: Number(item.discount_amount || 0),
@@ -6028,7 +6079,8 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     }
     if (event.key === "Enter" && searchResults[highlightedIndex]) {
       event.preventDefault();
-      addProduct(searchResults[highlightedIndex]);
+      const selected = searchResults[highlightedIndex];
+      addProduct(selected.product, selected.lot);
     }
   };
 
@@ -6103,17 +6155,19 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
             </label>
           </div>
           <div className="product-results">
-            {searchResults.map((product, index) => {
-              const stock = stockByProduct.get(product.id) || 0;
+            {searchResults.map((option, index) => {
+              const { product, lot } = option;
+              const stock = lot ? Number(lot.remaining_qty || 0) : (stockByProduct.get(product.id) || 0);
+              const rate = Number(lot?.temporary_sale_rate || product.selling_rate || 0);
               return (
                 <button
                   className={index === highlightedIndex ? "product-result product-result-active" : "product-result"}
-                  key={product.id}
-                  onClick={() => addProduct(product)}
+                  key={option.key}
+                  onClick={() => addProduct(product, lot)}
                 >
                   <span>
-                    <strong>{product.product_name}</strong>
-                    <small>{product.barcode || "No barcode"} - {currency.format(Number(product.selling_rate))}/{product.unit}</small>
+                    <strong>{product.product_name}{lot ? ` - ${getLotLabel(lot)}` : ""}</strong>
+                    <small>{product.barcode || "No barcode"} - {currency.format(rate)}/{product.unit}</small>
                   </span>
                   <em className={stock <= 5 ? "stock-low" : "stock-ok"}>{stock} in stock</em>
                 </button>
@@ -6135,14 +6189,15 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
           ) : (
             <div className="table-wrap cart-table">
               <table>
-                <thead><tr><th>Product</th><th>Rate</th><th>Qty</th>{printSettings.show_item_discount_column_pos !== false && <th>Item Discount</th>}<th>Total</th><th /></tr></thead>
+                <thead><tr><th>Product</th><th>Lot/Size</th><th>Rate</th><th>Qty</th>{printSettings.show_item_discount_column_pos !== false && <th>Item Discount</th>}<th>Total</th><th /></tr></thead>
                 <tbody>
                   {cart.map((item) => (
-                    <tr key={item.product_id}>
+                    <tr key={item.cart_key}>
                       <td className="primary-cell">
                         {item.product_name}
-                        <small className="cell-note">{stockByProduct.get(item.product_id) || 0} {item.unit} available</small>
+                        <small className="cell-note">{item.available_qty || stockByProduct.get(item.product_id) || 0} {item.unit} available</small>
                       </td>
+                      <td><span className="batch-id">{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "Auto FIFO"}</span></td>
                       <td>
                         <input
                           className="table-input"
@@ -6152,13 +6207,13 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
                           title={canManualRateOverride ? "Owner/Admin can override POS sale rate" : "You do not have permission to change sale rate"}
                           type="number"
                           value={item.selling_rate}
-                          onChange={(event) => updateCartItem(item.product_id, "selling_rate", event.target.value)}
+                          onChange={(event) => updateCartItem(item.cart_key, "selling_rate", event.target.value)}
                         />
                       </td>
-                      <td><input className="table-input" min="0.001" ref={(node) => { quantityRefs.current[item.product_id] = node; }} step="0.001" type="number" value={item.quantity} onChange={(event) => updateCartItem(item.product_id, "quantity", event.target.value)} onKeyDown={completeQuantityEntry} /></td>
-                      {printSettings.show_item_discount_column_pos !== false && <td><input className="table-input" min="0" step="0.01" type="number" value={item.discount_amount} onChange={(event) => updateCartItem(item.product_id, "discount_amount", event.target.value)} /></td>}
+                      <td><input className="table-input" min="0.001" ref={(node) => { quantityRefs.current[item.cart_key] = node; }} step="0.001" type="number" value={item.quantity} onChange={(event) => updateCartItem(item.cart_key, "quantity", event.target.value)} onKeyDown={completeQuantityEntry} /></td>
+                      {printSettings.show_item_discount_column_pos !== false && <td><input className="table-input" min="0" step="0.01" type="number" value={item.discount_amount} onChange={(event) => updateCartItem(item.cart_key, "discount_amount", event.target.value)} /></td>}
                       <td className="primary-cell">{currency.format(item.quantity * item.selling_rate - Number(item.discount_amount || 0))}</td>
-                      <td><button aria-label={`Remove ${item.product_name}`} className="remove-button" onClick={() => removeCartItem(item.product_id)}><Icon name="trash" size={16} /></button></td>
+                      <td><button aria-label={`Remove ${item.product_name}`} className="remove-button" onClick={() => removeCartItem(item.cart_key)}><Icon name="trash" size={16} /></button></td>
                     </tr>
                   ))}
                 </tbody>
@@ -6697,11 +6752,12 @@ function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = 
             <div><small>Status</small><strong>{invoice.sale_status || "COMPLETED"}</strong><span>{invoice.cancellation_reason || invoice.edit_reason || "No changes recorded"}</span></div>
           </section>
           <table className="invoice-table">
-            <thead><tr><th>Item</th><th>Qty</th><th>Rate</th>{showItemDiscountOnReceipt && <th>Item Discount</th>}<th>Amount</th></tr></thead>
+            <thead><tr><th>Item</th><th>Lot/Size</th><th>Qty</th><th>Rate</th>{showItemDiscountOnReceipt && <th>Item Discount</th>}<th>Amount</th></tr></thead>
             <tbody>
               {invoice.items?.map((item) => (
-                <tr key={item.product_id || item.id}>
+                <tr key={item.id || `${item.product_id}-${item.inventory_batch_id || "FIFO"}`}>
                   <td>{item.product_name}</td>
+                  <td>{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "-"}</td>
                   <td>{item.quantity} {item.unit}</td>
                   <td>{receiptCurrency.format(Number(item.selling_rate))}</td>
                   {showItemDiscountOnReceipt && <td>{receiptCurrency.format(Number(item.discount_amount || 0))}</td>}
