@@ -483,6 +483,11 @@ const initializeDatabase = async () => {
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS lot_size VARCHAR(120);
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS stock_source VARCHAR(40) DEFAULT 'PURCHASE';
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS remarks TEXT;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS adjusted_qty NUMERIC(14, 3) DEFAULT 0;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS transfer_in_qty NUMERIC(14, 3) DEFAULT 0;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS transfer_out_qty NUMERIC(14, 3) DEFAULT 0;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS returned_qty NUMERIC(14, 3) DEFAULT 0;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS waste_qty NUMERIC(14, 3) DEFAULT 0;
     UPDATE inventory_batches SET batch_status = 'ACTIVE' WHERE batch_status IS NULL;
     UPDATE inventory_batches SET effective_cost_per_unit = purchase_rate WHERE effective_cost_per_unit IS NULL;
 
@@ -5062,6 +5067,81 @@ app.post("/products/:productId/opening-stock-lots", (req, res) => addOpeningStoc
 
 const lotUsage = (lot) => Math.max(0, Number(lot.purchase_qty || 0) - Number(lot.remaining_qty || 0));
 
+const stockInventorySelectSql = `
+  SELECT
+    ib.id,
+    ib.product_id,
+    p.product_name,
+    p.category,
+    p.category_id,
+    p.unit,
+    p.barcode,
+    p.selling_rate,
+    ib.batch_no,
+    ib.lot_name,
+    ib.lot_size,
+    ib.batch_status,
+    ib.stock_source,
+    ib.purchase_qty,
+    ib.remaining_qty,
+    ib.purchase_rate,
+    ib.effective_cost_per_unit,
+    ib.temporary_sale_rate,
+    ib.mandi_tax_amount,
+    ib.freight_charges,
+    ib.labour_charges,
+    ib.other_charges,
+    ib.gross_amount,
+    ib.rebate_amount,
+    ib.net_payable,
+    ib.payment_timing,
+    ib.balance_amount,
+    ib.supplier_id,
+    ib.supplier_name,
+    ib.remarks,
+    ib.purchase_date,
+    ib.created_at,
+    COALESCE(sold_summary.sold_qty, 0) AS sold_qty,
+    COALESCE(ib.returned_qty, 0) AS returned_qty,
+    COALESCE(ib.waste_qty, 0) AS waste_qty,
+    COALESCE(ib.adjusted_qty, 0) AS adjusted_qty,
+    COALESCE(ib.transfer_in_qty, 0) AS transfer_in_qty,
+    COALESCE(ib.transfer_out_qty, 0) AS transfer_out_qty,
+    COALESCE(ib.remaining_qty, 0) AS balance_qty,
+    latest_audit.edited_at AS last_edited_at,
+    latest_audit.edited_by_name AS last_edited_by_name
+  FROM inventory_batches ib
+  JOIN products p ON p.id = ib.product_id
+  LEFT JOIN LATERAL (
+    SELECT COALESCE(SUM(sba.quantity), 0) AS sold_qty
+    FROM sale_batch_allocations sba
+    JOIN sale_items si ON si.id = sba.sale_item_id
+    JOIN sales s ON s.id = si.sale_id
+    WHERE sba.inventory_batch_id = ib.id
+      AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
+  ) sold_summary ON TRUE
+  LEFT JOIN LATERAL (
+    SELECT pat.edited_at, u.full_name AS edited_by_name
+    FROM product_audit_trail pat
+    LEFT JOIN users u ON u.id = pat.edited_by
+    WHERE pat.product_id = ib.product_id
+      AND COALESCE((pat.new_value->>'id')::INTEGER, (pat.old_value->>'id')::INTEGER) = ib.id
+      AND pat.action IN (
+        'OPENING_STOCK',
+        'OPENING_STOCK_LOT_ADDED',
+        'INVENTORY_LOT_EDIT',
+        'INVENTORY_LOT_ADD_QTY',
+        'INVENTORY_LOT_ADJUST',
+        'INVENTORY_LOT_DEACTIVATE',
+        'INVENTORY_LOT_REACTIVATE',
+        'INVENTORY_LOT_TRANSFER_OUT',
+        'INVENTORY_LOT_TRANSFER_IN'
+      )
+    ORDER BY pat.edited_at DESC, pat.id DESC
+    LIMIT 1
+  ) latest_audit ON TRUE
+`;
+
 app.get("/products/:id/lots", async (req, res) => {
   try {
     const productId = parsePositiveInteger(req.params.id);
@@ -5069,14 +5149,7 @@ app.get("/products/:id/lots", async (req, res) => {
     const [lotsResult, auditResult] = await Promise.all([
       pool.query(
         `
-        SELECT
-          ib.*,
-          p.product_name,
-          p.unit,
-          COALESCE(ib.purchase_qty, 0) - COALESCE(ib.remaining_qty, 0) AS sold_qty,
-          COALESCE(ib.remaining_qty, 0) AS balance_qty
-        FROM inventory_batches ib
-        JOIN products p ON p.id = ib.product_id
+        ${stockInventorySelectSql}
         WHERE ib.product_id = $1
         ORDER BY COALESCE(ib.purchase_date, ib.created_at::date), ib.created_at, ib.id
         `,
@@ -5088,7 +5161,7 @@ app.get("/products/:id/lots", async (req, res) => {
         FROM product_audit_trail pat
         LEFT JOIN users u ON u.id = pat.edited_by
         WHERE pat.product_id = $1
-          AND pat.action IN ('OPENING_STOCK', 'OPENING_STOCK_LOT_ADDED', 'INVENTORY_LOT_EDIT', 'INVENTORY_LOT_ADD_QTY', 'INVENTORY_LOT_ADJUST', 'INVENTORY_LOT_DEACTIVATE')
+          AND pat.action IN ('OPENING_STOCK', 'OPENING_STOCK_LOT_ADDED', 'INVENTORY_LOT_EDIT', 'INVENTORY_LOT_ADD_QTY', 'INVENTORY_LOT_ADJUST', 'INVENTORY_LOT_DEACTIVATE', 'INVENTORY_LOT_REACTIVATE', 'INVENTORY_LOT_TRANSFER_OUT', 'INVENTORY_LOT_TRANSFER_IN')
         ORDER BY pat.edited_at DESC, pat.id DESC
         LIMIT 50
         `,
@@ -5102,17 +5175,16 @@ app.get("/products/:id/lots", async (req, res) => {
   }
 });
 
-app.put("/inventory-lots/:lotId", async (req, res) => {
+app.put(["/inventory-lots/:lotId", "/lots/:lotId"], async (req, res) => {
   const client = await pool.connect();
   try {
     const lotId = parsePositiveInteger(req.params.lotId);
     const manager = await requireRateManager(req.body.updated_by || req.body.edited_by, client);
-    const newQuantity = parseNonNegativeNumber(req.body.purchase_qty ?? req.body.quantity);
     const purchaseRate = parsePositiveNumber(req.body.purchase_rate || req.body.opening_cost);
     const saleRate = parsePositiveNumber(req.body.sale_rate);
     const reason = cleanText(req.body.reason || "Opening stock lot edited");
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can edit opening stock lots" });
-    if (!lotId || newQuantity === null || !purchaseRate) return res.status(400).json({ message: "Enter valid lot quantity and cost rate" });
+    if (!lotId || !purchaseRate) return res.status(400).json({ message: "Enter valid lot details and cost rate" });
     await client.query("BEGIN");
     const lotResult = await client.query("SELECT * FROM inventory_batches WHERE id = $1 FOR UPDATE", [lotId]);
     const lot = lotResult.rows[0];
@@ -5120,43 +5192,35 @@ app.put("/inventory-lots/:lotId", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(404).json({ message: "Inventory lot not found" });
     }
-    const usedQty = lotUsage(lot);
-    if (newQuantity < usedQty) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ message: `Cannot reduce quantity below already used stock. Minimum allowed quantity is ${usedQty}.` });
-    }
-    const remainingQty = newQuantity - usedQty;
     const supplierId = parsePositiveInteger(req.body.supplier_id);
     const supplierName = supplierId ? nullableText(req.body.supplier_name) || lot.supplier_name : null;
     const lotName = cleanText(req.body.lot_name || req.body.lot_number || lot.lot_name || "Opening Stock Lot");
     const lotSize = nullableText(req.body.lot_size || req.body.size_grade || req.body.size);
     const purchaseDate = isDateInput(req.body.opening_stock_date || req.body.purchase_date) ? (req.body.opening_stock_date || req.body.purchase_date) : toDateKey(lot.purchase_date || new Date());
     const remarks = nullableText(req.body.remarks);
-    const netPayable = roundCurrency(newQuantity * purchaseRate);
+    const netPayable = roundCurrency(Number(lot.purchase_qty || 0) * purchaseRate);
     const updateResult = await client.query(
       `
       UPDATE inventory_batches
       SET lot_name = $1, lot_size = $2, supplier_id = $3, supplier_name = $4,
-          purchase_qty = $5, remaining_qty = $6, purchase_rate = $7,
-          effective_cost_per_unit = $7, gross_amount = $8, net_payable = $8,
-          balance_amount = 0, temporary_sale_rate = COALESCE($9, temporary_sale_rate),
-          purchase_date = $10, remarks = $11
-      WHERE id = $12
+          purchase_rate = $5, effective_cost_per_unit = $5,
+          gross_amount = $6, net_payable = $6,
+          balance_amount = 0, temporary_sale_rate = COALESCE($7, temporary_sale_rate),
+          purchase_date = $8, remarks = $9,
+          batch_status = CASE
+            WHEN COALESCE(batch_status, 'ACTIVE') = 'CANCELLED' THEN batch_status
+            WHEN remaining_qty > 0 THEN 'ACTIVE'
+            ELSE batch_status
+          END
+      WHERE id = $10
       RETURNING *
       `,
       [
         lotName, lotSize, supplierId || null, supplierName,
-        newQuantity, remainingQty, purchaseRate, netPayable, saleRate || null,
+        purchaseRate, netPayable, saleRate || null,
         purchaseDate, remarks, lotId,
       ]
     );
-    const quantityDiff = newQuantity - Number(lot.purchase_qty || 0);
-    if (quantityDiff !== 0) {
-      await client.query(
-        "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, $3, $4, $5, $6)",
-        [lot.product_id, Math.abs(quantityDiff), quantityDiff > 0 ? "IN" : "OUT", reason, manager.id, lot.branch_id || 1]
-      );
-    }
     if (saleRate && Number(saleRate) !== Number(lot.temporary_sale_rate || 0)) {
       await client.query("UPDATE products SET selling_rate = $1, selling_rate_updated_at = CURRENT_TIMESTAMP, selling_rate_updated_by = $2 WHERE id = $3", [saleRate, manager.id, lot.product_id]);
     }
@@ -5208,15 +5272,17 @@ app.post("/inventory-lots/:lotId/add-quantity", async (req, res) => {
   }
 });
 
-app.post("/inventory-lots/:lotId/adjust", async (req, res) => {
+app.post(["/inventory-lots/:lotId/adjust", "/lots/:lotId/adjust-stock"], async (req, res) => {
   const client = await pool.connect();
   try {
     const lotId = parsePositiveInteger(req.params.lotId);
-    const newQuantity = parseNonNegativeNumber(req.body.new_quantity ?? req.body.quantity);
+    const physicalQuantity = parseNonNegativeNumber(req.body.physical_quantity ?? req.body.balance_qty ?? req.body.new_balance_qty ?? req.body.new_quantity ?? req.body.quantity);
     const manager = await requireRateManager(req.body.updated_by || req.body.created_by, client);
     const reason = cleanText(req.body.reason);
+    const adjustmentType = cleanText(req.body.adjustment_type || "Physical Count Correction");
+    const remarks = nullableText(req.body.remarks);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can adjust lot quantity" });
-    if (!lotId || newQuantity === null || !reason) return res.status(400).json({ message: "Enter new quantity and adjustment reason" });
+    if (!lotId || physicalQuantity === null || !reason) return res.status(400).json({ message: "Enter physical quantity and adjustment reason" });
     await client.query("BEGIN");
     const lotResult = await client.query("SELECT * FROM inventory_batches WHERE id = $1 FOR UPDATE", [lotId]);
     const lot = lotResult.rows[0];
@@ -5224,18 +5290,32 @@ app.post("/inventory-lots/:lotId/adjust", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(404).json({ message: "Inventory lot not found" });
     }
-    const usedQty = lotUsage(lot);
-    if (newQuantity < usedQty) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ message: `Cannot reduce quantity below already used stock. Minimum allowed quantity is ${usedQty}.` });
-    }
-    const oldQty = Number(lot.purchase_qty || 0);
-    const diff = newQuantity - oldQty;
-    const updateResult = await client.query("UPDATE inventory_batches SET purchase_qty = $1, remaining_qty = $2 WHERE id = $3 RETURNING *", [newQuantity, newQuantity - usedQty, lotId]);
+    const oldBalance = Number(lot.remaining_qty || 0);
+    const diff = roundUnitCost(physicalQuantity - oldBalance);
+    const updateResult = await client.query(
+      `
+      UPDATE inventory_batches
+      SET remaining_qty = $1,
+          adjusted_qty = COALESCE(adjusted_qty, 0) + $2,
+          batch_status = CASE
+            WHEN COALESCE(batch_status, 'ACTIVE') = 'CANCELLED' THEN batch_status
+            WHEN $1 > 0 THEN 'ACTIVE'
+            ELSE batch_status
+          END,
+          remarks = COALESCE($3, remarks)
+      WHERE id = $4
+      RETURNING *
+      `,
+      [physicalQuantity, diff, remarks, lotId]
+    );
     if (diff !== 0) {
-      await client.query("INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, $3, $4, $5, $6)", [lot.product_id, Math.abs(diff), diff > 0 ? "IN" : "OUT", reason, manager.id, lot.branch_id || 1]);
+      await client.query(
+        "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, $3, $4, $5, $6)",
+        [lot.product_id, Math.abs(diff), diff > 0 ? "IN" : "OUT", `${adjustmentType}: ${reason}`, manager.id, lot.branch_id || 1]
+      );
     }
-    await client.query("INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'INVENTORY_LOT_ADJUST', $2::jsonb, $3::jsonb, $4, $5)", [lot.product_id, JSON.stringify(lot), JSON.stringify(updateResult.rows[0]), reason, manager.id]);
+    const newValue = { ...updateResult.rows[0], adjustment_type: adjustmentType, adjustment_qty: diff, physical_quantity: physicalQuantity, remarks };
+    await client.query("INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'INVENTORY_LOT_ADJUST', $2::jsonb, $3::jsonb, $4, $5)", [lot.product_id, JSON.stringify(lot), JSON.stringify(newValue), reason, manager.id]);
     await client.query("COMMIT");
     return res.json(updateResult.rows[0]);
   } catch (error) {
@@ -5325,6 +5405,103 @@ app.post("/inventory-lots/:lotId/reactivate", async (req, res) => {
   }
 });
 
+app.post("/lots/transfer-stock", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const fromLotId = parsePositiveInteger(req.body.from_lot_id || req.body.from_inventory_batch_id);
+    const toLotId = parsePositiveInteger(req.body.to_lot_id || req.body.to_inventory_batch_id);
+    const quantity = parsePositiveNumber(req.body.quantity);
+    const manager = await requireRateManager(req.body.updated_by || req.body.created_by, client);
+    const reason = cleanText(req.body.reason);
+    const remarks = nullableText(req.body.remarks);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can transfer stock between lots" });
+    if (!fromLotId || !toLotId || fromLotId === toLotId || !quantity || !reason) {
+      return res.status(400).json({ message: "Select source lot, destination lot, quantity and reason" });
+    }
+    await client.query("BEGIN");
+    const lotsResult = await client.query(
+      `
+      SELECT *
+      FROM inventory_batches
+      WHERE id = ANY($1::int[])
+      ORDER BY id
+      FOR UPDATE
+      `,
+      [[fromLotId, toLotId]]
+    );
+    const fromLot = lotsResult.rows.find((lot) => Number(lot.id) === fromLotId);
+    const toLot = lotsResult.rows.find((lot) => Number(lot.id) === toLotId);
+    if (!fromLot || !toLot) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Source or destination lot not found" });
+    }
+    if (String(toLot.batch_status || "ACTIVE").toUpperCase() === "CANCELLED") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Cannot transfer stock into a cancelled lot" });
+    }
+    if (Number(fromLot.remaining_qty || 0) < quantity) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ message: "Quantity to move cannot exceed source lot balance" });
+    }
+    const sourceUpdate = await client.query(
+      `
+      UPDATE inventory_batches
+      SET remaining_qty = remaining_qty - $1,
+          transfer_out_qty = COALESCE(transfer_out_qty, 0) + $1,
+          remarks = COALESCE($2, remarks)
+      WHERE id = $3
+      RETURNING *
+      `,
+      [quantity, remarks, fromLotId]
+    );
+    const destinationUpdate = await client.query(
+      `
+      UPDATE inventory_batches
+      SET remaining_qty = remaining_qty + $1,
+          transfer_in_qty = COALESCE(transfer_in_qty, 0) + $1,
+          batch_status = CASE WHEN COALESCE(batch_status, 'ACTIVE') = 'CANCELLED' THEN batch_status ELSE 'ACTIVE' END,
+          remarks = COALESCE($2, remarks)
+      WHERE id = $3
+      RETURNING *
+      `,
+      [quantity, remarks, toLotId]
+    );
+    await client.query(
+      "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, 'OUT', $3, $4, $5), ($6, $2, 'IN', $3, $4, $7)",
+      [
+        fromLot.product_id,
+        quantity,
+        `Stock transfer ${fromLotId} -> ${toLotId}: ${reason}`,
+        manager.id,
+        fromLot.branch_id || 1,
+        toLot.product_id,
+        toLot.branch_id || fromLot.branch_id || 1,
+      ]
+    );
+    await client.query(
+      "INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'INVENTORY_LOT_TRANSFER_OUT', $2::jsonb, $3::jsonb, $4, $5), ($6, 'INVENTORY_LOT_TRANSFER_IN', $7::jsonb, $8::jsonb, $4, $5)",
+      [
+        fromLot.product_id,
+        JSON.stringify(fromLot),
+        JSON.stringify({ ...sourceUpdate.rows[0], transfer_quantity: quantity, transfer_to_lot_id: toLotId, remarks }),
+        reason,
+        manager.id,
+        toLot.product_id,
+        JSON.stringify(toLot),
+        JSON.stringify({ ...destinationUpdate.rows[0], transfer_quantity: quantity, transfer_from_lot_id: fromLotId, remarks }),
+      ]
+    );
+    await client.query("COMMIT");
+    return res.json({ success: true, from_lot: sourceUpdate.rows[0], to_lot: destinationUpdate.rows[0] });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Transferring Stock" });
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/stock-inventory/audit", async (req, res) => {
   try {
     const result = await pool.query(
@@ -5351,7 +5528,9 @@ app.get("/stock-inventory/audit", async (req, res) => {
         'INVENTORY_LOT_ADD_QTY',
         'INVENTORY_LOT_ADJUST',
         'INVENTORY_LOT_DEACTIVATE',
-        'INVENTORY_LOT_REACTIVATE'
+        'INVENTORY_LOT_REACTIVATE',
+        'INVENTORY_LOT_TRANSFER_OUT',
+        'INVENTORY_LOT_TRANSFER_IN'
       )
       ORDER BY pat.edited_at DESC, pat.id DESC
       LIMIT 500
@@ -5361,6 +5540,33 @@ app.get("/stock-inventory/audit", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Stock Audit Trail" });
+  }
+});
+
+app.get("/lots/:lotId/audit-trail", async (req, res) => {
+  try {
+    const lotId = parsePositiveInteger(req.params.lotId);
+    if (!lotId) return res.status(400).json({ message: "Invalid lot" });
+    const result = await pool.query(
+      `
+      SELECT
+        pat.*,
+        p.product_name,
+        p.category,
+        u.full_name AS edited_by_name,
+        COALESCE(pat.new_value->>'lot_name', pat.old_value->>'lot_name', pat.new_value->>'batch_no', pat.old_value->>'batch_no') AS lot_name
+      FROM product_audit_trail pat
+      JOIN products p ON p.id = pat.product_id
+      LEFT JOIN users u ON u.id = pat.edited_by
+      WHERE COALESCE((pat.new_value->>'id')::INTEGER, (pat.old_value->>'id')::INTEGER, (pat.new_value->>'inventory_batch_id')::INTEGER, (pat.old_value->>'inventory_batch_id')::INTEGER) = $1
+      ORDER BY pat.edited_at DESC, pat.id DESC
+      `,
+      [lotId]
+    );
+    return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Lot Audit Trail" });
   }
 });
 
@@ -5414,61 +5620,7 @@ app.get("/inventory", async (req, res) => {
   try {
     const includeCancelled = String(req.query.include_cancelled || "").toLowerCase() === "true";
     const result = await pool.query(`
-      SELECT
-        ib.id,
-        ib.product_id,
-        p.product_name,
-        p.category,
-        p.category_id,
-        p.unit,
-        p.barcode,
-        p.selling_rate,
-        ib.batch_no,
-        ib.lot_name,
-        ib.lot_size,
-        ib.batch_status,
-        ib.stock_source,
-        ib.purchase_qty,
-        ib.remaining_qty,
-        ib.purchase_rate,
-        ib.effective_cost_per_unit,
-        ib.temporary_sale_rate,
-        ib.mandi_tax_amount,
-        ib.freight_charges,
-        ib.labour_charges,
-        ib.other_charges,
-        ib.gross_amount,
-        ib.rebate_amount,
-        ib.net_payable,
-        ib.payment_timing,
-        ib.balance_amount,
-        ib.supplier_id,
-        ib.supplier_name,
-        ib.remarks,
-        ib.purchase_date,
-        ib.created_at,
-        latest_audit.edited_at AS last_edited_at,
-        latest_audit.edited_by_name AS last_edited_by_name
-      FROM inventory_batches ib
-      JOIN products p ON p.id = ib.product_id
-      LEFT JOIN LATERAL (
-        SELECT pat.edited_at, u.full_name AS edited_by_name
-        FROM product_audit_trail pat
-        LEFT JOIN users u ON u.id = pat.edited_by
-        WHERE pat.product_id = ib.product_id
-          AND COALESCE((pat.new_value->>'id')::INTEGER, (pat.old_value->>'id')::INTEGER) = ib.id
-          AND pat.action IN (
-            'OPENING_STOCK',
-            'OPENING_STOCK_LOT_ADDED',
-            'INVENTORY_LOT_EDIT',
-            'INVENTORY_LOT_ADD_QTY',
-            'INVENTORY_LOT_ADJUST',
-            'INVENTORY_LOT_DEACTIVATE',
-            'INVENTORY_LOT_REACTIVATE'
-          )
-        ORDER BY pat.edited_at DESC, pat.id DESC
-        LIMIT 1
-      ) latest_audit ON TRUE
+      ${stockInventorySelectSql}
       WHERE ($1::boolean = TRUE OR COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED')
       ORDER BY ib.purchase_date, ib.created_at, ib.id
     `, [includeCancelled]);
@@ -6787,6 +6939,34 @@ app.post("/customer-payments", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Saving Customer Payment" });
+  }
+});
+
+app.get("/stock-inventory", async (req, res) => {
+  try {
+    const includeCancelled = String(req.query.include_cancelled ?? "true").toLowerCase() !== "false";
+    const [lotsResult, auditResult] = await Promise.all([
+      pool.query(`
+        ${stockInventorySelectSql}
+        WHERE ($1::boolean = TRUE OR COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED')
+        ORDER BY ib.purchase_date, ib.created_at, ib.id
+      `, [includeCancelled]),
+      pool.query(
+        `
+        SELECT pat.*, p.product_name, p.category, u.full_name AS edited_by_name
+        FROM product_audit_trail pat
+        JOIN products p ON p.id = pat.product_id
+        LEFT JOIN users u ON u.id = pat.edited_by
+        WHERE pat.action LIKE 'INVENTORY_LOT_%' OR pat.action IN ('OPENING_STOCK', 'OPENING_STOCK_LOT_ADDED')
+        ORDER BY pat.edited_at DESC, pat.id DESC
+        LIMIT 500
+        `
+      ),
+    ]);
+    return res.json({ lots: lotsResult.rows, audit: auditResult.rows });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Stock Inventory Error" });
   }
 });
 
@@ -11519,7 +11699,10 @@ app.post("/sale-returns", async (req, res) => {
       for (const allocation of allocations.rows) {
         if (quantityToRestore <= 0) break;
         const restoreQuantity = Math.min(quantityToRestore, Number(allocation.quantity));
-        await client.query("UPDATE inventory_batches SET remaining_qty = remaining_qty + $1 WHERE id = $2", [restoreQuantity, allocation.inventory_batch_id]);
+        await client.query(
+          "UPDATE inventory_batches SET remaining_qty = remaining_qty + $1, returned_qty = COALESCE(returned_qty, 0) + $1, batch_status = CASE WHEN COALESCE(batch_status, 'ACTIVE') = 'CANCELLED' THEN batch_status ELSE 'ACTIVE' END WHERE id = $2",
+          [restoreQuantity, allocation.inventory_batch_id]
+        );
         costAmount += roundCurrency(restoreQuantity * Number(allocation.purchase_rate));
         quantityToRestore -= restoreQuantity;
       }
@@ -11620,7 +11803,10 @@ app.post("/waste-entries", async (req, res) => {
     for (const batch of batchesResult.rows) {
       if (quantityToDeduct <= 0) break;
       const deductedQuantity = Math.min(quantityToDeduct, Number(batch.remaining_qty));
-      await client.query("UPDATE inventory_batches SET remaining_qty = remaining_qty - $1 WHERE id = $2", [deductedQuantity, batch.id]);
+      await client.query(
+        "UPDATE inventory_batches SET remaining_qty = remaining_qty - $1, waste_qty = COALESCE(waste_qty, 0) + $1 WHERE id = $2",
+        [deductedQuantity, batch.id]
+      );
       costAmount += roundCurrency(deductedQuantity * Number(batch.purchase_rate));
       quantityToDeduct -= deductedQuantity;
     }

@@ -1299,7 +1299,10 @@ function App() {
       opening_stock_date: toDateKey(lot.purchase_date || new Date()),
       remarks: lot.remarks || "",
       quantity: "",
-      new_quantity: String(lot.purchase_qty || ""),
+      new_quantity: String(lot.balance_qty ?? lot.remaining_qty ?? 0),
+      adjustment_type: "Physical Count Correction",
+      transfer_to_lot_id: "",
+      transfer_quantity: "",
       adjustment_date: toDateKey(new Date()),
       reason: "",
     });
@@ -1318,6 +1321,9 @@ function App() {
       remarks: "",
       quantity: "",
       new_quantity: "",
+      adjustment_type: "Physical Count Correction",
+      transfer_to_lot_id: "",
+      transfer_quantity: "",
       adjustment_date: toDateKey(new Date()),
       reason: "",
     });
@@ -1340,23 +1346,13 @@ function App() {
         reason: lotDraft.reason,
       };
       if (lotAction.type === "edit") {
-        const usedQty = Number(lotAction.lot.sold_qty ?? (Number(lotAction.lot.purchase_qty || 0) - Number(lotAction.lot.remaining_qty || 0)));
-        const nextQty = Number(lotDraft.purchase_qty || 0);
         const nextCost = Number(lotDraft.purchase_rate || 0);
         if (!lotDraft.lot_name.trim()) {
           alert("Please enter lot name / number.");
           return;
         }
-        if (!Number.isFinite(nextQty) || nextQty < 0) {
-          alert("Please enter a valid opening quantity.");
-          return;
-        }
         if (!Number.isFinite(nextCost) || nextCost <= 0) {
           alert("Please enter a valid opening cost / purchase rate.");
-          return;
-        }
-        if (nextQty < usedQty) {
-          alert(`Cannot reduce quantity below already used stock. Minimum allowed quantity is ${usedQty}.`);
           return;
         }
         await axios.put(`${API_URL}/inventory-lots/${lotAction.lot.id}`, {
@@ -1365,7 +1361,6 @@ function App() {
           lot_size: lotDraft.lot_size,
           supplier_id: lotDraft.supplier_id || null,
           supplier_name: selectedSupplier?.supplier_name || null,
-          purchase_qty: lotDraft.purchase_qty,
           purchase_rate: lotDraft.purchase_rate,
           sale_rate: lotDraft.sale_rate,
           opening_stock_date: lotDraft.opening_stock_date,
@@ -1387,7 +1382,6 @@ function App() {
         alert("Quantity added");
       }
       if (lotAction.type === "adjust") {
-        const usedQty = Number(lotAction.lot.sold_qty ?? (Number(lotAction.lot.purchase_qty || 0) - Number(lotAction.lot.remaining_qty || 0)));
         const nextQty = Number(lotDraft.new_quantity || 0);
         if (!lotDraft.reason.trim()) {
           alert("Adjustment reason is required.");
@@ -1397,17 +1391,38 @@ function App() {
           alert("Please enter a valid new quantity.");
           return;
         }
-        if (nextQty < usedQty) {
-          alert(`Cannot reduce quantity below already used stock. Minimum allowed quantity is ${usedQty}.`);
-          return;
-        }
         await axios.post(`${API_URL}/inventory-lots/${lotAction.lot.id}/adjust`, {
           ...basePayload,
-          new_quantity: lotDraft.new_quantity,
+          physical_quantity: lotDraft.new_quantity,
+          adjustment_type: lotDraft.adjustment_type,
           adjustment_date: lotDraft.adjustment_date,
+          remarks: lotDraft.remarks,
           reason: lotDraft.reason,
         });
         alert("Lot adjusted");
+      }
+      if (lotAction.type === "transfer") {
+        if (!lotDraft.reason.trim()) {
+          alert("Transfer reason is required.");
+          return;
+        }
+        if (!lotDraft.transfer_to_lot_id) {
+          alert("Select destination lot.");
+          return;
+        }
+        if (Number(lotDraft.transfer_quantity || 0) <= 0) {
+          alert("Enter quantity to move.");
+          return;
+        }
+        await axios.post(`${API_URL}/lots/transfer-stock`, {
+          from_lot_id: lotAction.lot.id,
+          to_lot_id: lotDraft.transfer_to_lot_id,
+          quantity: lotDraft.transfer_quantity,
+          reason: lotDraft.reason,
+          remarks: lotDraft.remarks,
+          updated_by: user.id,
+        });
+        alert("Stock transferred");
       }
       if (lotAction.type === "deactivate") {
         if (!lotDraft.reason.trim()) {
@@ -2330,6 +2345,7 @@ function App() {
                               <button className="table-action" onClick={() => openLotAction("edit", lot)}>Edit</button>
                               <button className="table-action" disabled={lot.batch_status === "CANCELLED"} onClick={() => openLotAction("add", lot)}>Add Quantity</button>
                               <button className="table-action" disabled={lot.batch_status === "CANCELLED"} onClick={() => openLotAction("adjust", lot)}>Adjust</button>
+                              <button className="table-action" disabled={lot.batch_status === "CANCELLED" || lotBalanceQuantity(lot) <= 0} onClick={() => openLotAction("transfer", lot)}>Transfer</button>
                               <button className="remove-button" disabled={lot.batch_status === "CANCELLED"} onClick={() => openLotAction("deactivate", lot)}>Deactivate</button>
                             </div>
                           </td>
@@ -2793,6 +2809,7 @@ function App() {
                   {lotAction.type === "edit" && "Edit Lot"}
                   {lotAction.type === "add" && "Add Quantity"}
                   {lotAction.type === "adjust" && "Adjust Quantity"}
+                  {lotAction.type === "transfer" && "Transfer Stock"}
                   {lotAction.type === "deactivate" && "Deactivate Lot"}
                   {lotAction.type === "reactivate" && "Reactivate Lot"}
                 </strong>
@@ -2818,7 +2835,6 @@ function App() {
                       {activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.supplier_name}</option>)}
                     </select>
                   </Field>
-                  <Field label="Opening Quantity"><input min="0" step="0.001" type="number" value={lotDraft.purchase_qty} onChange={(event) => setLotDraft({ ...lotDraft, purchase_qty: event.target.value })} /></Field>
                   <Field label="Opening Cost / Purchase Rate"><input min="0" step="0.01" type="number" value={lotDraft.purchase_rate} onChange={(event) => setLotDraft({ ...lotDraft, purchase_rate: event.target.value })} /></Field>
                   <Field label="Sale Rate"><input min="0" step="0.01" type="number" value={lotDraft.sale_rate} onChange={(event) => setLotDraft({ ...lotDraft, sale_rate: event.target.value })} /></Field>
                   <Field label="Opening Stock Date"><input type="date" value={lotDraft.opening_stock_date} onChange={(event) => setLotDraft({ ...lotDraft, opening_stock_date: event.target.value })} /></Field>
@@ -2836,9 +2852,45 @@ function App() {
 
               {lotAction.type === "adjust" && (
                 <div className="form-grid supplier-form-grid">
+                  <Field label="Current Software Qty"><input readOnly value={Number(lotAction.lot.balance_qty ?? lotAction.lot.remaining_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })} /></Field>
                   <Field label="Physical / Corrected Quantity"><input min="0" step="0.001" type="number" value={lotDraft.new_quantity} onChange={(event) => setLotDraft({ ...lotDraft, new_quantity: event.target.value })} /></Field>
+                  <Field label="Difference / Adjustment Qty"><input readOnly value={(Number(lotDraft.new_quantity || 0) - Number(lotAction.lot.balance_qty ?? lotAction.lot.remaining_qty ?? 0)).toLocaleString("en-IN", { maximumFractionDigits: 3 })} /></Field>
+                  <Field label="Adjustment Type">
+                    <select value={lotDraft.adjustment_type} onChange={(event) => setLotDraft({ ...lotDraft, adjustment_type: event.target.value })}>
+                      <option>Increase Stock</option>
+                      <option>Decrease Stock</option>
+                      <option>Physical Count Correction</option>
+                      <option>Damage</option>
+                      <option>Missing</option>
+                      <option>Found</option>
+                      <option>Owner Adjustment</option>
+                    </select>
+                  </Field>
                   <Field label="Adjustment Date"><input type="date" value={lotDraft.adjustment_date} onChange={(event) => setLotDraft({ ...lotDraft, adjustment_date: event.target.value })} /></Field>
                   <Field label="Reason"><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Reason is mandatory" /></Field>
+                  <Field label="Remarks"><input value={lotDraft.remarks} onChange={(event) => setLotDraft({ ...lotDraft, remarks: event.target.value })} /></Field>
+                </div>
+              )}
+
+              {lotAction.type === "transfer" && (
+                <div className="form-grid supplier-form-grid">
+                  <Field label="From Lot"><input readOnly value={`${lotAction.lot.product_name || ""} - ${lotAction.lot.lot_name || lotAction.lot.batch_no || `Lot #${lotAction.lot.id}`}`} /></Field>
+                  <Field label="Available Qty"><input readOnly value={Number(lotAction.lot.balance_qty ?? lotAction.lot.remaining_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })} /></Field>
+                  <Field label="To Lot">
+                    <select value={lotDraft.transfer_to_lot_id} onChange={(event) => setLotDraft({ ...lotDraft, transfer_to_lot_id: event.target.value })}>
+                      <option value="">Select destination lot</option>
+                      {inventory
+                        .filter((lot) => Number(lot.id) !== Number(lotAction.lot.id) && String(lot.batch_status || "ACTIVE").toUpperCase() !== "CANCELLED")
+                        .map((lot) => (
+                          <option key={lot.id} value={lot.id}>
+                            {lot.product_name} - {lot.lot_name || lot.batch_no || `Lot #${lot.id}`}{lot.lot_size ? ` / ${lot.lot_size}` : ""} - Bal {Number(lot.balance_qty ?? lot.remaining_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}
+                          </option>
+                        ))}
+                    </select>
+                  </Field>
+                  <Field label="Quantity To Move"><input min="0" step="0.001" type="number" value={lotDraft.transfer_quantity} onChange={(event) => setLotDraft({ ...lotDraft, transfer_quantity: event.target.value })} /></Field>
+                  <Field label="Reason"><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Reason is mandatory" /></Field>
+                  <Field label="Remarks"><input value={lotDraft.remarks} onChange={(event) => setLotDraft({ ...lotDraft, remarks: event.target.value })} /></Field>
                 </div>
               )}
 
@@ -5229,6 +5281,7 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
       <div className="table-actions">
         <button className="table-action" disabled={!canManageStock} onClick={() => onLotAction?.("edit", lot)}>Edit Lot</button>
         <button className="table-action" disabled={!canManageStock || status === "Cancelled"} onClick={() => onLotAction?.("adjust", lot)}>Adjust Stock</button>
+        <button className="table-action" disabled={!canManageStock || status === "Cancelled" || lotBalance(lot) <= 0} onClick={() => onLotAction?.("transfer", lot)}>Transfer</button>
         <button className="table-action" disabled={!canManageStock || status === "Cancelled"} onClick={() => onLotAction?.("add", lot)}>Add Qty</button>
         {status === "Cancelled" || status === "Inactive" ? (
           <button className="table-action" disabled={!canManageStock} onClick={() => onLotAction?.("reactivate", lot)}>Reactivate</button>
@@ -5251,6 +5304,7 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
         <td>{formatDisplayDate(lot.purchase_date || lot.created_at)}</td>
         <td>{qty(lotOpening(lot))}</td>
         <td>{qty(lotUsed(lot))}</td>
+        <td>{qty(lot.adjusted_qty)}</td>
         <td><span className={lotBalance(lot) <= 0 ? "origin-rate" : "stock-ok"}>{qty(lotBalance(lot))}</span></td>
         <td>{money(lotCost(lot))}</td>
         <td>{money(lotSaleRate(lot))}</td>
@@ -5346,7 +5400,7 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
                 {expandedProductId === String(product.product_id) && (
                   <tr className="sales-history-drilldown-row">
                     <td colSpan="10">
-                      <DataTable headers={["Product", "Category", "Supplier", "Lot No.", "Size", "Opening Date", "Opening Qty", "Sold Qty", "Balance Qty", "Cost", "Sale Rate", "Stock Value", "Status", "Remarks", "Created At", "Last Edited", "Actions"]}>
+                      <DataTable headers={["Product", "Category", "Supplier", "Lot No.", "Size", "Opening Date", "Opening Qty", "Sold Qty", "Adjusted Qty", "Balance Qty", "Cost", "Sale Rate", "Stock Value", "Status", "Remarks", "Created At", "Last Edited", "Actions"]}>
                         {renderLotRows(product.visible_lots)}
                       </DataTable>
                     </td>
@@ -5359,9 +5413,9 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
         </DataTable>
       )}
       {viewMode === "LOT" && (
-        <DataTable headers={["Product", "Category", "Supplier", "Lot No.", "Size", "Opening Date", "Opening Qty", "Sold Qty", "Balance Qty", "Cost", "Sale Rate", "Stock Value", "Status", "Remarks", "Created At", "Last Edited", "Actions"]}>
+        <DataTable headers={["Product", "Category", "Supplier", "Lot No.", "Size", "Opening Date", "Opening Qty", "Sold Qty", "Adjusted Qty", "Balance Qty", "Cost", "Sale Rate", "Stock Value", "Status", "Remarks", "Created At", "Last Edited", "Actions"]}>
           {renderLotRows(filteredLots)}
-          {filteredLots.length === 0 && <tr><td colSpan="17" className="empty-cell">No matching stock lots found.</td></tr>}
+          {filteredLots.length === 0 && <tr><td colSpan="18" className="empty-cell">No matching stock lots found.</td></tr>}
         </DataTable>
       )}
       {viewMode === "CATEGORY" && (
