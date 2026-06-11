@@ -988,6 +988,37 @@ tbody tr:last-child td {
   box-shadow: none;
 }
 
+.table-actions,
+.sales-history-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 210px;
+}
+
+.compact-button {
+  min-height: 0;
+  padding: 7px 9px;
+  border-radius: 9px;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.warning-note {
+  color: #fbbf24;
+}
+
+.sales-history-drilldown-row td {
+  padding: 12px;
+  background: rgba(15, 23, 42, 0.62);
+}
+
+.sales-history-drilldown-row .table-wrap {
+  margin: 0;
+  border-color: rgba(245, 158, 11, 0.16);
+  background: rgba(17, 24, 39, 0.72);
+}
+
 .error-banner {
   margin: 12px 16px;
   padding: 11px 13px;

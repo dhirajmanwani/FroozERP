@@ -2999,11 +2999,15 @@ const insertCustomerLedgerEntry = async (client, sale, transactionType, amount, 
 
 const buildSalePayload = async (client, { items, branchId, createdBy, customer, invoiceDiscount, payments, allowRateOverride }) => {
   const parsedItems = (Array.isArray(items) ? items : []).map((item) => ({
+    saleItemId: parsePositiveInteger(item.id || item.sale_item_id),
     productId: parsePositiveInteger(item.product_id),
     inventoryBatchId: parsePositiveInteger(item.inventory_batch_id),
     quantity: parsePositiveNumber(item.quantity),
     discountAmount: parseNonNegativeNumber(item.discount_amount),
     requestedRate: parsePositiveNumber(item.selling_rate),
+    lotDiscountId: parsePositiveInteger(item.lot_discount_id),
+    lotDiscountType: item.lot_discount_type ? String(item.lot_discount_type).trim().toUpperCase() : null,
+    lotDiscountValue: parseNonNegativeNumber(item.lot_discount_value),
   }));
   const selectedCustomerId = parsePositiveInteger(customer?.account_id || customer?.customer_id);
   const typedCustomerName = customer?.name?.trim() || null;
@@ -3057,21 +3061,6 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
   let totalCost = 0;
   for (const requestedItem of parsedItems) {
     const product = productsById.get(requestedItem.productId);
-    const sellingRate = allowRateOverride && requestedItem.requestedRate
-      ? requestedItem.requestedRate
-      : Number(product.selling_rate);
-    if (!Number.isFinite(sellingRate) || sellingRate <= 0) {
-      return { error: { status: 400, message: `${product.product_name} does not have a valid selling rate` } };
-    }
-    if (!allowRateOverride && requestedItem.requestedRate && Number(requestedItem.requestedRate) !== Number(product.selling_rate)) {
-      return { error: { status: 403, message: "Only Owner can change selling rate on an edited invoice" } };
-    }
-
-    const itemGross = roundCurrency(requestedItem.quantity * sellingRate);
-    if (requestedItem.discountAmount > itemGross) {
-      return { error: { status: 400, message: `Discount cannot exceed the value of ${product.product_name}` } };
-    }
-
     const batchParams = [requestedItem.productId, branchId];
     let batchFilter = "";
     if (requestedItem.inventoryBatchId) {
@@ -3080,7 +3069,14 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
     }
     const batchesResult = await client.query(
       `
-      SELECT id, remaining_qty, COALESCE(effective_cost_per_unit, purchase_rate) AS purchase_rate, lot_name, lot_size
+      SELECT
+        id,
+        remaining_qty,
+        COALESCE(effective_cost_per_unit, purchase_rate) AS purchase_rate,
+        COALESCE(purchase_bill_status, 'BILL_COMPLETED') AS purchase_bill_status,
+        COALESCE(temporary_sale_rate, 0) AS temporary_sale_rate,
+        lot_name,
+        lot_size
       FROM inventory_batches
       WHERE product_id = $1
         AND branch_id = $2
@@ -3104,6 +3100,26 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
       };
     }
 
+    const defaultSellingRate = Number(
+      requestedItem.inventoryBatchId && Number(batchesResult.rows[0]?.temporary_sale_rate || 0) > 0
+        ? batchesResult.rows[0].temporary_sale_rate
+        : product.selling_rate
+    );
+    const hasRequestedRate = requestedItem.requestedRate !== null && requestedItem.requestedRate !== undefined;
+    const sellingRate = hasRequestedRate ? Number(requestedItem.requestedRate) : defaultSellingRate;
+    const manualRateOverride = hasRequestedRate && roundCurrency(sellingRate) !== roundCurrency(defaultSellingRate);
+    if (!Number.isFinite(sellingRate) || sellingRate <= 0) {
+      return { error: { status: 400, message: `${product.product_name} does not have a valid selling rate` } };
+    }
+    if (manualRateOverride && !allowRateOverride) {
+      return { error: { status: 403, message: "You do not have permission to change sale rate" } };
+    }
+
+    const itemGross = roundCurrency(requestedItem.quantity * sellingRate);
+    if (requestedItem.discountAmount > itemGross) {
+      return { error: { status: 400, message: `Discount cannot exceed the value of ${product.product_name}` } };
+    }
+
     let quantityToDeduct = requestedItem.quantity;
     let itemCost = 0;
     const allocations = [];
@@ -3117,6 +3133,7 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
         quantity: deductedQuantity,
         purchaseRate: Number(batch.purchase_rate),
         costAmount,
+        costStatus: batch.purchase_bill_status === "BILL_PENDING" ? "PROVISIONAL" : "FINAL",
         lotName: batch.lot_name,
         lotSize: batch.lot_size,
       });
@@ -3128,9 +3145,12 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
       ...requestedItem,
       product,
       sellingRate,
+      defaultSellingRate,
+      manualRateOverride,
       grossAmount: itemGross,
       netAmount: roundCurrency(itemGross - requestedItem.discountAmount),
       costAmount: roundCurrency(itemCost),
+      costStatus: allocations.some((allocation) => allocation.costStatus === "PROVISIONAL") ? "PROVISIONAL" : "FINAL",
       inventoryBatchId: requestedItem.inventoryBatchId || allocations[0]?.inventoryBatchId || null,
       lotName: allocations[0]?.lotName || null,
       lotSize: allocations[0]?.lotSize || null,
@@ -8213,10 +8233,10 @@ app.get("/reports/summary", async (req, res) => {
         SELECT
           p.product_name,
           p.unit,
-          SUM(si.quantity) AS quantity_sold,
-          SUM(si.net_amount) AS revenue,
-          SUM(si.cost_amount) AS cost,
-          SUM(si.profit) AS profit,
+          SUM(COALESCE(sba.quantity, si.quantity)) AS quantity_sold,
+          SUM(ROUND((COALESCE(si.net_amount, si.amount - COALESCE(si.discount_amount, 0)) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2)) AS revenue,
+          SUM(ROUND((COALESCE(si.cost_amount, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2)) AS cost,
+          SUM(ROUND((COALESCE(si.profit, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2)) AS profit,
           ib.lot_name,
           ib.lot_size
         FROM sale_items si
@@ -8272,24 +8292,30 @@ app.get("/reports/summary", async (req, res) => {
             JSON_AGG(
               JSON_BUILD_OBJECT(
                 'id', si.id,
+                'sale_item_id', si.id,
                 'product_id', si.product_id,
                 'product_name', p.product_name,
+                'category', p.category,
                 'inventory_batch_id', sba.inventory_batch_id,
                 'lot_name', ib.lot_name,
                 'lot_size', ib.lot_size,
                 'unit', p.unit,
-                'quantity', si.quantity,
+                'quantity', COALESCE(sba.quantity, si.quantity),
+                'item_total_quantity', si.quantity,
                 'selling_rate', si.selling_rate,
-                'gross_amount', si.amount,
-                'discount_amount', COALESCE(si.discount_amount, 0),
-                'net_amount', COALESCE(si.net_amount, si.amount - COALESCE(si.discount_amount, 0)),
-                'cost_amount', si.cost_amount,
-                'profit', si.profit,
+                'gross_amount', ROUND((si.amount * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2),
+                'discount_amount', ROUND((COALESCE(si.discount_amount, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2),
+                'net_amount', ROUND((COALESCE(si.net_amount, si.amount - COALESCE(si.discount_amount, 0)) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2),
+                'cost_amount', ROUND((COALESCE(si.cost_amount, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2),
+                'profit', ROUND((COALESCE(si.profit, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2),
                 'cost_status', si.cost_status,
                 'default_selling_rate', si.default_selling_rate,
-                'manual_rate_override', COALESCE(si.manual_rate_override, FALSE)
+                'manual_rate_override', COALESCE(si.manual_rate_override, FALSE),
+                'lot_discount_id', si.lot_discount_id,
+                'lot_discount_type', si.lot_discount_type,
+                'lot_discount_value', COALESCE(si.lot_discount_value, 0)
               )
-              ORDER BY si.id
+              ORDER BY si.id, sba.id
             ) FILTER (WHERE si.id IS NOT NULL),
             '[]'::json
           ) AS items
@@ -8297,13 +8323,7 @@ app.get("/reports/summary", async (req, res) => {
         LEFT JOIN customers c ON c.id = s.customer_id
         LEFT JOIN sale_items si ON si.sale_id = s.id
         LEFT JOIN products p ON p.id = si.product_id
-        LEFT JOIN LATERAL (
-          SELECT inventory_batch_id
-          FROM sale_batch_allocations
-          WHERE sale_item_id = si.id
-          ORDER BY id
-          LIMIT 1
-        ) sba ON TRUE
+        LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
         LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
         WHERE s.sale_date BETWEEN $1 AND $2
         GROUP BY
@@ -11042,6 +11062,156 @@ app.get("/sales", async (req, res) => {
   }
 });
 
+const salesHistoryDateParams = (query) => {
+  const reportRange = getReportDateRange(query);
+  return {
+    dateFrom: query.date_from || reportRange.dateFrom || "1900-01-01",
+    dateTo: query.date_to || reportRange.dateTo || "2999-12-31",
+  };
+};
+
+const loadSalesHistoryStructured = async ({ dateFrom, dateTo, saleId = null, flat = false }) => {
+  const params = saleId ? [dateFrom, dateTo, saleId] : [dateFrom, dateTo];
+  const saleFilter = saleId ? "AND s.id = $3" : "";
+  const query = flat ? `
+    SELECT
+      s.id AS sale_id,
+      s.invoice_no,
+      s.sale_date,
+      s.created_at,
+      COALESCE(s.sale_status, 'COMPLETED') AS sale_status,
+      s.customer_id,
+      COALESCE(s.customer_name, c.customer_name, 'Walk-in Customer') AS customer_name,
+      s.customer_mobile,
+      s.payment_mode,
+      si.id AS sale_item_id,
+      si.product_id,
+      p.product_name,
+      p.category,
+      p.unit,
+      sba.inventory_batch_id,
+      ib.lot_name,
+      ib.lot_size,
+      COALESCE(sba.quantity, si.quantity) AS quantity,
+      si.selling_rate,
+      ROUND((si.amount * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2) AS gross_amount,
+      ROUND((COALESCE(si.discount_amount, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2) AS item_discount_amount,
+      ROUND((COALESCE(si.net_amount, si.amount - COALESCE(si.discount_amount, 0)) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2) AS net_amount,
+      ROUND((COALESCE(si.cost_amount, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2) AS cost_amount,
+      ROUND((COALESCE(si.profit, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2) AS profit,
+      si.cost_status,
+      COALESCE(si.manual_rate_override, FALSE) AS manual_rate_override
+    FROM sales s
+    LEFT JOIN customers c ON c.id = s.customer_id
+    LEFT JOIN sale_items si ON si.sale_id = s.id
+    LEFT JOIN products p ON p.id = si.product_id
+    LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
+    LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
+    WHERE s.sale_date BETWEEN $1 AND $2
+      ${saleFilter}
+    ORDER BY s.sale_date DESC, s.created_at DESC, s.id DESC, si.id, sba.id
+  ` : `
+    SELECT
+      s.id,
+      s.invoice_no,
+      s.sale_date,
+      s.created_at,
+      COALESCE(s.sale_status, 'COMPLETED') AS sale_status,
+      s.customer_id,
+      COALESCE(s.customer_name, c.customer_name, 'Walk-in Customer') AS customer_name,
+      s.customer_mobile,
+      s.payment_mode,
+      s.gross_amount,
+      COALESCE(s.item_discount_amount, 0) AS item_discount_amount,
+      COALESCE(s.invoice_discount_amount, 0) AS invoice_discount_amount,
+      COALESCE(s.item_discount_amount, 0) + COALESCE(s.invoice_discount_amount, 0) AS discount_amount,
+      s.total_amount,
+      s.total_cost,
+      s.profit,
+      COALESCE(
+        JSON_AGG(
+          JSON_BUILD_OBJECT(
+            'id', si.id,
+            'sale_item_id', si.id,
+            'product_id', si.product_id,
+            'product_name', p.product_name,
+            'category', p.category,
+            'inventory_batch_id', sba.inventory_batch_id,
+            'lot_name', ib.lot_name,
+            'lot_size', ib.lot_size,
+            'unit', p.unit,
+            'quantity', COALESCE(sba.quantity, si.quantity),
+            'selling_rate', si.selling_rate,
+            'gross_amount', ROUND((si.amount * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2),
+            'discount_amount', ROUND((COALESCE(si.discount_amount, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2),
+            'net_amount', ROUND((COALESCE(si.net_amount, si.amount - COALESCE(si.discount_amount, 0)) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2),
+            'cost_amount', ROUND((COALESCE(si.cost_amount, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2),
+            'profit', ROUND((COALESCE(si.profit, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2),
+            'cost_status', si.cost_status,
+            'manual_rate_override', COALESCE(si.manual_rate_override, FALSE)
+          )
+          ORDER BY si.id, sba.id
+        ) FILTER (WHERE si.id IS NOT NULL),
+        '[]'::json
+      ) AS items
+    FROM sales s
+    LEFT JOIN customers c ON c.id = s.customer_id
+    LEFT JOIN sale_items si ON si.sale_id = s.id
+    LEFT JOIN products p ON p.id = si.product_id
+    LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
+    LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
+    WHERE s.sale_date BETWEEN $1 AND $2
+      ${saleFilter}
+    GROUP BY s.id, c.customer_name
+    ORDER BY s.sale_date DESC, s.created_at DESC, s.id DESC
+  `;
+  const result = await pool.query(query, params);
+  return result.rows;
+};
+
+app.get("/sales-history", async (req, res) => {
+  try {
+    const range = salesHistoryDateParams(req.query);
+    return res.json(await loadSalesHistoryStructured(range));
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Sales History" });
+  }
+});
+
+app.get("/sales-history/items", async (req, res) => {
+  try {
+    const range = salesHistoryDateParams(req.query);
+    return res.json(await loadSalesHistoryStructured({ ...range, flat: true }));
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Sales History Items" });
+  }
+});
+
+app.get("/sales-history/lots", async (req, res) => {
+  try {
+    const range = salesHistoryDateParams(req.query);
+    return res.json(await loadSalesHistoryStructured({ ...range, flat: true }));
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Sales History Lots" });
+  }
+});
+
+app.get("/sales-history/:id", async (req, res) => {
+  try {
+    const saleId = parsePositiveInteger(req.params.id);
+    if (!saleId) return res.status(400).json({ message: "Invalid invoice" });
+    const rows = await loadSalesHistoryStructured({ dateFrom: "1900-01-01", dateTo: "2999-12-31", saleId });
+    if (!rows.length) return res.status(404).json({ message: "Invoice not found" });
+    return res.json(rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Sales History Invoice" });
+  }
+});
+
 app.get("/sales-report/changes", async (req, res) => {
   try {
     const [editedResult, cancelledResult, totalsResult] = await Promise.all([
@@ -11451,7 +11621,7 @@ app.put("/sales/:id", async (req, res) => {
       customer: req.body.customer,
       invoiceDiscount: req.body.invoice_discount,
       payments: req.body.payments,
-      allowRateOverride: editor.role_name === "Owner",
+      allowRateOverride: ["Owner", "Admin"].includes(editor.role_name),
     });
     if (salePayload.error) {
       await client.query("ROLLBACK");
@@ -11516,17 +11686,43 @@ app.put("/sales/:id", async (req, res) => {
       const saleItemResult = await client.query(
         `
         INSERT INTO sale_items (
-          sale_id, product_id, quantity, selling_rate, amount, discount_amount, net_amount, cost_amount, profit
+          sale_id, product_id, quantity, selling_rate, amount, discount_amount, net_amount,
+          cost_amount, profit, cost_status, default_selling_rate, manual_rate_override,
+          lot_discount_id, lot_discount_type, lot_discount_value
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         RETURNING id
         `,
         [
           saleId, item.productId, item.quantity, item.sellingRate, item.grossAmount,
           item.discountAmount, item.netAmount, item.costAmount, itemProfit,
+          item.costStatus, item.defaultSellingRate, item.manualRateOverride,
+          item.lotDiscountId || null, item.lotDiscountType || null, item.lotDiscountValue || 0,
         ]
       );
       const saleItemId = saleItemResult.rows[0].id;
+      if (item.manualRateOverride) {
+        await client.query(
+          `
+          INSERT INTO pos_rate_override_audit (
+            sale_id, sale_item_id, product_id, product_name, default_rate,
+            manual_rate, changed_by, invoice_no, reason
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          `,
+          [
+            saleId,
+            saleItemId,
+            item.productId,
+            item.product.product_name,
+            item.defaultSellingRate,
+            item.sellingRate,
+            editor.id,
+            updatedSale.invoice_no,
+            reason,
+          ]
+        );
+      }
       for (const allocation of item.allocations) {
         await client.query(
           `
@@ -11668,22 +11864,24 @@ app.get("/sales/:id", async (req, res) => {
       pool.query(
         `
         SELECT
-          si.id, si.product_id, p.product_name, p.unit, si.quantity, si.selling_rate,
+          si.id, si.id AS sale_item_id, si.product_id, p.product_name, p.category, p.unit,
+          COALESCE(sba.quantity, si.quantity) AS quantity,
+          si.quantity AS item_total_quantity,
+          si.selling_rate,
           sba.inventory_batch_id, ib.lot_name, ib.lot_size,
-          si.amount, si.discount_amount, COALESCE(si.net_amount, si.amount) AS net_amount,
-          si.cost_amount, si.profit, si.cost_status, si.default_selling_rate, si.manual_rate_override
+          ROUND((si.amount * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2) AS amount,
+          ROUND((COALESCE(si.discount_amount, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2) AS discount_amount,
+          ROUND((COALESCE(si.net_amount, si.amount - COALESCE(si.discount_amount, 0)) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2) AS net_amount,
+          ROUND((COALESCE(si.cost_amount, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2) AS cost_amount,
+          ROUND((COALESCE(si.profit, 0) * CASE WHEN si.quantity > 0 THEN COALESCE(sba.quantity, si.quantity) / si.quantity ELSE 1 END)::NUMERIC, 2) AS profit,
+          si.cost_status, si.default_selling_rate, si.manual_rate_override,
+          si.lot_discount_id, si.lot_discount_type, si.lot_discount_value
         FROM sale_items si
         JOIN products p ON p.id = si.product_id
-        LEFT JOIN LATERAL (
-          SELECT inventory_batch_id
-          FROM sale_batch_allocations
-          WHERE sale_item_id = si.id
-          ORDER BY id
-          LIMIT 1
-        ) sba ON TRUE
+        LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
         LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
         WHERE si.sale_id = $1
-        ORDER BY si.id
+        ORDER BY si.id, sba.id
         `,
         [saleId]
       ),
