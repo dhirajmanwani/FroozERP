@@ -26,12 +26,12 @@ const icons = {
   dashboard: "grid",
   products: "box",
   purchase: "cart",
-  "pending-purchases": "alert",
+  "pending-bills": "alert",
   inventory: "layers",
   returns: "history",
   waste: "alert",
   sales: "receipt",
-  "sales-history": "history",
+  discounts: "wallet",
   expenses: "wallet",
   accounts: "users",
   reports: "chart",
@@ -43,13 +43,13 @@ const navigationItems = [
   ["dashboard", "Dashboard"],
   ["products", "Products"],
   ["purchase", "Purchase Entry"],
-  ["pending-purchases", "Pending Purchase Bills"],
+  ["pending-bills", "Pending Bills"],
   ["accounts", "Accounts"],
   ["inventory", "Inventory"],
   ["returns", "Sale Returns"],
   ["waste", "Waste Management"],
   ["sales", "POS Billing"],
-  ["sales-history", "Sales History"],
+  ["discounts", "Discounts"],
   ["sale-rates", "Sale Rate Update"],
   ["expenses", "Expenses"],
   ["reports", "Reports"],
@@ -128,8 +128,8 @@ const accountPaymentActions = [
 const defaultRolePermissions = {
   Owner: { all: true },
   Admin: { all: true },
-  Cashier: { dashboard: true, sales: true, "sales-history": true, accounts: true },
-  "Purchase Manager": { dashboard: true, purchase: true, "pending-purchases": true, accounts: true, reports: true },
+  Cashier: { dashboard: true, sales: true, accounts: true, "pending-bills": true },
+  "Purchase Manager": { dashboard: true, purchase: true, "pending-bills": true, accounts: true, reports: true },
   "Inventory Manager": { dashboard: true, inventory: true, waste: true, reports: true },
 };
 
@@ -137,13 +137,13 @@ const modulePermissionMap = {
   dashboard: "dashboard",
   products: "inventory",
   purchase: "purchases",
-  "pending-purchases": "purchases",
+  "pending-bills": "billing",
   accounts: "supplier_accounts",
   inventory: "inventory",
   returns: "billing",
   waste: "waste_management",
   sales: "billing",
-  "sales-history": "billing",
+  discounts: "discounts",
   "sale-rates": "discounts",
   expenses: "reports",
   reports: "reports",
@@ -351,6 +351,8 @@ function App() {
     canManageSettings: false,
   });
   const [discountRules, setDiscountRules] = useState([]);
+  const [lotDiscounts, setLotDiscounts] = useState([]);
+  const [customerPendingBills, setCustomerPendingBills] = useState({ summary: [], invoices: [] });
   const [saleRates, setSaleRates] = useState([]);
   const [saleRateHistory, setSaleRateHistory] = useState([]);
   const [saleDesiredMargin, setSaleDesiredMargin] = useState("25");
@@ -770,6 +772,16 @@ function App() {
     setDiscountRules(response.data);
   };
 
+  const loadLotDiscounts = async () => {
+    const response = await axios.get(`${API_URL}/lot-discounts`);
+    setLotDiscounts(response.data);
+  };
+
+  const loadCustomerPendingBills = async () => {
+    const response = await axios.get(`${API_URL}/pending-bills/customer`);
+    setCustomerPendingBills(response.data || { summary: [], invoices: [] });
+  };
+
   const loadSaleRates = async (desiredMargin = saleDesiredMargin) => {
     const [ratesResponse, historyResponse] = await Promise.all([
       axios.get(`${API_URL}/sale-rates`, { params: { user_id: user.id, desired_margin: desiredMargin } }),
@@ -1154,10 +1166,23 @@ function App() {
   };
 
   const saveNewOpeningStockLot = async () => {
-    if (!editingProductId) return;
-    const nextLot = buildOpeningStockLotFromDraft();
-    if (!nextLot) return;
-    try {
+
+  const activeproductId = editingProductId || lotPanelProduct?.id;
+
+  if (!activeproductId) {
+    alert("No product id found");
+    return;
+  }
+
+  const nextLot = buildOpeningStockLotFromDraft();
+  alert(JSON.stringify(nextLot, null, 2));
+
+  if (!nextLot) {
+    alert("Lot data invalid. Check lot name, quantity, purchase rate, sale rate/date.");
+    return;
+  }
+
+  try {
       const payload = {
         ...nextLot,
         opening_cost: nextLot.purchase_rate,
@@ -1166,11 +1191,11 @@ function App() {
         branch_id: user.branch_id,
       };
       try {
-        await axios.post(`${API_URL}/products/${editingProductId}/opening-stock-lots`, payload);
+        await axios.post(`${API_URL}/products/${activeproductId}/opening-stock-lots`, payload);
       } catch (error) {
         const message = getErrorMessage(error, "Unable to add opening stock lot");
         if (message.includes("Add as separate lot anyway?") && window.confirm("This lot already exists. Add as separate lot anyway?")) {
-          await axios.post(`${API_URL}/products/${editingProductId}/opening-stock-lots`, { ...payload, allow_duplicate_lot: true });
+          await axios.post(`${API_URL}/products/${activeproductId}/opening-stock-lots`, { ...payload, allow_duplicate_lot: true });
         } else {
           throw error;
         }
@@ -1178,7 +1203,7 @@ function App() {
       resetOpeningStockDraft();
       setShowOpeningLotForm(false);
       setAddOpeningStock(false);
-      await refreshLotContext(lotPanelProduct || { id: editingProductId, product_name: productName });
+      await refreshLotContext(lotPanelProduct || { id: activeproductId, product_name: productName });
       alert("Opening stock lot added");
     } catch (error) {
       alert(getErrorMessage(error, "Unable to add opening stock lot"));
@@ -1818,14 +1843,17 @@ function App() {
       if (view === "products") {
         await Promise.all([loadProducts(), loadProductCategories(), loadSupplierData(), loadDashboardData()]);
       }
-      if (view === "sales-history") {
-        await loadSalesHistory();
+      if (view === "sales") await Promise.all([loadDiscountRules(), loadLotDiscounts(), loadCustomerData()]);
+      if (view === "discounts") {
+        const inventoryResponse = await axios.get(`${API_URL}/inventory`);
+        setInventory(inventoryResponse.data);
+        await Promise.all([loadLotDiscounts(), loadProducts(), loadSupplierData()]);
       }
-      if (view === "sales") await loadDiscountRules();
-      if (["purchase", "pending-purchases", "accounts"].includes(view)) {
+      if (["purchase", "pending-bills", "accounts"].includes(view)) {
         await loadSupplierData();
       }
-      if (["purchase", "pending-purchases"].includes(view)) await loadPurchases();
+      if (["purchase", "pending-bills"].includes(view)) await loadPurchases();
+      if (view === "pending-bills") await Promise.all([loadCustomerPendingBills(), loadCustomerData()]);
       if (view === "accounts") {
         await Promise.all([loadAccounts(), loadCustomerData(), loadSupplierData(), loadAccountOutstanding()]);
       }
@@ -2190,7 +2218,13 @@ function App() {
                           <Field label="Lot Remarks"><input value={openingStockDraft.remarks} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, remarks: event.target.value })} /></Field>
                         </div>
                         <div className="button-row">
-                          <button className="primary-button" onClick={saveNewOpeningStockLot}>Save Lot</button>
+                          <button
+  type="button"
+  className="primary-button"
+  onClick={saveNewOpeningStockLot}
+>
+  Save Lot
+</button>
                           <button className="secondary-button" onClick={() => {
                             resetOpeningStockDraft();
                             setShowOpeningLotForm(false);
@@ -2427,13 +2461,20 @@ function App() {
             </section>
           )}
 
-          {activeView === "pending-purchases" && (
-            <PendingPurchaseBillsModule
+          {activeView === "pending-bills" && (
+            <PendingBillsModule
+              customerPendingBills={customerPendingBills}
+              customers={customers}
               onCancelPurchase={cancelPurchase}
               onCompletePurchase={completePendingPurchase}
               onEditPurchase={editPurchase}
+              onReload={async () => {
+                await Promise.all([loadPurchases(), loadCustomerPendingBills(), loadDashboardData(), loadReports()]);
+              }}
               onOpenPurchaseAmendment={openPurchaseAmendment}
+              onViewInvoice={loadInvoice}
               purchases={purchases}
+              user={user}
             />
           )}
 
@@ -2528,9 +2569,10 @@ function App() {
             <PosBilling
               customers={customers.filter((customer) => customer.active !== false)}
               discountRules={discountRules}
+              lotDiscounts={lotDiscounts}
               inventory={inventory}
               onInvoice={setSelectedInvoice}
-              onSaved={loadDashboardData}
+              onSaved={async () => { await Promise.all([loadDashboardData(), loadLotDiscounts(), loadCustomerPendingBills()]); }}
               paymentSettings={settingsData.paymentSettings}
               posSettings={settingsData.posSettings}
               printSettings={settingsData.businessSettings}
@@ -2542,37 +2584,16 @@ function App() {
             />
           )}
 
-          {activeView === "sales-history" && (
-            <ModuleCard eyebrow="Revenue" title="Sales History" subtitle="Review completed sales, costs, and realized profit.">
-              <DataTable headers={["Invoice", "Date", "Status", "Customer", "Items", "Payment", "Gross", "Item Discount", "Bill Discount", "Net Amount", "Cost", "Profit", "Actions"]}>
-                {salesHistory.map((sale) => (
-                  <tr key={sale.id}>
-                    <td><span className="batch-id">{sale.invoice_no || `#${sale.id}`}</span></td>
-                    <td>{formatDisplayDate(sale.sale_date)}</td>
-                    <td><span className={sale.sale_status === "CANCELLED" ? "stock-low" : sale.sale_status === "EDITED" ? "origin-rate" : "stock-ok"}>{sale.sale_status || "COMPLETED"}</span></td>
-                    <td>{sale.customer_name || "Walk-in Customer"}</td>
-                    <td className="primary-cell">
-                      {sale.item_summary}
-                    </td>
-                    <td><span className="tag">{sale.payment_mode}</span></td>
-                    <td>{currency.format(Number(sale.gross_amount || sale.amount))}</td>
-                    <td>{currency.format(Number(sale.item_discount_amount || 0))}</td>
-                    <td>{currency.format(Number(sale.invoice_discount_amount || 0))}</td>
-                    <td>{currency.format(Number(sale.amount))}</td>
-                    <td>{currency.format(Number(sale.cost_amount))}</td>
-                    <td className="profit-cell">{currency.format(Number(sale.profit))}</td>
-                    <td>
-                      <div className="button-row table-actions-row">
-                        <button className="table-action" onClick={() => loadInvoice(sale.id)}>View</button>
-                        <button className="table-action" disabled={!canEditSales || sale.sale_status === "CANCELLED"} onClick={() => loadSaleForEdit(sale.id)}>Edit</button>
-                        <button className="remove-button" disabled={!canEditSales || sale.sale_status === "CANCELLED"} onClick={() => cancelSale(sale)}>Cancel</button>
-                        <button className="secondary-button" onClick={() => loadChangeHistory(sale.id)}>History</button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </DataTable>
-            </ModuleCard>
+          {activeView === "discounts" && (
+            <DiscountManagementModule
+              discounts={lotDiscounts}
+              inventory={inventory}
+              onReload={async () => {
+                await Promise.all([loadLotDiscounts(), loadDashboardData()]);
+              }}
+              products={products.filter((product) => product.active !== false)}
+              user={user}
+            />
           )}
 
           {activeView === "sale-rates" && canManageRates && (
@@ -2922,6 +2943,315 @@ function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEd
           </div>
         </ModuleCard>
       )}
+    </section>
+  );
+}
+
+function PendingBillsModule({ customerPendingBills = { summary: [], invoices: [] }, customers = [], onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenPurchaseAmendment, onReload, onViewInvoice, purchases, user }) {
+  const [activeTab, setActiveTab] = useState("purchase");
+  const [selectedCustomerKey, setSelectedCustomerKey] = useState("");
+  const [paymentDraft, setPaymentDraft] = useState({
+    customer_id: "",
+    payment_date: toDateKey(new Date()),
+    payment_amount: "",
+    payment_mode: "CASH",
+    reference_number: "",
+    remarks: "",
+  });
+  const summaries = Array.isArray(customerPendingBills.summary) ? customerPendingBills.summary : [];
+  const selectedCustomer = summaries.find((summary) => summary.key === selectedCustomerKey);
+  const canReceivePayment = ["Owner", "Admin", "Cashier"].includes(user.role);
+
+  const openReceivePayment = (summary, invoice = null) => {
+    if (!summary?.customer_id) {
+      alert("Customer account is required before receiving payment.");
+      return;
+    }
+    setSelectedCustomerKey(summary.key);
+    setPaymentDraft({
+      customer_id: summary.customer_id,
+      payment_date: toDateKey(new Date()),
+      payment_amount: invoice ? Number(invoice.balance_amount || 0).toFixed(2) : "",
+      payment_mode: "CASH",
+      reference_number: "",
+      remarks: invoice?.invoice_no ? `Against credit invoice ${invoice.invoice_no}` : "Against customer pending bills",
+    });
+  };
+
+  const saveCustomerPayment = async () => {
+    if (!canReceivePayment) {
+      alert("Your role cannot receive customer payments.");
+      return;
+    }
+    if (!paymentDraft.customer_id || Number(paymentDraft.payment_amount || 0) <= 0) {
+      alert("Enter valid customer payment details.");
+      return;
+    }
+    try {
+      await axios.post(`${API_URL}/customer-payments`, {
+        ...paymentDraft,
+        branch_id: user.branch_id,
+        created_by: user.id,
+      });
+      setPaymentDraft({ customer_id: "", payment_date: toDateKey(new Date()), payment_amount: "", payment_mode: "CASH", reference_number: "", remarks: "" });
+      await onReload();
+      alert("Customer payment saved");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to save customer payment"));
+    }
+  };
+
+  return (
+    <section className="settings-layout">
+      <ModuleCard eyebrow="Operations" title="Pending Bills" subtitle="Complete supplier pending bills and settle customer credit invoices.">
+        <div className="settings-tabs">
+          <button className={activeTab === "purchase" ? "tab-active" : ""} onClick={() => setActiveTab("purchase")}>Pending Purchase Bills</button>
+          <button className={activeTab === "customer" ? "tab-active" : ""} onClick={() => setActiveTab("customer")}>Customer Pending Bills</button>
+        </div>
+      </ModuleCard>
+
+      {activeTab === "purchase" && (
+        <PendingPurchaseBillsModule
+          onCancelPurchase={onCancelPurchase}
+          onCompletePurchase={onCompletePurchase}
+          onEditPurchase={onEditPurchase}
+          onOpenPurchaseAmendment={onOpenPurchaseAmendment}
+          purchases={purchases}
+        />
+      )}
+
+      {activeTab === "customer" && (
+        <>
+          <ModuleCard eyebrow="Customer Credit" title="Customer-Wise Pending Bills" subtitle="Credit POS bills stay here until customer receipts are entered.">
+            <div className="purchase-summary-grid supplier-payment-preview">
+              <SummaryMetric label="Customers Pending" value={summaries.length} featured />
+              <SummaryMetric label="Credit Amount" value={currency.format(summaries.reduce((sum, row) => sum + Number(row.total_credit_amount || 0), 0))} />
+              <SummaryMetric label="Balance" value={currency.format(summaries.reduce((sum, row) => sum + Number(row.balance || 0), 0))} />
+            </div>
+            <DataTable headers={["Customer Name", "Pending From Date", "Pending To Date", "Pending Bill Count", "Total Credit Amount", "Amount Received", "Balance", "Action"]}>
+              {summaries.map((summary) => (
+                <tr key={summary.key}>
+                  <td className="primary-cell">{summary.customer_name}</td>
+                  <td>{formatDisplayDate(summary.from)}</td>
+                  <td>{formatDisplayDate(summary.to)}</td>
+                  <td>{summary.pending_bill_count} bills</td>
+                  <td>{currency.format(Number(summary.total_credit_amount || 0))}</td>
+                  <td>{currency.format(Number(summary.amount_received || 0))}</td>
+                  <td className="balance-cell">{currency.format(Number(summary.balance || 0))}</td>
+                  <td><button className="table-action" onClick={() => setSelectedCustomerKey(summary.key)}>View</button></td>
+                </tr>
+              ))}
+            </DataTable>
+            {summaries.length === 0 && <div className="cart-empty">No customer pending bills.</div>}
+          </ModuleCard>
+
+          {selectedCustomer && (
+            <ModuleCard eyebrow="Customer Drill-Down" title={selectedCustomer.customer_name} subtitle="Receive payment, view invoices and print customer credit statement.">
+              <DataTable headers={["Bill Date", "Invoice Number", "Items / Narration", "Gross Amount", "Discount", "Net Amount", "Received", "Balance", "Due Date", "Status", "Action"]}>
+                {selectedCustomer.rows.map((invoice) => (
+                  <tr key={invoice.id}>
+                    <td>{formatDisplayDate(invoice.sale_date)}</td>
+                    <td><span className="batch-id">{invoice.invoice_no || `#${invoice.id}`}</span></td>
+                    <td className="primary-cell purchase-items-cell"><span title={invoice.item_narration}>{String(invoice.item_narration || "").split("\n").slice(0, 2).join(", ")}</span></td>
+                    <td>{currency.format(Number(invoice.gross_amount || 0))}</td>
+                    <td>{currency.format(Number(invoice.item_discount_amount || 0) + Number(invoice.invoice_discount_amount || 0))}</td>
+                    <td>{currency.format(Number(invoice.total_amount || 0))}</td>
+                    <td>{currency.format(Number(invoice.received_amount || 0))}</td>
+                    <td className="balance-cell">{currency.format(Number(invoice.balance_amount || 0))}</td>
+                    <td>{invoice.due_date ? formatDisplayDate(invoice.due_date) : "-"}</td>
+                    <td><span className={invoice.credit_status === "Paid" ? "stock-ok" : invoice.credit_status === "Partially Paid" ? "origin-rate" : "stock-low"}>{invoice.credit_status}</span></td>
+                    <td>
+                      <div className="button-row table-actions-row">
+                        <button className="primary-button" disabled={Number(invoice.balance_amount || 0) <= 0} onClick={() => openReceivePayment(selectedCustomer, invoice)}>Receive Payment</button>
+                        <button className="table-action" onClick={() => onViewInvoice(invoice.id)}>View Invoice</button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </DataTable>
+              <div className="button-row">
+                <button className="secondary-button" onClick={() => openReceivePayment(selectedCustomer)}>Receive General Payment</button>
+                <button className="secondary-button" onClick={() => window.print()}>Print Statement</button>
+                <button className="secondary-button" onClick={() => setSelectedCustomerKey("")}>Back to Customer Summary</button>
+              </div>
+            </ModuleCard>
+          )}
+
+          {paymentDraft.customer_id && (
+            <ModuleCard eyebrow="Customer Receipt" title="Receive Payment Against Credit" subtitle="Payment will reduce customer receivable and update Cash Book based on payment mode.">
+              <div className="form-grid supplier-form-grid">
+                <Field label="Customer">
+                  <select value={paymentDraft.customer_id} onChange={(event) => setPaymentDraft({ ...paymentDraft, customer_id: event.target.value })}>
+                    <option value="">Select customer</option>
+                    {customers.filter((customer) => customer.active !== false).map((customer) => <option key={customer.id} value={customer.id}>{customer.customer_name}</option>)}
+                  </select>
+                </Field>
+                <Field label="Payment Date"><input type="date" value={paymentDraft.payment_date} onChange={(event) => setPaymentDraft({ ...paymentDraft, payment_date: event.target.value })} /></Field>
+                <Field label="Payment Amount"><input min="0" step="0.01" type="number" value={paymentDraft.payment_amount} onChange={(event) => setPaymentDraft({ ...paymentDraft, payment_amount: event.target.value })} /></Field>
+                <Field label="Payment Mode">
+                  <select value={paymentDraft.payment_mode} onChange={(event) => setPaymentDraft({ ...paymentDraft, payment_mode: event.target.value })}>
+                    <option value="CASH">Cash</option>
+                    <option value="UPI">UPI</option>
+                    <option value="CARD">Card</option>
+                    <option value="BANK_TRANSFER">Bank</option>
+                  </select>
+                </Field>
+                <Field label="Reference Number"><input value={paymentDraft.reference_number} onChange={(event) => setPaymentDraft({ ...paymentDraft, reference_number: event.target.value })} /></Field>
+                <Field label="Remarks"><input value={paymentDraft.remarks} onChange={(event) => setPaymentDraft({ ...paymentDraft, remarks: event.target.value })} /></Field>
+              </div>
+              <div className="button-row">
+                <button className="primary-button" onClick={saveCustomerPayment}>Save Payment</button>
+                <button className="secondary-button" onClick={() => setPaymentDraft({ customer_id: "", payment_date: toDateKey(new Date()), payment_amount: "", payment_mode: "CASH", reference_number: "", remarks: "" })}>Cancel</button>
+              </div>
+            </ModuleCard>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+function DiscountManagementModule({ discounts = [], inventory = [], onReload, products = [], user }) {
+  const [productId, setProductId] = useState("");
+  const [selectedLotIds, setSelectedLotIds] = useState([]);
+  const [form, setForm] = useState({
+    discount_type: "FIXED_AMOUNT",
+    discount_value: "",
+    start_date: toDateKey(new Date()),
+    end_date: "",
+    active: true,
+    remarks: "",
+  });
+  const canManage = ["Owner", "Admin"].includes(user.role);
+  const productLots = inventory.filter((lot) =>
+    String(lot.product_id) === String(productId) &&
+    Number(lot.remaining_qty || 0) > 0 &&
+    lot.batch_status !== "CANCELLED"
+  );
+  const activeDiscountForLot = (lotId) => discounts.find((discount) =>
+    Number(discount.inventory_batch_id) === Number(lotId) &&
+    discount.active !== false &&
+    (!discount.end_date || toDateKey(discount.end_date) >= toDateKey(new Date()))
+  );
+
+  const toggleLot = (lotId) => {
+    setSelectedLotIds((ids) => ids.includes(lotId) ? ids.filter((id) => id !== lotId) : [...ids, lotId]);
+  };
+
+  const saveDiscount = async () => {
+    if (!canManage) {
+      alert("Only Owner/Admin can create discounts.");
+      return;
+    }
+    if (!productId || selectedLotIds.length === 0 || Number(form.discount_value || 0) < 0) {
+      alert("Select product, lot and valid discount value.");
+      return;
+    }
+    try {
+      await axios.post(`${API_URL}/lot-discounts`, {
+        product_id: productId,
+        inventory_batch_ids: selectedLotIds,
+        ...form,
+        created_by: user.id,
+      });
+      setSelectedLotIds([]);
+      setForm({ discount_type: "FIXED_AMOUNT", discount_value: "", start_date: toDateKey(new Date()), end_date: "", active: true, remarks: "" });
+      await onReload();
+      alert("Discount saved");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to save discount"));
+    }
+  };
+
+  const deactivateDiscount = async (discount) => {
+    if (!canManage) {
+      alert("Only Owner/Admin can deactivate discounts.");
+      return;
+    }
+    const remarks = window.prompt("Reason / remarks for deactivation", "Discount deactivated") || "Discount deactivated";
+    try {
+      await axios.post(`${API_URL}/lot-discounts/${discount.id}/deactivate`, { updated_by: user.id, remarks });
+      await onReload();
+      alert("Discount deactivated");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to deactivate discount"));
+    }
+  };
+
+  return (
+    <section className="settings-layout">
+      <ModuleCard eyebrow="Retail Pricing" title="Discount Management" subtitle="Create item-wise and lot-wise retail POS discounts without changing permanent sale rates.">
+        <div className="form-grid supplier-form-grid">
+          <Field label="Product / Item">
+            <select value={productId} onChange={(event) => { setProductId(event.target.value); setSelectedLotIds([]); }}>
+              <option value="">Select product</option>
+              {products.map((product) => <option key={product.id} value={product.id}>{product.category || "Fruit"} - {product.product_name}</option>)}
+            </select>
+          </Field>
+          <Field label="Discount Type">
+            <select value={form.discount_type} onChange={(event) => setForm({ ...form, discount_type: event.target.value })}>
+              <option value="FIXED_AMOUNT">Fixed Amount Discount</option>
+              <option value="PERCENTAGE">Percentage Discount</option>
+              <option value="SPECIAL_RATE">Special Sale Rate</option>
+            </select>
+          </Field>
+          <Field label="Discount Value"><input min="0" step="0.01" type="number" value={form.discount_value} onChange={(event) => setForm({ ...form, discount_value: event.target.value })} /></Field>
+          <Field label="Start Date"><input type="date" value={form.start_date} onChange={(event) => setForm({ ...form, start_date: event.target.value })} /></Field>
+          <Field label="End Date"><input type="date" value={form.end_date} onChange={(event) => setForm({ ...form, end_date: event.target.value })} /></Field>
+          <Field label="Status">
+            <select value={form.active ? "ACTIVE" : "INACTIVE"} onChange={(event) => setForm({ ...form, active: event.target.value === "ACTIVE" })}>
+              <option value="ACTIVE">Active</option>
+              <option value="INACTIVE">Inactive</option>
+            </select>
+          </Field>
+          <Field label="Remarks"><input value={form.remarks} onChange={(event) => setForm({ ...form, remarks: event.target.value })} /></Field>
+        </div>
+        <div className="button-row">
+          <button className="secondary-button" disabled={productLots.length === 0} onClick={() => setSelectedLotIds(productLots.map((lot) => lot.id))}>Select All Active Lots</button>
+          <button className="primary-button" disabled={!canManage} onClick={saveDiscount}>Save Discount</button>
+        </div>
+      </ModuleCard>
+
+      <ModuleCard eyebrow="Lot Selection" title="Available Lots / Batches" subtitle="Discounts apply only to the selected stock lots.">
+        <DataTable headers={["Select", "Lot Name / Number", "Size / Grade", "Supplier", "Available Qty", "Current Sale Rate", "Cost Rate", "Existing Discount", "Status"]}>
+          {productLots.map((lot) => {
+            const existing = activeDiscountForLot(lot.id);
+            return (
+              <tr key={lot.id}>
+                <td><input checked={selectedLotIds.includes(lot.id)} type="checkbox" onChange={() => toggleLot(lot.id)} /></td>
+                <td className="primary-cell">{lot.lot_name || lot.batch_no || `Lot #${lot.id}`}</td>
+                <td>{lot.lot_size || "-"}</td>
+                <td>{lot.supplier_name || "-"}</td>
+                <td>{Number(lot.remaining_qty || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
+                <td>{currency.format(Number(lot.temporary_sale_rate || 0) > 0 ? Number(lot.temporary_sale_rate) : Number(lot.selling_rate || 0))}</td>
+                <td>{currency.format(Number(lot.effective_cost_per_unit || lot.purchase_rate || 0))}</td>
+                <td>{existing ? `${existing.discount_type} ${currency.format(Number(existing.discount_value || 0))}` : "-"}</td>
+                <td><span className={lot.batch_status === "ACTIVE" || !lot.batch_status ? "stock-ok" : "stock-low"}>{lot.batch_status || "ACTIVE"}</span></td>
+              </tr>
+            );
+          })}
+        </DataTable>
+        {productId && productLots.length === 0 && <div className="cart-empty">No active lots with stock for this product.</div>}
+        {!productId && <div className="cart-empty">Select a product to view lots.</div>}
+      </ModuleCard>
+
+      <ModuleCard eyebrow="Active Discounts" title="Current Lot-Wise Discounts" subtitle="Reports and Sales History always keep discount accounting, even if receipt display hides it.">
+        <DataTable headers={["Product", "Lot / Size", "Discount Type", "Value", "Start", "End", "Status", "Remarks", "Actions"]}>
+          {discounts.map((discount) => (
+            <tr key={discount.id}>
+              <td className="primary-cell">{discount.product_name}</td>
+              <td>{discount.lot_name || discount.batch_no || "-"}{discount.lot_size ? ` / ${discount.lot_size}` : ""}</td>
+              <td>{discount.discount_type}</td>
+              <td>{discount.discount_type === "PERCENTAGE" ? `${Number(discount.discount_value || 0)}%` : currency.format(Number(discount.discount_value || 0))}</td>
+              <td>{formatDisplayDate(discount.start_date)}</td>
+              <td>{discount.end_date ? formatDisplayDate(discount.end_date) : "Open"}</td>
+              <td><span className={discount.active ? "stock-ok" : "stock-low"}>{discount.active ? "Active" : "Inactive"}</span></td>
+              <td>{discount.remarks || "-"}</td>
+              <td><button className="remove-button" disabled={!discount.active || !canManage} onClick={() => deactivateDiscount(discount)}>Deactivate</button></td>
+            </tr>
+          ))}
+        </DataTable>
+      </ModuleCard>
     </section>
   );
 }
@@ -3390,9 +3720,9 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
     discountReport: {
       title: "Discount Report",
       rows: filterRows(data.discountReport),
-      summary: (rows) => [["Total Discount", money(totalOf(rows, "total_discount")), true], ["Bill Discount", money(totalOf(rows, "bill_discount"))], ["Invoices", number(totalOf(rows, "invoice_count"))]],
-      headers: ["Date", "Payment", "Invoices", "Item Discount", "Bill Discount", "Total Discount"],
-      render: (row) => <tr key={`${row.sale_date}-${row.payment_mode}`}><td>{formatDisplayDate(row.sale_date)}</td><td>{row.payment_mode}</td><td>{row.invoice_count}</td><td>{money(row.item_discount)}</td><td>{money(row.bill_discount)}</td><td className="profit-cell">{money(row.total_discount)}</td></tr>,
+      summary: (rows) => [["Discount Amount", money(totalOf(rows, "discount_amount")), true], ["Gross Amount", money(totalOf(rows, "gross_amount"))], ["Net Amount", money(totalOf(rows, "net_amount"))], ["Profit Impact", money(totalOf(rows, "profit_impact"))]],
+      headers: ["Date", "Product", "Lot", "Discount Type", "Discount Value", "Qty Sold", "Gross Amount", "Discount Amount", "Net Amount", "Profit Impact"],
+      render: (row, index) => <tr key={`${row.sale_date}-${row.invoice_no}-${row.product_name}-${row.lot_name}-${index}`}><td>{formatDisplayDate(row.sale_date)}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.invoice_no || row.payment_mode}</small></td><td>{row.lot_name || "-"}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td>{row.discount_type || "Bill / Manual"}</td><td>{row.discount_type === "PERCENTAGE" ? `${Number(row.discount_value || 0)}%` : money(row.discount_value)}</td><td>{number(row.quantity_sold)}</td><td>{money(row.gross_amount)}</td><td>{money(row.discount_amount)}</td><td>{money(row.net_amount)}</td><td>{money(row.profit_impact)}</td></tr>,
     },
     purchasesByDate: {
       title: "Purchases by Date",
@@ -3676,7 +4006,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
     },
   };
   const categories = [
-    { id: "sales", title: "Sales Reports", icon: "receipt", description: "Unified sales history with item narration, discounts, payments and bill status.", reports: ["salesHistory"] },
+    { id: "sales", title: "Sales Reports", icon: "receipt", description: "Unified sales history with item narration, discounts, payments and bill status.", reports: ["salesHistory", "discountReport"] },
     { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Unified purchase history with item narration, bill status, payments and amendment actions.", reports: ["purchaseHistory"] },
     { id: "accounts", title: "Accounts & Ledger", icon: "users", description: "Customer ledger, supplier ledger, statements, payments and balances.", reports: ["customerLedger", "supplierLedger", "accountStatement", "paymentReport", "paymentModeSummary", "receivableReport", "payableReport"] },
     { id: "returns", title: "Sale Returns", icon: "history", description: "Return history, value and reason analysis.", reports: ["returnHistory", "returnValue", "returnReason"] },
@@ -6006,7 +6336,7 @@ const currentDateTimeLocal = () => {
   return `${year}-${month}-${day}T${hours}:${minutes}`;
 };
 
-function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, customers = [], discountRules = [], inventory, onInvoice, onSaved, paymentSettings = {}, posSettings = {}, printSettings = {}, products, saleRateSettings = {}, user }) {
+function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, customers = [], discountRules = [], lotDiscounts = [], inventory, onInvoice, onSaved, paymentSettings = {}, posSettings = {}, printSettings = {}, products, saleRateSettings = {}, user }) {
   const [search, setSearch] = useState("");
   const [barcode, setBarcode] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
@@ -6014,8 +6344,9 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
   const [paymentMode, setPaymentMode] = useState("CASH");
   const [quantityMode, setQuantityMode] = useState(posSettings.enable_weighing_scale ? "SCALE" : "MANUAL");
   const [scaleMessage, setScaleMessage] = useState("");
-  const [mixedPayments, setMixedPayments] = useState({ CASH: "", UPI: "", CARD: "" });
+  const [mixedPayments, setMixedPayments] = useState({ CASH: "", UPI: "", CARD: "", BANK_TRANSFER: "" });
   const [customer, setCustomer] = useState({ account_id: "", name: "", mobile: "", notes: "" });
+  const [creditInfo, setCreditInfo] = useState({ due_date: "", remarks: "" });
   const [billDateTime, setBillDateTime] = useState(currentDateTimeLocal);
   const [saving, setSaving] = useState(false);
   const [lastInvoice, setLastInvoice] = useState(null);
@@ -6091,6 +6422,41 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
 
   const getLotLabel = (lot) => lot ? [lot.lot_name || lot.batch_no, lot.lot_size].filter(Boolean).join(" / ") : "Auto FIFO";
 
+  const getActiveLotDiscount = (lotId) => {
+    if (!lotId) return null;
+    const today = toDateKey(new Date());
+    return [...lotDiscounts]
+      .filter((discount) =>
+        Number(discount.inventory_batch_id) === Number(lotId) &&
+        discount.active !== false &&
+        (!discount.start_date || toDateKey(discount.start_date) <= today) &&
+        (!discount.end_date || toDateKey(discount.end_date) >= today)
+      )
+      .sort((left, right) => Number(right.id || 0) - Number(left.id || 0))[0] || null;
+  };
+
+  const applyLotDiscount = (baseRate, quantity, discount) => {
+    const rate = Number(baseRate || 0);
+    const qty = Number(quantity || 0);
+    if (!discount) return { sellingRate: rate, discountAmount: 0, discountPerUnit: 0 };
+    const value = Number(discount.discount_value || 0);
+    if (discount.discount_type === "SPECIAL_RATE") {
+      return {
+        sellingRate: value,
+        discountAmount: 0,
+        discountPerUnit: 0,
+      };
+    }
+    const discountPerUnit = discount.discount_type === "PERCENTAGE"
+      ? roundUi(rate * value / 100)
+      : Math.min(value, rate);
+    return {
+      sellingRate: rate,
+      discountAmount: roundUi(discountPerUnit * qty),
+      discountPerUnit,
+    };
+  };
+
   const addProduct = (product, selectedLot = null) => {
     const productLots = lotsByProduct.get(product.id) || [];
     if (!selectedLot && productLots.length > 1 && lotSelectionMode !== "AUTO_FIFO") {
@@ -6108,9 +6474,11 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     }
     const lotSaleRate = Number(lot?.temporary_sale_rate || 0);
     const defaultRate = lotSaleRate > 0 ? lotSaleRate : Number(product.selling_rate);
+    const lotDiscount = getActiveLotDiscount(lot?.id);
+    const discounted = applyLotDiscount(defaultRate, nextQuantity, lotDiscount);
 
     setCart((items) => currentItem
-      ? items.map((item) => item.cart_key === cartKey ? { ...item, quantity: nextQuantity } : item)
+      ? items.map((item) => item.cart_key === cartKey ? { ...item, quantity: nextQuantity, discount_amount: roundUi(Number(item.lot_discount_per_unit || 0) * nextQuantity) } : item)
       : [...items, {
         cart_key: cartKey,
         product_id: product.id,
@@ -6121,9 +6489,13 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
         unit: product.unit,
         available_qty: availableStock,
         default_selling_rate: defaultRate,
-        selling_rate: defaultRate,
+        selling_rate: discounted.sellingRate,
         quantity: 1,
-        discount_amount: 0,
+        discount_amount: discounted.discountAmount,
+        lot_discount_id: lotDiscount?.id || null,
+        lot_discount_type: lotDiscount?.discount_type || null,
+        lot_discount_value: lotDiscount ? Number(lotDiscount.discount_value || 0) : 0,
+        lot_discount_per_unit: discounted.discountPerUnit,
       }]
     );
     setSearch("");
@@ -6147,7 +6519,13 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
       alert(currentItem.inventory_batch_id ? "Selected lot does not have enough stock." : `Only ${currentItem.available_qty || 0} units are available.`);
       return;
     }
-    setCart((items) => items.map((item) => item.cart_key === cartKey ? { ...item, [field]: value } : item));
+    setCart((items) => items.map((item) => {
+      if (item.cart_key !== cartKey) return item;
+      if (field === "quantity" && item.lot_discount_id) {
+        return { ...item, quantity: value, discount_amount: roundUi(Number(item.lot_discount_per_unit || 0) * number) };
+      }
+      return { ...item, [field]: value };
+    }));
   };
 
   const completeQuantityEntry = (event) => {
@@ -6231,26 +6609,34 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
       alert("Enter a valid customer mobile number.");
       return;
     }
+    if (paymentMode === "CREDIT" && !customer.account_id) {
+      if (!["Owner", "Admin"].includes(user.role)) {
+        alert("Select a saved customer account for credit sale.");
+        return;
+      }
+      if (!window.confirm("No saved customer selected. Assign this credit sale to Walk-in Customer Credit?")) return;
+    }
     let zeroRateConfirmed = confirmations.zero_rate_confirmed === true;
     let belowCostConfirmed = confirmations.below_cost_confirmed === true;
     for (const item of cart) {
       const rate = Number(item.selling_rate);
       const defaultRate = Number(item.default_selling_rate ?? item.selling_rate);
       const rateChanged = roundUi(rate) !== roundUi(defaultRate);
+      const discountControlledRate = item.lot_discount_type === "SPECIAL_RATE";
       if (!Number.isFinite(rate) || rate < 0) {
         alert(`Enter a valid sale rate for ${item.product_name}.`);
         return;
       }
-      if (rateChanged && !canManualRateOverride) {
+      if (rateChanged && !discountControlledRate && !canManualRateOverride) {
         alert("You do not have permission to change sale rate.");
         return;
       }
-      if (rateChanged && rate === 0 && !zeroRateConfirmed) {
+      if (rateChanged && !discountControlledRate && rate === 0 && !zeroRateConfirmed) {
         if (!["Owner", "Admin"].includes(user.role) || !window.confirm(`Sale rate for ${item.product_name} is zero. Continue?`)) return;
         zeroRateConfirmed = true;
       }
       const estimatedCost = Number(costByProduct.get(item.product_id) || 0);
-      if (rateChanged && estimatedCost > 0 && rate < estimatedCost && !belowCostConfirmed) {
+      if (rateChanged && !discountControlledRate && estimatedCost > 0 && rate < estimatedCost && !belowCostConfirmed) {
         if (!["Owner", "Admin"].includes(user.role) || !window.confirm(`This rate is below cost for ${item.product_name}. Continue?`)) return;
         belowCostConfirmed = true;
       }
@@ -6280,6 +6666,9 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
           quantity: Number(item.quantity),
           selling_rate: Number(item.selling_rate),
           discount_amount: Number(item.discount_amount || 0),
+          lot_discount_id: item.lot_discount_id || null,
+          lot_discount_type: item.lot_discount_type || null,
+          lot_discount_value: Number(item.lot_discount_value || 0),
         })),
         customer,
         invoice_discount: Number(totals.invoiceDiscount || 0),
@@ -6289,6 +6678,8 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
         created_by: user.id,
         bill_date: selectedBillDate,
         bill_datetime: billDateTime,
+        credit_due_date: paymentMode === "CREDIT" ? creditInfo.due_date || null : null,
+        credit_remarks: paymentMode === "CREDIT" ? creditInfo.remarks || customer.notes || "" : "",
         date_override_reason: dateOverrideReason,
         backdate_confirmed: confirmations.backdate_confirmed || dateConfirmations.backdate_confirmed || false,
         future_date_confirmed: confirmations.future_date_confirmed || dateConfirmations.future_date_confirmed || false,
@@ -6296,8 +6687,10 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
         zero_rate_confirmed: zeroRateConfirmed,
       });
       setCart([]);
-      setMixedPayments({ CASH: "", UPI: "", CARD: "" });
+      setMixedPayments({ CASH: "", UPI: "", CARD: "", BANK_TRANSFER: "" });
+      setPaymentMode("CASH");
       setCustomer({ account_id: "", name: "", mobile: "", notes: "" });
+      setCreditInfo({ due_date: "", remarks: "" });
       setBillDateTime(currentDateTimeLocal());
       await onSaved();
       setLastInvoice(response.data.sale);
@@ -6427,7 +6820,10 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
             {searchResults.map((option, index) => {
               const { product, lot } = option;
               const stock = lot ? Number(lot.remaining_qty || 0) : (stockByProduct.get(product.id) || 0);
-              const rate = Number(lot?.temporary_sale_rate || product.selling_rate || 0);
+              const baseRate = Number(lot?.temporary_sale_rate || product.selling_rate || 0);
+              const activeDiscount = getActiveLotDiscount(lot?.id);
+              const discounted = applyLotDiscount(baseRate, 1, activeDiscount);
+              const rate = discounted.sellingRate;
               return (
                 <button
                   className={index === highlightedIndex ? "product-result product-result-active" : "product-result"}
@@ -6436,7 +6832,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
                 >
                   <span>
                     <strong>{product.product_name}{lot ? ` - ${getLotLabel(lot)}` : ""}</strong>
-                    <small>{product.barcode || "No barcode"} - {currency.format(rate)}/{product.unit}</small>
+                    <small>{product.barcode || "No barcode"} - {currency.format(rate)}/{product.unit}{activeDiscount ? " after lot discount" : ""}</small>
                   </span>
                   <em className={stock <= 5 ? "stock-low" : "stock-ok"}>{stock} in stock</em>
                 </button>
@@ -6526,10 +6922,19 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
               <option value="CASH">Cash</option>
               <option value="UPI">UPI</option>
               <option value="CARD">Card</option>
+              <option value="BANK_TRANSFER">Bank</option>
+              <option value="CREDIT">Credit</option>
               <option value="MIXED">Mixed Payment</option>
             </select>
           </Field>
-          {paymentSettings.enable_upi_qr_on_invoice && paymentSettings.business_upi_id && ["UPI", "MIXED"].includes(paymentMode) && (
+          {paymentMode === "CREDIT" && (
+            <div className="credit-panel">
+              <p className="form-note">Credit sale will reduce inventory now and create customer receivable. Cash Book updates only when payment is received.</p>
+              <Field label="Due Date"><input type="date" value={creditInfo.due_date} onChange={(event) => setCreditInfo({ ...creditInfo, due_date: event.target.value })} /></Field>
+              <Field label="Credit Remarks"><input value={creditInfo.remarks} onChange={(event) => setCreditInfo({ ...creditInfo, remarks: event.target.value })} placeholder="Optional credit note" /></Field>
+            </div>
+          )}
+          {paymentSettings.enable_upi_qr_on_invoice && paymentSettings.business_upi_id && ["UPI", "MIXED", "BANK_TRANSFER"].includes(paymentMode) && (
             <p className="form-note">UPI QR will be printed for {paymentSettings.business_upi_id} on this invoice.</p>
           )}
           {paymentMode === "MIXED" && (

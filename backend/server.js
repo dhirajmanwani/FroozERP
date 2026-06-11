@@ -74,6 +74,7 @@ const CUSTOMER_TYPES = new Set(["RETAIL", "WHOLESALE"]);
 const ACCOUNT_TYPES = new Set(["CUSTOMER", "SUPPLIER", "TRANSPORT_VENDOR", "COMMISSION_AGENT", "STAFF", "OTHER"]);
 const DISCOUNT_TYPES = new Set(["FLAT_AMOUNT", "PERCENTAGE"]);
 const DISCOUNT_PAYMENT_MODES = new Set(["ALL", "CASH", "UPI", "CARD"]);
+const LOT_DISCOUNT_TYPES = new Set(["FIXED_AMOUNT", "PERCENTAGE", "SPECIAL_RATE"]);
 const ROUNDING_RULES = new Set(["NEAREST_RUPEE", "ROUND_UP_5", "ROUND_UP_10", "NO_ROUND"]);
 const SALE_STATUSES = new Set(["COMPLETED", "EDITED", "CANCELLED"]);
 const REFUND_TYPES = new Set(["CASH_REFUND", "UPI_REFUND", "CREDIT_NOTE", "FUTURE_ADJUSTMENT"]);
@@ -567,6 +568,39 @@ const initializeDatabase = async () => {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS lot_discounts (
+      id SERIAL PRIMARY KEY,
+      product_id INTEGER NOT NULL REFERENCES products(id),
+      inventory_batch_id INTEGER NOT NULL REFERENCES inventory_batches(id),
+      discount_type VARCHAR(30) NOT NULL,
+      discount_value NUMERIC(14, 2) NOT NULL CHECK (discount_value >= 0),
+      start_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      end_date DATE,
+      active BOOLEAN DEFAULT TRUE,
+      remarks TEXT,
+      created_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      edited_by INTEGER REFERENCES users(id),
+      edited_at TIMESTAMP,
+      deactivated_by INTEGER REFERENCES users(id),
+      deactivated_at TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS lot_discounts_batch_active_idx
+      ON lot_discounts (inventory_batch_id, active, start_date, end_date);
+
+    CREATE TABLE IF NOT EXISTS lot_discount_audit (
+      id SERIAL PRIMARY KEY,
+      discount_id INTEGER REFERENCES lot_discounts(id) ON DELETE SET NULL,
+      product_id INTEGER REFERENCES products(id),
+      inventory_batch_id INTEGER REFERENCES inventory_batches(id),
+      action VARCHAR(30) NOT NULL,
+      old_value JSONB,
+      new_value JSONB,
+      remarks TEXT,
+      changed_by INTEGER REFERENCES users(id),
+      changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE TABLE IF NOT EXISTS supplier_payments (
       id SERIAL PRIMARY KEY,
       supplier_id INTEGER NOT NULL REFERENCES suppliers(id),
@@ -974,6 +1008,12 @@ const initializeDatabase = async () => {
     ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS cost_status VARCHAR(30) DEFAULT 'FINAL';
     ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS default_selling_rate NUMERIC(14, 2);
     ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS manual_rate_override BOOLEAN DEFAULT FALSE;
+    ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS lot_discount_id INTEGER REFERENCES lot_discounts(id);
+    ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS lot_discount_type VARCHAR(30);
+    ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS lot_discount_value NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS due_date DATE;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS credit_remarks TEXT;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS credit_status VARCHAR(30) DEFAULT 'PAID';
     UPDATE sale_items SET default_selling_rate = selling_rate WHERE default_selling_rate IS NULL;
 
     CREATE TABLE IF NOT EXISTS pos_rate_override_audit (
@@ -2638,7 +2678,7 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
   totalCost = roundCurrency(totalCost);
   const subtotalAfterItemDiscounts = roundCurrency(grossAmount - itemDiscountAmount);
   const requestedPaymentsInput = Array.isArray(payments) && payments.length > 0 ? payments : null;
-  const allowedPaymentModes = new Set(["CASH", "UPI", "CARD"]);
+  const allowedPaymentModes = new Set(["CASH", "UPI", "CARD", "BANK_TRANSFER", "CREDIT"]);
   const paymentModes = requestedPaymentsInput
     ? requestedPaymentsInput.map((payment) => String(payment.mode || "").toUpperCase())
     : ["CASH"];
@@ -3329,6 +3369,217 @@ app.delete("/settings/discount-rules/:id", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Deleting Discount Rule" });
+  }
+});
+
+app.get("/lot-discounts", async (req, res) => {
+  try {
+    const values = [];
+    const filters = [];
+    if (req.query.product_id) {
+      values.push(parsePositiveInteger(req.query.product_id));
+      filters.push(`ld.product_id = $${values.length}`);
+    }
+    if (req.query.active !== undefined) {
+      values.push(String(req.query.active) === "true");
+      filters.push(`ld.active = $${values.length}`);
+    }
+    const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+    const result = await pool.query(
+      `
+      SELECT
+        ld.*,
+        p.product_name,
+        p.unit,
+        ib.batch_no,
+        ib.lot_name,
+        ib.lot_size,
+        ib.supplier_name,
+        ib.remaining_qty,
+        COALESCE(ib.temporary_sale_rate, p.selling_rate, 0) AS current_sale_rate,
+        COALESCE(ib.effective_cost_per_unit, ib.purchase_rate, 0) AS cost_rate,
+        ib.batch_status
+      FROM lot_discounts ld
+      JOIN products p ON p.id = ld.product_id
+      JOIN inventory_batches ib ON ib.id = ld.inventory_batch_id
+      ${whereClause}
+      ORDER BY ld.active DESC, p.product_name, ib.lot_name NULLS LAST, ld.start_date DESC, ld.id DESC
+      `,
+      values
+    );
+    return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Lot Discounts" });
+  }
+});
+
+app.post("/lot-discounts", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const manager = await requireRateManager(req.body.created_by || req.body.updated_by, client);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage discounts" });
+    const productId = parsePositiveInteger(req.body.product_id);
+    const lotIds = Array.isArray(req.body.inventory_batch_ids)
+      ? req.body.inventory_batch_ids.map(parsePositiveInteger).filter(Boolean)
+      : [parsePositiveInteger(req.body.inventory_batch_id)].filter(Boolean);
+    const discountType = String(req.body.discount_type || "").trim().toUpperCase();
+    const discountValue = parseNonNegativeNumber(req.body.discount_value);
+    const startDate = toBusinessDateKey(req.body.start_date || new Date());
+    const endDate = req.body.end_date ? toBusinessDateKey(req.body.end_date) : null;
+    if (!productId || lotIds.length === 0 || !LOT_DISCOUNT_TYPES.has(discountType) || discountValue === null || (endDate && endDate < startDate)) {
+      return res.status(400).json({ message: "Enter valid lot discount details" });
+    }
+
+    await client.query("BEGIN");
+    const lotsResult = await client.query(
+      `
+      SELECT ib.id, ib.product_id, ib.lot_name, ib.batch_no, p.product_name
+      FROM inventory_batches ib
+      JOIN products p ON p.id = ib.product_id
+      WHERE ib.id = ANY($1::INT[])
+        AND ib.product_id = $2
+        AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+      FOR SHARE
+      `,
+      [lotIds, productId]
+    );
+    if (lotsResult.rows.length !== lotIds.length) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Select valid active lots for this product" });
+    }
+
+    const created = [];
+    for (const lot of lotsResult.rows) {
+      const result = await client.query(
+        `
+        INSERT INTO lot_discounts (
+          product_id, inventory_batch_id, discount_type, discount_value,
+          start_date, end_date, active, remarks, created_by
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING *
+        `,
+        [
+          productId, lot.id, discountType, discountValue, startDate, endDate,
+          req.body.active !== false, nullableText(req.body.remarks), manager.id,
+        ]
+      );
+      const discount = result.rows[0];
+      created.push(discount);
+      await client.query(
+        `
+        INSERT INTO lot_discount_audit (
+          discount_id, product_id, inventory_batch_id, action, old_value, new_value, remarks, changed_by
+        )
+        VALUES ($1, $2, $3, 'CREATE', NULL, $4, $5, $6)
+        `,
+        [discount.id, productId, lot.id, discount, nullableText(req.body.remarks), manager.id]
+      );
+    }
+    await client.query("COMMIT");
+    return res.status(201).json(created);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Saving Lot Discount" });
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/lot-discounts/:id", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const discountId = parsePositiveInteger(req.params.id);
+    const manager = await requireRateManager(req.body.updated_by, client);
+    const discountType = String(req.body.discount_type || "").trim().toUpperCase();
+    const discountValue = parseNonNegativeNumber(req.body.discount_value);
+    const startDate = toBusinessDateKey(req.body.start_date || new Date());
+    const endDate = req.body.end_date ? toBusinessDateKey(req.body.end_date) : null;
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage discounts" });
+    if (!discountId || !LOT_DISCOUNT_TYPES.has(discountType) || discountValue === null || (endDate && endDate < startDate)) {
+      return res.status(400).json({ message: "Enter valid lot discount details" });
+    }
+    await client.query("BEGIN");
+    const oldResult = await client.query("SELECT * FROM lot_discounts WHERE id = $1 FOR UPDATE", [discountId]);
+    if (oldResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Lot discount not found" });
+    }
+    const result = await client.query(
+      `
+      UPDATE lot_discounts
+      SET discount_type = $1, discount_value = $2, start_date = $3, end_date = $4,
+          active = $5, remarks = $6, edited_by = $7, edited_at = CURRENT_TIMESTAMP,
+          deactivated_by = CASE WHEN $5 = FALSE AND active = TRUE THEN $7 ELSE deactivated_by END,
+          deactivated_at = CASE WHEN $5 = FALSE AND active = TRUE THEN CURRENT_TIMESTAMP ELSE deactivated_at END
+      WHERE id = $8
+      RETURNING *
+      `,
+      [discountType, discountValue, startDate, endDate, req.body.active !== false, nullableText(req.body.remarks), manager.id, discountId]
+    );
+    const updated = result.rows[0];
+    await client.query(
+      `
+      INSERT INTO lot_discount_audit (
+        discount_id, product_id, inventory_batch_id, action, old_value, new_value, remarks, changed_by
+      )
+      VALUES ($1, $2, $3, 'UPDATE', $4, $5, $6, $7)
+      `,
+      [discountId, updated.product_id, updated.inventory_batch_id, oldResult.rows[0], updated, nullableText(req.body.remarks), manager.id]
+    );
+    await client.query("COMMIT");
+    return res.json(updated);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Lot Discount" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/lot-discounts/:id/deactivate", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const discountId = parsePositiveInteger(req.params.id);
+    const manager = await requireRateManager(req.body.updated_by, client);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage discounts" });
+    if (!discountId) return res.status(400).json({ message: "Invalid discount" });
+    await client.query("BEGIN");
+    const oldResult = await client.query("SELECT * FROM lot_discounts WHERE id = $1 FOR UPDATE", [discountId]);
+    if (oldResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Lot discount not found" });
+    }
+    const result = await client.query(
+      `
+      UPDATE lot_discounts
+      SET active = FALSE, deactivated_by = $1, deactivated_at = CURRENT_TIMESTAMP,
+          edited_by = $1, edited_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+      RETURNING *
+      `,
+      [manager.id, discountId]
+    );
+    await client.query(
+      `
+      INSERT INTO lot_discount_audit (
+        discount_id, product_id, inventory_batch_id, action, old_value, new_value, remarks, changed_by
+      )
+      VALUES ($1, $2, $3, 'DEACTIVATE', $4, $5, $6, $7)
+      `,
+      [discountId, result.rows[0].product_id, result.rows[0].inventory_batch_id, oldResult.rows[0], result.rows[0], nullableText(req.body.remarks), manager.id]
+    );
+    await client.query("COMMIT");
+    return res.json({ success: true, discount: result.rows[0] });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Deactivating Lot Discount" });
+  } finally {
+    client.release();
   }
 });
 
@@ -4243,9 +4494,11 @@ app.get("/inventory", async (req, res) => {
         p.category_id,
         p.unit,
         p.barcode,
+        p.selling_rate,
         ib.batch_no,
         ib.lot_name,
         ib.lot_size,
+        ib.batch_status,
         ib.stock_source,
         ib.purchase_qty,
         ib.remaining_qty,
@@ -5588,6 +5841,119 @@ app.post("/customer-payments", async (req, res) => {
   }
 });
 
+app.get("/pending-bills/customer", async (req, res) => {
+  try {
+    const creditSalesResult = await pool.query(
+      `
+      SELECT
+        s.id,
+        s.invoice_no,
+        s.sale_date,
+        s.due_date,
+        s.customer_id,
+        COALESCE(c.customer_name, s.customer_name, 'Walk-in Customer') AS customer_name,
+        s.customer_mobile,
+        s.gross_amount,
+        s.item_discount_amount,
+        s.invoice_discount_amount,
+        s.total_amount,
+        s.sale_status,
+        COALESCE(pay.sale_paid, 0) AS sale_paid,
+        COALESCE(
+          STRING_AGG(
+            p.product_name ||
+            COALESCE(' ' || NULLIF(TRIM(CONCAT(ib.lot_name, CASE WHEN ib.lot_size IS NOT NULL THEN ' / ' || ib.lot_size ELSE '' END)), ''), '') ||
+            ' ' || TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM si.quantity::TEXT)) || ' ' || COALESCE(p.unit, '') ||
+            ' @ ' || si.selling_rate::TEXT,
+            E'\\n' ORDER BY si.id
+          ),
+          'No items'
+        ) AS item_narration
+      FROM sales s
+      LEFT JOIN customers c ON c.id = s.customer_id
+      LEFT JOIN sale_items si ON si.sale_id = s.id
+      LEFT JOIN products p ON p.id = si.product_id
+      LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
+      LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
+      LEFT JOIN (
+        SELECT sale_id, SUM(amount) AS sale_paid
+        FROM sale_payments
+        GROUP BY sale_id
+      ) pay ON pay.sale_id = s.id
+      WHERE s.payment_mode = 'CREDIT'
+        AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
+      GROUP BY s.id, c.customer_name, pay.sale_paid
+      ORDER BY s.customer_id NULLS LAST, s.sale_date, s.id
+      `
+    );
+    const paymentsResult = await pool.query(
+      `
+      SELECT
+        cp.customer_id,
+        SUM(cp.payment_amount) AS total_received
+      FROM customer_payments cp
+      WHERE COALESCE(cp.cancelled, FALSE) = FALSE
+      GROUP BY cp.customer_id
+      `
+    );
+    const paymentByCustomer = new Map(paymentsResult.rows.map((row) => [Number(row.customer_id), Number(row.total_received || 0)]));
+    const invoices = [];
+    const summaries = new Map();
+    for (const row of creditSalesResult.rows) {
+      const customerId = Number(row.customer_id || 0);
+      const key = String(customerId || row.customer_name || "Walk-in Customer");
+      const total = Number(row.total_amount || 0);
+      const salePaid = Number(row.sale_paid || 0);
+      const summary = summaries.get(key) || {
+        key,
+        customer_id: customerId || null,
+        customer_name: row.customer_name || "Walk-in Customer",
+        from: row.sale_date,
+        to: row.sale_date,
+        pending_bill_count: 0,
+        total_credit_amount: 0,
+        amount_received: 0,
+        balance: 0,
+        rows: [],
+        remainingCustomerReceipts: Number(paymentByCustomer.get(customerId) || 0),
+      };
+      const allocatedCustomerPayment = Math.min(summary.remainingCustomerReceipts, Math.max(total - salePaid, 0));
+      summary.remainingCustomerReceipts = roundCurrency(summary.remainingCustomerReceipts - allocatedCustomerPayment);
+      const received = roundCurrency(salePaid + allocatedCustomerPayment);
+      const balance = roundCurrency(Math.max(total - received, 0));
+      const status = balance <= 0.01 ? "Paid" : received > 0 ? "Partially Paid" : "Pending";
+      const invoice = {
+        ...row,
+        customer_id: customerId || null,
+        gross_amount: Number(row.gross_amount || total),
+        item_discount_amount: Number(row.item_discount_amount || 0),
+        invoice_discount_amount: Number(row.invoice_discount_amount || 0),
+        total_amount: total,
+        received_amount: received,
+        balance_amount: balance,
+        credit_status: status,
+      };
+      invoices.push(invoice);
+      if (balance > 0.01) summary.pending_bill_count += 1;
+      summary.from = row.sale_date < summary.from ? row.sale_date : summary.from;
+      summary.to = row.sale_date > summary.to ? row.sale_date : summary.to;
+      summary.total_credit_amount = roundCurrency(summary.total_credit_amount + total);
+      summary.amount_received = roundCurrency(summary.amount_received + received);
+      summary.balance = roundCurrency(summary.balance + balance);
+      summary.rows.push(invoice);
+      summaries.set(key, summary);
+    }
+    const summaryRows = [...summaries.values()]
+      .map(({ remainingCustomerReceipts, ...summary }) => summary)
+      .filter((summary) => summary.balance > 0.01)
+      .sort((left, right) => left.customer_name.localeCompare(right.customer_name));
+    return res.json({ summary: summaryRows, invoices });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Customer Pending Bills" });
+  }
+});
+
 app.get("/customer-ledger", async (req, res) => {
   try {
     const customerId = req.query.customer_id ? parsePositiveInteger(req.query.customer_id) : null;
@@ -6480,17 +6846,50 @@ app.get("/reports/summary", async (req, res) => {
       pool.query(
         `
         SELECT
-          sale_date,
-          payment_mode,
-          COUNT(*)::INTEGER AS invoice_count,
-          SUM(COALESCE(item_discount_amount, 0) + COALESCE(invoice_discount_amount, 0)) AS total_discount,
-          SUM(COALESCE(invoice_discount_amount, 0)) AS bill_discount,
-          SUM(COALESCE(item_discount_amount, 0)) AS item_discount
-        FROM sales
-        WHERE sale_status <> 'CANCELLED'
-          AND sale_date BETWEEN $1 AND $2
-        GROUP BY sale_date, payment_mode
-        ORDER BY sale_date DESC, payment_mode
+          s.sale_date,
+          s.invoice_no,
+          s.payment_mode,
+          p.product_name,
+          p.unit,
+          COALESCE(ib.lot_name, ib.batch_no, '') AS lot_name,
+          ib.lot_size,
+          si.lot_discount_type AS discount_type,
+          si.lot_discount_value AS discount_value,
+          SUM(si.quantity) AS quantity_sold,
+          SUM(
+            CASE
+              WHEN si.lot_discount_type = 'SPECIAL_RATE'
+              THEN si.quantity * COALESCE(si.default_selling_rate, si.selling_rate)
+              ELSE si.amount
+            END
+          ) AS gross_amount,
+          SUM(
+            COALESCE(si.discount_amount, 0) +
+            CASE
+              WHEN si.lot_discount_type = 'SPECIAL_RATE'
+              THEN GREATEST((COALESCE(si.default_selling_rate, si.selling_rate) - si.selling_rate) * si.quantity, 0)
+              ELSE 0
+            END
+          ) AS discount_amount,
+          SUM(COALESCE(si.net_amount, si.amount - COALESCE(si.discount_amount, 0))) AS net_amount,
+          SUM(COALESCE(si.profit, 0)) AS profit_impact
+        FROM sales s
+        JOIN sale_items si ON si.sale_id = s.id
+        JOIN products p ON p.id = si.product_id
+        LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
+        LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
+        WHERE s.sale_status <> 'CANCELLED'
+          AND s.sale_date BETWEEN $1 AND $2
+          AND (
+            COALESCE(si.discount_amount, 0) > 0
+            OR si.lot_discount_id IS NOT NULL
+            OR COALESCE(s.invoice_discount_amount, 0) > 0
+          )
+        GROUP BY
+          s.sale_date, s.invoice_no, s.payment_mode, p.product_name, p.unit,
+          COALESCE(ib.lot_name, ib.batch_no, ''), ib.lot_size,
+          si.lot_discount_type, si.lot_discount_value
+        ORDER BY s.sale_date DESC, p.product_name, lot_name
         `,
         [dateFrom, dateTo]
       ),
@@ -9266,6 +9665,9 @@ app.post("/sales", async (req, res) => {
       inventoryBatchId: parsePositiveInteger(item.inventory_batch_id),
       quantity: parsePositiveNumber(item.quantity),
       discountAmount: parseNonNegativeNumber(item.discount_amount),
+      lotDiscountId: parsePositiveInteger(item.lot_discount_id),
+      lotDiscountType: item.lot_discount_type ? String(item.lot_discount_type).trim().toUpperCase() : null,
+      lotDiscountValue: parseNonNegativeNumber(item.lot_discount_value),
       hasRequestedRate: item.selling_rate !== undefined && item.selling_rate !== null && String(item.selling_rate).trim() !== "",
       requestedRate: item.selling_rate !== undefined && item.selling_rate !== null && String(item.selling_rate).trim() !== ""
         ? parseNonNegativeNumber(item.selling_rate)
@@ -9280,7 +9682,14 @@ app.post("/sales", async (req, res) => {
       !parsedBranchId ||
       parsedInvoiceDiscount === null ||
       parsedItems.length === 0 ||
-      parsedItems.some((item) => !item.productId || !item.quantity || item.discountAmount === null || (item.hasRequestedRate && item.requestedRate === null))
+      parsedItems.some((item) =>
+        !item.productId ||
+        !item.quantity ||
+        item.discountAmount === null ||
+        (item.lotDiscountType && !LOT_DISCOUNT_TYPES.has(item.lotDiscountType)) ||
+        (item.lotDiscountType && item.lotDiscountValue === null) ||
+        (item.hasRequestedRate && item.requestedRate === null)
+      )
     ) {
       return res.status(400).json({ message: "Add valid products and quantities before checkout" });
     }
@@ -9364,7 +9773,8 @@ app.post("/sales", async (req, res) => {
       const defaultSellingRate = Number(requestedItem.inventoryBatchId && Number(batchesResult.rows[0]?.temporary_sale_rate || 0) > 0
         ? batchesResult.rows[0].temporary_sale_rate
         : product.selling_rate);
-      const manualRateOverride = requestedItem.hasRequestedRate && roundCurrency(requestedItem.requestedRate) !== roundCurrency(defaultSellingRate);
+      const lotSpecialRate = requestedItem.lotDiscountType === "SPECIAL_RATE" && requestedItem.hasRequestedRate;
+      const manualRateOverride = requestedItem.hasRequestedRate && !lotSpecialRate && roundCurrency(requestedItem.requestedRate) !== roundCurrency(defaultSellingRate);
       if (manualRateOverride && !rateOverrideUser) {
         rateOverrideUser = await getPermissionUser(parsedCreatedBy, "manual_pos_rate_override", ["Owner", "Admin"], client);
       }
@@ -9382,7 +9792,7 @@ app.post("/sales", async (req, res) => {
           });
         }
       }
-      const sellingRate = manualRateOverride ? Number(requestedItem.requestedRate) : defaultSellingRate;
+      const sellingRate = manualRateOverride || lotSpecialRate ? Number(requestedItem.requestedRate) : defaultSellingRate;
       if (!Number.isFinite(sellingRate) || sellingRate < 0 || (sellingRate === 0 && !(manualRateOverride && req.body.zero_rate_confirmed === true))) {
         await client.query("ROLLBACK");
         return res.status(400).json({ message: `${product.product_name} does not have a valid selling rate` });
@@ -9478,7 +9888,7 @@ app.post("/sales", async (req, res) => {
     const subtotalAfterItemDiscounts = roundCurrency(grossAmount - itemDiscountAmount);
 
     const requestedPaymentsInput = Array.isArray(payments) && payments.length > 0 ? payments : null;
-    const allowedPaymentModes = new Set(["CASH", "UPI", "CARD"]);
+    const allowedPaymentModes = new Set(["CASH", "UPI", "CARD", "BANK_TRANSFER", "CREDIT"]);
     const paymentModes = requestedPaymentsInput
       ? requestedPaymentsInput.map((payment) => String(payment.mode || "").toUpperCase())
       : ["CASH"];
@@ -9487,6 +9897,10 @@ app.post("/sales", async (req, res) => {
       return res.status(400).json({ message: "Select a valid payment mode" });
     }
     const paymentMode = paymentModes.length > 1 ? "MIXED" : paymentModes[0];
+    if (paymentMode === "MIXED" && paymentModes.includes("CREDIT")) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Credit sale cannot be mixed with cash or bank payment in one bill" });
+    }
     const discountRule = await getMatchingDiscountRule(client, grossAmount, paymentMode);
     const automaticInvoiceDiscount = Math.min(calculateInvoiceDiscount(discountRule, grossAmount), subtotalAfterItemDiscounts);
     const invoiceDiscountAmount = discountRule ? automaticInvoiceDiscount : parsedInvoiceDiscount;
@@ -9513,6 +9927,8 @@ app.post("/sales", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Payment amounts must match the invoice total" });
     }
+    const creditDueDate = req.body.credit_due_date ? toBusinessDateKey(req.body.credit_due_date) : null;
+    const creditRemarks = nullableText(req.body.credit_remarks);
 
     const saleResult = await client.query(
       `
@@ -9522,9 +9938,9 @@ app.post("/sales", async (req, res) => {
         gross_amount, item_discount_amount, invoice_discount_amount, tax_amount,
         discount_rule_id, discount_rule_name, discount_rule_type, discount_rule_value,
         discount_rule_payment_mode, profit_status, sale_date, transaction_date,
-        bill_datetime, backdated_bill, backdate_reason
+        bill_datetime, backdated_bill, backdate_reason, due_date, credit_remarks, credit_status
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
       RETURNING *
       `,
       [
@@ -9542,6 +9958,9 @@ app.post("/sales", async (req, res) => {
         requestedBillDateTime,
         isBackdatedBill,
         cleanText(date_override_reason || backdate_reason) || (isBackdatedBill ? "Backdated POS bill created" : null),
+        creditDueDate,
+        creditRemarks,
+        paymentMode === "CREDIT" ? "PENDING" : "PAID",
       ]
     );
     const sale = saleResult.rows[0];
@@ -9560,15 +9979,19 @@ app.post("/sales", async (req, res) => {
         `
         INSERT INTO sale_items (
           sale_id, product_id, quantity, selling_rate, amount, discount_amount, net_amount,
-          cost_amount, profit, cost_status, default_selling_rate, manual_rate_override
+          cost_amount, profit, cost_status, default_selling_rate, manual_rate_override,
+          lot_discount_id, lot_discount_type, lot_discount_value
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         RETURNING id
         `,
         [
           sale.id, item.productId, item.quantity, item.sellingRate, item.grossAmount,
           item.discountAmount, item.netAmount, item.costAmount, itemProfit, item.costStatus,
           item.defaultSellingRate, item.manualRateOverride,
+          item.lotDiscountId || null,
+          item.lotDiscountType || null,
+          item.lotDiscountValue || 0,
         ]
       );
       const saleItemId = saleItemResult.rows[0].id;
@@ -9623,7 +10046,7 @@ app.post("/sales", async (req, res) => {
       );
     }
 
-    for (const payment of parsedPayments) {
+    for (const payment of parsedPayments.filter((entry) => entry.mode !== "CREDIT")) {
       await client.query(
         "INSERT INTO sale_payments (sale_id, payment_mode, amount) VALUES ($1, $2, $3)",
         [sale.id, payment.mode, payment.amount]
@@ -9661,6 +10084,9 @@ app.post("/sales", async (req, res) => {
           amount: item.grossAmount,
           discount_amount: item.discountAmount,
           net_amount: item.netAmount,
+          lot_discount_id: item.lotDiscountId || null,
+          lot_discount_type: item.lotDiscountType || null,
+          lot_discount_value: item.lotDiscountValue || 0,
         })),
         payments: parsedPayments,
       },
