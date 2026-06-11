@@ -522,6 +522,7 @@ function App() {
   const [amendmentDate, setAmendmentDate] = useState("");
   const [amendmentSupplierId, setAmendmentSupplierId] = useState("");
   const [selectedInvoice, setSelectedInvoice] = useState(null);
+  const [selectedInvoicePrintMode, setSelectedInvoicePrintMode] = useState(null);
   const [editingSale, setEditingSale] = useState(null);
   const [changeHistory, setChangeHistory] = useState(null);
   const [profileOpen, setProfileOpen] = useState(false);
@@ -1668,13 +1669,23 @@ function App() {
     }
   };
 
-  const loadInvoice = async (saleId) => {
+  const loadInvoice = async (saleId, options = {}) => {
     try {
       const response = await axios.get(`${API_URL}/sales/${saleId}`);
       setSelectedInvoice(response.data);
+      setSelectedInvoicePrintMode(options.print ? (options.printMode || "THERMAL") : null);
     } catch (error) {
       alert(getErrorMessage(error, "Error Loading Invoice"));
     }
+  };
+
+  const printSaleInvoice = async (saleId, printMode = "THERMAL") => {
+    const invoiceId = Number(saleId || 0);
+    if (!invoiceId) {
+      alert("Unable to print invoice. Invoice ID is missing.");
+      return;
+    }
+    await loadInvoice(invoiceId, { print: true, printMode });
   };
 
   const loadSaleForEdit = async (saleId) => {
@@ -1696,10 +1707,15 @@ function App() {
   };
 
   const cancelSale = async (sale) => {
+    const saleId = Number(sale.sale_id || sale.id || 0);
+    if (!saleId) {
+      alert("Unable to cancel invoice. Invoice ID is missing.");
+      return;
+    }
     const reason = window.prompt(`Enter cancellation reason for ${sale.invoice_no || `#${sale.id}`}`);
     if (!reason?.trim()) return;
     try {
-      await axios.post(`${API_URL}/sales/${sale.id}/cancel`, { reason, cancelled_by: user.id });
+      await axios.post(`${API_URL}/sales/${saleId}/cancel`, { reason, cancelled_by: user.id });
       await Promise.all([loadSalesHistory(), loadDashboardData(), loadReports()]);
       alert("Invoice cancelled");
     } catch (error) {
@@ -1920,6 +1936,16 @@ function App() {
       alert("Sale invoice not found.");
       return;
     }
+    const preloadTasks = [];
+    if (!products.length) preloadTasks.push(loadProducts());
+    if (!inventory.length) {
+      preloadTasks.push(
+        axios.get(`${API_URL}/inventory`, { params: { include_cancelled: true } })
+          .then((response) => setInventory(response.data))
+      );
+    }
+    if (!customers.length) preloadTasks.push(loadCustomerData());
+    if (preloadTasks.length) await Promise.all(preloadTasks);
     await loadSaleForEdit(saleId);
   };
 
@@ -2007,7 +2033,8 @@ function App() {
 
   const activeLabel = navigationItems.find(([view]) => view === activeView)?.[1];
   const canManageRates = ["Owner", "Admin"].includes(user.role);
-  const canEditSales = ["Owner", "Admin"].includes(user.role);
+  const canEditSales = ["Owner", "Admin"].includes(user.role) || hasRolePermission("sale_edit");
+  const canCancelSales = ["Owner", "Admin"].includes(user.role) || hasRolePermission("invoice_cancellation");
   const canManageStock = ["Owner", "Admin", "Inventory Manager"].includes(user.role);
   const lotBalanceQuantity = (lot) => Number(lot.balance_qty ?? lot.remaining_qty ?? 0);
   const lotUsedQuantity = (lot) => Number(lot.sold_qty ?? Math.max(Number(lot.purchase_qty || 0) - Number(lot.remaining_qty || 0), 0));
@@ -2756,6 +2783,7 @@ function App() {
 
           {activeView === "reports" && (
             <ReportsModule
+              canCancelSales={canCancelSales}
               canEditSales={canEditSales}
               canManageStock={canManageStock}
               data={reportsData}
@@ -2767,6 +2795,7 @@ function App() {
               onOpenPurchaseAmendment={openPurchaseAmendment}
               onOpenSaleForEdit={openSaleForEditFromReport}
               onOpenSaleView={loadInvoice}
+              onPrintSale={printSaleInvoice}
               onCancelSale={cancelSale}
               onOpenLotAction={openLotAction}
               onOpenSupplierLedger={openSupplierLedgerFromReport}
@@ -2783,7 +2812,18 @@ function App() {
           )}
         </div>
       </section>
-      {selectedInvoice && <InvoiceModal invoice={selectedInvoice} onClose={() => setSelectedInvoice(null)} paymentSettings={settingsData.paymentSettings} printSettings={settingsData.businessSettings} />}
+      {selectedInvoice && (
+        <InvoiceModal
+          autoPrintMode={selectedInvoicePrintMode}
+          invoice={selectedInvoice}
+          onClose={() => {
+            setSelectedInvoice(null);
+            setSelectedInvoicePrintMode(null);
+          }}
+          paymentSettings={settingsData.paymentSettings}
+          printSettings={settingsData.businessSettings}
+        />
+      )}
       {editingSale && (
         <SaleEditModal
           invoice={editingSale}
@@ -3512,7 +3552,7 @@ function DiscountManagementModule({ discounts = [], inventory = [], onReload, pr
   );
 }
 
-function ReportsModule({ canEditSales, canManageStock, data = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onCancelSale, onOpenSupplierLedger, onReload }) {
+function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload }) {
   const [range, setRange] = useState("today");
   const [search, setSearch] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
@@ -4049,14 +4089,34 @@ function ReportsModule({ canEditSales, canManageStock, data = {}, onCancelPurcha
         ? ["Date", "Invoice", "Customer", "Item Summary", "Gross Total", "Item Discount", "Bill Discount", "Net Total", "Payment Mode", "Status", "Actions"]
         : ["Date", "Invoice", "Customer", "Item Name", "Lot No.", "Size / Grade", "Quantity", "Unit", "Rate", "Gross Amount", "Item Discount", "Bill Discount", "Net Amount", "Payment Mode", "User", "Actions"],
       render: (row) => {
-        const openInvoice = () => onOpenSaleView?.(row.sale_id || row.id);
-        const openEdit = () => canEditSales ? onOpenSaleForEdit?.(row) : openInvoice();
+        const saleId = row.sale_id || row.id;
+        const openInvoice = () => onOpenSaleView?.(saleId);
+        const openEdit = () => {
+          if (!canEditSales) {
+            alert("You do not have permission to edit this bill.");
+            return;
+          }
+          onOpenSaleForEdit?.(row);
+        };
+        const printInvoice = () => onPrintSale?.(saleId);
+        const cancelInvoice = () => {
+          if (!canCancelSales) {
+            alert("You do not have permission to cancel this bill.");
+            return;
+          }
+          if (row.status_label === "Cancelled") {
+            alert("This invoice is already cancelled.");
+            return;
+          }
+          onCancelSale?.(row);
+        };
         const rowActions = (
           <div className="table-actions sales-history-actions">
-            <button className="secondary-button compact-button" onClick={openEdit}>{canEditSales ? "View / Edit" : "Open Bill"}</button>
-            <button className="secondary-button compact-button" onClick={openInvoice}>Print</button>
+            <button className="secondary-button compact-button" onClick={openInvoice}>View Bill</button>
+            <button className="secondary-button compact-button" onClick={openEdit}>Edit Bill</button>
+            <button className="secondary-button compact-button" onClick={printInvoice}>Print Bill</button>
+            <button className="remove-button compact-button" disabled={row.status_label === "Cancelled"} onClick={cancelInvoice}>Cancel Bill</button>
             {row.showing_matched_only && <button className="secondary-button compact-button" onClick={openInvoice}>View Full Invoice</button>}
-            {canEditSales && row.status_label !== "Cancelled" && <button className="remove-button compact-button" onClick={() => onCancelSale?.(row)}>Cancel</button>}
           </div>
         );
         if (salesFilters.viewMode === "INVOICE") {
@@ -8561,11 +8621,12 @@ function PaymentReceiptModal({ payment, onClose }) {
   );
 }
 
-function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = {} }) {
+function InvoiceModal({ autoPrintMode = null, invoice, onClose, paymentSettings = {}, printSettings = {} }) {
   const [printMode, setPrintMode] = useState(printSettings.default_invoice_print === "A4_INVOICE" || printSettings.default_printer_type === "A4" ? "A4" : "THERMAL");
   const [upiQrDataUrl, setUpiQrDataUrl] = useState("");
   const [exporting, setExporting] = useState(false);
   const invoiceRef = useRef(null);
+  const autoPrintedRef = useRef(false);
   const activePrintMode = printMode === "A4" ? "A4" : "THERMAL";
   const invoicePayments = invoice.payments || [];
   const showItemDiscountOnReceipt = printSettings.show_item_discount_column_receipt !== false;
@@ -8609,6 +8670,11 @@ function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = 
     setPrintMode(mode);
     withDocumentTitle(invoiceFileName(), () => setTimeout(() => window.print(), 100));
   };
+  useEffect(() => {
+    if (!autoPrintMode || autoPrintedRef.current) return;
+    autoPrintedRef.current = true;
+    printWithMode(autoPrintMode === "A4" ? "A4" : "THERMAL");
+  }, [autoPrintMode]);
   const exportInvoicePdf = async (mode = activePrintMode, save = true) => {
     setPrintMode(mode);
     setExporting(true);
