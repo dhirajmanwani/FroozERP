@@ -444,6 +444,8 @@ function App() {
   const [productLotAudit, setProductLotAudit] = useState([]);
   const [productListSearch, setProductListSearch] = useState("");
   const [lotListSearch, setLotListSearch] = useState("");
+  const [showEmptyLots, setShowEmptyLots] = useState(false);
+  const [showInventoryEmptyLots, setShowInventoryEmptyLots] = useState(false);
   const [showOpeningLotForm, setShowOpeningLotForm] = useState(false);
   const [lotAction, setLotAction] = useState(null);
   const [lotDraft, setLotDraft] = useState({
@@ -832,7 +834,7 @@ function App() {
   const loadReports = async (params = {}) => {
     const [response, inventoryResponse, cashBookResponse] = await Promise.all([
       axios.get(`${API_URL}/reports/summary`, { params }),
-      axios.get(`${API_URL}/inventory`),
+      axios.get(`${API_URL}/inventory`, { params: { include_cancelled: true } }),
       axios.get(`${API_URL}/reports/cash-book`, { params }),
     ]);
     setReportsData({ ...response.data, stockLotReport: inventoryResponse.data, cashBookReport: cashBookResponse.data });
@@ -1905,7 +1907,23 @@ function App() {
   const activeLabel = navigationItems.find(([view]) => view === activeView)?.[1];
   const canManageRates = ["Owner", "Admin"].includes(user.role);
   const canEditSales = ["Owner", "Admin"].includes(user.role);
-  const inventoryGroups = [...inventory.reduce((groups, batch) => {
+  const lotBalanceQuantity = (lot) => Number(lot.balance_qty ?? lot.remaining_qty ?? 0);
+  const lotUsedQuantity = (lot) => Number(lot.sold_qty ?? Math.max(Number(lot.purchase_qty || 0) - Number(lot.remaining_qty || 0), 0));
+  const lotStatusLabel = (lot) => {
+    const status = String(lot.batch_status || "ACTIVE").toUpperCase();
+    if (status === "CANCELLED") return "Cancelled";
+    if (status === "INACTIVE") return "Inactive";
+    if (lotBalanceQuantity(lot) <= 0 && lotUsedQuantity(lot) > 0) return "Sold Out";
+    return "Active";
+  };
+  const lotStatusClass = (lot) => {
+    const label = lotStatusLabel(lot);
+    if (label === "Active") return "stock-ok";
+    if (label === "Sold Out") return "origin-rate";
+    return "stock-low";
+  };
+  const visibleInventory = inventory.filter((batch) => showInventoryEmptyLots || lotBalanceQuantity(batch) > 0);
+  const inventoryGroups = [...visibleInventory.reduce((groups, batch) => {
     const key = String(batch.product_id);
     const current = groups.get(key) || {
       product_id: batch.product_id,
@@ -1940,6 +1958,7 @@ function App() {
   });
   const lotSearchText = lotListSearch.trim().toLowerCase();
   const filteredProductLots = productLots.filter((lot) => {
+    if (!showEmptyLots && lotBalanceQuantity(lot) <= 0) return false;
     if (!lotSearchText) return true;
     return [
       lot.lot_name,
@@ -1953,6 +1972,7 @@ function App() {
       lot.selling_rate,
       lot.batch_status || "ACTIVE",
       lot.remarks,
+      lotStatusLabel(lot),
     ].some((value) => String(value ?? "").toLowerCase().includes(lotSearchText));
   });
 
@@ -2201,11 +2221,15 @@ function App() {
                         onChange={(event) => setLotListSearch(event.target.value)}
                       />
                     </label>
+                    <label className="check-field report-check-field">
+                      <input checked={showEmptyLots} type="checkbox" onChange={(event) => setShowEmptyLots(event.target.checked)} />
+                      <span>Show Empty Lots</span>
+                    </label>
                     <DataTable headers={["Supplier", "Lot", "Size/Grade", "Opening Date", "Opening Qty", "Sold Qty", "Balance Qty", "Cost", "Sale Rate", "Remarks", "Actions"]}>
                       {filteredProductLots.length ? filteredProductLots.map((lot) => (
                         <tr key={lot.id}>
                           <td>{lot.supplier_name || "No supplier payable"}</td>
-                          <td className="primary-cell">{lot.lot_name || lot.batch_no || `Lot #${lot.id}`}<small className="cell-note">{lot.batch_status || "ACTIVE"}</small></td>
+                          <td className="primary-cell">{lot.lot_name || lot.batch_no || `Lot #${lot.id}`}<small className={`cell-note ${lotStatusClass(lot)}`}>{lotStatusLabel(lot)}</small></td>
                           <td>{lot.lot_size || "-"}</td>
                           <td>{formatDisplayDate(lot.purchase_date)}</td>
                           <td>{Number(lot.purchase_qty || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
@@ -2224,7 +2248,7 @@ function App() {
                           </td>
                         </tr>
                       )) : (
-                        <tr><td colSpan="11" className="empty-cell">{productLots.length ? "No matching lots found." : "No lots found for this product."}</td></tr>
+                        <tr><td colSpan="11" className="empty-cell">{productLots.length ? (showEmptyLots ? "No matching lots found." : "No active lots found. Enable Show Empty Lots to view sold-out lots.") : "No lots found for this product."}</td></tr>
                       )}
                     </DataTable>
                     <div className="button-row">
@@ -2553,6 +2577,16 @@ function App() {
 
           {activeView === "inventory" && (
             <ModuleCard eyebrow="Stock Control" title="Inventory Summary & Lot Details" subtitle="Product-wise stock with expandable lot-level purchase, opening stock and FIFO costing details.">
+              <div className="report-toolbar">
+                <div>
+                  <strong>Active Stock View</strong>
+                  <p className="form-note">Sold-out lots are hidden by default but remain preserved for invoices, reports and audit trails.</p>
+                </div>
+                <label className="check-field report-check-field">
+                  <input checked={showInventoryEmptyLots} type="checkbox" onChange={(event) => setShowInventoryEmptyLots(event.target.checked)} />
+                  <span>Show Empty Lots</span>
+                </label>
+              </div>
               <DataTable headers={["Category / Item", "Total Stock", "Avg Cost", "Stock Value", "Lot Details"]}>
                 {inventoryGroups.map((group) => {
                   const averageCost = group.total_stock > 0 ? group.stock_value / group.total_stock : 0;
@@ -2571,9 +2605,10 @@ function App() {
                     </tr>
                   );
                 })}
+                {inventoryGroups.length === 0 && <tr><td colSpan="5" className="empty-cell">{inventory.length ? "No active stock lots found. Enable Show Empty Lots to view sold-out lots." : "No inventory lots found."}</td></tr>}
               </DataTable>
               <DataTable headers={["Lot", "Category", "Item", "Supplier", "Date", "Source", "Received", "Balance", "Cost", "Sale Rate", "Status"]}>
-                {inventory.map((item) => (
+                {visibleInventory.map((item) => (
                   <tr key={item.id}>
                     <td><span className="batch-id">{item.lot_name || item.batch_no}{item.lot_size ? ` / ${item.lot_size}` : ""}</span></td>
                     <td>{item.category || "Fruit"}</td>
@@ -2585,9 +2620,10 @@ function App() {
                     <td><span className={Number(item.remaining_qty) <= 5 ? "stock-low" : "stock-ok"}>{item.remaining_qty}</span></td>
                     <td>{currency.format(Number(item.effective_cost_per_unit || item.purchase_rate))}</td>
                     <td>{currency.format(Number(item.temporary_sale_rate || 0))}</td>
-                    <td>{item.batch_status || "ACTIVE"}</td>
+                    <td><span className={lotStatusClass(item)}>{lotStatusLabel(item)}</span></td>
                   </tr>
                 ))}
+                {visibleInventory.length === 0 && <tr><td colSpan="11" className="empty-cell">{inventory.length ? "No active lots found. Enable Show Empty Lots to view sold-out lots." : "No inventory lots found."}</td></tr>}
               </DataTable>
             </ModuleCard>
           )}
@@ -2901,9 +2937,15 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
   );
 }
 
-function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenPurchaseAmendment, purchases }) {
+const matchesPendingBillSearch = (values, search) => {
+  const text = String(search || "").trim().toLowerCase();
+  if (!text) return true;
+  return values.some((value) => String(value ?? "").toLowerCase().includes(text));
+};
+
+function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenPurchaseAmendment, purchases, search = "" }) {
   const [selectedSupplierKey, setSelectedSupplierKey] = useState("");
-  const pendingRows = purchases.filter((purchase) =>
+  const basePendingRows = purchases.filter((purchase) =>
     purchase.purchase_status !== "CANCELLED" &&
     purchase.purchase_bill_status === "BILL_PENDING"
   );
@@ -2915,6 +2957,22 @@ function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEd
     return `${product} ${qty}${unit} @ ${receiptCurrency.format(rate)} = ${receiptCurrency.format(Number(purchase.quantity || 0) * rate)}`;
   };
   const estimatedValue = (purchase) => Number(purchase.quantity || 0) * Number(purchase.expected_purchase_rate || purchase.purchase_rate || 0);
+  const pendingRows = basePendingRows.filter((purchase) => matchesPendingBillSearch([
+    purchase.supplier_name,
+    purchase.firm_name,
+    purchase.purchase_date,
+    purchase.bill_number,
+    purchase.payment_mode,
+    purchase.purchase_type,
+    purchase.remarks,
+    purchase.product_name,
+    purchase.quantity,
+    purchase.expected_purchase_rate,
+    purchase.purchase_rate,
+    estimatedValue(purchase),
+    narration(purchase),
+    "Pending Bill",
+  ], search));
   const supplierSummaries = [...pendingRows.reduce((map, purchase) => {
     const key = String(purchase.supplier_id || purchase.supplier_name || "UNKNOWN");
     const summary = map.get(key) || {
@@ -2962,7 +3020,7 @@ function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEd
             </tr>
           ))}
         </DataTable>
-        {supplierSummaries.length === 0 && <div className="cart-empty">No pending purchase bills.</div>}
+        {supplierSummaries.length === 0 && <div className="cart-empty">{basePendingRows.length ? "No matching pending bills found." : "No pending purchase bills."}</div>}
       </ModuleCard>
 
       {selectedSupplier && (
@@ -3000,6 +3058,7 @@ function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEd
 function PendingBillsModule({ customerPendingBills = { summary: [], invoices: [] }, customers = [], onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenPurchaseAmendment, onReload, onViewInvoice, purchases, user }) {
   const [activeTab, setActiveTab] = useState("purchase");
   const [selectedCustomerKey, setSelectedCustomerKey] = useState("");
+  const [pendingSearch, setPendingSearch] = useState("");
   const [paymentDraft, setPaymentDraft] = useState({
     customer_id: "",
     payment_date: toDateKey(new Date()),
@@ -3008,7 +3067,49 @@ function PendingBillsModule({ customerPendingBills = { summary: [], invoices: []
     reference_number: "",
     remarks: "",
   });
-  const summaries = Array.isArray(customerPendingBills.summary) ? customerPendingBills.summary : [];
+  const rawSummaries = Array.isArray(customerPendingBills.summary) ? customerPendingBills.summary : [];
+  const summaries = rawSummaries
+    .map((summary) => {
+      const rows = Array.isArray(summary.rows) ? summary.rows : [];
+      const summaryMatches = matchesPendingBillSearch([
+        summary.customer_name,
+        summary.from,
+        summary.to,
+        summary.pending_bill_count,
+        summary.total_credit_amount,
+        summary.amount_received,
+        summary.balance,
+        "Customer Pending Bills",
+      ], pendingSearch);
+      const filteredRows = rows.filter((invoice) => matchesPendingBillSearch([
+        summary.customer_name,
+        invoice.customer_name,
+        invoice.invoice_no,
+        invoice.sale_date,
+        invoice.bill_date,
+        invoice.item_narration,
+        invoice.gross_amount,
+        invoice.item_discount_amount,
+        invoice.invoice_discount_amount,
+        invoice.total_amount,
+        invoice.received_amount,
+        invoice.balance_amount,
+        invoice.due_date,
+        invoice.credit_status,
+        invoice.payment_mode,
+        invoice.remarks,
+      ], pendingSearch));
+      return { ...summary, rows: summaryMatches ? rows : filteredRows };
+    })
+    .filter((summary) => matchesPendingBillSearch([
+      summary.customer_name,
+      summary.from,
+      summary.to,
+      summary.pending_bill_count,
+      summary.total_credit_amount,
+      summary.amount_received,
+      summary.balance,
+    ], pendingSearch) || summary.rows.length > 0);
   const selectedCustomer = summaries.find((summary) => summary.key === selectedCustomerKey);
   const canReceivePayment = ["Owner", "Admin", "Cashier"].includes(user.role);
 
@@ -3054,6 +3155,14 @@ function PendingBillsModule({ customerPendingBills = { summary: [], invoices: []
   return (
     <section className="settings-layout">
       <ModuleCard eyebrow="Operations" title="Pending Bills" subtitle="Complete supplier pending bills and settle customer credit invoices.">
+        <label className="icon-input table-search-input">
+          <Icon name="search" />
+          <input
+            placeholder="Search pending bill, customer, supplier, invoice..."
+            value={pendingSearch}
+            onChange={(event) => setPendingSearch(event.target.value)}
+          />
+        </label>
         <div className="settings-tabs">
           <button className={activeTab === "purchase" ? "tab-active" : ""} onClick={() => setActiveTab("purchase")}>Pending Purchase Bills</button>
           <button className={activeTab === "customer" ? "tab-active" : ""} onClick={() => setActiveTab("customer")}>Customer Pending Bills</button>
@@ -3067,6 +3176,7 @@ function PendingBillsModule({ customerPendingBills = { summary: [], invoices: []
           onEditPurchase={onEditPurchase}
           onOpenPurchaseAmendment={onOpenPurchaseAmendment}
           purchases={purchases}
+          search={pendingSearch}
         />
       )}
 
@@ -3092,7 +3202,7 @@ function PendingBillsModule({ customerPendingBills = { summary: [], invoices: []
                 </tr>
               ))}
             </DataTable>
-            {summaries.length === 0 && <div className="cart-empty">No customer pending bills.</div>}
+            {summaries.length === 0 && <div className="cart-empty">{rawSummaries.length ? "No matching pending bills found." : "No customer pending bills."}</div>}
           </ModuleCard>
 
           {selectedCustomer && (
@@ -3334,8 +3444,10 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
   const [balanceSheetDetailLoading, setBalanceSheetDetailLoading] = useState(false);
   const [balanceSheetDetailError, setBalanceSheetDetailError] = useState("");
   const [cashBookDetail, setCashBookDetail] = useState(null);
-  const [cashBookFilters, setCashBookFilters] = useState({ paymentMode: "", accountFilter: "" });
+  const [cashBookFilters, setCashBookFilters] = useState({ paymentMode: "", accountFilter: "", bookAccount: "CASH" });
   const [groupCashBookByDate, setGroupCashBookByDate] = useState(false);
+  const [showCashBookRemarks, setShowCashBookRemarks] = useState(true);
+  const [inventoryLotReportFilter, setInventoryLotReportFilter] = useState("ACTIVE");
   const [purchaseFilters, setPurchaseFilters] = useState({
     supplier: "",
     product: "",
@@ -3351,10 +3463,16 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
   const currentCashBookParams = (overrides = {}) => {
     const nextFilters = { ...cashBookFilters, ...(overrides.filters || {}) };
     const nextGroupByDate = overrides.groupByDate ?? groupCashBookByDate;
+    const bookAccount = nextFilters.bookAccount || "CASH";
+    const accountFilter = bookAccount === "CASH" ? "CASH" : "BANK";
+    const paymentMode = ["UPI", "CARD", "BANK_TRANSFER"].includes(bookAccount)
+      ? bookAccount
+      : nextFilters.paymentMode;
     return {
       ...currentReportParams(),
-      payment_mode: nextFilters.paymentMode,
-      account_filter: nextFilters.accountFilter,
+      payment_mode: paymentMode,
+      account_filter: accountFilter,
+      party_filter: nextFilters.accountFilter,
       search,
       group_by_date: nextGroupByDate ? "true" : "",
     };
@@ -3489,6 +3607,28 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
   const dayBookRows = clubRowsByDateAccount(filteredLedgerRows);
   const cashBookData = data.cashBookReport || {};
   const cashBookRows = filterRows(cashBookData.rows);
+  const stockLotRows = filterRows(data.stockLotReport).filter((row) => {
+    const status = String(row.batch_status || "ACTIVE").toUpperCase();
+    const balance = Number(row.remaining_qty ?? row.balance_qty ?? 0);
+    if (inventoryLotReportFilter === "ACTIVE") return balance > 0 && !["CANCELLED", "INACTIVE"].includes(status);
+    if (inventoryLotReportFilter === "SOLD_OUT") return !["CANCELLED", "INACTIVE"].includes(status);
+    return true;
+  });
+  const cashBookAccountMode = cashBookFilters.bookAccount || "CASH";
+  const isCashBookMode = cashBookAccountMode === "CASH";
+  const cashBookAccountLabel = cashBookAccountMode === "CASH"
+    ? "Cash"
+    : cashBookAccountMode === "UPI"
+      ? "UPI"
+      : cashBookAccountMode === "CARD"
+        ? "Card"
+        : cashBookAccountMode === "BANK_TRANSFER"
+          ? "Bank Transfer"
+          : "Bank / UPI / Card";
+  const cashBookOpening = Number((isCashBookMode ? cashBookData.opening_cash : cashBookData.opening_bank) || 0);
+  const cashBookReceipts = Number((isCashBookMode ? cashBookData.cash_receipts : cashBookData.bank_receipts) || 0);
+  const cashBookPayments = Number((isCashBookMode ? cashBookData.cash_payments : cashBookData.bank_payments) || 0);
+  const cashBookClosing = Number((isCashBookMode ? cashBookData.closing_cash : cashBookData.closing_bank) || 0);
   const salesChanges = filterRows(data.salesChangeReport);
   const editedBills = salesChanges.filter((row) => row.sale_status === "EDITED" || row.edited_at);
   const cancelledBills = salesChanges.filter((row) => row.sale_status === "CANCELLED" || row.cancelled_at);
@@ -3982,10 +4122,15 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
     },
     lotWiseStock: {
       title: "Lot Wise Stock",
-      rows: filterRows(data.stockLotReport),
+      rows: stockLotRows,
       summary: (rows) => [["Lot Stock Value", money(rows.reduce((sum, row) => sum + Number(row.remaining_qty || 0) * Number(row.effective_cost_per_unit || row.purchase_rate || 0), 0)), true], ["Lots", rows.length], ["Categories", new Set(rows.map((row) => row.category || "Fruit")).size]],
-      headers: ["Category", "Item", "Lot / Size", "Source", "Supplier", "Received", "Balance", "Cost", "Value"],
-      render: (row) => <tr key={row.id}><td>{row.category || "Fruit"}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{row.lot_name || row.batch_no}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td><span className="tag">{row.stock_source || "PURCHASE"}</span></td><td>{row.supplier_name || "-"}</td><td>{number(row.purchase_qty)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.effective_cost_per_unit || row.purchase_rate)}</td><td>{money(Number(row.remaining_qty || 0) * Number(row.effective_cost_per_unit || row.purchase_rate || 0))}</td></tr>,
+      headers: ["Category", "Item", "Lot / Size", "Source", "Supplier", "Received", "Balance", "Cost", "Value", "Status"],
+      render: (row) => {
+        const status = String(row.batch_status || "ACTIVE").toUpperCase();
+        const balance = Number(row.remaining_qty ?? row.balance_qty ?? 0);
+        const statusLabel = status === "CANCELLED" ? "Cancelled" : status === "INACTIVE" ? "Inactive" : balance <= 0 ? "Sold Out" : "Active";
+        return <tr key={row.id}><td>{row.category || "Fruit"}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{row.lot_name || row.batch_no}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td><span className="tag">{row.stock_source || "PURCHASE"}</span></td><td>{row.supplier_name || "-"}</td><td>{number(row.purchase_qty)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.effective_cost_per_unit || row.purchase_rate)}</td><td>{money(Number(row.remaining_qty || 0) * Number(row.effective_cost_per_unit || row.purchase_rate || 0))}</td><td><span className={statusLabel === "Active" ? "stock-ok" : statusLabel === "Sold Out" ? "origin-rate" : "stock-low"}>{statusLabel}</span></td></tr>;
+      },
     },
     profitLoss: {
       title: "Profit & Loss",
@@ -4034,14 +4179,10 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       title: "Cash Book / Bank Book",
       rows: cashBookRows,
       summary: () => [
-        ["Opening Cash", money(cashBookData.opening_cash), true],
-        ["Opening Bank/UPI/Card", money(cashBookData.opening_bank)],
-        ["Cash Receipts", money(cashBookData.cash_receipts)],
-        ["Bank Receipts", money(cashBookData.bank_receipts)],
-        ["Cash Payments", money(cashBookData.cash_payments)],
-        ["Bank Payments", money(cashBookData.bank_payments)],
-        ["Closing Cash", money(cashBookData.closing_cash)],
-        ["Closing Bank/UPI/Card", money(cashBookData.closing_bank)],
+        [`Opening ${cashBookAccountLabel}`, money(cashBookOpening), true],
+        [`${cashBookAccountLabel} Receipts`, money(cashBookReceipts)],
+        [`${cashBookAccountLabel} Payments`, money(cashBookPayments)],
+        [`Closing ${cashBookAccountLabel}`, money(cashBookClosing), true],
         ["Total Closing", money(cashBookData.total_closing), true],
       ],
       headers: ["Date", "Particulars / Account", "Narration", "Receipt Cash", "Receipt Bank/UPI/Card", "Payment Cash", "Payment Bank/UPI/Card", "Cash Balance", "Bank Balance", "Total Balance", "Reference / Bill No"],
@@ -4230,17 +4371,33 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       )}
       {selectedReport === "cashBook" && (
         <>
+          <Field label="Book Account">
+            <select value={cashBookFilters.bookAccount} onChange={(event) => {
+              const next = { ...cashBookFilters, bookAccount: event.target.value, paymentMode: "" };
+              setCashBookFilters(next);
+              reloadCashBook(next, groupCashBookByDate);
+            }}>
+              <option value="CASH">Cash</option>
+              <option value="BANK">All Bank / UPI / Card</option>
+              <option value="UPI">UPI</option>
+              <option value="CARD">Card</option>
+              <option value="BANK_TRANSFER">Bank Transfer</option>
+            </select>
+          </Field>
           <Field label="Payment Mode">
             <select value={cashBookFilters.paymentMode} onChange={(event) => {
               const next = { ...cashBookFilters, paymentMode: event.target.value };
               setCashBookFilters(next);
               reloadCashBook(next, groupCashBookByDate);
-            }}>
+            }} disabled={["UPI", "CARD", "BANK_TRANSFER"].includes(cashBookFilters.bookAccount)}>
               <option value="">All modes</option>
-              <option value="CASH">Cash</option>
-              <option value="UPI">UPI</option>
-              <option value="CARD">Card</option>
-              <option value="BANK_TRANSFER">Bank Transfer</option>
+              {cashBookFilters.bookAccount === "CASH" ? <option value="CASH">Cash</option> : (
+                <>
+                  <option value="UPI">UPI</option>
+                  <option value="CARD">Card</option>
+                  <option value="BANK_TRANSFER">Bank Transfer</option>
+                </>
+              )}
             </select>
           </Field>
           <Field label="Account / Party">
@@ -4255,9 +4412,12 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
               <option value="EXPENSE">Expense</option>
               <option value="EMPLOYEE">Employee</option>
               <option value="OWNER">Owner</option>
-              <option value="BANK">Bank</option>
             </select>
           </Field>
+          <label className="check-field report-check-field">
+            <input checked={showCashBookRemarks} type="checkbox" onChange={(event) => setShowCashBookRemarks(event.target.checked)} />
+            <span>Show Entry Wise Remarks</span>
+          </label>
           <label className="check-field report-check-field">
             <input checked={groupCashBookByDate} type="checkbox" onChange={(event) => {
               const next = event.target.checked;
@@ -4267,12 +4427,21 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
             <span>Group by Date</span>
           </label>
           <button className="secondary-button" onClick={() => {
-            const next = { paymentMode: "", accountFilter: "" };
+            const next = { paymentMode: "", accountFilter: "", bookAccount: "CASH" };
             setCashBookFilters(next);
             setGroupCashBookByDate(false);
             reloadCashBook(next, false);
           }}>Clear Cash Book Filters</button>
         </>
+      )}
+      {selectedReport === "lotWiseStock" && (
+        <Field label="Lot Visibility">
+          <select value={inventoryLotReportFilter} onChange={(event) => setInventoryLotReportFilter(event.target.value)}>
+            <option value="ACTIVE">Active Stock Only</option>
+            <option value="SOLD_OUT">Include Sold Out Lots</option>
+            <option value="ALL">Include Cancelled/Inactive Lots</option>
+          </select>
+        </Field>
       )}
       {selectedReport === "salesHistory" && (
         <>
@@ -4449,6 +4618,78 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       </div>
     );
   };
+  const renderCashBookStatement = () => {
+    const receiptRows = cashBookRows.filter((row) =>
+      Number((isCashBookMode ? row.receipt_cash : row.receipt_bank) || 0) > 0
+    );
+    const paymentRows = cashBookRows.filter((row) =>
+      Number((isCashBookMode ? row.payment_cash : row.payment_bank) || 0) > 0
+    );
+    const receiptAmount = (row) => Number((isCashBookMode ? row.receipt_cash : row.receipt_bank) || 0);
+    const paymentAmount = (row) => Number((isCashBookMode ? row.payment_cash : row.payment_bank) || 0);
+    const renderBookRow = (row, amount, type) => (
+      <tr key={`${type}-${row.date}-${row.reference_no}-${row.source_id}`} onDoubleClick={() => setCashBookDetail(row)}>
+        <td>{formatDisplayDate(row.date)}</td>
+        <td className="primary-cell">
+          {row.account_name || row.party_name || "-"}
+          {showCashBookRemarks && <small className="cell-note">{row.narration || "-"}</small>}
+        </td>
+        <td><span className="tag">{row.source_type || type}</span></td>
+        <td className="balance-cell">{money(amount)}</td>
+      </tr>
+    );
+    return (
+      <section className="cash-book-statement">
+        <div className="pl-title-block cash-book-title">
+          <span>{isCashBookMode ? "Cash Book" : "Bank Book"}</span>
+          <h2>{isCashBookMode ? "Cash Book" : "Bank Book / UPI / Card Book"}</h2>
+          <p>{cashBookAccountLabel} | {formatDisplayDate(cashBookData.dateFrom || data.dateFrom)} to {formatDisplayDate(cashBookData.dateTo || data.dateTo)}</p>
+        </div>
+        {cashBookClosing < 0 && (
+          <div className="cash-book-warning">
+            {isCashBookMode ? "Cash balance" : "Bank balance"} is negative. Please verify opening balance and entries.
+          </div>
+        )}
+        <div className="cash-book-sides">
+          <section className="cash-book-panel">
+            <h3>Receipts / Inflow</h3>
+            <DataTable headers={["Date", "Particulars", "Type", "Receipt Amount"]}>
+              <tr className="date-total-row">
+                <td>{formatDisplayDate(cashBookData.dateFrom || data.dateFrom)}</td>
+                <td className="primary-cell">Opening Balance</td>
+                <td><span className="tag">Opening</span></td>
+                <td className="balance-cell">{money(cashBookOpening)}</td>
+              </tr>
+              {receiptRows.map((row) => renderBookRow(row, receiptAmount(row), "receipt"))}
+              {receiptRows.length === 0 && <tr><td colSpan="4" className="empty-cell">No receipts found for this range.</td></tr>}
+              <tr className="date-total-row">
+                <td colSpan="3">Total Receipts</td>
+                <td className="balance-cell">{money(cashBookReceipts)}</td>
+              </tr>
+            </DataTable>
+          </section>
+          <section className="cash-book-panel">
+            <h3>Payments / Outflow</h3>
+            <DataTable headers={["Date", "Particulars", "Type", "Payment Amount"]}>
+              {paymentRows.map((row) => renderBookRow(row, paymentAmount(row), "payment"))}
+              {paymentRows.length === 0 && <tr><td colSpan="4" className="empty-cell">No payments found for this range.</td></tr>}
+              <tr className="date-total-row">
+                <td colSpan="3">Total Payments</td>
+                <td className="balance-cell">{money(cashBookPayments)}</td>
+              </tr>
+            </DataTable>
+          </section>
+        </div>
+        <div className="cash-book-closing">
+          <span>Opening Balance: <strong>{money(cashBookOpening)}</strong></span>
+          <span>Total Receipts: <strong>{money(cashBookReceipts)}</strong></span>
+          <span>Total Payments: <strong>{money(cashBookPayments)}</strong></span>
+          <span>Closing Balance: <strong>{money(cashBookClosing)}</strong></span>
+          <span>Total Cash + Bank: <strong>{money(cashBookData.total_closing)}</strong></span>
+        </div>
+      </section>
+    );
+  };
   if (currentReport) {
     const rows = currentReport.rows || [];
     const handleReportPrintOption = () => {
@@ -4495,8 +4736,8 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       const title = safeFileName(currentReport.title);
       if (selectedReport === "balanceSheet") return `Balance_Sheet_As_At_${to}.pdf`;
       if (selectedReport === "cashBook") {
-        const mode = accountReportFilters.paymentMode || "All";
-        return `Cash_Book_${cashBookFilters.paymentMode || mode}_${from}_to_${to}.pdf`;
+        const mode = cashBookFilters.bookAccount || cashBookFilters.paymentMode || "All";
+        return `${mode === "CASH" ? "Cash_Book" : "Bank_Book"}_${cashBookFilters.paymentMode || mode}_${from}_to_${to}.pdf`;
       }
       return `${title}_${from}_to_${to}.pdf`;
     })();
@@ -4516,13 +4757,13 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
               beforePdfExport={handleReportPrintOption}
               beforePrint={handleReportPrintOption}
               fileName={reportFileName}
-              reportClassName={selectedReport === "salesHistory" ? "sales-history-print-report" : selectedReport === "purchaseHistory" ? "purchase-history-print-report" : selectedReport === "profitLoss" ? "profit-loss-print-report" : ""}
+              reportClassName={selectedReport === "salesHistory" ? "sales-history-print-report" : selectedReport === "purchaseHistory" ? "purchase-history-print-report" : selectedReport === "profitLoss" ? "profit-loss-print-report" : selectedReport === "cashBook" ? "cash-book-print-report" : ""}
               title={currentReport.title}
             >
               <div className="purchase-summary-grid supplier-payment-preview">
                 {(currentReport.summary?.(rows) || []).map(([label, value, featured]) => <SummaryMetric featured={featured} key={label} label={label} value={value} />)}
               </div>
-              {selectedReport === "profitLoss" ? renderProfitLossStatement() : (
+              {selectedReport === "profitLoss" ? renderProfitLossStatement() : selectedReport === "cashBook" ? renderCashBookStatement() : (
                 <>
                   <DataTable headers={currentReport.headers}>
                     {selectedReport === "purchaseHistory" ? renderPurchaseHistoryRows() : rows.map((row, index) => currentReport.render(row, index))}

@@ -814,6 +814,26 @@ const initializeDatabase = async () => {
       error_message TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS contra_entries (
+      id SERIAL PRIMARY KEY,
+      contra_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      contra_type VARCHAR(30) NOT NULL,
+      amount NUMERIC(14, 2) NOT NULL DEFAULT 0 CHECK (amount >= 0),
+      cash_account VARCHAR(120) DEFAULT 'Cash',
+      bank_account VARCHAR(120) DEFAULT 'Bank',
+      reference_number VARCHAR(120),
+      remarks TEXT,
+      branch_id INTEGER REFERENCES branches(id),
+      created_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      cancelled BOOLEAN DEFAULT FALSE,
+      cancelled_at TIMESTAMP,
+      cancelled_by INTEGER REFERENCES users(id)
+    );
+    ALTER TABLE contra_entries ADD COLUMN IF NOT EXISTS cancelled BOOLEAN DEFAULT FALSE;
+    ALTER TABLE contra_entries ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP;
+    ALTER TABLE contra_entries ADD COLUMN IF NOT EXISTS cancelled_by INTEGER REFERENCES users(id);
+
     CREATE TABLE IF NOT EXISTS expenses (
       id SERIAL PRIMARY KEY,
       expense_date DATE NOT NULL DEFAULT CURRENT_DATE,
@@ -1693,6 +1713,7 @@ const getCashBookReport = async ({
   dateTo = toDateKey(new Date()),
   paymentMode = "",
   accountFilter = "",
+  partyFilter = "",
   search = "",
   groupByDate = false,
   lineKey = "",
@@ -1701,6 +1722,7 @@ const getCashBookReport = async ({
   const to = isDateInput(dateTo) ? dateTo : from;
   const normalizedPaymentMode = normalizePaymentMode(paymentMode || "");
   const normalizedAccountFilter = String(accountFilter || "").trim().toUpperCase();
+  const normalizedPartyFilter = String(partyFilter || "").trim().toUpperCase();
   const searchText = cleanText(search).toLowerCase();
   const result = await pool.query(
     `
@@ -1850,6 +1872,78 @@ const getCashBookReport = async ({
       FROM sale_returns sr
       WHERE sr.return_date <= $1
         AND sr.refund_type IN ('CASH_REFUND', 'UPI_REFUND')
+      UNION ALL
+      SELECT
+        ce.contra_date AS date,
+        ce.created_at AS entry_time,
+        'Contra A/c - ' || COALESCE(ce.bank_account, 'Bank') AS account_name,
+        'CONTRA' AS account_type,
+        COALESCE(ce.bank_account, 'Bank') AS party_name,
+        'Cash deposited into ' || COALESCE(ce.bank_account, 'Bank') || COALESCE(' | ' || ce.remarks, '') AS narration,
+        'CASH' AS payment_mode,
+        'PAYMENT' AS direction,
+        ce.amount,
+        COALESCE(ce.reference_number, 'CONTRA-' || ce.id) AS reference_no,
+        'Contra Payment' AS source_type,
+        ce.id AS source_id
+      FROM contra_entries ce
+      WHERE ce.cancelled = FALSE
+        AND ce.contra_type = 'CASH_TO_BANK'
+        AND ce.contra_date <= $1
+      UNION ALL
+      SELECT
+        ce.contra_date AS date,
+        ce.created_at AS entry_time,
+        'Contra A/c - ' || COALESCE(ce.cash_account, 'Cash') AS account_name,
+        'CONTRA' AS account_type,
+        COALESCE(ce.cash_account, 'Cash') AS party_name,
+        'Cash deposited into ' || COALESCE(ce.bank_account, 'Bank') || COALESCE(' | ' || ce.remarks, '') AS narration,
+        'BANK_TRANSFER' AS payment_mode,
+        'RECEIPT' AS direction,
+        ce.amount,
+        COALESCE(ce.reference_number, 'CONTRA-' || ce.id) AS reference_no,
+        'Contra Receipt' AS source_type,
+        ce.id AS source_id
+      FROM contra_entries ce
+      WHERE ce.cancelled = FALSE
+        AND ce.contra_type = 'CASH_TO_BANK'
+        AND ce.contra_date <= $1
+      UNION ALL
+      SELECT
+        ce.contra_date AS date,
+        ce.created_at AS entry_time,
+        'Contra A/c - ' || COALESCE(ce.bank_account, 'Bank') AS account_name,
+        'CONTRA' AS account_type,
+        COALESCE(ce.bank_account, 'Bank') AS party_name,
+        'Cash withdrawn from ' || COALESCE(ce.bank_account, 'Bank') || COALESCE(' | ' || ce.remarks, '') AS narration,
+        'BANK_TRANSFER' AS payment_mode,
+        'PAYMENT' AS direction,
+        ce.amount,
+        COALESCE(ce.reference_number, 'CONTRA-' || ce.id) AS reference_no,
+        'Contra Payment' AS source_type,
+        ce.id AS source_id
+      FROM contra_entries ce
+      WHERE ce.cancelled = FALSE
+        AND ce.contra_type = 'BANK_TO_CASH'
+        AND ce.contra_date <= $1
+      UNION ALL
+      SELECT
+        ce.contra_date AS date,
+        ce.created_at AS entry_time,
+        'Contra A/c - ' || COALESCE(ce.cash_account, 'Cash') AS account_name,
+        'CONTRA' AS account_type,
+        COALESCE(ce.cash_account, 'Cash') AS party_name,
+        'Cash withdrawn from ' || COALESCE(ce.bank_account, 'Bank') || COALESCE(' | ' || ce.remarks, '') AS narration,
+        'CASH' AS payment_mode,
+        'RECEIPT' AS direction,
+        ce.amount,
+        COALESCE(ce.reference_number, 'CONTRA-' || ce.id) AS reference_no,
+        'Contra Receipt' AS source_type,
+        ce.id AS source_id
+      FROM contra_entries ce
+      WHERE ce.cancelled = FALSE
+        AND ce.contra_type = 'BANK_TO_CASH'
+        AND ce.contra_date <= $1
     ) cash_rows
     ORDER BY date, entry_time, reference_no
     `,
@@ -1877,6 +1971,7 @@ const getCashBookReport = async ({
       if (lineKey === "cash_at_bank" && row.mode_group !== "BANK") return false;
       if (normalizedPaymentMode && normalizePaymentMode(row.payment_mode) !== normalizedPaymentMode) return false;
       if (normalizedAccountFilter && normalizedAccountFilter !== "ALL" && row.account_type !== normalizedAccountFilter && row.mode_group !== normalizedAccountFilter) return false;
+      if (normalizedPartyFilter && normalizedPartyFilter !== "ALL" && row.account_type !== normalizedPartyFilter) return false;
       if (searchText) {
         const haystack = [
           row.account_name, row.party_name, row.narration, row.payment_mode,
@@ -4485,6 +4580,7 @@ app.post("/products/:id/cancel", async (req, res) => {
 
 app.get("/inventory", async (req, res) => {
   try {
+    const includeCancelled = String(req.query.include_cancelled || "").toLowerCase() === "true";
     const result = await pool.query(`
       SELECT
         ib.id,
@@ -4520,9 +4616,9 @@ app.get("/inventory", async (req, res) => {
         ib.purchase_date
       FROM inventory_batches ib
       JOIN products p ON p.id = ib.product_id
-      WHERE COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+      WHERE ($1::boolean = TRUE OR COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED')
       ORDER BY ib.purchase_date, ib.created_at, ib.id
-    `);
+    `, [includeCancelled]);
 
     return res.json(result.rows);
   } catch (error) {
@@ -6166,6 +6262,7 @@ app.get("/reports/cash-book", async (req, res) => {
       dateTo,
       paymentMode: req.query.payment_mode,
       accountFilter: req.query.account_filter,
+      partyFilter: req.query.party_filter,
       search: req.query.search,
       groupByDate: String(req.query.group_by_date || "").toLowerCase() === "true",
     });
@@ -6173,6 +6270,62 @@ app.get("/reports/cash-book", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Cash Book" });
+  }
+});
+
+app.get("/contra-entries", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM contra_entries
+      WHERE cancelled = FALSE
+      ORDER BY contra_date DESC, created_at DESC, id DESC
+      `
+    );
+    return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Contra Entries" });
+  }
+});
+
+app.post("/contra-entries", async (req, res) => {
+  try {
+    const contraType = String(req.body.contra_type || "").trim().toUpperCase();
+    const amount = parsePositiveNumber(req.body.amount);
+    if (!["CASH_TO_BANK", "BANK_TO_CASH"].includes(contraType)) {
+      return res.status(400).json({ message: "Select valid contra type" });
+    }
+    if (!amount) {
+      return res.status(400).json({ message: "Enter valid contra amount" });
+    }
+    const contraDate = isDateInput(req.body.contra_date) ? req.body.contra_date : toDateKey(new Date());
+    const result = await pool.query(
+      `
+      INSERT INTO contra_entries (
+        contra_date, contra_type, amount, cash_account, bank_account,
+        reference_number, remarks, branch_id, created_by
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING *
+      `,
+      [
+        contraDate,
+        contraType,
+        amount,
+        cleanText(req.body.cash_account) || "Cash",
+        cleanText(req.body.bank_account) || "Bank",
+        nullableText(req.body.reference_number),
+        nullableText(req.body.remarks),
+        parsePositiveInteger(req.body.branch_id),
+        parsePositiveInteger(req.body.created_by),
+      ]
+    );
+    return res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Saving Contra Entry" });
   }
 });
 

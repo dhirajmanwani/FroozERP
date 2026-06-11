@@ -1829,6 +1829,91 @@ tbody tr:last-child td {
   font-weight: 650;
 }
 
+.cash-book-statement {
+  display: grid;
+  gap: 14px;
+}
+
+.cash-book-title {
+  margin-bottom: 0;
+}
+
+.cash-book-warning {
+  padding: 11px 13px;
+  border: 1px solid rgba(251, 113, 133, 0.34);
+  border-radius: 12px;
+  color: #fecdd3;
+  background: rgba(127, 29, 29, 0.22);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.cash-book-sides {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.cash-book-panel {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 14px;
+  background: rgba(15, 23, 42, 0.34);
+}
+
+.cash-book-panel h3 {
+  margin: 0;
+  padding: 11px 13px;
+  border-bottom: 1px solid rgba(245, 158, 11, 0.16);
+  color: #f59e0b;
+  background: rgba(245, 158, 11, 0.08);
+  font-size: 12px;
+  font-weight: 900;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+}
+
+.cash-book-panel .table-wrap {
+  border: 0;
+  border-radius: 0;
+}
+
+.cash-book-panel td,
+.cash-book-panel th {
+  vertical-align: top;
+}
+
+.cash-book-panel .cell-note {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.cash-book-closing {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.cash-book-closing span {
+  display: block;
+  padding: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 12px;
+  color: #94a3b8;
+  background: rgba(15, 23, 42, 0.4);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.cash-book-closing strong {
+  display: block;
+  margin-top: 5px;
+  color: #f8fafc;
+  font-size: 14px;
+  font-weight: 900;
+}
+
 .receipt-summary {
   display: grid;
   gap: 8px;
@@ -2174,6 +2259,11 @@ tbody tr:last-child td {
 @media (max-width: 1100px) {
   .kpi-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .cash-book-sides,
+  .cash-book-closing {
+    grid-template-columns: 1fr;
   }
 
   .pos-layout {
@@ -2526,6 +2616,62 @@ tbody tr:last-child td {
     color: #111827 !important;
     background: #f3f4f6 !important;
     font-weight: 800 !important;
+  }
+
+  .print-section.cash-book-print-report.print-target .report-paper {
+    padding: 9mm !important;
+    font-size: 8.5px !important;
+  }
+
+  .print-section.cash-book-print-report.print-target .cash-book-statement,
+  .print-section.cash-book-print-report.print-target .cash-book-sides {
+    gap: 6px !important;
+  }
+
+  .print-section.cash-book-print-report.print-target .cash-book-sides {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr !important;
+  }
+
+  .print-section.cash-book-print-report.print-target .cash-book-panel,
+  .print-section.cash-book-print-report.print-target .cash-book-title,
+  .print-section.cash-book-print-report.print-target .cash-book-closing span {
+    border-color: #d1d5db !important;
+    border-radius: 0 !important;
+    color: #111827 !important;
+    background: #ffffff !important;
+    box-shadow: none !important;
+  }
+
+  .print-section.cash-book-print-report.print-target .cash-book-panel h3 {
+    padding: 5px 6px !important;
+    color: #111827 !important;
+    background: #f3f4f6 !important;
+    border-bottom: 1px solid #d1d5db !important;
+    font-size: 9px !important;
+  }
+
+  .print-section.cash-book-print-report.print-target .cash-book-closing {
+    grid-template-columns: repeat(5, 1fr) !important;
+    gap: 4px !important;
+  }
+
+  .print-section.cash-book-print-report.print-target .cash-book-closing span,
+  .print-section.cash-book-print-report.print-target .cash-book-closing strong,
+  .print-section.cash-book-print-report.print-target .cash-book-title span,
+  .print-section.cash-book-print-report.print-target .cash-book-title h2,
+  .print-section.cash-book-print-report.print-target .cash-book-title p {
+    color: #111827 !important;
+  }
+
+  .print-section.cash-book-print-report.print-target .cash-book-closing span {
+    padding: 5px !important;
+    font-size: 8px !important;
+  }
+
+  .print-section.cash-book-print-report.print-target .cash-book-closing strong {
+    margin-top: 2px !important;
+    font-size: 9px !important;
   }
 
   .print-section.profit-loss-print-report.print-target .report-paper {
