@@ -2252,6 +2252,29 @@ tbody tr:last-child td {
   margin-top: 20px;
 }
 
+.device-activation-panel {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  padding: 14px;
+  border: 1px solid rgba(245, 158, 11, 0.24);
+  border-radius: 14px;
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.device-activation-panel strong {
+  color: #f8fafc;
+  font-size: 14px;
+}
+
+.device-activation-panel small,
+.device-activation-panel p {
+  margin: 0;
+  color: #cbd5e1;
+  font-size: 12px;
+  font-weight: 650;
+}
+
 .sidebar-overlay {
   display: none;
 }

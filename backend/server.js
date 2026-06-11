@@ -1,12 +1,15 @@
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { execFile } = require("child_process");
 const { Pool, types } = require("pg");
 
 types.setTypeParser(1082, (value) => value);
 
 const app = express();
-app.use(cors());
 app.use(express.json());
 
 const pool = new Pool({
@@ -17,6 +20,34 @@ const pool = new Pool({
   port: Number(process.env.DB_PORT) || 5432,
 });
 const port = Number(process.env.PORT) || 5000;
+const host = process.env.HOST || "0.0.0.0";
+const backupDirectory = process.env.BACKUP_DIR || path.join(__dirname, "..", "backups");
+const allowedCorsOrigins = String(process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+const isPrivateNetworkHost = (hostname) =>
+  hostname === "localhost" ||
+  hostname === "127.0.0.1" ||
+  hostname === "::1" ||
+  /^10\./.test(hostname) ||
+  /^192\.168\./.test(hostname) ||
+  /^172\.(1[6-9]|2\d|3[0-1])\./.test(hostname);
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedCorsOrigins.includes("*") || allowedCorsOrigins.includes(origin)) return callback(null, true);
+    try {
+      const parsed = new URL(origin);
+      if (isPrivateNetworkHost(parsed.hostname)) return callback(null, true);
+    } catch {
+      return callback(new Error("Invalid CORS origin"));
+    }
+    return callback(new Error("Origin not allowed by FroozERP CORS"));
+  },
+}));
 
 const parsePositiveNumber = (value) => {
   const number = Number(value);
@@ -37,6 +68,34 @@ const roundCurrency = (value) => Math.round((Number(value) + Number.EPSILON) * 1
 const roundUnitCost = (value) => Math.round((Number(value) + Number.EPSILON) * 10000) / 10000;
 const hashPassword = (password) =>
   crypto.createHash("sha256").update(String(password || ""), "utf8").digest("hex");
+const hashActivationCode = (code) =>
+  crypto.createHash("sha256").update(String(code || "").trim().toUpperCase(), "utf8").digest("hex");
+const generateActivationCode = () => `FTF-${crypto.randomBytes(3).toString("hex").toUpperCase()}-${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
+const getLanIpAddresses = () => Object.values(os.networkInterfaces())
+  .flat()
+  .filter((entry) => entry && entry.family === "IPv4" && !entry.internal)
+  .map((entry) => entry.address);
+const getPrimaryLanIp = () => getLanIpAddresses()[0] || "localhost";
+const ensureDirectory = async (directory) => {
+  await fs.promises.mkdir(directory, { recursive: true });
+  return directory;
+};
+const formatBackupTimestamp = (date = new Date()) => {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}_${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`;
+};
+const execFileAsync = (file, args, options = {}) => new Promise((resolve, reject) => {
+  execFile(file, args, options, (error, stdout, stderr) => {
+    if (error) {
+      error.stdout = stdout;
+      error.stderr = stderr;
+      reject(error);
+      return;
+    }
+    resolve({ stdout, stderr });
+  });
+});
+const escapePowerShellSingleQuoted = (value) => String(value).replace(/'/g, "''");
 const passwordMatches = (password, storedHash) => {
   const stored = cleanText(storedHash);
   if (!stored) return false;
@@ -99,6 +158,11 @@ const PERMISSION_KEYS = [
   "manual_pos_rate_override",
   "pos_date_override",
   "sale_date_edit",
+  "device_management",
+  "activation_codes",
+  "backup_restore",
+  "branch_settings",
+  "system_info",
 ];
 
 const cleanText = (value) => (typeof value === "string" ? value.trim() : "");
@@ -167,8 +231,22 @@ const initializeDatabase = async () => {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     ALTER TABLE branches ADD COLUMN IF NOT EXISTS location VARCHAR(160);
+    ALTER TABLE branches ADD COLUMN IF NOT EXISTS address TEXT;
+    ALTER TABLE branches ADD COLUMN IF NOT EXISTS phone_number VARCHAR(40);
+    ALTER TABLE branches ADD COLUMN IF NOT EXISTS gst_number VARCHAR(80);
     ALTER TABLE branches ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE;
     ALTER TABLE branches ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+    ALTER TABLE branches ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+    CREATE TABLE IF NOT EXISTS counters (
+      id SERIAL PRIMARY KEY,
+      branch_id INTEGER REFERENCES branches(id),
+      counter_name VARCHAR(120) NOT NULL,
+      counter_type VARCHAR(40) NOT NULL DEFAULT 'RETAIL_COUNTER',
+      active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
     CREATE TABLE IF NOT EXISTS roles (
       id SERIAL PRIMARY KEY,
@@ -192,6 +270,7 @@ const initializeDatabase = async () => {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS notes TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS counter_id INTEGER REFERENCES counters(id);
     CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_unique_idx
       ON users (LOWER(username));
 
@@ -205,6 +284,7 @@ const initializeDatabase = async () => {
       sale_date DATE DEFAULT CURRENT_DATE,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS counter_id INTEGER REFERENCES counters(id);
 
     CREATE TABLE IF NOT EXISTS suppliers (
       id SERIAL PRIMARY KEY,
@@ -370,6 +450,7 @@ const initializeDatabase = async () => {
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS lot_name VARCHAR(120);
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS lot_size VARCHAR(120);
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS stock_source VARCHAR(40) DEFAULT 'PURCHASE';
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS counter_id INTEGER REFERENCES counters(id);
     UPDATE purchases SET purchase_status = 'ACTIVE' WHERE purchase_status IS NULL;
 
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS basic_amount NUMERIC(14, 2) DEFAULT 0;
@@ -622,6 +703,7 @@ const initializeDatabase = async () => {
     ALTER TABLE supplier_payments ADD COLUMN IF NOT EXISTS edited_by INTEGER REFERENCES users(id);
     ALTER TABLE supplier_payments ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP;
     ALTER TABLE supplier_payments ADD COLUMN IF NOT EXISTS edit_reason TEXT;
+    ALTER TABLE supplier_payments ADD COLUMN IF NOT EXISTS counter_id INTEGER REFERENCES counters(id);
 
     CREATE TABLE IF NOT EXISTS supplier_payment_audit (
       id SERIAL PRIMARY KEY,
@@ -722,6 +804,7 @@ const initializeDatabase = async () => {
     ALTER TABLE customer_payments ADD COLUMN IF NOT EXISTS edited_by INTEGER REFERENCES users(id);
     ALTER TABLE customer_payments ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP;
     ALTER TABLE customer_payments ADD COLUMN IF NOT EXISTS edit_reason TEXT;
+    ALTER TABLE customer_payments ADD COLUMN IF NOT EXISTS counter_id INTEGER REFERENCES counters(id);
 
     CREATE TABLE IF NOT EXISTS customer_payment_audit (
       id SERIAL PRIMARY KEY,
@@ -746,9 +829,11 @@ const initializeDatabase = async () => {
       total_return_amount NUMERIC(14, 2) NOT NULL DEFAULT 0 CHECK (total_return_amount >= 0),
       total_cost_amount NUMERIC(14, 2) NOT NULL DEFAULT 0 CHECK (total_cost_amount >= 0),
       branch_id INTEGER REFERENCES branches(id),
+      counter_id INTEGER REFERENCES counters(id),
       created_by INTEGER REFERENCES users(id),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    ALTER TABLE sale_returns ADD COLUMN IF NOT EXISTS counter_id INTEGER REFERENCES counters(id);
 
     CREATE TABLE IF NOT EXISTS sale_return_items (
       id SERIAL PRIMARY KEY,
@@ -770,9 +855,11 @@ const initializeDatabase = async () => {
       remarks TEXT,
       cost_amount NUMERIC(14, 2) NOT NULL DEFAULT 0,
       branch_id INTEGER REFERENCES branches(id),
+      counter_id INTEGER REFERENCES counters(id),
       created_by INTEGER REFERENCES users(id),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    ALTER TABLE waste_entries ADD COLUMN IF NOT EXISTS counter_id INTEGER REFERENCES counters(id);
 
     CREATE TABLE IF NOT EXISTS role_permission_settings (
       role_name VARCHAR(80) PRIMARY KEY,
@@ -812,6 +899,78 @@ const initializeDatabase = async () => {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       synced_at TIMESTAMP,
       error_message TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS authorized_devices (
+      id SERIAL PRIMARY KEY,
+      device_id VARCHAR(160) UNIQUE NOT NULL,
+      device_name VARCHAR(160) NOT NULL,
+      device_type VARCHAR(60) DEFAULT 'Browser',
+      user_agent TEXT,
+      local_ip VARCHAR(80),
+      assigned_branch_id INTEGER REFERENCES branches(id) DEFAULT 1,
+      assigned_counter_id INTEGER REFERENCES counters(id),
+      approved_by INTEGER REFERENCES users(id),
+      approved_at TIMESTAMP,
+      last_active_at TIMESTAMP,
+      status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+      request_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS assigned_branch_id INTEGER REFERENCES branches(id) DEFAULT 1;
+    ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS assigned_counter_id INTEGER REFERENCES counters(id);
+    ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMP;
+    ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS local_ip VARCHAR(80);
+
+    CREATE TABLE IF NOT EXISTS activation_codes (
+      id SERIAL PRIMARY KEY,
+      code_hash TEXT UNIQUE NOT NULL,
+      code_label VARCHAR(120),
+      branch_id INTEGER REFERENCES branches(id),
+      counter_id INTEGER REFERENCES counters(id),
+      created_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      expires_at TIMESTAMP NOT NULL,
+      used_by_device_id VARCHAR(160),
+      used_at TIMESTAMP,
+      status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE'
+    );
+
+    CREATE TABLE IF NOT EXISTS device_audit_trail (
+      id SERIAL PRIMARY KEY,
+      device_id VARCHAR(160),
+      action VARCHAR(40) NOT NULL,
+      old_value JSONB,
+      new_value JSONB,
+      reason TEXT,
+      changed_by INTEGER REFERENCES users(id),
+      changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS backup_logs (
+      id SERIAL PRIMARY KEY,
+      backup_file_name VARCHAR(220),
+      backup_path TEXT,
+      backup_size BIGINT DEFAULT 0,
+      backup_type VARCHAR(30) NOT NULL,
+      started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      completed_at TIMESTAMP,
+      status VARCHAR(20) NOT NULL DEFAULT 'RUNNING',
+      error_message TEXT,
+      created_by INTEGER REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS backup_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+      auto_backup_enabled BOOLEAN DEFAULT TRUE,
+      backup_on_shutdown BOOLEAN DEFAULT TRUE,
+      daily_backup_time VARCHAR(5) DEFAULT '23:59',
+      keep_last_backups INTEGER DEFAULT 30,
+      backup_location TEXT,
+      restore_enabled BOOLEAN DEFAULT FALSE,
+      updated_by INTEGER REFERENCES users(id),
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS contra_entries (
@@ -858,6 +1017,7 @@ const initializeDatabase = async () => {
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS cancelled_by INTEGER REFERENCES users(id);
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP;
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
+    ALTER TABLE expenses ADD COLUMN IF NOT EXISTS counter_id INTEGER REFERENCES counters(id);
     UPDATE expenses SET status = CASE WHEN active IS DISTINCT FROM FALSE THEN 'ACTIVE' ELSE 'CANCELLED' END WHERE status IS NULL;
     UPDATE expenses SET paid_to = vendor_name WHERE paid_to IS NULL AND vendor_name IS NOT NULL;
 
@@ -896,6 +1056,10 @@ const initializeDatabase = async () => {
     VALUES (1)
     ON CONFLICT (id) DO NOTHING;
 
+    INSERT INTO backup_settings (id, backup_location)
+    VALUES (1, '${backupDirectory.replace(/'/g, "''")}')
+    ON CONFLICT (id) DO NOTHING;
+
     INSERT INTO role_permission_settings (role_name, permissions)
     VALUES
       ('Owner', '{"settings":true,"discounts":true,"mandi_tax":true,"rebate_rules":true,"supplier_payments":true,"customer_payments":true,"sale_edit":true,"invoice_cancellation":true,"reports":true,"purchases":true,"supplier_accounts":true,"inventory":true,"waste_management":true,"billing":true}'::jsonb),
@@ -914,6 +1078,10 @@ const initializeDatabase = async () => {
     WHERE role_name IN ('Owner', 'Admin');
 
     UPDATE role_permission_settings
+    SET permissions = permissions || '{"device_management":true,"activation_codes":true,"backup_restore":true,"branch_settings":true,"system_info":true}'::jsonb
+    WHERE role_name IN ('Owner', 'Admin');
+
+    UPDATE role_permission_settings
     SET permissions = permissions || '{"manual_pos_rate_override":false}'::jsonb
     WHERE role_name IN ('Cashier', 'Purchase Manager', 'Inventory Manager')
       AND NOT (permissions ? 'manual_pos_rate_override');
@@ -928,9 +1096,23 @@ const initializeDatabase = async () => {
     WHERE role_name IN ('Cashier', 'Purchase Manager', 'Inventory Manager')
       AND NOT (permissions ? 'sale_date_edit');
 
+    UPDATE role_permission_settings
+    SET permissions = permissions || '{"device_management":false,"activation_codes":false,"backup_restore":false,"branch_settings":false,"system_info":false}'::jsonb
+    WHERE role_name IN ('Cashier', 'Purchase Manager', 'Inventory Manager')
+      AND NOT (permissions ? 'device_management');
+
     INSERT INTO branches (id, branch_name, location)
     VALUES (1, 'Main Branch', 'Primary Store')
     ON CONFLICT (id) DO NOTHING;
+
+    INSERT INTO counters (id, branch_id, counter_name, counter_type, active)
+    VALUES
+      (1, 1, 'Main Counter', 'RETAIL_COUNTER', TRUE),
+      (2, 1, 'Owner Dashboard', 'OWNER_DASHBOARD', TRUE),
+      (3, 1, 'Back Office', 'BACK_OFFICE', TRUE)
+    ON CONFLICT (id) DO NOTHING;
+
+    UPDATE branches SET address = COALESCE(address, location) WHERE id = 1;
 
     INSERT INTO roles (role_name)
     VALUES ('Owner'), ('Admin'), ('Cashier'), ('Purchase Manager'), ('Inventory Manager')
@@ -941,6 +1123,15 @@ const initializeDatabase = async () => {
     FROM roles r
     WHERE r.role_name = 'Owner'
       AND NOT EXISTS (SELECT 1 FROM users);
+
+    UPDATE users SET branch_id = 1 WHERE branch_id IS NULL;
+    UPDATE sales SET branch_id = 1 WHERE branch_id IS NULL;
+    UPDATE purchases SET branch_id = 1 WHERE branch_id IS NULL;
+    UPDATE supplier_payments SET branch_id = 1 WHERE branch_id IS NULL;
+    UPDATE customer_payments SET branch_id = 1 WHERE branch_id IS NULL;
+    UPDATE expenses SET branch_id = 1 WHERE branch_id IS NULL;
+    UPDATE sale_returns SET branch_id = 1 WHERE branch_id IS NULL;
+    UPDATE waste_entries SET branch_id = 1 WHERE branch_id IS NULL;
 
     INSERT INTO mandi_tax_rules (origin_type, tax_percent)
     VALUES ('LOCAL', 2), ('IMPORTED', 4)
@@ -2405,7 +2596,34 @@ const getDashboardAnalyticsPayload = async (query = {}) => {
   };
 };
 
-const getSettingsBundle = async (userId) => {
+const getSystemInfo = async (deviceId = "") => {
+  const lanIp = getPrimaryLanIp();
+  const [dbResult, backupResult, branchResult, deviceResult] = await Promise.all([
+    pool.query("SELECT CURRENT_DATABASE() AS database_name, NOW() AS checked_at"),
+    pool.query("SELECT * FROM backup_logs ORDER BY completed_at DESC NULLS LAST, id DESC LIMIT 1"),
+    pool.query("SELECT * FROM branches WHERE active IS DISTINCT FROM FALSE ORDER BY id LIMIT 1"),
+    deviceId
+      ? pool.query("SELECT * FROM authorized_devices WHERE device_id = $1 LIMIT 1", [deviceId])
+      : Promise.resolve({ rows: [] }),
+  ]);
+  return {
+    softwareVersion: "1.0.0",
+    backendStatus: "Online",
+    databaseStatus: dbResult.rows[0]?.database_name ? "Connected" : "Unknown",
+    databaseName: dbResult.rows[0]?.database_name || "",
+    serverHost: host,
+    serverPort: port,
+    serverIp: lanIp,
+    lanApiUrl: `http://${lanIp}:${port}`,
+    lanFrontendUrl: `http://${lanIp}:5173`,
+    currentDevice: deviceResult.rows[0] || null,
+    currentBranch: branchResult.rows[0] || null,
+    lastBackup: backupResult.rows[0] || null,
+    backupLocation: backupDirectory,
+  };
+};
+
+const getSettingsBundle = async (userId, deviceId = "") => {
   const [businessResult, saleRateResult, mandiResult, rebateResult, discountResult, roleResult, updateResult, syncResult, syncQueueResult, posResult, paymentResult, manager] = await Promise.all([
     pool.query("SELECT * FROM business_settings WHERE id = 1"),
     pool.query("SELECT * FROM sale_rate_settings WHERE id = 1"),
@@ -2432,6 +2650,40 @@ const getSettingsBundle = async (userId) => {
     ORDER BY u.active DESC, u.full_name
     `
   ) : { rows: [] };
+  const [devicesResult, activationResult, branchesResult, countersResult, backupSettingsResult, backupLogsResult, systemInfo] = manager ? await Promise.all([
+    pool.query(`
+      SELECT d.*, b.branch_name, c.counter_name, u.full_name AS approved_by_name
+      FROM authorized_devices d
+      LEFT JOIN branches b ON b.id = d.assigned_branch_id
+      LEFT JOIN counters c ON c.id = d.assigned_counter_id
+      LEFT JOIN users u ON u.id = d.approved_by
+      ORDER BY d.status = 'PENDING' DESC, d.updated_at DESC, d.id DESC
+    `),
+    pool.query(`
+      SELECT ac.id, ac.code_label, ac.branch_id, ac.counter_id, b.branch_name, c.counter_name,
+             ac.created_by, u.full_name AS created_by_name, ac.created_at, ac.expires_at,
+             ac.used_by_device_id, ac.used_at, ac.status
+      FROM activation_codes ac
+      LEFT JOIN branches b ON b.id = ac.branch_id
+      LEFT JOIN counters c ON c.id = ac.counter_id
+      LEFT JOIN users u ON u.id = ac.created_by
+      ORDER BY ac.created_at DESC, ac.id DESC
+      LIMIT 50
+    `),
+    pool.query("SELECT * FROM branches ORDER BY active DESC, id"),
+    pool.query("SELECT c.*, b.branch_name FROM counters c LEFT JOIN branches b ON b.id = c.branch_id ORDER BY c.active DESC, c.id"),
+    pool.query("SELECT * FROM backup_settings WHERE id = 1"),
+    pool.query("SELECT * FROM backup_logs ORDER BY started_at DESC, id DESC LIMIT 20"),
+    getSystemInfo(deviceId),
+  ]) : [
+    { rows: [] },
+    { rows: [] },
+    { rows: [] },
+    { rows: [] },
+    { rows: [] },
+    { rows: [] },
+    await getSystemInfo(deviceId),
+  ];
   const syncSettings = syncResult.rows[0] || {};
   return {
     businessSettings: businessResult.rows[0] || {},
@@ -2448,14 +2700,135 @@ const getSettingsBundle = async (userId) => {
       ...syncSettings,
       pending_count: Number(syncQueueResult.rows[0]?.pending_count || syncSettings.pending_count || 0),
     },
-    backupSettings: {
-      exportReady: true,
-      importReady: false,
-      lastBackupAt: null,
-      note: "Backup export/import structure is reserved for a future production backup workflow.",
-    },
+    authorizedDevices: devicesResult.rows,
+    activationCodes: activationResult.rows,
+    branches: branchesResult.rows,
+    counters: countersResult.rows,
+    backupSettings: backupSettingsResult.rows[0] || {},
+    backupLogs: backupLogsResult.rows,
+    systemInfo,
     canManageSettings: Boolean(manager),
   };
+};
+
+const createDatabaseBackup = async ({ backupType = "Manual", createdBy = null } = {}) => {
+  await ensureDirectory(backupDirectory);
+  const startedAt = new Date();
+  const timestamp = formatBackupTimestamp(startedAt);
+  const baseName = `FroozERP_Backup_${timestamp}`;
+  const workDir = path.join(backupDirectory, baseName);
+  const jsonPath = path.join(workDir, `${baseName}.json`);
+  const zipPath = path.join(backupDirectory, `${baseName}.zip`);
+  const logResult = await pool.query(
+    `
+    INSERT INTO backup_logs (backup_file_name, backup_path, backup_type, started_at, status, created_by)
+    VALUES ($1, $2, $3, $4, 'RUNNING', $5)
+    RETURNING id
+    `,
+    [`${baseName}.zip`, zipPath, backupType, startedAt, createdBy]
+  );
+  const logId = logResult.rows[0].id;
+  try {
+    await ensureDirectory(workDir);
+    const tablesResult = await pool.query(
+      `
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+        AND table_type = 'BASE TABLE'
+      ORDER BY table_name
+      `
+    );
+    const tables = {};
+    for (const row of tablesResult.rows) {
+      const tableName = row.table_name;
+      const dataResult = await pool.query(`SELECT * FROM "${tableName}"`);
+      tables[tableName] = dataResult.rows;
+    }
+    const payload = {
+      generated_at: startedAt.toISOString(),
+      backup_type: backupType,
+      database: process.env.DB_NAME || "froozerp",
+      tables,
+    };
+    await fs.promises.writeFile(jsonPath, JSON.stringify(payload, null, 2), "utf8");
+    let finalPath = zipPath;
+    let finalFileName = `${baseName}.zip`;
+    try {
+      const powershellPath = process.env.SystemRoot
+        ? path.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+        : "powershell.exe";
+      await execFileAsync(powershellPath, [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        `Compress-Archive -LiteralPath '${escapePowerShellSingleQuoted(jsonPath)}' -DestinationPath '${escapePowerShellSingleQuoted(zipPath)}' -Force`,
+      ], { windowsHide: true });
+      await fs.promises.rm(workDir, { recursive: true, force: true });
+    } catch (zipError) {
+      finalPath = jsonPath;
+      finalFileName = `${baseName}.json`;
+    }
+    const stat = await fs.promises.stat(finalPath);
+    const completedAt = new Date();
+    await pool.query(
+      `
+      UPDATE backup_logs
+      SET backup_file_name = $1,
+          backup_path = $2,
+          backup_size = $3,
+          completed_at = $4,
+          status = 'SUCCESS',
+          error_message = NULL
+      WHERE id = $5
+      `,
+      [finalFileName, finalPath, stat.size, completedAt, logId]
+    );
+    await cleanupOldBackups();
+    return {
+      id: logId,
+      backup_file_name: finalFileName,
+      backup_path: finalPath,
+      backup_size: stat.size,
+      backup_type: backupType,
+      started_at: startedAt,
+      completed_at: completedAt,
+      status: "SUCCESS",
+    };
+  } catch (error) {
+    await pool.query(
+      `
+      UPDATE backup_logs
+      SET completed_at = CURRENT_TIMESTAMP,
+          status = 'FAILED',
+          error_message = $1
+      WHERE id = $2
+      `,
+      [error.message || String(error), logId]
+    );
+    throw error;
+  }
+};
+
+const cleanupOldBackups = async () => {
+  const settingsResult = await pool.query("SELECT keep_last_backups FROM backup_settings WHERE id = 1");
+  const keep = Math.max(Number(settingsResult.rows[0]?.keep_last_backups || 30), 1);
+  const oldLogs = await pool.query(
+    `
+    SELECT id, backup_path
+    FROM backup_logs
+    WHERE status = 'SUCCESS'
+    ORDER BY completed_at DESC NULLS LAST, id DESC
+    OFFSET $1
+    `,
+    [keep]
+  );
+  for (const row of oldLogs.rows) {
+    if (row.backup_path && String(row.backup_path).startsWith(backupDirectory)) {
+      await fs.promises.rm(row.backup_path, { force: true }).catch(() => {});
+    }
+  }
 };
 
 const readDiscountRulePayload = (body) => {
@@ -2856,7 +3229,7 @@ app.get("/settings/purchase-rules", async (req, res) => {
 
 app.get("/settings", async (req, res) => {
   try {
-    return res.json(await getSettingsBundle(req.query.user_id));
+    return res.json(await getSettingsBundle(req.query.user_id, req.query.device_id));
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Settings" });
@@ -3809,9 +4182,340 @@ app.get("/", (req, res) => {
   res.send("FroozERP Backend Running");
 });
 
+const readDevicePayload = (body = {}, req = {}) => ({
+  device_id: cleanText(body.device_id),
+  device_name: cleanText(body.device_name) || "Unnamed Device",
+  device_type: cleanText(body.device_type) || "Browser",
+  user_agent: cleanText(body.user_agent || req.get?.("user-agent")),
+  local_ip: cleanText(body.local_ip || req.ip),
+  assigned_branch_id: parsePositiveInteger(body.assigned_branch_id) || 1,
+  assigned_counter_id: parsePositiveInteger(body.assigned_counter_id),
+});
+
+const upsertDeviceRequest = async (device, client = pool) => {
+  if (!device.device_id) return null;
+  const result = await client.query(
+    `
+    INSERT INTO authorized_devices (
+      device_id, device_name, device_type, user_agent, local_ip,
+      assigned_branch_id, assigned_counter_id, status, request_time, updated_at
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    ON CONFLICT (device_id) DO UPDATE
+    SET device_name = EXCLUDED.device_name,
+        device_type = EXCLUDED.device_type,
+        user_agent = EXCLUDED.user_agent,
+        local_ip = EXCLUDED.local_ip,
+        updated_at = CURRENT_TIMESTAMP
+    RETURNING *
+    `,
+    [
+      device.device_id,
+      device.device_name,
+      device.device_type,
+      device.user_agent,
+      device.local_ip,
+      device.assigned_branch_id,
+      device.assigned_counter_id,
+    ]
+  );
+  return result.rows[0];
+};
+
+const approveDevice = async ({ deviceId, approvedBy, branchId = 1, counterId = null, reason = "Approved" }, client = pool) => {
+  const beforeResult = await client.query("SELECT * FROM authorized_devices WHERE device_id = $1", [deviceId]);
+  const result = await client.query(
+    `
+    UPDATE authorized_devices
+    SET status = 'APPROVED',
+        approved_by = $2,
+        approved_at = COALESCE(approved_at, CURRENT_TIMESTAMP),
+        assigned_branch_id = COALESCE($3, assigned_branch_id, 1),
+        assigned_counter_id = COALESCE($4, assigned_counter_id),
+        last_active_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE device_id = $1
+    RETURNING *
+    `,
+    [deviceId, approvedBy, branchId, counterId]
+  );
+  await client.query(
+    `
+    INSERT INTO device_audit_trail (device_id, action, old_value, new_value, reason, changed_by)
+    VALUES ($1, 'APPROVE', $2::jsonb, $3::jsonb, $4, $5)
+    `,
+    [deviceId, JSON.stringify(beforeResult.rows[0] || {}), JSON.stringify(result.rows[0] || {}), reason, approvedBy]
+  );
+  return result.rows[0];
+};
+
+app.post("/devices/activate", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const device = readDevicePayload(req.body, req);
+    const codeHash = hashActivationCode(req.body.activation_code);
+    if (!device.device_id || !codeHash) {
+      return res.status(400).json({ message: "Device ID and activation code are required" });
+    }
+    await client.query("BEGIN");
+    await upsertDeviceRequest(device, client);
+    const codeResult = await client.query(
+      `
+      SELECT *
+      FROM activation_codes
+      WHERE code_hash = $1
+        AND status = 'ACTIVE'
+        AND expires_at > CURRENT_TIMESTAMP
+      FOR UPDATE
+      `,
+      [codeHash]
+    );
+    const activationCode = codeResult.rows[0];
+    if (!activationCode) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Activation code is invalid, expired or already used" });
+    }
+    const approvedDevice = await approveDevice({
+      deviceId: device.device_id,
+      approvedBy: activationCode.created_by,
+      branchId: activationCode.branch_id || device.assigned_branch_id || 1,
+      counterId: activationCode.counter_id || device.assigned_counter_id,
+      reason: "Approved by one-time activation code",
+    }, client);
+    await client.query(
+      `
+      UPDATE activation_codes
+      SET status = 'USED',
+          used_by_device_id = $1,
+          used_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+      `,
+      [device.device_id, activationCode.id]
+    );
+    await client.query("COMMIT");
+    return res.json({ success: true, device: approvedDevice });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Device activation failed" });
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/settings/devices/:deviceId", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage authorized devices" });
+    const deviceId = cleanText(req.params.deviceId);
+    const action = cleanText(req.body.action).toUpperCase();
+    if (!deviceId || !["APPROVE", "REJECT", "DISABLE", "RENAME"].includes(action)) {
+      return res.status(400).json({ message: "Select valid device action" });
+    }
+    const beforeResult = await pool.query("SELECT * FROM authorized_devices WHERE device_id = $1", [deviceId]);
+    if (!beforeResult.rows[0]) return res.status(404).json({ message: "Device not found" });
+    let result;
+    if (action === "APPROVE") {
+      result = { rows: [await approveDevice({
+        deviceId,
+        approvedBy: manager.id,
+        branchId: parsePositiveInteger(req.body.assigned_branch_id) || 1,
+        counterId: parsePositiveInteger(req.body.assigned_counter_id),
+        reason: cleanText(req.body.reason) || "Owner/Admin approval",
+      })] };
+    } else if (action === "RENAME") {
+      result = await pool.query(
+        `
+        UPDATE authorized_devices
+        SET device_name = COALESCE($2, device_name),
+            assigned_branch_id = COALESCE($3, assigned_branch_id),
+            assigned_counter_id = COALESCE($4, assigned_counter_id),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE device_id = $1
+        RETURNING *
+        `,
+        [deviceId, nullableText(req.body.device_name), parsePositiveInteger(req.body.assigned_branch_id), parsePositiveInteger(req.body.assigned_counter_id)]
+      );
+    } else {
+      result = await pool.query(
+        `
+        UPDATE authorized_devices
+        SET status = $2,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE device_id = $1
+        RETURNING *
+        `,
+        [deviceId, action === "REJECT" ? "REJECTED" : "DISABLED"]
+      );
+    }
+    await pool.query(
+      `
+      INSERT INTO device_audit_trail (device_id, action, old_value, new_value, reason, changed_by)
+      VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, $6)
+      `,
+      [deviceId, action, JSON.stringify(beforeResult.rows[0]), JSON.stringify(result.rows[0]), cleanText(req.body.reason), manager.id]
+    );
+    return res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Device" });
+  }
+});
+
+app.post("/settings/activation-codes", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.created_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can generate activation codes" });
+    const expiresHours = Math.max(Number(req.body.expires_in_hours || 24), 1);
+    const code = generateActivationCode();
+    const result = await pool.query(
+      `
+      INSERT INTO activation_codes (
+        code_hash, code_label, branch_id, counter_id, created_by, expires_at, status
+      )
+      VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP + ($6 || ' hours')::interval, 'ACTIVE')
+      RETURNING id, code_label, branch_id, counter_id, created_by, created_at, expires_at, status
+      `,
+      [
+        hashActivationCode(code),
+        nullableText(req.body.code_label) || "Device activation",
+        parsePositiveInteger(req.body.branch_id) || 1,
+        parsePositiveInteger(req.body.counter_id),
+        manager.id,
+        expiresHours,
+      ]
+    );
+    return res.json({ ...result.rows[0], code });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Generating Activation Code" });
+  }
+});
+
+app.put("/settings/activation-codes/:id/revoke", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can revoke activation codes" });
+    const codeId = parsePositiveInteger(req.params.id);
+    const result = await pool.query("UPDATE activation_codes SET status = 'REVOKED' WHERE id = $1 RETURNING id", [codeId]);
+    return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "Activation code not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Revoking Activation Code" });
+  }
+});
+
+app.post("/settings/branches", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage branches" });
+    const result = await pool.query(
+      `
+      INSERT INTO branches (branch_name, address, phone_number, gst_number, active)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING *
+      `,
+      [cleanText(req.body.branch_name), nullableText(req.body.address), nullableText(req.body.phone_number), nullableText(req.body.gst_number), req.body.active !== false]
+    );
+    return res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Saving Branch" });
+  }
+});
+
+app.post("/settings/counters", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage counters" });
+    const result = await pool.query(
+      `
+      INSERT INTO counters (branch_id, counter_name, counter_type, active)
+      VALUES ($1, $2, $3, $4)
+      RETURNING *
+      `,
+      [parsePositiveInteger(req.body.branch_id) || 1, cleanText(req.body.counter_name), cleanText(req.body.counter_type) || "RETAIL_COUNTER", req.body.active !== false]
+    );
+    return res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Saving Counter" });
+  }
+});
+
+app.put("/settings/backup", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage backups" });
+    const result = await pool.query(
+      `
+      UPDATE backup_settings
+      SET auto_backup_enabled = $1,
+          backup_on_shutdown = $2,
+          daily_backup_time = $3,
+          keep_last_backups = $4,
+          backup_location = $5,
+          updated_by = $6,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = 1
+      RETURNING *
+      `,
+      [
+        req.body.auto_backup_enabled !== false,
+        req.body.backup_on_shutdown !== false,
+        cleanText(req.body.daily_backup_time) || "23:59",
+        Math.max(Number(req.body.keep_last_backups || 30), 1),
+        nullableText(req.body.backup_location) || backupDirectory,
+        manager.id,
+      ]
+    );
+    return res.json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Saving Backup Settings" });
+  }
+});
+
+app.post("/settings/backup-now", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.created_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can run backups" });
+    const backup = await createDatabaseBackup({ backupType: req.body.backup_type || "Manual", createdBy: manager.id });
+    return res.json(backup);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: `Backup failed: ${error.message || "Unknown error"}` });
+  }
+});
+
+app.post("/settings/safe-shutdown", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.created_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can safely close software" });
+    const backup = await createDatabaseBackup({ backupType: "Shutdown", createdBy: manager.id });
+    return res.json({
+      ...backup,
+      message: "Backup completed. You may now close the server window.",
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: `Safe shutdown backup failed: ${error.message || "Unknown error"}` });
+  }
+});
+
+app.get("/settings/system-info", async (req, res) => {
+  try {
+    return res.json(await getSystemInfo(req.query.device_id));
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading System Info" });
+  }
+});
+
 app.post("/login", async (req, res) => {
   try {
     const { username, password } = req.body;
+    const devicePayload = readDevicePayload(req.body, req);
 
     const result = await pool.query(
       `
@@ -3845,6 +4549,33 @@ app.post("/login", async (req, res) => {
     if (!passwordMatches(password, user.password_hash)) {
       return res.status(401).json({ message: "Invalid password" });
     }
+    if (!devicePayload.device_id) {
+      return res.status(403).json({ code: "DEVICE_ID_REQUIRED", message: "Device ID is required for FroozERP access" });
+    }
+    let device = await upsertDeviceRequest(devicePayload);
+    const approvedCountResult = await pool.query("SELECT COUNT(*)::INTEGER AS count FROM authorized_devices WHERE status = 'APPROVED'");
+    const approvedCount = Number(approvedCountResult.rows[0]?.count || 0);
+    if (approvedCount === 0 && ["Owner", "Admin"].includes(user.role_name)) {
+      device = await approveDevice({
+        deviceId: devicePayload.device_id,
+        approvedBy: user.id,
+        branchId: user.branch_id || 1,
+        counterId: devicePayload.assigned_counter_id,
+        reason: "Bootstrap approval for first Owner/Admin device",
+      });
+    }
+    if (device.status !== "APPROVED") {
+      return res.status(403).json({
+        code: "DEVICE_NOT_APPROVED",
+        message: "This device is not approved. Ask owner for activation.",
+        device_id: device.device_id,
+        device_status: device.status,
+      });
+    }
+    await pool.query(
+      "UPDATE authorized_devices SET last_active_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE device_id = $1",
+      [device.device_id]
+    );
     const hashed = hashPassword(password);
     await pool.query(
       "UPDATE users SET password_hash = $1, last_login_at = CURRENT_TIMESTAMP WHERE id = $2",
@@ -10975,8 +11706,43 @@ app.get("/sales/:id", async (req, res) => {
 
 initializeDatabase()
   .then(() => {
-    app.listen(port, () => {
-      console.log(`Server running on port ${port}`);
+    let lastScheduledBackupDate = "";
+    setInterval(async () => {
+      try {
+        const settingsResult = await pool.query("SELECT * FROM backup_settings WHERE id = 1");
+        const settings = settingsResult.rows[0] || {};
+        if (settings.auto_backup_enabled === false) return;
+        const now = new Date();
+        const today = toDateKey(now);
+        const currentTime = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+        if (currentTime === (settings.daily_backup_time || "23:59") && lastScheduledBackupDate !== today) {
+          lastScheduledBackupDate = today;
+          await createDatabaseBackup({ backupType: "Scheduled" });
+        }
+      } catch (error) {
+        console.error("Scheduled backup failed", error);
+      }
+    }, 60 * 1000);
+
+    const runShutdownBackup = async (signal) => {
+      try {
+        const settingsResult = await pool.query("SELECT backup_on_shutdown FROM backup_settings WHERE id = 1");
+        if (settingsResult.rows[0]?.backup_on_shutdown !== false) {
+          await createDatabaseBackup({ backupType: "Shutdown" });
+        }
+      } catch (error) {
+        console.error("Shutdown backup failed", error);
+      } finally {
+        process.exit(signal === "SIGINT" ? 0 : 0);
+      }
+    };
+    process.once("SIGINT", () => runShutdownBackup("SIGINT"));
+    process.once("SIGTERM", () => runShutdownBackup("SIGTERM"));
+
+    app.listen(port, host, () => {
+      const lanIp = getPrimaryLanIp();
+      console.log(`Server running on ${host}:${port}`);
+      console.log(`LAN API URL: http://${lanIp}:${port}`);
     });
   })
   .catch((error) => {

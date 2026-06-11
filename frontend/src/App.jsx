@@ -5,7 +5,11 @@ import { jsPDF } from "jspdf";
 import QRCode from "qrcode";
 import "./App.css";
 
-const API_URL = "http://localhost:5000";
+const API_URL = (
+  import.meta.env.VITE_API_URL ||
+  window.__FROOZERP_API_URL__ ||
+  `${window.location.protocol}//${window.location.hostname}:5000`
+).replace(/\/$/, "");
 const currency = new Intl.NumberFormat("en-IN", {
   style: "currency",
   currency: "INR",
@@ -58,6 +62,23 @@ const navigationItems = [
 
 const getErrorMessage = (error, fallback) =>
   error.response?.data?.message || fallback;
+
+const getClientDeviceInfo = () => {
+  const storageKey = "froozerp_device_id";
+  let deviceId = localStorage.getItem(storageKey);
+  if (!deviceId) {
+    deviceId = `FZDEV-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+    localStorage.setItem(storageKey, deviceId);
+  }
+  const userAgent = navigator.userAgent || "Browser";
+  const deviceType = /mobile|android|iphone/i.test(userAgent) ? "Mobile Browser" : /ipad|tablet/i.test(userAgent) ? "Tablet Browser" : "Desktop Browser";
+  return {
+    device_id: deviceId,
+    device_name: localStorage.getItem("froozerp_device_name") || `${deviceType} - ${window.location.hostname}`,
+    device_type: deviceType,
+    user_agent: userAgent,
+  };
+};
 
 const toDateKey = (date) =>
   typeof date === "string" ? date.slice(0, 10) : date.toLocaleDateString("en-CA");
@@ -326,6 +347,9 @@ function App() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [user, setUser] = useState(null);
+  const [deviceInfo, setDeviceInfo] = useState(() => getClientDeviceInfo());
+  const [deviceGate, setDeviceGate] = useState(null);
+  const [activationCode, setActivationCode] = useState("");
   const [activeView, setActiveView] = useState("dashboard");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [products, setProducts] = useState([]);
@@ -348,6 +372,12 @@ function App() {
     updateCenter: {},
     syncSettings: {},
     backupSettings: {},
+    backupLogs: [],
+    authorizedDevices: [],
+    activationCodes: [],
+    branches: [],
+    counters: [],
+    systemInfo: {},
     canManageSettings: false,
   });
   const [discountRules, setDiscountRules] = useState([]);
@@ -747,7 +777,7 @@ function App() {
   };
 
   const loadSettingsData = async (currentUser = user) => {
-    const response = await axios.get(`${API_URL}/settings`, { params: { user_id: currentUser?.id } });
+    const response = await axios.get(`${API_URL}/settings`, { params: { user_id: currentUser?.id, device_id: deviceInfo.device_id } });
     const data = response.data;
     const nextSaleRateSettings = { ...defaultSaleRateSettings, ...(data.saleRateSettings || {}) };
     setSettingsData({
@@ -761,6 +791,12 @@ function App() {
       updateCenter: data.updateCenter || {},
       syncSettings: data.syncSettings || {},
       backupSettings: data.backupSettings || {},
+      backupLogs: data.backupLogs || [],
+      authorizedDevices: data.authorizedDevices || [],
+      activationCodes: data.activationCodes || [],
+      branches: data.branches || [],
+      counters: data.counters || [],
+      systemInfo: data.systemInfo || {},
       canManageSettings: Boolean(data.canManageSettings),
     });
     setSettingsRules({
@@ -910,9 +946,17 @@ function App() {
 
   const login = async () => {
   try {
-    const response = await axios.post(`${API_URL}/login`, { username, password });
+    const latestDevice = getClientDeviceInfo();
+    setDeviceInfo(latestDevice);
+    const response = await axios.post(`${API_URL}/login`, { username, password, ...latestDevice });
+    setDeviceGate(null);
     setUser(response.data);
   } catch (error) {
+    if (["DEVICE_NOT_APPROVED", "DEVICE_ID_REQUIRED"].includes(error.response?.data?.code)) {
+      setDeviceGate(error.response.data);
+      alert(error.response.data.message || "This device is not approved.");
+      return;
+    }
     alert(
   getErrorMessage(
     error,
@@ -948,9 +992,29 @@ function App() {
     console.error("Data loading failures:", results);
   }
 } catch (error) {
-  alert(getErrorMessage(error, "Login successful, but data loading failed"));
-}
+    alert(getErrorMessage(error, "Login successful, but data loading failed"));
+  }
 };
+
+  const activateDevice = async () => {
+    if (!activationCode.trim()) {
+      alert("Enter activation code.");
+      return;
+    }
+    try {
+      const latestDevice = getClientDeviceInfo();
+      const response = await axios.post(`${API_URL}/devices/activate`, {
+        ...latestDevice,
+        activation_code: activationCode,
+      });
+      setDeviceInfo(response.data.device || latestDevice);
+      setDeviceGate(null);
+      setActivationCode("");
+      alert("Device activated. Please login again.");
+    } catch (error) {
+      alert(getErrorMessage(error, "Device activation failed"));
+    }
+  };
 
   const addProduct = async () => {
     try {
@@ -1899,6 +1963,20 @@ function App() {
             />
           </label>
           <button className="primary-button login-button" onClick={login}>Sign In</button>
+          {deviceGate && (
+            <div className="device-activation-panel">
+              <span className="eyebrow">Device Activation Required</span>
+              <strong>This device is not approved.</strong>
+              <small>Device ID: {deviceGate.device_id || deviceInfo.device_id}</small>
+              <p>Ask the owner to approve this device from Settings, or enter a one-time activation code.</p>
+              <input
+                placeholder="Activation code"
+                value={activationCode}
+                onChange={(event) => setActivationCode(event.target.value.toUpperCase())}
+              />
+              <button className="secondary-button" onClick={activateDevice}>Activate Device</button>
+            </div>
+          )}
         </section>
       </main>
     );
@@ -5691,9 +5769,12 @@ function SettingsModule({ canManage, onReload, rules, settingsData, user }) {
       <DiscountSettings canManage={canManage} discountRules={settingsData.discountRules} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />
       <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />
       <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />
+      <SecurityDevicesSection activationCodes={settingsData.activationCodes || []} branches={settingsData.branches || []} canManage={canManage} counters={settingsData.counters || []} devices={settingsData.authorizedDevices || []} onReload={onReload} user={user} />
+      <BranchCounterSettings branches={settingsData.branches || []} canManage={canManage} counters={settingsData.counters || []} onReload={onReload} user={user} />
       <UpdateCenterSection canManage={canManage} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
       <SyncSettingsSection canManage={canManage} key={settingsData.syncSettings?.updated_at || "sync-settings"} onReload={onReload} syncSettings={settingsData.syncSettings} user={user} />
-      <BackupSettings backupSettings={settingsData.backupSettings} />
+      <BackupSettings backupLogs={settingsData.backupLogs || []} backupSettings={settingsData.backupSettings} canManage={canManage} onReload={onReload} user={user} />
+      <SystemInfoSection systemInfo={settingsData.systemInfo || {}} />
     </section>
   );
 }
@@ -6097,6 +6178,11 @@ const permissionLabels = [
   ["manual_pos_rate_override", "Manual POS Rate Override"],
   ["pos_date_override", "POS Bill Date Override"],
   ["sale_date_edit", "Sale Bill Date Edit"],
+  ["device_management", "Authorized Devices"],
+  ["activation_codes", "Activation Codes"],
+  ["backup_restore", "Backup / Restore"],
+  ["branch_settings", "Branch Settings"],
+  ["system_info", "System Info"],
 ];
 
 function PermissionSettings({ canManage, onReload, roles, user }) {
@@ -6400,15 +6486,267 @@ function SyncSettingsSection({ canManage, onReload, syncSettings, user }) {
   );
 }
 
-function BackupSettings({ backupSettings }) {
+function SecurityDevicesSection({ activationCodes, branches, canManage, counters, devices, onReload, user }) {
+  const [generatedCode, setGeneratedCode] = useState("");
+  const [codeDraft, setCodeDraft] = useState({ code_label: "Counter device activation", expires_in_hours: 24, branch_id: "1", counter_id: "" });
+  const deviceAction = async (device, action) => {
+    try {
+      await axios.put(`${API_URL}/settings/devices/${encodeURIComponent(device.device_id)}`, {
+        action,
+        updated_by: user.id,
+        device_name: device.device_name,
+        assigned_branch_id: device.assigned_branch_id || 1,
+        assigned_counter_id: device.assigned_counter_id || null,
+      });
+      await onReload();
+      alert(`Device ${action.toLowerCase()} saved`);
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update device"));
+    }
+  };
+  const generateCode = async () => {
+    try {
+      const response = await axios.post(`${API_URL}/settings/activation-codes`, {
+        ...codeDraft,
+        created_by: user.id,
+      });
+      setGeneratedCode(response.data.code);
+      await onReload();
+      alert("Activation code generated. Share it only with the device being approved.");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to generate activation code"));
+    }
+  };
+  const revokeCode = async (code) => {
+    try {
+      await axios.put(`${API_URL}/settings/activation-codes/${code.id}/revoke`, { updated_by: user.id });
+      await onReload();
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to revoke activation code"));
+    }
+  };
   return (
-    <ModuleCard eyebrow="Backup Settings" title="Backup Readiness" subtitle="Prepared structure for future export/import backup workflows.">
-      <div className="purchase-summary-grid">
-        <SummaryMetric label="Export Structure" value={backupSettings?.exportReady ? "Ready" : "Pending"} featured />
-        <SummaryMetric label="Import Workflow" value={backupSettings?.importReady ? "Ready" : "Future"} />
-        <SummaryMetric label="Last Backup" value={backupSettings?.lastBackupAt || "Not yet recorded"} />
+    <ModuleCard eyebrow="Security" title="Authorized Devices" subtitle="Only approved browsers can use FroozERP after login. New devices stay pending until approved or activated by one-time code.">
+      <div className="purchase-summary-grid supplier-payment-preview">
+        <SummaryMetric featured label="Approved Devices" value={devices.filter((device) => device.status === "APPROVED").length} />
+        <SummaryMetric label="Pending Requests" value={devices.filter((device) => device.status === "PENDING").length} />
+        <SummaryMetric label="Activation Codes" value={activationCodes.filter((code) => code.status === "ACTIVE").length} />
       </div>
-      <p className="form-note">{backupSettings?.note || "Backup actions will be implemented in a future release."}</p>
+      <DataTable headers={["Device", "Type", "Branch / Counter", "Status", "Last Active", "Actions"]}>
+        {devices.map((device) => (
+          <tr key={device.device_id}>
+            <td className="primary-cell">{device.device_name}<small className="cell-note">{device.device_id}</small></td>
+            <td>{device.device_type || "Browser"}</td>
+            <td>{device.branch_name || "Main Branch"}<small className="cell-note">{device.counter_name || "No counter assigned"}</small></td>
+            <td><span className={device.status === "APPROVED" ? "stock-ok" : device.status === "PENDING" ? "origin-rate" : "stock-low"}>{device.status}</span></td>
+            <td>{device.last_active_at ? new Date(device.last_active_at).toLocaleString("en-IN") : "Not active yet"}</td>
+            <td>
+              <div className="button-row table-actions-row">
+                <button className="table-action" disabled={!canManage || device.status === "APPROVED"} onClick={() => deviceAction(device, "APPROVE")}>Approve</button>
+                <button className="secondary-button" disabled={!canManage} onClick={() => deviceAction(device, "RENAME")}>Save</button>
+                <button className="remove-button" disabled={!canManage} onClick={() => deviceAction(device, device.status === "PENDING" ? "REJECT" : "DISABLE")}>{device.status === "PENDING" ? "Reject" : "Disable"}</button>
+              </div>
+            </td>
+          </tr>
+        ))}
+        {devices.length === 0 && <tr><td colSpan="6" className="empty-cell">No device requests yet.</td></tr>}
+      </DataTable>
+      <div className="form-grid supplier-form-grid">
+        <Field label="Activation Label"><input disabled={!canManage} value={codeDraft.code_label} onChange={(event) => setCodeDraft({ ...codeDraft, code_label: event.target.value })} /></Field>
+        <Field label="Expires In Hours"><input disabled={!canManage} min="1" type="number" value={codeDraft.expires_in_hours} onChange={(event) => setCodeDraft({ ...codeDraft, expires_in_hours: event.target.value })} /></Field>
+        <Field label="Branch">
+          <select disabled={!canManage} value={codeDraft.branch_id} onChange={(event) => setCodeDraft({ ...codeDraft, branch_id: event.target.value })}>
+            {branches.map((branch) => <option key={branch.id} value={branch.id}>{branch.branch_name}</option>)}
+          </select>
+        </Field>
+        <Field label="Counter Optional">
+          <select disabled={!canManage} value={codeDraft.counter_id} onChange={(event) => setCodeDraft({ ...codeDraft, counter_id: event.target.value })}>
+            <option value="">No counter limit</option>
+            {counters.map((counter) => <option key={counter.id} value={counter.id}>{counter.counter_name}</option>)}
+          </select>
+        </Field>
+      </div>
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage} onClick={generateCode}>Generate Activation Code</button>
+        {generatedCode && <span className="batch-id">New Code: {generatedCode}</span>}
+      </div>
+      <DataTable headers={["Label", "Branch", "Counter", "Expires", "Status", "Used By", "Actions"]}>
+        {activationCodes.map((code) => (
+          <tr key={code.id}>
+            <td className="primary-cell">{code.code_label || "Activation Code"}</td>
+            <td>{code.branch_name || "Any"}</td>
+            <td>{code.counter_name || "Any"}</td>
+            <td>{code.expires_at ? new Date(code.expires_at).toLocaleString("en-IN") : "-"}</td>
+            <td><span className={code.status === "ACTIVE" ? "stock-ok" : "stock-low"}>{code.status}</span></td>
+            <td>{code.used_by_device_id || "-"}</td>
+            <td><button className="remove-button" disabled={!canManage || code.status !== "ACTIVE"} onClick={() => revokeCode(code)}>Revoke</button></td>
+          </tr>
+        ))}
+      </DataTable>
+    </ModuleCard>
+  );
+}
+
+function BranchCounterSettings({ branches, canManage, counters, onReload, user }) {
+  const [branchDraft, setBranchDraft] = useState({ branch_name: "", address: "", phone_number: "", gst_number: "", active: true });
+  const [counterDraft, setCounterDraft] = useState({ branch_id: "1", counter_name: "", counter_type: "RETAIL_COUNTER", active: true });
+  const addBranch = async () => {
+    try {
+      await axios.post(`${API_URL}/settings/branches`, { ...branchDraft, updated_by: user.id });
+      setBranchDraft({ branch_name: "", address: "", phone_number: "", gst_number: "", active: true });
+      await onReload();
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to save branch"));
+    }
+  };
+  const addCounter = async () => {
+    try {
+      await axios.post(`${API_URL}/settings/counters`, { ...counterDraft, updated_by: user.id });
+      setCounterDraft({ branch_id: "1", counter_name: "", counter_type: "RETAIL_COUNTER", active: true });
+      await onReload();
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to save counter"));
+    }
+  };
+  return (
+    <ModuleCard eyebrow="Multi-Branch Foundation" title="Branch & Counter Master" subtitle="Future-ready branch/counter structure. Current store remains Main Branch unless more branches are added.">
+      <div className="form-grid supplier-form-grid">
+        <Field label="Branch Name"><input disabled={!canManage} value={branchDraft.branch_name} onChange={(event) => setBranchDraft({ ...branchDraft, branch_name: event.target.value })} /></Field>
+        <Field label="Phone"><input disabled={!canManage} value={branchDraft.phone_number} onChange={(event) => setBranchDraft({ ...branchDraft, phone_number: event.target.value })} /></Field>
+        <Field label="GST Number"><input disabled={!canManage} value={branchDraft.gst_number} onChange={(event) => setBranchDraft({ ...branchDraft, gst_number: event.target.value })} /></Field>
+        <Field label="Address"><input disabled={!canManage} value={branchDraft.address} onChange={(event) => setBranchDraft({ ...branchDraft, address: event.target.value })} /></Field>
+        <button className="primary-button" disabled={!canManage || !branchDraft.branch_name.trim()} onClick={addBranch}>Add Branch</button>
+      </div>
+      <DataTable headers={["Branch", "Address", "Phone", "GST", "Status"]}>
+        {branches.map((branch) => <tr key={branch.id}><td className="primary-cell">{branch.branch_name}</td><td>{branch.address || branch.location || "-"}</td><td>{branch.phone_number || "-"}</td><td>{branch.gst_number || "-"}</td><td><span className={branch.active !== false ? "stock-ok" : "stock-low"}>{branch.active !== false ? "Active" : "Inactive"}</span></td></tr>)}
+      </DataTable>
+      <div className="form-grid supplier-form-grid">
+        <Field label="Branch">
+          <select disabled={!canManage} value={counterDraft.branch_id} onChange={(event) => setCounterDraft({ ...counterDraft, branch_id: event.target.value })}>
+            {branches.map((branch) => <option key={branch.id} value={branch.id}>{branch.branch_name}</option>)}
+          </select>
+        </Field>
+        <Field label="Counter Name"><input disabled={!canManage} value={counterDraft.counter_name} onChange={(event) => setCounterDraft({ ...counterDraft, counter_name: event.target.value })} /></Field>
+        <Field label="Counter Type">
+          <select disabled={!canManage} value={counterDraft.counter_type} onChange={(event) => setCounterDraft({ ...counterDraft, counter_type: event.target.value })}>
+            <option value="RETAIL_COUNTER">Retail Counter</option>
+            <option value="OWNER_DASHBOARD">Owner Dashboard</option>
+            <option value="BACK_OFFICE">Back Office</option>
+          </select>
+        </Field>
+        <button className="primary-button" disabled={!canManage || !counterDraft.counter_name.trim()} onClick={addCounter}>Add Counter</button>
+      </div>
+      <DataTable headers={["Counter", "Branch", "Type", "Status"]}>
+        {counters.map((counter) => <tr key={counter.id}><td className="primary-cell">{counter.counter_name}</td><td>{counter.branch_name || "-"}</td><td>{counter.counter_type}</td><td><span className={counter.active !== false ? "stock-ok" : "stock-low"}>{counter.active !== false ? "Active" : "Inactive"}</span></td></tr>)}
+      </DataTable>
+    </ModuleCard>
+  );
+}
+
+function BackupSettings({ backupLogs = [], backupSettings, canManage, onReload, user }) {
+  const [draft, setDraft] = useState({
+    auto_backup_enabled: backupSettings?.auto_backup_enabled !== false,
+    backup_on_shutdown: backupSettings?.backup_on_shutdown !== false,
+    daily_backup_time: backupSettings?.daily_backup_time || "23:59",
+    keep_last_backups: backupSettings?.keep_last_backups || 30,
+    backup_location: backupSettings?.backup_location || "",
+  });
+  const [busy, setBusy] = useState(false);
+  const save = async () => {
+    try {
+      await axios.put(`${API_URL}/settings/backup`, { ...draft, updated_by: user.id });
+      await onReload();
+      alert("Backup settings saved");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to save backup settings"));
+    }
+  };
+  const backupNow = async (backupType = "Manual") => {
+    setBusy(true);
+    try {
+      const response = await axios.post(`${API_URL}/settings/backup-now`, { created_by: user.id, backup_type: backupType });
+      await onReload();
+      alert(`Backup created: ${response.data.backup_file_name}`);
+    } catch (error) {
+      alert(getErrorMessage(error, "Backup failed"));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const safeShutdown = async () => {
+    if (!window.confirm("Run shutdown backup now? After success, close the server window manually.")) return;
+    setBusy(true);
+    try {
+      const response = await axios.post(`${API_URL}/settings/safe-shutdown`, { created_by: user.id });
+      await onReload();
+      alert(response.data.message || "Backup completed. You may now close the server window.");
+    } catch (error) {
+      alert(getErrorMessage(error, "Safe shutdown backup failed"));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <ModuleCard eyebrow="Backup & Restore" title="Auto Backup and Safe Shutdown" subtitle="Manual, scheduled and shutdown backup workflow. Restore is prepared but kept disabled until verified.">
+      <div className="purchase-summary-grid">
+        <SummaryMetric label="Auto Backup" value={draft.auto_backup_enabled ? "ON" : "OFF"} featured />
+        <SummaryMetric label="Backup on Shutdown" value={draft.backup_on_shutdown ? "ON" : "OFF"} />
+        <SummaryMetric label="Daily Backup Time" value={draft.daily_backup_time} />
+        <SummaryMetric label="Keep Backups" value={draft.keep_last_backups} />
+      </div>
+      <div className="form-grid supplier-form-grid">
+        <label className="check-field"><input checked={draft.auto_backup_enabled} disabled={!canManage} type="checkbox" onChange={(event) => setDraft({ ...draft, auto_backup_enabled: event.target.checked })} /><span>Auto Backup ON/OFF</span></label>
+        <label className="check-field"><input checked={draft.backup_on_shutdown} disabled={!canManage} type="checkbox" onChange={(event) => setDraft({ ...draft, backup_on_shutdown: event.target.checked })} /><span>Backup on Shutdown</span></label>
+        <Field label="Daily Backup Time"><input disabled={!canManage} type="time" value={draft.daily_backup_time} onChange={(event) => setDraft({ ...draft, daily_backup_time: event.target.value })} /></Field>
+        <Field label="Keep Last X Backups"><input disabled={!canManage} min="1" type="number" value={draft.keep_last_backups} onChange={(event) => setDraft({ ...draft, keep_last_backups: event.target.value })} /></Field>
+        <Field label="Backup Location"><input disabled={!canManage} value={draft.backup_location} onChange={(event) => setDraft({ ...draft, backup_location: event.target.value })} /></Field>
+      </div>
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage || busy} onClick={() => backupNow("Manual")}>Backup Now</button>
+        <button className="secondary-button" disabled={!canManage || busy} onClick={save}>Save Backup Settings</button>
+        <button className="secondary-button" disabled={!canManage || busy} onClick={safeShutdown}>Close Software Safely</button>
+        <button className="remove-button" disabled>Restore Prepared - Disabled</button>
+      </div>
+      <p className="form-note">Restore requires Owner permission and remains disabled until backup verification testing is completed.</p>
+      <DataTable headers={["File", "Type", "Size", "Started", "Completed", "Status", "Error"]}>
+        {backupLogs.map((log) => (
+          <tr key={log.id}>
+            <td className="primary-cell">{log.backup_file_name || "-"}<small className="cell-note">{log.backup_path || "-"}</small></td>
+            <td>{log.backup_type}</td>
+            <td>{Number(log.backup_size || 0).toLocaleString("en-IN")} bytes</td>
+            <td>{log.started_at ? new Date(log.started_at).toLocaleString("en-IN") : "-"}</td>
+            <td>{log.completed_at ? new Date(log.completed_at).toLocaleString("en-IN") : "-"}</td>
+            <td><span className={log.status === "SUCCESS" ? "stock-ok" : log.status === "FAILED" ? "stock-low" : "origin-rate"}>{log.status}</span></td>
+            <td>{log.error_message || "-"}</td>
+          </tr>
+        ))}
+      </DataTable>
+    </ModuleCard>
+  );
+}
+
+function SystemInfoSection({ systemInfo }) {
+  const device = systemInfo.currentDevice || {};
+  const branch = systemInfo.currentBranch || {};
+  const backup = systemInfo.lastBackup || {};
+  return (
+    <ModuleCard eyebrow="System Info" title="Server, Network and Device Status" subtitle="Use the LAN URL from another device on the same shop network.">
+      <div className="purchase-summary-grid supplier-payment-preview">
+        <SummaryMetric featured label="Backend" value={systemInfo.backendStatus || "Unknown"} />
+        <SummaryMetric label="Database" value={systemInfo.databaseStatus || "Unknown"} />
+        <SummaryMetric label="Server IP" value={systemInfo.serverIp || "-"} />
+        <SummaryMetric label="Device Status" value={device.status || "Not registered"} />
+      </div>
+      <DataTable headers={["Item", "Value"]}>
+        <tr><td>Software Version</td><td>{systemInfo.softwareVersion || "1.0.0"}</td></tr>
+        <tr><td>LAN API URL</td><td>{systemInfo.lanApiUrl || "-"}</td></tr>
+        <tr><td>LAN Frontend URL</td><td>{systemInfo.lanFrontendUrl || "-"}</td></tr>
+        <tr><td>Current Device</td><td>{device.device_name || "-"} ({device.device_id || "-"})</td></tr>
+        <tr><td>Current Branch</td><td>{branch.branch_name || "Main Branch"}</td></tr>
+        <tr><td>Current Counter</td><td>{device.counter_name || device.assigned_counter_id || "Not assigned"}</td></tr>
+        <tr><td>Last Backup</td><td>{backup.completed_at ? new Date(backup.completed_at).toLocaleString("en-IN") : "Not recorded"}</td></tr>
+        <tr><td>Backup Location</td><td>{systemInfo.backupLocation || "-"}</td></tr>
+      </DataTable>
     </ModuleCard>
   );
 }
