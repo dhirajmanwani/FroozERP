@@ -5283,6 +5283,87 @@ app.post("/inventory-lots/:lotId/deactivate", async (req, res) => {
   }
 });
 
+app.post("/inventory-lots/:lotId/reactivate", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const lotId = parsePositiveInteger(req.params.lotId);
+    const manager = await requireRateManager(req.body.updated_by || req.body.reactivated_by, client);
+    const reason = cleanText(req.body.reason);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can reactivate lots" });
+    if (!lotId || !reason) return res.status(400).json({ message: "Reason is required" });
+    await client.query("BEGIN");
+    const lotResult = await client.query("SELECT * FROM inventory_batches WHERE id = $1 FOR UPDATE", [lotId]);
+    const lot = lotResult.rows[0];
+    if (!lot) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Inventory lot not found" });
+    }
+    const usedQty = lotUsage(lot);
+    const nextRemaining = Math.max(Number(lot.purchase_qty || 0) - usedQty, 0);
+    const updateResult = await client.query(
+      "UPDATE inventory_batches SET batch_status = 'ACTIVE', remaining_qty = $1 WHERE id = $2 RETURNING *",
+      [nextRemaining, lotId]
+    );
+    if (nextRemaining > Number(lot.remaining_qty || 0)) {
+      await client.query(
+        "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, 'IN', $3, $4, $5)",
+        [lot.product_id, nextRemaining - Number(lot.remaining_qty || 0), reason, manager.id, lot.branch_id || 1]
+      );
+    }
+    await client.query(
+      "INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'INVENTORY_LOT_REACTIVATE', $2::jsonb, $3::jsonb, $4, $5)",
+      [lot.product_id, JSON.stringify(lot), JSON.stringify(updateResult.rows[0]), reason, manager.id]
+    );
+    await client.query("COMMIT");
+    return res.json(updateResult.rows[0]);
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    return res.status(500).json({ message: "Error Reactivating Inventory Lot" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/stock-inventory/audit", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        pat.*,
+        p.product_name,
+        p.category,
+        u.full_name AS edited_by_name,
+        COALESCE(
+          (pat.new_value->>'id')::INTEGER,
+          (pat.old_value->>'id')::INTEGER,
+          (pat.new_value->>'inventory_batch_id')::INTEGER,
+          (pat.old_value->>'inventory_batch_id')::INTEGER
+        ) AS lot_id,
+        COALESCE(pat.new_value->>'lot_name', pat.old_value->>'lot_name', pat.new_value->>'batch_no', pat.old_value->>'batch_no') AS lot_name
+      FROM product_audit_trail pat
+      JOIN products p ON p.id = pat.product_id
+      LEFT JOIN users u ON u.id = pat.edited_by
+      WHERE pat.action IN (
+        'OPENING_STOCK',
+        'OPENING_STOCK_LOT_ADDED',
+        'INVENTORY_LOT_EDIT',
+        'INVENTORY_LOT_ADD_QTY',
+        'INVENTORY_LOT_ADJUST',
+        'INVENTORY_LOT_DEACTIVATE',
+        'INVENTORY_LOT_REACTIVATE'
+      )
+      ORDER BY pat.edited_at DESC, pat.id DESC
+      LIMIT 500
+      `
+    );
+    return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Stock Audit Trail" });
+  }
+});
+
 app.post("/products/:id/cancel", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -5364,9 +5445,30 @@ app.get("/inventory", async (req, res) => {
         ib.supplier_id,
         ib.supplier_name,
         ib.remarks,
-        ib.purchase_date
+        ib.purchase_date,
+        ib.created_at,
+        latest_audit.edited_at AS last_edited_at,
+        latest_audit.edited_by_name AS last_edited_by_name
       FROM inventory_batches ib
       JOIN products p ON p.id = ib.product_id
+      LEFT JOIN LATERAL (
+        SELECT pat.edited_at, u.full_name AS edited_by_name
+        FROM product_audit_trail pat
+        LEFT JOIN users u ON u.id = pat.edited_by
+        WHERE pat.product_id = ib.product_id
+          AND COALESCE((pat.new_value->>'id')::INTEGER, (pat.old_value->>'id')::INTEGER) = ib.id
+          AND pat.action IN (
+            'OPENING_STOCK',
+            'OPENING_STOCK_LOT_ADDED',
+            'INVENTORY_LOT_EDIT',
+            'INVENTORY_LOT_ADD_QTY',
+            'INVENTORY_LOT_ADJUST',
+            'INVENTORY_LOT_DEACTIVATE',
+            'INVENTORY_LOT_REACTIVATE'
+          )
+        ORDER BY pat.edited_at DESC, pat.id DESC
+        LIMIT 1
+      ) latest_audit ON TRUE
       WHERE ($1::boolean = TRUE OR COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED')
       ORDER BY ib.purchase_date, ib.created_at, ib.id
     `, [includeCancelled]);

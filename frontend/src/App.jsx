@@ -49,7 +49,6 @@ const navigationItems = [
   ["purchase", "Purchase Entry"],
   ["pending-bills", "Pending Bills"],
   ["accounts", "Accounts"],
-  ["inventory", "Inventory"],
   ["returns", "Sale Returns"],
   ["waste", "Waste Management"],
   ["sales", "POS Billing"],
@@ -151,7 +150,7 @@ const defaultRolePermissions = {
   Admin: { all: true },
   Cashier: { dashboard: true, sales: true, accounts: true, "pending-bills": true },
   "Purchase Manager": { dashboard: true, purchase: true, "pending-bills": true, accounts: true, reports: true },
-  "Inventory Manager": { dashboard: true, inventory: true, waste: true, reports: true },
+  "Inventory Manager": { dashboard: true, products: true, waste: true, reports: true },
 };
 
 const modulePermissionMap = {
@@ -160,7 +159,6 @@ const modulePermissionMap = {
   purchase: "purchases",
   "pending-bills": "billing",
   accounts: "supplier_accounts",
-  inventory: "inventory",
   returns: "billing",
   waste: "waste_management",
   sales: "billing",
@@ -1326,7 +1324,9 @@ function App() {
   };
 
   const refreshLotContext = async (product = lotPanelProduct) => {
-    await Promise.all([loadProducts(), loadDashboardData()]);
+    const inventoryResponse = await axios.get(`${API_URL}/inventory`, { params: { include_cancelled: true } });
+    setInventory(inventoryResponse.data);
+    await Promise.all([loadProducts(), loadDashboardData(), loadReports()]);
     if (product?.id) await loadProductLots(product, true);
   };
 
@@ -1420,6 +1420,18 @@ function App() {
           deactivated_by: user.id,
         });
         alert("Lot deactivated");
+      }
+      if (lotAction.type === "reactivate") {
+        if (!lotDraft.reason.trim()) {
+          alert("Reason is required to reactivate a lot.");
+          return;
+        }
+        await axios.post(`${API_URL}/inventory-lots/${lotAction.lot.id}/reactivate`, {
+          ...basePayload,
+          reason: lotDraft.reason,
+          reactivated_by: user.id,
+        });
+        alert("Lot reactivated");
       }
       closeLotAction();
       await refreshLotContext();
@@ -1904,10 +1916,6 @@ function App() {
     setSidebarOpen(false);
     setActiveView(view);
     try {
-      if (view === "inventory") {
-        const response = await axios.get(`${API_URL}/inventory`);
-        setInventory(response.data);
-      }
       if (view === "products") {
         await Promise.all([loadProducts(), loadProductCategories(), loadSupplierData(), loadDashboardData()]);
       }
@@ -1985,6 +1993,7 @@ function App() {
   const activeLabel = navigationItems.find(([view]) => view === activeView)?.[1];
   const canManageRates = ["Owner", "Admin"].includes(user.role);
   const canEditSales = ["Owner", "Admin"].includes(user.role);
+  const canManageStock = ["Owner", "Admin", "Inventory Manager"].includes(user.role);
   const lotBalanceQuantity = (lot) => Number(lot.balance_qty ?? lot.remaining_qty ?? 0);
   const lotUsedQuantity = (lot) => Number(lot.sold_qty ?? Math.max(Number(lot.purchase_qty || 0) - Number(lot.remaining_qty || 0), 0));
   const lotStatusLabel = (lot) => {
@@ -2155,7 +2164,7 @@ function App() {
                   </div>
                 </div>
                 <div className="quick-grid">
-                  {[["sales", "POS Billing"], ["purchase", "New Purchase"], ["accounts", "Accounts"], ["inventory", "View Inventory"]].map(([view, label]) => (
+                  {[["sales", "POS Billing"], ["purchase", "New Purchase"], ["accounts", "Accounts"], ["reports", "Stock Inventory"]].map(([view, label]) => (
                     <button className="quick-action" key={view} onClick={() => navigate(view)}>
                       <Icon name={icons[view]} />
                       <span>{label}</span>
@@ -2653,59 +2662,6 @@ function App() {
             />
           )}
 
-          {activeView === "inventory" && (
-            <ModuleCard eyebrow="Stock Control" title="Inventory Summary & Lot Details" subtitle="Product-wise stock with expandable lot-level purchase, opening stock and FIFO costing details.">
-              <div className="report-toolbar">
-                <div>
-                  <strong>Active Stock View</strong>
-                  <p className="form-note">Sold-out lots are hidden by default but remain preserved for invoices, reports and audit trails.</p>
-                </div>
-                <label className="check-field report-check-field">
-                  <input checked={showInventoryEmptyLots} type="checkbox" onChange={(event) => setShowInventoryEmptyLots(event.target.checked)} />
-                  <span>Show Empty Lots</span>
-                </label>
-              </div>
-              <DataTable headers={["Category / Item", "Total Stock", "Avg Cost", "Stock Value", "Lot Details"]}>
-                {inventoryGroups.map((group) => {
-                  const averageCost = group.total_stock > 0 ? group.stock_value / group.total_stock : 0;
-                  return (
-                    <tr key={group.product_id}>
-                      <td className="primary-cell">{group.category} - {group.product_name}<small className="cell-note">{group.unit}</small></td>
-                      <td><span className={Number(group.total_stock) <= 5 ? "stock-low" : "stock-ok"}>{group.total_stock.toLocaleString("en-IN", { maximumFractionDigits: 3 })}</span></td>
-                      <td>{currency.format(Number(averageCost || 0))}</td>
-                      <td>{currency.format(Number(group.stock_value || 0))}</td>
-                      <td className="primary-cell purchase-items-cell">
-                        <span title={group.lots.map((lot) => `${lot.lot_name || lot.batch_no}${lot.lot_size ? ` / ${lot.lot_size}` : ""} | ${lot.stock_source || "PURCHASE"} | Received ${lot.purchase_qty} | Balance ${lot.remaining_qty} | Cost ${currency.format(Number(lot.effective_cost_per_unit || lot.purchase_rate || 0))}`).join("\n")}>
-                          {group.lots.slice(0, 3).map((lot) => `${lot.lot_name || lot.batch_no}${lot.lot_size ? ` / ${lot.lot_size}` : ""}: ${lot.remaining_qty}`).join(", ")}
-                          {group.lots.length > 3 ? ` +${group.lots.length - 3} more` : ""}
-                        </span>
-                      </td>
-                    </tr>
-                  );
-                })}
-                {inventoryGroups.length === 0 && <tr><td colSpan="5" className="empty-cell">{inventory.length ? "No active stock lots found. Enable Show Empty Lots to view sold-out lots." : "No inventory lots found."}</td></tr>}
-              </DataTable>
-              <DataTable headers={["Lot", "Category", "Item", "Supplier", "Date", "Source", "Received", "Balance", "Cost", "Sale Rate", "Status"]}>
-                {visibleInventory.map((item) => (
-                  <tr key={item.id}>
-                    <td><span className="batch-id">{item.lot_name || item.batch_no}{item.lot_size ? ` / ${item.lot_size}` : ""}</span></td>
-                    <td>{item.category || "Fruit"}</td>
-                    <td className="primary-cell">{item.product_name}</td>
-                    <td>{item.supplier_name || "-"}</td>
-                    <td>{item.purchase_date}</td>
-                    <td><span className="tag">{item.stock_source || "PURCHASE"}</span></td>
-                    <td>{item.purchase_qty}</td>
-                    <td><span className={Number(item.remaining_qty) <= 5 ? "stock-low" : "stock-ok"}>{item.remaining_qty}</span></td>
-                    <td>{currency.format(Number(item.effective_cost_per_unit || item.purchase_rate))}</td>
-                    <td>{currency.format(Number(item.temporary_sale_rate || 0))}</td>
-                    <td><span className={lotStatusClass(item)}>{lotStatusLabel(item)}</span></td>
-                  </tr>
-                ))}
-                {visibleInventory.length === 0 && <tr><td colSpan="11" className="empty-cell">{inventory.length ? "No active lots found. Enable Show Empty Lots to view sold-out lots." : "No inventory lots found."}</td></tr>}
-              </DataTable>
-            </ModuleCard>
-          )}
-
           {activeView === "returns" && (
             <SaleReturnModule
               onReload={async () => {
@@ -2785,6 +2741,7 @@ function App() {
           {activeView === "reports" && (
             <ReportsModule
               canEditSales={canEditSales}
+              canManageStock={canManageStock}
               data={reportsData}
               onCancelPurchase={cancelPurchase}
               onCompletePurchase={completePendingPurchase}
@@ -2795,6 +2752,7 @@ function App() {
               onOpenSaleForEdit={openSaleForEditFromReport}
               onOpenSaleView={loadInvoice}
               onCancelSale={cancelSale}
+              onOpenLotAction={openLotAction}
               onOpenSupplierLedger={openSupplierLedgerFromReport}
               onReload={loadReports}
             />
@@ -2836,6 +2794,7 @@ function App() {
                   {lotAction.type === "add" && "Add Quantity"}
                   {lotAction.type === "adjust" && "Adjust Quantity"}
                   {lotAction.type === "deactivate" && "Deactivate Lot"}
+                  {lotAction.type === "reactivate" && "Reactivate Lot"}
                 </strong>
               </div>
               <button aria-label="Close lot editor" className="remove-button" onClick={closeLotAction}><Icon name="close" /></button>
@@ -2877,7 +2836,7 @@ function App() {
 
               {lotAction.type === "adjust" && (
                 <div className="form-grid supplier-form-grid">
-                  <Field label="New Opening Quantity"><input min="0" step="0.001" type="number" value={lotDraft.new_quantity} onChange={(event) => setLotDraft({ ...lotDraft, new_quantity: event.target.value })} /></Field>
+                  <Field label="Physical / Corrected Quantity"><input min="0" step="0.001" type="number" value={lotDraft.new_quantity} onChange={(event) => setLotDraft({ ...lotDraft, new_quantity: event.target.value })} /></Field>
                   <Field label="Adjustment Date"><input type="date" value={lotDraft.adjustment_date} onChange={(event) => setLotDraft({ ...lotDraft, adjustment_date: event.target.value })} /></Field>
                   <Field label="Reason"><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Reason is mandatory" /></Field>
                 </div>
@@ -2885,6 +2844,10 @@ function App() {
 
               {lotAction.type === "deactivate" && (
                 <Field label="Reason"><textarea value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Reason is mandatory. Lots with used stock cannot be deactivated." /></Field>
+              )}
+
+              {lotAction.type === "reactivate" && (
+                <Field label="Reason"><textarea value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Reason is mandatory. Reactivated lots return available unsold quantity to active stock." /></Field>
               )}
 
               <div className="button-row">
@@ -3497,7 +3460,7 @@ function DiscountManagementModule({ discounts = [], inventory = [], onReload, pr
   );
 }
 
-function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onCancelSale, onOpenSupplierLedger, onReload }) {
+function ReportsModule({ canEditSales, canManageStock, data = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onCancelSale, onOpenSupplierLedger, onReload }) {
   const [range, setRange] = useState("today");
   const [search, setSearch] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
@@ -4327,6 +4290,13 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
       headers: ["Date", "Type", "Quantity", "Cost"],
       render: (row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td>{row.waste_type}</td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
     },
+    stockInventory: {
+      title: "Stock Inventory",
+      rows: stockLotRows,
+      summary: () => [],
+      headers: [],
+      render: () => null,
+    },
     currentStock: {
       title: "Current Stock",
       rows: stockRows,
@@ -4437,7 +4407,7 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
     { id: "accounts", title: "Accounts & Ledger", icon: "users", description: "Customer ledger, supplier ledger, statements, payments and balances.", reports: ["customerLedger", "supplierLedger", "accountStatement", "paymentReport", "paymentModeSummary", "receivableReport", "payableReport"] },
     { id: "returns", title: "Sale Returns", icon: "history", description: "Return history, value and reason analysis.", reports: ["returnHistory", "returnValue", "returnReason"] },
     { id: "waste", title: "Waste Management", icon: "alert", description: "Daily, monthly, product-wise and cost-focused waste analysis.", reports: ["dailyWaste", "monthlyWaste", "productWiseWaste", "mostWastedProducts", "wasteCost"] },
-    { id: "inventory", title: "Inventory", icon: "layers", description: "Current stock, low stock, movement and valuation.", reports: ["currentStock", "lowStock", "stockMovement", "stockValuation", "lotWiseStock"] },
+    { id: "inventory", title: "Inventory Reports", icon: "layers", description: "Single stock inventory workspace for stock, lots, valuation, adjustments and audit.", reports: ["stockInventory"] },
     { id: "financial", title: "Financial Reports", icon: "wallet", description: "Profit and loss, balance sheet, cash book and expense reports.", reports: ["profitLoss", "balanceSheet", "cashBook", "expenseReport"] },
   ];
   const currentCategory = categories.find((category) => category.id === selectedCategory);
@@ -5029,7 +4999,15 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
               <div className="purchase-summary-grid supplier-payment-preview">
                 {(currentReport.summary?.(rows) || []).map(([label, value, featured]) => <SummaryMetric featured={featured} key={label} label={label} value={value} />)}
               </div>
-              {selectedReport === "profitLoss" ? renderProfitLossStatement() : selectedReport === "cashBook" ? renderCashBookStatement() : (
+              {selectedReport === "stockInventory" ? (
+                <StockInventoryReport
+                  auditEndpoint={`${API_URL}/stock-inventory/audit`}
+                  canManageStock={canManageStock}
+                  lots={Array.isArray(data.stockLotReport) ? data.stockLotReport : []}
+                  onLotAction={onOpenLotAction}
+                  products={Array.isArray(data.stockReport) ? data.stockReport : []}
+                />
+              ) : selectedReport === "profitLoss" ? renderProfitLossStatement() : selectedReport === "cashBook" ? renderCashBookStatement() : (
                 <>
                   <DataTable headers={currentReport.headers}>
                     {selectedReport === "purchaseHistory" ? renderPurchaseHistoryRows() : rows.map((row, index) => currentReport.render(row, index))}
@@ -5088,6 +5066,348 @@ function ReportsModule({ canEditSales, data = {}, onCancelPurchase, onCompletePu
           </button>
         ))}
       </section>
+    </section>
+  );
+}
+
+function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotAction, products = [] }) {
+  const [viewMode, setViewMode] = useState("PRODUCT");
+  const [search, setSearch] = useState("");
+  const [filters, setFilters] = useState({
+    category: "",
+    product: "",
+    lot: "",
+    supplier: "",
+    status: "ACTIVE",
+    date_from: "",
+    date_to: "",
+    showEmpty: false,
+    showInactive: false,
+  });
+  const [expandedProductId, setExpandedProductId] = useState("");
+  const [auditRows, setAuditRows] = useState([]);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [auditError, setAuditError] = useState("");
+  const [auditFocus, setAuditFocus] = useState(null);
+  const money = (value) => currency.format(Number(value || 0));
+  const qty = (value) => Number(value || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 });
+  const lotBalance = (lot) => Number(lot.balance_qty ?? lot.remaining_qty ?? 0);
+  const lotOpening = (lot) => Number(lot.purchase_qty || 0);
+  const lotUsed = (lot) => Number(lot.sold_qty ?? Math.max(lotOpening(lot) - Number(lot.remaining_qty || 0), 0));
+  const lotCost = (lot) => Number(lot.effective_cost_per_unit || lot.purchase_rate || 0);
+  const lotSaleRate = (lot) => Number(lot.temporary_sale_rate || lot.sale_rate || lot.selling_rate || 0);
+  const lotStatus = (lot) => {
+    const status = String(lot.batch_status || "ACTIVE").toUpperCase();
+    if (status === "CANCELLED") return "Cancelled";
+    if (status === "INACTIVE") return "Inactive";
+    if (lotBalance(lot) <= 0 && lotUsed(lot) > 0) return "Sold Out";
+    return "Active";
+  };
+  const statusClass = (status) => status === "Active" ? "stock-ok" : status === "Sold Out" ? "origin-rate" : "stock-low";
+  const activeLots = lots.filter((lot) => lotStatus(lot) === "Active");
+  const productGroups = [...lots.reduce((groups, lot) => {
+    const key = String(lot.product_id);
+    const current = groups.get(key) || {
+      product_id: lot.product_id,
+      product_name: lot.product_name,
+      category: lot.category || "Fruit",
+      unit: lot.unit || "",
+      minimum_stock: products.find((product) => Number(product.product_id) === Number(lot.product_id))?.minimum_stock || 0,
+      sale_rate: lot.selling_rate || 0,
+      total_stock: 0,
+      stock_value: 0,
+      active_lots: 0,
+      sold_out_lots: 0,
+      lots: [],
+    };
+    const balance = lotBalance(lot);
+    const status = lotStatus(lot);
+    current.total_stock += status === "Cancelled" || status === "Inactive" ? 0 : balance;
+    current.stock_value += status === "Cancelled" || status === "Inactive" ? 0 : balance * lotCost(lot);
+    current.active_lots += status === "Active" ? 1 : 0;
+    current.sold_out_lots += status === "Sold Out" ? 1 : 0;
+    current.lots.push(lot);
+    groups.set(key, current);
+    return groups;
+  }, new Map()).values()].sort((left, right) => `${left.category}-${left.product_name}`.localeCompare(`${right.category}-${right.product_name}`));
+  const categoryRows = [...productGroups.reduce((groups, product) => {
+    const key = product.category || "Fruit";
+    const current = groups.get(key) || { category: key, products: 0, total_quantity: 0, stock_value: 0, low_stock_count: 0, product_rows: [] };
+    current.products += 1;
+    current.total_quantity += product.total_stock;
+    current.stock_value += product.stock_value;
+    if (Number(product.total_stock || 0) <= Number(product.minimum_stock || 0)) current.low_stock_count += 1;
+    current.product_rows.push(product);
+    groups.set(key, current);
+    return groups;
+  }, new Map()).values()].sort((left, right) => left.category.localeCompare(right.category));
+  const categories = [...new Set(lots.map((lot) => lot.category || "Fruit"))].sort();
+  const suppliers = [...new Set(lots.map((lot) => lot.supplier_name).filter(Boolean))].sort();
+  const productOptions = productGroups.map((product) => [String(product.product_id), product.product_name]);
+  const lotOptions = lots.map((lot) => [String(lot.id), [lot.lot_name || lot.batch_no || `Lot #${lot.id}`, lot.lot_size].filter(Boolean).join(" / ")]);
+  const matchesText = (values) => {
+    const needle = search.trim().toLowerCase();
+    if (!needle) return true;
+    return values.some((value) => String(value ?? "").toLowerCase().includes(needle));
+  };
+  const filteredLots = lots.filter((lot) => {
+    const status = lotStatus(lot);
+    if (!filters.showEmpty && status === "Sold Out") return false;
+    if (!filters.showInactive && ["Inactive", "Cancelled"].includes(status)) return false;
+    if (filters.status && filters.status !== "ALL" && status !== filters.status) return false;
+    if (filters.category && (lot.category || "Fruit") !== filters.category) return false;
+    if (filters.product && String(lot.product_id) !== filters.product) return false;
+    if (filters.lot && String(lot.id) !== filters.lot) return false;
+    if (filters.supplier && lot.supplier_name !== filters.supplier) return false;
+    if (filters.date_from && toDateKey(lot.purchase_date || lot.created_at || "") < filters.date_from) return false;
+    if (filters.date_to && toDateKey(lot.purchase_date || lot.created_at || "") > filters.date_to) return false;
+    return matchesText([
+      lot.product_name,
+      lot.category,
+      lot.lot_name,
+      lot.batch_no,
+      lot.lot_size,
+      lot.supplier_name,
+      lot.purchase_qty,
+      lot.remaining_qty,
+      lot.purchase_rate,
+      lot.effective_cost_per_unit,
+      lot.temporary_sale_rate,
+      lot.selling_rate,
+      status,
+      lot.remarks,
+    ]);
+  });
+  const filteredProductRows = productGroups
+    .map((product) => ({ ...product, visible_lots: filteredLots.filter((lot) => Number(lot.product_id) === Number(product.product_id)) }))
+    .filter((product) => product.visible_lots.length > 0 && matchesText([product.product_name, product.category, product.total_stock, product.stock_value]));
+  const filteredCategoryRows = categoryRows
+    .map((category) => ({ ...category, product_rows: filteredProductRows.filter((product) => product.category === category.category) }))
+    .filter((category) => category.product_rows.length > 0 && matchesText([category.category, category.products, category.total_quantity, category.stock_value]));
+  const totalStockValue = activeLots.reduce((sum, lot) => sum + lotBalance(lot) * lotCost(lot), 0);
+  const lowStockItems = productGroups.filter((product) => Number(product.total_stock || 0) <= Number(product.minimum_stock || 0)).length;
+  const adjustmentCount = auditRows.filter((row) => row.action === "INVENTORY_LOT_ADJUST").length;
+
+  useEffect(() => {
+    let mounted = true;
+    const loadAudit = async () => {
+      if (!auditEndpoint) return;
+      setAuditLoading(true);
+      setAuditError("");
+      try {
+        const response = await axios.get(auditEndpoint);
+        if (mounted) setAuditRows(response.data || []);
+      } catch (error) {
+        if (mounted) setAuditError(getErrorMessage(error, "Unable to load stock audit trail"));
+      } finally {
+        if (mounted) setAuditLoading(false);
+      }
+    };
+    loadAudit();
+    return () => {
+      mounted = false;
+    };
+  }, [auditEndpoint]);
+
+  const openAudit = (lot = null) => {
+    setAuditFocus(lot || { all: true });
+  };
+  const focusedAuditRows = auditFocus?.all ? auditRows : auditRows.filter((row) => String(row.lot_id || "") === String(auditFocus?.id || ""));
+  const auditChangeSummary = (row) => {
+    const oldValue = row.old_value || {};
+    const newValue = row.new_value || {};
+    const beforeQty = oldValue.remaining_qty ?? oldValue.purchase_qty ?? "-";
+    const afterQty = newValue.remaining_qty ?? newValue.purchase_qty ?? "-";
+    const beforeRate = oldValue.purchase_rate ?? oldValue.effective_cost_per_unit ?? "-";
+    const afterRate = newValue.purchase_rate ?? newValue.effective_cost_per_unit ?? "-";
+    return `Qty ${beforeQty} -> ${afterQty} | Cost ${beforeRate} -> ${afterRate}`;
+  };
+  const clearFilters = () => setFilters({ category: "", product: "", lot: "", supplier: "", status: "ACTIVE", date_from: "", date_to: "", showEmpty: false, showInactive: false });
+  const renderLotActions = (lot) => {
+    const status = lotStatus(lot);
+    return (
+      <div className="table-actions">
+        <button className="table-action" disabled={!canManageStock} onClick={() => onLotAction?.("edit", lot)}>Edit Lot</button>
+        <button className="table-action" disabled={!canManageStock || status === "Cancelled"} onClick={() => onLotAction?.("adjust", lot)}>Adjust Stock</button>
+        <button className="table-action" disabled={!canManageStock || status === "Cancelled"} onClick={() => onLotAction?.("add", lot)}>Add Qty</button>
+        {status === "Cancelled" || status === "Inactive" ? (
+          <button className="table-action" disabled={!canManageStock} onClick={() => onLotAction?.("reactivate", lot)}>Reactivate</button>
+        ) : (
+          <button className="remove-button compact-button" disabled={!canManageStock} onClick={() => onLotAction?.("deactivate", lot)}>Deactivate</button>
+        )}
+        <button className="secondary-button compact-button" onClick={() => openAudit(lot)}>Audit</button>
+      </div>
+    );
+  };
+  const renderLotRows = (rows) => rows.map((lot) => {
+    const status = lotStatus(lot);
+    return (
+      <tr key={lot.id}>
+        <td className="primary-cell">{lot.product_name}<small className="cell-note">{lot.unit}</small></td>
+        <td>{lot.category || "Fruit"}</td>
+        <td>{lot.supplier_name || "-"}</td>
+        <td className="primary-cell">{lot.lot_name || lot.batch_no || `Lot #${lot.id}`}</td>
+        <td>{lot.lot_size || "-"}</td>
+        <td>{formatDisplayDate(lot.purchase_date || lot.created_at)}</td>
+        <td>{qty(lotOpening(lot))}</td>
+        <td>{qty(lotUsed(lot))}</td>
+        <td><span className={lotBalance(lot) <= 0 ? "origin-rate" : "stock-ok"}>{qty(lotBalance(lot))}</span></td>
+        <td>{money(lotCost(lot))}</td>
+        <td>{money(lotSaleRate(lot))}</td>
+        <td>{money(lotBalance(lot) * lotCost(lot))}</td>
+        <td><span className={statusClass(status)}>{status}</span></td>
+        <td className="purchase-items-cell"><span title={lot.remarks || "-"}>{lot.remarks || "-"}</span></td>
+        <td>{lot.created_at ? new Date(lot.created_at).toLocaleString("en-IN") : "-"}</td>
+        <td>{lot.last_edited_at ? new Date(lot.last_edited_at).toLocaleString("en-IN") : "-"}</td>
+        <td>{renderLotActions(lot)}</td>
+      </tr>
+    );
+  });
+
+  return (
+    <section className="stock-inventory-report">
+      <div className="purchase-summary-grid supplier-payment-preview">
+        <SummaryMetric featured label="Total Stock Value" value={money(totalStockValue)} />
+        <SummaryMetric label="Total Products" value={productGroups.length} />
+        <SummaryMetric label="Active Lots" value={activeLots.length} />
+        <SummaryMetric label="Sold Out Lots" value={lots.filter((lot) => lotStatus(lot) === "Sold Out").length} />
+        <SummaryMetric label="Low Stock Items" value={lowStockItems} />
+        <SummaryMetric label="Inventory Adjustments" value={auditLoading ? "Loading" : adjustmentCount} />
+      </div>
+      {auditError && <div className="error-banner">{auditError}</div>}
+      <div className="ledger-toolbar stock-inventory-toolbar no-print">
+        <Field label="View Mode">
+          <select value={viewMode} onChange={(event) => setViewMode(event.target.value)}>
+            <option value="PRODUCT">Product-wise</option>
+            <option value="LOT">Lot-wise</option>
+            <option value="CATEGORY">Category-wise</option>
+          </select>
+        </Field>
+        <Field label="Search"><input placeholder="Search product, lot, supplier, remarks..." value={search} onChange={(event) => setSearch(event.target.value)} /></Field>
+        <Field label="Category">
+          <select value={filters.category} onChange={(event) => setFilters({ ...filters, category: event.target.value })}>
+            <option value="">All categories</option>
+            {categories.map((category) => <option key={category} value={category}>{category}</option>)}
+          </select>
+        </Field>
+        <Field label="Product">
+          <select value={filters.product} onChange={(event) => setFilters({ ...filters, product: event.target.value })}>
+            <option value="">All products</option>
+            {productOptions.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+          </select>
+        </Field>
+        <Field label="Lot Number">
+          <select value={filters.lot} onChange={(event) => setFilters({ ...filters, lot: event.target.value })}>
+            <option value="">All lots</option>
+            {lotOptions.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+          </select>
+        </Field>
+        <Field label="Supplier">
+          <select value={filters.supplier} onChange={(event) => setFilters({ ...filters, supplier: event.target.value })}>
+            <option value="">All suppliers</option>
+            {suppliers.map((supplier) => <option key={supplier} value={supplier}>{supplier}</option>)}
+          </select>
+        </Field>
+        <Field label="Status">
+          <select value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })}>
+            <option value="ACTIVE">Active</option>
+            <option value="Sold Out">Sold Out</option>
+            <option value="Inactive">Inactive</option>
+            <option value="Cancelled">Cancelled</option>
+            <option value="ALL">All statuses</option>
+          </select>
+        </Field>
+        <Field label="Date From"><input type="date" value={filters.date_from} onChange={(event) => setFilters({ ...filters, date_from: event.target.value })} /></Field>
+        <Field label="Date To"><input type="date" value={filters.date_to} onChange={(event) => setFilters({ ...filters, date_to: event.target.value })} /></Field>
+        <label className="check-field report-check-field"><input checked={filters.showEmpty} type="checkbox" onChange={(event) => setFilters({ ...filters, showEmpty: event.target.checked })} /><span>Show Empty Lots</span></label>
+        <label className="check-field report-check-field"><input checked={filters.showInactive} type="checkbox" onChange={(event) => setFilters({ ...filters, showInactive: event.target.checked })} /><span>Show Inactive / Cancelled Lots</span></label>
+        <button className="secondary-button" onClick={clearFilters}>Clear Stock Filters</button>
+        <button className="secondary-button" onClick={() => openAudit()}>View Audit Trail</button>
+      </div>
+      {viewMode === "PRODUCT" && (
+        <DataTable headers={["Product", "Category", "Total Stock", "Available Lots", "Average Cost", "Sale Rate", "Stock Value", "Minimum Stock", "Status", "Action"]}>
+          {filteredProductRows.map((product) => {
+            const averageCost = product.total_stock > 0 ? product.stock_value / product.total_stock : 0;
+            const low = Number(product.total_stock || 0) <= Number(product.minimum_stock || 0);
+            return (
+              <React.Fragment key={product.product_id}>
+                <tr>
+                  <td className="primary-cell">{product.product_name}<small className="cell-note">{product.unit}</small></td>
+                  <td>{product.category}</td>
+                  <td>{qty(product.total_stock)}</td>
+                  <td>{product.active_lots}</td>
+                  <td>{money(averageCost)}</td>
+                  <td>{money(product.sale_rate)}</td>
+                  <td>{money(product.stock_value)}</td>
+                  <td>{qty(product.minimum_stock)}</td>
+                  <td><span className={low ? "stock-low" : "stock-ok"}>{low ? "Low Stock" : "OK"}</span></td>
+                  <td><button className="secondary-button compact-button" onClick={() => setExpandedProductId(expandedProductId === String(product.product_id) ? "" : String(product.product_id))}>View Lots</button></td>
+                </tr>
+                {expandedProductId === String(product.product_id) && (
+                  <tr className="sales-history-drilldown-row">
+                    <td colSpan="10">
+                      <DataTable headers={["Product", "Category", "Supplier", "Lot No.", "Size", "Opening Date", "Opening Qty", "Sold Qty", "Balance Qty", "Cost", "Sale Rate", "Stock Value", "Status", "Remarks", "Created At", "Last Edited", "Actions"]}>
+                        {renderLotRows(product.visible_lots)}
+                      </DataTable>
+                    </td>
+                  </tr>
+                )}
+              </React.Fragment>
+            );
+          })}
+          {filteredProductRows.length === 0 && <tr><td colSpan="10" className="empty-cell">No matching stock products found.</td></tr>}
+        </DataTable>
+      )}
+      {viewMode === "LOT" && (
+        <DataTable headers={["Product", "Category", "Supplier", "Lot No.", "Size", "Opening Date", "Opening Qty", "Sold Qty", "Balance Qty", "Cost", "Sale Rate", "Stock Value", "Status", "Remarks", "Created At", "Last Edited", "Actions"]}>
+          {renderLotRows(filteredLots)}
+          {filteredLots.length === 0 && <tr><td colSpan="17" className="empty-cell">No matching stock lots found.</td></tr>}
+        </DataTable>
+      )}
+      {viewMode === "CATEGORY" && (
+        <DataTable headers={["Category", "Products", "Total Quantity", "Stock Value", "Low Stock Count", "Action"]}>
+          {filteredCategoryRows.map((category) => (
+            <tr key={category.category}>
+              <td className="primary-cell">{category.category}</td>
+              <td>{category.product_rows.length}</td>
+              <td>{qty(category.product_rows.reduce((sum, product) => sum + product.total_stock, 0))}</td>
+              <td>{money(category.product_rows.reduce((sum, product) => sum + product.stock_value, 0))}</td>
+              <td>{category.product_rows.filter((product) => Number(product.total_stock || 0) <= Number(product.minimum_stock || 0)).length}</td>
+              <td><button className="secondary-button compact-button" onClick={() => { setViewMode("PRODUCT"); setFilters({ ...filters, category: category.category }); }}>View Products</button></td>
+            </tr>
+          ))}
+          {filteredCategoryRows.length === 0 && <tr><td colSpan="6" className="empty-cell">No matching stock categories found.</td></tr>}
+        </DataTable>
+      )}
+      {auditFocus && (
+        <div className="modal-backdrop">
+          <section className="invoice-modal change-history-modal">
+            <div className="invoice-toolbar">
+              <div>
+                <span className="eyebrow">Stock Audit Trail</span>
+                <strong>{auditFocus.all ? "All Inventory Changes" : `${auditFocus.product_name} - ${auditFocus.lot_name || auditFocus.batch_no || `Lot #${auditFocus.id}`}`}</strong>
+              </div>
+              <button className="remove-button" onClick={() => setAuditFocus(null)}><Icon name="close" /></button>
+            </div>
+            <div className="sale-edit-body">
+              <DataTable headers={["Date", "Product", "Lot", "Action", "Qty / Rate Change", "Reason", "Edited By"]}>
+                {focusedAuditRows.map((row) => (
+                  <tr key={row.id}>
+                    <td>{row.edited_at ? new Date(row.edited_at).toLocaleString("en-IN") : "-"}</td>
+                    <td className="primary-cell">{row.product_name}</td>
+                    <td>{row.lot_name || row.lot_id || "-"}</td>
+                    <td><span className="tag">{row.action}</span></td>
+                    <td>{auditChangeSummary(row)}</td>
+                    <td>{row.reason || "-"}</td>
+                    <td>{row.edited_by_name || "-"}</td>
+                  </tr>
+                ))}
+                {focusedAuditRows.length === 0 && <tr><td colSpan="7" className="empty-cell">No audit entries found.</td></tr>}
+              </DataTable>
+            </div>
+          </section>
+        </div>
+      )}
     </section>
   );
 }
