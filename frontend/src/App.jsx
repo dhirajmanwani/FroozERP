@@ -341,6 +341,43 @@ function Icon({ name, size = 18 }) {
   );
 }
 
+class ModuleErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error) {
+    console.error("FroozERP module error", error);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="modal-backdrop">
+          <section className="invoice-modal change-history-modal">
+            <div className="invoice-toolbar">
+              <div>
+                <span className="eyebrow">Module Error</span>
+                <strong>Unable to open this screen</strong>
+              </div>
+              <button className="remove-button" onClick={this.props.onClose}><Icon name="close" /></button>
+            </div>
+            <div className="cart-empty">
+              {this.state.error?.message || "Unexpected error while rendering this module."}
+            </div>
+          </section>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 function App() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -524,6 +561,8 @@ function App() {
   const [selectedInvoice, setSelectedInvoice] = useState(null);
   const [selectedInvoicePrintMode, setSelectedInvoicePrintMode] = useState(null);
   const [editingSale, setEditingSale] = useState(null);
+  const [saleEditLoading, setSaleEditLoading] = useState(false);
+  const [saleEditError, setSaleEditError] = useState("");
   const [changeHistory, setChangeHistory] = useState(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [accountLedgerFocusKey, setAccountLedgerFocusKey] = useState("");
@@ -1347,9 +1386,14 @@ function App() {
         reason: lotDraft.reason,
       };
       if (lotAction.type === "edit") {
+        const nextQty = Number(lotDraft.purchase_qty || 0);
         const nextCost = Number(lotDraft.purchase_rate || 0);
         if (!lotDraft.lot_name.trim()) {
           alert("Please enter lot name / number.");
+          return;
+        }
+        if (!Number.isFinite(nextQty) || nextQty < 0) {
+          alert("Please enter a valid opening quantity.");
           return;
         }
         if (!Number.isFinite(nextCost) || nextCost <= 0) {
@@ -1362,6 +1406,7 @@ function App() {
           lot_size: lotDraft.lot_size,
           supplier_id: lotDraft.supplier_id || null,
           supplier_name: selectedSupplier?.supplier_name || null,
+          purchase_qty: lotDraft.purchase_qty,
           purchase_rate: lotDraft.purchase_rate,
           sale_rate: lotDraft.sale_rate,
           opening_stock_date: lotDraft.opening_stock_date,
@@ -1389,7 +1434,7 @@ function App() {
           return;
         }
         if (!Number.isFinite(nextQty) || nextQty < 0) {
-          alert("Please enter a valid new quantity.");
+          alert("Please enter a valid physical quantity.");
           return;
         }
         await axios.post(`${API_URL}/inventory-lots/${lotAction.lot.id}/adjust`, {
@@ -1689,11 +1734,17 @@ function App() {
   };
 
   const loadSaleForEdit = async (saleId) => {
+    setSaleEditLoading(true);
+    setSaleEditError("");
     try {
       const response = await axios.get(`${API_URL}/sales/${saleId}`);
       setEditingSale(response.data);
     } catch (error) {
-      alert(getErrorMessage(error, "Error Loading Invoice"));
+      const message = getErrorMessage(error, "Error Loading Invoice");
+      setSaleEditError(message);
+      alert(message);
+    } finally {
+      setSaleEditLoading(false);
     }
   };
 
@@ -2824,19 +2875,42 @@ function App() {
           printSettings={settingsData.businessSettings}
         />
       )}
+      {saleEditLoading && (
+        <div className="modal-backdrop">
+          <section className="invoice-modal change-history-modal">
+            <div className="cart-empty">Loading invoice editor...</div>
+          </section>
+        </div>
+      )}
+      {saleEditError && !saleEditLoading && !editingSale && (
+        <div className="modal-backdrop">
+          <section className="invoice-modal change-history-modal">
+            <div className="invoice-toolbar">
+              <div>
+                <span className="eyebrow">Edit Bill</span>
+                <strong>Unable to load invoice</strong>
+              </div>
+              <button className="remove-button" onClick={() => setSaleEditError("")}><Icon name="close" /></button>
+            </div>
+            <div className="cart-empty">{saleEditError}</div>
+          </section>
+        </div>
+      )}
       {editingSale && (
-        <SaleEditModal
-          invoice={editingSale}
-          onClose={() => setEditingSale(null)}
-          onSaved={async () => {
-            setEditingSale(null);
-            await Promise.all([loadSalesHistory(), loadDashboardData(), loadReports()]);
-          }}
-          products={products.filter((product) => product.active !== false)}
-          inventory={inventory}
-          canSaleDateEdit={hasRolePermission("sale_date_edit")}
-          user={user}
-        />
+        <ModuleErrorBoundary onClose={() => setEditingSale(null)}>
+          <SaleEditModal
+            invoice={editingSale}
+            onClose={() => setEditingSale(null)}
+            onSaved={async () => {
+              setEditingSale(null);
+              await Promise.all([loadSalesHistory(), loadDashboardData(), loadReports()]);
+            }}
+            products={products.filter((product) => product.active !== false)}
+            inventory={inventory}
+            canSaleDateEdit={hasRolePermission("sale_date_edit")}
+            user={user}
+          />
+        </ModuleErrorBoundary>
       )}
       {changeHistory && <ChangeHistoryModal history={changeHistory} onClose={() => setChangeHistory(null)} />}
       {lotAction && (
@@ -2875,6 +2949,8 @@ function App() {
                       {activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.supplier_name}</option>)}
                     </select>
                   </Field>
+                  <Field label="Opening Quantity"><input min="0" step="0.001" type="number" value={lotDraft.purchase_qty} onChange={(event) => setLotDraft({ ...lotDraft, purchase_qty: event.target.value })} /></Field>
+                  <Field label="Current Balance Qty"><input readOnly value={Number(lotAction.lot.balance_qty ?? lotAction.lot.remaining_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })} /></Field>
                   <Field label="Opening Cost / Purchase Rate"><input min="0" step="0.01" type="number" value={lotDraft.purchase_rate} onChange={(event) => setLotDraft({ ...lotDraft, purchase_rate: event.target.value })} /></Field>
                   <Field label="Sale Rate"><input min="0" step="0.01" type="number" value={lotDraft.sale_rate} onChange={(event) => setLotDraft({ ...lotDraft, sale_rate: event.target.value })} /></Field>
                   <Field label="Opening Stock Date"><input type="date" value={lotDraft.opening_stock_date} onChange={(event) => setLotDraft({ ...lotDraft, opening_stock_date: event.target.value })} /></Field>
@@ -3899,12 +3975,17 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
   const saleItemNetBeforeInvoiceDiscount = (item) => Number(item.net_amount ?? (saleItemGross(item) - saleItemDiscount(item)));
   const saleLotLabel = (item) => [item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "-";
   const saleItemNarration = (item) => {
-    const product = item.product_name || "Item";
-    const lot = [item.lot_name, item.lot_size].filter(Boolean).join(" / ");
+    const lot = [item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "-";
     const qty = Number(item.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 });
-    const unit = String(item.unit || "").toLowerCase();
+    const unit = String(item.unit || "");
     const rate = Number(item.selling_rate || 0);
-    return `${product}${lot ? ` ${lot}` : ""} ${qty}${unit} @ ${money(rate)} = ${money(saleItemGross(item))}`;
+    return [
+      `Item: ${item.product_name || "Item"}`,
+      `Lot No: ${lot}`,
+      `Qty: ${qty} ${unit}`.trim(),
+      `Rate: ${money(rate)}`,
+      `Amount: ${money(saleItemGross(item))}`,
+    ].join("\n");
   };
   const saleItemSearchText = (row, item) => [
     row.invoice_no,
@@ -3970,6 +4051,8 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
       if (salesFilters.user && row.created_by_name !== salesFilters.user) return false;
       return true;
     });
+    const hasSelectorFilter = Boolean(salesFilters.customer || salesFilters.product || salesFilters.lot || salesFilters.paymentMode || salesFilters.user);
+    if (hasSelectorFilter && selectorItems.length === 0) return null;
     const searchText = search.trim().toLowerCase();
     if (!searchText) return { ...row, visible_items: selectorItems, all_items: allItems, showing_matched_only: false };
     const matchedItems = selectorItems.filter((item) => saleItemSearchText(row, item).includes(searchText));
@@ -8263,6 +8346,7 @@ function SaleEditModal({ canSaleDateEdit = false, inventory = [], invoice, onClo
   const gross = items.reduce((sum, item) => sum + Number(item.quantity || 0) * Number(item.selling_rate || 0), 0);
   const itemDiscount = items.reduce((sum, item) => sum + Number(item.discount_amount || 0), 0);
   const netPayable = Math.max(gross - itemDiscount - Number(invoiceDiscount || 0), 0);
+  const availableProducts = products.filter((product) => product.active !== false);
 
   const updateItem = (index, field, value) => {
     setItems((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, [field]: value } : item));
@@ -9080,11 +9164,11 @@ function DashboardAnalytics({ analytics, customRange, onApplyCustomRange, onCust
               <span className="eyebrow">Inventory</span>
               <h2>Low Stock Alerts</h2>
             </div>
-            <button className="secondary-button" onClick={() => onNavigate("inventory")} type="button">Open Inventory</button>
+            <button className="secondary-button" onClick={() => onNavigate("reports")} type="button">Open Stock Inventory</button>
           </div>
           <div className="low-stock-list">
             {lowStockItems.length ? lowStockItems.map((item) => (
-              <button className="low-stock-row" key={item.product_id} onClick={() => onNavigate("inventory")} type="button">
+              <button className="low-stock-row" key={item.product_id} onClick={() => onNavigate("reports")} type="button">
                 <div>
                   <strong>{item.product_name}</strong>
                   <span>Minimum {Number(item.minimum_stock || 0).toLocaleString("en-IN")} {item.unit || ""}</span>

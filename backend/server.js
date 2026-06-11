@@ -1268,6 +1268,21 @@ const initializeDatabase = async () => {
     );
     ALTER TABLE customer_ledger ADD COLUMN IF NOT EXISTS transaction_date DATE;
 
+    CREATE TABLE IF NOT EXISTS stock_adjustments (
+      id SERIAL PRIMARY KEY,
+      product_id INTEGER NOT NULL REFERENCES products(id),
+      inventory_batch_id INTEGER NOT NULL REFERENCES inventory_batches(id),
+      adjustment_date DATE NOT NULL DEFAULT CURRENT_DATE,
+      adjustment_type VARCHAR(80) NOT NULL,
+      quantity_before NUMERIC(14, 3) NOT NULL DEFAULT 0,
+      physical_quantity NUMERIC(14, 3) NOT NULL DEFAULT 0,
+      adjustment_quantity NUMERIC(14, 3) NOT NULL DEFAULT 0,
+      reason TEXT NOT NULL,
+      remarks TEXT,
+      adjusted_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE TABLE IF NOT EXISTS sale_permission_settings (
       role_name VARCHAR(80) PRIMARY KEY,
       can_edit_sales BOOLEAN DEFAULT FALSE,
@@ -5192,35 +5207,57 @@ app.put(["/inventory-lots/:lotId", "/lots/:lotId"], async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(404).json({ message: "Inventory lot not found" });
     }
+    const oldPurchaseQty = Number(lot.purchase_qty || 0);
+    const oldRemainingQty = Number(lot.remaining_qty || 0);
+    const requestedPurchaseQty = req.body.purchase_qty === undefined || req.body.purchase_qty === null || req.body.purchase_qty === ""
+      ? oldPurchaseQty
+      : parseNonNegativeNumber(req.body.purchase_qty);
+    if (requestedPurchaseQty === null) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: "Enter a valid opening quantity" });
+    }
+    const quantityDiff = roundUnitCost(requestedPurchaseQty - oldPurchaseQty);
+    const nextRemainingQty = roundUnitCost(oldRemainingQty + quantityDiff);
+    if (nextRemainingQty < 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: `Cannot reduce opening quantity below already used stock. Minimum opening quantity is ${roundUnitCost(oldPurchaseQty - oldRemainingQty)}.` });
+    }
     const supplierId = parsePositiveInteger(req.body.supplier_id);
     const supplierName = supplierId ? nullableText(req.body.supplier_name) || lot.supplier_name : null;
     const lotName = cleanText(req.body.lot_name || req.body.lot_number || lot.lot_name || "Opening Stock Lot");
     const lotSize = nullableText(req.body.lot_size || req.body.size_grade || req.body.size);
     const purchaseDate = isDateInput(req.body.opening_stock_date || req.body.purchase_date) ? (req.body.opening_stock_date || req.body.purchase_date) : toDateKey(lot.purchase_date || new Date());
     const remarks = nullableText(req.body.remarks);
-    const netPayable = roundCurrency(Number(lot.purchase_qty || 0) * purchaseRate);
+    const netPayable = roundCurrency(requestedPurchaseQty * purchaseRate);
     const updateResult = await client.query(
       `
       UPDATE inventory_batches
       SET lot_name = $1, lot_size = $2, supplier_id = $3, supplier_name = $4,
-          purchase_rate = $5, effective_cost_per_unit = $5,
-          gross_amount = $6, net_payable = $6,
-          balance_amount = 0, temporary_sale_rate = COALESCE($7, temporary_sale_rate),
-          purchase_date = $8, remarks = $9,
+          purchase_qty = $5::numeric, remaining_qty = $6::numeric,
+          purchase_rate = $7, effective_cost_per_unit = $7,
+          gross_amount = $8, net_payable = $8,
+          balance_amount = 0, temporary_sale_rate = COALESCE($9, temporary_sale_rate),
+          purchase_date = $10, remarks = $11,
           batch_status = CASE
             WHEN COALESCE(batch_status, 'ACTIVE') = 'CANCELLED' THEN batch_status
-            WHEN remaining_qty > 0 THEN 'ACTIVE'
+            WHEN $6::numeric > 0 THEN 'ACTIVE'
             ELSE batch_status
           END
-      WHERE id = $10
+      WHERE id = $12
       RETURNING *
       `,
       [
         lotName, lotSize, supplierId || null, supplierName,
-        purchaseRate, netPayable, saleRate || null,
+        requestedPurchaseQty, nextRemainingQty, purchaseRate, netPayable, saleRate || null,
         purchaseDate, remarks, lotId,
       ]
     );
+    if (quantityDiff !== 0) {
+      await client.query(
+        "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, $3, $4, $5, $6)",
+        [lot.product_id, Math.abs(quantityDiff), quantityDiff > 0 ? "IN" : "OUT", `Lot opening quantity edited: ${reason}`, manager.id, lot.branch_id || 1]
+      );
+    }
     if (saleRate && Number(saleRate) !== Number(lot.temporary_sale_rate || 0)) {
       await client.query("UPDATE products SET selling_rate = $1, selling_rate_updated_at = CURRENT_TIMESTAMP, selling_rate_updated_by = $2 WHERE id = $3", [saleRate, manager.id, lot.product_id]);
     }
@@ -5280,6 +5317,7 @@ app.post(["/inventory-lots/:lotId/adjust", "/lots/:lotId/adjust-stock"], async (
     const manager = await requireRateManager(req.body.updated_by || req.body.created_by, client);
     const reason = cleanText(req.body.reason);
     const adjustmentType = cleanText(req.body.adjustment_type || "Physical Count Correction");
+    const adjustmentDate = isDateInput(req.body.adjustment_date) ? req.body.adjustment_date : toDateKey(new Date());
     const remarks = nullableText(req.body.remarks);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can adjust lot quantity" });
     if (!lotId || physicalQuantity === null || !reason) return res.status(400).json({ message: "Enter physical quantity and adjustment reason" });
@@ -5295,11 +5333,11 @@ app.post(["/inventory-lots/:lotId/adjust", "/lots/:lotId/adjust-stock"], async (
     const updateResult = await client.query(
       `
       UPDATE inventory_batches
-      SET remaining_qty = $1,
-          adjusted_qty = COALESCE(adjusted_qty, 0) + $2,
+      SET remaining_qty = $1::numeric,
+          adjusted_qty = COALESCE(adjusted_qty, 0) + $2::numeric,
           batch_status = CASE
             WHEN COALESCE(batch_status, 'ACTIVE') = 'CANCELLED' THEN batch_status
-            WHEN $1 > 0 THEN 'ACTIVE'
+            WHEN $1::numeric > 0 THEN 'ACTIVE'
             ELSE batch_status
           END,
           remarks = COALESCE($3, remarks)
@@ -5314,6 +5352,28 @@ app.post(["/inventory-lots/:lotId/adjust", "/lots/:lotId/adjust-stock"], async (
         [lot.product_id, Math.abs(diff), diff > 0 ? "IN" : "OUT", `${adjustmentType}: ${reason}`, manager.id, lot.branch_id || 1]
       );
     }
+    await client.query(
+      `
+      INSERT INTO stock_adjustments (
+        product_id, inventory_batch_id, adjustment_date, adjustment_type,
+        quantity_before, physical_quantity, adjustment_quantity,
+        reason, remarks, adjusted_by
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      `,
+      [
+        lot.product_id,
+        lotId,
+        adjustmentDate,
+        adjustmentType,
+        oldBalance,
+        physicalQuantity,
+        diff,
+        reason,
+        remarks,
+        manager.id,
+      ]
+    );
     const newValue = { ...updateResult.rows[0], adjustment_type: adjustmentType, adjustment_qty: diff, physical_quantity: physicalQuantity, remarks };
     await client.query("INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'INVENTORY_LOT_ADJUST', $2::jsonb, $3::jsonb, $4, $5)", [lot.product_id, JSON.stringify(lot), JSON.stringify(newValue), reason, manager.id]);
     await client.query("COMMIT");
@@ -5321,7 +5381,7 @@ app.post(["/inventory-lots/:lotId/adjust", "/lots/:lotId/adjust-stock"], async (
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
-    return res.status(500).json({ message: "Error Adjusting Inventory Lot" });
+    return res.status(500).json({ message: `Error Adjusting Inventory Lot: ${error.message}` });
   } finally {
     client.release();
   }
@@ -5540,6 +5600,33 @@ app.get("/stock-inventory/audit", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Stock Audit Trail" });
+  }
+});
+
+app.get("/stock-adjustments", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        sa.*,
+        p.product_name,
+        p.category,
+        ib.lot_name,
+        ib.lot_size,
+        ib.batch_no,
+        u.full_name AS adjusted_by_name
+      FROM stock_adjustments sa
+      JOIN products p ON p.id = sa.product_id
+      JOIN inventory_batches ib ON ib.id = sa.inventory_batch_id
+      LEFT JOIN users u ON u.id = sa.adjusted_by
+      ORDER BY sa.adjustment_date DESC, sa.created_at DESC, sa.id DESC
+      LIMIT 500
+      `
+    );
+    return res.json(result.rows);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: `Error Loading Stock Adjustments: ${error.message}` });
   }
 });
 
