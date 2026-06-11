@@ -442,6 +442,8 @@ function App() {
   const [lotPanelProduct, setLotPanelProduct] = useState(null);
   const [productLots, setProductLots] = useState([]);
   const [productLotAudit, setProductLotAudit] = useState([]);
+  const [productListSearch, setProductListSearch] = useState("");
+  const [lotListSearch, setLotListSearch] = useState("");
   const [showOpeningLotForm, setShowOpeningLotForm] = useState(false);
   const [lotAction, setLotAction] = useState(null);
   const [lotDraft, setLotDraft] = useState({
@@ -1922,6 +1924,37 @@ function App() {
     groups.set(key, current);
     return groups;
   }, new Map()).values()].sort((left, right) => `${left.category}-${left.product_name}`.localeCompare(`${right.category}-${right.product_name}`));
+  const productSearchText = productListSearch.trim().toLowerCase();
+  const filteredProducts = products.filter((product) => {
+    if (!productSearchText) return true;
+    return [
+      product.product_name,
+      product.category_name,
+      product.category,
+      product.barcode,
+      product.origin_type,
+      product.selling_rate,
+      product.active !== false ? "active" : "inactive",
+      product.unit,
+    ].some((value) => String(value ?? "").toLowerCase().includes(productSearchText));
+  });
+  const lotSearchText = lotListSearch.trim().toLowerCase();
+  const filteredProductLots = productLots.filter((lot) => {
+    if (!lotSearchText) return true;
+    return [
+      lot.lot_name,
+      lot.batch_no,
+      lot.supplier_name,
+      lot.lot_size,
+      lot.purchase_date,
+      lot.purchase_rate,
+      lot.effective_cost_per_unit,
+      lot.temporary_sale_rate,
+      lot.selling_rate,
+      lot.batch_status || "ACTIVE",
+      lot.remarks,
+    ].some((value) => String(value ?? "").toLowerCase().includes(lotSearchText));
+  });
 
   return (
     <main className="erp-shell">
@@ -2160,8 +2193,16 @@ function App() {
                       </div>
                       <button className="secondary-button" onClick={() => loadProductLots(lotPanelProduct, true)}>Refresh Lots</button>
                     </div>
+                    <label className="icon-input table-search-input">
+                      <Icon name="search" />
+                      <input
+                        placeholder="Search lot, supplier, size..."
+                        value={lotListSearch}
+                        onChange={(event) => setLotListSearch(event.target.value)}
+                      />
+                    </label>
                     <DataTable headers={["Supplier", "Lot", "Size/Grade", "Opening Date", "Opening Qty", "Sold Qty", "Balance Qty", "Cost", "Sale Rate", "Remarks", "Actions"]}>
-                      {productLots.length ? productLots.map((lot) => (
+                      {filteredProductLots.length ? filteredProductLots.map((lot) => (
                         <tr key={lot.id}>
                           <td>{lot.supplier_name || "No supplier payable"}</td>
                           <td className="primary-cell">{lot.lot_name || lot.batch_no || `Lot #${lot.id}`}<small className="cell-note">{lot.batch_status || "ACTIVE"}</small></td>
@@ -2183,7 +2224,7 @@ function App() {
                           </td>
                         </tr>
                       )) : (
-                        <tr><td colSpan="11" className="empty-cell">No lots found for this product.</td></tr>
+                        <tr><td colSpan="11" className="empty-cell">{productLots.length ? "No matching lots found." : "No lots found for this product."}</td></tr>
                       )}
                     </DataTable>
                     <div className="button-row">
@@ -2257,8 +2298,16 @@ function App() {
               </ModuleCard>
 
               <ModuleCard eyebrow="Item List" title="Category-Wise Items" subtitle="Inactive items stay in history but are hidden from POS by default.">
+                <label className="icon-input table-search-input">
+                  <Icon name="search" />
+                  <input
+                    placeholder="Search item, category, barcode..."
+                    value={productListSearch}
+                    onChange={(event) => setProductListSearch(event.target.value)}
+                  />
+                </label>
                 <DataTable headers={["Category", "Item", "Barcode", "Origin", "Sale Rate", "Min Stock", "Stock", "Lots", "Unit", "Status", "Actions"]}>
-                  {products.map((product) => (
+                  {filteredProducts.map((product) => (
                     <tr key={product.id}>
                       <td>{product.category_name || product.category || "Fruit"}</td>
                       <td className="primary-cell">{product.product_name}<small className="cell-note">{product.remarks || ""}</small></td>
@@ -2279,6 +2328,7 @@ function App() {
                       </td>
                     </tr>
                   ))}
+                  {filteredProducts.length === 0 && <tr><td colSpan="11" className="empty-cell">No matching items found.</td></tr>}
                 </DataTable>
               </ModuleCard>
             </section>
@@ -7425,21 +7475,50 @@ function InvoiceModal({ invoice, onClose, paymentSettings = {}, printSettings = 
             <div><small>Payment</small><strong>{invoice.payment_mode}</strong><span>{invoice.branch_name || "SRT Retail Store"}</span></div>
             <div><small>Status</small><strong>{invoice.sale_status || "COMPLETED"}</strong><span>{invoice.cancellation_reason || invoice.edit_reason || "No changes recorded"}</span></div>
           </section>
-          <table className="invoice-table">
-            <thead><tr><th>Item</th><th>Lot/Size</th><th>Qty</th><th>Rate</th>{showItemDiscountOnReceipt && <th>Item Discount</th>}<th>Amount</th></tr></thead>
-            <tbody>
-              {invoice.items?.map((item) => (
-                <tr key={item.id || `${item.product_id}-${item.inventory_batch_id || "FIFO"}`}>
-                  <td>{item.product_name}</td>
-                  <td>{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "-"}</td>
-                  <td>{item.quantity} {item.unit}</td>
-                  <td>{receiptCurrency.format(Number(item.selling_rate))}</td>
-                  {showItemDiscountOnReceipt && <td>{receiptCurrency.format(Number(item.discount_amount || 0))}</td>}
-                  <td>{receiptCurrency.format(Number(item.net_amount))}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          {activePrintMode === "THERMAL" ? (
+            <section className="thermal-items-list">
+              {(invoice.items || []).map((item) => {
+                const lotText = [item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "-";
+                const discountAmount = Number(item.discount_amount || 0);
+                return (
+                  <article className="thermal-item-block" key={item.id || `${item.product_id}-${item.inventory_batch_id || "FIFO"}`}>
+                    <div className="thermal-item-name">{item.product_name}</div>
+                    <div className="thermal-item-detail">
+                      <span>Lot: {lotText}</span>
+                      <span>Qty: {item.quantity} {item.unit}</span>
+                      <span>Rate: {receiptCurrency.format(Number(item.selling_rate))}</span>
+                    </div>
+                    {showItemDiscountOnReceipt && (discountAmount > 0 || !hideZeroDiscountRows) && (
+                      <div className="thermal-item-discount">
+                        <span>Discount</span>
+                        <strong>{receiptCurrency.format(discountAmount)}</strong>
+                      </div>
+                    )}
+                    <div className="thermal-item-amount">
+                      <span>Amount</span>
+                      <strong>{receiptCurrency.format(Number(item.net_amount))}</strong>
+                    </div>
+                  </article>
+                );
+              })}
+            </section>
+          ) : (
+            <table className="invoice-table">
+              <thead><tr><th>Item</th><th>Lot/Size</th><th>Qty</th><th>Rate</th>{showItemDiscountOnReceipt && <th>Item Discount</th>}<th>Amount</th></tr></thead>
+              <tbody>
+                {invoice.items?.map((item) => (
+                  <tr key={item.id || `${item.product_id}-${item.inventory_batch_id || "FIFO"}`}>
+                    <td>{item.product_name}</td>
+                    <td>{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "-"}</td>
+                    <td>{item.quantity} {item.unit}</td>
+                    <td>{receiptCurrency.format(Number(item.selling_rate))}</td>
+                    {showItemDiscountOnReceipt && <td>{receiptCurrency.format(Number(item.discount_amount || 0))}</td>}
+                    <td>{receiptCurrency.format(Number(item.net_amount))}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
           <section className="invoice-total-box">
             <ThermalTotalLine label="Gross Total" value={Number(invoice.gross_amount)} />
             {shouldRenderBillDiscountRow && <ThermalTotalLine label="Bill Discount" value={-billDiscountAmount} />}

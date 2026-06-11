@@ -332,6 +332,8 @@
 
 .table-actions-row {
   min-width: 250px;
+  align-items: center;
+  justify-content: flex-start;
 }
 
 .primary-button:hover,
@@ -906,6 +908,7 @@ input[readonly] {
   max-height: 560px;
   margin-top: 23px;
   overflow: auto;
+  overscroll-behavior-inline: contain;
   border: 1px solid rgba(148, 163, 184, 0.1);
   border-radius: 10px;
 }
@@ -923,6 +926,18 @@ td {
   color: #94a3b8;
   font-size: 12px;
   white-space: nowrap;
+}
+
+td.primary-cell,
+td.purchase-items-cell {
+  max-width: 340px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+td .button-row {
+  flex-wrap: nowrap;
 }
 
 th {
@@ -1941,6 +1956,54 @@ tbody tr:last-child td {
   color: #0f172a;
 }
 
+.thermal-items-list {
+  display: grid;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.thermal-item-block {
+  padding: 7px 0;
+  border-bottom: 1px dashed #cbd5e1;
+  color: #111827;
+  font-size: 12px;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.thermal-item-name {
+  color: #0f172a;
+  font-weight: 900;
+}
+
+.thermal-item-detail {
+  display: grid;
+  gap: 2px;
+  margin-top: 3px;
+  color: #334155;
+  font-weight: 700;
+}
+
+.thermal-item-discount,
+.thermal-item-amount {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 3px;
+  color: #111827;
+}
+
+.thermal-item-discount strong,
+.thermal-item-amount strong {
+  flex: 0 0 auto;
+  text-align: right;
+}
+
+.thermal-item-amount {
+  font-weight: 900;
+}
+
 .invoice-total-box {
   width: min(280px, 100%);
   display: grid;
@@ -1986,6 +2049,15 @@ tbody tr:last-child td {
 
 .upi-qr-box strong {
   font-size: 12px;
+}
+
+.table-search-input {
+  width: min(520px, 100%);
+  margin: 0 0 14px;
+}
+
+.table-search-input input {
+  min-height: 44px;
 }
 
 .upi-qr-box span,
@@ -2655,43 +2727,92 @@ tbody tr:last-child td {
   }
 
   .invoice-paper.invoice-thermal .invoice-table {
-    width: 100%;
+    display: none;
+  }
+
+  .invoice-paper.invoice-thermal .thermal-items-list {
+    display: grid;
+    gap: 0;
     margin: 4px 0;
-    border-collapse: collapse;
-    table-layout: fixed;
     color: #111827;
+    border-top: 1px solid #111827;
+  }
+
+  .invoice-paper.invoice-thermal .thermal-item-block {
+    padding: 4px 0;
+    color: #111827 !important;
+    border-bottom: 1px dashed #111827;
     font-size: 11.5px;
     font-weight: 800;
-  }
-
-  .invoice-paper.invoice-thermal .invoice-table th,
-  .invoice-paper.invoice-thermal .invoice-table td {
-    padding: 3px 1px;
-    color: #111827 !important;
-    border-bottom: 1px solid #111827;
-    font-weight: 800;
-    vertical-align: top;
-  }
-
-  .invoice-paper.invoice-thermal .invoice-table th:first-child,
-  .invoice-paper.invoice-thermal .invoice-table td:first-child {
-    width: 33%;
+    line-height: 1.18;
+    overflow-wrap: anywhere;
     word-break: break-word;
+    page-break-inside: avoid;
+    break-inside: avoid;
   }
 
-  .invoice-paper.invoice-thermal .invoice-table th:not(:first-child),
-  .invoice-paper.invoice-thermal .invoice-table td:not(:first-child) {
+  .invoice-paper.invoice-thermal .thermal-item-name {
+    color: #111827 !important;
+    font-size: 12.5px;
+    font-weight: 900;
+    line-height: 1.16;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .invoice-paper.invoice-thermal .thermal-item-detail {
+    display: block;
+    margin-top: 2px;
+    color: #111827 !important;
+    font-size: 11px;
+    font-weight: 800;
+  }
+
+  .invoice-paper.invoice-thermal .thermal-item-detail span {
+    display: block;
+    color: #111827 !important;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .invoice-paper.invoice-thermal .thermal-item-discount,
+  .invoice-paper.invoice-thermal .thermal-item-amount {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 4px;
+    margin-top: 2px;
+    color: #111827 !important;
+    font-size: 11.5px;
+    font-weight: 900;
     white-space: nowrap;
+  }
+
+  .invoice-paper.invoice-thermal .thermal-item-discount span,
+  .invoice-paper.invoice-thermal .thermal-item-amount span {
+    min-width: 0;
+    color: #111827 !important;
+  }
+
+  .invoice-paper.invoice-thermal .thermal-item-discount strong,
+  .invoice-paper.invoice-thermal .thermal-item-amount strong {
+    flex: 0 0 auto;
+    color: #111827 !important;
     text-align: right;
   }
 
-  .invoice-paper.invoice-thermal.invoice-58mm .invoice-table {
+  .invoice-paper.invoice-thermal.invoice-58mm .thermal-item-block {
     font-size: 10.8px;
   }
 
-  .invoice-paper.invoice-thermal.invoice-58mm .invoice-table th,
-  .invoice-paper.invoice-thermal.invoice-58mm .invoice-table td {
-    padding-inline: 0;
+  .invoice-paper.invoice-thermal.invoice-58mm .thermal-item-name {
+    font-size: 11.8px;
+  }
+
+  .invoice-paper.invoice-thermal.invoice-58mm .thermal-item-detail,
+  .invoice-paper.invoice-thermal.invoice-58mm .thermal-item-discount,
+  .invoice-paper.invoice-thermal.invoice-58mm .thermal-item-amount {
+    font-size: 10.6px;
   }
 
   .invoice-paper.invoice-thermal .invoice-total-box {
@@ -2702,6 +2823,9 @@ tbody tr:last-child td {
   }
 
   .invoice-paper.invoice-thermal .total-line {
+    display: flex;
+    justify-content: space-between;
+    gap: 6px;
     padding: 1px 0;
     color: #111827 !important;
     font-size: 12px;
@@ -2714,6 +2838,15 @@ tbody tr:last-child td {
     color: #111827 !important;
     font-weight: 900;
     white-space: nowrap;
+  }
+
+  .invoice-paper.invoice-thermal .total-line span {
+    min-width: 0;
+  }
+
+  .invoice-paper.invoice-thermal .total-line strong {
+    flex: 0 0 auto;
+    text-align: right;
   }
 
   .invoice-paper.invoice-thermal .total-line-main {
