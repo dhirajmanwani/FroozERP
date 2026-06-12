@@ -1,0 +1,33 @@
+{
+  "name": "FroozERP",
+  "short_name": "FroozERP",
+  "description": "Premium fruit retail ERP for POS, inventory, accounts and reports.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0F172A",
+  "theme_color": "#0F172A",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "48x48 72x72 96x96 128x128 192x192 512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "POS Billing",
+      "short_name": "POS",
+      "url": "/?view=sales",
+      "icons": [{ "src": "/favicon.svg", "sizes": "192x192", "type": "image/svg+xml" }]
+    },
+    {
+      "name": "Owner Dashboard",
+      "short_name": "Dashboard",
+      "url": "/?view=dashboard",
+      "icons": [{ "src": "/favicon.svg", "sizes": "192x192", "type": "image/svg+xml" }]
+    }
+  ]
+}

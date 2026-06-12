@@ -70,7 +70,13 @@ const getClientDeviceInfo = () => {
     localStorage.setItem(storageKey, deviceId);
   }
   const userAgent = navigator.userAgent || "Browser";
-  const deviceType = /mobile|android|iphone/i.test(userAgent) ? "Mobile Browser" : /ipad|tablet/i.test(userAgent) ? "Tablet Browser" : "Desktop Browser";
+  const isAndroid = /android/i.test(userAgent);
+  const isTablet = /ipad|tablet/i.test(userAgent) || (isAndroid && !/mobile/i.test(userAgent));
+  const isPhone = /mobile|iphone/i.test(userAgent) && !isTablet;
+  const browser = /chrome|crios/i.test(userAgent) ? "Chrome" : /firefox|fxios/i.test(userAgent) ? "Firefox" : /safari/i.test(userAgent) ? "Safari" : "Browser";
+  const deviceType = isAndroid
+    ? isTablet ? `Android Tablet - ${browser}` : `Android Phone - ${browser}`
+    : isTablet ? `Tablet Browser - ${browser}` : isPhone ? `Mobile Browser - ${browser}` : `Desktop Browser - ${browser}`;
   return {
     device_id: deviceId,
     device_name: localStorage.getItem("froozerp_device_name") || `${deviceType} - ${window.location.hostname}`,
@@ -379,13 +385,17 @@ class ModuleErrorBoundary extends React.Component {
 }
 
 function App() {
+  const initialView = (() => {
+    const requestedView = new URLSearchParams(window.location.search).get("view");
+    return navigationItems.some(([view]) => view === requestedView) ? requestedView : "dashboard";
+  })();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [user, setUser] = useState(null);
   const [deviceInfo, setDeviceInfo] = useState(() => getClientDeviceInfo());
   const [deviceGate, setDeviceGate] = useState(null);
   const [activationCode, setActivationCode] = useState("");
-  const [activeView, setActiveView] = useState("dashboard");
+  const [activeView, setActiveView] = useState(initialView);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [products, setProducts] = useState([]);
   const [productCategories, setProductCategories] = useState([]);
@@ -7434,6 +7444,7 @@ function SystemInfoSection({ systemInfo }) {
   const device = systemInfo.currentDevice || {};
   const branch = systemInfo.currentBranch || {};
   const backup = systemInfo.lastBackup || {};
+  const androidUrl = systemInfo.lanFrontendUrl || (systemInfo.serverIp ? `http://${systemInfo.serverIp}:5173` : "-");
   return (
     <ModuleCard eyebrow="System Info" title="Server, Network and Device Status" subtitle="Use the LAN URL from another device on the same shop network.">
       <div className="purchase-summary-grid supplier-payment-preview">
@@ -7446,12 +7457,25 @@ function SystemInfoSection({ systemInfo }) {
         <tr><td>Software Version</td><td>{systemInfo.softwareVersion || "1.0.0"}</td></tr>
         <tr><td>LAN API URL</td><td>{systemInfo.lanApiUrl || "-"}</td></tr>
         <tr><td>LAN Frontend URL</td><td>{systemInfo.lanFrontendUrl || "-"}</td></tr>
+        <tr><td>Android Chrome URL</td><td>{androidUrl}</td></tr>
         <tr><td>Current Device</td><td>{device.device_name || "-"} ({device.device_id || "-"})</td></tr>
+        <tr><td>Current Device Type</td><td>{device.device_type || "Browser"}</td></tr>
         <tr><td>Current Branch</td><td>{branch.branch_name || "Main Branch"}</td></tr>
         <tr><td>Current Counter</td><td>{device.counter_name || device.assigned_counter_id || "Not assigned"}</td></tr>
         <tr><td>Last Backup</td><td>{backup.completed_at ? new Date(backup.completed_at).toLocaleString("en-IN") : "Not recorded"}</td></tr>
         <tr><td>Backup Location</td><td>{systemInfo.backupLocation || "-"}</td></tr>
       </DataTable>
+      <section className="android-help-card">
+        <span className="eyebrow">Android Connection Guide</span>
+        <ol>
+          <li>Connect the Android phone or tablet to the same Wi-Fi as the FroozERP server computer.</li>
+          <li>Open Chrome and enter <strong>{androidUrl}</strong>.</li>
+          <li>Login with your FroozERP user. If device approval appears, approve it from an already approved Owner device.</li>
+          <li>For counter tablets, assign the device as Retail Counter Tablet from Authorized Devices.</li>
+          <li>Use Chrome menu → Add to Home screen to install the FroozERP shortcut.</li>
+        </ol>
+        <p>Android devices use the same backend and database. No separate phone/tablet database is created.</p>
+      </section>
     </ModuleCard>
   );
 }
@@ -8106,6 +8130,9 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
 
   return (
     <section className="pos-layout" onKeyDown={handleShortcuts}>
+      <div className="mobile-pos-note">
+        POS billing is optimized for tablet and desktop. Phone screens remain supported for quick invoice lookup and emergency billing.
+      </div>
       <div className="pos-main">
         <section className="content-card pos-search-card">
           <div className="card-heading">
