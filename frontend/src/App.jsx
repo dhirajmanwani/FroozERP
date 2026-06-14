@@ -125,10 +125,11 @@ const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth
       windowHeight: Math.max(document.documentElement.clientHeight, element.scrollHeight),
     });
     const imgData = canvas.toDataURL("image/png");
-    const pageWidth = isThermal ? (receiptWidth === "58MM" ? 58 : 80) : 210;
+    const isLandscapeReport = !isThermal && Boolean(element.closest?.(".cash-book-print-report"));
+    const pageWidth = isThermal ? (receiptWidth === "58MM" ? 58 : 80) : isLandscapeReport ? 297 : 210;
     const imgHeight = (canvas.height * pageWidth) / canvas.width;
-    const pageHeight = isThermal ? Math.max(120, imgHeight) : 297;
-    const pdf = new jsPDF("p", "mm", isThermal ? [pageWidth, pageHeight] : "a4");
+    const pageHeight = isThermal ? Math.max(120, imgHeight) : isLandscapeReport ? 210 : 297;
+    const pdf = new jsPDF(isLandscapeReport ? "l" : "p", "mm", isThermal ? [pageWidth, pageHeight] : "a4");
     if (isThermal) {
       pdf.addImage(imgData, "PNG", 0, 0, pageWidth, imgHeight);
     } else {
@@ -3713,8 +3714,9 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
   const [balanceSheetDetailLoading, setBalanceSheetDetailLoading] = useState(false);
   const [balanceSheetDetailError, setBalanceSheetDetailError] = useState("");
   const [cashBookDetail, setCashBookDetail] = useState(null);
-  const [cashBookFilters, setCashBookFilters] = useState({ paymentMode: "", accountFilter: "", bookAccount: "CASH" });
-  const [groupCashBookByDate, setGroupCashBookByDate] = useState(false);
+  const [cashBookFilters, setCashBookFilters] = useState({ paymentMode: "", accountFilter: "", bookAccount: "ALL" });
+  const [cashBookViewMode, setCashBookViewMode] = useState("SUMMARY");
+  const [cashBookGroupBy, setCashBookGroupBy] = useState("PERIOD");
   const [showCashBookRemarks, setShowCashBookRemarks] = useState(true);
   const [inventoryLotReportFilter, setInventoryLotReportFilter] = useState("ACTIVE");
   const [purchaseFilters, setPurchaseFilters] = useState({
@@ -3731,9 +3733,8 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
   const currentReportParams = () => range === "custom" ? customRange : { range };
   const currentCashBookParams = (overrides = {}) => {
     const nextFilters = { ...cashBookFilters, ...(overrides.filters || {}) };
-    const nextGroupByDate = overrides.groupByDate ?? groupCashBookByDate;
-    const bookAccount = nextFilters.bookAccount || "CASH";
-    const accountFilter = bookAccount === "CASH" ? "CASH" : "BANK";
+    const bookAccount = nextFilters.bookAccount || "ALL";
+    const accountFilter = bookAccount === "CASH" ? "CASH" : ["BANK", "UPI", "CARD", "BANK_TRANSFER"].includes(bookAccount) ? "BANK" : "";
     const paymentMode = ["UPI", "CARD", "BANK_TRANSFER"].includes(bookAccount)
       ? bookAccount
       : nextFilters.paymentMode;
@@ -3743,14 +3744,13 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
       account_filter: accountFilter,
       party_filter: nextFilters.accountFilter,
       search,
-      group_by_date: nextGroupByDate ? "true" : "",
     };
   };
   const refreshReports = async () => {
     await onReload(selectedReport === "cashBook" ? currentCashBookParams() : currentReportParams());
   };
-  const reloadCashBook = async (filters = cashBookFilters, groupByDate = groupCashBookByDate) => {
-    await onReload(currentCashBookParams({ filters, groupByDate }));
+  const reloadCashBook = async (filters = cashBookFilters) => {
+    await onReload(currentCashBookParams({ filters }));
   };
   const clearLedgerFilters = async () => {
     setAccountReportFilters({ accountType: "", accountName: "", voucherType: "", paymentMode: "" });
@@ -3883,21 +3883,26 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
     if (inventoryLotReportFilter === "SOLD_OUT") return !["CANCELLED", "INACTIVE"].includes(status);
     return true;
   });
-  const cashBookAccountMode = cashBookFilters.bookAccount || "CASH";
-  const isCashBookMode = cashBookAccountMode === "CASH";
-  const cashBookAccountLabel = cashBookAccountMode === "CASH"
-    ? "Cash"
-    : cashBookAccountMode === "UPI"
+  const cashBookAccountMode = cashBookFilters.bookAccount || "ALL";
+  const cashBookAccountLabel = cashBookAccountMode === "ALL"
+    ? "Cash + Bank"
+    : cashBookAccountMode === "CASH"
+      ? "Cash"
+      : cashBookAccountMode === "UPI"
       ? "UPI"
       : cashBookAccountMode === "CARD"
         ? "Card"
         : cashBookAccountMode === "BANK_TRANSFER"
           ? "Bank Transfer"
           : "Bank / UPI / Card";
-  const cashBookOpening = Number((isCashBookMode ? cashBookData.opening_cash : cashBookData.opening_bank) || 0);
-  const cashBookReceipts = Number((isCashBookMode ? cashBookData.cash_receipts : cashBookData.bank_receipts) || 0);
-  const cashBookPayments = Number((isCashBookMode ? cashBookData.cash_payments : cashBookData.bank_payments) || 0);
-  const cashBookClosing = Number((isCashBookMode ? cashBookData.closing_cash : cashBookData.closing_bank) || 0);
+  const cashBookOpeningCash = Number(cashBookData.opening_cash || 0);
+  const cashBookOpeningBank = Number(cashBookData.opening_bank || 0);
+  const cashBookReceiptsCash = Number(cashBookData.cash_receipts || 0);
+  const cashBookReceiptsBank = Number(cashBookData.bank_receipts || 0);
+  const cashBookPaymentsCash = Number(cashBookData.cash_payments || 0);
+  const cashBookPaymentsBank = Number(cashBookData.bank_payments || 0);
+  const cashBookClosingCash = Number(cashBookData.closing_cash || 0);
+  const cashBookClosingBank = Number(cashBookData.closing_bank || 0);
   const salesChanges = filterRows(data.salesChangeReport);
   const editedBills = salesChanges.filter((row) => row.sale_status === "EDITED" || row.edited_at);
   const cancelledBills = salesChanges.filter((row) => row.sale_status === "CANCELLED" || row.cancelled_at);
@@ -4596,13 +4601,17 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
       </tr>,
     },
     cashBook: {
-      title: "Cash Book / Bank Book",
+      title: "Cash Book",
       rows: cashBookRows,
       summary: () => [
-        [`Opening ${cashBookAccountLabel}`, money(cashBookOpening), true],
-        [`${cashBookAccountLabel} Receipts`, money(cashBookReceipts)],
-        [`${cashBookAccountLabel} Payments`, money(cashBookPayments)],
-        [`Closing ${cashBookAccountLabel}`, money(cashBookClosing), true],
+        ["Opening Cash", money(cashBookOpeningCash), true],
+        ["Opening Bank", money(cashBookOpeningBank), true],
+        ["Cash Receipts", money(cashBookReceiptsCash)],
+        ["Bank Receipts", money(cashBookReceiptsBank)],
+        ["Cash Payments", money(cashBookPaymentsCash)],
+        ["Bank Payments", money(cashBookPaymentsBank)],
+        ["Closing Cash", money(cashBookClosingCash), true],
+        ["Closing Bank", money(cashBookClosingBank), true],
         ["Total Closing", money(cashBookData.total_closing), true],
       ],
       headers: ["Date", "Particulars / Account", "Narration", "Receipt Cash", "Receipt Bank/UPI/Card", "Payment Cash", "Payment Bank/UPI/Card", "Cash Balance", "Bank Balance", "Total Balance", "Reference / Bill No"],
@@ -4795,8 +4804,9 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
             <select value={cashBookFilters.bookAccount} onChange={(event) => {
               const next = { ...cashBookFilters, bookAccount: event.target.value, paymentMode: "" };
               setCashBookFilters(next);
-              reloadCashBook(next, groupCashBookByDate);
+              reloadCashBook(next);
             }}>
+              <option value="ALL">All Cash + Bank</option>
               <option value="CASH">Cash</option>
               <option value="BANK">All Bank / UPI / Card</option>
               <option value="UPI">UPI</option>
@@ -4808,10 +4818,17 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
             <select value={cashBookFilters.paymentMode} onChange={(event) => {
               const next = { ...cashBookFilters, paymentMode: event.target.value };
               setCashBookFilters(next);
-              reloadCashBook(next, groupCashBookByDate);
+              reloadCashBook(next);
             }} disabled={["UPI", "CARD", "BANK_TRANSFER"].includes(cashBookFilters.bookAccount)}>
               <option value="">All modes</option>
-              {cashBookFilters.bookAccount === "CASH" ? <option value="CASH">Cash</option> : (
+              {cashBookFilters.bookAccount === "CASH" ? <option value="CASH">Cash</option> : cashBookFilters.bookAccount === "ALL" ? (
+                <>
+                  <option value="CASH">Cash</option>
+                  <option value="UPI">UPI</option>
+                  <option value="CARD">Card</option>
+                  <option value="BANK_TRANSFER">Bank Transfer</option>
+                </>
+              ) : (
                 <>
                   <option value="UPI">UPI</option>
                   <option value="CARD">Card</option>
@@ -4824,7 +4841,7 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
             <select value={cashBookFilters.accountFilter} onChange={(event) => {
               const next = { ...cashBookFilters, accountFilter: event.target.value };
               setCashBookFilters(next);
-              reloadCashBook(next, groupCashBookByDate);
+              reloadCashBook(next);
             }}>
               <option value="">All accounts</option>
               <option value="CUSTOMER">Customer</option>
@@ -4834,23 +4851,29 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
               <option value="OWNER">Owner</option>
             </select>
           </Field>
+          <Field label="View Mode">
+            <select value={cashBookViewMode} onChange={(event) => setCashBookViewMode(event.target.value)}>
+              <option value="SUMMARY">Account Summary</option>
+              <option value="ENTRY">Entry-wise</option>
+            </select>
+          </Field>
+          <Field label="Group By">
+            <select value={cashBookGroupBy} onChange={(event) => setCashBookGroupBy(event.target.value)}>
+              <option value="PERIOD">Entire Selected Period</option>
+              <option value="DATE">Date-wise</option>
+              <option value="MONTH">Month-wise</option>
+            </select>
+          </Field>
           <label className="check-field report-check-field">
             <input checked={showCashBookRemarks} type="checkbox" onChange={(event) => setShowCashBookRemarks(event.target.checked)} />
             <span>Show Entry Wise Remarks</span>
           </label>
-          <label className="check-field report-check-field">
-            <input checked={groupCashBookByDate} type="checkbox" onChange={(event) => {
-              const next = event.target.checked;
-              setGroupCashBookByDate(next);
-              reloadCashBook(cashBookFilters, next);
-            }} />
-            <span>Group by Date</span>
-          </label>
           <button className="secondary-button" onClick={() => {
-            const next = { paymentMode: "", accountFilter: "", bookAccount: "CASH" };
+            const next = { paymentMode: "", accountFilter: "", bookAccount: "ALL" };
             setCashBookFilters(next);
-            setGroupCashBookByDate(false);
-            reloadCashBook(next, false);
+            setCashBookViewMode("SUMMARY");
+            setCashBookGroupBy("PERIOD");
+            reloadCashBook(next);
           }}>Clear Cash Book Filters</button>
         </>
       )}
@@ -5042,100 +5065,177 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
   };
   const renderCashBookDetailModal = () => {
     if (!cashBookDetail) return null;
+    const sourceRows = cashBookDetail.source_rows || [cashBookDetail];
+    const totalReceiptCash = sourceRows.reduce((sum, row) => sum + Number(row.receipt_cash || 0), 0);
+    const totalReceiptBank = sourceRows.reduce((sum, row) => sum + Number(row.receipt_bank || 0), 0);
+    const totalPaymentCash = sourceRows.reduce((sum, row) => sum + Number(row.payment_cash || 0), 0);
+    const totalPaymentBank = sourceRows.reduce((sum, row) => sum + Number(row.payment_bank || 0), 0);
     return (
       <div className="modal-backdrop">
         <section className="invoice-modal change-history-modal">
           <div className="invoice-modal-header">
             <div>
               <span className="eyebrow">Cash Book Detail</span>
-              <h2>{cashBookDetail.source_type || "Cash / Bank Movement"}</h2>
-              <p>{formatDisplayDate(cashBookDetail.date)} | {cashBookDetail.party_name || "-"}</p>
+              <h2>{cashBookDetail.account_name || cashBookDetail.source_type || "Cash / Bank Movement"}</h2>
+              <p>{cashBookDetail.group_label || formatDisplayDate(cashBookDetail.date)} | {sourceRows.length} entr{sourceRows.length === 1 ? "y" : "ies"}</p>
             </div>
             <button className="secondary-button" onClick={() => setCashBookDetail(null)}>Close</button>
           </div>
           <div className="purchase-summary-grid supplier-payment-preview">
-            <SummaryMetric label="Reference" value={cashBookDetail.reference_no || "-"} />
-            <SummaryMetric label="Payment Mode" value={cashBookDetail.payment_mode || "-"} />
-            <SummaryMetric label="Cash Movement" value={money(Number(cashBookDetail.receipt_cash || 0) - Number(cashBookDetail.payment_cash || 0))} />
-            <SummaryMetric featured label="Bank Movement" value={money(Number(cashBookDetail.receipt_bank || 0) - Number(cashBookDetail.payment_bank || 0))} />
+            <SummaryMetric label="Receipt Cash" value={money(totalReceiptCash)} />
+            <SummaryMetric label="Receipt Bank" value={money(totalReceiptBank)} />
+            <SummaryMetric label="Payment Cash" value={money(totalPaymentCash)} />
+            <SummaryMetric featured label="Payment Bank" value={money(totalPaymentBank)} />
           </div>
-          <div className="audit-readable">
-            {(cashBookDetail.narration || "No narration available")
-              .split("\n")
-              .filter(Boolean)
-              .map((line, index) => <span key={`${line}-${index}`}>{line}</span>)}
-          </div>
+          <DataTable headers={["Date & Time", "Voucher / Invoice", "Type", "Party", "Mode", "Cash", "Bank", "Remarks", "Created By", "Source"]}>
+            {sourceRows.map((row, index) => (
+              <tr key={`${row.source_type}-${row.source_id}-${index}`}>
+                <td>{formatDisplayDate(row.date)}<small className="cell-note">{row.entry_time ? new Date(row.entry_time).toLocaleTimeString("en-IN") : ""}</small></td>
+                <td className="primary-cell">{row.reference_no || "-"}</td>
+                <td>{row.source_type || "-"}</td>
+                <td>{row.party_name || row.account_name || "-"}</td>
+                <td>{row.payment_mode || "-"}</td>
+                <td className="amount-cell">{money(Number(row.receipt_cash || 0) || Number(row.payment_cash || 0))}</td>
+                <td className="amount-cell">{money(Number(row.receipt_bank || 0) || Number(row.payment_bank || 0))}</td>
+                <td className="purchase-items-cell">{row.narration || "-"}</td>
+                <td>{row.created_by_name || "-"}</td>
+                <td>{row.source_type || "-"}</td>
+              </tr>
+            ))}
+          </DataTable>
         </section>
       </div>
     );
   };
   const renderCashBookStatement = () => {
-    const receiptRows = cashBookRows.filter((row) =>
-      Number((isCashBookMode ? row.receipt_cash : row.receipt_bank) || 0) > 0
-    );
-    const paymentRows = cashBookRows.filter((row) =>
-      Number((isCashBookMode ? row.payment_cash : row.payment_bank) || 0) > 0
-    );
-    const receiptAmount = (row) => Number((isCashBookMode ? row.receipt_cash : row.receipt_bank) || 0);
-    const paymentAmount = (row) => Number((isCashBookMode ? row.payment_cash : row.payment_bank) || 0);
-    const renderBookRow = (row, amount, type) => (
-      <tr className="report-row-clickable" key={`${type}-${row.date}-${row.reference_no}-${row.source_id}`} onClick={() => setCashBookDetail(row)}>
-        <td className="date-cell">{formatDisplayDate(row.date)}</td>
+    const cashBookPeriodLabel = (row) => {
+      const key = toDateKey(row.date);
+      if (cashBookGroupBy === "DATE") return key;
+      if (cashBookGroupBy === "MONTH") return key.slice(0, 7);
+      return "Selected Period";
+    };
+    const cashBookGroupLabel = (row) => {
+      const key = cashBookPeriodLabel(row);
+      if (cashBookGroupBy === "DATE") return formatDisplayDate(key);
+      if (cashBookGroupBy === "MONTH") {
+        const [year, month] = key.split("-");
+        return `${month}/${year}`;
+      }
+      return `${formatDisplayDate(cashBookData.dateFrom || data.dateFrom)} to ${formatDisplayDate(cashBookData.dateTo || data.dateTo)}`;
+    };
+    const groupCashBookRows = (rows) => {
+      if (cashBookViewMode === "ENTRY") {
+        return rows.map((row) => ({ ...row, source_rows: [row], group_label: cashBookGroupLabel(row), ledger_folio: row.reference_no || "-" }));
+      }
+      return [...rows.reduce((groups, row) => {
+        const side = Number(row.receipt_cash || 0) || Number(row.receipt_bank || 0) ? "RECEIPT" : "PAYMENT";
+        const periodKey = cashBookPeriodLabel(row);
+        const key = [periodKey, side, row.account_type || "", row.account_name || row.party_name || "", row.mode_group || ""].join("|");
+        const current = groups.get(key) || {
+          date: cashBookGroupBy === "PERIOD" ? (cashBookData.dateFrom || data.dateFrom) : periodKey,
+          account_name: row.account_name || row.party_name || "-",
+          account_type: row.account_type,
+          party_name: row.party_name,
+          mode_group: row.mode_group,
+          group_label: cashBookGroupLabel(row),
+          payment_mode: "Multiple",
+          reference_no: "—",
+          ledger_folio: "—",
+          source_type: side === "RECEIPT" ? "Account Summary Receipt" : "Account Summary Payment",
+          receipt_cash: 0,
+          receipt_bank: 0,
+          payment_cash: 0,
+          payment_bank: 0,
+          source_rows: [],
+        };
+        current.receipt_cash += Number(row.receipt_cash || 0);
+        current.receipt_bank += Number(row.receipt_bank || 0);
+        current.payment_cash += Number(row.payment_cash || 0);
+        current.payment_bank += Number(row.payment_bank || 0);
+        current.source_rows.push(row);
+        groups.set(key, current);
+        return groups;
+      }, new Map()).values()];
+    };
+    const displayRows = groupCashBookRows(cashBookRows);
+    const receiptRows = displayRows.filter((row) => Number(row.receipt_cash || 0) + Number(row.receipt_bank || 0) > 0);
+    const paymentRows = displayRows.filter((row) => Number(row.payment_cash || 0) + Number(row.payment_bank || 0) > 0);
+    const receiptSideCashTotal = cashBookOpeningCash + cashBookReceiptsCash;
+    const receiptSideBankTotal = cashBookOpeningBank + cashBookReceiptsBank;
+    const paymentSideCashTotal = cashBookPaymentsCash + cashBookClosingCash;
+    const paymentSideBankTotal = cashBookPaymentsBank + cashBookClosingBank;
+    const renderBookRow = (row, side) => (
+      <tr className="report-row-clickable" key={`${side}-${row.group_label}-${row.account_name}-${row.mode_group || ""}-${row.source_id || row.reference_no}`} onClick={() => setCashBookDetail(row)}>
+        <td className="date-cell">{cashBookViewMode === "ENTRY" ? formatDisplayDate(row.date) : row.group_label}</td>
         <td className="primary-cell">
-          {row.account_name || row.party_name || "-"}
-          {showCashBookRemarks && <small className="cell-note">{row.narration || "-"}</small>}
+          {side === "RECEIPT" ? "To " : "By "}{row.account_name || row.party_name || "-"} A/c
+          {cashBookViewMode === "ENTRY" && showCashBookRemarks && <small className="cell-note">{row.narration || "-"}</small>}
+          {cashBookViewMode === "SUMMARY" && <small className="cell-note">{row.source_rows.length} entr{row.source_rows.length === 1 ? "y" : "ies"}</small>}
         </td>
-        <td className="status-cell"><span className="tag">{row.source_type || type}</span></td>
-        <td className="balance-cell amount-cell">{money(amount)}</td>
+        <td className="status-cell">{row.ledger_folio || "—"}</td>
+        <td className="balance-cell amount-cell">{money(side === "RECEIPT" ? row.receipt_cash : row.payment_cash)}</td>
+        <td className="balance-cell amount-cell">{money(side === "RECEIPT" ? row.receipt_bank : row.payment_bank)}</td>
       </tr>
     );
     return (
       <section className="cash-book-statement">
         <div className="pl-title-block cash-book-title">
-          <span>{isCashBookMode ? "Cash Book" : "Bank Book"}</span>
-          <h2>{isCashBookMode ? "Cash Book" : "Bank Book / UPI / Card Book"}</h2>
-          <p>{cashBookAccountLabel} | {formatDisplayDate(cashBookData.dateFrom || data.dateFrom)} to {formatDisplayDate(cashBookData.dateTo || data.dateTo)}</p>
+          <span>Traditional Double-Sided Format</span>
+          <h2>CASH BOOK</h2>
+          <p>{cashBookAccountLabel} | {cashBookViewMode === "SUMMARY" ? "Account Summary" : "Entry-wise"} | {cashBookGroupBy === "PERIOD" ? "Entire Selected Period" : cashBookGroupBy === "DATE" ? "Date-wise" : "Month-wise"} | {formatDisplayDate(cashBookData.dateFrom || data.dateFrom)} to {formatDisplayDate(cashBookData.dateTo || data.dateTo)}</p>
         </div>
-        {cashBookClosing < 0 && (
+        {(cashBookClosingCash < 0 || cashBookClosingBank < 0) && (
           <div className="cash-book-warning">
-            {isCashBookMode ? "Cash balance" : "Bank balance"} is negative. Please verify opening balance and entries.
+            Cash or bank balance is negative. Please verify opening balance and entries.
           </div>
         )}
         <div className="cash-book-sides">
           <section className="cash-book-panel">
-            <h3>Receipts / Inflow</h3>
-            <DataTable headers={["Date", "Particulars", "Type", "Receipt Amount"]}>
+            <h3><span>Dr.</span> Receipts / Money Coming In</h3>
+            <DataTable headers={["Date", "Particulars", "L.F.", "Cash (₹)", "Bank (₹)"]}>
               <tr className="date-total-row">
                 <td>{formatDisplayDate(cashBookData.dateFrom || data.dateFrom)}</td>
-                <td className="primary-cell">Opening Balance</td>
-                <td><span className="tag">Opening</span></td>
-                <td className="balance-cell">{money(cashBookOpening)}</td>
+                <td className="primary-cell">To Balance b/d</td>
+                <td className="status-cell">—</td>
+                <td className="balance-cell amount-cell">{money(cashBookOpeningCash)}</td>
+                <td className="balance-cell amount-cell">{money(cashBookOpeningBank)}</td>
               </tr>
-              {receiptRows.map((row) => renderBookRow(row, receiptAmount(row), "receipt"))}
-              {receiptRows.length === 0 && <tr><td colSpan="4" className="empty-cell">No receipts found for this range.</td></tr>}
+              {receiptRows.map((row) => renderBookRow(row, "RECEIPT"))}
+              {receiptRows.length === 0 && <tr><td colSpan="5" className="empty-cell">No receipts found for this range.</td></tr>}
               <tr className="date-total-row">
-                <td colSpan="3">Total Receipts</td>
-                <td className="balance-cell">{money(cashBookReceipts)}</td>
+                <td colSpan="3">Total Dr. Side</td>
+                <td className="balance-cell amount-cell">{money(receiptSideCashTotal)}</td>
+                <td className="balance-cell amount-cell">{money(receiptSideBankTotal)}</td>
               </tr>
             </DataTable>
           </section>
           <section className="cash-book-panel">
-            <h3>Payments / Outflow</h3>
-            <DataTable headers={["Date", "Particulars", "Type", "Payment Amount"]}>
-              {paymentRows.map((row) => renderBookRow(row, paymentAmount(row), "payment"))}
-              {paymentRows.length === 0 && <tr><td colSpan="4" className="empty-cell">No payments found for this range.</td></tr>}
+            <h3><span>Cr.</span> Payments / Money Going Out</h3>
+            <DataTable headers={["Date", "Particulars", "L.F.", "Cash (₹)", "Bank (₹)"]}>
+              {paymentRows.map((row) => renderBookRow(row, "PAYMENT"))}
+              {paymentRows.length === 0 && <tr><td colSpan="5" className="empty-cell">No payments found for this range.</td></tr>}
               <tr className="date-total-row">
-                <td colSpan="3">Total Payments</td>
-                <td className="balance-cell">{money(cashBookPayments)}</td>
+                <td>{formatDisplayDate(cashBookData.dateTo || data.dateTo)}</td>
+                <td className="primary-cell">By Balance c/d</td>
+                <td className="status-cell">—</td>
+                <td className="balance-cell amount-cell">{money(cashBookClosingCash)}</td>
+                <td className="balance-cell amount-cell">{money(cashBookClosingBank)}</td>
+              </tr>
+              <tr className="date-total-row">
+                <td colSpan="3">Total Cr. Side</td>
+                <td className="balance-cell amount-cell">{money(paymentSideCashTotal)}</td>
+                <td className="balance-cell amount-cell">{money(paymentSideBankTotal)}</td>
               </tr>
             </DataTable>
           </section>
         </div>
         <div className="cash-book-closing">
-          <span>Opening Balance: <strong>{money(cashBookOpening)}</strong></span>
-          <span>Total Receipts: <strong>{money(cashBookReceipts)}</strong></span>
-          <span>Total Payments: <strong>{money(cashBookPayments)}</strong></span>
-          <span>Closing Balance: <strong>{money(cashBookClosing)}</strong></span>
+          <span>Total Cash Receipts: <strong>{money(cashBookReceiptsCash)}</strong></span>
+          <span>Total Bank Receipts: <strong>{money(cashBookReceiptsBank)}</strong></span>
+          <span>Total Cash Payments: <strong>{money(cashBookPaymentsCash)}</strong></span>
+          <span>Total Bank Payments: <strong>{money(cashBookPaymentsBank)}</strong></span>
+          <span>Closing Cash: <strong>{money(cashBookClosingCash)}</strong></span>
+          <span>Closing Bank: <strong>{money(cashBookClosingBank)}</strong></span>
           <span>Total Cash + Bank: <strong>{money(cashBookData.total_closing)}</strong></span>
         </div>
       </section>
@@ -5188,7 +5288,7 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
       if (selectedReport === "balanceSheet") return `Balance_Sheet_As_At_${to}.pdf`;
       if (selectedReport === "cashBook") {
         const mode = cashBookFilters.bookAccount || cashBookFilters.paymentMode || "All";
-        return `${mode === "CASH" ? "Cash_Book" : "Bank_Book"}_${cashBookFilters.paymentMode || mode}_${from}_to_${to}.pdf`;
+        return `${mode === "BANK" ? "Bank_Book" : "Cash_Book"}_${cashBookFilters.paymentMode || mode}_${from}_to_${to}.pdf`;
       }
       return `${title}_${from}_to_${to}.pdf`;
     })();

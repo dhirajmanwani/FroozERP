@@ -2069,6 +2069,10 @@ tbody tr:last-child td {
 }
 
 .cash-book-panel h3 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   margin: 0;
   padding: 11px 13px;
   border-bottom: 1px solid rgba(245, 158, 11, 0.16);
@@ -2080,14 +2084,49 @@ tbody tr:last-child td {
   text-transform: uppercase;
 }
 
+.cash-book-panel h3 span {
+  display: inline-grid;
+  place-items: center;
+  min-width: 38px;
+  padding: 4px 7px;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  border-radius: 999px;
+  color: #f8fafc;
+  background: rgba(245, 158, 11, 0.14);
+  font-size: 11px;
+}
+
 .cash-book-panel .table-wrap {
   border: 0;
   border-radius: 0;
+  margin: 0;
 }
 
 .cash-book-panel td,
 .cash-book-panel th {
   vertical-align: top;
+}
+
+.cash-book-panel th:nth-child(1),
+.cash-book-panel td:nth-child(1) {
+  width: 17%;
+}
+
+.cash-book-panel th:nth-child(2),
+.cash-book-panel td:nth-child(2) {
+  width: 43%;
+}
+
+.cash-book-panel th:nth-child(3),
+.cash-book-panel td:nth-child(3) {
+  width: 9%;
+}
+
+.cash-book-panel th:nth-child(4),
+.cash-book-panel td:nth-child(4),
+.cash-book-panel th:nth-child(5),
+.cash-book-panel td:nth-child(5) {
+  width: 15.5%;
 }
 
 .cash-book-panel .cell-note {
@@ -2097,7 +2136,7 @@ tbody tr:last-child td {
 
 .cash-book-closing {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   gap: 10px;
 }
 
@@ -2543,9 +2582,12 @@ tbody tr:last-child td {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .cash-book-sides,
+  .cash-book-sides {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .cash-book-closing {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .pos-layout {
@@ -2558,6 +2600,12 @@ tbody tr:last-child td {
 
   .checkout-card {
     position: static;
+  }
+}
+
+@media (max-width: 820px) {
+  .cash-book-sides {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -3090,7 +3138,7 @@ tbody tr:last-child td {
   }
 
   .print-section.cash-book-print-report.print-target .cash-book-closing {
-    grid-template-columns: repeat(5, 1fr) !important;
+    grid-template-columns: repeat(7, 1fr) !important;
     gap: 4px !important;
   }
 
