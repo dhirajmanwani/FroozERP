@@ -4,6 +4,7 @@ import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import QRCode from "qrcode";
 import "./App.css";
+import { initializeLocalDatabase } from "./local/localDatabase";
 
 const API_URL = (
   import.meta.env.VITE_API_URL ||
@@ -417,6 +418,7 @@ function App() {
   const [password, setPassword] = useState("");
   const [user, setUser] = useState(null);
   const [deviceInfo, setDeviceInfo] = useState(() => getClientDeviceInfo());
+  const [localDbStatus, setLocalDbStatus] = useState(null);
   const [deviceGate, setDeviceGate] = useState(null);
   const [activationCode, setActivationCode] = useState("");
   const [activeView, setActiveView] = useState(initialView);
@@ -600,6 +602,16 @@ function App() {
   const [changeHistory, setChangeHistory] = useState(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [accountLedgerFocusKey, setAccountLedgerFocusKey] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    initializeLocalDatabase().then((status) => {
+      if (!cancelled) setLocalDbStatus(status);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const rolePermissionMap = useMemo(() => {
     const map = new Map();
@@ -2861,6 +2873,7 @@ function App() {
           {activeView === "settings" && (
             <SettingsModule
               canManage={canManageRates}
+              localDbStatus={localDbStatus}
               onReload={async () => { await Promise.all([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()]); }}
               settingsData={settingsData}
               rules={settingsRules}
@@ -6624,7 +6637,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
   );
 }
 
-function SettingsModule({ canManage, onReload, rules, settingsData, user }) {
+function SettingsModule({ canManage, localDbStatus, onReload, rules, settingsData, user }) {
   return (
     <section className="settings-layout">
       <section className="settings-banner">
@@ -6647,7 +6660,7 @@ function SettingsModule({ canManage, onReload, rules, settingsData, user }) {
       <SecurityDevicesSection activationCodes={settingsData.activationCodes || []} branches={settingsData.branches || []} canManage={canManage} counters={settingsData.counters || []} devices={settingsData.authorizedDevices || []} onReload={onReload} user={user} />
       <BranchCounterSettings branches={settingsData.branches || []} canManage={canManage} counters={settingsData.counters || []} onReload={onReload} user={user} />
       <UpdateCenterSection canManage={canManage} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
-      <SyncSettingsSection canManage={canManage} key={settingsData.syncSettings?.updated_at || "sync-settings"} onReload={onReload} syncSettings={settingsData.syncSettings} user={user} />
+      <SyncSettingsSection canManage={canManage} key={settingsData.syncSettings?.updated_at || "sync-settings"} localDbStatus={localDbStatus} onReload={onReload} syncSettings={settingsData.syncSettings} user={user} />
       <BackupSettings backupLogs={settingsData.backupLogs || []} backupSettings={settingsData.backupSettings} canManage={canManage} onReload={onReload} user={user} />
       <SystemInfoSection systemInfo={settingsData.systemInfo || {}} />
     </section>
@@ -7311,7 +7324,7 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
   );
 }
 
-function SyncSettingsSection({ canManage, onReload, syncSettings, user }) {
+function SyncSettingsSection({ canManage, localDbStatus, onReload, syncSettings, user }) {
   const [draft, setDraft] = useState(syncSettings || {});
   const [online, setOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
   const [statusMessage, setStatusMessage] = useState("");
@@ -7341,20 +7354,27 @@ function SyncSettingsSection({ canManage, onReload, syncSettings, user }) {
   };
   const pending = Number(draft.pending_count || 0);
   const autoStatus = pending > 0 ? "Sync Pending" : online ? "Online" : "Offline";
+  const nativeDbLabel = localDbStatus?.available
+    ? localDbStatus.initialized ? "Local SQLite Ready" : "Local SQLite Error"
+    : "Browser Mode";
   return (
     <ModuleCard eyebrow="Sync Settings" title="Offline Sync Architecture" subtitle="Local database, sync queue and status indicator are prepared. Cloud sync delivery is not enabled yet.">
       <div className="purchase-summary-grid supplier-payment-preview">
         <SummaryMetric label="Auto Sync Status" value={autoStatus} featured />
         <SummaryMetric label="Pending Queue" value={pending} />
         <SummaryMetric label="Last Sync Time" value={draft.last_sync_at ? new Date(draft.last_sync_at).toLocaleString("en-IN") : "Not synced"} />
+        <SummaryMetric label="Local Database" value={nativeDbLabel} />
       </div>
       {statusMessage && <p className="form-note">{statusMessage}</p>}
       <div className="form-grid supplier-form-grid">
         <Field label="Device ID"><input disabled value={draft.device_id || "LOCAL-STORE"} /></Field>
         <Field label="Device Display Name"><input disabled={!canManage} value={draft.device_display_name || ""} onChange={(event) => setDraft({ ...draft, device_display_name: event.target.value })} /></Field>
+        <Field label="Local SQLite Path"><input disabled value={localDbStatus?.databasePath || "Available in FroozERP desktop app"} /></Field>
+        <Field label="Local Schema Version"><input disabled value={localDbStatus?.schemaVersion || "Not initialized"} /></Field>
         <label className="check-field"><input checked={draft.sync_enabled === true} disabled type="checkbox" /><span>Enable future sync option is view-only until cloud sync is enabled</span></label>
         <Field label="Notes"><textarea disabled value={draft.notes || "Cloud sync is prepared but not enabled yet."} /></Field>
       </div>
+      {localDbStatus?.error && <p className="form-note stock-low">{localDbStatus.error}</p>}
       <p className="form-note">Cloud sync is prepared but not enabled yet. Status, pending queue and last sync time are maintained by the system.</p>
       <button className="primary-button" disabled={!canManage} onClick={save}>Save Device Name</button>
     </ModuleCard>

@@ -1,0 +1,12 @@
+{
+  "name": "froozerp-workspace",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "app": "frontend\\node_modules\\.bin\\tauri.cmd dev",
+    "app:dev": "frontend\\node_modules\\.bin\\tauri.cmd dev",
+    "app:build": "frontend\\node_modules\\.bin\\tauri.cmd build",
+    "build": "npm --prefix frontend run build",
+    "backend:check": "node --check backend/server.js"
+  }
+}
