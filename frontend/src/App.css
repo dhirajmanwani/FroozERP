@@ -1047,6 +1047,130 @@ tbody tr:last-child td {
   min-width: 0;
 }
 
+.pdf-export-active {
+  background: #ffffff !important;
+}
+
+.pdf-export-mode,
+.pdf-export-mode * {
+  color: #000000 !important;
+  background-color: #ffffff !important;
+  background-image: none !important;
+  box-shadow: none !important;
+  text-shadow: none !important;
+  opacity: 1 !important;
+  filter: none !important;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+.pdf-export-mode {
+  overflow: visible !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  font-size: 11px !important;
+  line-height: 1.35 !important;
+}
+
+.pdf-export-mode.report-paper,
+.pdf-export-mode.print-area {
+  width: 1122px !important;
+  max-width: none !important;
+  padding: 42px !important;
+}
+
+.pdf-export-mode .report-print-header {
+  display: flex !important;
+  border-bottom: 2px solid #000000 !important;
+}
+
+.pdf-export-mode .table-wrap {
+  max-height: none !important;
+  overflow: visible !important;
+  border: 1.5px solid #000000 !important;
+  border-radius: 0 !important;
+  margin: 14px 0 !important;
+}
+
+.pdf-export-mode table {
+  width: 100% !important;
+  min-width: 0 !important;
+  table-layout: fixed !important;
+  border-collapse: collapse !important;
+}
+
+.pdf-export-mode th,
+.pdf-export-mode td {
+  padding: 7px 8px !important;
+  border: 1px solid #111111 !important;
+  color: #000000 !important;
+  background: #ffffff !important;
+  font-size: 10.5px !important;
+  line-height: 1.35 !important;
+  white-space: normal !important;
+  overflow-wrap: anywhere !important;
+  word-break: break-word !important;
+  vertical-align: top !important;
+}
+
+.pdf-export-mode th {
+  color: #000000 !important;
+  background: #e5e7eb !important;
+  font-weight: 900 !important;
+}
+
+.pdf-export-mode .summary-metric,
+.pdf-export-mode .pl-section,
+.pdf-export-mode .pl-title-block,
+.pdf-export-mode .cash-book-panel,
+.pdf-export-mode .cash-book-title,
+.pdf-export-mode .cash-book-closing span,
+.pdf-export-mode .invoice-customer,
+.pdf-export-mode .invoice-total-box,
+.pdf-export-mode .thermal-item-block,
+.pdf-export-mode .upi-qr-box,
+.pdf-export-mode .total-line {
+  border: 1px solid #111111 !important;
+  border-radius: 0 !important;
+  color: #000000 !important;
+  background: #ffffff !important;
+}
+
+.pdf-export-mode .tag,
+.pdf-export-mode .stock-ok,
+.pdf-export-mode .stock-low,
+.pdf-export-mode .origin-rate,
+.pdf-export-mode .profit-cell,
+.pdf-export-mode .balance-cell,
+.pdf-export-mode .primary-cell,
+.pdf-export-mode .cell-note,
+.pdf-export-mode small,
+.pdf-export-mode span,
+.pdf-export-mode strong,
+.pdf-export-mode p,
+.pdf-export-mode h2,
+.pdf-export-mode h3 {
+  color: #000000 !important;
+}
+
+.pdf-export-mode .no-print,
+.pdf-export-mode .no-print * {
+  display: none !important;
+}
+
+.pdf-export-thermal {
+  width: auto !important;
+  padding: 10px !important;
+  font-size: 10px !important;
+}
+
+.pdf-export-thermal .thermal-item-block,
+.pdf-export-thermal .invoice-total-box,
+.pdf-export-thermal .invoice-customer,
+.pdf-export-thermal .upi-qr-box {
+  border-color: #000000 !important;
+}
+
 .compact-button {
   min-height: 0;
   padding: 7px 9px;
@@ -3408,5 +3532,79 @@ tbody tr:last-child td {
   .brand-lockup-invoice .brand-monogram {
     print-color-adjust: exact;
     -webkit-print-color-adjust: exact;
+  }
+
+  .print-area,
+  .invoice-paper,
+  .print-area *,
+  .invoice-paper * {
+    color: #000000 !important;
+    background-color: #ffffff !important;
+    background-image: none !important;
+    box-shadow: none !important;
+    text-shadow: none !important;
+    opacity: 1 !important;
+    filter: none !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .print-area,
+  .invoice-paper {
+    font-size: 11px !important;
+    line-height: 1.35 !important;
+  }
+
+  .print-area .report-print-header {
+    border-bottom: 2px solid #000000 !important;
+  }
+
+  .print-area .table-wrap {
+    max-height: none !important;
+    overflow: visible !important;
+    border: 1.5px solid #000000 !important;
+    border-radius: 0 !important;
+  }
+
+  .print-area table,
+  .invoice-paper table {
+    border-collapse: collapse !important;
+  }
+
+  .print-area th,
+  .print-area td,
+  .invoice-paper th,
+  .invoice-paper td {
+    border: 1px solid #111111 !important;
+    color: #000000 !important;
+    background: #ffffff !important;
+    font-size: 10px !important;
+    line-height: 1.35 !important;
+    white-space: normal !important;
+    overflow-wrap: anywhere !important;
+    word-break: break-word !important;
+  }
+
+  .print-area th,
+  .invoice-paper th {
+    background: #e5e7eb !important;
+    font-weight: 900 !important;
+  }
+
+  .print-area .summary-metric,
+  .print-area .pl-section,
+  .print-area .pl-title-block,
+  .print-area .cash-book-panel,
+  .print-area .cash-book-title,
+  .print-area .cash-book-closing span,
+  .invoice-paper .invoice-customer,
+  .invoice-paper .invoice-total-box,
+  .invoice-paper .thermal-item-block,
+  .invoice-paper .upi-qr-box,
+  .invoice-paper .total-line {
+    border: 1px solid #111111 !important;
+    border-radius: 0 !important;
+    color: #000000 !important;
+    background: #ffffff !important;
   }
 }

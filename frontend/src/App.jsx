@@ -110,23 +110,46 @@ const withDocumentTitle = (fileName, action) => {
 };
 const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth = "80MM", save = true }) => {
   if (!element) throw new Error("Nothing to export");
-  const canvas = await html2canvas(element, {
-    backgroundColor: "#ffffff",
-    scale: 2,
-    useCORS: true,
-    scrollX: 0,
-    scrollY: -window.scrollY,
-  });
-  const imgData = canvas.toDataURL("image/png");
   const isThermal = mode === "THERMAL";
-  const pageWidth = isThermal ? (receiptWidth === "58MM" ? 58 : 80) : 210;
-  const pageHeight = isThermal ? Math.max(120, (canvas.height * pageWidth) / canvas.width) : 297;
-  const pdf = new jsPDF("p", "mm", isThermal ? [pageWidth, pageHeight] : "a4");
-  const imgHeight = (canvas.height * pageWidth) / canvas.width;
-  pdf.addImage(imgData, "PNG", 0, 0, pageWidth, imgHeight);
-  const finalFileName = safeFileName(fileName).replace(/\.pdf$/i, "") + ".pdf";
-  if (save) pdf.save(finalFileName);
-  return { blob: pdf.output("blob"), fileName: finalFileName, pdf };
+  element.classList.add("pdf-export-mode", isThermal ? "pdf-export-thermal" : "pdf-export-a4");
+  document.body.classList.add("pdf-export-active");
+  try {
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const canvas = await html2canvas(element, {
+      backgroundColor: "#ffffff",
+      scale: 2,
+      useCORS: true,
+      scrollX: 0,
+      scrollY: 0,
+      windowWidth: Math.max(document.documentElement.clientWidth, element.scrollWidth),
+      windowHeight: Math.max(document.documentElement.clientHeight, element.scrollHeight),
+    });
+    const imgData = canvas.toDataURL("image/png");
+    const pageWidth = isThermal ? (receiptWidth === "58MM" ? 58 : 80) : 210;
+    const imgHeight = (canvas.height * pageWidth) / canvas.width;
+    const pageHeight = isThermal ? Math.max(120, imgHeight) : 297;
+    const pdf = new jsPDF("p", "mm", isThermal ? [pageWidth, pageHeight] : "a4");
+    if (isThermal) {
+      pdf.addImage(imgData, "PNG", 0, 0, pageWidth, imgHeight);
+    } else {
+      let yOffset = 0;
+      let remainingHeight = imgHeight;
+      pdf.addImage(imgData, "PNG", 0, yOffset, pageWidth, imgHeight);
+      remainingHeight -= pageHeight;
+      while (remainingHeight > 0) {
+        yOffset -= pageHeight;
+        pdf.addPage();
+        pdf.addImage(imgData, "PNG", 0, yOffset, pageWidth, imgHeight);
+        remainingHeight -= pageHeight;
+      }
+    }
+    const finalFileName = safeFileName(fileName).replace(/\.pdf$/i, "") + ".pdf";
+    if (save) pdf.save(finalFileName);
+    return { blob: pdf.output("blob"), fileName: finalFileName, pdf };
+  } finally {
+    element.classList.remove("pdf-export-mode", "pdf-export-thermal", "pdf-export-a4");
+    document.body.classList.remove("pdf-export-active");
+  }
 };
 
 const supplierPaymentModes = [
@@ -6052,6 +6075,8 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
   const [editingPaymentKey, setEditingPaymentKey] = useState("");
   const [paymentAudit, setPaymentAudit] = useState(null);
   const [receiptPayment, setReceiptPayment] = useState(null);
+  const [ledgerExporting, setLedgerExporting] = useState(false);
+  const ledgerPrintRef = useRef(null);
   const canManageAllAccounts = ["Owner", "Admin"].includes(user.role);
   const canUseSupplierPayments = canManageAllAccounts || user.role === "Purchase Manager";
   const canUseCustomerPayments = canManageAllAccounts || user.role === "Cashier";
@@ -6105,6 +6130,21 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
     (!ledgerDateRange.date_from || toDateKey(row.date) >= ledgerDateRange.date_from) &&
     (!ledgerDateRange.date_to || toDateKey(row.date) <= ledgerDateRange.date_to)
   );
+  const exportLedgerPdf = async () => {
+    if (!ledgerPrintRef.current) return;
+    setLedgerExporting(true);
+    try {
+      await exportElementToPdf({
+        element: ledgerPrintRef.current,
+        fileName: `${accountLedger.account?.account_name || "Account_Ledger"}_${formatFileDate(ledgerDateRange.date_from || "all")}_to_${formatFileDate(ledgerDateRange.date_to || toDateKey(new Date()))}.pdf`,
+        mode: "A4",
+      });
+    } catch (error) {
+      alert(`Unable to export ledger PDF: ${error.message}`);
+    } finally {
+      setLedgerExporting(false);
+    }
+  };
 
   const saveAccount = async () => {
     try {
@@ -6337,9 +6377,9 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
             <Field label="Statement From"><input type="date" value={ledgerDateRange.date_from} onChange={(event) => setLedgerDateRange({ ...ledgerDateRange, date_from: event.target.value })} /></Field>
             <Field label="Statement To"><input type="date" value={ledgerDateRange.date_to} onChange={(event) => setLedgerDateRange({ ...ledgerDateRange, date_to: event.target.value })} /></Field>
             <button className="secondary-button" onClick={() => window.print()}><Icon name="print" /> Print Statement</button>
-            <button className="secondary-button" onClick={() => window.print()}>PDF Export</button>
+            <button className="secondary-button" disabled={ledgerExporting} onClick={exportLedgerPdf}>{ledgerExporting ? "Exporting..." : "PDF Export"}</button>
           </div>
-          <div className="print-area report-paper">
+          <div ref={ledgerPrintRef} className="print-area report-paper">
             <header className="report-print-header">
               <BrandLogo invoice />
               <div>
@@ -8711,6 +8751,23 @@ function PaymentReceiptModal({ payment, onClose }) {
   const paymentAmount = Number(payment.payment_amount || 0);
   const rebateAmount = Number(payment.rebate_amount || 0);
   const totalImpact = paymentAmount + rebateAmount;
+  const receiptRef = useRef(null);
+  const [exporting, setExporting] = useState(false);
+  const exportReceiptPdf = async () => {
+    if (!receiptRef.current) return;
+    setExporting(true);
+    try {
+      await exportElementToPdf({
+        element: receiptRef.current,
+        fileName: `FroozERP_Payment_Receipt_${payment.payment_key || payment.id || toDateKey(new Date())}.pdf`,
+        mode: "A4",
+      });
+    } catch (error) {
+      alert(`Unable to export receipt PDF: ${error.message}`);
+    } finally {
+      setExporting(false);
+    }
+  };
   return (
     <div className="modal-backdrop">
       <section className="invoice-modal">
@@ -8721,11 +8778,11 @@ function PaymentReceiptModal({ payment, onClose }) {
           </div>
           <div className="invoice-actions">
             <button className="secondary-button" onClick={() => window.print()}><Icon name="print" /> Print Receipt</button>
-            <button className="secondary-button" onClick={() => window.print()}>Save PDF</button>
+            <button className="secondary-button" disabled={exporting} onClick={exportReceiptPdf}>{exporting ? "Exporting..." : "Save PDF"}</button>
             <button aria-label="Close receipt" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
-        <article className="invoice-paper print-area">
+        <article ref={receiptRef} className="invoice-paper print-area">
           <header className="invoice-header">
             <BrandLogo invoice />
             <div className="invoice-meta">
