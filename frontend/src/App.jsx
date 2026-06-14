@@ -1771,16 +1771,18 @@ function App() {
     const saleId = Number(sale.sale_id || sale.id || 0);
     if (!saleId) {
       alert("Unable to cancel invoice. Invoice ID is missing.");
-      return;
+      return false;
     }
     const reason = window.prompt(`Enter cancellation reason for ${sale.invoice_no || `#${sale.id}`}`);
-    if (!reason?.trim()) return;
+    if (!reason?.trim()) return false;
     try {
       await axios.post(`${API_URL}/sales/${saleId}/cancel`, { reason, cancelled_by: user.id });
       await Promise.all([loadSalesHistory(), loadDashboardData(), loadReports()]);
       alert("Invoice cancelled");
+      return true;
     } catch (error) {
       alert(getErrorMessage(error, "Unable to cancel invoice"));
+      return false;
     }
   };
 
@@ -2876,10 +2878,26 @@ function App() {
       {selectedInvoice && (
         <InvoiceModal
           autoPrintMode={selectedInvoicePrintMode}
+          canCancel={canCancelSales && selectedInvoice.sale_status !== "CANCELLED"}
+          canEdit={canEditSales && selectedInvoice.sale_status !== "CANCELLED"}
           invoice={selectedInvoice}
+          onCancel={async () => {
+            const invoice = selectedInvoice;
+            const cancelled = await cancelSale(invoice);
+            if (cancelled) {
+              setSelectedInvoice(null);
+              setSelectedInvoicePrintMode(null);
+            }
+          }}
           onClose={() => {
             setSelectedInvoice(null);
             setSelectedInvoicePrintMode(null);
+          }}
+          onEdit={() => {
+            const invoice = selectedInvoice;
+            setSelectedInvoice(null);
+            setSelectedInvoicePrintMode(null);
+            openSaleForEditFromReport(invoice);
           }}
           paymentSettings={settingsData.paymentSettings}
           printSettings={settingsData.businessSettings}
@@ -3249,19 +3267,18 @@ function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEd
         <ModuleCard eyebrow="Supplier Drill-Down" title={selectedSupplier.supplier_name} subtitle="Complete, edit or safely cancel pending bill entries for this supplier.">
           <DataTable headers={["Date", "Items Narration", "Estimated Total", "Status", "Action"]}>
             {selectedRows.map((purchase) => (
-              <tr key={purchase.id}>
+              <tr className="report-row-clickable" key={purchase.id} onClick={() => onOpenPurchaseAmendment(purchase)}>
                 <td>{formatDisplayDate(purchase.purchase_date)}</td>
-                <td className="primary-cell purchase-items-cell" onDoubleClick={() => onOpenPurchaseAmendment(purchase)}>
+                <td className="primary-cell purchase-items-cell">
                   <span title={narration(purchase)}>{narration(purchase)}</span>
-                  <small className="cell-note">Double-click to open Add/Edit Purchase</small>
                 </td>
                 <td>{currency.format(estimatedValue(purchase))}</td>
                 <td><span className="origin-rate">Pending Bill</span></td>
                 <td>
                   <div className="button-row table-actions-row">
-                    <button className="primary-button" onClick={() => onCompletePurchase(purchase)}>Complete Bill</button>
-                    <button className="table-action" onClick={() => onEditPurchase(purchase)}>Edit Pending Entry</button>
-                    <button className="remove-button" onClick={() => onCancelPurchase(purchase)}>Cancel Pending Entry</button>
+                    <button className="primary-button" onClick={(event) => { event.stopPropagation(); onCompletePurchase(purchase); }}>Complete Bill</button>
+                    <button className="table-action" onClick={(event) => { event.stopPropagation(); onEditPurchase(purchase); }}>Edit Pending Entry</button>
+                    <button className="remove-button" onClick={(event) => { event.stopPropagation(); onCancelPurchase(purchase); }}>Cancel Pending Entry</button>
                   </div>
                 </td>
               </tr>
@@ -4179,73 +4196,44 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
         return [["Net Sales", money(totalOf(activeRows, "net_total")), true], ["Invoices", invoiceCount], ["Item Lines", number(activeRows.reduce((sum, row) => sum + (row.item_rows?.length || 1), 0))], ["Gross Total", money(totalOf(activeRows, "gross_total"))], ["Item Discount", money(totalOf(activeRows, "item_discount_total"))], ["Bill Discount", money(totalOf(activeRows, "bill_discount_total"))]];
       },
       headers: salesFilters.viewMode === "INVOICE"
-        ? ["Date", "Invoice", "Customer", "Item Summary", "Gross Total", "Item Discount", "Bill Discount", "Net Total", "Payment Mode", "Status", "Actions"]
-        : ["Date", "Invoice", "Customer", "Item Name", "Lot No.", "Size / Grade", "Quantity", "Unit", "Rate", "Gross Amount", "Item Discount", "Bill Discount", "Net Amount", "Payment Mode", "User", "Actions"],
+        ? ["Date", "Invoice", "Customer", "Item Summary", "Gross Total", "Item Discount", "Bill Discount", "Net Total", "Payment Mode", "Status"]
+        : ["Date", "Invoice", "Customer", "Item Name", "Lot No.", "Size / Grade", "Quantity", "Unit", "Rate", "Gross Amount", "Item Discount", "Bill Discount", "Net Amount", "Payment Mode", "User"],
       render: (row) => {
         const saleId = row.sale_id || row.id;
         const openInvoice = () => onOpenSaleView?.(saleId);
-        const openEdit = () => {
-          if (!canEditSales) {
-            alert("You do not have permission to edit this bill.");
-            return;
-          }
-          onOpenSaleForEdit?.(row);
-        };
-        const printInvoice = () => onPrintSale?.(saleId);
-        const cancelInvoice = () => {
-          if (!canCancelSales) {
-            alert("You do not have permission to cancel this bill.");
-            return;
-          }
-          if (row.status_label === "Cancelled") {
-            alert("This invoice is already cancelled.");
-            return;
-          }
-          onCancelSale?.(row);
-        };
-        const rowActions = (
-          <div className="table-actions sales-history-actions">
-            <button className="secondary-button compact-button" onClick={openInvoice}>View Bill</button>
-            <button className="secondary-button compact-button" onClick={openEdit}>Edit Bill</button>
-            <button className="secondary-button compact-button" onClick={printInvoice}>Print Bill</button>
-            <button className="remove-button compact-button" disabled={row.status_label === "Cancelled"} onClick={cancelInvoice}>Cancel Bill</button>
-            {row.showing_matched_only && <button className="secondary-button compact-button" onClick={openInvoice}>View Full Invoice</button>}
-          </div>
-        );
         if (salesFilters.viewMode === "INVOICE") {
           const expanded = Boolean(expandedSalesRows[row.display_key]);
           return (
             <React.Fragment key={row.display_key}>
-              <tr className={row.status_label === "Cancelled" ? "muted-row" : ""} onDoubleClick={openInvoice}>
-                <td className="primary-cell" onDoubleClick={(event) => { event.stopPropagation(); setSalesFilters({ ...salesFilters, date: toDateKey(row.sale_date) }); }}>
+              <tr className={`report-row-clickable ${row.status_label === "Cancelled" ? "muted-row" : ""}`} onClick={openInvoice}>
+                <td className="primary-cell date-cell">
                   {formatDisplayDate(row.sale_date)}
                 </td>
                 <td className="primary-cell">
                   {row.invoice_no || `#${row.sale_id}`}
                   {row.showing_matched_only && <small className="cell-note warning-note">Showing matched items only</small>}
                 </td>
-                <td className="primary-cell" onDoubleClick={(event) => { event.stopPropagation(); onOpenCustomerLedger?.(row); }}>
+                <td className="primary-cell">
                   {row.customer_name || "Walk-in Customer"}
-                  <small className="cell-note">{row.customer_mobile || "Double-click for ledger"}</small>
+                  {row.customer_mobile && <small className="cell-note">{row.customer_mobile}</small>}
                 </td>
                 <td className="primary-cell purchase-items-cell sales-items-cell">
-                  <button className="table-link-button" onClick={() => setExpandedSalesRows((current) => ({ ...current, [row.display_key]: !expanded }))}>{expanded ? "Hide Items" : salesNarrationDisplay(row)}</button>
+                  <span>{salesNarrationDisplay(row)}</span>
                   <small className="cell-note">{row.item_rows?.length || 0} item line{(row.item_rows?.length || 0) === 1 ? "" : "s"}</small>
                 </td>
-                <td>{money(row.gross_total)}</td>
-                <td>{money(row.item_discount_total)}</td>
-                <td>{money(row.bill_discount_total)}</td>
-                <td>{money(row.net_total)}</td>
-                <td>{row.payment_mode || "-"}</td>
-                <td>{row.status_label}</td>
-                <td>{rowActions}</td>
+                <td className="amount-cell">{money(row.gross_total)}</td>
+                <td className="amount-cell">{money(row.item_discount_total)}</td>
+                <td className="amount-cell">{money(row.bill_discount_total)}</td>
+                <td className="amount-cell">{money(row.net_total)}</td>
+                <td className="status-cell">{row.payment_mode || "-"}</td>
+                <td className="status-cell">{row.status_label}</td>
               </tr>
               {expanded && (
                 <tr className="sales-history-drilldown-row">
-                  <td colSpan="11">
+                  <td colSpan="10">
                     <DataTable headers={["Item", "Lot", "Size", "Qty", "Unit", "Rate", "Gross", "Item Disc.", "Bill Disc.", "Net", "Cost Rate", "Profit"]}>
                       {(row.item_rows || []).map((item) => (
-                        <tr key={item.display_key} onDoubleClick={openInvoice}>
+                        <tr className="report-row-clickable" key={item.display_key} onClick={openInvoice}>
                           <td className="primary-cell">{item.item_name}</td>
                           <td>{item.lot_name || "-"}</td>
                           <td>{item.lot_size || "-"}</td>
@@ -4268,23 +4256,22 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
           );
         }
         return (
-          <tr className={row.status_label === "Cancelled" ? "muted-row" : ""} key={row.display_key} onDoubleClick={openInvoice}>
-            <td>{formatDisplayDate(row.sale_date)}</td>
+          <tr className={`report-row-clickable ${row.status_label === "Cancelled" ? "muted-row" : ""}`} key={row.display_key} onClick={openInvoice}>
+            <td className="date-cell">{formatDisplayDate(row.sale_date)}</td>
             <td className="primary-cell">{row.invoice_no || `#${row.sale_id}`}{row.showing_matched_only && <small className="cell-note warning-note">Matched item</small>}</td>
-            <td className="primary-cell" onDoubleClick={(event) => { event.stopPropagation(); onOpenCustomerLedger?.(row); }}>{row.customer_name || "Walk-in Customer"}</td>
+            <td className="primary-cell">{row.customer_name || "Walk-in Customer"}</td>
             <td className="primary-cell">{row.item_name}</td>
             <td>{row.lot_name || "-"}</td>
             <td>{row.lot_size || "-"}</td>
             <td>{number(row.quantity)}</td>
             <td>{row.unit || "-"}</td>
             <td>{money(row.rate)}</td>
-            <td>{money(row.gross_total)}</td>
-            <td>{money(row.item_discount_total)}</td>
-            <td>{money(row.bill_discount_total)}</td>
-            <td>{money(row.net_total)}</td>
-            <td>{row.payment_mode || "-"}</td>
+            <td className="amount-cell">{money(row.gross_total)}</td>
+            <td className="amount-cell">{money(row.item_discount_total)}</td>
+            <td className="amount-cell">{money(row.bill_discount_total)}</td>
+            <td className="amount-cell">{money(row.net_total)}</td>
+            <td className="status-cell">{row.payment_mode || "-"}</td>
             <td>{row.created_by_name || row.sold_by || "-"}</td>
-            <td>{rowActions}</td>
           </tr>
         );
       },
@@ -4356,16 +4343,16 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
       ],
       headers: ["Date", "Supplier", "Narration", "Gross Total", "Net Total", "Status"],
       render: (row) => (
-        <tr key={row.display_key}>
-          <td className="primary-cell" onDoubleClick={() => setPurchaseFilters((current) => ({ ...current, date: toDateKey(row.purchase_date) }))}>{formatDisplayDate(row.purchase_date)}</td>
-          <td className="primary-cell" onDoubleClick={() => onOpenSupplierLedger?.(row)}>{row.supplier_name}<small className="cell-note">{row.firm_name || "Double-click for supplier ledger"}</small></td>
-          <td className="primary-cell purchase-items-cell" onDoubleClick={() => onOpenPurchaseAmendment?.(row.source_rows?.[0] || row)}>
+        <tr className="report-row-clickable" key={row.display_key} onClick={() => onOpenPurchaseAmendment?.(row.source_rows?.[0] || row)}>
+          <td className="primary-cell date-cell">{formatDisplayDate(row.purchase_date)}</td>
+          <td className="primary-cell">{row.supplier_name}{row.firm_name && <small className="cell-note">{row.firm_name}</small>}</td>
+          <td className="primary-cell purchase-items-cell">
             <span title={row.item_narration}>{purchaseNarrationDisplay(row)}</span>
             <small className="cell-note">{clubPurchaseItems ? `${row.source_rows.length} item${row.source_rows.length === 1 ? "" : "s"}` : `${number(row.quantity)} ${row.unit || ""}`}</small>
           </td>
-          <td>{money(row.gross_total)}</td>
-          <td>{money(row.net_total)}</td>
-          <td><span className={row.status_label === "Cancelled" ? "stock-low" : row.status_label === "Pending Bill" ? "origin-rate" : "stock-ok"}>{row.status_label}</span></td>
+          <td className="amount-cell">{money(row.gross_total)}</td>
+          <td className="amount-cell">{money(row.net_total)}</td>
+          <td className="status-cell"><span className={row.status_label === "Cancelled" ? "stock-low" : row.status_label === "Pending Bill" ? "origin-rate" : "stock-ok"}>{row.status_label}</span></td>
         </tr>
       ),
     },
@@ -4596,7 +4583,7 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
         ["Total Closing", money(cashBookData.total_closing), true],
       ],
       headers: ["Date", "Particulars / Account", "Narration", "Receipt Cash", "Receipt Bank/UPI/Card", "Payment Cash", "Payment Bank/UPI/Card", "Cash Balance", "Bank Balance", "Total Balance", "Reference / Bill No"],
-      render: (row, index) => <tr onDoubleClick={() => setCashBookDetail(row)} key={`${row.date}-${row.reference_no}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell">{row.account_name || row.party_name}</td><td className="purchase-items-cell"><span title={row.narration}>{row.narration || "-"}</span></td><td>{money(row.receipt_cash)}</td><td>{money(row.receipt_bank)}</td><td>{money(row.payment_cash)}</td><td>{money(row.payment_bank)}</td><td>{money(row.cash_balance)}</td><td>{money(row.bank_balance)}</td><td className="profit-cell">{money(row.total_balance)}</td><td>{row.reference_no || "-"}</td></tr>,
+      render: (row, index) => <tr className="report-row-clickable" onClick={() => setCashBookDetail(row)} key={`${row.date}-${row.reference_no}-${index}`}><td className="date-cell">{formatDisplayDate(row.date)}</td><td className="primary-cell">{row.account_name || row.party_name}</td><td className="purchase-items-cell"><span title={row.narration}>{row.narration || "-"}</span></td><td className="amount-cell">{money(row.receipt_cash)}</td><td className="amount-cell">{money(row.receipt_bank)}</td><td className="amount-cell">{money(row.payment_cash)}</td><td className="amount-cell">{money(row.payment_bank)}</td><td className="amount-cell">{money(row.cash_balance)}</td><td className="amount-cell">{money(row.bank_balance)}</td><td className="profit-cell amount-cell">{money(row.total_balance)}</td><td>{row.reference_no || "-"}</td></tr>,
     },
     expenseReport: {
       title: "Expense Report",
@@ -5069,14 +5056,14 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
     const receiptAmount = (row) => Number((isCashBookMode ? row.receipt_cash : row.receipt_bank) || 0);
     const paymentAmount = (row) => Number((isCashBookMode ? row.payment_cash : row.payment_bank) || 0);
     const renderBookRow = (row, amount, type) => (
-      <tr key={`${type}-${row.date}-${row.reference_no}-${row.source_id}`} onDoubleClick={() => setCashBookDetail(row)}>
-        <td>{formatDisplayDate(row.date)}</td>
+      <tr className="report-row-clickable" key={`${type}-${row.date}-${row.reference_no}-${row.source_id}`} onClick={() => setCashBookDetail(row)}>
+        <td className="date-cell">{formatDisplayDate(row.date)}</td>
         <td className="primary-cell">
           {row.account_name || row.party_name || "-"}
           {showCashBookRemarks && <small className="cell-note">{row.narration || "-"}</small>}
         </td>
-        <td><span className="tag">{row.source_type || type}</span></td>
-        <td className="balance-cell">{money(amount)}</td>
+        <td className="status-cell"><span className="tag">{row.source_type || type}</span></td>
+        <td className="balance-cell amount-cell">{money(amount)}</td>
       </tr>
     );
     return (
@@ -5294,6 +5281,7 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
   const [auditLoading, setAuditLoading] = useState(false);
   const [auditError, setAuditError] = useState("");
   const [auditFocus, setAuditFocus] = useState(null);
+  const [selectedLotDetail, setSelectedLotDetail] = useState(null);
   const money = (value) => currency.format(Number(value || 0));
   const qty = (value) => Number(value || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 });
   const lotBalance = (lot) => Number(lot.balance_qty ?? lot.remaining_qty ?? 0);
@@ -5445,10 +5433,11 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
       </div>
     );
   };
+  const openLotDetail = (lot) => setSelectedLotDetail(lot);
   const renderLotRows = (rows) => rows.map((lot) => {
     const status = lotStatus(lot);
     return (
-      <tr key={lot.id}>
+      <tr className="report-row-clickable" key={lot.id} onClick={() => openLotDetail(lot)}>
         <td className="primary-cell">{lot.product_name}<small className="cell-note">{lot.unit}</small></td>
         <td>{lot.category || "Fruit"}</td>
         <td>{lot.supplier_name || "-"}</td>
@@ -5466,7 +5455,6 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
         <td className="purchase-items-cell"><span title={lot.remarks || "-"}>{lot.remarks || "-"}</span></td>
         <td>{lot.created_at ? new Date(lot.created_at).toLocaleString("en-IN") : "-"}</td>
         <td>{lot.last_edited_at ? new Date(lot.last_edited_at).toLocaleString("en-IN") : "-"}</td>
-        <td>{renderLotActions(lot)}</td>
       </tr>
     );
   });
@@ -5532,13 +5520,14 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
         <button className="secondary-button" onClick={() => openAudit()}>View Audit Trail</button>
       </div>
       {viewMode === "PRODUCT" && (
-        <DataTable headers={["Product", "Category", "Total Stock", "Available Lots", "Average Cost", "Sale Rate", "Stock Value", "Minimum Stock", "Status", "Action"]}>
+        <DataTable headers={["Product", "Category", "Total Stock", "Available Lots", "Average Cost", "Sale Rate", "Stock Value", "Minimum Stock", "Status"]}>
           {filteredProductRows.map((product) => {
             const averageCost = product.total_stock > 0 ? product.stock_value / product.total_stock : 0;
             const low = Number(product.total_stock || 0) <= Number(product.minimum_stock || 0);
+            const toggleProduct = () => setExpandedProductId(expandedProductId === String(product.product_id) ? "" : String(product.product_id));
             return (
               <React.Fragment key={product.product_id}>
-                <tr>
+                <tr className="report-row-clickable" onClick={toggleProduct}>
                   <td className="primary-cell">{product.product_name}<small className="cell-note">{product.unit}</small></td>
                   <td>{product.category}</td>
                   <td>{qty(product.total_stock)}</td>
@@ -5548,12 +5537,11 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
                   <td>{money(product.stock_value)}</td>
                   <td>{qty(product.minimum_stock)}</td>
                   <td><span className={low ? "stock-low" : "stock-ok"}>{low ? "Low Stock" : "OK"}</span></td>
-                  <td><button className="secondary-button compact-button" onClick={() => setExpandedProductId(expandedProductId === String(product.product_id) ? "" : String(product.product_id))}>View Lots</button></td>
                 </tr>
                 {expandedProductId === String(product.product_id) && (
                   <tr className="sales-history-drilldown-row">
-                    <td colSpan="10">
-                      <DataTable headers={["Product", "Category", "Supplier", "Lot No.", "Size", "Opening Date", "Opening Qty", "Sold Qty", "Adjusted Qty", "Balance Qty", "Cost", "Sale Rate", "Stock Value", "Status", "Remarks", "Created At", "Last Edited", "Actions"]}>
+                    <td colSpan="9">
+                      <DataTable headers={["Product", "Category", "Supplier", "Lot No.", "Size", "Opening Date", "Opening Qty", "Sold Qty", "Adjusted Qty", "Balance Qty", "Cost", "Sale Rate", "Stock Value", "Status", "Remarks", "Created At", "Last Edited"]}>
                         {renderLotRows(product.visible_lots)}
                       </DataTable>
                     </td>
@@ -5562,29 +5550,61 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
               </React.Fragment>
             );
           })}
-          {filteredProductRows.length === 0 && <tr><td colSpan="10" className="empty-cell">No matching stock products found.</td></tr>}
+          {filteredProductRows.length === 0 && <tr><td colSpan="9" className="empty-cell">No matching stock products found.</td></tr>}
         </DataTable>
       )}
       {viewMode === "LOT" && (
-        <DataTable headers={["Product", "Category", "Supplier", "Lot No.", "Size", "Opening Date", "Opening Qty", "Sold Qty", "Adjusted Qty", "Balance Qty", "Cost", "Sale Rate", "Stock Value", "Status", "Remarks", "Created At", "Last Edited", "Actions"]}>
+        <DataTable headers={["Product", "Category", "Supplier", "Lot No.", "Size", "Opening Date", "Opening Qty", "Sold Qty", "Adjusted Qty", "Balance Qty", "Cost", "Sale Rate", "Stock Value", "Status", "Remarks", "Created At", "Last Edited"]}>
           {renderLotRows(filteredLots)}
-          {filteredLots.length === 0 && <tr><td colSpan="18" className="empty-cell">No matching stock lots found.</td></tr>}
+          {filteredLots.length === 0 && <tr><td colSpan="17" className="empty-cell">No matching stock lots found.</td></tr>}
         </DataTable>
       )}
       {viewMode === "CATEGORY" && (
-        <DataTable headers={["Category", "Products", "Total Quantity", "Stock Value", "Low Stock Count", "Action"]}>
+        <DataTable headers={["Category", "Products", "Total Quantity", "Stock Value", "Low Stock Count"]}>
           {filteredCategoryRows.map((category) => (
-            <tr key={category.category}>
+            <tr className="report-row-clickable" key={category.category} onClick={() => { setViewMode("PRODUCT"); setFilters({ ...filters, category: category.category }); }}>
               <td className="primary-cell">{category.category}</td>
               <td>{category.product_rows.length}</td>
               <td>{qty(category.product_rows.reduce((sum, product) => sum + product.total_stock, 0))}</td>
               <td>{money(category.product_rows.reduce((sum, product) => sum + product.stock_value, 0))}</td>
               <td>{category.product_rows.filter((product) => Number(product.total_stock || 0) <= Number(product.minimum_stock || 0)).length}</td>
-              <td><button className="secondary-button compact-button" onClick={() => { setViewMode("PRODUCT"); setFilters({ ...filters, category: category.category }); }}>View Products</button></td>
             </tr>
           ))}
-          {filteredCategoryRows.length === 0 && <tr><td colSpan="6" className="empty-cell">No matching stock categories found.</td></tr>}
+          {filteredCategoryRows.length === 0 && <tr><td colSpan="5" className="empty-cell">No matching stock categories found.</td></tr>}
         </DataTable>
+      )}
+      {selectedLotDetail && (
+        <div className="modal-backdrop">
+          <section className="invoice-modal change-history-modal">
+            <div className="invoice-toolbar">
+              <div>
+                <span className="eyebrow">Stock Lot Detail</span>
+                <strong>{selectedLotDetail.product_name} - {selectedLotDetail.lot_name || selectedLotDetail.batch_no || `Lot #${selectedLotDetail.id}`}</strong>
+              </div>
+              <button aria-label="Close lot detail" className="remove-button" onClick={() => setSelectedLotDetail(null)}><Icon name="close" /></button>
+            </div>
+            <div className="sale-edit-body">
+              <div className="purchase-summary-grid supplier-payment-preview">
+                <SummaryMetric label="Balance Qty" value={qty(lotBalance(selectedLotDetail))} featured />
+                <SummaryMetric label="Stock Value" value={money(lotBalance(selectedLotDetail) * lotCost(selectedLotDetail))} />
+                <SummaryMetric label="Status" value={lotStatus(selectedLotDetail)} />
+              </div>
+              <DataTable headers={["Field", "Value"]}>
+                <tr><td>Product</td><td className="primary-cell">{selectedLotDetail.product_name}</td></tr>
+                <tr><td>Category</td><td>{selectedLotDetail.category || "Fruit"}</td></tr>
+                <tr><td>Supplier</td><td>{selectedLotDetail.supplier_name || "-"}</td></tr>
+                <tr><td>Lot / Size</td><td>{[selectedLotDetail.lot_name || selectedLotDetail.batch_no || `Lot #${selectedLotDetail.id}`, selectedLotDetail.lot_size].filter(Boolean).join(" / ")}</td></tr>
+                <tr><td>Opening / Sold / Adjusted</td><td>{qty(lotOpening(selectedLotDetail))} / {qty(lotUsed(selectedLotDetail))} / {qty(selectedLotDetail.adjusted_qty)}</td></tr>
+                <tr><td>Cost / Sale Rate</td><td>{money(lotCost(selectedLotDetail))} / {money(lotSaleRate(selectedLotDetail))}</td></tr>
+                <tr><td>Opening Date</td><td>{formatDisplayDate(selectedLotDetail.purchase_date || selectedLotDetail.created_at)}</td></tr>
+                <tr><td>Remarks</td><td>{selectedLotDetail.remarks || "-"}</td></tr>
+              </DataTable>
+              <div className="detail-action-bar no-print">
+                {renderLotActions(selectedLotDetail)}
+              </div>
+            </div>
+          </section>
+        </div>
       )}
       {auditFocus && (
         <div className="modal-backdrop">
@@ -8732,7 +8752,7 @@ function PaymentReceiptModal({ payment, onClose }) {
   );
 }
 
-function InvoiceModal({ autoPrintMode = null, invoice, onClose, paymentSettings = {}, printSettings = {} }) {
+function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false, invoice, onCancel, onClose, onEdit, paymentSettings = {}, printSettings = {} }) {
   const [printMode, setPrintMode] = useState(printSettings.default_invoice_print === "A4_INVOICE" || printSettings.default_printer_type === "A4" ? "A4" : "THERMAL");
   const [upiQrDataUrl, setUpiQrDataUrl] = useState("");
   const [exporting, setExporting] = useState(false);
@@ -8838,10 +8858,12 @@ function InvoiceModal({ autoPrintMode = null, invoice, onClose, paymentSettings 
             <strong>{invoice.invoice_no}</strong>
           </div>
           <div className="invoice-actions">
+            {canEdit && <button className="primary-button" onClick={onEdit}>Edit Bill</button>}
             <button className="secondary-button" onClick={() => printWithMode("THERMAL")}><Icon name="print" /> POS Thermal Print</button>
             <button className="secondary-button" onClick={() => printWithMode("A4")}><Icon name="print" /> A4 Invoice Print</button>
             <button className="secondary-button" disabled={exporting} onClick={() => exportInvoicePdf(activePrintMode, true)}>{exporting ? "Exporting..." : "PDF Export"}</button>
             <button className="whatsapp-button" disabled={exporting} onClick={sendWhatsApp}><Icon name="message" /> Send on WhatsApp</button>
+            {canCancel && <button className="remove-button" onClick={onCancel}>Cancel Bill</button>}
             <button aria-label="Close invoice" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>

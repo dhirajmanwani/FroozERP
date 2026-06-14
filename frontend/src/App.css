@@ -906,11 +906,13 @@ input[readonly] {
 
 .table-wrap {
   max-height: 560px;
-  margin-top: 23px;
+  margin: 18px 0 8px;
   overflow: auto;
   overscroll-behavior-inline: contain;
-  border: 1px solid rgba(148, 163, 184, 0.1);
-  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 14px;
+  background: rgba(2, 6, 23, 0.28);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.16);
 }
 
 table {
@@ -921,11 +923,18 @@ table {
 
 th,
 td {
-  padding: 13px 14px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.09);
+  padding: 12px 14px;
+  border-right: 1px solid rgba(148, 163, 184, 0.12);
+  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
   color: #94a3b8;
   font-size: 12px;
+  line-height: 1.4;
   white-space: nowrap;
+}
+
+th:last-child,
+td:last-child {
+  border-right: 0;
 }
 
 td.primary-cell,
@@ -944,19 +953,24 @@ th {
   position: sticky;
   top: 0;
   z-index: 1;
-  color: #cbd5e1;
-  background: #172033;
+  border-bottom: 1px solid rgba(245, 158, 11, 0.22);
+  color: #e2e8f0;
+  background: linear-gradient(180deg, rgba(30, 41, 59, 0.98), rgba(15, 23, 42, 0.98));
   font-size: 10px;
   letter-spacing: 0.8px;
   text-transform: uppercase;
 }
 
 tbody tr {
-  transition: 160ms ease;
+  transition: background 160ms ease, box-shadow 160ms ease;
+}
+
+tbody tr:nth-child(even) {
+  background: rgba(15, 23, 42, 0.2);
 }
 
 tbody tr:hover {
-  background: rgba(245, 158, 11, 0.04);
+  background: rgba(245, 158, 11, 0.07);
 }
 
 tbody tr:last-child td {
@@ -966,6 +980,31 @@ tbody tr:last-child td {
 .primary-cell {
   color: #e2e8f0;
   font-weight: 750;
+}
+
+.report-row-clickable {
+  cursor: pointer;
+}
+
+.report-row-clickable:hover td {
+  color: #f8fafc;
+}
+
+.report-row-clickable:focus-within,
+.report-row-clickable:active {
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.amount-cell,
+.balance-cell,
+.profit-cell {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.date-cell,
+.status-cell {
+  text-align: center;
 }
 
 .table-link-button {
@@ -994,6 +1033,18 @@ tbody tr:last-child td {
   flex-wrap: wrap;
   gap: 6px;
   min-width: 210px;
+}
+
+.detail-action-bar {
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px solid rgba(245, 158, 11, 0.16);
+  border-radius: 14px;
+  background: rgba(15, 23, 42, 0.46);
+}
+
+.detail-action-bar .table-actions {
+  min-width: 0;
 }
 
 .compact-button {
