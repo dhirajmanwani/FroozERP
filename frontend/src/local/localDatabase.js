@@ -134,3 +134,10 @@ export async function queueSyncTestEntity({ entityId, value, branchId, deviceId,
     userId,
   });
 }
+
+export async function completeLocalPosSale(sale) {
+  if (!isTauriRuntime()) {
+    throw new Error("Local-first POS checkout is only available inside the FroozERP desktop app.");
+  }
+  return invokeLocal("pos_sale_complete_local", { sale });
+}

@@ -1043,6 +1043,12 @@ const initializeDatabase = async () => {
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS offline_invoice_ref VARCHAR(180);
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS source_device_id VARCHAR(160);
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS entity_version INTEGER NOT NULL DEFAULT 1;
+    CREATE UNIQUE INDEX IF NOT EXISTS sales_global_id_unique_idx
+      ON sales (global_id)
+      WHERE global_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS sales_offline_invoice_ref_unique_idx
+      ON sales (offline_invoice_ref)
+      WHERE offline_invoice_ref IS NOT NULL;
 
     CREATE TABLE IF NOT EXISTS backup_logs (
       id SERIAL PRIMARY KEY,
@@ -4606,6 +4612,25 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
   if (!Array.isArray(payload.items) || payload.items.length === 0) {
     return rejectOperation(operation, "VALIDATION_ERROR", "POS sale requires at least one item");
   }
+  const existingSale = await client.query(
+    "SELECT id, invoice_no, entity_version, created_at FROM sales WHERE global_id = $1 OR offline_invoice_ref = $2 LIMIT 1",
+    [invoiceGlobalId, offlineInvoiceRef]
+  );
+  if (existingSale.rows[0]) {
+    return {
+      operation_id: operation.operation_id,
+      status: "accepted",
+      server_entity_version: existingSale.rows[0].entity_version || 1,
+      server_updated_at: existingSale.rows[0].created_at,
+      error_code: null,
+      message: "POS sale already exists on server",
+      result_payload: {
+        sale_id: existingSale.rows[0].id,
+        invoice_no: existingSale.rows[0].invoice_no,
+        duplicate: true,
+      },
+    };
+  }
   const duplicate = await client.query(
     "SELECT * FROM sync_pos_sale_staging WHERE invoice_global_id = $1 OR offline_invoice_ref = $2 LIMIT 1",
     [invoiceGlobalId, offlineInvoiceRef]
@@ -4620,15 +4645,15 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
       message: "POS sale foundation already staged",
     };
   }
-  const insufficient = payload.items.find((item) => Number(item.quantity || 0) <= 0);
-  if (insufficient) {
+
+  const conflict = async (reason, serverPayload = {}) => {
     await client.query(
       `
       INSERT INTO sync_conflict_log (
         operation_id, device_id, branch_id, entity_type, entity_id,
-        local_version, local_payload, reason
+        local_version, server_version, local_payload, server_payload, reason
       )
-      VALUES ($1, $2, $3, 'pos_sale', $4, $5, $6::jsonb, $7)
+      VALUES ($1, $2, $3, 'pos_sale', $4, $5, $6, $7::jsonb, $8::jsonb, $9)
       `,
       [
         operation.operation_id,
@@ -4636,38 +4661,233 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
         context.branchId,
         invoiceGlobalId,
         operation.version || 1,
+        null,
         JSON.stringify(payload),
-        "Invalid POS item quantity; invoice retained locally for review",
+        JSON.stringify(serverPayload),
+        reason,
       ]
     );
-    return rejectOperation(operation, "CONFLICT", "Invalid POS item quantity; invoice retained locally for review");
+    return rejectOperation(operation, "CONFLICT", reason);
+  };
+
+  const invalidItem = payload.items.find((item) => Number(item.quantity || 0) <= 0);
+  if (invalidItem) return conflict("Invalid POS item quantity; invoice retained locally for review");
+
+  const stockRequests = new Map();
+  for (const item of payload.items) {
+    const lotId = parsePositiveInteger(item.inventory_batch_id || item.lot_id);
+    const productId = parsePositiveInteger(item.product_id);
+    const quantity = parsePositiveNumber(item.quantity);
+    if (!lotId || !productId || !quantity) {
+      return rejectOperation(operation, "VALIDATION_ERROR", "POS sale items require product, lot and quantity");
+    }
+    const key = String(lotId);
+    const existing = stockRequests.get(key) || { lotId, productId, quantity: 0 };
+    existing.quantity += quantity;
+    stockRequests.set(key, existing);
   }
+  const lotIds = [...stockRequests.values()].map((request) => request.lotId);
+  const lotsResult = await client.query(
+    "SELECT id, product_id, remaining_qty FROM inventory_batches WHERE id = ANY($1::int[]) AND branch_id = $2 FOR UPDATE",
+    [lotIds, context.branchId]
+  );
+  const lotsById = new Map(lotsResult.rows.map((row) => [Number(row.id), row]));
+  for (const request of stockRequests.values()) {
+    const lot = lotsById.get(request.lotId);
+    if (!lot || Number(lot.product_id) !== Number(request.productId)) {
+      return conflict("Server lot is unavailable or belongs to another product", { lot_id: request.lotId });
+    }
+    if (Number(lot.remaining_qty || 0) < request.quantity) {
+      return conflict("Server stock is insufficient; local invoice retained for owner review", {
+        lot_id: request.lotId,
+        requested_quantity: request.quantity,
+        available_quantity: Number(lot.remaining_qty || 0),
+      });
+    }
+  }
+
+  const salePayload = await buildSalePayload(client, {
+    items: payload.items.map((item) => ({
+      product_id: item.product_id,
+      inventory_batch_id: item.inventory_batch_id || item.lot_id,
+      quantity: item.quantity,
+      selling_rate: item.selling_rate ?? item.rate,
+      discount_amount: item.discount_amount ?? item.discount ?? 0,
+      lot_discount_id: item.lot_discount_id || null,
+      lot_discount_type: item.lot_discount_type || null,
+      lot_discount_value: item.lot_discount_value || 0,
+    })),
+    branchId: context.branchId,
+    createdBy: context.user.id,
+    customer: payload.customer || {},
+    invoiceDiscount: payload.bill_discount_total || payload.invoice_discount || 0,
+    payments: payload.payments || [],
+    allowRateOverride: true,
+  });
+  if (salePayload.error) {
+    if (salePayload.error.status === 409) {
+      return conflict(salePayload.error.message || "POS sale conflict; invoice retained locally for review", salePayload.error);
+    }
+    return rejectOperation(operation, "VALIDATION_ERROR", salePayload.error.message || "POS sale validation failed");
+  }
+
+  const transactionDate = toBusinessDateKey(payload.bill_date || payload.bill_datetime || new Date());
+  const requestedBillDateTime = cleanText(payload.bill_datetime) || `${transactionDate}T00:00`;
+  const saleResult = await client.query(
+    `
+    INSERT INTO sales (
+      total_amount, total_cost, profit, branch_id, created_by, customer_id,
+      customer_name, customer_mobile, customer_notes, payment_mode,
+      gross_amount, item_discount_amount, invoice_discount_amount, tax_amount,
+      discount_rule_id, discount_rule_name, discount_rule_type, discount_rule_value,
+      discount_rule_payment_mode, profit_status, sale_date, transaction_date,
+      bill_datetime, backdated_bill, backdate_reason, due_date, credit_remarks, credit_status,
+      global_id, offline_invoice_ref, source_device_id, entity_version
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+            $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, 1)
+    RETURNING *
+    `,
+    [
+      salePayload.totalAmount,
+      salePayload.totalCost,
+      salePayload.profit,
+      context.branchId,
+      context.user.id,
+      salePayload.customerId,
+      salePayload.customerName,
+      salePayload.customerMobile,
+      salePayload.customerNotes,
+      salePayload.paymentMode,
+      salePayload.grossAmount,
+      salePayload.itemDiscountAmount,
+      salePayload.invoiceDiscountAmount,
+      salePayload.taxAmount,
+      salePayload.discountRule?.id || null,
+      salePayload.discountRule?.rule_name || null,
+      salePayload.discountRule?.discount_type || null,
+      salePayload.discountRule?.discount_value || 0,
+      salePayload.discountRule?.payment_mode || null,
+      salePayload.invoiceItems.some((item) => item.costStatus === "PROVISIONAL") ? "PROVISIONAL" : "FINAL",
+      transactionDate,
+      transactionDate,
+      requestedBillDateTime,
+      transactionDate < toDateKey(new Date()),
+      cleanText(payload.date_override_reason) || (transactionDate < toDateKey(new Date()) ? "Backdated offline POS bill synced" : null),
+      payload.credit_due_date ? toBusinessDateKey(payload.credit_due_date) : null,
+      nullableText(payload.credit_remarks),
+      salePayload.paymentMode === "CREDIT" ? "PENDING" : "PAID",
+      invoiceGlobalId,
+      offlineInvoiceRef,
+      context.deviceId,
+    ]
+  );
+  const sale = saleResult.rows[0];
+  const invoiceNo = `FZ-${toDateKey(sale.sale_date).replaceAll("-", "")}-${String(sale.id).padStart(6, "0")}`;
+  await client.query("UPDATE sales SET invoice_no = $1 WHERE id = $2", [invoiceNo, sale.id]);
+
+  for (const item of salePayload.invoiceItems) {
+    const subtotalAfterItemDiscounts = Math.max(salePayload.grossAmount - salePayload.itemDiscountAmount, 0);
+    const invoiceDiscountShare = subtotalAfterItemDiscounts === 0
+      ? 0
+      : roundCurrency(salePayload.invoiceDiscountAmount * (item.netAmount / subtotalAfterItemDiscounts));
+    const itemProfit = roundCurrency(item.netAmount - invoiceDiscountShare - item.costAmount);
+    const saleItemResult = await client.query(
+      `
+      INSERT INTO sale_items (
+        sale_id, product_id, quantity, selling_rate, amount, discount_amount, net_amount,
+        cost_amount, profit, cost_status, default_selling_rate, manual_rate_override,
+        lot_discount_id, lot_discount_type, lot_discount_value
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+      RETURNING id
+      `,
+      [
+        sale.id,
+        item.productId,
+        item.quantity,
+        item.sellingRate,
+        item.grossAmount,
+        item.discountAmount,
+        item.netAmount,
+        item.costAmount,
+        itemProfit,
+        item.costStatus,
+        item.defaultSellingRate,
+        item.manualRateOverride,
+        item.lotDiscountId || null,
+        item.lotDiscountType || null,
+        item.lotDiscountValue || 0,
+      ]
+    );
+    const saleItemId = saleItemResult.rows[0].id;
+    for (const allocation of item.allocations) {
+      await client.query(
+        `
+        INSERT INTO sale_batch_allocations (
+          sale_item_id, inventory_batch_id, quantity, purchase_rate, cost_amount
+        )
+        VALUES ($1, $2, $3, $4, $5)
+        `,
+        [saleItemId, allocation.inventoryBatchId, allocation.quantity, allocation.purchaseRate, allocation.costAmount]
+      );
+    }
+    await client.query(
+      `
+      INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id)
+      VALUES ($1, $2, 'OUT', $3, $4, $5)
+      `,
+      [item.productId, item.quantity, `Offline invoice ${offlineInvoiceRef} synced as ${invoiceNo}`, context.user.id, context.branchId]
+    );
+  }
+
+  for (const payment of salePayload.payments.filter((entry) => entry.mode !== "CREDIT")) {
+    await client.query(
+      "INSERT INTO sale_payments (sale_id, payment_mode, amount) VALUES ($1, $2, $3)",
+      [sale.id, payment.mode, payment.amount]
+    );
+  }
+
+  await insertCustomerLedgerEntry(
+    client,
+    { ...sale, invoice_no: invoiceNo, customer_name: salePayload.customerName, customer_mobile: salePayload.customerMobile },
+    "SALE",
+    salePayload.totalAmount,
+    context.user.id,
+    `Offline invoice ${offlineInvoiceRef} synced as ${invoiceNo}`
+  );
+
   const result = await client.query(
     `
     INSERT INTO sync_pos_sale_staging (
       invoice_global_id, offline_invoice_ref, branch_id, device_id, created_by, payload, result_status
     )
-    VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'accepted_for_review')
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'live_sale_created')
     RETURNING *
     `,
     [invoiceGlobalId, offlineInvoiceRef, context.branchId, context.deviceId, context.user.id, JSON.stringify(payload)]
   );
   const row = result.rows[0];
-  await logSyncChange(client, {
+  const change = await logSyncChange(client, {
     branchId: context.branchId,
-    entityType: "pos_sale_staged",
-    entityId: row.invoice_global_id,
+    entityType: "pos_sale",
+    entityId: invoiceGlobalId,
     operationType: "UPSERT",
-    version: row.entity_version,
-    payload: row,
+    version: sale.entity_version || row.entity_version || 1,
+    payload: { ...sale, invoice_no: invoiceNo, offline_invoice_ref: offlineInvoiceRef },
   });
   return {
     operation_id: operation.operation_id,
     status: "accepted",
-    server_entity_version: row.entity_version,
-    server_updated_at: row.updated_at,
+    server_entity_version: sale.entity_version || row.entity_version || 1,
+    server_updated_at: change.created_at || row.updated_at,
     error_code: null,
-    message: "POS sale staged for controlled Phase 2 review; live sale tables were not mutated",
+    message: "POS sale synced",
+    result_payload: {
+      sale_id: sale.id,
+      invoice_no: invoiceNo,
+      offline_invoice_ref: offlineInvoiceRef,
+    },
   };
 };
 

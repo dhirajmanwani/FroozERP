@@ -4,10 +4,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
-const CURRENT_SCHEMA_VERSION: &str = "002_sync_engine_foundation";
+const CURRENT_SCHEMA_VERSION: &str = "003_local_first_pos";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
+const MIGRATION_003: &str = include_str!("../migrations/sqlite/003_local_first_pos.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -75,6 +76,12 @@ pub struct PulledChange {
     pub version: Option<i64>,
     pub payload: serde_json::Value,
     pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LocalPosSaleResult {
+    pub invoice: serde_json::Value,
+    pub pending_operations: i64,
 }
 
 pub fn initialize(app: &AppHandle) -> Result<LocalDbStatus, String> {
@@ -148,6 +155,18 @@ pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck]) -> Result<LocalDbStatu
                     params![ack.operation_id, server_ack, ack.server_entity_version],
                 )
                 .map_err(to_error)?;
+                tx.execute(
+                    "UPDATE local_pos_invoices
+                     SET sync_status = 'synced',
+                         server_invoice_no = json_extract(?2, '$.result_payload.invoice_no'),
+                         server_sale_id = json_extract(?2, '$.result_payload.sale_id'),
+                         synced_at = datetime('now'),
+                         updated_at = datetime('now'),
+                         entity_version = COALESCE(?3, entity_version)
+                     WHERE id = (SELECT entity_id FROM sync_outbox WHERE operation_id = ?1 AND entity_type = 'pos_sale')",
+                    params![ack.operation_id, server_ack, ack.server_entity_version],
+                )
+                .map_err(to_error)?;
             }
             "conflict" => {
                 tx.execute(
@@ -159,6 +178,13 @@ pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck]) -> Result<LocalDbStatu
                         ack.message.clone().unwrap_or_else(|| "Conflict".to_string()),
                         server_ack
                     ],
+                )
+                .map_err(to_error)?;
+                tx.execute(
+                    "UPDATE local_pos_invoices
+                     SET sync_status = 'conflict', updated_at = datetime('now')
+                     WHERE id = (SELECT entity_id FROM sync_outbox WHERE operation_id = ?1 AND entity_type = 'pos_sale')",
+                    params![ack.operation_id],
                 )
                 .map_err(to_error)?;
                 record_conflict_with_tx(&tx, ack)?;
@@ -174,6 +200,13 @@ pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck]) -> Result<LocalDbStatu
                         ack.message.clone().unwrap_or_else(|| "Sync operation failed".to_string()),
                         server_ack
                     ],
+                )
+                .map_err(to_error)?;
+                tx.execute(
+                    "UPDATE local_pos_invoices
+                     SET sync_status = 'failed', updated_at = datetime('now')
+                     WHERE id = (SELECT entity_id FROM sync_outbox WHERE operation_id = ?1 AND entity_type = 'pos_sale')",
+                    params![ack.operation_id],
                 )
                 .map_err(to_error)?;
             }
@@ -300,6 +333,266 @@ pub fn retry_failed_operations(app: &AppHandle) -> Result<LocalDbStatus, String>
     status_at(&path)
 }
 
+pub fn complete_local_pos_sale(app: &AppHandle, sale: serde_json::Value) -> Result<LocalPosSaleResult, String> {
+    let path = database_path(app)?;
+    complete_local_pos_sale_at(&path, sale)
+}
+
+fn complete_local_pos_sale_at(path: &Path, sale: serde_json::Value) -> Result<LocalPosSaleResult, String> {
+    initialize_at(&path)?;
+    let mut conn = Connection::open(path).map_err(to_error)?;
+    let tx = conn.transaction().map_err(to_error)?;
+
+    let invoice_id = required_text(&sale, "invoice_global_id")?;
+    let offline_ref = required_text(&sale, "offline_invoice_ref")?;
+    let branch_id = required_text(&sale, "branch_id")?;
+    let device_id = required_text(&sale, "device_id")?;
+    let user_id = optional_text(&sale, "user_id");
+    let bill_datetime = required_text(&sale, "bill_datetime")?;
+    let bill_date = optional_text(&sale, "bill_date").unwrap_or_else(|| bill_datetime.chars().take(10).collect());
+    let payment_mode = required_text(&sale, "payment_mode")?;
+    let gross_total = required_number(&sale, "gross_total")?;
+    let item_discount_total = number_or_zero(&sale, "item_discount_total");
+    let bill_discount_total = number_or_zero(&sale, "bill_discount_total");
+    let tax_total = number_or_zero(&sale, "tax_total");
+    let net_total = required_number(&sale, "net_total")?;
+    let entity_version = sale.get("entity_version").and_then(|v| v.as_i64()).unwrap_or(1);
+    let customer = sale.get("customer").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let customer_id = optional_text(&customer, "account_id").or_else(|| optional_text(&customer, "customer_id"));
+    let customer_name = optional_text(&customer, "name");
+    let customer_mobile = optional_text(&customer, "mobile");
+    let items = sale
+        .get("items")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "POS sale requires at least one item".to_string())?;
+    if items.is_empty() {
+        return Err("POS sale requires at least one item".to_string());
+    }
+    if net_total < 0.0 || gross_total < 0.0 {
+        return Err("POS sale totals must be non-negative".to_string());
+    }
+
+    tx.execute(
+        "INSERT INTO local_pos_invoices (
+            id, offline_invoice_ref, branch_id, device_id, user_id, customer_id,
+            customer_name, customer_mobile, bill_date, bill_datetime, payment_mode,
+            gross_total, item_discount_total, bill_discount_total, tax_total, net_total,
+            status, sync_status, entity_version, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                   'COMPLETED', 'pending', ?17, datetime('now'), datetime('now'))",
+        params![
+            invoice_id,
+            offline_ref,
+            branch_id,
+            device_id,
+            user_id,
+            customer_id,
+            customer_name,
+            customer_mobile,
+            bill_date,
+            bill_datetime,
+            payment_mode,
+            gross_total,
+            item_discount_total,
+            bill_discount_total,
+            tax_total,
+            net_total,
+            entity_version,
+        ],
+    )
+    .map_err(to_error)?;
+
+    for item in items {
+        let item_id = required_text(item, "item_global_id")?;
+        let product_id = required_text(item, "product_id")?;
+        let lot_id = required_text(item, "lot_id")?;
+        let quantity = required_number(item, "quantity")?;
+        let rate = required_number(item, "rate")?;
+        let discount = number_or_zero(item, "discount");
+        let amount = required_number(item, "amount")?;
+        let stock_movement_id = required_text(item, "stock_movement_id")?;
+        if quantity <= 0.0 {
+            return Err("POS item quantity must be greater than zero".to_string());
+        }
+        if rate < 0.0 || discount < 0.0 || amount < 0.0 {
+            return Err("POS item rate, discount and amount must be non-negative".to_string());
+        }
+
+        let existing_balance: Option<f64> = tx
+            .query_row(
+                "SELECT balance_qty FROM local_inventory_lots WHERE id = ?1 OR cloud_id = ?1 LIMIT 1",
+                [&lot_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(to_error)?;
+        let starting_balance = existing_balance.unwrap_or_else(|| number_or_zero(item, "available_qty"));
+        if starting_balance < quantity {
+            return Err(format!(
+                "Selected lot does not have enough local stock for {}",
+                optional_text(item, "product_name").unwrap_or_else(|| product_id.clone())
+            ));
+        }
+
+        tx.execute(
+            "INSERT INTO local_products (id, cloud_id, branch_id, product_name, unit, sale_rate, sync_status, updated_at)
+             VALUES (?1, ?1, ?2, ?3, ?4, ?5, 'synced', datetime('now'))
+             ON CONFLICT(id) DO UPDATE SET
+               product_name = COALESCE(excluded.product_name, local_products.product_name),
+               unit = COALESCE(excluded.unit, local_products.unit),
+               sale_rate = COALESCE(excluded.sale_rate, local_products.sale_rate),
+               updated_at = excluded.updated_at",
+            params![
+                product_id,
+                branch_id,
+                optional_text(item, "product_name").unwrap_or_else(|| "Unnamed Product".to_string()),
+                optional_text(item, "unit"),
+                rate,
+            ],
+        )
+        .map_err(to_error)?;
+
+        tx.execute(
+            "INSERT INTO local_inventory_lots (
+                id, cloud_id, branch_id, device_id, product_id, product_name, lot_no, size_grade,
+                opening_qty, balance_qty, sale_rate, status, sync_status, updated_at
+             ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, 'ACTIVE', 'synced', datetime('now'))
+             ON CONFLICT(id) DO NOTHING",
+            params![
+                lot_id,
+                branch_id,
+                device_id,
+                product_id,
+                optional_text(item, "product_name"),
+                optional_text(item, "lot_name"),
+                optional_text(item, "lot_size"),
+                starting_balance,
+                rate,
+            ],
+        )
+        .map_err(to_error)?;
+
+        tx.execute(
+            "UPDATE local_inventory_lots
+             SET sold_qty = sold_qty + ?2,
+                 balance_qty = balance_qty - ?2,
+                 updated_at = datetime('now'),
+                 sync_status = CASE WHEN LOWER(sync_status) = 'pending' THEN sync_status ELSE 'synced' END
+             WHERE id = ?1 AND balance_qty >= ?2",
+            params![lot_id, quantity],
+        )
+        .map_err(to_error)?;
+        if tx.changes() != 1 {
+            return Err("Selected lot does not have enough local stock".to_string());
+        }
+
+        tx.execute(
+            "INSERT INTO local_pos_invoice_items (
+                id, invoice_id, product_id, product_name, lot_id, lot_name, lot_size,
+                quantity, unit, rate, discount, amount, stock_movement_id, entity_version
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                item_id,
+                invoice_id,
+                product_id,
+                optional_text(item, "product_name"),
+                lot_id,
+                optional_text(item, "lot_name"),
+                optional_text(item, "lot_size"),
+                quantity,
+                optional_text(item, "unit"),
+                rate,
+                discount,
+                amount,
+                stock_movement_id,
+                entity_version,
+            ],
+        )
+        .map_err(to_error)?;
+
+        tx.execute(
+            "INSERT INTO local_stock_movements (
+                id, invoice_id, item_id, product_id, lot_id, branch_id, device_id,
+                movement_type, quantity, quantity_delta, movement_time, sync_status
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'SALE_OUT', ?8, ?9, datetime('now'), 'pending')",
+            params![
+                stock_movement_id,
+                invoice_id,
+                item_id,
+                product_id,
+                lot_id,
+                branch_id,
+                device_id,
+                quantity,
+                -quantity,
+            ],
+        )
+        .map_err(to_error)?;
+    }
+
+    let payments = sale
+        .get("payments")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "POS sale requires payment postings".to_string())?;
+    if payments.is_empty() {
+        return Err("POS sale requires payment postings".to_string());
+    }
+    for payment in payments {
+        let posting_id = required_text(payment, "posting_id")?;
+        let mode = required_text(payment, "mode")?;
+        let amount = required_number(payment, "amount")?;
+        if amount <= 0.0 {
+            return Err("Payment posting amount must be greater than zero".to_string());
+        }
+        let posting_type = if mode.eq_ignore_ascii_case("CREDIT") {
+            "CUSTOMER_RECEIVABLE"
+        } else {
+            "PAYMENT_RECEIVED"
+        };
+        tx.execute(
+            "INSERT INTO local_payment_postings (
+                id, invoice_id, posting_type, payment_mode, account_id, customer_id,
+                amount, branch_id, device_id, posting_time, sync_status
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'), 'pending')",
+            params![
+                posting_id,
+                invoice_id,
+                posting_type,
+                mode,
+                optional_text(payment, "account_id"),
+                customer_id,
+                amount,
+                branch_id,
+                device_id,
+            ],
+        )
+        .map_err(to_error)?;
+    }
+
+    let operation_id = required_text(&sale, "operation_id")?;
+    let operation = SyncOperation {
+        id: operation_id.clone(),
+        operation_id: Some(operation_id),
+        entity_type: "pos_sale".to_string(),
+        entity_id: invoice_id.clone(),
+        operation_type: "UPSERT".to_string(),
+        payload: sale.clone(),
+        branch_id: Some(branch_id),
+        device_id: Some(device_id),
+        user_id,
+        version: Some(entity_version),
+        created_at: None,
+    };
+    enqueue_sync_operation_with_conn(&tx, &operation)?;
+    tx.commit().map_err(to_error)?;
+
+    let conn = Connection::open(path).map_err(to_error)?;
+    Ok(LocalPosSaleResult {
+        invoice: sale,
+        pending_operations: pending_outbox_count_at(&conn)?,
+    })
+}
+
 fn enqueue_sync_operation_with_conn(conn: &Connection, operation: &SyncOperation) -> Result<(), String> {
     let payload = serde_json::to_string(&operation.payload).map_err(to_error)?;
     let operation_id = operation
@@ -362,6 +655,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
 
     apply_migration(&mut conn, "001_local_foundation", MIGRATION_001)?;
     apply_migration(&mut conn, "002_sync_engine_foundation", MIGRATION_002)?;
+    apply_migration(&mut conn, "003_local_first_pos", MIGRATION_003)?;
     Ok(())
 }
 
@@ -475,6 +769,45 @@ fn count_outbox_status(conn: &Connection, statuses: &[&str]) -> Result<i64, Stri
 
 fn single_optional_string(conn: &Connection, sql: &str) -> Result<Option<String>, String> {
     conn.query_row(sql, [], |row| row.get(0)).optional().map_err(to_error)
+}
+
+fn required_text(value: &serde_json::Value, key: &str) -> Result<String, String> {
+    optional_text(value, key).ok_or_else(|| format!("{key} is required"))
+}
+
+fn optional_text(value: &serde_json::Value, key: &str) -> Option<String> {
+    match value.get(key) {
+        Some(serde_json::Value::String(text)) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Some(serde_json::Value::Number(number)) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+fn required_number(value: &serde_json::Value, key: &str) -> Result<f64, String> {
+    value
+        .get(key)
+        .and_then(json_number)
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| format!("{key} must be a valid number"))
+}
+
+fn number_or_zero(value: &serde_json::Value, key: &str) -> f64 {
+    value.get(key).and_then(json_number).unwrap_or(0.0)
+}
+
+fn json_number(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_f64(),
+        serde_json::Value::String(text) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    }
 }
 
 fn pending_outbox_at(conn: &Connection, limit: i64) -> Result<Vec<PendingSyncOperation>, String> {
@@ -670,6 +1003,89 @@ mod tests {
         initialize_at(&path).expect("reinitialize local db");
         let value = get_smoke_value_at(&path).expect("read smoke value");
         assert_eq!(value.as_deref(), Some("survives-restart"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn local_pos_sale_persists_invoice_stock_payment_and_outbox() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-phase2-pos-{}.sqlite3",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+
+        initialize_at(&path).expect("initialize local db");
+        let sale = serde_json::json!({
+            "operation_id": "op-test-sale-1",
+            "invoice_global_id": "invoice-test-sale-1",
+            "offline_invoice_ref": "OFF-TEST-1",
+            "branch_id": "1",
+            "device_id": "device-test",
+            "user_id": "1",
+            "customer": { "name": "Walk-in Customer", "mobile": "" },
+            "bill_date": "2026-06-16",
+            "bill_datetime": "2026-06-16T10:00",
+            "payment_mode": "CASH",
+            "gross_total": 20.0,
+            "item_discount_total": 0.0,
+            "bill_discount_total": 0.0,
+            "tax_total": 0.0,
+            "net_total": 20.0,
+            "entity_version": 1,
+            "items": [{
+                "item_global_id": "line-test-sale-1",
+                "product_id": "product-test",
+                "product_name": "Test Product",
+                "lot_id": "lot-test",
+                "lot_name": "Test Lot",
+                "lot_size": "Small",
+                "quantity": 2.0,
+                "unit": "KG",
+                "rate": 10.0,
+                "discount": 0.0,
+                "amount": 20.0,
+                "stock_movement_id": "stock-test-sale-1",
+                "available_qty": 5.0
+            }],
+            "payments": [{
+                "posting_id": "posting-test-sale-1",
+                "mode": "CASH",
+                "amount": 20.0
+            }]
+        });
+
+        let result = complete_local_pos_sale_at(&path, sale).expect("complete local POS sale");
+        assert_eq!(result.pending_operations, 1);
+        drop(Connection::open(&path).expect("open and drop sqlite handle"));
+
+        initialize_at(&path).expect("reinitialize local db");
+        let conn = Connection::open(&path).expect("open sqlite");
+        let invoice_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_pos_invoices WHERE id = 'invoice-test-sale-1'", [], |row| row.get(0))
+            .expect("invoice count");
+        let item_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_pos_invoice_items WHERE invoice_id = 'invoice-test-sale-1'", [], |row| row.get(0))
+            .expect("item count");
+        let movement_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_stock_movements WHERE invoice_id = 'invoice-test-sale-1'", [], |row| row.get(0))
+            .expect("movement count");
+        let payment_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_payment_postings WHERE invoice_id = 'invoice-test-sale-1'", [], |row| row.get(0))
+            .expect("payment count");
+        let balance_qty: f64 = conn
+            .query_row("SELECT balance_qty FROM local_inventory_lots WHERE id = 'lot-test'", [], |row| row.get(0))
+            .expect("lot balance");
+        let outbox_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_outbox WHERE operation_id = 'op-test-sale-1' AND status = 'pending'", [], |row| row.get(0))
+            .expect("outbox count");
+
+        assert_eq!(invoice_count, 1);
+        assert_eq!(item_count, 1);
+        assert_eq!(movement_count, 1);
+        assert_eq!(payment_count, 1);
+        assert_eq!(balance_qty, 3.0);
+        assert_eq!(outbox_count, 1);
 
         let _ = fs::remove_file(&path);
     }

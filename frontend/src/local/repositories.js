@@ -1,6 +1,7 @@
 import {
   applyPulledChanges,
   applyPushAcknowledgements,
+  completeLocalPosSale,
   enqueueSyncOperation,
   getPendingOutbox,
   getLocalDatabaseStatus,
@@ -70,6 +71,9 @@ export const repositories = {
   settings: new LocalCacheRepository("setting"),
   syncTest: {
     queue: queueSyncTestEntity,
+  },
+  pos: {
+    completeSale: completeLocalPosSale,
   },
   pull: {
     apply: applyPulledChanges,

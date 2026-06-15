@@ -4,7 +4,7 @@ import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import QRCode from "qrcode";
 import "./App.css";
-import { initializeLocalDatabase } from "./local/localDatabase";
+import { completeLocalPosSale, initializeLocalDatabase, isTauriRuntime } from "./local/localDatabase";
 import {
   getSyncStatus,
   queueSafeSyncTest,
@@ -2899,16 +2899,31 @@ function App() {
           {activeView === "sales" && (
             <PosBilling
               customers={customers.filter((customer) => customer.active !== false)}
+              deviceInfo={deviceInfo}
               discountRules={discountRules}
               lotDiscounts={lotDiscounts}
               inventory={inventory}
               onInvoice={setSelectedInvoice}
-              onSaved={async () => { await Promise.all([loadDashboardData(), loadLotDiscounts(), loadCustomerPendingBills()]); }}
+              onSaved={async (result) => {
+                if (result?.localSale) {
+                  setSalesHistory((rows) => [result.localSale, ...rows]);
+                  setInventory((rows) => rows.map((lot) => {
+                    const movement = result.localSale.items.find((item) => String(item.inventory_batch_id) === String(lot.id));
+                    return movement
+                      ? { ...lot, remaining_qty: Math.max(Number(lot.remaining_qty || 0) - Number(movement.quantity || 0), 0) }
+                      : lot;
+                  }));
+                  await refreshSyncStatus();
+                  return;
+                }
+                await Promise.all([loadDashboardData(), loadLotDiscounts(), loadCustomerPendingBills()]);
+              }}
               paymentSettings={settingsData.paymentSettings}
               posSettings={settingsData.posSettings}
               printSettings={settingsData.businessSettings}
               products={products.filter((product) => product.active !== false)}
               saleRateSettings={settingsData.saleRateSettings}
+              syncInBackground={runSyncNow}
               canManualRateOverride={hasRolePermission("manual_pos_rate_override")}
               canPosDateOverride={hasRolePermission("pos_date_override")}
               user={user}
@@ -8004,7 +8019,7 @@ const currentDateTimeLocal = () => {
   return `${year}-${month}-${day}T${hours}:${minutes}`;
 };
 
-function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, customers = [], discountRules = [], lotDiscounts = [], inventory, onInvoice, onSaved, paymentSettings = {}, posSettings = {}, printSettings = {}, products, saleRateSettings = {}, user }) {
+function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onInvoice, onSaved, paymentSettings = {}, posSettings = {}, printSettings = {}, products, saleRateSettings = {}, syncInBackground, user }) {
   const [search, setSearch] = useState("");
   const [barcode, setBarcode] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
@@ -8245,6 +8260,70 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     });
   };
 
+  const newSyncId = (prefix) => {
+    const id = typeof crypto !== "undefined" && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    return `${prefix}-${id}`;
+  };
+
+  const buildLocalSalePayload = ({ payments, selectedBillDate, dateOverrideReason }) => {
+    const invoiceGlobalId = newSyncId("invoice");
+    const offlineInvoiceRef = `OFF-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${String(Math.floor(Math.random() * 10000)).padStart(4, "0")}`;
+    return {
+      operation_id: newSyncId("op"),
+      invoice_global_id: invoiceGlobalId,
+      offline_invoice_ref: offlineInvoiceRef,
+      branch_id: String(user.branch_id || 1),
+      device_id: deviceInfo.device_id || newSyncId("device"),
+      user_id: String(user.id || ""),
+      customer,
+      bill_date: selectedBillDate,
+      bill_datetime: billDateTime,
+      payment_mode: paymentMode,
+      gross_total: Number(totals.gross || 0),
+      item_discount_total: Number(totals.itemDiscount || 0),
+      bill_discount_total: Number(totals.invoiceDiscount || 0),
+      tax_total: 0,
+      net_total: Number(totals.total || 0),
+      status: "COMPLETED",
+      sync_status: "pending",
+      entity_version: 1,
+      date_override_reason: dateOverrideReason,
+      items: cart.map((item) => {
+        const itemGlobalId = newSyncId("line");
+        const stockMovementId = newSyncId("stock");
+        return {
+          item_global_id: itemGlobalId,
+          invoice_global_id: invoiceGlobalId,
+          product_id: String(item.product_id),
+          product_name: item.product_name,
+          lot_id: item.inventory_batch_id ? String(item.inventory_batch_id) : "",
+          lot_name: item.lot_name || "",
+          lot_size: item.lot_size || "",
+          quantity: Number(item.quantity),
+          unit: item.unit || "",
+          rate: Number(item.selling_rate),
+          discount: Number(item.discount_amount || 0),
+          amount: roundUi(Number(item.quantity) * Number(item.selling_rate) - Number(item.discount_amount || 0)),
+          stock_movement_id: stockMovementId,
+          available_qty: Number(item.available_qty || 0),
+          selling_rate: Number(item.selling_rate),
+          discount_amount: Number(item.discount_amount || 0),
+          inventory_batch_id: item.inventory_batch_id ? Number(item.inventory_batch_id) : null,
+          lot_discount_id: item.lot_discount_id || null,
+          lot_discount_type: item.lot_discount_type || null,
+          lot_discount_value: Number(item.lot_discount_value || 0),
+        };
+      }),
+      payments: payments.map((payment) => ({
+        posting_id: newSyncId("posting"),
+        mode: payment.mode,
+        amount: Number(payment.amount),
+      })),
+    };
+  };
+
   const checkout = async (printAfterSave = false, confirmations = {}) => {
     if (saving && !confirmations.retry) return;
     if (cart.length === 0) {
@@ -8327,6 +8406,57 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
 
     setSaving(true);
     try {
+      if (isTauriRuntime()) {
+        if (cart.some((item) => !item.inventory_batch_id)) {
+          alert("Desktop local-first POS requires a selected stock lot for every item.");
+          return;
+        }
+        const localSale = buildLocalSalePayload({ payments, selectedBillDate, dateOverrideReason });
+        const result = await completeLocalPosSale(localSale);
+        const invoice = {
+          id: localSale.invoice_global_id,
+          invoice_no: localSale.offline_invoice_ref,
+          offline_invoice_ref: localSale.offline_invoice_ref,
+          sale_date: selectedBillDate,
+          bill_datetime: billDateTime,
+          customer_name: customer.name || "Walk-in Customer",
+          customer_mobile: customer.mobile || "",
+          payment_mode: paymentMode,
+          amount: localSale.net_total,
+          total_amount: localSale.net_total,
+          sync_status: "pending",
+          items: localSale.items.map((item) => ({
+            product_id: item.product_id,
+            product_name: item.product_name,
+            unit: item.unit,
+            quantity: item.quantity,
+            selling_rate: item.rate,
+            inventory_batch_id: item.inventory_batch_id,
+            lot_name: item.lot_name,
+            lot_size: item.lot_size,
+            amount: item.amount,
+            discount_amount: item.discount,
+            net_amount: item.amount,
+          })),
+          payments: localSale.payments,
+        };
+        setCart([]);
+        setMixedPayments({ CASH: "", UPI: "", CARD: "", BANK_TRANSFER: "" });
+        setPaymentMode("CASH");
+        setCustomer({ account_id: "", name: "", mobile: "", notes: "" });
+        setCreditInfo({ due_date: "", remarks: "" });
+        setBillDateTime(currentDateTimeLocal());
+        await onSaved?.({ localSale: invoice, pendingOperations: result?.pending_operations });
+        setLastInvoice(invoice);
+        onInvoice(invoice);
+        if (typeof syncInBackground === "function") {
+          syncInBackground().catch(() => {});
+        }
+        if (printAfterSave || printSettings.auto_print_after_billing === true) {
+          setTimeout(() => window.print(), 250);
+        }
+        return;
+      }
       const response = await axios.post(`${API_URL}/sales`, {
         items: cart.map((item) => ({
           product_id: item.product_id,

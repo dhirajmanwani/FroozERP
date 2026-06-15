@@ -1,6 +1,6 @@
 mod local_db;
 
-use local_db::{LocalDbStatus, PendingSyncOperation, PulledChange, SyncAck, SyncOperation};
+use local_db::{LocalDbStatus, LocalPosSaleResult, PendingSyncOperation, PulledChange, SyncAck, SyncOperation};
 use tauri::AppHandle;
 
 #[tauri::command]
@@ -75,6 +75,11 @@ fn sync_queue_test_entity(
     local_db::queue_sync_test_entity(&app, &entity_id, &value, branch_id, device_id, user_id)
 }
 
+#[tauri::command]
+fn pos_sale_complete_local(app: AppHandle, sale: serde_json::Value) -> Result<LocalPosSaleResult, String> {
+    local_db::complete_local_pos_sale(&app, sale)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -89,7 +94,8 @@ pub fn run() {
             sync_apply_pull_changes,
             sync_mark_failed,
             sync_retry_failed_operations,
-            sync_queue_test_entity
+            sync_queue_test_entity,
+            pos_sale_complete_local
         ])
         .run(tauri::generate_context!())
         .expect("error while running FroozERP desktop app");
