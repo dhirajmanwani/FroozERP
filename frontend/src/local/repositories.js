@@ -1,4 +1,13 @@
-import { enqueueSyncOperation } from "./localDatabase";
+import {
+  applyPulledChanges,
+  applyPushAcknowledgements,
+  enqueueSyncOperation,
+  getPendingOutbox,
+  getLocalDatabaseStatus,
+  markSyncFailed,
+  queueSyncTestEntity,
+  retryFailedLocalOperations,
+} from "./localDatabase";
 
 const newId = () =>
   typeof crypto !== "undefined" && crypto.randomUUID
@@ -8,19 +17,33 @@ const newId = () =>
 const nowIso = () => new Date().toISOString();
 
 export class SyncOutboxRepository {
-  async enqueue({ entityType, entityId, operationType, payload, branchId, deviceId, version = 1 }) {
+  async enqueue({ entityType, entityId, operationType, payload, branchId, deviceId, userId, version = 1 }) {
     const operation = {
       id: newId(),
+      operation_id: newId(),
       entity_type: entityType,
       entity_id: entityId,
       operation_type: operationType,
       payload,
       branch_id: branchId || "",
       device_id: deviceId || "",
+      user_id: userId ? String(userId) : "",
       version,
       created_at: nowIso(),
     };
     return enqueueSyncOperation(operation);
+  }
+
+  async pending(limit = 50) {
+    return getPendingOutbox(limit);
+  }
+
+  async applyAcks(acks) {
+    return applyPushAcknowledgements(acks);
+  }
+
+  async retryFailed() {
+    return retryFailedLocalOperations();
   }
 }
 
@@ -45,5 +68,15 @@ export const repositories = {
   categories: new LocalCacheRepository("category"),
   lots: new LocalCacheRepository("inventory_lot"),
   settings: new LocalCacheRepository("setting"),
+  syncTest: {
+    queue: queueSyncTestEntity,
+  },
+  pull: {
+    apply: applyPulledChanges,
+  },
+  status: {
+    get: getLocalDatabaseStatus,
+    fail: markSyncFailed,
+  },
   outbox: new SyncOutboxRepository(),
 };

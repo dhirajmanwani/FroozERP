@@ -9,7 +9,12 @@ const emptyStatus = {
   databasePath: "",
   schemaVersion: "",
   pendingOperations: 0,
+  failedOperations: 0,
+  conflictOperations: 0,
   lastSuccessfulSyncAt: "",
+  lastPushAt: "",
+  lastPullAt: "",
+  currentCursor: "",
   error: "",
 };
 
@@ -27,7 +32,12 @@ const normalizeStatus = (status, fallback = {}) => ({
   databasePath: status?.database_path || "",
   schemaVersion: status?.schema_version || "",
   pendingOperations: Number(status?.pending_operations || 0),
+  failedOperations: Number(status?.failed_operations || 0),
+  conflictOperations: Number(status?.conflict_operations || 0),
   lastSuccessfulSyncAt: status?.last_successful_sync_at || "",
+  lastPushAt: status?.last_push_at || "",
+  lastPullAt: status?.last_pull_at || "",
+  currentCursor: status?.current_cursor || "",
   error: status?.error || "",
 });
 
@@ -77,4 +87,50 @@ export async function enqueueSyncOperation(operation) {
 export async function getPendingOutboxCount() {
   if (!isTauriRuntime()) return 0;
   return invokeLocal("sync_outbox_count");
+}
+
+export async function getPendingOutbox(limit = 50) {
+  if (!isTauriRuntime()) return [];
+  return invokeLocal("sync_outbox_pending", { limit });
+}
+
+export async function applyPushAcknowledgements(acks) {
+  if (!isTauriRuntime()) return emptyStatus;
+  const status = await invokeLocal("sync_apply_push_acks", { acks });
+  return normalizeStatus(status);
+}
+
+export async function applyPulledChanges({ changes, nextCursor, deviceId }) {
+  if (!isTauriRuntime()) return emptyStatus;
+  const status = await invokeLocal("sync_apply_pull_changes", {
+    changes,
+    nextCursor,
+    deviceId,
+  });
+  return normalizeStatus(status);
+}
+
+export async function markSyncFailed(message) {
+  if (!isTauriRuntime()) return emptyStatus;
+  const status = await invokeLocal("sync_mark_failed", { message });
+  return normalizeStatus(status);
+}
+
+export async function retryFailedLocalOperations() {
+  if (!isTauriRuntime()) return emptyStatus;
+  const status = await invokeLocal("sync_retry_failed_operations");
+  return normalizeStatus(status);
+}
+
+export async function queueSyncTestEntity({ entityId, value, branchId, deviceId, userId }) {
+  if (!isTauriRuntime()) {
+    throw new Error("Local sync test writes are only available inside the FroozERP desktop app.");
+  }
+  return invokeLocal("sync_queue_test_entity", {
+    entityId,
+    value,
+    branchId,
+    deviceId,
+    userId,
+  });
 }

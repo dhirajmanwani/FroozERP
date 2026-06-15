@@ -5,6 +5,12 @@ import { jsPDF } from "jspdf";
 import QRCode from "qrcode";
 import "./App.css";
 import { initializeLocalDatabase } from "./local/localDatabase";
+import {
+  getSyncStatus,
+  queueSafeSyncTest,
+  retryFailedOperations,
+  syncNow,
+} from "./local/syncService";
 
 const API_URL = (
   import.meta.env.VITE_API_URL ||
@@ -419,6 +425,8 @@ function App() {
   const [user, setUser] = useState(null);
   const [deviceInfo, setDeviceInfo] = useState(() => getClientDeviceInfo());
   const [localDbStatus, setLocalDbStatus] = useState(null);
+  const [syncStatus, setSyncStatus] = useState(null);
+  const [syncMessage, setSyncMessage] = useState("");
   const [deviceGate, setDeviceGate] = useState(null);
   const [activationCode, setActivationCode] = useState("");
   const [activeView, setActiveView] = useState(initialView);
@@ -612,6 +620,67 @@ function App() {
       cancelled = true;
     };
   }, []);
+
+  const refreshSyncStatus = async () => {
+    const status = await getSyncStatus();
+    setSyncStatus(status);
+    return status;
+  };
+
+  const runSyncNow = async () => {
+    if (!user) return null;
+    setSyncMessage("Syncing...");
+    const status = await syncNow({
+      apiUrl: API_URL,
+      user,
+      deviceInfo,
+      branchId: user.branch_id || 1,
+    });
+    setSyncStatus(status);
+    setSyncMessage(status.lastError ? `Sync failed: ${status.lastError}` : "Sync complete");
+    return status;
+  };
+
+  const queuePhase2SyncTest = async () => {
+    if (!user) return;
+    try {
+      const entityId = await queueSafeSyncTest({
+        value: `Phase 2 sync test ${new Date().toISOString()}`,
+        user,
+        deviceInfo,
+        branchId: user.branch_id || 1,
+      });
+      setSyncMessage(`Queued safe sync test ${entityId}`);
+      await refreshSyncStatus();
+    } catch (error) {
+      setSyncMessage(getErrorMessage(error, "Unable to queue safe sync test"));
+    }
+  };
+
+  const retrySyncFailures = async () => {
+    const status = await retryFailedOperations();
+    setSyncStatus(status);
+    setSyncMessage("Failed sync operations moved back to pending");
+  };
+
+  useEffect(() => {
+    if (!user) return undefined;
+    let cancelled = false;
+    refreshSyncStatus().then((status) => {
+      if (!cancelled) setSyncStatus(status);
+    });
+    const timer = window.setInterval(() => {
+      runSyncNow();
+    }, 60_000);
+    const onlineHandler = () => runSyncNow();
+    window.addEventListener("online", onlineHandler);
+    runSyncNow();
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener("online", onlineHandler);
+    };
+  }, [user, deviceInfo.device_id]);
 
   const rolePermissionMap = useMemo(() => {
     const map = new Map();
@@ -2875,7 +2944,12 @@ function App() {
               canManage={canManageRates}
               localDbStatus={localDbStatus}
               onReload={async () => { await Promise.all([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()]); }}
+              onRetrySync={retrySyncFailures}
+              onRunSync={runSyncNow}
+              onQueueSyncTest={queuePhase2SyncTest}
               settingsData={settingsData}
+              syncMessage={syncMessage}
+              syncStatus={syncStatus}
               rules={settingsRules}
               user={user}
             />
@@ -6637,7 +6711,19 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
   );
 }
 
-function SettingsModule({ canManage, localDbStatus, onReload, rules, settingsData, user }) {
+function SettingsModule({
+  canManage,
+  localDbStatus,
+  onQueueSyncTest,
+  onReload,
+  onRetrySync,
+  onRunSync,
+  rules,
+  settingsData,
+  syncMessage,
+  syncStatus,
+  user,
+}) {
   return (
     <section className="settings-layout">
       <section className="settings-banner">
@@ -6660,7 +6746,19 @@ function SettingsModule({ canManage, localDbStatus, onReload, rules, settingsDat
       <SecurityDevicesSection activationCodes={settingsData.activationCodes || []} branches={settingsData.branches || []} canManage={canManage} counters={settingsData.counters || []} devices={settingsData.authorizedDevices || []} onReload={onReload} user={user} />
       <BranchCounterSettings branches={settingsData.branches || []} canManage={canManage} counters={settingsData.counters || []} onReload={onReload} user={user} />
       <UpdateCenterSection canManage={canManage} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
-      <SyncSettingsSection canManage={canManage} key={settingsData.syncSettings?.updated_at || "sync-settings"} localDbStatus={localDbStatus} onReload={onReload} syncSettings={settingsData.syncSettings} user={user} />
+      <SyncSettingsSection
+        canManage={canManage}
+        key={settingsData.syncSettings?.updated_at || "sync-settings"}
+        localDbStatus={localDbStatus}
+        onQueueSyncTest={onQueueSyncTest}
+        onReload={onReload}
+        onRetrySync={onRetrySync}
+        onRunSync={onRunSync}
+        syncMessage={syncMessage}
+        syncSettings={settingsData.syncSettings}
+        syncStatus={syncStatus}
+        user={user}
+      />
       <BackupSettings backupLogs={settingsData.backupLogs || []} backupSettings={settingsData.backupSettings} canManage={canManage} onReload={onReload} user={user} />
       <SystemInfoSection systemInfo={settingsData.systemInfo || {}} />
     </section>
@@ -7324,7 +7422,18 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
   );
 }
 
-function SyncSettingsSection({ canManage, localDbStatus, onReload, syncSettings, user }) {
+function SyncSettingsSection({
+  canManage,
+  localDbStatus,
+  onQueueSyncTest,
+  onReload,
+  onRetrySync,
+  onRunSync,
+  syncMessage,
+  syncSettings,
+  syncStatus,
+  user,
+}) {
   const [draft, setDraft] = useState(syncSettings || {});
   const [online, setOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
   const [statusMessage, setStatusMessage] = useState("");
@@ -7352,31 +7461,52 @@ function SyncSettingsSection({ canManage, localDbStatus, onReload, syncSettings,
       alert(getErrorMessage(error, "Unable to save device display name"));
     }
   };
-  const pending = Number(draft.pending_count || 0);
-  const autoStatus = pending > 0 ? "Sync Pending" : online ? "Online" : "Offline";
+  const pending = Number(syncStatus?.pendingOperations ?? draft.pending_count ?? 0);
+  const failed = Number(syncStatus?.failedOperations || 0);
+  const conflicts = Number(syncStatus?.conflictOperations || 0);
+  const autoStatus = syncStatus?.syncing
+    ? "Syncing"
+    : pending > 0
+      ? "Sync Pending"
+      : syncStatus?.online || online
+        ? "Online"
+        : "Offline";
   const nativeDbLabel = localDbStatus?.available
     ? localDbStatus.initialized ? "Local SQLite Ready" : "Local SQLite Error"
     : "Browser Mode";
+  const lastSync = syncStatus?.lastSuccessfulSyncAt || draft.last_sync_at;
+  const lastPush = syncStatus?.lastPushAt;
+  const lastPull = syncStatus?.lastPullAt;
   return (
-    <ModuleCard eyebrow="Sync Settings" title="Offline Sync Architecture" subtitle="Local database, sync queue and status indicator are prepared. Cloud sync delivery is not enabled yet.">
+    <ModuleCard eyebrow="Sync Settings" title="Offline Sync Engine" subtitle="Local outbox, idempotent cloud push, cursor pull and conflict status are active for Phase 2 foundation entities.">
       <div className="purchase-summary-grid supplier-payment-preview">
         <SummaryMetric label="Auto Sync Status" value={autoStatus} featured />
         <SummaryMetric label="Pending Queue" value={pending} />
-        <SummaryMetric label="Last Sync Time" value={draft.last_sync_at ? new Date(draft.last_sync_at).toLocaleString("en-IN") : "Not synced"} />
+        <SummaryMetric label="Failed" value={failed} />
+        <SummaryMetric label="Conflicts" value={conflicts} />
+        <SummaryMetric label="Last Sync Time" value={lastSync ? new Date(lastSync).toLocaleString("en-IN") : "Not synced"} />
         <SummaryMetric label="Local Database" value={nativeDbLabel} />
       </div>
-      {statusMessage && <p className="form-note">{statusMessage}</p>}
+      {(statusMessage || syncMessage || syncStatus?.lastError) && <p className="form-note">{syncMessage || statusMessage || syncStatus?.lastError}</p>}
       <div className="form-grid supplier-form-grid">
         <Field label="Device ID"><input disabled value={draft.device_id || "LOCAL-STORE"} /></Field>
         <Field label="Device Display Name"><input disabled={!canManage} value={draft.device_display_name || ""} onChange={(event) => setDraft({ ...draft, device_display_name: event.target.value })} /></Field>
         <Field label="Local SQLite Path"><input disabled value={localDbStatus?.databasePath || "Available in FroozERP desktop app"} /></Field>
         <Field label="Local Schema Version"><input disabled value={localDbStatus?.schemaVersion || "Not initialized"} /></Field>
-        <label className="check-field"><input checked={draft.sync_enabled === true} disabled type="checkbox" /><span>Enable future sync option is view-only until cloud sync is enabled</span></label>
-        <Field label="Notes"><textarea disabled value={draft.notes || "Cloud sync is prepared but not enabled yet."} /></Field>
+        <Field label="Last Push"><input disabled value={lastPush ? new Date(lastPush).toLocaleString("en-IN") : "Not pushed"} /></Field>
+        <Field label="Last Pull"><input disabled value={lastPull ? new Date(lastPull).toLocaleString("en-IN") : "Not pulled"} /></Field>
+        <Field label="Current Cursor"><input disabled value={syncStatus?.currentCursor || "0"} /></Field>
+        <label className="check-field"><input checked={draft.sync_enabled === true} disabled type="checkbox" /><span>Phase 2 sync foundation enabled for approved native devices</span></label>
+        <Field label="Notes"><textarea disabled value={draft.notes || "Cloud sync foundation is active for reference data and safe test entities."} /></Field>
       </div>
       {localDbStatus?.error && <p className="form-note stock-low">{localDbStatus.error}</p>}
-      <p className="form-note">Cloud sync is prepared but not enabled yet. Status, pending queue and last sync time are maintained by the system.</p>
-      <button className="primary-button" disabled={!canManage} onClick={save}>Save Device Name</button>
+      <p className="form-note">Phase 2 sync supports device registration, reference pull, safe test push/pull, retry, cursor tracking and conflict logging. Live POS still uses the existing online API until local-first POS is fully verified.</p>
+      <div className="toolbar-actions">
+        <button className="primary-button" disabled={!canManage} onClick={save}>Save Device Name</button>
+        <button className="secondary-button" disabled={!canManage || !onRunSync} onClick={onRunSync}>Sync Now</button>
+        <button className="secondary-button" disabled={!canManage || !onRetrySync} onClick={onRetrySync}>Retry Failed</button>
+        <button className="secondary-button" disabled={!canManage || !onQueueSyncTest} onClick={onQueueSyncTest}>Queue Safe Test</button>
+      </div>
     </ModuleCard>
   );
 }
