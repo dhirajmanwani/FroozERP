@@ -6,7 +6,8 @@ Financial entities must not use silent last-write-wins.
 
 Current Phase 2 behaviour:
 
-- Invalid POS sale sync payloads are rejected as `conflict`.
+- Invalid or impossible POS sale sync payloads are rejected as `conflict`.
+- Server stock is checked before accepting synced POS stock movements.
 - The local invoice operation remains in the local outbox with conflict status.
 - The server writes a `sync_conflict_log` row for owner review.
 - Live sales, stock and payment tables are not mutated by conflicted operations.
@@ -25,9 +26,10 @@ Reference changes are applied locally through repository/Tauri commands. Future 
 
 Multiple offline devices may sell from the same lot. For Phase 2 foundation:
 
-- Server-side POS stock validation is not enabled for live tables yet.
-- POS sale sync payloads are staged in `sync_pos_sale_staging`.
-- Invalid or impossible payloads are rejected/conflicted.
+- Server-side POS stock validation is enabled for synced POS sales.
+- Accepted POS sale sync payloads write live sales, item, payment and stock movement records.
+- Duplicate operation IDs or duplicate invoice global IDs do not create another invoice or stock deduction.
+- Invalid or impossible payloads are rejected/conflicted before sale creation.
 - Server stock is never silently allowed to go negative through the Phase 2 sync foundation.
 
 True multi-device offline selling from the same lot still requires operational controls or reservation logic in a later phase.

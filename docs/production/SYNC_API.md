@@ -71,6 +71,53 @@ Response:
 
 Idempotency is enforced by `sync_processed_operations.operation_id`.
 
+### POS Sale Push
+
+`entity_type: "pos_sale"` writes a local-first POS sale to the server after the Tauri SQLite transaction has already completed.
+
+Required payload fields:
+
+```json
+{
+  "invoice_global_id": "invoice-uuid",
+  "offline_invoice_ref": "OFF-20260616-0001",
+  "branch_id": "1",
+  "device_id": "FZDEV-...",
+  "user_id": "1",
+  "customer": { "account_id": "", "name": "Walk-in Customer", "mobile": "" },
+  "bill_date": "2026-06-16",
+  "bill_datetime": "2026-06-16T10:00",
+  "payment_mode": "CASH",
+  "gross_total": 20,
+  "item_discount_total": 0,
+  "bill_discount_total": 0,
+  "tax_total": 0,
+  "net_total": 20,
+  "items": [
+    {
+      "product_id": 1,
+      "inventory_batch_id": 10,
+      "lot_id": "10",
+      "quantity": 2,
+      "selling_rate": 10,
+      "discount_amount": 0
+    }
+  ],
+  "payments": [
+    { "posting_id": "posting-uuid", "mode": "CASH", "amount": 20 }
+  ]
+}
+```
+
+Server behavior:
+
+- Checks `sync_processed_operations.operation_id` before processing.
+- Checks existing `sales.global_id` and `sales.offline_invoice_ref` before creating a sale.
+- Validates device, branch, user, product, selected lot, payment and stock.
+- Creates sale header, sale items, batch allocations, stock transactions, payment rows and customer ledger rows in the same PostgreSQL transaction.
+- Rejects insufficient stock as `conflict` and records `sync_conflict_log`.
+- Never allows POS sync stock to become silently negative.
+
 ## Pull
 
 `GET /api/sync/pull?cursor=0&device_id=<id>&branch_id=1&user_id=1&limit=50`
