@@ -10,7 +10,7 @@ const { Pool, types } = require("pg");
 types.setTypeParser(1082, (value) => value);
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
 const pool = new Pool({
   user: process.env.DB_USER || "postgres",
@@ -927,6 +927,10 @@ const initializeDatabase = async () => {
     ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS assigned_counter_id INTEGER REFERENCES counters(id);
     ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMP;
     ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS local_ip VARCHAR(80);
+    ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS platform VARCHAR(80) DEFAULT 'Browser';
+    ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS app_version VARCHAR(40) DEFAULT '1.0.0';
+    ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS last_sync_at TIMESTAMP;
+    ALTER TABLE authorized_devices ADD COLUMN IF NOT EXISTS sync_status VARCHAR(40) DEFAULT 'IDLE';
 
     CREATE TABLE IF NOT EXISTS activation_codes (
       id SERIAL PRIMARY KEY,
@@ -952,6 +956,93 @@ const initializeDatabase = async () => {
       changed_by INTEGER REFERENCES users(id),
       changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS sync_processed_operations (
+      operation_id VARCHAR(180) PRIMARY KEY,
+      device_id VARCHAR(160) NOT NULL,
+      entity_type VARCHAR(80) NOT NULL,
+      entity_id VARCHAR(180) NOT NULL,
+      result_status VARCHAR(40) NOT NULL,
+      result_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS sync_processed_device_idx
+      ON sync_processed_operations (device_id, processed_at);
+
+    CREATE TABLE IF NOT EXISTS sync_change_log (
+      change_id BIGSERIAL PRIMARY KEY,
+      branch_id INTEGER NOT NULL DEFAULT 1,
+      entity_type VARCHAR(80) NOT NULL,
+      entity_id VARCHAR(180) NOT NULL,
+      operation_type VARCHAR(30) NOT NULL,
+      entity_version INTEGER NOT NULL DEFAULT 1,
+      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS sync_change_log_cursor_idx
+      ON sync_change_log (branch_id, change_id);
+    CREATE INDEX IF NOT EXISTS sync_change_log_entity_idx
+      ON sync_change_log (entity_type, entity_id);
+
+    CREATE TABLE IF NOT EXISTS sync_test_entities (
+      id VARCHAR(180) PRIMARY KEY,
+      branch_id INTEGER NOT NULL DEFAULT 1 REFERENCES branches(id),
+      device_id VARCHAR(160),
+      value TEXT NOT NULL,
+      entity_version INTEGER NOT NULL DEFAULT 1,
+      deleted_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS sync_conflict_log (
+      id BIGSERIAL PRIMARY KEY,
+      operation_id VARCHAR(180),
+      device_id VARCHAR(160),
+      branch_id INTEGER,
+      entity_type VARCHAR(80) NOT NULL,
+      entity_id VARCHAR(180) NOT NULL,
+      local_version INTEGER,
+      server_version INTEGER,
+      local_payload JSONB,
+      server_payload JSONB,
+      reason TEXT NOT NULL,
+      status VARCHAR(30) NOT NULL DEFAULT 'open',
+      detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      resolved_at TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS sync_pos_sale_staging (
+      invoice_global_id VARCHAR(180) PRIMARY KEY,
+      offline_invoice_ref VARCHAR(180) UNIQUE NOT NULL,
+      branch_id INTEGER NOT NULL DEFAULT 1 REFERENCES branches(id),
+      device_id VARCHAR(160) NOT NULL,
+      created_by INTEGER REFERENCES users(id),
+      payload JSONB NOT NULL,
+      result_status VARCHAR(40) NOT NULL DEFAULT 'accepted_for_review',
+      entity_version INTEGER NOT NULL DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    ALTER TABLE product_categories ADD COLUMN IF NOT EXISTS global_id VARCHAR(180);
+    ALTER TABLE product_categories ADD COLUMN IF NOT EXISTS entity_version INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE product_categories ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP;
+    UPDATE product_categories SET global_id = 'category-' || id WHERE global_id IS NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS product_categories_global_id_unique_idx
+      ON product_categories (global_id);
+
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS global_id VARCHAR(180);
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS entity_version INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP;
+    UPDATE products SET global_id = 'product-' || id WHERE global_id IS NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS products_global_id_unique_idx
+      ON products (global_id);
+
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS global_id VARCHAR(180);
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS offline_invoice_ref VARCHAR(180);
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS source_device_id VARCHAR(160);
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS entity_version INTEGER NOT NULL DEFAULT 1;
 
     CREATE TABLE IF NOT EXISTS backup_logs (
       id SERIAL PRIMARY KEY,
@@ -4289,6 +4380,478 @@ const approveDevice = async ({ deviceId, approvedBy, branchId = 1, counterId = n
   return result.rows[0];
 };
 
+const normalizeSyncStatus = (value) => String(value || "").trim().toLowerCase();
+const SYNC_OPERATION_TYPES = new Set(["UPSERT", "DELETE", "CREATE", "UPDATE"]);
+const SYNC_ENTITY_TYPES = new Set(["sync_test", "pos_sale"]);
+const syncRateWindow = new Map();
+
+const requireSyncContext = async ({ userId, deviceId, branchId }, client = pool) => {
+  const parsedUserId = parsePositiveInteger(userId);
+  const parsedBranchId = parsePositiveInteger(branchId) || 1;
+  const cleanDeviceId = cleanText(deviceId);
+  if (!parsedUserId || !cleanDeviceId) {
+    return { error: { status: 401, message: "Sync requires user_id and device_id" } };
+  }
+  const userResult = await client.query(
+    `
+    SELECT u.id, u.full_name, u.branch_id, u.active, r.role_name
+    FROM users u
+    JOIN roles r ON r.id = u.role_id
+    WHERE u.id = $1 AND u.active = TRUE
+    `,
+    [parsedUserId]
+  );
+  const user = userResult.rows[0];
+  if (!user) return { error: { status: 401, message: "Sync user is not active" } };
+  const deviceResult = await client.query(
+    "SELECT * FROM authorized_devices WHERE device_id = $1 LIMIT 1",
+    [cleanDeviceId]
+  );
+  const device = deviceResult.rows[0];
+  if (!device) return { error: { status: 403, message: "Device is not registered for sync" } };
+  if (device.status !== "APPROVED") {
+    return { error: { status: 403, message: "Device is not approved for sync" } };
+  }
+  if (["DISABLED", "REVOKED"].includes(String(device.status || "").toUpperCase())) {
+    return { error: { status: 403, message: "Device is disabled or revoked" } };
+  }
+  const deviceBranchId = Number(device.assigned_branch_id || parsedBranchId || 1);
+  if (deviceBranchId !== parsedBranchId) {
+    return { error: { status: 403, message: "Device is not assigned to this branch" } };
+  }
+  return { user, device, branchId: parsedBranchId, deviceId: cleanDeviceId };
+};
+
+const rateLimitSyncRequest = (req, res, next) => {
+  const key = `${req.ip}:${cleanText(req.body?.device_id || req.query?.device_id || "unknown")}`;
+  const now = Date.now();
+  const current = syncRateWindow.get(key) || { startedAt: now, count: 0 };
+  if (now - current.startedAt > 60_000) {
+    current.startedAt = now;
+    current.count = 0;
+  }
+  current.count += 1;
+  syncRateWindow.set(key, current);
+  if (current.count > 120) {
+    return res.status(429).json({ message: "Too many sync requests. Please retry shortly." });
+  }
+  return next();
+};
+
+const logSyncChange = async (client, { branchId = 1, entityType, entityId, operationType = "UPSERT", version = 1, payload = {} }) => {
+  const result = await client.query(
+    `
+    INSERT INTO sync_change_log (
+      branch_id, entity_type, entity_id, operation_type, entity_version, payload
+    )
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+    RETURNING change_id, created_at
+    `,
+    [branchId, entityType, String(entityId), operationType, version, JSON.stringify(payload)]
+  );
+  return result.rows[0];
+};
+
+const seedReferenceChangeLog = async () => {
+  await pool.query(`
+    INSERT INTO sync_change_log (branch_id, entity_type, entity_id, operation_type, entity_version, payload, created_at)
+    SELECT
+      1,
+      'product_category',
+      pc.global_id,
+      CASE WHEN pc.deleted_at IS NULL AND pc.active IS DISTINCT FROM FALSE THEN 'UPSERT' ELSE 'DELETE' END,
+      pc.entity_version,
+      TO_JSONB(pc),
+      COALESCE(pc.updated_at, pc.created_at, CURRENT_TIMESTAMP)
+    FROM product_categories pc
+    WHERE NOT EXISTS (
+      SELECT 1 FROM sync_change_log scl
+      WHERE scl.entity_type = 'product_category' AND scl.entity_id = pc.global_id
+    );
+
+    INSERT INTO sync_change_log (branch_id, entity_type, entity_id, operation_type, entity_version, payload, created_at)
+    SELECT
+      1,
+      'product',
+      p.global_id,
+      CASE WHEN p.deleted_at IS NULL AND p.active IS DISTINCT FROM FALSE THEN 'UPSERT' ELSE 'DELETE' END,
+      p.entity_version,
+      TO_JSONB(p),
+      COALESCE(p.selling_rate_updated_at, p.created_at, CURRENT_TIMESTAMP)
+    FROM products p
+    WHERE NOT EXISTS (
+      SELECT 1 FROM sync_change_log scl
+      WHERE scl.entity_type = 'product' AND scl.entity_id = p.global_id
+    );
+  `);
+};
+
+const processedAckFromRow = (row) => ({
+  operation_id: row.operation_id,
+  status: row.result_status,
+  server_entity_version: row.result_payload?.server_entity_version || null,
+  server_updated_at: row.result_payload?.server_updated_at || row.processed_at,
+  error_code: row.result_payload?.error_code || null,
+  message: row.result_payload?.message || "Already processed",
+});
+
+const storeProcessedOperation = async (client, operation, deviceId, ack) => {
+  await client.query(
+    `
+    INSERT INTO sync_processed_operations (
+      operation_id, device_id, entity_type, entity_id, result_status, result_payload, processed_at
+    )
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb, CURRENT_TIMESTAMP)
+    ON CONFLICT (operation_id) DO NOTHING
+    `,
+    [
+      operation.operation_id,
+      deviceId,
+      operation.entity_type,
+      operation.entity_id,
+      ack.status,
+      JSON.stringify({
+        ...ack,
+        server_entity_version: ack.server_entity_version || null,
+        server_updated_at: ack.server_updated_at || new Date().toISOString(),
+      }),
+    ]
+  );
+};
+
+const rejectOperation = (operation, errorCode, message) => ({
+  operation_id: operation.operation_id,
+  status: errorCode === "CONFLICT" ? "conflict" : "rejected",
+  server_entity_version: null,
+  server_updated_at: new Date().toISOString(),
+  error_code: errorCode,
+  message,
+});
+
+const processSyncTestOperation = async (client, operation, context) => {
+  const payload = operation.payload || {};
+  const value = cleanText(payload.value);
+  if (!value) return rejectOperation(operation, "VALIDATION_ERROR", "sync_test.value is required");
+  if (operation.operation_type === "DELETE") {
+    const result = await client.query(
+      `
+      UPDATE sync_test_entities
+      SET deleted_at = CURRENT_TIMESTAMP,
+          entity_version = entity_version + 1,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1 AND branch_id = $2
+      RETURNING *
+      `,
+      [operation.entity_id, context.branchId]
+    );
+    const row = result.rows[0];
+    if (!row) return rejectOperation(operation, "NOT_FOUND", "Sync test entity not found");
+    const change = await logSyncChange(client, {
+      branchId: context.branchId,
+      entityType: "sync_test",
+      entityId: row.id,
+      operationType: "DELETE",
+      version: row.entity_version,
+      payload: row,
+    });
+    return {
+      operation_id: operation.operation_id,
+      status: "accepted",
+      server_entity_version: row.entity_version,
+      server_updated_at: change.created_at,
+      error_code: null,
+      message: "Deleted",
+    };
+  }
+  const result = await client.query(
+    `
+    INSERT INTO sync_test_entities (id, branch_id, device_id, value, entity_version, updated_at)
+    VALUES ($1, $2, $3, $4, 1, CURRENT_TIMESTAMP)
+    ON CONFLICT (id) DO UPDATE
+    SET value = EXCLUDED.value,
+        device_id = EXCLUDED.device_id,
+        entity_version = sync_test_entities.entity_version + 1,
+        deleted_at = NULL,
+        updated_at = CURRENT_TIMESTAMP
+    RETURNING *
+    `,
+    [operation.entity_id, context.branchId, context.deviceId, value]
+  );
+  const row = result.rows[0];
+  const change = await logSyncChange(client, {
+    branchId: context.branchId,
+    entityType: "sync_test",
+    entityId: row.id,
+    operationType: "UPSERT",
+    version: row.entity_version,
+    payload: row,
+  });
+  return {
+    operation_id: operation.operation_id,
+    status: "accepted",
+    server_entity_version: row.entity_version,
+    server_updated_at: change.created_at,
+    error_code: null,
+    message: "Accepted",
+  };
+};
+
+const processPosSaleFoundationOperation = async (client, operation, context) => {
+  const payload = operation.payload || {};
+  const invoiceGlobalId = cleanText(payload.invoice_global_id || operation.entity_id);
+  const offlineInvoiceRef = cleanText(payload.offline_invoice_ref);
+  if (!invoiceGlobalId || !offlineInvoiceRef) {
+    return rejectOperation(operation, "VALIDATION_ERROR", "POS sale requires invoice_global_id and offline_invoice_ref");
+  }
+  if (!Array.isArray(payload.items) || payload.items.length === 0) {
+    return rejectOperation(operation, "VALIDATION_ERROR", "POS sale requires at least one item");
+  }
+  const duplicate = await client.query(
+    "SELECT * FROM sync_pos_sale_staging WHERE invoice_global_id = $1 OR offline_invoice_ref = $2 LIMIT 1",
+    [invoiceGlobalId, offlineInvoiceRef]
+  );
+  if (duplicate.rows[0]) {
+    return {
+      operation_id: operation.operation_id,
+      status: "accepted",
+      server_entity_version: duplicate.rows[0].entity_version,
+      server_updated_at: duplicate.rows[0].updated_at,
+      error_code: null,
+      message: "POS sale foundation already staged",
+    };
+  }
+  const insufficient = payload.items.find((item) => Number(item.quantity || 0) <= 0);
+  if (insufficient) {
+    await client.query(
+      `
+      INSERT INTO sync_conflict_log (
+        operation_id, device_id, branch_id, entity_type, entity_id,
+        local_version, local_payload, reason
+      )
+      VALUES ($1, $2, $3, 'pos_sale', $4, $5, $6::jsonb, $7)
+      `,
+      [
+        operation.operation_id,
+        context.deviceId,
+        context.branchId,
+        invoiceGlobalId,
+        operation.version || 1,
+        JSON.stringify(payload),
+        "Invalid POS item quantity; invoice retained locally for review",
+      ]
+    );
+    return rejectOperation(operation, "CONFLICT", "Invalid POS item quantity; invoice retained locally for review");
+  }
+  const result = await client.query(
+    `
+    INSERT INTO sync_pos_sale_staging (
+      invoice_global_id, offline_invoice_ref, branch_id, device_id, created_by, payload, result_status
+    )
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'accepted_for_review')
+    RETURNING *
+    `,
+    [invoiceGlobalId, offlineInvoiceRef, context.branchId, context.deviceId, context.user.id, JSON.stringify(payload)]
+  );
+  const row = result.rows[0];
+  await logSyncChange(client, {
+    branchId: context.branchId,
+    entityType: "pos_sale_staged",
+    entityId: row.invoice_global_id,
+    operationType: "UPSERT",
+    version: row.entity_version,
+    payload: row,
+  });
+  return {
+    operation_id: operation.operation_id,
+    status: "accepted",
+    server_entity_version: row.entity_version,
+    server_updated_at: row.updated_at,
+    error_code: null,
+    message: "POS sale staged for controlled Phase 2 review; live sale tables were not mutated",
+  };
+};
+
+const processSyncOperation = async (client, operation, context) => {
+  if (!operation || typeof operation !== "object") {
+    return rejectOperation({ operation_id: "" }, "VALIDATION_ERROR", "Invalid operation");
+  }
+  operation.operation_id = cleanText(operation.operation_id);
+  operation.entity_type = cleanText(operation.entity_type);
+  operation.entity_id = cleanText(operation.entity_id);
+  operation.operation_type = cleanText(operation.operation_type || "UPSERT").toUpperCase();
+  operation.version = Number(operation.version || operation.entity_version || 1);
+  if (!operation.operation_id || !operation.entity_type || !operation.entity_id) {
+    return rejectOperation(operation, "VALIDATION_ERROR", "operation_id, entity_type and entity_id are required");
+  }
+  if (!SYNC_ENTITY_TYPES.has(operation.entity_type)) {
+    return rejectOperation(operation, "UNSUPPORTED_ENTITY", `Unsupported Phase 2 sync entity: ${operation.entity_type}`);
+  }
+  if (!SYNC_OPERATION_TYPES.has(operation.operation_type)) {
+    return rejectOperation(operation, "UNSUPPORTED_OPERATION", `Unsupported operation type: ${operation.operation_type}`);
+  }
+  const processed = await client.query(
+    "SELECT * FROM sync_processed_operations WHERE operation_id = $1 FOR UPDATE",
+    [operation.operation_id]
+  );
+  if (processed.rows[0]) return processedAckFromRow(processed.rows[0]);
+  const ack = operation.entity_type === "sync_test"
+    ? await processSyncTestOperation(client, operation, context)
+    : await processPosSaleFoundationOperation(client, operation, context);
+  await storeProcessedOperation(client, operation, context.deviceId, ack);
+  return ack;
+};
+
+app.get("/api/health", async (_req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    return res.json({ status: "ok", server_time: new Date().toISOString() });
+  } catch (error) {
+    console.error("Health check failed", error.message);
+    return res.status(503).json({ status: "error", message: "Backend unavailable" });
+  }
+});
+
+app.post("/api/sync/register-device", rateLimitSyncRequest, async (req, res) => {
+  try {
+    const device = readDevicePayload({
+      ...req.body,
+      device_type: req.body.platform || req.body.device_type || "Desktop",
+    }, req);
+    if (!device.device_id) return res.status(400).json({ message: "device_id is required" });
+    const saved = await upsertDeviceRequest(device);
+    await pool.query(
+      `
+      UPDATE authorized_devices
+      SET platform = $2,
+          app_version = $3,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE device_id = $1
+      `,
+      [device.device_id, cleanText(req.body.platform) || device.device_type, cleanText(req.body.app_version) || "1.0.0"]
+    );
+    return res.json({
+      device_id: saved.device_id,
+      status: saved.status,
+      branch_id: saved.assigned_branch_id || 1,
+      message: saved.status === "APPROVED" ? "Device registered" : "Device pending approval",
+    });
+  } catch (error) {
+    console.error("Device sync registration failed", error.message);
+    return res.status(500).json({ message: "Device registration failed" });
+  }
+});
+
+app.post("/api/sync/push", rateLimitSyncRequest, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const operations = Array.isArray(req.body.operations) ? req.body.operations : [];
+    if (operations.length > 100) return res.status(413).json({ message: "Sync push batch is too large" });
+    await client.query("BEGIN");
+    const context = await requireSyncContext({
+      userId: req.body.user_id,
+      deviceId: req.body.device_id,
+      branchId: req.body.branch_id,
+    }, client);
+    if (context.error) {
+      await client.query("ROLLBACK");
+      return res.status(context.error.status).json({ message: context.error.message });
+    }
+    const sorted = [...operations].sort((a, b) =>
+      String(a.created_at || "").localeCompare(String(b.created_at || "")) ||
+      String(a.operation_id || "").localeCompare(String(b.operation_id || ""))
+    );
+    const acknowledgements = [];
+    for (const operation of sorted) {
+      const ack = await processSyncOperation(client, operation, context);
+      acknowledgements.push(ack);
+    }
+    await client.query(
+      "UPDATE authorized_devices SET last_sync_at = CURRENT_TIMESTAMP, sync_status = 'PUSHED', updated_at = CURRENT_TIMESTAMP WHERE device_id = $1",
+      [context.deviceId]
+    );
+    await client.query("COMMIT");
+    return res.json({
+      device_id: context.deviceId,
+      branch_id: context.branchId,
+      server_time: new Date().toISOString(),
+      acknowledgements,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("Sync push failed", error.message);
+    return res.status(500).json({ message: "Sync push failed" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/sync/pull", rateLimitSyncRequest, async (req, res) => {
+  try {
+    const context = await requireSyncContext({
+      userId: req.query.user_id,
+      deviceId: req.query.device_id,
+      branchId: req.query.branch_id,
+    });
+    if (context.error) return res.status(context.error.status).json({ message: context.error.message });
+    const cursor = Math.max(0, Number(req.query.cursor || 0));
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
+    const result = await pool.query(
+      `
+      SELECT change_id, branch_id, entity_type, entity_id, operation_type,
+             entity_version AS version, payload, created_at AS updated_at
+      FROM sync_change_log
+      WHERE branch_id = $1
+        AND change_id > $2
+      ORDER BY change_id
+      LIMIT $3
+      `,
+      [context.branchId, cursor, limit + 1]
+    );
+    const rows = result.rows.slice(0, limit);
+    const nextCursor = rows.length ? String(rows[rows.length - 1].change_id) : String(cursor);
+    await pool.query(
+      "UPDATE authorized_devices SET last_sync_at = CURRENT_TIMESTAMP, sync_status = 'PULLED', updated_at = CURRENT_TIMESTAMP WHERE device_id = $1",
+      [context.deviceId]
+    );
+    return res.json({
+      changes: rows,
+      next_cursor: nextCursor,
+      server_time: new Date().toISOString(),
+      has_more: result.rows.length > limit,
+    });
+  } catch (error) {
+    console.error("Sync pull failed", error.message);
+    return res.status(500).json({ message: "Sync pull failed" });
+  }
+});
+
+app.get("/api/sync/status", rateLimitSyncRequest, async (req, res) => {
+  try {
+    const context = await requireSyncContext({
+      userId: req.query.user_id,
+      deviceId: req.query.device_id,
+      branchId: req.query.branch_id,
+    });
+    if (context.error) return res.status(context.error.status).json({ message: context.error.message });
+    const [processed, conflicts, changes] = await Promise.all([
+      pool.query("SELECT COUNT(*)::INTEGER AS count FROM sync_processed_operations WHERE device_id = $1", [context.deviceId]),
+      pool.query("SELECT COUNT(*)::INTEGER AS count FROM sync_conflict_log WHERE device_id = $1 AND status = 'open'", [context.deviceId]),
+      pool.query("SELECT COALESCE(MAX(change_id), 0)::BIGINT AS cursor FROM sync_change_log WHERE branch_id = $1", [context.branchId]),
+    ]);
+    return res.json({
+      device_id: context.deviceId,
+      branch_id: context.branchId,
+      processed_operations: processed.rows[0]?.count || 0,
+      open_conflicts: conflicts.rows[0]?.count || 0,
+      latest_cursor: String(changes.rows[0]?.cursor || 0),
+      server_time: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("Sync status failed", error.message);
+    return res.status(500).json({ message: "Sync status failed" });
+  }
+});
+
 app.post("/devices/activate", async (req, res) => {
   const client = await pool.connect();
   try {
@@ -4677,11 +5240,11 @@ app.post("/product-categories", async (req, res) => {
     }
     const result = await client.query(
       `
-      INSERT INTO product_categories (category_name, active, remarks, created_by, updated_by)
-      VALUES ($1, $2, $3, $4, $4)
+      INSERT INTO product_categories (global_id, category_name, active, remarks, created_by, updated_by)
+      VALUES ($5, $1, $2, $3, $4, $4)
       RETURNING *
       `,
-      [categoryName, req.body.active !== false, nullableText(req.body.remarks), manager.id]
+      [categoryName, req.body.active !== false, nullableText(req.body.remarks), manager.id, `category-${crypto.randomUUID()}`]
     );
     await client.query(
       `
@@ -4690,6 +5253,14 @@ app.post("/product-categories", async (req, res) => {
       `,
       [result.rows[0].id, JSON.stringify(result.rows[0]), cleanText(req.body.reason) || "Category created", manager.id]
     );
+    await logSyncChange(client, {
+      branchId: 1,
+      entityType: "product_category",
+      entityId: result.rows[0].global_id,
+      operationType: "UPSERT",
+      version: result.rows[0].entity_version || 1,
+      payload: result.rows[0],
+    });
     await client.query("COMMIT");
     return res.status(201).json(result.rows[0]);
   } catch (error) {
@@ -4726,7 +5297,9 @@ app.put("/product-categories/:id", async (req, res) => {
     const result = await client.query(
       `
       UPDATE product_categories
-      SET category_name = $1, active = $2, remarks = $3, updated_by = $4, updated_at = CURRENT_TIMESTAMP
+      SET category_name = $1, active = $2, remarks = $3, updated_by = $4,
+          entity_version = entity_version + 1,
+          updated_at = CURRENT_TIMESTAMP
       WHERE id = $5
       RETURNING *
       `,
@@ -4740,6 +5313,14 @@ app.put("/product-categories/:id", async (req, res) => {
       `,
       [categoryId, JSON.stringify(current), JSON.stringify(result.rows[0]), reason, manager.id]
     );
+    await logSyncChange(client, {
+      branchId: 1,
+      entityType: "product_category",
+      entityId: result.rows[0].global_id,
+      operationType: "UPSERT",
+      version: result.rows[0].entity_version || 1,
+      payload: result.rows[0],
+    });
     await client.query("COMMIT");
     return res.json(result.rows[0]);
   } catch (error) {
@@ -4769,7 +5350,7 @@ app.delete("/product-categories/:id", async (req, res) => {
     }
     const usageResult = await client.query("SELECT COUNT(*)::INTEGER AS usage_count FROM products WHERE category_id = $1", [categoryId]);
     if (Number(usageResult.rows[0].usage_count || 0) > 0) {
-      const result = await client.query("UPDATE product_categories SET active = FALSE, updated_by = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *", [manager.id, categoryId]);
+      const result = await client.query("UPDATE product_categories SET active = FALSE, deleted_at = CURRENT_TIMESTAMP, entity_version = entity_version + 1, updated_by = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *", [manager.id, categoryId]);
       await client.query(
         `
         INSERT INTO product_category_audit_trail (category_id, action, old_value, new_value, reason, edited_by)
@@ -4777,10 +5358,21 @@ app.delete("/product-categories/:id", async (req, res) => {
         `,
         [categoryId, JSON.stringify(current), JSON.stringify(result.rows[0]), "This category has items or transactions. It can only be deactivated.", manager.id]
       );
+      await logSyncChange(client, {
+        branchId: 1,
+        entityType: "product_category",
+        entityId: result.rows[0].global_id,
+        operationType: "DELETE",
+        version: result.rows[0].entity_version || 1,
+        payload: result.rows[0],
+      });
       await client.query("COMMIT");
       return res.status(409).json({ message: "This category has items or transactions. It can only be deactivated.", category: result.rows[0] });
     }
-    await client.query("DELETE FROM product_categories WHERE id = $1", [categoryId]);
+    const tombstoneResult = await client.query(
+      "UPDATE product_categories SET active = FALSE, deleted_at = CURRENT_TIMESTAMP, entity_version = entity_version + 1, updated_by = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *",
+      [manager.id, categoryId]
+    );
     await client.query(
       `
       INSERT INTO product_category_audit_trail (category_id, action, old_value, new_value, reason, edited_by)
@@ -4788,6 +5380,14 @@ app.delete("/product-categories/:id", async (req, res) => {
       `,
       [null, JSON.stringify(current), reason, manager.id]
     );
+    await logSyncChange(client, {
+      branchId: 1,
+      entityType: "product_category",
+      entityId: tombstoneResult.rows[0].global_id,
+      operationType: "DELETE",
+      version: tombstoneResult.rows[0].entity_version || 1,
+      payload: tombstoneResult.rows[0],
+    });
     await client.query("COMMIT");
     return res.json({ success: true });
   } catch (error) {
@@ -4873,10 +5473,18 @@ app.post("/products", async (req, res) => {
     }
     if (!selectedCategory) {
       const categoryResult = await client.query(
-        "INSERT INTO product_categories (category_name, active, created_by, updated_by) VALUES ($1, TRUE, $2, $2) RETURNING *",
-        [cleanText(category || "Fruit"), rateManager.id]
+        "INSERT INTO product_categories (global_id, category_name, active, created_by, updated_by) VALUES ($1, $2, TRUE, $3, $3) RETURNING *",
+        [`category-${crypto.randomUUID()}`, cleanText(category || "Fruit"), rateManager.id]
       );
       selectedCategory = categoryResult.rows[0];
+      await logSyncChange(client, {
+        branchId: 1,
+        entityType: "product_category",
+        entityId: selectedCategory.global_id,
+        operationType: "UPSERT",
+        version: selectedCategory.entity_version || 1,
+        payload: selectedCategory,
+      });
     }
     if (selectedCategory.active === false) {
       await client.query("ROLLBACK");
@@ -4894,16 +5502,16 @@ app.post("/products", async (req, res) => {
     const result = await client.query(
       `
       INSERT INTO products (
-        product_name, selling_rate, unit, barcode, origin_type, category, category_id,
+        global_id, product_name, selling_rate, unit, barcode, origin_type, category, category_id,
         minimum_stock, active, remarks, selling_rate_updated_by
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      VALUES ($12, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       RETURNING *
       `,
       [
         product_name.trim(), parsedSellingRate, parsedUnit, barcode?.trim() || null, parsedOriginType,
         selectedCategory.category_name, selectedCategory.id, parsedMinimumStock, active !== false,
-        nullableText(remarks), rateManager.id,
+        nullableText(remarks), rateManager.id, `product-${crypto.randomUUID()}`,
       ]
     );
     const product = result.rows[0];
@@ -4914,6 +5522,14 @@ app.post("/products", async (req, res) => {
       `,
       [product.id, JSON.stringify(product), "Product item created", rateManager.id]
     );
+    await logSyncChange(client, {
+      branchId: parsePositiveInteger(branch_id) || 1,
+      entityType: "product",
+      entityId: product.global_id,
+      operationType: "UPSERT",
+      version: product.entity_version || 1,
+      payload: product,
+    });
     const openingLots = Array.isArray(req.body.opening_stock_lots) ? req.body.opening_stock_lots : [];
     const createdLots = [];
     for (const lot of openingLots) {
@@ -4994,6 +5610,7 @@ app.put("/products/:id", async (req, res) => {
         product_name = $1, selling_rate = $2, unit = $3, barcode = $4,
         origin_type = $5, category = $6, category_id = $7, minimum_stock = $8, active = $9,
         remarks = $10,
+        entity_version = entity_version + 1,
         selling_rate_updated_at = CASE WHEN selling_rate <> $2 THEN CURRENT_TIMESTAMP ELSE selling_rate_updated_at END,
         selling_rate_updated_by = CASE WHEN selling_rate <> $2 THEN $11 ELSE selling_rate_updated_by END
       WHERE id = $12
@@ -5022,6 +5639,14 @@ app.put("/products/:id", async (req, res) => {
       `,
       [productId, JSON.stringify(current), JSON.stringify(result.rows[0]), rate_change_reason?.trim() || "Product master update", parsePositiveInteger(updated_by) || rateManager?.id || null]
     );
+    await logSyncChange(client, {
+      branchId: 1,
+      entityType: sellingRateChanged ? "sale_rate" : "product",
+      entityId: result.rows[0].global_id,
+      operationType: "UPSERT",
+      version: result.rows[0].entity_version || 1,
+      payload: result.rows[0],
+    });
     await client.query("COMMIT");
     return res.json(result.rows[0]);
   } catch (error) {
@@ -5684,7 +6309,10 @@ app.post("/products/:id/cancel", async (req, res) => {
       `,
       [productId]
     );
-    const result = await client.query("UPDATE products SET active = FALSE WHERE id = $1 RETURNING *", [productId]);
+    const result = await client.query(
+      "UPDATE products SET active = FALSE, deleted_at = CURRENT_TIMESTAMP, entity_version = entity_version + 1 WHERE id = $1 RETURNING *",
+      [productId]
+    );
     await client.query(
       `
       INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by)
@@ -5692,6 +6320,14 @@ app.post("/products/:id/cancel", async (req, res) => {
       `,
       [productId, Number(usageResult.rows[0].usage_count || 0) > 0 ? "DEACTIVATE" : "CANCEL", JSON.stringify(product), JSON.stringify(result.rows[0]), reason, manager.id]
     );
+    await logSyncChange(client, {
+      branchId: 1,
+      entityType: "product",
+      entityId: result.rows[0].global_id,
+      operationType: "DELETE",
+      version: result.rows[0].entity_version || 1,
+      payload: result.rows[0],
+    });
     await client.query("COMMIT");
     return res.json({ success: true, product: result.rows[0], had_transactions: Number(usageResult.rows[0].usage_count || 0) > 0 });
   } catch (error) {
@@ -12278,7 +12914,8 @@ app.get("/sales/:id", async (req, res) => {
 });
 
 initializeDatabase()
-  .then(() => {
+  .then(async () => {
+    await seedReferenceChangeLog();
     let lastScheduledBackupDate = "";
     setInterval(async () => {
       try {
