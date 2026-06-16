@@ -27,6 +27,14 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
+const APP_VERSION = "1.0.0";
+const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
+const APP_COMPANY = "SRT Company";
+const UPDATE_FEED_URL = (
+  import.meta.env.VITE_UPDATE_FEED_URL ||
+  window.__FROOZERP_UPDATE_FEED_URL__ ||
+  ""
+).trim();
 const roundUi = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 const defaultPurchaseRules = {
   mandiTaxRules: [],
@@ -68,6 +76,7 @@ const navigationItems = [
 
 const getErrorMessage = (error, fallback) =>
   error.response?.data?.message || fallback;
+const cachedUserKey = "froozerp_cached_user";
 
 const getClientDeviceInfo = () => {
   const storageKey = "froozerp_device_id";
@@ -316,19 +325,18 @@ const defaultPaymentSettings = {
   qr_display_size: "MEDIUM",
 };
 
-function BrandLogo({ compact = false, invoice = false }) {
+function BrandLogo({ compact = false, invoice = false, splash = false }) {
+  const imageSrc = compact ? "/branding/frooz-symbol-192.png" : invoice ? "/branding/frooz-logo-invoice-320.png" : "/branding/frooz-logo-full-512.png";
+  const alt = compact ? "FroozERP" : "Feel the Freakin' Frooz official logo";
   return (
-    <div className={`${invoice ? "brand-lockup brand-lockup-invoice" : "brand-lockup"} ${compact ? "brand-lockup-compact" : ""}`}>
+    <div className={`${invoice ? "brand-lockup brand-lockup-invoice" : "brand-lockup"} ${compact ? "brand-lockup-compact" : ""} ${splash ? "brand-lockup-splash" : ""}`}>
       <span className="brand-monogram">
-        <svg aria-hidden="true" viewBox="0 0 48 48">
-          <path d="M13 12h21M13 23h16M13 12v24M25 12v24M25 34h11" />
-          <path className="brand-monogram-accent" d="M34 12h4M13 36h4" />
-        </svg>
+        <img alt={alt} src={imageSrc} />
       </span>
       {!compact && (
         <span className="brand-copy">
-          <strong>FEEL THE FREAKIN&apos; FROOZ</strong>
-          <small>by SRT Company</small>
+          <strong>FroozERP</strong>
+          <small>Feel the Freakin&apos; Frooz - by SRT Company</small>
         </span>
       )}
     </div>
@@ -1103,8 +1111,20 @@ function App() {
     setDeviceInfo(latestDevice);
     const response = await axios.post(`${API_URL}/login`, { username, password, ...latestDevice });
     setDeviceGate(null);
+    localStorage.setItem(cachedUserKey, JSON.stringify({ ...response.data, cached_at: new Date().toISOString() }));
     setUser(response.data);
   } catch (error) {
+    const cachedUser = localStorage.getItem(cachedUserKey);
+    if (isTauriRuntime() && cachedUser) {
+      try {
+        const parsedUser = JSON.parse(cachedUser);
+        setUser({ ...parsedUser, offline_session: true });
+        alert("Backend is unavailable. FroozERP opened in authorised offline mode for local-first modules.");
+        return;
+      } catch {
+        localStorage.removeItem(cachedUserKey);
+      }
+    }
     if (["DEVICE_NOT_APPROVED", "DEVICE_ID_REQUIRED"].includes(error.response?.data?.code)) {
       setDeviceGate(error.response.data);
       alert(error.response.data.message || "This device is not approved.");
@@ -2163,8 +2183,14 @@ function App() {
           </div>
           <div className="login-copy">
             <span className="eyebrow">Business Management</span>
-            <h1>Welcome back</h1>
-            <p>Sign in to manage your retail operations.</p>
+            <h1>{APP_DISPLAY_NAME}</h1>
+            <p>Preparing FroozERP, checking the local database, device authorisation and sync readiness.</p>
+          </div>
+          <div className="first-launch-steps">
+            <span>Checking local database</span>
+            <span>Checking device authorisation</span>
+            <span>Preparing authorised reference data</span>
+            <span>Ready for online or local-first POS</span>
           </div>
           <label>
             Username
@@ -7396,9 +7422,13 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
 function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
   const [draft, setDraft] = useState(updateCenter || {});
   const [message, setMessage] = useState("");
+  const [lastChecked, setLastChecked] = useState("");
   const status = draft.update_status || "READY_FOR_FUTURE_UPDATES";
   const updateAvailable = ["UPDATE_AVAILABLE", "DOWNLOAD_READY_FUTURE", "DOWNLOADED"].includes(status);
   const updateDownloaded = ["DOWNLOADED", "INSTALL_READY_FUTURE"].includes(status);
+  const latestVersion = draft.latest_version || draft.current_version || APP_VERSION;
+  const releaseTitle = draft.release_title || "FroozERP Windows release";
+  const releaseNotes = draft.release_notes || draft.changelog || "No hosted update feed is configured yet.";
   const save = async (status) => {
     try {
       const response = await axios.put(`${API_URL}/settings/update-center`, {
@@ -7415,23 +7445,57 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
       alert(getErrorMessage(error, "Unable to update update center"));
     }
   };
+  const checkForUpdates = async () => {
+    const checkedAt = new Date().toISOString();
+    setLastChecked(checkedAt);
+    if (!UPDATE_FEED_URL) {
+      setMessage("Update feed is not configured. Hosted signed release metadata is required for real update checks.");
+      return;
+    }
+    try {
+      const response = await axios.get(UPDATE_FEED_URL, { timeout: 8000 });
+      const data = response.data || {};
+      setDraft((current) => ({
+        ...current,
+        latest_version: data.version || data.latest_version || latestVersion,
+        release_title: data.title || data.release_title || releaseTitle,
+        release_notes: data.notes || data.release_notes || releaseNotes,
+        published_at: data.pub_date || data.published_at || checkedAt,
+        update_status: data.version && data.version !== APP_VERSION ? "UPDATE_AVAILABLE" : "NO_UPDATE_AVAILABLE",
+      }));
+      setMessage(data.version && data.version !== APP_VERSION ? `FroozERP update available - version ${data.version}` : "No update available");
+    } catch (error) {
+      setMessage(getErrorMessage(error, "Unable to check update feed"));
+    }
+  };
   return (
-    <ModuleCard eyebrow="Updates" title="Update Center" subtitle="Future-ready local update metadata. Online delivery is intentionally not enabled yet.">
+    <ModuleCard eyebrow="Software Updates" title="FroozERP Windows Updates" subtitle="Updater-ready foundation with local data preservation checks before installing signed releases.">
       <div className="purchase-summary-grid supplier-payment-preview">
-        <SummaryMetric label="Current Version" value={draft.current_version || "1.0.0"} featured />
-        <SummaryMetric label="Release Date" value={draft.release_date ? toDateKey(draft.release_date) : toDateKey(new Date())} />
+        <SummaryMetric label="Current Version" value={draft.current_version || APP_VERSION} featured />
+        <SummaryMetric label="Latest Version" value={latestVersion} />
         <SummaryMetric label="Status" value={status} />
+        <SummaryMetric label="Last Checked" value={lastChecked ? new Date(lastChecked).toLocaleString("en-IN") : "Not checked"} />
       </div>
-      {!updateAvailable && <p className="form-note">{message || "No update available"}</p>}
+      <div className={updateAvailable ? "update-available-panel" : "update-foundation-panel"}>
+        <strong>{updateAvailable ? `FroozERP update available - version ${latestVersion}` : releaseTitle}</strong>
+        <span>{releaseNotes}</span>
+        <small>Feed: {UPDATE_FEED_URL || "Not configured"}</small>
+        <small>Published: {draft.published_at ? new Date(draft.published_at).toLocaleString("en-IN") : "Pending hosted release metadata"}</small>
+      </div>
+      <p className="form-note">{message || "Before installing an update, FroozERP checks local database health, preserves SQLite data, pending outbox operations, device identity and settings."}</p>
       <div className="form-grid supplier-form-grid">
         <Field label="Current Version"><input disabled={!canManage} value={draft.current_version || ""} onChange={(event) => setDraft({ ...draft, current_version: event.target.value })} /></Field>
+        <Field label="Latest Version"><input disabled={!canManage} value={draft.latest_version || ""} onChange={(event) => setDraft({ ...draft, latest_version: event.target.value })} /></Field>
+        <Field label="Production Update Feed"><input disabled value={UPDATE_FEED_URL || "Configure VITE_UPDATE_FEED_URL or window.__FROOZERP_UPDATE_FEED_URL__"} /></Field>
         <Field label="Release Date"><input disabled={!canManage} type="date" value={toDateKey(draft.release_date || new Date())} onChange={(event) => setDraft({ ...draft, release_date: event.target.value })} /></Field>
-        <Field label="Changelog"><textarea disabled={!canManage} value={draft.changelog || ""} onChange={(event) => setDraft({ ...draft, changelog: event.target.value })} /></Field>
+        <Field label="Release Notes"><textarea disabled={!canManage} value={draft.release_notes || draft.changelog || ""} onChange={(event) => setDraft({ ...draft, release_notes: event.target.value })} /></Field>
       </div>
       <div className="button-row">
-        <button className="secondary-button" disabled={!canManage} onClick={() => save("NO_UPDATE_AVAILABLE")}>Check for Updates</button>
+        <button className="secondary-button" disabled={!canManage} onClick={checkForUpdates}>Check for Updates</button>
+        <button className="secondary-button" disabled={!canManage} onClick={() => save("NO_UPDATE_AVAILABLE")}>Save Update Metadata</button>
         <button className="secondary-button" disabled={!canManage || !updateAvailable || updateDownloaded} onClick={() => save("DOWNLOADED")}>Download Update</button>
         {updateDownloaded && <button className="primary-button" disabled={!canManage} onClick={() => save("INSTALL_READY_FUTURE")}>Install Update</button>}
+        {updateAvailable && <button className="secondary-button" disabled={!canManage} onClick={() => setMessage("Reminder saved for this session.")}>Remind Me Later</button>}
       </div>
     </ModuleCard>
   );
@@ -7515,7 +7579,7 @@ function SyncSettingsSection({
         <Field label="Notes"><textarea disabled value={draft.notes || "Cloud sync foundation is active for reference data and safe test entities."} /></Field>
       </div>
       {localDbStatus?.error && <p className="form-note stock-low">{localDbStatus.error}</p>}
-      <p className="form-note">Phase 2 sync supports device registration, reference pull, safe test push/pull, retry, cursor tracking and conflict logging. Live POS still uses the existing online API until local-first POS is fully verified.</p>
+      <p className="form-note">Native FroozERP uses local-first POS for selected-lot sales, queues sync operations locally and pushes them when the backend is reachable. Browser mode remains online-first.</p>
       <div className="toolbar-actions">
         <button className="primary-button" disabled={!canManage} onClick={save}>Save Device Name</button>
         <button className="secondary-button" disabled={!canManage || !onRunSync} onClick={onRunSync}>Sync Now</button>
@@ -7772,6 +7836,15 @@ function SystemInfoSection({ systemInfo }) {
   const androidUrl = systemInfo.lanFrontendUrl || (systemInfo.serverIp ? `http://${systemInfo.serverIp}:5173` : "-");
   return (
     <ModuleCard eyebrow="System Info" title="Server, Network and Device Status" subtitle="Use the LAN URL from another device on the same shop network.">
+      <section className="about-frooz-panel">
+        <BrandLogo />
+        <div>
+          <span className="eyebrow">About FroozERP</span>
+          <h3>{APP_DISPLAY_NAME}</h3>
+          <p>By {APP_COMPANY}</p>
+          <small>Version {APP_VERSION} - Device {device.device_id || "Not registered"} - Platform {device.device_type || "Windows/Desktop or Browser"}</small>
+        </div>
+      </section>
       <div className="purchase-summary-grid supplier-payment-preview">
         <SummaryMetric featured label="Backend" value={systemInfo.backendStatus || "Unknown"} />
         <SummaryMetric label="Database" value={systemInfo.databaseStatus || "Unknown"} />
@@ -7779,7 +7852,9 @@ function SystemInfoSection({ systemInfo }) {
         <SummaryMetric label="Device Status" value={device.status || "Not registered"} />
       </div>
       <DataTable headers={["Item", "Value"]}>
-        <tr><td>Software Version</td><td>{systemInfo.softwareVersion || "1.0.0"}</td></tr>
+        <tr><td>Software Version</td><td>{systemInfo.softwareVersion || APP_VERSION}</td></tr>
+        <tr><td>Display Branding</td><td>{APP_DISPLAY_NAME}</td></tr>
+        <tr><td>Company</td><td>{APP_COMPANY}</td></tr>
         <tr><td>LAN API URL</td><td>{systemInfo.lanApiUrl || "-"}</td></tr>
         <tr><td>LAN Frontend URL</td><td>{systemInfo.lanFrontendUrl || "-"}</td></tr>
         <tr><td>Android Chrome URL</td><td>{androidUrl}</td></tr>

@@ -43,20 +43,14 @@
   border-radius: 11px;
   background: linear-gradient(145deg, rgba(245, 158, 11, 0.16), rgba(245, 158, 11, 0.03));
   box-shadow: 0 8px 25px rgba(245, 158, 11, 0.12), inset 0 1px rgba(255, 255, 255, 0.08);
+  overflow: hidden;
 }
 
-.brand-monogram svg {
-  width: 31px;
-  height: 31px;
-  fill: none;
-  stroke: #f8fafc;
-  stroke-linecap: square;
-  stroke-linejoin: miter;
-  stroke-width: 3;
-}
-
-.brand-monogram .brand-monogram-accent {
-  stroke: #f59e0b;
+.brand-monogram img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
 }
 
 .brand-copy {
@@ -86,7 +80,13 @@
 }
 
 .brand-lockup-compact {
-  display: none;
+  display: inline-flex;
+}
+
+.brand-lockup-compact .brand-monogram {
+  width: 36px;
+  height: 36px;
+  border-radius: 9px;
 }
 
 .sidebar-section,
@@ -275,13 +275,9 @@
 }
 
 .welcome-banner .brand-monogram {
-  width: 36px;
-  height: 36px;
-}
-
-.welcome-banner .brand-monogram svg {
-  width: 27px;
-  height: 27px;
+  width: 72px;
+  height: 72px;
+  background: #fff;
 }
 
 .welcome-banner .brand-copy strong {
@@ -1354,6 +1350,50 @@ tbody tr:last-child td {
   font-size: 13px;
 }
 
+.update-foundation-panel,
+.update-available-panel,
+.about-frooz-panel {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  margin: 0 0 18px;
+  padding: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.35);
+}
+
+.update-foundation-panel,
+.update-available-panel {
+  display: grid;
+  align-items: start;
+}
+
+.update-available-panel {
+  border-color: rgba(245, 158, 11, 0.45);
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.update-foundation-panel strong,
+.update-available-panel strong,
+.about-frooz-panel h3 {
+  margin: 0;
+  color: #f8fafc;
+}
+
+.update-foundation-panel span,
+.update-available-panel span,
+.about-frooz-panel p,
+.about-frooz-panel small {
+  color: #cbd5e1;
+}
+
+.about-frooz-panel .brand-monogram {
+  width: 76px;
+  height: 76px;
+  background: #fff;
+}
+
 .account-tabs {
   display: flex;
   flex-wrap: wrap;
@@ -2218,17 +2258,12 @@ tbody tr:last-child td {
 }
 
 .brand-lockup-invoice .brand-monogram {
-  width: 48px;
-  height: 48px;
+  width: 68px;
+  height: 68px;
   border-color: #d39a29;
   border-radius: 8px;
-  background: #0f172a;
+  background: #fff;
   box-shadow: none;
-}
-
-.brand-lockup-invoice .brand-monogram svg {
-  width: 35px;
-  height: 35px;
 }
 
 .brand-lockup-invoice .brand-copy strong {
@@ -2460,13 +2495,9 @@ tbody tr:last-child td {
 }
 
 .login-brand .brand-monogram {
-  width: 50px;
-  height: 50px;
-}
-
-.login-brand .brand-monogram svg {
-  width: 37px;
-  height: 37px;
+  width: 86px;
+  height: 86px;
+  background: #fff;
 }
 
 .login-brand .brand-copy strong {
@@ -2481,6 +2512,31 @@ tbody tr:last-child td {
 
 .login-copy {
   margin: 32px 0 21px;
+}
+
+.first-launch-steps {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 20px;
+  padding: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.36);
+}
+
+.first-launch-steps span {
+  color: #cbd5e1;
+  font-size: 12px;
+}
+
+.first-launch-steps span::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 8px;
+  border-radius: 999px;
+  background: #22c55e;
 }
 
 .login-copy h1 {
@@ -2674,11 +2730,6 @@ tbody tr:last-child td {
     width: 33px;
     height: 33px;
     border-radius: 8px;
-  }
-
-  .brand-lockup-compact .brand-monogram svg {
-    width: 25px;
-    height: 25px;
   }
 
   .topbar {
@@ -3318,11 +3369,6 @@ tbody tr:last-child td {
     width: 28px;
     height: 28px;
     border-radius: 5px;
-  }
-
-  .invoice-paper.invoice-thermal .brand-monogram svg {
-    width: 20px;
-    height: 20px;
   }
 
   .invoice-paper.invoice-thermal .brand-copy strong,
