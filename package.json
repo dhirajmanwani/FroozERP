@@ -6,6 +6,9 @@
     "app": "frontend\\node_modules\\.bin\\tauri.cmd dev",
     "app:dev": "frontend\\node_modules\\.bin\\tauri.cmd dev",
     "app:build": "frontend\\node_modules\\.bin\\tauri.cmd build",
+    "build:windows": "frontend\\node_modules\\.bin\\tauri.cmd build --bundles nsis",
+    "verify:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\verify-windows.ps1",
+    "release:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\copy-windows-release.ps1",
     "build": "npm --prefix frontend run build",
     "backend:check": "node --check backend/server.js"
   }

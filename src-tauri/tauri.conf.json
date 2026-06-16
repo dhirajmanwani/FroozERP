@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "FroozERP",
+        "title": "FroozERP - Feel the Freakin' Frooz",
         "width": 1280,
         "height": 800,
         "minWidth": 1024,
@@ -24,8 +24,24 @@
     }
   },
   "bundle": {
-    "active": false,
-    "targets": "all",
-    "icon": []
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "SRT Company",
+    "copyright": "Copyright (c) 2026 SRT Company",
+    "shortDescription": "FroozERP fruit retail ERP",
+    "longDescription": "FroozERP - Feel the Freakin' Frooz. Premium fruit retail ERP for POS, inventory, accounts, reports and local-first sync.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "installMode": "perMachine",
+        "displayLanguageSelector": false
+      }
+    }
   }
 }
