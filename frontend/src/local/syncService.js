@@ -48,11 +48,32 @@ const syncContext = ({ user, deviceInfo, branchId }) => ({
   branchId: String(branchId || user?.branch_id || 1),
 });
 
-export async function checkBackendHealth(apiUrl) {
+export async function checkBackendHealth(apiUrl, options = {}) {
+  const url = `${apiUrl}/api/health`;
   try {
-    const response = await axios.get(`${apiUrl}/api/health`, withTimeout(5000));
-    return response.data?.status === "ok";
-  } catch {
+    const response = await axios.get(url, withTimeout(options.timeoutMs || 5000));
+    const online = response.data?.status === "ok";
+    if (options.details) {
+      return {
+        online,
+        apiUrl,
+        url,
+        status: response.status,
+        message: online ? "FroozERP backend is reachable." : "Health endpoint responded but did not report ok.",
+        data: response.data,
+      };
+    }
+    return online;
+  } catch (error) {
+    if (options.details) {
+      return {
+        online: false,
+        apiUrl,
+        url,
+        status: error.response?.status || null,
+        message: error.response?.data?.message || error.message || "Health check failed",
+      };
+    }
     return false;
   }
 }

@@ -4,18 +4,38 @@ import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import QRCode from "qrcode";
 import "./App.css";
-import { completeLocalPosSale, initializeLocalDatabase, isTauriRuntime } from "./local/localDatabase";
 import {
+  cacheLocalReferenceSnapshot,
+  cancelLocalPosSale,
+  completeLocalPosSale,
+  editLocalPosSale,
+  getOrCreateLocalDeviceIdentity,
+  initializeLocalDatabase,
+  isTauriRuntime,
+  listLocalPosSales,
+  loadLocalReferenceSnapshot,
+  loadLocalPosSale,
+} from "./local/localDatabase";
+import {
+  authenticateOfflineSession,
+  cacheOfflineSession,
+  readOfflineSession,
+  verifyOfflineSessionRecord,
+} from "./local/offlineSession";
+import {
+  checkBackendHealth,
   getSyncStatus,
   queueSafeSyncTest,
   retryFailedOperations,
   syncNow,
 } from "./local/syncService";
 
+const isDesktopShell = () => Boolean(window.__TAURI_INTERNALS__ || window.__TAURI__);
+
 const API_URL = (
   import.meta.env.VITE_API_URL ||
   window.__FROOZERP_API_URL__ ||
-  `${window.location.protocol}//${window.location.hostname}:5000`
+  (isDesktopShell() ? "http://127.0.0.1:5000" : `${window.location.protocol}//${window.location.hostname}:5000`)
 ).replace(/\/$/, "");
 const currency = new Intl.NumberFormat("en-IN", {
   style: "currency",
@@ -76,7 +96,69 @@ const navigationItems = [
 
 const getErrorMessage = (error, fallback) =>
   error.response?.data?.message || fallback;
-const cachedUserKey = "froozerp_cached_user";
+
+const getAuthErrorMessage = (error, fallback) => {
+  const code = error.response?.data?.code;
+  const message = error.response?.data?.message;
+  if (code === "INVALID_CREDENTIALS") return "Invalid username or password.";
+  if (code === "USER_DISABLED") return message || "This user account is disabled. Contact your Owner or Administrator.";
+  if (code === "DEVICE_PENDING_APPROVAL") return message || "This device is pending owner approval.";
+  if (["DEVICE_DISABLED", "DEVICE_REVOKED"].includes(code)) return message || "This device is disabled for FroozERP access.";
+  if (code === "BRANCH_ACCESS_DENIED") return message || "This branch is not authorised for login.";
+  if (code === "SERVER_UNAVAILABLE") return message || "FroozERP backend is unavailable.";
+  return message || fallback;
+};
+
+const hasObjectContent = (value) =>
+  Boolean(value) && typeof value === "object" && Object.keys(value).length > 0;
+
+const localSnapshotToInvoice = (snapshot) => {
+  const invoice = snapshot?.invoice || snapshot || {};
+  const items = snapshot?.items || invoice.items || [];
+  const payments = snapshot?.payments || invoice.payments || [];
+  return {
+    ...invoice,
+    id: invoice.id || invoice.invoice_global_id,
+    sale_id: invoice.id || invoice.invoice_global_id,
+    invoice_no: invoice.server_invoice_no || invoice.offline_invoice_ref || invoice.invoice_no,
+    sale_status: invoice.status || invoice.sale_status || "COMPLETED",
+    sale_date: invoice.bill_date || invoice.sale_date,
+    transaction_date: invoice.bill_date || invoice.transaction_date,
+    customer_name: invoice.customer_name,
+    customer_mobile: invoice.customer_mobile,
+    customer_id: invoice.customer_id,
+    gross_amount: Number(invoice.gross_total ?? invoice.gross_amount ?? 0),
+    item_discount_amount: Number(invoice.item_discount_total ?? invoice.item_discount_amount ?? 0),
+    invoice_discount_amount: Number(invoice.bill_discount_total ?? invoice.invoice_discount_amount ?? 0),
+    tax_amount: Number(invoice.tax_total ?? invoice.tax_amount ?? 0),
+    total_amount: Number(invoice.net_total ?? invoice.total_amount ?? 0),
+    payment_mode: invoice.payment_mode || "CASH",
+    edit_reason: invoice.edit_reason,
+    cancellation_reason: invoice.cancellation_reason,
+    items: items.map((item) => ({
+      ...item,
+      id: item.id || item.item_global_id,
+      product_id: item.product_id,
+      product_name: item.product_name,
+      inventory_batch_id: item.inventory_batch_id || item.lot_id,
+      lot_id: item.lot_id || item.inventory_batch_id,
+      lot_name: item.lot_name,
+      lot_size: item.lot_size,
+      quantity: Number(item.quantity || 0),
+      selling_rate: Number(item.selling_rate ?? item.rate ?? 0),
+      rate: Number(item.rate ?? item.selling_rate ?? 0),
+      discount_amount: Number(item.discount_amount ?? item.discount ?? 0),
+      discount: Number(item.discount ?? item.discount_amount ?? 0),
+      amount: Number(item.amount ?? item.net_amount ?? 0),
+      net_amount: Number(item.net_amount ?? item.amount ?? 0),
+      unit: item.unit,
+      stock_movement_id: item.stock_movement_id,
+    })),
+    payments,
+    sync_status: invoice.sync_status,
+    entity_version: invoice.entity_version,
+  };
+};
 
 const getClientDeviceInfo = () => {
   const storageKey = "froozerp_device_id";
@@ -98,6 +180,21 @@ const getClientDeviceInfo = () => {
     device_name: localStorage.getItem("froozerp_device_name") || `${deviceType} - ${window.location.hostname}`,
     device_type: deviceType,
     user_agent: userAgent,
+  };
+};
+
+const resolveLocalDeviceInfo = async (fallback = getClientDeviceInfo()) => {
+  if (!isTauriRuntime()) return fallback;
+  const identity = await getOrCreateLocalDeviceIdentity().catch(() => null);
+  if (!identity?.device_id) return fallback;
+  localStorage.setItem("froozerp_device_id", identity.device_id);
+  if (identity.device_name) localStorage.setItem("froozerp_device_name", identity.device_name);
+  return {
+    ...fallback,
+    device_id: identity.device_id,
+    device_name: identity.device_name || fallback.device_name,
+    device_type: identity.platform || fallback.device_type,
+    branch_id: identity.branch_id || fallback.branch_id,
   };
 };
 
@@ -326,7 +423,9 @@ const defaultPaymentSettings = {
 };
 
 function BrandLogo({ compact = false, invoice = false, splash = false }) {
-  const imageSrc = compact ? "/branding/frooz-symbol-192.png" : invoice ? "/branding/frooz-logo-invoice-320.png" : "/branding/frooz-logo-full-512.png";
+  const assetBase = import.meta.env.BASE_URL || "/";
+  const assetPath = (path) => `${assetBase}${path}`.replace(/([^:]\/)\/+/g, "$1");
+  const imageSrc = compact ? assetPath("branding/frooz-symbol-192.png") : invoice ? assetPath("branding/frooz-logo-invoice-320.png") : assetPath("branding/frooz-logo-full-512.png");
   const alt = compact ? "FroozERP" : "Feel the Freakin' Frooz official logo";
   return (
     <div className={`${invoice ? "brand-lockup brand-lockup-invoice" : "brand-lockup"} ${compact ? "brand-lockup-compact" : ""} ${splash ? "brand-lockup-splash" : ""}`}>
@@ -435,8 +534,21 @@ function App() {
   const [localDbStatus, setLocalDbStatus] = useState(null);
   const [syncStatus, setSyncStatus] = useState(null);
   const [syncMessage, setSyncMessage] = useState("");
+  const [startupError, setStartupError] = useState("");
+  const [startupNotice, setStartupNotice] = useState("");
+  const [backendHealth, setBackendHealth] = useState({
+    apiUrl: API_URL,
+    url: `${API_URL}/api/health`,
+    online: null,
+    message: "Backend reachability has not been checked yet.",
+  });
+  const [loginBusy, setLoginBusy] = useState(false);
+  const [offlineMode, setOfflineMode] = useState(false);
+  const [offlineReady, setOfflineReady] = useState(false);
+  const [lastReferenceSyncAt, setLastReferenceSyncAt] = useState("");
   const [deviceGate, setDeviceGate] = useState(null);
   const [activationCode, setActivationCode] = useState("");
+  const [recoveryOpen, setRecoveryOpen] = useState(false);
   const [activeView, setActiveView] = useState(initialView);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [products, setProducts] = useState([]);
@@ -621,8 +733,20 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
-    initializeLocalDatabase().then((status) => {
-      if (!cancelled) setLocalDbStatus(status);
+    initializeLocalDatabase().then(async (status) => {
+      if (cancelled) return;
+      setLocalDbStatus(status);
+      if (!isTauriRuntime()) return;
+      const identity = await getOrCreateLocalDeviceIdentity().catch(() => null);
+      if (!identity?.device_id || cancelled) return;
+      localStorage.setItem("froozerp_device_id", identity.device_id);
+      if (identity.device_name) localStorage.setItem("froozerp_device_name", identity.device_name);
+      setDeviceInfo((current) => ({
+        ...current,
+        device_id: identity.device_id,
+        device_name: identity.device_name || current.device_name,
+        device_type: identity.platform || current.device_type,
+      }));
     });
     return () => {
       cancelled = true;
@@ -914,6 +1038,204 @@ function App() {
     };
   }, [editingPurchaseId, expectedPurchaseRate, purchaseBillStatus, purchaseCart, purchaseFreightCharges, purchaseLabourCharges, purchaseOtherCharges, purchasePaidAmount, purchaseQuantity, purchaseRateInput, purchaseRebateRuleId, purchaseRules, purchaseType, selectedPurchaseProduct]);
 
+  const applySettingsBundle = (bundle = {}) => {
+    const nextSaleRateSettings = { ...defaultSaleRateSettings, ...(bundle.saleRateSettings || {}) };
+    setSettingsData({
+      businessSettings: { ...defaultBusinessSettings, ...(bundle.businessSettings || {}) },
+      saleRateSettings: nextSaleRateSettings,
+      posSettings: { ...defaultPosSettings, ...(bundle.posSettings || {}) },
+      paymentSettings: { ...defaultPaymentSettings, ...(bundle.paymentSettings || {}) },
+      discountRules: bundle.discountRules || [],
+      roles: bundle.roles || [],
+      users: bundle.users || [],
+      updateCenter: bundle.updateCenter || {},
+      syncSettings: bundle.syncSettings || {},
+      backupSettings: bundle.backupSettings || {},
+      backupLogs: bundle.backupLogs || [],
+      authorizedDevices: bundle.authorizedDevices || [],
+      activationCodes: bundle.activationCodes || [],
+      branches: bundle.branches || [],
+      counters: bundle.counters || [],
+      systemInfo: bundle.systemInfo || {},
+      canManageSettings: Boolean(bundle.canManageSettings),
+    });
+    setSettingsRules({
+      mandiTaxRules: bundle.mandiTaxRules || [],
+      rebateRules: bundle.rebateRules || [],
+    });
+    setDiscountRules((bundle.discountRules || []).filter((rule) => rule.active !== false));
+    setLotDiscounts(bundle.lotDiscounts || []);
+    setProductDuplicateWarning(bundle.productDuplicateWarning || "");
+    setSaleRates(bundle.saleRates || []);
+    setSaleRateHistory(bundle.saleRateHistory || []);
+    setSaleDesiredMargin(String(nextSaleRateSettings.desired_margin_percent || 25));
+  };
+
+  const applyReferenceSnapshot = async (snapshot, { offline = false, nextView = null } = {}) => {
+    const bundle = snapshot?.settings_bundle || {};
+    setProducts(snapshot?.products || []);
+    setProductCategories(snapshot?.categories || []);
+    setInventory(snapshot?.inventory_lots || []);
+    setCustomers(snapshot?.customers || []);
+    setSalesHistory(snapshot?.sales_history || []);
+    applySettingsBundle(bundle);
+    setOfflineMode(offline);
+    setOfflineReady(Boolean(snapshot?.reference_ready));
+    setLastReferenceSyncAt(snapshot?.last_successful_sync_at || "");
+    setSyncStatus((current) => ({
+      ...(current || {}),
+      online: !offline,
+      syncing: false,
+      pendingOperations: Number(snapshot?.pending_operations ?? current?.pendingOperations ?? 0),
+      failedOperations: Number(snapshot?.failed_operations ?? current?.failedOperations ?? 0),
+      conflictOperations: Number(snapshot?.conflict_operations ?? current?.conflictOperations ?? 0),
+      lastSuccessfulSyncAt: snapshot?.last_successful_sync_at || current?.lastSuccessfulSyncAt || "",
+      lastPushAt: current?.lastPushAt || "",
+      lastPullAt: current?.lastPullAt || "",
+      currentCursor: current?.currentCursor || "0",
+      lastError: "",
+      syncing: false,
+    }));
+    if (nextView) setActiveView(nextView);
+    if (offline) {
+      setSyncMessage("Offline - changes will sync later");
+      setStartupNotice("Offline mode is active. FroozERP loaded your local SQLite data and will sync changes later.");
+    } else {
+      setSyncMessage("");
+    }
+  };
+
+  const fetchOnlineReferenceSnapshot = async (currentUser, latestDevice) => {
+    const [
+      productsResponse,
+      categoriesResponse,
+      settingsResponse,
+      inventoryResponse,
+      customersResponse,
+      salesResponse,
+      duplicateLogResponse,
+      lotDiscountsResponse,
+    ] = await Promise.all([
+      axios.get(`${API_URL}/products`),
+      axios.get(`${API_URL}/product-categories`),
+      axios.get(`${API_URL}/settings`, { params: { user_id: currentUser?.id, device_id: latestDevice.device_id } }),
+      axios.get(`${API_URL}/inventory`, { params: { include_cancelled: true } }),
+      axios.get(`${API_URL}/customers`),
+      axios.get(`${API_URL}/sales`),
+      axios.get(`${API_URL}/product-duplicate-archive-log`).catch(() => ({ data: { message: "" } })),
+      axios.get(`${API_URL}/lot-discounts`).catch(() => ({ data: [] })),
+    ]);
+
+    const settingsPayload = settingsResponse.data || {};
+    const branchId = String(currentUser?.branch_id || 1);
+    const branchRecord = (settingsPayload.branches || []).find((row) => String(row.id) === branchId);
+
+    return {
+      cached_at: new Date().toISOString(),
+      last_successful_sync_at: new Date().toISOString(),
+      branch_context: {
+        branch_id: branchId,
+        branch_name: branchRecord?.branch_name || currentUser?.branch || "Main Branch",
+      },
+      user_profile: currentUser,
+      device_identity: {
+        ...latestDevice,
+        platform: "tauri-windows",
+        app_version: APP_VERSION,
+        branch_id: branchId,
+        registration_status: "approved",
+      },
+      products: productsResponse.data || [],
+      categories: categoriesResponse.data || [],
+      inventory_lots: inventoryResponse.data || [],
+      customers: customersResponse.data || [],
+      sales_history: salesResponse.data || [],
+      settings_bundle: {
+        businessSettings: settingsPayload.businessSettings || {},
+        saleRateSettings: settingsPayload.saleRateSettings || {},
+        posSettings: settingsPayload.posSettings || {},
+        paymentSettings: settingsPayload.paymentSettings || {},
+        discountRules: settingsPayload.discountRules || [],
+        roles: settingsPayload.roles || [],
+        users: settingsPayload.users || [],
+        updateCenter: settingsPayload.updateCenter || {},
+        syncSettings: settingsPayload.syncSettings || {},
+        backupSettings: settingsPayload.backupSettings || {},
+        backupLogs: settingsPayload.backupLogs || [],
+        authorizedDevices: settingsPayload.authorizedDevices || [],
+        activationCodes: settingsPayload.activationCodes || [],
+        branches: settingsPayload.branches || [],
+        counters: settingsPayload.counters || [],
+        systemInfo: settingsPayload.systemInfo || {},
+        canManageSettings: Boolean(settingsPayload.canManageSettings),
+        mandiTaxRules: settingsPayload.mandiTaxRules || [],
+        rebateRules: settingsPayload.rebateRules || [],
+        lotDiscounts: lotDiscountsResponse.data || [],
+        productDuplicateWarning: duplicateLogResponse.data?.message || "",
+      },
+    };
+  };
+
+  const hydrateOnlineSession = async (currentUser, latestDevice) => {
+    const snapshot = await fetchOnlineReferenceSnapshot(currentUser, latestDevice);
+    const offlineSession = await cacheOfflineSession({
+      username,
+      password,
+      user: currentUser,
+      deviceId: latestDevice.device_id,
+      branchId: currentUser?.branch_id || 1,
+      lastSuccessfulSyncAt: snapshot.last_successful_sync_at,
+    });
+    await applyReferenceSnapshot(snapshot, { offline: false, nextView: initialView });
+    if (isTauriRuntime()) {
+      const status = await cacheLocalReferenceSnapshot({
+        ...snapshot,
+        offline_auth: offlineSession,
+      });
+      setLocalDbStatus(status);
+    }
+    setStartupNotice("Online login succeeded and local reference data has been refreshed for offline use.");
+    return snapshot;
+  };
+
+  const continueOffline = async (latestDevice = deviceInfo) => {
+    latestDevice = await resolveLocalDeviceInfo(latestDevice || getClientDeviceInfo());
+    const snapshot = await loadLocalReferenceSnapshot({
+      username,
+      deviceId: latestDevice.device_id,
+    }).catch(() => null);
+    const cachedOfflineRecord = hasObjectContent(snapshot?.offline_auth)
+      ? snapshot.offline_auth
+      : readOfflineSession();
+    const offlineAuth = cachedOfflineRecord
+      ? await verifyOfflineSessionRecord(cachedOfflineRecord, {
+        username,
+        password,
+        deviceId: latestDevice.device_id,
+      })
+      : await authenticateOfflineSession({
+        username,
+        password,
+        deviceId: latestDevice.device_id,
+      });
+    if (!offlineAuth.ok) {
+      setStartupError(offlineAuth.message);
+      return false;
+    }
+    if (!snapshot?.reference_ready) {
+      setOfflineReady(false);
+      setLastReferenceSyncAt(snapshot?.last_successful_sync_at || offlineAuth.session?.lastSuccessfulSyncAt || "");
+      setStartupError("This device must connect to the internet once before offline use.");
+      return false;
+    }
+    const offlineUser = hasObjectContent(snapshot?.user_profile)
+      ? snapshot.user_profile
+      : offlineAuth.session?.user;
+    setUser({ ...offlineUser, offline_session: true });
+    await applyReferenceSnapshot(snapshot, { offline: true, nextView: "sales" });
+    return true;
+  };
+
   const loadProducts = async () => {
     const [response, duplicateLogResponse] = await Promise.all([
       axios.get(`${API_URL}/products`),
@@ -1029,6 +1351,25 @@ function App() {
   };
 
   const loadReports = async (params = {}) => {
+    if (isTauriRuntime() && offlineMode) {
+      const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id }).catch(() => null);
+      const localRows = await listLocalPosSales().catch(() => []);
+      const salesRows = localRows.map(localSnapshotToInvoice);
+      setReportsData((current) => ({
+        ...current,
+        salesHistoryReport: salesRows,
+        stockLotReport: snapshot?.inventory_lots || inventory,
+        cashBookReport: salesRows.flatMap((sale) => (sale.payments || []).map((payment) => ({
+          transaction_date: sale.sale_date,
+          source: "LOCAL_POS",
+          party_name: sale.customer_name || "Walk-in Customer",
+          payment_mode: payment.mode || payment.payment_mode || sale.payment_mode,
+          total_amount: Number(payment.amount || sale.total_amount || 0),
+          transaction_count: 1,
+        }))),
+      }));
+      return;
+    }
     const [response, inventoryResponse, cashBookResponse] = await Promise.all([
       axios.get(`${API_URL}/reports/summary`, { params }),
       axios.get(`${API_URL}/inventory`, { params: { include_cancelled: true } }),
@@ -1043,6 +1384,11 @@ function App() {
   };
 
   const loadSalesHistory = async () => {
+    if (isTauriRuntime() && offlineMode) {
+      const localRows = await listLocalPosSales();
+      setSalesHistory(localRows.map(localSnapshotToInvoice));
+      return;
+    }
     const response = await axios.get(`${API_URL}/sales`);
     setSalesHistory(response.data);
   };
@@ -1075,6 +1421,15 @@ function App() {
   };
 
   const loadDashboardData = async () => {
+    if (isTauriRuntime() && offlineMode) {
+      const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id }).catch(() => null);
+      const localRows = await listLocalPosSales().catch(() => []);
+      setInventory(snapshot?.inventory_lots || inventory);
+      setSalesHistory(localRows.map(localSnapshotToInvoice));
+      setSupplierDashboard((current) => current || {});
+      setDashboardAnalytics((current) => current || {});
+      return;
+    }
     const [inventoryResponse, salesResponse, supplierMetricsResponse, analyticsResponse] = await Promise.all([
       axios.get(`${API_URL}/inventory`),
       axios.get(`${API_URL}/sales`),
@@ -1106,68 +1461,90 @@ function App() {
   };
 
   const login = async () => {
-  try {
-    const latestDevice = getClientDeviceInfo();
-    setDeviceInfo(latestDevice);
-    const response = await axios.post(`${API_URL}/login`, { username, password, ...latestDevice });
-    setDeviceGate(null);
-    localStorage.setItem(cachedUserKey, JSON.stringify({ ...response.data, cached_at: new Date().toISOString() }));
-    setUser(response.data);
-  } catch (error) {
-    const cachedUser = localStorage.getItem(cachedUserKey);
-    if (isTauriRuntime() && cachedUser) {
-      try {
-        const parsedUser = JSON.parse(cachedUser);
-        setUser({ ...parsedUser, offline_session: true });
-        alert("Backend is unavailable. FroozERP opened in authorised offline mode for local-first modules.");
+    setLoginBusy(true);
+    setStartupError("");
+    setStartupNotice("");
+    try {
+      const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
+      setDeviceInfo(latestDevice);
+      setBackendHealth((current) => ({
+        ...current,
+        apiUrl: API_URL,
+        url: `${API_URL}/api/health`,
+        online: null,
+        message: "Checking FroozERP backend...",
+      }));
+      const health = await checkBackendHealth(API_URL, { details: true, timeoutMs: 4000 });
+      setBackendHealth(health);
+      const backendOnline = health.online;
+
+      if (!backendOnline) {
+        setOfflineMode(true);
+        const opened = await continueOffline(latestDevice);
+        if (!opened) {
+          setStartupError((current) => current || `Backend health check failed at ${health.url}: ${health.message}.`);
+        }
         return;
-      } catch {
-        localStorage.removeItem(cachedUserKey);
       }
+
+      const response = await axios.post(`${API_URL}/login`, { username: username.trim(), password, ...latestDevice }, { timeout: 8000 });
+      setDeviceGate(null);
+      setUser(response.data);
+      if (response.data?.force_password_change) {
+        setStartupNotice("Sign in succeeded. This account must change its temporary password from User Management before regular use.");
+      }
+
+      try {
+        await hydrateOnlineSession(response.data, latestDevice);
+      } catch (hydrateError) {
+        console.error("Online hydration failed", hydrateError);
+        const snapshot = await loadLocalReferenceSnapshot({ username, deviceId: latestDevice.device_id }).catch(() => null);
+        if (snapshot?.reference_ready) {
+          setUser({ ...response.data, offline_session: true });
+          await applyReferenceSnapshot(snapshot, { offline: true, nextView: "sales" });
+          setStartupNotice("Backend login succeeded. FroozERP continued in offline mode because reference-data refresh failed.");
+          return;
+        }
+        setUser(null);
+        setStartupError(getErrorMessage(hydrateError, "Login succeeded, but no usable local reference data was available."));
+      }
+    } catch (error) {
+      if (["DEVICE_NOT_APPROVED", "DEVICE_PENDING_APPROVAL", "DEVICE_DISABLED", "DEVICE_REVOKED", "DEVICE_ID_REQUIRED"].includes(error.response?.data?.code)) {
+        setDeviceGate(error.response.data);
+        setStartupError(error.response.data.message || "This device is not approved.");
+        return;
+      }
+      if (isTauriRuntime()) {
+        const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
+        const opened = await continueOffline(latestDevice);
+        if (opened) return;
+      }
+      setStartupError(getAuthErrorMessage(error, `Unable to sign in through ${API_URL}. Connect once to the FroozERP backend to authorise this device.`));
+    } finally {
+      setLoginBusy(false);
     }
-    if (["DEVICE_NOT_APPROVED", "DEVICE_ID_REQUIRED"].includes(error.response?.data?.code)) {
-      setDeviceGate(error.response.data);
-      alert(error.response.data.message || "This device is not approved.");
-      return;
+  };
+
+  const retryOnline = async () => {
+    setLoginBusy(true);
+    setStartupError("");
+    setStartupNotice(`Checking backend at ${API_URL}/api/health...`);
+    try {
+      const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
+      setDeviceInfo(latestDevice);
+      const health = await checkBackendHealth(API_URL, { details: true, timeoutMs: 4000 });
+      setBackendHealth(health);
+      setOfflineMode(!health.online);
+      if (health.online) {
+        setStartupNotice(`Backend online at ${health.url}. Enter credentials and click Sign In to complete first online login.`);
+      } else {
+        setStartupError(`Backend health check failed at ${health.url}: ${health.message}`);
+      }
+      return health;
+    } finally {
+      setLoginBusy(false);
     }
-    alert(
-  getErrorMessage(
-    error,
-    `Login successful, but data loading failed: ${error?.response?.config?.url || error?.message}`
-  )
-);
-    return;
-  }
-
-  try {
-  const results = await Promise.allSettled([
-    loadProducts(),
-    loadProductCategories(),
-    loadDashboardData(),
-  ]);
-
-  const failedLoads = results
-    .map((result, index) => {
-      const names = ["Products", "Product Categories", "Dashboard Data"];
-      return result.status === "rejected"
-        ? `${names[index]} failed: ${
-            result.reason?.response?.config?.url ||
-            result.reason?.response?.data?.message ||
-            result.reason?.message ||
-            "Unknown error"
-          }`
-        : null;
-    })
-    .filter(Boolean);
-
-  if (failedLoads.length > 0) {
-    alert(`Login successful, but these failed:\n\n${failedLoads.join("\n")}`);
-    console.error("Data loading failures:", results);
-  }
-} catch (error) {
-    alert(getErrorMessage(error, "Login successful, but data loading failed"));
-  }
-};
+  };
 
   const activateDevice = async () => {
     if (!activationCode.trim()) {
@@ -1851,6 +2228,12 @@ function App() {
 
   const loadInvoice = async (saleId, options = {}) => {
     try {
+      if (isTauriRuntime() && (offlineMode || String(saleId || "").startsWith("invoice-") || String(saleId || "").startsWith("pos-invoice-"))) {
+        const snapshot = await loadLocalPosSale(saleId);
+        setSelectedInvoice(localSnapshotToInvoice(snapshot));
+        setSelectedInvoicePrintMode(options.print ? (options.printMode || "THERMAL") : null);
+        return;
+      }
       const response = await axios.get(`${API_URL}/sales/${saleId}`);
       setSelectedInvoice(response.data);
       setSelectedInvoicePrintMode(options.print ? (options.printMode || "THERMAL") : null);
@@ -1860,7 +2243,7 @@ function App() {
   };
 
   const printSaleInvoice = async (saleId, printMode = "THERMAL") => {
-    const invoiceId = Number(saleId || 0);
+    const invoiceId = saleId || "";
     if (!invoiceId) {
       alert("Unable to print invoice. Invoice ID is missing.");
       return;
@@ -1872,6 +2255,11 @@ function App() {
     setSaleEditLoading(true);
     setSaleEditError("");
     try {
+      if (isTauriRuntime() && (offlineMode || String(saleId || "").startsWith("invoice-") || String(saleId || "").startsWith("pos-invoice-"))) {
+        const snapshot = await loadLocalPosSale(saleId);
+        setEditingSale(localSnapshotToInvoice(snapshot));
+        return;
+      }
       const response = await axios.get(`${API_URL}/sales/${saleId}`);
       setEditingSale(response.data);
     } catch (error) {
@@ -1893,7 +2281,7 @@ function App() {
   };
 
   const cancelSale = async (sale) => {
-    const saleId = Number(sale.sale_id || sale.id || 0);
+    const saleId = sale.sale_id || sale.id || "";
     if (!saleId) {
       alert("Unable to cancel invoice. Invoice ID is missing.");
       return false;
@@ -1901,6 +2289,22 @@ function App() {
     const reason = window.prompt(`Enter cancellation reason for ${sale.invoice_no || `#${sale.id}`}`);
     if (!reason?.trim()) return false;
     try {
+      if (isTauriRuntime() && (offlineMode || sale.sync_status || String(saleId).startsWith("invoice-") || String(saleId).startsWith("pos-invoice-"))) {
+        const result = await cancelLocalPosSale({
+          invoice_global_id: String(saleId),
+          reason,
+          user_id: String(user.id || ""),
+          device_id: deviceInfo.device_id,
+        });
+        const localInvoice = localSnapshotToInvoice(result.invoice);
+        setSalesHistory((rows) => rows.map((row) => String(row.id) === String(saleId) ? { ...row, ...localInvoice } : row));
+        const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id }).catch(() => null);
+        if (snapshot) {
+          setInventory(snapshot.inventory_lots || []);
+        }
+        await refreshSyncStatus();
+        return true;
+      }
       await axios.post(`${API_URL}/sales/${saleId}/cancel`, { reason, cancelled_by: user.id });
       await Promise.all([loadSalesHistory(), loadDashboardData(), loadReports()]);
       alert("Invoice cancelled");
@@ -2119,17 +2523,33 @@ function App() {
       alert("Your role cannot edit completed sales.");
       return;
     }
-    const saleId = Number(sale.sale_id || sale.id || 0);
+    const saleId = String(sale.sale_id || sale.id || "");
     if (!saleId) {
       alert("Sale invoice not found.");
       return;
     }
+    const localEligible = isTauriRuntime() && (
+      offlineMode ||
+      sale.sync_status ||
+      sale.offline_invoice_ref ||
+      sale.localSale ||
+      saleId.startsWith("invoice-") ||
+      saleId.startsWith("pos-invoice-")
+    );
     const preloadTasks = [];
     if (!products.length) preloadTasks.push(loadProducts());
-    if (!inventory.length) {
+    if (!inventory.length && !localEligible) {
       preloadTasks.push(
         axios.get(`${API_URL}/inventory`, { params: { include_cancelled: true } })
           .then((response) => setInventory(response.data))
+      );
+    }
+    if (!inventory.length && localEligible) {
+      preloadTasks.push(
+        loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id })
+          .then((snapshot) => {
+            if (snapshot) setInventory(snapshot.inventory_lots || []);
+          })
       );
     }
     if (!customers.length) preloadTasks.push(loadCustomerData());
@@ -2140,6 +2560,21 @@ function App() {
   const navigate = async (view) => {
     if (!hasModuleAccess(view)) {
       alert("Your role does not have access to this module.");
+      return;
+    }
+    if (offlineMode) {
+      const offlineSupportedViews = new Set(["dashboard", "products", "sales", "settings"]);
+      if (!offlineSupportedViews.has(view)) {
+        setStartupNotice("This module still requires the backend. FroozERP kept your local-first POS workspace available.");
+        return;
+      }
+      const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id });
+      if (!snapshot?.reference_ready) {
+        setStartupError("This device must connect to the internet once before offline use.");
+        return;
+      }
+      setSidebarOpen(false);
+      await applyReferenceSnapshot(snapshot, { offline: true, nextView: view });
       return;
     }
     setSidebarOpen(false);
@@ -2205,7 +2640,38 @@ function App() {
               onKeyDown={(event) => event.key === "Enter" && login()}
             />
           </label>
-          <button className="primary-button login-button" onClick={login}>Sign In</button>
+          {(startupNotice || startupError || lastReferenceSyncAt) && (
+            <div className={`startup-status-panel ${startupError ? "startup-status-error" : ""}`}>
+              {startupNotice && <p>{startupNotice}</p>}
+              {startupError && <p>{startupError}</p>}
+              {lastReferenceSyncAt && <small>Last successful local data sync: {new Date(lastReferenceSyncAt).toLocaleString("en-IN")}</small>}
+            </div>
+          )}
+          <div className="startup-api-panel">
+            <span>API base</span>
+            <code>{backendHealth.apiUrl}</code>
+            <small>
+              {backendHealth.online === true ? "Online" : backendHealth.online === false ? "Offline" : "Not checked"} - {backendHealth.message}
+            </small>
+          </div>
+          <div className="startup-actions">
+            <button className="primary-button login-button" disabled={loginBusy} onClick={login}>
+              {loginBusy ? "Signing In..." : "Sign In"}
+            </button>
+            <button className="recovery-link-button" disabled={loginBusy} onClick={() => setRecoveryOpen(true)}>
+              Forgot Username or Password?
+            </button>
+            {isTauriRuntime() && (
+              <>
+                <button className="secondary-button" disabled={loginBusy} onClick={retryOnline}>
+                  Retry Online
+                </button>
+                <button className="secondary-button" disabled={loginBusy} onClick={() => continueOffline()}>
+                  Continue Offline
+                </button>
+              </>
+            )}
+          </div>
           {deviceGate && (
             <div className="device-activation-panel">
               <span className="eyebrow">Device Activation Required</span>
@@ -2219,6 +2685,15 @@ function App() {
               />
               <button className="secondary-button" onClick={activateDevice}>Activate Device</button>
             </div>
+          )}
+          {recoveryOpen && (
+            <AccountRecoveryModal
+              apiUrl={API_URL}
+              backendHealth={backendHealth}
+              deviceInfo={deviceInfo}
+              onClose={() => setRecoveryOpen(false)}
+              onRetryOnline={retryOnline}
+            />
           )}
         </section>
       </main>
@@ -2318,13 +2793,13 @@ function App() {
             </button>
           ))}
         </nav>
-        <div className="sidebar-profile" onClick={() => setProfileOpen(true)} role="button" tabIndex={0} onKeyDown={(event) => event.key === "Enter" && setProfileOpen(true)}>
+          <div className="sidebar-profile" onClick={() => setProfileOpen(true)} role="button" tabIndex={0} onKeyDown={(event) => event.key === "Enter" && setProfileOpen(true)}>
           <div className="user-avatar">{user.full_name.charAt(0)}</div>
           <div>
             <strong>{user.full_name}</strong>
             <small>{user.role}</small>
           </div>
-          <button aria-label="Log out" className="logout-button" onClick={(event) => { event.stopPropagation(); setUser(null); }}>
+          <button aria-label="Log out" className="logout-button" onClick={(event) => { event.stopPropagation(); setUser(null); setOfflineMode(false); setStartupError(""); setStartupNotice(""); }}>
             <Icon name="logout" size={17} />
           </button>
         </div>
@@ -2356,6 +2831,7 @@ function App() {
             <span className="status-dot" />
             {user.branch}
           </div>
+          {offlineMode && <div className="offline-pill">Offline - changes will sync later</div>}
         </header>
 
         <div className="content-area">
@@ -3079,10 +3555,26 @@ function App() {
       {editingSale && (
         <ModuleErrorBoundary onClose={() => setEditingSale(null)}>
           <SaleEditModal
+            deviceInfo={deviceInfo}
             invoice={editingSale}
+            offlineMode={offlineMode}
             onClose={() => setEditingSale(null)}
-            onSaved={async () => {
+            onSaved={async (result) => {
               setEditingSale(null);
+              if (result?.localSale) {
+                setSalesHistory((rows) => {
+                  const exists = rows.some((row) => String(row.id || row.sale_id) === String(result.localSale.id || result.localSale.sale_id));
+                  return exists
+                    ? rows.map((row) => String(row.id || row.sale_id) === String(result.localSale.id || result.localSale.sale_id) ? { ...row, ...result.localSale } : row)
+                    : [result.localSale, ...rows];
+                });
+                const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id }).catch(() => null);
+                if (snapshot) {
+                  setInventory(snapshot.inventory_lots || []);
+                }
+                await refreshSyncStatus();
+                return;
+              }
               await Promise.all([loadSalesHistory(), loadDashboardData(), loadReports()]);
             }}
             products={products.filter((product) => product.active !== false)}
@@ -3211,6 +3703,252 @@ function App() {
   );
 }
 
+function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onClose, onRetryOnline }) {
+  const [mode, setMode] = useState("");
+  const [identifier, setIdentifier] = useState("");
+  const [methods, setMethods] = useState([]);
+  const [method, setMethod] = useState("");
+  const [requestId, setRequestId] = useState("");
+  const [otp, setOtp] = useState("");
+  const [verificationToken, setVerificationToken] = useState("");
+  const [recoveredUsername, setRecoveredUsername] = useState("");
+  const [passwordDraft, setPasswordDraft] = useState({ new_password: "", confirm_password: "" });
+  const [showPassword, setShowPassword] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState("");
+  const [error, setError] = useState("");
+  const [step, setStep] = useState("choose");
+  const [providerStatus, setProviderStatus] = useState(null);
+  const [supportContacts, setSupportContacts] = useState([]);
+  const [developmentOtp, setDevelopmentOtp] = useState("");
+
+  const onlineRequired = backendHealth?.online === false;
+  const resetMessages = () => {
+    setStatus("");
+    setError("");
+    setDevelopmentOtp("");
+  };
+  const recoveryPayload = () => ({
+    identifier,
+    purpose: mode,
+    method,
+    device_id: deviceInfo?.device_id,
+  });
+  const chooseMode = (nextMode) => {
+    resetMessages();
+    setMode(nextMode);
+    setStep(onlineRequired ? "offline" : "identify");
+  };
+  const loadOptions = async () => {
+    resetMessages();
+    if (!identifier.trim()) {
+      setError("Enter your registered username, email or mobile number.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const health = await checkBackendHealth(apiUrl, { details: true, timeoutMs: 4000 });
+      if (!health.online) {
+        setStep("offline");
+        setError(`Account recovery requires internet access. ${health.message}`);
+        return;
+      }
+      const response = await axios.post(`${apiUrl}/auth/recovery/options`, recoveryPayload(), { timeout: 8000 });
+      setProviderStatus(response.data.provider_status || null);
+      setSupportContacts(response.data.support_contacts || []);
+      if (response.data.code === "STAFF_OWNER_ASSISTANCE_REQUIRED") {
+        setStep("staff");
+        setStatus(response.data.message);
+        return;
+      }
+      if (!response.data.methods?.length) {
+        setError(response.data.message || "No verified recovery method is available for this account.");
+        return;
+      }
+      setMethods(response.data.methods);
+      setMethod(response.data.methods[0]?.method || "");
+      setStep("method");
+      setStatus("Select where FroozERP should send the verification code.");
+    } catch (requestError) {
+      setError(getAuthErrorMessage(requestError, "Unable to load recovery options."));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const sendOtp = async () => {
+    resetMessages();
+    if (!method) {
+      setError("Select a recovery method.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const response = await axios.post(`${apiUrl}/auth/recovery/send-otp`, recoveryPayload(), { timeout: 8000 });
+      setProviderStatus(response.data.provider_status || null);
+      if (response.data.code === "PROVIDER_NOT_CONFIGURED" && !response.data.development_otp) {
+        setError(response.data.message || "Recovery delivery provider is not configured.");
+        return;
+      }
+      setRequestId(response.data.request_id || "");
+      setDevelopmentOtp(response.data.development_otp || "");
+      setStep("otp");
+      setStatus(response.data.development_otp ? "Development recovery code generated for internal testing." : "Verification code sent.");
+    } catch (requestError) {
+      setError(getAuthErrorMessage(requestError, "Unable to send recovery code."));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const verifyOtp = async () => {
+    resetMessages();
+    setBusy(true);
+    try {
+      const response = await axios.post(`${apiUrl}/auth/recovery/verify-otp`, {
+        request_id: requestId,
+        otp,
+        device_id: deviceInfo?.device_id,
+      }, { timeout: 8000 });
+      setVerificationToken(response.data.verification_token || "");
+      if (mode === "username") {
+        setRecoveredUsername(response.data.username || "");
+        setStep("username-result");
+        setStatus("Username recovered successfully.");
+      } else {
+        setStep("reset");
+        setStatus("Verification complete. Set a new password.");
+      }
+    } catch (requestError) {
+      setError(getAuthErrorMessage(requestError, "Unable to verify recovery code."));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const resetPassword = async () => {
+    resetMessages();
+    setBusy(true);
+    try {
+      const response = await axios.post(`${apiUrl}/auth/recovery/reset-password`, {
+        request_id: requestId,
+        verification_token: verificationToken,
+        ...passwordDraft,
+        device_id: deviceInfo?.device_id,
+      }, { timeout: 8000 });
+      setStep("done");
+      setStatus(response.data.message || "Password changed. Sign in again with the new password.");
+    } catch (requestError) {
+      setError(getAuthErrorMessage(requestError, "Unable to reset password."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-backdrop">
+      <section className="invoice-modal recovery-modal">
+        <div className="invoice-toolbar">
+          <div>
+            <span className="eyebrow">FroozERP Account Recovery</span>
+            <strong>Forgot Username or Password?</strong>
+          </div>
+          <button aria-label="Close recovery" className="remove-button" onClick={onClose}><Icon name="close" /></button>
+        </div>
+        <div className="sale-edit-body recovery-body">
+          <BrandLogo compact />
+          {step === "choose" && (
+            <div className="recovery-option-grid">
+              <button className="secondary-button" onClick={() => chooseMode("username")}>Forgot Username</button>
+              <button className="secondary-button" onClick={() => chooseMode("password")}>Forgot Password</button>
+              <button className="secondary-button" onClick={() => setStep("staff")}>Contact Owner / Administrator</button>
+            </div>
+          )}
+          {step === "offline" && (
+            <div className="startup-status-panel startup-status-error">
+              <p><strong>Internet connection required</strong></p>
+              <p>Account recovery securely verifies your registered email or mobile number and therefore requires an online connection.</p>
+              <div className="button-row">
+                <button className="secondary-button" disabled={busy} onClick={onRetryOnline}>Retry Online</button>
+                <button className="secondary-button" onClick={() => setStep("staff")}>Contact Owner / Administrator</button>
+                <button className="secondary-button" onClick={onClose}>Back to Sign In</button>
+              </div>
+            </div>
+          )}
+          {step === "identify" && (
+            <>
+              <Field label="Registered username, email or mobile"><input value={identifier} onChange={(event) => setIdentifier(event.target.value)} /></Field>
+              <button className="primary-button" disabled={busy} onClick={loadOptions}>{busy ? "Checking..." : "Continue"}</button>
+            </>
+          )}
+          {step === "method" && (
+            <>
+              <Field label="Recovery Method">
+                <select value={method} onChange={(event) => setMethod(event.target.value)}>
+                  {methods.map((entry) => <option key={entry.method} value={entry.method}>{entry.label}</option>)}
+                </select>
+              </Field>
+              <button className="primary-button" disabled={busy} onClick={sendOtp}>{busy ? "Sending..." : "Send Verification Code"}</button>
+            </>
+          )}
+          {step === "otp" && (
+            <>
+              {developmentOtp && <div className="startup-status-panel"><p>Development test OTP: <strong>{developmentOtp}</strong></p></div>}
+              <Field label="Verification Code"><input inputMode="numeric" value={otp} onChange={(event) => setOtp(event.target.value.replace(/\D/g, "").slice(0, 8))} /></Field>
+              <button className="primary-button" disabled={busy} onClick={verifyOtp}>{busy ? "Verifying..." : "Verify Code"}</button>
+            </>
+          )}
+          {step === "username-result" && (
+            <div className="startup-status-panel">
+              <p>Recovered username</p>
+              <strong>{recoveredUsername}</strong>
+              <button className="primary-button" onClick={onClose}>Back to Sign In</button>
+            </div>
+          )}
+          {step === "reset" && (
+            <>
+              <Field label="New Password">
+                <input type={showPassword ? "text" : "password"} value={passwordDraft.new_password} onChange={(event) => setPasswordDraft({ ...passwordDraft, new_password: event.target.value })} />
+              </Field>
+              <Field label="Confirm New Password">
+                <input type={showPassword ? "text" : "password"} value={passwordDraft.confirm_password} onChange={(event) => setPasswordDraft({ ...passwordDraft, confirm_password: event.target.value })} />
+              </Field>
+              <label className="check-field"><input checked={showPassword} type="checkbox" onChange={(event) => setShowPassword(event.target.checked)} /><span>Show password</span></label>
+              <p className="form-note">Use a password the staff member cannot guess. FroozERP stores only a secure password hash.</p>
+              <button className="primary-button" disabled={busy} onClick={resetPassword}>{busy ? "Saving..." : "Reset Password"}</button>
+            </>
+          )}
+          {step === "staff" && (
+            <div className="startup-status-panel">
+              <p><strong>Account assistance required</strong></p>
+              <p>For the security of your business, staff login recovery is managed by your authorised Owner or Administrator.</p>
+              {supportContacts.length > 0 && supportContacts.map((contact) => (
+                <small key={`${contact.contact_type}-${contact.contact_value}`}>{contact.label}: {contact.contact_value}</small>
+              ))}
+              <div className="button-row">
+                <button className="secondary-button" onClick={() => setStep("choose")}>Back</button>
+                <button className="primary-button" onClick={onClose}>Back to Sign In</button>
+              </div>
+            </div>
+          )}
+          {step === "done" && (
+            <div className="startup-status-panel">
+              <p>{status}</p>
+              <button className="primary-button" onClick={onClose}>Back to Sign In</button>
+            </div>
+          )}
+          {(status || error || providerStatus) && step !== "done" && (
+            <div className={`startup-status-panel ${error ? "startup-status-error" : ""}`}>
+              {status && <p>{status}</p>}
+              {error && <p>{error}</p>}
+              {providerStatus && (
+                <small>Email: {providerStatus.email}; SMS: {providerStatus.sms}; Development: {providerStatus.development}</small>
+              )}
+            </div>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function ReportToolbar({ exporting = false, onPdfExport, onPrint, title }) {
   return (
     <div className="report-toolbar no-print">
@@ -3226,6 +3964,29 @@ function ReportToolbar({ exporting = false, onPdfExport, onPrint, title }) {
 function UserProfilePanel({ onClose, onLogout, user }) {
   const [passwordDraft, setPasswordDraft] = useState({ password: "", confirm_password: "" });
   const [showPasswordForm, setShowPasswordForm] = useState(false);
+  const [profile, setProfile] = useState(null);
+  const [recoveryDraft, setRecoveryDraft] = useState({ email: "", mobile: "" });
+  const [verification, setVerification] = useState({ type: "", requestId: "", otp: "", maskedContact: "" });
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const loadRecoveryProfile = async () => {
+    try {
+      const response = await axios.get(`${API_URL}/auth/recovery/profile`, {
+        params: { user_id: user.id, updated_by: user.id },
+      });
+      setProfile(response.data);
+      setRecoveryDraft({
+        email: response.data.pending_recovery_email || response.data.recovery_email || "",
+        mobile: response.data.pending_recovery_mobile || response.data.recovery_mobile || "",
+      });
+    } catch (loadError) {
+      setError(getAuthErrorMessage(loadError, "Unable to load recovery profile"));
+    }
+  };
+  useEffect(() => {
+    loadRecoveryProfile();
+  }, [user.id]);
   const savePassword = async () => {
     try {
       await axios.put(`${API_URL}/users/${user.id}/password`, {
@@ -3237,6 +3998,56 @@ function UserProfilePanel({ onClose, onLogout, user }) {
       alert("Password changed");
     } catch (error) {
       alert(getErrorMessage(error, "Unable to change password"));
+    }
+  };
+  const requestContactOtp = async (type) => {
+    setBusy(true);
+    setMessage("");
+    setError("");
+    try {
+      const response = await axios.post(`${API_URL}/auth/recovery/contact/request`, {
+        user_id: user.id,
+        updated_by: user.id,
+        contact_type: type,
+        contact_value: type === "email" ? recoveryDraft.email : recoveryDraft.mobile,
+      });
+      setVerification({
+        type,
+        requestId: response.data.request_id,
+        otp: response.data.development_otp || "",
+        maskedContact: response.data.masked_contact || "",
+      });
+      setMessage(`Verification code sent to ${response.data.masked_contact}.`);
+      await loadRecoveryProfile();
+    } catch (requestError) {
+      setError(getAuthErrorMessage(requestError, "Unable to send recovery contact OTP"));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const verifyContactOtp = async () => {
+    if (!verification.type || !verification.requestId || !verification.otp.trim()) {
+      setError("Enter the verification code.");
+      return;
+    }
+    setBusy(true);
+    setMessage("");
+    setError("");
+    try {
+      const response = await axios.post(`${API_URL}/auth/recovery/contact/verify`, {
+        user_id: user.id,
+        updated_by: user.id,
+        contact_type: verification.type,
+        request_id: verification.requestId,
+        otp: verification.otp,
+      });
+      setMessage(response.data.message || "Recovery contact verified.");
+      setVerification({ type: "", requestId: "", otp: "", maskedContact: "" });
+      await loadRecoveryProfile();
+    } catch (verifyError) {
+      setError(getAuthErrorMessage(verifyError, "Unable to verify recovery contact"));
+    } finally {
+      setBusy(false);
     }
   };
   return (
@@ -3263,6 +4074,41 @@ function UserProfilePanel({ onClose, onLogout, user }) {
             <Field label="Joining Date"><input disabled value={user.joining_date ? toDateKey(user.joining_date) : ""} /></Field>
             <Field label="Notes"><textarea disabled value={user.notes || ""} /></Field>
           </div>
+          <ModuleCard eyebrow="Recovery Security" title="Owner Recovery Contacts" subtitle="Recovery contacts are usable only after OTP verification. Password recovery requires backend connectivity.">
+            <div className="purchase-summary-grid supplier-payment-preview">
+              <SummaryMetric label="Email Status" value={profile?.recovery_email_verified ? "Verified" : profile?.pending_recovery_email ? "Pending" : "Not Verified"} featured={profile?.recovery_email_verified} />
+              <SummaryMetric label="Mobile Status" value={profile?.recovery_mobile_verified ? "Verified" : profile?.pending_recovery_mobile ? "Pending" : "Not Verified"} featured={profile?.recovery_mobile_verified} />
+              <SummaryMetric label="Email Provider" value={profile?.provider_status?.email || "Checking"} />
+              <SummaryMetric label="SMS Provider" value={profile?.provider_status?.sms || "Checking"} />
+            </div>
+            <div className="form-grid supplier-form-grid">
+              <Field label="Recovery Email">
+                <input type="email" value={recoveryDraft.email} onChange={(event) => setRecoveryDraft({ ...recoveryDraft, email: event.target.value })} />
+              </Field>
+              <Field label="Recovery Mobile">
+                <input value={recoveryDraft.mobile} onChange={(event) => setRecoveryDraft({ ...recoveryDraft, mobile: event.target.value })} placeholder="10 digits or +91XXXXXXXXXX" />
+              </Field>
+            </div>
+            <div className="button-row">
+              <button className="secondary-button" disabled={busy} onClick={() => requestContactOtp("email")}>Verify Email</button>
+              <button className="secondary-button" disabled={busy} onClick={() => requestContactOtp("mobile")}>Verify Mobile</button>
+              <button className="secondary-button" disabled={busy} onClick={loadRecoveryProfile}>Refresh Status</button>
+            </div>
+            {verification.requestId && (
+              <div className="form-grid settings-add-grid">
+                <Field label={`OTP for ${verification.maskedContact || verification.type}`}>
+                  <input inputMode="numeric" value={verification.otp} onChange={(event) => setVerification({ ...verification, otp: event.target.value.replace(/\D/g, "").slice(0, 8) })} />
+                </Field>
+                <button className="primary-button" disabled={busy} onClick={verifyContactOtp}>{busy ? "Verifying..." : "Confirm Verification"}</button>
+              </div>
+            )}
+            {(message || error) && (
+              <div className={`startup-status-panel ${error ? "startup-status-error" : ""}`}>
+                {message && <p>{message}</p>}
+                {error && <p>{error}</p>}
+              </div>
+            )}
+          </ModuleCard>
           {showPasswordForm && (
             <div className="form-grid settings-add-grid">
               <Field label="New Password"><input type="password" value={passwordDraft.password} onChange={(event) => setPasswordDraft({ ...passwordDraft, password: event.target.value })} /></Field>
@@ -7261,6 +8107,8 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
     username: "",
     mobile_number: "",
     email: "",
+    recovery_enabled: true,
+    staff_self_recovery_enabled: false,
     role: "Cashier",
     password: "",
     confirm_password: "",
@@ -7271,6 +8119,7 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
   const [draft, setDraft] = useState(emptyForm);
   const [editingId, setEditingId] = useState(null);
   const [passwordTarget, setPasswordTarget] = useState(null);
+  const [recoveryMessage, setRecoveryMessage] = useState("");
   const roleNames = (roles || []).map((role) => role.role_name).filter(Boolean);
   const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
   const startEdit = (item) => {
@@ -7280,6 +8129,8 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
       username: item.username || "",
       mobile_number: item.mobile_number || "",
       email: item.email || "",
+      recovery_enabled: item.recovery_enabled !== false,
+      staff_self_recovery_enabled: item.staff_self_recovery_enabled === true,
       role: item.role || "Cashier",
       password: "",
       confirm_password: "",
@@ -7329,15 +8180,44 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
   const changePassword = async () => {
     if (!passwordTarget) return;
     try {
-      await axios.put(`${API_URL}/users/${passwordTarget.id}/password`, {
-        password: passwordTarget.password,
-        confirm_password: passwordTarget.confirm_password,
+      if (passwordTarget.recoveryAction) {
+        const supplied = passwordTarget.password || "";
+        if (supplied && supplied !== passwordTarget.confirm_password) {
+          setRecoveryMessage("Temporary password and confirmation do not match.");
+          return;
+        }
+        const response = await axios.post(`${API_URL}/users/${passwordTarget.id}/recovery-action`, {
+          action: "RESET_PASSWORD",
+          temporary_password: supplied,
+          updated_by: user.id,
+        });
+        setRecoveryMessage(response.data.temporary_password
+          ? `Temporary password generated. Share it securely once: ${response.data.temporary_password}`
+          : "Temporary password set. The user must change it at next login.");
+      } else {
+        await axios.put(`${API_URL}/users/${passwordTarget.id}/password`, {
+          password: passwordTarget.password,
+          confirm_password: passwordTarget.confirm_password,
+          updated_by: user.id,
+        });
+        setRecoveryMessage("Password updated and active sessions revoked.");
+      }
+      setPasswordTarget(null);
+      await onReload();
+    } catch (error) {
+      setRecoveryMessage(getAuthErrorMessage(error, "Unable to update password"));
+    }
+  };
+  const recoveryAction = async (item, action) => {
+    try {
+      const response = await axios.post(`${API_URL}/users/${item.id}/recovery-action`, {
+        action,
         updated_by: user.id,
       });
-      setPasswordTarget(null);
-      alert("Password updated");
+      setRecoveryMessage(response.data.message || "Recovery action completed.");
+      await onReload();
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update password"));
+      setRecoveryMessage(getAuthErrorMessage(error, "Unable to complete recovery action"));
     }
   };
   const userAction = async (item, action) => {
@@ -7369,8 +8249,11 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
         {!editingId && <Field label="Password"><input disabled={!canManage} type="password" value={draft.password} onChange={(event) => updateDraft("password", event.target.value)} /></Field>}
         {!editingId && <Field label="Confirm Password"><input disabled={!canManage} type="password" value={draft.confirm_password} onChange={(event) => updateDraft("confirm_password", event.target.value)} /></Field>}
         <label className="check-field"><input checked={draft.active} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("active", event.target.checked)} /><span>Active user</span></label>
+        <label className="check-field"><input checked={draft.recovery_enabled} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("recovery_enabled", event.target.checked)} /><span>Recovery enabled</span></label>
+        <label className="check-field"><input checked={draft.staff_self_recovery_enabled} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("staff_self_recovery_enabled", event.target.checked)} /><span>Allow staff self-recovery</span></label>
         <Field label="Notes"><textarea disabled={!canManage} value={draft.notes} onChange={(event) => updateDraft("notes", event.target.value)} /></Field>
       </div>
+      {recoveryMessage && <div className="startup-status-panel"><p>{recoveryMessage}</p></div>}
       <div className="button-row">
         <button className="primary-button" disabled={!canManage} onClick={saveUser}>{editingId ? "Update User" : "Add User"}</button>
         {editingId && <button className="secondary-button" onClick={resetForm}>Cancel Edit</button>}
@@ -7378,7 +8261,13 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
       <DataTable headers={["Name", "Username", "Role", "Mobile", "Last Login", "Status", "Actions"]}>
         {users.map((item) => (
           <tr key={item.id}>
-            <td className="primary-cell">{item.full_name}<small className="cell-note">{item.email || "No email"}</small></td>
+            <td className="primary-cell">
+              {item.full_name}
+              <small className="cell-note">{item.email || "No email"}</small>
+              <small className="cell-note">
+                Recovery {item.recovery_enabled === false ? "disabled" : item.recovery_email_verified || item.recovery_mobile_verified || item.verified_email || item.verified_mobile ? "ready" : "needs verified contact"}
+              </small>
+            </td>
             <td>{item.username}</td>
             <td><span className="tag">{item.role}</span></td>
             <td>{item.mobile_number || "-"}</td>
@@ -7388,6 +8277,11 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
               <div className="button-row table-actions-row">
                 <button className="table-action" disabled={!canManage} onClick={() => startEdit(item)}>Edit</button>
                 <button className="table-action" disabled={!canManage} onClick={() => setPasswordTarget({ id: item.id, name: item.full_name, password: "", confirm_password: "" })}>Password</button>
+                <button className="table-action" disabled={!canManage || item.id === user.id} onClick={() => setPasswordTarget({ id: item.id, name: item.full_name, password: "", confirm_password: "", recoveryAction: true })}>Reset Staff Password</button>
+                <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "UNLOCK_ACCOUNT")}>Unlock</button>
+                <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "RESEND_USERNAME")}>Resend Username</button>
+                <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "REVOKE_SESSIONS")}>Revoke Sessions</button>
+                <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => recoveryAction(item, "REQUIRE_PASSWORD_CHANGE")}>Require Change</button>
                 {item.active ? <button className="secondary-button" disabled={!canManage || item.id === user.id} onClick={() => userAction(item, "deactivate")}>Deactivate</button> : <button className="secondary-button" disabled={!canManage} onClick={() => userAction(item, "reactivate")}>Reactivate</button>}
                 <button className="remove-button" disabled={!canManage || item.id === user.id} onClick={() => userAction(item, "delete")}><Icon name="trash" size={15} /></button>
               </div>
@@ -7400,17 +8294,18 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
           <section className="invoice-modal change-history-modal">
             <div className="invoice-toolbar">
               <div>
-                <span className="eyebrow">Reset Password</span>
+                <span className="eyebrow">{passwordTarget.recoveryAction ? "Staff Account Recovery" : "Reset Password"}</span>
                 <strong>{passwordTarget.name}</strong>
               </div>
               <button aria-label="Close password reset" className="remove-button" onClick={() => setPasswordTarget(null)}><Icon name="close" /></button>
             </div>
             <div className="sale-edit-body">
+              {passwordTarget.recoveryAction && <p className="form-note">Leave the fields blank to generate a one-time temporary password. The user will be required to change it at next login.</p>}
               <div className="form-grid settings-add-grid">
-                <Field label="New Password"><input type="password" value={passwordTarget.password} onChange={(event) => setPasswordTarget({ ...passwordTarget, password: event.target.value })} /></Field>
+                <Field label={passwordTarget.recoveryAction ? "Temporary Password" : "New Password"}><input type="password" value={passwordTarget.password} onChange={(event) => setPasswordTarget({ ...passwordTarget, password: event.target.value })} /></Field>
                 <Field label="Confirm Password"><input type="password" value={passwordTarget.confirm_password} onChange={(event) => setPasswordTarget({ ...passwordTarget, confirm_password: event.target.value })} /></Field>
               </div>
-              <button className="primary-button" onClick={changePassword}>Save Password</button>
+              <button className="primary-button" onClick={changePassword}>{passwordTarget.recoveryAction ? "Reset Staff Access" : "Save Password"}</button>
             </div>
           </section>
         </div>
@@ -8852,7 +9747,7 @@ function ThermalTotalLine({ label, total, value }) {
   return <div className={total ? "total-line total-line-main" : "total-line"}><span>{label}</span><strong>{receiptCurrency.format(value)}</strong></div>;
 }
 
-function SaleEditModal({ canSaleDateEdit = false, inventory = [], invoice, onClose, onSaved, products, user }) {
+function SaleEditModal({ canSaleDateEdit = false, deviceInfo, inventory = [], invoice, offlineMode = false, onClose, onSaved, products, user }) {
   const [items, setItems] = useState(() => (invoice.items || []).map((item) => ({
     id: item.id || item.sale_item_id,
     product_id: item.product_id,
@@ -8955,29 +9850,75 @@ function SaleEditModal({ canSaleDateEdit = false, inventory = [], invoice, onClo
     }
     setSaving(true);
     try {
-      await axios.put(`${API_URL}/sales/${invoice.id}`, {
-        items: items.map((item) => ({
+      const editItems = items.map((item) => ({
           id: Number(item.id || 0) || undefined,
-          product_id: Number(item.product_id),
-          inventory_batch_id: Number(item.inventory_batch_id || 0) || null,
+          item_global_id: String(item.id || `sale-item-${crypto.randomUUID?.() || Date.now()}`),
+          product_id: String(item.product_id),
+          product_name: item.product_name || products.find((product) => String(product.id) === String(item.product_id))?.product_name || "",
+          lot_id: String(item.inventory_batch_id || item.lot_id || ""),
+          inventory_batch_id: String(item.inventory_batch_id || item.lot_id || ""),
+          lot_name: item.lot_name || "",
+          lot_size: item.lot_size || "",
+          unit: item.unit || "",
           quantity: Number(item.quantity),
+          rate: Number(item.selling_rate),
           selling_rate: Number(item.selling_rate),
+          discount: Number(item.discount_amount || 0),
           discount_amount: Number(item.discount_amount || 0),
+          amount: Math.max(Number(item.quantity || 0) * Number(item.selling_rate || 0) - Number(item.discount_amount || 0), 0),
           lot_discount_id: item.lot_discount_id || null,
           lot_discount_type: item.lot_discount_type || null,
           lot_discount_value: Number(item.lot_discount_value || 0),
-        })),
+          stock_movement_id: item.stock_movement_id || `stock-edit-${crypto.randomUUID?.() || Date.now()}`,
+        }));
+      const payload = {
+        invoice_global_id: String(invoice.sale_id || invoice.id),
+        items: editItems,
         customer,
         invoice_discount: Number(invoiceDiscount || 0),
+        bill_discount_total: Number(invoiceDiscount || 0),
+        gross_total: gross,
+        item_discount_total: itemDiscount,
+        tax_total: Number(invoice.tax_amount || invoice.tax_total || 0),
+        net_total: netPayable,
         payments: [{ mode: paymentMode, amount: netPayable }],
         branch_id: invoice.branch_id || user.branch_id,
+        user_id: String(user.id || ""),
         edited_by: user.id,
+        device_id: deviceInfo?.device_id || "",
         bill_date: billDate,
         bill_datetime: `${billDate}T00:00`,
+        payment_mode: paymentMode,
         reason,
-      });
-      await onSaved();
-      alert("Invoice updated");
+      };
+      const localEligible = isTauriRuntime() && (
+        offlineMode ||
+        invoice.sync_status ||
+        String(invoice.id || invoice.sale_id || "").startsWith("invoice-") ||
+        String(invoice.id || invoice.sale_id || "").startsWith("pos-invoice-")
+      );
+      if (localEligible) {
+        const result = await editLocalPosSale(payload);
+        await onSaved({ localSale: localSnapshotToInvoice(result.invoice), pendingOperations: result.pending_operations });
+        alert("Invoice updated locally. Pending sync.");
+      } else {
+        await axios.put(`${API_URL}/sales/${invoice.id}`, {
+          ...payload,
+          items: editItems.map((item) => ({
+            id: Number(item.id || 0) || undefined,
+            product_id: Number(item.product_id),
+            inventory_batch_id: Number(item.inventory_batch_id || 0) || null,
+            quantity: Number(item.quantity),
+            selling_rate: Number(item.selling_rate),
+            discount_amount: Number(item.discount_amount || 0),
+            lot_discount_id: item.lot_discount_id || null,
+            lot_discount_type: item.lot_discount_type || null,
+            lot_discount_value: Number(item.lot_discount_value || 0),
+          })),
+        });
+        await onSaved();
+        alert("Invoice updated");
+      }
     } catch (error) {
       alert(getErrorMessage(error, "Unable to update invoice"));
     } finally {

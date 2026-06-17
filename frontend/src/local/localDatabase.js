@@ -67,6 +67,25 @@ export async function getLocalDatabaseStatus() {
   }
 }
 
+export async function cacheLocalReferenceSnapshot(snapshot) {
+  if (!isTauriRuntime()) return emptyStatus;
+  const status = await invokeLocal("local_cache_reference_snapshot", { snapshot });
+  return normalizeStatus(status);
+}
+
+export async function loadLocalReferenceSnapshot({ username, deviceId } = {}) {
+  if (!isTauriRuntime()) return null;
+  return invokeLocal("local_load_reference_snapshot", {
+    username: username || null,
+    device_id: deviceId || null,
+  });
+}
+
+export async function getOrCreateLocalDeviceIdentity() {
+  if (!isTauriRuntime()) return null;
+  return invokeLocal("local_get_or_create_device_identity");
+}
+
 export async function setLocalSmokeValue(value) {
   if (!isTauriRuntime()) return null;
   return invokeLocal("local_db_set_smoke_value", { value });
@@ -140,4 +159,30 @@ export async function completeLocalPosSale(sale) {
     throw new Error("Local-first POS checkout is only available inside the FroozERP desktop app.");
   }
   return invokeLocal("pos_sale_complete_local", { sale });
+}
+
+export async function editLocalPosSale(edit) {
+  if (!isTauriRuntime()) {
+    throw new Error("Local-first POS editing is only available inside the FroozERP desktop app.");
+  }
+  return invokeLocal("pos_sale_edit_local", { edit });
+}
+
+export async function cancelLocalPosSale(cancellation) {
+  if (!isTauriRuntime()) {
+    throw new Error("Local-first POS cancellation is only available inside the FroozERP desktop app.");
+  }
+  return invokeLocal("pos_sale_cancel_local", { cancellation });
+}
+
+export async function loadLocalPosSale(invoiceId) {
+  if (!isTauriRuntime()) {
+    throw new Error("Local-first POS invoice loading is only available inside the FroozERP desktop app.");
+  }
+  return invokeLocal("pos_sale_load_local", { invoiceId: String(invoiceId || "") });
+}
+
+export async function listLocalPosSales() {
+  if (!isTauriRuntime()) return [];
+  return invokeLocal("pos_sale_list_local");
 }

@@ -1,14 +1,17 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
-const CURRENT_SCHEMA_VERSION: &str = "003_local_first_pos";
+const CURRENT_SCHEMA_VERSION: &str = "004_offline_sale_edit_cancel";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
 const MIGRATION_003: &str = include_str!("../migrations/sqlite/003_local_first_pos.sql");
+const MIGRATION_004: &str = include_str!("../migrations/sqlite/004_offline_sale_edit_cancel.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -82,6 +85,44 @@ pub struct PulledChange {
 pub struct LocalPosSaleResult {
     pub invoice: serde_json::Value,
     pub pending_operations: i64,
+}
+
+pub fn ensure_device_identity(app: &AppHandle) -> Result<serde_json::Value, String> {
+    let path = database_path(app)?;
+    initialize_at(&path)?;
+    ensure_device_identity_at(&path)
+}
+
+pub fn cache_reference_snapshot(app: &AppHandle, snapshot: &serde_json::Value) -> Result<LocalDbStatus, String> {
+    let path = database_path(app)?;
+    initialize_at(&path)?;
+    cache_reference_snapshot_at(&path, snapshot)?;
+    status_at(&path)
+}
+
+pub fn cache_reference_snapshot_path(path: &Path, snapshot: &serde_json::Value) -> Result<LocalDbStatus, String> {
+    initialize_at(path)?;
+    cache_reference_snapshot_at(path, snapshot)?;
+    status_at(path)
+}
+
+pub fn load_reference_snapshot(
+    app: &AppHandle,
+    username: Option<&str>,
+    device_id: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let path = database_path(app)?;
+    initialize_at(&path)?;
+    load_reference_snapshot_at(&path, username, device_id)
+}
+
+pub fn load_reference_snapshot_path(
+    path: &Path,
+    username: Option<&str>,
+    device_id: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    initialize_at(path)?;
+    load_reference_snapshot_at(path, username, device_id)
 }
 
 pub fn initialize(app: &AppHandle) -> Result<LocalDbStatus, String> {
@@ -336,6 +377,41 @@ pub fn retry_failed_operations(app: &AppHandle) -> Result<LocalDbStatus, String>
 pub fn complete_local_pos_sale(app: &AppHandle, sale: serde_json::Value) -> Result<LocalPosSaleResult, String> {
     let path = database_path(app)?;
     complete_local_pos_sale_at(&path, sale)
+}
+
+pub fn edit_local_pos_sale(app: &AppHandle, edit: serde_json::Value) -> Result<LocalPosSaleResult, String> {
+    let path = database_path(app)?;
+    edit_local_pos_sale_at(&path, edit)
+}
+
+pub fn cancel_local_pos_sale(app: &AppHandle, cancellation: serde_json::Value) -> Result<LocalPosSaleResult, String> {
+    let path = database_path(app)?;
+    cancel_local_pos_sale_at(&path, cancellation)
+}
+
+pub fn load_local_pos_sale(app: &AppHandle, invoice_id: &str) -> Result<serde_json::Value, String> {
+    let path = database_path(app)?;
+    initialize_at(&path)?;
+    let conn = Connection::open(path).map_err(to_error)?;
+    load_invoice_snapshot(&conn, invoice_id)
+}
+
+pub fn list_local_pos_sales(app: &AppHandle) -> Result<Vec<serde_json::Value>, String> {
+    let path = database_path(app)?;
+    initialize_at(&path)?;
+    let conn = Connection::open(path).map_err(to_error)?;
+    let mut stmt = conn
+        .prepare("SELECT id FROM local_pos_invoices ORDER BY bill_datetime DESC, created_at DESC LIMIT 200")
+        .map_err(to_error)?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(to_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_error)?;
+    drop(stmt);
+    ids.into_iter()
+        .map(|id| load_invoice_snapshot(&conn, &id))
+        .collect()
 }
 
 fn complete_local_pos_sale_at(path: &Path, sale: serde_json::Value) -> Result<LocalPosSaleResult, String> {
@@ -593,6 +669,564 @@ fn complete_local_pos_sale_at(path: &Path, sale: serde_json::Value) -> Result<Lo
     })
 }
 
+fn unique_local_id(prefix: &str) -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("{prefix}-{millis}-{}", checksum(&format!("{prefix}-{millis}"))[..8].to_string())
+}
+
+fn load_invoice_snapshot(conn: &Connection, invoice_id: &str) -> Result<serde_json::Value, String> {
+    let invoice = conn
+        .query_row(
+            "SELECT id, offline_invoice_ref, branch_id, device_id, user_id, customer_id, customer_name,
+                    customer_mobile, bill_date, bill_datetime, payment_mode, gross_total,
+                    item_discount_total, bill_discount_total, tax_total, net_total, status,
+                    sync_status, server_invoice_no, server_sale_id, entity_version, created_at,
+                    updated_at, edit_reason, cancellation_reason, cancelled_by, cancelled_at, base_version
+             FROM local_pos_invoices WHERE id = ?1",
+            [invoice_id],
+            |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "invoice_global_id": row.get::<_, String>(0)?,
+                    "offline_invoice_ref": row.get::<_, String>(1)?,
+                    "branch_id": row.get::<_, String>(2)?,
+                    "device_id": row.get::<_, String>(3)?,
+                    "user_id": row.get::<_, Option<String>>(4)?,
+                    "customer_id": row.get::<_, Option<String>>(5)?,
+                    "customer_name": row.get::<_, Option<String>>(6)?,
+                    "customer_mobile": row.get::<_, Option<String>>(7)?,
+                    "bill_date": row.get::<_, String>(8)?,
+                    "bill_datetime": row.get::<_, String>(9)?,
+                    "payment_mode": row.get::<_, String>(10)?,
+                    "gross_total": row.get::<_, f64>(11)?,
+                    "item_discount_total": row.get::<_, f64>(12)?,
+                    "bill_discount_total": row.get::<_, f64>(13)?,
+                    "tax_total": row.get::<_, f64>(14)?,
+                    "net_total": row.get::<_, f64>(15)?,
+                    "status": row.get::<_, String>(16)?,
+                    "sync_status": row.get::<_, String>(17)?,
+                    "server_invoice_no": row.get::<_, Option<String>>(18)?,
+                    "server_sale_id": row.get::<_, Option<String>>(19)?,
+                    "entity_version": row.get::<_, i64>(20)?,
+                    "created_at": row.get::<_, String>(21)?,
+                    "updated_at": row.get::<_, String>(22)?,
+                    "edit_reason": row.get::<_, Option<String>>(23)?,
+                    "cancellation_reason": row.get::<_, Option<String>>(24)?,
+                    "cancelled_by": row.get::<_, Option<String>>(25)?,
+                    "cancelled_at": row.get::<_, Option<String>>(26)?,
+                    "base_version": row.get::<_, Option<i64>>(27)?,
+                }))
+            },
+        )
+        .optional()
+        .map_err(to_error)?
+        .ok_or_else(|| "Local invoice not found".to_string())?;
+
+    let items = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, product_id, product_name, lot_id, lot_name, lot_size, quantity,
+                        unit, rate, discount, amount, stock_movement_id, entity_version
+                 FROM local_pos_invoice_items WHERE invoice_id = ?1 ORDER BY id",
+            )
+            .map_err(to_error)?;
+        let rows = stmt
+            .query_map([invoice_id], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "item_global_id": row.get::<_, String>(0)?,
+                    "product_id": row.get::<_, String>(1)?,
+                    "product_name": row.get::<_, Option<String>>(2)?,
+                    "lot_id": row.get::<_, String>(3)?,
+                    "inventory_batch_id": row.get::<_, String>(3)?,
+                    "lot_name": row.get::<_, Option<String>>(4)?,
+                    "lot_size": row.get::<_, Option<String>>(5)?,
+                    "quantity": row.get::<_, f64>(6)?,
+                    "unit": row.get::<_, Option<String>>(7)?,
+                    "rate": row.get::<_, f64>(8)?,
+                    "selling_rate": row.get::<_, f64>(8)?,
+                    "discount": row.get::<_, f64>(9)?,
+                    "discount_amount": row.get::<_, f64>(9)?,
+                    "amount": row.get::<_, f64>(10)?,
+                    "net_amount": row.get::<_, f64>(10)?,
+                    "stock_movement_id": row.get::<_, String>(11)?,
+                    "entity_version": row.get::<_, i64>(12)?,
+                }))
+            })
+            .map_err(to_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?
+    };
+
+    let payments = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, posting_type, payment_mode, account_id, customer_id, amount, posting_time
+                 FROM local_payment_postings WHERE invoice_id = ?1 ORDER BY posting_time, id",
+            )
+            .map_err(to_error)?;
+        let rows = stmt
+            .query_map([invoice_id], |row| {
+                Ok(serde_json::json!({
+                    "posting_id": row.get::<_, String>(0)?,
+                    "posting_type": row.get::<_, String>(1)?,
+                    "mode": row.get::<_, String>(2)?,
+                    "account_id": row.get::<_, Option<String>>(3)?,
+                    "customer_id": row.get::<_, Option<String>>(4)?,
+                    "amount": row.get::<_, f64>(5)?,
+                    "posting_time": row.get::<_, String>(6)?,
+                }))
+            })
+            .map_err(to_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?
+    };
+
+    Ok(serde_json::json!({
+        "invoice": invoice,
+        "items": items,
+        "payments": payments,
+    }))
+}
+
+fn restore_invoice_stock(tx: &rusqlite::Transaction<'_>, invoice_id: &str, device_id: &str, reason: &str) -> Result<(), String> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT id, item_id, product_id, lot_id, branch_id, quantity
+             FROM local_stock_movements
+             WHERE invoice_id = ?1 AND movement_type = 'SALE_OUT' AND quantity_delta < 0",
+        )
+        .map_err(to_error)?;
+    let rows = stmt
+        .query_map([invoice_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, f64>(5)?,
+            ))
+        })
+        .map_err(to_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_error)?;
+    drop(stmt);
+
+    for (movement_id, item_id, product_id, lot_id, branch_id, quantity) in rows {
+        tx.execute(
+            "UPDATE local_inventory_lots
+             SET sold_qty = MAX(sold_qty - ?2, 0),
+                 balance_qty = balance_qty + ?2,
+                 updated_at = datetime('now')
+             WHERE id = ?1",
+            params![lot_id, quantity],
+        )
+        .map_err(to_error)?;
+        if tx.changes() != 1 {
+            return Err(format!("Cannot restore stock for lot {lot_id}"));
+        }
+        tx.execute(
+            "INSERT INTO local_stock_movements (
+                id, invoice_id, item_id, product_id, lot_id, branch_id, device_id,
+                movement_type, quantity, quantity_delta, movement_time, sync_status
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'SALE_REVERSAL', ?8, ?8, datetime('now'), 'pending')",
+            params![
+                unique_local_id("stock-reversal"),
+                invoice_id,
+                item_id,
+                product_id,
+                lot_id,
+                branch_id,
+                device_id,
+                quantity,
+            ],
+        )
+        .map_err(to_error)?;
+        tx.execute(
+            "UPDATE local_stock_movements SET sync_status = 'reversed' WHERE id = ?1",
+            [movement_id],
+        )
+        .map_err(to_error)?;
+        let _ = reason;
+    }
+    Ok(())
+}
+
+fn insert_local_sale_items_and_stock(
+    tx: &rusqlite::Transaction<'_>,
+    invoice_id: &str,
+    branch_id: &str,
+    device_id: &str,
+    entity_version: i64,
+    items: &[serde_json::Value],
+) -> Result<(), String> {
+    for item in items {
+        let item_id = optional_text(item, "item_global_id")
+            .or_else(|| optional_text(item, "id"))
+            .unwrap_or_else(|| unique_local_id("sale-item"));
+        let product_id = required_text(item, "product_id")?;
+        let lot_id = optional_text(item, "lot_id")
+            .or_else(|| optional_text(item, "inventory_batch_id"))
+            .ok_or_else(|| "Sale item requires lot_id".to_string())?;
+        let quantity = required_number(item, "quantity")?;
+        let rate = item
+            .get("rate")
+            .or_else(|| item.get("selling_rate"))
+            .and_then(json_number)
+            .ok_or_else(|| "Sale item rate is required".to_string())?;
+        let discount = item
+            .get("discount")
+            .or_else(|| item.get("discount_amount"))
+            .and_then(json_number)
+            .unwrap_or(0.0);
+        let amount = item
+            .get("amount")
+            .or_else(|| item.get("net_amount"))
+            .and_then(json_number)
+            .unwrap_or((quantity * rate - discount).max(0.0));
+        if quantity <= 0.0 {
+            return Err("POS item quantity must be greater than zero".to_string());
+        }
+        if rate < 0.0 || discount < 0.0 || amount < 0.0 {
+            return Err("POS item rate, discount and amount must be non-negative".to_string());
+        }
+        tx.execute(
+            "UPDATE local_inventory_lots
+             SET sold_qty = sold_qty + ?2,
+                 balance_qty = balance_qty - ?2,
+                 updated_at = datetime('now')
+             WHERE id = ?1 AND balance_qty >= ?2",
+            params![lot_id, quantity],
+        )
+        .map_err(to_error)?;
+        if tx.changes() != 1 {
+            return Err(format!(
+                "Selected lot does not have enough local stock for {}",
+                optional_text(item, "product_name").unwrap_or_else(|| product_id.clone())
+            ));
+        }
+        let stock_movement_id = optional_text(item, "stock_movement_id").unwrap_or_else(|| unique_local_id("stock-out"));
+        tx.execute(
+            "INSERT INTO local_pos_invoice_items (
+                id, invoice_id, product_id, product_name, lot_id, lot_name, lot_size,
+                quantity, unit, rate, discount, amount, stock_movement_id, entity_version
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                item_id,
+                invoice_id,
+                product_id,
+                optional_text(item, "product_name"),
+                lot_id,
+                optional_text(item, "lot_name"),
+                optional_text(item, "lot_size"),
+                quantity,
+                optional_text(item, "unit"),
+                rate,
+                discount,
+                amount,
+                stock_movement_id,
+                entity_version,
+            ],
+        )
+        .map_err(to_error)?;
+        tx.execute(
+            "INSERT INTO local_stock_movements (
+                id, invoice_id, item_id, product_id, lot_id, branch_id, device_id,
+                movement_type, quantity, quantity_delta, movement_time, sync_status
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'SALE_OUT', ?8, ?9, datetime('now'), 'pending')",
+            params![
+                stock_movement_id,
+                invoice_id,
+                item_id,
+                product_id,
+                lot_id,
+                branch_id,
+                device_id,
+                quantity,
+                -quantity,
+            ],
+        )
+        .map_err(to_error)?;
+    }
+    Ok(())
+}
+
+fn replace_local_payment_postings(
+    tx: &rusqlite::Transaction<'_>,
+    invoice_id: &str,
+    branch_id: &str,
+    device_id: &str,
+    customer_id: Option<String>,
+    payments: &[serde_json::Value],
+    reverse_existing: bool,
+) -> Result<(), String> {
+    if reverse_existing {
+        let mut stmt = tx
+            .prepare(
+                "SELECT payment_mode, account_id, customer_id, amount
+                 FROM local_payment_postings
+                 WHERE invoice_id = ?1 AND posting_type IN ('PAYMENT_RECEIVED', 'CUSTOMER_RECEIVABLE')",
+            )
+            .map_err(to_error)?;
+        let existing = stmt
+            .query_map([invoice_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, f64>(3)?,
+                ))
+            })
+            .map_err(to_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_error)?;
+        drop(stmt);
+        for (mode, account_id, customer, amount) in existing {
+            if amount > 0.0 {
+                tx.execute(
+                    "INSERT INTO local_payment_postings (
+                        id, invoice_id, posting_type, payment_mode, account_id, customer_id,
+                        amount, branch_id, device_id, posting_time, sync_status
+                     ) VALUES (?1, ?2, 'PAYMENT_REVERSAL', ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'), 'pending')",
+                    params![unique_local_id("payment-reversal"), invoice_id, mode, account_id, customer, amount, branch_id, device_id],
+                )
+                .map_err(to_error)?;
+            }
+        }
+    }
+    tx.execute("DELETE FROM local_payment_postings WHERE invoice_id = ?1 AND posting_type IN ('PAYMENT_RECEIVED', 'CUSTOMER_RECEIVABLE')", [invoice_id])
+        .map_err(to_error)?;
+    for payment in payments {
+        let posting_id = optional_text(payment, "posting_id").unwrap_or_else(|| unique_local_id("payment"));
+        let mode = required_text(payment, "mode")?;
+        let amount = required_number(payment, "amount")?;
+        if amount <= 0.0 {
+            return Err("Payment posting amount must be greater than zero".to_string());
+        }
+        let posting_type = if mode.eq_ignore_ascii_case("CREDIT") {
+            "CUSTOMER_RECEIVABLE"
+        } else {
+            "PAYMENT_RECEIVED"
+        };
+        tx.execute(
+            "INSERT INTO local_payment_postings (
+                id, invoice_id, posting_type, payment_mode, account_id, customer_id,
+                amount, branch_id, device_id, posting_time, sync_status
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'), 'pending')",
+            params![
+                posting_id,
+                invoice_id,
+                posting_type,
+                mode,
+                optional_text(payment, "account_id"),
+                optional_text(payment, "customer_id").or_else(|| customer_id.clone()),
+                amount,
+                branch_id,
+                device_id,
+            ],
+        )
+        .map_err(to_error)?;
+        if mode.eq_ignore_ascii_case("CREDIT") {
+            tx.execute(
+                "INSERT INTO local_customer_ledger_entries (
+                    id, invoice_id, customer_id, branch_id, device_id, transaction_type,
+                    debit_amount, credit_amount, balance_delta, remarks, sync_status
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'SALE_CREDIT', ?6, 0, ?6, 'Offline credit sale/update', 'pending')",
+                params![unique_local_id("ledger"), invoice_id, optional_text(payment, "customer_id").or_else(|| customer_id.clone()), branch_id, device_id, amount],
+            )
+            .map_err(to_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn edit_local_pos_sale_at(path: &Path, edit: serde_json::Value) -> Result<LocalPosSaleResult, String> {
+    initialize_at(path)?;
+    let mut conn = Connection::open(path).map_err(to_error)?;
+    let tx = conn.transaction().map_err(to_error)?;
+    let invoice_id = required_text(&edit, "invoice_global_id").or_else(|_| required_text(&edit, "id"))?;
+    let reason = required_text(&edit, "reason")?;
+    let old_snapshot = load_invoice_snapshot(&tx, &invoice_id)?;
+    if old_snapshot["invoice"]["status"].as_str().unwrap_or("") == "CANCELLED" {
+        return Err("Cancelled sale cannot be edited".to_string());
+    }
+    let old_version = old_snapshot["invoice"]["entity_version"].as_i64().unwrap_or(1);
+    let new_version = old_version + 1;
+    let branch_id = required_text(&edit, "branch_id").or_else(|_| required_text(&old_snapshot["invoice"], "branch_id"))?;
+    let device_id = required_text(&edit, "device_id").or_else(|_| required_text(&old_snapshot["invoice"], "device_id"))?;
+    let user_id = optional_text(&edit, "user_id").or_else(|| optional_text(&old_snapshot["invoice"], "user_id"));
+    let customer = edit.get("customer").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let customer_id = optional_text(&customer, "account_id").or_else(|| optional_text(&customer, "customer_id"));
+    let customer_name = optional_text(&customer, "name");
+    let customer_mobile = optional_text(&customer, "mobile");
+    let bill_datetime = required_text(&edit, "bill_datetime")?;
+    let bill_date = optional_text(&edit, "bill_date").unwrap_or_else(|| bill_datetime.chars().take(10).collect());
+    let payment_mode = required_text(&edit, "payment_mode")?;
+    let gross_total = required_number(&edit, "gross_total")?;
+    let item_discount_total = number_or_zero(&edit, "item_discount_total");
+    let bill_discount_total = number_or_zero(&edit, "bill_discount_total");
+    let tax_total = number_or_zero(&edit, "tax_total");
+    let net_total = required_number(&edit, "net_total")?;
+    let items = edit.get("items").and_then(|value| value.as_array()).ok_or_else(|| "Edited sale requires items".to_string())?;
+    if items.is_empty() {
+        return Err("Invoice must contain at least one item".to_string());
+    }
+    let payments = edit.get("payments").and_then(|value| value.as_array()).ok_or_else(|| "Edited sale requires payment postings".to_string())?;
+    if payments.is_empty() {
+        return Err("Edited sale requires payment postings".to_string());
+    }
+
+    restore_invoice_stock(&tx, &invoice_id, &device_id, &reason)?;
+    tx.execute("DELETE FROM local_pos_invoice_items WHERE invoice_id = ?1", [invoice_id.as_str()])
+        .map_err(to_error)?;
+    insert_local_sale_items_and_stock(&tx, &invoice_id, &branch_id, &device_id, new_version, items)?;
+    replace_local_payment_postings(&tx, &invoice_id, &branch_id, &device_id, customer_id.clone(), payments, true)?;
+    tx.execute(
+        "UPDATE local_pos_invoices
+         SET customer_id = ?2, customer_name = ?3, customer_mobile = ?4,
+             bill_date = ?5, bill_datetime = ?6, payment_mode = ?7,
+             gross_total = ?8, item_discount_total = ?9, bill_discount_total = ?10,
+             tax_total = ?11, net_total = ?12, status = 'EDITED',
+             sync_status = 'pending', entity_version = ?13, base_version = ?14,
+             edit_reason = ?15, updated_at = datetime('now')
+         WHERE id = ?1",
+        params![
+            invoice_id,
+            customer_id,
+            customer_name,
+            customer_mobile,
+            bill_date,
+            bill_datetime,
+            payment_mode,
+            gross_total,
+            item_discount_total,
+            bill_discount_total,
+            tax_total,
+            net_total,
+            new_version,
+            old_version,
+            reason,
+        ],
+    )
+    .map_err(to_error)?;
+    let new_snapshot = load_invoice_snapshot(&tx, &invoice_id)?;
+    let audit_id = unique_local_id("sale-audit");
+    tx.execute(
+        "INSERT INTO local_sale_audit_log (id, invoice_id, action, user_id, device_id, reason, old_value, new_value, sync_status)
+         VALUES (?1, ?2, 'EDIT', ?3, ?4, ?5, ?6, ?7, 'pending')",
+        params![
+            audit_id,
+            invoice_id,
+            user_id,
+            device_id,
+            reason,
+            serde_json::to_string(&old_snapshot).map_err(to_error)?,
+            serde_json::to_string(&new_snapshot).map_err(to_error)?,
+        ],
+    )
+    .map_err(to_error)?;
+    let operation_id = optional_text(&edit, "operation_id").unwrap_or_else(|| unique_local_id("sale-edit-op"));
+    let operation_payload = serde_json::json!({
+        "operation_kind": "SALE_EDIT",
+        "base_version": old_version,
+        "new_version": new_version,
+        "reason": reason,
+        "old_snapshot": old_snapshot,
+        "sale": new_snapshot,
+    });
+    enqueue_sync_operation_with_conn(&tx, &SyncOperation {
+        id: operation_id.clone(),
+        operation_id: Some(operation_id),
+        entity_type: "pos_sale".to_string(),
+        entity_id: invoice_id.clone(),
+        operation_type: "SALE_EDIT".to_string(),
+        payload: operation_payload,
+        branch_id: Some(branch_id),
+        device_id: Some(device_id),
+        user_id,
+        version: Some(new_version),
+        created_at: None,
+    })?;
+    tx.commit().map_err(to_error)?;
+    let conn = Connection::open(path).map_err(to_error)?;
+    Ok(LocalPosSaleResult { invoice: new_snapshot, pending_operations: pending_outbox_count_at(&conn)? })
+}
+
+fn cancel_local_pos_sale_at(path: &Path, cancellation: serde_json::Value) -> Result<LocalPosSaleResult, String> {
+    initialize_at(path)?;
+    let mut conn = Connection::open(path).map_err(to_error)?;
+    let tx = conn.transaction().map_err(to_error)?;
+    let invoice_id = required_text(&cancellation, "invoice_global_id").or_else(|_| required_text(&cancellation, "id"))?;
+    let reason = required_text(&cancellation, "reason")?;
+    let old_snapshot = load_invoice_snapshot(&tx, &invoice_id)?;
+    if old_snapshot["invoice"]["status"].as_str().unwrap_or("") == "CANCELLED" {
+        return Err("Sale is already cancelled".to_string());
+    }
+    let old_version = old_snapshot["invoice"]["entity_version"].as_i64().unwrap_or(1);
+    let new_version = old_version + 1;
+    let branch_id = required_text(&old_snapshot["invoice"], "branch_id")?;
+    let device_id = optional_text(&cancellation, "device_id").or_else(|| optional_text(&old_snapshot["invoice"], "device_id")).ok_or_else(|| "device_id is required".to_string())?;
+    let user_id = optional_text(&cancellation, "user_id").or_else(|| optional_text(&old_snapshot["invoice"], "user_id"));
+    restore_invoice_stock(&tx, &invoice_id, &device_id, &reason)?;
+    replace_local_payment_postings(&tx, &invoice_id, &branch_id, &device_id, optional_text(&old_snapshot["invoice"], "customer_id"), &[], true)?;
+    tx.execute(
+        "UPDATE local_pos_invoices
+         SET status = 'CANCELLED',
+             sync_status = 'pending',
+             cancellation_reason = ?2,
+             cancelled_by = ?3,
+             cancelled_at = datetime('now'),
+             entity_version = ?4,
+             base_version = ?5,
+             updated_at = datetime('now')
+         WHERE id = ?1",
+        params![invoice_id, reason, user_id, new_version, old_version],
+    )
+    .map_err(to_error)?;
+    let new_snapshot = load_invoice_snapshot(&tx, &invoice_id)?;
+    tx.execute(
+        "INSERT INTO local_sale_audit_log (id, invoice_id, action, user_id, device_id, reason, old_value, new_value, sync_status)
+         VALUES (?1, ?2, 'CANCEL', ?3, ?4, ?5, ?6, ?7, 'pending')",
+        params![
+            unique_local_id("sale-audit"),
+            invoice_id,
+            user_id,
+            device_id,
+            reason,
+            serde_json::to_string(&old_snapshot).map_err(to_error)?,
+            serde_json::to_string(&new_snapshot).map_err(to_error)?,
+        ],
+    )
+    .map_err(to_error)?;
+    let operation_id = optional_text(&cancellation, "operation_id").unwrap_or_else(|| unique_local_id("sale-cancel-op"));
+    let operation_payload = serde_json::json!({
+        "operation_kind": "SALE_CANCEL",
+        "base_version": old_version,
+        "new_version": new_version,
+        "reason": reason,
+        "old_snapshot": old_snapshot,
+        "sale": new_snapshot,
+    });
+    enqueue_sync_operation_with_conn(&tx, &SyncOperation {
+        id: operation_id.clone(),
+        operation_id: Some(operation_id),
+        entity_type: "pos_sale".to_string(),
+        entity_id: invoice_id.clone(),
+        operation_type: "SALE_CANCEL".to_string(),
+        payload: operation_payload,
+        branch_id: Some(branch_id),
+        device_id: Some(device_id),
+        user_id,
+        version: Some(new_version),
+        created_at: None,
+    })?;
+    tx.commit().map_err(to_error)?;
+    let conn = Connection::open(path).map_err(to_error)?;
+    Ok(LocalPosSaleResult { invoice: new_snapshot, pending_operations: pending_outbox_count_at(&conn)? })
+}
+
 fn enqueue_sync_operation_with_conn(conn: &Connection, operation: &SyncOperation) -> Result<(), String> {
     let payload = serde_json::to_string(&operation.payload).map_err(to_error)?;
     let operation_id = operation
@@ -656,6 +1290,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "001_local_foundation", MIGRATION_001)?;
     apply_migration(&mut conn, "002_sync_engine_foundation", MIGRATION_002)?;
     apply_migration(&mut conn, "003_local_first_pos", MIGRATION_003)?;
+    apply_migration(&mut conn, "004_offline_sale_edit_cancel", MIGRATION_004)?;
     Ok(())
 }
 
@@ -712,17 +1347,614 @@ fn status_at(path: &Path) -> Result<LocalDbStatus, String> {
         last_push_at: single_optional_string(
             &conn,
             "SELECT last_push_at FROM sync_state ORDER BY updated_at DESC LIMIT 1",
+            &[],
         )?,
         last_pull_at: single_optional_string(
             &conn,
             "SELECT last_pull_at FROM sync_state ORDER BY updated_at DESC LIMIT 1",
+            &[],
         )?,
         current_cursor: single_optional_string(
             &conn,
             "SELECT COALESCE(last_pull_cursor, last_server_cursor) FROM sync_state ORDER BY updated_at DESC LIMIT 1",
+            &[],
         )?,
         error: None,
     })
+}
+
+fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Result<(), String> {
+    let mut conn = Connection::open(path).map_err(to_error)?;
+    let tx = conn.transaction().map_err(to_error)?;
+
+    let branch_id = snapshot
+        .get("branch_context")
+        .and_then(|value| optional_text(value, "branch_id"))
+        .or_else(|| snapshot.get("device_identity").and_then(|value| optional_text(value, "branch_id")))
+        .unwrap_or_else(|| "1".to_string());
+    let device_identity = snapshot.get("device_identity").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let device_id = optional_text(&device_identity, "device_id").unwrap_or_else(|| "default".to_string());
+    let device_name = optional_text(&device_identity, "device_name").unwrap_or_else(|| "FroozERP Device".to_string());
+    let platform = optional_text(&device_identity, "platform").unwrap_or_else(|| "tauri-windows".to_string());
+    let app_version = optional_text(&device_identity, "app_version").unwrap_or_else(|| "1.0.0".to_string());
+    let registration_status = optional_text(&device_identity, "registration_status").unwrap_or_else(|| "approved".to_string());
+
+    tx.execute(
+        "INSERT INTO local_device_identity (
+            device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now'))
+         ON CONFLICT(device_id) DO UPDATE SET
+           device_name = excluded.device_name,
+           platform = excluded.platform,
+           app_version = excluded.app_version,
+           branch_id = excluded.branch_id,
+           registration_status = excluded.registration_status,
+           last_seen_at = excluded.last_seen_at,
+           updated_at = excluded.updated_at",
+        params![device_id, device_name, platform, app_version, branch_id, registration_status],
+    )
+    .map_err(to_error)?;
+
+    let user_profile = snapshot.get("user_profile").cloned().unwrap_or_else(|| serde_json::json!({}));
+    if let Some(username) = optional_text(&user_profile, "username") {
+        let key = format!("offline_user_profile::{}::{}", device_id, username.to_lowercase());
+        tx.execute(
+            "INSERT INTO local_kv (key, value, updated_at)
+             VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![key, serde_json::to_string(&user_profile).map_err(to_error)?],
+        )
+        .map_err(to_error)?;
+    }
+
+    if let Some(offline_auth) = snapshot.get("offline_auth").cloned() {
+        if let Some(username_lower) = optional_text(&offline_auth, "usernameLower")
+            .or_else(|| optional_text(&offline_auth, "username_lower"))
+        {
+            let key = format!("offline_auth::{}::{}", device_id, username_lower.to_lowercase());
+            tx.execute(
+                "INSERT INTO local_kv (key, value, updated_at)
+                 VALUES (?1, ?2, datetime('now'))
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                params![key, serde_json::to_string(&offline_auth).map_err(to_error)?],
+            )
+            .map_err(to_error)?;
+        }
+    }
+
+    tx.execute(
+        "INSERT INTO local_kv (key, value, updated_at)
+         VALUES ('offline_branch_context', ?1, datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        [serde_json::to_string(snapshot.get("branch_context").unwrap_or(&serde_json::json!({}))).map_err(to_error)?],
+    )
+    .map_err(to_error)?;
+
+    let reference_meta = serde_json::json!({
+        "last_successful_sync_at": snapshot.get("last_successful_sync_at").and_then(|value| value.as_str()).unwrap_or(""),
+        "cached_at": snapshot.get("cached_at").and_then(|value| value.as_str()).unwrap_or(""),
+        "device_id": device_id,
+        "branch_id": branch_id,
+    });
+    tx.execute(
+        "INSERT INTO local_kv (key, value, updated_at)
+         VALUES ('offline_reference_meta', ?1, datetime('now'))
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        [serde_json::to_string(&reference_meta).map_err(to_error)?],
+    )
+    .map_err(to_error)?;
+
+    tx.execute("DELETE FROM local_inventory_lots WHERE COALESCE(branch_id, '1') = ?1", [branch_id.as_str()])
+        .map_err(to_error)?;
+    tx.execute("DELETE FROM local_products WHERE COALESCE(branch_id, '1') = ?1", [branch_id.as_str()])
+        .map_err(to_error)?;
+    tx.execute("DELETE FROM local_categories WHERE COALESCE(branch_id, '1') = ?1", [branch_id.as_str()])
+        .map_err(to_error)?;
+    tx.execute("DELETE FROM local_customers WHERE COALESCE(branch_id, '1') = ?1", [branch_id.as_str()])
+        .map_err(to_error)?;
+    tx.execute("DELETE FROM local_settings WHERE COALESCE(branch_id, '1') = ?1", [branch_id.as_str()])
+        .map_err(to_error)?;
+
+    let mut category_id_map: HashMap<String, String> = HashMap::new();
+    if let Some(categories) = snapshot.get("categories").and_then(|value| value.as_array()) {
+        for category in categories {
+            let category_checksum = checksum(&serde_json::to_string(category).map_err(to_error)?);
+            let category_id = optional_text(category, "global_id")
+                .or_else(|| optional_text(category, "id"))
+                .unwrap_or_else(|| format!("category-{category_checksum}"));
+            for key in [optional_text(category, "global_id"), optional_text(category, "id")] {
+                if let Some(key) = key.filter(|value| !value.is_empty()) {
+                    category_id_map.insert(key, category_id.clone());
+                }
+            }
+        }
+    }
+
+    if let Some(categories) = snapshot.get("categories").and_then(|value| value.as_array()) {
+        for category in categories {
+            let category_checksum = checksum(&serde_json::to_string(category).map_err(to_error)?);
+            let category_id = optional_text(category, "global_id")
+                .or_else(|| optional_text(category, "id"))
+                .unwrap_or_else(|| format!("category-{category_checksum}"));
+            tx.execute(
+                "INSERT INTO local_categories (
+                    id, cloud_id, branch_id, name, active, created_at, updated_at, version, sync_status, deleted_at
+                 ) VALUES (?1, ?1, ?2, ?3, ?4, COALESCE(?5, datetime('now')), COALESCE(?6, datetime('now')), ?7, 'synced', ?8)",
+                params![
+                    category_id,
+                    branch_id,
+                    category
+                        .get("category_name")
+                        .or_else(|| category.get("name"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("Uncategorised"),
+                    if category.get("active").and_then(|value| value.as_bool()).unwrap_or(true) { 1 } else { 0 },
+                    optional_text(category, "created_at"),
+                    optional_text(category, "updated_at"),
+                    category.get("entity_version").or_else(|| category.get("version")).and_then(|value| value.as_i64()).unwrap_or(1),
+                    optional_text(category, "deleted_at"),
+                ],
+            )
+            .map_err(to_error)?;
+        }
+    }
+
+    let mut product_id_map: HashMap<String, String> = HashMap::new();
+    if let Some(products) = snapshot.get("products").and_then(|value| value.as_array()) {
+        for product in products {
+            let product_checksum = checksum(&serde_json::to_string(product).map_err(to_error)?);
+            let product_id = optional_text(product, "global_id")
+                .or_else(|| optional_text(product, "id"))
+                .unwrap_or_else(|| format!("product-{product_checksum}"));
+            for key in [optional_text(product, "global_id"), optional_text(product, "id")] {
+                if let Some(key) = key.filter(|value| !value.is_empty()) {
+                    product_id_map.insert(key, product_id.clone());
+                }
+            }
+        }
+    }
+
+    if let Some(products) = snapshot.get("products").and_then(|value| value.as_array()) {
+        for product in products {
+            let product_checksum = checksum(&serde_json::to_string(product).map_err(to_error)?);
+            let product_id = optional_text(product, "global_id")
+                .or_else(|| optional_text(product, "id"))
+                .unwrap_or_else(|| format!("product-{product_checksum}"));
+            let resolved_category_id = optional_text(product, "category_global_id")
+                .or_else(|| optional_text(product, "category_id"))
+                .and_then(|value| category_id_map.get(&value).cloned());
+            tx.execute(
+                "INSERT INTO local_products (
+                    id, cloud_id, branch_id, product_name, category_id, category_name, unit, barcode,
+                    sale_rate, minimum_stock, active, remarks, created_at, updated_at, version, sync_status, deleted_at
+                 ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, datetime('now')), COALESCE(?13, datetime('now')), ?14, 'synced', ?15)",
+                params![
+                    product_id,
+                    branch_id,
+                    product.get("product_name").and_then(|value| value.as_str()).unwrap_or("Unnamed Product"),
+                    resolved_category_id,
+                    product.get("category_name").or_else(|| product.get("category")).and_then(|value| value.as_str()),
+                    optional_text(product, "unit"),
+                    optional_text(product, "barcode"),
+                    product.get("selling_rate").or_else(|| product.get("sale_rate")).and_then(json_number),
+                    product.get("minimum_stock").and_then(json_number),
+                    if product.get("active").and_then(|value| value.as_bool()).unwrap_or(true) { 1 } else { 0 },
+                    optional_text(product, "remarks"),
+                    optional_text(product, "created_at"),
+                    optional_text(product, "updated_at"),
+                    product.get("entity_version").or_else(|| product.get("version")).and_then(|value| value.as_i64()).unwrap_or(1),
+                    optional_text(product, "deleted_at"),
+                ],
+            )
+            .map_err(to_error)?;
+        }
+    }
+
+    if let Some(lots) = snapshot.get("inventory_lots").and_then(|value| value.as_array()) {
+        for lot in lots {
+            let lot_checksum = checksum(&serde_json::to_string(lot).map_err(to_error)?);
+            let lot_id = optional_text(lot, "global_id")
+                .or_else(|| optional_text(lot, "id"))
+                .unwrap_or_else(|| format!("lot-{lot_checksum}"));
+            let product_id = optional_text(lot, "product_global_id")
+                .or_else(|| optional_text(lot, "product_id"))
+                .and_then(|value| product_id_map.get(&value).cloned())
+                .unwrap_or_default();
+            if product_id.is_empty() {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO local_inventory_lots (
+                    id, cloud_id, branch_id, product_id, product_name, supplier_id, supplier_name,
+                    lot_no, size_grade, opening_date, opening_qty, purchased_qty, sold_qty, returned_qty, waste_qty,
+                    adjusted_qty, transfer_in_qty, transfer_out_qty, balance_qty, cost_rate, sale_rate, status,
+                    remarks, created_at, updated_at, version, sync_status, deleted_at
+                 ) VALUES (
+                    ?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
+                    ?20, ?21, COALESCE(?22, datetime('now')), COALESCE(?23, datetime('now')), ?24, 'synced', ?25
+                 )",
+                params![
+                    lot_id,
+                    branch_id,
+                    product_id,
+                    optional_text(lot, "product_name"),
+                    optional_text(lot, "supplier_id"),
+                    optional_text(lot, "supplier_name"),
+                    optional_text(lot, "lot_no").or_else(|| optional_text(lot, "batch_no")).or_else(|| optional_text(lot, "lot_name")),
+                    optional_text(lot, "size_grade").or_else(|| optional_text(lot, "lot_size")),
+                    optional_text(lot, "opening_date").or_else(|| optional_text(lot, "purchase_date")),
+                    lot.get("opening_qty").or_else(|| lot.get("purchase_qty")).and_then(json_number).unwrap_or(0.0),
+                    lot.get("sold_qty").and_then(json_number).unwrap_or_else(|| {
+                        let opening = lot.get("purchase_qty").and_then(json_number).unwrap_or(0.0);
+                        let balance = lot.get("remaining_qty").or_else(|| lot.get("balance_qty")).and_then(json_number).unwrap_or(0.0);
+                        (opening - balance).max(0.0)
+                    }),
+                    lot.get("returned_qty").and_then(json_number).unwrap_or(0.0),
+                    lot.get("waste_qty").and_then(json_number).unwrap_or(0.0),
+                    lot.get("adjusted_qty").and_then(json_number).unwrap_or(0.0),
+                    lot.get("transfer_in_qty").and_then(json_number).unwrap_or(0.0),
+                    lot.get("transfer_out_qty").and_then(json_number).unwrap_or(0.0),
+                    lot.get("remaining_qty").or_else(|| lot.get("balance_qty")).and_then(json_number).unwrap_or(0.0),
+                    lot.get("effective_cost_per_unit").or_else(|| lot.get("purchase_rate")).and_then(json_number).unwrap_or(0.0),
+                    lot.get("temporary_sale_rate").or_else(|| lot.get("sale_rate")).or_else(|| lot.get("selling_rate")).and_then(json_number),
+                    optional_text(lot, "batch_status").or_else(|| optional_text(lot, "status")).unwrap_or_else(|| "ACTIVE".to_string()),
+                    optional_text(lot, "remarks"),
+                    optional_text(lot, "created_at"),
+                    optional_text(lot, "updated_at"),
+                    lot.get("entity_version").or_else(|| lot.get("version")).and_then(|value| value.as_i64()).unwrap_or(1),
+                    optional_text(lot, "deleted_at"),
+                ],
+            )
+            .map_err(to_error)?;
+        }
+    }
+
+    if let Some(customers) = snapshot.get("customers").and_then(|value| value.as_array()) {
+        for customer in customers {
+            let customer_checksum = checksum(&serde_json::to_string(customer).map_err(to_error)?);
+            let customer_id = optional_text(customer, "global_id")
+                .or_else(|| optional_text(customer, "id"))
+                .unwrap_or_else(|| format!("customer-{customer_checksum}"));
+            tx.execute(
+                "INSERT INTO local_customers (
+                    id, cloud_id, branch_id, account_name, mobile_number, account_type,
+                    active, system_account, created_at, updated_at, version, sync_status, deleted_at
+                 ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(?8, datetime('now')), COALESCE(?9, datetime('now')), ?10, 'synced', ?11)",
+                params![
+                    customer_id,
+                    branch_id,
+                    customer.get("customer_name").or_else(|| customer.get("account_name")).and_then(|value| value.as_str()).unwrap_or("Customer"),
+                    optional_text(customer, "mobile_number"),
+                    customer.get("customer_type").or_else(|| customer.get("account_type")).and_then(|value| value.as_str()).unwrap_or("Customer"),
+                    if customer.get("active").and_then(|value| value.as_bool()).unwrap_or(true) { 1 } else { 0 },
+                    if customer.get("system_account").and_then(|value| value.as_bool()).unwrap_or(false) { 1 } else { 0 },
+                    optional_text(customer, "created_at"),
+                    optional_text(customer, "updated_at"),
+                    customer.get("entity_version").or_else(|| customer.get("version")).and_then(|value| value.as_i64()).unwrap_or(1),
+                    optional_text(customer, "deleted_at"),
+                ],
+            )
+            .map_err(to_error)?;
+        }
+    }
+
+    if let Some(settings_bundle) = snapshot.get("settings_bundle").and_then(|value| value.as_object()) {
+        for (key, value) in settings_bundle {
+            tx.execute(
+                "INSERT INTO local_settings (
+                    id, cloud_id, branch_id, setting_key, setting_value, created_at, updated_at, version, sync_status
+                 ) VALUES (?1, ?1, ?2, ?3, ?4, datetime('now'), datetime('now'), 1, 'synced')",
+                params![
+                    format!("setting-{}-{}", branch_id, key),
+                    branch_id,
+                    key,
+                    serde_json::to_string(value).map_err(to_error)?,
+                ],
+            )
+            .map_err(to_error)?;
+        }
+    }
+
+    tx.execute(
+        "INSERT INTO sync_state (device_id, last_successful_sync_at, current_sync_status, updated_at)
+         VALUES (?1, COALESCE(?2, datetime('now')), 'IDLE', datetime('now'))
+         ON CONFLICT(device_id) DO UPDATE SET
+           last_successful_sync_at = COALESCE(excluded.last_successful_sync_at, sync_state.last_successful_sync_at),
+           current_sync_status = 'IDLE',
+           updated_at = excluded.updated_at",
+        params![device_id, snapshot.get("last_successful_sync_at").and_then(|value| value.as_str())],
+    )
+    .map_err(to_error)?;
+
+    tx.commit().map_err(to_error)
+}
+
+fn load_reference_snapshot_at(
+    path: &Path,
+    username: Option<&str>,
+    device_id: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    initialize_at(path)?;
+    let conn = Connection::open(path).map_err(to_error)?;
+    let requested_device = device_id.unwrap_or("default");
+    let username_key = username
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty());
+
+    let user_profile = if let Some(username_lower) = username_key {
+        let key = format!("offline_user_profile::{}::{}", requested_device, username_lower);
+        single_optional_string(&conn, "SELECT value FROM local_kv WHERE key = ?1", &[&key])?
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+            .unwrap_or_else(|| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    let offline_auth = if let Some(username_lower) = username
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+    {
+        let key = format!("offline_auth::{}::{}", requested_device, username_lower);
+        single_optional_string(&conn, "SELECT value FROM local_kv WHERE key = ?1", &[&key])?
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+            .unwrap_or_else(|| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    let branch_context = single_optional_string(&conn, "SELECT value FROM local_kv WHERE key = 'offline_branch_context'", &[])?
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+        .unwrap_or_else(|| serde_json::json!({ "branch_id": "1", "branch_name": "Main Branch" }));
+
+    let device_identity = conn
+        .query_row(
+            "SELECT device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at, last_sync_at
+             FROM local_device_identity
+             WHERE device_id = ?1
+             ORDER BY updated_at DESC
+             LIMIT 1",
+            [requested_device],
+            |row| {
+                Ok(serde_json::json!({
+                    "device_id": row.get::<_, String>(0)?,
+                    "device_name": row.get::<_, String>(1)?,
+                    "platform": row.get::<_, String>(2)?,
+                    "app_version": row.get::<_, String>(3)?,
+                    "branch_id": row.get::<_, String>(4)?,
+                    "registration_status": row.get::<_, String>(5)?,
+                    "last_seen_at": row.get::<_, Option<String>>(6)?,
+                    "last_sync_at": row.get::<_, Option<String>>(7)?,
+                }))
+            },
+        )
+        .optional()
+        .map_err(to_error)?
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let categories = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id, branch_id, name, active, updated_at, version, deleted_at
+                 FROM local_categories
+                 WHERE deleted_at IS NULL
+                 ORDER BY name",
+            )
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "category_name": row.get::<_, String>(2)?,
+                    "active": row.get::<_, i64>(3)? == 1,
+                    "updated_at": row.get::<_, Option<String>>(4)?,
+                    "entity_version": row.get::<_, i64>(5)?,
+                    "deleted_at": row.get::<_, Option<String>>(6)?,
+                    "branch_id": row.get::<_, Option<String>>(1)?,
+                }))
+            })
+            .map_err(to_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?
+    };
+
+    let products = {
+        let mut statement = conn
+            .prepare(
+                "SELECT
+                    p.id, p.product_name, p.category_id, p.category_name, p.unit, p.barcode,
+                    p.sale_rate, p.minimum_stock, p.active, p.remarks, p.updated_at, p.version,
+                    COALESCE(SUM(CASE WHEN l.deleted_at IS NULL AND UPPER(COALESCE(l.status, 'ACTIVE')) <> 'CANCELLED' THEN l.balance_qty ELSE 0 END), 0) AS current_stock,
+                    COUNT(CASE WHEN l.deleted_at IS NULL AND UPPER(COALESCE(l.status, 'ACTIVE')) <> 'CANCELLED' THEN 1 END) AS lot_count
+                 FROM local_products p
+                 LEFT JOIN local_inventory_lots l ON l.product_id = p.id
+                 WHERE p.deleted_at IS NULL
+                 GROUP BY p.id, p.product_name, p.category_id, p.category_name, p.unit, p.barcode,
+                          p.sale_rate, p.minimum_stock, p.active, p.remarks, p.updated_at, p.version
+                 ORDER BY p.product_name",
+            )
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "product_name": row.get::<_, String>(1)?,
+                    "category_id": row.get::<_, Option<String>>(2)?,
+                    "category_name": row.get::<_, Option<String>>(3)?,
+                    "unit": row.get::<_, Option<String>>(4)?,
+                    "barcode": row.get::<_, Option<String>>(5)?,
+                    "selling_rate": row.get::<_, Option<f64>>(6)?,
+                    "sale_rate": row.get::<_, Option<f64>>(6)?,
+                    "minimum_stock": row.get::<_, Option<f64>>(7)?,
+                    "active": row.get::<_, i64>(8)? == 1,
+                    "remarks": row.get::<_, Option<String>>(9)?,
+                    "updated_at": row.get::<_, Option<String>>(10)?,
+                    "entity_version": row.get::<_, i64>(11)?,
+                    "current_stock": row.get::<_, f64>(12)?,
+                    "lot_count": row.get::<_, i64>(13)?,
+                }))
+            })
+            .map_err(to_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?
+    };
+
+    let inventory_lots = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id, product_id, product_name, supplier_id, supplier_name, lot_no, size_grade,
+                        opening_date, opening_qty, sold_qty, adjusted_qty, balance_qty, cost_rate, sale_rate,
+                        status, remarks, created_at, updated_at
+                 FROM local_inventory_lots
+                 WHERE deleted_at IS NULL
+                 ORDER BY product_name, opening_date, id",
+            )
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "product_id": row.get::<_, String>(1)?,
+                    "product_name": row.get::<_, Option<String>>(2)?,
+                    "supplier_id": row.get::<_, Option<String>>(3)?,
+                    "supplier_name": row.get::<_, Option<String>>(4)?,
+                    "batch_no": row.get::<_, Option<String>>(5)?,
+                    "lot_name": row.get::<_, Option<String>>(5)?,
+                    "lot_size": row.get::<_, Option<String>>(6)?,
+                    "size_grade": row.get::<_, Option<String>>(6)?,
+                    "purchase_date": row.get::<_, Option<String>>(7)?,
+                    "opening_date": row.get::<_, Option<String>>(7)?,
+                    "purchase_qty": row.get::<_, f64>(8)?,
+                    "opening_qty": row.get::<_, f64>(8)?,
+                    "sold_qty": row.get::<_, f64>(9)?,
+                    "adjusted_qty": row.get::<_, f64>(10)?,
+                    "remaining_qty": row.get::<_, f64>(11)?,
+                    "balance_qty": row.get::<_, f64>(11)?,
+                    "purchase_rate": row.get::<_, f64>(12)?,
+                    "effective_cost_per_unit": row.get::<_, f64>(12)?,
+                    "temporary_sale_rate": row.get::<_, Option<f64>>(13)?,
+                    "sale_rate": row.get::<_, Option<f64>>(13)?,
+                    "batch_status": row.get::<_, String>(14)?,
+                    "remarks": row.get::<_, Option<String>>(15)?,
+                    "created_at": row.get::<_, Option<String>>(16)?,
+                    "updated_at": row.get::<_, Option<String>>(17)?,
+                }))
+            })
+            .map_err(to_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?
+    };
+
+    let customers = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id, account_name, mobile_number, account_type, active, system_account, updated_at, version
+                 FROM local_customers
+                 WHERE deleted_at IS NULL
+                 ORDER BY account_name",
+            )
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "customer_name": row.get::<_, String>(1)?,
+                    "account_name": row.get::<_, String>(1)?,
+                    "mobile_number": row.get::<_, Option<String>>(2)?,
+                    "customer_type": row.get::<_, String>(3)?,
+                    "account_type": row.get::<_, String>(3)?,
+                    "active": row.get::<_, i64>(4)? == 1,
+                    "system_account": row.get::<_, i64>(5)? == 1,
+                    "updated_at": row.get::<_, Option<String>>(6)?,
+                    "entity_version": row.get::<_, i64>(7)?,
+                }))
+            })
+            .map_err(to_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?
+    };
+
+    let settings_bundle = {
+        let mut statement = conn
+            .prepare("SELECT setting_key, setting_value FROM local_settings WHERE deleted_at IS NULL ORDER BY setting_key")
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                let key: String = row.get(0)?;
+                let value: String = row.get(1)?;
+                let parsed = serde_json::from_str::<serde_json::Value>(&value).unwrap_or(serde_json::Value::String(value));
+                Ok((key, parsed))
+            })
+            .map_err(to_error)?;
+        let mut map = serde_json::Map::new();
+        for row in rows {
+            let (key, value) = row.map_err(to_error)?;
+            map.insert(key, value);
+        }
+        serde_json::Value::Object(map)
+    };
+
+    let sales_history = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id, offline_invoice_ref, bill_date, bill_datetime, customer_name, customer_mobile,
+                        payment_mode, gross_total, item_discount_total, bill_discount_total, tax_total, net_total,
+                        status, sync_status, server_invoice_no, created_at
+                 FROM local_pos_invoices
+                 ORDER BY datetime(created_at) DESC, id DESC",
+            )
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                let invoice_no: Option<String> = row.get(14)?;
+                let offline_ref: String = row.get(1)?;
+                let net_total: f64 = row.get(11)?;
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "invoice_no": invoice_no.unwrap_or_else(|| offline_ref.clone()),
+                    "offline_invoice_ref": offline_ref,
+                    "sale_date": row.get::<_, String>(2)?,
+                    "bill_datetime": row.get::<_, String>(3)?,
+                    "customer_name": row.get::<_, Option<String>>(4)?,
+                    "customer_mobile": row.get::<_, Option<String>>(5)?,
+                    "payment_mode": row.get::<_, String>(6)?,
+                    "gross_amount": row.get::<_, f64>(7)?,
+                    "item_discount_amount": row.get::<_, f64>(8)?,
+                    "invoice_discount_amount": row.get::<_, f64>(9)?,
+                    "tax_amount": row.get::<_, f64>(10)?,
+                    "total_amount": net_total,
+                    "amount": net_total,
+                    "sale_status": row.get::<_, String>(12)?,
+                    "sync_status": row.get::<_, String>(13)?,
+                    "created_at": row.get::<_, Option<String>>(15)?,
+                }))
+            })
+            .map_err(to_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?
+    };
+
+    let last_successful_sync_at = single_optional_string(
+        &conn,
+        "SELECT last_successful_sync_at FROM sync_state ORDER BY updated_at DESC LIMIT 1",
+        &[],
+    )?;
+    let pending_operations = count_outbox_status(&conn, &["pending", "syncing", "failed"])?;
+    let reference_ready = !products.is_empty() && !inventory_lots.is_empty();
+
+    Ok(serde_json::json!({
+        "reference_ready": reference_ready,
+        "first_sync_required": !reference_ready,
+        "database_path": path_to_string(path),
+        "last_successful_sync_at": last_successful_sync_at,
+        "device_identity": device_identity,
+        "branch_context": branch_context,
+        "user_profile": user_profile,
+        "offline_auth": offline_auth,
+        "products": products,
+        "categories": categories,
+        "inventory_lots": inventory_lots,
+        "customers": customers,
+        "settings_bundle": settings_bundle,
+        "sales_history": sales_history,
+        "pending_operations": pending_operations,
+        "failed_operations": count_outbox_status(&conn, &["failed"])?,
+        "conflict_operations": count_outbox_status(&conn, &["conflict"])?,
+    }))
 }
 
 fn set_smoke_value_at(path: &Path, value: &str) -> Result<(), String> {
@@ -767,8 +1999,66 @@ fn count_outbox_status(conn: &Connection, statuses: &[&str]) -> Result<i64, Stri
     conn.query_row(&sql, [], |row| row.get(0)).map_err(to_error)
 }
 
-fn single_optional_string(conn: &Connection, sql: &str) -> Result<Option<String>, String> {
-    conn.query_row(sql, [], |row| row.get(0)).optional().map_err(to_error)
+fn single_optional_string(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Option<String>, String> {
+    conn.query_row(sql, params, |row| row.get::<_, Option<String>>(0))
+        .optional()
+        .map(|value| value.flatten())
+        .map_err(to_error)
+}
+
+pub fn ensure_device_identity_at(path: &Path) -> Result<serde_json::Value, String> {
+    let conn = Connection::open(path).map_err(to_error)?;
+    if let Some(existing) = conn
+        .query_row(
+            "SELECT device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at, last_sync_at
+             FROM local_device_identity
+             ORDER BY updated_at DESC, rowid DESC
+             LIMIT 1",
+            [],
+            |row| {
+                Ok(serde_json::json!({
+                    "device_id": row.get::<_, String>(0)?,
+                    "device_name": row.get::<_, String>(1)?,
+                    "platform": row.get::<_, String>(2)?,
+                    "app_version": row.get::<_, String>(3)?,
+                    "branch_id": row.get::<_, String>(4)?,
+                    "registration_status": row.get::<_, String>(5)?,
+                    "last_seen_at": row.get::<_, Option<String>>(6)?,
+                    "last_sync_at": row.get::<_, Option<String>>(7)?,
+                }))
+            },
+        )
+        .optional()
+        .map_err(to_error)?
+    {
+        return Ok(existing);
+    }
+
+    let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-Device".to_string());
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let device_id = format!("FZDEV-{}-{}", hostname.replace(' ', "-").to_uppercase(), timestamp);
+    let device_name = format!("{} - FroozERP", hostname);
+    conn.execute(
+        "INSERT INTO local_device_identity (
+            device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at, updated_at
+         ) VALUES (?1, ?2, 'tauri-windows', '1.0.0', '1', 'pending', datetime('now'), datetime('now'))",
+        params![device_id, device_name],
+    )
+    .map_err(to_error)?;
+
+    Ok(serde_json::json!({
+        "device_id": device_id,
+        "device_name": device_name,
+        "platform": "tauri-windows",
+        "app_version": "1.0.0",
+        "branch_id": "1",
+        "registration_status": "pending",
+        "last_seen_at": null,
+        "last_sync_at": null,
+    }))
 }
 
 fn required_text(value: &serde_json::Value, key: &str) -> Result<String, String> {
@@ -988,6 +2278,47 @@ fn to_error(error: impl std::fmt::Display) -> String {
 mod tests {
     use super::*;
 
+    fn test_sale_payload(invoice_id: &str, operation_id: &str, quantity: f64, amount: f64) -> serde_json::Value {
+        serde_json::json!({
+            "operation_id": operation_id,
+            "invoice_global_id": invoice_id,
+            "offline_invoice_ref": "OFF-TEST-1",
+            "branch_id": "1",
+            "device_id": "device-test",
+            "user_id": "1",
+            "customer": { "name": "Walk-in Customer", "mobile": "" },
+            "bill_date": "2026-06-16",
+            "bill_datetime": "2026-06-16T10:00",
+            "payment_mode": "CASH",
+            "gross_total": amount,
+            "item_discount_total": 0.0,
+            "bill_discount_total": 0.0,
+            "tax_total": 0.0,
+            "net_total": amount,
+            "entity_version": 1,
+            "items": [{
+                "item_global_id": "line-test-sale-1",
+                "product_id": "product-test",
+                "product_name": "Test Product",
+                "lot_id": "lot-test",
+                "lot_name": "Test Lot",
+                "lot_size": "Small",
+                "quantity": quantity,
+                "unit": "KG",
+                "rate": 10.0,
+                "discount": 0.0,
+                "amount": amount,
+                "stock_movement_id": "stock-test-sale-1",
+                "available_qty": 5.0
+            }],
+            "payments": [{
+                "posting_id": "posting-test-sale-1",
+                "mode": "CASH",
+                "amount": amount
+            }]
+        })
+    }
+
     #[test]
     fn local_db_persists_smoke_value_after_reopen() {
         let path = std::env::temp_dir().join(format!(
@@ -1016,44 +2347,7 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         initialize_at(&path).expect("initialize local db");
-        let sale = serde_json::json!({
-            "operation_id": "op-test-sale-1",
-            "invoice_global_id": "invoice-test-sale-1",
-            "offline_invoice_ref": "OFF-TEST-1",
-            "branch_id": "1",
-            "device_id": "device-test",
-            "user_id": "1",
-            "customer": { "name": "Walk-in Customer", "mobile": "" },
-            "bill_date": "2026-06-16",
-            "bill_datetime": "2026-06-16T10:00",
-            "payment_mode": "CASH",
-            "gross_total": 20.0,
-            "item_discount_total": 0.0,
-            "bill_discount_total": 0.0,
-            "tax_total": 0.0,
-            "net_total": 20.0,
-            "entity_version": 1,
-            "items": [{
-                "item_global_id": "line-test-sale-1",
-                "product_id": "product-test",
-                "product_name": "Test Product",
-                "lot_id": "lot-test",
-                "lot_name": "Test Lot",
-                "lot_size": "Small",
-                "quantity": 2.0,
-                "unit": "KG",
-                "rate": 10.0,
-                "discount": 0.0,
-                "amount": 20.0,
-                "stock_movement_id": "stock-test-sale-1",
-                "available_qty": 5.0
-            }],
-            "payments": [{
-                "posting_id": "posting-test-sale-1",
-                "mode": "CASH",
-                "amount": 20.0
-            }]
-        });
+        let sale = test_sale_payload("invoice-test-sale-1", "op-test-sale-1", 2.0, 20.0);
 
         let result = complete_local_pos_sale_at(&path, sale).expect("complete local POS sale");
         assert_eq!(result.pending_operations, 1);
@@ -1086,6 +2380,136 @@ mod tests {
         assert_eq!(payment_count, 1);
         assert_eq!(balance_qty, 3.0);
         assert_eq!(outbox_count, 1);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn local_pos_sale_edit_restores_stock_rewrites_payment_and_queues_outbox() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-phase3-pos-edit-{}.sqlite3",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+
+        initialize_at(&path).expect("initialize local db");
+        complete_local_pos_sale_at(&path, test_sale_payload("invoice-test-edit-1", "op-test-edit-create", 2.0, 20.0))
+            .expect("complete local POS sale");
+        let edit = serde_json::json!({
+            "operation_id": "op-test-edit-1",
+            "invoice_global_id": "invoice-test-edit-1",
+            "branch_id": "1",
+            "device_id": "device-test",
+            "user_id": "1",
+            "reason": "Customer reduced quantity",
+            "customer": { "name": "Walk-in Customer", "mobile": "" },
+            "bill_date": "2026-06-16",
+            "bill_datetime": "2026-06-16T10:00",
+            "payment_mode": "CASH",
+            "gross_total": 10.0,
+            "item_discount_total": 0.0,
+            "bill_discount_total": 0.0,
+            "tax_total": 0.0,
+            "net_total": 10.0,
+            "items": [{
+                "item_global_id": "line-test-edit-1",
+                "product_id": "product-test",
+                "product_name": "Test Product",
+                "lot_id": "lot-test",
+                "lot_name": "Test Lot",
+                "lot_size": "Small",
+                "quantity": 1.0,
+                "unit": "KG",
+                "rate": 10.0,
+                "discount": 0.0,
+                "amount": 10.0
+            }],
+            "payments": [{
+                "posting_id": "posting-test-edit-1",
+                "mode": "CASH",
+                "amount": 10.0
+            }]
+        });
+
+        let result = edit_local_pos_sale_at(&path, edit).expect("edit local POS sale");
+        assert_eq!(result.pending_operations, 2);
+        drop(Connection::open(&path).expect("open and drop sqlite handle"));
+
+        initialize_at(&path).expect("reinitialize local db");
+        let conn = Connection::open(&path).expect("open sqlite");
+        let status: String = conn
+            .query_row("SELECT status FROM local_pos_invoices WHERE id = 'invoice-test-edit-1'", [], |row| row.get(0))
+            .expect("invoice status");
+        let net_total: f64 = conn
+            .query_row("SELECT net_total FROM local_pos_invoices WHERE id = 'invoice-test-edit-1'", [], |row| row.get(0))
+            .expect("invoice net");
+        let balance_qty: f64 = conn
+            .query_row("SELECT balance_qty FROM local_inventory_lots WHERE id = 'lot-test'", [], |row| row.get(0))
+            .expect("lot balance");
+        let edit_outbox: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_outbox WHERE operation_id = 'op-test-edit-1' AND operation_type = 'SALE_EDIT'", [], |row| row.get(0))
+            .expect("edit outbox");
+        let audit_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_sale_audit_log WHERE invoice_id = 'invoice-test-edit-1' AND action = 'EDIT'", [], |row| row.get(0))
+            .expect("audit count");
+
+        assert_eq!(status, "EDITED");
+        assert_eq!(net_total, 10.0);
+        assert_eq!(balance_qty, 4.0);
+        assert_eq!(edit_outbox, 1);
+        assert_eq!(audit_count, 1);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn local_pos_sale_cancel_restores_stock_reverses_payment_and_queues_outbox() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-phase3-pos-cancel-{}.sqlite3",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+
+        initialize_at(&path).expect("initialize local db");
+        complete_local_pos_sale_at(&path, test_sale_payload("invoice-test-cancel-1", "op-test-cancel-create", 2.0, 20.0))
+            .expect("complete local POS sale");
+        let result = cancel_local_pos_sale_at(&path, serde_json::json!({
+            "operation_id": "op-test-cancel-1",
+            "invoice_global_id": "invoice-test-cancel-1",
+            "device_id": "device-test",
+            "user_id": "1",
+            "reason": "Customer cancelled"
+        }))
+        .expect("cancel local POS sale");
+        assert_eq!(result.pending_operations, 2);
+        drop(Connection::open(&path).expect("open and drop sqlite handle"));
+
+        initialize_at(&path).expect("reinitialize local db");
+        let conn = Connection::open(&path).expect("open sqlite");
+        let status: String = conn
+            .query_row("SELECT status FROM local_pos_invoices WHERE id = 'invoice-test-cancel-1'", [], |row| row.get(0))
+            .expect("invoice status");
+        let balance_qty: f64 = conn
+            .query_row("SELECT balance_qty FROM local_inventory_lots WHERE id = 'lot-test'", [], |row| row.get(0))
+            .expect("lot balance");
+        let cancel_outbox: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_outbox WHERE operation_id = 'op-test-cancel-1' AND operation_type = 'SALE_CANCEL'", [], |row| row.get(0))
+            .expect("cancel outbox");
+        let reversal_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_payment_postings WHERE invoice_id = 'invoice-test-cancel-1' AND posting_type = 'PAYMENT_REVERSAL'", [], |row| row.get(0))
+            .expect("payment reversal count");
+
+        assert_eq!(status, "CANCELLED");
+        assert_eq!(balance_qty, 5.0);
+        assert_eq!(cancel_outbox, 1);
+        assert_eq!(reversal_count, 1);
+
+        let duplicate = cancel_local_pos_sale_at(&path, serde_json::json!({
+            "invoice_global_id": "invoice-test-cancel-1",
+            "device_id": "device-test",
+            "reason": "Duplicate cancel"
+        }));
+        assert!(duplicate.is_err());
 
         let _ = fs::remove_file(&path);
     }

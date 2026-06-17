@@ -240,6 +240,18 @@
   background: #1e293b;
 }
 
+.offline-pill {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 10px;
+  padding: 7px 12px;
+  border-radius: 999px;
+  background: rgba(245, 158, 11, 0.16);
+  color: #fcd34d;
+  font-size: 11px;
+  font-weight: 750;
+}
+
 .status-dot {
   width: 7px;
   height: 7px;
@@ -250,6 +262,68 @@
 
 .content-area {
   padding: 26px 30px;
+}
+
+.startup-status-panel {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.45);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  color: #cbd5e1;
+}
+
+.startup-status-panel p,
+.startup-status-panel small {
+  margin: 0;
+  display: block;
+}
+
+.startup-status-panel p + p,
+.startup-status-panel p + small {
+  margin-top: 7px;
+}
+
+.startup-status-error {
+  border-color: rgba(248, 113, 113, 0.45);
+  color: #fecaca;
+}
+
+.startup-api-panel {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.24);
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  color: #cbd5e1;
+  display: grid;
+  gap: 5px;
+}
+
+.startup-api-panel span {
+  color: #94a3b8;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.startup-api-panel code {
+  color: #f8fafc;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.startup-api-panel small {
+  color: #cbd5e1;
+  line-height: 1.35;
+}
+
+.startup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 16px;
 }
 
 .welcome-banner,
@@ -2551,6 +2625,42 @@ tbody tr:last-child td {
 .login-button {
   width: 100%;
   margin-top: 20px;
+}
+
+.recovery-link-button {
+  width: 100%;
+  margin-top: 10px;
+  border: 0;
+  color: #fbbf24;
+  background: transparent;
+  box-shadow: none;
+  font-size: 13px;
+  font-weight: 800;
+  text-decoration: underline;
+  text-underline-offset: 4px;
+}
+
+.recovery-link-button:hover {
+  color: #fde68a;
+  transform: none;
+  box-shadow: none;
+}
+
+.recovery-modal {
+  width: min(620px, 100%);
+}
+
+.recovery-body {
+  padding-top: 10px;
+}
+
+.recovery-body .brand-lockup {
+  margin-bottom: 6px;
+}
+
+.recovery-option-grid {
+  display: grid;
+  gap: 10px;
 }
 
 .device-activation-panel {

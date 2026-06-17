@@ -1,5 +1,5 @@
 const CACHE_NAME = "froozerp-shell-v1";
-const SHELL_ASSETS = ["/", "/branding/frooz-symbol-64.png", "/branding/frooz-symbol-192.png", "/manifest.webmanifest"];
+const SHELL_ASSETS = ["./", "./branding/frooz-symbol-64.png", "./branding/frooz-symbol-192.png", "./manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {
   self.skipWaiting();
@@ -20,6 +20,6 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (url.port === "5000" || url.pathname.startsWith("/api/")) return;
   if (event.request.mode === "navigate") {
-    event.respondWith(fetch(event.request).catch(() => caches.match("/")));
+    event.respondWith(fetch(event.request).catch(() => caches.match("./")));
   }
 });
