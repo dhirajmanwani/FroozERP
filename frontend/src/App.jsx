@@ -98,6 +98,9 @@ const navigationItems = [
   ["settings", "Settings"],
 ];
 
+const offlineLocalDataViews = new Set(["dashboard", "products", "sales", "reports", "settings"]);
+const offlineBackendRequiredViews = new Set(["purchase", "pending-bills", "accounts", "returns", "waste", "discounts", "sale-rates", "expenses"]);
+
 const getErrorMessage = (error, fallback) =>
   error.response?.data?.message || fallback;
 
@@ -734,6 +737,17 @@ function App() {
   const [changeHistory, setChangeHistory] = useState(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [accountLedgerFocusKey, setAccountLedgerFocusKey] = useState("");
+
+  useEffect(() => {
+    const onPopState = () => {
+      const requestedView = new URLSearchParams(window.location.search).get("view");
+      if (requestedView && navigationItems.some(([view]) => view === requestedView)) {
+        setActiveView(requestedView);
+      }
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -2633,12 +2647,13 @@ function App() {
       alert("Your role does not have access to this module.");
       return;
     }
+    const currentUrlView = new URLSearchParams(window.location.search).get("view");
+    if (currentUrlView !== view) {
+      const nextUrl = new URL(window.location.href);
+      nextUrl.searchParams.set("view", view);
+      window.history.pushState({ view }, "", nextUrl);
+    }
     if (offlineMode) {
-      const offlineSupportedViews = new Set(["dashboard", "products", "sales", "settings"]);
-      if (!offlineSupportedViews.has(view)) {
-        setStartupNotice("This module still requires the backend. FroozERP kept your local-first POS workspace available.");
-        return;
-      }
       const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id });
       if (!snapshot?.reference_ready) {
         setStartupError("This device must connect to the internet once before offline use.");
@@ -2646,6 +2661,14 @@ function App() {
       }
       setSidebarOpen(false);
       await applyReferenceSnapshot(snapshot, { offline: true, nextView: view });
+      if (offlineBackendRequiredViews.has(view)) {
+        setSyncMessage("Offline - this module opens with local cached data where available. Some actions require the FroozERP backend.");
+      } else if (offlineLocalDataViews.has(view)) {
+        setSyncMessage("Offline - loaded local SQLite data for this module.");
+      }
+      if (view === "reports") await loadReports().catch(() => null);
+      if (view === "dashboard") await loadDashboardData().catch(() => null);
+      if (view === "sales") await Promise.all([loadSalesHistory(), loadReports()]).catch(() => null);
       return;
     }
     setSidebarOpen(false);
@@ -2907,6 +2930,13 @@ function App() {
         </header>
 
         <div className="content-area">
+          {(startupNotice || startupError || syncMessage) && (
+            <div className={`startup-status-panel ${startupError ? "startup-status-error" : ""}`}>
+              {startupError && <p>{startupError}</p>}
+              {!startupError && startupNotice && <p>{startupNotice}</p>}
+              {!startupError && syncMessage && <small>{syncMessage}</small>}
+            </div>
+          )}
           {activeView === "dashboard" && (
             <>
               <section className="welcome-banner">
