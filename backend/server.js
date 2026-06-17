@@ -5530,7 +5530,7 @@ const approveDevice = async ({ deviceId, approvedBy, branchId = 1, counterId = n
 };
 
 const normalizeSyncStatus = (value) => String(value || "").trim().toLowerCase();
-const SYNC_OPERATION_TYPES = new Set(["UPSERT", "DELETE", "CREATE", "UPDATE"]);
+const SYNC_OPERATION_TYPES = new Set(["UPSERT", "DELETE", "CREATE", "UPDATE", "SALE_EDIT", "SALE_CANCEL"]);
 const SYNC_ENTITY_TYPES = new Set(["sync_test", "pos_sale"]);
 const syncRateWindow = new Map();
 
@@ -5745,6 +5745,84 @@ const processSyncTestOperation = async (client, operation, context) => {
   };
 };
 
+const normalizeSyncSaleItems = async (client, items = []) => {
+  const normalized = [];
+  for (const item of Array.isArray(items) ? items : []) {
+    const lotId = parsePositiveInteger(item.inventory_batch_id || item.lot_id);
+    let productId = parsePositiveInteger(item.product_id);
+    if (!productId) {
+      const productKey = cleanText(item.product_id);
+      if (productKey) {
+        const productResult = await client.query(
+          "SELECT id FROM products WHERE global_id = $1 OR id::text = $1 LIMIT 1",
+          [productKey]
+        );
+        productId = parsePositiveInteger(productResult.rows[0]?.id);
+      }
+    }
+    if (!productId && lotId) {
+      const lotResult = await client.query("SELECT product_id FROM inventory_batches WHERE id = $1 LIMIT 1", [lotId]);
+      productId = parsePositiveInteger(lotResult.rows[0]?.product_id);
+    }
+    normalized.push({
+      ...item,
+      product_id: productId,
+      inventory_batch_id: lotId,
+      lot_id: lotId,
+      selling_rate: item.selling_rate ?? item.rate,
+      discount_amount: item.discount_amount ?? item.discount ?? 0,
+    });
+  }
+  return normalized;
+};
+
+const syncSaleEnvelope = (operation) => {
+  const payload = operation.payload || {};
+  const sale = payload.sale || {};
+  const invoice = sale.invoice || payload.invoice || {};
+  const oldInvoice = payload.old_snapshot?.invoice || {};
+  const invoiceGlobalId = cleanText(
+    invoice.invoice_global_id ||
+    invoice.id ||
+    oldInvoice.invoice_global_id ||
+    oldInvoice.id ||
+    payload.invoice_global_id ||
+    operation.entity_id
+  );
+  const offlineInvoiceRef = cleanText(
+    invoice.offline_invoice_ref ||
+    oldInvoice.offline_invoice_ref ||
+    payload.offline_invoice_ref
+  );
+  return {
+    payload,
+    sale,
+    invoice,
+    invoiceGlobalId,
+    offlineInvoiceRef,
+    reason: cleanText(payload.reason || invoice.edit_reason || invoice.cancellation_reason),
+    version: Number(payload.new_version || invoice.entity_version || operation.version || 1),
+  };
+};
+
+const findSyncedSaleForOperation = async (client, operation) => {
+  const { invoiceGlobalId, offlineInvoiceRef } = syncSaleEnvelope(operation);
+  if (!invoiceGlobalId && !offlineInvoiceRef) return null;
+  const result = await client.query(
+    `
+    SELECT *
+    FROM sales
+    WHERE ($1 <> '' AND global_id = $1)
+       OR ($2 <> '' AND offline_invoice_ref = $2)
+    ORDER BY id DESC
+    LIMIT 1
+    FOR UPDATE
+    `,
+    [invoiceGlobalId, offlineInvoiceRef]
+  );
+  return result.rows[0] || null;
+};
+
 const processPosSaleFoundationOperation = async (client, operation, context) => {
   const payload = operation.payload || {};
   const invoiceGlobalId = cleanText(payload.invoice_global_id || operation.entity_id);
@@ -5816,8 +5894,9 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
   const invalidItem = payload.items.find((item) => Number(item.quantity || 0) <= 0);
   if (invalidItem) return conflict("Invalid POS item quantity; invoice retained locally for review");
 
+  const normalizedItems = await normalizeSyncSaleItems(client, payload.items);
   const stockRequests = new Map();
-  for (const item of payload.items) {
+  for (const item of normalizedItems) {
     const lotId = parsePositiveInteger(item.inventory_batch_id || item.lot_id);
     const productId = parsePositiveInteger(item.product_id);
     const quantity = parsePositiveNumber(item.quantity);
@@ -5850,7 +5929,7 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
   }
 
   const salePayload = await buildSalePayload(client, {
-    items: payload.items.map((item) => ({
+    items: normalizedItems.map((item) => ({
       product_id: item.product_id,
       inventory_batch_id: item.inventory_batch_id || item.lot_id,
       quantity: item.quantity,
@@ -6034,6 +6113,267 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
   };
 };
 
+const processPosSaleEditOperation = async (client, operation, context) => {
+  const envelope = syncSaleEnvelope(operation);
+  const { payload, sale, invoice, invoiceGlobalId, offlineInvoiceRef, reason, version } = envelope;
+  if (!reason) return rejectOperation(operation, "VALIDATION_ERROR", "Offline sale edit requires a reason");
+  const editor = await getSalePermissionUser(context.user.id, "edit", client);
+  if (!editor) return rejectOperation(operation, "AUTHORIZATION_ERROR", "Sync user is not allowed to edit sales");
+  const currentSale = await findSyncedSaleForOperation(client, operation);
+  if (!currentSale) {
+    return rejectOperation(operation, "DEPENDENCY_MISSING", "Original offline sale must sync before its edit can be applied");
+  }
+  if (currentSale.sale_status === "CANCELLED") {
+    return rejectOperation(operation, "CONFLICT", "Cancelled invoices cannot be edited");
+  }
+  if (Number(currentSale.entity_version || 1) >= version && currentSale.sale_status === "EDITED") {
+    return {
+      operation_id: operation.operation_id,
+      status: "accepted",
+      server_entity_version: currentSale.entity_version || version,
+      server_updated_at: currentSale.edited_at || currentSale.created_at,
+      error_code: null,
+      message: "Offline sale edit already applied",
+      result_payload: { sale_id: currentSale.id, invoice_no: currentSale.invoice_no, offline_invoice_ref: offlineInvoiceRef, duplicate: true },
+    };
+  }
+
+  const requestedSaleDate = invoice.bill_date || invoice.sale_date
+    ? toBusinessDateKey(invoice.bill_date || invoice.sale_date)
+    : toDateKey(currentSale.sale_date);
+  const editedInvoiceNo = `FZ-${requestedSaleDate.replaceAll("-", "")}-${String(currentSale.id).padStart(6, "0")}`;
+  const oldSnapshot = await getSaleSnapshot(client, currentSale.id);
+  await restoreSaleInventory(client, currentSale.id, editor.id, "Offline edit reversal for invoice", "IN");
+  await client.query("DELETE FROM sale_batch_allocations WHERE sale_item_id IN (SELECT id FROM sale_items WHERE sale_id = $1)", [currentSale.id]);
+  await client.query("DELETE FROM sale_items WHERE sale_id = $1", [currentSale.id]);
+  await client.query("DELETE FROM sale_payments WHERE sale_id = $1", [currentSale.id]);
+
+  const normalizedItems = await normalizeSyncSaleItems(client, sale.items || payload.items);
+  const salePayload = await buildSalePayload(client, {
+    items: normalizedItems,
+    branchId: parsePositiveInteger(invoice.branch_id) || context.branchId,
+    createdBy: editor.id,
+    customer: {
+      account_id: invoice.customer_id || "",
+      name: invoice.customer_name || "",
+      mobile: invoice.customer_mobile || "",
+      notes: invoice.customer_notes || "",
+    },
+    invoiceDiscount: invoice.bill_discount_total || invoice.invoice_discount_amount || 0,
+    payments: (sale.payments || []).filter((payment) => payment.posting_type !== "PAYMENT_REVERSAL"),
+    allowRateOverride: ["Owner", "Admin"].includes(editor.role_name),
+  });
+  if (salePayload.error) {
+    return rejectOperation(operation, salePayload.error.status === 409 ? "CONFLICT" : "VALIDATION_ERROR", salePayload.error.message || "Offline sale edit validation failed");
+  }
+
+  const updateResult = await client.query(
+    `
+    UPDATE sales
+    SET
+      total_amount = $1,
+      total_cost = $2,
+      profit = $3,
+      branch_id = $4,
+      customer_id = $5,
+      customer_name = $6,
+      customer_mobile = $7,
+      customer_notes = $8,
+      payment_mode = $9,
+      gross_amount = $10,
+      item_discount_amount = $11,
+      invoice_discount_amount = $12,
+      tax_amount = $13,
+      discount_rule_id = $14,
+      discount_rule_name = $15,
+      discount_rule_type = $16,
+      discount_rule_value = $17,
+      discount_rule_payment_mode = $18,
+      sale_date = $19,
+      transaction_date = $19,
+      bill_datetime = COALESCE($22::timestamp, bill_datetime),
+      invoice_no = $24,
+      sale_status = 'EDITED',
+      edited_by = $20,
+      edited_at = CURRENT_TIMESTAMP,
+      edit_reason = $21,
+      entity_version = GREATEST(COALESCE(entity_version, 1), $25)
+    WHERE id = $23
+    RETURNING *
+    `,
+    [
+      salePayload.totalAmount, salePayload.totalCost, salePayload.profit, salePayload.branchId,
+      salePayload.customerId, salePayload.customerName, salePayload.customerMobile, salePayload.customerNotes, salePayload.paymentMode,
+      salePayload.grossAmount, salePayload.itemDiscountAmount, salePayload.invoiceDiscountAmount, salePayload.taxAmount,
+      salePayload.discountRule?.id || null, salePayload.discountRule?.rule_name || null,
+      salePayload.discountRule?.discount_type || null, salePayload.discountRule?.discount_value || 0,
+      salePayload.discountRule?.payment_mode || null,
+      requestedSaleDate,
+      editor.id,
+      reason,
+      invoice.bill_datetime || `${requestedSaleDate}T00:00`,
+      currentSale.id,
+      editedInvoiceNo,
+      version,
+    ]
+  );
+  const updatedSale = updateResult.rows[0];
+
+  for (const item of salePayload.invoiceItems) {
+    const subtotalAfterItemDiscounts = Math.max(salePayload.grossAmount - salePayload.itemDiscountAmount, 0);
+    const invoiceDiscountShare = subtotalAfterItemDiscounts === 0
+      ? 0
+      : roundCurrency(salePayload.invoiceDiscountAmount * (item.netAmount / subtotalAfterItemDiscounts));
+    const itemProfit = roundCurrency(item.netAmount - invoiceDiscountShare - item.costAmount);
+    const saleItemResult = await client.query(
+      `
+      INSERT INTO sale_items (
+        sale_id, product_id, quantity, selling_rate, amount, discount_amount, net_amount,
+        cost_amount, profit, cost_status, default_selling_rate, manual_rate_override,
+        lot_discount_id, lot_discount_type, lot_discount_value
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+      RETURNING id
+      `,
+      [
+        currentSale.id, item.productId, item.quantity, item.sellingRate, item.grossAmount,
+        item.discountAmount, item.netAmount, item.costAmount, itemProfit,
+        item.costStatus, item.defaultSellingRate, item.manualRateOverride,
+        item.lotDiscountId || null, item.lotDiscountType || null, item.lotDiscountValue || 0,
+      ]
+    );
+    const saleItemId = saleItemResult.rows[0].id;
+    for (const allocation of item.allocations) {
+      await client.query(
+        `
+        INSERT INTO sale_batch_allocations (
+          sale_item_id, inventory_batch_id, quantity, purchase_rate, cost_amount
+        )
+        VALUES ($1, $2, $3, $4, $5)
+        `,
+        [saleItemId, allocation.inventoryBatchId, allocation.quantity, allocation.purchaseRate, allocation.costAmount]
+      );
+    }
+    await client.query(
+      `
+      INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id)
+      VALUES ($1, $2, 'OUT', $3, $4, $5)
+      `,
+      [item.productId, item.quantity, `Offline edit synced for invoice ${updatedSale.invoice_no}`, editor.id, salePayload.branchId]
+    );
+  }
+
+  for (const payment of salePayload.payments) {
+    await client.query("INSERT INTO sale_payments (sale_id, payment_mode, amount) VALUES ($1, $2, $3)", [currentSale.id, payment.mode, payment.amount]);
+  }
+  await client.query(
+    `
+    INSERT INTO sale_audit_trail (sale_id, action, field_name, old_value, new_value, reason, edited_by)
+    VALUES ($1, 'EDIT', 'offline_sync_invoice', $2::jsonb, $3::jsonb, $4, $5)
+    `,
+    [currentSale.id, JSON.stringify(oldSnapshot), JSON.stringify(await getSaleSnapshot(client, currentSale.id)), reason, editor.id]
+  );
+  const delta = roundCurrency(salePayload.totalAmount - Number(currentSale.total_amount || 0));
+  if (delta !== 0 || salePayload.customerMobile || salePayload.customerName) {
+    await insertCustomerLedgerEntry(
+      client,
+      updatedSale,
+      delta >= 0 ? "SALE_EDIT_DEBIT" : "SALE_EDIT_CREDIT",
+      delta,
+      editor.id,
+      `Offline invoice ${updatedSale.invoice_no} edited during sync: ${reason}`
+    );
+  }
+  const change = await logSyncChange(client, {
+    branchId: context.branchId,
+    entityType: "pos_sale",
+    entityId: invoiceGlobalId || operation.entity_id,
+    operationType: "SALE_EDIT",
+    version: updatedSale.entity_version || version,
+    payload: { ...updatedSale, offline_invoice_ref: offlineInvoiceRef },
+  });
+  return {
+    operation_id: operation.operation_id,
+    status: "accepted",
+    server_entity_version: updatedSale.entity_version || version,
+    server_updated_at: change.created_at || updatedSale.edited_at,
+    error_code: null,
+    message: "Offline sale edit synced",
+    result_payload: { sale_id: updatedSale.id, invoice_no: updatedSale.invoice_no, offline_invoice_ref: offlineInvoiceRef },
+  };
+};
+
+const processPosSaleCancelOperation = async (client, operation, context) => {
+  const { payload, invoice, invoiceGlobalId, offlineInvoiceRef, reason, version } = syncSaleEnvelope(operation);
+  const cancelReason = reason || "Offline invoice cancelled";
+  const canceller = await getSalePermissionUser(context.user.id, "cancel", client);
+  if (!canceller) return rejectOperation(operation, "AUTHORIZATION_ERROR", "Sync user is not allowed to cancel sales");
+  const currentSale = await findSyncedSaleForOperation(client, operation);
+  if (!currentSale) {
+    return rejectOperation(operation, "DEPENDENCY_MISSING", "Original offline sale must sync before its cancellation can be applied");
+  }
+  if (currentSale.sale_status === "CANCELLED") {
+    return {
+      operation_id: operation.operation_id,
+      status: "accepted",
+      server_entity_version: currentSale.entity_version || version,
+      server_updated_at: currentSale.cancelled_at || currentSale.created_at,
+      error_code: null,
+      message: "Offline sale cancellation already applied",
+      result_payload: { sale_id: currentSale.id, invoice_no: currentSale.invoice_no, offline_invoice_ref: offlineInvoiceRef, duplicate: true },
+    };
+  }
+  const oldSnapshot = await getSaleSnapshot(client, currentSale.id);
+  await restoreSaleInventory(client, currentSale.id, canceller.id, "Offline cancellation reversal for invoice", "IN");
+  await client.query("DELETE FROM sale_batch_allocations WHERE sale_item_id IN (SELECT id FROM sale_items WHERE sale_id = $1)", [currentSale.id]);
+  const updateResult = await client.query(
+    `
+    UPDATE sales
+    SET sale_status = 'CANCELLED',
+        cancelled_by = $1,
+        cancelled_at = COALESCE($2::timestamp, CURRENT_TIMESTAMP),
+        cancellation_reason = $3,
+        entity_version = GREATEST(COALESCE(entity_version, 1), $5)
+    WHERE id = $4
+    RETURNING *
+    `,
+    [canceller.id, invoice.cancelled_at || payload.cancelled_at || null, cancelReason, currentSale.id, version]
+  );
+  const cancelledSale = updateResult.rows[0];
+  await client.query(
+    `
+    INSERT INTO sale_audit_trail (sale_id, action, field_name, old_value, new_value, reason, edited_by)
+    VALUES ($1, 'CANCEL', 'offline_sync_invoice', $2::jsonb, $3::jsonb, $4, $5)
+    `,
+    [currentSale.id, JSON.stringify(oldSnapshot), JSON.stringify(await getSaleSnapshot(client, currentSale.id)), cancelReason, canceller.id]
+  );
+  await insertCustomerLedgerEntry(
+    client,
+    cancelledSale,
+    "SALE_CANCELLED",
+    Number(currentSale.total_amount || 0),
+    canceller.id,
+    `Offline invoice ${cancelledSale.invoice_no} cancelled during sync: ${cancelReason}`
+  );
+  const change = await logSyncChange(client, {
+    branchId: context.branchId,
+    entityType: "pos_sale",
+    entityId: invoiceGlobalId || operation.entity_id,
+    operationType: "SALE_CANCEL",
+    version: cancelledSale.entity_version || version,
+    payload: { ...cancelledSale, offline_invoice_ref: offlineInvoiceRef },
+  });
+  return {
+    operation_id: operation.operation_id,
+    status: "accepted",
+    server_entity_version: cancelledSale.entity_version || version,
+    server_updated_at: change.created_at || cancelledSale.cancelled_at,
+    error_code: null,
+    message: "Offline sale cancellation synced",
+    result_payload: { sale_id: cancelledSale.id, invoice_no: cancelledSale.invoice_no, offline_invoice_ref: offlineInvoiceRef },
+  };
+};
+
 const processSyncOperation = async (client, operation, context) => {
   if (!operation || typeof operation !== "object") {
     return rejectOperation({ operation_id: "" }, "VALIDATION_ERROR", "Invalid operation");
@@ -6059,7 +6399,11 @@ const processSyncOperation = async (client, operation, context) => {
   if (processed.rows[0]) return processedAckFromRow(processed.rows[0]);
   const ack = operation.entity_type === "sync_test"
     ? await processSyncTestOperation(client, operation, context)
-    : await processPosSaleFoundationOperation(client, operation, context);
+    : operation.operation_type === "SALE_EDIT"
+      ? await processPosSaleEditOperation(client, operation, context)
+      : operation.operation_type === "SALE_CANCEL"
+        ? await processPosSaleCancelOperation(client, operation, context)
+        : await processPosSaleFoundationOperation(client, operation, context);
   await storeProcessedOperation(client, operation, context.deviceId, ack);
   return ack;
 };

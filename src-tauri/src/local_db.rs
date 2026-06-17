@@ -57,6 +57,8 @@ pub struct PendingSyncOperation {
     pub payload: serde_json::Value,
     pub created_at: Option<String>,
     pub retry_count: i64,
+    pub status: String,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2105,7 +2107,8 @@ fn pending_outbox_at(conn: &Connection, limit: i64) -> Result<Vec<PendingSyncOpe
         .prepare(
             "SELECT id, COALESCE(operation_id, id), entity_type, entity_id, operation_type,
                     branch_id, device_id, user_id, COALESCE(entity_version, version, 1),
-                    COALESCE(payload_json, payload), created_at, retry_count
+                    COALESCE(payload_json, payload), created_at, retry_count,
+                    COALESCE(status, 'pending'), last_error
              FROM sync_outbox
              WHERE LOWER(status) IN ('pending', 'failed')
              ORDER BY created_at, id
@@ -2129,6 +2132,8 @@ fn pending_outbox_at(conn: &Connection, limit: i64) -> Result<Vec<PendingSyncOpe
                 payload,
                 created_at: row.get(10)?,
                 retry_count: row.get(11)?,
+                status: row.get(12)?,
+                last_error: row.get(13)?,
             })
         })
         .map_err(to_error)?;

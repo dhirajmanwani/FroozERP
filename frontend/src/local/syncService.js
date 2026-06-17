@@ -1,5 +1,5 @@
 import axios from "axios";
-import { checkFroozBackendHealth } from "./connectivityService";
+import { checkFroozBackendHealth, getConnectivitySnapshot } from "./connectivityService";
 import { isTauriRuntime } from "./localDatabase";
 import { repositories } from "./repositories";
 
@@ -16,6 +16,13 @@ let lastStatus = {
   pendingOperations: 0,
   failedOperations: 0,
   conflictOperations: 0,
+  apiUrl: "",
+  backendUrl: "",
+  lastFailureKind: "",
+  lastHttpStatus: null,
+  syncStage: "",
+  syncProgressDone: 0,
+  syncProgressTotal: 0,
 };
 
 const clampBackoff = () => {
@@ -30,6 +37,10 @@ const withTimeout = (timeoutMs = 10000) => ({
   timeout: timeoutMs,
 });
 
+const normalizeApiUrl = (apiUrl) => String(apiUrl || "").replace(/\/$/, "");
+
+const endpointUrl = (apiUrl, path) => `${normalizeApiUrl(apiUrl)}${path}`;
+
 const normalizeLocalStatus = (status = {}) => ({
   ...lastStatus,
   lastPushAt: status.lastPushAt || lastStatus.lastPushAt,
@@ -41,6 +52,71 @@ const normalizeLocalStatus = (status = {}) => ({
   conflictOperations: Number(status.conflictOperations || 0),
   lastError: status.error || "",
 });
+
+const classifySyncError = (error) => {
+  const status = error.response?.status || null;
+  const serverMessage = error.response?.data?.message || error.response?.data?.error;
+  if (status) {
+    if (status === 401) {
+      return {
+        online: true,
+        kind: "AUTHORIZATION",
+        message: `Authorisation required - ${serverMessage || "sync user session is not valid."}`,
+        status,
+      };
+    }
+    if (status === 403) {
+      return {
+        online: true,
+        kind: "DEVICE_AUTHORIZATION",
+        message: `Authorisation required - ${serverMessage || "device is not authorised for sync."}`,
+        status,
+      };
+    }
+    if (status === 404) {
+      return {
+        online: true,
+        kind: "WRONG_ENDPOINT",
+        message: `Sync failed - endpoint not found (${status}). Check the sync API route and API base.`,
+        status,
+      };
+    }
+    if (status === 409) {
+      return {
+        online: true,
+        kind: "CONFLICT",
+        message: `Conflict - ${serverMessage || "server reported a sync conflict."}`,
+        status,
+      };
+    }
+    return {
+      online: true,
+      kind: status >= 500 ? "SERVER_ERROR" : "HTTP_ERROR",
+      message: `Sync failed - ${serverMessage || `backend returned HTTP ${status}.`}`,
+      status,
+    };
+  }
+  if (error.code === "ECONNABORTED") {
+    return { online: false, kind: "TIMEOUT", message: "Offline - backend sync request timed out.", status: null };
+  }
+  const message = error.message || "Sync failed";
+  const networkFailure = /network|refused|failed to fetch|timeout|unreachable|offline/i.test(message);
+  return {
+    online: !networkFailure,
+    kind: networkFailure ? "BACKEND_UNREACHABLE" : "CLIENT_ERROR",
+    message: networkFailure ? `Offline - backend unreachable (${message})` : `Sync failed - ${message}`,
+    status: null,
+  };
+};
+
+const logSyncEndpoint = (phase, apiUrl, path, extra = {}) => {
+  console.info("[FroozERP sync]", {
+    phase,
+    apiUrl: normalizeApiUrl(apiUrl),
+    endpoint: endpointUrl(apiUrl, path),
+    ...extra,
+  });
+};
 
 const syncContext = ({ user, deviceInfo, branchId }) => ({
   userId: user?.id,
@@ -59,10 +135,19 @@ export async function initialiseSync({ apiUrl, user, deviceInfo, branchId }) {
   lastStatus = normalizeLocalStatus(localStatus);
   const context = syncContext({ user, deviceInfo, branchId });
   if (!isTauriRuntime() || !context.userId || !context.deviceId) return lastStatus;
-  const online = await checkBackendHealth(apiUrl);
-  lastStatus = { ...lastStatus, online };
-  if (!online) return lastStatus;
-  await axios.post(`${apiUrl}/api/sync/register-device`, {
+  const health = await checkBackendHealth(apiUrl, { details: true, reason: "sync-initialise" });
+  lastStatus = {
+    ...lastStatus,
+    online: Boolean(health.online),
+    apiUrl: health.apiUrl || normalizeApiUrl(apiUrl),
+    backendUrl: health.url || endpointUrl(apiUrl, "/api/health"),
+    lastFailureKind: health.online ? "" : health.reasonCode,
+    lastHttpStatus: health.status || null,
+    lastError: health.online ? "" : health.message,
+  };
+  if (!health.online) return lastStatus;
+  logSyncEndpoint("register-device", apiUrl, "/api/sync/register-device", { deviceId: context.deviceId });
+  await axios.post(endpointUrl(apiUrl, "/api/sync/register-device"), {
     device_id: context.deviceId,
     device_name: context.deviceName || "FroozERP Device",
     platform: "tauri-windows",
@@ -77,7 +162,14 @@ export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId
   if (!isTauriRuntime() || !context.userId || !context.deviceId) return lastStatus;
   const operations = await repositories.outbox.pending(50);
   if (operations.length === 0) return normalizeLocalStatus(await repositories.status.get());
-  const response = await axios.post(`${apiUrl}/api/sync/push`, {
+  logSyncEndpoint("push", apiUrl, "/api/sync/push", { count: operations.length });
+  lastStatus = {
+    ...lastStatus,
+    syncStage: "push",
+    syncProgressDone: 0,
+    syncProgressTotal: operations.length,
+  };
+  const response = await axios.post(endpointUrl(apiUrl, "/api/sync/push"), {
     user_id: context.userId,
     device_id: context.deviceId,
     branch_id: context.branchId,
@@ -93,7 +185,15 @@ export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId
     })),
   }, withTimeout(15000));
   const status = await repositories.outbox.applyAcks(response.data?.acknowledgements || []);
-  lastStatus = { ...normalizeLocalStatus(status), online: true, lastError: "" };
+  lastStatus = {
+    ...normalizeLocalStatus(status),
+    online: true,
+    lastError: "",
+    apiUrl: normalizeApiUrl(apiUrl),
+    syncStage: "push",
+    syncProgressDone: operations.length,
+    syncProgressTotal: operations.length,
+  };
   return lastStatus;
 }
 
@@ -102,7 +202,8 @@ export async function pullServerChanges({ apiUrl, user, deviceInfo, branchId }) 
   if (!isTauriRuntime() || !context.userId || !context.deviceId) return lastStatus;
   const localStatus = await repositories.status.get();
   const cursor = localStatus.currentCursor || "0";
-  const response = await axios.get(`${apiUrl}/api/sync/pull`, {
+  logSyncEndpoint("pull", apiUrl, "/api/sync/pull", { cursor });
+  const response = await axios.get(endpointUrl(apiUrl, "/api/sync/pull"), {
     ...withTimeout(15000),
     params: {
       user_id: context.userId,
@@ -117,7 +218,7 @@ export async function pullServerChanges({ apiUrl, user, deviceInfo, branchId }) 
     nextCursor: response.data?.next_cursor || cursor,
     deviceId: context.deviceId,
   });
-  lastStatus = { ...normalizeLocalStatus(status), online: true, lastError: "" };
+  lastStatus = { ...normalizeLocalStatus(status), online: true, lastError: "", apiUrl: normalizeApiUrl(apiUrl), syncStage: "pull" };
   return { ...lastStatus, hasMore: Boolean(response.data?.has_more) };
 }
 
@@ -141,23 +242,38 @@ export async function getSyncStatus() {
 export async function syncNow({ apiUrl, user, deviceInfo, branchId }) {
   if (runningSync) return runningSync;
   runningSync = (async () => {
-    lastStatus = { ...lastStatus, syncing: true, lastError: "" };
+    lastStatus = { ...lastStatus, syncing: true, lastError: "", apiUrl: normalizeApiUrl(apiUrl), syncStage: "starting" };
     try {
       await initialiseSync({ apiUrl, user, deviceInfo, branchId });
-      if (!lastStatus.online) throw new Error("FroozERP backend is offline");
+      if (!lastStatus.online) {
+        const offlineError = new Error(lastStatus.lastError || getConnectivitySnapshot().message || "Offline - backend unreachable");
+        offlineError.froozConnectivity = true;
+        throw offlineError;
+      }
       await pushPendingOperations({ apiUrl, user, deviceInfo, branchId });
       let pullStatus = await pullServerChanges({ apiUrl, user, deviceInfo, branchId });
       while (pullStatus.hasMore) {
         pullStatus = await pullServerChanges({ apiUrl, user, deviceInfo, branchId });
       }
       resetBackoff();
-      lastStatus = { ...lastStatus, syncing: false, online: true, lastError: "" };
+      lastStatus = { ...lastStatus, syncing: false, online: true, lastError: "", syncStage: "idle", syncProgressDone: 0, syncProgressTotal: 0 };
       return lastStatus;
     } catch (error) {
       clampBackoff();
-      const message = error.response?.data?.message || error.message || "Sync failed";
+      const classified = classifySyncError(error);
+      const message = classified.message;
       const status = await repositories.status.fail(message);
-      lastStatus = { ...normalizeLocalStatus(status), syncing: false, online: false, lastError: message };
+      lastStatus = {
+        ...normalizeLocalStatus(status),
+        syncing: false,
+        online: classified.online,
+        lastError: message,
+        lastFailureKind: classified.kind,
+        lastHttpStatus: classified.status,
+        apiUrl: normalizeApiUrl(apiUrl),
+        backendUrl: endpointUrl(apiUrl, "/api/health"),
+        syncStage: "failed",
+      };
       return lastStatus;
     } finally {
       runningSync = null;

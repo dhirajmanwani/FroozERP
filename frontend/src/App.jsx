@@ -7764,6 +7764,7 @@ function SettingsModule({
       <BranchCounterSettings branches={settingsData.branches || []} canManage={canManage} counters={settingsData.counters || []} onReload={onReload} user={user} />
       <UpdateCenterSection canManage={canManage} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
       <SyncSettingsSection
+        backendHealth={backendHealth}
         canManage={canManage}
         key={settingsData.syncSettings?.updated_at || "sync-settings"}
         localDbStatus={localDbStatus}
@@ -8527,6 +8528,7 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
 }
 
 function SyncSettingsSection({
+  backendHealth,
   canManage,
   localDbStatus,
   onQueueSyncTest,
@@ -8539,17 +8541,7 @@ function SyncSettingsSection({
   user,
 }) {
   const [draft, setDraft] = useState(syncSettings || {});
-  const [online, setOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
   const [statusMessage, setStatusMessage] = useState("");
-  useEffect(() => {
-    const updateOnlineStatus = () => setOnline(navigator.onLine);
-    window.addEventListener("online", updateOnlineStatus);
-    window.addEventListener("offline", updateOnlineStatus);
-    return () => {
-      window.removeEventListener("online", updateOnlineStatus);
-      window.removeEventListener("offline", updateOnlineStatus);
-    };
-  }, []);
   const save = async () => {
     try {
       const response = await axios.put(`${API_URL}/settings/sync-status`, {
@@ -8568,13 +8560,22 @@ function SyncSettingsSection({
   const pending = Number(syncStatus?.pendingOperations ?? draft.pending_count ?? 0);
   const failed = Number(syncStatus?.failedOperations || 0);
   const conflicts = Number(syncStatus?.conflictOperations || 0);
-  const autoStatus = syncStatus?.syncing
-    ? "Syncing"
-    : pending > 0
-      ? "Sync Pending"
-      : syncStatus?.online || online
-        ? "Online"
-        : "Offline";
+  const backendOnline = backendHealth?.online === true || syncStatus?.online === true;
+  const syncTotal = Number(syncStatus?.syncProgressTotal || pending || 0);
+  const syncDone = Number(syncStatus?.syncProgressDone || 0);
+  const autoStatus = backendHealth?.online === false
+    ? "Offline - backend unreachable"
+    : ["AUTHORIZATION", "DEVICE_AUTHORIZATION"].includes(syncStatus?.lastFailureKind)
+      ? "Authorisation required"
+      : conflicts > 0
+        ? "Conflict"
+        : syncStatus?.syncing
+          ? `Online - syncing ${syncDone} of ${syncTotal}`
+          : backendOnline && pending > 0
+            ? `Online - ${pending} changes pending`
+            : backendOnline
+              ? "Online - all changes synced"
+              : "Backend status not checked";
   const nativeDbLabel = localDbStatus?.available
     ? localDbStatus.initialized ? "Local SQLite Ready" : "Local SQLite Error"
     : "Browser Mode";
@@ -8599,6 +8600,10 @@ function SyncSettingsSection({
         <Field label="Local Schema Version"><input disabled value={localDbStatus?.schemaVersion || "Not initialized"} /></Field>
         <Field label="Last Push"><input disabled value={lastPush ? new Date(lastPush).toLocaleString("en-IN") : "Not pushed"} /></Field>
         <Field label="Last Pull"><input disabled value={lastPull ? new Date(lastPull).toLocaleString("en-IN") : "Not pulled"} /></Field>
+        <Field label="Settings API Base"><input disabled value={backendHealth?.apiUrl || API_URL} /></Field>
+        <Field label="Sync Worker API Base"><input disabled value={syncStatus?.apiUrl || API_URL} /></Field>
+        <Field label="Backend Health URL"><input disabled value={backendHealth?.url || `${API_URL}/api/health`} /></Field>
+        <Field label="Last Sync Failure"><input disabled value={syncStatus?.lastError || backendHealth?.message || "None"} /></Field>
         <Field label="Current Cursor"><input disabled value={syncStatus?.currentCursor || "0"} /></Field>
         <label className="check-field"><input checked={draft.sync_enabled === true} disabled type="checkbox" /><span>Phase 2 sync foundation enabled for approved native devices</span></label>
         <Field label="Notes"><textarea disabled value={draft.notes || "Cloud sync foundation is active for reference data and safe test entities."} /></Field>
