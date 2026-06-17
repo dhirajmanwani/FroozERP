@@ -6,6 +6,7 @@ const os = require("os");
 const path = require("path");
 const { execFile } = require("child_process");
 const { Pool, types } = require("pg");
+const nodemailer = require("nodemailer");
 
 types.setTypeParser(1082, (value) => value);
 
@@ -26,6 +27,11 @@ const allowedCorsOrigins = String(process.env.CORS_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
+const allowedTauriCorsOrigins = new Set([
+  "tauri://localhost",
+  "http://tauri.localhost",
+  "https://tauri.localhost",
+]);
 
 const isPrivateNetworkHost = (hostname) =>
   hostname === "localhost" ||
@@ -39,6 +45,7 @@ app.use(cors({
   origin(origin, callback) {
     if (!origin) return callback(null, true);
     if (allowedCorsOrigins.includes("*") || allowedCorsOrigins.includes(origin)) return callback(null, true);
+    if (allowedTauriCorsOrigins.has(origin)) return callback(null, true);
     try {
       const parsed = new URL(origin);
       if (isPrivateNetworkHost(parsed.hostname)) return callback(null, true);
@@ -71,6 +78,51 @@ const hashPassword = (password) =>
 const hashActivationCode = (code) =>
   crypto.createHash("sha256").update(String(code || "").trim().toUpperCase(), "utf8").digest("hex");
 const generateActivationCode = () => `FTF-${crypto.randomBytes(3).toString("hex").toUpperCase()}-${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
+const normalizeUsername = (value) => cleanText(value).toLowerCase();
+const normalizePhone = (value) => cleanText(value).replace(/[^\d+]/g, "");
+const hashSensitiveValue = (value) =>
+  crypto.createHash("sha256").update(String(value || "").trim().toLowerCase(), "utf8").digest("hex");
+const recoveryOtpSecret = process.env.RECOVERY_OTP_HASH_SECRET || process.env.OTP_HASH_SECRET || process.env.DB_PASSWORD || "froozerp-local-dev-otp-secret";
+const recoveryGenericMessage = "If the provided information matches an eligible account, a verification code will be sent.";
+const recoveryDevOtpEnabled = /^true$/i.test(process.env.RECOVERY_DEV_OTP_ENABLED || "") && process.env.NODE_ENV !== "production";
+const generateOtpCode = () => String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+const generateTemporaryPassword = () => `FZ-${crypto.randomBytes(4).toString("hex").toUpperCase()}-${crypto.randomInt(1000, 9999)}`;
+const hashOtp = (requestId, otp) =>
+  crypto.createHmac("sha256", recoveryOtpSecret).update(`${requestId}:${String(otp || "").trim()}`).digest("hex");
+const hashRecoveryToken = (requestId, token) =>
+  crypto.createHmac("sha256", recoveryOtpSecret).update(`token:${requestId}:${String(token || "")}`).digest("hex");
+const maskEmail = (email) => {
+  const value = cleanText(email);
+  const [name, domain] = value.split("@");
+  if (!name || !domain) return "";
+  return `${name.slice(0, 1)}***@${domain}`;
+};
+const maskMobile = (mobile) => {
+  const value = normalizePhone(mobile);
+  if (!value) return "";
+  return `${"*".repeat(Math.max(4, value.length - 4))}${value.slice(-4)}`;
+};
+const normalizeRecoveryEmail = (email) => {
+  const value = cleanText(email).toLowerCase();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) ? value : "";
+};
+const normalizeRecoveryMobile = (mobile) => {
+  const digits = cleanText(mobile).replace(/[^\d]/g, "");
+  if (digits.length === 10) return `+91${digits}`;
+  if (digits.length === 12 && digits.startsWith("91")) return `+${digits}`;
+  return "";
+};
+const buildOtpEmailHtml = ({ code, purpose }) => `
+  <div style="font-family:Arial,sans-serif;background:#0f172a;padding:24px;color:#e2e8f0">
+    <div style="max-width:520px;margin:auto;background:#1e293b;border:1px solid #334155;border-radius:12px;padding:24px">
+      <h2 style="margin:0 0 8px;color:#f8fafc">FroozERP Verification Code</h2>
+      <p style="margin:0 0 18px;color:#cbd5e1">Use this code to ${purpose === "username" ? "recover your username" : purpose === "contact" ? "verify your recovery contact" : "reset your password"}.</p>
+      <div style="font-size:32px;letter-spacing:8px;font-weight:800;color:#fbbf24">${code}</div>
+      <p style="margin:18px 0 0;color:#94a3b8">This code expires in 10 minutes. If you did not request this, contact your Owner/Admin.</p>
+      <p style="margin:14px 0 0;color:#94a3b8">FroozERP - Feel the Freakin' Frooz<br/>SRT Company</p>
+    </div>
+  </div>
+`;
 const getLanIpAddresses = () => Object.values(os.networkInterfaces())
   .flat()
   .filter((entry) => entry && entry.family === "IPv4" && !entry.internal)
@@ -194,6 +246,315 @@ const requireRateManager = async (userId, client = pool) => {
   return user && RATE_MANAGER_ROLES.has(user.role_name) ? user : null;
 };
 
+const writeAuthAudit = async ({ userId = null, actorUserId = null, username = "", action, safeCode = "", deviceId = "", ipAddress = "", details = {} }, client = pool) => {
+  try {
+    await client.query(
+      `
+      INSERT INTO auth_audit_log (user_id, actor_user_id, username, action, safe_code, device_id, ip_address, details)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+      `,
+      [
+        parsePositiveInteger(userId),
+        parsePositiveInteger(actorUserId),
+        cleanText(username) || null,
+        cleanText(action) || "AUTH_EVENT",
+        cleanText(safeCode) || null,
+        cleanText(deviceId) || null,
+        cleanText(ipAddress) || null,
+        JSON.stringify(details || {}),
+      ]
+    );
+  } catch (error) {
+    console.error("Auth audit failed", error.message || error);
+  }
+};
+
+const authFailure = async (res, { status = 401, code = "INVALID_CREDENTIALS", publicMessage = "Invalid username or password.", userId = null, username = "", deviceId = "", ipAddress = "", details = {} }) => {
+  await writeAuthAudit({ userId, username, action: "LOGIN_FAILED", safeCode: code, deviceId, ipAddress, details });
+  return res.status(status).json({ code, message: publicMessage });
+};
+
+const getRecoveryProviderStatus = () => ({
+  email: process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS ? "configured" : "not_configured",
+  sms: process.env.SMS_PROVIDER_URL && (process.env.SMS_PROVIDER_TOKEN || process.env.SMS_PROVIDER_API_KEY) ? "configured" : "not_configured",
+  development: recoveryDevOtpEnabled ? "enabled" : "disabled",
+});
+
+const sendEmailOtp = async ({ to, code, purpose }) => {
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    return { delivered: false, provider: "EmailOtpProvider", status: "not_configured" };
+  }
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: /^true$/i.test(process.env.SMTP_SECURE || ""),
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
+    },
+  });
+  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
+  const info = await transporter.sendMail({
+    from,
+    to,
+    subject: "Your FroozERP verification code",
+    text: `Your FroozERP verification code is ${code}. It expires in 10 minutes.`,
+    html: buildOtpEmailHtml({ code, purpose }),
+  });
+  return { delivered: true, provider: "EmailOtpProvider", status: "accepted", message_id: info.messageId };
+};
+
+const sendSmsOtp = async ({ to, code }) => {
+  if (!process.env.SMS_PROVIDER_URL || !(process.env.SMS_PROVIDER_TOKEN || process.env.SMS_PROVIDER_API_KEY)) {
+    return { delivered: false, provider: "SmsOtpProvider", status: "not_configured" };
+  }
+  const template = process.env.SMS_PROVIDER_TEMPLATE || "Your FroozERP verification code is {{otp}}. It expires in 10 minutes.";
+  const body = {
+    to,
+    message: template.replace("{{otp}}", code),
+    sender: process.env.SMS_SENDER_ID || "FROOZ",
+    template_id: process.env.SMS_TEMPLATE_ID || undefined,
+  };
+  const headers = { "Content-Type": "application/json" };
+  if (process.env.SMS_PROVIDER_TOKEN) headers.Authorization = `Bearer ${process.env.SMS_PROVIDER_TOKEN}`;
+  if (process.env.SMS_PROVIDER_API_KEY) headers["x-api-key"] = process.env.SMS_PROVIDER_API_KEY;
+  const response = await fetch(process.env.SMS_PROVIDER_URL, {
+    method: process.env.SMS_PROVIDER_METHOD || "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+  const responseText = await response.text();
+  if (!response.ok) {
+    return { delivered: false, provider: "SmsOtpProvider", status: "provider_rejected", http_status: response.status, response: responseText.slice(0, 180) };
+  }
+  return { delivered: true, provider: "SmsOtpProvider", status: "accepted", http_status: response.status };
+};
+
+const sendRecoveryOtp = async ({ method, contact, code, purpose }) => {
+  const providerStatus = getRecoveryProviderStatus();
+  if (method === "email" && providerStatus.email === "configured") {
+    return sendEmailOtp({ to: contact, code, purpose });
+  }
+  if (method === "mobile" && providerStatus.sms === "configured") {
+    return sendSmsOtp({ to: contact, code, purpose });
+  }
+  if (recoveryDevOtpEnabled) {
+    return { delivered: true, provider: "DevelopmentOtpProvider", status: "development_only", development_code: code, purpose };
+  }
+  return { delivered: false, provider: method === "email" ? "EmailOtpProvider" : "SmsOtpProvider", status: "not_configured" };
+};
+
+const sendRecoveryNotification = async ({ method, contact, subject, message, html }) => {
+  const providerStatus = getRecoveryProviderStatus();
+  if (method === "email") {
+    if (providerStatus.email !== "configured") return { delivered: false, provider: "EmailOtpProvider", status: "not_configured" };
+    const transporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: /^true$/i.test(process.env.SMTP_SECURE || ""),
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS,
+      },
+    });
+    const info = await transporter.sendMail({
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: contact,
+      subject,
+      text: message,
+      html,
+    });
+    return { delivered: true, provider: "EmailOtpProvider", status: "accepted", message_id: info.messageId };
+  }
+  if (providerStatus.sms !== "configured") return { delivered: false, provider: "SmsOtpProvider", status: "not_configured" };
+  const headers = { "Content-Type": "application/json" };
+  if (process.env.SMS_PROVIDER_TOKEN) headers.Authorization = `Bearer ${process.env.SMS_PROVIDER_TOKEN}`;
+  if (process.env.SMS_PROVIDER_API_KEY) headers["x-api-key"] = process.env.SMS_PROVIDER_API_KEY;
+  const response = await fetch(process.env.SMS_PROVIDER_URL, {
+    method: process.env.SMS_PROVIDER_METHOD || "POST",
+    headers,
+    body: JSON.stringify({
+      to: contact,
+      message,
+      sender: process.env.SMS_SENDER_ID || "FROOZ",
+      template_id: process.env.SMS_TEMPLATE_ID || undefined,
+    }),
+  });
+  const responseText = await response.text();
+  if (!response.ok) {
+    return { delivered: false, provider: "SmsOtpProvider", status: "provider_rejected", http_status: response.status, response: responseText.slice(0, 180) };
+  }
+  return { delivered: true, provider: "SmsOtpProvider", status: "accepted", http_status: response.status };
+};
+
+const findRecoveryUser = async (identifier, client = pool) => {
+  const text = cleanText(identifier);
+  const phone = normalizePhone(text);
+  if (!text) return null;
+  const result = await client.query(
+    `
+    SELECT
+      u.id, u.full_name, u.username, u.active, u.mobile_number, u.email,
+      u.verified_email, u.verified_mobile, u.recovery_enabled,
+      u.recovery_email, u.recovery_email_verified, u.recovery_email_verified_at,
+      u.recovery_mobile, u.recovery_mobile_verified, u.recovery_mobile_verified_at,
+      u.staff_self_recovery_enabled, u.force_password_change,
+      r.role_name
+    FROM users u
+    JOIN roles r ON r.id = u.role_id
+    WHERE LOWER(u.username) = LOWER($1)
+       OR ($2 <> '' AND LOWER(COALESCE(u.recovery_email, u.verified_email, '')) = LOWER($2))
+       OR ($3 <> '' AND COALESCE(u.recovery_mobile, u.verified_mobile, '') = $3)
+    ORDER BY CASE WHEN LOWER(u.username) = LOWER($1) THEN 0 ELSE 1 END, u.id
+    LIMIT 1
+    `,
+    [text, text, phone]
+  );
+  return result.rows[0] || null;
+};
+
+const getRecoveryMethodsForUser = (user) => {
+  if (!user) return [];
+  const roleName = String(user.role_name || "");
+  const manager = RATE_MANAGER_ROLES.has(roleName);
+  if (!manager && user.staff_self_recovery_enabled !== true) return [];
+  const methods = [];
+  const email = cleanText(user.recovery_email || user.verified_email);
+  const mobile = cleanText(user.recovery_mobile || user.verified_mobile);
+  const emailVerified = user.recovery_email_verified === true || (!user.recovery_email && Boolean(user.verified_email));
+  const mobileVerified = user.recovery_mobile_verified === true || (!user.recovery_mobile && Boolean(user.verified_mobile));
+  if (email && emailVerified) methods.push({ method: "email", label: `Email: ${maskEmail(email)}` });
+  if (mobile && mobileVerified) methods.push({ method: "mobile", label: `Mobile: ${maskMobile(mobile)}` });
+  return methods;
+};
+
+const ensureRecoveryEligible = (user) => {
+  if (!user) return { ok: false, code: "GENERIC_RESPONSE", message: recoveryGenericMessage };
+  if (user.active === false) return { ok: false, code: "USER_DISABLED", message: "This account is disabled. Contact your Owner or Administrator." };
+  if (user.recovery_enabled === false) return { ok: false, code: "RECOVERY_NOT_ENABLED", message: "Account recovery is not enabled for this user." };
+  const roleName = String(user.role_name || "");
+  const manager = RATE_MANAGER_ROLES.has(roleName);
+  if (!manager && user.staff_self_recovery_enabled !== true) {
+    return {
+      ok: false,
+      code: "STAFF_OWNER_ASSISTANCE_REQUIRED",
+      message: "Account assistance required. For the security of your business, staff login recovery is managed by your authorised Owner or Administrator.",
+    };
+  }
+  const methods = getRecoveryMethodsForUser(user);
+  if (!methods.length) {
+    return { ok: false, code: "RECOVERY_CONTACT_NOT_CONFIGURED", message: "No verified recovery email or mobile is configured for this account." };
+  }
+  return { ok: true, methods };
+};
+
+const getSupportContacts = async ({ staffOnly = false } = {}) => {
+  const result = await pool.query(
+    `
+    SELECT label, contact_type, contact_value
+    FROM owner_admin_support_contacts
+    WHERE active = TRUE
+      AND ($1::BOOLEAN = FALSE OR visible_to_staff = TRUE)
+    ORDER BY id
+    `,
+    [staffOnly]
+  );
+  return result.rows;
+};
+
+const requireSelfOrRateManager = async (targetUserId, actorUserId, client = pool) => {
+  const parsedTarget = parsePositiveInteger(targetUserId);
+  const parsedActor = parsePositiveInteger(actorUserId);
+  if (!parsedTarget || !parsedActor) return null;
+  if (parsedTarget === parsedActor) {
+    const result = await client.query(
+      `
+      SELECT u.id, u.full_name, u.username, r.role_name
+      FROM users u
+      JOIN roles r ON r.id = u.role_id
+      WHERE u.id = $1 AND u.active = TRUE
+      `,
+      [parsedActor]
+    );
+    return result.rows[0] || null;
+  }
+  return requireRateManager(parsedActor, client);
+};
+
+const createOtpRequest = async ({ client = pool, user, purpose, method, contact, req, deviceId = "" }) => {
+  const requestId = `rec_${crypto.randomUUID()}`;
+  const otp = generateOtpCode();
+  await client.query(
+    `
+    UPDATE account_recovery_requests
+    SET invalidated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+    WHERE user_id = $1 AND purpose = $2 AND method = $3 AND used_at IS NULL AND invalidated_at IS NULL
+    `,
+    [user.id, purpose, method]
+  );
+  await client.query(
+    `
+    INSERT INTO account_recovery_requests (
+      request_id, user_id, purpose, method, contact_hash, otp_hash,
+      expires_at, resend_available_at, requested_ip, requested_device_id, user_agent
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP + INTERVAL '10 minutes',
+            CURRENT_TIMESTAMP + INTERVAL '60 seconds', $7, $8, $9)
+    `,
+    [
+      requestId,
+      user.id,
+      purpose,
+      method,
+      hashSensitiveValue(contact),
+      hashOtp(requestId, otp),
+      req.ip,
+      deviceId,
+      cleanText(req.get("user-agent")),
+    ]
+  );
+  const delivery = await sendRecoveryOtp({ method, contact, code: otp, purpose });
+  return { requestId, otp, delivery };
+};
+
+const invalidateOtpRequest = async (requestId, client = pool) => {
+  if (!requestId) return;
+  await client.query(
+    "UPDATE account_recovery_requests SET invalidated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE request_id = $1 AND used_at IS NULL",
+    [requestId]
+  );
+};
+
+const verifyOtpRequest = async ({ requestId, otp, purpose, client = pool }) => {
+  const result = await client.query(
+    `
+    SELECT rr.*, u.username, u.active, u.full_name
+    FROM account_recovery_requests rr
+    JOIN users u ON u.id = rr.user_id
+    WHERE rr.request_id = $1
+    LIMIT 1
+    `,
+    [requestId]
+  );
+  const request = result.rows[0];
+  if (!request || request.purpose !== purpose || request.used_at || request.invalidated_at || new Date(request.expires_at).getTime() <= Date.now()) {
+    return { ok: false, status: 400, code: "OTP_EXPIRED_OR_INVALID", message: "The verification code is invalid or expired." };
+  }
+  if (Number(request.attempt_count || 0) >= 5) {
+    return { ok: false, status: 429, code: "OTP_ATTEMPTS_EXCEEDED", message: "Too many incorrect verification attempts." };
+  }
+  const expected = Buffer.from(request.otp_hash, "hex");
+  const actual = Buffer.from(hashOtp(requestId, otp), "hex");
+  if (expected.length !== actual.length || !crypto.timingSafeEqual(expected, actual)) {
+    await client.query(
+      "UPDATE account_recovery_requests SET attempt_count = COALESCE(attempt_count, 0) + 1, updated_at = CURRENT_TIMESTAMP WHERE request_id = $1",
+      [requestId]
+    );
+    return { ok: false, status: 400, code: "OTP_INVALID", message: "The verification code is invalid or expired.", request };
+  }
+  return { ok: true, request };
+};
+
 const getPermissionUser = async (userId, permissionKey, defaultRoles = [], client = pool) => {
   const parsedUserId = parsePositiveInteger(userId);
   if (!parsedUserId || !PERMISSION_KEYS.includes(permissionKey)) return null;
@@ -271,8 +632,75 @@ const initializeDatabase = async () => {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS counter_id INTEGER REFERENCES counters(id);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS verified_email VARCHAR(180);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS verified_mobile VARCHAR(30);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_email VARCHAR(180);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_email_verified BOOLEAN DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_email_verified_at TIMESTAMP;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_recovery_email VARCHAR(180);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_mobile VARCHAR(30);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_mobile_verified BOOLEAN DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_mobile_verified_at TIMESTAMP;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_recovery_mobile VARCHAR(30);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_enabled BOOLEAN DEFAULT TRUE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS staff_self_recovery_enabled BOOLEAN DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS force_password_change BOOLEAN DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS session_revocation_version INTEGER DEFAULT 0;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP;
     CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_unique_idx
       ON users (LOWER(username));
+
+    CREATE TABLE IF NOT EXISTS auth_audit_log (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id),
+      actor_user_id INTEGER REFERENCES users(id),
+      username VARCHAR(120),
+      action VARCHAR(80) NOT NULL,
+      safe_code VARCHAR(80),
+      device_id VARCHAR(160),
+      ip_address VARCHAR(80),
+      details JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS account_recovery_requests (
+      request_id VARCHAR(80) PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id),
+      purpose VARCHAR(40) NOT NULL,
+      method VARCHAR(20) NOT NULL,
+      contact_hash VARCHAR(128) NOT NULL,
+      otp_hash VARCHAR(128) NOT NULL,
+      expires_at TIMESTAMP NOT NULL,
+      attempt_count INTEGER DEFAULT 0,
+      resend_available_at TIMESTAMP,
+      used_at TIMESTAMP,
+      invalidated_at TIMESTAMP,
+      verified_at TIMESTAMP,
+      verification_token_hash VARCHAR(128),
+      verification_expires_at TIMESTAMP,
+      requested_ip VARCHAR(80),
+      requested_device_id VARCHAR(160),
+      user_agent TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS account_recovery_user_idx
+      ON account_recovery_requests (user_id, purpose, created_at DESC);
+    CREATE INDEX IF NOT EXISTS account_recovery_contact_idx
+      ON account_recovery_requests (contact_hash, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS owner_admin_support_contacts (
+      id SERIAL PRIMARY KEY,
+      label VARCHAR(120) NOT NULL,
+      contact_type VARCHAR(30) NOT NULL,
+      contact_value VARCHAR(180) NOT NULL,
+      visible_to_staff BOOLEAN DEFAULT FALSE,
+      active BOOLEAN DEFAULT TRUE,
+      updated_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
     CREATE TABLE IF NOT EXISTS sales (
       id SERIAL PRIMARY KEY,
@@ -3656,6 +4084,8 @@ const readUserPayload = (body) => ({
   username: cleanText(body.username),
   mobile_number: nullableText(body.mobile_number),
   email: nullableText(body.email),
+  recovery_enabled: body.recovery_enabled !== false,
+  staff_self_recovery_enabled: body.staff_self_recovery_enabled === true,
   role: cleanText(body.role || "Cashier"),
   active: body.active !== false,
   joining_date: body.joining_date || toDateKey(new Date()),
@@ -3716,6 +4146,12 @@ app.get("/users", async (req, res) => {
       SELECT
         u.id, u.full_name, u.username, u.mobile_number, u.email, u.active,
         u.joining_date, u.notes, u.last_login_at, u.created_at, u.updated_at,
+        u.verified_email, u.verified_mobile, u.recovery_enabled,
+        u.recovery_email, u.recovery_email_verified, u.recovery_email_verified_at,
+        u.recovery_mobile, u.recovery_mobile_verified, u.recovery_mobile_verified_at,
+        u.pending_recovery_email, u.pending_recovery_mobile,
+        u.staff_self_recovery_enabled, u.force_password_change,
+        u.session_revocation_version, u.locked_until,
         r.role_name AS role, b.branch_name AS branch
       FROM users u
       LEFT JOIN roles r ON r.id = u.role_id
@@ -3747,15 +4183,18 @@ app.post("/users", async (req, res) => {
       `
       INSERT INTO users (
         full_name, username, password_hash, role_id, branch_id, active,
-        mobile_number, email, joining_date, notes, updated_at
+        mobile_number, email, recovery_enabled, staff_self_recovery_enabled,
+        joining_date, notes, updated_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
-      RETURNING id, full_name, username, mobile_number, email, active, joining_date, notes, created_at, updated_at
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP)
+      RETURNING id, full_name, username, mobile_number, email, verified_email, verified_mobile, recovery_email, recovery_email_verified, recovery_mobile, recovery_mobile_verified, recovery_enabled, staff_self_recovery_enabled, active, joining_date, notes, created_at, updated_at
       `,
       [
         payload.full_name, payload.username, hashPassword(password), roleId,
         parsePositiveInteger(req.body.branch_id) || manager.branch_id || 1,
-        payload.active, payload.mobile_number, payload.email, payload.joining_date, payload.notes,
+        payload.active, payload.mobile_number, payload.email,
+        payload.recovery_enabled, payload.staff_self_recovery_enabled,
+        payload.joining_date, payload.notes,
       ]
     );
     return res.status(201).json({ ...result.rows[0], role: payload.role });
@@ -3783,11 +4222,17 @@ app.put("/users/:id", async (req, res) => {
       UPDATE users
       SET full_name = $1, username = $2, role_id = $3, active = $4,
           mobile_number = $5, email = $6, joining_date = $7, notes = $8,
+          recovery_enabled = $9, staff_self_recovery_enabled = $10,
           updated_at = CURRENT_TIMESTAMP
-      WHERE id = $9
-      RETURNING id, full_name, username, mobile_number, email, active, joining_date, notes, last_login_at, created_at, updated_at
+      WHERE id = $11
+      RETURNING id, full_name, username, mobile_number, email, verified_email, verified_mobile, recovery_email, recovery_email_verified, recovery_mobile, recovery_mobile_verified, recovery_enabled, staff_self_recovery_enabled, active, joining_date, notes, last_login_at, created_at, updated_at
       `,
-      [payload.full_name, payload.username, roleId, payload.active, payload.mobile_number, payload.email, payload.joining_date, payload.notes, userId]
+      [
+        payload.full_name, payload.username, roleId, payload.active,
+        payload.mobile_number, payload.email, payload.joining_date, payload.notes,
+        payload.recovery_enabled, payload.staff_self_recovery_enabled,
+        userId,
+      ]
     );
     return result.rows[0] ? res.json({ ...result.rows[0], role: payload.role }) : res.status(404).json({ message: "User not found" });
   } catch (error) {
@@ -3806,9 +4251,28 @@ app.put("/users/:id/password", async (req, res) => {
     if (!userId || (!manager && actorId !== userId)) return res.status(403).json({ message: "Not allowed to change this password" });
     if (password.length < 4 || password !== confirmPassword) return res.status(400).json({ message: "Enter matching password with at least 4 characters" });
     const result = await pool.query(
-      "UPDATE users SET password_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING id",
+      `
+      UPDATE users
+      SET password_hash = $1,
+          password_changed_at = CURRENT_TIMESTAMP,
+          session_revocation_version = COALESCE(session_revocation_version, 0) + 1,
+          force_password_change = FALSE,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+      RETURNING id, username
+      `,
       [hashPassword(password), userId]
     );
+    if (result.rows[0]) {
+      await writeAuthAudit({
+        userId,
+        actorUserId: actorId,
+        username: result.rows[0].username,
+        action: manager ? "ADMIN_PASSWORD_RESET" : "USER_PASSWORD_CHANGE",
+        safeCode: "PASSWORD_UPDATED",
+        ipAddress: req.ip,
+      });
+    }
     return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "User not found" });
   } catch (error) {
     console.error(error);
@@ -3859,6 +4323,685 @@ app.delete("/users/:id", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Deleting User" });
+  }
+});
+
+app.get("/auth/recovery/config", async (req, res) => {
+  try {
+    const supportContacts = await getSupportContacts({ staffOnly: true });
+    return res.json({
+      provider_status: getRecoveryProviderStatus(),
+      support_contacts: supportContacts,
+      public_message: recoveryGenericMessage,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ code: "RECOVERY_CONFIG_ERROR", message: "Unable to load recovery configuration" });
+  }
+});
+
+app.get("/auth/recovery/profile", async (req, res) => {
+  try {
+    const userId = parsePositiveInteger(req.query.user_id);
+    const actor = await requireSelfOrRateManager(userId, req.query.updated_by || req.query.user_id);
+    if (!actor) return res.status(403).json({ code: "BRANCH_ACCESS_DENIED", message: "Not allowed to view recovery profile" });
+    const result = await pool.query(
+      `
+      SELECT id, username, full_name, recovery_enabled,
+             recovery_email, recovery_email_verified, recovery_email_verified_at, pending_recovery_email,
+             recovery_mobile, recovery_mobile_verified, recovery_mobile_verified_at, pending_recovery_mobile
+      FROM users
+      WHERE id = $1
+      `,
+      [userId]
+    );
+    const profile = result.rows[0];
+    if (!profile) return res.status(404).json({ code: "USER_NOT_FOUND", message: "User not found" });
+    return res.json({
+      ...profile,
+      masked_recovery_email: maskEmail(profile.recovery_email),
+      masked_recovery_mobile: maskMobile(profile.recovery_mobile),
+      provider_status: getRecoveryProviderStatus(),
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ code: "RECOVERY_PROFILE_ERROR", message: "Unable to load recovery profile" });
+  }
+});
+
+app.post("/auth/recovery/contact/request", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = parsePositiveInteger(req.body.user_id);
+    const actor = await requireSelfOrRateManager(userId, req.body.updated_by || req.body.user_id, client);
+    const contactType = cleanText(req.body.contact_type).toLowerCase();
+    if (!actor) return res.status(403).json({ code: "BRANCH_ACCESS_DENIED", message: "Not allowed to update recovery contact" });
+    if (!["email", "mobile"].includes(contactType)) return res.status(400).json({ code: "INVALID_CONTACT_TYPE", message: "Select email or mobile recovery contact." });
+    const normalized = contactType === "email"
+      ? normalizeRecoveryEmail(req.body.contact_value)
+      : normalizeRecoveryMobile(req.body.contact_value);
+    if (!normalized) {
+      return res.status(400).json({
+        code: "INVALID_RECOVERY_CONTACT",
+        message: contactType === "email" ? "Enter a valid recovery email address." : "Enter a valid Indian mobile number.",
+      });
+    }
+    const duplicateResult = await client.query(
+      `
+      SELECT id, username
+      FROM users
+      WHERE id <> $1
+        AND (
+          ($2 = 'email' AND LOWER(COALESCE(recovery_email, verified_email, '')) = LOWER($3))
+          OR ($2 = 'mobile' AND COALESCE(recovery_mobile, verified_mobile, '') = $3)
+        )
+      LIMIT 1
+      `,
+      [userId, contactType, normalized]
+    );
+    if (duplicateResult.rows[0]) {
+      return res.status(409).json({ code: "RECOVERY_CONTACT_IN_USE", message: "This recovery contact is already configured for another user." });
+    }
+    const userResult = await client.query("SELECT id, username, full_name FROM users WHERE id = $1 AND active = TRUE", [userId]);
+    const targetUser = userResult.rows[0];
+    if (!targetUser) return res.status(404).json({ code: "USER_NOT_FOUND", message: "User not found" });
+    const method = contactType === "email" ? "email" : "mobile";
+    const delivery = await createOtpRequest({
+      client,
+      user: targetUser,
+      purpose: contactType === "email" ? "contact_email" : "contact_mobile",
+      method,
+      contact: normalized,
+      req,
+      deviceId: cleanText(req.body.device_id),
+    });
+    if (!delivery.delivery.delivered) {
+      await invalidateOtpRequest(delivery.requestId, client);
+      return res.status(503).json({
+        code: method === "email" ? "EMAIL_PROVIDER_NOT_CONFIGURED" : "SMS_PROVIDER_NOT_CONFIGURED",
+        message: method === "email"
+          ? "Email recovery is not configured. Ask the administrator to configure SMTP settings."
+          : "SMS recovery is not configured. Please use verified email recovery or contact the administrator.",
+        provider_status: getRecoveryProviderStatus(),
+        delivery_status: delivery.delivery.status,
+      });
+    }
+    await client.query("BEGIN");
+    await client.query(
+      contactType === "email"
+        ? "UPDATE users SET pending_recovery_email = $1, recovery_email_verified = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
+        : "UPDATE users SET pending_recovery_mobile = $1, recovery_mobile_verified = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+      [normalized, userId]
+    );
+    await writeAuthAudit({
+      userId,
+      actorUserId: actor.id,
+      username: targetUser.username,
+      action: contactType === "email" ? "RECOVERY_EMAIL_OTP_REQUESTED" : "RECOVERY_MOBILE_OTP_REQUESTED",
+      safeCode: "OTP_REQUESTED",
+      deviceId: cleanText(req.body.device_id),
+      ipAddress: req.ip,
+      details: { method, provider: delivery.delivery.provider },
+    }, client);
+    await client.query("COMMIT");
+    return res.json({
+      success: true,
+      code: "OTP_SENT",
+      request_id: delivery.requestId,
+      masked_contact: contactType === "email" ? maskEmail(normalized) : maskMobile(normalized),
+      provider_status: getRecoveryProviderStatus(),
+      development_otp: recoveryDevOtpEnabled ? delivery.delivery.development_code : undefined,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error(error);
+    return res.status(500).json({ code: "RECOVERY_CONTACT_REQUEST_ERROR", message: "Unable to send recovery contact verification code" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/auth/recovery/contact/verify", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = parsePositiveInteger(req.body.user_id);
+    const actor = await requireSelfOrRateManager(userId, req.body.updated_by || req.body.user_id, client);
+    const contactType = cleanText(req.body.contact_type).toLowerCase();
+    if (!actor) return res.status(403).json({ code: "BRANCH_ACCESS_DENIED", message: "Not allowed to verify recovery contact" });
+    if (!["email", "mobile"].includes(contactType)) return res.status(400).json({ code: "INVALID_CONTACT_TYPE", message: "Select email or mobile recovery contact." });
+    const purpose = contactType === "email" ? "contact_email" : "contact_mobile";
+    await client.query("BEGIN");
+    const verification = await verifyOtpRequest({ requestId: cleanText(req.body.request_id), otp: cleanText(req.body.otp), purpose, client });
+    if (!verification.ok) {
+      await writeAuthAudit({
+        userId,
+        actorUserId: actor.id,
+        action: contactType === "email" ? "RECOVERY_EMAIL_OTP_FAILED" : "RECOVERY_MOBILE_OTP_FAILED",
+        safeCode: verification.code,
+        deviceId: cleanText(req.body.device_id),
+        ipAddress: req.ip,
+      }, client);
+      await client.query("COMMIT");
+      return res.status(verification.status).json({ code: verification.code, message: verification.message });
+    }
+    if (Number(verification.request.user_id) !== Number(userId)) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ code: "RECOVERY_REQUEST_MISMATCH", message: "Verification request does not match this user." });
+    }
+    const pendingColumn = contactType === "email" ? "pending_recovery_email" : "pending_recovery_mobile";
+    const pendingResult = await client.query(`SELECT username, ${pendingColumn} AS pending_contact FROM users WHERE id = $1 FOR UPDATE`, [userId]);
+    const pendingContact = pendingResult.rows[0]?.pending_contact;
+    if (!pendingContact) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ code: "NO_PENDING_CONTACT", message: "No pending recovery contact is waiting for verification." });
+    }
+    await client.query(
+      contactType === "email"
+        ? `UPDATE users
+           SET recovery_email = pending_recovery_email,
+               verified_email = pending_recovery_email,
+               recovery_email_verified = TRUE,
+               recovery_email_verified_at = CURRENT_TIMESTAMP,
+               pending_recovery_email = NULL,
+               recovery_enabled = TRUE,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1`
+        : `UPDATE users
+           SET recovery_mobile = pending_recovery_mobile,
+               verified_mobile = pending_recovery_mobile,
+               recovery_mobile_verified = TRUE,
+               recovery_mobile_verified_at = CURRENT_TIMESTAMP,
+               pending_recovery_mobile = NULL,
+               recovery_enabled = TRUE,
+               updated_at = CURRENT_TIMESTAMP
+           WHERE id = $1`,
+      [userId]
+    );
+    await client.query("UPDATE account_recovery_requests SET used_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE request_id = $1", [cleanText(req.body.request_id)]);
+    await writeAuthAudit({
+      userId,
+      actorUserId: actor.id,
+      username: pendingResult.rows[0]?.username,
+      action: contactType === "email" ? "RECOVERY_EMAIL_VERIFIED" : "RECOVERY_MOBILE_VERIFIED",
+      safeCode: "CONTACT_VERIFIED",
+      deviceId: cleanText(req.body.device_id),
+      ipAddress: req.ip,
+      details: { contact_type: contactType },
+    }, client);
+    await client.query("COMMIT");
+    return res.json({
+      success: true,
+      code: "CONTACT_VERIFIED",
+      message: contactType === "email" ? "Recovery email verified." : "Recovery mobile verified.",
+      masked_contact: contactType === "email" ? maskEmail(pendingContact) : maskMobile(pendingContact),
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error(error);
+    return res.status(500).json({ code: "RECOVERY_CONTACT_VERIFY_ERROR", message: "Unable to verify recovery contact" });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/auth/recovery/readiness-report", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.query.user_id || req.query.updated_by);
+    if (!manager) return res.status(403).json({ code: "BRANCH_ACCESS_DENIED", message: "Only Owner or Admin can view recovery readiness" });
+    const result = await pool.query(
+      `
+      SELECT u.id, u.full_name, u.username, u.email, u.mobile_number, r.role_name
+      FROM users u
+      JOIN roles r ON r.id = u.role_id
+      WHERE u.active = TRUE
+        AND NOT (
+          (COALESCE(u.recovery_email_verified, FALSE) = TRUE AND COALESCE(u.recovery_email, '') <> '')
+          OR (COALESCE(u.recovery_mobile_verified, FALSE) = TRUE AND COALESCE(u.recovery_mobile, '') <> '')
+          OR COALESCE(u.verified_email, '') <> ''
+          OR COALESCE(u.verified_mobile, '') <> ''
+        )
+      ORDER BY r.role_name, u.username
+      `
+    );
+    return res.json({
+      missing_verified_contacts: result.rows,
+      provider_status: getRecoveryProviderStatus(),
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ code: "RECOVERY_REPORT_ERROR", message: "Unable to load recovery readiness report" });
+  }
+});
+
+app.post("/auth/recovery/options", async (req, res) => {
+  try {
+    const identifier = cleanText(req.body.identifier);
+    const purpose = cleanText(req.body.purpose || "password").toLowerCase();
+    const user = await findRecoveryUser(identifier);
+    const eligibility = ensureRecoveryEligible(user);
+    const response = {
+      success: true,
+      code: eligibility.code || "RECOVERY_OPTIONS_READY",
+      message: eligibility.ok ? "Select a verified recovery method." : (eligibility.message || recoveryGenericMessage),
+      methods: eligibility.ok ? eligibility.methods : [],
+      provider_status: getRecoveryProviderStatus(),
+      support_contacts: await getSupportContacts({ staffOnly: true }),
+    };
+    await writeAuthAudit({
+      userId: user?.id,
+      username: user?.username || identifier,
+      action: "RECOVERY_OPTIONS",
+      safeCode: response.code,
+      deviceId: cleanText(req.body.device_id),
+      ipAddress: req.ip,
+      details: { purpose },
+    });
+    return res.json(response);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ code: "RECOVERY_OPTIONS_ERROR", message: "Unable to check recovery options" });
+  }
+});
+
+app.post("/auth/recovery/send-otp", async (req, res) => {
+  try {
+    const identifier = cleanText(req.body.identifier);
+    const purpose = cleanText(req.body.purpose || "password").toLowerCase() === "username" ? "username" : "password";
+    const method = cleanText(req.body.method).toLowerCase();
+    const user = await findRecoveryUser(identifier);
+    const eligibility = ensureRecoveryEligible(user);
+    if (!eligibility.ok) {
+      await writeAuthAudit({
+        userId: user?.id,
+        username: user?.username || identifier,
+        action: "RECOVERY_OTP_REQUEST",
+        safeCode: eligibility.code || "GENERIC_RESPONSE",
+        deviceId: cleanText(req.body.device_id),
+        ipAddress: req.ip,
+        details: { purpose, method },
+      });
+      return res.json({
+        success: true,
+        code: eligibility.code || "GENERIC_RESPONSE",
+        message: eligibility.message || recoveryGenericMessage,
+        provider_status: getRecoveryProviderStatus(),
+      });
+    }
+    const selectedMethod = eligibility.methods.find((entry) => entry.method === method);
+    if (!selectedMethod) {
+      return res.status(400).json({ code: "RECOVERY_METHOD_UNAVAILABLE", message: "Select an available recovery method." });
+    }
+    const recentResult = await pool.query(
+      `
+      SELECT
+        COUNT(*) FILTER (WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '15 minutes')::INTEGER AS recent_count,
+        MAX(created_at) AS last_created_at,
+        MAX(resend_available_at) AS resend_available_at
+      FROM account_recovery_requests
+      WHERE user_id = $1 AND purpose = $2 AND method = $3
+      `,
+      [user.id, purpose, method]
+    );
+    const recent = recentResult.rows[0] || {};
+    if (Number(recent.recent_count || 0) >= 5) {
+      await writeAuthAudit({
+        userId: user.id,
+        username: user.username,
+        action: "RECOVERY_OTP_RATE_LIMITED",
+        safeCode: "RATE_LIMITED",
+        deviceId: cleanText(req.body.device_id),
+        ipAddress: req.ip,
+        details: { purpose, method },
+      });
+      return res.status(429).json({ code: "RATE_LIMITED", message: "Too many recovery attempts. Try again later." });
+    }
+    if (recent.resend_available_at && new Date(recent.resend_available_at).getTime() > Date.now()) {
+      return res.status(429).json({ code: "RESEND_COOLDOWN", message: "Please wait before requesting another verification code." });
+    }
+    const contact = method === "email"
+      ? cleanText(user.recovery_email || user.verified_email)
+      : cleanText(user.recovery_mobile || user.verified_mobile);
+    const requestId = `rec_${crypto.randomUUID()}`;
+    const otp = generateOtpCode();
+    await pool.query(
+      `
+      UPDATE account_recovery_requests
+      SET invalidated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      WHERE user_id = $1 AND purpose = $2 AND method = $3 AND used_at IS NULL AND invalidated_at IS NULL
+      `,
+      [user.id, purpose, method]
+    );
+    await pool.query(
+      `
+      INSERT INTO account_recovery_requests (
+        request_id, user_id, purpose, method, contact_hash, otp_hash,
+        expires_at, resend_available_at, requested_ip, requested_device_id, user_agent
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP + INTERVAL '10 minutes',
+              CURRENT_TIMESTAMP + INTERVAL '60 seconds', $7, $8, $9)
+      `,
+      [
+        requestId,
+        user.id,
+        purpose,
+        method,
+        hashSensitiveValue(contact),
+        hashOtp(requestId, otp),
+        req.ip,
+        cleanText(req.body.device_id),
+        cleanText(req.get("user-agent")),
+      ]
+    );
+    const delivery = await sendRecoveryOtp({ method, contact, code: otp, purpose });
+    await writeAuthAudit({
+      userId: user.id,
+      username: user.username,
+      action: "RECOVERY_OTP_REQUESTED",
+      safeCode: delivery.delivered ? "OTP_REQUESTED" : "PROVIDER_DELIVERY_FAILED",
+      deviceId: cleanText(req.body.device_id),
+      ipAddress: req.ip,
+      details: { purpose, method, provider: delivery.provider, delivery_status: delivery.status },
+    });
+    if (!delivery.delivered) {
+      await invalidateOtpRequest(requestId);
+      return res.status(503).json({
+        success: false,
+        code: delivery.status === "not_configured" ? "PROVIDER_NOT_CONFIGURED" : "PROVIDER_DELIVERY_FAILED",
+        message: method === "email"
+          ? "Email recovery is not configured or the provider rejected the request."
+          : "SMS recovery is not configured. Please use verified email recovery or contact the administrator.",
+        provider_status: getRecoveryProviderStatus(),
+        delivery_status: delivery.status,
+      });
+    }
+    return res.json({
+      success: true,
+      code: "OTP_SENT",
+      message: recoveryGenericMessage,
+      request_id: requestId,
+      expires_in_seconds: 600,
+      provider_status: getRecoveryProviderStatus(),
+      delivery_status: delivery.status,
+      development_otp: recoveryDevOtpEnabled ? delivery.development_code : undefined,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ code: "RECOVERY_OTP_ERROR", message: "Unable to send recovery code" });
+  }
+});
+
+app.post("/auth/recovery/verify-otp", async (req, res) => {
+  try {
+    const requestId = cleanText(req.body.request_id);
+    const otp = cleanText(req.body.otp);
+    const result = await pool.query(
+      `
+      SELECT rr.*, u.username, u.active, u.full_name,
+             u.recovery_email, u.verified_email, u.recovery_mobile, u.verified_mobile
+      FROM account_recovery_requests rr
+      JOIN users u ON u.id = rr.user_id
+      WHERE rr.request_id = $1
+      LIMIT 1
+      `,
+      [requestId]
+    );
+    const request = result.rows[0];
+    if (!request || request.used_at || request.invalidated_at || new Date(request.expires_at).getTime() <= Date.now()) {
+      return res.status(400).json({ code: "OTP_EXPIRED_OR_INVALID", message: "The verification code is invalid or expired." });
+    }
+    if (Number(request.attempt_count || 0) >= 5) {
+      return res.status(429).json({ code: "OTP_ATTEMPTS_EXCEEDED", message: "Too many incorrect verification attempts." });
+    }
+    const expected = Buffer.from(request.otp_hash, "hex");
+    const actual = Buffer.from(hashOtp(requestId, otp), "hex");
+    if (expected.length !== actual.length || !crypto.timingSafeEqual(expected, actual)) {
+      await pool.query(
+        "UPDATE account_recovery_requests SET attempt_count = COALESCE(attempt_count, 0) + 1, updated_at = CURRENT_TIMESTAMP WHERE request_id = $1",
+        [requestId]
+      );
+      await writeAuthAudit({
+        userId: request.user_id,
+        username: request.username,
+        action: "RECOVERY_OTP_FAILED",
+        safeCode: "OTP_INVALID",
+        deviceId: cleanText(req.body.device_id),
+        ipAddress: req.ip,
+      });
+      return res.status(400).json({ code: "OTP_INVALID", message: "The verification code is invalid or expired." });
+    }
+    const verificationToken = crypto.randomBytes(32).toString("hex");
+    await pool.query(
+      `
+      UPDATE account_recovery_requests
+      SET verified_at = CURRENT_TIMESTAMP,
+          verification_token_hash = $2,
+          verification_expires_at = CURRENT_TIMESTAMP + INTERVAL '10 minutes',
+          updated_at = CURRENT_TIMESTAMP
+      WHERE request_id = $1
+      `,
+      [requestId, hashRecoveryToken(requestId, verificationToken)]
+    );
+    await writeAuthAudit({
+      userId: request.user_id,
+      username: request.username,
+      action: "RECOVERY_OTP_VERIFIED",
+      safeCode: "OTP_VERIFIED",
+      deviceId: cleanText(req.body.device_id),
+      ipAddress: req.ip,
+      details: { purpose: request.purpose, method: request.method },
+    });
+    const response = {
+      success: true,
+      code: "OTP_VERIFIED",
+      message: request.purpose === "username" ? "Username recovered." : "Verification complete. Set a new password.",
+      verification_token: verificationToken,
+    };
+    if (request.purpose === "username") {
+      response.username = request.username;
+      const notifyContact = request.method === "email"
+        ? cleanText(request.recovery_email || request.verified_email)
+        : cleanText(request.recovery_mobile || request.verified_mobile);
+      if (notifyContact) {
+        const notifyResult = await sendRecoveryNotification({
+          method: request.method,
+          contact: notifyContact,
+          subject: "Your FroozERP username",
+          message: `Your FroozERP username is ${request.username}. If you did not request this, contact your administrator immediately.`,
+          html: `<p>Your FroozERP username is <strong>${request.username}</strong>.</p><p>If you did not request this, contact your administrator immediately.</p>`,
+        }).catch((error) => ({ delivered: false, status: "notification_failed", error: error.message || String(error) }));
+        await writeAuthAudit({
+          userId: request.user_id,
+          username: request.username,
+          action: "RECOVERY_USERNAME_NOTICE",
+          safeCode: notifyResult.delivered ? "NOTICE_SENT" : "NOTICE_NOT_SENT",
+          deviceId: cleanText(req.body.device_id),
+          ipAddress: req.ip,
+          details: { method: request.method, status: notifyResult.status },
+        });
+      }
+    }
+    return res.json(response);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ code: "RECOVERY_VERIFY_ERROR", message: "Unable to verify recovery code" });
+  }
+});
+
+app.post("/auth/recovery/reset-password", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const requestId = cleanText(req.body.request_id);
+    const token = cleanText(req.body.verification_token);
+    const password = String(req.body.new_password || "");
+    const confirmPassword = String(req.body.confirm_password || "");
+    if (password.length < 4 || password !== confirmPassword) {
+      return res.status(400).json({ code: "PASSWORD_POLICY_FAILED", message: "Enter matching password with at least 4 characters." });
+    }
+    await client.query("BEGIN");
+    const result = await client.query(
+      `
+      SELECT rr.*, u.username, u.recovery_email, u.verified_email, u.recovery_mobile, u.verified_mobile
+      FROM account_recovery_requests rr
+      JOIN users u ON u.id = rr.user_id
+      WHERE rr.request_id = $1
+      FOR UPDATE
+      `,
+      [requestId]
+    );
+    const request = result.rows[0];
+    if (
+      !request ||
+      request.purpose !== "password" ||
+      request.used_at ||
+      request.invalidated_at ||
+      !request.verified_at ||
+      !request.verification_token_hash ||
+      new Date(request.verification_expires_at || 0).getTime() <= Date.now() ||
+      hashRecoveryToken(requestId, token) !== request.verification_token_hash
+    ) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ code: "RECOVERY_TOKEN_INVALID", message: "Password reset verification expired. Start again." });
+    }
+    await client.query(
+      `
+      UPDATE users
+      SET password_hash = $1,
+          force_password_change = FALSE,
+          session_revocation_version = COALESCE(session_revocation_version, 0) + 1,
+          password_changed_at = CURRENT_TIMESTAMP,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+      `,
+      [hashPassword(password), request.user_id]
+    );
+    await client.query(
+      "UPDATE account_recovery_requests SET used_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE request_id = $1",
+      [requestId]
+    );
+    await writeAuthAudit({
+      userId: request.user_id,
+      username: request.username,
+      action: "RECOVERY_PASSWORD_RESET",
+      safeCode: "PASSWORD_RESET_SUCCESS",
+      deviceId: cleanText(req.body.device_id),
+      ipAddress: req.ip,
+      details: { method: request.method },
+    }, client);
+    await client.query("COMMIT");
+    const notifyContact = request.method === "email"
+      ? cleanText(request.recovery_email || request.verified_email)
+      : cleanText(request.recovery_mobile || request.verified_mobile);
+    if (notifyContact) {
+      const notifyResult = await sendRecoveryNotification({
+        method: request.method,
+        contact: notifyContact,
+        subject: "FroozERP password changed",
+        message: "Your FroozERP password was changed. If you did not make this change, contact your administrator immediately.",
+        html: "<p>Your FroozERP password was changed.</p><p>If you did not make this change, contact your administrator immediately.</p>",
+      }).catch((error) => ({ delivered: false, status: "notification_failed", error: error.message || String(error) }));
+      await writeAuthAudit({
+        userId: request.user_id,
+        username: request.username,
+        action: "RECOVERY_PASSWORD_CHANGED_NOTICE",
+        safeCode: notifyResult.delivered ? "NOTICE_SENT" : "NOTICE_NOT_SENT",
+        deviceId: cleanText(req.body.device_id),
+        ipAddress: req.ip,
+        details: { method: request.method, status: notifyResult.status },
+      });
+    }
+    return res.json({ success: true, code: "PASSWORD_RESET_SUCCESS", message: "Password changed. Sign in again with the new password." });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error(error);
+    return res.status(500).json({ code: "RECOVERY_PASSWORD_RESET_ERROR", message: "Unable to reset password" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/users/:id/recovery-action", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    const userId = parsePositiveInteger(req.params.id);
+    const action = cleanText(req.body.action).toUpperCase();
+    if (!manager) return res.status(403).json({ code: "BRANCH_ACCESS_DENIED", message: "Only Owner or Admin can manage recovery actions" });
+    if (!userId || userId === manager.id) return res.status(400).json({ code: "INVALID_USER_ACTION", message: "Select a valid staff account." });
+    const userResult = await pool.query(
+      `
+      SELECT u.id, u.username, u.email, u.mobile_number, u.verified_email, u.verified_mobile, r.role_name
+      FROM users u
+      JOIN roles r ON r.id = u.role_id
+      WHERE u.id = $1
+      `,
+      [userId]
+    );
+    const target = userResult.rows[0];
+    if (!target) return res.status(404).json({ code: "USER_NOT_FOUND", message: "User not found" });
+    if (RATE_MANAGER_ROLES.has(target.role_name) && manager.role_name !== "Owner") {
+      return res.status(403).json({ code: "BRANCH_ACCESS_DENIED", message: "Only Owner can manage Owner/Admin recovery actions." });
+    }
+    if (action === "RESET_PASSWORD") {
+      const requestedPassword = String(req.body.temporary_password || "");
+      const temporaryPassword = requestedPassword.length >= 4 ? requestedPassword : generateTemporaryPassword();
+      await pool.query(
+        `
+        UPDATE users
+        SET password_hash = $1,
+            force_password_change = TRUE,
+            session_revocation_version = COALESCE(session_revocation_version, 0) + 1,
+            password_changed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $2
+        `,
+        [hashPassword(temporaryPassword), userId]
+      );
+      await writeAuthAudit({
+        userId,
+        actorUserId: manager.id,
+        username: target.username,
+        action: "ADMIN_STAFF_PASSWORD_RESET",
+        safeCode: "TEMPORARY_PASSWORD_SET",
+        ipAddress: req.ip,
+      });
+      return res.json({
+        success: true,
+        code: "TEMPORARY_PASSWORD_SET",
+        temporary_password: requestedPassword.length >= 4 ? undefined : temporaryPassword,
+        message: "Temporary password set. The user must change it at next login.",
+      });
+    }
+    if (action === "UNLOCK_ACCOUNT") {
+      await pool.query("UPDATE users SET locked_until = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1", [userId]);
+    } else if (action === "RESEND_USERNAME") {
+      await writeAuthAudit({ userId, actorUserId: manager.id, username: target.username, action: "ADMIN_RESEND_USERNAME", safeCode: "USERNAME_RESEND_REQUESTED", ipAddress: req.ip });
+      return res.json({
+        success: true,
+        code: "USERNAME_RESEND_REQUESTED",
+        message: getRecoveryProviderStatus().email === "not_configured" && getRecoveryProviderStatus().sms === "not_configured"
+          ? "Username resend provider is not configured. Share the username manually through an approved business contact."
+          : "Username resend requested through the configured provider.",
+      });
+    } else if (action === "DISABLE_USER") {
+      await pool.query("UPDATE users SET active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $1", [userId]);
+    } else if (action === "REVOKE_SESSIONS") {
+      await pool.query("UPDATE users SET session_revocation_version = COALESCE(session_revocation_version, 0) + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $1", [userId]);
+    } else if (action === "REQUIRE_PASSWORD_CHANGE") {
+      await pool.query("UPDATE users SET force_password_change = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = $1", [userId]);
+    } else {
+      return res.status(400).json({ code: "INVALID_RECOVERY_ACTION", message: "Select a valid recovery action." });
+    }
+    await writeAuthAudit({
+      userId,
+      actorUserId: manager.id,
+      username: target.username,
+      action: `ADMIN_${action}`,
+      safeCode: "OK",
+      ipAddress: req.ip,
+    });
+    return res.json({ success: true, code: "OK", message: "User recovery action completed." });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ code: "USER_RECOVERY_ACTION_ERROR", message: "Unable to complete user recovery action" });
   }
 });
 
@@ -5337,7 +6480,8 @@ app.get("/settings/system-info", async (req, res) => {
 
 app.post("/login", async (req, res) => {
   try {
-    const { username, password } = req.body;
+    const username = cleanText(req.body.username);
+    const password = String(req.body.password || "");
     const devicePayload = readDevicePayload(req.body, req);
 
     const result = await pool.query(
@@ -5353,27 +6497,89 @@ app.post("/login", async (req, res) => {
         u.notes,
         u.last_login_at,
         u.branch_id,
+        u.active,
+        u.force_password_change,
+        u.session_revocation_version,
+        u.locked_until,
         r.role_name,
-        b.branch_name
+        b.branch_name,
+        b.active AS branch_active
       FROM users u
       JOIN roles r ON u.role_id = r.id
       JOIN branches b ON u.branch_id = b.id
-      WHERE u.username = $1
-        AND u.active = TRUE
+      WHERE LOWER(u.username) = LOWER($1)
       `,
       [username]
     );
 
     if (result.rows.length === 0) {
-      return res.status(401).json({ message: "User not found" });
+      return authFailure(res, {
+        code: "INVALID_CREDENTIALS",
+        username,
+        deviceId: devicePayload.device_id,
+        ipAddress: req.ip,
+        details: { stage: "user_lookup" },
+      });
     }
 
     const user = result.rows[0];
+    if (user.active === false) {
+      return authFailure(res, {
+        status: 403,
+        code: "USER_DISABLED",
+        publicMessage: "This user account is disabled. Contact your Owner or Administrator.",
+        userId: user.id,
+        username: user.username,
+        deviceId: devicePayload.device_id,
+        ipAddress: req.ip,
+        details: { stage: "user_status" },
+      });
+    }
+    if (user.branch_active === false) {
+      return authFailure(res, {
+        status: 403,
+        code: "BRANCH_ACCESS_DENIED",
+        publicMessage: "This branch is not authorised for login.",
+        userId: user.id,
+        username: user.username,
+        deviceId: devicePayload.device_id,
+        ipAddress: req.ip,
+        details: { stage: "branch_status", branch_id: user.branch_id },
+      });
+    }
+    if (user.locked_until && new Date(user.locked_until).getTime() > Date.now()) {
+      return authFailure(res, {
+        status: 423,
+        code: "USER_LOCKED",
+        publicMessage: "This account is temporarily locked. Contact your Owner or Administrator.",
+        userId: user.id,
+        username: user.username,
+        deviceId: devicePayload.device_id,
+        ipAddress: req.ip,
+        details: { stage: "user_locked" },
+      });
+    }
     if (!passwordMatches(password, user.password_hash)) {
-      return res.status(401).json({ message: "Invalid password" });
+      return authFailure(res, {
+        code: "INVALID_CREDENTIALS",
+        publicMessage: "Invalid username or password.",
+        userId: user.id,
+        username: user.username,
+        deviceId: devicePayload.device_id,
+        ipAddress: req.ip,
+        details: { stage: "password_verification" },
+      });
     }
     if (!devicePayload.device_id) {
-      return res.status(403).json({ code: "DEVICE_ID_REQUIRED", message: "Device ID is required for FroozERP access" });
+      return authFailure(res, {
+        status: 403,
+        code: "DEVICE_ID_REQUIRED",
+        publicMessage: "Device ID is required for FroozERP access.",
+        userId: user.id,
+        username: user.username,
+        ipAddress: req.ip,
+        details: { stage: "device_identity" },
+      });
     }
     let device = await upsertDeviceRequest(devicePayload);
     const approvedCountResult = await pool.query("SELECT COUNT(*)::INTEGER AS count FROM authorized_devices WHERE status = 'APPROVED'");
@@ -5388,9 +6594,26 @@ app.post("/login", async (req, res) => {
       });
     }
     if (device.status !== "APPROVED") {
+      const deviceStatus = String(device.status || "").toUpperCase();
+      const code = deviceStatus === "DISABLED"
+        ? "DEVICE_DISABLED"
+        : deviceStatus === "REVOKED"
+          ? "DEVICE_REVOKED"
+          : "DEVICE_PENDING_APPROVAL";
+      await writeAuthAudit({
+        userId: user.id,
+        username: user.username,
+        action: "LOGIN_FAILED",
+        safeCode: code,
+        deviceId: device.device_id,
+        ipAddress: req.ip,
+        details: { stage: "device_authorisation", device_status: device.status },
+      });
       return res.status(403).json({
-        code: "DEVICE_NOT_APPROVED",
-        message: "This device is not approved. Ask owner for activation.",
+        code,
+        message: code === "DEVICE_DISABLED" || code === "DEVICE_REVOKED"
+          ? "This device is disabled for FroozERP access."
+          : "This device is pending owner approval.",
         device_id: device.device_id,
         device_status: device.status,
       });
@@ -5404,6 +6627,15 @@ app.post("/login", async (req, res) => {
       "UPDATE users SET password_hash = $1, last_login_at = CURRENT_TIMESTAMP WHERE id = $2",
       [hashed, user.id]
     );
+    await writeAuthAudit({
+      userId: user.id,
+      username: user.username,
+      action: "LOGIN_SUCCESS",
+      safeCode: "OK",
+      deviceId: device.device_id,
+      ipAddress: req.ip,
+      details: { branch_id: user.branch_id, role: user.role_name },
+    });
 
     return res.json({
       id: user.id,
@@ -5417,6 +6649,8 @@ app.post("/login", async (req, res) => {
       joining_date: user.joining_date,
       notes: user.notes,
       last_login_at: new Date().toISOString(),
+      force_password_change: user.force_password_change === true,
+      session_revocation_version: user.session_revocation_version || 0,
     });
   } catch (error) {
     console.error(error);
