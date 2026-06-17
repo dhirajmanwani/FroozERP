@@ -9204,6 +9204,15 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
   }, [cart, discountRules, paymentMode, saleRateSettings.bill_level_slab_discount_enabled]);
 
   const getLotLabel = (lot) => lot ? [lot.lot_name || lot.batch_no, lot.lot_size].filter(Boolean).join(" / ") : "Auto FIFO";
+  const getCompactLotName = (lot) => {
+    const raw = String(lot?.lot_name || lot?.batch_no || "").trim();
+    if (!raw) return "Auto FIFO";
+    const parts = raw.split("-");
+    if (parts.length >= 3 && /^\d{8,}$/.test(parts[1])) {
+      return `${parts[0]}-${parts[parts.length - 1]}`;
+    }
+    return raw.length > 22 ? `${raw.slice(0, 18)}...` : raw;
+  };
 
   const getActiveLotDiscount = (lotId) => {
     if (!lotId) return null;
@@ -9730,10 +9739,16 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
                   className={index === highlightedIndex ? "product-result product-result-active" : "product-result"}
                   key={option.key}
                   onClick={() => addProduct(product, lot)}
+                  title={lot ? `Full lot: ${getLotLabel(lot)}` : product.product_name}
                 >
-                  <span>
-                    <strong>{product.product_name}{lot ? ` - ${getLotLabel(lot)}` : ""}</strong>
-                    <small>{product.barcode || "No barcode"} - {currency.format(rate)}/{product.unit}{activeDiscount ? " after lot discount" : ""}</small>
+                  <span className="product-result-main">
+                    <strong>{product.product_name}</strong>
+                    <span className="product-result-meta">
+                      <span>Lot: {getCompactLotName(lot)}</span>
+                      <span>Size: {lot?.lot_size || product.lot_size || "Standard"}</span>
+                      <span>Unit: {product.unit || "Unit"}</span>
+                    </span>
+                    <small>Rate: {currency.format(rate)}/{product.unit || "Unit"}{activeDiscount ? " after lot discount" : ""}</small>
                   </span>
                   <em className={stock <= 5 ? "stock-low" : "stock-ok"}>{stock} in stock</em>
                 </button>
