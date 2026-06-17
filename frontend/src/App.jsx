@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
@@ -22,6 +22,10 @@ import {
   readOfflineSession,
   verifyOfflineSessionRecord,
 } from "./local/offlineSession";
+import {
+  connectivityEventNames,
+  subscribeConnectivity,
+} from "./local/connectivityService";
 import {
   checkBackendHealth,
   getSyncStatus,
@@ -759,6 +763,18 @@ function App() {
     return status;
   };
 
+  const userRef = useRef(user);
+  const deviceInfoRef = useRef(deviceInfo);
+  const reconnectSyncRef = useRef(false);
+
+  useEffect(() => {
+    userRef.current = user;
+  }, [user]);
+
+  useEffect(() => {
+    deviceInfoRef.current = deviceInfo;
+  }, [deviceInfo]);
+
   const runSyncNow = async () => {
     if (!user) return null;
     setSyncMessage("Syncing...");
@@ -772,6 +788,71 @@ function App() {
     setSyncMessage(status.lastError ? `Sync failed: ${status.lastError}` : "Sync complete");
     return status;
   };
+
+  const applyConnectivityState = useCallback((health) => {
+    setBackendHealth(health);
+    if (health.online === null || health.checking) return;
+    setOfflineMode(!health.online);
+    if (health.online) {
+      setStartupError((current) => {
+        if (!current) return "";
+        const recoverable = /backend|network|internet|offline|connect/i.test(current);
+        return recoverable ? "" : current;
+      });
+      setStartupNotice((current) => current || "Online - FroozERP backend is reachable.");
+    }
+  }, []);
+
+  const performConnectivityCheck = useCallback(async (reason = "manual", options = {}) => {
+    const health = await checkBackendHealth(API_URL, {
+      details: true,
+      timeoutMs: options.timeoutMs || 3500,
+      force: Boolean(options.force),
+      reason,
+    });
+    applyConnectivityState(health);
+    if (health.online && userRef.current && !reconnectSyncRef.current) {
+      reconnectSyncRef.current = true;
+      syncNow({
+        apiUrl: API_URL,
+        user: userRef.current,
+        deviceInfo: deviceInfoRef.current,
+        branchId: userRef.current.branch_id || 1,
+      })
+        .then((status) => {
+          setSyncStatus(status);
+          setSyncMessage(status.lastError ? `Sync failed: ${status.lastError}` : "Online - pending changes checked for sync");
+        })
+        .finally(() => {
+          reconnectSyncRef.current = false;
+        });
+    }
+    return health;
+  }, [applyConnectivityState]);
+
+  useEffect(() => subscribeConnectivity(applyConnectivityState), [applyConnectivityState]);
+
+  useEffect(() => {
+    performConnectivityCheck("startup", { force: true });
+    const handleConnectivityEvent = (event) => {
+      if (event.type === "visibilitychange" && document.hidden) return;
+      performConnectivityCheck(event.type, { force: true });
+    };
+    for (const eventName of connectivityEventNames) {
+      const target = eventName === "visibilitychange" ? document : window;
+      target.addEventListener(eventName, handleConnectivityEvent);
+    }
+    const timer = window.setInterval(() => {
+      performConnectivityCheck(backendHealth.online ? "periodic-online" : "periodic-offline");
+    }, backendHealth.online ? 60_000 : 10_000);
+    return () => {
+      window.clearInterval(timer);
+      for (const eventName of connectivityEventNames) {
+        const target = eventName === "visibilitychange" ? document : window;
+        target.removeEventListener(eventName, handleConnectivityEvent);
+      }
+    };
+  }, [backendHealth.online, performConnectivityCheck]);
 
   const queuePhase2SyncTest = async () => {
     if (!user) return;
@@ -802,17 +883,17 @@ function App() {
       if (!cancelled) setSyncStatus(status);
     });
     const timer = window.setInterval(() => {
-      runSyncNow();
+      if (backendHealth.online) runSyncNow();
     }, 60_000);
-    const onlineHandler = () => runSyncNow();
+    const onlineHandler = () => performConnectivityCheck("sync-online-event", { force: true });
     window.addEventListener("online", onlineHandler);
-    runSyncNow();
+    if (backendHealth.online) runSyncNow();
     return () => {
       cancelled = true;
       window.clearInterval(timer);
       window.removeEventListener("online", onlineHandler);
     };
-  }, [user, deviceInfo.device_id]);
+  }, [user, deviceInfo.device_id, backendHealth.online, performConnectivityCheck]);
 
   const rolePermissionMap = useMemo(() => {
     const map = new Map();
@@ -1467,15 +1548,7 @@ function App() {
     try {
       const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
       setDeviceInfo(latestDevice);
-      setBackendHealth((current) => ({
-        ...current,
-        apiUrl: API_URL,
-        url: `${API_URL}/api/health`,
-        online: null,
-        message: "Checking FroozERP backend...",
-      }));
-      const health = await checkBackendHealth(API_URL, { details: true, timeoutMs: 4000 });
-      setBackendHealth(health);
+      const health = await performConnectivityCheck("login", { force: true, timeoutMs: 4000 });
       const backendOnline = health.online;
 
       if (!backendOnline) {
@@ -1532,9 +1605,7 @@ function App() {
     try {
       const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
       setDeviceInfo(latestDevice);
-      const health = await checkBackendHealth(API_URL, { details: true, timeoutMs: 4000 });
-      setBackendHealth(health);
-      setOfflineMode(!health.online);
+      const health = await performConnectivityCheck("retry-online", { force: true, timeoutMs: 4000 });
       if (health.online) {
         setStartupNotice(`Backend online at ${health.url}. Enter credentials and click Sign In to complete first online login.`);
       } else {
@@ -2692,6 +2763,7 @@ function App() {
               backendHealth={backendHealth}
               deviceInfo={deviceInfo}
               onClose={() => setRecoveryOpen(false)}
+              onCheckOnline={performConnectivityCheck}
               onRetryOnline={retryOnline}
             />
           )}
@@ -3703,7 +3775,7 @@ function App() {
   );
 }
 
-function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onClose, onRetryOnline }) {
+function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline, onClose, onRetryOnline }) {
   const [mode, setMode] = useState("");
   const [identifier, setIdentifier] = useState("");
   const [methods, setMethods] = useState([]);
@@ -3723,6 +3795,34 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onClose, onRe
   const [developmentOtp, setDevelopmentOtp] = useState("");
 
   const onlineRequired = backendHealth?.online === false;
+  useEffect(() => {
+    let cancelled = false;
+    setStatus("Checking FroozERP service...");
+    onCheckOnline?.("recovery-open", { force: true, timeoutMs: 3500 }).then((health) => {
+      if (cancelled) return;
+      if (health?.online) {
+        setStatus("FroozERP service is online. Choose a recovery option.");
+        if (step === "offline") setStep(mode ? "identify" : "choose");
+      } else {
+        setError(`Account recovery requires internet access. ${health?.message || "Backend is unavailable."}`);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (backendHealth?.checking) {
+      setStatus("Checking FroozERP service...");
+      return;
+    }
+    if (backendHealth?.online) {
+      setError("");
+      setStatus("FroozERP service is online. Continue account recovery.");
+      if (step === "offline") setStep(mode ? "identify" : "choose");
+    }
+  }, [backendHealth?.checking, backendHealth?.online, mode, step]);
   const resetMessages = () => {
     setStatus("");
     setError("");
@@ -3747,7 +3847,7 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onClose, onRe
     }
     setBusy(true);
     try {
-      const health = await checkBackendHealth(apiUrl, { details: true, timeoutMs: 4000 });
+      const health = await (onCheckOnline?.("recovery-options", { force: true, timeoutMs: 4000 }) || checkBackendHealth(apiUrl, { details: true, timeoutMs: 4000 }));
       if (!health.online) {
         setStep("offline");
         setError(`Account recovery requires internet access. ${health.message}`);
