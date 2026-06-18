@@ -41,6 +41,18 @@ const normalizeApiUrl = (apiUrl) => String(apiUrl || "").replace(/\/$/, "");
 
 const endpointUrl = (apiUrl, path) => `${normalizeApiUrl(apiUrl)}${path}`;
 
+const writeSyncLog = async (level, message, details = {}) => {
+  const entry = `[FroozERP sync] ${message} ${JSON.stringify(details)}`;
+  console.info(entry);
+  if (!isTauriRuntime()) return;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("app_log", { level, message: entry });
+  } catch {
+    // Console logging remains available in browser/dev mode.
+  }
+};
+
 const normalizeLocalStatus = (status = {}) => ({
   ...lastStatus,
   lastPushAt: status.lastPushAt || lastStatus.lastPushAt,
@@ -99,7 +111,7 @@ const classifySyncError = (error) => {
   if (error.code === "ECONNABORTED") {
     return { online: false, kind: "TIMEOUT", message: "Offline - backend sync request timed out.", status: null };
   }
-  const message = error.message || "Sync failed";
+  const message = typeof error === "string" ? error : error.message || "Sync failed";
   const networkFailure = /network|refused|failed to fetch|timeout|unreachable|offline/i.test(message);
   return {
     online: !networkFailure,
@@ -110,7 +122,7 @@ const classifySyncError = (error) => {
 };
 
 const logSyncEndpoint = (phase, apiUrl, path, extra = {}) => {
-  console.info("[FroozERP sync]", {
+  writeSyncLog("INFO", "endpoint", {
     phase,
     apiUrl: normalizeApiUrl(apiUrl),
     endpoint: endpointUrl(apiUrl, path),
@@ -161,7 +173,14 @@ export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId
   const context = syncContext({ user, deviceInfo, branchId });
   if (!isTauriRuntime() || !context.userId || !context.deviceId) return lastStatus;
   const operations = await repositories.outbox.pending(50);
-  if (operations.length === 0) return normalizeLocalStatus(await repositories.status.get());
+  if (operations.length === 0) {
+    writeSyncLog("INFO", "push-skipped", {
+      apiUrl: normalizeApiUrl(apiUrl),
+      endpoint: endpointUrl(apiUrl, "/api/sync/push"),
+      reason: "no-pending-operations",
+    });
+    return normalizeLocalStatus(await repositories.status.get());
+  }
   logSyncEndpoint("push", apiUrl, "/api/sync/push", { count: operations.length });
   lastStatus = {
     ...lastStatus,
@@ -184,6 +203,13 @@ export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId
       created_at: operation.created_at,
     })),
   }, withTimeout(15000));
+  writeSyncLog("INFO", "push-result", {
+    apiUrl: normalizeApiUrl(apiUrl),
+    endpoint: endpointUrl(apiUrl, "/api/sync/push"),
+    status: response.status,
+    operationCount: operations.length,
+    acknowledgementCount: (response.data?.acknowledgements || []).length,
+  });
   const status = await repositories.outbox.applyAcks(response.data?.acknowledgements || []);
   lastStatus = {
     ...normalizeLocalStatus(status),
@@ -212,6 +238,14 @@ export async function pullServerChanges({ apiUrl, user, deviceInfo, branchId }) 
       cursor,
       limit: 50,
     },
+  });
+  writeSyncLog("INFO", "pull-result", {
+    apiUrl: normalizeApiUrl(apiUrl),
+    endpoint: endpointUrl(apiUrl, "/api/sync/pull"),
+    status: response.status,
+    changeCount: (response.data?.changes || []).length,
+    nextCursor: response.data?.next_cursor || cursor,
+    hasMore: Boolean(response.data?.has_more),
   });
   const status = await applyPulledChanges({
     changes: response.data?.changes || [],
@@ -262,6 +296,14 @@ export async function syncNow({ apiUrl, user, deviceInfo, branchId }) {
       clampBackoff();
       const classified = classifySyncError(error);
       const message = classified.message;
+      writeSyncLog(classified.online ? "WARN" : "ERROR", "sync-failed", {
+        apiUrl: normalizeApiUrl(apiUrl),
+        backendUrl: endpointUrl(apiUrl, "/api/health"),
+        stage: lastStatus.syncStage || "unknown",
+        kind: classified.kind,
+        status: classified.status || null,
+        message,
+      });
       const status = await repositories.status.fail(message);
       lastStatus = {
         ...normalizeLocalStatus(status),

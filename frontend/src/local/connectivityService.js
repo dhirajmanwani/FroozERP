@@ -22,6 +22,21 @@ const listeners = new Set();
 
 const healthUrl = (apiUrl) => `${String(apiUrl || "").replace(/\/$/, "")}/api/health`;
 
+const isTauriRuntime = () =>
+  typeof window !== "undefined" && (Boolean(window.__TAURI_INTERNALS__) || Boolean(window.__TAURI__));
+
+const writeConnectivityLog = async (level, message, details = {}) => {
+  const entry = `[FroozERP connectivity] ${message} ${JSON.stringify(details)}`;
+  console.info(entry);
+  if (!isTauriRuntime()) return;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("app_log", { level, message: entry });
+  } catch {
+    // Console logging remains available in browser/dev mode.
+  }
+};
+
 const classifyHealthError = (error) => {
   if (axios.isCancel?.(error) || error.name === "CanceledError" || error.code === "ERR_CANCELED") {
     return { reasonCode: "ABORTED", message: "Previous health check was cancelled." };
@@ -58,6 +73,7 @@ export async function checkFroozBackendHealth(apiUrl, options = {}) {
   const url = healthUrl(normalizedApiUrl);
   const reason = options.reason || "manual";
   const timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS;
+  writeConnectivityLog("INFO", "health-check-start", { apiUrl: normalizedApiUrl, endpoint: url, reason });
 
   if (inFlight && !options.force) return inFlight;
   if (inFlightController && options.force) inFlightController.abort();
@@ -96,6 +112,13 @@ export async function checkFroozBackendHealth(apiUrl, options = {}) {
         lastOnlineAt: online ? new Date().toISOString() : latestState.lastOnlineAt,
         lastErrorAt: online ? latestState.lastErrorAt : new Date().toISOString(),
       };
+      writeConnectivityLog("INFO", "health-check-result", {
+        apiUrl: normalizedApiUrl,
+        endpoint: url,
+        reason,
+        online,
+        status: response.status,
+      });
       return latestState;
     } catch (error) {
       const classified = classifyHealthError(error);
@@ -112,6 +135,14 @@ export async function checkFroozBackendHealth(apiUrl, options = {}) {
         lastCheckedAt: new Date().toISOString(),
         lastErrorAt: new Date().toISOString(),
       };
+      writeConnectivityLog("ERROR", "health-check-failed", {
+        apiUrl: normalizedApiUrl,
+        endpoint: url,
+        reason,
+        reasonCode: classified.reasonCode,
+        status: error.response?.status || null,
+        message: classified.message,
+      });
       return latestState;
     } finally {
       inFlight = null;

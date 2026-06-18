@@ -41,6 +41,19 @@ const API_URL = (
   window.__FROOZERP_API_URL__ ||
   (isDesktopShell() ? "http://127.0.0.1:5000" : `${window.location.protocol}//${window.location.hostname}:5000`)
 ).replace(/\/$/, "");
+
+const writeDiagnosticLog = async (level, message, details = {}) => {
+  const entry = `[FroozERP app] ${message} ${JSON.stringify(details)}`;
+  console.info(entry);
+  if (!isDesktopShell()) return;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("app_log", { level, message: entry });
+  } catch {
+    // Browser/dev mode keeps console logging.
+  }
+};
+
 const currency = new Intl.NumberFormat("en-IN", {
   style: "currency",
   currency: "INR",
@@ -780,6 +793,13 @@ function App() {
   const userRef = useRef(user);
   const deviceInfoRef = useRef(deviceInfo);
   const reconnectSyncRef = useRef(false);
+  const lastAutoSyncStartedAtRef = useRef(0);
+  const shouldStartBackgroundSync = () => {
+    const now = Date.now();
+    if (now - lastAutoSyncStartedAtRef.current < 30_000) return false;
+    lastAutoSyncStartedAtRef.current = now;
+    return true;
+  };
 
   useEffect(() => {
     userRef.current = user;
@@ -789,8 +809,11 @@ function App() {
     deviceInfoRef.current = deviceInfo;
   }, [deviceInfo]);
 
-  const runSyncNow = async () => {
+  const runSyncNow = async (options = {}) => {
     if (!user) return null;
+    const force = Boolean(options.force);
+    if (!force && !shouldStartBackgroundSync()) return syncStatus;
+    if (force) lastAutoSyncStartedAtRef.current = Date.now();
     setSyncMessage("Syncing...");
     const status = await syncNow({
       apiUrl: API_URL,
@@ -825,7 +848,7 @@ function App() {
       reason,
     });
     applyConnectivityState(health);
-    if (health.online && userRef.current && !reconnectSyncRef.current) {
+    if (health.online && userRef.current && !reconnectSyncRef.current && shouldStartBackgroundSync()) {
       reconnectSyncRef.current = true;
       syncNow({
         apiUrl: API_URL,
@@ -1574,7 +1597,9 @@ function App() {
         return;
       }
 
+      writeDiagnosticLog("INFO", "login-request", { apiUrl: API_URL, endpoint: `${API_URL}/login`, deviceId: latestDevice.device_id });
       const response = await axios.post(`${API_URL}/login`, { username: username.trim(), password, ...latestDevice }, { timeout: 8000 });
+      writeDiagnosticLog("INFO", "login-success", { apiUrl: API_URL, endpoint: `${API_URL}/login`, userId: response.data?.id, deviceId: latestDevice.device_id });
       setDeviceGate(null);
       setUser(response.data);
       if (response.data?.force_password_change) {
@@ -1596,6 +1621,13 @@ function App() {
         setStartupError(getErrorMessage(hydrateError, "Login succeeded, but no usable local reference data was available."));
       }
     } catch (error) {
+      writeDiagnosticLog("ERROR", "login-failed", {
+        apiUrl: API_URL,
+        endpoint: `${API_URL}/login`,
+        status: error.response?.status || null,
+        code: error.response?.data?.code || "",
+        message: error.response?.data?.message || error.message || "Login failed",
+      });
       if (["DEVICE_NOT_APPROVED", "DEVICE_PENDING_APPROVAL", "DEVICE_DISABLED", "DEVICE_REVOKED", "DEVICE_ID_REQUIRED"].includes(error.response?.data?.code)) {
         setDeviceGate(error.response.data);
         setStartupError(error.response.data.message || "This device is not approved.");
@@ -3564,7 +3596,7 @@ function App() {
               localDbStatus={localDbStatus}
               onReload={async () => { await Promise.all([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()]); }}
               onRetrySync={retrySyncFailures}
-              onRunSync={runSyncNow}
+              onRunSync={() => runSyncNow({ force: true })}
               onQueueSyncTest={queuePhase2SyncTest}
               settingsData={settingsData}
               syncMessage={syncMessage}
@@ -3883,6 +3915,7 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
         setError(`Account recovery requires internet access. ${health.message}`);
         return;
       }
+      writeDiagnosticLog("INFO", "recovery-options-request", { apiUrl, endpoint: `${apiUrl}/auth/recovery/options` });
       const response = await axios.post(`${apiUrl}/auth/recovery/options`, recoveryPayload(), { timeout: 8000 });
       setProviderStatus(response.data.provider_status || null);
       setSupportContacts(response.data.support_contacts || []);
@@ -3900,6 +3933,12 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
       setStep("method");
       setStatus("Select where FroozERP should send the verification code.");
     } catch (requestError) {
+      writeDiagnosticLog("ERROR", "recovery-options-failed", {
+        apiUrl,
+        endpoint: `${apiUrl}/auth/recovery/options`,
+        status: requestError.response?.status || null,
+        message: requestError.response?.data?.message || requestError.message || "Recovery options failed",
+      });
       setError(getAuthErrorMessage(requestError, "Unable to load recovery options."));
     } finally {
       setBusy(false);
@@ -3913,6 +3952,7 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
     }
     setBusy(true);
     try {
+      writeDiagnosticLog("INFO", "recovery-send-otp-request", { apiUrl, endpoint: `${apiUrl}/auth/recovery/send-otp` });
       const response = await axios.post(`${apiUrl}/auth/recovery/send-otp`, recoveryPayload(), { timeout: 8000 });
       setProviderStatus(response.data.provider_status || null);
       if (response.data.code === "PROVIDER_NOT_CONFIGURED" && !response.data.development_otp) {
@@ -3924,6 +3964,12 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
       setStep("otp");
       setStatus(response.data.development_otp ? "Development recovery code generated for internal testing." : "Verification code sent.");
     } catch (requestError) {
+      writeDiagnosticLog("ERROR", "recovery-send-otp-failed", {
+        apiUrl,
+        endpoint: `${apiUrl}/auth/recovery/send-otp`,
+        status: requestError.response?.status || null,
+        message: requestError.response?.data?.message || requestError.message || "Recovery OTP failed",
+      });
       setError(getAuthErrorMessage(requestError, "Unable to send recovery code."));
     } finally {
       setBusy(false);
@@ -3933,6 +3979,7 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
     resetMessages();
     setBusy(true);
     try {
+      writeDiagnosticLog("INFO", "recovery-verify-otp-request", { apiUrl, endpoint: `${apiUrl}/auth/recovery/verify-otp` });
       const response = await axios.post(`${apiUrl}/auth/recovery/verify-otp`, {
         request_id: requestId,
         otp,
@@ -3948,6 +3995,12 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
         setStatus("Verification complete. Set a new password.");
       }
     } catch (requestError) {
+      writeDiagnosticLog("ERROR", "recovery-verify-otp-failed", {
+        apiUrl,
+        endpoint: `${apiUrl}/auth/recovery/verify-otp`,
+        status: requestError.response?.status || null,
+        message: requestError.response?.data?.message || requestError.message || "Recovery verify failed",
+      });
       setError(getAuthErrorMessage(requestError, "Unable to verify recovery code."));
     } finally {
       setBusy(false);

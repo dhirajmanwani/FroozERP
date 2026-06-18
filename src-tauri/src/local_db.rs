@@ -74,7 +74,7 @@ pub struct SyncAck {
 
 #[derive(Debug, Deserialize)]
 pub struct PulledChange {
-    pub change_id: i64,
+    pub change_id: serde_json::Value,
     pub entity_type: String,
     pub entity_id: String,
     pub operation_type: String,
@@ -2165,7 +2165,7 @@ fn record_conflict_with_tx(tx: &rusqlite::Transaction, ack: &SyncAck) -> Result<
 }
 
 fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Result<(), String> {
-    let _change_id = change.change_id;
+    let _change_id = &change.change_id;
     let operation = change.operation_type.to_uppercase();
     match change.entity_type.as_str() {
         "product_category" => {
@@ -2199,6 +2199,20 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
             }
         }
         "product" | "sale_rate" => {
+            let category_id = change
+                .payload
+                .get("category_global_id")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string())
+                .or_else(|| {
+                    change.payload.get("category_id").and_then(|v| {
+                        if let Some(raw) = v.as_str() {
+                            Some(if raw.starts_with("category-") { raw.to_string() } else { format!("category-{raw}") })
+                        } else {
+                            v.as_i64().map(|id| format!("category-{id}"))
+                        }
+                    })
+                });
             tx.execute(
                 "INSERT INTO local_products (
                     id, cloud_id, branch_id, product_name, category_id, category_name, unit,
@@ -2222,7 +2236,7 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                     change.entity_id,
                     change.payload.get("branch_id").and_then(|v| v.as_i64()).map(|v| v.to_string()).unwrap_or_else(|| "1".to_string()),
                     change.payload.get("product_name").and_then(|v| v.as_str()).unwrap_or("Unnamed"),
-                    change.payload.get("category_id").and_then(|v| v.as_i64()).map(|v| v.to_string()),
+                    category_id,
                     change.payload.get("category").or_else(|| change.payload.get("category_name")).and_then(|v| v.as_str()),
                     change.payload.get("unit").and_then(|v| v.as_str()),
                     change.payload.get("barcode").and_then(|v| v.as_str()),
