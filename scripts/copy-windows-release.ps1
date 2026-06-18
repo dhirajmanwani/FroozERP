@@ -15,7 +15,10 @@ if (-not $installer) {
   throw "No Windows installer artifact was found under $bundleDir. Run npm run build:windows first."
 }
 
-$target = Join-Path $releaseDir "FroozERP-Setup-1.0.0.exe"
+$tauriConfigPath = Join-Path $root "src-tauri\tauri.conf.json"
+$tauriConfig = Get-Content -LiteralPath $tauriConfigPath -Raw | ConvertFrom-Json
+$version = $tauriConfig.version
+$target = Join-Path $releaseDir "FroozERP-Setup-$version.exe"
 Copy-Item -LiteralPath $installer.FullName -Destination $target -Force
 
 [pscustomobject]@{

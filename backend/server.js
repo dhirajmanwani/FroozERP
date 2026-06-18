@@ -3152,7 +3152,7 @@ const getSystemInfo = async (deviceId = "") => {
       : Promise.resolve({ rows: [] }),
   ]);
   return {
-    softwareVersion: "1.0.0",
+    softwareVersion: "1.0.1",
     backendStatus: "Online",
     databaseStatus: dbResult.rows[0]?.database_name ? "Connected" : "Unknown",
     databaseName: dbResult.rows[0]?.database_name || "",
