@@ -64,7 +64,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.2";
+const APP_VERSION = "1.0.3";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const UPDATE_FEED_URL = (
@@ -529,8 +529,12 @@ class ModuleErrorBoundary extends React.Component {
     return { error };
   }
 
-  componentDidCatch(error) {
-    console.error("FroozERP module error", error);
+  componentDidCatch(error, errorInfo) {
+    const safeMessage = error?.message || "Unexpected module render error";
+    console.error("FroozERP module error", {
+      message: safeMessage,
+      componentStack: errorInfo?.componentStack || "",
+    });
   }
 
   render() {
@@ -574,7 +578,15 @@ function App() {
     apiUrl: API_URL,
     url: `${API_URL}/api/health`,
     online: null,
+    checking: false,
+    reachabilityStatus: "checking",
+    status: "checking",
+    httpStatus: null,
+    reasonCode: "NOT_CHECKED",
     message: "Backend reachability has not been checked yet.",
+    lastCheckedAt: "",
+    lastOnlineAt: "",
+    lastErrorAt: "",
   });
   const [loginBusy, setLoginBusy] = useState(false);
   const [offlineMode, setOfflineMode] = useState(false);
@@ -936,13 +948,10 @@ function App() {
     const timer = window.setInterval(() => {
       if (backendHealth.online) runSyncNow();
     }, 60_000);
-    const onlineHandler = () => performConnectivityCheck("sync-online-event", { force: true });
-    window.addEventListener("online", onlineHandler);
     if (backendHealth.online) runSyncNow();
     return () => {
       cancelled = true;
       window.clearInterval(timer);
-      window.removeEventListener("online", onlineHandler);
     };
   }, [user, deviceInfo.device_id, backendHealth.online, performConnectivityCheck]);
 
@@ -3624,19 +3633,22 @@ function App() {
           )}
 
           {activeView === "settings" && (
-            <SettingsModule
-              canManage={canManageRates}
-              localDbStatus={localDbStatus}
-              onReload={async () => { await Promise.all([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()]); }}
-              onRetrySync={retrySyncFailures}
-              onRunSync={() => runSyncNow({ force: true })}
-              onQueueSyncTest={queuePhase2SyncTest}
-              settingsData={settingsData}
-              syncMessage={syncMessage}
-              syncStatus={syncStatus}
-              rules={settingsRules}
-              user={user}
-            />
+            <ModuleErrorBoundary onClose={() => setActiveView("dashboard")}>
+              <SettingsModule
+                backendHealth={backendHealth}
+                canManage={canManageRates}
+                localDbStatus={localDbStatus}
+                onReload={async () => { await Promise.all([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()]); }}
+                onRetrySync={retrySyncFailures}
+                onRunSync={() => runSyncNow({ force: true })}
+                onQueueSyncTest={queuePhase2SyncTest}
+                settingsData={settingsData}
+                syncMessage={syncMessage}
+                syncStatus={syncStatus}
+                rules={settingsRules}
+                user={user}
+              />
+            </ModuleErrorBoundary>
           )}
 
           {activeView === "reports" && (
@@ -7815,6 +7827,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
 }
 
 function SettingsModule({
+  backendHealth,
   canManage,
   localDbStatus,
   onQueueSyncTest,

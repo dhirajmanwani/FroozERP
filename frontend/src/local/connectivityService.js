@@ -7,17 +7,21 @@ let latestState = {
   url: "",
   online: null,
   checking: false,
+  reachabilityStatus: "checking",
   reason: "initial",
   reasonCode: "NOT_CHECKED",
-  status: null,
+  status: "checking",
+  httpStatus: null,
   message: "Backend reachability has not been checked yet.",
   lastCheckedAt: "",
   lastOnlineAt: "",
   lastErrorAt: "",
+  requestId: 0,
 };
 
 let inFlight = null;
 let inFlightController = null;
+let latestRequestId = 0;
 const listeners = new Set();
 
 const healthUrl = (apiUrl) => `${String(apiUrl || "").replace(/\/$/, "")}/api/health`;
@@ -39,21 +43,37 @@ const writeConnectivityLog = async (level, message, details = {}) => {
 
 const classifyHealthError = (error) => {
   if (axios.isCancel?.(error) || error.name === "CanceledError" || error.code === "ERR_CANCELED") {
-    return { reasonCode: "ABORTED", message: "Previous health check was cancelled." };
+    return { reasonCode: "ABORTED", reachabilityStatus: "checking", message: "Previous health check was cancelled." };
   }
   if (error.code === "ECONNABORTED") {
-    return { reasonCode: "TIMEOUT", message: "FroozERP backend health check timed out." };
+    return { reasonCode: "TIMEOUT", reachabilityStatus: "timeout", message: "FroozERP backend health check timed out." };
   }
   if (error.response) {
+    const status = error.response.status;
+    if (status === 401) {
+      return {
+        reasonCode: "AUTHORIZATION",
+        reachabilityStatus: "unauthorised",
+        message: error.response.data?.message || "FroozERP backend is reachable, but the session is not authorised.",
+      };
+    }
+    if (status === 403) {
+      return {
+        reasonCode: "DEVICE_AUTHORIZATION",
+        reachabilityStatus: "unauthorised",
+        message: error.response.data?.message || "FroozERP backend is reachable, but this device is not authorised.",
+      };
+    }
     return {
-      reasonCode: "HTTP_FAILURE",
-      message: error.response.data?.message || `FroozERP backend returned HTTP ${error.response.status}.`,
+      reasonCode: status >= 500 ? "SERVER_ERROR" : "HTTP_FAILURE",
+      reachabilityStatus: status >= 500 ? "server_error" : "offline",
+      message: error.response.data?.message || `FroozERP backend returned HTTP ${status}.`,
     };
   }
   if (error.message?.toLowerCase().includes("network")) {
-    return { reasonCode: "NO_NETWORK", message: "Network is available to Windows, but FroozERP backend is unreachable." };
+    return { reasonCode: "NO_NETWORK", reachabilityStatus: "offline", message: "Network is available to Windows, but FroozERP backend is unreachable." };
   }
-  return { reasonCode: "BACKEND_UNAVAILABLE", message: error.message || "FroozERP backend is unavailable." };
+  return { reasonCode: "BACKEND_UNAVAILABLE", reachabilityStatus: "offline", message: error.message || "FroozERP backend is unavailable." };
 };
 
 const emit = () => {
@@ -78,12 +98,17 @@ export async function checkFroozBackendHealth(apiUrl, options = {}) {
   if (inFlight && !options.force) return inFlight;
   if (inFlightController && options.force) inFlightController.abort();
 
+  const requestId = latestRequestId + 1;
+  latestRequestId = requestId;
   inFlightController = new AbortController();
   latestState = {
     ...latestState,
     apiUrl: normalizedApiUrl,
     url,
     checking: true,
+    reachabilityStatus: "checking",
+    status: "checking",
+    requestId,
     reason,
     message: `Checking FroozERP service at ${url}...`,
   };
@@ -97,20 +122,24 @@ export async function checkFroozBackendHealth(apiUrl, options = {}) {
         headers: { "Cache-Control": "no-cache" },
         params: { t: Date.now() },
       });
+      if (requestId !== latestRequestId) return latestState;
       const online = response.data?.status === "ok";
       latestState = {
         apiUrl: normalizedApiUrl,
         url,
         online,
         checking: false,
+        reachabilityStatus: online ? "online" : "server_error",
         reason,
         reasonCode: online ? "ONLINE" : "HTTP_FAILURE",
-        status: response.status,
+        status: online ? "online" : "server_error",
+        httpStatus: response.status,
         message: online ? "FroozERP backend is reachable." : "Health endpoint responded but did not report ok.",
         data: response.data,
         lastCheckedAt: new Date().toISOString(),
         lastOnlineAt: online ? new Date().toISOString() : latestState.lastOnlineAt,
         lastErrorAt: online ? latestState.lastErrorAt : new Date().toISOString(),
+        requestId,
       };
       writeConnectivityLog("INFO", "health-check-result", {
         apiUrl: normalizedApiUrl,
@@ -122,18 +151,24 @@ export async function checkFroozBackendHealth(apiUrl, options = {}) {
       return latestState;
     } catch (error) {
       const classified = classifyHealthError(error);
+      if (requestId !== latestRequestId || classified.reasonCode === "ABORTED") {
+        return latestState;
+      }
       latestState = {
         ...latestState,
         apiUrl: normalizedApiUrl,
         url,
         online: false,
         checking: false,
+        reachabilityStatus: classified.reachabilityStatus,
+        status: classified.reachabilityStatus,
         reason,
         reasonCode: classified.reasonCode,
-        status: error.response?.status || null,
+        httpStatus: error.response?.status || null,
         message: classified.message,
         lastCheckedAt: new Date().toISOString(),
         lastErrorAt: new Date().toISOString(),
+        requestId,
       };
       writeConnectivityLog("ERROR", "health-check-failed", {
         apiUrl: normalizedApiUrl,
@@ -145,9 +180,11 @@ export async function checkFroozBackendHealth(apiUrl, options = {}) {
       });
       return latestState;
     } finally {
-      inFlight = null;
-      inFlightController = null;
-      emit();
+      if (requestId === latestRequestId) {
+        inFlight = null;
+        inFlightController = null;
+        emit();
+      }
     }
   })();
 

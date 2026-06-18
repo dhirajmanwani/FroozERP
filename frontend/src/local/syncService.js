@@ -154,7 +154,7 @@ export async function initialiseSync({ apiUrl, user, deviceInfo, branchId }) {
     apiUrl: health.apiUrl || normalizeApiUrl(apiUrl),
     backendUrl: health.url || endpointUrl(apiUrl, "/api/health"),
     lastFailureKind: health.online ? "" : health.reasonCode,
-    lastHttpStatus: health.status || null,
+    lastHttpStatus: health.httpStatus || null,
     lastError: health.online ? "" : health.message,
   };
   if (!health.online) return lastStatus;
