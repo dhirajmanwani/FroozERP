@@ -64,7 +64,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.1";
+const APP_VERSION = "1.0.2";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const UPDATE_FEED_URL = (
@@ -73,6 +73,20 @@ const UPDATE_FEED_URL = (
   ""
 ).trim();
 const roundUi = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
+const createPurchaseLineId = () => {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  return `purchase-line-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+};
+const normalizePurchaseLinePart = (value) => String(value ?? "").trim().toLowerCase();
+const buildPurchaseLineIdentity = (item) => [
+  String(item?.product_id || ""),
+  normalizePurchaseLinePart(item?.lot_name),
+  normalizePurchaseLinePart(item?.lot_size),
+  normalizePurchaseLinePart(item?.unit),
+  normalizePurchaseLinePart(item?.origin_type),
+  String(Number(item?.purchase_rate || 0)),
+  String(Number(item?.temporary_sale_rate || 0)),
+].join("|");
 const defaultPurchaseRules = {
   mandiTaxRules: [],
   rebateRules: [],
@@ -737,7 +751,7 @@ function App() {
   const [purchaseLotName, setPurchaseLotName] = useState("");
   const [purchaseLotSize, setPurchaseLotSize] = useState("");
   const [purchaseCart, setPurchaseCart] = useState([]);
-  const [editingPurchaseItemIndex, setEditingPurchaseItemIndex] = useState(null);
+  const [editingPurchaseItemLineId, setEditingPurchaseItemLineId] = useState(null);
   const [editingPurchaseId, setEditingPurchaseId] = useState(null);
   const [purchaseAmendmentMode, setPurchaseAmendmentMode] = useState(false);
   const [amendmentDate, setAmendmentDate] = useState("");
@@ -2155,7 +2169,7 @@ function App() {
     setPurchaseLotName("");
     setPurchaseLotSize("");
     setPurchaseCart([]);
-    setEditingPurchaseItemIndex(null);
+    setEditingPurchaseItemLineId(null);
     setEditingPurchaseId(null);
     setPurchaseAmendmentMode(false);
     setAmendmentDate("");
@@ -2171,7 +2185,7 @@ function App() {
     setPurchaseItemRemarks("");
     setPurchaseLotName("");
     setPurchaseLotSize("");
-    setEditingPurchaseItemIndex(null);
+    setEditingPurchaseItemLineId(null);
   };
 
   const addPurchaseCartItem = () => {
@@ -2201,6 +2215,7 @@ function App() {
       return;
     }
     const item = {
+      line_id: editingPurchaseItemLineId || createPurchaseLineId(),
       product_id: product.id,
       product_name: product.product_name,
       unit: product.unit,
@@ -2215,14 +2230,32 @@ function App() {
     };
     setPurchaseCart((currentCart) => {
       const nextCart = [...currentCart];
-      if (editingPurchaseItemIndex !== null) {
-        nextCart[editingPurchaseItemIndex] = item;
+      const itemIdentity = buildPurchaseLineIdentity(item);
+      if (editingPurchaseItemLineId !== null) {
+        const editingIndex = nextCart.findIndex((cartItem) => cartItem.line_id === editingPurchaseItemLineId);
+        if (editingIndex < 0) return currentCart;
+        const duplicateIndex = nextCart.findIndex((cartItem) =>
+          cartItem.line_id !== editingPurchaseItemLineId &&
+          buildPurchaseLineIdentity(cartItem) === itemIdentity
+        );
+        if (duplicateIndex >= 0) {
+          const shouldMerge = window.confirm("This edited item exactly matches another purchase-cart row. Add this quantity to the existing row and remove the edited row?");
+          if (!shouldMerge) return currentCart;
+          nextCart[duplicateIndex] = {
+            ...nextCart[duplicateIndex],
+            quantity: Number(nextCart[duplicateIndex].quantity || 0) + quantity,
+          };
+          nextCart.splice(editingIndex, 1);
+        } else {
+          nextCart[editingIndex] = item;
+        }
       } else {
-        const existingIndex = nextCart.findIndex((cartItem) => Number(cartItem.product_id) === Number(item.product_id));
+        const existingIndex = nextCart.findIndex((cartItem) => buildPurchaseLineIdentity(cartItem) === itemIdentity);
         if (existingIndex >= 0) {
+          const shouldMerge = window.confirm("This exact product lot already exists in the purchase cart. Add this quantity to the existing row?");
+          if (!shouldMerge) return currentCart;
           nextCart[existingIndex] = {
             ...nextCart[existingIndex],
-            ...item,
             quantity: Number(nextCart[existingIndex].quantity || 0) + quantity,
           };
         } else {
@@ -2234,10 +2267,10 @@ function App() {
     resetPurchaseItemFields();
   };
 
-  const editPurchaseCartItem = (index) => {
-    const item = purchaseCart[index];
+  const editPurchaseCartItem = (lineId) => {
+    const item = purchaseCart.find((cartItem) => cartItem.line_id === lineId);
     if (!item) return;
-    setEditingPurchaseItemIndex(index);
+    setEditingPurchaseItemLineId(item.line_id);
     setPurchaseProductId(String(item.product_id));
     setPurchaseQuantity(String(item.quantity || ""));
     setPurchaseRateInput(String(item.purchase_rate || ""));
@@ -2248,9 +2281,9 @@ function App() {
     setPurchaseItemRemarks(item.remarks || "");
   };
 
-  const removePurchaseCartItem = (index) => {
-    setPurchaseCart((currentCart) => currentCart.filter((_, itemIndex) => itemIndex !== index));
-    if (editingPurchaseItemIndex === index) resetPurchaseItemFields();
+  const removePurchaseCartItem = (lineId) => {
+    setPurchaseCart((currentCart) => currentCart.filter((item) => item.line_id !== lineId));
+    if (editingPurchaseItemLineId === lineId) resetPurchaseItemFields();
   };
 
   const validatePurchaseBeforeSave = () => {
@@ -2501,7 +2534,7 @@ function App() {
     setPurchaseLotName(purchase.lot_name || purchase.item_lot_name || "");
     setPurchaseLotSize(purchase.lot_size || purchase.item_lot_size || "");
     setPurchaseCart([]);
-    setEditingPurchaseItemIndex(null);
+    setEditingPurchaseItemLineId(null);
     setActiveView("purchase");
   };
 
@@ -3395,14 +3428,14 @@ function App() {
                 </div>
                 {!editingPurchaseId && (
                   <div className="button-row">
-                    <button className="secondary-button" onClick={addPurchaseCartItem}>{editingPurchaseItemIndex !== null ? "Update Item" : purchaseAmendmentMode ? "Add Forgotten Item" : "Add Item"}</button>
-                    {editingPurchaseItemIndex !== null && <button className="secondary-button" onClick={resetPurchaseItemFields}>Cancel Item Edit</button>}
+                    <button className="secondary-button" onClick={addPurchaseCartItem}>{editingPurchaseItemLineId !== null ? "Update Item" : purchaseAmendmentMode ? "Add Forgotten Item" : "Add Item"}</button>
+                    {editingPurchaseItemLineId !== null && <button className="secondary-button" onClick={resetPurchaseItemFields}>Cancel Item Edit</button>}
                   </div>
                 )}
                 {!editingPurchaseId && (
                   <DataTable headers={["Product", "Lot / Size", "Qty", "Unit", "Origin", "Purchase / Expected Rate", "Temp Sale Rate", "Remarks", "Actions"]}>
-                    {purchaseCart.map((item, index) => (
-                      <tr key={`${item.product_id}-${index}`}>
+                    {purchaseCart.map((item) => (
+                      <tr key={item.line_id}>
                         <td className="primary-cell">{item.product_name}</td>
                         <td>{item.lot_name || "-"}{item.lot_size ? ` / ${item.lot_size}` : ""}</td>
                         <td>{item.quantity}</td>
@@ -3413,8 +3446,8 @@ function App() {
                         <td>{item.remarks || "-"}</td>
                         <td>
                           <div className="button-row table-actions-row">
-                            <button className="table-action" onClick={() => editPurchaseCartItem(index)}>Edit</button>
-                            <button className="remove-button" onClick={() => removePurchaseCartItem(index)}>Remove</button>
+                            <button className="table-action" onClick={() => editPurchaseCartItem(item.line_id)}>Edit</button>
+                            <button className="remove-button" onClick={() => removePurchaseCartItem(item.line_id)}>Remove</button>
                           </div>
                         </td>
                       </tr>

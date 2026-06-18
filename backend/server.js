@@ -891,6 +891,8 @@ const initializeDatabase = async () => {
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS labour_charges NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS lot_name VARCHAR(120);
     ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS lot_size VARCHAR(120);
+    ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS unit VARCHAR(30);
+    ALTER TABLE purchase_items ADD COLUMN IF NOT EXISTS origin_type VARCHAR(20);
 
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS effective_cost_per_unit NUMERIC(14, 4);
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS supplier_id INTEGER;
@@ -911,6 +913,8 @@ const initializeDatabase = async () => {
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS lot_size VARCHAR(120);
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS stock_source VARCHAR(40) DEFAULT 'PURCHASE';
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS remarks TEXT;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS unit VARCHAR(30);
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS origin_type VARCHAR(20);
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS adjusted_qty NUMERIC(14, 3) DEFAULT 0;
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS transfer_in_qty NUMERIC(14, 3) DEFAULT 0;
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS transfer_out_qty NUMERIC(14, 3) DEFAULT 0;
@@ -918,6 +922,18 @@ const initializeDatabase = async () => {
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS waste_qty NUMERIC(14, 3) DEFAULT 0;
     UPDATE inventory_batches SET batch_status = 'ACTIVE' WHERE batch_status IS NULL;
     UPDATE inventory_batches SET effective_cost_per_unit = purchase_rate WHERE effective_cost_per_unit IS NULL;
+    UPDATE purchase_items pi
+       SET unit = COALESCE(pi.unit, p.unit),
+           origin_type = COALESCE(pi.origin_type, p.origin_type)
+      FROM products p
+     WHERE pi.product_id = p.id
+       AND (pi.unit IS NULL OR pi.origin_type IS NULL);
+    UPDATE inventory_batches ib
+       SET unit = COALESCE(ib.unit, p.unit),
+           origin_type = COALESCE(ib.origin_type, p.origin_type)
+      FROM products p
+     WHERE ib.product_id = p.id
+       AND (ib.unit IS NULL OR ib.origin_type IS NULL);
 
     CREATE TABLE IF NOT EXISTS mandi_tax_rules (
       id SERIAL PRIMARY KEY,
@@ -3152,7 +3168,7 @@ const getSystemInfo = async (deviceId = "") => {
       : Promise.resolve({ rows: [] }),
   ]);
   return {
-    softwareVersion: "1.0.1",
+    softwareVersion: "1.0.2",
     backendStatus: "Online",
     databaseStatus: dbResult.rows[0]?.database_name ? "Connected" : "Unknown",
     databaseName: dbResult.rows[0]?.database_name || "",
@@ -11974,6 +11990,8 @@ const readPurchaseEntryPayload = (body) => {
     billDate: isDateInput(body.bill_date) ? body.bill_date : null,
     lotName: nullableText(body.lot_name || body.lot_number),
     lotSize: nullableText(body.lot_size || body.size_grade || body.size),
+    unit: nullableText(body.unit),
+    originType: nullableText(body.origin_type) ? String(body.origin_type).trim().toUpperCase() : null,
     branchId: parsePositiveInteger(body.branch_id),
     actorId: parsePositiveInteger(body.created_by || body.edited_by) || 1,
     remarks: nullableText(body.remarks),
@@ -12015,14 +12033,15 @@ const buildPurchaseFinancials = async (client, entry) => {
   if (supplierResult.rows.length === 0) return { error: "Add New Supplier" };
 
   const productResult = await client.query(
-    "SELECT id, product_name, origin_type FROM products WHERE id = $1 AND active = TRUE FOR SHARE",
+    "SELECT id, product_name, origin_type, unit FROM products WHERE id = $1 AND active = TRUE FOR SHARE",
     [entry.productId]
   );
   if (productResult.rows.length === 0) return { error: "Product not found", status: 404 };
 
   const supplier = supplierResult.rows[0];
   const product = productResult.rows[0];
-  const originType = product.origin_type || "LOCAL";
+  const originType = entry.originType || product.origin_type || "LOCAL";
+  const unit = entry.unit || product.unit || "";
   const [mandiResult, rebateResult] = await Promise.all([
     client.query("SELECT * FROM mandi_tax_rules WHERE origin_type = $1 AND active = TRUE", [originType]),
     client.query("SELECT * FROM rebate_rules WHERE id = $1 AND active = TRUE", [entry.rebateRuleId]),
@@ -12049,6 +12068,7 @@ const buildPurchaseFinancials = async (client, entry) => {
     supplier,
     product,
     originType,
+    unit,
     rebateRule,
     financials: {
       mandiTaxPercent,
@@ -12182,7 +12202,7 @@ const insertOpeningStockLot = async (client, { product, lot, actorId, branchId }
 const getPurchasePartiesForArrival = async (client, entry) => {
   const [supplierResult, productResult] = await Promise.all([
     client.query("SELECT id, supplier_name FROM suppliers WHERE id = $1 AND active = TRUE FOR SHARE", [entry.supplierId]),
-    client.query("SELECT id, product_name, origin_type, selling_rate FROM products WHERE id = $1 AND active = TRUE FOR SHARE", [entry.productId]),
+    client.query("SELECT id, product_name, origin_type, unit, selling_rate FROM products WHERE id = $1 AND active = TRUE FOR SHARE", [entry.productId]),
   ]);
   if (supplierResult.rows.length === 0) return { error: "Add New Supplier" };
   if (productResult.rows.length === 0) return { error: "Product not found", status: 404 };
@@ -12324,6 +12344,8 @@ app.post("/purchase", async (req, res) => {
       }
       const provisionalCost = Number(entry.expectedPurchaseRate || 0);
       const provisionalAmount = roundCurrency(entry.quantity * provisionalCost);
+      const itemUnit = entry.unit || arrival.product.unit || "";
+      const itemOriginType = entry.originType || arrival.product.origin_type || "LOCAL";
       const purchaseResult = await client.query(
         `
         INSERT INTO purchases (
@@ -12345,11 +12367,11 @@ app.post("/purchase", async (req, res) => {
         `
         INSERT INTO purchase_items (
           purchase_id, product_id, quantity, purchase_rate, amount, basic_amount,
-          net_payable, effective_cost_per_unit
+          net_payable, effective_cost_per_unit, lot_name, lot_size, unit, origin_type
         )
-        VALUES ($1, $2, $3, $4, $5, 0, 0, $4)
+        VALUES ($1, $2, $3, $4, $5, 0, 0, $4, $6, $7, $8, $9)
         `,
-        [purchase.id, entry.productId, entry.quantity, provisionalCost, provisionalAmount]
+        [purchase.id, entry.productId, entry.quantity, provisionalCost, provisionalAmount, entry.lotName, entry.lotSize, itemUnit, itemOriginType]
       );
       const batchNo = `PENDING-${Date.now()}-${purchase.id}`;
       await client.query(
@@ -12357,13 +12379,15 @@ app.post("/purchase", async (req, res) => {
         INSERT INTO inventory_batches (
           product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
           supplier_id, supplier_name, branch_id, gross_amount, net_payable, balance_amount,
-          purchase_id, batch_status, purchase_bill_status, temporary_sale_rate
+          purchase_id, batch_status, purchase_bill_status, temporary_sale_rate, lot_name, lot_size,
+          unit, origin_type
         )
-        VALUES ($1, $2, $3, $3, $4, $4, $5, $6, $7, 0, 0, 0, $8, 'ACTIVE', 'BILL_PENDING', $9)
+        VALUES ($1, $2, $3, $3, $4, $4, $5, $6, $7, 0, 0, 0, $8, 'ACTIVE', 'BILL_PENDING', $9, $10, $11, $12, $13)
         `,
         [
           entry.productId, batchNo, entry.quantity, provisionalCost, arrival.supplier.id,
           arrival.supplier.supplier_name, entry.branchId, purchase.id, entry.temporarySaleRate,
+          entry.lotName, entry.lotSize, itemUnit, itemOriginType,
         ]
       );
       await client.query(
@@ -12392,7 +12416,9 @@ app.post("/purchase", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(calculation.status || 400).json({ message: calculation.error });
     }
-    const { supplier, product, originType, rebateRule, financials } = calculation;
+    const { supplier, product, originType, unit, rebateRule, financials } = calculation;
+    const itemUnit = entry.unit || unit || product.unit || "";
+    const itemOriginType = entry.originType || originType || product.origin_type || "LOCAL";
 
     const purchaseResult = await client.query(
       `
@@ -12426,14 +12452,14 @@ app.post("/purchase", async (req, res) => {
       INSERT INTO purchase_items (
         purchase_id, product_id, quantity, purchase_rate, amount, basic_amount,
         mandi_tax_amount, other_charges, rebate_amount, net_payable, effective_cost_per_unit,
-        freight_charges, labour_charges
+        freight_charges, labour_charges, lot_name, lot_size, unit, origin_type
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
       `,
       [
         purchase.id, entry.productId, entry.quantity, entry.purchaseRate, financials.netPayable, financials.basicAmount,
         financials.mandiTaxAmount, entry.otherCharges, financials.rebateAmount, financials.netPayable, financials.effectiveCostPerUnit,
-        entry.freightCharges, entry.labourCharges,
+        entry.freightCharges, entry.labourCharges, entry.lotName, entry.lotSize, itemUnit, itemOriginType,
       ]
     );
 
@@ -12444,9 +12470,9 @@ app.post("/purchase", async (req, res) => {
         product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
         supplier_id, supplier_name, branch_id, mandi_tax_amount, freight_charges, labour_charges,
         other_charges, gross_amount, rebate_amount, net_payable, payment_timing, balance_amount,
-        purchase_id, batch_status, purchase_bill_status
+        purchase_id, batch_status, purchase_bill_status, lot_name, lot_size, unit, origin_type
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'ACTIVE', 'BILL_COMPLETED')
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'ACTIVE', 'BILL_COMPLETED', $20, $21, $22, $23)
       `,
       [
         entry.productId,
@@ -12468,6 +12494,10 @@ app.post("/purchase", async (req, res) => {
         rebateRule.rule_name,
         financials.balanceAmount,
         purchase.id,
+        entry.lotName,
+        entry.lotSize,
+        itemUnit,
+        itemOriginType,
       ]
     );
 
@@ -12533,6 +12563,8 @@ app.post("/purchase-bill", async (req, res) => {
       purchase_rate: item.purchase_rate,
       expected_purchase_rate: item.expected_purchase_rate,
       temporary_sale_rate: item.temporary_sale_rate,
+      unit: item.unit,
+      origin_type: item.origin_type,
       lot_name: item.lot_name,
       lot_size: item.lot_size,
       remarks: cleanText(item.remarks) || baseEntry.remarks,
@@ -12560,6 +12592,8 @@ app.post("/purchase-bill", async (req, res) => {
         }
         const provisionalCost = Number(entry.expectedPurchaseRate || 0);
         const provisionalAmount = roundCurrency(entry.quantity * provisionalCost);
+        const itemUnit = entry.unit || arrival.product.unit || "";
+        const itemOriginType = entry.originType || arrival.product.origin_type || "LOCAL";
         const purchaseResult = await client.query(
           `
           INSERT INTO purchases (
@@ -12583,11 +12617,11 @@ app.post("/purchase-bill", async (req, res) => {
           `
           INSERT INTO purchase_items (
             purchase_id, product_id, quantity, purchase_rate, amount, basic_amount,
-            net_payable, effective_cost_per_unit, lot_name, lot_size
+            net_payable, effective_cost_per_unit, lot_name, lot_size, unit, origin_type
           )
-          VALUES ($1, $2, $3, $4, $5, 0, 0, $4, $6, $7)
+          VALUES ($1, $2, $3, $4, $5, 0, 0, $4, $6, $7, $8, $9)
           `,
-          [purchase.id, entry.productId, entry.quantity, provisionalCost, provisionalAmount, entry.lotName, entry.lotSize]
+          [purchase.id, entry.productId, entry.quantity, provisionalCost, provisionalAmount, entry.lotName, entry.lotSize, itemUnit, itemOriginType]
         );
         const batchNo = `PENDING-${Date.now()}-${purchase.id}`;
         await client.query(
@@ -12596,14 +12630,14 @@ app.post("/purchase-bill", async (req, res) => {
             product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
             supplier_id, supplier_name, branch_id, gross_amount, net_payable, balance_amount,
             purchase_id, batch_status, purchase_bill_status, temporary_sale_rate, lot_name, lot_size,
-            stock_source, remarks, purchase_date
+            stock_source, remarks, purchase_date, unit, origin_type
           )
-          VALUES ($1, $2, $3, $3, $4, $4, $5, $6, $7, 0, 0, 0, $8, 'ACTIVE', 'BILL_PENDING', $9, $10, $11, 'PURCHASE', $12, $13)
+          VALUES ($1, $2, $3, $3, $4, $4, $5, $6, $7, 0, 0, 0, $8, 'ACTIVE', 'BILL_PENDING', $9, $10, $11, 'PURCHASE', $12, $13, $14, $15)
           `,
           [
             entry.productId, batchNo, entry.quantity, provisionalCost, arrival.supplier.id,
             arrival.supplier.supplier_name, entry.branchId, purchase.id, entry.temporarySaleRate,
-            entry.lotName, entry.lotSize, entry.remarks, entry.purchaseDate,
+            entry.lotName, entry.lotSize, entry.remarks, entry.purchaseDate, itemUnit, itemOriginType,
           ]
         );
         await client.query(
@@ -12670,7 +12704,9 @@ app.post("/purchase-bill", async (req, res) => {
     const createdPurchases = [];
     for (let index = 0; index < completedEntries.length; index += 1) {
       const item = completedEntries[index];
-      const { entry, supplier, product, originType, rebateRule } = item;
+      const { entry, supplier, product, originType, unit, rebateRule } = item;
+      const itemUnit = entry.unit || unit || product.unit || "";
+      const itemOriginType = entry.originType || originType || product.origin_type || "LOCAL";
       const isLast = index === completedEntries.length - 1;
       const paidAmount = baseEntry.purchaseType === "CASH"
         ? isLast
@@ -12715,14 +12751,14 @@ app.post("/purchase-bill", async (req, res) => {
         INSERT INTO purchase_items (
           purchase_id, product_id, quantity, purchase_rate, amount, basic_amount,
           mandi_tax_amount, other_charges, rebate_amount, net_payable, effective_cost_per_unit,
-          freight_charges, labour_charges, lot_name, lot_size
+          freight_charges, labour_charges, lot_name, lot_size, unit, origin_type
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
         `,
         [
           purchase.id, entry.productId, entry.quantity, entry.purchaseRate, financials.netPayable, financials.basicAmount,
           financials.mandiTaxAmount, entry.otherCharges, financials.rebateAmount, financials.netPayable, financials.effectiveCostPerUnit,
-          entry.freightCharges, entry.labourCharges, entry.lotName, entry.lotSize,
+          entry.freightCharges, entry.labourCharges, entry.lotName, entry.lotSize, itemUnit, itemOriginType,
         ]
       );
       const batchNo = `BATCH-${Date.now()}-${purchase.id}`;
@@ -12732,15 +12768,15 @@ app.post("/purchase-bill", async (req, res) => {
           product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
           supplier_id, supplier_name, branch_id, mandi_tax_amount, freight_charges, labour_charges,
           other_charges, gross_amount, rebate_amount, net_payable, payment_timing, balance_amount,
-          purchase_id, batch_status, purchase_bill_status, lot_name, lot_size, stock_source, remarks, purchase_date
+          purchase_id, batch_status, purchase_bill_status, lot_name, lot_size, stock_source, remarks, purchase_date, unit, origin_type
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'ACTIVE', 'BILL_COMPLETED', $20, $21, 'PURCHASE', $22, $23)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'ACTIVE', 'BILL_COMPLETED', $20, $21, 'PURCHASE', $22, $23, $24, $25)
         `,
         [
           entry.productId, batchNo, entry.quantity, entry.quantity, entry.purchaseRate, financials.effectiveCostPerUnit,
           supplier.id, supplier.supplier_name, entry.branchId, financials.mandiTaxAmount, entry.freightCharges, entry.labourCharges,
           entry.otherCharges, financials.grossAmount, financials.rebateAmount, financials.netPayable, rebateRule.rule_name,
-          financials.balanceAmount, purchase.id, entry.lotName, entry.lotSize, entry.remarks, entry.purchaseDate,
+          financials.balanceAmount, purchase.id, entry.lotName, entry.lotSize, entry.remarks, entry.purchaseDate, itemUnit, itemOriginType,
         ]
       );
       await client.query(
