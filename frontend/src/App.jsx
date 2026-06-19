@@ -64,7 +64,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.8";
+const APP_VERSION = "1.0.9";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -5060,11 +5060,15 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
     date: "",
     status: "ACTIVE",
     viewMode: "INVOICE",
+    customerMode: "ALL",
     customer: "",
+    selectedCustomers: [],
     product: "",
     lot: "",
     paymentMode: "",
+    userMode: "ALL",
     user: "",
+    selectedUsers: [],
   });
   const [expandedSalesRows, setExpandedSalesRows] = useState({});
   const [accountReportFilters, setAccountReportFilters] = useState({
@@ -5394,9 +5398,29 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
   const saleItemGross = (item) => Number(item.gross_amount ?? item.amount ?? 0) || Number(item.quantity || 0) * Number(item.selling_rate || 0);
   const saleItemDiscount = (item) => Number(item.discount_amount || 0);
   const saleItemNetBeforeInvoiceDiscount = (item) => Number(item.net_amount ?? (saleItemGross(item) - saleItemDiscount(item)));
-  const saleLotLabel = (item) => [item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "-";
+  const saleLotLabel = (item) => item.lot_name || "No Lot Number";
+  const officialWalkInCustomerName = "Walk-in Customer";
+  const normalizeCustomerName = (value) => String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "");
+  const isWalkInSaleRow = (row) => {
+    if (row.system_account === true || row.customer_system_account === true) return true;
+    if (row.customer_id && String(row.customer_id) !== "1") return false;
+    return ["", "1", normalizeCustomerName(officialWalkInCustomerName), "walkincust", "walkincustomer"].includes(normalizeCustomerName(row.customer_name));
+  };
+  const saleCustomerKey = (row) => isWalkInSaleRow(row) ? "WALK_IN" : String(row.customer_id || row.customer_account_id || row.customer_name || "UNKNOWN");
+  const saleCustomerLabel = (row) => isWalkInSaleRow(row) ? officialWalkInCustomerName : (row.customer_name || "Unassigned Customer");
+  const saleUserKey = (row) => String(row.created_by_user_id || row.created_by || row.user_id || row.sold_by_user_id || row.created_by_name || row.sold_by || "UNKNOWN");
+  const saleUserLabel = (row) => row.created_by_name || row.sold_by || (saleUserKey(row) === "UNKNOWN" ? "Unknown User" : saleUserKey(row));
+  const salePayments = (row) => {
+    if (Array.isArray(row.payments) && row.payments.length) return row.payments;
+    if (Array.isArray(row.payment_allocations) && row.payment_allocations.length) return row.payment_allocations;
+    return [{ mode: row.payment_mode || "UNKNOWN", amount: Number(row.total_amount || row.net_total || 0) }];
+  };
+  const salePaymentAmount = (row, modes) => salePayments(row).reduce((sum, payment) => {
+    const mode = String(payment.mode || payment.payment_mode || "").toUpperCase();
+    return modes.has(mode) ? sum + Number(payment.amount || payment.payment_amount || 0) : sum;
+  }, 0);
   const saleItemNarration = (item) => {
-    const lot = [item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "-";
+    const lot = item.lot_name || "No Lot Number";
     const qty = Number(item.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 });
     const unit = String(item.unit || "");
     const rate = Number(item.selling_rate || 0);
@@ -5489,16 +5513,16 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
     return `${summary || "No item detail"}${extraCount ? ` +${extraCount} more` : ""}`;
   };
   const salesFilterOptions = salesHistoryRawRows.reduce((options, row) => {
-    if (row.customer_name) options.customers.set(String(row.customer_id || row.customer_name), row.customer_name || "Walk-in Customer");
+    options.customers.set(saleCustomerKey(row), saleCustomerLabel(row));
     if (row.payment_mode) options.paymentModes.add(row.payment_mode);
-    if (row.created_by_name) options.users.add(row.created_by_name);
+    options.users.set(saleUserKey(row), saleUserLabel(row));
     for (const item of saleItems(row)) {
       if (item.product_id || item.product_name) options.products.set(String(item.product_id || item.product_name), item.product_name || "Item");
       const lotKey = String(item.inventory_batch_id || item.lot_name || "");
       if (lotKey) options.lots.set(lotKey, saleLotLabel(item));
     }
     return options;
-  }, { customers: new Map(), products: new Map(), lots: new Map(), paymentModes: new Set(), users: new Set() });
+  }, { customers: new Map(), products: new Map(), lots: new Map(), paymentModes: new Set(), users: new Map() });
   const filteredSalesHistoryRows = salesHistoryRawRows.filter((row) => {
     if (salesFilters.date && toDateKey(row.sale_date) !== salesFilters.date) return false;
     if (salesFilters.status === "CANCELLED") return row.sale_status === "CANCELLED";
@@ -5508,14 +5532,25 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
   }).map((row) => {
     const allItems = saleItems(row);
     const selectorItems = allItems.filter((item) => {
-      if (salesFilters.customer && String(row.customer_id || row.customer_name || "") !== salesFilters.customer) return false;
+      const customerKey = saleCustomerKey(row);
+      if (salesFilters.customerMode === "WALK_IN" && customerKey !== "WALK_IN") return false;
+      if (salesFilters.customerMode === "SINGLE" && salesFilters.customer && customerKey !== salesFilters.customer) return false;
+      if (salesFilters.customerMode === "CUSTOM" && salesFilters.selectedCustomers.length > 0 && !salesFilters.selectedCustomers.includes(customerKey)) return false;
       if (salesFilters.product && String(item.product_id || item.product_name || "") !== salesFilters.product) return false;
       if (salesFilters.lot && String(item.inventory_batch_id || item.lot_name || "") !== salesFilters.lot) return false;
       if (salesFilters.paymentMode && row.payment_mode !== salesFilters.paymentMode) return false;
-      if (salesFilters.user && row.created_by_name !== salesFilters.user) return false;
+      const userKey = saleUserKey(row);
+      if (salesFilters.userMode === "SINGLE" && salesFilters.user && userKey !== salesFilters.user) return false;
+      if (salesFilters.userMode === "CUSTOM" && salesFilters.selectedUsers.length > 0 && !salesFilters.selectedUsers.includes(userKey)) return false;
       return true;
     });
-    const hasSelectorFilter = Boolean(salesFilters.customer || salesFilters.product || salesFilters.lot || salesFilters.paymentMode || salesFilters.user);
+    const hasSelectorFilter = Boolean(
+      salesFilters.customerMode !== "ALL" ||
+      salesFilters.userMode !== "ALL" ||
+      salesFilters.product ||
+      salesFilters.lot ||
+      salesFilters.paymentMode
+    );
     if (hasSelectorFilter && selectorItems.length === 0) return null;
     const searchText = search.trim().toLowerCase();
     if (!searchText) return { ...row, visible_items: selectorItems, all_items: allItems, showing_matched_only: false };
@@ -5576,6 +5611,58 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
         };
       });
     };
+    if (salesFilters.viewMode === "CUSTOMER") {
+      const groups = new Map();
+      for (const row of filteredSalesHistoryRows) {
+        const customerKey = saleCustomerKey(row);
+        const itemRows = buildItemRows(row);
+        const group = groups.get(customerKey) || {
+          row_type: "CUSTOMER_GROUP",
+          display_key: `customer-${customerKey}`,
+          customer_key: customerKey,
+          customer_name: saleCustomerLabel(row),
+          invoices: new Set(),
+          item_lines: 0,
+          gross_total: 0,
+          net_total: 0,
+          cash_total: 0,
+          upi_bank_total: 0,
+          credit_total: 0,
+          quantity_groups: new Map(),
+          rows: [],
+        };
+        group.invoices.add(row.id);
+        group.item_lines += itemRows.length;
+        group.gross_total += Number(row.gross_total || row.total_amount || 0);
+        group.net_total += Number(row.net_total || row.total_amount || 0);
+        group.cash_total += salePaymentAmount(row, new Set(["CASH"]));
+        group.upi_bank_total += salePaymentAmount(row, new Set(["UPI", "BANK", "BANK_TRANSFER"]));
+        if (String(row.payment_mode || "").toUpperCase() === "CREDIT") {
+          group.credit_total += Number(row.net_total || row.total_amount || 0);
+        }
+        for (const item of itemRows) {
+          const unit = normalizeSaleUnit(item.unit);
+          group.quantity_groups.set(unit, (group.quantity_groups.get(unit) || 0) + Number(item.quantity || 0));
+        }
+        group.rows.push(...itemRows.map((item, index) => ({
+          ...item,
+          row_type: "CUSTOMER_ITEM",
+          display_key: `customer-item-${customerKey}-${item.display_key}`,
+          customer_name: saleCustomerLabel(row),
+          invoice_first_line: index === 0,
+          invoice_item_count: itemRows.length,
+        })));
+        groups.set(customerKey, group);
+      }
+      return [...groups.values()].sort((left, right) => left.customer_name.localeCompare(right.customer_name)).flatMap((group) => [
+        {
+          ...group,
+          invoice_count: group.invoices.size,
+          quantity_summary: formatSaleQuantityGroups(group.quantity_groups),
+        },
+        ...group.rows,
+      ]);
+    }
     if (salesFilters.viewMode === "INVOICE" || clubSalesItems) {
       return filteredSalesHistoryRows.map((row) => {
         const items = row.visible_items?.length ? row.visible_items : saleItems(row);
@@ -5600,6 +5687,57 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
       });
     }
     return filteredSalesHistoryRows.flatMap(buildItemRows);
+  })();
+  const salesHasItemDiscount = salesHistoryRows.some((row) => row.row_type !== "CUSTOMER_GROUP" && Number(row.item_discount_total || 0) > 0);
+  const salesHasBillDiscount = salesHistoryRows.some((row) => row.row_type !== "CUSTOMER_GROUP" && Number(row.bill_discount_total || 0) > 0);
+  const salesHistoryHeaders = (() => {
+    if (salesFilters.viewMode === "CUSTOMER") {
+      return [
+        "Date / Time",
+        "Invoice",
+        "Item Name",
+        "Lot Number",
+        "Quantity",
+        "Unit",
+        "Rate",
+        ...(salesHasItemDiscount ? ["Item Discount"] : []),
+        ...(salesHasBillDiscount ? ["Bill Discount"] : []),
+        "Net Total",
+        "Payment Mode",
+        "Status",
+      ];
+    }
+    if (salesFilters.viewMode === "INVOICE") {
+      return [
+        "Date",
+        "Invoice",
+        "Customer",
+        "Item Summary",
+        "Quantity",
+        "Gross Total",
+        ...(salesHasItemDiscount ? ["Item Discount"] : []),
+        ...(salesHasBillDiscount ? ["Bill Discount"] : []),
+        "Net Total",
+        "Payment Mode",
+        "Status",
+      ];
+    }
+    return [
+      "Date",
+      "Invoice",
+      "Customer",
+      "Item Name",
+      "Lot No.",
+      "Quantity",
+      "Unit",
+      "Rate",
+      "Gross Amount",
+      ...(salesHasItemDiscount ? ["Item Discount"] : []),
+      ...(salesHasBillDiscount ? ["Bill Discount"] : []),
+      "Net Amount",
+      "Payment Mode",
+      "User",
+    ];
   })();
   const salesNarrationDisplay = (row) => (
     salesPrintNarration || salesPrintNarrationRef.current ? row.item_narration : row.item_summary
@@ -5630,16 +5768,45 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
       title: "Sales History",
       rows: salesHistoryRows,
       summary: (rows) => {
-        const activeRows = rows.filter((row) => row.status_label !== "Cancelled");
-        const invoiceCount = new Set(activeRows.map((row) => row.sale_id)).size;
-        return [["Net Sales", money(totalOf(activeRows, "net_total")), true], ["Total Quantity", combineSaleQuantityGroups(activeRows)], ["Invoices", invoiceCount], ["Item Lines", number(activeRows.reduce((sum, row) => sum + (row.item_rows?.length || 1), 0))], ["Gross Total", money(totalOf(activeRows, "gross_total"))], ["Item Discount", money(totalOf(activeRows, "item_discount_total"))], ["Bill Discount", money(totalOf(activeRows, "bill_discount_total"))]];
+        const activeRows = rows.filter((row) => row.row_type !== "CUSTOMER_GROUP" && row.status_label !== "Cancelled");
+        const activeInvoices = filteredSalesHistoryRows.filter((row) => saleStatusLabel(row) !== "Cancelled");
+        const invoiceCount = new Set(activeInvoices.map((row) => row.id)).size;
+        const itemLineCount = activeRows.reduce((sum, row) => sum + (row.item_rows?.length || 1), 0);
+        const totalCash = activeInvoices.reduce((sum, row) => sum + salePaymentAmount(row, new Set(["CASH"])), 0);
+        const totalUpiBank = activeInvoices.reduce((sum, row) => sum + salePaymentAmount(row, new Set(["UPI", "BANK", "BANK_TRANSFER"])), 0);
+        const grossTotal = activeInvoices.reduce((sum, row) => sum + Number(row.gross_total || row.total_amount || 0), 0);
+        return [
+          ["Total Quantity", combineSaleQuantityGroups(activeRows), true],
+          ["Invoices", invoiceCount],
+          ["Item Lines", number(itemLineCount)],
+          ["Total Cash", money(totalCash)],
+          ["Total UPI / Bank", money(totalUpiBank)],
+          ["Gross Total", money(grossTotal)],
+        ];
       },
-      headers: salesFilters.viewMode === "INVOICE"
-        ? ["Date", "Invoice", "Customer", "Item Summary", "Quantity", "Gross Total", "Item Discount", "Bill Discount", "Net Total", "Payment Mode", "Status"]
-        : ["Date", "Invoice", "Customer", "Item Name", "Lot No.", "Size / Grade", "Quantity", "Unit", "Rate", "Gross Amount", "Item Discount", "Bill Discount", "Net Amount", "Payment Mode", "User"],
+      headers: salesHistoryHeaders,
       render: (row) => {
         const saleId = row.sale_id || row.id;
         const openInvoice = () => onOpenSaleView?.(saleId);
+        if (row.row_type === "CUSTOMER_GROUP") {
+          return (
+            <tr className="date-total-row customer-sales-group-row" key={row.display_key}>
+              <td colSpan={salesHistoryHeaders.length}>
+                <div className="customer-sales-group-summary">
+                  <strong>{row.customer_name}</strong>
+                  <span>{row.invoice_count} invoice{row.invoice_count === 1 ? "" : "s"}</span>
+                  <span>{row.item_lines} item line{row.item_lines === 1 ? "" : "s"}</span>
+                  <span>{row.quantity_summary || "-"}</span>
+                  <span>Gross {money(row.gross_total)}</span>
+                  <span>Net {money(row.net_total)}</span>
+                  <span>Cash {money(row.cash_total)}</span>
+                  <span>UPI/Bank {money(row.upi_bank_total)}</span>
+                  {Number(row.credit_total || 0) > 0 && <span>Credit {money(row.credit_total)}</span>}
+                </div>
+              </td>
+            </tr>
+          );
+        }
         if (salesFilters.viewMode === "INVOICE") {
           const expanded = Boolean(expandedSalesRows[row.display_key]);
           return (
@@ -5662,27 +5829,26 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
                 </td>
                 <td className="status-cell">{row.quantity_summary || "-"}</td>
                 <td className="amount-cell">{money(row.gross_total)}</td>
-                <td className="amount-cell">{money(row.item_discount_total)}</td>
-                <td className="amount-cell">{money(row.bill_discount_total)}</td>
+                {salesHasItemDiscount && <td className="amount-cell">{Number(row.item_discount_total || 0) ? money(row.item_discount_total) : "-"}</td>}
+                {salesHasBillDiscount && <td className="amount-cell">{Number(row.bill_discount_total || 0) ? money(row.bill_discount_total) : "-"}</td>}
                 <td className="amount-cell">{money(row.net_total)}</td>
                 <td className="status-cell">{row.payment_mode || "-"}</td>
                 <td className="status-cell">{row.status_label}</td>
               </tr>
               {expanded && (
                 <tr className="sales-history-drilldown-row">
-                  <td colSpan="11">
-                    <DataTable headers={["Item", "Lot", "Size", "Qty", "Unit", "Rate", "Gross", "Item Disc.", "Bill Disc.", "Net", "Cost Rate", "Profit"]}>
+                  <td colSpan={salesHistoryHeaders.length}>
+                    <DataTable headers={["Item", "Lot", "Qty", "Unit", "Rate", "Gross", ...(salesHasItemDiscount ? ["Item Disc."] : []), ...(salesHasBillDiscount ? ["Bill Disc."] : []), "Net", "Cost Rate", "Profit"]}>
                       {(row.item_rows || []).map((item) => (
                         <tr className="report-row-clickable" key={item.display_key} onClick={openInvoice}>
                           <td className="primary-cell">{item.item_name}</td>
-                          <td>{item.lot_name || "-"}</td>
-                          <td>{item.lot_size || "-"}</td>
+                          <td>{item.lot_name || "No Lot Number"}</td>
                           <td>{number(item.quantity)}</td>
                           <td>{item.unit || "-"}</td>
                           <td>{money(item.rate)}</td>
                           <td>{money(item.gross_total)}</td>
-                          <td>{money(item.item_discount_total)}</td>
-                          <td>{money(item.bill_discount_total)}</td>
+                          {salesHasItemDiscount && <td>{Number(item.item_discount_total || 0) ? money(item.item_discount_total) : "-"}</td>}
+                          {salesHasBillDiscount && <td>{Number(item.bill_discount_total || 0) ? money(item.bill_discount_total) : "-"}</td>}
                           <td>{money(item.net_total)}</td>
                           <td>{money(item.cost_rate)}</td>
                           <td className="profit-cell">{money(item.profit)}</td>
@@ -5697,21 +5863,20 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
         }
         return (
           <tr className={`report-row-clickable ${row.status_label === "Cancelled" ? "muted-row" : ""}`} key={row.display_key} onClick={openInvoice}>
-            <td className="date-cell">{formatDisplayDate(row.sale_date)}</td>
+            <td className="date-cell">{row.row_type === "CUSTOMER_ITEM" ? new Date(row.bill_datetime || row.created_at || row.sale_date).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" }) : formatDisplayDate(row.sale_date)}</td>
             <td className="primary-cell">{row.invoice_no || `#${row.sale_id}`}{row.showing_matched_only && <small className="cell-note warning-note">Matched item</small>}</td>
-            <td className="primary-cell">{row.customer_name || "Walk-in Customer"}</td>
+            {salesFilters.viewMode !== "CUSTOMER" && <td className="primary-cell">{row.customer_name || "Walk-in Customer"}</td>}
             <td className="primary-cell">{row.item_name}</td>
-            <td>{row.lot_name || "-"}</td>
-            <td>{row.lot_size || "-"}</td>
+            <td>{row.lot_name || "No Lot Number"}</td>
             <td>{number(row.quantity)}</td>
             <td>{row.unit || "-"}</td>
             <td>{money(row.rate)}</td>
-            <td className="amount-cell">{money(row.gross_total)}</td>
-            <td className="amount-cell">{money(row.item_discount_total)}</td>
-            <td className="amount-cell">{money(row.bill_discount_total)}</td>
-            <td className="amount-cell">{money(row.net_total)}</td>
-            <td className="status-cell">{row.payment_mode || "-"}</td>
-            <td>{row.created_by_name || row.sold_by || "-"}</td>
+            {salesFilters.viewMode !== "CUSTOMER" && <td className="amount-cell">{money(row.gross_total)}</td>}
+            {salesHasItemDiscount && <td className="amount-cell">{Number(row.item_discount_total || 0) ? money(row.item_discount_total) : "-"}</td>}
+            {salesHasBillDiscount && <td className="amount-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? "-" : Number(row.bill_discount_total || 0) ? money(row.bill_discount_total) : "-"}</td>}
+            <td className="amount-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? "-" : money(row.net_total)}</td>
+            <td className="status-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? "-" : (row.payment_mode || "-")}</td>
+            <td>{row.row_type === "CUSTOMER_ITEM" ? (row.invoice_first_line ? row.status_label : "-") : (row.created_by_name || row.sold_by || "-")}</td>
           </tr>
         );
       },
@@ -6303,6 +6468,7 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
           <Field label="View Mode">
             <select value={salesFilters.viewMode} onChange={(event) => setSalesFilters({ ...salesFilters, viewMode: event.target.value })}>
               <option value="INVOICE">Invoice-wise</option>
+              <option value="CUSTOMER">Customer-wise</option>
               <option value="ITEM">Item-wise</option>
               <option value="LOT">Lot-wise</option>
             </select>
@@ -6311,11 +6477,50 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
             <input type="date" value={salesFilters.date} onChange={(event) => setSalesFilters({ ...salesFilters, date: event.target.value })} />
           </Field>
           <Field label="Customer">
-            <select value={salesFilters.customer} onChange={(event) => setSalesFilters({ ...salesFilters, customer: event.target.value })}>
-              <option value="">All customers</option>
-              {[...salesFilterOptions.customers.entries()].map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+            <select value={salesFilters.customerMode} onChange={(event) => setSalesFilters({ ...salesFilters, customerMode: event.target.value, customer: "", selectedCustomers: [] })}>
+              <option value="ALL">All Customers</option>
+              <option value="WALK_IN">Walk-in Customer</option>
+              <option value="SINGLE">Single Registered Customer</option>
+              <option value="CUSTOM">Custom Customer Selection</option>
             </select>
           </Field>
+          {salesFilters.customerMode === "SINGLE" && (
+            <Field label="Select Customer">
+              <select value={salesFilters.customer} onChange={(event) => setSalesFilters({ ...salesFilters, customer: event.target.value })}>
+                <option value="">Choose customer</option>
+                {[...salesFilterOptions.customers.entries()].filter(([key]) => key !== "WALK_IN").map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+              </select>
+            </Field>
+          )}
+          {salesFilters.customerMode === "CUSTOM" && (
+            <Field label="Customers">
+              <select multiple size="3" value={salesFilters.selectedCustomers} onChange={(event) => setSalesFilters({ ...salesFilters, selectedCustomers: [...event.target.selectedOptions].map((option) => option.value) })}>
+                {[...salesFilterOptions.customers.entries()].map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+              </select>
+            </Field>
+          )}
+          <Field label="User">
+            <select value={salesFilters.userMode} onChange={(event) => setSalesFilters({ ...salesFilters, userMode: event.target.value, user: "", selectedUsers: [] })}>
+              <option value="ALL">All Users</option>
+              <option value="SINGLE">Single User</option>
+              <option value="CUSTOM">Custom Selection</option>
+            </select>
+          </Field>
+          {salesFilters.userMode === "SINGLE" && (
+            <Field label="Select User">
+              <select value={salesFilters.user} onChange={(event) => setSalesFilters({ ...salesFilters, user: event.target.value })}>
+                <option value="">Choose user</option>
+                {[...salesFilterOptions.users.entries()].map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+              </select>
+            </Field>
+          )}
+          {salesFilters.userMode === "CUSTOM" && (
+            <Field label="Users">
+              <select multiple size="3" value={salesFilters.selectedUsers} onChange={(event) => setSalesFilters({ ...salesFilters, selectedUsers: [...event.target.selectedOptions].map((option) => option.value) })}>
+                {[...salesFilterOptions.users.entries()].map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+              </select>
+            </Field>
+          )}
           <Field label="Product">
             <select value={salesFilters.product} onChange={(event) => setSalesFilters({ ...salesFilters, product: event.target.value })}>
               <option value="">All products</option>
@@ -6346,7 +6551,7 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
             <input checked={search.trim().length > 0} readOnly type="checkbox" />
             <span>{search.trim() ? "Showing matched items only where applicable" : "Item-level search ready"}</span>
           </label>
-          <button className="secondary-button" onClick={() => setSalesFilters({ date: "", status: "ACTIVE", viewMode: "INVOICE", customer: "", product: "", lot: "", paymentMode: "", user: "" })}>Clear Sales Filters</button>
+          <button className="secondary-button" onClick={() => setSalesFilters({ date: "", status: "ACTIVE", viewMode: "INVOICE", customerMode: "ALL", customer: "", selectedCustomers: [], product: "", lot: "", paymentMode: "", userMode: "ALL", user: "", selectedUsers: [] })}>Clear Sales Filters</button>
         </>
       )}
       {selectedReport === "purchaseHistory" && (
@@ -6798,19 +7003,25 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
 }
 
 function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotAction, products = [] }) {
-  const [viewMode, setViewMode] = useState("PRODUCT");
-  const [search, setSearch] = useState("");
+  const [viewMode, setViewMode] = useState(() => localStorage.getItem("froozerp-stock-view-mode") || "PRODUCT");
   const [filters, setFilters] = useState({
+    productSearch: "",
+    lotSearch: "",
     category: "",
     product: "",
     lot: "",
     supplier: "",
-    status: "ACTIVE",
+    status: "IN_STOCK",
+    unit: "",
+    origin: "ALL",
+    dateType: "ARRIVAL",
     date_from: "",
     date_to: "",
     showEmpty: false,
     showInactive: false,
   });
+  const [sortBy, setSortBy] = useState("PRODUCT_ASC");
+  const [pageSize, setPageSize] = useState(50);
   const [expandedProductId, setExpandedProductId] = useState("");
   const [auditRows, setAuditRows] = useState([]);
   const [auditLoading, setAuditLoading] = useState(false);
@@ -6824,14 +7035,36 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
   const lotUsed = (lot) => Number(lot.sold_qty ?? Math.max(lotOpening(lot) - Number(lot.remaining_qty || 0), 0));
   const lotCost = (lot) => Number(lot.effective_cost_per_unit || lot.purchase_rate || 0);
   const lotSaleRate = (lot) => Number(lot.temporary_sale_rate || lot.sale_rate || lot.selling_rate || 0);
+  const normalizeUnit = (unit) => String(unit || "UNIT").trim().toUpperCase() || "UNIT";
+  const productMinimumStock = (lot) => Number(products.find((product) => Number(product.product_id || product.id) === Number(lot.product_id))?.minimum_stock || 0);
+  const lotDateValue = (lot) => {
+    if (filters.dateType === "BILL") return lot.purchase_bill_date || lot.bill_date || lot.purchase_date || lot.created_at || "";
+    if (filters.dateType === "MOVEMENT") return lot.last_movement_at || lot.last_edited_at || lot.updated_at || lot.created_at || lot.purchase_date || "";
+    return lot.purchase_date || lot.arrival_date || lot.created_at || "";
+  };
   const lotStatus = (lot) => {
     const status = String(lot.batch_status || "ACTIVE").toUpperCase();
     if (status === "CANCELLED") return "Cancelled";
     if (status === "INACTIVE") return "Inactive";
+    if (lot.sync_status === "CONFLICT") return "Sync Conflict";
+    if (lotBalance(lot) < 0) return "Negative Stock";
     if (lotBalance(lot) <= 0 && lotUsed(lot) > 0) return "Sold Out";
+    if (lotBalance(lot) <= productMinimumStock(lot) && lotBalance(lot) > 0) return "Low Stock";
     return "Active";
   };
+  const displayStockStatus = (status) => status === "Active" ? "In Stock" : status;
   const statusClass = (status) => status === "Active" ? "stock-ok" : status === "Sold Out" ? "origin-rate" : "stock-low";
+  const formatUnitGroups = (groups) => [...groups.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([unit, value]) => `${qty(value)} ${unit}`)
+    .join(" • ") || "-";
+  const addUnitValue = (groups, unit, value) => {
+    const key = normalizeUnit(unit);
+    groups.set(key, (groups.get(key) || 0) + Number(value || 0));
+  };
+  useEffect(() => {
+    localStorage.setItem("froozerp-stock-view-mode", viewMode);
+  }, [viewMode]);
   const activeLots = lots.filter((lot) => lotStatus(lot) === "Active");
   const productGroups = [...lots.reduce((groups, lot) => {
     const key = String(lot.product_id);
@@ -6840,9 +7073,10 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
       product_name: lot.product_name,
       category: lot.category || "Fruit",
       unit: lot.unit || "",
-      minimum_stock: products.find((product) => Number(product.product_id) === Number(lot.product_id))?.minimum_stock || 0,
+      minimum_stock: productMinimumStock(lot),
       sale_rate: lot.selling_rate || 0,
       total_stock: 0,
+      quantity_groups: new Map(),
       stock_value: 0,
       active_lots: 0,
       sold_out_lots: 0,
@@ -6851,13 +7085,14 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
     const balance = lotBalance(lot);
     const status = lotStatus(lot);
     current.total_stock += status === "Cancelled" || status === "Inactive" ? 0 : balance;
+    if (!["Cancelled", "Inactive"].includes(status)) addUnitValue(current.quantity_groups, lot.unit, balance);
     current.stock_value += status === "Cancelled" || status === "Inactive" ? 0 : balance * lotCost(lot);
     current.active_lots += status === "Active" ? 1 : 0;
     current.sold_out_lots += status === "Sold Out" ? 1 : 0;
     current.lots.push(lot);
     groups.set(key, current);
     return groups;
-  }, new Map()).values()].sort((left, right) => `${left.category}-${left.product_name}`.localeCompare(`${right.category}-${right.product_name}`));
+  }, new Map()).values()].map((product) => ({ ...product, total_stock_summary: formatUnitGroups(product.quantity_groups) })).sort((left, right) => `${left.category}-${left.product_name}`.localeCompare(`${right.category}-${right.product_name}`));
   const categoryRows = [...productGroups.reduce((groups, product) => {
     const key = product.category || "Fruit";
     const current = groups.get(key) || { category: key, products: 0, total_quantity: 0, stock_value: 0, low_stock_count: 0, product_rows: [] };
@@ -6871,24 +7106,67 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
   }, new Map()).values()].sort((left, right) => left.category.localeCompare(right.category));
   const categories = [...new Set(lots.map((lot) => lot.category || "Fruit"))].sort();
   const suppliers = [...new Set(lots.map((lot) => lot.supplier_name).filter(Boolean))].sort();
+  const unitOptions = [...new Set(lots.map((lot) => normalizeUnit(lot.unit)).filter(Boolean))].sort();
   const productOptions = productGroups.map((product) => [String(product.product_id), product.product_name]);
   const lotOptions = lots.map((lot) => [String(lot.id), [lot.lot_name || lot.batch_no || `Lot #${lot.id}`, lot.lot_size].filter(Boolean).join(" / ")]);
+  const matchesNeedle = (needle, values) => {
+    const normalized = needle.trim().toLowerCase();
+    if (!normalized) return true;
+    return values.some((value) => String(value ?? "").toLowerCase().includes(normalized));
+  };
+  const statusMatches = (lot) => {
+    const status = lotStatus(lot);
+    if (filters.status === "ALL") return true;
+    if (filters.status === "IN_STOCK") return ["Active", "Low Stock"].includes(status);
+    if (filters.status === "LOW_STOCK") return status === "Low Stock";
+    if (filters.status === "OUT_OF_STOCK") return status === "Sold Out";
+    if (filters.status === "NEGATIVE") return status === "Negative Stock";
+    if (filters.status === "CONFLICT") return status === "Sync Conflict";
+    return true;
+  };
+  const sortLots = (rows) => [...rows].sort((left, right) => {
+    if (sortBy === "LOT_ASC") return String(left.lot_name || left.batch_no || "").localeCompare(String(right.lot_name || right.batch_no || ""));
+    if (sortBy === "ARRIVAL_NEW") return String(lotDateValue(right)).localeCompare(String(lotDateValue(left)));
+    if (sortBy === "ARRIVAL_OLD") return String(lotDateValue(left)).localeCompare(String(lotDateValue(right)));
+    if (sortBy === "STOCK_HIGH") return lotBalance(right) - lotBalance(left);
+    if (sortBy === "STOCK_LOW") return lotBalance(left) - lotBalance(right);
+    if (sortBy === "RATE_HIGH") return lotSaleRate(right) - lotSaleRate(left);
+    if (sortBy === "RATE_LOW") return lotSaleRate(left) - lotSaleRate(right);
+    if (sortBy === "SUPPLIER_ASC") return String(left.supplier_name || "").localeCompare(String(right.supplier_name || ""));
+    if (sortBy === "UPDATED_NEW") return String(right.last_edited_at || right.updated_at || right.created_at || "").localeCompare(String(left.last_edited_at || left.updated_at || left.created_at || ""));
+    return `${left.product_name || ""}-${lotDateValue(left)}-${left.lot_name || ""}`.localeCompare(`${right.product_name || ""}-${lotDateValue(right)}-${right.lot_name || ""}`);
+  });
   const matchesText = (values) => {
-    const needle = search.trim().toLowerCase();
+    const needle = `${filters.productSearch} ${filters.lotSearch}`.trim().toLowerCase();
     if (!needle) return true;
     return values.some((value) => String(value ?? "").toLowerCase().includes(needle));
   };
-  const filteredLots = lots.filter((lot) => {
+  const filteredLots = sortLots(lots.filter((lot) => {
     const status = lotStatus(lot);
     if (!filters.showEmpty && status === "Sold Out") return false;
     if (!filters.showInactive && ["Inactive", "Cancelled"].includes(status)) return false;
-    if (filters.status && filters.status !== "ALL" && status !== filters.status) return false;
+    if (!statusMatches(lot)) return false;
     if (filters.category && (lot.category || "Fruit") !== filters.category) return false;
     if (filters.product && String(lot.product_id) !== filters.product) return false;
     if (filters.lot && String(lot.id) !== filters.lot) return false;
     if (filters.supplier && lot.supplier_name !== filters.supplier) return false;
-    if (filters.date_from && toDateKey(lot.purchase_date || lot.created_at || "") < filters.date_from) return false;
-    if (filters.date_to && toDateKey(lot.purchase_date || lot.created_at || "") > filters.date_to) return false;
+    if (filters.unit && normalizeUnit(lot.unit) !== filters.unit) return false;
+    if (filters.origin !== "ALL" && String(lot.origin_type || lot.origin || "LOCAL").toUpperCase() !== filters.origin) return false;
+    const dateKey = toDateKey(lotDateValue(lot));
+    if (filters.date_from && dateKey < filters.date_from) return false;
+    if (filters.date_to && dateKey > filters.date_to) return false;
+    const productMatch = matchesNeedle(filters.productSearch, [lot.product_name, lot.barcode, lot.category]);
+    const lotMatch = matchesNeedle(filters.lotSearch, [
+      lot.lot_name,
+      lot.batch_no,
+      lot.lot_size,
+      lot.unit,
+      lotBalance(lot),
+      lotSaleRate(lot),
+      status,
+      lotDateValue(lot),
+    ]);
+    if (!productMatch || !lotMatch) return false;
     return matchesText([
       lot.product_name,
       lot.category,
@@ -6905,15 +7183,33 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
       status,
       lot.remarks,
     ]);
-  });
+  }));
+  const pagedLots = filteredLots.slice(0, Number(pageSize || 50));
   const filteredProductRows = productGroups
-    .map((product) => ({ ...product, visible_lots: filteredLots.filter((lot) => Number(lot.product_id) === Number(product.product_id)) }))
-    .filter((product) => product.visible_lots.length > 0 && matchesText([product.product_name, product.category, product.total_stock, product.stock_value]));
+    .map((product) => {
+      const visibleLots = filteredLots.filter((lot) => Number(lot.product_id) === Number(product.product_id));
+      const unitGroups = visibleLots.reduce((groups, lot) => {
+        addUnitValue(groups, lot.unit, lotBalance(lot));
+        return groups;
+      }, new Map());
+      return {
+        ...product,
+        visible_lots: visibleLots,
+        total_stock_summary: formatUnitGroups(unitGroups),
+        filtered_stock_value: visibleLots.reduce((sum, lot) => sum + lotBalance(lot) * lotCost(lot), 0),
+        filtered_active_lots: visibleLots.filter((lot) => lotStatus(lot) === "Active").length,
+      };
+    })
+    .filter((product) => product.visible_lots.length > 0);
   const filteredCategoryRows = categoryRows
     .map((category) => ({ ...category, product_rows: filteredProductRows.filter((product) => product.category === category.category) }))
     .filter((category) => category.product_rows.length > 0 && matchesText([category.category, category.products, category.total_quantity, category.stock_value]));
-  const totalStockValue = activeLots.reduce((sum, lot) => sum + lotBalance(lot) * lotCost(lot), 0);
-  const lowStockItems = productGroups.filter((product) => Number(product.total_stock || 0) <= Number(product.minimum_stock || 0)).length;
+  const filteredUnitGroups = filteredLots.reduce((groups, lot) => {
+    addUnitValue(groups, lot.unit, lotBalance(lot));
+    return groups;
+  }, new Map());
+  const totalStockValue = filteredLots.filter((lot) => lotStatus(lot) === "Active").reduce((sum, lot) => sum + lotBalance(lot) * lotCost(lot), 0);
+  const lowStockItems = filteredLots.filter((lot) => lotStatus(lot) === "Low Stock").length;
   const adjustmentCount = auditRows.filter((row) => row.action === "INVENTORY_LOT_ADJUST").length;
 
   useEffect(() => {
@@ -6950,7 +7246,7 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
     const afterRate = newValue.purchase_rate ?? newValue.effective_cost_per_unit ?? "-";
     return `Qty ${beforeQty} -> ${afterQty} | Cost ${beforeRate} -> ${afterRate}`;
   };
-  const clearFilters = () => setFilters({ category: "", product: "", lot: "", supplier: "", status: "ACTIVE", date_from: "", date_to: "", showEmpty: false, showInactive: false });
+  const clearFilters = () => setFilters({ productSearch: "", lotSearch: "", category: "", product: "", lot: "", supplier: "", status: "IN_STOCK", unit: "", origin: "ALL", dateType: "ARRIVAL", date_from: "", date_to: "", showEmpty: false, showInactive: false });
   const renderLotActions = (lot) => {
     const status = lotStatus(lot);
     return (
@@ -6983,10 +7279,10 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
         <td>{qty(lotUsed(lot))}</td>
         <td>{qty(lot.adjusted_qty)}</td>
         <td><span className={lotBalance(lot) <= 0 ? "origin-rate" : "stock-ok"}>{qty(lotBalance(lot))}</span></td>
-        <td>{money(lotCost(lot))}</td>
+        {canManageStock && <td>{money(lotCost(lot))}</td>}
         <td>{money(lotSaleRate(lot))}</td>
-        <td>{money(lotBalance(lot) * lotCost(lot))}</td>
-        <td><span className={statusClass(status)}>{status}</span></td>
+        {canManageStock && <td>{money(lotBalance(lot) * lotCost(lot))}</td>}
+        <td><span className={statusClass(status)}>{displayStockStatus(status)}</span></td>
         <td className="purchase-items-cell"><span title={lot.remarks || "-"}>{lot.remarks || "-"}</span></td>
         <td>{lot.created_at ? new Date(lot.created_at).toLocaleString("en-IN") : "-"}</td>
         <td>{lot.last_edited_at ? new Date(lot.last_edited_at).toLocaleString("en-IN") : "-"}</td>
@@ -6997,23 +7293,31 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
   return (
     <section className="stock-inventory-report">
       <div className="purchase-summary-grid supplier-payment-preview">
-        <SummaryMetric featured label="Total Stock Value" value={money(totalStockValue)} />
-        <SummaryMetric label="Total Products" value={productGroups.length} />
-        <SummaryMetric label="Active Lots" value={activeLots.length} />
-        <SummaryMetric label="Sold Out Lots" value={lots.filter((lot) => lotStatus(lot) === "Sold Out").length} />
+        <SummaryMetric featured label="Total Stock Value" value={canManageStock ? money(totalStockValue) : "Restricted"} />
+        <SummaryMetric label="Products" value={filteredProductRows.length} />
+        <SummaryMetric label="Active Lots" value={filteredLots.filter((lot) => ["Active", "Low Stock"].includes(lotStatus(lot))).length} />
+        <SummaryMetric label="Stock" value={formatUnitGroups(filteredUnitGroups)} />
+        <SummaryMetric label="Out-of-Stock Lots" value={filteredLots.filter((lot) => lotStatus(lot) === "Sold Out").length} />
         <SummaryMetric label="Low Stock Items" value={lowStockItems} />
         <SummaryMetric label="Inventory Adjustments" value={auditLoading ? "Loading" : adjustmentCount} />
       </div>
       {auditError && <div className="error-banner">{auditError}</div>}
-      <div className="ledger-toolbar stock-inventory-toolbar no-print">
+      <div className="ledger-toolbar stock-inventory-toolbar sticky-report-filters no-print">
         <Field label="View Mode">
           <select value={viewMode} onChange={(event) => setViewMode(event.target.value)}>
-            <option value="PRODUCT">Product-wise</option>
-            <option value="LOT">Lot-wise</option>
-            <option value="CATEGORY">Category-wise</option>
+            <option value="PRODUCT">Product View</option>
+            <option value="LOT">Lot View</option>
           </select>
         </Field>
-        <Field label="Search"><input placeholder="Search product, lot, supplier, remarks..." value={search} onChange={(event) => setSearch(event.target.value)} /></Field>
+        <Field label="Product Search"><input placeholder="Search product name or barcode..." value={filters.productSearch} onChange={(event) => setFilters({ ...filters, productSearch: event.target.value })} /></Field>
+        <Field label="Lot Search"><input placeholder="Search lot number, lot name or size..." value={filters.lotSearch} onChange={(event) => setFilters({ ...filters, lotSearch: event.target.value })} /></Field>
+        <Field label="Date Type">
+          <select value={filters.dateType} onChange={(event) => setFilters({ ...filters, dateType: event.target.value })}>
+            <option value="ARRIVAL">Arrival Date</option>
+            <option value="BILL">Purchase Bill Date</option>
+            <option value="MOVEMENT">Last Stock Movement Date</option>
+          </select>
+        </Field>
         <Field label="Category">
           <select value={filters.category} onChange={(event) => setFilters({ ...filters, category: event.target.value })}>
             <option value="">All categories</option>
@@ -7040,43 +7344,107 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
         </Field>
         <Field label="Status">
           <select value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })}>
-            <option value="ACTIVE">Active</option>
-            <option value="Sold Out">Sold Out</option>
-            <option value="Inactive">Inactive</option>
-            <option value="Cancelled">Cancelled</option>
-            <option value="ALL">All statuses</option>
+            <option value="ALL">All</option>
+            <option value="IN_STOCK">In Stock</option>
+            <option value="LOW_STOCK">Low Stock</option>
+            <option value="OUT_OF_STOCK">Out of Stock</option>
+            <option value="NEGATIVE">Negative Stock</option>
+            <option value="CONFLICT">Sync Conflict</option>
+          </select>
+        </Field>
+        <Field label="Unit">
+          <select value={filters.unit} onChange={(event) => setFilters({ ...filters, unit: event.target.value })}>
+            <option value="">All units</option>
+            {unitOptions.map((unit) => <option key={unit} value={unit}>{unit}</option>)}
+          </select>
+        </Field>
+        <Field label="Origin">
+          <select value={filters.origin} onChange={(event) => setFilters({ ...filters, origin: event.target.value })}>
+            <option value="ALL">All</option>
+            <option value="LOCAL">Local</option>
+            <option value="IMPORTED">Imported</option>
           </select>
         </Field>
         <Field label="Date From"><input type="date" value={filters.date_from} onChange={(event) => setFilters({ ...filters, date_from: event.target.value })} /></Field>
         <Field label="Date To"><input type="date" value={filters.date_to} onChange={(event) => setFilters({ ...filters, date_to: event.target.value })} /></Field>
+        <Field label="Sort By">
+          <select value={sortBy} onChange={(event) => setSortBy(event.target.value)}>
+            <option value="PRODUCT_ASC">Product Name</option>
+            <option value="LOT_ASC">Lot Number</option>
+            <option value="ARRIVAL_OLD">Arrival Date - Oldest</option>
+            <option value="ARRIVAL_NEW">Arrival Date - Newest</option>
+            <option value="STOCK_HIGH">Available Stock - High</option>
+            <option value="STOCK_LOW">Available Stock - Low</option>
+            <option value="RATE_HIGH">Sale Rate - High</option>
+            <option value="RATE_LOW">Sale Rate - Low</option>
+            <option value="SUPPLIER_ASC">Supplier</option>
+            <option value="UPDATED_NEW">Last Updated</option>
+          </select>
+        </Field>
+        <Field label="Rows">
+          <select value={pageSize} onChange={(event) => setPageSize(Number(event.target.value))}>
+            <option value="25">25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+        </Field>
         <label className="check-field report-check-field"><input checked={filters.showEmpty} type="checkbox" onChange={(event) => setFilters({ ...filters, showEmpty: event.target.checked })} /><span>Show Empty Lots</span></label>
         <label className="check-field report-check-field"><input checked={filters.showInactive} type="checkbox" onChange={(event) => setFilters({ ...filters, showInactive: event.target.checked })} /><span>Show Inactive / Cancelled Lots</span></label>
-        <button className="secondary-button" onClick={clearFilters}>Clear Stock Filters</button>
+        <button className="secondary-button" onClick={clearFilters}>Clear All Filters</button>
         <button className="secondary-button" onClick={() => openAudit()}>View Audit Trail</button>
+      </div>
+      <div className="quick-filter-row no-print">
+        <button className="filter-chip" onClick={() => setFilters({ ...filters, dateType: "ARRIVAL", date_from: toDateKey(new Date()), date_to: toDateKey(new Date()) })}>Today's Arrivals</button>
+        <button className="filter-chip" onClick={() => {
+          const date = new Date();
+          date.setDate(date.getDate() - 6);
+          setFilters({ ...filters, dateType: "ARRIVAL", date_from: toDateKey(date), date_to: toDateKey(new Date()) });
+        }}>Last 7 Days</button>
+        <button className="filter-chip" onClick={() => {
+          const date = new Date();
+          date.setDate(date.getDate() - 29);
+          setFilters({ ...filters, dateType: "ARRIVAL", date_from: toDateKey(date), date_to: toDateKey(new Date()) });
+        }}>Last 30 Days</button>
+        <button className="filter-chip" onClick={() => setFilters({ ...filters, status: "LOW_STOCK" })}>Low Stock</button>
+        <button className="filter-chip" onClick={() => setFilters({ ...filters, status: "OUT_OF_STOCK", showEmpty: true })}>Out of Stock</button>
+        <button className="filter-chip" onClick={() => setFilters({ ...filters, origin: "IMPORTED" })}>Imported</button>
+        <button className="filter-chip" onClick={() => setFilters({ ...filters, origin: "LOCAL" })}>Local</button>
+        <button className="filter-chip" onClick={() => { setSortBy("UPDATED_NEW"); setFilters({ ...filters, dateType: "MOVEMENT" }); }}>Recently Updated</button>
+      </div>
+      <div className="active-filter-chip-row no-print">
+        {filters.productSearch && <button className="filter-chip" onClick={() => setFilters({ ...filters, productSearch: "" })}>{filters.productSearch} x</button>}
+        {filters.lotSearch && <button className="filter-chip" onClick={() => setFilters({ ...filters, lotSearch: "" })}>{filters.lotSearch} x</button>}
+        {filters.date_from && <button className="filter-chip" onClick={() => setFilters({ ...filters, date_from: "" })}>From {formatDisplayDate(filters.date_from)} x</button>}
+        {filters.date_to && <button className="filter-chip" onClick={() => setFilters({ ...filters, date_to: "" })}>To {formatDisplayDate(filters.date_to)} x</button>}
+        {filters.status !== "IN_STOCK" && <button className="filter-chip" onClick={() => setFilters({ ...filters, status: "IN_STOCK" })}>{filters.status.replaceAll("_", " ")} x</button>}
+        {filters.unit && <button className="filter-chip" onClick={() => setFilters({ ...filters, unit: "" })}>{filters.unit} x</button>}
+        {filters.origin !== "ALL" && <button className="filter-chip" onClick={() => setFilters({ ...filters, origin: "ALL" })}>{filters.origin} x</button>}
       </div>
       {viewMode === "PRODUCT" && (
         <DataTable headers={["Product", "Category", "Total Stock", "Available Lots", "Average Cost", "Sale Rate", "Stock Value", "Minimum Stock", "Status"]}>
           {filteredProductRows.map((product) => {
-            const averageCost = product.total_stock > 0 ? product.stock_value / product.total_stock : 0;
-            const low = Number(product.total_stock || 0) <= Number(product.minimum_stock || 0);
+            const visibleBalance = product.visible_lots.reduce((sum, lot) => sum + lotBalance(lot), 0);
+            const visibleValue = product.filtered_stock_value;
+            const averageCost = visibleBalance > 0 ? visibleValue / visibleBalance : 0;
+            const low = product.visible_lots.some((lot) => lotStatus(lot) === "Low Stock");
             const toggleProduct = () => setExpandedProductId(expandedProductId === String(product.product_id) ? "" : String(product.product_id));
             return (
               <React.Fragment key={product.product_id}>
                 <tr className="report-row-clickable" onClick={toggleProduct}>
-                  <td className="primary-cell">{product.product_name}<small className="cell-note">{product.unit}</small></td>
+                  <td className="primary-cell">{product.product_name}<small className="cell-note">Click to view lots</small></td>
                   <td>{product.category}</td>
-                  <td>{qty(product.total_stock)}</td>
-                  <td>{product.active_lots}</td>
-                  <td>{money(averageCost)}</td>
+                  <td>{product.total_stock_summary}</td>
+                  <td>{product.filtered_active_lots}</td>
+                  <td>{canManageStock ? money(averageCost) : "Restricted"}</td>
                   <td>{money(product.sale_rate)}</td>
-                  <td>{money(product.stock_value)}</td>
+                  <td>{canManageStock ? money(visibleValue) : "Restricted"}</td>
                   <td>{qty(product.minimum_stock)}</td>
                   <td><span className={low ? "stock-low" : "stock-ok"}>{low ? "Low Stock" : "OK"}</span></td>
                 </tr>
                 {expandedProductId === String(product.product_id) && (
                   <tr className="sales-history-drilldown-row">
                     <td colSpan="9">
-                      <DataTable headers={["Product", "Category", "Supplier", "Lot No.", "Size", "Opening Date", "Opening Qty", "Sold Qty", "Adjusted Qty", "Balance Qty", "Cost", "Sale Rate", "Stock Value", "Status", "Remarks", "Created At", "Last Edited"]}>
+                      <DataTable headers={["Product", "Category", "Supplier", "Lot No.", "Size", "Opening Date", "Opening Qty", "Sold Qty", "Adjusted Qty", "Balance Qty", ...(canManageStock ? ["Cost"] : []), "Sale Rate", ...(canManageStock ? ["Stock Value"] : []), "Status", "Remarks", "Created At", "Last Edited"]}>
                         {renderLotRows(product.visible_lots)}
                       </DataTable>
                     </td>
@@ -7089,8 +7457,8 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
         </DataTable>
       )}
       {viewMode === "LOT" && (
-        <DataTable headers={["Product", "Category", "Supplier", "Lot No.", "Size", "Opening Date", "Opening Qty", "Sold Qty", "Adjusted Qty", "Balance Qty", "Cost", "Sale Rate", "Stock Value", "Status", "Remarks", "Created At", "Last Edited"]}>
-          {renderLotRows(filteredLots)}
+        <DataTable headers={["Product", "Category", "Supplier", "Lot No.", "Size", "Opening Date", "Opening Qty", "Sold Qty", "Adjusted Qty", "Balance Qty", ...(canManageStock ? ["Cost"] : []), "Sale Rate", ...(canManageStock ? ["Stock Value"] : []), "Status", "Remarks", "Created At", "Last Edited"]}>
+          {renderLotRows(pagedLots)}
           {filteredLots.length === 0 && <tr><td colSpan="17" className="empty-cell">No matching stock lots found.</td></tr>}
         </DataTable>
       )}
@@ -9640,6 +10008,8 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
   const mixedExcess = roundUi(Math.max(mixedAllocated - totals.total, 0));
   const isMixedPaymentBalanced = paymentMode !== "MIXED" || Math.abs(mixedAllocated - totals.total) <= 0.01;
   const hasInvalidMixedPayment = paymentMode === "MIXED" && mixedPaymentModes.some(([mode]) => Number(mixedPayments[mode] || 0) < 0);
+  const registeredCustomerSelected = Boolean(customer.account_id) && customer.system_account !== true;
+  const mandiTaxConfigured = paymentSettings.enable_sales_mandi_tax === true && Number(paymentSettings.sales_mandi_tax_percent || 0) > 0;
 
   const getLotLabel = (lot) => lot ? [lot.lot_name || lot.batch_no, lot.lot_size].filter(Boolean).join(" / ") : "Auto FIFO";
   const getCompactLotName = (lot) => {
@@ -10413,6 +10783,24 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
           <Field label="Customer Name"><input placeholder="Walk-in customer" value={customer.name} onChange={(event) => setCustomer({ ...customer, name: event.target.value })} /></Field>
           <Field label="Mobile Number"><input inputMode="numeric" placeholder="Optional for WhatsApp" value={customer.mobile} onChange={(event) => setCustomer({ ...customer, mobile: event.target.value.replace(/\D/g, "") })} /></Field>
           <Field label="Notes"><textarea placeholder="Optional notes" value={customer.notes} onChange={(event) => setCustomer({ ...customer, notes: event.target.value })} /></Field>
+        </div>
+        <div className="checkout-section mandi-tax-panel">
+          <div className="section-title-row">
+            <strong>Mandi Tax</strong>
+            <span className={registeredCustomerSelected && mandiTaxConfigured ? "stock-ok" : "origin-rate"}>
+              {registeredCustomerSelected ? (mandiTaxConfigured ? "Applied" : "Configuration Required") : "Not Applicable"}
+            </span>
+          </div>
+          {!registeredCustomerSelected && <p className="form-note">Mandi Tax is not applicable for the official Walk-in Customer by default.</p>}
+          {registeredCustomerSelected && !mandiTaxConfigured && <p className="form-note stock-low">Mandi Tax configuration required for registered-customer sales.</p>}
+          {registeredCustomerSelected && mandiTaxConfigured && (
+            <div className="tax-preview-grid">
+              <div className="total-line"><span>Tax Rate</span><strong>{Number(totals.mandiTaxRate || 0)}%</strong></div>
+              <TotalLine label="Taxable Amount" value={totals.taxableAmount} />
+              <TotalLine label="Mandi Tax Amount" value={totals.mandiTaxAmount} />
+              <small className="form-note">Basis: {salesMandiTaxBasisLabel[totals.mandiTaxBasis] || totals.mandiTaxBasis}</small>
+            </div>
+          )}
         </div>
         <div className="checkout-section">
           <div className="discount-preview">

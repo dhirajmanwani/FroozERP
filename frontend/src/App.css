@@ -1743,9 +1743,10 @@ tbody tr:last-child td {
 
 .pos-layout {
   display: grid;
-  grid-template-columns: minmax(710px, 1fr) minmax(238px, 260px);
+  grid-template-columns: minmax(690px, 1fr) minmax(320px, 380px);
   gap: 17px;
   align-items: start;
+  min-height: 0;
 }
 
 .pos-main {
@@ -2249,6 +2250,10 @@ tbody tr:last-child td {
 .checkout-card {
   position: sticky;
   top: 18px;
+  max-height: calc(100vh - 104px);
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 20px;
   border: 1px solid rgba(148, 163, 184, 0.1);
   border-radius: 14px;
@@ -2305,7 +2310,7 @@ tbody tr:last-child td {
 
 .mixed-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 7px;
 }
 
@@ -2319,7 +2324,7 @@ tbody tr:last-child td {
 }
 
 .mixed-payment-panel .mixed-grid {
-  grid-template-columns: repeat(2, minmax(118px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .mixed-payment-panel input {
@@ -2342,6 +2347,26 @@ tbody tr:last-child td {
   gap: 8px;
   padding: 16px 0;
   border-top: 1px solid rgba(148, 163, 184, 0.1);
+}
+
+.mandi-tax-panel {
+  border-top-color: rgba(245, 158, 11, 0.18);
+}
+
+.section-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.tax-preview-grid {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid rgba(245, 158, 11, 0.18);
+  border-radius: 12px;
+  background: rgba(245, 158, 11, 0.07);
 }
 
 .total-line {
@@ -2379,6 +2404,61 @@ tbody tr:last-child td {
 .checkout-button:disabled {
   cursor: wait;
   opacity: 0.7;
+}
+
+.sticky-report-filters {
+  position: sticky;
+  top: 10px;
+  z-index: 8;
+  align-items: end;
+  padding: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 16px;
+  background: rgba(15, 23, 42, 0.96);
+  backdrop-filter: blur(14px);
+}
+
+.quick-filter-row,
+.active-filter-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.filter-chip {
+  min-height: 32px;
+  padding: 6px 11px;
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  border-radius: 999px;
+  color: #fbbf24;
+  background: rgba(245, 158, 11, 0.08);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.customer-sales-group-row td {
+  border-top: 1px solid rgba(245, 158, 11, 0.38);
+  border-bottom: 1px solid rgba(245, 158, 11, 0.22);
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.customer-sales-group-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+}
+
+.customer-sales-group-summary strong {
+  color: #f8fafc;
+  font-size: 14px;
+}
+
+.customer-sales-group-summary span {
+  color: #cbd5e1;
+  font-size: 12px;
+  font-weight: 800;
 }
 
 .modal-backdrop {
