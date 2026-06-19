@@ -64,7 +64,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.3";
+const APP_VERSION = "1.0.4";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const UPDATE_FEED_URL = (
@@ -9227,6 +9227,14 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
   const [search, setSearch] = useState("");
   const [barcode, setBarcode] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
+  const [lotSelectorProduct, setLotSelectorProduct] = useState(null);
+  const [lotSelectorSearch, setLotSelectorSearch] = useState("");
+  const [lotFilter, setLotFilter] = useState("AVAILABLE");
+  const [lotSizeFilter, setLotSizeFilter] = useState("");
+  const [lotUnitFilter, setLotUnitFilter] = useState("");
+  const [lotRateMin, setLotRateMin] = useState("");
+  const [lotRateMax, setLotRateMax] = useState("");
+  const [showSoldOutLots, setShowSoldOutLots] = useState(false);
   const [cart, setCart] = useState([]);
   const [paymentMode, setPaymentMode] = useState("CASH");
   const [quantityMode, setQuantityMode] = useState(posSettings.enable_weighing_scale ? "SCALE" : "MANUAL");
@@ -9247,10 +9255,40 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
 
   const effectiveQuantityMode = posSettings.enable_weighing_scale ? quantityMode : "MANUAL";
   const lotSelectionMode = String(saleRateSettings.pos_lot_selection_mode || "ASK_MULTIPLE").toUpperCase();
+  const canViewSoldOutLots = ["Owner", "Admin"].includes(user?.role);
+  const lotBalance = (lot) => Number(lot?.remaining_qty ?? lot?.balance_qty ?? 0);
+  const lotStatus = (lot) => {
+    const status = String(lot?.batch_status || lot?.status || "ACTIVE").toUpperCase();
+    if (status === "CANCELLED") return "Cancelled";
+    if (status === "INACTIVE") return "Inactive";
+    if (lotBalance(lot) <= 0) return "Sold Out";
+    return "Active";
+  };
+  const isSelectableLot = (lot) => lotStatus(lot) === "Active" && lotBalance(lot) > 0;
+  const lotSaleRateValue = (lot, product) => {
+    const rate = Number(lot?.temporary_sale_rate ?? lot?.sale_rate ?? lot?.selling_rate ?? 0);
+    return rate > 0 ? rate : Number(product?.selling_rate ?? product?.sale_rate ?? 0);
+  };
+  const lotDateKey = (lot) => toDateKey(lot?.purchase_date || lot?.opening_date || lot?.created_at || "");
+  const lotStableName = (lot) => String(lot?.lot_name || lot?.batch_no || lot?.lot_no || lot?.id || "").trim();
+  const newCartLineId = () => {
+    if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+    return `pos-line-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  };
+  const normalizeCartIdentityPart = (value) => String(value ?? "").trim().toLowerCase();
+  const buildCartIdentity = ({ product, lot, unit, sellingRate }) => [
+    product?.id,
+    lot?.id || "FIFO",
+    normalizeCartIdentityPart(lotStableName(lot)),
+    normalizeCartIdentityPart(lot?.lot_size || lot?.size_grade || ""),
+    normalizeCartIdentityPart(unit || product?.unit || lot?.unit || ""),
+    Number(sellingRate || lotSaleRateValue(lot, product) || 0).toFixed(4),
+  ].join("|");
 
   const stockByProduct = useMemo(
     () => inventory.reduce((stock, batch) => {
-      stock.set(batch.product_id, (stock.get(batch.product_id) || 0) + Number(batch.remaining_qty || 0));
+      if (lotStatus(batch) !== "Active") return stock;
+      stock.set(batch.product_id, (stock.get(batch.product_id) || 0) + Math.max(lotBalance(batch), 0));
       return stock;
     }, new Map()),
     [inventory]
@@ -9258,7 +9296,6 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
 
   const lotsByProduct = useMemo(
     () => inventory.reduce((lots, batch) => {
-      if (Number(batch.remaining_qty || 0) <= 0) return lots;
       const rows = lots.get(batch.product_id) || [];
       rows.push(batch);
       lots.set(batch.product_id, rows);
@@ -9278,17 +9315,33 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
 
   const searchResults = useMemo(() => {
     const query = search.trim().toLowerCase();
-    const matchedProducts = (query
-      ? products.filter((product) => product.product_name.toLowerCase().includes(query))
-      : products
-    ).slice(0, 8);
-    return matchedProducts.flatMap((product) => {
+    const matchesProduct = (product) => {
+      if (!query) return true;
       const lots = lotsByProduct.get(product.id) || [];
-      if (lotSelectionMode === "AUTO_FIFO") return [{ key: `product-${product.id}`, product, lot: null }];
-      if (lots.length <= 1 && lotSelectionMode !== "MANUAL") return [{ key: `product-${product.id}`, product, lot: lots[0] || null }];
-      return lots.map((lot) => ({ key: `lot-${lot.id}`, product, lot }));
-    }).slice(0, 12);
-  }, [lotSelectionMode, lotsByProduct, products, search]);
+      return [
+        product.product_name,
+        product.category,
+        product.category_name,
+        product.barcode,
+        product.unit,
+        product.selling_rate,
+        ...lots.flatMap((lot) => [
+          lotStableName(lot),
+          lot.lot_size,
+          lot.size_grade,
+          lot.unit || product.unit,
+          lotSaleRateValue(lot, product),
+          lotBalance(lot),
+          lotStatus(lot),
+          lotDateKey(lot),
+        ]),
+      ].some((value) => String(value ?? "").toLowerCase().includes(query));
+    };
+    return products
+      .filter((product) => matchesProduct(product))
+      .map((product) => ({ key: `product-${product.id}`, product, lotCount: (lotsByProduct.get(product.id) || []).filter(isSelectableLot).length }))
+      .slice(0, 12);
+  }, [lotsByProduct, products, search]);
 
   const totals = useMemo(() => {
     const gross = cart.reduce((sum, item) => sum + item.quantity * Number(item.selling_rate), 0);
@@ -9353,74 +9406,129 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     };
   };
 
+  const getCartQuantityForLot = (lotId, excludeLineId = "") =>
+    cart
+      .filter((item) => String(item.inventory_batch_id || "") === String(lotId || "") && item.line_id !== excludeLineId)
+      .reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+
+  const openLotSelector = (product) => {
+    const productLots = (lotsByProduct.get(product.id) || []).filter((lot) => {
+      const status = lotStatus(lot);
+      if (status === "Cancelled" || status === "Inactive") return false;
+      return showSoldOutLots && canViewSoldOutLots ? true : lotBalance(lot) > 0;
+    });
+    if (productLots.length === 0) {
+      alert(`No available stock lots found for ${product.product_name}.`);
+      return;
+    }
+    setLotSelectorProduct(product);
+    setLotSelectorSearch("");
+    setLotFilter("AVAILABLE");
+    setLotSizeFilter("");
+    setLotUnitFilter("");
+    setLotRateMin("");
+    setLotRateMax("");
+    setShowSoldOutLots(false);
+  };
+
+  const closeLotSelector = () => {
+    setLotSelectorProduct(null);
+    setLotSelectorSearch("");
+  };
+
   const addProduct = (product, selectedLot = null) => {
-    const productLots = lotsByProduct.get(product.id) || [];
-    if (!selectedLot && productLots.length > 1 && lotSelectionMode !== "AUTO_FIFO") {
-      alert("Please select lot for this item.");
+    const productLots = (lotsByProduct.get(product.id) || []).filter(isSelectableLot);
+    if (!selectedLot) {
+      if (lotSelectionMode === "AUTO_FIFO" && productLots.length === 1) {
+        selectedLot = productLots[0];
+      } else {
+        openLotSelector(product);
+        return;
+      }
+    }
+    const lot = selectedLot;
+    if (!lot || !isSelectableLot(lot)) {
+      alert("Please select an active lot with available stock.");
       return;
     }
-    const lot = selectedLot || (lotSelectionMode === "AUTO_FIFO" ? null : productLots[0]) || null;
-    const cartKey = `${product.id}-${lot?.id || "FIFO"}`;
-    const availableStock = lot ? Number(lot.remaining_qty || 0) : (stockByProduct.get(product.id) || 0);
-    const currentItem = cart.find((item) => item.cart_key === cartKey);
-    const nextQuantity = Number(currentItem?.quantity || 0) + 1;
-    if (availableStock < nextQuantity) {
-      alert(lot ? "Selected lot does not have enough stock." : `Insufficient stock for ${product.product_name}. Available quantity: ${availableStock}`);
-      return;
-    }
-    const lotSaleRate = Number(lot?.temporary_sale_rate || 0);
+    const availableStock = lotBalance(lot);
+    const lotSaleRate = Number(lot?.temporary_sale_rate || lot?.sale_rate || lot?.selling_rate || 0);
     const defaultRate = lotSaleRate > 0 ? lotSaleRate : Number(product.selling_rate);
     const lotDiscount = getActiveLotDiscount(lot?.id);
-    const discounted = applyLotDiscount(defaultRate, nextQuantity, lotDiscount);
+    const discounted = applyLotDiscount(defaultRate, 1, lotDiscount);
+    const cartIdentity = buildCartIdentity({ product, lot, unit: lot.unit || product.unit, sellingRate: discounted.sellingRate });
+    const currentItem = cart.find((item) => item.cart_identity === cartIdentity);
+    const nextQuantity = Number(currentItem?.quantity || 0) + 1;
+    const nextLotQuantity = getCartQuantityForLot(lot.id) + 1;
+    if (availableStock < nextLotQuantity) {
+      const moreAvailable = Math.max(availableStock - getCartQuantityForLot(lot.id), 0);
+      alert(`Only ${moreAvailable.toLocaleString("en-IN", { maximumFractionDigits: 3 })} more units are available in Lot ${lotStableName(lot) || lot.id}.`);
+      return;
+    }
+    const lineId = currentItem?.line_id || newCartLineId();
+    const nextDiscounted = applyLotDiscount(defaultRate, nextQuantity, lotDiscount);
 
     setCart((items) => currentItem
-      ? items.map((item) => item.cart_key === cartKey ? { ...item, quantity: nextQuantity, discount_amount: roundUi(Number(item.lot_discount_per_unit || 0) * nextQuantity) } : item)
+      ? items.map((item) => item.line_id === currentItem.line_id ? { ...item, quantity: nextQuantity, discount_amount: roundUi(Number(item.lot_discount_per_unit || 0) * nextQuantity) } : item)
       : [...items, {
-        cart_key: cartKey,
+        line_id: lineId,
+        cart_key: lineId,
+        cart_identity: cartIdentity,
         product_id: product.id,
-        inventory_batch_id: lot?.id || null,
+        inventory_batch_id: lot.id,
         product_name: product.product_name,
-        lot_name: lot?.lot_name || lot?.batch_no || "",
-        lot_size: lot?.lot_size || "",
-        unit: product.unit,
+        lot_name: lot.lot_name || lot.batch_no || "",
+        lot_size: lot.lot_size || lot.size_grade || "",
+        unit: lot.unit || product.unit,
         available_qty: availableStock,
         default_selling_rate: defaultRate,
-        selling_rate: discounted.sellingRate,
+        selling_rate: nextDiscounted.sellingRate,
         quantity: 1,
-        discount_amount: discounted.discountAmount,
+        discount_amount: nextDiscounted.discountAmount,
         lot_discount_id: lotDiscount?.id || null,
         lot_discount_type: lotDiscount?.discount_type || null,
         lot_discount_value: lotDiscount ? Number(lotDiscount.discount_value || 0) : 0,
-        lot_discount_per_unit: discounted.discountPerUnit,
+        lot_discount_per_unit: nextDiscounted.discountPerUnit,
       }]
     );
     setSearch("");
     setHighlightedIndex(0);
+    closeLotSelector();
     setTimeout(() => {
-      const input = quantityRefs.current[cartKey];
+      const input = quantityRefs.current[lineId];
       input?.focus();
       input?.select();
     }, 0);
   };
 
-  const updateCartItem = (cartKey, field, value) => {
+  const updateCartItem = (lineId, field, value) => {
     const number = Number(value);
     if (!Number.isFinite(number) || number < 0) return;
     if (field === "selling_rate" && !canManualRateOverride) {
       alert("You do not have permission to change sale rate.");
       return;
     }
-    const currentItem = cart.find((item) => item.cart_key === cartKey);
-    if (field === "quantity" && currentItem && number > Number(currentItem.available_qty || 0)) {
-      alert(currentItem.inventory_batch_id ? "Selected lot does not have enough stock." : `Only ${currentItem.available_qty || 0} units are available.`);
+    const currentItem = cart.find((item) => item.line_id === lineId);
+    if (field === "quantity" && currentItem && number + getCartQuantityForLot(currentItem.inventory_batch_id, currentItem.line_id) > Number(currentItem.available_qty || 0)) {
+      const moreAvailable = Math.max(Number(currentItem.available_qty || 0) - getCartQuantityForLot(currentItem.inventory_batch_id, currentItem.line_id), 0);
+      alert(currentItem.inventory_batch_id ? `Only ${moreAvailable.toLocaleString("en-IN", { maximumFractionDigits: 3 })} more units are available in Lot ${currentItem.lot_name || currentItem.inventory_batch_id}.` : `Only ${currentItem.available_qty || 0} units are available.`);
       return;
     }
     setCart((items) => items.map((item) => {
-      if (item.cart_key !== cartKey) return item;
+      if (item.line_id !== lineId) return item;
       if (field === "quantity" && item.lot_discount_id) {
         return { ...item, quantity: value, discount_amount: roundUi(Number(item.lot_discount_per_unit || 0) * number) };
       }
-      return { ...item, [field]: value };
+      const updated = { ...item, [field]: value };
+      if (field === "selling_rate") {
+        updated.cart_identity = buildCartIdentity({
+          product: { id: item.product_id, unit: item.unit, selling_rate: item.default_selling_rate },
+          lot: { id: item.inventory_batch_id, lot_name: item.lot_name, lot_size: item.lot_size, unit: item.unit },
+          unit: item.unit,
+          sellingRate: value,
+        });
+      }
+      return updated;
     }));
   };
 
@@ -9432,8 +9540,8 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     searchRef.current?.focus();
   };
 
-  const removeCartItem = (productId) => {
-    setCart((items) => items.filter((item) => item.cart_key !== productId));
+  const removeCartItem = (lineId) => {
+    setCart((items) => items.filter((item) => item.line_id !== lineId));
   };
 
   const scanBarcode = () => {
@@ -9444,7 +9552,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
       alert(`No product is assigned to barcode ${code}`);
       barcodeRef.current?.focus();
     } else {
-      addProduct(product);
+      openLotSelector(product);
     }
     setBarcode("");
   };
@@ -9453,7 +9561,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     setScaleMessage("Scale not connected - enter quantity manually.");
     const lastItem = cart.at(-1);
     if (lastItem) {
-      const input = quantityRefs.current[lastItem.product_id];
+      const input = quantityRefs.current[lastItem.line_id];
       input?.focus();
       input?.select();
     }
@@ -9753,9 +9861,65 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     if (event.key === "Enter" && searchResults[highlightedIndex]) {
       event.preventDefault();
       const selected = searchResults[highlightedIndex];
-      addProduct(selected.product, selected.lot);
+      openLotSelector(selected.product);
     }
   };
+
+  const lotSelectorLots = useMemo(() => {
+    if (!lotSelectorProduct) return [];
+    const query = lotSelectorSearch.trim().toLowerCase();
+    const minRate = lotRateMin === "" ? null : Number(lotRateMin);
+    const maxRate = lotRateMax === "" ? null : Number(lotRateMax);
+    return (lotsByProduct.get(lotSelectorProduct.id) || [])
+      .filter((lot) => {
+        const status = lotStatus(lot);
+        if (status === "Cancelled" || status === "Inactive") return false;
+        if (!showSoldOutLots || !canViewSoldOutLots) {
+          if (lotBalance(lot) <= 0) return false;
+        }
+        if (lotFilter === "ACTIVE" && status !== "Active") return false;
+        if (lotFilter === "DISCOUNTED" && !getActiveLotDiscount(lot.id)) return false;
+        if (lotFilter === "AVAILABLE" && lotBalance(lot) <= 0) return false;
+        if (lotSizeFilter && String(lot.lot_size || lot.size_grade || "") !== lotSizeFilter) return false;
+        if (lotUnitFilter && String(lot.unit || lotSelectorProduct.unit || "") !== lotUnitFilter) return false;
+        const rate = lotSaleRateValue(lot, lotSelectorProduct);
+        if (Number.isFinite(minRate) && minRate !== null && rate < minRate) return false;
+        if (Number.isFinite(maxRate) && maxRate !== null && rate > maxRate) return false;
+        if (!query) return true;
+        return [
+          lotStableName(lot),
+          lot.lot_name,
+          lot.batch_no,
+          lot.lot_no,
+          lotSelectorProduct.product_name,
+          lot.lot_size,
+          lot.size_grade,
+          lot.unit || lotSelectorProduct.unit,
+          rate,
+          lotBalance(lot),
+          status,
+          lotDateKey(lot),
+          lot.remarks,
+        ].some((value) => String(value ?? "").trim().toLowerCase().includes(query));
+      })
+      .sort((left, right) => {
+        const dateCompare = String(lotDateKey(left) || "9999-12-31").localeCompare(String(lotDateKey(right) || "9999-12-31"));
+        if (dateCompare !== 0) return dateCompare;
+        const lotCompare = lotStableName(left).localeCompare(lotStableName(right), undefined, { numeric: true, sensitivity: "base" });
+        if (lotCompare !== 0) return lotCompare;
+        return Number(left.id || 0) - Number(right.id || 0);
+      });
+  }, [canViewSoldOutLots, lotFilter, lotRateMax, lotRateMin, lotSelectorProduct, lotSelectorSearch, lotSizeFilter, lotUnitFilter, lotsByProduct, showSoldOutLots]);
+
+  const lotSelectorSizeOptions = useMemo(() => {
+    if (!lotSelectorProduct) return [];
+    return [...new Set((lotsByProduct.get(lotSelectorProduct.id) || []).map((lot) => String(lot.lot_size || lot.size_grade || "").trim()).filter(Boolean))].sort();
+  }, [lotSelectorProduct, lotsByProduct]);
+
+  const lotSelectorUnitOptions = useMemo(() => {
+    if (!lotSelectorProduct) return [];
+    return [...new Set((lotsByProduct.get(lotSelectorProduct.id) || []).map((lot) => String(lot.unit || lotSelectorProduct.unit || "").trim()).filter(Boolean))].sort();
+  }, [lotSelectorProduct, lotsByProduct]);
 
   const handleShortcuts = (event) => {
     if (event.key === "F2") {
@@ -9832,32 +9996,38 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
           </div>
           <div className="product-results">
             {searchResults.map((option, index) => {
-              const { product, lot } = option;
-              const stock = lot ? Number(lot.remaining_qty || 0) : (stockByProduct.get(product.id) || 0);
-              const baseRate = Number(lot?.temporary_sale_rate || product.selling_rate || 0);
-              const activeDiscount = getActiveLotDiscount(lot?.id);
-              const discounted = applyLotDiscount(baseRate, 1, activeDiscount);
-              const rate = discounted.sellingRate;
+              const { product } = option;
+              const lots = lotsByProduct.get(product.id) || [];
+              const activeLots = lots.filter(isSelectableLot);
+              const stock = activeLots.reduce((sum, lot) => sum + lotBalance(lot), 0);
+              const rates = activeLots.map((lot) => lotSaleRateValue(lot, product)).filter((rate) => rate > 0);
+              const minRate = rates.length ? Math.min(...rates) : Number(product.selling_rate || 0);
+              const maxRate = rates.length ? Math.max(...rates) : minRate;
+              const discountedCount = activeLots.filter((lot) => getActiveLotDiscount(lot.id)).length;
+              const rateLabel = minRate === maxRate
+                ? `${currency.format(minRate)}/${product.unit || "Unit"}`
+                : `${currency.format(minRate)} - ${currency.format(maxRate)}`;
               return (
                 <button
                   className={index === highlightedIndex ? "product-result product-result-active" : "product-result"}
                   key={option.key}
-                  onClick={() => addProduct(product, lot)}
-                  title={lot ? `Full lot: ${getLotLabel(lot)}` : product.product_name}
+                  onClick={() => openLotSelector(product)}
+                  title={`Select lot for ${product.product_name}`}
                 >
                   <span className="product-result-main">
                     <strong>{product.product_name}</strong>
                     <span className="product-result-meta">
-                      <span>Lot: {getCompactLotName(lot)}</span>
-                      <span>Size: {lot?.lot_size || product.lot_size || "Standard"}</span>
+                      <span>{activeLots.length} available lot{activeLots.length === 1 ? "" : "s"}</span>
+                      <span>Stock: {stock.toLocaleString("en-IN", { maximumFractionDigits: 3 })}</span>
                       <span>Unit: {product.unit || "Unit"}</span>
                     </span>
-                    <small>Rate: {currency.format(rate)}/{product.unit || "Unit"}{activeDiscount ? " after lot discount" : ""}</small>
+                    <small>Rate: {rateLabel}{discountedCount ? ` - ${discountedCount} discounted lot${discountedCount === 1 ? "" : "s"}` : ""}</small>
                   </span>
-                  <em className={stock <= 5 ? "stock-low" : "stock-ok"}>{stock} in stock</em>
+                  <em className={stock <= 5 ? "stock-low" : "stock-ok"}>{stock.toLocaleString("en-IN", { maximumFractionDigits: 3 })} in stock</em>
                 </button>
               );
             })}
+            {searchResults.length === 0 && <div className="cart-empty">No matching products or lots found.</div>}
           </div>
         </section>
 
@@ -9877,7 +10047,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
                 <thead><tr><th>Product</th><th>Lot/Size</th><th>Rate</th><th>Qty</th>{printSettings.show_item_discount_column_pos !== false && <th>Item Discount</th>}<th>Total</th><th /></tr></thead>
                 <tbody>
                   {cart.map((item) => (
-                    <tr key={item.cart_key}>
+                    <tr key={item.line_id}>
                       <td className="primary-cell">
                         {item.product_name}
                         <small className="cell-note">{item.available_qty || stockByProduct.get(item.product_id) || 0} {item.unit} available</small>
@@ -9892,13 +10062,13 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
                           title={canManualRateOverride ? "Owner/Admin can override POS sale rate" : "You do not have permission to change sale rate"}
                           type="number"
                           value={item.selling_rate}
-                          onChange={(event) => updateCartItem(item.cart_key, "selling_rate", event.target.value)}
+                          onChange={(event) => updateCartItem(item.line_id, "selling_rate", event.target.value)}
                         />
                       </td>
-                      <td><input className="table-input" min="0.001" ref={(node) => { quantityRefs.current[item.cart_key] = node; }} step="0.001" type="number" value={item.quantity} onChange={(event) => updateCartItem(item.cart_key, "quantity", event.target.value)} onKeyDown={completeQuantityEntry} /></td>
-                      {printSettings.show_item_discount_column_pos !== false && <td><input className="table-input" min="0" step="0.01" type="number" value={item.discount_amount} onChange={(event) => updateCartItem(item.cart_key, "discount_amount", event.target.value)} /></td>}
+                      <td><input className="table-input" min="0.001" ref={(node) => { quantityRefs.current[item.line_id] = node; }} step="0.001" type="number" value={item.quantity} onChange={(event) => updateCartItem(item.line_id, "quantity", event.target.value)} onKeyDown={completeQuantityEntry} /></td>
+                      {printSettings.show_item_discount_column_pos !== false && <td><input className="table-input" min="0" step="0.01" type="number" value={item.discount_amount} onChange={(event) => updateCartItem(item.line_id, "discount_amount", event.target.value)} /></td>}
                       <td className="primary-cell">{currency.format(item.quantity * item.selling_rate - Number(item.discount_amount || 0))}</td>
-                      <td><button aria-label={`Remove ${item.product_name}`} className="remove-button" onClick={() => removeCartItem(item.cart_key)}><Icon name="trash" size={16} /></button></td>
+                      <td><button aria-label={`Remove ${item.product_name}`} className="remove-button" onClick={() => removeCartItem(item.line_id)}><Icon name="trash" size={16} /></button></td>
                     </tr>
                   ))}
                 </tbody>
@@ -9984,6 +10154,111 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
           </button>
         </div>
       </aside>
+      {lotSelectorProduct && (
+        <div className="modal-backdrop lot-selector-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && closeLotSelector()}>
+          <section className="invoice-modal lot-selector-modal" role="dialog" aria-modal="true" aria-label={`Select lot for ${lotSelectorProduct.product_name}`}>
+            <div className="invoice-toolbar lot-selector-toolbar">
+              <div>
+                <span className="eyebrow">Lot Selection</span>
+                <h2>{lotSelectorProduct.product_name}</h2>
+                <p>Select the exact lot being sold. Different lots stay as separate cart rows.</p>
+              </div>
+              <button className="secondary-button" onClick={closeLotSelector}>Close</button>
+            </div>
+            <div className="lot-selector-controls">
+              <label className="icon-input lot-selector-search">
+                <Icon name="search" />
+                <input
+                  autoFocus
+                  placeholder="Search lot, size, rate or stock..."
+                  value={lotSelectorSearch}
+                  onChange={(event) => setLotSelectorSearch(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") closeLotSelector();
+                    if (event.key === "Enter" && lotSelectorLots.length > 0 && isSelectableLot(lotSelectorLots[0])) addProduct(lotSelectorProduct, lotSelectorLots[0]);
+                  }}
+                />
+                {lotSelectorSearch && <button aria-label="Clear lot search" className="clear-search-button" type="button" onClick={() => setLotSelectorSearch("")}>×</button>}
+              </label>
+              <Field label="Filter">
+                <select value={lotFilter} onChange={(event) => setLotFilter(event.target.value)}>
+                  <option value="AVAILABLE">All Available Lots</option>
+                  <option value="ACTIVE">Active Lots</option>
+                  <option value="DISCOUNTED">Discounted Lots</option>
+                </select>
+              </Field>
+              <Field label="Size / Grade">
+                <select value={lotSizeFilter} onChange={(event) => setLotSizeFilter(event.target.value)}>
+                  <option value="">All sizes</option>
+                  {lotSelectorSizeOptions.map((size) => <option key={size} value={size}>{size}</option>)}
+                </select>
+              </Field>
+              <Field label="Unit">
+                <select value={lotUnitFilter} onChange={(event) => setLotUnitFilter(event.target.value)}>
+                  <option value="">All units</option>
+                  {lotSelectorUnitOptions.map((unit) => <option key={unit} value={unit}>{unit}</option>)}
+                </select>
+              </Field>
+              <Field label="Min Rate"><input min="0" step="0.01" type="number" value={lotRateMin} onChange={(event) => setLotRateMin(event.target.value)} /></Field>
+              <Field label="Max Rate"><input min="0" step="0.01" type="number" value={lotRateMax} onChange={(event) => setLotRateMax(event.target.value)} /></Field>
+              {canViewSoldOutLots && (
+                <label className="toggle-line lot-sold-out-toggle">
+                  <input type="checkbox" checked={showSoldOutLots} onChange={(event) => setShowSoldOutLots(event.target.checked)} />
+                  Show Sold-Out Lots
+                </label>
+              )}
+            </div>
+            <div className="lot-selector-table-wrap">
+              <table className="lot-selector-table">
+                <thead>
+                  <tr>
+                    <th>Lot No.</th>
+                    <th>Size / Grade</th>
+                    <th>Unit</th>
+                    <th>Available Stock</th>
+                    <th>Rate</th>
+                    <th>Discount</th>
+                    <th>Date</th>
+                    <th>Status</th>
+                    <th>Select</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {lotSelectorLots.map((lot) => {
+                    const rate = lotSaleRateValue(lot, lotSelectorProduct);
+                    const activeDiscount = getActiveLotDiscount(lot.id);
+                    const selectable = isSelectableLot(lot);
+                    return (
+                      <tr key={lot.id} className={selectable ? "lot-selector-row" : "lot-selector-row lot-selector-row-disabled"} onDoubleClick={() => selectable && addProduct(lotSelectorProduct, lot)}>
+                        <td>
+                          <strong>{getCompactLotName(lot)}</strong>
+                          <small>{lotSelectorProduct.product_name}</small>
+                        </td>
+                        <td>{lot.lot_size || lot.size_grade || "Standard"}</td>
+                        <td>{lot.unit || lotSelectorProduct.unit || "Unit"}</td>
+                        <td className={lotBalance(lot) <= 5 ? "stock-low" : "stock-ok"}>{lotBalance(lot).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
+                        <td>{currency.format(rate)}</td>
+                        <td>{activeDiscount ? <span className="status-badge status-active">Discounted</span> : <span className="status-badge">None</span>}</td>
+                        <td>{formatDisplayDate(lotDateKey(lot))}</td>
+                        <td><span className={`status-badge status-${lotStatus(lot).toLowerCase().replace(/\s+/g, "-")}`}>{lotStatus(lot)}</span></td>
+                        <td>
+                          <button className="primary-button select-lot-button" disabled={!selectable} onClick={() => addProduct(lotSelectorProduct, lot)}>
+                            Select
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {lotSelectorLots.length === 0 && (
+                    <tr><td className="empty-cell" colSpan={9}>No matching lots found.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+            <p className="form-note">Default view shows active lots with available stock. Sold-out lots are reference-only and cannot be billed.</p>
+          </section>
+        </div>
+      )}
     </section>
   );
 }
