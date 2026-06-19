@@ -64,7 +64,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.6";
+const APP_VERSION = "1.0.7";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const UPDATE_FEED_URL = (
@@ -5310,6 +5310,49 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
       `Amount: ${money(saleItemGross(item))}`,
     ].join("\n");
   };
+  const normalizeSaleUnit = (unit) => String(unit || "UNIT").trim().toUpperCase() || "UNIT";
+  const saleQuantityGroups = (items = []) => {
+    const groups = new Map();
+    for (const item of items) {
+      const quantity = Number(item.quantity || 0);
+      if (!quantity) continue;
+      const unit = normalizeSaleUnit(item.unit);
+      groups.set(unit, (groups.get(unit) || 0) + quantity);
+    }
+    return groups;
+  };
+  const formatSaleQuantityGroups = (groups) => {
+    const entries = groups instanceof Map ? [...groups.entries()] : Object.entries(groups || {});
+    if (!entries.length) return "-";
+    return entries
+      .sort(([unitA], [unitB]) => unitA.localeCompare(unitB))
+      .map(([unit, quantity]) => {
+        const numericQuantity = Number(quantity || 0);
+        const quantityText = numericQuantity.toLocaleString("en-IN", Number.isInteger(numericQuantity)
+          ? { maximumFractionDigits: 0 }
+          : { minimumFractionDigits: 3, maximumFractionDigits: 3 });
+        return `${quantityText} ${unit}`;
+      })
+      .join(" • ");
+  };
+  const saleQuantitySummary = (items = []) => formatSaleQuantityGroups(saleQuantityGroups(items));
+  const combineSaleQuantityGroups = (rows = []) => {
+    const groups = new Map();
+    for (const row of rows) {
+      const items = row.item_rows?.length
+        ? row.item_rows
+        : row.quantity !== undefined
+          ? [row]
+          : [];
+      for (const item of items) {
+        const quantity = Number(item.quantity || 0);
+        if (!quantity) continue;
+        const unit = normalizeSaleUnit(item.unit);
+        groups.set(unit, (groups.get(unit) || 0) + quantity);
+      }
+    }
+    return formatSaleQuantityGroups(groups);
+  };
   const saleItemSearchText = (row, item) => [
     row.invoice_no,
     row.customer_name,
@@ -5419,6 +5462,7 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
           item_summary: saleItemNarration(item),
           item_narration: saleItemNarration(item),
           gross_total: saleItemGross(item),
+          quantity_summary: saleQuantitySummary([item]),
           item_discount_total: saleItemDiscount(item),
           bill_discount_total: invoiceDiscountShare,
           discount_total: saleItemDiscount(item) + invoiceDiscountShare,
@@ -5444,6 +5488,7 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
           display_key: `sale-${row.id}`,
           item_summary: saleNarrationPreview(items),
           item_narration: items.map(saleItemNarration).join("\n") || "No item detail available",
+          quantity_summary: saleQuantitySummary(items),
           gross_total: itemRows.reduce((sum, item) => sum + Number(item.gross_total || 0), 0),
           item_discount_total: itemRows.reduce((sum, item) => sum + Number(item.item_discount_total || 0), 0),
           bill_discount_total: itemRows.reduce((sum, item) => sum + Number(item.bill_discount_total || 0), 0),
@@ -5489,10 +5534,10 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
       summary: (rows) => {
         const activeRows = rows.filter((row) => row.status_label !== "Cancelled");
         const invoiceCount = new Set(activeRows.map((row) => row.sale_id)).size;
-        return [["Net Sales", money(totalOf(activeRows, "net_total")), true], ["Invoices", invoiceCount], ["Item Lines", number(activeRows.reduce((sum, row) => sum + (row.item_rows?.length || 1), 0))], ["Gross Total", money(totalOf(activeRows, "gross_total"))], ["Item Discount", money(totalOf(activeRows, "item_discount_total"))], ["Bill Discount", money(totalOf(activeRows, "bill_discount_total"))]];
+        return [["Net Sales", money(totalOf(activeRows, "net_total")), true], ["Total Quantity", combineSaleQuantityGroups(activeRows)], ["Invoices", invoiceCount], ["Item Lines", number(activeRows.reduce((sum, row) => sum + (row.item_rows?.length || 1), 0))], ["Gross Total", money(totalOf(activeRows, "gross_total"))], ["Item Discount", money(totalOf(activeRows, "item_discount_total"))], ["Bill Discount", money(totalOf(activeRows, "bill_discount_total"))]];
       },
       headers: salesFilters.viewMode === "INVOICE"
-        ? ["Date", "Invoice", "Customer", "Item Summary", "Gross Total", "Item Discount", "Bill Discount", "Net Total", "Payment Mode", "Status"]
+        ? ["Date", "Invoice", "Customer", "Item Summary", "Quantity", "Gross Total", "Item Discount", "Bill Discount", "Net Total", "Payment Mode", "Status"]
         : ["Date", "Invoice", "Customer", "Item Name", "Lot No.", "Size / Grade", "Quantity", "Unit", "Rate", "Gross Amount", "Item Discount", "Bill Discount", "Net Amount", "Payment Mode", "User"],
       render: (row) => {
         const saleId = row.sale_id || row.id;
@@ -5517,6 +5562,7 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
                   <span>{salesNarrationDisplay(row)}</span>
                   <small className="cell-note">{row.item_rows?.length || 0} item line{(row.item_rows?.length || 0) === 1 ? "" : "s"}</small>
                 </td>
+                <td className="status-cell">{row.quantity_summary || "-"}</td>
                 <td className="amount-cell">{money(row.gross_total)}</td>
                 <td className="amount-cell">{money(row.item_discount_total)}</td>
                 <td className="amount-cell">{money(row.bill_discount_total)}</td>
@@ -5526,7 +5572,7 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
               </tr>
               {expanded && (
                 <tr className="sales-history-drilldown-row">
-                  <td colSpan="10">
+                  <td colSpan="11">
                     <DataTable headers={["Item", "Lot", "Size", "Qty", "Unit", "Rate", "Gross", "Item Disc.", "Bill Disc.", "Net", "Cost Rate", "Profit"]}>
                       {(row.item_rows || []).map((item) => (
                         <tr className="report-row-clickable" key={item.display_key} onClick={openInvoice}>
