@@ -64,7 +64,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.4";
+const APP_VERSION = "1.0.5";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const UPDATE_FEED_URL = (
@@ -164,6 +164,10 @@ const localSnapshotToInvoice = (snapshot) => {
     gross_amount: Number(invoice.gross_total ?? invoice.gross_amount ?? 0),
     item_discount_amount: Number(invoice.item_discount_total ?? invoice.item_discount_amount ?? 0),
     invoice_discount_amount: Number(invoice.bill_discount_total ?? invoice.invoice_discount_amount ?? 0),
+    taxable_amount: Number(invoice.taxable_amount ?? 0),
+    mandi_tax_rate: Number(invoice.mandi_tax_rate ?? 0),
+    mandi_tax_basis: invoice.mandi_tax_basis,
+    tax_config_snapshot: invoice.tax_config_snapshot,
     tax_amount: Number(invoice.tax_total ?? invoice.tax_amount ?? 0),
     total_amount: Number(invoice.net_total ?? invoice.total_amount ?? 0),
     payment_mode: invoice.payment_mode || "CASH",
@@ -454,6 +458,10 @@ const defaultPaymentSettings = {
   enable_upi_qr_on_invoice: false,
   show_upi_qr_on_all_bills: false,
   qr_display_size: "MEDIUM",
+  enable_sales_mandi_tax: false,
+  sales_mandi_tax_percent: 0,
+  sales_mandi_tax_basis: "NET_AFTER_ALL_DISCOUNTS",
+  sales_mandi_tax_effective_date: "",
 };
 
 function BrandLogo({ compact = false, invoice = false, splash = false }) {
@@ -770,6 +778,7 @@ function App() {
   const [amendmentSupplierId, setAmendmentSupplierId] = useState("");
   const [selectedInvoice, setSelectedInvoice] = useState(null);
   const [selectedInvoicePrintMode, setSelectedInvoicePrintMode] = useState(null);
+  const [cancelDraft, setCancelDraft] = useState(null);
   const [editingSale, setEditingSale] = useState(null);
   const [saleEditLoading, setSaleEditLoading] = useState(false);
   const [saleEditError, setSaleEditError] = useState("");
@@ -2439,14 +2448,49 @@ function App() {
     }
   };
 
+  const getSaleDetailsForAction = async (sale) => {
+    const saleId = sale.sale_id || sale.id || "";
+    if (!saleId) {
+      throw new Error("Unable to open invoice. Invoice ID is missing.");
+    }
+    if ((sale.items || []).length > 0 || (sale.payments || []).length > 0) return sale;
+    if (isTauriRuntime() && (offlineMode || sale.sync_status || String(saleId).startsWith("invoice-") || String(saleId).startsWith("pos-invoice-"))) {
+      const snapshot = await loadLocalPosSale(saleId);
+      return localSnapshotToInvoice(snapshot);
+    }
+    const response = await axios.get(`${API_URL}/sales/${saleId}`);
+    return response.data;
+  };
+
   const cancelSale = async (sale) => {
+    try {
+      const fullSale = await getSaleDetailsForAction(sale);
+      if (fullSale.sale_status === "CANCELLED") {
+        alert("Invoice is already cancelled.");
+        return false;
+      }
+      setCancelDraft({ sale: fullSale, reason: "", saving: false });
+      return false;
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to open cancellation confirmation"));
+      return false;
+    }
+  };
+
+  const confirmCancelSale = async () => {
+    if (!cancelDraft?.sale) return false;
+    const sale = cancelDraft.sale;
+    const reason = cancelDraft.reason || "";
+    if (!reason.trim()) {
+      alert("Cancellation reason is required.");
+      return false;
+    }
     const saleId = sale.sale_id || sale.id || "";
     if (!saleId) {
       alert("Unable to cancel invoice. Invoice ID is missing.");
       return false;
     }
-    const reason = window.prompt(`Enter cancellation reason for ${sale.invoice_no || `#${sale.id}`}`);
-    if (!reason?.trim()) return false;
+    setCancelDraft((current) => current ? { ...current, saving: true } : current);
     try {
       if (isTauriRuntime() && (offlineMode || sale.sync_status || String(saleId).startsWith("invoice-") || String(saleId).startsWith("pos-invoice-"))) {
         const result = await cancelLocalPosSale({
@@ -2462,15 +2506,23 @@ function App() {
           setInventory(snapshot.inventory_lots || []);
         }
         await refreshSyncStatus();
+        setCancelDraft(null);
+        setSelectedInvoice(null);
+        setSelectedInvoicePrintMode(null);
         return true;
       }
       await axios.post(`${API_URL}/sales/${saleId}/cancel`, { reason, cancelled_by: user.id });
       await Promise.all([loadSalesHistory(), loadDashboardData(), loadReports()]);
       alert("Invoice cancelled");
+      setCancelDraft(null);
+      setSelectedInvoice(null);
+      setSelectedInvoicePrintMode(null);
       return true;
     } catch (error) {
       alert(getErrorMessage(error, "Unable to cancel invoice"));
       return false;
+    } finally {
+      setCancelDraft((current) => current ? { ...current, saving: false } : current);
     }
   };
 
@@ -3738,6 +3790,10 @@ function App() {
             invoice={editingSale}
             offlineMode={offlineMode}
             onClose={() => setEditingSale(null)}
+            onAddCustomer={() => {
+              setEditingSale(null);
+              navigate("accounts");
+            }}
             onSaved={async (result) => {
               setEditingSale(null);
               if (result?.localSale) {
@@ -3759,9 +3815,19 @@ function App() {
             products={products.filter((product) => product.active !== false)}
             inventory={inventory}
             canSaleDateEdit={hasRolePermission("sale_date_edit")}
+            customers={customers.filter((customer) => customer.active !== false)}
+            paymentSettings={settingsData.paymentSettings}
             user={user}
           />
         </ModuleErrorBoundary>
+      )}
+      {cancelDraft && (
+        <SaleCancelModal
+          draft={cancelDraft}
+          onClose={() => setCancelDraft(null)}
+          onConfirm={confirmCancelSale}
+          onReasonChange={(reason) => setCancelDraft((current) => current ? { ...current, reason } : current)}
+        />
       )}
       {changeHistory && <ChangeHistoryModal history={changeHistory} onClose={() => setChangeHistory(null)} />}
       {lotAction && (
@@ -8002,7 +8068,18 @@ function PaymentSettingsSection({ canManage, onReload, paymentSettings, user }) 
         </Field>
         <label className="check-field"><input checked={draft.enable_upi_qr_on_invoice === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enable_upi_qr_on_invoice", event.target.checked)} /><span>Enable UPI QR on Invoice</span></label>
         <label className="check-field"><input checked={draft.show_upi_qr_on_all_bills === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("show_upi_qr_on_all_bills", event.target.checked)} /><span>Show UPI QR on all bills</span></label>
+        <label className="check-field"><input checked={draft.enable_sales_mandi_tax === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enable_sales_mandi_tax", event.target.checked)} /><span>Enable Mandi Tax on registered-customer sales</span></label>
+        <Field label="Sales Mandi Tax Rate (%)"><input disabled={!canManage} min="0" step="0.001" type="number" value={draft.sales_mandi_tax_percent || 0} onChange={(event) => updateDraft("sales_mandi_tax_percent", event.target.value)} /></Field>
+        <Field label="Sales Mandi Tax Basis">
+          <select disabled={!canManage} value={draft.sales_mandi_tax_basis || "NET_AFTER_ALL_DISCOUNTS"} onChange={(event) => updateDraft("sales_mandi_tax_basis", event.target.value)}>
+            <option value="GROSS_BEFORE_DISCOUNTS">Gross item value before discounts</option>
+            <option value="AFTER_ITEM_DISCOUNT">Sale value after item discount</option>
+            <option value="NET_AFTER_ALL_DISCOUNTS">Net sale value after item and bill discounts</option>
+          </select>
+        </Field>
+        <Field label="Effective Date"><input disabled={!canManage} type="date" value={draft.sales_mandi_tax_effective_date ? toDateKey(draft.sales_mandi_tax_effective_date) : ""} onChange={(event) => updateDraft("sales_mandi_tax_effective_date", event.target.value)} /></Field>
         {draft.enable_upi_qr_on_invoice === true && !draft.business_upi_id && <p className="form-note stock-low">Please add UPI ID in Settings to show QR code.</p>}
+        {draft.enable_sales_mandi_tax === true && Number(draft.sales_mandi_tax_percent || 0) <= 0 && <p className="form-note stock-low">Enter a Mandi Tax rate before saving registered-customer sales with tax.</p>}
       </div>
       <button className="primary-button" disabled={!canManage} onClick={save}>Save Payment Settings</button>
     </ModuleCard>
@@ -9240,7 +9317,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
   const [quantityMode, setQuantityMode] = useState(posSettings.enable_weighing_scale ? "SCALE" : "MANUAL");
   const [scaleMessage, setScaleMessage] = useState("");
   const [mixedPayments, setMixedPayments] = useState({ CASH: "", UPI: "", CARD: "", BANK_TRANSFER: "" });
-  const [customer, setCustomer] = useState({ account_id: "", name: "", mobile: "", notes: "" });
+  const [customer, setCustomer] = useState({ account_id: "", name: "", mobile: "", notes: "", system_account: false });
   const [creditInfo, setCreditInfo] = useState({ due_date: "", remarks: "" });
   const [billDateTime, setBillDateTime] = useState(currentDateTimeLocal);
   const [saving, setSaving] = useState(false);
@@ -9343,22 +9420,57 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
       .slice(0, 12);
   }, [lotsByProduct, products, search]);
 
+  const salesMandiTaxBasisLabel = {
+    GROSS_BEFORE_DISCOUNTS: "Gross item value before discounts",
+    AFTER_ITEM_DISCOUNT: "Sale value after item discount",
+    NET_AFTER_ALL_DISCOUNTS: "Net sale value after item and bill discounts",
+  };
+
   const totals = useMemo(() => {
     const gross = cart.reduce((sum, item) => sum + item.quantity * Number(item.selling_rate), 0);
     const itemDiscount = cart.reduce((sum, item) => sum + Number(item.discount_amount || 0), 0);
     const subtotalAfterItemDiscounts = Math.max(gross - itemDiscount, 0);
     const discountRule = saleRateSettings.bill_level_slab_discount_enabled === false ? null : getMatchingDiscountRule(discountRules, gross, paymentMode);
     const invoiceDiscountAmount = Math.min(calculateDiscountFromRule(discountRule, gross), subtotalAfterItemDiscounts);
+    const basis = String(paymentSettings.sales_mandi_tax_basis || "NET_AFTER_ALL_DISCOUNTS").toUpperCase();
+    const taxEligible = paymentSettings.enable_sales_mandi_tax === true && Boolean(customer.account_id) && customer.system_account !== true && Number(paymentSettings.sales_mandi_tax_percent || 0) > 0;
+    const taxableAmount = taxEligible
+      ? Math.max(
+          basis === "GROSS_BEFORE_DISCOUNTS"
+            ? gross
+            : basis === "AFTER_ITEM_DISCOUNT"
+              ? subtotalAfterItemDiscounts
+              : subtotalAfterItemDiscounts - invoiceDiscountAmount,
+          0
+        )
+      : 0;
+    const mandiTaxAmount = roundUi(taxableAmount * Number(paymentSettings.sales_mandi_tax_percent || 0) / 100);
     return {
       gross,
       itemDiscount,
       invoiceDiscount: invoiceDiscountAmount,
+      taxableAmount,
+      mandiTaxRate: taxEligible ? Number(paymentSettings.sales_mandi_tax_percent || 0) : 0,
+      mandiTaxAmount,
+      mandiTaxBasis: basis,
       discount: itemDiscount + invoiceDiscountAmount,
-      total: Math.max(gross - itemDiscount - invoiceDiscountAmount, 0),
+      total: Math.max(gross - itemDiscount - invoiceDiscountAmount + mandiTaxAmount, 0),
       itemCount: cart.reduce((sum, item) => sum + Number(item.quantity), 0),
       discountRule,
     };
-  }, [cart, discountRules, paymentMode, saleRateSettings.bill_level_slab_discount_enabled]);
+  }, [cart, customer.account_id, customer.system_account, discountRules, paymentMode, paymentSettings.enable_sales_mandi_tax, paymentSettings.sales_mandi_tax_basis, paymentSettings.sales_mandi_tax_percent, saleRateSettings.bill_level_slab_discount_enabled]);
+
+  const mixedPaymentModes = [
+    ["CASH", "Cash Amount"],
+    ["UPI", "UPI Amount"],
+    ["CARD", "Card Amount"],
+    ["BANK_TRANSFER", "Bank Transfer Amount"],
+  ];
+  const mixedAllocated = roundUi(mixedPaymentModes.reduce((sum, [mode]) => sum + Number(mixedPayments[mode] || 0), 0));
+  const mixedRemaining = roundUi(Math.max(totals.total - mixedAllocated, 0));
+  const mixedExcess = roundUi(Math.max(mixedAllocated - totals.total, 0));
+  const isMixedPaymentBalanced = paymentMode !== "MIXED" || Math.abs(mixedAllocated - totals.total) <= 0.01;
+  const hasInvalidMixedPayment = paymentMode === "MIXED" && mixedPaymentModes.some(([mode]) => Number(mixedPayments[mode] || 0) < 0);
 
   const getLotLabel = (lot) => lot ? [lot.lot_name || lot.batch_no, lot.lot_size].filter(Boolean).join(" / ") : "Auto FIFO";
   const getCompactLotName = (lot) => {
@@ -9570,7 +9682,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
   const selectCustomer = (customerId) => {
     const selected = customers.find((item) => String(item.id) === String(customerId));
     if (!selected) {
-      setCustomer({ account_id: "", name: "", mobile: "", notes: "" });
+      setCustomer({ account_id: "", name: "", mobile: "", notes: "", system_account: false });
       return;
     }
     setCustomer({
@@ -9578,6 +9690,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
       name: selected.customer_name || "",
       mobile: selected.mobile_number || "",
       notes: selected.notes || "",
+      system_account: selected.system_account === true,
     });
   };
 
@@ -9591,6 +9704,9 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
   const buildLocalSalePayload = ({ payments, selectedBillDate, dateOverrideReason }) => {
     const invoiceGlobalId = newSyncId("invoice");
     const offlineInvoiceRef = `OFF-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${String(Math.floor(Math.random() * 10000)).padStart(4, "0")}`;
+    const savedCustomer = customer.account_id
+      ? customer
+      : { ...customer, name: "Walk-in Customer", mobile: customer.mobile || "", system_account: true };
     return {
       operation_id: newSyncId("op"),
       invoice_global_id: invoiceGlobalId,
@@ -9598,14 +9714,26 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
       branch_id: String(user.branch_id || 1),
       device_id: deviceInfo.device_id || newSyncId("device"),
       user_id: String(user.id || ""),
-      customer,
+      customer: savedCustomer,
       bill_date: selectedBillDate,
       bill_datetime: billDateTime,
       payment_mode: paymentMode,
       gross_total: Number(totals.gross || 0),
       item_discount_total: Number(totals.itemDiscount || 0),
       bill_discount_total: Number(totals.invoiceDiscount || 0),
-      tax_total: 0,
+      taxable_amount: Number(totals.taxableAmount || 0),
+      mandi_tax_rate: Number(totals.mandiTaxRate || 0),
+      mandi_tax_basis: totals.mandiTaxBasis,
+      tax_config_snapshot: totals.mandiTaxAmount > 0 ? {
+        tax_type: "MANDI_TAX",
+        tax_rate: Number(totals.mandiTaxRate || 0),
+        taxable_basis: totals.mandiTaxBasis,
+        taxable_amount: Number(totals.taxableAmount || 0),
+        tax_amount: Number(totals.mandiTaxAmount || 0),
+        effective_date: paymentSettings.sales_mandi_tax_effective_date || null,
+        source: "payment_settings",
+      } : null,
+      tax_total: Number(totals.mandiTaxAmount || 0),
       net_total: Number(totals.total || 0),
       status: "COMPLETED",
       sync_status: "pending",
@@ -9713,6 +9841,10 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
       alert("Invoice discount cannot exceed the cart subtotal.");
       return;
     }
+    if (hasInvalidMixedPayment) {
+      alert("Mixed payment amounts cannot be negative.");
+      return;
+    }
 
     const payments = paymentMode === "MIXED"
       ? Object.entries(mixedPayments)
@@ -9721,7 +9853,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
       : [{ mode: paymentMode, amount: totals.total }];
     const paidAmount = payments.reduce((sum, payment) => sum + Number(payment.amount), 0);
     if (Math.abs(paidAmount - totals.total) > 0.01) {
-      alert("Payment amounts must match the invoice total.");
+      alert("Payment amounts must match the tax-inclusive invoice total.");
       return;
     }
 
@@ -9740,11 +9872,18 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
           offline_invoice_ref: localSale.offline_invoice_ref,
           sale_date: selectedBillDate,
           bill_datetime: billDateTime,
-          customer_name: customer.name || "Walk-in Customer",
-          customer_mobile: customer.mobile || "",
+          customer_name: localSale.customer?.name || "Walk-in Customer",
+          customer_mobile: localSale.customer?.mobile || "",
           payment_mode: paymentMode,
           amount: localSale.net_total,
           total_amount: localSale.net_total,
+          gross_amount: localSale.gross_total,
+          item_discount_amount: localSale.item_discount_total,
+          invoice_discount_amount: localSale.bill_discount_total,
+          taxable_amount: localSale.taxable_amount,
+          mandi_tax_rate: localSale.mandi_tax_rate,
+          mandi_tax_basis: localSale.mandi_tax_basis,
+          tax_amount: localSale.tax_total,
           sync_status: "pending",
           items: localSale.items.map((item) => ({
             product_id: item.product_id,
@@ -9764,7 +9903,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
         setCart([]);
         setMixedPayments({ CASH: "", UPI: "", CARD: "", BANK_TRANSFER: "" });
         setPaymentMode("CASH");
-        setCustomer({ account_id: "", name: "", mobile: "", notes: "" });
+        setCustomer({ account_id: "", name: "", mobile: "", notes: "", system_account: false });
         setCreditInfo({ due_date: "", remarks: "" });
         setBillDateTime(currentDateTimeLocal());
         await onSaved?.({ localSale: invoice, pendingOperations: result?.pending_operations });
@@ -9792,9 +9931,14 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
         customer,
         invoice_discount: Number(totals.invoiceDiscount || 0),
         discount_rule_id: totals.discountRule?.id || null,
+        taxable_amount: Number(totals.taxableAmount || 0),
+        mandi_tax_rate: Number(totals.mandiTaxRate || 0),
+        mandi_tax_basis: totals.mandiTaxBasis,
+        tax_total: Number(totals.mandiTaxAmount || 0),
         payments,
         branch_id: user.branch_id,
         created_by: user.id,
+        device_id: deviceInfo.device_id,
         bill_date: selectedBillDate,
         bill_datetime: billDateTime,
         credit_due_date: paymentMode === "CREDIT" ? creditInfo.due_date || null : null,
@@ -9808,7 +9952,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
       setCart([]);
       setMixedPayments({ CASH: "", UPI: "", CARD: "", BANK_TRANSFER: "" });
       setPaymentMode("CASH");
-      setCustomer({ account_id: "", name: "", mobile: "", notes: "" });
+      setCustomer({ account_id: "", name: "", mobile: "", notes: "", system_account: false });
       setCreditInfo({ due_date: "", remarks: "" });
       setBillDateTime(currentDateTimeLocal());
       await onSaved();
@@ -10128,10 +10272,34 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
             <p className="form-note">UPI QR will be printed for {paymentSettings.business_upi_id} on this invoice.</p>
           )}
           {paymentMode === "MIXED" && (
-            <div className="mixed-grid">
-              {Object.keys(mixedPayments).map((mode) => (
-                <Field key={mode} label={mode}><input min="0" step="0.01" type="number" value={mixedPayments[mode]} onChange={(event) => setMixedPayments({ ...mixedPayments, [mode]: event.target.value })} /></Field>
-              ))}
+            <div className="mixed-payment-panel">
+              <div className="mixed-grid">
+                {mixedPaymentModes.map(([mode, label], index) => (
+                  <Field key={mode} label={label}>
+                    <input
+                      min="0"
+                      step="0.01"
+                      type="number"
+                      value={mixedPayments[mode]}
+                      onChange={(event) => setMixedPayments({ ...mixedPayments, [mode]: event.target.value })}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          const next = event.currentTarget.closest(".mixed-payment-panel")?.querySelectorAll("input")?.[index + 1];
+                          next?.focus();
+                        }
+                      }}
+                    />
+                  </Field>
+                ))}
+              </div>
+              <div className="mixed-payment-summary">
+                <TotalLine label="Net Payable" value={totals.total} />
+                <TotalLine label="Total Allocated" value={mixedAllocated} />
+                <TotalLine label="Remaining Amount" value={mixedRemaining} />
+                <TotalLine label="Excess Amount" value={mixedExcess} muted={mixedExcess === 0} />
+              </div>
+              {!isMixedPaymentBalanced && <p className="form-note stock-low">Mixed payment split must exactly match Net Payable.</p>}
             </div>
           )}
         </div>
@@ -10139,17 +10307,20 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
           <TotalLine label="Gross Total" value={totals.gross} />
           <TotalLine label="Item Discount" value={-totals.itemDiscount} />
           <TotalLine label="Bill Discount" value={-totals.invoiceDiscount} />
-          <TotalLine label="Tax" value={0} muted />
+          {totals.mandiTaxAmount > 0 && <TotalLine label="Taxable Amount" value={totals.taxableAmount} />}
+          {totals.mandiTaxAmount > 0 && <TotalLine label={`Mandi Tax (${totals.mandiTaxRate}%)`} value={totals.mandiTaxAmount} />}
+          {totals.mandiTaxAmount === 0 && <TotalLine label="Tax" value={0} muted />}
           <TotalLine label="Net Payable" value={totals.total} total />
+          {totals.mandiTaxAmount > 0 && <p className="form-note">Mandi Tax basis: {salesMandiTaxBasisLabel[totals.mandiTaxBasis] || totals.mandiTaxBasis}</p>}
         </div>
         <div className="button-row checkout-actions">
-          <button className="primary-button checkout-button" disabled={saving} onClick={() => checkout(false)}>
+          <button className="primary-button checkout-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment} onClick={() => checkout(false)}>
             <Icon name="receipt" /> {saving ? "Saving..." : "Save Bill"}
           </button>
           <button className="secondary-button" disabled={!lastInvoice || saving} onClick={printLastInvoice}>
             <Icon name="print" /> Print Bill
           </button>
-          <button className="primary-button" disabled={saving} onClick={() => checkout(true)}>
+          <button className="primary-button" disabled={saving || !isMixedPaymentBalanced || hasInvalidMixedPayment} onClick={() => checkout(true)}>
             <Icon name="print" /> Save & Print
           </button>
         </div>
@@ -10271,7 +10442,101 @@ function ThermalTotalLine({ label, total, value }) {
   return <div className={total ? "total-line total-line-main" : "total-line"}><span>{label}</span><strong>{receiptCurrency.format(value)}</strong></div>;
 }
 
-function SaleEditModal({ canSaleDateEdit = false, deviceInfo, inventory = [], invoice, offlineMode = false, onClose, onSaved, products, user }) {
+function SaleCancelModal({ draft, onClose, onConfirm, onReasonChange }) {
+  const sale = draft.sale || {};
+  const payments = sale.payments || [];
+  const items = sale.items || [];
+  return (
+    <div className="modal-backdrop">
+      <section className="invoice-modal sale-cancel-modal">
+        <div className="invoice-toolbar">
+          <div>
+            <span className="eyebrow">Cancel Bill</span>
+            <strong>{sale.invoice_no || `Invoice #${sale.id || sale.sale_id}`}</strong>
+          </div>
+          <button aria-label="Close cancellation" className="remove-button" disabled={draft.saving} onClick={onClose}><Icon name="close" /></button>
+        </div>
+        <div className="sale-edit-body">
+          <section className="purchase-summary">
+            <div className="purchase-summary-grid">
+              <SummaryMetric label="Customer" value={sale.customer_name || "Walk-in Customer"} />
+              <SummaryMetric label="Bill Date" value={formatDisplayDate(sale.sale_date || sale.transaction_date || sale.created_at)} />
+              <SummaryMetric label="Status" value={sale.sale_status || "COMPLETED"} />
+              <SummaryMetric label="Bill Amount" value={currency.format(Number(sale.total_amount || sale.net_total || 0))} featured />
+            </div>
+          </section>
+          <DataTable headers={["Payment Mode", "Amount"]}>
+            {payments.length > 0 ? payments.map((payment, index) => (
+              <tr key={`${payment.mode || payment.payment_mode}-${index}`}>
+                <td>{payment.mode || payment.payment_mode}</td>
+                <td>{currency.format(Number(payment.amount || 0))}</td>
+              </tr>
+            )) : (
+              <tr><td>{sale.payment_mode || "-"}</td><td>{currency.format(Number(sale.total_amount || sale.net_total || 0))}</td></tr>
+            )}
+          </DataTable>
+          <DataTable headers={["Item", "Lot / Size", "Qty", "Rate", "Amount"]}>
+            {items.map((item, index) => (
+              <tr key={item.id || item.sale_item_id || `${item.product_id}-${index}`}>
+                <td className="primary-cell">{item.product_name}</td>
+                <td>{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "-"}</td>
+                <td>{Number(item.quantity || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })} {item.unit || ""}</td>
+                <td>{currency.format(Number(item.selling_rate || item.rate || 0))}</td>
+                <td>{currency.format(Number(item.net_amount || item.amount || 0))}</td>
+              </tr>
+            ))}
+          </DataTable>
+          <Field label="Cancellation Reason">
+            <textarea value={draft.reason || ""} onChange={(event) => onReasonChange(event.target.value)} placeholder="Reason is required for audit, ledger reversal and stock restoration." />
+          </Field>
+          <p className="form-note stock-low">This will mark the invoice as CANCELLED, restore exact lot stock, and reverse cash/bank/customer ledger impact. The invoice will remain visible with a cancelled badge.</p>
+          <div className="button-row">
+            <button className="remove-button" disabled={draft.saving || !draft.reason?.trim()} onClick={onConfirm}>{draft.saving ? "Cancelling..." : "Confirm Cancel Bill"}</button>
+            <button className="secondary-button" disabled={draft.saving} onClick={onClose}>Keep Bill</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function SaleEditModal({ canSaleDateEdit = false, customers = [], deviceInfo, inventory = [], invoice, offlineMode = false, onAddCustomer, onClose, onSaved, paymentSettings = {}, products, user }) {
+  const activeCustomers = customers.filter((entry) => entry.active !== false);
+  const walkInCustomer = activeCustomers.find((entry) => entry.system_account === true && String(entry.customer_name || "").toLowerCase().includes("walk-in")) || null;
+  const customerFromAccount = (account) => account ? ({
+    account_id: account.id || "",
+    name: account.customer_name || "Walk-in Customer",
+    mobile: account.mobile_number || "",
+    notes: account.notes || "",
+    system_account: account.system_account === true,
+  }) : ({
+    account_id: "",
+    name: "Walk-in Customer",
+    mobile: "",
+    notes: "",
+    system_account: true,
+  });
+  const initialCustomer = (() => {
+    const matched = activeCustomers.find((entry) => String(entry.id) === String(invoice.customer_id || ""));
+    if (matched) return customerFromAccount(matched);
+    if (!invoice.customer_id) return walkInCustomer ? customerFromAccount(walkInCustomer) : customerFromAccount(null);
+    return {
+      account_id: invoice.customer_id || "",
+      name: invoice.customer_name || "",
+      mobile: invoice.customer_mobile || "",
+      notes: invoice.customer_notes || "",
+      system_account: false,
+    };
+  })();
+  const invoicePayments = invoice.payments || [];
+  const initialMixedPayments = (() => {
+    const draft = { CASH: "", UPI: "", CARD: "", BANK_TRANSFER: "" };
+    for (const payment of invoicePayments) {
+      const mode = String(payment.mode || payment.payment_mode || "").toUpperCase();
+      if (Object.prototype.hasOwnProperty.call(draft, mode)) draft[mode] = String(Number(payment.amount || 0));
+    }
+    return draft;
+  })();
   const [items, setItems] = useState(() => (invoice.items || []).map((item) => ({
     id: item.id || item.sale_item_id,
     product_id: item.product_id,
@@ -10287,18 +10552,20 @@ function SaleEditModal({ canSaleDateEdit = false, deviceInfo, inventory = [], in
     lot_discount_type: item.lot_discount_type || null,
     lot_discount_value: item.lot_discount_value || 0,
   })));
-  const [customer, setCustomer] = useState({
-    account_id: invoice.customer_id || "",
-    name: invoice.customer_name || "",
-    mobile: invoice.customer_mobile || "",
-    notes: invoice.customer_notes || "",
-  });
-  const [paymentMode, setPaymentMode] = useState(invoice.payment_mode === "MIXED" ? "CASH" : invoice.payment_mode || "CASH");
+  const [customer, setCustomer] = useState(initialCustomer);
+  const [paymentMode, setPaymentMode] = useState(invoice.payment_mode === "MIXED" || invoicePayments.length > 1 ? "MIXED" : invoice.payment_mode || "CASH");
+  const [mixedPayments, setMixedPayments] = useState(initialMixedPayments);
   const [billDate, setBillDate] = useState(toDateKey(invoice.sale_date || invoice.transaction_date || new Date()));
   const [invoiceDiscount, setInvoiceDiscount] = useState(invoice.invoice_discount_amount || 0);
   const [reason, setReason] = useState("");
   const [saving, setSaving] = useState(false);
   const canChangeRate = ["Owner", "Admin"].includes(user.role);
+  const mixedPaymentModes = [
+    ["CASH", "Cash Amount"],
+    ["UPI", "UPI Amount"],
+    ["CARD", "Card Amount"],
+    ["BANK_TRANSFER", "Bank Transfer Amount"],
+  ];
   const activeLotsForProduct = (productId) => inventory.filter((lot) =>
     Number(lot.product_id) === Number(productId) &&
     Number(lot.remaining_qty ?? lot.balance_qty ?? 0) > 0 &&
@@ -10306,8 +10573,36 @@ function SaleEditModal({ canSaleDateEdit = false, deviceInfo, inventory = [], in
   );
   const gross = items.reduce((sum, item) => sum + Number(item.quantity || 0) * Number(item.selling_rate || 0), 0);
   const itemDiscount = items.reduce((sum, item) => sum + Number(item.discount_amount || 0), 0);
-  const netPayable = Math.max(gross - itemDiscount - Number(invoiceDiscount || 0), 0);
+  const subtotalAfterItemDiscounts = Math.max(gross - itemDiscount, 0);
+  const basis = String(paymentSettings.sales_mandi_tax_basis || "NET_AFTER_ALL_DISCOUNTS").toUpperCase();
+  const editTaxEligible = paymentSettings.enable_sales_mandi_tax === true && Boolean(customer.account_id) && customer.system_account !== true && Number(paymentSettings.sales_mandi_tax_percent || 0) > 0;
+  const taxableAmount = editTaxEligible
+    ? Math.max(
+        basis === "GROSS_BEFORE_DISCOUNTS"
+          ? gross
+          : basis === "AFTER_ITEM_DISCOUNT"
+            ? subtotalAfterItemDiscounts
+            : subtotalAfterItemDiscounts - Number(invoiceDiscount || 0),
+        0
+      )
+    : 0;
+  const mandiTaxAmount = roundUi(taxableAmount * Number(paymentSettings.sales_mandi_tax_percent || 0) / 100);
+  const netPayable = Math.max(gross - itemDiscount - Number(invoiceDiscount || 0) + mandiTaxAmount, 0);
+  const mixedAllocated = roundUi(mixedPaymentModes.reduce((sum, [mode]) => sum + Number(mixedPayments[mode] || 0), 0));
+  const mixedRemaining = roundUi(Math.max(netPayable - mixedAllocated, 0));
+  const mixedExcess = roundUi(Math.max(mixedAllocated - netPayable, 0));
+  const hasInvalidMixedPayment = paymentMode === "MIXED" && mixedPaymentModes.some(([mode]) => Number(mixedPayments[mode] || 0) < 0);
+  const isMixedPaymentBalanced = paymentMode !== "MIXED" || Math.abs(mixedAllocated - netPayable) <= 0.01;
   const availableProducts = products.filter((product) => product.active !== false);
+  const selectEditCustomer = (customerId) => {
+    if (!customerId || customerId === "__WALK_IN__") {
+      setCustomer(walkInCustomer ? customerFromAccount(walkInCustomer) : customerFromAccount(null));
+      return;
+    }
+    const selected = activeCustomers.find((entry) => String(entry.id) === String(customerId));
+    if (!selected) return;
+    setCustomer(customerFromAccount(selected));
+  };
 
   const updateItem = (index, field, value) => {
     setItems((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, [field]: value } : item));
@@ -10372,6 +10667,24 @@ function SaleEditModal({ canSaleDateEdit = false, deviceInfo, inventory = [], in
       alert("Enter a valid customer mobile number.");
       return;
     }
+    if (Number(invoiceDiscount || 0) > subtotalAfterItemDiscounts) {
+      alert("Bill discount cannot exceed sale value after item discounts.");
+      return;
+    }
+    if (hasInvalidMixedPayment) {
+      alert("Mixed payment amounts cannot be negative.");
+      return;
+    }
+    const payments = paymentMode === "MIXED"
+      ? mixedPaymentModes
+        .map(([mode]) => ({ mode, amount: roundUi(Number(mixedPayments[mode] || 0)) }))
+        .filter((payment) => payment.amount > 0)
+      : [{ mode: paymentMode, amount: netPayable }];
+    const paidAmount = roundUi(payments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0));
+    if (paymentMode === "MIXED" && (!isMixedPaymentBalanced || Math.abs(paidAmount - netPayable) > 0.01)) {
+      alert("Mixed payment split must exactly match Net Payable.");
+      return;
+    }
     setSaving(true);
     try {
       const editItems = items.map((item) => ({
@@ -10403,9 +10716,21 @@ function SaleEditModal({ canSaleDateEdit = false, deviceInfo, inventory = [], in
         bill_discount_total: Number(invoiceDiscount || 0),
         gross_total: gross,
         item_discount_total: itemDiscount,
-        tax_total: Number(invoice.tax_amount || invoice.tax_total || 0),
+        taxable_amount: taxableAmount,
+        mandi_tax_rate: editTaxEligible ? Number(paymentSettings.sales_mandi_tax_percent || 0) : 0,
+        mandi_tax_basis: basis,
+        tax_config_snapshot: mandiTaxAmount > 0 ? {
+          tax_type: "MANDI_TAX",
+          tax_rate: editTaxEligible ? Number(paymentSettings.sales_mandi_tax_percent || 0) : 0,
+          taxable_basis: basis,
+          taxable_amount: taxableAmount,
+          tax_amount: mandiTaxAmount,
+          effective_date: paymentSettings.sales_mandi_tax_effective_date || null,
+          source: "payment_settings",
+        } : null,
+        tax_total: mandiTaxAmount,
         net_total: netPayable,
-        payments: [{ mode: paymentMode, amount: netPayable }],
+        payments,
         branch_id: invoice.branch_id || user.branch_id,
         user_id: String(user.id || ""),
         edited_by: user.id,
@@ -10459,15 +10784,26 @@ function SaleEditModal({ canSaleDateEdit = false, deviceInfo, inventory = [], in
             <strong>{invoice.invoice_no}</strong>
           </div>
           <div className="invoice-actions">
-            <button className="primary-button" disabled={saving} onClick={save}>{saving ? "Saving..." : "Save Edit"}</button>
+            <button className="primary-button" disabled={saving || hasInvalidMixedPayment || !isMixedPaymentBalanced} onClick={save}>{saving ? "Saving..." : "Save Edit"}</button>
             <button aria-label="Close editor" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
         <div className="sale-edit-body">
           <div className="form-grid supplier-form-grid">
             <Field label="Bill Date"><input disabled={!canSaleDateEdit} type="date" value={billDate} onChange={(event) => setBillDate(event.target.value)} /></Field>
-            <Field label="Customer Name"><input value={customer.name} onChange={(event) => setCustomer({ ...customer, name: event.target.value })} /></Field>
-            <Field label="Mobile Number"><input inputMode="numeric" value={customer.mobile} onChange={(event) => setCustomer({ ...customer, mobile: event.target.value.replace(/\D/g, "") })} /></Field>
+            <Field label="Customer Account">
+              <select value={customer.account_id || "__WALK_IN__"} onChange={(event) => selectEditCustomer(event.target.value)}>
+                <option value="__WALK_IN__">Walk-in Customer</option>
+                {customer.account_id && !activeCustomers.some((entry) => String(entry.id) === String(customer.account_id)) && (
+                  <option value={customer.account_id}>{customer.name || `Customer #${customer.account_id}`} - current bill customer</option>
+                )}
+                {activeCustomers.map((entry) => (
+                  <option key={entry.id} value={entry.id}>{entry.customer_name}{entry.mobile_number ? ` - ${entry.mobile_number}` : ""}{entry.system_account ? " (System)" : ""}</option>
+                ))}
+              </select>
+            </Field>
+            <Field label="Selected Customer"><input readOnly value={customer.name || "Walk-in Customer"} /></Field>
+            <Field label="Mobile Number"><input readOnly value={customer.mobile || ""} /></Field>
             <Field label="Payment Mode">
               <select value={paymentMode} onChange={(event) => setPaymentMode(event.target.value)}>
                 <option value="CASH">Cash</option>
@@ -10475,12 +10811,47 @@ function SaleEditModal({ canSaleDateEdit = false, deviceInfo, inventory = [], in
                 <option value="CARD">Card</option>
                 <option value="BANK_TRANSFER">Bank Transfer</option>
                 <option value="CREDIT">Credit</option>
+                <option value="MIXED">Mixed Payment</option>
               </select>
             </Field>
             <Field label="Bill Discount"><input min="0" step="0.01" type="number" value={invoiceDiscount} onChange={(event) => setInvoiceDiscount(event.target.value)} /></Field>
-            <Field label="Customer Notes"><textarea value={customer.notes} onChange={(event) => setCustomer({ ...customer, notes: event.target.value })} /></Field>
+            <Field label="Customer Notes"><textarea readOnly value={customer.notes || ""} /></Field>
             <Field label="Edit Reason"><textarea value={reason} onChange={(event) => setReason(event.target.value)} /></Field>
           </div>
+          <div className="sale-edit-add-row">
+            <button className="secondary-button" type="button" onClick={onAddCustomer}>Add New Customer</button>
+          </div>
+          {paymentMode === "MIXED" && (
+            <div className="mixed-payment-panel sale-edit-mixed-panel">
+              <div className="mixed-grid">
+                {mixedPaymentModes.map(([mode, label], index) => (
+                  <Field key={mode} label={label}>
+                    <input
+                      min="0"
+                      step="0.01"
+                      type="number"
+                      value={mixedPayments[mode]}
+                      onChange={(event) => setMixedPayments({ ...mixedPayments, [mode]: event.target.value })}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          const next = event.currentTarget.closest(".mixed-payment-panel")?.querySelectorAll("input")?.[index + 1];
+                          next?.focus();
+                        }
+                      }}
+                    />
+                  </Field>
+                ))}
+              </div>
+              <div className="mixed-payment-summary">
+                <TotalLine label="Net Payable" value={netPayable} />
+                <TotalLine label="Total Allocated" value={mixedAllocated} />
+                <TotalLine label="Remaining Amount" value={mixedRemaining} />
+                <TotalLine label="Excess Amount" value={mixedExcess} muted={mixedExcess === 0} />
+              </div>
+              {!isMixedPaymentBalanced && <p className="form-note stock-low">Mixed payment split must exactly match Net Payable.</p>}
+            </div>
+          )}
           <div className="sale-edit-add-row">
             <select defaultValue="" onChange={(event) => { addItem(event.target.value); event.target.value = ""; }}>
               <option value="">Add item</option>
@@ -10522,6 +10893,8 @@ function SaleEditModal({ canSaleDateEdit = false, deviceInfo, inventory = [], in
               <SummaryMetric label="Gross Total" value={currency.format(gross)} />
               <SummaryMetric label="Item Discount" value={currency.format(itemDiscount)} />
               <SummaryMetric label="Bill Discount" value={currency.format(Number(invoiceDiscount || 0))} />
+              <SummaryMetric label="Taxable Amount" value={currency.format(taxableAmount)} />
+              <SummaryMetric label={`Mandi Tax (${editTaxEligible ? Number(paymentSettings.sales_mandi_tax_percent || 0) : 0}%)`} value={currency.format(mandiTaxAmount)} />
               <SummaryMetric label="Net Payable" value={currency.format(netPayable)} featured />
             </div>
           </section>
@@ -10907,7 +11280,8 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
           <section className="invoice-total-box">
             <ThermalTotalLine label="Gross Total" value={Number(invoice.gross_amount)} />
             {shouldRenderBillDiscountRow && <ThermalTotalLine label="Bill Discount" value={-billDiscountAmount} />}
-            <ThermalTotalLine label="Tax" value={Number(invoice.tax_amount || 0)} />
+            {Number(invoice.taxable_amount || 0) > 0 && <ThermalTotalLine label="Taxable Amount" value={Number(invoice.taxable_amount || 0)} />}
+            <ThermalTotalLine label={Number(invoice.mandi_tax_rate || 0) > 0 ? `Mandi Tax (${Number(invoice.mandi_tax_rate || 0)}%)` : "Tax"} value={Number(invoice.tax_amount || 0)} />
             <ThermalTotalLine label="Net Payable" total value={Number(invoice.total_amount)} />
           </section>
           {shouldShowUpiWarning && <p className="form-note stock-low">Please add UPI ID in Settings to show QR code.</p>}

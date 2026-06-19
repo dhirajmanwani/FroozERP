@@ -6,12 +6,13 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
-const CURRENT_SCHEMA_VERSION: &str = "004_offline_sale_edit_cancel";
+const CURRENT_SCHEMA_VERSION: &str = "005_mandi_tax_sale_details";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
 const MIGRATION_003: &str = include_str!("../migrations/sqlite/003_local_first_pos.sql");
 const MIGRATION_004: &str = include_str!("../migrations/sqlite/004_offline_sale_edit_cancel.sql");
+const MIGRATION_005: &str = include_str!("../migrations/sqlite/005_mandi_tax_sale_details.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -432,6 +433,10 @@ fn complete_local_pos_sale_at(path: &Path, sale: serde_json::Value) -> Result<Lo
     let gross_total = required_number(&sale, "gross_total")?;
     let item_discount_total = number_or_zero(&sale, "item_discount_total");
     let bill_discount_total = number_or_zero(&sale, "bill_discount_total");
+    let taxable_amount = number_or_zero(&sale, "taxable_amount");
+    let mandi_tax_rate = number_or_zero(&sale, "mandi_tax_rate");
+    let mandi_tax_basis = optional_text(&sale, "mandi_tax_basis");
+    let tax_config_snapshot = sale.get("tax_config_snapshot").map(|value| value.to_string());
     let tax_total = number_or_zero(&sale, "tax_total");
     let net_total = required_number(&sale, "net_total")?;
     let entity_version = sale.get("entity_version").and_then(|v| v.as_i64()).unwrap_or(1);
@@ -455,9 +460,10 @@ fn complete_local_pos_sale_at(path: &Path, sale: serde_json::Value) -> Result<Lo
             id, offline_invoice_ref, branch_id, device_id, user_id, customer_id,
             customer_name, customer_mobile, bill_date, bill_datetime, payment_mode,
             gross_total, item_discount_total, bill_discount_total, tax_total, net_total,
+            taxable_amount, mandi_tax_rate, mandi_tax_basis, tax_config_snapshot,
             status, sync_status, entity_version, created_at, updated_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                   'COMPLETED', 'pending', ?17, datetime('now'), datetime('now'))",
+                   ?17, ?18, ?19, ?20, 'COMPLETED', 'pending', ?21, datetime('now'), datetime('now'))",
         params![
             invoice_id,
             offline_ref,
@@ -475,6 +481,10 @@ fn complete_local_pos_sale_at(path: &Path, sale: serde_json::Value) -> Result<Lo
             bill_discount_total,
             tax_total,
             net_total,
+            taxable_amount,
+            mandi_tax_rate,
+            mandi_tax_basis,
+            tax_config_snapshot,
             entity_version,
         ],
     )
@@ -686,7 +696,8 @@ fn load_invoice_snapshot(conn: &Connection, invoice_id: &str) -> Result<serde_js
                     customer_mobile, bill_date, bill_datetime, payment_mode, gross_total,
                     item_discount_total, bill_discount_total, tax_total, net_total, status,
                     sync_status, server_invoice_no, server_sale_id, entity_version, created_at,
-                    updated_at, edit_reason, cancellation_reason, cancelled_by, cancelled_at, base_version
+                    updated_at, edit_reason, cancellation_reason, cancelled_by, cancelled_at, base_version,
+                    taxable_amount, mandi_tax_rate, mandi_tax_basis, tax_config_snapshot
              FROM local_pos_invoices WHERE id = ?1",
             [invoice_id],
             |row| {
@@ -720,6 +731,10 @@ fn load_invoice_snapshot(conn: &Connection, invoice_id: &str) -> Result<serde_js
                     "cancelled_by": row.get::<_, Option<String>>(25)?,
                     "cancelled_at": row.get::<_, Option<String>>(26)?,
                     "base_version": row.get::<_, Option<i64>>(27)?,
+                    "taxable_amount": row.get::<_, f64>(28)?,
+                    "mandi_tax_rate": row.get::<_, f64>(29)?,
+                    "mandi_tax_basis": row.get::<_, Option<String>>(30)?,
+                    "tax_config_snapshot": row.get::<_, Option<String>>(31)?,
                 }))
             },
         )
@@ -1069,6 +1084,10 @@ fn edit_local_pos_sale_at(path: &Path, edit: serde_json::Value) -> Result<LocalP
     let gross_total = required_number(&edit, "gross_total")?;
     let item_discount_total = number_or_zero(&edit, "item_discount_total");
     let bill_discount_total = number_or_zero(&edit, "bill_discount_total");
+    let taxable_amount = number_or_zero(&edit, "taxable_amount");
+    let mandi_tax_rate = number_or_zero(&edit, "mandi_tax_rate");
+    let mandi_tax_basis = optional_text(&edit, "mandi_tax_basis");
+    let tax_config_snapshot = edit.get("tax_config_snapshot").map(|value| value.to_string());
     let tax_total = number_or_zero(&edit, "tax_total");
     let net_total = required_number(&edit, "net_total")?;
     let items = edit.get("items").and_then(|value| value.as_array()).ok_or_else(|| "Edited sale requires items".to_string())?;
@@ -1090,9 +1109,10 @@ fn edit_local_pos_sale_at(path: &Path, edit: serde_json::Value) -> Result<LocalP
          SET customer_id = ?2, customer_name = ?3, customer_mobile = ?4,
              bill_date = ?5, bill_datetime = ?6, payment_mode = ?7,
              gross_total = ?8, item_discount_total = ?9, bill_discount_total = ?10,
-             tax_total = ?11, net_total = ?12, status = 'EDITED',
-             sync_status = 'pending', entity_version = ?13, base_version = ?14,
-             edit_reason = ?15, updated_at = datetime('now')
+             tax_total = ?11, net_total = ?12, taxable_amount = ?13,
+             mandi_tax_rate = ?14, mandi_tax_basis = ?15, tax_config_snapshot = ?16,
+             status = 'EDITED', sync_status = 'pending', entity_version = ?17, base_version = ?18,
+             edit_reason = ?19, updated_at = datetime('now')
          WHERE id = ?1",
         params![
             invoice_id,
@@ -1107,6 +1127,10 @@ fn edit_local_pos_sale_at(path: &Path, edit: serde_json::Value) -> Result<LocalP
             bill_discount_total,
             tax_total,
             net_total,
+            taxable_amount,
+            mandi_tax_rate,
+            mandi_tax_basis,
+            tax_config_snapshot,
             new_version,
             old_version,
             reason,
@@ -1293,6 +1317,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "002_sync_engine_foundation", MIGRATION_002)?;
     apply_migration(&mut conn, "003_local_first_pos", MIGRATION_003)?;
     apply_migration(&mut conn, "004_offline_sale_edit_cancel", MIGRATION_004)?;
+    apply_migration(&mut conn, "005_mandi_tax_sale_details", MIGRATION_005)?;
     Ok(())
 }
 

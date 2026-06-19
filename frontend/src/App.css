@@ -2199,6 +2199,34 @@ tbody tr:last-child td {
   gap: 7px;
 }
 
+.mixed-payment-panel {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 14px;
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.mixed-payment-panel .mixed-grid {
+  grid-template-columns: repeat(2, minmax(118px, 1fr));
+}
+
+.mixed-payment-panel input {
+  min-width: 0;
+}
+
+.mixed-payment-summary {
+  display: grid;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px dashed rgba(148, 163, 184, 0.18);
+}
+
+.sale-edit-mixed-panel {
+  margin: 12px 0;
+}
+
 .totals {
   display: grid;
   gap: 8px;
@@ -3391,6 +3419,10 @@ tbody tr:last-child td {
   .pos-inputs,
   .product-results,
   .mixed-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .mixed-payment-panel .mixed-grid {
     grid-template-columns: 1fr;
   }
 

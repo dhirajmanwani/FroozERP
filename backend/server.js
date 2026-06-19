@@ -1078,11 +1078,19 @@ const initializeDatabase = async () => {
       enable_upi_qr_on_invoice BOOLEAN DEFAULT FALSE,
       show_upi_qr_on_all_bills BOOLEAN DEFAULT FALSE,
       qr_display_size VARCHAR(20) DEFAULT 'MEDIUM',
+      enable_sales_mandi_tax BOOLEAN DEFAULT FALSE,
+      sales_mandi_tax_percent NUMERIC(6, 3) DEFAULT 0,
+      sales_mandi_tax_basis VARCHAR(40) DEFAULT 'NET_AFTER_ALL_DISCOUNTS',
+      sales_mandi_tax_effective_date DATE,
       updated_by INTEGER REFERENCES users(id),
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS show_upi_qr_on_all_bills BOOLEAN DEFAULT FALSE;
     ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS qr_display_size VARCHAR(20) DEFAULT 'MEDIUM';
+    ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS enable_sales_mandi_tax BOOLEAN DEFAULT FALSE;
+    ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS sales_mandi_tax_percent NUMERIC(6, 3) DEFAULT 0;
+    ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS sales_mandi_tax_basis VARCHAR(40) DEFAULT 'NET_AFTER_ALL_DISCOUNTS';
+    ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS sales_mandi_tax_effective_date DATE;
 
     CREATE TABLE IF NOT EXISTS sale_discount_rules (
       id SERIAL PRIMARY KEY,
@@ -1708,6 +1716,11 @@ const initializeDatabase = async () => {
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS discount_rule_value NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS discount_rule_payment_mode VARCHAR(20);
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS tax_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS taxable_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS mandi_tax_rate NUMERIC(6, 3) DEFAULT 0;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS mandi_tax_basis VARCHAR(40);
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS mandi_tax_effective_date DATE;
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS tax_config_snapshot JSONB;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS sale_status VARCHAR(20) DEFAULT 'COMPLETED';
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS edited_by INTEGER REFERENCES users(id);
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP;
@@ -1791,8 +1804,20 @@ const initializeDatabase = async () => {
       id SERIAL PRIMARY KEY,
       sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
       payment_mode VARCHAR(20) NOT NULL,
-      amount NUMERIC(14, 2) NOT NULL CHECK (amount > 0)
+      amount NUMERIC(14, 2) NOT NULL CHECK (amount > 0),
+      reference_number VARCHAR(120),
+      payment_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      user_id INTEGER,
+      branch_id INTEGER,
+      device_id VARCHAR(120),
+      status VARCHAR(20) DEFAULT 'POSTED'
     );
+    ALTER TABLE sale_payments ADD COLUMN IF NOT EXISTS reference_number VARCHAR(120);
+    ALTER TABLE sale_payments ADD COLUMN IF NOT EXISTS payment_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+    ALTER TABLE sale_payments ADD COLUMN IF NOT EXISTS user_id INTEGER;
+    ALTER TABLE sale_payments ADD COLUMN IF NOT EXISTS branch_id INTEGER;
+    ALTER TABLE sale_payments ADD COLUMN IF NOT EXISTS device_id VARCHAR(120);
+    ALTER TABLE sale_payments ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'POSTED';
 
     CREATE TABLE IF NOT EXISTS customer_ledger (
       id SERIAL PRIMARY KEY,
@@ -1808,6 +1833,7 @@ const initializeDatabase = async () => {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     ALTER TABLE customer_ledger ADD COLUMN IF NOT EXISTS transaction_date DATE;
+    ALTER TABLE customer_ledger ADD COLUMN IF NOT EXISTS customer_id INTEGER;
 
     CREATE TABLE IF NOT EXISTS stock_adjustments (
       id SERIAL PRIMARY KEY,
@@ -1867,6 +1893,8 @@ const initializeDatabase = async () => {
 
     CREATE INDEX IF NOT EXISTS customer_ledger_mobile_idx
       ON customer_ledger (customer_mobile, created_at, id);
+    CREATE INDEX IF NOT EXISTS customer_ledger_customer_id_idx
+      ON customer_ledger (customer_id, transaction_date, id);
 
     CREATE INDEX IF NOT EXISTS suppliers_name_search_idx
       ON suppliers (LOWER(supplier_name), LOWER(COALESCE(firm_name, '')));
@@ -3168,7 +3196,7 @@ const getSystemInfo = async (deviceId = "") => {
       : Promise.resolve({ rows: [] }),
   ]);
   return {
-    softwareVersion: "1.0.4",
+    softwareVersion: "1.0.5",
     backendStatus: "Online",
     databaseStatus: dbResult.rows[0]?.database_name ? "Connected" : "Unknown",
     databaseName: dbResult.rows[0]?.database_name || "",
@@ -3448,6 +3476,93 @@ const getMatchingDiscountRule = async (client, subtotal, paymentMode) => {
   return result.rows[0] || null;
 };
 
+const SALES_MANDI_TAX_BASIS = new Set([
+  "GROSS_BEFORE_DISCOUNTS",
+  "AFTER_ITEM_DISCOUNT",
+  "NET_AFTER_ALL_DISCOUNTS",
+]);
+
+const getSalesMandiTaxConfig = async (client) => {
+  const result = await client.query(
+    `SELECT enable_sales_mandi_tax, sales_mandi_tax_percent, sales_mandi_tax_basis, sales_mandi_tax_effective_date
+     FROM payment_settings
+     WHERE id = 1`
+  );
+  const settings = result.rows[0] || {};
+  const basis = String(settings.sales_mandi_tax_basis || "NET_AFTER_ALL_DISCOUNTS").toUpperCase();
+  return {
+    enabled: settings.enable_sales_mandi_tax === true,
+    rate: Number(settings.sales_mandi_tax_percent || 0),
+    basis: SALES_MANDI_TAX_BASIS.has(basis) ? basis : "NET_AFTER_ALL_DISCOUNTS",
+    effectiveDate: settings.sales_mandi_tax_effective_date || null,
+  };
+};
+
+const calculateSalesMandiTax = ({ grossAmount, itemDiscountAmount, invoiceDiscountAmount, customerAccount, config }) => {
+  const eligible = config?.enabled === true && customerAccount && customerAccount.system_account !== true && Number(config.rate || 0) > 0;
+  if (!eligible) {
+    return {
+      taxableAmount: 0,
+      taxAmount: 0,
+      taxRate: 0,
+      taxBasis: config?.basis || "NET_AFTER_ALL_DISCOUNTS",
+      taxEffectiveDate: config?.effectiveDate || null,
+      taxConfigSnapshot: null,
+    };
+  }
+  const gross = roundCurrency(grossAmount);
+  const afterItem = roundCurrency(grossAmount - itemDiscountAmount);
+  const afterAllDiscounts = roundCurrency(grossAmount - itemDiscountAmount - invoiceDiscountAmount);
+  const taxableAmount = roundCurrency(Math.max(
+    config.basis === "GROSS_BEFORE_DISCOUNTS"
+      ? gross
+      : config.basis === "AFTER_ITEM_DISCOUNT"
+        ? afterItem
+        : afterAllDiscounts,
+    0
+  ));
+  const taxRate = Number(config.rate || 0);
+  const taxAmount = roundCurrency(taxableAmount * taxRate / 100);
+  return {
+    taxableAmount,
+    taxAmount,
+    taxRate,
+    taxBasis: config.basis,
+    taxEffectiveDate: config.effectiveDate,
+    taxConfigSnapshot: {
+      tax_type: "MANDI_TAX",
+      tax_rate: taxRate,
+      taxable_basis: config.basis,
+      taxable_amount: taxableAmount,
+      tax_amount: taxAmount,
+      effective_date: config.effectiveDate,
+      source: "payment_settings",
+    },
+  };
+};
+
+const insertSalePaymentAllocation = async (client, { saleId, payment, userId, branchId, deviceId }) => {
+  await client.query(
+    `
+    INSERT INTO sale_payments (
+      sale_id, payment_mode, amount, reference_number, payment_time,
+      user_id, branch_id, device_id, status
+    )
+    VALUES ($1, $2, $3, $4, COALESCE($5::timestamp, CURRENT_TIMESTAMP), $6, $7, $8, 'POSTED')
+    `,
+    [
+      saleId,
+      payment.mode,
+      payment.amount,
+      nullableText(payment.reference_number || payment.reference || payment.transaction_reference),
+      payment.payment_time || payment.paid_at || null,
+      userId || null,
+      branchId || null,
+      cleanText(deviceId || payment.device_id),
+    ]
+  );
+};
+
 const getSalePermissionUser = async (userId, action, client = pool) => {
   const parsedUserId = parsePositiveInteger(userId);
   if (!parsedUserId || !["edit", "cancel"].includes(action)) return null;
@@ -3538,13 +3653,14 @@ const insertCustomerLedgerEntry = async (client, sale, transactionType, amount, 
   await client.query(
     `
     INSERT INTO customer_ledger (
-      sale_id, customer_name, customer_mobile, transaction_type,
+      sale_id, customer_id, customer_name, customer_mobile, transaction_type,
       debit_amount, credit_amount, balance_delta, remarks, created_by, transaction_date
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
     `,
     [
       sale.id,
+      sale.customer_id || null,
       sale.customer_name || null,
       sale.customer_mobile || null,
       transactionType,
@@ -3571,7 +3687,6 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
     lotDiscountValue: parseNonNegativeNumber(item.lot_discount_value),
   }));
   const selectedCustomerId = parsePositiveInteger(customer?.account_id || customer?.customer_id);
-  const typedCustomerName = customer?.name?.trim() || null;
   const customerMobile = customer?.mobile?.trim() || null;
   const customerNotes = customer?.notes?.trim() || null;
 
@@ -3604,7 +3719,7 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
     }
   }
   const customerId = customerAccount.id;
-  const customerName = typedCustomerName || customerAccount.customer_name || "Walk-in Customer";
+  const customerName = customerAccount.customer_name || "Walk-in Customer";
 
   const productIds = [...new Set(parsedItems.map((item) => item.productId))];
   const productResult = await client.query(
@@ -3745,13 +3860,24 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
     return { error: { status: 400, message: "Invoice discount cannot exceed the cart subtotal" } };
   }
 
-  const taxAmount = 0;
+  const salesMandiTaxConfig = await getSalesMandiTaxConfig(client);
+  const salesMandiTax = calculateSalesMandiTax({
+    grossAmount,
+    itemDiscountAmount,
+    invoiceDiscountAmount,
+    customerAccount,
+    config: salesMandiTaxConfig,
+  });
+  const taxAmount = salesMandiTax.taxAmount;
   const totalAmount = roundCurrency(subtotalAfterItemDiscounts - invoiceDiscountAmount + taxAmount);
   const profit = roundCurrency(totalAmount - totalCost);
   const requestedPayments = requestedPaymentsInput || [{ mode: "CASH", amount: totalAmount }];
   const parsedPayments = requestedPayments.map((payment) => ({
     mode: String(payment.mode || "").toUpperCase(),
     amount: parsePositiveNumber(payment.amount),
+    reference_number: nullableText(payment.reference_number || payment.reference || payment.transaction_reference),
+    payment_time: payment.payment_time || payment.paid_at || null,
+    device_id: cleanText(payment.device_id),
   }));
   const paidAmount = roundCurrency(parsedPayments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0));
   if (
@@ -3773,6 +3899,11 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
     itemDiscountAmount,
     invoiceDiscountAmount,
     taxAmount,
+    taxableAmount: salesMandiTax.taxableAmount,
+    mandiTaxRate: salesMandiTax.taxRate,
+    mandiTaxBasis: salesMandiTax.taxBasis,
+    mandiTaxEffectiveDate: salesMandiTax.taxEffectiveDate,
+    taxConfigSnapshot: salesMandiTax.taxConfigSnapshot,
     totalAmount,
     totalCost,
     profit,
@@ -3973,6 +4104,11 @@ app.put("/settings/payment", async (req, res) => {
   try {
     const manager = await requireRateManager(req.body.updated_by);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage payment settings" });
+    const salesMandiTaxPercent = parseNonNegativeNumber(req.body.sales_mandi_tax_percent);
+    const salesMandiTaxBasis = cleanText(req.body.sales_mandi_tax_basis).toUpperCase() || "NET_AFTER_ALL_DISCOUNTS";
+    if (salesMandiTaxPercent === null || !SALES_MANDI_TAX_BASIS.has(salesMandiTaxBasis)) {
+      return res.status(400).json({ message: "Enter valid sales Mandi Tax settings" });
+    }
     const result = await pool.query(
       `
       UPDATE payment_settings
@@ -3981,7 +4117,11 @@ app.put("/settings/payment", async (req, res) => {
           enable_upi_qr_on_invoice = $3,
           show_upi_qr_on_all_bills = $4,
           qr_display_size = $5,
-          updated_by = $6,
+          enable_sales_mandi_tax = $6,
+          sales_mandi_tax_percent = $7,
+          sales_mandi_tax_basis = $8,
+          sales_mandi_tax_effective_date = $9,
+          updated_by = $10,
           updated_at = CURRENT_TIMESTAMP
       WHERE id = 1
       RETURNING *
@@ -3992,6 +4132,10 @@ app.put("/settings/payment", async (req, res) => {
         req.body.enable_upi_qr_on_invoice === true,
         req.body.show_upi_qr_on_all_bills === true,
         ["SMALL", "MEDIUM", "LARGE"].includes(cleanText(req.body.qr_display_size).toUpperCase()) ? cleanText(req.body.qr_display_size).toUpperCase() : "MEDIUM",
+        req.body.enable_sales_mandi_tax === true,
+        salesMandiTaxPercent,
+        salesMandiTaxBasis,
+        isDateInput(req.body.sales_mandi_tax_effective_date) ? req.body.sales_mandi_tax_effective_date : null,
         manager.id,
       ]
     );
@@ -5977,13 +6121,15 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
       total_amount, total_cost, profit, branch_id, created_by, customer_id,
       customer_name, customer_mobile, customer_notes, payment_mode,
       gross_amount, item_discount_amount, invoice_discount_amount, tax_amount,
+      taxable_amount, mandi_tax_rate, mandi_tax_basis, mandi_tax_effective_date, tax_config_snapshot,
       discount_rule_id, discount_rule_name, discount_rule_type, discount_rule_value,
       discount_rule_payment_mode, profit_status, sale_date, transaction_date,
       bill_datetime, backdated_bill, backdate_reason, due_date, credit_remarks, credit_status,
       global_id, offline_invoice_ref, source_device_id, entity_version
     )
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-            $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, 1)
+            $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
+            $32, $33, $34, $35, $36, 1)
     RETURNING *
     `,
     [
@@ -6001,6 +6147,11 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
       salePayload.itemDiscountAmount,
       salePayload.invoiceDiscountAmount,
       salePayload.taxAmount,
+      salePayload.taxableAmount || 0,
+      salePayload.mandiTaxRate || 0,
+      salePayload.mandiTaxBasis || null,
+      salePayload.mandiTaxEffectiveDate || null,
+      JSON.stringify(salePayload.taxConfigSnapshot || null),
       salePayload.discountRule?.id || null,
       salePayload.discountRule?.rule_name || null,
       salePayload.discountRule?.discount_type || null,
@@ -6080,10 +6231,13 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
   }
 
   for (const payment of salePayload.payments.filter((entry) => entry.mode !== "CREDIT")) {
-    await client.query(
-      "INSERT INTO sale_payments (sale_id, payment_mode, amount) VALUES ($1, $2, $3)",
-      [sale.id, payment.mode, payment.amount]
-    );
+    await insertSalePaymentAllocation(client, {
+      saleId: sale.id,
+      payment,
+      userId: context.user.id,
+      branchId: context.branchId,
+      deviceId: context.deviceId,
+    });
   }
 
   await insertCustomerLedgerEntry(
@@ -6200,27 +6354,37 @@ const processPosSaleEditOperation = async (client, operation, context) => {
       item_discount_amount = $11,
       invoice_discount_amount = $12,
       tax_amount = $13,
-      discount_rule_id = $14,
-      discount_rule_name = $15,
-      discount_rule_type = $16,
-      discount_rule_value = $17,
-      discount_rule_payment_mode = $18,
-      sale_date = $19,
-      transaction_date = $19,
-      bill_datetime = COALESCE($22::timestamp, bill_datetime),
-      invoice_no = $24,
+      taxable_amount = $14,
+      mandi_tax_rate = $15,
+      mandi_tax_basis = $16,
+      mandi_tax_effective_date = $17,
+      tax_config_snapshot = $18::jsonb,
+      discount_rule_id = $19,
+      discount_rule_name = $20,
+      discount_rule_type = $21,
+      discount_rule_value = $22,
+      discount_rule_payment_mode = $23,
+      sale_date = $24,
+      transaction_date = $24,
+      bill_datetime = COALESCE($27::timestamp, bill_datetime),
+      invoice_no = $29,
       sale_status = 'EDITED',
-      edited_by = $20,
+      edited_by = $25,
       edited_at = CURRENT_TIMESTAMP,
-      edit_reason = $21,
-      entity_version = GREATEST(COALESCE(entity_version, 1), $25)
-    WHERE id = $23
+      edit_reason = $26,
+      entity_version = GREATEST(COALESCE(entity_version, 1), $30)
+    WHERE id = $28
     RETURNING *
     `,
     [
       salePayload.totalAmount, salePayload.totalCost, salePayload.profit, salePayload.branchId,
       salePayload.customerId, salePayload.customerName, salePayload.customerMobile, salePayload.customerNotes, salePayload.paymentMode,
       salePayload.grossAmount, salePayload.itemDiscountAmount, salePayload.invoiceDiscountAmount, salePayload.taxAmount,
+      salePayload.taxableAmount || 0,
+      salePayload.mandiTaxRate || 0,
+      salePayload.mandiTaxBasis || null,
+      salePayload.mandiTaxEffectiveDate || null,
+      JSON.stringify(salePayload.taxConfigSnapshot || null),
       salePayload.discountRule?.id || null, salePayload.discountRule?.rule_name || null,
       salePayload.discountRule?.discount_type || null, salePayload.discountRule?.discount_value || 0,
       salePayload.discountRule?.payment_mode || null,
@@ -6280,7 +6444,13 @@ const processPosSaleEditOperation = async (client, operation, context) => {
   }
 
   for (const payment of salePayload.payments) {
-    await client.query("INSERT INTO sale_payments (sale_id, payment_mode, amount) VALUES ($1, $2, $3)", [currentSale.id, payment.mode, payment.amount]);
+    await insertSalePaymentAllocation(client, {
+      saleId: currentSale.id,
+      payment,
+      userId: editor.id,
+      branchId: salePayload.branchId,
+      deviceId: context.deviceId,
+    });
   }
   await client.query(
     `
@@ -6289,8 +6459,27 @@ const processPosSaleEditOperation = async (client, operation, context) => {
     `,
     [currentSale.id, JSON.stringify(oldSnapshot), JSON.stringify(await getSaleSnapshot(client, currentSale.id)), reason, editor.id]
   );
+  const customerChanged = String(currentSale.customer_id || "") !== String(salePayload.customerId || "")
+    || String(currentSale.customer_name || "") !== String(salePayload.customerName || "");
   const delta = roundCurrency(salePayload.totalAmount - Number(currentSale.total_amount || 0));
-  if (delta !== 0 || salePayload.customerMobile || salePayload.customerName) {
+  if (customerChanged) {
+    await insertCustomerLedgerEntry(
+      client,
+      currentSale,
+      "SALE_EDIT_CREDIT",
+      Number(currentSale.total_amount || 0),
+      editor.id,
+      `Invoice ${updatedSale.invoice_no} customer changed during offline sync edit: ${reason}`
+    );
+    await insertCustomerLedgerEntry(
+      client,
+      updatedSale,
+      "SALE_EDIT_DEBIT",
+      salePayload.totalAmount,
+      editor.id,
+      `Invoice ${updatedSale.invoice_no} moved to selected customer during offline sync edit: ${reason}`
+    );
+  } else if (delta !== 0 || salePayload.customerMobile || salePayload.customerName) {
     await insertCustomerLedgerEntry(
       client,
       updatedSale,
@@ -6342,6 +6531,7 @@ const processPosSaleCancelOperation = async (client, operation, context) => {
   const oldSnapshot = await getSaleSnapshot(client, currentSale.id);
   await restoreSaleInventory(client, currentSale.id, canceller.id, "Offline cancellation reversal for invoice", "IN");
   await client.query("DELETE FROM sale_batch_allocations WHERE sale_item_id IN (SELECT id FROM sale_items WHERE sale_id = $1)", [currentSale.id]);
+  await client.query("UPDATE sale_payments SET status = 'REVERSED' WHERE sale_id = $1", [currentSale.id]);
   const updateResult = await client.query(
     `
     UPDATE sales
@@ -13417,7 +13607,6 @@ app.post("/sales", async (req, res) => {
         : null,
     }));
     const selectedCustomerId = parsePositiveInteger(customer?.account_id || customer?.customer_id);
-    const typedCustomerName = customer?.name?.trim() || null;
     const customerMobile = customer?.mobile?.trim() || null;
     const customerNotes = customer?.notes?.trim() || null;
 
@@ -13462,7 +13651,7 @@ app.post("/sales", async (req, res) => {
       }
     }
     const customerId = customerAccount.id;
-    const customerName = typedCustomerName || customerAccount.customer_name || "Walk-in Customer";
+    const customerName = customerAccount.customer_name || "Walk-in Customer";
 
     const productIds = [...new Set(parsedItems.map((item) => item.productId))];
     const productResult = await client.query(
@@ -13653,7 +13842,15 @@ app.post("/sales", async (req, res) => {
       return res.status(400).json({ message: "Invoice discount cannot exceed the cart subtotal" });
     }
 
-    const taxAmount = 0;
+    const salesMandiTaxConfig = await getSalesMandiTaxConfig(client);
+    const salesMandiTax = calculateSalesMandiTax({
+      grossAmount,
+      itemDiscountAmount,
+      invoiceDiscountAmount,
+      customerAccount,
+      config: salesMandiTaxConfig,
+    });
+    const taxAmount = salesMandiTax.taxAmount;
     const totalAmount = roundCurrency(subtotalAfterItemDiscounts - invoiceDiscountAmount + taxAmount);
     const profit = roundCurrency(totalAmount - totalCost);
     const profitStatus = invoiceItems.some((item) => item.costStatus === "PROVISIONAL") ? "PROVISIONAL" : "FINAL";
@@ -13661,6 +13858,9 @@ app.post("/sales", async (req, res) => {
     const parsedPayments = requestedPayments.map((payment) => ({
       mode: String(payment.mode || "").toUpperCase(),
       amount: parsePositiveNumber(payment.amount),
+      reference_number: nullableText(payment.reference_number || payment.reference || payment.transaction_reference),
+      payment_time: payment.payment_time || payment.paid_at || null,
+      device_id: cleanText(payment.device_id),
     }));
     const paidAmount = roundCurrency(parsedPayments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0));
     if (
@@ -13679,17 +13879,23 @@ app.post("/sales", async (req, res) => {
         total_amount, total_cost, profit, branch_id, created_by, customer_id,
         customer_name, customer_mobile, customer_notes, payment_mode,
         gross_amount, item_discount_amount, invoice_discount_amount, tax_amount,
+        taxable_amount, mandi_tax_rate, mandi_tax_basis, mandi_tax_effective_date, tax_config_snapshot,
         discount_rule_id, discount_rule_name, discount_rule_type, discount_rule_value,
         discount_rule_payment_mode, profit_status, sale_date, transaction_date,
         bill_datetime, backdated_bill, backdate_reason, due_date, credit_remarks, credit_status
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)
       RETURNING *
       `,
       [
         totalAmount, totalCost, profit, parsedBranchId, parsedCreatedBy, customerId,
         customerName, customerMobile, customerNotes, paymentMode,
         grossAmount, itemDiscountAmount, invoiceDiscountAmount, taxAmount,
+        salesMandiTax.taxableAmount,
+        salesMandiTax.taxRate,
+        salesMandiTax.taxBasis,
+        salesMandiTax.taxEffectiveDate,
+        JSON.stringify(salesMandiTax.taxConfigSnapshot || null),
         discountRule?.id || null,
         discountRule?.rule_name || null,
         discountRule?.discount_type || null,
@@ -13790,10 +13996,13 @@ app.post("/sales", async (req, res) => {
     }
 
     for (const payment of parsedPayments.filter((entry) => entry.mode !== "CREDIT")) {
-      await client.query(
-        "INSERT INTO sale_payments (sale_id, payment_mode, amount) VALUES ($1, $2, $3)",
-        [sale.id, payment.mode, payment.amount]
-      );
+      await insertSalePaymentAllocation(client, {
+        saleId: sale.id,
+        payment,
+        userId: parsedCreatedBy,
+        branchId: parsedBranchId,
+        deviceId: cleanText(req.body.device_id || req.body.source_device_id),
+      });
     }
 
     await insertCustomerLedgerEntry(
@@ -14490,26 +14699,36 @@ app.put("/sales/:id", async (req, res) => {
         item_discount_amount = $11,
         invoice_discount_amount = $12,
         tax_amount = $13,
-        discount_rule_id = $14,
-        discount_rule_name = $15,
-        discount_rule_type = $16,
-        discount_rule_value = $17,
-        discount_rule_payment_mode = $18,
-        sale_date = $19,
-        transaction_date = $19,
-        bill_datetime = COALESCE($22::timestamp, bill_datetime),
-        invoice_no = $24,
+        taxable_amount = $14,
+        mandi_tax_rate = $15,
+        mandi_tax_basis = $16,
+        mandi_tax_effective_date = $17,
+        tax_config_snapshot = $18::jsonb,
+        discount_rule_id = $19,
+        discount_rule_name = $20,
+        discount_rule_type = $21,
+        discount_rule_value = $22,
+        discount_rule_payment_mode = $23,
+        sale_date = $24,
+        transaction_date = $24,
+        bill_datetime = COALESCE($27::timestamp, bill_datetime),
+        invoice_no = $29,
         sale_status = 'EDITED',
-        edited_by = $20,
+        edited_by = $25,
         edited_at = CURRENT_TIMESTAMP,
-        edit_reason = $21
-      WHERE id = $23
+        edit_reason = $26
+      WHERE id = $28
       RETURNING *
       `,
       [
         salePayload.totalAmount, salePayload.totalCost, salePayload.profit, salePayload.branchId,
         salePayload.customerId, salePayload.customerName, salePayload.customerMobile, salePayload.customerNotes, salePayload.paymentMode,
         salePayload.grossAmount, salePayload.itemDiscountAmount, salePayload.invoiceDiscountAmount, salePayload.taxAmount,
+        salePayload.taxableAmount || 0,
+        salePayload.mandiTaxRate || 0,
+        salePayload.mandiTaxBasis || null,
+        salePayload.mandiTaxEffectiveDate || null,
+        JSON.stringify(salePayload.taxConfigSnapshot || null),
         salePayload.discountRule?.id || null, salePayload.discountRule?.rule_name || null,
         salePayload.discountRule?.discount_type || null, salePayload.discountRule?.discount_value || 0,
         salePayload.discountRule?.payment_mode || null,
@@ -14589,7 +14808,13 @@ app.put("/sales/:id", async (req, res) => {
     }
 
     for (const payment of salePayload.payments) {
-      await client.query("INSERT INTO sale_payments (sale_id, payment_mode, amount) VALUES ($1, $2, $3)", [saleId, payment.mode, payment.amount]);
+      await insertSalePaymentAllocation(client, {
+        saleId,
+        payment,
+        userId: editor.id,
+        branchId: salePayload.branchId,
+        deviceId: cleanText(req.body.device_id || req.body.source_device_id),
+      });
     }
 
     await client.query(
@@ -14600,8 +14825,27 @@ app.put("/sales/:id", async (req, res) => {
       [saleId, JSON.stringify(oldSnapshot), JSON.stringify(await getSaleSnapshot(client, saleId)), reason, editor.id]
     );
 
+    const customerChanged = String(currentSale.customer_id || "") !== String(salePayload.customerId || "")
+      || String(currentSale.customer_name || "") !== String(salePayload.customerName || "");
     const delta = roundCurrency(salePayload.totalAmount - Number(currentSale.total_amount || 0));
-    if (delta !== 0 || salePayload.customerMobile || salePayload.customerName) {
+    if (customerChanged) {
+      await insertCustomerLedgerEntry(
+        client,
+        currentSale,
+        "SALE_EDIT_CREDIT",
+        Number(currentSale.total_amount || 0),
+        editor.id,
+        `Invoice ${updatedSale.invoice_no} customer changed: ${reason}`
+      );
+      await insertCustomerLedgerEntry(
+        client,
+        updatedSale,
+        "SALE_EDIT_DEBIT",
+        salePayload.totalAmount,
+        editor.id,
+        `Invoice ${updatedSale.invoice_no} moved to selected customer: ${reason}`
+      );
+    } else if (delta !== 0 || salePayload.customerMobile || salePayload.customerName) {
       await insertCustomerLedgerEntry(
         client,
         updatedSale,
@@ -14647,6 +14891,7 @@ app.post("/sales/:id/cancel", async (req, res) => {
     const oldSnapshot = await getSaleSnapshot(client, saleId);
     await restoreSaleInventory(client, saleId, canceller.id, "Cancellation reversal for invoice", "IN");
     await client.query("DELETE FROM sale_batch_allocations WHERE sale_item_id IN (SELECT id FROM sale_items WHERE sale_id = $1)", [saleId]);
+    await client.query("UPDATE sale_payments SET status = 'REVERSED' WHERE sale_id = $1", [saleId]);
     const updateResult = await client.query(
       `
       UPDATE sales
@@ -14731,7 +14976,7 @@ app.get("/sales/:id", async (req, res) => {
         [saleId]
       ),
       pool.query(
-        "SELECT payment_mode AS mode, amount FROM sale_payments WHERE sale_id = $1 ORDER BY id",
+        "SELECT payment_mode AS mode, amount, reference_number, payment_time, status FROM sale_payments WHERE sale_id = $1 ORDER BY id",
         [saleId]
       ),
     ]);
