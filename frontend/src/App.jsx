@@ -64,9 +64,70 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.7";
+const APP_VERSION = "1.0.8";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
+const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
+const applicationFontSizeOptions = [
+  { value: "SMALL", label: "Small", scale: "90%" },
+  { value: "MEDIUM", label: "Medium", scale: "100%" },
+  { value: "LARGE", label: "Large", scale: "115%" },
+  { value: "EXTRA_LARGE", label: "Extra Large", scale: "130%" },
+];
+const normalizeApplicationFontSize = (value) =>
+  applicationFontSizeOptions.some((option) => option.value === value) ? value : "MEDIUM";
+const getStoredApplicationFontSize = () => {
+  try {
+    return normalizeApplicationFontSize(localStorage.getItem(APPLICATION_FONT_SIZE_STORAGE_KEY));
+  } catch {
+    return "MEDIUM";
+  }
+};
+const PRINT_PROFILE_STORAGE_PREFIX = "froozerp_print_profile";
+const readStoredPrintProfile = (documentType) => {
+  try {
+    return localStorage.getItem(`${PRINT_PROFILE_STORAGE_PREFIX}_${documentType}`) || "";
+  } catch {
+    return "";
+  }
+};
+const rememberPrintProfile = (documentType, profile) => {
+  try {
+    localStorage.setItem(`${PRINT_PROFILE_STORAGE_PREFIX}_${documentType}`, profile);
+  } catch {
+    // Printing still works when local storage is unavailable.
+  }
+};
+const PRINT_PAGE_PROFILE_STYLE_ID = "froozerp-print-page-profile";
+const printPageProfileCss = (profile) => {
+  if (profile === "A4_LANDSCAPE") return "@media print { @page { size: A4 landscape; margin: 0; } }";
+  if (profile === "THERMAL_58") return "@media print { @page { size: 58mm 220mm; margin: 0; } }";
+  if (profile === "THERMAL_80") return "@media print { @page { size: 80mm 220mm; margin: 0; } }";
+  return "@media print { @page { size: A4 portrait; margin: 0; } }";
+};
+const applyPrintPageProfile = (profile) => {
+  let style = document.getElementById(PRINT_PAGE_PROFILE_STYLE_ID);
+  if (!style) {
+    style = document.createElement("style");
+    style.id = PRINT_PAGE_PROFILE_STYLE_ID;
+    document.head.appendChild(style);
+  }
+  style.textContent = printPageProfileCss(profile);
+};
+const clearPrintPageProfile = () => {
+  document.getElementById(PRINT_PAGE_PROFILE_STYLE_ID)?.remove();
+};
+const schedulePrintPageProfileCleanup = () => {
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    window.removeEventListener("afterprint", cleanup);
+    clearPrintPageProfile();
+  };
+  window.addEventListener("afterprint", cleanup, { once: true });
+  setTimeout(cleanup, 30000);
+};
 const UPDATE_FEED_URL = (
   import.meta.env.VITE_UPDATE_FEED_URL ||
   window.__FROOZERP_UPDATE_FEED_URL__ ||
@@ -259,10 +320,20 @@ const withDocumentTitle = (fileName, action) => {
     document.title = previousTitle;
   }, 1000);
 };
-const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth = "80MM", save = true }) => {
+const getReportPrintProfile = (reportClassName = "") => (
+  /(sales-history|purchase-history|cash-book|stock-inventory)/i.test(reportClassName)
+    ? "A4_LANDSCAPE"
+    : "A4_PORTRAIT"
+);
+const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth = "80MM", printProfile = "", save = true }) => {
   if (!element) throw new Error("Nothing to export");
   const isThermal = mode === "THERMAL";
+  const resolvedProfile = isThermal ? (receiptWidth === "58MM" ? "THERMAL_58" : "THERMAL_80") : (printProfile || "A4_PORTRAIT");
+  element.dataset.printProfile = resolvedProfile;
   element.classList.add("pdf-export-mode", isThermal ? "pdf-export-thermal" : "pdf-export-a4");
+  if (!isThermal) {
+    element.classList.add(resolvedProfile === "A4_LANDSCAPE" ? "pdf-export-a4-landscape" : "pdf-export-a4-portrait");
+  }
   document.body.classList.add("pdf-export-active");
   try {
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
@@ -276,7 +347,7 @@ const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth
       windowHeight: Math.max(document.documentElement.clientHeight, element.scrollHeight),
     });
     const imgData = canvas.toDataURL("image/png");
-    const isLandscapeReport = !isThermal && Boolean(element.closest?.(".cash-book-print-report"));
+    const isLandscapeReport = !isThermal && resolvedProfile === "A4_LANDSCAPE";
     const pageWidth = isThermal ? (receiptWidth === "58MM" ? 58 : 80) : isLandscapeReport ? 297 : 210;
     const imgHeight = (canvas.height * pageWidth) / canvas.width;
     const pageHeight = isThermal ? Math.max(120, imgHeight) : isLandscapeReport ? 210 : 297;
@@ -299,7 +370,8 @@ const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth
     if (save) pdf.save(finalFileName);
     return { blob: pdf.output("blob"), fileName: finalFileName, pdf };
   } finally {
-    element.classList.remove("pdf-export-mode", "pdf-export-thermal", "pdf-export-a4");
+    delete element.dataset.printProfile;
+    element.classList.remove("pdf-export-mode", "pdf-export-thermal", "pdf-export-a4", "pdf-export-a4-landscape", "pdf-export-a4-portrait");
     document.body.classList.remove("pdf-export-active");
   }
 };
@@ -604,6 +676,7 @@ function App() {
   const [activationCode, setActivationCode] = useState("");
   const [recoveryOpen, setRecoveryOpen] = useState(false);
   const [activeView, setActiveView] = useState(initialView);
+  const [applicationFontSize, setApplicationFontSize] = useState(getStoredApplicationFontSize);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [products, setProducts] = useState([]);
   const [productCategories, setProductCategories] = useState([]);
@@ -785,6 +858,16 @@ function App() {
   const [changeHistory, setChangeHistory] = useState(null);
   const [profileOpen, setProfileOpen] = useState(false);
   const [accountLedgerFocusKey, setAccountLedgerFocusKey] = useState("");
+
+  useEffect(() => {
+    const normalized = normalizeApplicationFontSize(applicationFontSize);
+    document.documentElement.dataset.appFontSize = normalized.toLowerCase().replace("_", "-");
+    try {
+      localStorage.setItem(APPLICATION_FONT_SIZE_STORAGE_KEY, normalized);
+    } catch {
+      // Device-local accessibility preference only; ignore locked storage.
+    }
+  }, [applicationFontSize]);
 
   useEffect(() => {
     const onPopState = () => {
@@ -3687,6 +3770,7 @@ function App() {
           {activeView === "settings" && (
             <ModuleErrorBoundary onClose={() => setActiveView("dashboard")}>
               <SettingsModule
+                applicationFontSize={applicationFontSize}
                 backendHealth={backendHealth}
                 canManage={canManageRates}
                 localDbStatus={localDbStatus}
@@ -3695,6 +3779,7 @@ function App() {
                 onRunSync={() => runSyncNow({ force: true })}
                 onQueueSyncTest={queuePhase2SyncTest}
                 settingsData={settingsData}
+                setApplicationFontSize={setApplicationFontSize}
                 syncMessage={syncMessage}
                 syncStatus={syncStatus}
                 rules={settingsRules}
@@ -4424,18 +4509,27 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
   const [printTarget, setPrintTarget] = useState(false);
   const [exporting, setExporting] = useState(false);
   const reportRef = useRef(null);
+  const reportProfileKey = `report_${safeFileName(reportClassName || title || "report")}`;
+  const printProfile = readStoredPrintProfile(reportProfileKey) || getReportPrintProfile(reportClassName);
+  const profileLabel = printProfile === "A4_LANDSCAPE" ? "A4 Landscape" : "A4 Portrait";
   const printReport = () => {
     if (beforePrint && beforePrint() === false) return;
+    rememberPrintProfile(reportProfileKey, printProfile);
+    applyPrintPageProfile(printProfile);
     setTimeout(() => {
       setPrintTarget(true);
       setTimeout(() => {
         withDocumentTitle(fileName || title, () => window.print());
-        setTimeout(() => setPrintTarget(false), 250);
+        setTimeout(() => {
+          setPrintTarget(false);
+          schedulePrintPageProfileCleanup();
+        }, 1000);
       }, 50);
     }, 0);
   };
   const exportReport = async () => {
     if (beforePdfExport && beforePdfExport() === false) return;
+    rememberPrintProfile(reportProfileKey, printProfile);
     setPrintTarget(true);
     setExporting(true);
     try {
@@ -4444,6 +4538,7 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
         element: reportRef.current,
         fileName: fileName || `${title}.pdf`,
         mode: "A4",
+        printProfile,
       });
     } catch (error) {
       alert(`Unable to export PDF: ${error.message}`);
@@ -4453,7 +4548,7 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
     }
   };
   return (
-    <section className={`print-section ${reportClassName} ${printTarget ? "print-target" : ""}`}>
+    <section className={`print-section ${reportClassName} print-profile-${printProfile.toLowerCase().replace("_", "-")} ${printTarget ? "print-target" : ""}`}>
       <ReportToolbar exporting={exporting} onPdfExport={exportReport} onPrint={printReport} title={title} />
       <div ref={reportRef} className="print-area report-paper">
         <header className="report-print-header">
@@ -4463,6 +4558,9 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
             <span>{new Date().toLocaleString("en-IN")}</span>
           </div>
         </header>
+        <div className="print-profile-status no-screen">
+          Printer/Profile: {profileLabel} | Auto typography: active | Minimum body font: 10pt
+        </div>
         {children}
       </div>
     </section>
@@ -7939,6 +8037,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
 }
 
 function SettingsModule({
+  applicationFontSize,
   backendHealth,
   canManage,
   localDbStatus,
@@ -7948,6 +8047,7 @@ function SettingsModule({
   onRunSync,
   rules,
   settingsData,
+  setApplicationFontSize,
   syncMessage,
   syncStatus,
   user,
@@ -7962,6 +8062,7 @@ function SettingsModule({
         </div>
         <span className={canManage ? "stock-ok" : "stock-low"}>{canManage ? "Manager Access" : "Read Only"}</span>
       </section>
+      <AppearanceAccessibilitySettings applicationFontSize={applicationFontSize} setApplicationFontSize={setApplicationFontSize} />
       <BusinessSettingsSection businessSettings={settingsData.businessSettings} canManage={canManage} key={settingsData.businessSettings?.updated_at || "business-settings"} onReload={onReload} user={user} />
       <PosSettingsSection canManage={canManage} key={settingsData.posSettings?.updated_at || "pos-settings"} onReload={onReload} posSettings={settingsData.posSettings} user={user} />
       <PaymentSettingsSection canManage={canManage} key={settingsData.paymentSettings?.updated_at || "payment-settings"} onReload={onReload} paymentSettings={settingsData.paymentSettings} user={user} />
@@ -7991,6 +8092,28 @@ function SettingsModule({
       <BackupSettings backupLogs={settingsData.backupLogs || []} backupSettings={settingsData.backupSettings} canManage={canManage} onReload={onReload} user={user} />
       <SystemInfoSection systemInfo={settingsData.systemInfo || {}} />
     </section>
+  );
+}
+
+function AppearanceAccessibilitySettings({ applicationFontSize, setApplicationFontSize }) {
+  const selected = applicationFontSizeOptions.find((option) => option.value === applicationFontSize) || applicationFontSizeOptions[1];
+  return (
+    <ModuleCard eyebrow="Appearance / Accessibility" title="Display Typography" subtitle="Device-local display preference. This changes the app UI only; invoices and report print typography stay on their own print profiles.">
+      <div className="form-grid supplier-form-grid">
+        <Field label="Application Font Size">
+          <select value={selected.value} onChange={(event) => setApplicationFontSize(normalizeApplicationFontSize(event.target.value))}>
+            {applicationFontSizeOptions.map((option) => (
+              <option key={option.value} value={option.value}>{option.label} - {option.scale}</option>
+            ))}
+          </select>
+        </Field>
+        <div className="accessibility-preview-card">
+          <span>Current Scale</span>
+          <strong>{selected.label}</strong>
+          <small>{selected.scale}. Applied immediately on this device and remembered after restart.</small>
+        </div>
+      </div>
+    </ModuleCard>
   );
 }
 
@@ -11170,12 +11293,14 @@ function PaymentReceiptModal({ payment, onClose }) {
 }
 
 function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false, invoice, onCancel, onClose, onEdit, paymentSettings = {}, printSettings = {} }) {
-  const [printMode, setPrintMode] = useState(printSettings.default_invoice_print === "A4_INVOICE" || printSettings.default_printer_type === "A4" ? "A4" : "THERMAL");
+  const storedInvoiceProfile = readStoredPrintProfile("invoice");
+  const [printMode, setPrintMode] = useState(storedInvoiceProfile === "A4_INVOICE" ? "A4" : storedInvoiceProfile === "THERMAL_RECEIPT" ? "THERMAL" : printSettings.default_invoice_print === "A4_INVOICE" || printSettings.default_printer_type === "A4" ? "A4" : "THERMAL");
   const [upiQrDataUrl, setUpiQrDataUrl] = useState("");
   const [exporting, setExporting] = useState(false);
   const invoiceRef = useRef(null);
   const autoPrintedRef = useRef(false);
   const activePrintMode = printMode === "A4" ? "A4" : "THERMAL";
+  const resolvedInvoiceProfile = activePrintMode === "A4" ? "A4 Portrait" : printSettings.receipt_width === "58MM" ? "58mm Thermal" : "80mm Thermal";
   const invoicePayments = invoice.payments || [];
   const showItemDiscountOnReceipt = printSettings.show_item_discount_column_receipt !== false;
   const showBillDiscountRow = printSettings.show_bill_discount_row_receipt !== false;
@@ -11216,7 +11341,11 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
   const invoiceFileName = () => `FroozERP_POS_Invoice_${invoice.invoice_no || `SALE-${invoice.id}`}_${formatFileDate(invoiceDateKey)}.pdf`;
   const printWithMode = (mode) => {
     setPrintMode(mode);
+    const nextProfile = mode === "A4" ? "A4_PORTRAIT" : printSettings.receipt_width === "58MM" ? "THERMAL_58" : "THERMAL_80";
+    rememberPrintProfile("invoice", mode === "A4" ? "A4_INVOICE" : "THERMAL_RECEIPT");
+    applyPrintPageProfile(nextProfile);
     withDocumentTitle(invoiceFileName(), () => setTimeout(() => window.print(), 100));
+    schedulePrintPageProfileCleanup();
   };
   useEffect(() => {
     if (!autoPrintMode || autoPrintedRef.current) return;
@@ -11228,11 +11357,13 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
     setExporting(true);
     try {
       await new Promise((resolve) => setTimeout(resolve, upiPayload && !upiQrDataUrl ? 250 : 80));
+      rememberPrintProfile("invoice", mode === "A4" ? "A4_INVOICE" : "THERMAL_RECEIPT");
       return await exportElementToPdf({
         element: invoiceRef.current,
         fileName: invoiceFileName(),
         mode,
         receiptWidth: printSettings.receipt_width || "80MM",
+        printProfile: mode === "A4" ? "A4_PORTRAIT" : "",
         save,
       });
     } finally {
@@ -11284,7 +11415,10 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
             <button aria-label="Close invoice" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
-        <article ref={invoiceRef} className={`invoice-paper ${activePrintMode === "A4" ? "invoice-a4" : "invoice-thermal"} ${printSettings.receipt_width === "58MM" ? "invoice-58mm" : "invoice-80mm"}`}>
+        <article ref={invoiceRef} className={`invoice-paper ${activePrintMode === "A4" ? "invoice-a4 print-profile-a4-portrait" : "invoice-thermal"} ${printSettings.receipt_width === "58MM" ? "invoice-58mm print-profile-thermal-58" : "invoice-80mm print-profile-thermal-80"}`}>
+          <div className="print-profile-status no-screen">
+            Printer/Profile: {resolvedInvoiceProfile} | Auto typography: active | UI font-size preference ignored for print
+          </div>
           <header className="invoice-header">
             <BrandLogo invoice />
             <div className="invoice-meta">
