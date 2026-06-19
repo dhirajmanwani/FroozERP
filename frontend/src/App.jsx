@@ -64,7 +64,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.5";
+const APP_VERSION = "1.0.6";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const UPDATE_FEED_URL = (
@@ -10553,6 +10553,7 @@ function SaleEditModal({ canSaleDateEdit = false, customers = [], deviceInfo, in
     lot_discount_value: item.lot_discount_value || 0,
   })));
   const [customer, setCustomer] = useState(initialCustomer);
+  const [customerSearch, setCustomerSearch] = useState("");
   const [paymentMode, setPaymentMode] = useState(invoice.payment_mode === "MIXED" || invoicePayments.length > 1 ? "MIXED" : invoice.payment_mode || "CASH");
   const [mixedPayments, setMixedPayments] = useState(initialMixedPayments);
   const [billDate, setBillDate] = useState(toDateKey(invoice.sale_date || invoice.transaction_date || new Date()));
@@ -10594,6 +10595,17 @@ function SaleEditModal({ canSaleDateEdit = false, customers = [], deviceInfo, in
   const hasInvalidMixedPayment = paymentMode === "MIXED" && mixedPaymentModes.some(([mode]) => Number(mixedPayments[mode] || 0) < 0);
   const isMixedPaymentBalanced = paymentMode !== "MIXED" || Math.abs(mixedAllocated - netPayable) <= 0.01;
   const availableProducts = products.filter((product) => product.active !== false);
+  const normalizedCustomerSearch = customerSearch.trim().toLowerCase();
+  const filteredCustomers = activeCustomers.filter((entry) => {
+    if (!normalizedCustomerSearch) return true;
+    return [
+      entry.customer_name,
+      entry.mobile_number,
+      entry.gst_number,
+      entry.account_code,
+      entry.notes,
+    ].filter(Boolean).join(" ").toLowerCase().includes(normalizedCustomerSearch);
+  });
   const selectEditCustomer = (customerId) => {
     if (!customerId || customerId === "__WALK_IN__") {
       setCustomer(walkInCustomer ? customerFromAccount(walkInCustomer) : customerFromAccount(null));
@@ -10792,15 +10804,24 @@ function SaleEditModal({ canSaleDateEdit = false, customers = [], deviceInfo, in
           <div className="form-grid supplier-form-grid">
             <Field label="Bill Date"><input disabled={!canSaleDateEdit} type="date" value={billDate} onChange={(event) => setBillDate(event.target.value)} /></Field>
             <Field label="Customer Account">
+              <input
+                placeholder="Search customer name, mobile or GST..."
+                value={customerSearch}
+                onChange={(event) => setCustomerSearch(event.target.value)}
+              />
               <select value={customer.account_id || "__WALK_IN__"} onChange={(event) => selectEditCustomer(event.target.value)}>
                 <option value="__WALK_IN__">Walk-in Customer</option>
                 {customer.account_id && !activeCustomers.some((entry) => String(entry.id) === String(customer.account_id)) && (
                   <option value={customer.account_id}>{customer.name || `Customer #${customer.account_id}`} - current bill customer</option>
                 )}
-                {activeCustomers.map((entry) => (
+                {filteredCustomers.map((entry) => (
                   <option key={entry.id} value={entry.id}>{entry.customer_name}{entry.mobile_number ? ` - ${entry.mobile_number}` : ""}{entry.system_account ? " (System)" : ""}</option>
                 ))}
+                {filteredCustomers.length === 0 && (
+                  <option disabled value="__NO_CUSTOMERS__">No matching saved customers</option>
+                )}
               </select>
+              <small className="field-hint">Only saved customers or the official Walk-in Customer can be selected.</small>
             </Field>
             <Field label="Selected Customer"><input readOnly value={customer.name || "Walk-in Customer"} /></Field>
             <Field label="Mobile Number"><input readOnly value={customer.mobile || ""} /></Field>
