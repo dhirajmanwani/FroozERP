@@ -2520,6 +2520,64 @@ tbody tr:last-child td {
   box-shadow: 0 20px 70px rgba(2, 6, 23, 0.6);
 }
 
+.whatsapp-send-modal {
+  width: min(980px, 100%);
+}
+
+.inline-input-action {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.whatsapp-recipient-list {
+  display: grid;
+  gap: 8px;
+  max-height: 320px;
+  overflow: auto;
+  padding: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.whatsapp-recipient-row {
+  display: grid;
+  grid-template-columns: auto minmax(180px, 1fr) minmax(150px, auto);
+  gap: 10px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 10px;
+  background: rgba(30, 41, 59, 0.72);
+}
+
+.whatsapp-recipient-row span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.whatsapp-recipient-row strong,
+.whatsapp-recipient-row small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.whatsapp-recipient-row em {
+  color: #cbd5e1;
+  font-style: normal;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.recipient-unavailable {
+  opacity: 0.62;
+}
+
 .sale-edit-modal,
 .change-history-modal {
   width: min(1040px, 100%);

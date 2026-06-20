@@ -11,7 +11,7 @@ const nodemailer = require("nodemailer");
 types.setTypeParser(1082, (value) => value);
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "25mb" }));
 
 const pool = new Pool({
   user: process.env.DB_USER || "postgres",
@@ -80,6 +80,22 @@ const hashActivationCode = (code) =>
 const generateActivationCode = () => `FTF-${crypto.randomBytes(3).toString("hex").toUpperCase()}-${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
 const normalizeUsername = (value) => cleanText(value).toLowerCase();
 const normalizePhone = (value) => cleanText(value).replace(/[^\d+]/g, "");
+const normalizeWhatsappPhone = (value, defaultCountryCode = "91") => {
+  let digits = cleanText(value).replace(/[^\d+]/g, "");
+  if (!digits) return "";
+  if (digits.startsWith("00")) digits = digits.slice(2);
+  if (digits.startsWith("+")) digits = digits.slice(1);
+  digits = digits.replace(/\D/g, "");
+  const countryCode = cleanText(defaultCountryCode).replace(/\D/g, "") || "91";
+  if (digits.length === 10) digits = `${countryCode}${digits}`;
+  if (digits.length < 11 || digits.length > 15) return "";
+  return digits;
+};
+const maskAccessToken = (value) => {
+  const token = cleanText(value);
+  if (!token) return "";
+  return `${token.slice(0, 5)}...${token.slice(-4)}`;
+};
 const hashSensitiveValue = (value) =>
   crypto.createHash("sha256").update(String(value || "").trim().toLowerCase(), "utf8").digest("hex");
 const recoveryOtpSecret = process.env.RECOVERY_OTP_HASH_SECRET || process.env.OTP_HASH_SECRET || process.env.DB_PASSWORD || "froozerp-local-dev-otp-secret";
@@ -215,10 +231,18 @@ const PERMISSION_KEYS = [
   "backup_restore",
   "branch_settings",
   "system_info",
+  "whatsapp_send",
+  "whatsapp_settings",
 ];
 
 const cleanText = (value) => (typeof value === "string" ? value.trim() : "");
 const nullableText = (value) => cleanText(value) || null;
+const safeDocumentFileName = (value) =>
+  (cleanText(value) || "FroozERP_Document.pdf")
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "")
+    .replace(/\s+/g, "_")
+    .replace(/_+/g, "_")
+    .slice(0, 180);
 const normalizeSupplierType = (value) => String(value || "LOCAL_SUPPLIER").toUpperCase();
 const normalizePaymentMode = (value) => String(value || "").trim().toUpperCase().replace(/\s+/g, "_");
 const normalizeDiscountType = (value) => String(value || "FLAT_AMOUNT").toUpperCase();
@@ -734,6 +758,8 @@ const initializeDatabase = async () => {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS whatsapp_number VARCHAR(30);
+    ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS whatsapp_opt_in BOOLEAN DEFAULT TRUE;
 
     CREATE TABLE IF NOT EXISTS product_categories (
       id SERIAL PRIMARY KEY,
@@ -1098,6 +1124,32 @@ const initializeDatabase = async () => {
     ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS sales_mandi_tax_product_scope VARCHAR(40) DEFAULT 'ALL_PRODUCTS';
     ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS sales_mandi_tax_disable_reason TEXT;
 
+    CREATE TABLE IF NOT EXISTS whatsapp_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+      enabled BOOLEAN DEFAULT FALSE,
+      phone_number_id VARCHAR(160),
+      access_token TEXT,
+      default_country_code VARCHAR(8) DEFAULT '91',
+      updated_by INTEGER REFERENCES users(id),
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS whatsapp_send_logs (
+      id BIGSERIAL PRIMARY KEY,
+      source_type VARCHAR(40) NOT NULL,
+      source_id VARCHAR(180),
+      account_id INTEGER,
+      account_type VARCHAR(30),
+      phone_number VARCHAR(30) NOT NULL,
+      document_name VARCHAR(220) NOT NULL,
+      status VARCHAR(40) NOT NULL,
+      error_message TEXT,
+      sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      sent_by_user_id INTEGER REFERENCES users(id)
+    );
+    CREATE INDEX IF NOT EXISTS whatsapp_send_logs_source_idx
+      ON whatsapp_send_logs (source_type, source_id, sent_at DESC);
+
     CREATE TABLE IF NOT EXISTS sale_discount_rules (
       id SERIAL PRIMARY KEY,
       rule_name VARCHAR(140) NOT NULL,
@@ -1201,6 +1253,8 @@ const initializeDatabase = async () => {
     ALTER TABLE customers ADD COLUMN IF NOT EXISTS ifsc_code VARCHAR(30);
     ALTER TABLE customers ADD COLUMN IF NOT EXISTS upi_id VARCHAR(120);
     ALTER TABLE customers ADD COLUMN IF NOT EXISTS system_account BOOLEAN DEFAULT FALSE;
+    ALTER TABLE customers ADD COLUMN IF NOT EXISTS whatsapp_number VARCHAR(30);
+    ALTER TABLE customers ADD COLUMN IF NOT EXISTS whatsapp_opt_in BOOLEAN DEFAULT TRUE;
     INSERT INTO customers (
       customer_name, customer_type, mobile_number, notes, opening_balance, active, system_account
     )
@@ -1244,6 +1298,8 @@ const initializeDatabase = async () => {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    ALTER TABLE accounts ADD COLUMN IF NOT EXISTS whatsapp_number VARCHAR(30);
+    ALTER TABLE accounts ADD COLUMN IF NOT EXISTS whatsapp_opt_in BOOLEAN DEFAULT TRUE;
     CREATE INDEX IF NOT EXISTS accounts_name_mobile_search_lower_idx
       ON accounts (LOWER(account_name), COALESCE(mobile_number, ''));
 
@@ -1608,6 +1664,10 @@ const initializeDatabase = async () => {
     VALUES (1)
     ON CONFLICT (id) DO NOTHING;
 
+    INSERT INTO whatsapp_settings (id)
+    VALUES (1)
+    ON CONFLICT (id) DO NOTHING;
+
     INSERT INTO update_center (id)
     VALUES (1)
     ON CONFLICT (id) DO NOTHING;
@@ -1642,6 +1702,10 @@ const initializeDatabase = async () => {
     WHERE role_name IN ('Owner', 'Admin');
 
     UPDATE role_permission_settings
+    SET permissions = permissions || '{"whatsapp_send":true,"whatsapp_settings":true}'::jsonb
+    WHERE role_name IN ('Owner', 'Admin');
+
+    UPDATE role_permission_settings
     SET permissions = permissions || '{"manual_pos_rate_override":false}'::jsonb
     WHERE role_name IN ('Cashier', 'Purchase Manager', 'Inventory Manager')
       AND NOT (permissions ? 'manual_pos_rate_override');
@@ -1660,6 +1724,11 @@ const initializeDatabase = async () => {
     SET permissions = permissions || '{"device_management":false,"activation_codes":false,"backup_restore":false,"branch_settings":false,"system_info":false}'::jsonb
     WHERE role_name IN ('Cashier', 'Purchase Manager', 'Inventory Manager')
       AND NOT (permissions ? 'device_management');
+
+    UPDATE role_permission_settings
+    SET permissions = permissions || '{"whatsapp_send":false,"whatsapp_settings":false}'::jsonb
+    WHERE role_name IN ('Cashier', 'Purchase Manager', 'Inventory Manager')
+      AND NOT (permissions ? 'whatsapp_send');
 
     INSERT INTO branches (id, branch_name, location)
     VALUES (1, 'Main Branch', 'Primary Store')
@@ -2159,6 +2228,8 @@ const readSupplierPayload = (body) => {
     account_number: nullableText(body.account_number),
     ifsc_code: nullableText(body.ifsc_code),
     upi_id: nullableText(body.upi_id),
+    whatsapp_number: nullableText(body.whatsapp_number),
+    whatsapp_opt_in: body.whatsapp_opt_in === undefined ? true : body.whatsapp_opt_in === true || body.whatsapp_opt_in === "true",
     notes: nullableText(body.notes),
     opening_balance: parseNonNegativeNumber(body.opening_balance),
     supplier_type: supplierType,
@@ -2195,6 +2266,8 @@ const readCustomerPayload = (body) => {
     account_number: nullableText(body.account_number),
     ifsc_code: nullableText(body.ifsc_code),
     upi_id: nullableText(body.upi_id),
+    whatsapp_number: nullableText(body.whatsapp_number),
+    whatsapp_opt_in: body.whatsapp_opt_in === undefined ? true : body.whatsapp_opt_in === true || body.whatsapp_opt_in === "true",
     notes: nullableText(body.notes),
     opening_balance: parseNonNegativeNumber(body.opening_balance),
     active: body.active === undefined ? true : body.active === true || body.active === "true",
@@ -2216,6 +2289,8 @@ const readAccountPayload = (body) => {
     account_number: nullableText(body.account_number),
     ifsc_code: nullableText(body.ifsc_code),
     upi_id: nullableText(body.upi_id),
+    whatsapp_number: nullableText(body.whatsapp_number),
+    whatsapp_opt_in: body.whatsapp_opt_in === undefined ? true : body.whatsapp_opt_in === true || body.whatsapp_opt_in === "true",
     opening_balance: parseNonNegativeNumber(body.opening_balance),
     active: body.active === undefined ? true : body.active === true || body.active === "true",
     notes: nullableText(body.notes),
@@ -3219,7 +3294,7 @@ const getSystemInfo = async (deviceId = "") => {
 };
 
 const getSettingsBundle = async (userId, deviceId = "") => {
-  const [businessResult, saleRateResult, mandiResult, rebateResult, discountResult, roleResult, updateResult, syncResult, syncQueueResult, posResult, paymentResult, manager] = await Promise.all([
+  const [businessResult, saleRateResult, mandiResult, rebateResult, discountResult, roleResult, updateResult, syncResult, syncQueueResult, posResult, paymentResult, whatsappResult, manager] = await Promise.all([
     pool.query("SELECT * FROM business_settings WHERE id = 1"),
     pool.query("SELECT * FROM sale_rate_settings WHERE id = 1"),
     pool.query("SELECT * FROM mandi_tax_rules ORDER BY origin_type"),
@@ -3231,6 +3306,7 @@ const getSettingsBundle = async (userId, deviceId = "") => {
     pool.query("SELECT COUNT(*)::INTEGER AS pending_count FROM sync_queue WHERE sync_status = 'PENDING'"),
     pool.query("SELECT * FROM pos_settings WHERE id = 1"),
     pool.query("SELECT * FROM payment_settings WHERE id = 1"),
+    pool.query("SELECT * FROM whatsapp_settings WHERE id = 1"),
     userId ? requireRateManager(userId) : Promise.resolve(null),
   ]);
   const usersResult = manager ? await pool.query(
@@ -3280,11 +3356,20 @@ const getSettingsBundle = async (userId, deviceId = "") => {
     await getSystemInfo(deviceId),
   ];
   const syncSettings = syncResult.rows[0] || {};
+  const whatsappSettings = whatsappResult.rows[0] || {};
   return {
     businessSettings: businessResult.rows[0] || {},
     saleRateSettings: saleRateResult.rows[0] || {},
     posSettings: posResult.rows[0] || {},
     paymentSettings: paymentResult.rows[0] || {},
+    whatsappSettings: {
+      enabled: whatsappSettings.enabled === true,
+      phone_number_id: whatsappSettings.phone_number_id || "",
+      default_country_code: whatsappSettings.default_country_code || "91",
+      access_token_configured: Boolean(whatsappSettings.access_token),
+      access_token_masked: maskAccessToken(whatsappSettings.access_token),
+      updated_at: whatsappSettings.updated_at || "",
+    },
     mandiTaxRules: mandiResult.rows,
     rebateRules: rebateResult.rows,
     discountRules: discountResult.rows,
@@ -4170,6 +4255,262 @@ app.put("/settings/payment", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Updating Payment Settings" });
+  }
+});
+
+app.put("/settings/whatsapp", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage WhatsApp settings" });
+    const existing = await pool.query("SELECT * FROM whatsapp_settings WHERE id = 1");
+    const existingToken = existing.rows[0]?.access_token || "";
+    const suppliedToken = cleanText(req.body.access_token);
+    const tokenToStore = suppliedToken && !suppliedToken.includes("...") ? suppliedToken : existingToken;
+    const countryCode = cleanText(req.body.default_country_code).replace(/\D/g, "") || "91";
+    const result = await pool.query(
+      `
+      UPDATE whatsapp_settings
+      SET enabled = $1,
+          phone_number_id = $2,
+          access_token = $3,
+          default_country_code = $4,
+          updated_by = $5,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = 1
+      RETURNING *
+      `,
+      [
+        req.body.enabled === true,
+        nullableText(req.body.phone_number_id),
+        tokenToStore || null,
+        countryCode,
+        manager.id,
+      ]
+    );
+    const row = result.rows[0] || {};
+    return res.json({
+      enabled: row.enabled === true,
+      phone_number_id: row.phone_number_id || "",
+      default_country_code: row.default_country_code || "91",
+      access_token_configured: Boolean(row.access_token),
+      access_token_masked: maskAccessToken(row.access_token),
+      updated_at: row.updated_at || "",
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating WhatsApp Settings" });
+  }
+});
+
+app.post("/settings/whatsapp/test", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can test WhatsApp settings" });
+    const settingsResult = await pool.query("SELECT * FROM whatsapp_settings WHERE id = 1");
+    const settings = settingsResult.rows[0] || {};
+    if (settings.enabled !== true || !settings.phone_number_id || !settings.access_token) {
+      return res.status(400).json({ message: "WhatsApp API is not configured." });
+    }
+    const response = await fetch(`https://graph.facebook.com/v19.0/${encodeURIComponent(settings.phone_number_id)}?fields=display_phone_number,verified_name`, {
+      headers: { Authorization: `Bearer ${settings.access_token}` },
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      return res.status(response.status).json({ message: payload?.error?.message || "WhatsApp test connection failed" });
+    }
+    return res.json({ success: true, phone: payload.display_phone_number || "", name: payload.verified_name || "" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Unable to test WhatsApp connection" });
+  }
+});
+
+const insertWhatsappLog = async ({ sourceType, sourceId, accountId, accountType, phoneNumber, documentName, status, errorMessage, sentByUserId }, client = pool) => {
+  await client.query(
+    `
+    INSERT INTO whatsapp_send_logs (
+      source_type, source_id, account_id, account_type, phone_number, document_name,
+      status, error_message, sent_by_user_id
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `,
+    [
+      cleanText(sourceType) || "report",
+      cleanText(sourceId) || null,
+      parsePositiveInteger(accountId),
+      cleanText(accountType) || null,
+      cleanText(phoneNumber),
+      cleanText(documentName) || "FroozERP_Document.pdf",
+      cleanText(status) || "failed",
+      cleanText(errorMessage) || null,
+      parsePositiveInteger(sentByUserId),
+    ]
+  );
+};
+
+app.post("/api/whatsapp/send-document", async (req, res) => {
+  const {
+    phoneNumbers = [],
+    pdfBase64,
+    pdfFile,
+    caption = "",
+    documentName = "FroozERP_Document.pdf",
+    sourceType = "report",
+    sourceId = "",
+    sentByUserId,
+  } = req.body || {};
+  try {
+    const settingsResult = await pool.query("SELECT * FROM whatsapp_settings WHERE id = 1");
+    const settings = settingsResult.rows[0] || {};
+    const recipients = (Array.isArray(phoneNumbers) ? phoneNumbers : [])
+      .map((entry) => {
+        const rawNumber = typeof entry === "string" ? entry : entry.phoneNumber || entry.phone_number || "";
+        const phoneNumber = normalizeWhatsappPhone(rawNumber, settings.default_country_code || "91");
+        return {
+          originalNumber: rawNumber,
+          phoneNumber,
+          accountId: typeof entry === "object" ? entry.accountId || entry.account_id : null,
+          accountType: typeof entry === "object" ? entry.accountType || entry.account_type : "manual",
+        };
+      });
+
+    if (!recipients.length) return res.status(400).json({ message: "Select at least one WhatsApp number." });
+
+    const invalidResults = recipients
+      .filter((recipient) => !recipient.phoneNumber)
+      .map((recipient) => ({
+        phoneNumber: recipient.originalNumber,
+        status: "invalid number",
+        errorMessage: "Enter a valid WhatsApp number with country code or a 10 digit Indian mobile number.",
+      }));
+    for (const invalid of invalidResults) {
+      await insertWhatsappLog({
+        sourceType,
+        sourceId,
+        phoneNumber: invalid.phoneNumber || "invalid",
+        documentName,
+        status: "invalid number",
+        errorMessage: invalid.errorMessage,
+        sentByUserId,
+      });
+    }
+    const validRecipients = recipients.filter((recipient) => recipient.phoneNumber);
+    if (!validRecipients.length) return res.json({ configured: false, results: invalidResults });
+
+    if (settings.enabled !== true || !settings.phone_number_id || !settings.access_token) {
+      const results = validRecipients.map((recipient) => ({
+        phoneNumber: recipient.phoneNumber,
+        status: "WhatsApp not configured",
+        errorMessage: "WhatsApp API not configured. PDF exported for manual sharing.",
+      }));
+      for (const recipient of validRecipients) {
+        await insertWhatsappLog({
+          sourceType,
+          sourceId,
+          accountId: recipient.accountId,
+          accountType: recipient.accountType,
+          phoneNumber: recipient.phoneNumber,
+          documentName,
+          status: "WhatsApp not configured",
+          errorMessage: "WhatsApp API not configured. PDF exported for manual sharing.",
+          sentByUserId,
+        });
+      }
+      return res.json({ configured: false, results: [...invalidResults, ...results] });
+    }
+
+    const base64Payload = cleanText(pdfBase64 || pdfFile).replace(/^data:application\/pdf;base64,/i, "");
+    if (!base64Payload) return res.status(400).json({ message: "PDF document data is required." });
+    const pdfBuffer = Buffer.from(base64Payload, "base64");
+    const mediaForm = new FormData();
+    mediaForm.append("messaging_product", "whatsapp");
+    mediaForm.append("type", "application/pdf");
+    mediaForm.append("file", new Blob([pdfBuffer], { type: "application/pdf" }), safeDocumentFileName(documentName).replace(/\.pdf$/i, "") + ".pdf");
+    const uploadResponse = await fetch(`https://graph.facebook.com/v19.0/${encodeURIComponent(settings.phone_number_id)}/media`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${settings.access_token}` },
+      body: mediaForm,
+    });
+    const uploadPayload = await uploadResponse.json().catch(() => ({}));
+    if (!uploadResponse.ok || !uploadPayload.id) {
+      const errorMessage = uploadPayload?.error?.message || "Unable to upload PDF to WhatsApp.";
+      const failed = validRecipients.map((recipient) => ({
+        phoneNumber: recipient.phoneNumber,
+        status: "failed",
+        errorMessage,
+      }));
+      for (const recipient of validRecipients) {
+        await insertWhatsappLog({
+          sourceType,
+          sourceId,
+          accountId: recipient.accountId,
+          accountType: recipient.accountType,
+          phoneNumber: recipient.phoneNumber,
+          documentName,
+          status: "failed",
+          errorMessage,
+          sentByUserId,
+        });
+      }
+      return res.status(uploadResponse.status || 502).json({ configured: true, results: [...invalidResults, ...failed], message: errorMessage });
+    }
+
+    const results = [];
+    for (const recipient of validRecipients) {
+      try {
+        const sendResponse = await fetch(`https://graph.facebook.com/v19.0/${encodeURIComponent(settings.phone_number_id)}/messages`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${settings.access_token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            messaging_product: "whatsapp",
+            to: recipient.phoneNumber,
+            type: "document",
+            document: {
+              id: uploadPayload.id,
+              filename: safeDocumentFileName(documentName).replace(/\.pdf$/i, "") + ".pdf",
+              caption: cleanText(caption) || "FroozERP document",
+            },
+          }),
+        });
+        const sendPayload = await sendResponse.json().catch(() => ({}));
+        const success = sendResponse.ok;
+        const status = success ? "sent" : "failed";
+        const errorMessage = success ? "" : sendPayload?.error?.message || "WhatsApp send failed.";
+        await insertWhatsappLog({
+          sourceType,
+          sourceId,
+          accountId: recipient.accountId,
+          accountType: recipient.accountType,
+          phoneNumber: recipient.phoneNumber,
+          documentName,
+          status,
+          errorMessage,
+          sentByUserId,
+        });
+        results.push({ phoneNumber: recipient.phoneNumber, status, errorMessage });
+      } catch (sendError) {
+        const errorMessage = sendError.message || "WhatsApp send failed.";
+        await insertWhatsappLog({
+          sourceType,
+          sourceId,
+          accountId: recipient.accountId,
+          accountType: recipient.accountType,
+          phoneNumber: recipient.phoneNumber,
+          documentName,
+          status: "failed",
+          errorMessage,
+          sentByUserId,
+        });
+        results.push({ phoneNumber: recipient.phoneNumber, status: "failed", errorMessage });
+      }
+    }
+    return res.json({ configured: true, results: [...invalidResults, ...results] });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Unable to send WhatsApp document" });
   }
 });
 
@@ -8765,15 +9106,16 @@ app.post("/accounts", async (req, res) => {
         INSERT INTO customers (
           customer_name, customer_type, firm_name, mobile_number, alternate_number, address,
           city, gst_number, bank_name, account_number, ifsc_code, upi_id, notes,
-          opening_balance, active
+          opening_balance, active, whatsapp_number, whatsapp_opt_in
         )
-        VALUES ($1, 'RETAIL', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        VALUES ($1, 'RETAIL', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         RETURNING id
         `,
         [
           account.account_name, account.firm_name, account.mobile_number, account.alternate_number,
           account.address, account.city, account.gst_number, account.bank_name, account.account_number,
           account.ifsc_code, account.upi_id, account.notes, account.opening_balance, account.active,
+          account.whatsapp_number, account.whatsapp_opt_in,
         ]
       );
       return res.status(201).json({ success: true, account_key: `CUSTOMER-${result.rows[0].id}` });
@@ -8795,9 +9137,9 @@ app.post("/accounts", async (req, res) => {
         INSERT INTO suppliers (
           supplier_name, firm_name, mobile_number, alternate_number, address, city,
           gst_number, bank_name, account_number, ifsc_code, upi_id, notes,
-          opening_balance, supplier_type, active
+          opening_balance, supplier_type, active, whatsapp_number, whatsapp_opt_in
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
         RETURNING id
         `,
         [
@@ -8805,6 +9147,7 @@ app.post("/accounts", async (req, res) => {
           account.address, account.city, account.gst_number, account.bank_name, account.account_number,
           account.ifsc_code, account.upi_id, account.notes, account.opening_balance,
           supplierTypeFromAccountType(account.account_type), account.active,
+          account.whatsapp_number, account.whatsapp_opt_in,
         ]
       );
       return res.status(201).json({ success: true, account_key: `SUPPLIER-${result.rows[0].id}` });
@@ -8813,9 +9156,10 @@ app.post("/accounts", async (req, res) => {
       `
       INSERT INTO accounts (
         account_name, account_type, firm_name, mobile_number, alternate_number, address, city,
-        gst_number, bank_name, account_number, ifsc_code, upi_id, opening_balance, active, notes
+        gst_number, bank_name, account_number, ifsc_code, upi_id, opening_balance, active, notes,
+        whatsapp_number, whatsapp_opt_in
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
       RETURNING id
       `,
       [
@@ -8823,6 +9167,7 @@ app.post("/accounts", async (req, res) => {
         account.alternate_number, account.address, account.city, account.gst_number,
         account.bank_name, account.account_number, account.ifsc_code, account.upi_id,
         account.opening_balance, account.active, account.notes,
+        account.whatsapp_number, account.whatsapp_opt_in,
       ]
     );
     return res.status(201).json({ success: true, account_key: `ACCOUNT-${result.rows[0].id}` });
@@ -8859,14 +9204,15 @@ app.put("/accounts/:accountKey", async (req, res) => {
         SET customer_name = $1, firm_name = $2, mobile_number = $3, alternate_number = $4,
             address = $5, city = $6, gst_number = $7, bank_name = $8, account_number = $9,
             ifsc_code = $10, upi_id = $11, opening_balance = $12, active = $13,
-            notes = $14, updated_at = CURRENT_TIMESTAMP
-        WHERE id = $15
+            notes = $14, whatsapp_number = $15, whatsapp_opt_in = $16, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $17
         RETURNING id
         `,
         [
           account.account_name, account.firm_name, account.mobile_number, account.alternate_number,
           account.address, account.city, account.gst_number, account.bank_name, account.account_number,
-          account.ifsc_code, account.upi_id, account.opening_balance, account.active, account.notes, sourceId,
+          account.ifsc_code, account.upi_id, account.opening_balance, account.active, account.notes,
+          account.whatsapp_number, account.whatsapp_opt_in, sourceId,
         ]
       );
       return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "Account not found" });
@@ -8892,15 +9238,16 @@ app.put("/accounts/:accountKey", async (req, res) => {
         SET supplier_name = $1, firm_name = $2, mobile_number = $3, alternate_number = $4,
             address = $5, city = $6, gst_number = $7, bank_name = $8, account_number = $9,
             ifsc_code = $10, upi_id = $11, opening_balance = $12, supplier_type = $13,
-            active = $14, notes = $15, updated_at = CURRENT_TIMESTAMP
-        WHERE id = $16
+            active = $14, notes = $15, whatsapp_number = $16, whatsapp_opt_in = $17, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $18
         RETURNING id
         `,
         [
           account.account_name, account.firm_name, account.mobile_number, account.alternate_number,
           account.address, account.city, account.gst_number, account.bank_name, account.account_number,
           account.ifsc_code, account.upi_id, account.opening_balance,
-          supplierTypeFromAccountType(account.account_type), account.active, account.notes, sourceId,
+          supplierTypeFromAccountType(account.account_type), account.active, account.notes,
+          account.whatsapp_number, account.whatsapp_opt_in, sourceId,
         ]
       );
       return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "Account not found" });
@@ -8912,15 +9259,17 @@ app.put("/accounts/:accountKey", async (req, res) => {
         SET account_name = $1, account_type = $2, firm_name = $3, mobile_number = $4,
             alternate_number = $5, address = $6, city = $7, gst_number = $8,
             bank_name = $9, account_number = $10, ifsc_code = $11, upi_id = $12,
-            opening_balance = $13, active = $14, notes = $15, updated_at = CURRENT_TIMESTAMP
-        WHERE id = $16
+            opening_balance = $13, active = $14, notes = $15,
+            whatsapp_number = $16, whatsapp_opt_in = $17, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $18
         RETURNING id
         `,
         [
           account.account_name, account.account_type, account.firm_name, account.mobile_number,
           account.alternate_number, account.address, account.city, account.gst_number,
           account.bank_name, account.account_number, account.ifsc_code, account.upi_id,
-          account.opening_balance, account.active, account.notes, sourceId,
+          account.opening_balance, account.active, account.notes,
+          account.whatsapp_number, account.whatsapp_opt_in, sourceId,
         ]
       );
       return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "Account not found" });
@@ -9442,16 +9791,16 @@ app.post("/suppliers", async (req, res) => {
       INSERT INTO suppliers (
         supplier_name, firm_name, mobile_number, alternate_number, address, city,
         gst_number, bank_name, account_number, ifsc_code, upi_id, notes,
-        opening_balance, supplier_type, active
+        opening_balance, supplier_type, active, whatsapp_number, whatsapp_opt_in
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
       RETURNING *
       `,
       [
         supplier.supplier_name, supplier.firm_name, supplier.mobile_number, supplier.alternate_number,
         supplier.address, supplier.city, supplier.gst_number, supplier.bank_name, supplier.account_number,
         supplier.ifsc_code, supplier.upi_id, supplier.notes, supplier.opening_balance, supplier.supplier_type,
-        supplier.active,
+        supplier.active, supplier.whatsapp_number, supplier.whatsapp_opt_in,
       ]
     );
     return res.status(201).json(result.rows[0]);
@@ -9515,15 +9864,17 @@ app.put("/suppliers/:id", async (req, res) => {
         opening_balance = $13,
         supplier_type = $14,
         active = $15,
+        whatsapp_number = $16,
+        whatsapp_opt_in = $17,
         updated_at = CURRENT_TIMESTAMP
-      WHERE id = $16
+      WHERE id = $18
       RETURNING *
       `,
       [
         supplier.supplier_name, supplier.firm_name, supplier.mobile_number, supplier.alternate_number,
         supplier.address, supplier.city, supplier.gst_number, supplier.bank_name, supplier.account_number,
         supplier.ifsc_code, supplier.upi_id, supplier.notes, supplier.opening_balance, supplier.supplier_type,
-        supplier.active, supplierId,
+        supplier.active, supplier.whatsapp_number, supplier.whatsapp_opt_in, supplierId,
       ]
     );
     return result.rows[0] ? res.json(result.rows[0]) : res.status(404).json({ message: "Supplier not found" });
@@ -9590,16 +9941,16 @@ app.post("/customers", async (req, res) => {
       INSERT INTO customers (
         customer_name, customer_type, firm_name, mobile_number, alternate_number, address,
         city, gst_number, bank_name, account_number, ifsc_code, upi_id, notes,
-        opening_balance, active
+        opening_balance, active, whatsapp_number, whatsapp_opt_in
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
       RETURNING *
       `,
       [
         customer.customer_name, customer.customer_type, customer.firm_name, customer.mobile_number,
         customer.alternate_number, customer.address, customer.city, customer.gst_number,
         customer.bank_name, customer.account_number, customer.ifsc_code, customer.upi_id,
-        customer.notes, customer.opening_balance, customer.active,
+        customer.notes, customer.opening_balance, customer.active, customer.whatsapp_number, customer.whatsapp_opt_in,
       ]
     );
     return res.status(201).json(result.rows[0]);
@@ -9633,15 +9984,16 @@ app.put("/customers/:id", async (req, res) => {
           alternate_number = $5, address = $6, city = $7, gst_number = $8,
           bank_name = $9, account_number = $10, ifsc_code = $11, upi_id = $12,
           notes = $13, opening_balance = $14, active = $15,
+          whatsapp_number = $16, whatsapp_opt_in = $17,
           updated_at = CURRENT_TIMESTAMP
-      WHERE id = $16
+      WHERE id = $18
       RETURNING *
       `,
       [
         customer.customer_name, customer.customer_type, customer.firm_name, customer.mobile_number,
         customer.alternate_number, customer.address, customer.city, customer.gst_number,
         customer.bank_name, customer.account_number, customer.ifsc_code, customer.upi_id,
-        customer.notes, customer.opening_balance, customer.active, customerId,
+        customer.notes, customer.opening_balance, customer.active, customer.whatsapp_number, customer.whatsapp_opt_in, customerId,
       ]
     );
     return result.rows[0] ? res.json(result.rows[0]) : res.status(404).json({ message: "Customer not found" });

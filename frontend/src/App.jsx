@@ -64,7 +64,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.10";
+const APP_VERSION = "1.0.11";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -376,6 +376,92 @@ const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth
   }
 };
 
+const normalizeWhatsappNumber = (value, defaultCountryCode = "91") => {
+  let digits = String(value || "").trim().replace(/[^\d+]/g, "");
+  if (!digits) return "";
+  if (digits.startsWith("00")) digits = digits.slice(2);
+  if (digits.startsWith("+")) digits = digits.slice(1);
+  digits = digits.replace(/\D/g, "");
+  const countryCode = String(defaultCountryCode || "91").replace(/\D/g, "") || "91";
+  if (digits.length === 10) digits = `${countryCode}${digits}`;
+  return digits.length >= 11 && digits.length <= 15 ? digits : "";
+};
+
+const blobToBase64 = (blob) => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onloadend = () => resolve(String(reader.result || "").replace(/^data:application\/pdf;base64,/i, ""));
+  reader.onerror = reject;
+  reader.readAsDataURL(blob);
+});
+
+const buildWhatsappRecipients = ({ customers = [], suppliers = [], accounts = [] } = {}) => {
+  const recipients = [];
+  const add = ({ id, type, name, mobile, whatsappNumber, optIn = true }) => {
+    const displayName = String(name || "").trim();
+    const rawNumber = String(whatsappNumber || mobile || "").trim();
+    if (!displayName) return;
+    recipients.push({
+      key: `${type}-${id || displayName}-${rawNumber}`,
+      accountId: id || null,
+      accountType: type,
+      name: displayName,
+      phoneNumber: rawNumber,
+      mobileNumber: mobile || "",
+      whatsappNumber: whatsappNumber || "",
+      optIn: optIn !== false,
+    });
+  };
+  customers.forEach((customer) => add({
+    id: customer.id,
+    type: "customer",
+    name: customer.customer_name || customer.account_name,
+    mobile: customer.mobile_number,
+    whatsappNumber: customer.whatsapp_number,
+    optIn: customer.whatsapp_opt_in,
+  }));
+  suppliers.forEach((supplier) => add({
+    id: supplier.id,
+    type: "supplier",
+    name: supplier.supplier_name || supplier.account_name,
+    mobile: supplier.mobile_number,
+    whatsappNumber: supplier.whatsapp_number,
+    optIn: supplier.whatsapp_opt_in,
+  }));
+  accounts.forEach((account) => {
+    if (account.source === "CUSTOMER" || account.source === "SUPPLIER") return;
+    add({
+      id: account.source_id || account.id,
+      type: String(account.account_type || "manual").toLowerCase(),
+      name: account.account_name,
+      mobile: account.mobile_number,
+      whatsappNumber: account.whatsapp_number,
+      optIn: account.whatsapp_opt_in,
+    });
+  });
+  const seen = new Set();
+  return recipients.filter((recipient) => {
+    const fingerprint = `${recipient.accountType}-${recipient.accountId || ""}-${recipient.name}-${recipient.phoneNumber}`;
+    if (seen.has(fingerprint)) return false;
+    seen.add(fingerprint);
+    return true;
+  });
+};
+
+const openWhatsappWebFallback = async ({ caption, fileName, numbers = [] }) => {
+  try {
+    await navigator.clipboard?.writeText?.(caption || "");
+  } catch {
+    // Clipboard is a convenience only.
+  }
+  const targets = numbers.length ? numbers : [""];
+  targets.slice(0, 5).forEach((number) => {
+    const url = number
+      ? `https://wa.me/${number}?text=${encodeURIComponent(caption || `FroozERP document exported as ${fileName}. Please attach the PDF manually.`)}`
+      : `https://wa.me/?text=${encodeURIComponent(caption || `FroozERP document exported as ${fileName}. Please attach the PDF manually.`)}`;
+    window.open(url, "_blank", "noopener,noreferrer");
+  });
+};
+
 const supplierPaymentModes = [
   ["CASH", "Cash"],
   ["UPI", "UPI"],
@@ -539,6 +625,15 @@ const defaultPaymentSettings = {
   sales_mandi_tax_disable_reason: "",
 };
 
+const defaultWhatsappSettings = {
+  enabled: false,
+  phone_number_id: "",
+  access_token: "",
+  access_token_configured: false,
+  access_token_masked: "",
+  default_country_code: "91",
+};
+
 function BrandLogo({ compact = false, invoice = false, splash = false }) {
   const assetBase = import.meta.env.BASE_URL || "/";
   const assetPath = (path) => `${assetBase}${path}`.replace(/([^:]\/)\/+/g, "$1");
@@ -695,6 +790,7 @@ function App() {
     saleRateSettings: defaultSaleRateSettings,
     posSettings: defaultPosSettings,
     paymentSettings: defaultPaymentSettings,
+    whatsappSettings: defaultWhatsappSettings,
     discountRules: [],
     roles: [],
     users: [],
@@ -1281,6 +1377,7 @@ function App() {
       saleRateSettings: nextSaleRateSettings,
       posSettings: { ...defaultPosSettings, ...(bundle.posSettings || {}) },
       paymentSettings: { ...defaultPaymentSettings, ...(bundle.paymentSettings || {}) },
+      whatsappSettings: { ...defaultWhatsappSettings, ...(bundle.whatsappSettings || {}) },
       discountRules: bundle.discountRules || [],
       roles: bundle.roles || [],
       users: bundle.users || [],
@@ -1504,6 +1601,7 @@ function App() {
       saleRateSettings: nextSaleRateSettings,
       posSettings: { ...defaultPosSettings, ...(data.posSettings || {}) },
       paymentSettings: { ...defaultPaymentSettings, ...(data.paymentSettings || {}) },
+      whatsappSettings: { ...defaultWhatsappSettings, ...(data.whatsappSettings || {}) },
       discountRules: data.discountRules || [],
       roles: data.roles || [],
       users: data.users || [],
@@ -3794,9 +3892,11 @@ function App() {
 
           {activeView === "reports" && (
             <ReportsModule
+              accounts={accounts}
               canCancelSales={canCancelSales}
               canEditSales={canEditSales}
               canManageStock={canManageStock}
+              customers={customers}
               data={reportsData}
               onCancelPurchase={cancelPurchase}
               onCompletePurchase={completePendingPurchase}
@@ -3811,6 +3911,8 @@ function App() {
               onOpenLotAction={openLotAction}
               onOpenSupplierLedger={openSupplierLedgerFromReport}
               onReload={loadReports}
+              suppliers={suppliers}
+              user={user}
             />
           )}
 
@@ -3849,6 +3951,7 @@ function App() {
           }}
           paymentSettings={settingsData.paymentSettings}
           printSettings={settingsData.businessSettings}
+          user={user}
         />
       )}
       {saleEditLoading && (
@@ -4332,6 +4435,211 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
   );
 }
 
+function WhatsAppSendModal({
+  caption,
+  documentName,
+  generatePdf,
+  onClose,
+  recipients = [],
+  sourceId = "",
+  sourceType = "report",
+  title = "Send via WhatsApp",
+  user,
+}) {
+  const [search, setSearch] = useState("");
+  const [manualNumber, setManualNumber] = useState("");
+  const [manualRecipients, setManualRecipients] = useState([]);
+  const [selectedKeys, setSelectedKeys] = useState(() => new Set());
+  const [sending, setSending] = useState(false);
+  const [status, setStatus] = useState("");
+  const [results, setResults] = useState([]);
+  const [error, setError] = useState("");
+  const allRecipients = useMemo(() => [...recipients, ...manualRecipients], [manualRecipients, recipients]);
+  const filteredRecipients = useMemo(() => {
+    const text = search.trim().toLowerCase();
+    if (!text) return allRecipients;
+    return allRecipients.filter((recipient) =>
+      [recipient.name, recipient.phoneNumber, recipient.mobileNumber, recipient.whatsappNumber, recipient.accountType]
+        .some((value) => String(value || "").toLowerCase().includes(text))
+    );
+  }, [allRecipients, search]);
+  const selectedRecipients = allRecipients.filter((recipient) => selectedKeys.has(recipient.key));
+  const toggleRecipient = (key) => {
+    setSelectedKeys((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+  const selectAllVisible = () => {
+    setSelectedKeys((current) => {
+      const next = new Set(current);
+      filteredRecipients.forEach((recipient) => {
+        if (recipient.phoneNumber && recipient.optIn !== false) next.add(recipient.key);
+      });
+      return next;
+    });
+  };
+  const clearSelected = () => setSelectedKeys(new Set());
+  const addManualRecipient = () => {
+    const normalized = normalizeWhatsappNumber(manualNumber);
+    if (!normalized) {
+      setError("Enter a valid WhatsApp number. Use 10 digit Indian mobile or international number with country code.");
+      return;
+    }
+    const recipient = {
+      key: `manual-${normalized}-${Date.now()}`,
+      accountId: null,
+      accountType: "manual",
+      name: `Manual ${normalized}`,
+      phoneNumber: normalized,
+      mobileNumber: normalized,
+      whatsappNumber: normalized,
+      optIn: true,
+    };
+    setManualRecipients((rows) => [...rows, recipient]);
+    setSelectedKeys((current) => new Set([...current, recipient.key]));
+    setManualNumber("");
+    setError("");
+  };
+  const send = async () => {
+    setError("");
+    setResults([]);
+    if (selectedRecipients.length === 0) {
+      setError("Select at least one WhatsApp number or add a manual number.");
+      return;
+    }
+    const normalizedNumbers = selectedRecipients.map((recipient) => ({
+      phoneNumber: normalizeWhatsappNumber(recipient.phoneNumber || recipient.whatsappNumber || recipient.mobileNumber),
+      accountId: recipient.accountId,
+      accountType: recipient.accountType,
+      label: recipient.name,
+    }));
+    const invalid = normalizedNumbers.filter((entry) => !entry.phoneNumber);
+    if (invalid.length) {
+      setError(`${invalid.length} selected recipient has no valid WhatsApp number.`);
+      return;
+    }
+    setSending(true);
+    setStatus("Generating PDF...");
+    let pdfResult = null;
+    try {
+      pdfResult = await generatePdf();
+      const fileName = pdfResult.fileName || documentName;
+      setStatus("Sending PDF on WhatsApp...");
+      const pdfBase64 = await blobToBase64(pdfResult.blob);
+      const response = await axios.post(`${API_URL}/api/whatsapp/send-document`, {
+        phoneNumbers: normalizedNumbers,
+        pdfBase64,
+        caption,
+        documentName: fileName,
+        sourceType,
+        sourceId,
+        sentByUserId: user?.id,
+      });
+      const responseResults = response.data?.results || [];
+      setResults(responseResults);
+      if (response.data?.configured === false) {
+        pdfResult.pdf?.save(fileName);
+        await openWhatsappWebFallback({
+          caption: `${caption}\n\nPDF exported as ${fileName}. Please attach the PDF manually in WhatsApp.`,
+          fileName,
+          numbers: normalizedNumbers.map((entry) => entry.phoneNumber),
+        });
+        setStatus("WhatsApp API not configured. PDF exported for manual sharing.");
+      } else if (responseResults.some((item) => item.status !== "sent")) {
+        setStatus("Some numbers failed. Check WhatsApp log.");
+      } else {
+        setStatus("PDF sent successfully.");
+      }
+    } catch (sendError) {
+      const message = getErrorMessage(sendError, "Unable to send WhatsApp document");
+      if (pdfResult?.pdf) {
+        pdfResult.pdf.save(pdfResult.fileName || documentName);
+        await openWhatsappWebFallback({
+          caption: `${caption}\n\nPDF exported as ${pdfResult.fileName || documentName}. Please attach the PDF manually in WhatsApp.`,
+          fileName: pdfResult.fileName || documentName,
+          numbers: normalizedNumbers.map((entry) => entry.phoneNumber),
+        });
+        setStatus("PDF exported for manual sharing.");
+      }
+      setError(message);
+    } finally {
+      setSending(false);
+    }
+  };
+  return (
+    <div className="modal-backdrop">
+      <section className="invoice-modal whatsapp-send-modal">
+        <div className="invoice-toolbar">
+          <div>
+            <span className="eyebrow">WhatsApp Export</span>
+            <strong>{title}</strong>
+          </div>
+          <button aria-label="Close WhatsApp send" className="remove-button" disabled={sending} onClick={onClose}><Icon name="close" /></button>
+        </div>
+        <div className="sale-edit-body">
+          <div className="form-grid supplier-form-grid">
+            <Field label="Search Customer / Supplier">
+              <input placeholder="Search by customer, supplier or number..." value={search} onChange={(event) => setSearch(event.target.value)} />
+            </Field>
+            <Field label="Manual WhatsApp Number">
+              <div className="inline-input-action">
+                <input placeholder="10 digit or +country number" value={manualNumber} onChange={(event) => setManualNumber(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") addManualRecipient(); }} />
+                <button className="secondary-button" type="button" onClick={addManualRecipient}>Add</button>
+              </div>
+            </Field>
+          </div>
+          <div className="button-row">
+            <button className="secondary-button" disabled={sending} onClick={selectAllVisible}>Select All Visible</button>
+            <button className="secondary-button" disabled={sending} onClick={clearSelected}>Clear Selection</button>
+            <span className="tag">{selectedRecipients.length} selected</span>
+          </div>
+          <div className="whatsapp-recipient-list">
+            {filteredRecipients.map((recipient) => {
+              const number = recipient.whatsappNumber || recipient.phoneNumber || recipient.mobileNumber;
+              const unavailable = !number || recipient.optIn === false;
+              return (
+                <label className={`whatsapp-recipient-row ${unavailable ? "recipient-unavailable" : ""}`} key={recipient.key}>
+                  <input checked={selectedKeys.has(recipient.key)} disabled={sending || unavailable} type="checkbox" onChange={() => toggleRecipient(recipient.key)} />
+                  <span>
+                    <strong>{recipient.name}</strong>
+                    <small>{recipient.accountType || "account"} {recipient.optIn === false ? "- opt-out" : ""}</small>
+                  </span>
+                  <em>{unavailable ? "WhatsApp number not available" : number}</em>
+                </label>
+              );
+            })}
+            {filteredRecipients.length === 0 && <div className="cart-empty">No matching WhatsApp contacts found.</div>}
+          </div>
+          {(status || error) && (
+            <div className={`startup-status-panel ${error ? "startup-status-error" : ""}`}>
+              {status && <p>{status}</p>}
+              {error && <p>{error}</p>}
+            </div>
+          )}
+          {results.length > 0 && (
+            <DataTable headers={["Number", "Status", "Message"]}>
+              {results.map((row, index) => (
+                <tr key={`${row.phoneNumber}-${index}`}>
+                  <td>{row.phoneNumber}</td>
+                  <td><span className={row.status === "sent" ? "stock-ok" : "stock-low"}>{row.status}</span></td>
+                  <td>{row.errorMessage || "Done"}</td>
+                </tr>
+              ))}
+            </DataTable>
+          )}
+          <div className="button-row">
+            <button className="primary-button" disabled={sending || selectedRecipients.length === 0} onClick={send}>{sending ? "Sending..." : "Send PDF"}</button>
+            <button className="secondary-button" disabled={sending} onClick={onClose}>Close</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function ReportToolbar({ exporting = false, onPdfExport, onPrint, onWhatsApp, title }) {
   return (
     <div className="report-toolbar no-print">
@@ -4510,9 +4818,10 @@ function UserProfilePanel({ onClose, onLogout, user }) {
   );
 }
 
-function PrintableReport({ beforePdfExport, beforePrint, children, fileName, reportClassName = "", title }) {
+function PrintableReport({ beforePdfExport, beforePrint, children, fileName, reportClassName = "", title, user, whatsappRecipients = [] }) {
   const [printTarget, setPrintTarget] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [whatsappOpen, setWhatsappOpen] = useState(false);
   const reportRef = useRef(null);
   const reportProfileKey = `report_${safeFileName(reportClassName || title || "report")}`;
   const printProfile = readStoredPrintProfile(reportProfileKey) || getReportPrintProfile(reportClassName);
@@ -4552,32 +4861,20 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
       setPrintTarget(false);
     }
   };
-  const shareReport = async () => {
+  const generateWhatsappPdf = async () => {
     if (beforePdfExport && beforePdfExport() === false) return;
     rememberPrintProfile(reportProfileKey, printProfile);
     setPrintTarget(true);
     setExporting(true);
     try {
       await new Promise((resolve) => setTimeout(resolve, 80));
-      const result = await exportElementToPdf({
+      return await exportElementToPdf({
         element: reportRef.current,
         fileName: fileName || `${title}.pdf`,
         mode: "A4",
         printProfile,
         save: false,
       });
-      const file = new File([result.blob], result.fileName, { type: "application/pdf" });
-      const message = `${title} exported from FroozERP`;
-      if (navigator.canShare?.({ files: [file] }) && navigator.share) {
-        await navigator.share({ files: [file], title, text: message });
-      } else {
-        result.pdf?.save(result.fileName);
-        const url = `https://wa.me/?text=${encodeURIComponent(`${message}. PDF generated as ${result.fileName}; attach it if your browser cannot share files directly.`)}`;
-        window.open(url, "_blank", "noopener,noreferrer");
-        alert("WhatsApp file sharing is not available on this device. The report PDF was generated; attach it manually if WhatsApp Web opens without the file.");
-      }
-    } catch (error) {
-      alert(`Unable to share report: ${error.message}`);
     } finally {
       setExporting(false);
       setPrintTarget(false);
@@ -4585,7 +4882,7 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
   };
   return (
     <section className={`print-section ${reportClassName} print-profile-${printProfile.toLowerCase().replace("_", "-")} ${printTarget ? "print-target" : ""}`}>
-      <ReportToolbar exporting={exporting} onPdfExport={exportReport} onPrint={printReport} onWhatsApp={shareReport} title={title} />
+      <ReportToolbar exporting={exporting} onPdfExport={exportReport} onPrint={printReport} onWhatsApp={() => setWhatsappOpen(true)} title={title} />
       <div ref={reportRef} className="print-area report-paper">
         <header className="report-print-header">
           <BrandLogo invoice />
@@ -4599,6 +4896,19 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
         </div>
         {children}
       </div>
+      {whatsappOpen && (
+        <WhatsAppSendModal
+          caption={`${title} exported from FroozERP`}
+          documentName={fileName || `${title}.pdf`}
+          generatePdf={generateWhatsappPdf}
+          onClose={() => setWhatsappOpen(false)}
+          recipients={whatsappRecipients}
+          sourceId={fileName || title}
+          sourceType="report"
+          title={`Send ${title} via WhatsApp`}
+          user={user}
+        />
+      )}
     </section>
   );
 }
@@ -5081,7 +5391,7 @@ function DiscountManagementModule({ discounts = [], inventory = [], onReload, pr
   );
 }
 
-function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload }) {
+function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageStock, customers = [], data = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, suppliers = [], user }) {
   const [range, setRange] = useState("today");
   const [search, setSearch] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
@@ -5120,6 +5430,7 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
   const [balanceSheetDetailLoading, setBalanceSheetDetailLoading] = useState(false);
   const [balanceSheetDetailError, setBalanceSheetDetailError] = useState("");
   const [cashBookDetail, setCashBookDetail] = useState(null);
+  const whatsappRecipients = useMemo(() => buildWhatsappRecipients({ accounts, customers, suppliers }), [accounts, customers, suppliers]);
   const [cashBookFilters, setCashBookFilters] = useState({ paymentMode: "", accountFilter: "", bookAccount: "ALL" });
   const [cashBookViewMode, setCashBookViewMode] = useState("SUMMARY");
   const [cashBookGroupBy, setCashBookGroupBy] = useState("PERIOD");
@@ -6980,6 +7291,8 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
               fileName={reportFileName}
               reportClassName={selectedReport === "salesHistory" ? "sales-history-print-report" : selectedReport === "purchaseHistory" ? "purchase-history-print-report" : selectedReport === "profitLoss" ? "profit-loss-print-report" : selectedReport === "cashBook" ? "cash-book-print-report" : ""}
               title={currentReport.title}
+              user={user}
+              whatsappRecipients={whatsappRecipients}
             >
               {reportFilterSummary.length > 0 && (
                 <div className="report-filter-summary">
@@ -7981,6 +8294,8 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
     account_type: "CUSTOMER",
     firm_name: "",
     mobile_number: "",
+    whatsapp_number: "",
+    whatsapp_opt_in: true,
     alternate_number: "",
     address: "",
     city: "",
@@ -8014,6 +8329,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
   const [paymentAudit, setPaymentAudit] = useState(null);
   const [receiptPayment, setReceiptPayment] = useState(null);
   const [ledgerExporting, setLedgerExporting] = useState(false);
+  const [ledgerWhatsappOpen, setLedgerWhatsappOpen] = useState(false);
   const ledgerPrintRef = useRef(null);
   const canManageAllAccounts = ["Owner", "Admin"].includes(user.role);
   const canUseSupplierPayments = canManageAllAccounts || user.role === "Purchase Manager";
@@ -8083,6 +8399,23 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
       setLedgerExporting(false);
     }
   };
+  const ledgerDocumentName = `FroozERP_Ledger_${safeFileName(accountLedger.account?.account_name || accountLedger.account?.customer_name || accountLedger.account?.supplier_name || "Account")}_${formatFileDate(ledgerDateRange.date_from || "all")}_to_${formatFileDate(ledgerDateRange.date_to || toDateKey(new Date()))}.pdf`;
+  const ledgerWhatsappRecipients = useMemo(() => buildWhatsappRecipients({
+    accounts: accountLedger.account ? [{
+      ...accountLedger.account,
+      source_id: accountLedger.account.source_id || accountLedger.account.id,
+      account_name: accountLedger.account.account_name || accountLedger.account.customer_name || accountLedger.account.supplier_name,
+    }] : [],
+  }), [accountLedger.account]);
+  const generateLedgerWhatsappPdf = async () => {
+    if (!ledgerPrintRef.current) throw new Error("Select an account ledger first");
+    return exportElementToPdf({
+      element: ledgerPrintRef.current,
+      fileName: ledgerDocumentName,
+      mode: "A4",
+      save: false,
+    });
+  };
 
   const saveAccount = async () => {
     try {
@@ -8125,6 +8458,8 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
       account_type: account.account_type || "OTHER",
       firm_name: account.firm_name || "",
       mobile_number: account.mobile_number || "",
+      whatsapp_number: account.whatsapp_number || "",
+      whatsapp_opt_in: account.whatsapp_opt_in !== false,
       alternate_number: account.alternate_number || "",
       address: account.address || "",
       city: account.city || "",
@@ -8178,6 +8513,9 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
         account_type: selectedPaymentAccount?.account_type,
         outstanding_before: outstandingBefore,
         outstanding_after: outstandingAfter,
+        mobile_number: selectedPaymentAccount?.whatsapp_number || selectedPaymentAccount?.mobile_number,
+        whatsapp_number: selectedPaymentAccount?.whatsapp_number,
+        whatsapp_opt_in: selectedPaymentAccount?.whatsapp_opt_in,
       });
       setEditingPaymentKey("");
       setPayment((current) => ({ ...current, amount: "", rebate_amount: "", reference_number: "", remarks: "" }));
@@ -8252,6 +8590,8 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
               <Field label="Account Name"><input value={draft.account_name} onChange={(event) => setDraft({ ...draft, account_name: event.target.value })} /></Field>
               <Field label="Firm Name"><input value={draft.firm_name} onChange={(event) => setDraft({ ...draft, firm_name: event.target.value })} /></Field>
               <Field label="Mobile"><input value={draft.mobile_number} onChange={(event) => setDraft({ ...draft, mobile_number: event.target.value.replace(/\D/g, "") })} /></Field>
+              <Field label="WhatsApp Number"><input placeholder="Blank uses mobile number" value={draft.whatsapp_number} onChange={(event) => setDraft({ ...draft, whatsapp_number: event.target.value.replace(/[^\d+]/g, "") })} /></Field>
+              <label className="check-field"><input checked={draft.whatsapp_opt_in !== false} type="checkbox" onChange={(event) => setDraft({ ...draft, whatsapp_opt_in: event.target.checked })} /><span>WhatsApp Opt-in</span></label>
               <Field label="Alternate Number"><input value={draft.alternate_number} onChange={(event) => setDraft({ ...draft, alternate_number: event.target.value.replace(/\D/g, "") })} /></Field>
               <Field label="City"><input value={draft.city} onChange={(event) => setDraft({ ...draft, city: event.target.value })} /></Field>
               <Field label="GST Number"><input value={draft.gst_number} onChange={(event) => setDraft({ ...draft, gst_number: event.target.value })} /></Field>
@@ -8316,6 +8656,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
             <Field label="Statement To"><input type="date" value={ledgerDateRange.date_to} onChange={(event) => setLedgerDateRange({ ...ledgerDateRange, date_to: event.target.value })} /></Field>
             <button className="secondary-button" onClick={() => window.print()}><Icon name="print" /> Print Statement</button>
             <button className="secondary-button" disabled={ledgerExporting} onClick={exportLedgerPdf}>{ledgerExporting ? "Exporting..." : "PDF Export"}</button>
+            <button className="whatsapp-button" disabled={!accountLedger.account || ledgerExporting} onClick={() => setLedgerWhatsappOpen(true)}><Icon name="message" /> WhatsApp</button>
           </div>
           <div ref={ledgerPrintRef} className="print-area report-paper">
             <header className="report-print-header">
@@ -8345,6 +8686,19 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
               ))}
             </DataTable>
           </div>
+          {ledgerWhatsappOpen && (
+            <WhatsAppSendModal
+              caption={`FroozERP ledger statement for ${accountLedger.account?.account_name || accountLedger.account?.customer_name || accountLedger.account?.supplier_name || "account"}.`}
+              documentName={ledgerDocumentName}
+              generatePdf={generateLedgerWhatsappPdf}
+              onClose={() => setLedgerWhatsappOpen(false)}
+              recipients={ledgerWhatsappRecipients}
+              sourceId={ledgerAccountKey}
+              sourceType="ledger"
+              title="Send Ledger via WhatsApp"
+              user={user}
+            />
+          )}
         </ModuleCard>
       )}
 
@@ -8456,7 +8810,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
           </DataTable>
         </ModuleCard>
       )}
-      {receiptPayment && <PaymentReceiptModal payment={receiptPayment} onClose={() => setReceiptPayment(null)} />}
+      {receiptPayment && <PaymentReceiptModal payment={receiptPayment} onClose={() => setReceiptPayment(null)} user={user} />}
       {paymentAudit && <PaymentAuditModal audit={paymentAudit} onClose={() => setPaymentAudit(null)} />}
     </section>
   );
@@ -8492,6 +8846,7 @@ function SettingsModule({
       <BusinessSettingsSection businessSettings={settingsData.businessSettings} canManage={canManage} key={settingsData.businessSettings?.updated_at || "business-settings"} onReload={onReload} user={user} />
       <PosSettingsSection canManage={canManage} key={settingsData.posSettings?.updated_at || "pos-settings"} onReload={onReload} posSettings={settingsData.posSettings} user={user} />
       <PaymentSettingsSection canManage={canManage} key={settingsData.paymentSettings?.updated_at || "payment-settings"} onReload={onReload} paymentSettings={settingsData.paymentSettings} user={user} />
+      <WhatsAppSettingsSection canManage={canManage} key={settingsData.whatsappSettings?.updated_at || "whatsapp-settings"} onReload={onReload} user={user} whatsappSettings={settingsData.whatsappSettings} />
       <MandiTaxSettings canManage={canManage} onReload={onReload} rules={rules.mandiTaxRules} user={user} />
       <RebateSettings canManage={canManage} onReload={onReload} rules={rules.rebateRules} user={user} />
       <SaleRateSettingsSection canManage={canManage} key={settingsData.saleRateSettings?.updated_at || "sale-rate-settings"} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />
@@ -8693,6 +9048,57 @@ function PaymentSettingsSection({ canManage, onReload, paymentSettings, user }) 
         {draft.enable_sales_mandi_tax !== true && <p className="form-note">Mandi Tax warnings stay disabled in POS while this setting is off. Use the reason field to document why it is not applicable.</p>}
       </div>
       <button className="primary-button" disabled={!canManage} onClick={save}>Save Payment Settings</button>
+    </ModuleCard>
+  );
+}
+
+function WhatsAppSettingsSection({ canManage, onReload, user, whatsappSettings }) {
+  const [draft, setDraft] = useState({ ...defaultWhatsappSettings, ...whatsappSettings, access_token: "" });
+  const [message, setMessage] = useState("");
+  const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
+  const save = async () => {
+    try {
+      await axios.put(`${API_URL}/settings/whatsapp`, { ...draft, updated_by: user.id });
+      setDraft((current) => ({ ...current, access_token: "" }));
+      await onReload();
+      setMessage("WhatsApp settings updated.");
+    } catch (error) {
+      setMessage(getErrorMessage(error, "Unable to update WhatsApp settings"));
+    }
+  };
+  const testConnection = async () => {
+    try {
+      const response = await axios.post(`${API_URL}/settings/whatsapp/test`, { updated_by: user.id });
+      setMessage(response.data?.success ? `WhatsApp connected: ${response.data.name || response.data.phone || "verified"}` : "WhatsApp connection checked.");
+    } catch (error) {
+      setMessage(getErrorMessage(error, "Unable to test WhatsApp connection"));
+    }
+  };
+  return (
+    <ModuleCard eyebrow="WhatsApp Settings" title="WhatsApp Business Cloud API" subtitle="Send bills, ledgers and reports as PDFs through WhatsApp. If not configured, FroozERP exports the PDF for manual WhatsApp Web attachment.">
+      <div className="purchase-summary-grid supplier-payment-preview">
+        <SummaryMetric featured label="Sending" value={draft.enabled ? "Enabled" : "Disabled"} />
+        <SummaryMetric label="Access Token" value={whatsappSettings?.access_token_configured ? "Configured" : "Not configured"} />
+        <SummaryMetric label="Default Country Code" value={`+${draft.default_country_code || "91"}`} />
+      </div>
+      <div className="form-grid supplier-form-grid">
+        <label className="check-field"><input checked={draft.enabled === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enabled", event.target.checked)} /><span>Enable WhatsApp Cloud API sending</span></label>
+        <Field label="WhatsApp Business Phone Number ID">
+          <input disabled={!canManage} placeholder="Meta phone number ID" value={draft.phone_number_id || ""} onChange={(event) => updateDraft("phone_number_id", event.target.value)} />
+        </Field>
+        <Field label="Access Token">
+          <input disabled={!canManage} placeholder={whatsappSettings?.access_token_configured ? whatsappSettings.access_token_masked || "Token configured - enter new token to replace" : "Paste WhatsApp Cloud API access token"} type="password" value={draft.access_token || ""} onChange={(event) => updateDraft("access_token", event.target.value)} />
+        </Field>
+        <Field label="Default Country Code">
+          <input disabled={!canManage} placeholder="91" value={draft.default_country_code || "91"} onChange={(event) => updateDraft("default_country_code", event.target.value.replace(/\D/g, "").slice(0, 5))} />
+        </Field>
+      </div>
+      <p className="form-note">Tokens are stored only on the backend. They are never returned to the frontend after saving.</p>
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage} onClick={save}>Save WhatsApp Settings</button>
+        <button className="secondary-button" disabled={!canManage || !whatsappSettings?.access_token_configured} onClick={testConnection}>Test Connection</button>
+      </div>
+      {message && <div className="startup-status-panel"><p>{message}</p></div>}
     </ModuleCard>
   );
 }
@@ -8974,6 +9380,8 @@ const permissionLabels = [
   ["backup_restore", "Backup / Restore"],
   ["branch_settings", "Branch Settings"],
   ["system_info", "System Info"],
+  ["whatsapp_send", "WhatsApp Send"],
+  ["whatsapp_settings", "WhatsApp Settings"],
 ];
 
 function PermissionSettings({ canManage, onReload, roles, user }) {
@@ -11706,19 +12114,32 @@ function PaymentAuditModal({ audit, onClose }) {
   );
 }
 
-function PaymentReceiptModal({ payment, onClose }) {
+function PaymentReceiptModal({ payment, onClose, user }) {
   const paymentAmount = Number(payment.payment_amount || 0);
   const rebateAmount = Number(payment.rebate_amount || 0);
   const totalImpact = paymentAmount + rebateAmount;
   const receiptRef = useRef(null);
   const [exporting, setExporting] = useState(false);
+  const [whatsappOpen, setWhatsappOpen] = useState(false);
+  const receiptFileName = `FroozERP_Payment_Receipt_${payment.payment_key || payment.id || toDateKey(new Date())}.pdf`;
+  const receiptRecipients = useMemo(() => buildWhatsappRecipients({
+    accounts: [{
+      id: payment.id,
+      source_id: payment.id,
+      account_name: payment.account_name,
+      account_type: payment.payment_source || payment.account_type || "account",
+      mobile_number: payment.mobile_number,
+      whatsapp_number: payment.whatsapp_number,
+      whatsapp_opt_in: payment.whatsapp_opt_in,
+    }],
+  }), [payment]);
   const exportReceiptPdf = async () => {
     if (!receiptRef.current) return;
     setExporting(true);
     try {
       await exportElementToPdf({
         element: receiptRef.current,
-        fileName: `FroozERP_Payment_Receipt_${payment.payment_key || payment.id || toDateKey(new Date())}.pdf`,
+        fileName: receiptFileName,
         mode: "A4",
       });
     } catch (error) {
@@ -11738,6 +12159,7 @@ function PaymentReceiptModal({ payment, onClose }) {
           <div className="invoice-actions">
             <button className="secondary-button" onClick={() => window.print()}><Icon name="print" /> Print Receipt</button>
             <button className="secondary-button" disabled={exporting} onClick={exportReceiptPdf}>{exporting ? "Exporting..." : "Save PDF"}</button>
+            <button className="whatsapp-button" disabled={exporting} onClick={() => setWhatsappOpen(true)}><Icon name="message" /> WhatsApp</button>
             <button aria-label="Close receipt" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
@@ -11763,16 +12185,30 @@ function PaymentReceiptModal({ payment, onClose }) {
           </section>
           <p className="invoice-footer">{payment.remarks || "Thank you. This receipt is generated from FroozERP Accounts."}</p>
         </article>
+        {whatsappOpen && (
+          <WhatsAppSendModal
+            caption={`FroozERP payment receipt for ${payment.account_name || "account"} - ${receiptCurrency.format(paymentAmount)}.`}
+            documentName={receiptFileName}
+            generatePdf={() => exportElementToPdf({ element: receiptRef.current, fileName: receiptFileName, mode: "A4", save: false })}
+            onClose={() => setWhatsappOpen(false)}
+            recipients={receiptRecipients}
+            sourceId={payment.payment_key || payment.id}
+            sourceType="receipt"
+            title="Send Payment Receipt via WhatsApp"
+            user={user}
+          />
+        )}
       </section>
     </div>
   );
 }
 
-function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false, invoice, onCancel, onClose, onEdit, paymentSettings = {}, printSettings = {} }) {
+function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false, invoice, onCancel, onClose, onEdit, paymentSettings = {}, printSettings = {}, user }) {
   const storedInvoiceProfile = readStoredPrintProfile("invoice");
   const [printMode, setPrintMode] = useState(storedInvoiceProfile === "A4_INVOICE" ? "A4" : storedInvoiceProfile === "THERMAL_RECEIPT" ? "THERMAL" : printSettings.default_invoice_print === "A4_INVOICE" || printSettings.default_printer_type === "A4" ? "A4" : "THERMAL");
   const [upiQrDataUrl, setUpiQrDataUrl] = useState("");
   const [exporting, setExporting] = useState(false);
+  const [whatsappOpen, setWhatsappOpen] = useState(false);
   const invoiceRef = useRef(null);
   const autoPrintedRef = useRef(false);
   const activePrintMode = printMode === "A4" ? "A4" : "THERMAL";
@@ -11846,29 +12282,22 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
       setExporting(false);
     }
   };
-  const sendWhatsApp = async () => {
-    const pdfFile = await exportInvoicePdf(activePrintMode, false);
-    const message = [
+  const invoiceWhatsappMessage = () => [
       "Thank you for shopping with FEEL THE FREAKIN' FROOZ. Your invoice is ready.",
       `Invoice: ${invoice.invoice_no}`,
       `Bill Date: ${formatDisplayDate(invoiceDateKey)}`,
       `Amount: ${currency.format(Number(invoice.total_amount))}`,
       "We appreciate your business.",
     ].join("\n");
-    const file = new File([pdfFile.blob], pdfFile.fileName, { type: "application/pdf" });
-    if (navigator.canShare?.({ files: [file] }) && navigator.share) {
-      try {
-        await navigator.share({ files: [file], title: invoice.invoice_no, text: message });
-        return;
-      } catch (error) {
-        if (error.name === "AbortError") return;
-      }
-    }
-    await exportInvoicePdf(activePrintMode, true);
-    alert("PDF has been generated. Attach the downloaded PDF if WhatsApp Web does not allow automatic attachment.");
-    const mobile = String(invoice.customer_mobile || "").replace(/\D/g, "");
-    window.open(`https://wa.me/${mobile ? mobile : ""}?text=${encodeURIComponent(message)}`, "_blank", "noopener,noreferrer");
-  };
+  const invoiceWhatsappRecipients = useMemo(() => buildWhatsappRecipients({
+    customers: invoice.customer_name || invoice.customer_mobile || invoice.whatsapp_number ? [{
+      id: invoice.customer_id,
+      customer_name: invoice.customer_name || "Customer",
+      mobile_number: invoice.customer_mobile,
+      whatsapp_number: invoice.customer_whatsapp_number || invoice.whatsapp_number,
+      whatsapp_opt_in: invoice.whatsapp_opt_in,
+    }] : [],
+  }), [invoice]);
 
   return (
     <div className="modal-backdrop">
@@ -11883,7 +12312,7 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
             <button className="secondary-button" onClick={() => printWithMode("THERMAL")}><Icon name="print" /> POS Thermal Print</button>
             <button className="secondary-button" onClick={() => printWithMode("A4")}><Icon name="print" /> A4 Invoice Print</button>
             <button className="secondary-button" disabled={exporting} onClick={() => exportInvoicePdf(activePrintMode, true)}>{exporting ? "Exporting..." : "PDF Export"}</button>
-            <button className="whatsapp-button" disabled={exporting} onClick={sendWhatsApp}><Icon name="message" /> Send on WhatsApp</button>
+            <button className="whatsapp-button" disabled={exporting} onClick={() => setWhatsappOpen(true)}><Icon name="message" /> Send on WhatsApp</button>
             {canCancel && <button className="remove-button" onClick={onCancel}>Cancel Bill</button>}
             <button aria-label="Close invoice" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
@@ -11975,6 +12404,19 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
             <small>GST-ready invoice - Powered by SRT Company</small>
           </footer>
         </article>
+        {whatsappOpen && (
+          <WhatsAppSendModal
+            caption={invoiceWhatsappMessage()}
+            documentName={invoiceFileName()}
+            generatePdf={() => exportInvoicePdf(activePrintMode, false)}
+            onClose={() => setWhatsappOpen(false)}
+            recipients={invoiceWhatsappRecipients}
+            sourceId={invoice.id || invoice.sale_id || invoice.invoice_no}
+            sourceType="bill"
+            title={`Send Bill ${invoice.invoice_no} via WhatsApp`}
+            user={user}
+          />
+        )}
       </section>
     </div>
   );
