@@ -64,7 +64,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.9";
+const APP_VERSION = "1.0.10";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -534,6 +534,9 @@ const defaultPaymentSettings = {
   sales_mandi_tax_percent: 0,
   sales_mandi_tax_basis: "NET_AFTER_ALL_DISCOUNTS",
   sales_mandi_tax_effective_date: "",
+  sales_mandi_tax_customer_scope: "REGISTERED_CUSTOMERS",
+  sales_mandi_tax_product_scope: "ALL_PRODUCTS",
+  sales_mandi_tax_disable_reason: "",
 };
 
 function BrandLogo({ compact = false, invoice = false, splash = false }) {
@@ -3737,6 +3740,7 @@ function App() {
               products={products.filter((product) => product.active !== false)}
               saleRateSettings={settingsData.saleRateSettings}
               syncInBackground={runSyncNow}
+              onConfigureMandiTax={() => setActiveView("settings")}
               canManualRateOverride={hasRolePermission("manual_pos_rate_override")}
               canPosDateOverride={hasRolePermission("pos_date_override")}
               user={user}
@@ -4328,13 +4332,14 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
   );
 }
 
-function ReportToolbar({ exporting = false, onPdfExport, onPrint, title }) {
+function ReportToolbar({ exporting = false, onPdfExport, onPrint, onWhatsApp, title }) {
   return (
     <div className="report-toolbar no-print">
       <strong>{title}</strong>
       <div className="button-row">
         <button className="secondary-button" onClick={onPrint}><Icon name="print" /> Print</button>
         <button className="secondary-button" disabled={exporting} onClick={onPdfExport || onPrint}>{exporting ? "Exporting..." : "PDF Export"}</button>
+        <button className="whatsapp-button" disabled={exporting} onClick={onWhatsApp || onPdfExport || onPrint}><Icon name="message" /> WhatsApp</button>
       </div>
     </div>
   );
@@ -4547,9 +4552,40 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
       setPrintTarget(false);
     }
   };
+  const shareReport = async () => {
+    if (beforePdfExport && beforePdfExport() === false) return;
+    rememberPrintProfile(reportProfileKey, printProfile);
+    setPrintTarget(true);
+    setExporting(true);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      const result = await exportElementToPdf({
+        element: reportRef.current,
+        fileName: fileName || `${title}.pdf`,
+        mode: "A4",
+        printProfile,
+        save: false,
+      });
+      const file = new File([result.blob], result.fileName, { type: "application/pdf" });
+      const message = `${title} exported from FroozERP`;
+      if (navigator.canShare?.({ files: [file] }) && navigator.share) {
+        await navigator.share({ files: [file], title, text: message });
+      } else {
+        result.pdf?.save(result.fileName);
+        const url = `https://wa.me/?text=${encodeURIComponent(`${message}. PDF generated as ${result.fileName}; attach it if your browser cannot share files directly.`)}`;
+        window.open(url, "_blank", "noopener,noreferrer");
+        alert("WhatsApp file sharing is not available on this device. The report PDF was generated; attach it manually if WhatsApp Web opens without the file.");
+      }
+    } catch (error) {
+      alert(`Unable to share report: ${error.message}`);
+    } finally {
+      setExporting(false);
+      setPrintTarget(false);
+    }
+  };
   return (
     <section className={`print-section ${reportClassName} print-profile-${printProfile.toLowerCase().replace("_", "-")} ${printTarget ? "print-target" : ""}`}>
-      <ReportToolbar exporting={exporting} onPdfExport={exportReport} onPrint={printReport} title={title} />
+      <ReportToolbar exporting={exporting} onPdfExport={exportReport} onPrint={printReport} onWhatsApp={shareReport} title={title} />
       <div ref={reportRef} className="print-area report-paper">
         <header className="report-print-header">
           <BrandLogo invoice />
@@ -6909,6 +6945,23 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
       }
       return `${title}_${from}_to_${to}.pdf`;
     })();
+    const reportFilterSummary = (() => {
+      const parts = [];
+      if (data.dateFrom || data.dateTo || customRange.date_from || customRange.date_to) {
+        parts.push(`Range: ${formatDisplayDate(data.dateFrom || customRange.date_from)} to ${formatDisplayDate(data.dateTo || customRange.date_to)}`);
+      }
+      if (search.trim()) parts.push(`Search: ${search.trim()}`);
+      if (selectedReport === "salesHistory") {
+        parts.push(`View: ${salesFilters.viewMode === "CUSTOMER" ? "Customer-wise" : salesFilters.viewMode === "INVOICE" ? "Invoice-wise" : salesFilters.viewMode === "LOT" ? "Lot-wise" : "Item-wise"}`);
+        parts.push(`Status: ${salesFilters.status}`);
+        if (salesFilters.customerMode !== "ALL") parts.push(`Customer: ${salesFilters.customerMode.replaceAll("_", " ")}`);
+        if (salesFilters.userMode !== "ALL") parts.push(`Users: ${salesFilters.userMode.replaceAll("_", " ")}`);
+        if (salesFilters.paymentMode) parts.push(`Payment: ${salesFilters.paymentMode}`);
+        if (salesFilters.product) parts.push(`Product filter active`);
+        if (salesFilters.lot) parts.push(`Lot filter active`);
+      }
+      return parts;
+    })();
     return (
       <>
         <section className="settings-layout">
@@ -6928,6 +6981,11 @@ function ReportsModule({ canCancelSales, canEditSales, canManageStock, data = {}
               reportClassName={selectedReport === "salesHistory" ? "sales-history-print-report" : selectedReport === "purchaseHistory" ? "purchase-history-print-report" : selectedReport === "profitLoss" ? "profit-loss-print-report" : selectedReport === "cashBook" ? "cash-book-print-report" : ""}
               title={currentReport.title}
             >
+              {reportFilterSummary.length > 0 && (
+                <div className="report-filter-summary">
+                  {reportFilterSummary.map((item) => <span key={item}>{item}</span>)}
+                </div>
+              )}
               <div className="purchase-summary-grid supplier-payment-preview">
                 {(currentReport.summary?.(rows) || []).map(([label, value, featured]) => <SummaryMetric featured={featured} key={label} label={label} value={value} />)}
               </div>
@@ -8592,7 +8650,7 @@ function PaymentSettingsSection({ canManage, onReload, paymentSettings, user }) 
     }
   };
   return (
-    <ModuleCard eyebrow="Payment Settings" title="UPI QR on Invoice" subtitle="Database-backed UPI configuration used by POS invoices, receipts, print and WhatsApp workflows.">
+    <ModuleCard eyebrow="Payment & Tax Settings" title="UPI, Payment QR and Sales Mandi Tax" subtitle="Configure invoice payment QR and registered-customer Mandi Tax rules used by POS, print, PDF and WhatsApp exports.">
       <div className="form-grid supplier-form-grid">
         <Field label="Business UPI ID"><input disabled={!canManage} placeholder="name@bank" value={draft.business_upi_id || ""} onChange={(event) => updateDraft("business_upi_id", event.target.value)} /></Field>
         <Field label="Payee Name"><input disabled={!canManage} value={draft.upi_payee_name || ""} onChange={(event) => updateDraft("upi_payee_name", event.target.value)} /></Field>
@@ -8607,6 +8665,20 @@ function PaymentSettingsSection({ canManage, onReload, paymentSettings, user }) 
         <label className="check-field"><input checked={draft.show_upi_qr_on_all_bills === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("show_upi_qr_on_all_bills", event.target.checked)} /><span>Show UPI QR on all bills</span></label>
         <label className="check-field"><input checked={draft.enable_sales_mandi_tax === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enable_sales_mandi_tax", event.target.checked)} /><span>Enable Mandi Tax on registered-customer sales</span></label>
         <Field label="Sales Mandi Tax Rate (%)"><input disabled={!canManage} min="0" step="0.001" type="number" value={draft.sales_mandi_tax_percent || 0} onChange={(event) => updateDraft("sales_mandi_tax_percent", event.target.value)} /></Field>
+        <Field label="Customer Applicability">
+          <select disabled={!canManage} value={draft.sales_mandi_tax_customer_scope || "REGISTERED_CUSTOMERS"} onChange={(event) => updateDraft("sales_mandi_tax_customer_scope", event.target.value)}>
+            <option value="REGISTERED_CUSTOMERS">Registered/Saved Customer Accounts</option>
+            <option value="ALL_CUSTOMERS">All Customers</option>
+            <option value="NONE">Not Applicable</option>
+          </select>
+        </Field>
+        <Field label="Product / Category Applicability">
+          <select disabled={!canManage} value={draft.sales_mandi_tax_product_scope || "ALL_PRODUCTS"} onChange={(event) => updateDraft("sales_mandi_tax_product_scope", event.target.value)}>
+            <option value="ALL_PRODUCTS">All Products</option>
+            <option value="FRUIT_PRODUCTS">Fruit Products Only</option>
+            <option value="CATEGORY_CONFIGURED">Category configured separately</option>
+          </select>
+        </Field>
         <Field label="Sales Mandi Tax Basis">
           <select disabled={!canManage} value={draft.sales_mandi_tax_basis || "NET_AFTER_ALL_DISCOUNTS"} onChange={(event) => updateDraft("sales_mandi_tax_basis", event.target.value)}>
             <option value="GROSS_BEFORE_DISCOUNTS">Gross item value before discounts</option>
@@ -8615,8 +8687,10 @@ function PaymentSettingsSection({ canManage, onReload, paymentSettings, user }) 
           </select>
         </Field>
         <Field label="Effective Date"><input disabled={!canManage} type="date" value={draft.sales_mandi_tax_effective_date ? toDateKey(draft.sales_mandi_tax_effective_date) : ""} onChange={(event) => updateDraft("sales_mandi_tax_effective_date", event.target.value)} /></Field>
+        <Field label="Disable / Not Applicable Reason"><textarea disabled={!canManage || draft.enable_sales_mandi_tax === true} placeholder="Required when Mandi Tax is not applicable for this business." value={draft.sales_mandi_tax_disable_reason || ""} onChange={(event) => updateDraft("sales_mandi_tax_disable_reason", event.target.value)} /></Field>
         {draft.enable_upi_qr_on_invoice === true && !draft.business_upi_id && <p className="form-note stock-low">Please add UPI ID in Settings to show QR code.</p>}
         {draft.enable_sales_mandi_tax === true && Number(draft.sales_mandi_tax_percent || 0) <= 0 && <p className="form-note stock-low">Enter a Mandi Tax rate before saving registered-customer sales with tax.</p>}
+        {draft.enable_sales_mandi_tax !== true && <p className="form-note">Mandi Tax warnings stay disabled in POS while this setting is off. Use the reason field to document why it is not applicable.</p>}
       </div>
       <button className="primary-button" disabled={!canManage} onClick={save}>Save Payment Settings</button>
     </ModuleCard>
@@ -9837,7 +9911,7 @@ const currentDateTimeLocal = () => {
   return `${year}-${month}-${day}T${hours}:${minutes}`;
 };
 
-function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onInvoice, onSaved, paymentSettings = {}, posSettings = {}, printSettings = {}, products, saleRateSettings = {}, syncInBackground, user }) {
+function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, paymentSettings = {}, posSettings = {}, printSettings = {}, products, saleRateSettings = {}, syncInBackground, user }) {
   const [search, setSearch] = useState("");
   const [barcode, setBarcode] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
@@ -9970,7 +10044,9 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     const discountRule = saleRateSettings.bill_level_slab_discount_enabled === false ? null : getMatchingDiscountRule(discountRules, gross, paymentMode);
     const invoiceDiscountAmount = Math.min(calculateDiscountFromRule(discountRule, gross), subtotalAfterItemDiscounts);
     const basis = String(paymentSettings.sales_mandi_tax_basis || "NET_AFTER_ALL_DISCOUNTS").toUpperCase();
-    const taxEligible = paymentSettings.enable_sales_mandi_tax === true && Boolean(customer.account_id) && customer.system_account !== true && Number(paymentSettings.sales_mandi_tax_percent || 0) > 0;
+    const customerScope = String(paymentSettings.sales_mandi_tax_customer_scope || "REGISTERED_CUSTOMERS").toUpperCase();
+    const customerEligible = customerScope === "ALL_CUSTOMERS" || (customerScope === "REGISTERED_CUSTOMERS" && Boolean(customer.account_id) && customer.system_account !== true);
+    const taxEligible = customerScope !== "NONE" && paymentSettings.enable_sales_mandi_tax === true && customerEligible && Number(paymentSettings.sales_mandi_tax_percent || 0) > 0;
     const taxableAmount = taxEligible
       ? Math.max(
           basis === "GROSS_BEFORE_DISCOUNTS"
@@ -10009,7 +10085,11 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
   const isMixedPaymentBalanced = paymentMode !== "MIXED" || Math.abs(mixedAllocated - totals.total) <= 0.01;
   const hasInvalidMixedPayment = paymentMode === "MIXED" && mixedPaymentModes.some(([mode]) => Number(mixedPayments[mode] || 0) < 0);
   const registeredCustomerSelected = Boolean(customer.account_id) && customer.system_account !== true;
+  const salesMandiCustomerScope = String(paymentSettings.sales_mandi_tax_customer_scope || "REGISTERED_CUSTOMERS").toUpperCase();
   const mandiTaxConfigured = paymentSettings.enable_sales_mandi_tax === true && Number(paymentSettings.sales_mandi_tax_percent || 0) > 0;
+  const mandiTaxRelevantForCustomer = salesMandiCustomerScope === "ALL_CUSTOMERS" || (salesMandiCustomerScope === "REGISTERED_CUSTOMERS" && registeredCustomerSelected);
+  const mandiTaxNeedsConfiguration = mandiTaxRelevantForCustomer && salesMandiCustomerScope !== "NONE" && paymentSettings.enable_sales_mandi_tax === true && Number(paymentSettings.sales_mandi_tax_percent || 0) <= 0;
+  const mandiTaxDisabled = mandiTaxRelevantForCustomer && (salesMandiCustomerScope === "NONE" || paymentSettings.enable_sales_mandi_tax !== true);
 
   const getLotLabel = (lot) => lot ? [lot.lot_name || lot.batch_no, lot.lot_size].filter(Boolean).join(" / ") : "Auto FIFO";
   const getCompactLotName = (lot) => {
@@ -10788,11 +10868,17 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
           <div className="section-title-row">
             <strong>Mandi Tax</strong>
             <span className={registeredCustomerSelected && mandiTaxConfigured ? "stock-ok" : "origin-rate"}>
-              {registeredCustomerSelected ? (mandiTaxConfigured ? "Applied" : "Configuration Required") : "Not Applicable"}
+              {registeredCustomerSelected ? (mandiTaxConfigured ? "Applied" : mandiTaxDisabled ? "Disabled" : "Configuration Required") : "Not Applicable"}
             </span>
           </div>
           {!registeredCustomerSelected && <p className="form-note">Mandi Tax is not applicable for the official Walk-in Customer by default.</p>}
-          {registeredCustomerSelected && !mandiTaxConfigured && <p className="form-note stock-low">Mandi Tax configuration required for registered-customer sales.</p>}
+          {mandiTaxDisabled && <p className="form-note">Mandi Tax is disabled in Settings for registered-customer sales. Enable it only if this business rule applies.</p>}
+          {mandiTaxNeedsConfiguration && (
+            <div className="warning-action-row">
+              <p className="form-note stock-low">Mandi Tax configuration required for registered-customer sales.</p>
+              <button className="secondary-button compact-button" type="button" onClick={onConfigureMandiTax}>Configure Mandi Tax</button>
+            </div>
+          )}
           {registeredCustomerSelected && mandiTaxConfigured && (
             <div className="tax-preview-grid">
               <div className="total-line"><span>Tax Rate</span><strong>{Number(totals.mandiTaxRate || 0)}%</strong></div>
@@ -11133,7 +11219,9 @@ function SaleEditModal({ canSaleDateEdit = false, customers = [], deviceInfo, in
   const itemDiscount = items.reduce((sum, item) => sum + Number(item.discount_amount || 0), 0);
   const subtotalAfterItemDiscounts = Math.max(gross - itemDiscount, 0);
   const basis = String(paymentSettings.sales_mandi_tax_basis || "NET_AFTER_ALL_DISCOUNTS").toUpperCase();
-  const editTaxEligible = paymentSettings.enable_sales_mandi_tax === true && Boolean(customer.account_id) && customer.system_account !== true && Number(paymentSettings.sales_mandi_tax_percent || 0) > 0;
+  const editCustomerScope = String(paymentSettings.sales_mandi_tax_customer_scope || "REGISTERED_CUSTOMERS").toUpperCase();
+  const editCustomerTaxEligible = editCustomerScope === "ALL_CUSTOMERS" || (editCustomerScope === "REGISTERED_CUSTOMERS" && Boolean(customer.account_id) && customer.system_account !== true);
+  const editTaxEligible = editCustomerScope !== "NONE" && paymentSettings.enable_sales_mandi_tax === true && editCustomerTaxEligible && Number(paymentSettings.sales_mandi_tax_percent || 0) > 0;
   const taxableAmount = editTaxEligible
     ? Math.max(
         basis === "GROSS_BEFORE_DISCOUNTS"
@@ -11759,10 +11847,6 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
     }
   };
   const sendWhatsApp = async () => {
-    if (!invoice.customer_mobile) {
-      alert("Add a customer mobile number to send this invoice on WhatsApp.");
-      return;
-    }
     const pdfFile = await exportInvoicePdf(activePrintMode, false);
     const message = [
       "Thank you for shopping with FEEL THE FREAKIN' FROOZ. Your invoice is ready.",
@@ -11782,7 +11866,8 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
     }
     await exportInvoicePdf(activePrintMode, true);
     alert("PDF has been generated. Attach the downloaded PDF if WhatsApp Web does not allow automatic attachment.");
-    window.open(`https://wa.me/${invoice.customer_mobile}?text=${encodeURIComponent(message)}`, "_blank", "noopener,noreferrer");
+    const mobile = String(invoice.customer_mobile || "").replace(/\D/g, "");
+    window.open(`https://wa.me/${mobile ? mobile : ""}?text=${encodeURIComponent(message)}`, "_blank", "noopener,noreferrer");
   };
 
   return (
@@ -11805,7 +11890,7 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
         </div>
         <article ref={invoiceRef} className={`invoice-paper ${activePrintMode === "A4" ? "invoice-a4 print-profile-a4-portrait" : "invoice-thermal"} ${printSettings.receipt_width === "58MM" ? "invoice-58mm print-profile-thermal-58" : "invoice-80mm print-profile-thermal-80"}`}>
           <div className="print-profile-status no-screen">
-            Printer/Profile: {resolvedInvoiceProfile} | Auto typography: active | UI font-size preference ignored for print
+            Printer/Profile: {resolvedInvoiceProfile} | Auto typography: active | App font-size preference applied within print limits
           </div>
           <header className="invoice-header">
             <BrandLogo invoice />

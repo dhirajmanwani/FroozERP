@@ -1189,7 +1189,7 @@ tbody tr:last-child td {
   overflow: visible !important;
   border: 0 !important;
   border-radius: 0 !important;
-  font-size: 11pt !important;
+  font-size: clamp(10pt, calc(11pt * var(--font-scale)), 14pt) !important;
   line-height: 1.35 !important;
 }
 
@@ -1236,7 +1236,7 @@ tbody tr:last-child td {
   border: 1px solid #111111 !important;
   color: #000000 !important;
   background: #ffffff !important;
-  font-size: 10pt !important;
+  font-size: clamp(9pt, calc(10pt * var(--font-scale)), 12pt) !important;
   line-height: 1.35 !important;
   white-space: normal !important;
   overflow-wrap: anywhere !important;
@@ -1248,9 +1248,11 @@ tbody tr:last-child td {
   color: #000000 !important;
   background: #e5e7eb !important;
   font-weight: 900 !important;
+  font-size: clamp(9.5pt, calc(10.5pt * var(--font-scale)), 12.5pt) !important;
 }
 
 .pdf-export-mode .summary-metric,
+.pdf-export-mode .report-filter-summary span,
 .pdf-export-mode .pl-section,
 .pdf-export-mode .pl-title-block,
 .pdf-export-mode .cash-book-panel,
@@ -1282,6 +1284,26 @@ tbody tr:last-child td {
 .pdf-export-mode h2,
 .pdf-export-mode h3 {
   color: #000000 !important;
+}
+
+.pdf-export-mode h2,
+.pdf-export-mode .report-print-header strong {
+  font-size: clamp(15pt, calc(17pt * var(--font-scale)), 22pt) !important;
+}
+
+.pdf-export-mode .summary-metric strong,
+.pdf-export-mode .total-line-main strong {
+  font-size: clamp(11pt, calc(13pt * var(--font-scale)), 16pt) !important;
+}
+
+.pdf-export-mode.sales-history-print-report th,
+.pdf-export-mode.sales-history-print-report td {
+  width: auto !important;
+  min-width: 0 !important;
+  display: table-cell !important;
+  white-space: normal !important;
+  overflow-wrap: anywhere !important;
+  word-break: normal !important;
 }
 
 .pdf-export-mode .no-print,
@@ -2458,6 +2480,23 @@ tbody tr:last-child td {
 .customer-sales-group-summary span {
   color: #cbd5e1;
   font-size: 12px;
+  font-weight: 800;
+}
+
+.report-filter-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 10px 0 12px;
+}
+
+.report-filter-summary span {
+  padding: 5px 8px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 999px;
+  color: #cbd5e1;
+  background: rgba(15, 23, 42, 0.42);
+  font-size: var(--font-size-sm);
   font-weight: 800;
 }
 
@@ -3889,6 +3928,28 @@ tbody tr:last-child td {
     display: none !important;
   }
 
+  .print-section.sales-history-print-report.print-target th,
+  .print-section.sales-history-print-report.print-target td {
+    display: table-cell !important;
+    width: auto !important;
+    min-width: 0 !important;
+    font-size: clamp(9pt, calc(9.8pt * var(--font-scale)), 12pt) !important;
+    line-height: 1.28 !important;
+    white-space: normal !important;
+    overflow-wrap: anywhere !important;
+    word-break: normal !important;
+  }
+
+  .print-section.sales-history-print-report.print-target th {
+    font-size: clamp(9.5pt, calc(10.5pt * var(--font-scale)), 12.5pt) !important;
+  }
+
+  .print-section.sales-history-print-report.print-target .amount-cell,
+  .print-section.sales-history-print-report.print-target .status-cell,
+  .print-section.sales-history-print-report.print-target .date-cell {
+    white-space: normal !important;
+  }
+
   .print-section.print-target .cell-note,
   .print-section.print-target .purchase-summary-grid,
   .print-section.print-target .date-total-row td:last-child {
@@ -3899,6 +3960,13 @@ tbody tr:last-child td {
     color: #111827 !important;
     background: #f3f4f6 !important;
     font-weight: 800 !important;
+  }
+
+  .print-section.print-target .report-filter-summary span {
+    color: #111827 !important;
+    background: #ffffff !important;
+    border: 1px solid #111111 !important;
+    font-size: clamp(8.5pt, calc(9pt * var(--font-scale)), 11pt) !important;
   }
 
   .print-section.cash-book-print-report.print-target .report-paper {

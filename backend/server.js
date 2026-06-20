@@ -1082,6 +1082,9 @@ const initializeDatabase = async () => {
       sales_mandi_tax_percent NUMERIC(6, 3) DEFAULT 0,
       sales_mandi_tax_basis VARCHAR(40) DEFAULT 'NET_AFTER_ALL_DISCOUNTS',
       sales_mandi_tax_effective_date DATE,
+      sales_mandi_tax_customer_scope VARCHAR(40) DEFAULT 'REGISTERED_CUSTOMERS',
+      sales_mandi_tax_product_scope VARCHAR(40) DEFAULT 'ALL_PRODUCTS',
+      sales_mandi_tax_disable_reason TEXT,
       updated_by INTEGER REFERENCES users(id),
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
@@ -1091,6 +1094,9 @@ const initializeDatabase = async () => {
     ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS sales_mandi_tax_percent NUMERIC(6, 3) DEFAULT 0;
     ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS sales_mandi_tax_basis VARCHAR(40) DEFAULT 'NET_AFTER_ALL_DISCOUNTS';
     ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS sales_mandi_tax_effective_date DATE;
+    ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS sales_mandi_tax_customer_scope VARCHAR(40) DEFAULT 'REGISTERED_CUSTOMERS';
+    ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS sales_mandi_tax_product_scope VARCHAR(40) DEFAULT 'ALL_PRODUCTS';
+    ALTER TABLE payment_settings ADD COLUMN IF NOT EXISTS sales_mandi_tax_disable_reason TEXT;
 
     CREATE TABLE IF NOT EXISTS sale_discount_rules (
       id SERIAL PRIMARY KEY,
@@ -3484,22 +3490,29 @@ const SALES_MANDI_TAX_BASIS = new Set([
 
 const getSalesMandiTaxConfig = async (client) => {
   const result = await client.query(
-    `SELECT enable_sales_mandi_tax, sales_mandi_tax_percent, sales_mandi_tax_basis, sales_mandi_tax_effective_date
+    `SELECT enable_sales_mandi_tax, sales_mandi_tax_percent, sales_mandi_tax_basis, sales_mandi_tax_effective_date,
+            sales_mandi_tax_customer_scope, sales_mandi_tax_product_scope, sales_mandi_tax_disable_reason
      FROM payment_settings
      WHERE id = 1`
   );
   const settings = result.rows[0] || {};
   const basis = String(settings.sales_mandi_tax_basis || "NET_AFTER_ALL_DISCOUNTS").toUpperCase();
+  const customerScope = String(settings.sales_mandi_tax_customer_scope || "REGISTERED_CUSTOMERS").toUpperCase();
+  const productScope = String(settings.sales_mandi_tax_product_scope || "ALL_PRODUCTS").toUpperCase();
   return {
     enabled: settings.enable_sales_mandi_tax === true,
     rate: Number(settings.sales_mandi_tax_percent || 0),
     basis: SALES_MANDI_TAX_BASIS.has(basis) ? basis : "NET_AFTER_ALL_DISCOUNTS",
     effectiveDate: settings.sales_mandi_tax_effective_date || null,
+    customerScope: ["REGISTERED_CUSTOMERS", "ALL_CUSTOMERS", "NONE"].includes(customerScope) ? customerScope : "REGISTERED_CUSTOMERS",
+    productScope: ["ALL_PRODUCTS", "FRUIT_PRODUCTS", "CATEGORY_CONFIGURED"].includes(productScope) ? productScope : "ALL_PRODUCTS",
+    disableReason: settings.sales_mandi_tax_disable_reason || null,
   };
 };
 
 const calculateSalesMandiTax = ({ grossAmount, itemDiscountAmount, invoiceDiscountAmount, customerAccount, config }) => {
-  const eligible = config?.enabled === true && customerAccount && customerAccount.system_account !== true && Number(config.rate || 0) > 0;
+  const customerEligible = config?.customerScope === "ALL_CUSTOMERS" || (config?.customerScope === "REGISTERED_CUSTOMERS" && customerAccount && customerAccount.system_account !== true);
+  const eligible = config?.customerScope !== "NONE" && config?.enabled === true && customerEligible && Number(config.rate || 0) > 0;
   if (!eligible) {
     return {
       taxableAmount: 0,
@@ -3536,6 +3549,8 @@ const calculateSalesMandiTax = ({ grossAmount, itemDiscountAmount, invoiceDiscou
       taxable_amount: taxableAmount,
       tax_amount: taxAmount,
       effective_date: config.effectiveDate,
+      customer_scope: config.customerScope,
+      product_scope: config.productScope,
       source: "payment_settings",
     },
   };
@@ -4106,6 +4121,12 @@ app.put("/settings/payment", async (req, res) => {
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage payment settings" });
     const salesMandiTaxPercent = parseNonNegativeNumber(req.body.sales_mandi_tax_percent);
     const salesMandiTaxBasis = cleanText(req.body.sales_mandi_tax_basis).toUpperCase() || "NET_AFTER_ALL_DISCOUNTS";
+    const salesMandiTaxCustomerScope = ["REGISTERED_CUSTOMERS", "ALL_CUSTOMERS", "NONE"].includes(cleanText(req.body.sales_mandi_tax_customer_scope).toUpperCase())
+      ? cleanText(req.body.sales_mandi_tax_customer_scope).toUpperCase()
+      : "REGISTERED_CUSTOMERS";
+    const salesMandiTaxProductScope = ["ALL_PRODUCTS", "FRUIT_PRODUCTS", "CATEGORY_CONFIGURED"].includes(cleanText(req.body.sales_mandi_tax_product_scope).toUpperCase())
+      ? cleanText(req.body.sales_mandi_tax_product_scope).toUpperCase()
+      : "ALL_PRODUCTS";
     if (salesMandiTaxPercent === null || !SALES_MANDI_TAX_BASIS.has(salesMandiTaxBasis)) {
       return res.status(400).json({ message: "Enter valid sales Mandi Tax settings" });
     }
@@ -4121,7 +4142,10 @@ app.put("/settings/payment", async (req, res) => {
           sales_mandi_tax_percent = $7,
           sales_mandi_tax_basis = $8,
           sales_mandi_tax_effective_date = $9,
-          updated_by = $10,
+          sales_mandi_tax_customer_scope = $10,
+          sales_mandi_tax_product_scope = $11,
+          sales_mandi_tax_disable_reason = $12,
+          updated_by = $13,
           updated_at = CURRENT_TIMESTAMP
       WHERE id = 1
       RETURNING *
@@ -4136,6 +4160,9 @@ app.put("/settings/payment", async (req, res) => {
         salesMandiTaxPercent,
         salesMandiTaxBasis,
         isDateInput(req.body.sales_mandi_tax_effective_date) ? req.body.sales_mandi_tax_effective_date : null,
+        salesMandiTaxCustomerScope,
+        salesMandiTaxProductScope,
+        nullableText(req.body.sales_mandi_tax_disable_reason),
         manager.id,
       ]
     );
