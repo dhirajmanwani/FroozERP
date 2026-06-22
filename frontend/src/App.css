@@ -6,31 +6,31 @@
 
 @media screen {
   :where(.erp-shell, .login-shell, .modal-backdrop) {
-    font-size: var(--font-size-base);
+    font-size: var(--font-size-base) !important;
   }
 
-  :where(.erp-shell, .login-shell, .modal-backdrop) :where(input, select, textarea, button, label, p, td) {
-    font-size: var(--font-size-base);
+  :where(.erp-shell, .login-shell, .modal-backdrop) :where(input, select, textarea, button, label, p, td, span, li) {
+    font-size: var(--font-size-base) !important;
   }
 
   :where(.erp-shell, .login-shell, .modal-backdrop) :where(th, small, .eyebrow, .tag, .shortcut-hint, .form-note, .cell-note) {
-    font-size: var(--font-size-sm);
+    font-size: var(--font-size-sm) !important;
   }
 
   :where(.erp-shell, .login-shell, .modal-backdrop) :where(.brand-copy small, .sidebar-section) {
-    font-size: var(--font-size-xs);
+    font-size: var(--font-size-xs) !important;
   }
 
-  :where(.erp-shell, .login-shell, .modal-backdrop) :where(h3, .card-heading strong, .report-category-card strong, .report-menu-card strong, .invoice-toolbar strong) {
-    font-size: var(--font-size-lg);
+  :where(.erp-shell, .login-shell, .modal-backdrop) :where(h3, .card-heading strong, .report-category-card strong, .report-menu-card strong, .invoice-toolbar strong, .primary-cell, .kpi-card span) {
+    font-size: var(--font-size-lg) !important;
   }
 
   :where(.erp-shell, .login-shell, .modal-backdrop) :where(h1, h2, .welcome-banner h2, .card-heading h2, .empty-state h2, .kpi-card strong) {
-    font-size: var(--font-size-xl);
+    font-size: var(--font-size-xl) !important;
   }
 
   :where(.erp-shell, .login-shell, .modal-backdrop) :where(.login-copy h1) {
-    font-size: var(--font-size-2xl);
+    font-size: var(--font-size-2xl) !important;
   }
 
   :where(.erp-shell, .login-shell, .modal-backdrop) :where(input, select, textarea) {
@@ -43,6 +43,11 @@
     line-height: 1.25;
   }
 
+  :root[data-app-font-size="large"] :where(.summary-metric, .content-card, .module-card, .invoice-modal),
+  :root[data-app-font-size="extra-large"] :where(.summary-metric, .content-card, .module-card, .invoice-modal) {
+    overflow-wrap: break-word;
+  }
+
   :root[data-app-font-size="large"] .table-wrap,
   :root[data-app-font-size="extra-large"] .table-wrap {
     overflow-x: auto;
@@ -51,6 +56,14 @@
   :root[data-app-font-size="large"] table,
   :root[data-app-font-size="extra-large"] table {
     min-width: max(100%, 920px);
+  }
+
+  :root[data-app-font-size="large"] th,
+  :root[data-app-font-size="large"] td,
+  :root[data-app-font-size="extra-large"] th,
+  :root[data-app-font-size="extra-large"] td {
+    padding-block: calc(10px * var(--font-scale));
+    white-space: nowrap;
   }
 }
 
@@ -301,6 +314,18 @@
   color: #fcd34d;
   font-size: 11px;
   font-weight: 750;
+}
+
+.kiosk-exit-button {
+  white-space: nowrap;
+}
+
+.device-control-grid {
+  align-items: end;
+}
+
+.kiosk-exit-modal {
+  max-width: 520px;
 }
 
 .status-dot {
@@ -2440,6 +2465,66 @@ tbody tr:last-child td {
   backdrop-filter: blur(14px);
 }
 
+.stock-inventory-report .supplier-payment-preview {
+  grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.stock-inventory-toolbar {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  margin-bottom: 8px;
+}
+
+.stock-filter-row {
+  display: grid;
+  align-items: end;
+  gap: 8px;
+}
+
+.stock-filter-row-primary {
+  grid-template-columns: minmax(120px, 0.8fr) minmax(220px, 1.6fr) minmax(150px, 1fr) minmax(128px, 0.85fr) minmax(128px, 0.85fr) minmax(140px, 0.9fr);
+}
+
+.stock-filter-row-secondary {
+  grid-template-columns: minmax(240px, 1.6fr) minmax(135px, 0.8fr) minmax(150px, 1fr) minmax(105px, 0.7fr) minmax(155px, 1fr) minmax(82px, 0.5fr) minmax(126px, 0.75fr);
+}
+
+.stacked-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 5px;
+}
+
+.stock-toggle-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.stock-clear-button {
+  align-self: end;
+}
+
+.stock-inventory-report .quick-filter-row,
+.stock-inventory-report .active-filter-chip-row {
+  gap: 6px;
+  margin: 6px 0;
+}
+
+.stock-inventory-report .filter-chip {
+  min-height: 28px;
+  padding: 5px 9px;
+}
+
+.stock-inventory-report .table-wrap {
+  margin-top: 8px;
+  max-height: min(52vh, 470px);
+}
+
 .quick-filter-row,
 .active-filter-chip-row {
   display: flex;
@@ -3415,6 +3500,11 @@ tbody tr:last-child td {
     grid-template-columns: 1fr;
   }
 
+  .stock-filter-row-primary,
+  .stock-filter-row-secondary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .checkout-card {
     position: static;
   }
@@ -3422,6 +3512,11 @@ tbody tr:last-child td {
 
 @media (max-width: 820px) {
   .cash-book-sides {
+    grid-template-columns: 1fr;
+  }
+
+  .stock-filter-row-primary,
+  .stock-filter-row-secondary {
     grid-template-columns: 1fr;
   }
 }

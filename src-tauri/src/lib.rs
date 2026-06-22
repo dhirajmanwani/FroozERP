@@ -7,9 +7,13 @@ use std::{
     io::Write,
     panic,
     path::PathBuf,
+    sync::atomic::{AtomicBool, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
+
+static KIOSK_LOCK_ENABLED: AtomicBool = AtomicBool::new(false);
+static KIOSK_CLOSE_ALLOWED: AtomicBool = AtomicBool::new(false);
 
 fn diagnostic_log_path() -> PathBuf {
     env::var_os("APPDATA")
@@ -57,6 +61,37 @@ fn app_log_path() -> Result<String, String> {
 fn app_log(level: Option<String>, message: String) -> Result<(), String> {
     write_app_log(level.as_deref().unwrap_or("INFO"), &message);
     Ok(())
+}
+
+#[tauri::command]
+fn set_kiosk_mode(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Main window not available".to_string())?;
+    KIOSK_LOCK_ENABLED.store(enabled, Ordering::SeqCst);
+    if enabled {
+        KIOSK_CLOSE_ALLOWED.store(false, Ordering::SeqCst);
+    }
+    window.set_fullscreen(enabled).map_err(|error| error.to_string())?;
+    window.set_decorations(!enabled).map_err(|error| error.to_string())?;
+    window.set_resizable(!enabled).map_err(|error| error.to_string())?;
+    write_app_log("INFO", &format!("Kiosk mode set to {}", enabled));
+    Ok(())
+}
+
+#[tauri::command]
+fn close_froozerp_window(app: AppHandle, allow_exit: Option<bool>) -> Result<(), String> {
+    if allow_exit.unwrap_or(false) {
+        KIOSK_CLOSE_ALLOWED.store(true, Ordering::SeqCst);
+        KIOSK_LOCK_ENABLED.store(false, Ordering::SeqCst);
+    }
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Main window not available".to_string())?;
+    let _ = window.set_fullscreen(false);
+    let _ = window.set_decorations(true);
+    let _ = window.set_resizable(true);
+    window.close().map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -226,6 +261,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_log_path,
             app_log,
+            set_kiosk_mode,
+            close_froozerp_window,
             local_cache_reference_snapshot,
             local_load_reference_snapshot,
             local_get_or_create_device_identity,
@@ -247,6 +284,15 @@ pub fn run() {
             pos_sale_load_local,
             pos_sale_list_local
         ])
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if KIOSK_LOCK_ENABLED.load(Ordering::SeqCst) && !KIOSK_CLOSE_ALLOWED.load(Ordering::SeqCst) {
+                    api.prevent_close();
+                    let _ = window.emit("kiosk-exit-required", ());
+                    write_app_log("INFO", "Close prevented by kiosk lock");
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .map_err(|error| error.to_string());
 

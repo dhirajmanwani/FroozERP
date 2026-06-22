@@ -54,6 +54,18 @@ const writeDiagnosticLog = async (level, message, details = {}) => {
   }
 };
 
+const invokeTauriCommand = async (command, args = {}) => {
+  if (!isDesktopShell()) return null;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke(command, args);
+};
+
+const listenTauriEvent = async (eventName, handler) => {
+  if (!isDesktopShell()) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen(eventName, handler);
+};
+
 const currency = new Intl.NumberFormat("en-IN", {
   style: "currency",
   currency: "INR",
@@ -64,7 +76,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.11";
+const APP_VERSION = "1.0.12";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -487,9 +499,9 @@ const accountPaymentActions = [
 const defaultRolePermissions = {
   Owner: { all: true },
   Admin: { all: true },
-  Cashier: { dashboard: true, sales: true, accounts: true, "pending-bills": true },
-  "Purchase Manager": { dashboard: true, purchase: true, "pending-bills": true, accounts: true, reports: true },
-  "Inventory Manager": { dashboard: true, products: true, waste: true, reports: true },
+  Cashier: { sales: true, accounts: true, "pending-bills": true },
+  "Purchase Manager": { purchase: true, "pending-bills": true, accounts: true, reports: true },
+  "Inventory Manager": { products: true, waste: true, reports: true },
 };
 
 const modulePermissionMap = {
@@ -632,6 +644,13 @@ const defaultWhatsappSettings = {
   access_token_configured: false,
   access_token_masked: "",
   default_country_code: "91",
+};
+
+const defaultDeviceControlSettings = {
+  fullscreen_lock_enabled: false,
+  require_exit_code_to_close: true,
+  exit_code_configured: false,
+  updated_at: "",
 };
 
 function BrandLogo({ compact = false, invoice = false, splash = false }) {
@@ -791,6 +810,7 @@ function App() {
     posSettings: defaultPosSettings,
     paymentSettings: defaultPaymentSettings,
     whatsappSettings: defaultWhatsappSettings,
+    deviceControlSettings: defaultDeviceControlSettings,
     discountRules: [],
     roles: [],
     users: [],
@@ -798,6 +818,7 @@ function App() {
     syncSettings: {},
     backupSettings: {},
     backupLogs: [],
+    exitAttemptLogs: [],
     authorizedDevices: [],
     activationCodes: [],
     branches: [],
@@ -956,6 +977,10 @@ function App() {
   const [saleEditError, setSaleEditError] = useState("");
   const [changeHistory, setChangeHistory] = useState(null);
   const [profileOpen, setProfileOpen] = useState(false);
+  const [exitCodeModalOpen, setExitCodeModalOpen] = useState(false);
+  const [exitCodeInput, setExitCodeInput] = useState("");
+  const [exitCodeError, setExitCodeError] = useState("");
+  const [exitAttemptCount, setExitAttemptCount] = useState(0);
   const [accountLedgerFocusKey, setAccountLedgerFocusKey] = useState("");
 
   useEffect(() => {
@@ -967,6 +992,25 @@ function App() {
       // Device-local accessibility preference only; ignore locked storage.
     }
   }, [applicationFontSize]);
+
+  useEffect(() => {
+    const fullscreenEnabled = settingsData.deviceControlSettings?.fullscreen_lock_enabled === true;
+    invokeTauriCommand("set_kiosk_mode", { enabled: fullscreenEnabled }).catch((error) => {
+      if (fullscreenEnabled) writeDiagnosticLog("ERROR", "Unable to apply fullscreen lock mode", { error: String(error?.message || error) });
+    });
+  }, [settingsData.deviceControlSettings?.fullscreen_lock_enabled]);
+
+  useEffect(() => {
+    let unlisten = () => {};
+    listenTauriEvent("kiosk-exit-required", () => {
+      setExitCodeError("");
+      setExitCodeInput("");
+      setExitCodeModalOpen(true);
+    }).then((cleanup) => {
+      unlisten = cleanup;
+    }).catch(() => {});
+    return () => unlisten();
+  }, []);
 
   useEffect(() => {
     const onPopState = () => {
@@ -1155,14 +1199,19 @@ function App() {
   const hasModuleAccess = (view) => {
     if (!user) return false;
     const roleName = user.role;
+    const permissions = rolePermissionMap.get(roleName);
+    if (view === "dashboard") {
+      if (roleName === "Owner") return true;
+      if (permissions && Object.prototype.hasOwnProperty.call(permissions, "dashboard")) return Boolean(permissions.dashboard);
+      return roleName === "Admin";
+    }
     const defaultPermissions = defaultRolePermissions[roleName] || {};
     if (defaultPermissions.all || defaultPermissions[view]) return true;
     const permissionKey = modulePermissionMap[view];
-    const permissions = rolePermissionMap.get(roleName);
     if (view === "accounts" && permissions) {
       return Boolean(permissions.customer_payments || permissions.supplier_payments || permissions.supplier_accounts);
     }
-    if (!permissions || !permissionKey || permissionKey === "dashboard") return view === "dashboard";
+    if (!permissions || !permissionKey) return false;
     return Boolean(permissions[permissionKey]);
   };
 
@@ -1175,6 +1224,60 @@ function App() {
     }
     return ["Admin"].includes(user.role) && ["manual_pos_rate_override", "pos_date_override"].includes(permissionKey);
   };
+
+  const requestControlledExit = () => {
+    if (settingsData.deviceControlSettings?.fullscreen_lock_enabled) {
+      setExitCodeInput("");
+      setExitCodeError("");
+      setExitCodeModalOpen(true);
+      return;
+    }
+    invokeTauriCommand("close_froozerp_window").catch(() => window.close());
+  };
+
+  const verifyExitCodeAndClose = async () => {
+    try {
+      if (exitAttemptCount >= 3) {
+        await new Promise((resolve) => window.setTimeout(resolve, 800));
+      }
+      await axios.post(`${API_URL}/settings/device-control/verify-exit-code`, {
+        user_id: user?.id,
+        device_id: deviceInfo.device_id,
+        exit_code: exitCodeInput,
+      });
+      setExitCodeError("");
+      setExitCodeModalOpen(false);
+      setExitAttemptCount(0);
+      await invokeTauriCommand("close_froozerp_window", { allowExit: true });
+    } catch (error) {
+      setExitAttemptCount((count) => count + 1);
+      setExitCodeError(getErrorMessage(error, "Invalid exit code"));
+    }
+  };
+
+  const getDefaultAllowedView = () => {
+    const roleName = user?.role || "";
+    const preferredByRole = {
+      Owner: ["dashboard", "sales", "reports"],
+      Admin: ["dashboard", "reports", "sales"],
+      Cashier: ["sales", "pending-bills", "accounts"],
+      "Purchase Manager": ["purchase", "pending-bills", "reports"],
+      "Inventory Manager": ["reports", "products", "waste"],
+    };
+    const candidates = [...(preferredByRole[roleName] || []), ...navigationItems.map(([view]) => view)];
+    return candidates.find((view) => hasModuleAccess(view) && (roleName === "Owner" || roleName === "Admin" || view !== "sale-rates")) || "sales";
+  };
+
+  useEffect(() => {
+    if (!user) return;
+    if (!hasModuleAccess(activeView)) {
+      const fallback = getDefaultAllowedView();
+      setActiveView(fallback);
+      const nextUrl = new URL(window.location.href);
+      nextUrl.searchParams.set("view", fallback);
+      window.history.replaceState({ view: fallback }, "", nextUrl);
+    }
+  }, [user, activeView, settingsData.roles]);
 
   const kpis = useMemo(() => {
     const today = toDateKey(new Date());
@@ -1378,6 +1481,7 @@ function App() {
       posSettings: { ...defaultPosSettings, ...(bundle.posSettings || {}) },
       paymentSettings: { ...defaultPaymentSettings, ...(bundle.paymentSettings || {}) },
       whatsappSettings: { ...defaultWhatsappSettings, ...(bundle.whatsappSettings || {}) },
+      deviceControlSettings: { ...defaultDeviceControlSettings, ...(bundle.deviceControlSettings || {}) },
       discountRules: bundle.discountRules || [],
       roles: bundle.roles || [],
       users: bundle.users || [],
@@ -1385,6 +1489,7 @@ function App() {
       syncSettings: bundle.syncSettings || {},
       backupSettings: bundle.backupSettings || {},
       backupLogs: bundle.backupLogs || [],
+      exitAttemptLogs: bundle.exitAttemptLogs || [],
       authorizedDevices: bundle.authorizedDevices || [],
       activationCodes: bundle.activationCodes || [],
       branches: bundle.branches || [],
@@ -1488,6 +1593,7 @@ function App() {
         saleRateSettings: settingsPayload.saleRateSettings || {},
         posSettings: settingsPayload.posSettings || {},
         paymentSettings: settingsPayload.paymentSettings || {},
+        deviceControlSettings: settingsPayload.deviceControlSettings || {},
         discountRules: settingsPayload.discountRules || [],
         roles: settingsPayload.roles || [],
         users: settingsPayload.users || [],
@@ -1495,6 +1601,7 @@ function App() {
         syncSettings: settingsPayload.syncSettings || {},
         backupSettings: settingsPayload.backupSettings || {},
         backupLogs: settingsPayload.backupLogs || [],
+        exitAttemptLogs: settingsPayload.exitAttemptLogs || [],
         authorizedDevices: settingsPayload.authorizedDevices || [],
         activationCodes: settingsPayload.activationCodes || [],
         branches: settingsPayload.branches || [],
@@ -1602,6 +1709,7 @@ function App() {
       posSettings: { ...defaultPosSettings, ...(data.posSettings || {}) },
       paymentSettings: { ...defaultPaymentSettings, ...(data.paymentSettings || {}) },
       whatsappSettings: { ...defaultWhatsappSettings, ...(data.whatsappSettings || {}) },
+      deviceControlSettings: { ...defaultDeviceControlSettings, ...(data.deviceControlSettings || {}) },
       discountRules: data.discountRules || [],
       roles: data.roles || [],
       users: data.users || [],
@@ -1609,6 +1717,7 @@ function App() {
       syncSettings: data.syncSettings || {},
       backupSettings: data.backupSettings || {},
       backupLogs: data.backupLogs || [],
+      exitAttemptLogs: data.exitAttemptLogs || [],
       authorizedDevices: data.authorizedDevices || [],
       activationCodes: data.activationCodes || [],
       branches: data.branches || [],
@@ -1738,15 +1847,17 @@ function App() {
   };
 
   const getDashboardParams = (range = dashboardRange, customRange = dashboardCustomRange) => {
+    const userParam = { user_id: user?.id };
     if (range === "custom") {
       return customRange.date_from && customRange.date_to
-        ? { date_from: customRange.date_from, date_to: customRange.date_to }
-        : { days: 7 };
+        ? { ...userParam, date_from: customRange.date_from, date_to: customRange.date_to }
+        : { ...userParam, days: 7 };
     }
-    return { days: range };
+    return { ...userParam, days: range };
   };
 
   const loadDashboardAnalytics = async (range = dashboardRange, customRange = dashboardCustomRange) => {
+    if (user && !hasModuleAccess("dashboard")) return;
     const response = await axios.get(`${API_URL}/dashboard-analytics`, {
       params: getDashboardParams(range, customRange),
     });
@@ -1755,6 +1866,7 @@ function App() {
   };
 
   const loadDashboardData = async () => {
+    if (user && !hasModuleAccess("dashboard")) return;
     if (isTauriRuntime() && offlineMode) {
       const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id }).catch(() => null);
       const localRows = await listLocalPosSales().catch(() => []);
@@ -1767,7 +1879,7 @@ function App() {
     const [inventoryResponse, salesResponse, supplierMetricsResponse, analyticsResponse] = await Promise.all([
       axios.get(`${API_URL}/inventory`),
       axios.get(`${API_URL}/sales`),
-      axios.get(`${API_URL}/dashboard-metrics`),
+      axios.get(`${API_URL}/dashboard-metrics`, { params: { user_id: user?.id } }),
       axios.get(`${API_URL}/dashboard-analytics`, { params: getDashboardParams() }),
     ]);
     setInventory(inventoryResponse.data);
@@ -3237,6 +3349,11 @@ function App() {
             {user.branch}
           </div>
           {offlineMode && <div className="offline-pill">Offline - changes will sync later</div>}
+          {settingsData.deviceControlSettings?.fullscreen_lock_enabled && (
+            <button className="secondary-button kiosk-exit-button" onClick={requestControlledExit}>
+              Owner Exit
+            </button>
+          )}
         </header>
 
         <div className="content-area">
@@ -3247,7 +3364,17 @@ function App() {
               {!startupError && syncMessage && <small>{syncMessage}</small>}
             </div>
           )}
-          {activeView === "dashboard" && (
+          {activeView === "dashboard" && !hasModuleAccess("dashboard") && (
+            <section className="content-card">
+              <div className="empty-state">
+                <h2>You do not have permission to view Dashboard.</h2>
+                <p>Ask the Owner or Administrator to enable the View Dashboard permission for your role.</p>
+                <button className="primary-button" onClick={() => navigate(getDefaultAllowedView())}>Open Allowed Screen</button>
+              </div>
+            </section>
+          )}
+
+          {activeView === "dashboard" && hasModuleAccess("dashboard") && (
             <>
               <section className="welcome-banner">
                 <div>
@@ -3925,6 +4052,39 @@ function App() {
           )}
         </div>
       </section>
+      {exitCodeModalOpen && (
+        <div className="modal-backdrop">
+          <section className="invoice-modal change-history-modal kiosk-exit-modal">
+            <div className="invoice-toolbar">
+              <div>
+                <span className="eyebrow">Owner Exit Required</span>
+                <strong>Fullscreen Lock Mode is enabled</strong>
+              </div>
+              <button className="remove-button" onClick={() => setExitCodeModalOpen(false)}><Icon name="close" /></button>
+            </div>
+            <div className="sale-edit-body">
+              <p className="form-note">Enter the Owner exit code to leave fullscreen and close FroozERP. Staff cannot disable this mode from the app UI.</p>
+              <Field label="Exit Code">
+                <input
+                  autoFocus
+                  inputMode="numeric"
+                  type="password"
+                  value={exitCodeInput}
+                  onChange={(event) => setExitCodeInput(event.target.value.replace(/\D/g, ""))}
+                  onKeyDown={(event) => event.key === "Enter" && verifyExitCodeAndClose()}
+                />
+              </Field>
+              {exitCodeError && <div className="error-banner">{exitCodeError}</div>}
+              {exitAttemptCount >= 3 && <p className="form-note stock-low">Too many failed attempts. A short delay is applied before the next check.</p>}
+              <div className="button-row">
+                <button className="primary-button" disabled={!exitCodeInput || exitCodeInput.length < 4} onClick={verifyExitCodeAndClose}>Unlock and Exit</button>
+                <button className="secondary-button" onClick={() => setExitCodeModalOpen(false)}>Stay in FroozERP</button>
+              </div>
+              <p className="form-note">Emergency note: if the exit code is forgotten, use Owner/Admin recovery or repair the app without deleting business data.</p>
+            </div>
+          </section>
+        </div>
+      )}
       {selectedInvoice && (
         <InvoiceModal
           autoPrintMode={selectedInvoicePrintMode}
@@ -7477,9 +7637,26 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
   }, new Map()).values()].sort((left, right) => left.category.localeCompare(right.category));
   const categories = [...new Set(lots.map((lot) => lot.category || "Fruit"))].sort();
   const suppliers = [...new Set(lots.map((lot) => lot.supplier_name).filter(Boolean))].sort();
-  const unitOptions = [...new Set(lots.map((lot) => normalizeUnit(lot.unit)).filter(Boolean))].sort();
   const productOptions = productGroups.map((product) => [String(product.product_id), product.product_name]);
-  const lotOptions = lots.map((lot) => [String(lot.id), [lot.lot_name || lot.batch_no || `Lot #${lot.id}`, lot.lot_size].filter(Boolean).join(" / ")]);
+  const selectedProductLots = filters.product
+    ? lots
+        .filter((lot) => String(lot.product_id) === filters.product)
+        .sort((left, right) => `${lotDateValue(left)}-${left.lot_name || ""}`.localeCompare(`${lotDateValue(right)}-${right.lot_name || ""}`))
+    : [];
+  const lotOptions = selectedProductLots.map((lot) => [
+    String(lot.id),
+    [
+      lot.lot_name || lot.batch_no || "No Lot Number",
+      lot.lot_size,
+      lot.supplier_name,
+      `${qty(lotBalance(lot))} ${normalizeUnit(lot.unit)}`,
+      money(lotSaleRate(lot)),
+    ].filter(Boolean).join(" / "),
+  ]);
+  const updateProductFilter = (productId) => {
+    setFilters((current) => ({ ...current, product: productId, lot: "", lotSearch: "" }));
+    setExpandedProductId("");
+  };
   const matchesNeedle = (needle, values) => {
     const normalized = needle.trim().toLowerCase();
     if (!normalized) return true;
@@ -7521,7 +7698,6 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
     if (filters.product && String(lot.product_id) !== filters.product) return false;
     if (filters.lot && String(lot.id) !== filters.lot) return false;
     if (filters.supplier && lot.supplier_name !== filters.supplier) return false;
-    if (filters.unit && normalizeUnit(lot.unit) !== filters.unit) return false;
     if (filters.origin !== "ALL" && String(lot.origin_type || lot.origin || "LOCAL").toUpperCase() !== filters.origin) return false;
     const dateKey = toDateKey(lotDateValue(lot));
     if (filters.date_from && dateKey < filters.date_from) return false;
@@ -7530,6 +7706,8 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
     const lotMatch = matchesNeedle(filters.lotSearch, [
       lot.lot_name,
       lot.batch_no,
+      lot.supplier_lot_number,
+      lot.reference_no,
       lot.lot_size,
       lot.unit,
       lotBalance(lot),
@@ -7660,6 +7838,24 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
       </tr>
     );
   });
+  const compactLotHeaders = ["Product", "Lot Number", "Supplier", "Stock", "Unit", "Arrival Date", ...(canManageStock ? ["Purchase / Expected Rate"] : []), "Sale Rate", ...(canManageStock ? ["Stock Value"] : []), "Status"];
+  const renderCompactLotRows = (rows) => rows.map((lot) => {
+    const status = lotStatus(lot);
+    return (
+      <tr className="report-row-clickable" key={lot.id} onClick={() => openLotDetail(lot)}>
+        <td className="primary-cell">{lot.product_name}<small className="cell-note">{lot.category || ""}</small></td>
+        <td className="primary-cell">{lot.lot_name || lot.batch_no || "No Lot Number"}<small className="cell-note">{lot.lot_size || ""}</small></td>
+        <td>{lot.supplier_name || "-"}</td>
+        <td><span className={lotBalance(lot) <= 0 ? "origin-rate" : "stock-ok"}>{qty(lotBalance(lot))}</span></td>
+        <td>{normalizeUnit(lot.unit)}</td>
+        <td>{formatDisplayDate(lot.purchase_date || lot.created_at)}</td>
+        {canManageStock && <td>{money(lotCost(lot))}</td>}
+        <td>{money(lotSaleRate(lot))}</td>
+        {canManageStock && <td>{money(lotBalance(lot) * lotCost(lot))}</td>}
+        <td><span className={statusClass(status)}>{displayStockStatus(status)}</span></td>
+      </tr>
+    );
+  });
 
   return (
     <section className="stock-inventory-report">
@@ -7673,96 +7869,110 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
         <SummaryMetric label="Inventory Adjustments" value={auditLoading ? "Loading" : adjustmentCount} />
       </div>
       {auditError && <div className="error-banner">{auditError}</div>}
-      <div className="ledger-toolbar stock-inventory-toolbar sticky-report-filters no-print">
-        <Field label="View Mode">
-          <select value={viewMode} onChange={(event) => setViewMode(event.target.value)}>
-            <option value="PRODUCT">Product View</option>
-            <option value="LOT">Lot View</option>
-          </select>
-        </Field>
-        <Field label="Product Search"><input placeholder="Search product name or barcode..." value={filters.productSearch} onChange={(event) => setFilters({ ...filters, productSearch: event.target.value })} /></Field>
-        <Field label="Lot Search"><input placeholder="Search lot number, lot name or size..." value={filters.lotSearch} onChange={(event) => setFilters({ ...filters, lotSearch: event.target.value })} /></Field>
-        <Field label="Date Type">
-          <select value={filters.dateType} onChange={(event) => setFilters({ ...filters, dateType: event.target.value })}>
-            <option value="ARRIVAL">Arrival Date</option>
-            <option value="BILL">Purchase Bill Date</option>
-            <option value="MOVEMENT">Last Stock Movement Date</option>
-          </select>
-        </Field>
-        <Field label="Category">
-          <select value={filters.category} onChange={(event) => setFilters({ ...filters, category: event.target.value })}>
-            <option value="">All categories</option>
-            {categories.map((category) => <option key={category} value={category}>{category}</option>)}
-          </select>
-        </Field>
-        <Field label="Product">
-          <select value={filters.product} onChange={(event) => setFilters({ ...filters, product: event.target.value })}>
-            <option value="">All products</option>
-            {productOptions.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
-          </select>
-        </Field>
-        <Field label="Lot Number">
-          <select value={filters.lot} onChange={(event) => setFilters({ ...filters, lot: event.target.value })}>
-            <option value="">All lots</option>
-            {lotOptions.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
-          </select>
-        </Field>
-        <Field label="Supplier">
-          <select value={filters.supplier} onChange={(event) => setFilters({ ...filters, supplier: event.target.value })}>
-            <option value="">All suppliers</option>
-            {suppliers.map((supplier) => <option key={supplier} value={supplier}>{supplier}</option>)}
-          </select>
-        </Field>
-        <Field label="Status">
-          <select value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })}>
-            <option value="ALL">All</option>
-            <option value="IN_STOCK">In Stock</option>
-            <option value="LOW_STOCK">Low Stock</option>
-            <option value="OUT_OF_STOCK">Out of Stock</option>
-            <option value="NEGATIVE">Negative Stock</option>
-            <option value="CONFLICT">Sync Conflict</option>
-          </select>
-        </Field>
-        <Field label="Unit">
-          <select value={filters.unit} onChange={(event) => setFilters({ ...filters, unit: event.target.value })}>
-            <option value="">All units</option>
-            {unitOptions.map((unit) => <option key={unit} value={unit}>{unit}</option>)}
-          </select>
-        </Field>
-        <Field label="Origin">
-          <select value={filters.origin} onChange={(event) => setFilters({ ...filters, origin: event.target.value })}>
-            <option value="ALL">All</option>
-            <option value="LOCAL">Local</option>
-            <option value="IMPORTED">Imported</option>
-          </select>
-        </Field>
-        <Field label="Date From"><input type="date" value={filters.date_from} onChange={(event) => setFilters({ ...filters, date_from: event.target.value })} /></Field>
-        <Field label="Date To"><input type="date" value={filters.date_to} onChange={(event) => setFilters({ ...filters, date_to: event.target.value })} /></Field>
-        <Field label="Sort By">
-          <select value={sortBy} onChange={(event) => setSortBy(event.target.value)}>
-            <option value="PRODUCT_ASC">Product Name</option>
-            <option value="LOT_ASC">Lot Number</option>
-            <option value="ARRIVAL_OLD">Arrival Date - Oldest</option>
-            <option value="ARRIVAL_NEW">Arrival Date - Newest</option>
-            <option value="STOCK_HIGH">Available Stock - High</option>
-            <option value="STOCK_LOW">Available Stock - Low</option>
-            <option value="RATE_HIGH">Sale Rate - High</option>
-            <option value="RATE_LOW">Sale Rate - Low</option>
-            <option value="SUPPLIER_ASC">Supplier</option>
-            <option value="UPDATED_NEW">Last Updated</option>
-          </select>
-        </Field>
-        <Field label="Rows">
-          <select value={pageSize} onChange={(event) => setPageSize(Number(event.target.value))}>
-            <option value="25">25</option>
-            <option value="50">50</option>
-            <option value="100">100</option>
-          </select>
-        </Field>
-        <label className="check-field report-check-field"><input checked={filters.showEmpty} type="checkbox" onChange={(event) => setFilters({ ...filters, showEmpty: event.target.checked })} /><span>Show Empty Lots</span></label>
-        <label className="check-field report-check-field"><input checked={filters.showInactive} type="checkbox" onChange={(event) => setFilters({ ...filters, showInactive: event.target.checked })} /><span>Show Inactive / Cancelled Lots</span></label>
-        <button className="secondary-button" onClick={clearFilters}>Clear All Filters</button>
-        <button className="secondary-button" onClick={() => openAudit()}>View Audit Trail</button>
+      <div className="stock-inventory-toolbar sticky-report-filters no-print">
+        <div className="stock-filter-row stock-filter-row-primary">
+          <Field label="View Mode">
+            <select value={viewMode} onChange={(event) => setViewMode(event.target.value)}>
+              <option value="PRODUCT">Product View</option>
+              <option value="LOT">Lot View</option>
+            </select>
+          </Field>
+          <Field label="Product Search / Selector">
+            <div className="stacked-control">
+              <input placeholder="Search or select product..." value={filters.productSearch} onChange={(event) => setFilters({ ...filters, productSearch: event.target.value })} />
+              <select value={filters.product} onChange={(event) => updateProductFilter(event.target.value)}>
+                <option value="">All products</option>
+                {productOptions.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+              </select>
+            </div>
+          </Field>
+          <Field label="Date Type">
+            <select value={filters.dateType} onChange={(event) => setFilters({ ...filters, dateType: event.target.value })}>
+              <option value="ARRIVAL">Arrival Date</option>
+              <option value="BILL">Purchase Bill Date</option>
+              <option value="MOVEMENT">Last Stock Movement Date</option>
+            </select>
+          </Field>
+          <Field label="Date From"><input type="date" value={filters.date_from} onChange={(event) => setFilters({ ...filters, date_from: event.target.value })} /></Field>
+          <Field label="Date To"><input type="date" value={filters.date_to} onChange={(event) => setFilters({ ...filters, date_to: event.target.value })} /></Field>
+          <Field label="Status">
+            <select value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })}>
+              <option value="ALL">All</option>
+              <option value="IN_STOCK">In Stock</option>
+              <option value="LOW_STOCK">Low Stock</option>
+              <option value="OUT_OF_STOCK">Out of Stock</option>
+              <option value="NEGATIVE">Negative Stock</option>
+              <option value="CONFLICT">Conflict</option>
+            </select>
+          </Field>
+        </div>
+        <div className="stock-filter-row stock-filter-row-secondary">
+          <Field label="Lot Filter">
+            <div className="stacked-control">
+              <input
+                disabled={!filters.product}
+                placeholder={filters.product ? "Search lot number, supplier lot, date, stock or rate..." : "Select product first"}
+                value={filters.lotSearch}
+                onChange={(event) => setFilters({ ...filters, lotSearch: event.target.value })}
+              />
+              <select
+                disabled={!filters.product}
+                value={filters.lot}
+                onChange={(event) => setFilters({ ...filters, lot: event.target.value })}
+              >
+                <option value="">{filters.product ? "All lots for selected product" : "Select product first"}</option>
+                {filters.product && lotOptions.length === 0 && <option value="" disabled>No lots found for this product</option>}
+                {lotOptions.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+              </select>
+            </div>
+          </Field>
+          <Field label="Category">
+            <select value={filters.category} onChange={(event) => setFilters({ ...filters, category: event.target.value })}>
+              <option value="">All categories</option>
+              {categories.map((category) => <option key={category} value={category}>{category}</option>)}
+            </select>
+          </Field>
+          <Field label="Supplier">
+            <select value={filters.supplier} onChange={(event) => setFilters({ ...filters, supplier: event.target.value })}>
+              <option value="">All suppliers</option>
+              {suppliers.map((supplier) => <option key={supplier} value={supplier}>{supplier}</option>)}
+            </select>
+          </Field>
+          <Field label="Origin">
+            <select value={filters.origin} onChange={(event) => setFilters({ ...filters, origin: event.target.value })}>
+              <option value="ALL">All</option>
+              <option value="LOCAL">Local</option>
+              <option value="IMPORTED">Imported</option>
+            </select>
+          </Field>
+          <Field label="Sort By">
+            <select value={sortBy} onChange={(event) => setSortBy(event.target.value)}>
+              <option value="PRODUCT_ASC">Product Name</option>
+              <option value="LOT_ASC">Lot Number</option>
+              <option value="ARRIVAL_OLD">Arrival Date - Oldest</option>
+              <option value="ARRIVAL_NEW">Arrival Date - Newest</option>
+              <option value="STOCK_HIGH">Available Stock - High</option>
+              <option value="STOCK_LOW">Available Stock - Low</option>
+              <option value="RATE_HIGH">Sale Rate - High</option>
+              <option value="RATE_LOW">Sale Rate - Low</option>
+              <option value="SUPPLIER_ASC">Supplier</option>
+              <option value="UPDATED_NEW">Last Updated</option>
+            </select>
+          </Field>
+          <Field label="Rows">
+            <select value={pageSize} onChange={(event) => setPageSize(Number(event.target.value))}>
+              <option value="25">25</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </Field>
+          <button className="secondary-button stock-clear-button" onClick={clearFilters}>Clear All Filters</button>
+        </div>
+        <div className="stock-toggle-row">
+          <label className="check-field report-check-field"><input checked={filters.showEmpty} type="checkbox" onChange={(event) => setFilters({ ...filters, showEmpty: event.target.checked })} /><span>Show Empty Lots</span></label>
+          <label className="check-field report-check-field"><input checked={filters.showInactive} type="checkbox" onChange={(event) => setFilters({ ...filters, showInactive: event.target.checked })} /><span>Show Inactive / Cancelled Lots</span></label>
+          <button className="secondary-button compact-button" onClick={() => openAudit()}>View Audit Trail</button>
+        </div>
       </div>
       <div className="quick-filter-row no-print">
         <button className="filter-chip" onClick={() => setFilters({ ...filters, dateType: "ARRIVAL", date_from: toDateKey(new Date()), date_to: toDateKey(new Date()) })}>Today's Arrivals</button>
@@ -7785,10 +7995,11 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
       <div className="active-filter-chip-row no-print">
         {filters.productSearch && <button className="filter-chip" onClick={() => setFilters({ ...filters, productSearch: "" })}>{filters.productSearch} x</button>}
         {filters.lotSearch && <button className="filter-chip" onClick={() => setFilters({ ...filters, lotSearch: "" })}>{filters.lotSearch} x</button>}
+        {filters.product && <button className="filter-chip" onClick={() => updateProductFilter("")}>{productOptions.find(([id]) => id === filters.product)?.[1] || "Product"} x</button>}
+        {filters.lot && <button className="filter-chip" onClick={() => setFilters({ ...filters, lot: "" })}>{lotOptions.find(([id]) => id === filters.lot)?.[1] || "Lot"} x</button>}
         {filters.date_from && <button className="filter-chip" onClick={() => setFilters({ ...filters, date_from: "" })}>From {formatDisplayDate(filters.date_from)} x</button>}
         {filters.date_to && <button className="filter-chip" onClick={() => setFilters({ ...filters, date_to: "" })}>To {formatDisplayDate(filters.date_to)} x</button>}
         {filters.status !== "IN_STOCK" && <button className="filter-chip" onClick={() => setFilters({ ...filters, status: "IN_STOCK" })}>{filters.status.replaceAll("_", " ")} x</button>}
-        {filters.unit && <button className="filter-chip" onClick={() => setFilters({ ...filters, unit: "" })}>{filters.unit} x</button>}
         {filters.origin !== "ALL" && <button className="filter-chip" onClick={() => setFilters({ ...filters, origin: "ALL" })}>{filters.origin} x</button>}
       </div>
       {viewMode === "PRODUCT" && (
@@ -7815,8 +8026,8 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
                 {expandedProductId === String(product.product_id) && (
                   <tr className="sales-history-drilldown-row">
                     <td colSpan="9">
-                      <DataTable headers={["Product", "Category", "Supplier", "Lot No.", "Size", "Opening Date", "Opening Qty", "Sold Qty", "Adjusted Qty", "Balance Qty", ...(canManageStock ? ["Cost"] : []), "Sale Rate", ...(canManageStock ? ["Stock Value"] : []), "Status", "Remarks", "Created At", "Last Edited"]}>
-                        {renderLotRows(product.visible_lots)}
+                      <DataTable headers={compactLotHeaders}>
+                        {renderCompactLotRows(product.visible_lots)}
                       </DataTable>
                     </td>
                   </tr>
@@ -7828,9 +8039,9 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
         </DataTable>
       )}
       {viewMode === "LOT" && (
-        <DataTable headers={["Product", "Category", "Supplier", "Lot No.", "Size", "Opening Date", "Opening Qty", "Sold Qty", "Adjusted Qty", "Balance Qty", ...(canManageStock ? ["Cost"] : []), "Sale Rate", ...(canManageStock ? ["Stock Value"] : []), "Status", "Remarks", "Created At", "Last Edited"]}>
-          {renderLotRows(pagedLots)}
-          {filteredLots.length === 0 && <tr><td colSpan="17" className="empty-cell">No matching stock lots found.</td></tr>}
+        <DataTable headers={compactLotHeaders}>
+          {renderCompactLotRows(pagedLots)}
+          {filteredLots.length === 0 && <tr><td colSpan={compactLotHeaders.length} className="empty-cell">No matching stock lots found.</td></tr>}
         </DataTable>
       )}
       {viewMode === "CATEGORY" && (
@@ -8853,6 +9064,7 @@ function SettingsModule({
       <DiscountSettings canManage={canManage} discountRules={settingsData.discountRules} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />
       <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />
       <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />
+      <DeviceControlSettingsSection canManage={canManage} deviceControlSettings={settingsData.deviceControlSettings} exitAttemptLogs={settingsData.exitAttemptLogs || []} onReload={onReload} user={user} />
       <SecurityDevicesSection activationCodes={settingsData.activationCodes || []} branches={settingsData.branches || []} canManage={canManage} counters={settingsData.counters || []} devices={settingsData.authorizedDevices || []} onReload={onReload} user={user} />
       <BranchCounterSettings branches={settingsData.branches || []} canManage={canManage} counters={settingsData.counters || []} onReload={onReload} user={user} />
       <UpdateCenterSection canManage={canManage} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
@@ -9358,6 +9570,7 @@ function DiscountRuleRow({ canManage, onReload, rule, user }) {
 }
 
 const permissionLabels = [
+  ["dashboard", "View Dashboard"],
   ["settings", "Settings"],
   ["discounts", "Discounts"],
   ["mandi_tax", "Mandi Tax"],
@@ -9422,6 +9635,76 @@ function PermissionSettings({ canManage, onReload, roles, user }) {
             <td><button className="table-action" disabled={!canManage || role.role_name === "Owner"} onClick={() => saveRole(role.role_name)}>Save</button></td>
           </tr>
         ))}
+      </DataTable>
+    </ModuleCard>
+  );
+}
+
+function DeviceControlSettingsSection({ canManage, deviceControlSettings = defaultDeviceControlSettings, exitAttemptLogs = [], onReload, user }) {
+  const [draft, setDraft] = useState({ ...defaultDeviceControlSettings, ...deviceControlSettings });
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [exitCode, setExitCode] = useState("");
+  const [confirmExitCode, setConfirmExitCode] = useState("");
+  const [message, setMessage] = useState("");
+  useEffect(() => {
+    setDraft({ ...defaultDeviceControlSettings, ...deviceControlSettings });
+  }, [deviceControlSettings?.updated_at, deviceControlSettings?.fullscreen_lock_enabled, deviceControlSettings?.exit_code_configured]);
+  const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
+  const save = async () => {
+    try {
+      await axios.put(`${API_URL}/settings/device-control`, {
+        fullscreen_lock_enabled: draft.fullscreen_lock_enabled === true,
+        require_exit_code_to_close: draft.require_exit_code_to_close !== false,
+        current_password: currentPassword,
+        exit_code: exitCode,
+        confirm_exit_code: confirmExitCode,
+        updated_by: user.id,
+      });
+      setCurrentPassword("");
+      setExitCode("");
+      setConfirmExitCode("");
+      setMessage("Device control settings updated");
+      await onReload();
+    } catch (error) {
+      setMessage(getErrorMessage(error, "Unable to update device control settings"));
+    }
+  };
+  return (
+    <ModuleCard eyebrow="Security / Device Control" title="Fullscreen Lock & Owner Exit Code" subtitle="App-level kiosk protection for counter devices. Windows administrator controls can still force close the application.">
+      <div className="purchase-summary-grid supplier-payment-preview">
+        <SummaryMetric featured label="Fullscreen Lock Mode" value={draft.fullscreen_lock_enabled ? "Enabled" : "Disabled"} />
+        <SummaryMetric label="Exit Code" value={draft.exit_code_configured ? "Configured" : "Not Set"} />
+        <SummaryMetric label="Close Protection" value={draft.require_exit_code_to_close !== false ? "Exit code required" : "Not required"} />
+      </div>
+      {message && <div className={message.toLowerCase().includes("unable") || message.toLowerCase().includes("incorrect") ? "error-banner" : "startup-status-panel"}>{message}</div>}
+      <div className="form-grid supplier-form-grid device-control-grid">
+        <label className="check-field report-check-field">
+          <input checked={draft.fullscreen_lock_enabled === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("fullscreen_lock_enabled", event.target.checked)} />
+          <span>Enable Fullscreen Lock Mode</span>
+        </label>
+        <label className="check-field report-check-field">
+          <input checked={draft.require_exit_code_to_close !== false} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("require_exit_code_to_close", event.target.checked)} />
+          <span>Require Exit Code to Close App</span>
+        </label>
+        <Field label="Current Owner/Admin Password"><input disabled={!canManage} type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} placeholder="Required only when changing exit code" /></Field>
+        <Field label="New Exit Code"><input disabled={!canManage} inputMode="numeric" type="password" value={exitCode} onChange={(event) => setExitCode(event.target.value.replace(/\D/g, ""))} placeholder="Minimum 4 digits, recommended 6" /></Field>
+        <Field label="Confirm Exit Code"><input disabled={!canManage} inputMode="numeric" type="password" value={confirmExitCode} onChange={(event) => setConfirmExitCode(event.target.value.replace(/\D/g, ""))} /></Field>
+      </div>
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage} onClick={save}>Save Device Control</button>
+      </div>
+      <p className="form-note">Failed exit attempts are logged for Owner/Admin review. If the exit code is forgotten, use Owner/Admin recovery or repair installation without deleting data.</p>
+      <DataTable headers={["Attempted At", "User", "Device", "Result", "Reason"]}>
+        {exitAttemptLogs.map((row) => (
+          <tr key={row.id}>
+            <td>{row.attempted_at ? new Date(row.attempted_at).toLocaleString("en-IN") : "-"}</td>
+            <td>{row.user_name || row.user_id || "-"}</td>
+            <td>{row.device_id || "-"}</td>
+            <td><span className={row.success ? "stock-ok" : "stock-low"}>{row.success ? "Allowed" : "Blocked"}</span></td>
+            <td>{row.failure_reason || "-"}</td>
+          </tr>
+        ))}
+        {exitAttemptLogs.length === 0 && <tr><td colSpan="5" className="empty-cell">No exit attempts logged yet.</td></tr>}
       </DataTable>
     </ModuleCard>
   );

@@ -77,6 +77,8 @@ const hashPassword = (password) =>
   crypto.createHash("sha256").update(String(password || ""), "utf8").digest("hex");
 const hashActivationCode = (code) =>
   crypto.createHash("sha256").update(String(code || "").trim().toUpperCase(), "utf8").digest("hex");
+const hashExitCode = (code) =>
+  crypto.createHash("sha256").update(String(code || "").trim(), "utf8").digest("hex");
 const generateActivationCode = () => `FTF-${crypto.randomBytes(3).toString("hex").toUpperCase()}-${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
 const normalizeUsername = (value) => cleanText(value).toLowerCase();
 const normalizePhone = (value) => cleanText(value).replace(/[^\d+]/g, "");
@@ -209,6 +211,7 @@ const WASTE_TYPES = new Set(["DAAGI", "SAMPLING", "PERSONAL_USE", "OTHER"]);
 const PURCHASE_BILL_STATUSES = new Set(["BILL_PENDING", "BILL_COMPLETED"]);
 const PRODUCT_UNITS = new Set(["KG", "BOX", "PIECE", "DOZEN"]);
 const PERMISSION_KEYS = [
+  "dashboard",
   "settings",
   "discounts",
   "mandi_tax",
@@ -1387,6 +1390,24 @@ const initializeDatabase = async () => {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS device_control_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+      fullscreen_lock_enabled BOOLEAN DEFAULT FALSE,
+      require_exit_code_to_close BOOLEAN DEFAULT TRUE,
+      exit_code_hash TEXT,
+      updated_by INTEGER REFERENCES users(id),
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS device_exit_attempt_logs (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id),
+      device_id VARCHAR(160),
+      success BOOLEAN NOT NULL DEFAULT FALSE,
+      attempted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      failure_reason TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS update_center (
       id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
       current_version VARCHAR(40) NOT NULL DEFAULT '1.0.0',
@@ -1668,6 +1689,10 @@ const initializeDatabase = async () => {
     VALUES (1)
     ON CONFLICT (id) DO NOTHING;
 
+    INSERT INTO device_control_settings (id)
+    VALUES (1)
+    ON CONFLICT (id) DO NOTHING;
+
     INSERT INTO update_center (id)
     VALUES (1)
     ON CONFLICT (id) DO NOTHING;
@@ -1682,11 +1707,11 @@ const initializeDatabase = async () => {
 
     INSERT INTO role_permission_settings (role_name, permissions)
     VALUES
-      ('Owner', '{"settings":true,"discounts":true,"mandi_tax":true,"rebate_rules":true,"supplier_payments":true,"customer_payments":true,"sale_edit":true,"invoice_cancellation":true,"reports":true,"purchases":true,"supplier_accounts":true,"inventory":true,"waste_management":true,"billing":true}'::jsonb),
-      ('Admin', '{"settings":true,"discounts":true,"mandi_tax":true,"rebate_rules":true,"supplier_payments":true,"customer_payments":true,"sale_edit":true,"invoice_cancellation":true,"reports":true,"purchases":true,"supplier_accounts":true,"inventory":true,"waste_management":true,"billing":true}'::jsonb),
-      ('Cashier', '{"billing":true,"customer_payments":true,"settings":false,"invoice_cancellation":false,"sale_edit":false,"discounts":false,"mandi_tax":false,"rebate_rules":false,"supplier_payments":false,"reports":false,"purchases":false,"supplier_accounts":false,"inventory":false,"waste_management":false}'::jsonb),
-      ('Purchase Manager', '{"purchases":true,"supplier_payments":true,"supplier_accounts":true,"reports":true,"settings":false,"discounts":false,"mandi_tax":false,"rebate_rules":false,"customer_payments":false,"sale_edit":false,"invoice_cancellation":false,"inventory":false,"waste_management":false,"billing":false}'::jsonb),
-      ('Inventory Manager', '{"inventory":true,"waste_management":true,"reports":true,"settings":false,"discounts":false,"mandi_tax":false,"rebate_rules":false,"supplier_payments":false,"customer_payments":false,"sale_edit":false,"invoice_cancellation":false,"purchases":false,"supplier_accounts":false,"billing":false}'::jsonb)
+      ('Owner', '{"dashboard":true,"settings":true,"discounts":true,"mandi_tax":true,"rebate_rules":true,"supplier_payments":true,"customer_payments":true,"sale_edit":true,"invoice_cancellation":true,"reports":true,"purchases":true,"supplier_accounts":true,"inventory":true,"waste_management":true,"billing":true}'::jsonb),
+      ('Admin', '{"dashboard":true,"settings":true,"discounts":true,"mandi_tax":true,"rebate_rules":true,"supplier_payments":true,"customer_payments":true,"sale_edit":true,"invoice_cancellation":true,"reports":true,"purchases":true,"supplier_accounts":true,"inventory":true,"waste_management":true,"billing":true}'::jsonb),
+      ('Cashier', '{"dashboard":false,"billing":true,"customer_payments":true,"settings":false,"invoice_cancellation":false,"sale_edit":false,"discounts":false,"mandi_tax":false,"rebate_rules":false,"supplier_payments":false,"reports":false,"purchases":false,"supplier_accounts":false,"inventory":false,"waste_management":false}'::jsonb),
+      ('Purchase Manager', '{"dashboard":false,"purchases":true,"supplier_payments":true,"supplier_accounts":true,"reports":true,"settings":false,"discounts":false,"mandi_tax":false,"rebate_rules":false,"customer_payments":false,"sale_edit":false,"invoice_cancellation":false,"inventory":false,"waste_management":false,"billing":false}'::jsonb),
+      ('Inventory Manager', '{"dashboard":false,"inventory":true,"waste_management":true,"reports":true,"settings":false,"discounts":false,"mandi_tax":false,"rebate_rules":false,"supplier_payments":false,"customer_payments":false,"sale_edit":false,"invoice_cancellation":false,"purchases":false,"supplier_accounts":false,"billing":false}'::jsonb)
     ON CONFLICT (role_name) DO NOTHING;
 
     UPDATE role_permission_settings
@@ -1704,6 +1729,11 @@ const initializeDatabase = async () => {
     UPDATE role_permission_settings
     SET permissions = permissions || '{"whatsapp_send":true,"whatsapp_settings":true}'::jsonb
     WHERE role_name IN ('Owner', 'Admin');
+
+    UPDATE role_permission_settings
+    SET permissions = permissions || '{"dashboard":true}'::jsonb
+    WHERE role_name IN ('Owner', 'Admin')
+      AND NOT (permissions ? 'dashboard');
 
     UPDATE role_permission_settings
     SET permissions = permissions || '{"manual_pos_rate_override":false}'::jsonb
@@ -1729,6 +1759,11 @@ const initializeDatabase = async () => {
     SET permissions = permissions || '{"whatsapp_send":false,"whatsapp_settings":false}'::jsonb
     WHERE role_name IN ('Cashier', 'Purchase Manager', 'Inventory Manager')
       AND NOT (permissions ? 'whatsapp_send');
+
+    UPDATE role_permission_settings
+    SET permissions = permissions || '{"dashboard":false}'::jsonb
+    WHERE role_name IN ('Cashier', 'Purchase Manager', 'Inventory Manager')
+      AND NOT (permissions ? 'dashboard');
 
     INSERT INTO branches (id, branch_name, location)
     VALUES (1, 'Main Branch', 'Primary Store')
@@ -3294,7 +3329,7 @@ const getSystemInfo = async (deviceId = "") => {
 };
 
 const getSettingsBundle = async (userId, deviceId = "") => {
-  const [businessResult, saleRateResult, mandiResult, rebateResult, discountResult, roleResult, updateResult, syncResult, syncQueueResult, posResult, paymentResult, whatsappResult, manager] = await Promise.all([
+  const [businessResult, saleRateResult, mandiResult, rebateResult, discountResult, roleResult, updateResult, syncResult, syncQueueResult, posResult, paymentResult, whatsappResult, deviceControlResult, manager] = await Promise.all([
     pool.query("SELECT * FROM business_settings WHERE id = 1"),
     pool.query("SELECT * FROM sale_rate_settings WHERE id = 1"),
     pool.query("SELECT * FROM mandi_tax_rules ORDER BY origin_type"),
@@ -3307,6 +3342,7 @@ const getSettingsBundle = async (userId, deviceId = "") => {
     pool.query("SELECT * FROM pos_settings WHERE id = 1"),
     pool.query("SELECT * FROM payment_settings WHERE id = 1"),
     pool.query("SELECT * FROM whatsapp_settings WHERE id = 1"),
+    pool.query("SELECT * FROM device_control_settings WHERE id = 1"),
     userId ? requireRateManager(userId) : Promise.resolve(null),
   ]);
   const usersResult = manager ? await pool.query(
@@ -3321,7 +3357,7 @@ const getSettingsBundle = async (userId, deviceId = "") => {
     ORDER BY u.active DESC, u.full_name
     `
   ) : { rows: [] };
-  const [devicesResult, activationResult, branchesResult, countersResult, backupSettingsResult, backupLogsResult, systemInfo] = manager ? await Promise.all([
+  const [devicesResult, activationResult, branchesResult, countersResult, backupSettingsResult, backupLogsResult, systemInfo, exitLogsResult] = manager ? await Promise.all([
     pool.query(`
       SELECT d.*, b.branch_name, c.counter_name, u.full_name AS approved_by_name
       FROM authorized_devices d
@@ -3346,6 +3382,13 @@ const getSettingsBundle = async (userId, deviceId = "") => {
     pool.query("SELECT * FROM backup_settings WHERE id = 1"),
     pool.query("SELECT * FROM backup_logs ORDER BY started_at DESC, id DESC LIMIT 20"),
     getSystemInfo(deviceId),
+    pool.query(`
+      SELECT l.*, u.full_name AS user_name
+      FROM device_exit_attempt_logs l
+      LEFT JOIN users u ON u.id = l.user_id
+      ORDER BY l.attempted_at DESC, l.id DESC
+      LIMIT 20
+    `),
   ]) : [
     { rows: [] },
     { rows: [] },
@@ -3354,9 +3397,11 @@ const getSettingsBundle = async (userId, deviceId = "") => {
     { rows: [] },
     { rows: [] },
     await getSystemInfo(deviceId),
+    { rows: [] },
   ];
   const syncSettings = syncResult.rows[0] || {};
   const whatsappSettings = whatsappResult.rows[0] || {};
+  const deviceControlSettings = deviceControlResult.rows[0] || {};
   return {
     businessSettings: businessResult.rows[0] || {},
     saleRateSettings: saleRateResult.rows[0] || {},
@@ -3369,6 +3414,12 @@ const getSettingsBundle = async (userId, deviceId = "") => {
       access_token_configured: Boolean(whatsappSettings.access_token),
       access_token_masked: maskAccessToken(whatsappSettings.access_token),
       updated_at: whatsappSettings.updated_at || "",
+    },
+    deviceControlSettings: {
+      fullscreen_lock_enabled: deviceControlSettings.fullscreen_lock_enabled === true,
+      require_exit_code_to_close: deviceControlSettings.require_exit_code_to_close !== false,
+      exit_code_configured: Boolean(deviceControlSettings.exit_code_hash),
+      updated_at: deviceControlSettings.updated_at || "",
     },
     mandiTaxRules: mandiResult.rows,
     rebateRules: rebateResult.rows,
@@ -3386,6 +3437,7 @@ const getSettingsBundle = async (userId, deviceId = "") => {
     counters: countersResult.rows,
     backupSettings: backupSettingsResult.rows[0] || {},
     backupLogs: backupLogsResult.rows,
+    exitAttemptLogs: exitLogsResult.rows,
     systemInfo,
     canManageSettings: Boolean(manager),
   };
@@ -4088,6 +4140,81 @@ app.put("/settings/role-permissions/:roleName", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Updating Role Permissions" });
+  }
+});
+
+app.put("/settings/device-control", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage device control settings" });
+    const currentPassword = cleanText(req.body.current_password);
+    const newExitCode = cleanText(req.body.exit_code);
+    const confirmExitCode = cleanText(req.body.confirm_exit_code);
+    let exitCodeHash = null;
+    let updateExitCode = false;
+    if (newExitCode || confirmExitCode) {
+      if (!currentPassword) return res.status(400).json({ message: "Current Owner/Admin password is required to change the exit code" });
+      if (!/^\d{4,}$/.test(newExitCode)) return res.status(400).json({ message: "Exit code must be at least 4 digits" });
+      if (newExitCode !== confirmExitCode) return res.status(400).json({ message: "Exit code confirmation does not match" });
+      const userResult = await pool.query("SELECT password_hash FROM users WHERE id = $1", [manager.id]);
+      if (!passwordMatches(currentPassword, userResult.rows[0]?.password_hash)) {
+        return res.status(403).json({ message: "Current password is incorrect" });
+      }
+      exitCodeHash = hashExitCode(newExitCode);
+      updateExitCode = true;
+    }
+    const result = await pool.query(
+      `
+      UPDATE device_control_settings
+      SET fullscreen_lock_enabled = $1,
+          require_exit_code_to_close = $2,
+          exit_code_hash = CASE WHEN $3::BOOLEAN THEN $4 ELSE exit_code_hash END,
+          updated_by = $5,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = 1
+      RETURNING id, fullscreen_lock_enabled, require_exit_code_to_close, exit_code_hash, updated_at
+      `,
+      [
+        req.body.fullscreen_lock_enabled === true,
+        req.body.require_exit_code_to_close !== false,
+        updateExitCode,
+        exitCodeHash,
+        manager.id,
+      ]
+    );
+    const row = result.rows[0] || {};
+    return res.json({
+      fullscreen_lock_enabled: row.fullscreen_lock_enabled === true,
+      require_exit_code_to_close: row.require_exit_code_to_close !== false,
+      exit_code_configured: Boolean(row.exit_code_hash),
+      updated_at: row.updated_at || "",
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Device Control Settings" });
+  }
+});
+
+app.post("/settings/device-control/verify-exit-code", async (req, res) => {
+  try {
+    const userId = parsePositiveInteger(req.body.user_id);
+    const deviceId = cleanText(req.body.device_id);
+    const exitCode = cleanText(req.body.exit_code);
+    const settingsResult = await pool.query("SELECT * FROM device_control_settings WHERE id = 1");
+    const settings = settingsResult.rows[0] || {};
+    const valid = Boolean(settings.exit_code_hash) && hashExitCode(exitCode) === settings.exit_code_hash;
+    await pool.query(
+      `
+      INSERT INTO device_exit_attempt_logs (user_id, device_id, success, failure_reason)
+      VALUES ($1, $2, $3, $4)
+      `,
+      [userId, deviceId || null, valid, valid ? null : "Invalid exit code"]
+    );
+    if (!valid) return res.status(403).json({ message: "Invalid exit code" });
+    return res.json({ success: true });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Verifying Exit Code" });
   }
 });
 
@@ -10318,6 +10445,9 @@ app.get("/customer-ledger", async (req, res) => {
 
 app.get("/dashboard-metrics", async (req, res) => {
   try {
+    if (!(await getPermissionUser(req.query.user_id, "dashboard", []))) {
+      return res.status(403).json({ message: "You do not have permission to view Dashboard." });
+    }
     return res.json(await getDashboardSummary());
   } catch (error) {
     console.error(error);
@@ -10327,6 +10457,9 @@ app.get("/dashboard-metrics", async (req, res) => {
 
 app.get("/dashboard-analytics", async (req, res) => {
   try {
+    if (!(await getPermissionUser(req.query.user_id, "dashboard", []))) {
+      return res.status(403).json({ message: "You do not have permission to view Dashboard." });
+    }
     return res.json(await getDashboardAnalyticsPayload(req.query));
   } catch (error) {
     console.error(error);
@@ -10336,6 +10469,9 @@ app.get("/dashboard-analytics", async (req, res) => {
 
 app.get("/dashboard-sales-trend", async (req, res) => {
   try {
+    if (!(await getPermissionUser(req.query.user_id, "dashboard", []))) {
+      return res.status(403).json({ message: "You do not have permission to view Dashboard." });
+    }
     const { dateFrom, dateTo, days } = parseDashboardRange(req.query);
     return res.json({ dateFrom, dateTo, days, data: await getDashboardSalesTrend(dateFrom, dateTo) });
   } catch (error) {
@@ -10346,6 +10482,9 @@ app.get("/dashboard-sales-trend", async (req, res) => {
 
 app.get("/dashboard-profit-trend", async (req, res) => {
   try {
+    if (!(await getPermissionUser(req.query.user_id, "dashboard", []))) {
+      return res.status(403).json({ message: "You do not have permission to view Dashboard." });
+    }
     const { dateFrom, dateTo, days } = parseDashboardRange(req.query);
     return res.json({ dateFrom, dateTo, days, data: await getDashboardProfitTrend(dateFrom, dateTo) });
   } catch (error) {
@@ -10356,6 +10495,9 @@ app.get("/dashboard-profit-trend", async (req, res) => {
 
 app.get("/dashboard-expense-trend", async (req, res) => {
   try {
+    if (!(await getPermissionUser(req.query.user_id, "dashboard", []))) {
+      return res.status(403).json({ message: "You do not have permission to view Dashboard." });
+    }
     const { dateFrom, dateTo, days } = parseDashboardRange(req.query);
     return res.json({ dateFrom, dateTo, days, data: await getDashboardExpenseTrend(dateFrom, dateTo) });
   } catch (error) {
