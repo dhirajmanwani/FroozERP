@@ -76,7 +76,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.12";
+const APP_VERSION = "1.0.14";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -981,6 +981,7 @@ function App() {
   const [exitCodeInput, setExitCodeInput] = useState("");
   const [exitCodeError, setExitCodeError] = useState("");
   const [exitAttemptCount, setExitAttemptCount] = useState(0);
+  const [loginDeviceControlSettings, setLoginDeviceControlSettings] = useState(defaultDeviceControlSettings);
   const [accountLedgerFocusKey, setAccountLedgerFocusKey] = useState("");
 
   useEffect(() => {
@@ -999,6 +1000,26 @@ function App() {
       if (fullscreenEnabled) writeDiagnosticLog("ERROR", "Unable to apply fullscreen lock mode", { error: String(error?.message || error) });
     });
   }, [settingsData.deviceControlSettings?.fullscreen_lock_enabled]);
+
+  useEffect(() => {
+    if (user) return undefined;
+    let cancelled = false;
+    const loadLoginDeviceControl = async () => {
+      try {
+        const response = await axios.get(`${API_URL}/settings`, { params: { device_id: deviceInfo.device_id } });
+        if (cancelled) return;
+        const nextSettings = { ...defaultDeviceControlSettings, ...(response.data?.deviceControlSettings || {}) };
+        setLoginDeviceControlSettings(nextSettings);
+        await invokeTauriCommand("set_kiosk_mode", { enabled: nextSettings.fullscreen_lock_enabled === true });
+      } catch {
+        if (!cancelled) setLoginDeviceControlSettings(defaultDeviceControlSettings);
+      }
+    };
+    loadLoginDeviceControl();
+    return () => {
+      cancelled = true;
+    };
+  }, [user, deviceInfo.device_id]);
 
   useEffect(() => {
     let unlisten = () => {};
@@ -1225,8 +1246,26 @@ function App() {
     return ["Admin"].includes(user.role) && ["manual_pos_rate_override", "pos_date_override"].includes(permissionKey);
   };
 
-  const requestControlledExit = () => {
-    if (settingsData.deviceControlSettings?.fullscreen_lock_enabled) {
+  const requestControlledExit = async () => {
+    let fullscreenEnabled = Boolean(user
+      ? settingsData.deviceControlSettings?.fullscreen_lock_enabled
+      : loginDeviceControlSettings?.fullscreen_lock_enabled);
+    if (!user) {
+      try {
+        const response = await axios.get(`${API_URL}/settings`, {
+          params: { device_id: deviceInfo.device_id },
+          timeout: 5000,
+        });
+        const nextSettings = { ...defaultDeviceControlSettings, ...(response.data?.deviceControlSettings || {}) };
+        setLoginDeviceControlSettings(nextSettings);
+        fullscreenEnabled = Boolean(nextSettings.fullscreen_lock_enabled || nextSettings.require_exit_code_to_close);
+      } catch {
+        fullscreenEnabled = Boolean(
+          loginDeviceControlSettings?.fullscreen_lock_enabled || loginDeviceControlSettings?.require_exit_code_to_close
+        );
+      }
+    }
+    if (fullscreenEnabled) {
       setExitCodeInput("");
       setExitCodeError("");
       setExitCodeModalOpen(true);
@@ -1241,7 +1280,7 @@ function App() {
         await new Promise((resolve) => window.setTimeout(resolve, 800));
       }
       await axios.post(`${API_URL}/settings/device-control/verify-exit-code`, {
-        user_id: user?.id,
+        user_id: user?.id || 1,
         device_id: deviceInfo.device_id,
         exit_code: exitCodeInput,
       });
@@ -1254,6 +1293,44 @@ function App() {
       setExitCodeError(getErrorMessage(error, "Invalid exit code"));
     }
   };
+
+  const exitLockEnabled = user
+    ? settingsData.deviceControlSettings?.fullscreen_lock_enabled
+    : loginDeviceControlSettings?.fullscreen_lock_enabled;
+
+  const exitCodeModal = exitCodeModalOpen && (
+    <div className="modal-backdrop">
+      <section className="invoice-modal change-history-modal kiosk-exit-modal">
+        <div className="invoice-toolbar">
+          <div>
+            <span className="eyebrow">Owner Exit Required</span>
+            <strong>{exitLockEnabled ? "Fullscreen Lock Mode is enabled" : "Close FroozERP"}</strong>
+          </div>
+          <button className="remove-button" onClick={() => setExitCodeModalOpen(false)}><Icon name="close" /></button>
+        </div>
+        <div className="sale-edit-body">
+          <p className="form-note">Enter the Owner exit code to leave fullscreen and close FroozERP. Staff cannot bypass this from the app UI.</p>
+          <Field label="Exit Code">
+            <input
+              autoFocus
+              inputMode="numeric"
+              type="password"
+              value={exitCodeInput}
+              onChange={(event) => setExitCodeInput(event.target.value.replace(/\D/g, ""))}
+              onKeyDown={(event) => event.key === "Enter" && verifyExitCodeAndClose()}
+            />
+          </Field>
+          {exitCodeError && <div className="error-banner">{exitCodeError}</div>}
+          {exitAttemptCount >= 3 && <p className="form-note stock-low">Too many failed attempts. A short delay is applied before the next check.</p>}
+          <div className="button-row">
+            <button className="primary-button" disabled={!exitCodeInput || exitCodeInput.length < 4} onClick={verifyExitCodeAndClose}>Unlock and Exit</button>
+            <button className="secondary-button" onClick={() => setExitCodeModalOpen(false)}>Stay in FroozERP</button>
+          </div>
+          <p className="form-note">Emergency note: if the exit code is forgotten, use Owner/Admin recovery or repair the app without deleting business data.</p>
+        </div>
+      </section>
+    </div>
+  );
 
   const getDefaultAllowedView = () => {
     const roleName = user?.role || "";
@@ -3187,6 +3264,12 @@ function App() {
                 </button>
               </>
             )}
+            <button className="secondary-button login-close-exit-button" disabled={loginBusy} onClick={requestControlledExit}>
+              Close &amp; Exit
+            </button>
+            <small className="login-exit-helper">
+              {loginDeviceControlSettings.fullscreen_lock_enabled ? "Owner code required to close FroozERP" : "Close FroozERP safely"}
+            </small>
           </div>
           {deviceGate && (
             <div className="device-activation-panel">
@@ -3212,6 +3295,7 @@ function App() {
               onRetryOnline={retryOnline}
             />
           )}
+          {exitCodeModal}
         </section>
       </main>
     );
@@ -4052,39 +4136,7 @@ function App() {
           )}
         </div>
       </section>
-      {exitCodeModalOpen && (
-        <div className="modal-backdrop">
-          <section className="invoice-modal change-history-modal kiosk-exit-modal">
-            <div className="invoice-toolbar">
-              <div>
-                <span className="eyebrow">Owner Exit Required</span>
-                <strong>Fullscreen Lock Mode is enabled</strong>
-              </div>
-              <button className="remove-button" onClick={() => setExitCodeModalOpen(false)}><Icon name="close" /></button>
-            </div>
-            <div className="sale-edit-body">
-              <p className="form-note">Enter the Owner exit code to leave fullscreen and close FroozERP. Staff cannot disable this mode from the app UI.</p>
-              <Field label="Exit Code">
-                <input
-                  autoFocus
-                  inputMode="numeric"
-                  type="password"
-                  value={exitCodeInput}
-                  onChange={(event) => setExitCodeInput(event.target.value.replace(/\D/g, ""))}
-                  onKeyDown={(event) => event.key === "Enter" && verifyExitCodeAndClose()}
-                />
-              </Field>
-              {exitCodeError && <div className="error-banner">{exitCodeError}</div>}
-              {exitAttemptCount >= 3 && <p className="form-note stock-low">Too many failed attempts. A short delay is applied before the next check.</p>}
-              <div className="button-row">
-                <button className="primary-button" disabled={!exitCodeInput || exitCodeInput.length < 4} onClick={verifyExitCodeAndClose}>Unlock and Exit</button>
-                <button className="secondary-button" onClick={() => setExitCodeModalOpen(false)}>Stay in FroozERP</button>
-              </div>
-              <p className="form-note">Emergency note: if the exit code is forgotten, use Owner/Admin recovery or repair the app without deleting business data.</p>
-            </div>
-          </section>
-        </div>
-      )}
+      {exitCodeModal}
       {selectedInvoice && (
         <InvoiceModal
           autoPrintMode={selectedInvoicePrintMode}
