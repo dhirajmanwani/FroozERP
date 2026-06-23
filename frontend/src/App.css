@@ -1251,8 +1251,11 @@ tbody tr:last-child td {
   text-shadow: none !important;
   opacity: 1 !important;
   filter: none !important;
+  transform: none !important;
   -webkit-print-color-adjust: exact;
   print-color-adjust: exact;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: geometricPrecision;
 }
 
 .pdf-export-mode {
@@ -1396,20 +1399,6 @@ tbody tr:last-child td {
 
 .no-screen {
   display: none;
-}
-
-.print-profile-status {
-  margin: 8px 0 12px;
-  padding: 6px 8px;
-  border: 1px solid #111111;
-  color: #000000;
-  background: #ffffff;
-  font-size: 9pt;
-  font-weight: 800;
-}
-
-.pdf-export-mode .print-profile-status.no-screen {
-  display: block !important;
 }
 
 .compact-button {
@@ -2648,6 +2637,22 @@ tbody tr:last-child td {
   border-radius: 14px;
   background: #1e293b;
   box-shadow: 0 20px 70px rgba(2, 6, 23, 0.6);
+}
+
+.pdf-preview-modal {
+  width: min(1120px, calc(100vw - 32px));
+  height: min(860px, calc(100vh - 32px));
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.pdf-preview-frame {
+  width: calc(100% - 32px);
+  height: calc(100% - 16px);
+  margin: 0 16px 16px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 12px;
+  background: #ffffff;
 }
 
 .whatsapp-send-modal {
@@ -4458,10 +4463,6 @@ tbody tr:last-child td {
   .invoice-paper.invoice-a4 .total-line-main strong,
   .invoice-paper.invoice-a4 .total-line-main span {
     font-size: 13pt !important;
-  }
-
-  .print-profile-status.no-screen {
-    display: block !important;
   }
 
   .invoice-paper.invoice-80mm {

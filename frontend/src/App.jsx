@@ -76,7 +76,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.16";
+const APP_VERSION = "1.0.17";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -337,6 +337,58 @@ const getReportPrintProfile = (reportClassName = "") => (
     ? "A4_LANDSCAPE"
     : "A4_PORTRAIT"
 );
+const parseSafeDate = (value) => {
+  if (!value) return null;
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+  const raw = String(value).trim();
+  if (!raw) return null;
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(raw) ? raw.replace(" ", "T") : raw;
+  const parsed = new Date(normalized);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+const formatEntryTime = (invoice = {}) => {
+  const timeOnly = String(invoice.entry_time || invoice.sale_time || invoice.bill_time || "").trim();
+  if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(timeOnly)) {
+    const [hours, minutes] = timeOnly.split(":").map(Number);
+    const date = new Date();
+    date.setHours(hours, minutes, 0, 0);
+    return date.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" });
+  }
+  const savedTimestamp = parseSafeDate(
+    invoice.created_at ||
+    invoice.createdAt ||
+    invoice.bill_datetime ||
+    invoice.sale_datetime ||
+    invoice.transaction_time ||
+    invoice.updated_at
+  );
+  if (!savedTimestamp) return "Not recorded";
+  return savedTimestamp.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" });
+};
+const createPdfPreviewUrl = (blob) => URL.createObjectURL(blob);
+const savePdfResult = async ({ blob, fileName, pdf }) => {
+  const finalFileName = safeFileName(fileName).replace(/\.pdf$/i, "") + ".pdf";
+  if (window.showSaveFilePicker) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: finalFileName,
+        types: [{
+          description: "PDF document",
+          accept: { "application/pdf": [".pdf"] },
+        }],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return { fileName: finalFileName, method: "save-picker" };
+    } catch (error) {
+      if (error?.name === "AbortError") return { fileName: finalFileName, canceled: true };
+      console.warn("FroozERP PDF save picker unavailable; using browser download fallback.", error);
+    }
+  }
+  pdf.save(finalFileName);
+  return { fileName: finalFileName, method: "browser-download" };
+};
 const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth = "80MM", printProfile = "", save = true }) => {
   if (!element) throw new Error("Nothing to export");
   const isThermal = mode === "THERMAL";
@@ -351,7 +403,7 @@ const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     const canvas = await html2canvas(element, {
       backgroundColor: "#ffffff",
-      scale: 2,
+      scale: Math.max(2, Math.min(3, window.devicePixelRatio || 2)),
       useCORS: true,
       scrollX: 0,
       scrollY: 0,
@@ -379,8 +431,9 @@ const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth
       }
     }
     const finalFileName = safeFileName(fileName).replace(/\.pdf$/i, "") + ".pdf";
-    if (save) pdf.save(finalFileName);
-    return { blob: pdf.output("blob"), fileName: finalFileName, pdf };
+    const blob = pdf.output("blob");
+    const saveResult = save ? await savePdfResult({ blob, fileName: finalFileName, pdf }) : null;
+    return { blob, fileName: finalFileName, pdf, saveResult };
   } finally {
     delete element.dataset.printProfile;
     element.classList.remove("pdf-export-mode", "pdf-export-thermal", "pdf-export-a4", "pdf-export-a4-landscape", "pdf-export-a4-portrait");
@@ -972,6 +1025,7 @@ function App() {
   const [selectedInvoice, setSelectedInvoice] = useState(null);
   const [selectedInvoicePrintMode, setSelectedInvoicePrintMode] = useState(null);
   const [cancelDraft, setCancelDraft] = useState(null);
+  const [posRefreshToken, setPosRefreshToken] = useState(0);
   const [editingSale, setEditingSale] = useState(null);
   const [saleEditLoading, setSaleEditLoading] = useState(false);
   const [saleEditError, setSaleEditError] = useState("");
@@ -2835,6 +2889,33 @@ function App() {
     return response.data;
   };
 
+  const refreshAfterSaleCancellation = async ({ local = false } = {}) => {
+    setSelectedInvoice(null);
+    setSelectedInvoicePrintMode(null);
+    setPosRefreshToken((token) => token + 1);
+    if (isTauriRuntime() && (offlineMode || local)) {
+      const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id }).catch(() => null);
+      if (snapshot) {
+        setProducts(snapshot.products || []);
+        setInventory(snapshot.inventory_lots || []);
+        setSalesHistory(snapshot.sales_history || []);
+      }
+      await refreshSyncStatus().catch(() => null);
+      return;
+    }
+    const inventoryRefresh = axios.get(`${API_URL}/inventory`, { params: { include_cancelled: true } })
+      .then((response) => setInventory(response.data));
+    await Promise.all([
+      loadProducts().catch(() => null),
+      inventoryRefresh.catch(() => null),
+      loadSalesHistory().catch(() => null),
+      loadDashboardData().catch(() => null),
+      loadReports().catch(() => null),
+      loadCustomerPendingBills().catch(() => null),
+      loadAccountOutstanding().catch(() => null),
+    ]);
+  };
+
   const cancelSale = async (sale) => {
     try {
       const fullSale = await getSaleDetailsForAction(sale);
@@ -2880,16 +2961,13 @@ function App() {
         }
         await refreshSyncStatus();
         setCancelDraft(null);
-        setSelectedInvoice(null);
-        setSelectedInvoicePrintMode(null);
+        await refreshAfterSaleCancellation({ local: true });
         return true;
       }
       await axios.post(`${API_URL}/sales/${saleId}/cancel`, { reason, cancelled_by: user.id });
-      await Promise.all([loadSalesHistory(), loadDashboardData(), loadReports()]);
+      await refreshAfterSaleCancellation();
       alert("Invoice cancelled");
       setCancelDraft(null);
-      setSelectedInvoice(null);
-      setSelectedInvoicePrintMode(null);
       return true;
     } catch (error) {
       alert(getErrorMessage(error, "Unable to cancel invoice"));
@@ -4047,6 +4125,7 @@ function App() {
               posSettings={settingsData.posSettings}
               printSettings={settingsData.businessSettings}
               products={products.filter((product) => product.active !== false)}
+              refreshToken={posRefreshToken}
               saleRateSettings={settingsData.saleRateSettings}
               syncInBackground={runSyncNow}
               onConfigureMandiTax={() => setActiveView("settings")}
@@ -4852,12 +4931,33 @@ function WhatsAppSendModal({
   );
 }
 
-function ReportToolbar({ exporting = false, onPdfExport, onPrint, onWhatsApp, title }) {
+function PdfPreviewModal({ fileName, onClose, onSave, url }) {
+  return (
+    <div className="modal-backdrop">
+      <section className="invoice-modal pdf-preview-modal">
+        <div className="invoice-toolbar">
+          <div>
+            <span className="eyebrow">PDF Preview</span>
+            <strong>{fileName}</strong>
+          </div>
+          <div className="invoice-actions">
+            <button className="primary-button" onClick={onSave}>Save PDF</button>
+            <button aria-label="Close PDF preview" className="remove-button" onClick={onClose}><Icon name="close" /></button>
+          </div>
+        </div>
+        <iframe className="pdf-preview-frame" src={url} title={fileName} />
+      </section>
+    </div>
+  );
+}
+
+function ReportToolbar({ exporting = false, onPdfExport, onPdfView, onPrint, onWhatsApp, title }) {
   return (
     <div className="report-toolbar no-print">
       <strong>{title}</strong>
       <div className="button-row">
         <button className="secondary-button" onClick={onPrint}><Icon name="print" /> Print</button>
+        {onPdfView && <button className="secondary-button" disabled={exporting} onClick={onPdfView}>{exporting ? "Preparing..." : "View PDF"}</button>}
         <button className="secondary-button" disabled={exporting} onClick={onPdfExport || onPrint}>{exporting ? "Exporting..." : "PDF Export"}</button>
         <button className="whatsapp-button" disabled={exporting} onClick={onWhatsApp || onPdfExport || onPrint}><Icon name="message" /> WhatsApp</button>
       </div>
@@ -5034,10 +5134,13 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
   const [printTarget, setPrintTarget] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [whatsappOpen, setWhatsappOpen] = useState(false);
+  const [pdfPreview, setPdfPreview] = useState(null);
   const reportRef = useRef(null);
   const reportProfileKey = `report_${safeFileName(reportClassName || title || "report")}`;
   const printProfile = readStoredPrintProfile(reportProfileKey) || getReportPrintProfile(reportClassName);
-  const profileLabel = printProfile === "A4_LANDSCAPE" ? "A4 Landscape" : "A4 Portrait";
+  useEffect(() => () => {
+    if (pdfPreview?.url) URL.revokeObjectURL(pdfPreview.url);
+  }, [pdfPreview?.url]);
   const printReport = () => {
     if (beforePrint && beforePrint() === false) return;
     rememberPrintProfile(reportProfileKey, printProfile);
@@ -5073,6 +5176,31 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
       setPrintTarget(false);
     }
   };
+  const viewReportPdf = async () => {
+    if (beforePdfExport && beforePdfExport() === false) return;
+    rememberPrintProfile(reportProfileKey, printProfile);
+    setPrintTarget(true);
+    setExporting(true);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      const result = await exportElementToPdf({
+        element: reportRef.current,
+        fileName: fileName || `${title}.pdf`,
+        mode: "A4",
+        printProfile,
+        save: false,
+      });
+      setPdfPreview((current) => {
+        if (current?.url) URL.revokeObjectURL(current.url);
+        return { ...result, url: createPdfPreviewUrl(result.blob) };
+      });
+    } catch (error) {
+      alert(`Unable to view PDF: ${error.message}`);
+    } finally {
+      setExporting(false);
+      setPrintTarget(false);
+    }
+  };
   const generateWhatsappPdf = async () => {
     if (beforePdfExport && beforePdfExport() === false) return;
     rememberPrintProfile(reportProfileKey, printProfile);
@@ -5094,7 +5222,7 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
   };
   return (
     <section className={`print-section ${reportClassName} print-profile-${printProfile.toLowerCase().replace("_", "-")} ${printTarget ? "print-target" : ""}`}>
-      <ReportToolbar exporting={exporting} onPdfExport={exportReport} onPrint={printReport} onWhatsApp={() => setWhatsappOpen(true)} title={title} />
+      <ReportToolbar exporting={exporting} onPdfExport={exportReport} onPdfView={viewReportPdf} onPrint={printReport} onWhatsApp={() => setWhatsappOpen(true)} title={title} />
       <div ref={reportRef} className="print-area report-paper">
         <header className="report-print-header">
           <BrandLogo invoice />
@@ -5103,11 +5231,19 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
             <span>{new Date().toLocaleString("en-IN")}</span>
           </div>
         </header>
-        <div className="print-profile-status no-screen">
-          Printer/Profile: {profileLabel} | Auto typography: active | Minimum body font: 10pt
-        </div>
         {children}
       </div>
+      {pdfPreview && (
+        <PdfPreviewModal
+          fileName={pdfPreview.fileName}
+          onClose={() => setPdfPreview((current) => {
+            if (current?.url) URL.revokeObjectURL(current.url);
+            return null;
+          })}
+          onSave={() => savePdfResult(pdfPreview)}
+          url={pdfPreview.url}
+        />
+      )}
       {whatsappOpen && (
         <WhatsAppSendModal
           caption={`${title} exported from FroozERP`}
@@ -10727,7 +10863,7 @@ const currentDateTimeLocal = () => {
   return `${year}-${month}-${day}T${hours}:${minutes}`;
 };
 
-function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, paymentSettings = {}, posSettings = {}, printSettings = {}, products, saleRateSettings = {}, syncInBackground, user }) {
+function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, syncInBackground, user }) {
   const [search, setSearch] = useState("");
   const [barcode, setBarcode] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
@@ -10756,6 +10892,14 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
   useEffect(() => {
     searchRef.current?.focus();
   }, []);
+
+  useEffect(() => {
+    setLotSelectorProduct(null);
+    setLotSelectorSearch("");
+    setLotFilter("AVAILABLE");
+    setShowSoldOutLots(false);
+    searchRef.current?.focus();
+  }, [refreshToken]);
 
   const effectiveQuantityMode = posSettings.enable_weighing_scale ? quantityMode : "MANUAL";
   const lotSelectionMode = String(saleRateSettings.pos_lot_selection_mode || "ASK_MULTIPLE").toUpperCase();
@@ -12617,10 +12761,10 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
   const [upiQrDataUrl, setUpiQrDataUrl] = useState("");
   const [exporting, setExporting] = useState(false);
   const [whatsappOpen, setWhatsappOpen] = useState(false);
+  const [pdfPreview, setPdfPreview] = useState(null);
   const invoiceRef = useRef(null);
   const autoPrintedRef = useRef(false);
   const activePrintMode = printMode === "A4" ? "A4" : "THERMAL";
-  const resolvedInvoiceProfile = activePrintMode === "A4" ? "A4 Portrait" : printSettings.receipt_width === "58MM" ? "58mm Thermal" : "80mm Thermal";
   const invoicePayments = invoice.payments || [];
   const showItemDiscountOnReceipt = printSettings.show_item_discount_column_receipt !== false;
   const showBillDiscountRow = printSettings.show_bill_discount_row_receipt !== false;
@@ -12657,8 +12801,12 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
       active = false;
     };
   }, [qrCodeWidth, upiPayload]);
+  useEffect(() => () => {
+    if (pdfPreview?.url) URL.revokeObjectURL(pdfPreview.url);
+  }, [pdfPreview?.url]);
   const invoiceDateKey = toDateKey(invoice.sale_date || invoice.transaction_date || invoice.created_at);
-  const invoiceFileName = () => `FroozERP_POS_Invoice_${invoice.invoice_no || `SALE-${invoice.id}`}_${formatFileDate(invoiceDateKey)}.pdf`;
+  const invoiceFileName = () => `FroozERP-Invoice-${safeFileName(invoice.invoice_no || `SALE-${invoice.id}`)}.pdf`;
+  const invoiceEntryTime = formatEntryTime(invoice);
   const printWithMode = (mode) => {
     setPrintMode(mode);
     const nextProfile = mode === "A4" ? "A4_PORTRAIT" : printSettings.receipt_width === "58MM" ? "THERMAL_58" : "THERMAL_80";
@@ -12686,6 +12834,20 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
         printProfile: mode === "A4" ? "A4_PORTRAIT" : "",
         save,
       });
+    } finally {
+      setExporting(false);
+    }
+  };
+  const viewInvoicePdf = async (mode = activePrintMode) => {
+    setExporting(true);
+    try {
+      const result = await exportInvoicePdf(mode, false);
+      setPdfPreview((current) => {
+        if (current?.url) URL.revokeObjectURL(current.url);
+        return { ...result, url: createPdfPreviewUrl(result.blob) };
+      });
+    } catch (error) {
+      alert(`Unable to view invoice PDF: ${error.message}`);
     } finally {
       setExporting(false);
     }
@@ -12719,16 +12881,14 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
             {canEdit && <button className="primary-button" onClick={onEdit}>Edit Bill</button>}
             <button className="secondary-button" onClick={() => printWithMode("THERMAL")}><Icon name="print" /> POS Thermal Print</button>
             <button className="secondary-button" onClick={() => printWithMode("A4")}><Icon name="print" /> A4 Invoice Print</button>
-            <button className="secondary-button" disabled={exporting} onClick={() => exportInvoicePdf(activePrintMode, true)}>{exporting ? "Exporting..." : "PDF Export"}</button>
+            <button className="secondary-button" disabled={exporting} onClick={() => viewInvoicePdf(activePrintMode)}>{exporting ? "Preparing..." : "View PDF"}</button>
+            <button className="secondary-button" disabled={exporting} onClick={() => exportInvoicePdf(activePrintMode, true)}>{exporting ? "Exporting..." : "Save PDF"}</button>
             <button className="whatsapp-button" disabled={exporting} onClick={() => setWhatsappOpen(true)}><Icon name="message" /> Send on WhatsApp</button>
             {canCancel && <button className="remove-button" onClick={onCancel}>Cancel Bill</button>}
             <button aria-label="Close invoice" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
         <article ref={invoiceRef} className={`invoice-paper ${activePrintMode === "A4" ? "invoice-a4 print-profile-a4-portrait" : "invoice-thermal"} ${printSettings.receipt_width === "58MM" ? "invoice-58mm print-profile-thermal-58" : "invoice-80mm print-profile-thermal-80"}`}>
-          <div className="print-profile-status no-screen">
-            Printer/Profile: {resolvedInvoiceProfile} | Auto typography: active | App font-size preference applied within print limits
-          </div>
           <header className="invoice-header">
             <BrandLogo invoice />
             <div className="invoice-meta">
@@ -12736,7 +12896,7 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
               <span>{printSettings.business_name || "FroozERP Retail"}</span>
               <span>{invoice.invoice_no}</span>
               <span>Bill Date: {formatDisplayDate(invoiceDateKey)}</span>
-              <span>Entry Time: {new Date(invoice.created_at).toLocaleString("en-IN")}</span>
+              <span>Entry Time: {invoiceEntryTime}</span>
             </div>
           </header>
           <section className="invoice-customer">
@@ -12812,6 +12972,17 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
             <small>GST-ready invoice - Powered by SRT Company</small>
           </footer>
         </article>
+        {pdfPreview && (
+          <PdfPreviewModal
+            fileName={pdfPreview.fileName}
+            onClose={() => setPdfPreview((current) => {
+              if (current?.url) URL.revokeObjectURL(current.url);
+              return null;
+            })}
+            onSave={() => savePdfResult(pdfPreview)}
+            url={pdfPreview.url}
+          />
+        )}
         {whatsappOpen && (
           <WhatsAppSendModal
             caption={invoiceWhatsappMessage()}
