@@ -1,12 +1,16 @@
 mod local_db;
 
-use local_db::{LocalDbStatus, LocalPosSaleResult, PendingSyncOperation, PulledChange, SyncAck, SyncOperation};
+use local_db::{
+    LocalDbStatus, LocalPosSaleResult, PendingSyncOperation, PulledChange, SyncAck, SyncOperation,
+};
+use serde::Serialize;
 use std::{
     env,
     fs::{self, OpenOptions},
     io::Write,
     panic,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::Command,
     sync::atomic::{AtomicBool, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -14,6 +18,25 @@ use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
 static KIOSK_LOCK_ENABLED: AtomicBool = AtomicBool::new(false);
 static KIOSK_CLOSE_ALLOWED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Serialize, Clone)]
+struct CleanupCandidate {
+    path: String,
+    kind: String,
+    action: String,
+    safe: bool,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CleanupResult {
+    install_path: String,
+    data_path: String,
+    candidates: Vec<CleanupCandidate>,
+    removed: Vec<CleanupCandidate>,
+    blocked: Vec<CleanupCandidate>,
+    message: String,
+}
 
 fn diagnostic_log_path() -> PathBuf {
     env::var_os("APPDATA")
@@ -29,6 +52,162 @@ fn app_data_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| env::temp_dir())
         .join("com.srtcompany.froozerp")
+}
+
+fn normalize_path(path: &Path) -> String {
+    path.to_string_lossy().replace('/', "\\").to_lowercase()
+}
+
+fn is_under(path: &Path, parent: &Path) -> bool {
+    normalize_path(path).starts_with(&normalize_path(parent))
+}
+
+fn current_install_dir() -> PathBuf {
+    env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\FroozERP"))
+}
+
+fn push_shortcut_candidate(candidates: &mut Vec<CleanupCandidate>, path: PathBuf, reason: &str) {
+    if path.exists() {
+        candidates.push(CleanupCandidate {
+            path: path.to_string_lossy().to_string(),
+            kind: "shortcut".to_string(),
+            action: "remove legacy shortcut".to_string(),
+            safe: true,
+            reason: reason.to_string(),
+        });
+    }
+}
+
+fn froozerp_cleanup_candidates() -> CleanupResult {
+    let install_dir = current_install_dir();
+    let data_dir = app_data_dir();
+    let mut candidates = Vec::new();
+    let mut blocked = Vec::new();
+
+    if let Some(user_profile) = env::var_os("USERPROFILE").map(PathBuf::from) {
+        push_shortcut_candidate(
+            &mut candidates,
+            user_profile.join("Desktop").join("FroozERP.lnk"),
+            "old user Desktop shortcut can point to stale app versions",
+        );
+        push_shortcut_candidate(
+            &mut candidates,
+            user_profile
+                .join("AppData")
+                .join("Roaming")
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+                .join("FroozERP.lnk"),
+            "old user Start Menu shortcut replaced by the per-machine FroozERP folder shortcut",
+        );
+        push_shortcut_candidate(
+            &mut candidates,
+            user_profile
+                .join("AppData")
+                .join("Roaming")
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+                .join("Chrome Apps")
+                .join("FroozERP.lnk"),
+            "old Chrome/PWA shortcut can launch a stale web app",
+        );
+    }
+    if let Some(program_data) = env::var_os("PROGRAMDATA").map(PathBuf::from) {
+        push_shortcut_candidate(
+            &mut candidates,
+            program_data
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+                .join("FroozERP.lnk"),
+            "old root-level Start Menu shortcut replaced by Programs\\FroozERP\\FroozERP.lnk",
+        );
+    }
+
+    let legacy_chrome_uninstall_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\d0400be39e01c338dfc0b992b6a2c220";
+    let legacy_chrome_key_exists = Command::new("reg")
+        .args(["query", legacy_chrome_uninstall_key])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if legacy_chrome_key_exists {
+        candidates.push(CleanupCandidate {
+            path: legacy_chrome_uninstall_key.to_string(),
+            kind: "registry-uninstall-entry".to_string(),
+            action: "remove legacy Chrome/PWA uninstall entry".to_string(),
+            safe: true,
+            reason: "old Chrome app entry can make Programs & Features show a duplicate FroozERP version".to_string(),
+        });
+    }
+
+    let mut old_install_paths = Vec::new();
+    if let Some(program_files_x86) = env::var_os("ProgramFiles(x86)").map(PathBuf::from) {
+        old_install_paths.push(program_files_x86.join("FroozERP"));
+    }
+    if let Some(program_files) = env::var_os("ProgramFiles").map(PathBuf::from) {
+        for old_leaf in [
+            "FroozERP-old",
+            "FroozERP Old",
+            "FroozERP Backup",
+            "FroozERP-Backup",
+        ] {
+            old_install_paths.push(program_files.join(old_leaf));
+        }
+    }
+
+    for path in old_install_paths {
+        if !path.exists() || path == install_dir {
+            continue;
+        }
+        if is_under(&path, &data_dir) {
+            blocked.push(CleanupCandidate {
+                path: path.to_string_lossy().to_string(),
+                kind: "install-folder".to_string(),
+                action: "blocked".to_string(),
+                safe: false,
+                reason: "path is inside the FroozERP business data directory".to_string(),
+            });
+            continue;
+        }
+        let has_app_binary =
+            path.join("froozerp.exe").exists() || path.join("uninstall.exe").exists();
+        if has_app_binary {
+            candidates.push(CleanupCandidate {
+                path: path.to_string_lossy().to_string(),
+                kind: "install-folder".to_string(),
+                action: "remove old app install folder".to_string(),
+                safe: true,
+                reason: "verified known old Program Files app folder outside business data"
+                    .to_string(),
+            });
+        } else {
+            blocked.push(CleanupCandidate {
+                path: path.to_string_lossy().to_string(),
+                kind: "install-folder".to_string(),
+                action: "blocked".to_string(),
+                safe: false,
+                reason: "known old install path exists but app binaries were not verified"
+                    .to_string(),
+            });
+        }
+    }
+
+    CleanupResult {
+        install_path: install_dir.to_string_lossy().to_string(),
+        data_path: data_dir.to_string_lossy().to_string(),
+        candidates,
+        removed: Vec::new(),
+        blocked,
+        message: "Old application files detected. Business data paths are excluded.".to_string(),
+    }
 }
 
 fn webview_recovery_marker_path() -> PathBuf {
@@ -72,9 +251,15 @@ fn set_kiosk_mode(app: AppHandle, enabled: bool) -> Result<(), String> {
     if enabled {
         KIOSK_CLOSE_ALLOWED.store(false, Ordering::SeqCst);
     }
-    window.set_fullscreen(enabled).map_err(|error| error.to_string())?;
-    window.set_decorations(!enabled).map_err(|error| error.to_string())?;
-    window.set_resizable(!enabled).map_err(|error| error.to_string())?;
+    window
+        .set_fullscreen(enabled)
+        .map_err(|error| error.to_string())?;
+    window
+        .set_decorations(!enabled)
+        .map_err(|error| error.to_string())?;
+    window
+        .set_resizable(!enabled)
+        .map_err(|error| error.to_string())?;
     write_app_log("INFO", &format!("Kiosk mode set to {}", enabled));
     Ok(())
 }
@@ -95,7 +280,77 @@ fn close_froozerp_window(app: AppHandle, allow_exit: Option<bool>) -> Result<(),
 }
 
 #[tauri::command]
-fn local_cache_reference_snapshot(app: AppHandle, snapshot: serde_json::Value) -> Result<LocalDbStatus, String> {
+fn detect_old_froozerp_versions() -> Result<CleanupResult, String> {
+    Ok(froozerp_cleanup_candidates())
+}
+
+#[tauri::command]
+fn clean_old_froozerp_versions() -> Result<CleanupResult, String> {
+    let mut result = froozerp_cleanup_candidates();
+    let data_dir = app_data_dir();
+    let install_dir = current_install_dir();
+    let candidates = result.candidates.clone();
+    result.candidates = candidates.clone();
+    for candidate in candidates {
+        let path = PathBuf::from(&candidate.path);
+        if !candidate.safe || is_under(&path, &data_dir) || path == install_dir {
+            let mut blocked = candidate.clone();
+            blocked.safe = false;
+            blocked.action = "blocked".to_string();
+            blocked.reason = "cleanup safety check refused this path".to_string();
+            result.blocked.push(blocked);
+            continue;
+        }
+        let cleanup_result = if candidate.kind == "shortcut" {
+            if path.exists() {
+                fs::remove_file(&path)
+            } else {
+                Ok(())
+            }
+        } else if candidate.kind == "install-folder" {
+            if path.exists() {
+                fs::remove_dir_all(&path)
+            } else {
+                Ok(())
+            }
+        } else if candidate.kind == "registry-uninstall-entry" {
+            match Command::new("reg")
+                .args(["delete", &candidate.path, "/f"])
+                .status()
+            {
+                Ok(status) if status.success() => Ok(()),
+                Ok(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "registry cleanup command failed",
+                )),
+                Err(error) => Err(error),
+            }
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "unknown cleanup candidate kind",
+            ))
+        };
+        match cleanup_result {
+            Ok(_) => result.removed.push(candidate),
+            Err(error) => {
+                let mut blocked = candidate.clone();
+                blocked.safe = false;
+                blocked.action = "failed".to_string();
+                blocked.reason = format!("cleanup failed: {}", error);
+                result.blocked.push(blocked);
+            }
+        }
+    }
+    result.message = "Old application file cleanup completed. Business data preserved.".to_string();
+    Ok(result)
+}
+
+#[tauri::command]
+fn local_cache_reference_snapshot(
+    app: AppHandle,
+    snapshot: serde_json::Value,
+) -> Result<LocalDbStatus, String> {
     local_db::cache_reference_snapshot(&app, &snapshot)
 }
 
@@ -144,7 +399,10 @@ fn sync_outbox_count(app: AppHandle) -> Result<i64, String> {
 }
 
 #[tauri::command]
-fn sync_outbox_pending(app: AppHandle, limit: Option<i64>) -> Result<Vec<PendingSyncOperation>, String> {
+fn sync_outbox_pending(
+    app: AppHandle,
+    limit: Option<i64>,
+) -> Result<Vec<PendingSyncOperation>, String> {
     local_db::pending_outbox(&app, limit.unwrap_or(50))
 }
 
@@ -186,17 +444,26 @@ fn sync_queue_test_entity(
 }
 
 #[tauri::command]
-fn pos_sale_complete_local(app: AppHandle, sale: serde_json::Value) -> Result<LocalPosSaleResult, String> {
+fn pos_sale_complete_local(
+    app: AppHandle,
+    sale: serde_json::Value,
+) -> Result<LocalPosSaleResult, String> {
     local_db::complete_local_pos_sale(&app, sale)
 }
 
 #[tauri::command]
-fn pos_sale_edit_local(app: AppHandle, edit: serde_json::Value) -> Result<LocalPosSaleResult, String> {
+fn pos_sale_edit_local(
+    app: AppHandle,
+    edit: serde_json::Value,
+) -> Result<LocalPosSaleResult, String> {
     local_db::edit_local_pos_sale(&app, edit)
 }
 
 #[tauri::command]
-fn pos_sale_cancel_local(app: AppHandle, cancellation: serde_json::Value) -> Result<LocalPosSaleResult, String> {
+fn pos_sale_cancel_local(
+    app: AppHandle,
+    cancellation: serde_json::Value,
+) -> Result<LocalPosSaleResult, String> {
     local_db::cancel_local_pos_sale(&app, cancellation)
 }
 
@@ -226,8 +493,18 @@ pub fn run() {
         if let Some(parent) = panic_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&panic_path) {
-            let _ = writeln!(file, "{} [PANIC] {} at {}", timestamp_ms(), payload, location);
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&panic_path)
+        {
+            let _ = writeln!(
+                file,
+                "{} [PANIC] {} at {}",
+                timestamp_ms(),
+                payload,
+                location
+            );
         }
     }));
 
@@ -236,8 +513,25 @@ pub fn run() {
     let result = tauri::Builder::default()
         .setup(|app| {
             let path = diagnostic_log_path();
-            write_app_log("INFO", &format!("Application log file: {}", path.to_string_lossy()));
+            write_app_log(
+                "INFO",
+                &format!("Application log file: {}", path.to_string_lossy()),
+            );
             write_app_log("INFO", "Tauri setup started");
+            match clean_old_froozerp_versions() {
+                Ok(cleanup) => write_app_log(
+                    "INFO",
+                    &format!(
+                        "Old version cleanup completed: removed={}, blocked={}, data_path={}",
+                        cleanup.removed.len(),
+                        cleanup.blocked.len(),
+                        cleanup.data_path
+                    ),
+                ),
+                Err(error) => {
+                    write_app_log("ERROR", &format!("Old version cleanup failed: {}", error))
+                }
+            }
             let marker = webview_recovery_marker_path();
             if !marker.exists() {
                 if let Some(window) = app.get_webview_window("main") {
@@ -249,10 +543,16 @@ pub fn run() {
                             }
                             let _ = fs::write(&marker, "1.0.0");
                         }
-                        Err(error) => write_app_log("ERROR", &format!("One-time WebView cache recovery failed: {}", error)),
+                        Err(error) => write_app_log(
+                            "ERROR",
+                            &format!("One-time WebView cache recovery failed: {}", error),
+                        ),
                     }
                 } else {
-                    write_app_log("ERROR", "Main window was not available during WebView cache recovery");
+                    write_app_log(
+                        "ERROR",
+                        "Main window was not available during WebView cache recovery",
+                    );
                 }
             }
             write_app_log("INFO", "Tauri setup completed");
@@ -263,6 +563,8 @@ pub fn run() {
             app_log,
             set_kiosk_mode,
             close_froozerp_window,
+            detect_old_froozerp_versions,
+            clean_old_froozerp_versions,
             local_cache_reference_snapshot,
             local_load_reference_snapshot,
             local_get_or_create_device_identity,
@@ -286,7 +588,9 @@ pub fn run() {
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                if KIOSK_LOCK_ENABLED.load(Ordering::SeqCst) && !KIOSK_CLOSE_ALLOWED.load(Ordering::SeqCst) {
+                if KIOSK_LOCK_ENABLED.load(Ordering::SeqCst)
+                    && !KIOSK_CLOSE_ALLOWED.load(Ordering::SeqCst)
+                {
                     api.prevent_close();
                     let _ = window.emit("kiosk-exit-required", ());
                     write_app_log("INFO", "Close prevented by kiosk lock");
@@ -297,7 +601,10 @@ pub fn run() {
         .map_err(|error| error.to_string());
 
     if let Err(error) = result {
-        write_app_log("ERROR", &format!("error while running FroozERP desktop app: {}", error));
+        write_app_log(
+            "ERROR",
+            &format!("error while running FroozERP desktop app: {}", error),
+        );
         panic!("error while running FroozERP desktop app: {}", error);
     }
 }

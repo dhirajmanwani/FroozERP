@@ -76,7 +76,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.15";
+const APP_VERSION = "1.0.16";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -9979,6 +9979,8 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
   const [draft, setDraft] = useState(updateCenter || {});
   const [message, setMessage] = useState("");
   const [lastChecked, setLastChecked] = useState("");
+  const [cleanupResult, setCleanupResult] = useState(null);
+  const [cleanupBusy, setCleanupBusy] = useState(false);
   const status = draft.update_status || "READY_FOR_FUTURE_UPDATES";
   const updateAvailable = ["UPDATE_AVAILABLE", "DOWNLOAD_READY_FUTURE", "DOWNLOADED"].includes(status);
   const updateDownloaded = ["DOWNLOADED", "INSTALL_READY_FUTURE"].includes(status);
@@ -10024,6 +10026,44 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
       setMessage(getErrorMessage(error, "Unable to check update feed"));
     }
   };
+  const detectOldVersions = async () => {
+    try {
+      setCleanupBusy(true);
+      const result = await invokeTauriCommand("detect_old_froozerp_versions");
+      if (!result) {
+        setMessage("Old version cleanup is available only in the Windows desktop app.");
+        return;
+      }
+      setCleanupResult(result);
+      setMessage(`${result.candidates?.length || 0} safe cleanup item(s) found. Data path is excluded.`);
+    } catch (error) {
+      setMessage(getErrorMessage(error, "Unable to detect old FroozERP versions"));
+    } finally {
+      setCleanupBusy(false);
+    }
+  };
+  const cleanOldVersions = async () => {
+    if (!canManage || cleanupBusy) return;
+    const count = cleanupResult?.candidates?.length || 0;
+    const confirmed = window.confirm(
+      `Clean ${count} old FroozERP shortcut/install item(s)?\n\nBusiness data will be preserved:\n${cleanupResult?.data_path || "%APPDATA%\\com.srtcompany.froozerp"}`
+    );
+    if (!confirmed) return;
+    try {
+      setCleanupBusy(true);
+      const result = await invokeTauriCommand("clean_old_froozerp_versions");
+      if (!result) {
+        setMessage("Old version cleanup is available only in the Windows desktop app.");
+        return;
+      }
+      setCleanupResult(result);
+      setMessage(`Old application files cleaned. Business data preserved. Removed ${result.removed?.length || 0}; blocked ${result.blocked?.length || 0}.`);
+    } catch (error) {
+      setMessage(getErrorMessage(error, "Unable to clean old FroozERP versions"));
+    } finally {
+      setCleanupBusy(false);
+    }
+  };
   return (
     <ModuleCard eyebrow="Software Updates" title="FroozERP Windows Updates" subtitle="Updater-ready foundation with local data preservation checks before installing signed releases.">
       <div className="purchase-summary-grid supplier-payment-preview">
@@ -10052,6 +10092,39 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
         <button className="secondary-button" disabled={!canManage || !updateAvailable || updateDownloaded} onClick={() => save("DOWNLOADED")}>Download Update</button>
         {updateDownloaded && <button className="primary-button" disabled={!canManage} onClick={() => save("INSTALL_READY_FUTURE")}>Install Update</button>}
         {updateAvailable && <button className="secondary-button" disabled={!canManage} onClick={() => setMessage("Reminder saved for this session.")}>Remind Me Later</button>}
+      </div>
+      <div className="update-foundation-panel maintenance-cleanup-panel">
+        <strong>Updates / Maintenance</strong>
+        <span>Clean old FroozERP app shortcuts and duplicate install folders. SQLite, backups, logs, device identity, user settings and pending sync data are never removed.</span>
+        <div className="button-row">
+          <button className="secondary-button" disabled={!canManage || cleanupBusy} onClick={detectOldVersions}>Detect Old FroozERP Versions</button>
+          <button className="primary-button" disabled={!canManage || cleanupBusy || !(cleanupResult?.candidates?.length)} onClick={cleanOldVersions}>Clean Old FroozERP Versions</button>
+        </div>
+        {cleanupResult && (
+          <div className="cleanup-result-grid">
+            <SummaryMetric label="Install Path" value={cleanupResult.install_path || "Unknown"} />
+            <SummaryMetric label="Data Path Preserved" value={cleanupResult.data_path || "Unknown"} />
+            <SummaryMetric label="Safe Items" value={cleanupResult.candidates?.length || 0} />
+            <SummaryMetric label="Removed" value={cleanupResult.removed?.length || 0} />
+            <SummaryMetric label="Blocked / Manual" value={cleanupResult.blocked?.length || 0} />
+          </div>
+        )}
+        {Boolean(cleanupResult?.candidates?.length) && (
+          <div className="cleanup-path-list">
+            <strong>Safe cleanup candidates</strong>
+            {cleanupResult.candidates.map((item) => (
+              <small key={`${item.kind}-${item.path}`}>{item.action}: {item.path} — {item.reason}</small>
+            ))}
+          </div>
+        )}
+        {Boolean(cleanupResult?.blocked?.length) && (
+          <div className="cleanup-path-list cleanup-blocked-list">
+            <strong>Blocked / manual review</strong>
+            {cleanupResult.blocked.map((item) => (
+              <small key={`${item.kind}-${item.path}`}>{item.path} — {item.reason}</small>
+            ))}
+          </div>
+        )}
       </div>
     </ModuleCard>
   );

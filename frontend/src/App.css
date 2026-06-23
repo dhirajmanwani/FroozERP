@@ -343,6 +343,36 @@
   max-width: 520px;
 }
 
+.maintenance-cleanup-panel {
+  margin-top: 16px;
+}
+
+.cleanup-result-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.cleanup-path-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.32);
+}
+
+.cleanup-path-list small {
+  color: #cbd5e1;
+  word-break: break-word;
+}
+
+.cleanup-blocked-list {
+  border-color: rgba(248, 113, 113, 0.32);
+}
+
 .status-dot {
   width: 7px;
   height: 7px;
