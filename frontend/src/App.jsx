@@ -1233,7 +1233,11 @@ function App() {
         const recoverable = /backend|network|internet|offline|connect/i.test(current);
         return recoverable ? "" : current;
       });
-      setStartupNotice((current) => current || "Online - FroozERP backend is reachable.");
+      setStartupNotice((current) => (
+        /offline|local sqlite|sync changes later/i.test(current || "")
+          ? "Online - FroozERP backend is reachable."
+          : current || "Online - FroozERP backend is reachable."
+      ));
     }
   }, []);
 
