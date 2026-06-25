@@ -39,11 +39,43 @@ import {
 const isDesktopShell = () => Boolean(window.__TAURI_INTERNALS__ || window.__TAURI__);
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
-const API_URL = (
-  import.meta.env.VITE_API_URL ||
-  window.__FROOZERP_API_URL__ ||
+const normalizeApiBase = (value) => String(value || "").trim().replace(/\/$/, "");
+const API_MODE = String(
+  import.meta.env.VITE_API_MODE ||
+  window.__FROOZERP_API_MODE__ ||
+  "LOCAL_SHOP_SERVER"
+).trim().toUpperCase();
+const LOCAL_API_URL = normalizeApiBase(
+  import.meta.env.VITE_LOCAL_API_URL ||
+  window.__FROOZERP_LOCAL_API_URL__ ||
   (isDesktopShell() ? "http://127.0.0.1:5000" : `${window.location.protocol}//${window.location.hostname}:5000`)
-).replace(/\/$/, "");
+);
+const CLOUD_API_URL = normalizeApiBase(
+  import.meta.env.VITE_CLOUD_API_URL ||
+  window.__FROOZERP_CLOUD_API_URL__ ||
+  ""
+);
+const CUSTOM_API_URL = normalizeApiBase(
+  import.meta.env.VITE_CUSTOM_API_URL ||
+  window.__FROOZERP_CUSTOM_API_URL__ ||
+  ""
+);
+const resolveConfiguredApiUrl = () => {
+  if (API_MODE === "CLOUD_PRODUCTION" && CLOUD_API_URL) return CLOUD_API_URL;
+  if (API_MODE === "CUSTOM_API_URL" && CUSTOM_API_URL) return CUSTOM_API_URL;
+  if (import.meta.env.VITE_API_URL || window.__FROOZERP_API_URL__) {
+    return normalizeApiBase(import.meta.env.VITE_API_URL || window.__FROOZERP_API_URL__);
+  }
+  return LOCAL_API_URL;
+};
+const API_URL = resolveConfiguredApiUrl();
+const API_CONFIG = {
+  mode: API_MODE,
+  apiUrl: API_URL,
+  localApiUrl: LOCAL_API_URL,
+  cloudApiUrl: CLOUD_API_URL || "Not configured",
+  customApiUrl: CUSTOM_API_URL || "Not configured",
+};
 
 const writeDiagnosticLog = async (level, message, details = {}) => {
   const entry = `[FroozERP app] ${message} ${JSON.stringify(details)}`;
@@ -79,7 +111,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.25";
+const APP_VERSION = "1.0.26";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -10482,6 +10514,11 @@ function SyncSettingsSection({
         <Field label="Local Schema Version"><input disabled value={localDbStatus?.schemaVersion || "Not initialized"} /></Field>
         <Field label="Last Push"><input disabled value={lastPush ? new Date(lastPush).toLocaleString("en-IN") : "Not pushed"} /></Field>
         <Field label="Last Pull"><input disabled value={lastPull ? new Date(lastPull).toLocaleString("en-IN") : "Not pulled"} /></Field>
+        <Field label="API Mode"><input disabled value={API_CONFIG.mode} /></Field>
+        <Field label="Selected API URL"><input disabled value={API_CONFIG.apiUrl} /></Field>
+        <Field label="Local Shop API URL"><input disabled value={API_CONFIG.localApiUrl} /></Field>
+        <Field label="Cloud API URL"><input disabled value={API_CONFIG.cloudApiUrl} /></Field>
+        <Field label="Custom API URL"><input disabled value={API_CONFIG.customApiUrl} /></Field>
         <Field label="Settings API Base"><input disabled value={backendHealth?.apiUrl || API_URL} /></Field>
         <Field label="Sync Worker API Base"><input disabled value={syncStatus?.apiUrl || API_URL} /></Field>
         <Field label="Backend Health URL"><input disabled value={backendHealth?.url || `${API_URL}/api/health`} /></Field>
@@ -10548,7 +10585,7 @@ function SecurityDevicesSection({ activationCodes, branches, canManage, counters
         <SummaryMetric label="Pending Requests" value={devices.filter((device) => device.status === "PENDING").length} />
         <SummaryMetric label="Activation Codes" value={activationCodes.filter((code) => code.status === "ACTIVE").length} />
       </div>
-      <DataTable headers={["Device", "Type", "Branch / Counter", "Status", "Last Active", "Actions"]}>
+      <DataTable headers={["Device", "Type", "Branch / Counter", "Status", "Last Active", "Last Sync", "Actions"]}>
         {devices.map((device) => (
           <tr key={device.device_id}>
             <td className="primary-cell">{device.device_name}<small className="cell-note">{device.device_id}</small></td>
@@ -10556,6 +10593,7 @@ function SecurityDevicesSection({ activationCodes, branches, canManage, counters
             <td>{device.branch_name || "Main Branch"}<small className="cell-note">{device.counter_name || "No counter assigned"}</small></td>
             <td><span className={device.status === "APPROVED" ? "stock-ok" : device.status === "PENDING" ? "origin-rate" : "stock-low"}>{device.status}</span></td>
             <td>{device.last_active_at ? new Date(device.last_active_at).toLocaleString("en-IN") : "Not active yet"}</td>
+            <td>{device.last_sync_at ? new Date(device.last_sync_at).toLocaleString("en-IN") : "Not synced"}<small className="cell-note">{device.sync_status || "IDLE"} {device.app_version ? `- v${device.app_version}` : ""}</small></td>
             <td>
               <div className="button-row table-actions-row">
                 <button className="table-action" disabled={!canManage || device.status === "APPROVED"} onClick={() => deviceAction(device, "APPROVE")}>Approve</button>
@@ -10565,7 +10603,7 @@ function SecurityDevicesSection({ activationCodes, branches, canManage, counters
             </td>
           </tr>
         ))}
-        {devices.length === 0 && <tr><td colSpan="6" className="empty-cell">No device requests yet.</td></tr>}
+        {devices.length === 0 && <tr><td colSpan="7" className="empty-cell">No device requests yet.</td></tr>}
       </DataTable>
       <div className="form-grid supplier-form-grid">
         <Field label="Activation Label"><input disabled={!canManage} value={codeDraft.code_label} onChange={(event) => setCodeDraft({ ...codeDraft, code_label: event.target.value })} /></Field>

@@ -23,6 +23,15 @@ const pool = new Pool({
 const port = Number(process.env.PORT) || 5000;
 const host = process.env.HOST || "0.0.0.0";
 const backupDirectory = process.env.BACKUP_DIR || path.join(__dirname, "..", "backups");
+const readReleaseVersion = () => {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
+    return manifest.version || "0.0.0";
+  } catch {
+    return process.env.APP_VERSION || "0.0.0";
+  }
+};
+const appVersion = process.env.APP_VERSION || readReleaseVersion();
 const allowedCorsOrigins = String(process.env.CORS_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim())
@@ -7109,14 +7118,33 @@ const processSyncOperation = async (client, operation, context) => {
   return ack;
 };
 
-app.get("/api/health", async (_req, res) => {
+const healthHandler = async (_req, res) => {
   try {
     await pool.query("SELECT 1");
-    return res.json({ status: "ok", server_time: new Date().toISOString() });
+    return res.json({
+      status: "ok",
+      server_time: new Date().toISOString(),
+      version: appVersion,
+      database: "reachable",
+      mode: process.env.NODE_ENV || "development",
+    });
   } catch (error) {
     console.error("Health check failed", error.message);
     return res.status(503).json({ status: "error", message: "Backend unavailable" });
   }
+};
+
+app.get("/api/health", healthHandler);
+app.get("/health", healthHandler);
+
+app.get("/api/version", (_req, res) => {
+  res.json({
+    status: "ok",
+    version: appVersion,
+    server_time: new Date().toISOString(),
+    node_env: process.env.NODE_ENV || "development",
+    api: "FroozERP Cloud Foundation",
+  });
 });
 
 app.post("/api/sync/register-device", rateLimitSyncRequest, async (req, res) => {
@@ -7257,6 +7285,123 @@ app.get("/api/sync/status", rateLimitSyncRequest, async (req, res) => {
   } catch (error) {
     console.error("Sync status failed", error.message);
     return res.status(500).json({ message: "Sync status failed" });
+  }
+});
+
+app.get("/api/owner/dashboard-foundation", async (req, res) => {
+  try {
+    const branchId = parsePositiveInteger(req.query.branch_id) || 1;
+    const today = new Date().toISOString().slice(0, 10);
+    const [
+      metrics,
+      sales,
+      expenses,
+      stock,
+      devices,
+      processedSync,
+    ] = await Promise.all([
+      getDashboardSummary(),
+      pool.query(
+        `
+        SELECT
+          COUNT(*)::INTEGER AS invoice_count,
+          COALESCE(SUM(total_amount), 0)::NUMERIC AS total_sales,
+          COALESCE(SUM(CASE WHEN payment_mode = 'CREDIT' THEN total_amount ELSE 0 END), 0)::NUMERIC AS credit_sales
+        FROM sales
+        WHERE sale_date = $1
+          AND COALESCE(branch_id, 1) = $2
+          AND COALESCE(sale_status, 'COMPLETED') <> 'CANCELLED'
+        `,
+        [today, branchId]
+      ),
+      pool.query(
+        `
+        SELECT COALESCE(SUM(amount), 0)::NUMERIC AS total_expenses
+        FROM expenses
+        WHERE expense_date = $1
+          AND COALESCE(branch_id, 1) = $2
+          AND COALESCE(status, 'ACTIVE') <> 'CANCELLED'
+        `,
+        [today, branchId]
+      ),
+      pool.query(
+        `
+        SELECT
+          COALESCE(SUM(CASE WHEN COALESCE(remaining_qty, 0) > 0 THEN remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate, 0) ELSE 0 END), 0)::NUMERIC AS stock_value,
+          COUNT(*) FILTER (WHERE COALESCE(remaining_qty, 0) > 0)::INTEGER AS active_lots,
+          COUNT(*) FILTER (WHERE COALESCE(remaining_qty, 0) <= 0)::INTEGER AS empty_lots
+        FROM inventory_batches
+        WHERE COALESCE(branch_id, 1) = $1
+          AND COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'
+        `,
+        [branchId]
+      ),
+      pool.query(
+        `
+        SELECT device_id, device_name, device_type, platform, status, last_active_at, last_sync_at, sync_status, app_version
+        FROM authorized_devices
+        ORDER BY COALESCE(last_sync_at, last_active_at, created_at) DESC NULLS LAST
+        LIMIT 50
+        `
+      ),
+      pool.query(
+        `
+        SELECT COUNT(*)::INTEGER AS processed_count
+        FROM sync_processed_operations
+        WHERE processed_at >= NOW() - INTERVAL '1 day'
+        `
+      ),
+    ]);
+
+    const cashBank = await pool.query(
+      `
+      SELECT
+        COALESCE(SUM(CASE WHEN payment_mode = 'CASH' THEN amount ELSE 0 END), 0)::NUMERIC AS cash_total,
+        COALESCE(SUM(CASE WHEN payment_mode IN ('UPI', 'BANK_TRANSFER') THEN amount ELSE 0 END), 0)::NUMERIC AS bank_upi_total,
+        COALESCE(SUM(CASE WHEN payment_mode = 'CARD' THEN amount ELSE 0 END), 0)::NUMERIC AS card_total
+      FROM sale_payments
+      WHERE payment_time::date = $1
+        AND COALESCE(branch_id, 1) = $2
+        AND COALESCE(status, 'POSTED') = 'POSTED'
+      `,
+      [today, branchId]
+    );
+
+    return res.json({
+      status: "ok",
+      branch_id: branchId,
+      server_time: new Date().toISOString(),
+      data_freshness: {
+        source: "cloud-postgresql",
+        live: true,
+        message: "Live cloud data from current backend database.",
+      },
+      today: {
+        date: today,
+        invoice_count: sales.rows[0]?.invoice_count || 0,
+        total_sales: Number(sales.rows[0]?.total_sales || metrics.todaySales || 0),
+        cash_total: Number(cashBank.rows[0]?.cash_total || 0),
+        bank_upi_total: Number(cashBank.rows[0]?.bank_upi_total || 0),
+        card_total: Number(cashBank.rows[0]?.card_total || 0),
+        credit_sales: Number(sales.rows[0]?.credit_sales || 0),
+        expenses: Number(expenses.rows[0]?.total_expenses || metrics.todayExpenses || 0),
+      },
+      balances: {
+        customer_receivables: Number(metrics.customerOutstanding || 0),
+        supplier_payables: Number(metrics.supplierOutstanding || 0),
+        stock_value: Number(stock.rows[0]?.stock_value || metrics.stockValue || 0),
+        active_lots: stock.rows[0]?.active_lots || 0,
+        empty_lots: stock.rows[0]?.empty_lots || 0,
+      },
+      devices: devices.rows,
+      sync: {
+        processed_operations_last_24h: processedSync.rows[0]?.processed_count || 0,
+        note: "Device-local pending queue is reported by each authorised device during sync.",
+      },
+    });
+  } catch (error) {
+    console.error("Owner dashboard foundation failed", error.message);
+    return res.status(500).json({ message: "Owner dashboard foundation failed" });
   }
 });
 
