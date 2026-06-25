@@ -2,6 +2,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import axios from "axios";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
+import * as pdfjsLib from "pdfjs-dist";
+import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
 import QRCode from "qrcode";
 import "./App.css";
 import {
@@ -35,6 +37,7 @@ import {
 } from "./local/syncService";
 
 const isDesktopShell = () => Boolean(window.__TAURI_INTERNALS__ || window.__TAURI__);
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 const API_URL = (
   import.meta.env.VITE_API_URL ||
@@ -76,7 +79,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.17";
+const APP_VERSION = "1.0.25";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -320,9 +323,10 @@ const formatDisplayDate = (dateValue) => {
 const formatFileDate = (dateValue) => formatDisplayDate(dateValue).replaceAll("/", "-");
 const safeFileName = (value) =>
   String(value || "FroozERP_Document")
-    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "")
-    .replace(/\s+/g, "_")
-    .replace(/_+/g, "_")
+    .replace(/&/g, " and ")
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, " ")
+    .replace(/[\s_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
     .slice(0, 140);
 const withDocumentTitle = (fileName, action) => {
   const previousTitle = document.title;
@@ -365,9 +369,21 @@ const formatEntryTime = (invoice = {}) => {
   if (!savedTimestamp) return "Not recorded";
   return savedTimestamp.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" });
 };
-const createPdfPreviewUrl = (blob) => URL.createObjectURL(blob);
+const ensurePdfBlob = (blob) => {
+  if (!blob) throw new Error("PDF data is missing");
+  return blob.type === "application/pdf" ? blob : new Blob([blob], { type: "application/pdf" });
+};
 const savePdfResult = async ({ blob, fileName, pdf }) => {
   const finalFileName = safeFileName(fileName).replace(/\.pdf$/i, "") + ".pdf";
+  const pdfBlob = ensurePdfBlob(blob);
+  if (isDesktopShell()) {
+    const bytes = Array.from(new Uint8Array(await pdfBlob.arrayBuffer()));
+    const savedPath = await invokeTauriCommand("save_pdf_with_dialog", {
+      fileName: finalFileName,
+      bytes,
+    });
+    return { fileName: finalFileName, method: "tauri-save-dialog", path: savedPath, canceled: !savedPath };
+  }
   if (window.showSaveFilePicker) {
     try {
       const handle = await window.showSaveFilePicker({
@@ -378,7 +394,7 @@ const savePdfResult = async ({ blob, fileName, pdf }) => {
         }],
       });
       const writable = await handle.createWritable();
-      await writable.write(blob);
+      await writable.write(pdfBlob);
       await writable.close();
       return { fileName: finalFileName, method: "save-picker" };
     } catch (error) {
@@ -388,6 +404,19 @@ const savePdfResult = async ({ blob, fileName, pdf }) => {
   }
   pdf.save(finalFileName);
   return { fileName: finalFileName, method: "browser-download" };
+};
+const openPdfInSystemViewer = async ({ blob, fileName }) => {
+  const pdfBlob = ensurePdfBlob(blob);
+  const bytes = Array.from(new Uint8Array(await pdfBlob.arrayBuffer()));
+  const openedPath = await invokeTauriCommand("open_pdf_in_system_viewer", {
+    fileName: safeFileName(fileName).replace(/\.pdf$/i, "") + ".pdf",
+    bytes,
+  });
+  if (openedPath) return openedPath;
+  const url = URL.createObjectURL(pdfBlob);
+  window.open(url, "_blank", "noopener,noreferrer");
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+  return url;
 };
 const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth = "80MM", printProfile = "", save = true }) => {
   if (!element) throw new Error("Nothing to export");
@@ -431,7 +460,7 @@ const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth
       }
     }
     const finalFileName = safeFileName(fileName).replace(/\.pdf$/i, "") + ".pdf";
-    const blob = pdf.output("blob");
+    const blob = ensurePdfBlob(pdf.output("blob"));
     const saveResult = save ? await savePdfResult({ blob, fileName: finalFileName, pdf }) : null;
     return { blob, fileName: finalFileName, pdf, saveResult };
   } finally {
@@ -4931,7 +4960,112 @@ function WhatsAppSendModal({
   );
 }
 
-function PdfPreviewModal({ fileName, onClose, onSave, url }) {
+function PdfPageCanvas({ page, zoom }) {
+  const canvasRef = useRef(null);
+  const [renderError, setRenderError] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    let renderTask = null;
+    const render = async () => {
+      try {
+        setRenderError("");
+        const viewport = page.getViewport({ scale: zoom });
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const context = canvas.getContext("2d", { alpha: false });
+        const outputScale = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+        canvas.width = Math.floor(viewport.width * outputScale);
+        canvas.height = Math.floor(viewport.height * outputScale);
+        canvas.style.width = `${Math.floor(viewport.width)}px`;
+        canvas.style.height = `${Math.floor(viewport.height)}px`;
+        context.setTransform(outputScale, 0, 0, outputScale, 0, 0);
+        renderTask = page.render({ canvasContext: context, viewport });
+        await renderTask.promise;
+      } catch (error) {
+        if (!cancelled && error?.name !== "RenderingCancelledException") {
+          setRenderError(error?.message || "Unable to render this PDF page.");
+        }
+      }
+    };
+    render();
+    return () => {
+      cancelled = true;
+      renderTask?.cancel?.();
+    };
+  }, [page, zoom]);
+  return (
+    <div className="pdf-page-shell">
+      <canvas ref={canvasRef} />
+      {renderError && <div className="pdf-preview-error">{renderError}</div>}
+    </div>
+  );
+}
+
+function PdfPreviewModal({ blob, fileName, onClose, onSave }) {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [pages, setPages] = useState([]);
+  const [zoom, setZoom] = useState(1);
+  const [opening, setOpening] = useState(false);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    let loadingTask = null;
+    const load = async () => {
+      try {
+        setLoading(true);
+        setError("");
+        const pdfBlob = ensurePdfBlob(blob);
+        const header = new Uint8Array(await pdfBlob.slice(0, 5).arrayBuffer());
+        const signature = String.fromCharCode(...header);
+        if (signature !== "%PDF-") {
+          throw new Error("The generated file is not a valid PDF document.");
+        }
+        const bytes = new Uint8Array(await pdfBlob.arrayBuffer());
+        loadingTask = pdfjsLib.getDocument({ data: bytes });
+        const document = await loadingTask.promise;
+        const loadedPages = [];
+        for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
+          loadedPages.push(await document.getPage(pageNumber));
+        }
+        if (!cancelled) setPages(loadedPages);
+      } catch (loadError) {
+        if (!cancelled) {
+          setError(loadError?.message || "Unable to preview this PDF inside FroozERP.");
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    load();
+    return () => {
+      cancelled = true;
+      loadingTask?.destroy?.();
+    };
+  }, [blob]);
+  const openFallback = async () => {
+    setOpening(true);
+    try {
+      await openPdfInSystemViewer({ blob, fileName });
+    } catch (openError) {
+      console.error("FroozERP PDF system viewer failed", openError);
+      alert("Unable to open PDF in system viewer. Please save the PDF and open it manually.");
+    } finally {
+      setOpening(false);
+    }
+  };
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      const result = await onSave?.();
+      if (result?.canceled) return;
+      if (result?.path) alert(`PDF saved successfully:\n${result.path}`);
+    } catch (saveError) {
+      alert(`Unable to save PDF: ${saveError.message || saveError}`);
+    } finally {
+      setSaving(false);
+    }
+  };
   return (
     <div className="modal-backdrop">
       <section className="invoice-modal pdf-preview-modal">
@@ -4939,13 +5073,31 @@ function PdfPreviewModal({ fileName, onClose, onSave, url }) {
           <div>
             <span className="eyebrow">PDF Preview</span>
             <strong>{fileName}</strong>
+            <small>{loading ? "Loading PDF pages..." : error ? "Preview fallback available" : `${pages.length} page${pages.length === 1 ? "" : "s"} rendered inside FroozERP`}</small>
           </div>
           <div className="invoice-actions">
-            <button className="primary-button" onClick={onSave}>Save PDF</button>
+            <button className="secondary-button" disabled={loading || Boolean(error)} onClick={() => setZoom((value) => Math.max(0.65, Number((value - 0.1).toFixed(2))))}>Zoom -</button>
+            <span className="tag">{Math.round(zoom * 100)}%</span>
+            <button className="secondary-button" disabled={loading || Boolean(error)} onClick={() => setZoom((value) => Math.min(1.8, Number((value + 0.1).toFixed(2))))}>Zoom +</button>
+            <button className="secondary-button" disabled={loading || Boolean(error)} onClick={() => window.print()}><Icon name="print" /> Print</button>
+            <button className="primary-button" disabled={saving} onClick={handleSave}>{saving ? "Saving..." : "Save PDF"}</button>
+            <button className="secondary-button" disabled={opening} onClick={openFallback}>{opening ? "Opening..." : "Open in System Viewer"}</button>
             <button aria-label="Close PDF preview" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
-        <iframe className="pdf-preview-frame" src={url} title={fileName} />
+        <div className="pdf-preview-pages">
+          {loading && <div className="cart-empty">Rendering PDF preview inside FroozERP...</div>}
+          {error && (
+            <div className="pdf-preview-fallback">
+              <strong>Unable to render PDF preview inside FroozERP.</strong>
+              <p>{error}</p>
+              <button className="primary-button" disabled={opening} onClick={openFallback}>{opening ? "Opening..." : "Open PDF in system viewer"}</button>
+            </div>
+          )}
+          {!loading && !error && pages.map((page, index) => (
+            <PdfPageCanvas key={index + 1} page={page} zoom={zoom} />
+          ))}
+        </div>
       </section>
     </div>
   );
@@ -5138,9 +5290,6 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
   const reportRef = useRef(null);
   const reportProfileKey = `report_${safeFileName(reportClassName || title || "report")}`;
   const printProfile = readStoredPrintProfile(reportProfileKey) || getReportPrintProfile(reportClassName);
-  useEffect(() => () => {
-    if (pdfPreview?.url) URL.revokeObjectURL(pdfPreview.url);
-  }, [pdfPreview?.url]);
   const printReport = () => {
     if (beforePrint && beforePrint() === false) return;
     rememberPrintProfile(reportProfileKey, printProfile);
@@ -5190,10 +5339,7 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
         printProfile,
         save: false,
       });
-      setPdfPreview((current) => {
-        if (current?.url) URL.revokeObjectURL(current.url);
-        return { ...result, url: createPdfPreviewUrl(result.blob) };
-      });
+      setPdfPreview({ ...result });
     } catch (error) {
       alert(`Unable to view PDF: ${error.message}`);
     } finally {
@@ -5236,12 +5382,9 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
       {pdfPreview && (
         <PdfPreviewModal
           fileName={pdfPreview.fileName}
-          onClose={() => setPdfPreview((current) => {
-            if (current?.url) URL.revokeObjectURL(current.url);
-            return null;
-          })}
+          blob={pdfPreview.blob}
+          onClose={() => setPdfPreview(null)}
           onSave={() => savePdfResult(pdfPreview)}
-          url={pdfPreview.url}
         />
       )}
       {whatsappOpen && (
@@ -12801,9 +12944,6 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
       active = false;
     };
   }, [qrCodeWidth, upiPayload]);
-  useEffect(() => () => {
-    if (pdfPreview?.url) URL.revokeObjectURL(pdfPreview.url);
-  }, [pdfPreview?.url]);
   const invoiceDateKey = toDateKey(invoice.sale_date || invoice.transaction_date || invoice.created_at);
   const invoiceFileName = () => `FroozERP-Invoice-${safeFileName(invoice.invoice_no || `SALE-${invoice.id}`)}.pdf`;
   const invoiceEntryTime = formatEntryTime(invoice);
@@ -12842,10 +12982,7 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
     setExporting(true);
     try {
       const result = await exportInvoicePdf(mode, false);
-      setPdfPreview((current) => {
-        if (current?.url) URL.revokeObjectURL(current.url);
-        return { ...result, url: createPdfPreviewUrl(result.blob) };
-      });
+      setPdfPreview({ ...result });
     } catch (error) {
       alert(`Unable to view invoice PDF: ${error.message}`);
     } finally {
@@ -12975,12 +13112,9 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
         {pdfPreview && (
           <PdfPreviewModal
             fileName={pdfPreview.fileName}
-            onClose={() => setPdfPreview((current) => {
-              if (current?.url) URL.revokeObjectURL(current.url);
-              return null;
-            })}
+            blob={pdfPreview.blob}
+            onClose={() => setPdfPreview(null)}
             onSave={() => savePdfResult(pdfPreview)}
-            url={pdfPreview.url}
           />
         )}
         {whatsappOpen && (

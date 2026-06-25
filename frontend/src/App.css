@@ -4,6 +4,59 @@
   font-size: var(--font-size-base);
 }
 
+@media print {
+  body:has(.pdf-preview-pages) * {
+    visibility: hidden !important;
+  }
+
+  body:has(.pdf-preview-pages),
+  body:has(.pdf-preview-pages) .modal-backdrop,
+  body:has(.pdf-preview-pages) .pdf-preview-modal,
+  body:has(.pdf-preview-pages) .pdf-preview-pages,
+  body:has(.pdf-preview-pages) .pdf-page-shell,
+  body:has(.pdf-preview-pages) .pdf-page-shell canvas {
+    visibility: visible !important;
+  }
+
+  body:has(.pdf-preview-pages) .modal-backdrop,
+  body:has(.pdf-preview-pages) .pdf-preview-modal,
+  body:has(.pdf-preview-pages) .pdf-preview-pages {
+    position: static !important;
+    display: block !important;
+    width: auto !important;
+    height: auto !important;
+    max-width: none !important;
+    max-height: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+    border: 0 !important;
+    background: #ffffff !important;
+    box-shadow: none !important;
+  }
+
+  body:has(.pdf-preview-pages) .invoice-toolbar {
+    display: none !important;
+  }
+
+  body:has(.pdf-preview-pages) .pdf-page-shell {
+    width: auto !important;
+    max-width: 100% !important;
+    margin: 0 0 8mm !important;
+    padding: 0 !important;
+    border: 0 !important;
+    background: #ffffff !important;
+    box-shadow: none !important;
+    break-after: page;
+    page-break-after: always;
+  }
+
+  body:has(.pdf-preview-pages) .pdf-page-shell:last-child {
+    break-after: auto;
+    page-break-after: auto;
+  }
+}
+
 @media screen {
   :where(.erp-shell, .login-shell, .modal-backdrop) {
     font-size: var(--font-size-base) !important;
@@ -2646,13 +2699,48 @@ tbody tr:last-child td {
   grid-template-rows: auto minmax(0, 1fr);
 }
 
-.pdf-preview-frame {
+.pdf-preview-pages {
   width: calc(100% - 32px);
   height: calc(100% - 16px);
   margin: 0 16px 16px;
+  padding: 18px;
+  overflow: auto;
   border: 1px solid rgba(148, 163, 184, 0.22);
   border-radius: 12px;
+  background: rgba(2, 6, 23, 0.55);
+}
+
+.pdf-page-shell {
+  width: fit-content;
+  max-width: 100%;
+  margin: 0 auto 18px;
+  padding: 10px;
+  border-radius: 8px;
   background: #ffffff;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.32);
+}
+
+.pdf-page-shell canvas {
+  display: block;
+  max-width: 100%;
+  height: auto !important;
+  image-rendering: auto;
+}
+
+.pdf-preview-error,
+.pdf-preview-fallback {
+  padding: 18px;
+  border: 1px solid rgba(248, 113, 113, 0.36);
+  border-radius: 12px;
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.18);
+}
+
+.pdf-preview-fallback {
+  display: grid;
+  gap: 10px;
+  max-width: 620px;
+  margin: 32px auto;
 }
 
 .whatsapp-send-modal {

@@ -14,6 +14,15 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::Controls::Dialogs::{
+    CommDlgExtendedError, GetSaveFileNameW, OPENFILENAMEW, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
+};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::{
+    Shell::ShellExecuteW,
+    WindowsAndMessaging::SW_SHOWNORMAL,
+};
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
 static KIOSK_LOCK_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -240,6 +249,189 @@ fn app_log_path() -> Result<String, String> {
 fn app_log(level: Option<String>, message: String) -> Result<(), String> {
     write_app_log(level.as_deref().unwrap_or("INFO"), &message);
     Ok(())
+}
+
+fn sanitize_file_name(value: &str) -> String {
+    let normalized_source = value.replace('&', " and ");
+    let cleaned: String = normalized_source
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '-',
+            ch if ch.is_control() => '-',
+            ch => ch,
+        })
+        .collect();
+    let mut collapsed = String::with_capacity(cleaned.len());
+    let mut previous_separator = false;
+    for ch in cleaned.chars() {
+        if ch.is_whitespace() || ch == '_' || ch == '-' {
+            if !previous_separator {
+                collapsed.push('-');
+                previous_separator = true;
+            }
+        } else {
+            collapsed.push(ch);
+            previous_separator = false;
+        }
+    }
+    let trimmed = collapsed.trim_matches([' ', '.', '-']).trim();
+    if trimmed.is_empty() {
+        "FroozERP-Document.pdf".to_string()
+    } else if trimmed.to_ascii_lowercase().ends_with(".pdf") {
+        trimmed.to_string()
+    } else {
+        format!("{}.pdf", trimmed)
+    }
+}
+
+fn unique_preview_pdf_path(preview_dir: &Path, file_name: &str) -> PathBuf {
+    let sanitized = sanitize_file_name(file_name);
+    let base_path = preview_dir.join(&sanitized);
+    if !base_path.exists() {
+        return base_path;
+    }
+
+    let (stem, extension) = sanitized
+        .rsplit_once('.')
+        .map(|(stem, extension)| (stem.to_string(), format!(".{}", extension)))
+        .unwrap_or_else(|| (sanitized.clone(), String::new()));
+
+    for index in 1..1000 {
+        let candidate = preview_dir.join(format!("{}-({}){}", stem, index, extension));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    preview_dir.join(format!("{}-{}.pdf", stem, timestamp_ms()))
+}
+
+#[tauri::command]
+fn open_pdf_in_system_viewer(file_name: String, bytes: Vec<u8>) -> Result<String, String> {
+    if bytes.is_empty() {
+        return Err("PDF file is empty".to_string());
+    }
+    let preview_dir = app_data_dir().join("pdf-preview");
+    fs::create_dir_all(&preview_dir).map_err(|error| error.to_string())?;
+    let path = unique_preview_pdf_path(&preview_dir, &file_name);
+    fs::write(&path, bytes).map_err(|error| error.to_string())?;
+    if !path.is_file() {
+        return Err("PDF preview file was not created".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    open_path_with_windows_shell(&path)?;
+    #[cfg(not(target_os = "windows"))]
+    Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" })
+        .arg(&path)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(target_os = "windows")]
+fn open_path_with_windows_shell(path: &Path) -> Result<(), String> {
+    let operation = wide_null("open");
+    let file = wide_null(&path.to_string_lossy());
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if (result as isize) <= 32 {
+        return Err(format!("Windows shell open failed with code {}", result as isize));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn save_pdf_path_with_windows_dialog(suggested_name: &str) -> Result<Option<PathBuf>, String> {
+    let mut file_buffer = vec![0u16; 32768];
+    let suggested = wide_null(suggested_name);
+    let copy_len = suggested.len().min(file_buffer.len());
+    file_buffer[..copy_len].copy_from_slice(&suggested[..copy_len]);
+
+    let filter = wide_null("PDF documents (*.pdf)\0*.pdf\0All files (*.*)\0*.*\0");
+    let title = wide_null("Save FroozERP PDF");
+    let initial_dir = env::var("USERPROFILE")
+        .map(|home| PathBuf::from(home).join("Desktop"))
+        .ok()
+        .filter(|path| path.exists())
+        .map(|path| wide_null(&path.to_string_lossy()));
+
+    let mut dialog: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    dialog.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    dialog.lpstrFilter = filter.as_ptr();
+    dialog.lpstrFile = file_buffer.as_mut_ptr();
+    dialog.nMaxFile = file_buffer.len() as u32;
+    dialog.lpstrTitle = title.as_ptr();
+    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    if let Some(initial_dir) = initial_dir.as_ref() {
+        dialog.lpstrInitialDir = initial_dir.as_ptr();
+    }
+
+    let accepted = unsafe { GetSaveFileNameW(&mut dialog) };
+    if accepted == 0 {
+        let error_code = unsafe { CommDlgExtendedError() };
+        if error_code == 0 {
+            return Ok(None);
+        }
+        return Err(format!("Windows save dialog failed with code {}", error_code));
+    }
+
+    let selected_len = file_buffer
+        .iter()
+        .position(|ch| *ch == 0)
+        .unwrap_or(file_buffer.len());
+    let selected = String::from_utf16_lossy(&file_buffer[..selected_len]);
+    if selected.trim().is_empty() {
+        return Ok(None);
+    }
+    let mut path = PathBuf::from(selected);
+    if path.extension().is_none() {
+        path.set_extension("pdf");
+    }
+    Ok(Some(path))
+}
+
+#[tauri::command]
+fn save_pdf_with_dialog(file_name: String, bytes: Vec<u8>) -> Result<Option<String>, String> {
+    if bytes.is_empty() {
+        return Err("PDF file is empty".to_string());
+    }
+    let suggested_name = sanitize_file_name(&file_name);
+    #[cfg(target_os = "windows")]
+    let selected_path = save_pdf_path_with_windows_dialog(&suggested_name)?;
+    #[cfg(not(target_os = "windows"))]
+    let selected_path = {
+        let fallback_dir = app_data_dir().join("pdf-export");
+        fs::create_dir_all(&fallback_dir).map_err(|error| error.to_string())?;
+        Some(fallback_dir.join(&suggested_name))
+    };
+    let Some(path) = selected_path else {
+        return Ok(None);
+    };
+    let path = if path.extension().is_none() {
+        let mut with_extension = path;
+        with_extension.set_extension("pdf");
+        with_extension
+    } else {
+        path
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(&path, bytes).map_err(|error| error.to_string())?;
+    Ok(Some(path.to_string_lossy().to_string()))
 }
 
 #[tauri::command]
@@ -561,6 +753,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_log_path,
             app_log,
+            open_pdf_in_system_viewer,
+            save_pdf_with_dialog,
             set_kiosk_mode,
             close_froozerp_window,
             detect_old_froozerp_versions,
