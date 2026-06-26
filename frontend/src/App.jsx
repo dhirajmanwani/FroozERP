@@ -77,6 +77,95 @@ const API_CONFIG = {
   customApiUrl: CUSTOM_API_URL || "Not configured",
 };
 
+const API_MODE_LABELS = {
+  LOCAL_SHOP_SERVER: "Local Shop Server",
+  CLOUD_PRODUCTION: "Cloud Production",
+  CUSTOM_API_URL: "Custom API URL",
+};
+
+const getApiModeLabel = () => API_MODE_LABELS[API_MODE] || API_MODE;
+
+const isCloudConfigured = () => Boolean(CLOUD_API_URL);
+
+const formatStatusDateTime = (value) => {
+  if (!value) return "";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "" : date.toLocaleString("en-IN");
+};
+
+const buildConnectionStatusModel = ({ backendHealth = {}, syncStatus = {}, internetAvailable = true }) => {
+  const pending = Number(syncStatus?.pendingOperations || 0);
+  const failed = Number(syncStatus?.failedOperations || 0);
+  const conflicts = Number(syncStatus?.conflictOperations || 0);
+  const backendOnline = backendHealth?.online === true;
+  const backendOffline = backendHealth?.online === false;
+  const apiModeLabel = getApiModeLabel();
+  const lastSyncText = formatStatusDateTime(syncStatus?.lastSuccessfulSyncAt || syncStatus?.lastPullAt || syncStatus?.lastPushAt);
+
+  let localBackendStatus = "Not selected";
+  let cloudBackendStatus = isCloudConfigured() ? "Configured - not checked" : "Cloud sync not configured";
+  if (API_MODE === "LOCAL_SHOP_SERVER") {
+    localBackendStatus = backendOnline ? "Local Backend Reachable" : backendOffline ? "Local Backend Offline" : "Local Backend Checking";
+    cloudBackendStatus = isCloudConfigured() ? "Cloud configured - not selected" : "Cloud sync not active";
+  } else if (API_MODE === "CLOUD_PRODUCTION") {
+    localBackendStatus = "Local backend not selected";
+    cloudBackendStatus = backendOnline ? "Cloud Backend Reachable" : backendOffline ? "Cloud Backend Offline" : "Cloud Backend Checking";
+  } else {
+    localBackendStatus = "Custom API selected";
+    cloudBackendStatus = isCloudConfigured() ? "Cloud configured - not selected" : "Cloud sync not active";
+  }
+
+  let syncSummary = "Backend status not checked";
+  if (failed > 0 || syncStatus?.lastError) {
+    syncSummary = `Sync Failed${syncStatus?.lastError ? ` - ${syncStatus.lastError}` : ""}`;
+  } else if (conflicts > 0) {
+    syncSummary = "Conflict";
+  } else if (syncStatus?.syncing) {
+    const done = Number(syncStatus?.syncProgressDone || 0);
+    const total = Number(syncStatus?.syncProgressTotal || pending || 0);
+    syncSummary = total ? `Syncing ${done} of ${total}` : "Syncing";
+  } else if (backendOffline) {
+    syncSummary = pending > 0 ? `Offline Queue Active - ${pending} pending` : "Offline Queue Active";
+  } else if (pending > 0) {
+    syncSummary = `Sync Pending - ${pending} pending`;
+  } else if (API_MODE === "CLOUD_PRODUCTION" && backendOnline) {
+    syncSummary = lastSyncText ? `Synced - last sync ${lastSyncText}` : "Cloud online - sync not completed yet";
+  } else if (API_MODE === "LOCAL_SHOP_SERVER" && backendOnline) {
+    syncSummary = "Cloud Sync Offline / Not Connected";
+  } else if (backendOnline) {
+    syncSummary = "Selected backend reachable";
+  }
+
+  let banner = "Checking FroozERP backend status...";
+  if (backendOffline) {
+    banner = API_MODE === "CLOUD_PRODUCTION"
+      ? `Cloud offline. Local work is saved safely. Pending sync: ${pending}.`
+      : "Offline mode active. FroozERP is using local SQLite data. Changes will sync when backend/cloud is reachable.";
+  } else if (API_MODE === "LOCAL_SHOP_SERVER" && backendOnline) {
+    banner = "Local server reachable. Cloud sync is not active.";
+  } else if (API_MODE === "CLOUD_PRODUCTION" && backendOnline) {
+    banner = `Cloud online.${lastSyncText ? ` Last sync completed at ${lastSyncText}.` : " Sync is ready."}`;
+  } else if (backendOnline) {
+    banner = "Selected backend API is reachable.";
+  }
+
+  return {
+    apiModeLabel,
+    internetStatus: internetAvailable ? "Internet Available" : "No Internet",
+    localBackendStatus,
+    cloudBackendStatus,
+    currentApiUrl: backendHealth?.apiUrl || API_URL,
+    lastHealthCheck: formatStatusDateTime(backendHealth?.lastCheckedAt) || "Not checked",
+    lastSuccessfulSync: lastSyncText || "Not synced",
+    pending,
+    failed,
+    conflicts,
+    syncSummary,
+    banner,
+    detail: `${syncSummary}. API mode: ${apiModeLabel}.`,
+  };
+};
+
 const writeDiagnosticLog = async (level, message, details = {}) => {
   const entry = `[FroozERP app] ${message} ${JSON.stringify(details)}`;
   console.info(entry);
@@ -111,7 +200,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.28";
+const APP_VERSION = "1.0.29";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -909,6 +998,9 @@ function App() {
   const [activeView, setActiveView] = useState(initialView);
   const [applicationFontSize, setApplicationFontSize] = useState(getStoredApplicationFontSize);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [internetAvailable, setInternetAvailable] = useState(() => (
+    typeof navigator === "undefined" ? true : navigator.onLine !== false
+  ));
   const [products, setProducts] = useState([]);
   const [productCategories, setProductCategories] = useState([]);
   const [productDuplicateWarning, setProductDuplicateWarning] = useState("");
@@ -1110,6 +1202,19 @@ function App() {
   }, [applicationFontSize]);
 
   useEffect(() => {
+    const updateInternetStatus = () => setInternetAvailable(typeof navigator === "undefined" ? true : navigator.onLine !== false);
+    window.addEventListener("online", updateInternetStatus);
+    window.addEventListener("offline", updateInternetStatus);
+    updateInternetStatus();
+    return () => {
+      window.removeEventListener("online", updateInternetStatus);
+      window.removeEventListener("offline", updateInternetStatus);
+    };
+  }, []);
+
+  const connectionStatus = buildConnectionStatusModel({ backendHealth, syncStatus, internetAvailable });
+
+  useEffect(() => {
     const fullscreenEnabled = settingsData.deviceControlSettings?.fullscreen_lock_enabled === true;
     invokeTauriCommand("set_kiosk_mode", { enabled: fullscreenEnabled }).catch((error) => {
       if (fullscreenEnabled) writeDiagnosticLog("ERROR", "Unable to apply fullscreen lock mode", { error: String(error?.message || error) });
@@ -1219,7 +1324,8 @@ function App() {
       branchId: user.branch_id || 1,
     });
     setSyncStatus(status);
-    setSyncMessage(status.lastError ? `Sync failed: ${status.lastError}` : "Sync complete");
+    const nextStatus = buildConnectionStatusModel({ backendHealth, syncStatus: status, internetAvailable });
+    setSyncMessage(status.lastError ? `Sync failed: ${status.lastError}` : nextStatus.syncSummary);
     return status;
   };
 
@@ -1234,9 +1340,9 @@ function App() {
         return recoverable ? "" : current;
       });
       setStartupNotice((current) => (
-        /offline|local sqlite|sync changes later/i.test(current || "")
-          ? "Online - FroozERP backend is reachable."
-          : current || "Online - FroozERP backend is reachable."
+        /offline|local sqlite|sync changes later|online login succeeded|local reference data/i.test(current || "")
+          ? buildConnectionStatusModel({ backendHealth: health, syncStatus, internetAvailable }).banner
+          : current || buildConnectionStatusModel({ backendHealth: health, syncStatus, internetAvailable }).banner
       ));
     } else {
       setStartupNotice("Offline mode is active. FroozERP loaded your local SQLite data and will sync changes later.");
@@ -1259,17 +1365,18 @@ function App() {
         user: userRef.current,
         deviceInfo: deviceInfoRef.current,
         branchId: userRef.current.branch_id || 1,
-      })
+        })
         .then((status) => {
           setSyncStatus(status);
-          setSyncMessage(status.lastError ? `Sync failed: ${status.lastError}` : "Online - pending changes checked for sync");
+          const nextStatus = buildConnectionStatusModel({ backendHealth: health, syncStatus: status, internetAvailable });
+          setSyncMessage(status.lastError ? `Sync failed: ${status.lastError}` : nextStatus.syncSummary);
         })
         .finally(() => {
           reconnectSyncRef.current = false;
         });
     }
     return health;
-  }, [applyConnectivityState]);
+  }, [applyConnectivityState, internetAvailable]);
 
   useEffect(() => subscribeConnectivity(applyConnectivityState), [applyConnectivityState]);
 
@@ -1833,7 +1940,11 @@ function App() {
       });
       setLocalDbStatus(status);
     }
-    setStartupNotice("Online login succeeded and local reference data has been refreshed for offline use.");
+    setStartupNotice(buildConnectionStatusModel({
+      backendHealth: { ...backendHealth, online: true },
+      syncStatus,
+      internetAvailable,
+    }).banner);
     return snapshot;
   };
 
@@ -3387,10 +3498,10 @@ function App() {
             </div>
           )}
           <div className="startup-api-panel">
-            <span>API base</span>
+            <span>{connectionStatus.apiModeLabel}</span>
             <code>{backendHealth.apiUrl}</code>
             <small>
-              {backendHealth.online === true ? "Online" : backendHealth.online === false ? "Offline" : "Not checked"} - {backendHealth.message}
+              {connectionStatus.internetStatus} - {API_MODE === "LOCAL_SHOP_SERVER" ? connectionStatus.localBackendStatus : connectionStatus.cloudBackendStatus}
             </small>
           </div>
           <div className="startup-actions">
@@ -3578,7 +3689,7 @@ function App() {
             <span className="status-dot" />
             {user.branch}
           </div>
-          {offlineMode && <div className="offline-pill">Offline - changes will sync later</div>}
+          <div className="offline-pill">{connectionStatus.syncSummary}</div>
           {settingsData.deviceControlSettings?.fullscreen_lock_enabled && (
             <button className="secondary-button kiosk-exit-button" onClick={requestControlledExit}>
               Owner Exit
@@ -3590,8 +3701,8 @@ function App() {
           {(startupNotice || startupError || syncMessage) && (
             <div className={`startup-status-panel ${startupError ? "startup-status-error" : ""}`}>
               {startupError && <p>{startupError}</p>}
-              {!startupError && startupNotice && <p>{startupNotice}</p>}
-              {!startupError && syncMessage && <small>{syncMessage}</small>}
+              {!startupError && <p>{connectionStatus.banner}</p>}
+              {!startupError && <small>{connectionStatus.detail}</small>}
             </div>
           )}
           {activeView === "dashboard" && !hasModuleAccess("dashboard") && (
@@ -4233,6 +4344,7 @@ function App() {
                 applicationFontSize={applicationFontSize}
                 backendHealth={backendHealth}
                 canManage={canManageRates}
+                connectionStatus={connectionStatus}
                 localDbStatus={localDbStatus}
                 onReload={async () => { await Promise.all([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()]); }}
                 onRetrySync={retrySyncFailures}
@@ -9401,6 +9513,7 @@ function SettingsModule({
   applicationFontSize,
   backendHealth,
   canManage,
+  connectionStatus,
   localDbStatus,
   onQueueSyncTest,
   onReload,
@@ -9441,6 +9554,7 @@ function SettingsModule({
       <SyncSettingsSection
         backendHealth={backendHealth}
         canManage={canManage}
+        connectionStatus={connectionStatus}
         key={settingsData.syncSettings?.updated_at || "sync-settings"}
         localDbStatus={localDbStatus}
         onQueueSyncTest={onQueueSyncTest}
@@ -10451,6 +10565,7 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
 function SyncSettingsSection({
   backendHealth,
   canManage,
+  connectionStatus,
   localDbStatus,
   onQueueSyncTest,
   onReload,
@@ -10481,22 +10596,7 @@ function SyncSettingsSection({
   const pending = Number(syncStatus?.pendingOperations ?? draft.pending_count ?? 0);
   const failed = Number(syncStatus?.failedOperations || 0);
   const conflicts = Number(syncStatus?.conflictOperations || 0);
-  const backendOnline = backendHealth?.online === true || syncStatus?.online === true;
-  const syncTotal = Number(syncStatus?.syncProgressTotal || pending || 0);
-  const syncDone = Number(syncStatus?.syncProgressDone || 0);
-  const autoStatus = backendHealth?.online === false
-    ? "Offline - backend unreachable"
-    : ["AUTHORIZATION", "DEVICE_AUTHORIZATION"].includes(syncStatus?.lastFailureKind)
-      ? "Authorisation required"
-      : conflicts > 0
-        ? "Conflict"
-        : syncStatus?.syncing
-          ? `Online - syncing ${syncDone} of ${syncTotal}`
-          : backendOnline && pending > 0
-            ? `Online - ${pending} changes pending`
-            : backendOnline
-              ? "Online - all changes synced"
-              : "Backend status not checked";
+  const autoStatus = connectionStatus?.syncSummary || "Backend status not checked";
   const nativeDbLabel = localDbStatus?.available
     ? localDbStatus.initialized ? "Local SQLite Ready" : "Local SQLite Error"
     : "Browser Mode";
@@ -10522,7 +10622,15 @@ function SyncSettingsSection({
         <Field label="Last Push"><input disabled value={lastPush ? new Date(lastPush).toLocaleString("en-IN") : "Not pushed"} /></Field>
         <Field label="Last Pull"><input disabled value={lastPull ? new Date(lastPull).toLocaleString("en-IN") : "Not pulled"} /></Field>
         <Field label="API Mode"><input disabled value={API_CONFIG.mode} /></Field>
+        <Field label="API Mode Label"><input disabled value={connectionStatus?.apiModeLabel || getApiModeLabel()} /></Field>
         <Field label="Selected API URL"><input disabled value={API_CONFIG.apiUrl} /></Field>
+        <Field label="Internet Status"><input disabled value={connectionStatus?.internetStatus || "Not checked"} /></Field>
+        <Field label="Local Backend Status"><input disabled value={connectionStatus?.localBackendStatus || "Not checked"} /></Field>
+        <Field label="Cloud Backend Status"><input disabled value={connectionStatus?.cloudBackendStatus || "Not checked"} /></Field>
+        <Field label="Last Health Check"><input disabled value={connectionStatus?.lastHealthCheck || "Not checked"} /></Field>
+        <Field label="Last Successful Sync"><input disabled value={connectionStatus?.lastSuccessfulSync || "Not synced"} /></Field>
+        <Field label="Pending Queue Count"><input disabled value={connectionStatus?.pending ?? pending} /></Field>
+        <Field label="Failed Queue Count"><input disabled value={connectionStatus?.failed ?? failed} /></Field>
         <Field label="Local Shop API URL"><input disabled value={API_CONFIG.localApiUrl} /></Field>
         <Field label="Cloud API URL"><input disabled value={API_CONFIG.cloudApiUrl} /></Field>
         <Field label="Custom API URL"><input disabled value={API_CONFIG.customApiUrl} /></Field>
