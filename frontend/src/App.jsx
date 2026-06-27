@@ -85,7 +85,8 @@ const API_MODE_LABELS = {
 
 const getApiModeLabel = () => API_MODE_LABELS[API_MODE] || API_MODE;
 
-const isCloudConfigured = () => Boolean(CLOUD_API_URL);
+const isLocalEndpoint = (value) => /^(https?:\/\/)?(localhost|127\.0\.0\.1|\[::1\])(?::|\/|$)/i.test(String(value || "").trim());
+const isCloudConfigured = () => Boolean(CLOUD_API_URL) && !isLocalEndpoint(CLOUD_API_URL);
 
 const formatStatusDateTime = (value) => {
   if (!value) return "";
@@ -103,16 +104,20 @@ const buildConnectionStatusModel = ({ backendHealth = {}, syncStatus = {}, inter
   const lastSyncText = formatStatusDateTime(syncStatus?.lastSuccessfulSyncAt || syncStatus?.lastPullAt || syncStatus?.lastPushAt);
 
   let localBackendStatus = "Not selected";
-  let cloudBackendStatus = isCloudConfigured() ? "Configured - not checked" : "Cloud sync not configured";
+  let cloudBackendStatus = isCloudConfigured() ? "Cloud Configured - Not Checked" : "Cloud Not Configured";
   if (API_MODE === "LOCAL_SHOP_SERVER") {
-    localBackendStatus = backendOnline ? "Local Backend Reachable" : backendOffline ? "Local Backend Offline" : "Local Backend Checking";
-    cloudBackendStatus = isCloudConfigured() ? "Cloud configured - not selected" : "Cloud sync not active";
+    localBackendStatus = backendOnline ? "Local Server Connected" : backendOffline ? "Local Server Offline" : "Checking Local Server";
+    cloudBackendStatus = isCloudConfigured() ? "Cloud Configured - Not Checked" : "Cloud Not Configured";
   } else if (API_MODE === "CLOUD_PRODUCTION") {
-    localBackendStatus = "Local backend not selected";
-    cloudBackendStatus = backendOnline ? "Cloud Backend Reachable" : backendOffline ? "Cloud Backend Offline" : "Cloud Backend Checking";
+    localBackendStatus = "Local Server Not Selected";
+    cloudBackendStatus = isCloudConfigured()
+      ? backendOnline ? "Cloud Connected" : backendOffline ? "Cloud Offline" : "Checking Cloud"
+      : "Cloud Not Configured";
   } else {
-    localBackendStatus = "Custom API selected";
-    cloudBackendStatus = isCloudConfigured() ? "Cloud configured - not selected" : "Cloud sync not active";
+    localBackendStatus = isLocalEndpoint(API_URL)
+      ? backendOnline ? "Local Server Connected" : backendOffline ? "Local Server Offline" : "Checking Local Server"
+      : "Custom API Selected";
+    cloudBackendStatus = isCloudConfigured() ? "Cloud Configured - Not Checked" : "Cloud Not Configured";
   }
 
   let syncSummary = "Backend status not checked";
@@ -128,10 +133,10 @@ const buildConnectionStatusModel = ({ backendHealth = {}, syncStatus = {}, inter
     syncSummary = pending > 0 ? `Offline Queue Active - ${pending} pending` : "Offline Queue Active";
   } else if (pending > 0) {
     syncSummary = `Sync Pending - ${pending} pending`;
-  } else if (API_MODE === "CLOUD_PRODUCTION" && backendOnline) {
+  } else if (API_MODE === "CLOUD_PRODUCTION" && isCloudConfigured() && backendOnline) {
     syncSummary = lastSyncText ? `Synced - last sync ${lastSyncText}` : "Cloud online - sync not completed yet";
   } else if (API_MODE === "LOCAL_SHOP_SERVER" && backendOnline) {
-    syncSummary = "Cloud Sync Offline / Not Connected";
+    syncSummary = pending > 0 ? `Pending Sync - ${pending} pending` : "Local Server Connected";
   } else if (backendOnline) {
     syncSummary = "Selected backend reachable";
   }
@@ -142,8 +147,8 @@ const buildConnectionStatusModel = ({ backendHealth = {}, syncStatus = {}, inter
       ? `Cloud offline. Local work is saved safely. Pending sync: ${pending}.`
       : "Offline mode active. FroozERP is using local SQLite data. Changes will sync when backend/cloud is reachable.";
   } else if (API_MODE === "LOCAL_SHOP_SERVER" && backendOnline) {
-    banner = "Local server reachable. Cloud sync is not active.";
-  } else if (API_MODE === "CLOUD_PRODUCTION" && backendOnline) {
+    banner = "Local server connected. Cloud remains not configured unless a real cloud API is set.";
+  } else if (API_MODE === "CLOUD_PRODUCTION" && isCloudConfigured() && backendOnline) {
     banner = `Cloud online.${lastSyncText ? ` Last sync completed at ${lastSyncText}.` : " Sync is ready."}`;
   } else if (backendOnline) {
     banner = "Selected backend API is reachable.";
@@ -1351,6 +1356,8 @@ function App() {
   }, []);
 
   const performConnectivityCheck = useCallback(async (reason = "manual", options = {}) => {
+    const browserOnline = typeof navigator === "undefined" ? true : navigator.onLine !== false;
+    setInternetAvailable(browserOnline);
     const health = await checkBackendHealth(API_URL, {
       details: true,
       timeoutMs: options.timeoutMs || 3500,
@@ -1392,7 +1399,7 @@ function App() {
     }
     const timer = window.setInterval(() => {
       performConnectivityCheck(backendHealth.online ? "periodic-online" : "periodic-offline");
-    }, backendHealth.online ? 60_000 : 10_000);
+    }, 15_000);
     return () => {
       window.clearInterval(timer);
       for (const eventName of connectivityEventNames) {
@@ -4346,6 +4353,7 @@ function App() {
                 canManage={canManageRates}
                 connectionStatus={connectionStatus}
                 localDbStatus={localDbStatus}
+                onCheckConnection={() => performConnectivityCheck("settings-sync-check", { force: true, timeoutMs: 3500 })}
                 onReload={async () => { await Promise.all([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()]); }}
                 onRetrySync={retrySyncFailures}
                 onRunSync={() => runSyncNow({ force: true })}
@@ -9515,6 +9523,7 @@ function SettingsModule({
   canManage,
   connectionStatus,
   localDbStatus,
+  onCheckConnection,
   onQueueSyncTest,
   onReload,
   onRetrySync,
@@ -9557,6 +9566,7 @@ function SettingsModule({
         connectionStatus={connectionStatus}
         key={settingsData.syncSettings?.updated_at || "sync-settings"}
         localDbStatus={localDbStatus}
+        onCheckConnection={onCheckConnection}
         onQueueSyncTest={onQueueSyncTest}
         onReload={onReload}
         onRetrySync={onRetrySync}
@@ -10567,6 +10577,7 @@ function SyncSettingsSection({
   canManage,
   connectionStatus,
   localDbStatus,
+  onCheckConnection,
   onQueueSyncTest,
   onReload,
   onRetrySync,
@@ -10578,6 +10589,7 @@ function SyncSettingsSection({
 }) {
   const [draft, setDraft] = useState(syncSettings || {});
   const [statusMessage, setStatusMessage] = useState("");
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
   const save = async () => {
     try {
       const response = await axios.put(`${API_URL}/settings/sync-status`, {
@@ -10596,7 +10608,11 @@ function SyncSettingsSection({
   const pending = Number(syncStatus?.pendingOperations ?? draft.pending_count ?? 0);
   const failed = Number(syncStatus?.failedOperations || 0);
   const conflicts = Number(syncStatus?.conflictOperations || 0);
-  const autoStatus = connectionStatus?.syncSummary || "Backend status not checked";
+  const appMode = connectionStatus?.apiModeLabel || getApiModeLabel();
+  const internetStatus = connectionStatus?.internetStatus || "Not checked";
+  const localServerStatus = connectionStatus?.localBackendStatus || "Not checked";
+  const cloudStatus = connectionStatus?.cloudBackendStatus || "Cloud Not Configured";
+  const syncSummary = connectionStatus?.syncSummary || "Backend status not checked";
   const nativeDbLabel = localDbStatus?.available
     ? localDbStatus.initialized ? "Local SQLite Ready" : "Local SQLite Error"
     : "Browser Mode";
@@ -10604,52 +10620,57 @@ function SyncSettingsSection({
   const lastPush = syncStatus?.lastPushAt;
   const lastPull = syncStatus?.lastPullAt;
   return (
-    <ModuleCard eyebrow="Sync Settings" title="Offline Sync Engine" subtitle="Local outbox, idempotent cloud push, cursor pull and conflict status are active for Phase 2 foundation entities.">
-      <div className="purchase-summary-grid supplier-payment-preview">
-        <SummaryMetric label="Auto Sync Status" value={autoStatus} featured />
-        <SummaryMetric label="Pending Queue" value={pending} />
-        <SummaryMetric label="Failed" value={failed} />
-        <SummaryMetric label="Conflicts" value={conflicts} />
-        <SummaryMetric label="Last Sync Time" value={lastSync ? new Date(lastSync).toLocaleString("en-IN") : "Not synced"} />
-        <SummaryMetric label="Local Database" value={nativeDbLabel} />
+    <ModuleCard eyebrow="Sync & Connection" title="Connection Status" subtitle="Owner view for live internet, local server and cloud sync readiness.">
+      <div className="purchase-summary-grid supplier-payment-preview sync-owner-summary">
+        <SummaryMetric label="App Mode" value={appMode} featured />
+        <SummaryMetric label="Internet" value={internetStatus} />
+        <SummaryMetric label="Local Server" value={localServerStatus} />
+        <SummaryMetric label="Cloud" value={cloudStatus} />
+        <SummaryMetric label="Sync Status" value={syncSummary} />
+        <SummaryMetric label="Pending Sync" value={pending} />
+        <SummaryMetric label="Last Sync" value={lastSync ? new Date(lastSync).toLocaleString("en-IN") : "Not synced"} />
       </div>
       {(statusMessage || syncMessage || syncStatus?.lastError) && <p className="form-note">{syncMessage || statusMessage || syncStatus?.lastError}</p>}
-      <div className="form-grid supplier-form-grid">
-        <Field label="Device ID"><input disabled value={draft.device_id || "LOCAL-STORE"} /></Field>
-        <Field label="Device Display Name"><input disabled={!canManage} value={draft.device_display_name || ""} onChange={(event) => setDraft({ ...draft, device_display_name: event.target.value })} /></Field>
-        <Field label="Local SQLite Path"><input disabled value={localDbStatus?.databasePath || "Available in FroozERP desktop app"} /></Field>
-        <Field label="Local Schema Version"><input disabled value={localDbStatus?.schemaVersion || "Not initialized"} /></Field>
-        <Field label="Last Push"><input disabled value={lastPush ? new Date(lastPush).toLocaleString("en-IN") : "Not pushed"} /></Field>
-        <Field label="Last Pull"><input disabled value={lastPull ? new Date(lastPull).toLocaleString("en-IN") : "Not pulled"} /></Field>
-        <Field label="API Mode"><input disabled value={API_CONFIG.mode} /></Field>
-        <Field label="API Mode Label"><input disabled value={connectionStatus?.apiModeLabel || getApiModeLabel()} /></Field>
-        <Field label="Selected API URL"><input disabled value={API_CONFIG.apiUrl} /></Field>
-        <Field label="Internet Status"><input disabled value={connectionStatus?.internetStatus || "Not checked"} /></Field>
-        <Field label="Local Backend Status"><input disabled value={connectionStatus?.localBackendStatus || "Not checked"} /></Field>
-        <Field label="Cloud Backend Status"><input disabled value={connectionStatus?.cloudBackendStatus || "Not checked"} /></Field>
-        <Field label="Last Health Check"><input disabled value={connectionStatus?.lastHealthCheck || "Not checked"} /></Field>
-        <Field label="Last Successful Sync"><input disabled value={connectionStatus?.lastSuccessfulSync || "Not synced"} /></Field>
-        <Field label="Pending Queue Count"><input disabled value={connectionStatus?.pending ?? pending} /></Field>
-        <Field label="Failed Queue Count"><input disabled value={connectionStatus?.failed ?? failed} /></Field>
-        <Field label="Local Shop API URL"><input disabled value={API_CONFIG.localApiUrl} /></Field>
-        <Field label="Cloud API URL"><input disabled value={API_CONFIG.cloudApiUrl} /></Field>
-        <Field label="Custom API URL"><input disabled value={API_CONFIG.customApiUrl} /></Field>
-        <Field label="Settings API Base"><input disabled value={backendHealth?.apiUrl || API_URL} /></Field>
-        <Field label="Sync Worker API Base"><input disabled value={syncStatus?.apiUrl || API_URL} /></Field>
-        <Field label="Backend Health URL"><input disabled value={backendHealth?.url || `${API_URL}/api/health`} /></Field>
-        <Field label="Last Sync Failure"><input disabled value={syncStatus?.lastError || backendHealth?.message || "None"} /></Field>
-        <Field label="Current Cursor"><input disabled value={syncStatus?.currentCursor || "0"} /></Field>
-        <label className="check-field"><input checked={draft.sync_enabled === true} disabled type="checkbox" /><span>Phase 2 sync foundation enabled for approved native devices</span></label>
-        <Field label="Notes"><textarea disabled value={draft.notes || "Cloud sync foundation is active for reference data and safe test entities."} /></Field>
-      </div>
       {localDbStatus?.error && <p className="form-note stock-low">{localDbStatus.error}</p>}
-      <p className="form-note">Native FroozERP uses local-first POS for selected-lot sales, queues sync operations locally and pushes them when the backend is reachable. Browser mode remains online-first.</p>
       <div className="toolbar-actions">
-        <button className="primary-button" disabled={!canManage} onClick={save}>Save Device Name</button>
+        <button className="secondary-button" disabled={!onCheckConnection} onClick={onCheckConnection}>Check Connection</button>
         <button className="secondary-button" disabled={!canManage || !onRunSync} onClick={onRunSync}>Sync Now</button>
         <button className="secondary-button" disabled={!canManage || !onRetrySync} onClick={onRetrySync}>Retry Failed</button>
-        <button className="secondary-button" disabled={!canManage || !onQueueSyncTest} onClick={onQueueSyncTest}>Queue Safe Test</button>
+        <button className="secondary-button" onClick={() => setShowDiagnostics((current) => !current)}>Advanced Diagnostics</button>
       </div>
+      {showDiagnostics && (
+        <div className="sync-diagnostics-panel">
+          <div className="form-grid supplier-form-grid">
+            <Field label="Device ID"><input disabled value={draft.device_id || "LOCAL-STORE"} /></Field>
+            <Field label="Device Display Name"><input disabled={!canManage} value={draft.device_display_name || ""} onChange={(event) => setDraft({ ...draft, device_display_name: event.target.value })} /></Field>
+            <Field label="Local SQLite Path"><input disabled value={localDbStatus?.databasePath || "Available in FroozERP desktop app"} /></Field>
+            <Field label="Local Schema Version"><input disabled value={localDbStatus?.schemaVersion || "Not initialized"} /></Field>
+            <Field label="Last Push"><input disabled value={lastPush ? new Date(lastPush).toLocaleString("en-IN") : "Not pushed"} /></Field>
+            <Field label="Last Pull"><input disabled value={lastPull ? new Date(lastPull).toLocaleString("en-IN") : "Not pulled"} /></Field>
+            <Field label="API Mode"><input disabled value={API_CONFIG.mode} /></Field>
+            <Field label="Selected API URL"><input disabled value={API_CONFIG.apiUrl} /></Field>
+            <Field label="Last Health Check"><input disabled value={connectionStatus?.lastHealthCheck || "Not checked"} /></Field>
+            <Field label="Pending Queue Count"><input disabled value={connectionStatus?.pending ?? pending} /></Field>
+            <Field label="Failed Queue Count"><input disabled value={connectionStatus?.failed ?? failed} /></Field>
+            <Field label="Conflict Queue Count"><input disabled value={conflicts} /></Field>
+            <Field label="Local Database"><input disabled value={nativeDbLabel} /></Field>
+            <Field label="Local Shop API URL"><input disabled value={API_CONFIG.localApiUrl} /></Field>
+            <Field label="Cloud API URL"><input disabled value={API_CONFIG.cloudApiUrl} /></Field>
+            <Field label="Custom API URL"><input disabled value={API_CONFIG.customApiUrl} /></Field>
+            <Field label="Settings API Base"><input disabled value={backendHealth?.apiUrl || API_URL} /></Field>
+            <Field label="Sync Worker API Base"><input disabled value={syncStatus?.apiUrl || API_URL} /></Field>
+            <Field label="Backend Health URL"><input disabled value={backendHealth?.url || `${API_URL}/api/health`} /></Field>
+            <Field label="Last Sync Failure"><input disabled value={syncStatus?.lastError || backendHealth?.message || "None"} /></Field>
+            <Field label="Current Cursor"><input disabled value={syncStatus?.currentCursor || "0"} /></Field>
+            <label className="check-field"><input checked={draft.sync_enabled === true} disabled type="checkbox" /><span>Sync foundation enabled for approved native devices</span></label>
+            <Field label="Notes"><textarea disabled value={draft.notes || "Cloud sync foundation is active for reference data and safe test entities."} /></Field>
+          </div>
+          <div className="toolbar-actions">
+            <button className="primary-button" disabled={!canManage} onClick={save}>Save Device Name</button>
+            <button className="secondary-button" disabled={!canManage || !onQueueSyncTest} onClick={onQueueSyncTest}>Queue Safe Test</button>
+          </div>
+        </div>
+      )}
     </ModuleCard>
   );
 }
