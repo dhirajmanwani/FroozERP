@@ -76,6 +76,7 @@ const API_CONFIG = {
   cloudApiUrl: CLOUD_API_URL || "Not configured",
   customApiUrl: CUSTOM_API_URL || "Not configured",
 };
+const SYNC_FRESHNESS_MS = 5 * 60 * 1000;
 
 const API_MODE_LABELS = {
   LOCAL_SHOP_SERVER: "Local Shop Server",
@@ -85,13 +86,42 @@ const API_MODE_LABELS = {
 
 const getApiModeLabel = () => API_MODE_LABELS[API_MODE] || API_MODE;
 
-const isLocalEndpoint = (value) => /^(https?:\/\/)?(localhost|127\.0\.0\.1|\[::1\])(?::|\/|$)/i.test(String(value || "").trim());
-const isCloudConfigured = () => Boolean(CLOUD_API_URL) && !isLocalEndpoint(CLOUD_API_URL);
+const isLocalEndpoint = (value) => /^(https?:\/\/)?(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::|\/|$)/i.test(String(value || "").trim());
+const isRealCloudUrl = (value) => {
+  const url = String(value || "").trim();
+  return /^https?:\/\//i.test(url) && !isLocalEndpoint(url) && !/:5000(?:\/|$)/i.test(url);
+};
+const CLOUD_CONFIGURED = isRealCloudUrl(CLOUD_API_URL);
 
 const formatStatusDateTime = (value) => {
   if (!value) return "";
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "" : date.toLocaleString("en-IN");
+};
+
+const isFreshStatusDateTime = (value, maxAgeMs = SYNC_FRESHNESS_MS) => {
+  if (!value) return false;
+  const time = new Date(value).getTime();
+  return Number.isFinite(time) && Date.now() - time <= maxAgeMs;
+};
+
+const probeRealInternet = async (timeoutMs = 4000) => {
+  if (typeof navigator !== "undefined" && navigator.onLine === false) return false;
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    await fetch("https://www.gstatic.com/generate_204", {
+      method: "GET",
+      mode: "no-cors",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    window.clearTimeout(timer);
+  }
 };
 
 const buildConnectionStatusModel = ({ backendHealth = {}, syncStatus = {}, internetAvailable = true }) => {
@@ -100,24 +130,27 @@ const buildConnectionStatusModel = ({ backendHealth = {}, syncStatus = {}, inter
   const conflicts = Number(syncStatus?.conflictOperations || 0);
   const backendOnline = backendHealth?.online === true;
   const backendOffline = backendHealth?.online === false;
+  const cloudReachable = API_MODE === "CLOUD_PRODUCTION" && CLOUD_CONFIGURED && backendOnline;
   const apiModeLabel = getApiModeLabel();
-  const lastSyncText = formatStatusDateTime(syncStatus?.lastSuccessfulSyncAt || syncStatus?.lastPullAt || syncStatus?.lastPushAt);
+  const lastSyncAt = syncStatus?.lastSuccessfulSyncAt || syncStatus?.lastPullAt || syncStatus?.lastPushAt;
+  const lastSyncText = formatStatusDateTime(lastSyncAt);
+  const freshSync = cloudReachable && isFreshStatusDateTime(lastSyncAt);
 
-  let localBackendStatus = "Not selected";
-  let cloudBackendStatus = isCloudConfigured() ? "Cloud Configured - Not Checked" : "Cloud Not Configured";
+  let localBackendStatus;
+  let cloudBackendStatus;
   if (API_MODE === "LOCAL_SHOP_SERVER") {
     localBackendStatus = backendOnline ? "Local Server Connected" : backendOffline ? "Local Server Offline" : "Checking Local Server";
-    cloudBackendStatus = isCloudConfigured() ? "Cloud Configured - Not Checked" : "Cloud Not Configured";
+    cloudBackendStatus = "Cloud Not Configured";
   } else if (API_MODE === "CLOUD_PRODUCTION") {
     localBackendStatus = "Local Server Not Selected";
-    cloudBackendStatus = isCloudConfigured()
+    cloudBackendStatus = CLOUD_CONFIGURED
       ? backendOnline ? "Cloud Connected" : backendOffline ? "Cloud Offline" : "Checking Cloud"
       : "Cloud Not Configured";
   } else {
     localBackendStatus = isLocalEndpoint(API_URL)
       ? backendOnline ? "Local Server Connected" : backendOffline ? "Local Server Offline" : "Checking Local Server"
       : "Custom API Selected";
-    cloudBackendStatus = isCloudConfigured() ? "Cloud Configured - Not Checked" : "Cloud Not Configured";
+    cloudBackendStatus = CLOUD_CONFIGURED ? "Cloud Configured - Not Checked" : "Cloud Not Configured";
   }
 
   let syncSummary = "Backend status not checked";
@@ -133,10 +166,12 @@ const buildConnectionStatusModel = ({ backendHealth = {}, syncStatus = {}, inter
     syncSummary = pending > 0 ? `Offline Queue Active - ${pending} pending` : "Offline Queue Active";
   } else if (pending > 0) {
     syncSummary = `Sync Pending - ${pending} pending`;
-  } else if (API_MODE === "CLOUD_PRODUCTION" && isCloudConfigured() && backendOnline) {
-    syncSummary = lastSyncText ? `Synced - last sync ${lastSyncText}` : "Cloud online - sync not completed yet";
+  } else if (freshSync) {
+    syncSummary = `Synced - last sync ${lastSyncText}`;
+  } else if (cloudReachable) {
+    syncSummary = "Cloud connected - sync not completed yet";
   } else if (API_MODE === "LOCAL_SHOP_SERVER" && backendOnline) {
-    syncSummary = pending > 0 ? `Pending Sync - ${pending} pending` : "Local Server Connected";
+    syncSummary = "No pending local changes - Cloud sync not active";
   } else if (backendOnline) {
     syncSummary = "Selected backend reachable";
   }
@@ -148,8 +183,8 @@ const buildConnectionStatusModel = ({ backendHealth = {}, syncStatus = {}, inter
       : "Offline mode active. FroozERP is using local SQLite data. Changes will sync when backend/cloud is reachable.";
   } else if (API_MODE === "LOCAL_SHOP_SERVER" && backendOnline) {
     banner = "Local server connected. Cloud remains not configured unless a real cloud API is set.";
-  } else if (API_MODE === "CLOUD_PRODUCTION" && isCloudConfigured() && backendOnline) {
-    banner = `Cloud online.${lastSyncText ? ` Last sync completed at ${lastSyncText}.` : " Sync is ready."}`;
+  } else if (cloudReachable) {
+    banner = freshSync ? `Cloud online. Last sync completed at ${lastSyncText}.` : "Cloud online. Sync has not completed recently.";
   } else if (backendOnline) {
     banner = "Selected backend API is reachable.";
   }
@@ -1207,7 +1242,11 @@ function App() {
   }, [applicationFontSize]);
 
   useEffect(() => {
-    const updateInternetStatus = () => setInternetAvailable(typeof navigator === "undefined" ? true : navigator.onLine !== false);
+    const updateInternetStatus = () => {
+      if (typeof navigator !== "undefined" && navigator.onLine === false) {
+        setInternetAvailable(false);
+      }
+    };
     window.addEventListener("online", updateInternetStatus);
     window.addEventListener("offline", updateInternetStatus);
     updateInternetStatus();
@@ -1299,6 +1338,7 @@ function App() {
 
   const userRef = useRef(user);
   const deviceInfoRef = useRef(deviceInfo);
+  const syncStatusRef = useRef(syncStatus);
   const reconnectSyncRef = useRef(false);
   const lastAutoSyncStartedAtRef = useRef(0);
   const shouldStartBackgroundSync = () => {
@@ -1315,6 +1355,10 @@ function App() {
   useEffect(() => {
     deviceInfoRef.current = deviceInfo;
   }, [deviceInfo]);
+
+  useEffect(() => {
+    syncStatusRef.current = syncStatus;
+  }, [syncStatus]);
 
   const runSyncNow = async (options = {}) => {
     if (!user) return null;
@@ -1334,7 +1378,7 @@ function App() {
     return status;
   };
 
-  const applyConnectivityState = useCallback((health) => {
+  const applyConnectivityState = useCallback((health, statusInternetAvailable = internetAvailable, statusSyncStatus = syncStatusRef.current) => {
     setBackendHealth(health);
     if (health.online === null || health.checking) return;
     setOfflineMode(!health.online);
@@ -1346,25 +1390,26 @@ function App() {
       });
       setStartupNotice((current) => (
         /offline|local sqlite|sync changes later|online login succeeded|local reference data/i.test(current || "")
-          ? buildConnectionStatusModel({ backendHealth: health, syncStatus, internetAvailable }).banner
-          : current || buildConnectionStatusModel({ backendHealth: health, syncStatus, internetAvailable }).banner
+          ? buildConnectionStatusModel({ backendHealth: health, syncStatus: statusSyncStatus, internetAvailable: statusInternetAvailable }).banner
+          : current || buildConnectionStatusModel({ backendHealth: health, syncStatus: statusSyncStatus, internetAvailable: statusInternetAvailable }).banner
       ));
     } else {
       setStartupNotice("Offline mode is active. FroozERP loaded your local SQLite data and will sync changes later.");
       setSyncMessage("Offline - backend unavailable. Changes will sync later.");
     }
-  }, []);
+  }, [internetAvailable]);
 
   const performConnectivityCheck = useCallback(async (reason = "manual", options = {}) => {
     const browserOnline = typeof navigator === "undefined" ? true : navigator.onLine !== false;
-    setInternetAvailable(browserOnline);
+    const realInternet = browserOnline ? await probeRealInternet(options.timeoutMs || 4000) : false;
+    setInternetAvailable(realInternet);
     const health = await checkBackendHealth(API_URL, {
       details: true,
       timeoutMs: options.timeoutMs || 3500,
       force: Boolean(options.force),
       reason,
     });
-    applyConnectivityState(health);
+    applyConnectivityState(health, realInternet, syncStatusRef.current);
     if (health.online && userRef.current && !reconnectSyncRef.current && shouldStartBackgroundSync()) {
       reconnectSyncRef.current = true;
       syncNow({
@@ -1375,7 +1420,7 @@ function App() {
         })
         .then((status) => {
           setSyncStatus(status);
-          const nextStatus = buildConnectionStatusModel({ backendHealth: health, syncStatus: status, internetAvailable });
+          const nextStatus = buildConnectionStatusModel({ backendHealth: health, syncStatus: status, internetAvailable: realInternet });
           setSyncMessage(status.lastError ? `Sync failed: ${status.lastError}` : nextStatus.syncSummary);
         })
         .finally(() => {
@@ -1383,7 +1428,7 @@ function App() {
         });
     }
     return health;
-  }, [applyConnectivityState, internetAvailable]);
+  }, [applyConnectivityState]);
 
   useEffect(() => subscribeConnectivity(applyConnectivityState), [applyConnectivityState]);
 
@@ -10621,17 +10666,22 @@ function SyncSettingsSection({
   const lastPull = syncStatus?.lastPullAt;
   return (
     <ModuleCard eyebrow="Sync & Connection" title="Connection Status" subtitle="Owner view for live internet, local server and cloud sync readiness.">
-      <div className="purchase-summary-grid supplier-payment-preview sync-owner-summary">
-        <SummaryMetric label="App Mode" value={appMode} featured />
-        <SummaryMetric label="Internet" value={internetStatus} />
-        <SummaryMetric label="Local Server" value={localServerStatus} />
-        <SummaryMetric label="Cloud" value={cloudStatus} />
-        <SummaryMetric label="Sync Status" value={syncSummary} />
-        <SummaryMetric label="Pending Sync" value={pending} />
-        <SummaryMetric label="Last Sync" value={lastSync ? new Date(lastSync).toLocaleString("en-IN") : "Not synced"} />
+      <div className="sync-owner-summary">
+        {[
+          ["App Mode", appMode],
+          ["Internet", internetStatus],
+          ["Local Server", localServerStatus],
+          ["Cloud", cloudStatus],
+          ["Sync Status", syncSummary],
+          ["Pending Sync", pending],
+          ["Last Sync", lastSync ? new Date(lastSync).toLocaleString("en-IN") : "Not synced"],
+        ].map(([label, value]) => (
+          <div className="sync-owner-row" key={label}>
+            <span>{label}</span>
+            <strong>{value}</strong>
+          </div>
+        ))}
       </div>
-      {(statusMessage || syncMessage || syncStatus?.lastError) && <p className="form-note">{syncMessage || statusMessage || syncStatus?.lastError}</p>}
-      {localDbStatus?.error && <p className="form-note stock-low">{localDbStatus.error}</p>}
       <div className="toolbar-actions">
         <button className="secondary-button" disabled={!onCheckConnection} onClick={onCheckConnection}>Check Connection</button>
         <button className="secondary-button" disabled={!canManage || !onRunSync} onClick={onRunSync}>Sync Now</button>
@@ -10640,6 +10690,8 @@ function SyncSettingsSection({
       </div>
       {showDiagnostics && (
         <div className="sync-diagnostics-panel">
+          {(statusMessage || syncMessage || syncStatus?.lastError) && <p className="form-note">{syncMessage || statusMessage || syncStatus?.lastError}</p>}
+          {localDbStatus?.error && <p className="form-note stock-low">{localDbStatus.error}</p>}
           <div className="form-grid supplier-form-grid">
             <Field label="Device ID"><input disabled value={draft.device_id || "LOCAL-STORE"} /></Field>
             <Field label="Device Display Name"><input disabled={!canManage} value={draft.device_display_name || ""} onChange={(event) => setDraft({ ...draft, device_display_name: event.target.value })} /></Field>
