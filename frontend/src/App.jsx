@@ -40,29 +40,87 @@ const isDesktopShell = () => Boolean(window.__TAURI_INTERNALS__ || window.__TAUR
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 const normalizeApiBase = (value) => String(value || "").trim().replace(/\/$/, "");
-const API_MODE = String(
+const API_MODES = Object.freeze({
+  LOCAL_SINGLE_DEVICE: "LOCAL_SINGLE_DEVICE",
+  BRANCH_LAN_SERVER: "BRANCH_LAN_SERVER",
+  BRANCH_LAN_CLIENT: "BRANCH_LAN_CLIENT",
+  CLOUD_PRODUCTION: "CLOUD_PRODUCTION",
+  FIELD_REMOTE_DEVICE: "FIELD_REMOTE_DEVICE",
+  CUSTOM_API_URL: "CUSTOM_API_URL",
+});
+const API_MODE_OPTIONS = [
+  [API_MODES.LOCAL_SINGLE_DEVICE, "Local Single Device"],
+  [API_MODES.BRANCH_LAN_SERVER, "Branch LAN Server"],
+  [API_MODES.BRANCH_LAN_CLIENT, "Branch LAN Client"],
+  [API_MODES.CLOUD_PRODUCTION, "Cloud Production"],
+  [API_MODES.FIELD_REMOTE_DEVICE, "Field Remote Device"],
+  [API_MODES.CUSTOM_API_URL, "Custom API URL"],
+];
+const normalizeApiMode = (value) => {
+  const mode = String(value || "").trim().toUpperCase();
+  if (mode === "LOCAL_SHOP_SERVER") return API_MODES.LOCAL_SINGLE_DEVICE;
+  return API_MODES[mode] || API_MODES.LOCAL_SINGLE_DEVICE;
+};
+const readSavedApiConfig = () => {
+  if (typeof window === "undefined" || !window.localStorage) return {};
+  try {
+    return JSON.parse(window.localStorage.getItem("froozerp.apiConfig") || "{}") || {};
+  } catch {
+    return {};
+  }
+};
+const writeSavedApiConfig = (config) => {
+  if (typeof window === "undefined" || !window.localStorage) return;
+  window.localStorage.setItem("froozerp.apiConfig", JSON.stringify(config));
+};
+const SAVED_API_CONFIG = readSavedApiConfig();
+const API_MODE = normalizeApiMode(
+  SAVED_API_CONFIG.mode ||
   import.meta.env.VITE_API_MODE ||
   window.__FROOZERP_API_MODE__ ||
-  "LOCAL_SHOP_SERVER"
-).trim().toUpperCase();
+  API_MODES.LOCAL_SINGLE_DEVICE
+);
 const LOCAL_API_URL = normalizeApiBase(
+  SAVED_API_CONFIG.localApiUrl ||
   import.meta.env.VITE_LOCAL_API_URL ||
   window.__FROOZERP_LOCAL_API_URL__ ||
   (isDesktopShell() ? "http://127.0.0.1:5000" : `${window.location.protocol}//${window.location.hostname}:5000`)
 );
+const BRANCH_LAN_API_URL = normalizeApiBase(
+  SAVED_API_CONFIG.branchLanApiUrl ||
+  import.meta.env.VITE_BRANCH_LAN_API_URL ||
+  window.__FROOZERP_BRANCH_LAN_API_URL__ ||
+  ""
+);
 const CLOUD_API_URL = normalizeApiBase(
+  SAVED_API_CONFIG.cloudApiUrl ||
   import.meta.env.VITE_CLOUD_API_URL ||
   window.__FROOZERP_CLOUD_API_URL__ ||
   ""
 );
 const CUSTOM_API_URL = normalizeApiBase(
+  SAVED_API_CONFIG.customApiUrl ||
   import.meta.env.VITE_CUSTOM_API_URL ||
   window.__FROOZERP_CUSTOM_API_URL__ ||
   ""
 );
+const BRANCH_SERVER_BIND_HOST = String(
+  SAVED_API_CONFIG.branchServerBindHost ||
+  import.meta.env.VITE_BRANCH_SERVER_BIND_HOST ||
+  window.__FROOZERP_BRANCH_SERVER_BIND_HOST__ ||
+  "0.0.0.0"
+).trim();
+const BRANCH_SERVER_PORT = String(
+  SAVED_API_CONFIG.branchServerPort ||
+  import.meta.env.VITE_BRANCH_SERVER_PORT ||
+  window.__FROOZERP_BRANCH_SERVER_PORT__ ||
+  "5000"
+).trim();
 const resolveConfiguredApiUrl = () => {
-  if (API_MODE === "CLOUD_PRODUCTION" && CLOUD_API_URL) return CLOUD_API_URL;
-  if (API_MODE === "CUSTOM_API_URL" && CUSTOM_API_URL) return CUSTOM_API_URL;
+  if (API_MODE === API_MODES.BRANCH_LAN_CLIENT && BRANCH_LAN_API_URL) return BRANCH_LAN_API_URL;
+  if (API_MODE === API_MODES.CLOUD_PRODUCTION && CLOUD_API_URL) return CLOUD_API_URL;
+  if (API_MODE === API_MODES.FIELD_REMOTE_DEVICE && CLOUD_API_URL) return CLOUD_API_URL;
+  if (API_MODE === API_MODES.CUSTOM_API_URL && CUSTOM_API_URL) return CUSTOM_API_URL;
   if (import.meta.env.VITE_API_URL || window.__FROOZERP_API_URL__) {
     return normalizeApiBase(import.meta.env.VITE_API_URL || window.__FROOZERP_API_URL__);
   }
@@ -73,23 +131,58 @@ const API_CONFIG = {
   mode: API_MODE,
   apiUrl: API_URL,
   localApiUrl: LOCAL_API_URL,
+  branchLanApiUrl: BRANCH_LAN_API_URL || "Not configured",
   cloudApiUrl: CLOUD_API_URL || "Not configured",
   customApiUrl: CUSTOM_API_URL || "Not configured",
+  branchServerBindHost: BRANCH_SERVER_BIND_HOST,
+  branchServerPort: BRANCH_SERVER_PORT,
 };
 const SYNC_FRESHNESS_MS = 5 * 60 * 1000;
 
 const API_MODE_LABELS = {
-  LOCAL_SHOP_SERVER: "Local Shop Server",
+  LOCAL_SINGLE_DEVICE: "Local Single Device",
+  BRANCH_LAN_SERVER: "Branch LAN Server",
+  BRANCH_LAN_CLIENT: "Branch LAN Client",
   CLOUD_PRODUCTION: "Cloud Production",
+  FIELD_REMOTE_DEVICE: "Field Remote Device",
   CUSTOM_API_URL: "Custom API URL",
 };
 
 const getApiModeLabel = () => API_MODE_LABELS[API_MODE] || API_MODE;
+const isCloudMode = (mode = API_MODE) => mode === API_MODES.CLOUD_PRODUCTION || mode === API_MODES.FIELD_REMOTE_DEVICE;
 
 const isLocalEndpoint = (value) => /^(https?:\/\/)?(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::|\/|$)/i.test(String(value || "").trim());
+const isPrivateNetworkHost = (hostname) => {
+  const host = String(hostname || "").trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (!host) return false;
+  if (host === "localhost" || host === "::1" || host.endsWith(".local")) return true;
+  if (/^(10|127|169\.254|192\.168)\./.test(host)) return true;
+  const private172 = host.match(/^172\.(\d{1,3})\./);
+  if (private172) {
+    const secondOctet = Number(private172[1]);
+    return secondOctet >= 16 && secondOctet <= 31;
+  }
+  return /^(fc|fd|fe80:)/i.test(host);
+};
+const isValidHttpApiUrl = (value) => {
+  try {
+    const parsed = new URL(String(value || "").trim());
+    return ["http:", "https:"].includes(parsed.protocol) && Boolean(parsed.hostname);
+  } catch {
+    return false;
+  }
+};
 const isRealCloudUrl = (value) => {
   const url = String(value || "").trim();
-  return /^https?:\/\//i.test(url) && !isLocalEndpoint(url) && !/:5000(?:\/|$)/i.test(url);
+  try {
+    const parsed = new URL(url);
+    return ["http:", "https:"].includes(parsed.protocol)
+      && !isLocalEndpoint(url)
+      && !isPrivateNetworkHost(parsed.hostname)
+      && parsed.port !== "5000";
+  } catch {
+    return false;
+  }
 };
 const CLOUD_CONFIGURED = isRealCloudUrl(CLOUD_API_URL);
 
@@ -130,7 +223,8 @@ const buildConnectionStatusModel = ({ backendHealth = {}, syncStatus = {}, inter
   const conflicts = Number(syncStatus?.conflictOperations || 0);
   const backendOnline = backendHealth?.online === true;
   const backendOffline = backendHealth?.online === false;
-  const cloudReachable = API_MODE === "CLOUD_PRODUCTION" && CLOUD_CONFIGURED && backendOnline;
+  const cloudReachable = isCloudMode() && CLOUD_CONFIGURED && backendOnline;
+  const fieldRemoteMode = API_MODE === API_MODES.FIELD_REMOTE_DEVICE;
   const apiModeLabel = getApiModeLabel();
   const lastSyncAt = syncStatus?.lastSuccessfulSyncAt || syncStatus?.lastPullAt || syncStatus?.lastPushAt;
   const lastSyncText = formatStatusDateTime(lastSyncAt);
@@ -138,13 +232,21 @@ const buildConnectionStatusModel = ({ backendHealth = {}, syncStatus = {}, inter
 
   let localBackendStatus;
   let cloudBackendStatus;
-  if (API_MODE === "LOCAL_SHOP_SERVER") {
+  if (API_MODE === API_MODES.LOCAL_SINGLE_DEVICE) {
     localBackendStatus = backendOnline ? "Local Server Connected" : backendOffline ? "Local Server Offline" : "Checking Local Server";
-    cloudBackendStatus = "Cloud Not Configured";
-  } else if (API_MODE === "CLOUD_PRODUCTION") {
-    localBackendStatus = "Local Server Not Selected";
+    cloudBackendStatus = "Cloud Sync Not Active";
+  } else if (API_MODE === API_MODES.BRANCH_LAN_SERVER) {
+    localBackendStatus = backendOnline ? "Branch Server Connected" : backendOffline ? "Branch Server Offline" : "Checking Branch Server";
+    cloudBackendStatus = CLOUD_CONFIGURED ? "Cloud Sync Not Active" : "Cloud Not Configured";
+  } else if (API_MODE === API_MODES.BRANCH_LAN_CLIENT) {
+    localBackendStatus = BRANCH_LAN_API_URL
+      ? backendOnline ? "LAN Client Connected" : backendOffline ? "Branch Server Offline" : "Checking Branch Server"
+      : "Branch Server URL Required";
+    cloudBackendStatus = "Cloud Sync Not Active";
+  } else if (API_MODE === API_MODES.CLOUD_PRODUCTION || fieldRemoteMode) {
+    localBackendStatus = "Not Used In This Mode";
     cloudBackendStatus = CLOUD_CONFIGURED
-      ? backendOnline ? "Cloud Connected" : backendOffline ? "Cloud Offline" : "Checking Cloud"
+      ? backendOnline ? "Cloud Connected" : backendOffline ? "Cloud Configured But Offline" : "Checking Cloud"
       : "Cloud Not Configured";
   } else {
     localBackendStatus = isLocalEndpoint(API_URL)
@@ -161,16 +263,20 @@ const buildConnectionStatusModel = ({ backendHealth = {}, syncStatus = {}, inter
   } else if (syncStatus?.syncing) {
     const done = Number(syncStatus?.syncProgressDone || 0);
     const total = Number(syncStatus?.syncProgressTotal || pending || 0);
-    syncSummary = total ? `Syncing ${done} of ${total}` : "Syncing";
+    syncSummary = total ? `Sync Active - ${done} of ${total}` : "Sync Active";
+  } else if (fieldRemoteMode) {
+    syncSummary = CLOUD_CONFIGURED
+      ? "Field Remote Not Ready - purchase offline sync required"
+      : "Field Remote Not Ready - Cloud and purchase sync required";
   } else if (backendOffline) {
-    syncSummary = pending > 0 ? `Offline Queue Active - ${pending} pending` : "Offline Queue Active";
+    syncSummary = pending > 0 ? `Pending local changes - ${pending}` : "Cloud sync not active";
   } else if (pending > 0) {
-    syncSummary = `Sync Pending - ${pending} pending`;
+    syncSummary = `Pending local changes - ${pending}`;
   } else if (freshSync) {
     syncSummary = `Synced - last sync ${lastSyncText}`;
   } else if (cloudReachable) {
     syncSummary = "Cloud connected - sync not completed yet";
-  } else if (API_MODE === "LOCAL_SHOP_SERVER" && backendOnline) {
+  } else if ((API_MODE === API_MODES.LOCAL_SINGLE_DEVICE || API_MODE === API_MODES.BRANCH_LAN_SERVER || API_MODE === API_MODES.BRANCH_LAN_CLIENT) && backendOnline) {
     syncSummary = "No pending local changes - Cloud sync not active";
   } else if (backendOnline) {
     syncSummary = "Selected backend reachable";
@@ -178,11 +284,13 @@ const buildConnectionStatusModel = ({ backendHealth = {}, syncStatus = {}, inter
 
   let banner = "Checking FroozERP backend status...";
   if (backendOffline) {
-    banner = API_MODE === "CLOUD_PRODUCTION"
+    banner = isCloudMode()
       ? `Cloud offline. Local work is saved safely. Pending sync: ${pending}.`
       : "Offline mode active. FroozERP is using local SQLite data. Changes will sync when backend/cloud is reachable.";
-  } else if (API_MODE === "LOCAL_SHOP_SERVER" && backendOnline) {
-    banner = "Local server connected. Cloud remains not configured unless a real cloud API is set.";
+  } else if (fieldRemoteMode) {
+    banner = "Field Remote Device requires Cloud Production and purchase offline sync. Current version only prepares configuration.";
+  } else if ((API_MODE === API_MODES.LOCAL_SINGLE_DEVICE || API_MODE === API_MODES.BRANCH_LAN_SERVER || API_MODE === API_MODES.BRANCH_LAN_CLIENT) && backendOnline) {
+    banner = "Branch/local server connected. Cloud remains separate unless a real cloud API is set.";
   } else if (cloudReachable) {
     banner = freshSync ? `Cloud online. Last sync completed at ${lastSyncText}.` : "Cloud online. Sync has not completed recently.";
   } else if (backendOnline) {
@@ -240,7 +348,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.29";
+const APP_VERSION = "1.0.30";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -1890,7 +1998,6 @@ function App() {
       lastPullAt: current?.lastPullAt || "",
       currentCursor: current?.currentCursor || "0",
       lastError: "",
-      syncing: false,
     }));
     if (nextView) setActiveView(nextView);
     if (offline) {
@@ -3553,7 +3660,7 @@ function App() {
             <span>{connectionStatus.apiModeLabel}</span>
             <code>{backendHealth.apiUrl}</code>
             <small>
-              {connectionStatus.internetStatus} - {API_MODE === "LOCAL_SHOP_SERVER" ? connectionStatus.localBackendStatus : connectionStatus.cloudBackendStatus}
+              {connectionStatus.internetStatus} - {isCloudMode() ? connectionStatus.cloudBackendStatus : connectionStatus.localBackendStatus}
             </small>
           </div>
           <div className="startup-actions">
@@ -10635,6 +10742,16 @@ function SyncSettingsSection({
   const [draft, setDraft] = useState(syncSettings || {});
   const [statusMessage, setStatusMessage] = useState("");
   const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [configDraft, setConfigDraft] = useState({
+    mode: API_CONFIG.mode,
+    localApiUrl: API_CONFIG.localApiUrl,
+    branchLanApiUrl: BRANCH_LAN_API_URL,
+    cloudApiUrl: CLOUD_API_URL,
+    customApiUrl: CUSTOM_API_URL,
+    branchServerBindHost: API_CONFIG.branchServerBindHost,
+    branchServerPort: API_CONFIG.branchServerPort,
+  });
+  const [configMessage, setConfigMessage] = useState("");
   const save = async () => {
     try {
       const response = await axios.put(`${API_URL}/settings/sync-status`, {
@@ -10650,6 +10767,71 @@ function SyncSettingsSection({
       alert(getErrorMessage(error, "Unable to save device display name"));
     }
   };
+  const modeNeedsBranchUrl = configDraft.mode === API_MODES.BRANCH_LAN_CLIENT;
+  const modeNeedsCloudUrl = configDraft.mode === API_MODES.CLOUD_PRODUCTION || configDraft.mode === API_MODES.FIELD_REMOTE_DEVICE;
+  const modeNeedsCustomUrl = configDraft.mode === API_MODES.CUSTOM_API_URL;
+  const selectedTestUrl = modeNeedsBranchUrl
+    ? configDraft.branchLanApiUrl
+    : modeNeedsCloudUrl
+      ? configDraft.cloudApiUrl
+      : modeNeedsCustomUrl
+        ? configDraft.customApiUrl
+        : configDraft.localApiUrl;
+  const testApiUrl = async (url, label = "API") => {
+    const apiUrl = normalizeApiBase(url);
+    if (!isValidHttpApiUrl(apiUrl)) {
+      setConfigMessage(`${label} URL is invalid. Use http:// or https://.`);
+      return false;
+    }
+    try {
+      const response = await axios.get(`${apiUrl}/api/health`, { timeout: 3500, headers: { "Cache-Control": "no-store" } });
+      const ok = response.status >= 200 && response.status < 300 && String(response.data?.status || "").toLowerCase() === "ok";
+      setConfigMessage(ok ? `${label} connection passed` : `${label} responded but health is not ok`);
+      return ok;
+    } catch (error) {
+      setConfigMessage(`${label} connection failed: ${getErrorMessage(error, "Backend not reachable")}`);
+      return false;
+    }
+  };
+  const saveApiConfig = async () => {
+    if (!canManage) return;
+    const nextConfig = {
+      mode: normalizeApiMode(configDraft.mode),
+      localApiUrl: normalizeApiBase(configDraft.localApiUrl) || "http://127.0.0.1:5000",
+      branchLanApiUrl: normalizeApiBase(configDraft.branchLanApiUrl),
+      cloudApiUrl: normalizeApiBase(configDraft.cloudApiUrl),
+      customApiUrl: normalizeApiBase(configDraft.customApiUrl),
+      branchServerBindHost: String(configDraft.branchServerBindHost || "0.0.0.0").trim(),
+      branchServerPort: String(configDraft.branchServerPort || "5000").trim(),
+    };
+    if (nextConfig.mode === API_MODES.BRANCH_LAN_CLIENT) {
+      if (!isValidHttpApiUrl(nextConfig.branchLanApiUrl)) {
+        setConfigMessage("Branch LAN Client requires a branch server API URL such as http://192.168.1.41:5000.");
+        return;
+      }
+      const ok = await testApiUrl(nextConfig.branchLanApiUrl, "Branch server");
+      if (!ok && !window.confirm("Branch server health check failed. Save this URL anyway?")) return;
+    }
+    if (nextConfig.mode === API_MODES.CLOUD_PRODUCTION && nextConfig.cloudApiUrl && !isRealCloudUrl(nextConfig.cloudApiUrl)) {
+      setConfigMessage("Cloud Production requires a real hosted cloud URL. Localhost, LAN IPs and :5000 are not cloud.");
+      return;
+    }
+    if (nextConfig.mode === API_MODES.FIELD_REMOTE_DEVICE) {
+      if (!nextConfig.cloudApiUrl) {
+        setConfigMessage("Field Remote Device saved as not ready: Cloud Production URL and purchase offline sync are required.");
+      } else if (!isRealCloudUrl(nextConfig.cloudApiUrl)) {
+        setConfigMessage("Field Remote Device requires a real hosted cloud URL, not localhost or LAN.");
+        return;
+      }
+    }
+    if (nextConfig.mode === API_MODES.CUSTOM_API_URL && !isValidHttpApiUrl(nextConfig.customApiUrl)) {
+      setConfigMessage("Custom API URL is invalid. Use http:// or https://.");
+      return;
+    }
+    writeSavedApiConfig(nextConfig);
+    setConfigMessage("API mode saved. FroozERP will reload to apply it.");
+    window.setTimeout(() => window.location.reload(), 500);
+  };
   const pending = Number(syncStatus?.pendingOperations ?? draft.pending_count ?? 0);
   const failed = Number(syncStatus?.failedOperations || 0);
   const conflicts = Number(syncStatus?.conflictOperations || 0);
@@ -10658,6 +10840,9 @@ function SyncSettingsSection({
   const localServerStatus = connectionStatus?.localBackendStatus || "Not checked";
   const cloudStatus = connectionStatus?.cloudBackendStatus || "Cloud Not Configured";
   const syncSummary = connectionStatus?.syncSummary || "Backend status not checked";
+  const fieldRemoteWarning = API_MODE === API_MODES.FIELD_REMOTE_DEVICE
+    ? "Field Remote Device requires Cloud Production + purchase offline sync. Current version can prepare configuration but cannot safely sync remote purchase entries yet."
+    : "";
   const nativeDbLabel = localDbStatus?.available
     ? localDbStatus.initialized ? "Local SQLite Ready" : "Local SQLite Error"
     : "Browser Mode";
@@ -10682,6 +10867,45 @@ function SyncSettingsSection({
           </div>
         ))}
       </div>
+      {showDiagnostics && fieldRemoteWarning && <p className="form-note stock-low">{fieldRemoteWarning}</p>}
+      {showDiagnostics && (
+      <div className="sync-diagnostics-panel">
+        <div className="form-grid supplier-form-grid">
+          <Field label="App Mode">
+            <select disabled={!canManage} value={configDraft.mode} onChange={(event) => setConfigDraft({ ...configDraft, mode: event.target.value })}>
+              {API_MODE_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+            </select>
+          </Field>
+          {(configDraft.mode === API_MODES.LOCAL_SINGLE_DEVICE || configDraft.mode === API_MODES.BRANCH_LAN_SERVER) && (
+            <Field label="Local API URL"><input disabled={!canManage} value={configDraft.localApiUrl} onChange={(event) => setConfigDraft({ ...configDraft, localApiUrl: event.target.value })} /></Field>
+          )}
+          {(configDraft.mode === API_MODES.BRANCH_LAN_SERVER) && (
+            <>
+              <Field label="Backend Bind Host"><input disabled={!canManage} value={configDraft.branchServerBindHost} onChange={(event) => setConfigDraft({ ...configDraft, branchServerBindHost: event.target.value })} /></Field>
+              <Field label="Backend Port"><input disabled={!canManage} value={configDraft.branchServerPort} onChange={(event) => setConfigDraft({ ...configDraft, branchServerPort: event.target.value })} /></Field>
+            </>
+          )}
+          {modeNeedsBranchUrl && (
+            <Field label="Branch Server API URL"><input disabled={!canManage} placeholder="http://192.168.1.41:5000" value={configDraft.branchLanApiUrl} onChange={(event) => setConfigDraft({ ...configDraft, branchLanApiUrl: event.target.value })} /></Field>
+          )}
+          {modeNeedsCloudUrl && (
+            <Field label="Cloud API URL"><input disabled={!canManage} placeholder="https://api.froozerp.com" value={configDraft.cloudApiUrl} onChange={(event) => setConfigDraft({ ...configDraft, cloudApiUrl: event.target.value })} /></Field>
+          )}
+          {modeNeedsCustomUrl && (
+            <Field label="Custom API URL"><input disabled={!canManage} placeholder="https://backend.example.com" value={configDraft.customApiUrl} onChange={(event) => setConfigDraft({ ...configDraft, customApiUrl: event.target.value })} /></Field>
+          )}
+        </div>
+        {configDraft.mode === API_MODES.BRANCH_LAN_SERVER && <p className="form-note">Branch LAN Server requires backend HOST=0.0.0.0, port {configDraft.branchServerPort || "5000"}, and Windows firewall access for same-shop devices.</p>}
+        {configDraft.mode === API_MODES.BRANCH_LAN_CLIENT && <p className="form-note">Branch LAN Client must use the main branch server IP. It is same Wi-Fi/LAN only, not cloud.</p>}
+        {configDraft.mode === API_MODES.CLOUD_PRODUCTION && <p className="form-note">Cloud Production requires hosted backend, hosted PostgreSQL, HTTPS, and CORS. Blank URL remains Cloud Not Configured.</p>}
+        {configDraft.mode === API_MODES.FIELD_REMOTE_DEVICE && <p className="form-note stock-low">Field Remote Device is not ready. It requires hosted cloud plus purchase offline sync, stock arrival sync, supplier bill draft sync, and conflict/idempotency verification.</p>}
+        {configMessage && <p className="form-note">{configMessage}</p>}
+        <div className="toolbar-actions">
+          <button className="secondary-button" disabled={!canManage || !selectedTestUrl} onClick={() => testApiUrl(selectedTestUrl, "Selected API")}>Test Connection</button>
+          <button className="primary-button" disabled={!canManage} onClick={saveApiConfig}>Save Mode</button>
+        </div>
+      </div>
+      )}
       <div className="toolbar-actions">
         <button className="secondary-button" disabled={!onCheckConnection} onClick={onCheckConnection}>Check Connection</button>
         <button className="secondary-button" disabled={!canManage || !onRunSync} onClick={onRunSync}>Sync Now</button>
@@ -10706,9 +10930,12 @@ function SyncSettingsSection({
             <Field label="Failed Queue Count"><input disabled value={connectionStatus?.failed ?? failed} /></Field>
             <Field label="Conflict Queue Count"><input disabled value={conflicts} /></Field>
             <Field label="Local Database"><input disabled value={nativeDbLabel} /></Field>
-            <Field label="Local Shop API URL"><input disabled value={API_CONFIG.localApiUrl} /></Field>
+            <Field label="Local API URL"><input disabled value={API_CONFIG.localApiUrl} /></Field>
+            <Field label="Branch LAN API URL"><input disabled value={API_CONFIG.branchLanApiUrl} /></Field>
             <Field label="Cloud API URL"><input disabled value={API_CONFIG.cloudApiUrl} /></Field>
             <Field label="Custom API URL"><input disabled value={API_CONFIG.customApiUrl} /></Field>
+            <Field label="Branch Server Bind Host"><input disabled value={API_CONFIG.branchServerBindHost} /></Field>
+            <Field label="Branch Server Port"><input disabled value={API_CONFIG.branchServerPort} /></Field>
             <Field label="Settings API Base"><input disabled value={backendHealth?.apiUrl || API_URL} /></Field>
             <Field label="Sync Worker API Base"><input disabled value={syncStatus?.apiUrl || API_URL} /></Field>
             <Field label="Backend Health URL"><input disabled value={backendHealth?.url || `${API_URL}/api/health`} /></Field>

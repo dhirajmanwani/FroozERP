@@ -4230,7 +4230,10 @@ app.post("/settings/device-control/verify-exit-code", async (req, res) => {
 app.get("/settings/update-center", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM update_center WHERE id = 1");
-    return res.json(result.rows[0] || {});
+    return res.json({
+      ...(result.rows[0] || {}),
+      current_version: appVersion,
+    });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Update Center" });
