@@ -1,6 +1,6 @@
 # FroozERP Phase 4B Multi-Device Cloud Readiness
 
-Date: 2026-06-28
+Date: 2026-06-29
 
 ## Scope
 
@@ -70,7 +70,28 @@ Secrets must not be committed to the repository.
 
 ## Safe Schema Foundation Plan
 
-Do not apply destructive migration steps for Phase 4B.1. The following should be introduced only through idempotent additive migrations after a verified database backup:
+Do not apply destructive migration steps for Phase 4B. The following should be introduced only through idempotent additive migrations after a verified database backup:
+
+- `company_id`
+- `branch_id`
+- `sub_branch_id`
+- `device_id`
+- `created_by_user_id`
+- `updated_by_user_id`
+- `idempotency_key`
+- `conflict_status`
+- `sync_status`
+- `last_synced_at`
+- `source_device_id`
+
+Phase 4B.2 adds source-controlled additive migration plans only:
+
+- `backend/migrations/cloud/005_multibranch_identity_foundation.sql`
+- `src-tauri/migrations/sqlite/006_multibranch_identity_foundation.sql`
+
+These files are not a claim that cloud sync is complete. Apply them only through the controlled migration process with a backup and installed-app verification.
+
+Additional fields that remain part of future sync work:
 
 - `company_id`
 - `sub_branch_id`
@@ -83,6 +104,23 @@ Do not apply destructive migration steps for Phase 4B.1. The following should be
 - `updated_at`
 
 Current code already has `branch_id`, `device_id`, `user_id`, `operation_id`, local outbox status, and backend processed-operation idempotency through `sync_processed_operations.operation_id`. It does not yet have first-class `company_id`, `sub_branch_id`, `idempotency_key`, or `conflict_status` across business and sync tables.
+
+## Phase 4B.2 Owner Readiness Check
+
+Settings -> Sync & Connection includes a Cloud Readiness Check button. It performs a safe status check only; it does not push business data, alter queues, or mark cloud sync complete.
+
+The readiness check reports one of these owner-facing outcomes:
+
+- Ready for Cloud Sync
+- Cloud Not Configured
+- Cloud URL Invalid
+- Cloud Server Unreachable
+- Device Not Registered
+- Branch Not Selected
+- Pending Sync Exists
+- Failed Sync Exists
+
+`Ready for Cloud Sync` means the configured cloud health endpoint is reachable and local identity prerequisites are present. It does not mean all entities are synced or field remote purchase mode is production-ready.
 
 ## Current Sync Coverage
 
