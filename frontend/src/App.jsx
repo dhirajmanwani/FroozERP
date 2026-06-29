@@ -10576,11 +10576,16 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
   const [cleanupResult, setCleanupResult] = useState(null);
   const [cleanupBusy, setCleanupBusy] = useState(false);
   const status = draft.update_status || "READY_FOR_FUTURE_UPDATES";
+  const feedConfigured = Boolean(UPDATE_FEED_URL);
   const updateAvailable = ["UPDATE_AVAILABLE", "DOWNLOAD_READY_FUTURE", "DOWNLOADED"].includes(status);
   const updateDownloaded = ["DOWNLOADED", "INSTALL_READY_FUTURE"].includes(status);
-  const latestVersion = draft.latest_version || draft.current_version || APP_VERSION;
+  const installedVersion = APP_VERSION;
+  const latestHostedVersion = feedConfigured ? (draft.latest_version || "Not Available") : "Not Available";
   const releaseTitle = draft.release_title || "FroozERP Windows release";
-  const releaseNotes = draft.release_notes || draft.changelog || "No hosted update feed is configured yet.";
+  const releaseNotes = draft.release_notes || draft.changelog || "Hosted update feed is not configured yet. Local installer updates still work.";
+  const updatePanelMessage = message || (!feedConfigured
+    ? "Hosted update feed is not configured yet. Local installer updates still work."
+    : "Before installing an update, FroozERP checks local database health, preserves SQLite data, pending outbox operations, device identity and settings.");
   const save = async (status) => {
     try {
       const response = await axios.put(`${API_URL}/settings/update-center`, {
@@ -10601,7 +10606,7 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
     const checkedAt = new Date().toISOString();
     setLastChecked(checkedAt);
     if (!UPDATE_FEED_URL) {
-      setMessage("Update feed is not configured. Hosted signed release metadata is required for real update checks.");
+      setMessage("Hosted update feed is not configured yet. Local installer updates still work.");
       return;
     }
     try {
@@ -10609,13 +10614,13 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
       const data = response.data || {};
       setDraft((current) => ({
         ...current,
-        latest_version: data.version || data.latest_version || latestVersion,
+        latest_version: data.version || data.latest_version || latestHostedVersion,
         release_title: data.title || data.release_title || releaseTitle,
         release_notes: data.notes || data.release_notes || releaseNotes,
         published_at: data.pub_date || data.published_at || checkedAt,
-        update_status: data.version && data.version !== APP_VERSION ? "UPDATE_AVAILABLE" : "NO_UPDATE_AVAILABLE",
+        update_status: data.version && data.version !== installedVersion ? "UPDATE_AVAILABLE" : "NO_UPDATE_AVAILABLE",
       }));
-      setMessage(data.version && data.version !== APP_VERSION ? `FroozERP update available - version ${data.version}` : "No update available");
+      setMessage(data.version && data.version !== installedVersion ? `FroozERP update available - version ${data.version}` : "No update available");
     } catch (error) {
       setMessage(getErrorMessage(error, "Unable to check update feed"));
     }
@@ -10661,29 +10666,31 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
   return (
     <ModuleCard eyebrow="Software Updates" title="FroozERP Windows Updates" subtitle="Updater-ready foundation with local data preservation checks before installing signed releases.">
       <div className="purchase-summary-grid supplier-payment-preview">
-        <SummaryMetric label="Current Version" value={draft.current_version || APP_VERSION} featured />
-        <SummaryMetric label="Latest Version" value={latestVersion} />
+        <SummaryMetric label="Installed App Version" value={installedVersion} featured />
+        <SummaryMetric label="Update Feed" value={feedConfigured ? "Configured" : "Not Configured"} />
+        <SummaryMetric label="Latest Hosted Version" value={latestHostedVersion} />
         <SummaryMetric label="Status" value={status} />
         <SummaryMetric label="Last Checked" value={lastChecked ? new Date(lastChecked).toLocaleString("en-IN") : "Not checked"} />
       </div>
       <div className={updateAvailable ? "update-available-panel" : "update-foundation-panel"}>
-        <strong>{updateAvailable ? `FroozERP update available - version ${latestVersion}` : releaseTitle}</strong>
+        <strong>{updateAvailable ? `FroozERP update available - version ${latestHostedVersion}` : releaseTitle}</strong>
         <span>{releaseNotes}</span>
-        <small>Feed: {UPDATE_FEED_URL || "Not configured"}</small>
+        <small>Update Feed: {UPDATE_FEED_URL || "Not Configured"}</small>
+        <small>Installed App Version: {installedVersion}</small>
         <small>Published: {draft.published_at ? new Date(draft.published_at).toLocaleString("en-IN") : "Pending hosted release metadata"}</small>
       </div>
-      <p className="form-note">{message || "Before installing an update, FroozERP checks local database health, preserves SQLite data, pending outbox operations, device identity and settings."}</p>
+      <p className="form-note">{updatePanelMessage}</p>
       <div className="form-grid supplier-form-grid">
-        <Field label="Current Version"><input disabled={!canManage} value={draft.current_version || ""} onChange={(event) => setDraft({ ...draft, current_version: event.target.value })} /></Field>
-        <Field label="Latest Version"><input disabled={!canManage} value={draft.latest_version || ""} onChange={(event) => setDraft({ ...draft, latest_version: event.target.value })} /></Field>
-        <Field label="Production Update Feed"><input disabled value={UPDATE_FEED_URL || "Configure VITE_UPDATE_FEED_URL or window.__FROOZERP_UPDATE_FEED_URL__"} /></Field>
+        <Field label="Installed App Version"><input disabled value={installedVersion} /></Field>
+        <Field label="Latest Hosted Version"><input disabled={!canManage || !feedConfigured} value={feedConfigured ? (draft.latest_version || "") : "Not Available"} onChange={(event) => setDraft({ ...draft, latest_version: event.target.value })} /></Field>
+        <Field label="Update Feed"><input disabled value={UPDATE_FEED_URL || "Not Configured"} /></Field>
         <Field label="Release Date"><input disabled={!canManage} type="date" value={toDateKey(draft.release_date || new Date())} onChange={(event) => setDraft({ ...draft, release_date: event.target.value })} /></Field>
         <Field label="Release Notes"><textarea disabled={!canManage} value={draft.release_notes || draft.changelog || ""} onChange={(event) => setDraft({ ...draft, release_notes: event.target.value })} /></Field>
       </div>
       <div className="button-row">
-        <button className="secondary-button" disabled={!canManage} onClick={checkForUpdates}>Check for Updates</button>
+        <button className="secondary-button" disabled={!canManage || !feedConfigured} onClick={checkForUpdates}>Check for Updates</button>
         <button className="secondary-button" disabled={!canManage} onClick={() => save("NO_UPDATE_AVAILABLE")}>Save Update Metadata</button>
-        <button className="secondary-button" disabled={!canManage || !updateAvailable || updateDownloaded} onClick={() => save("DOWNLOADED")}>Download Update</button>
+        <button className="secondary-button" disabled={!canManage || !feedConfigured || !updateAvailable || updateDownloaded} onClick={() => save("DOWNLOADED")}>Download Update</button>
         {updateDownloaded && <button className="primary-button" disabled={!canManage} onClick={() => save("INSTALL_READY_FUTURE")}>Install Update</button>}
         {updateAvailable && <button className="secondary-button" disabled={!canManage} onClick={() => setMessage("Reminder saved for this session.")}>Remind Me Later</button>}
       </div>
