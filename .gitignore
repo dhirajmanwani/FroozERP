@@ -3,3 +3,10 @@ node_modules/
 frontend/node_modules/
 frontend/dist/
 src-tauri/target/
+release/
+*.sqlite
+*.sqlite3
+*.db
+*.log
+*.tmp
+tmp-phase4b2-*.png
