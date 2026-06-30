@@ -29,8 +29,7 @@ const pool = new Pool(databaseUrl
       port: Number(process.env.DB_PORT) || 5432,
       ssl: databaseSslEnabled ? { rejectUnauthorized: databaseSslRejectUnauthorized } : undefined,
     });
-const port = Number(process.env.PORT) || 5000;
-const host = process.env.HOST || "0.0.0.0";
+const PORT = process.env.PORT || 5000;
 const backupDirectory = process.env.BACKUP_DIR || path.join(__dirname, "..", "backups");
 const readReleaseVersion = () => {
   try {
@@ -3408,10 +3407,10 @@ const getSystemInfo = async (deviceId = "") => {
     backendStatus: "Online",
     databaseStatus: dbResult.rows[0]?.database_name ? "Connected" : "Unknown",
     databaseName: dbResult.rows[0]?.database_name || "",
-    serverHost: host,
-    serverPort: port,
+    serverHost: "0.0.0.0",
+    serverPort: Number(PORT),
     serverIp: lanIp,
-    lanApiUrl: `http://${lanIp}:${port}`,
+    lanApiUrl: `http://${lanIp}:${PORT}`,
     lanFrontendUrl: `http://${lanIp}:5173`,
     currentDevice: deviceResult.rows[0] || null,
     currentBranch: branchResult.rows[0] || null,
@@ -15987,10 +15986,10 @@ prepareDatabaseForStartup()
     process.once("SIGINT", () => runShutdownBackup("SIGINT"));
     process.once("SIGTERM", () => runShutdownBackup("SIGTERM"));
 
-    app.listen(port, host, () => {
+    app.listen(PORT, "0.0.0.0", () => {
       const lanIp = getPrimaryLanIp();
-      console.log(`Server running on ${host}:${port}`);
-      console.log(`LAN API URL: http://${lanIp}:${port}`);
+      console.log(`Server running on 0.0.0.0:${PORT}`);
+      console.log(`LAN API URL: http://${lanIp}:${PORT}`);
     });
   })
   .catch((error) => {
