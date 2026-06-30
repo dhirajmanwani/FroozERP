@@ -116,6 +116,11 @@ const BRANCH_SERVER_PORT = String(
   window.__FROOZERP_BRANCH_SERVER_PORT__ ||
   "5000"
 ).trim();
+const CONFIGURED_COMPANY_ID = String(SAVED_API_CONFIG.companyId || import.meta.env.VITE_COMPANY_ID || "").trim();
+const CONFIGURED_BRANCH_ID = String(SAVED_API_CONFIG.branchId || import.meta.env.VITE_BRANCH_ID || "1").trim();
+const CONFIGURED_SUB_BRANCH_ID = String(SAVED_API_CONFIG.subBranchId || import.meta.env.VITE_SUB_BRANCH_ID || "").trim();
+const CONFIGURED_DEVICE_ID = String(SAVED_API_CONFIG.deviceId || import.meta.env.VITE_DEVICE_ID || "").trim();
+const CONFIGURED_DEVICE_NAME = String(SAVED_API_CONFIG.deviceName || import.meta.env.VITE_DEVICE_NAME || "").trim();
 const resolveConfiguredApiUrl = () => {
   if (API_MODE === API_MODES.BRANCH_LAN_CLIENT && BRANCH_LAN_API_URL) return BRANCH_LAN_API_URL;
   if (API_MODE === API_MODES.CLOUD_PRODUCTION && CLOUD_API_URL) return CLOUD_API_URL;
@@ -136,6 +141,11 @@ const API_CONFIG = {
   customApiUrl: CUSTOM_API_URL || "Not configured",
   branchServerBindHost: BRANCH_SERVER_BIND_HOST,
   branchServerPort: BRANCH_SERVER_PORT,
+  companyId: CONFIGURED_COMPANY_ID || "Not configured",
+  branchId: CONFIGURED_BRANCH_ID || "Not configured",
+  subBranchId: CONFIGURED_SUB_BRANCH_ID || "Not configured",
+  deviceId: CONFIGURED_DEVICE_ID || "Local SQLite identity",
+  deviceName: CONFIGURED_DEVICE_NAME || "Local SQLite identity",
 };
 const SYNC_FRESHNESS_MS = 5 * 60 * 1000;
 
@@ -178,8 +188,7 @@ const isRealCloudUrl = (value) => {
     const parsed = new URL(url);
     return parsed.protocol === "https:"
       && !isLocalEndpoint(url)
-      && !isPrivateNetworkHost(parsed.hostname)
-      && parsed.port !== "5000";
+      && !isPrivateNetworkHost(parsed.hostname);
   } catch {
     return false;
   }
@@ -246,7 +255,9 @@ const buildConnectionStatusModel = ({ backendHealth = {}, syncStatus = {}, inter
   } else if (API_MODE === API_MODES.CLOUD_PRODUCTION || fieldRemoteMode) {
     localBackendStatus = "Not Used In This Mode";
     cloudBackendStatus = CLOUD_CONFIGURED
-      ? backendOnline ? "Cloud Connected" : backendOffline ? "Cloud Configured But Offline" : "Checking Cloud"
+      ? backendOnline
+        ? fieldRemoteMode ? "Cloud Connected - Field Remote Not Ready" : "Cloud Connected"
+        : backendOffline ? "Cloud Configured But Offline" : "Checking Cloud"
       : "Cloud Not Configured";
   } else {
     localBackendStatus = isLocalEndpoint(API_URL)
@@ -10827,6 +10838,9 @@ function SyncSettingsSection({
       setCloudReadiness({ status, detail, checkedAt: new Date().toISOString() });
       return status;
     };
+    if (configDraft.mode === API_MODES.FIELD_REMOTE_DEVICE) {
+      return setResult("Field Remote Not Ready", "Remote purchase/offline sync handlers are not implemented. This mode cannot be marked production-ready.");
+    }
     if (!cloudUrl) {
       return setResult("Cloud Not Configured", "Cloud is not configured yet. Local and LAN modes can still work.");
     }
@@ -10867,7 +10881,7 @@ function SyncSettingsSection({
       if (String(health.database || health.dbStatus || "").toLowerCase().includes("error")) {
         return setResult("Cloud Server Unreachable", "Cloud backend is reachable, but database health is not ready.");
       }
-      return setResult("Ready for Cloud Sync", `Cloud health is reachable at version ${version}. Business entity sync still needs staged rollout.`);
+      return setResult("Cloud Foundation Reachable", `Cloud health is reachable at version ${version}. Full business-module sync is not production-ready.`);
     } catch (error) {
       return setResult("Cloud Server Unreachable", getErrorMessage(error, "Cloud backend health endpoint is not reachable."));
     } finally {
@@ -10884,6 +10898,11 @@ function SyncSettingsSection({
       customApiUrl: normalizeApiBase(configDraft.customApiUrl),
       branchServerBindHost: String(configDraft.branchServerBindHost || "0.0.0.0").trim(),
       branchServerPort: String(configDraft.branchServerPort || "5000").trim(),
+      companyId: CONFIGURED_COMPANY_ID,
+      branchId: CONFIGURED_BRANCH_ID,
+      subBranchId: CONFIGURED_SUB_BRANCH_ID,
+      deviceId: CONFIGURED_DEVICE_ID,
+      deviceName: CONFIGURED_DEVICE_NAME,
     };
     if (nextConfig.mode === API_MODES.BRANCH_LAN_CLIENT) {
       if (!isValidHttpApiUrl(nextConfig.branchLanApiUrl)) {
@@ -10946,15 +10965,6 @@ function SyncSettingsSection({
               {API_MODE_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
             </select>
           </Field>
-          {modeNeedsBranchUrl && (
-            <Field label="Branch Server URL/IP"><input disabled={!canManage} placeholder="http://192.168.1.41:5000" value={configDraft.branchLanApiUrl} onChange={(event) => setConfigDraft({ ...configDraft, branchLanApiUrl: event.target.value })} /></Field>
-          )}
-          {modeNeedsCloudUrl && (
-            <Field label="Cloud API URL"><input disabled={!canManage} placeholder="https://api.froozerp.com" value={configDraft.cloudApiUrl} onChange={(event) => setConfigDraft({ ...configDraft, cloudApiUrl: event.target.value })} /></Field>
-          )}
-          {modeNeedsCustomUrl && (
-            <Field label="Custom API URL"><input disabled={!canManage} placeholder="https://backend.example.com" value={configDraft.customApiUrl} onChange={(event) => setConfigDraft({ ...configDraft, customApiUrl: event.target.value })} /></Field>
-          )}
         </div>
         {configDraft.mode === API_MODES.LOCAL_SINGLE_DEVICE && <p className="form-note">Local Single Device uses this computer's local backend.</p>}
         {configDraft.mode === API_MODES.BRANCH_LAN_SERVER && <p className="form-note">Branch LAN Server is for the main shop computer serving same-branch devices over Wi-Fi/LAN.</p>}
@@ -10993,7 +11003,7 @@ function SyncSettingsSection({
         <button className="secondary-button" onClick={() => setShowDiagnostics((current) => !current)}>Advanced Diagnostics</button>
       </div>
       {showDiagnostics && cloudReadiness && (
-        <p className={cloudReadiness.status === "Ready for Cloud Sync" ? "form-note stock-ok" : "form-note"}>
+        <p className={cloudReadiness.status === "Cloud Foundation Reachable" ? "form-note stock-ok" : "form-note"}>
           <strong>{cloudReadiness.status}</strong> - {cloudReadiness.detail}
         </p>
       )}
@@ -11002,6 +11012,15 @@ function SyncSettingsSection({
           {(statusMessage || syncMessage || syncStatus?.lastError) && <p className="form-note">{syncMessage || statusMessage || syncStatus?.lastError}</p>}
           {localDbStatus?.error && <p className="form-note stock-low">{localDbStatus.error}</p>}
           <div className="form-grid supplier-form-grid">
+            {modeNeedsBranchUrl && (
+              <Field label="Branch Server URL/IP"><input disabled={!canManage} placeholder="http://192.168.1.41:5000" value={configDraft.branchLanApiUrl} onChange={(event) => setConfigDraft({ ...configDraft, branchLanApiUrl: event.target.value })} /></Field>
+            )}
+            {modeNeedsCloudUrl && (
+              <Field label="Cloud API URL"><input disabled={!canManage} placeholder="https://api.froozerp.com" value={configDraft.cloudApiUrl} onChange={(event) => setConfigDraft({ ...configDraft, cloudApiUrl: event.target.value })} /></Field>
+            )}
+            {modeNeedsCustomUrl && (
+              <Field label="Custom API URL"><input disabled={!canManage} placeholder="https://backend.example.com" value={configDraft.customApiUrl} onChange={(event) => setConfigDraft({ ...configDraft, customApiUrl: event.target.value })} /></Field>
+            )}
             <Field label="Branch"><input disabled value={branchLabel} /></Field>
             <Field label="Device ID"><input disabled value={draft.device_id || "LOCAL-STORE"} /></Field>
             <Field label="Device Display Name"><input disabled={!canManage} value={draft.device_display_name || ""} onChange={(event) => setDraft({ ...draft, device_display_name: event.target.value })} /></Field>
@@ -11010,6 +11029,11 @@ function SyncSettingsSection({
             <Field label="Last Push"><input disabled value={lastPush ? new Date(lastPush).toLocaleString("en-IN") : "Not pushed"} /></Field>
             <Field label="Last Pull"><input disabled value={lastPull ? new Date(lastPull).toLocaleString("en-IN") : "Not pulled"} /></Field>
             <Field label="API Mode"><input disabled value={API_CONFIG.mode} /></Field>
+            <Field label="Configured Company ID"><input disabled value={API_CONFIG.companyId} /></Field>
+            <Field label="Configured Branch ID"><input disabled value={API_CONFIG.branchId} /></Field>
+            <Field label="Configured Sub-Branch ID"><input disabled value={API_CONFIG.subBranchId} /></Field>
+            <Field label="Configured Device ID"><input disabled value={API_CONFIG.deviceId} /></Field>
+            <Field label="Configured Device Name"><input disabled value={API_CONFIG.deviceName} /></Field>
             <Field label="Selected API URL"><input disabled value={API_CONFIG.apiUrl} /></Field>
             <Field label="Last Health Check"><input disabled value={connectionStatus?.lastHealthCheck || "Not checked"} /></Field>
             <Field label="Pending Queue Count"><input disabled value={connectionStatus?.pending ?? pending} /></Field>

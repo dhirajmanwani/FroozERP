@@ -42,11 +42,22 @@ const normalizeApiUrl = (apiUrl) => String(apiUrl || "").replace(/\/$/, "");
 const endpointUrl = (apiUrl, path) => `${normalizeApiUrl(apiUrl)}${path}`;
 
 const readSavedApiConfig = () => {
-  if (typeof window === "undefined" || !window.localStorage) return {};
+  const defaults = {
+    mode: String(import.meta.env.VITE_API_MODE || "LOCAL_SINGLE_DEVICE").trim().toUpperCase(),
+    companyId: String(import.meta.env.VITE_COMPANY_ID || "").trim(),
+    branchId: String(import.meta.env.VITE_BRANCH_ID || "1").trim(),
+    subBranchId: String(import.meta.env.VITE_SUB_BRANCH_ID || "").trim(),
+    deviceId: String(import.meta.env.VITE_DEVICE_ID || "").trim(),
+    deviceName: String(import.meta.env.VITE_DEVICE_NAME || "").trim(),
+    cloudApiUrl: normalizeApiUrl(import.meta.env.VITE_CLOUD_API_URL || ""),
+    branchLanApiUrl: normalizeApiUrl(import.meta.env.VITE_BRANCH_LAN_API_URL || ""),
+    customApiUrl: normalizeApiUrl(import.meta.env.VITE_CUSTOM_API_URL || ""),
+  };
+  if (typeof window === "undefined" || !window.localStorage) return defaults;
   try {
-    return JSON.parse(window.localStorage.getItem("froozerp.apiConfig") || "{}") || {};
+    return { ...defaults, ...(JSON.parse(window.localStorage.getItem("froozerp.apiConfig") || "{}") || {}) };
   } catch {
-    return {};
+    return defaults;
   }
 };
 
@@ -179,6 +190,8 @@ export async function initialiseSync({ apiUrl, user, deviceInfo, branchId }) {
     user_id: context.userId,
     role: user?.role_name || user?.role || "",
     app_mode: apiConfig.mode || "",
+    company_id: apiConfig.companyId || "",
+    sub_branch_id: apiConfig.subBranchId || "",
     cloud_api_url: apiConfig.cloudApiUrl || "",
     branch_lan_api_url: apiConfig.branchLanApiUrl || "",
     custom_api_url: apiConfig.customApiUrl || "",

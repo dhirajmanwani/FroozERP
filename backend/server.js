@@ -46,13 +46,49 @@ const allowedCorsOrigins = String(process.env.CORS_ORIGINS || "")
   .map((origin) => origin.trim())
   .filter(Boolean);
 const apiContractVersion = "1";
+const APP_MODES = new Set([
+  "LOCAL_SINGLE_DEVICE",
+  "BRANCH_LAN_SERVER",
+  "BRANCH_LAN_CLIENT",
+  "CLOUD_PRODUCTION",
+  "FIELD_REMOTE_DEVICE",
+  "CUSTOM_API_URL",
+]);
 const deploymentType = String(process.env.FROOZERP_DEPLOYMENT_TYPE || "local").trim().toLowerCase();
-const configuredCompanyId = String(process.env.FROOZERP_COMPANY_ID || "").trim() || null;
+const requestedAppMode = String(process.env.APP_MODE || "LOCAL_SINGLE_DEVICE").trim().toUpperCase();
+const configuredAppMode = APP_MODES.has(requestedAppMode) ? requestedAppMode : "LOCAL_SINGLE_DEVICE";
+const configuredCompanyId = String(process.env.COMPANY_ID || process.env.FROOZERP_COMPANY_ID || "").trim() || null;
 const configuredCompanyName = String(process.env.FROOZERP_COMPANY_NAME || "").trim() || null;
+const configuredBranchId = String(process.env.BRANCH_ID || "").trim() || null;
+const configuredDeviceId = String(process.env.DEVICE_ID || "").trim() || null;
+const configuredDeviceName = String(process.env.DEVICE_NAME || "").trim() || null;
 const cloudDeploymentId = String(process.env.FROOZERP_CLOUD_DEPLOYMENT_ID || "").trim() || null;
-const publicCloudApiUrl = String(process.env.FROOZERP_PUBLIC_API_URL || "").trim().replace(/\/$/, "") || null;
+const publicCloudApiUrl = String(process.env.CLOUD_API_URL || process.env.FROOZERP_PUBLIC_API_URL || "").trim().replace(/\/$/, "") || null;
+const isPrivateCloudHostname = (hostname) => {
+  const hostValue = String(hostname || "").trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (!hostValue) return true;
+  if (hostValue === "localhost" || hostValue === "::1" || hostValue.endsWith(".local")) return true;
+  if (/^(10|127|169\.254|192\.168)\./.test(hostValue)) return true;
+  const private172 = hostValue.match(/^172\.(\d{1,3})\./);
+  if (private172) {
+    const secondOctet = Number(private172[1]);
+    if (secondOctet >= 16 && secondOctet <= 31) return true;
+  }
+  return /^(fc|fd|fe80:)/i.test(hostValue);
+};
+const isRealHostedCloudUrl = (value) => {
+  try {
+    const parsed = new URL(String(value || "").trim());
+    return parsed.protocol === "https:" && !isPrivateCloudHostname(parsed.hostname);
+  } catch {
+    return false;
+  }
+};
+const cloudApiConfigured = isRealHostedCloudUrl(publicCloudApiUrl);
 const cloudConfigurationReady = deploymentType === "cloud"
   && process.env.NODE_ENV === "production"
+  && configuredAppMode === "CLOUD_PRODUCTION"
+  && cloudApiConfigured
   && Boolean(configuredCompanyId)
   && Boolean(cloudDeploymentId)
   && allowedCorsOrigins.length > 0;
@@ -7154,9 +7190,13 @@ const healthHandler = async (_req, res) => {
       database: "reachable",
       mode: process.env.NODE_ENV || "development",
       deployment_type: deploymentType,
+      app_mode: configuredAppMode,
+      cloud_api_configured: cloudApiConfigured,
+      device_identity_configured: Boolean(configuredDeviceId && configuredDeviceName),
       cloud_ready: cloudConfigurationReady,
       company_id: configuredCompanyId,
       company_name: configuredCompanyName,
+      branch_id: configuredBranchId,
     });
   } catch (error) {
     console.error("Health check failed", error.message);
@@ -7176,9 +7216,13 @@ app.get("/api/version", (_req, res) => {
     server_time: new Date().toISOString(),
     node_env: process.env.NODE_ENV || "development",
     deployment_type: deploymentType,
+    app_mode: configuredAppMode,
+    cloud_api_configured: cloudApiConfigured,
+    device_identity_configured: Boolean(configuredDeviceId && configuredDeviceName),
     cloud_ready: cloudConfigurationReady,
     company_id: configuredCompanyId,
     company_name: configuredCompanyName,
+    branch_id: configuredBranchId,
     api: "FroozERP Cloud Foundation",
   });
 });
@@ -7244,7 +7288,7 @@ app.get("/api/device/identity", rateLimitSyncRequest, async (req, res) => {
       branch_name: branch.branch_name || null,
       sub_branch_id: null,
       device_id: context.deviceId,
-      device_name: context.device.device_name,
+      device_name: context.device.device_name || configuredDeviceName,
       device_type: context.device.device_type,
       user_id: context.user.id,
       role: context.user.role_name,
