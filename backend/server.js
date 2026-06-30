@@ -13,7 +13,30 @@ types.setTypeParser(1082, (value) => value);
 const app = express();
 app.use(express.json({ limit: "25mb" }));
 
-const databaseUrl = String(process.env.CLOUD_DATABASE_URL || process.env.DATABASE_URL || "").trim();
+const primaryDatabaseUrl = String(process.env.DATABASE_URL || "").trim();
+const cloudDatabaseUrl = String(process.env.CLOUD_DATABASE_URL || "").trim();
+const runtimeNodeEnv = String(process.env.NODE_ENV || "").trim().toLowerCase();
+const runtimeAppMode = String(process.env.APP_MODE || "").trim().toUpperCase();
+const runtimeDeploymentType = String(process.env.FROOZERP_DEPLOYMENT_TYPE || "").trim().toLowerCase();
+const railwayRuntime = Boolean(
+  process.env.RAILWAY_PROJECT_ID ||
+  process.env.RAILWAY_ENVIRONMENT_ID ||
+  process.env.RAILWAY_SERVICE_ID
+);
+const productionDatabaseRequired = runtimeNodeEnv === "production"
+  || runtimeAppMode === "CLOUD_PRODUCTION"
+  || runtimeDeploymentType === "cloud"
+  || railwayRuntime;
+const databaseUrl = primaryDatabaseUrl || cloudDatabaseUrl;
+const databaseSource = primaryDatabaseUrl
+  ? "DATABASE_URL"
+  : cloudDatabaseUrl
+    ? "CLOUD_DATABASE_URL"
+    : "LOCAL_FALLBACK";
+if (productionDatabaseRequired && !databaseUrl) {
+  throw new Error("Railway DATABASE_URL/CLOUD_DATABASE_URL is missing. Refusing localhost in production.");
+}
+console.log(`DB source used: ${databaseSource}`);
 const databaseSslEnabled = /^true$/i.test(process.env.DB_SSL || "");
 const databaseSslRejectUnauthorized = !/^false$/i.test(process.env.DB_SSL_REJECT_UNAUTHORIZED || "");
 const pool = new Pool(databaseUrl
@@ -53,8 +76,8 @@ const APP_MODES = new Set([
   "FIELD_REMOTE_DEVICE",
   "CUSTOM_API_URL",
 ]);
-const deploymentType = String(process.env.FROOZERP_DEPLOYMENT_TYPE || "local").trim().toLowerCase();
-const requestedAppMode = String(process.env.APP_MODE || "LOCAL_SINGLE_DEVICE").trim().toUpperCase();
+const deploymentType = runtimeDeploymentType || "local";
+const requestedAppMode = runtimeAppMode || "LOCAL_SINGLE_DEVICE";
 const configuredAppMode = APP_MODES.has(requestedAppMode) ? requestedAppMode : "LOCAL_SINGLE_DEVICE";
 const configuredCompanyId = String(process.env.COMPANY_ID || process.env.FROOZERP_COMPANY_ID || "").trim() || null;
 const configuredCompanyName = String(process.env.FROOZERP_COMPANY_NAME || "").trim() || null;
