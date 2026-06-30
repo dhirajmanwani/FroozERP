@@ -26,6 +26,14 @@ const listeners = new Set();
 
 const healthUrl = (apiUrl) => `${String(apiUrl || "").replace(/\/$/, "")}/api/health`;
 
+const hasExpectedCloudIdentity = (data = {}) =>
+  data.app === "FroozERP"
+  && String(data.api_version) === "1"
+  && Boolean(data.version)
+  && data.deployment_type === "cloud"
+  && data.cloud_ready === true
+  && Boolean(data.company_id);
+
 const isTauriRuntime = () =>
   typeof window !== "undefined" && (Boolean(window.__TAURI_INTERNALS__) || Boolean(window.__TAURI__));
 
@@ -123,7 +131,19 @@ export async function checkFroozBackendHealth(apiUrl, options = {}) {
         params: { t: Date.now() },
       });
       if (requestId !== latestRequestId) return latestState;
-      const online = response.data?.status === "ok";
+      const healthOk = response.data?.status === "ok";
+      const cloudIdentityValid = !options.requireCloudIdentity || hasExpectedCloudIdentity(response.data);
+      const online = healthOk && cloudIdentityValid;
+      const reasonCode = online
+        ? "ONLINE"
+        : healthOk && options.requireCloudIdentity
+          ? "CLOUD_IDENTITY_INVALID"
+          : "HTTP_FAILURE";
+      const message = online
+        ? options.requireCloudIdentity ? "FroozERP cloud backend is reachable and identified." : "FroozERP backend is reachable."
+        : healthOk && options.requireCloudIdentity
+          ? "Backend responded, but it is not configured as a valid FroozERP cloud deployment."
+          : "Health endpoint responded but did not report ok.";
       latestState = {
         apiUrl: normalizedApiUrl,
         url,
@@ -131,10 +151,10 @@ export async function checkFroozBackendHealth(apiUrl, options = {}) {
         checking: false,
         reachabilityStatus: online ? "online" : "server_error",
         reason,
-        reasonCode: online ? "ONLINE" : "HTTP_FAILURE",
+        reasonCode,
         status: online ? "online" : "server_error",
         httpStatus: response.status,
-        message: online ? "FroozERP backend is reachable." : "Health endpoint responded but did not report ok.",
+        message,
         data: response.data,
         lastCheckedAt: new Date().toISOString(),
         lastOnlineAt: online ? new Date().toISOString() : latestState.lastOnlineAt,

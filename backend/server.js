@@ -13,13 +13,22 @@ types.setTypeParser(1082, (value) => value);
 const app = express();
 app.use(express.json({ limit: "25mb" }));
 
-const pool = new Pool({
-  user: process.env.DB_USER || "postgres",
-  host: process.env.DB_HOST || "localhost",
-  database: process.env.DB_NAME || "froozerp",
-  password: process.env.DB_PASSWORD || "8386",
-  port: Number(process.env.DB_PORT) || 5432,
-});
+const databaseUrl = String(process.env.CLOUD_DATABASE_URL || process.env.DATABASE_URL || "").trim();
+const databaseSslEnabled = /^true$/i.test(process.env.DB_SSL || "");
+const databaseSslRejectUnauthorized = !/^false$/i.test(process.env.DB_SSL_REJECT_UNAUTHORIZED || "");
+const pool = new Pool(databaseUrl
+  ? {
+      connectionString: databaseUrl,
+      ssl: databaseSslEnabled ? { rejectUnauthorized: databaseSslRejectUnauthorized } : undefined,
+    }
+  : {
+      user: process.env.DB_USER || "postgres",
+      host: process.env.DB_HOST || "localhost",
+      database: process.env.DB_NAME || "froozerp",
+      password: process.env.DB_PASSWORD || "8386",
+      port: Number(process.env.DB_PORT) || 5432,
+      ssl: databaseSslEnabled ? { rejectUnauthorized: databaseSslRejectUnauthorized } : undefined,
+    });
 const port = Number(process.env.PORT) || 5000;
 const host = process.env.HOST || "0.0.0.0";
 const backupDirectory = process.env.BACKUP_DIR || path.join(__dirname, "..", "backups");
@@ -36,6 +45,17 @@ const allowedCorsOrigins = String(process.env.CORS_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
+const apiContractVersion = "1";
+const deploymentType = String(process.env.FROOZERP_DEPLOYMENT_TYPE || "local").trim().toLowerCase();
+const configuredCompanyId = String(process.env.FROOZERP_COMPANY_ID || "").trim() || null;
+const configuredCompanyName = String(process.env.FROOZERP_COMPANY_NAME || "").trim() || null;
+const cloudDeploymentId = String(process.env.FROOZERP_CLOUD_DEPLOYMENT_ID || "").trim() || null;
+const publicCloudApiUrl = String(process.env.FROOZERP_PUBLIC_API_URL || "").trim().replace(/\/$/, "") || null;
+const cloudConfigurationReady = deploymentType === "cloud"
+  && process.env.NODE_ENV === "production"
+  && Boolean(configuredCompanyId)
+  && Boolean(cloudDeploymentId)
+  && allowedCorsOrigins.length > 0;
 const allowedTauriCorsOrigins = new Set([
   "tauri://localhost",
   "http://tauri.localhost",
@@ -6135,7 +6155,7 @@ const readDevicePayload = (body = {}, req = {}) => ({
   device_type: cleanText(body.device_type) || "Browser",
   user_agent: cleanText(body.user_agent || req.get?.("user-agent")),
   local_ip: cleanText(body.local_ip || req.ip),
-  assigned_branch_id: parsePositiveInteger(body.assigned_branch_id) || 1,
+  assigned_branch_id: parsePositiveInteger(body.assigned_branch_id || body.branch_id) || 1,
   assigned_counter_id: parsePositiveInteger(body.assigned_counter_id),
 });
 
@@ -7091,7 +7111,8 @@ const processSyncOperation = async (client, operation, context) => {
   if (!operation || typeof operation !== "object") {
     return rejectOperation({ operation_id: "" }, "VALIDATION_ERROR", "Invalid operation");
   }
-  operation.operation_id = cleanText(operation.operation_id);
+  operation.idempotency_key = cleanText(operation.idempotency_key || operation.operation_id);
+  operation.operation_id = cleanText(operation.operation_id || operation.idempotency_key);
   operation.entity_type = cleanText(operation.entity_type);
   operation.entity_id = cleanText(operation.entity_id);
   operation.operation_type = cleanText(operation.operation_type || "UPSERT").toUpperCase();
@@ -7126,10 +7147,16 @@ const healthHandler = async (_req, res) => {
     await pool.query("SELECT 1");
     return res.json({
       status: "ok",
+      app: "FroozERP",
+      api_version: apiContractVersion,
       server_time: new Date().toISOString(),
       version: appVersion,
       database: "reachable",
       mode: process.env.NODE_ENV || "development",
+      deployment_type: deploymentType,
+      cloud_ready: cloudConfigurationReady,
+      company_id: configuredCompanyId,
+      company_name: configuredCompanyName,
     });
   } catch (error) {
     console.error("Health check failed", error.message);
@@ -7143,14 +7170,20 @@ app.get("/health", healthHandler);
 app.get("/api/version", (_req, res) => {
   res.json({
     status: "ok",
+    app: "FroozERP",
+    api_version: apiContractVersion,
     version: appVersion,
     server_time: new Date().toISOString(),
     node_env: process.env.NODE_ENV || "development",
+    deployment_type: deploymentType,
+    cloud_ready: cloudConfigurationReady,
+    company_id: configuredCompanyId,
+    company_name: configuredCompanyName,
     api: "FroozERP Cloud Foundation",
   });
 });
 
-app.post("/api/sync/register-device", rateLimitSyncRequest, async (req, res) => {
+const registerSyncDeviceHandler = async (req, res) => {
   try {
     const device = readDevicePayload({
       ...req.body,
@@ -7172,11 +7205,63 @@ app.post("/api/sync/register-device", rateLimitSyncRequest, async (req, res) => 
       device_id: saved.device_id,
       status: saved.status,
       branch_id: saved.assigned_branch_id || 1,
+      company_id: configuredCompanyId || "1",
+      sub_branch_id: null,
+      app_mode: cleanText(req.body.app_mode) || null,
+      role: cleanText(req.body.role) || null,
       message: saved.status === "APPROVED" ? "Device registered" : "Device pending approval",
     });
   } catch (error) {
     console.error("Device sync registration failed", error.message);
     return res.status(500).json({ message: "Device registration failed" });
+  }
+};
+
+app.post("/api/sync/register-device", rateLimitSyncRequest, registerSyncDeviceHandler);
+app.post("/api/device/register", rateLimitSyncRequest, registerSyncDeviceHandler);
+
+app.get("/api/device/identity", rateLimitSyncRequest, async (req, res) => {
+  try {
+    const context = await requireSyncContext({
+      userId: req.query.user_id,
+      deviceId: req.query.device_id,
+      branchId: req.query.branch_id,
+    });
+    if (context.error) return res.status(context.error.status).json({ message: context.error.message });
+    const branchResult = await pool.query(
+      "SELECT id, branch_name FROM branches WHERE id = $1 LIMIT 1",
+      [context.branchId]
+    );
+    const branch = branchResult.rows[0] || {};
+    return res.json({
+      status: "ok",
+      app: "FroozERP",
+      api_version: apiContractVersion,
+      app_version: appVersion,
+      company_id: configuredCompanyId || "1",
+      company_name: configuredCompanyName,
+      branch_id: context.branchId,
+      branch_name: branch.branch_name || null,
+      sub_branch_id: null,
+      device_id: context.deviceId,
+      device_name: context.device.device_name,
+      device_type: context.device.device_type,
+      user_id: context.user.id,
+      role: context.user.role_name,
+      app_mode: cleanText(req.query.app_mode) || null,
+      cloud_api_url: publicCloudApiUrl,
+      branch_lan_api_url: null,
+      custom_api_url: null,
+      last_sync_at: context.device.last_sync_at || null,
+      sync_status: context.device.sync_status || "IDLE",
+      pending_queue_count: null,
+      failed_queue_count: null,
+      registration_status: context.device.status,
+      server_time: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("Device identity lookup failed", error.message);
+    return res.status(500).json({ message: "Device identity lookup failed" });
   }
 });
 
@@ -7278,8 +7363,18 @@ app.get("/api/sync/status", rateLimitSyncRequest, async (req, res) => {
       pool.query("SELECT COALESCE(MAX(change_id), 0)::BIGINT AS cursor FROM sync_change_log WHERE branch_id = $1", [context.branchId]),
     ]);
     return res.json({
+      status: "ok",
+      app: "FroozERP",
+      api_version: apiContractVersion,
+      company_id: configuredCompanyId || "1",
       device_id: context.deviceId,
       branch_id: context.branchId,
+      user_id: context.user.id,
+      role: context.user.role_name,
+      last_sync_at: context.device.last_sync_at || null,
+      sync_status: context.device.sync_status || "IDLE",
+      pending_queue_count: null,
+      failed_queue_count: null,
       processed_operations: processed.rows[0]?.count || 0,
       open_conflicts: conflicts.rows[0]?.count || 0,
       latest_cursor: String(changes.rows[0]?.cursor || 0),

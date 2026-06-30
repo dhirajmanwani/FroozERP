@@ -176,7 +176,7 @@ const isRealCloudUrl = (value) => {
   const url = String(value || "").trim();
   try {
     const parsed = new URL(url);
-    return ["http:", "https:"].includes(parsed.protocol)
+    return parsed.protocol === "https:"
       && !isLocalEndpoint(url)
       && !isPrivateNetworkHost(parsed.hostname)
       && parsed.port !== "5000";
@@ -1516,6 +1516,7 @@ function App() {
       timeoutMs: options.timeoutMs || 3500,
       force: Boolean(options.force),
       reason,
+      requireCloudIdentity: isCloudMode(),
     });
     applyConnectivityState(health, realInternet, syncStatusRef.current);
     if (health.online && userRef.current && !reconnectSyncRef.current && shouldStartBackgroundSync()) {
@@ -10796,8 +10797,22 @@ function SyncSettingsSection({
     }
     try {
       const response = await axios.get(`${apiUrl}/api/health`, { timeout: 3500, headers: { "Cache-Control": "no-store" } });
-      const ok = response.status >= 200 && response.status < 300 && String(response.data?.status || "").toLowerCase() === "ok";
-      setConfigMessage(ok ? `${label} connection passed` : `${label} responded but health is not ok`);
+      const health = response.data || {};
+      const healthOk = response.status >= 200 && response.status < 300 && String(health.status || "").toLowerCase() === "ok";
+      const cloudIdentityOk = !modeNeedsCloudUrl || (
+        health.app === "FroozERP"
+        && String(health.api_version) === "1"
+        && Boolean(health.version)
+        && health.deployment_type === "cloud"
+        && health.cloud_ready === true
+        && Boolean(health.company_id)
+      );
+      const ok = healthOk && cloudIdentityOk;
+      setConfigMessage(ok
+        ? `${label} connection passed`
+        : healthOk && modeNeedsCloudUrl
+          ? `${label} responded, but it is not a configured FroozERP cloud deployment`
+          : `${label} responded but health is not ok`);
       return ok;
     } catch (error) {
       setConfigMessage(`${label} connection failed: ${getErrorMessage(error, "Backend not reachable")}`);
@@ -10837,8 +10852,17 @@ function SyncSettingsSection({
       const health = response.data || {};
       const ok = response.status >= 200 && response.status < 300 && String(health.status || "").toLowerCase() === "ok";
       const version = health.version || health.appVersion;
-      if (!ok || !version) {
-        return setResult("Cloud Server Unreachable", "Cloud health responded without a valid FroozERP version.");
+      const expectedCloudIdentity = health.app === "FroozERP"
+        && String(health.api_version) === "1"
+        && Boolean(version)
+        && health.deployment_type === "cloud"
+        && health.cloud_ready === true
+        && Boolean(health.company_id);
+      if (!ok) {
+        return setResult("Cloud Server Unreachable", "Cloud health endpoint did not report ok.");
+      }
+      if (!expectedCloudIdentity) {
+        return setResult("Cloud Server Unreachable", "Server responded, but the FroozERP app/version/company cloud identity is incomplete.");
       }
       if (String(health.database || health.dbStatus || "").toLowerCase().includes("error")) {
         return setResult("Cloud Server Unreachable", "Cloud backend is reachable, but database health is not ready.");
@@ -10965,12 +10989,10 @@ function SyncSettingsSection({
       {fieldRemoteWarning && <p className="form-note stock-low">{fieldRemoteWarning}</p>}
       <div className="toolbar-actions">
         <button className="secondary-button" disabled={!onCheckConnection} onClick={onCheckConnection}>Check Connection</button>
-        <button className="secondary-button" disabled={cloudReadinessBusy} onClick={runCloudReadinessCheck}>{cloudReadinessBusy ? "Checking Cloud..." : "Cloud Readiness Check"}</button>
         <button className="secondary-button" disabled={!canManage || !onRunSync} onClick={onRunSync}>Sync Now</button>
-        <button className="secondary-button" disabled={!canManage || !onRetrySync} onClick={onRetrySync}>Retry Failed</button>
         <button className="secondary-button" onClick={() => setShowDiagnostics((current) => !current)}>Advanced Diagnostics</button>
       </div>
-      {cloudReadiness && (
+      {showDiagnostics && cloudReadiness && (
         <p className={cloudReadiness.status === "Ready for Cloud Sync" ? "form-note stock-ok" : "form-note"}>
           <strong>{cloudReadiness.status}</strong> - {cloudReadiness.detail}
         </p>
@@ -11011,6 +11033,7 @@ function SyncSettingsSection({
           <div className="toolbar-actions">
             <button className="primary-button" disabled={!canManage} onClick={save}>Save Device Name</button>
             <button className="secondary-button" disabled={cloudReadinessBusy} onClick={runCloudReadinessCheck}>{cloudReadinessBusy ? "Checking Cloud..." : "Cloud Readiness Check"}</button>
+            <button className="secondary-button" disabled={!canManage || !onRetrySync} onClick={onRetrySync}>Retry Failed</button>
             <button className="secondary-button" disabled={!canManage || !onQueueSyncTest} onClick={onQueueSyncTest}>Queue Safe Test</button>
           </div>
         </div>

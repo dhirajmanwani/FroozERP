@@ -41,6 +41,15 @@ const normalizeApiUrl = (apiUrl) => String(apiUrl || "").replace(/\/$/, "");
 
 const endpointUrl = (apiUrl, path) => `${normalizeApiUrl(apiUrl)}${path}`;
 
+const readSavedApiConfig = () => {
+  if (typeof window === "undefined" || !window.localStorage) return {};
+  try {
+    return JSON.parse(window.localStorage.getItem("froozerp.apiConfig") || "{}") || {};
+  } catch {
+    return {};
+  }
+};
+
 const writeSyncLog = async (level, message, details = {}) => {
   const entry = `[FroozERP sync] ${message} ${JSON.stringify(details)}`;
   console.info(entry);
@@ -147,7 +156,9 @@ export async function initialiseSync({ apiUrl, user, deviceInfo, branchId }) {
   lastStatus = normalizeLocalStatus(localStatus);
   const context = syncContext({ user, deviceInfo, branchId });
   if (!isTauriRuntime() || !context.userId || !context.deviceId) return lastStatus;
-  const health = await checkBackendHealth(apiUrl, { details: true, reason: "sync-initialise" });
+  const apiConfig = readSavedApiConfig();
+  const requireCloudIdentity = ["CLOUD_PRODUCTION", "FIELD_REMOTE_DEVICE"].includes(apiConfig.mode);
+  const health = await checkBackendHealth(apiUrl, { details: true, reason: "sync-initialise", requireCloudIdentity });
   lastStatus = {
     ...lastStatus,
     online: Boolean(health.online),
@@ -163,8 +174,14 @@ export async function initialiseSync({ apiUrl, user, deviceInfo, branchId }) {
     device_id: context.deviceId,
     device_name: context.deviceName || "FroozERP Device",
     platform: "tauri-windows",
-    app_version: "1.0.0",
+    app_version: "1.0.30",
     branch_id: context.branchId,
+    user_id: context.userId,
+    role: user?.role_name || user?.role || "",
+    app_mode: apiConfig.mode || "",
+    cloud_api_url: apiConfig.cloudApiUrl || "",
+    branch_lan_api_url: apiConfig.branchLanApiUrl || "",
+    custom_api_url: apiConfig.customApiUrl || "",
   }, withTimeout());
   return lastStatus;
 }
@@ -195,6 +212,7 @@ export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId
     client_timestamp: new Date().toISOString(),
     operations: operations.map((operation) => ({
       operation_id: operation.operation_id,
+      idempotency_key: operation.operation_id,
       entity_type: operation.entity_type,
       entity_id: operation.entity_id,
       operation_type: operation.operation_type,

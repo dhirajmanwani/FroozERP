@@ -16,6 +16,21 @@ This is a readiness audit for real cloud sync across multiple FroozERP devices:
 
 This document does not mark cloud sync as ready. Real cloud requires a hosted backend URL, hosted PostgreSQL, HTTPS, CORS, production environment variables, configured app cloud API URL, and successful multi-device tests.
 
+## Phase 4B.3 Foundation
+
+Phase 4B.3 adds a strict cloud identity contract and migration plans without deploying or claiming a real cloud:
+
+- `/api/health` and `/api/version` identify the service as FroozERP and report API version, app version, deployment type, cloud readiness, and company identity.
+- Cloud status requires an HTTPS non-local URL plus a health response with `app=FroozERP`, API/app versions, `deployment_type=cloud`, `cloud_ready=true`, and a company ID.
+- `/api/device/register` is a compatibility endpoint for the existing approved-device registration flow.
+- `/api/device/identity` returns authorised company/branch/device/user/role and sync metadata.
+- Existing `/api/sync/register-device`, `/api/sync/push`, `/api/sync/pull`, and `/api/sync/status` routes remain the active sync foundation.
+- Push operations now send an explicit idempotency key equal to the stable operation ID.
+- `backend/migrations/cloud/006_cloud_device_runtime_foundation.sql` plans central company/device configuration and processed inbox operations.
+- `src-tauri/migrations/sqlite/007_cloud_runtime_and_inbox_foundation.sql` plans local runtime configuration, stable device metadata, and inbox operations.
+
+The Phase 4B.3 migration files are create-only plans and are not automatically applied in this phase.
+
 ## Current Mode Status
 
 - `LOCAL_SINGLE_DEVICE` exists for app and backend on the same laptop.
@@ -49,8 +64,15 @@ Backend/cloud host configuration:
 - `DB_NAME`
 - `DB_USER`
 - `DB_PASSWORD`
-- `CLOUD_DATABASE_URL` or equivalent provider-managed PostgreSQL URL (not read by the current backend yet)
+- `DATABASE_URL` or `CLOUD_DATABASE_URL`
+- `DB_SSL`
+- `DB_SSL_REJECT_UNAUTHORIZED`
 - `CORS_ORIGINS`
+- `FROOZERP_DEPLOYMENT_TYPE=cloud`
+- `FROOZERP_COMPANY_ID`
+- `FROOZERP_COMPANY_NAME`
+- `FROOZERP_CLOUD_DEPLOYMENT_ID`
+- `FROOZERP_PUBLIC_API_URL`
 - HTTPS termination at the cloud platform, load balancer, or reverse proxy
 
 Secrets must not be committed to the repository.
@@ -181,7 +203,7 @@ Until those are implemented and verified in the installed app, owner-facing stat
 
 - LAN mode is not the same as cloud mode. It only works on the same shop network.
 - Real cloud cannot be tested until a hosted backend and hosted PostgreSQL exist.
-- `CLOUD_DATABASE_URL` is not consumed by the current backend yet; cloud database configuration currently uses `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, and `DB_PASSWORD`.
+- Hosted PostgreSQL can use `DATABASE_URL` or `CLOUD_DATABASE_URL`, with explicit SSL settings. No hosted database is configured in the repository.
 - Multi-device offline selling from the same lot can conflict when devices reconnect.
 - Stock reservations are not implemented.
 - Full owner/admin conflict review UI is not complete.
