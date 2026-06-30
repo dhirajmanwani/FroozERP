@@ -64,6 +64,20 @@ const configuredDeviceId = String(process.env.DEVICE_ID || "").trim() || null;
 const configuredDeviceName = String(process.env.DEVICE_NAME || "").trim() || null;
 const cloudDeploymentId = String(process.env.FROOZERP_CLOUD_DEPLOYMENT_ID || "").trim() || null;
 const publicCloudApiUrl = String(process.env.CLOUD_API_URL || process.env.FROOZERP_PUBLIC_API_URL || "").trim().replace(/\/$/, "") || null;
+const hostedCloudDeployment = deploymentType === "cloud" && configuredAppMode === "CLOUD_PRODUCTION";
+const readOptionalBoolean = (value, defaultValue) => {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return defaultValue;
+  return normalized === "true";
+};
+const runStartupSchemaBootstrap = readOptionalBoolean(
+  process.env.RUN_STARTUP_SCHEMA_BOOTSTRAP,
+  !hostedCloudDeployment
+);
+const runStartupReferenceSeed = readOptionalBoolean(
+  process.env.RUN_STARTUP_REFERENCE_SEED,
+  !hostedCloudDeployment
+);
 const databaseConfigurationProvided = Boolean(
   databaseUrl ||
   (process.env.DB_HOST && process.env.DB_NAME && process.env.DB_USER)
@@ -101,6 +115,8 @@ const cloudConfigurationChecks = () => ({
   branch_id_configured: Boolean(configuredBranchId),
   cloud_deployment_id_configured: Boolean(cloudDeploymentId),
   allowed_origins_configured: allowedCorsOrigins.length > 0 && !allowedCorsOrigins.includes("*"),
+  startup_schema_bootstrap_disabled: !runStartupSchemaBootstrap,
+  startup_reference_seed_disabled: !runStartupReferenceSeed,
 });
 const cloudConfigurationReady = Object.values(cloudConfigurationChecks()).every(Boolean);
 const allowedTauriCorsOrigins = new Set([
@@ -15900,9 +15916,44 @@ app.get("/sales/:id", async (req, res) => {
   }
 });
 
-initializeDatabase()
+const verifyRequiredDatabaseSchema = async () => {
+  const requiredTables = [
+    "users",
+    "branches",
+    "authorized_devices",
+    "products",
+    "inventory_batches",
+    "purchases",
+    "sales",
+    "sync_processed_operations",
+    "sync_change_log",
+  ];
+  const result = await pool.query(
+    `SELECT required.table_name
+     FROM unnest($1::text[]) AS required(table_name)
+     WHERE to_regclass(format('public.%I', required.table_name)) IS NULL
+     ORDER BY required.table_name`,
+    [requiredTables]
+  );
+  if (result.rows.length > 0) {
+    const missing = result.rows.map((row) => row.table_name).join(", ");
+    throw new Error(`Database schema is not prepared. Missing required tables: ${missing}. Restore or migrate explicitly before startup.`);
+  }
+};
+
+const prepareDatabaseForStartup = async () => {
+  if (runStartupSchemaBootstrap) {
+    await initializeDatabase();
+    return;
+  }
+  await verifyRequiredDatabaseSchema();
+};
+
+prepareDatabaseForStartup()
   .then(async () => {
-    await seedReferenceChangeLog();
+    if (runStartupReferenceSeed) {
+      await seedReferenceChangeLog();
+    }
     let lastScheduledBackupDate = "";
     setInterval(async () => {
       try {

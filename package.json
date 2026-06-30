@@ -10,6 +10,7 @@
     "verify:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\verify-windows.ps1",
     "release:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\copy-windows-release.ps1",
     "build": "npm --prefix frontend run build",
-    "backend:check": "node --check backend/server.js"
+    "backend:check": "node --check backend/server.js",
+    "cloud:verify": "node scripts/cloud/verify-hosted-cloud.mjs"
   }
 }
