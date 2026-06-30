@@ -19,6 +19,7 @@ const runtimeNodeEnv = String(process.env.NODE_ENV || "").trim().toLowerCase();
 const runtimeAppMode = String(process.env.APP_MODE || "").trim().toUpperCase();
 const runtimeDeploymentType = String(process.env.FROOZERP_DEPLOYMENT_TYPE || "").trim().toLowerCase();
 const railwayRuntime = Boolean(
+  process.env.RAILWAY_ENVIRONMENT ||
   process.env.RAILWAY_PROJECT_ID ||
   process.env.RAILWAY_ENVIRONMENT_ID ||
   process.env.RAILWAY_SERVICE_ID
@@ -27,16 +28,40 @@ const productionDatabaseRequired = runtimeNodeEnv === "production"
   || runtimeAppMode === "CLOUD_PRODUCTION"
   || runtimeDeploymentType === "cloud"
   || railwayRuntime;
-const databaseUrl = primaryDatabaseUrl || cloudDatabaseUrl;
-const databaseSource = primaryDatabaseUrl
-  ? "DATABASE_URL"
-  : cloudDatabaseUrl
-    ? "CLOUD_DATABASE_URL"
-    : "LOCAL_FALLBACK";
-if (productionDatabaseRequired && !databaseUrl) {
-  throw new Error("Railway DATABASE_URL/CLOUD_DATABASE_URL is missing. Refusing localhost in production.");
+const localDatabaseHosts = new Set(["localhost", "127.0.0.1", "::1", "0.0.0.0"]);
+const parseDatabaseUrlCandidate = (value, source) => {
+  if (!value || value.includes("${{")) return null;
+  try {
+    const parsed = new URL(value);
+    if (!["postgres:", "postgresql:"].includes(parsed.protocol)) return null;
+    const host = String(parsed.hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+    if (!host) return null;
+    return {
+      connectionString: value,
+      source,
+      host,
+      local: localDatabaseHosts.has(host),
+    };
+  } catch {
+    return null;
+  }
+};
+const primaryDatabaseCandidate = parseDatabaseUrlCandidate(primaryDatabaseUrl, "DATABASE_URL");
+const cloudDatabaseCandidate = parseDatabaseUrlCandidate(cloudDatabaseUrl, "CLOUD_DATABASE_URL");
+const databaseCandidate = [primaryDatabaseCandidate, cloudDatabaseCandidate]
+  .find((candidate) => candidate && (!productionDatabaseRequired || !candidate.local));
+if (productionDatabaseRequired && !databaseCandidate) {
+  console.log("DB source used: NONE");
+  console.log("DB host: unavailable");
+  console.log("Local fallback blocked: true");
+  throw new Error("Production database URL missing. Set DATABASE_URL to Railway Postgres DATABASE_URL.");
 }
+const databaseUrl = databaseCandidate?.connectionString || "";
+const databaseSource = databaseCandidate?.source || "LOCAL_FALLBACK";
+const databaseHost = databaseCandidate?.host || String(process.env.DB_HOST || "localhost").trim().toLowerCase();
 console.log(`DB source used: ${databaseSource}`);
+console.log(`DB host: ${databaseHost}`);
+console.log(`Local fallback blocked: ${productionDatabaseRequired}`);
 const databaseSslEnabled = /^true$/i.test(process.env.DB_SSL || "");
 const databaseSslRejectUnauthorized = !/^false$/i.test(process.env.DB_SSL_REJECT_UNAUTHORIZED || "");
 const pool = new Pool(databaseUrl
