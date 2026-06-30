@@ -41,7 +41,7 @@ const readReleaseVersion = () => {
   }
 };
 const appVersion = process.env.APP_VERSION || readReleaseVersion();
-const allowedCorsOrigins = String(process.env.CORS_ORIGINS || "")
+const allowedCorsOrigins = String(process.env.ALLOWED_ORIGINS || process.env.CORS_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
@@ -64,6 +64,10 @@ const configuredDeviceId = String(process.env.DEVICE_ID || "").trim() || null;
 const configuredDeviceName = String(process.env.DEVICE_NAME || "").trim() || null;
 const cloudDeploymentId = String(process.env.FROOZERP_CLOUD_DEPLOYMENT_ID || "").trim() || null;
 const publicCloudApiUrl = String(process.env.CLOUD_API_URL || process.env.FROOZERP_PUBLIC_API_URL || "").trim().replace(/\/$/, "") || null;
+const databaseConfigurationProvided = Boolean(
+  databaseUrl ||
+  (process.env.DB_HOST && process.env.DB_NAME && process.env.DB_USER)
+);
 const isPrivateCloudHostname = (hostname) => {
   const hostValue = String(hostname || "").trim().toLowerCase().replace(/^\[|\]$/g, "");
   if (!hostValue) return true;
@@ -79,19 +83,26 @@ const isPrivateCloudHostname = (hostname) => {
 const isRealHostedCloudUrl = (value) => {
   try {
     const parsed = new URL(String(value || "").trim());
-    return parsed.protocol === "https:" && !isPrivateCloudHostname(parsed.hostname);
+    return parsed.protocol === "https:"
+      && !isPrivateCloudHostname(parsed.hostname)
+      && parsed.port !== "5000";
   } catch {
     return false;
   }
 };
 const cloudApiConfigured = isRealHostedCloudUrl(publicCloudApiUrl);
-const cloudConfigurationReady = deploymentType === "cloud"
-  && process.env.NODE_ENV === "production"
-  && configuredAppMode === "CLOUD_PRODUCTION"
-  && cloudApiConfigured
-  && Boolean(configuredCompanyId)
-  && Boolean(cloudDeploymentId)
-  && allowedCorsOrigins.length > 0;
+const cloudConfigurationChecks = () => ({
+  deployment_type_cloud: deploymentType === "cloud",
+  node_env_production: process.env.NODE_ENV === "production",
+  app_mode_cloud_production: configuredAppMode === "CLOUD_PRODUCTION",
+  public_https_cloud_api: cloudApiConfigured,
+  hosted_database_configured: databaseConfigurationProvided,
+  company_id_configured: Boolean(configuredCompanyId),
+  branch_id_configured: Boolean(configuredBranchId),
+  cloud_deployment_id_configured: Boolean(cloudDeploymentId),
+  allowed_origins_configured: allowedCorsOrigins.length > 0 && !allowedCorsOrigins.includes("*"),
+});
+const cloudConfigurationReady = Object.values(cloudConfigurationChecks()).every(Boolean);
 const allowedTauriCorsOrigins = new Set([
   "tauri://localhost",
   "http://tauri.localhost",
@@ -7227,6 +7238,41 @@ app.get("/api/version", (_req, res) => {
   });
 });
 
+app.get("/api/cloud/readiness", async (_req, res) => {
+  let databaseReachable = false;
+  try {
+    await pool.query("SELECT 1");
+    databaseReachable = true;
+  } catch (error) {
+    console.error("Cloud readiness database check failed", error.message);
+  }
+  const checks = {
+    ...cloudConfigurationChecks(),
+    database_reachable: databaseReachable,
+  };
+  const blockers = Object.entries(checks)
+    .filter(([, ready]) => !ready)
+    .map(([name]) => name);
+  const ready = blockers.length === 0;
+  return res.json({
+    status: "ok",
+    app: "FroozERP",
+    api_version: apiContractVersion,
+    version: appVersion,
+    readiness: ready ? "deployment_ready" : "not_ready",
+    cloud_ready: ready,
+    checks,
+    blockers,
+    deployment_type: deploymentType,
+    app_mode: configuredAppMode,
+    company_id: configuredCompanyId,
+    branch_id: configuredBranchId,
+    cloud_api_url: publicCloudApiUrl,
+    allowed_origin_count: allowedCorsOrigins.filter((origin) => origin !== "*").length,
+    server_time: new Date().toISOString(),
+  });
+});
+
 const registerSyncDeviceHandler = async (req, res) => {
   try {
     const device = readDevicePayload({
@@ -7306,6 +7352,60 @@ app.get("/api/device/identity", rateLimitSyncRequest, async (req, res) => {
   } catch (error) {
     console.error("Device identity lookup failed", error.message);
     return res.status(500).json({ message: "Device identity lookup failed" });
+  }
+});
+
+app.get("/api/branch/status", rateLimitSyncRequest, async (req, res) => {
+  try {
+    const context = await requireSyncContext({
+      userId: req.query.user_id,
+      deviceId: req.query.device_id,
+      branchId: req.query.branch_id,
+    });
+    if (context.error) return res.status(context.error.status).json({ message: context.error.message });
+    const [branchResult, deviceSummaryResult] = await Promise.all([
+      pool.query(
+        "SELECT id, branch_name, active, parent_branch_id FROM branches WHERE id = $1 LIMIT 1",
+        [context.branchId]
+      ),
+      pool.query(
+        `SELECT
+           COUNT(*)::INTEGER AS registered_devices,
+           COUNT(*) FILTER (WHERE status = 'APPROVED')::INTEGER AS approved_devices,
+           MAX(last_active_at) AS last_device_activity_at,
+           MAX(last_sync_at) AS last_branch_sync_at
+         FROM authorized_devices
+         WHERE assigned_branch_id = $1`,
+        [context.branchId]
+      ),
+    ]);
+    const branch = branchResult.rows[0];
+    if (!branch) return res.status(404).json({ message: "Branch not found" });
+    const devices = deviceSummaryResult.rows[0] || {};
+    return res.json({
+      status: "ok",
+      app: "FroozERP",
+      api_version: apiContractVersion,
+      version: appVersion,
+      company_id: configuredCompanyId || "1",
+      branch_id: branch.id,
+      branch_name: branch.branch_name,
+      parent_branch_id: branch.parent_branch_id,
+      branch_active: branch.active !== false,
+      requesting_device_id: context.deviceId,
+      device_registration_status: context.device.status,
+      registered_devices: Number(devices.registered_devices || 0),
+      approved_devices: Number(devices.approved_devices || 0),
+      last_device_activity_at: devices.last_device_activity_at || null,
+      last_branch_sync_at: devices.last_branch_sync_at || null,
+      deployment_type: deploymentType,
+      app_mode: configuredAppMode,
+      cloud_ready: cloudConfigurationReady,
+      server_time: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("Branch status lookup failed", error.message);
+    return res.status(500).json({ message: "Branch status lookup failed" });
   }
 });
 

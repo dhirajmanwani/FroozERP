@@ -188,7 +188,8 @@ const isRealCloudUrl = (value) => {
     const parsed = new URL(url);
     return parsed.protocol === "https:"
       && !isLocalEndpoint(url)
-      && !isPrivateNetworkHost(parsed.hostname);
+      && !isPrivateNetworkHost(parsed.hostname)
+      && parsed.port !== "5000";
   } catch {
     return false;
   }
@@ -10881,7 +10882,15 @@ function SyncSettingsSection({
       if (String(health.database || health.dbStatus || "").toLowerCase().includes("error")) {
         return setResult("Cloud Server Unreachable", "Cloud backend is reachable, but database health is not ready.");
       }
-      return setResult("Cloud Foundation Reachable", `Cloud health is reachable at version ${version}. Full business-module sync is not production-ready.`);
+      const readinessResponse = await axios.get(`${cloudUrl}/api/cloud/readiness`, { timeout: 5000, headers: { "Cache-Control": "no-store" } });
+      const readiness = readinessResponse.data || {};
+      if (readiness.cloud_ready !== true || readiness.readiness !== "deployment_ready") {
+        const blockers = Array.isArray(readiness.blockers) && readiness.blockers.length
+          ? ` Missing: ${readiness.blockers.join(", ")}.`
+          : "";
+        return setResult("Cloud Configuration Incomplete", `Hosted backend responded but deployment readiness checks did not pass.${blockers}`);
+      }
+      return setResult("Cloud Deployment Ready", `Hosted API and PostgreSQL readiness checks passed at version ${version}. Full business-module sync is still not production-ready.`);
     } catch (error) {
       return setResult("Cloud Server Unreachable", getErrorMessage(error, "Cloud backend health endpoint is not reachable."));
     } finally {
@@ -11003,7 +11012,7 @@ function SyncSettingsSection({
         <button className="secondary-button" onClick={() => setShowDiagnostics((current) => !current)}>Advanced Diagnostics</button>
       </div>
       {showDiagnostics && cloudReadiness && (
-        <p className={cloudReadiness.status === "Cloud Foundation Reachable" ? "form-note stock-ok" : "form-note"}>
+        <p className={cloudReadiness.status === "Cloud Deployment Ready" ? "form-note stock-ok" : "form-note"}>
           <strong>{cloudReadiness.status}</strong> - {cloudReadiness.detail}
         </p>
       )}
