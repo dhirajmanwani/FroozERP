@@ -10,3 +10,10 @@ release/
 *.log
 *.tmp
 tmp-phase4b2-*.png
+
+node_modules/
+*/node_modules/
+.cache/
+*/.cache/
+backend/node_modules/
+frontend/node_modules/
