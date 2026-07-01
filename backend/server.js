@@ -990,8 +990,7 @@ const initializeDatabase = async () => {
       'Archived duplicate product during startup migration'
     FROM archived_products
     ON CONFLICT (duplicate_product_id) DO NOTHING;
-    DROP INDEX IF EXISTS products_category_name_lower_unique_idx;
-    CREATE UNIQUE INDEX products_category_name_lower_unique_idx
+    CREATE UNIQUE INDEX IF NOT EXISTS products_category_name_lower_unique_idx
       ON products (LOWER(COALESCE(category, 'Fruit')), LOWER(product_name))
       WHERE active IS DISTINCT FROM FALSE;
     CREATE UNIQUE INDEX IF NOT EXISTS products_barcode_unique_idx
@@ -1007,6 +1006,50 @@ const initializeDatabase = async () => {
     FROM product_categories pc
     WHERE p.category_id IS NULL
       AND LOWER(pc.category_name) = LOWER(COALESCE(NULLIF(TRIM(p.category), ''), 'Fruit'));
+
+    CREATE TABLE IF NOT EXISTS purchases (
+      id SERIAL PRIMARY KEY,
+      supplier_name VARCHAR(160) NOT NULL,
+      invoice_no VARCHAR(120),
+      total_amount NUMERIC(14, 2),
+      branch_id INTEGER REFERENCES branches(id),
+      created_by INTEGER REFERENCES users(id),
+      purchase_date DATE DEFAULT CURRENT_DATE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS purchase_items (
+      id SERIAL PRIMARY KEY,
+      purchase_id INTEGER REFERENCES purchases(id),
+      product_id INTEGER REFERENCES products(id),
+      quantity NUMERIC(14, 3),
+      purchase_rate NUMERIC(14, 2),
+      amount NUMERIC(14, 2)
+    );
+
+    CREATE TABLE IF NOT EXISTS inventory_batches (
+      id SERIAL PRIMARY KEY,
+      product_id INTEGER REFERENCES products(id),
+      batch_no VARCHAR(120) NOT NULL,
+      purchase_qty NUMERIC(14, 3) NOT NULL,
+      remaining_qty NUMERIC(14, 3) NOT NULL,
+      purchase_rate NUMERIC(14, 2) NOT NULL,
+      supplier_name VARCHAR(160),
+      branch_id INTEGER REFERENCES branches(id),
+      purchase_date DATE DEFAULT CURRENT_DATE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS stock_transactions (
+      id SERIAL PRIMARY KEY,
+      product_id INTEGER REFERENCES products(id),
+      quantity NUMERIC(14, 3) NOT NULL,
+      transaction_type VARCHAR(30) NOT NULL,
+      remarks TEXT,
+      user_id INTEGER REFERENCES users(id),
+      branch_id INTEGER REFERENCES branches(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
 
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS basic_amount NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS supplier_id INTEGER;
@@ -1476,6 +1519,17 @@ const initializeDatabase = async () => {
       reason TEXT NOT NULL,
       edited_by INTEGER REFERENCES users(id),
       edited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS sale_items (
+      id SERIAL PRIMARY KEY,
+      sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+      product_id INTEGER NOT NULL REFERENCES products(id),
+      quantity NUMERIC(14, 3) NOT NULL CHECK (quantity > 0),
+      selling_rate NUMERIC(14, 2) NOT NULL CHECK (selling_rate >= 0),
+      amount NUMERIC(14, 2) NOT NULL,
+      cost_amount NUMERIC(14, 2) NOT NULL,
+      profit NUMERIC(14, 2) NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS sale_returns (
@@ -2009,17 +2063,6 @@ const initializeDatabase = async () => {
       reason TEXT NOT NULL,
       edited_by INTEGER REFERENCES users(id),
       edited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS sale_items (
-      id SERIAL PRIMARY KEY,
-      sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
-      product_id INTEGER NOT NULL REFERENCES products(id),
-      quantity NUMERIC(14, 3) NOT NULL CHECK (quantity > 0),
-      selling_rate NUMERIC(14, 2) NOT NULL CHECK (selling_rate >= 0),
-      amount NUMERIC(14, 2) NOT NULL,
-      cost_amount NUMERIC(14, 2) NOT NULL,
-      profit NUMERIC(14, 2) NOT NULL
     );
 
     ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS discount_amount NUMERIC(14, 2) DEFAULT 0;
@@ -15963,37 +16006,90 @@ app.get("/sales/:id", async (req, res) => {
   }
 });
 
-const verifyRequiredDatabaseSchema = async () => {
-  const requiredTables = [
-    "users",
-    "branches",
-    "authorized_devices",
-    "products",
-    "inventory_batches",
-    "purchases",
-    "sales",
-    "sync_processed_operations",
-    "sync_change_log",
-  ];
+const REQUIRED_DATABASE_TABLES = [
+  "users",
+  "branches",
+  "authorized_devices",
+  "products",
+  "inventory_batches",
+  "stock_transactions",
+  "purchases",
+  "purchase_items",
+  "sales",
+  "sale_items",
+  "sale_payments",
+  "customer_ledger",
+  "supplier_payments",
+  "customer_payments",
+  "expenses",
+  "sync_processed_operations",
+  "sync_change_log",
+];
+
+const getMissingRequiredDatabaseTables = async () => {
   const result = await pool.query(
     `SELECT required.table_name
      FROM unnest($1::text[]) AS required(table_name)
      WHERE to_regclass(format('public.%I', required.table_name)) IS NULL
      ORDER BY required.table_name`,
-    [requiredTables]
+    [REQUIRED_DATABASE_TABLES]
   );
-  if (result.rows.length > 0) {
-    const missing = result.rows.map((row) => row.table_name).join(", ");
+  return result.rows.map((row) => row.table_name);
+};
+
+const verifyRequiredDatabaseSchema = async () => {
+  const missingTables = await getMissingRequiredDatabaseTables();
+  if (missingTables.length > 0) {
+    const missing = missingTables.join(", ");
     throw new Error(`Database schema is not prepared. Missing required tables: ${missing}. Restore or migrate explicitly before startup.`);
   }
 };
 
+const countPublicDatabaseTables = async () => {
+  const result = await pool.query(
+    "SELECT COUNT(*)::INTEGER AS count FROM pg_tables WHERE schemaname = 'public'"
+  );
+  return Number(result.rows[0]?.count || 0);
+};
+
+const readBusinessCounts = async () => {
+  const countTables = [
+    "products",
+    "inventory_batches",
+    "purchases",
+    "purchase_items",
+    "sales",
+    "sale_payments",
+    "customer_ledger",
+    "supplier_payments",
+    "expenses",
+  ];
+  const entries = await Promise.all(countTables.map(async (tableName) => {
+    const result = await pool.query(`SELECT COUNT(*)::BIGINT AS count FROM ${tableName}`);
+    return [tableName, Number(result.rows[0]?.count || 0)];
+  }));
+  return Object.fromEntries(entries);
+};
+
 const prepareDatabaseForStartup = async () => {
+  console.log("schema bootstrap started");
   if (runStartupSchemaBootstrap) {
     await initializeDatabase();
-    return;
+  } else {
+    const missingTables = await getMissingRequiredDatabaseTables();
+    if (missingTables.length > 0) {
+      const publicTableCount = await countPublicDatabaseTables();
+      if (hostedCloudDeployment && publicTableCount === 0) {
+        await initializeDatabase();
+      } else {
+        const missing = missingTables.join(", ");
+        throw new Error(`Database schema is partially prepared. Missing required tables: ${missing}. Automatic bootstrap refused to protect existing data.`);
+      }
+    }
   }
   await verifyRequiredDatabaseSchema();
+  console.log("schema bootstrap completed");
+  console.log(`business counts after bootstrap: ${JSON.stringify(await readBusinessCounts())}`);
 };
 
 prepareDatabaseForStartup()
