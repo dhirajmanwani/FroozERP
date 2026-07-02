@@ -1238,6 +1238,7 @@ function App() {
     date_to: toDateKey(new Date()),
   });
   const [dashboardAnalytics, setDashboardAnalytics] = useState(emptyDashboardAnalytics);
+  const [dashboardError, setDashboardError] = useState("");
   const [supplierDashboard, setSupplierDashboard] = useState({
     todaySales: 0,
     todayProfit: 0,
@@ -2096,21 +2097,25 @@ function App() {
 
   const hydrateOnlineSession = async (currentUser, latestDevice) => {
     const snapshot = await fetchOnlineReferenceSnapshot(currentUser, latestDevice);
-    const offlineSession = await cacheOfflineSession({
-      username,
-      password,
-      user: currentUser,
-      deviceId: latestDevice.device_id,
-      branchId: currentUser?.branch_id || 1,
-      lastSuccessfulSyncAt: snapshot.last_successful_sync_at,
-    });
     await applyReferenceSnapshot(snapshot, { offline: false, nextView: initialView });
-    if (isTauriRuntime()) {
-      const status = await cacheLocalReferenceSnapshot({
-        ...snapshot,
-        offline_auth: offlineSession,
+    try {
+      const offlineSession = await cacheOfflineSession({
+        username,
+        password,
+        user: currentUser,
+        deviceId: latestDevice.device_id,
+        branchId: currentUser?.branch_id || 1,
+        lastSuccessfulSyncAt: snapshot.last_successful_sync_at,
       });
-      setLocalDbStatus(status);
+      if (isTauriRuntime()) {
+        const status = await cacheLocalReferenceSnapshot({
+          ...snapshot,
+          offline_auth: offlineSession,
+        });
+        setLocalDbStatus(status);
+      }
+    } catch (cacheError) {
+      console.warn("Online login succeeded but local reference caching failed", cacheError);
     }
     setStartupNotice(buildConnectionStatusModel({
       backendHealth: { ...backendHealth, online: true },
@@ -2345,6 +2350,7 @@ function App() {
     });
     setDashboardAnalytics(response.data);
     if (response.data.summary) setSupplierDashboard(response.data.summary);
+    setDashboardError("");
   };
 
   const loadDashboardData = async () => {
@@ -2356,18 +2362,27 @@ function App() {
       setSalesHistory(localRows.map(localSnapshotToInvoice));
       setSupplierDashboard((current) => current || {});
       setDashboardAnalytics((current) => current || {});
+      setDashboardError("");
       return;
     }
-    const [inventoryResponse, salesResponse, supplierMetricsResponse, analyticsResponse] = await Promise.all([
+    const requests = await Promise.allSettled([
       axios.get(`${API_URL}/inventory`),
       axios.get(`${API_URL}/sales`),
       axios.get(`${API_URL}/dashboard-metrics`, { params: { user_id: user?.id } }),
       axios.get(`${API_URL}/dashboard-analytics`, { params: getDashboardParams() }),
     ]);
-    setInventory(inventoryResponse.data);
-    setSalesHistory(salesResponse.data);
-    setSupplierDashboard(supplierMetricsResponse.data);
-    setDashboardAnalytics(analyticsResponse.data);
+    const [inventoryResult, salesResult, metricsResult, analyticsResult] = requests;
+    if (inventoryResult.status === "fulfilled") setInventory(inventoryResult.value.data || []);
+    if (salesResult.status === "fulfilled") setSalesHistory(salesResult.value.data || []);
+    if (metricsResult.status === "fulfilled") setSupplierDashboard(metricsResult.value.data || {});
+    if (analyticsResult.status === "fulfilled") setDashboardAnalytics(analyticsResult.value.data || emptyDashboardAnalytics);
+    const failures = requests.filter((result) => result.status === "rejected");
+    if (failures.length) {
+      console.warn("Dashboard refresh partially failed", failures.map((result) => getErrorMessage(result.reason, result.reason?.message || "Unknown dashboard error")));
+      setDashboardError("Some dashboard cards could not be refreshed. Other modules remain available.");
+    } else {
+      setDashboardError("");
+    }
   };
 
   const changeDashboardRange = async (range) => {
@@ -2375,7 +2390,8 @@ function App() {
       setDashboardRange(range);
       if (range !== "custom") await loadDashboardAnalytics(range, dashboardCustomRange);
     } catch (error) {
-      alert(getErrorMessage(error, "Dashboard analytics failed"));
+      console.warn("Dashboard analytics refresh failed", error);
+      setDashboardError(getErrorMessage(error, "Dashboard analytics could not be refreshed."));
     }
   };
 
@@ -2384,7 +2400,8 @@ function App() {
       setDashboardRange("custom");
       await loadDashboardAnalytics("custom", dashboardCustomRange);
     } catch (error) {
-      alert(getErrorMessage(error, "Dashboard analytics failed"));
+      console.warn("Dashboard custom range refresh failed", error);
+      setDashboardError(getErrorMessage(error, "Dashboard analytics could not be refreshed."));
     }
   };
 
@@ -2420,15 +2437,10 @@ function App() {
         await hydrateOnlineSession(response.data, latestDevice);
       } catch (hydrateError) {
         console.error("Online hydration failed", hydrateError);
-        const snapshot = await loadLocalReferenceSnapshot({ username, deviceId: latestDevice.device_id }).catch(() => null);
-        if (snapshot?.reference_ready) {
-          setUser({ ...response.data, offline_session: true });
-          await applyReferenceSnapshot(snapshot, { offline: true, nextView: "sales" });
-          setStartupNotice("Backend login succeeded. FroozERP continued in offline mode because reference-data refresh failed.");
-          return;
-        }
-        setUser(null);
-        setStartupError(getErrorMessage(hydrateError, "Login succeeded, but no usable local reference data was available."));
+        setOfflineMode(false);
+        setActiveView(initialView);
+        setStartupNotice("Backend login succeeded. Some reference data could not be refreshed; empty sections remain usable and can be retried.");
+        setSyncMessage(getErrorMessage(hydrateError, "Reference-data refresh is temporarily unavailable."));
       }
     } catch (error) {
       writeDiagnosticLog("ERROR", "login-failed", {
@@ -2511,19 +2523,29 @@ function App() {
         alert("Please select or add product category.");
         return;
       }
+      const parsedSellingRate = Number(sellingRate);
+      const parsedMinimumStock = Number(productMinimumStock || 0);
+      if (!productName.trim() || !unit || !Number.isFinite(parsedSellingRate) || parsedSellingRate <= 0) {
+        alert("Enter an item name, unit and valid sale rate.");
+        return;
+      }
+      if (!Number.isFinite(parsedMinimumStock) || parsedMinimumStock < 0) {
+        alert("Enter a valid minimum stock quantity.");
+        return;
+      }
       if (addOpeningStock && !editingProductId && openingStockLots.length === 0) {
         alert("Please add at least one opening stock lot.");
         return;
       }
       const payload = {
         product_name: productName,
-        selling_rate: sellingRate,
         unit,
         barcode: productBarcode,
         origin_type: productOriginType,
         category: finalCategoryName,
         category_id: productCategoryId || null,
-        minimum_stock: productMinimumStock,
+        minimum_stock: parsedMinimumStock,
+        selling_rate: parsedSellingRate,
         active: productActive,
         remarks: productRemarks,
         branch_id: user.branch_id,
@@ -2675,15 +2697,15 @@ function App() {
     const quantity = Number(openingStockDraft.quantity || 0);
     const purchaseRate = Number(openingStockDraft.purchase_rate || 0);
     const saleRate = Number(openingStockDraft.sale_rate || sellingRate || 0);
-    if (quantity <= 0) {
+    if (!Number.isFinite(quantity) || quantity <= 0) {
       alert("Please enter lot quantity.");
       return null;
     }
-    if (purchaseRate <= 0) {
+    if (!Number.isFinite(purchaseRate) || purchaseRate <= 0) {
       alert("Please enter opening stock rate.");
       return null;
     }
-    if (saleRate <= 0) {
+    if (!Number.isFinite(saleRate) || saleRate <= 0) {
       alert("Please enter sale rate.");
       return null;
     }
@@ -2711,23 +2733,14 @@ function App() {
   };
 
   const saveNewOpeningStockLot = async () => {
-
-  const activeproductId = editingProductId || lotPanelProduct?.id;
-
-  if (!activeproductId) {
-    alert("No product id found");
-    return;
-  }
-
-  const nextLot = buildOpeningStockLotFromDraft();
-  alert(JSON.stringify(nextLot, null, 2));
-
-  if (!nextLot) {
-    alert("Lot data invalid. Check lot name, quantity, purchase rate, sale rate/date.");
-    return;
-  }
-
-  try {
+    const activeProductId = editingProductId || lotPanelProduct?.id;
+    if (!activeProductId) {
+      alert("Product id missing. Close this form and reopen it from the product lot panel.");
+      return;
+    }
+    const nextLot = buildOpeningStockLotFromDraft();
+    if (!nextLot) return;
+    try {
       const payload = {
         ...nextLot,
         opening_cost: nextLot.purchase_rate,
@@ -2736,11 +2749,11 @@ function App() {
         branch_id: user.branch_id,
       };
       try {
-        await axios.post(`${API_URL}/products/${activeproductId}/opening-stock-lots`, payload);
+        await axios.post(`${API_URL}/products/${activeProductId}/opening-stock-lots`, payload);
       } catch (error) {
         const message = getErrorMessage(error, "Unable to add opening stock lot");
         if (message.includes("Add as separate lot anyway?") && window.confirm("This lot already exists. Add as separate lot anyway?")) {
-          await axios.post(`${API_URL}/products/${activeproductId}/opening-stock-lots`, { ...payload, allow_duplicate_lot: true });
+          await axios.post(`${API_URL}/products/${activeProductId}/opening-stock-lots`, { ...payload, allow_duplicate_lot: true });
         } else {
           throw error;
         }
@@ -2748,7 +2761,7 @@ function App() {
       resetOpeningStockDraft();
       setShowOpeningLotForm(false);
       setAddOpeningStock(false);
-      await refreshLotContext(lotPanelProduct || { id: activeproductId, product_name: productName });
+      await refreshLotContext(lotPanelProduct || { id: activeProductId, product_name: productName });
       alert("Opening stock lot added");
     } catch (error) {
       alert(getErrorMessage(error, "Unable to add opening stock lot"));
@@ -3627,7 +3640,8 @@ function App() {
       if (view === "settings") await loadSettingsData();
       if (view === "sale-rates") await loadSaleRates();
     } catch (error) {
-      alert(getErrorMessage(error, "Error Loading Data"));
+      console.warn(`Unable to refresh ${view}`, error);
+      setSyncMessage(getErrorMessage(error, `${navigationItems.find(([itemView]) => itemView === view)?.[1] || "Module"} data could not be refreshed.`));
     }
   };
 
@@ -3889,6 +3903,11 @@ function App() {
 
           {activeView === "dashboard" && hasModuleAccess("dashboard") && (
             <>
+              {dashboardError && (
+                <div className="startup-status-panel startup-status-error">
+                  <p>{dashboardError}</p>
+                </div>
+              )}
               <section className="welcome-banner">
                 <div>
                   <BrandLogo />
@@ -4420,7 +4439,6 @@ function App() {
                   loadCustomerData(),
                   loadAccountOutstanding(),
                   loadAccountPayments(),
-                  loadDashboardData(),
                 ]);
               }}
               user={user}

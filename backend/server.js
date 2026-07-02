@@ -3162,78 +3162,133 @@ const parseDashboardRange = (query = {}) => {
   };
 };
 
+const DEFAULT_DASHBOARD_SUMMARY = Object.freeze({
+  todaySales: 0,
+  todayProfit: 0,
+  stockValue: 0,
+  lowStockItems: 0,
+  transactions: 0,
+  supplierOutstanding: 0,
+  customerOutstanding: 0,
+  todayExpenses: 0,
+  todayReturns: 0,
+  monthlyReturns: 0,
+  todayWaste: 0,
+  wasteValue: 0,
+  monthlyWaste: 0,
+  monthlyWasteQuantity: 0,
+  wastePercentage: 0,
+  totalRebateReceived: 0,
+  todaySupplierPayments: 0,
+  supplier_count: 0,
+  active_supplier_count: 0,
+});
+
+const readDashboardMetric = async (metricName, query) => {
+  try {
+    const result = await pool.query(query);
+    return Number(result.rows[0]?.value || 0);
+  } catch (error) {
+    console.warn(`Dashboard metric ${metricName} defaulted to zero: ${error.code || error.message}`);
+    return 0;
+  }
+};
+
+const readDashboardOutstanding = async (label, loader, summaryBuilder) => {
+  try {
+    return Number(summaryBuilder(await loader()).outstandingBalance || 0);
+  } catch (error) {
+    console.warn(`Dashboard ${label} outstanding defaulted to zero: ${error.code || error.message}`);
+    return 0;
+  }
+};
+
 const getDashboardSummary = async () => {
-  const [metricsResult, supplierRows, customerRows] = await Promise.all([
-    pool.query(
-      `
+  const [
+    todaySales,
+    todayProfit,
+    stockValue,
+    lowStockItems,
+    transactions,
+    todayExpenses,
+    todayReturns,
+    monthlyReturns,
+    todayWaste,
+    monthlyWaste,
+    monthlyWasteQuantity,
+    totalRebateReceived,
+    todaySupplierPayments,
+    supplierCount,
+    activeSupplierCount,
+    supplierOutstanding,
+    customerOutstanding,
+  ] = await Promise.all([
+    readDashboardMetric("todaySales", "SELECT COALESCE(SUM(total_amount), 0) AS value FROM sales WHERE sale_date = CURRENT_DATE AND COALESCE(sale_status, 'COMPLETED') <> 'CANCELLED'"),
+    readDashboardMetric("todayProfit", "SELECT COALESCE(SUM(profit), 0) AS value FROM sales WHERE sale_date = CURRENT_DATE AND COALESCE(sale_status, 'COMPLETED') <> 'CANCELLED'"),
+    readDashboardMetric("stockValue", "SELECT COALESCE(SUM(remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate, 0)), 0) AS value FROM inventory_batches WHERE COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'"),
+    readDashboardMetric("lowStockItems", `
+      SELECT COALESCE(COUNT(*), 0) AS value
+      FROM (
+        SELECT p.id, COALESCE(SUM(ib.remaining_qty), 0) AS current_stock, COALESCE(p.minimum_stock, 5) AS minimum_stock
+        FROM products p
+        LEFT JOIN inventory_batches ib ON ib.product_id = p.id AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+        WHERE p.active IS DISTINCT FROM FALSE
+        GROUP BY p.id, p.minimum_stock
+      ) stock
+      WHERE stock.current_stock <= stock.minimum_stock
+    `),
+    readDashboardMetric("transactions", "SELECT COALESCE(COUNT(*), 0) AS value FROM sales WHERE sale_date = CURRENT_DATE AND COALESCE(sale_status, 'COMPLETED') <> 'CANCELLED'"),
+    readDashboardMetric("todayExpenses", "SELECT COALESCE(SUM(amount), 0) AS value FROM expenses WHERE expense_date = CURRENT_DATE AND active IS DISTINCT FROM FALSE"),
+    readDashboardMetric("todayReturns", "SELECT COALESCE(SUM(total_return_amount), 0) AS value FROM sale_returns WHERE return_date = CURRENT_DATE"),
+    readDashboardMetric("monthlyReturns", "SELECT COALESCE(SUM(total_return_amount), 0) AS value FROM sale_returns WHERE return_date >= DATE_TRUNC('month', CURRENT_DATE)::date"),
+    readDashboardMetric("todayWaste", "SELECT COALESCE(SUM(cost_amount), 0) AS value FROM waste_entries WHERE waste_date = CURRENT_DATE"),
+    readDashboardMetric("monthlyWaste", "SELECT COALESCE(SUM(cost_amount), 0) AS value FROM waste_entries WHERE waste_date >= DATE_TRUNC('month', CURRENT_DATE)::date"),
+    readDashboardMetric("monthlyWasteQuantity", "SELECT COALESCE(SUM(quantity), 0) AS value FROM waste_entries WHERE waste_date >= DATE_TRUNC('month', CURRENT_DATE)::date"),
+    readDashboardMetric("totalRebateReceived", `
       SELECT
-        COALESCE((SELECT SUM(total_amount) FROM sales WHERE sale_date = CURRENT_DATE AND sale_status <> 'CANCELLED'), 0) AS "todaySales",
-        COALESCE((SELECT SUM(profit) FROM sales WHERE sale_date = CURRENT_DATE AND sale_status <> 'CANCELLED'), 0) AS "todayProfit",
-        COALESCE((
-          SELECT SUM(remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate))
-          FROM inventory_batches
-          WHERE COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'
-        ), 0) AS "stockValue",
-        COALESCE((
-          SELECT COUNT(*)
-          FROM (
-            SELECT
-              p.id,
-              COALESCE(SUM(ib.remaining_qty), 0) AS current_stock,
-              COALESCE(p.minimum_stock, 5) AS minimum_stock
-            FROM products p
-            LEFT JOIN inventory_batches ib ON ib.product_id = p.id
-              AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
-            WHERE p.active IS DISTINCT FROM FALSE
-            GROUP BY p.id, p.minimum_stock
-          ) stock
-          WHERE stock.current_stock <= stock.minimum_stock
-        ), 0) AS "lowStockItems",
-        COALESCE((SELECT COUNT(*) FROM sales WHERE sale_date = CURRENT_DATE AND sale_status <> 'CANCELLED'), 0) AS "transactions",
-        COALESCE((SELECT SUM(amount) FROM expenses WHERE expense_date = CURRENT_DATE AND active IS DISTINCT FROM FALSE), 0) AS "todayExpenses",
-        COALESCE((SELECT SUM(total_return_amount) FROM sale_returns WHERE return_date = CURRENT_DATE), 0) AS "todayReturns",
-        COALESCE((SELECT SUM(total_return_amount) FROM sale_returns WHERE return_date >= DATE_TRUNC('month', CURRENT_DATE)::date), 0) AS "monthlyReturns",
-        COALESCE((SELECT SUM(cost_amount) FROM waste_entries WHERE waste_date = CURRENT_DATE), 0) AS "todayWaste",
-        COALESCE((SELECT SUM(cost_amount) FROM waste_entries WHERE waste_date >= DATE_TRUNC('month', CURRENT_DATE)::date), 0) AS "monthlyWaste",
-        COALESCE((SELECT SUM(quantity) FROM waste_entries WHERE waste_date >= DATE_TRUNC('month', CURRENT_DATE)::date), 0) AS "monthlyWasteQuantity",
         COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'), 0)
-          + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE), 0) AS "totalRebateReceived",
+        + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE), 0) AS value
+    `),
+    readDashboardMetric("todaySupplierPayments", `
+      SELECT
         COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE payment_date = CURRENT_DATE AND cancelled = FALSE), 0)
-          + COALESCE((SELECT SUM(paid_amount) FROM purchases WHERE COALESCE(payment_date, purchase_date) = CURRENT_DATE AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'), 0) AS "todaySupplierPayments",
-        COALESCE((SELECT COUNT(*) FROM suppliers), 0) AS supplier_count,
-        COALESCE((SELECT COUNT(*) FROM suppliers WHERE active = TRUE), 0) AS active_supplier_count
-      `
-    ),
-    getSupplierSummaryRows(),
-    getCustomerSummaryRows(),
+        + COALESCE((SELECT SUM(paid_amount) FROM purchases WHERE COALESCE(payment_date, purchase_date) = CURRENT_DATE AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'), 0) AS value
+    `),
+    readDashboardMetric("supplier_count", "SELECT COALESCE(COUNT(*), 0) AS value FROM suppliers"),
+    readDashboardMetric("active_supplier_count", "SELECT COALESCE(COUNT(*), 0) AS value FROM suppliers WHERE active = TRUE"),
+    readDashboardOutstanding("supplier", getSupplierSummaryRows, buildSupplierSummaryPayload),
+    readDashboardOutstanding("customer", getCustomerSummaryRows, buildCustomerSummaryPayload),
   ]);
-  const metrics = metricsResult.rows[0] || {};
-  const supplierSummary = buildSupplierSummaryPayload(supplierRows);
-  const customerSummary = buildCustomerSummaryPayload(customerRows);
+  const metrics = {
+    ...DEFAULT_DASHBOARD_SUMMARY,
+    todaySales,
+    todayProfit,
+    stockValue,
+    lowStockItems,
+    transactions,
+    supplierOutstanding,
+    customerOutstanding,
+    todayExpenses,
+    todayReturns,
+    monthlyReturns,
+    todayWaste,
+    wasteValue: todayWaste,
+    monthlyWaste,
+    monthlyWasteQuantity,
+    totalRebateReceived,
+    todaySupplierPayments,
+    supplier_count: supplierCount,
+    active_supplier_count: activeSupplierCount,
+  };
   return {
-    todaySales: Number(metrics.todaySales || 0),
-    todayProfit: Number(metrics.todayProfit || 0),
-    stockValue: Number(metrics.stockValue || 0),
-    lowStockItems: Number(metrics.lowStockItems || 0),
-    transactions: Number(metrics.transactions || 0),
-    supplierOutstanding: Number(supplierSummary.outstandingBalance || 0),
-    customerOutstanding: Number(customerSummary.outstandingBalance || 0),
-    todayExpenses: Number(metrics.todayExpenses || 0),
-    todayReturns: Number(metrics.todayReturns || 0),
-    monthlyReturns: Number(metrics.monthlyReturns || 0),
-    todayWaste: Number(metrics.todayWaste || 0),
-    monthlyWaste: Number(metrics.monthlyWaste || 0),
-    monthlyWasteQuantity: Number(metrics.monthlyWasteQuantity || 0),
-    wastePercentage: Number(metrics.stockValue || 0) > 0
-      ? roundCurrency((Number(metrics.monthlyWaste || 0) / (Number(metrics.stockValue || 0) + Number(metrics.monthlyWaste || 0))) * 100)
+    ...DEFAULT_DASHBOARD_SUMMARY,
+    ...metrics,
+    wastePercentage: metrics.stockValue > 0
+      ? roundCurrency((metrics.monthlyWaste / (metrics.stockValue + metrics.monthlyWaste)) * 100)
       : 0,
-    totalRebateReceived: Number(metrics.totalRebateReceived || 0),
-    todaySupplierPayments: Number(metrics.todaySupplierPayments || 0),
-    total_supplier_outstanding: Number(supplierSummary.outstandingBalance || 0),
-    total_rebate_received: Number(metrics.totalRebateReceived || 0),
-    todays_supplier_payments: Number(metrics.todaySupplierPayments || 0),
-    supplier_count: Number(metrics.supplier_count || 0),
-    active_supplier_count: Number(metrics.active_supplier_count || 0),
+    total_supplier_outstanding: supplierOutstanding,
+    total_rebate_received: totalRebateReceived,
+    todays_supplier_payments: todaySupplierPayments,
   };
 };
 
@@ -8044,7 +8099,7 @@ app.post("/login", async (req, res) => {
         b.active AS branch_active
       FROM users u
       JOIN roles r ON u.role_id = r.id
-      JOIN branches b ON u.branch_id = b.id
+      LEFT JOIN branches b ON b.id = COALESCE(u.branch_id, 1)
       WHERE LOWER(u.username) = LOWER($1)
       `,
       [username]
@@ -8180,8 +8235,10 @@ app.post("/login", async (req, res) => {
       full_name: user.full_name,
       username: user.username,
       role: user.role_name,
-      branch_id: user.branch_id,
-      branch: user.branch_name,
+      branch_id: user.branch_id || 1,
+      branch: user.branch_name || "Main Branch",
+      counter_id: device.assigned_counter_id || 1,
+      counter: device.counter_name || "Main Counter",
       mobile_number: user.mobile_number,
       email: user.email,
       joining_date: user.joining_date,
@@ -11531,6 +11588,28 @@ app.get("/reports/day-book", async (req, res) => {
   }
 });
 
+const resolveReportTask = async (task, index) => {
+  try {
+    return await task;
+  } catch (error) {
+    console.warn(`Report section ${index + 1} returned an empty result: ${error.code || error.message}`);
+    return [6, 7].includes(index) ? [] : { rows: [] };
+  }
+};
+
+const EMPTY_BALANCE_SHEET = Object.freeze({
+  cash: 0,
+  bank: 0,
+  inventory: 0,
+  customerReceivable: 0,
+  supplierPayable: 0,
+  netProfit: 0,
+  ownerCapital: 0,
+  netPosition: 0,
+  totalAssets: 0,
+  totalLiabilities: 0,
+});
+
 app.get("/reports/summary", async (req, res) => {
   try {
     const reportRange = getReportDateRange(req.query);
@@ -12547,8 +12626,11 @@ app.get("/reports/summary", async (req, res) => {
         `,
         [dateFrom, dateTo]
       ),
-    ]);
-    const balanceSheetSnapshot = await getBalanceSheetSnapshot({ dateTo });
+    ].map(resolveReportTask));
+    const balanceSheetSnapshot = await getBalanceSheetSnapshot({ dateTo }).catch((error) => {
+      console.warn(`Report balance sheet returned zero defaults: ${error.code || error.message}`);
+      return EMPTY_BALANCE_SHEET;
+    });
     const profitLoss = profitLossResult.rows[0] || {};
     const customerReceivable = customerRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0);
     const supplierPayable = supplierRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0);
