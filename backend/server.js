@@ -3493,6 +3493,25 @@ const buildDashboardInsights = ({ summary, salesTrend, expenseTrend, topSellingP
   return insights;
 };
 
+const dashboardAnalyticsFallbacks = [
+  DEFAULT_DASHBOARD_SUMMARY,
+  [],
+  [],
+  [],
+  [],
+  [],
+  [],
+];
+
+const resolveDashboardAnalyticsTask = async (task, index) => {
+  try {
+    return await task;
+  } catch (error) {
+    console.warn(`Dashboard analytics section ${index + 1} returned an empty result: ${error.code || error.message}`);
+    return dashboardAnalyticsFallbacks[index];
+  }
+};
+
 const getDashboardAnalyticsPayload = async (query = {}) => {
   const range = parseDashboardRange(query);
   const [
@@ -3511,7 +3530,7 @@ const getDashboardAnalyticsPayload = async (query = {}) => {
     getDashboardPurchaseSalesComparison(range.dateFrom, range.dateTo),
     getDashboardTopSellingProducts(range.dateFrom, range.dateTo),
     getDashboardLowStockItems(),
-  ]);
+  ].map(resolveDashboardAnalyticsTask));
   const expensesByDate = new Map(expenseTrend.map((row) => [row.date, row.expenses]));
   const netProfitTrend = profitTrend.map((row) => {
     const expenses = Number(expensesByDate.get(row.date) || 0);
