@@ -929,6 +929,7 @@ const initializeDatabase = async () => {
     ALTER TABLE products ADD COLUMN IF NOT EXISTS category VARCHAR(80) DEFAULT 'Fruit';
     ALTER TABLE products ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS remarks TEXT;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS minimum_stock NUMERIC(14, 3) DEFAULT 0;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS archived_duplicate_of INTEGER;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS archive_reason TEXT;
@@ -8274,6 +8275,7 @@ app.post("/login", async (req, res) => {
 
 app.get("/product-categories", async (req, res) => {
   try {
+    await ensureProductEntrySchema();
     const result = await pool.query(
       `
       SELECT
@@ -8495,8 +8497,120 @@ app.get("/product-duplicate-archive-log", async (req, res) => {
   }
 });
 
+const ensureProductEntrySchema = async (client = pool) => {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS product_categories (
+      id SERIAL PRIMARY KEY,
+      category_name VARCHAR(120) NOT NULL,
+      active BOOLEAN DEFAULT TRUE,
+      remarks TEXT,
+      created_by INTEGER REFERENCES users(id),
+      updated_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    ALTER TABLE product_categories ADD COLUMN IF NOT EXISTS global_id VARCHAR(180);
+    ALTER TABLE product_categories ADD COLUMN IF NOT EXISTS entity_version INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE product_categories ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP;
+
+    CREATE TABLE IF NOT EXISTS products (
+      id SERIAL PRIMARY KEY,
+      product_name VARCHAR(160) NOT NULL,
+      selling_rate NUMERIC(14, 2) NOT NULL,
+      unit VARCHAR(30) NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS global_id VARCHAR(180);
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS category_id INTEGER REFERENCES product_categories(id);
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS barcode VARCHAR(100);
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS origin_type VARCHAR(20) DEFAULT 'LOCAL';
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS category VARCHAR(80) DEFAULT 'Fruit';
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS minimum_stock NUMERIC(14, 3) DEFAULT 0;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS active BOOLEAN DEFAULT TRUE;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS remarks TEXT;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS selling_rate_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS selling_rate_updated_by INTEGER REFERENCES users(id);
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS entity_version INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP;
+
+    CREATE TABLE IF NOT EXISTS inventory_batches (
+      id SERIAL PRIMARY KEY,
+      product_id INTEGER REFERENCES products(id),
+      batch_no VARCHAR(120) NOT NULL,
+      purchase_qty NUMERIC(14, 3) NOT NULL,
+      remaining_qty NUMERIC(14, 3) NOT NULL,
+      purchase_rate NUMERIC(14, 2) NOT NULL,
+      supplier_name VARCHAR(160),
+      branch_id INTEGER REFERENCES branches(id),
+      purchase_date DATE DEFAULT CURRENT_DATE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS effective_cost_per_unit NUMERIC(14, 4);
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS supplier_id INTEGER REFERENCES suppliers(id);
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS gross_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS net_payable NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS balance_amount NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS batch_status VARCHAR(20) DEFAULT 'ACTIVE';
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS purchase_bill_status VARCHAR(30) DEFAULT 'BILL_COMPLETED';
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS temporary_sale_rate NUMERIC(14, 2) DEFAULT 0;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS lot_name VARCHAR(120);
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS lot_size VARCHAR(120);
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS stock_source VARCHAR(40) DEFAULT 'PURCHASE';
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS remarks TEXT;
+
+    CREATE TABLE IF NOT EXISTS stock_transactions (
+      id SERIAL PRIMARY KEY,
+      product_id INTEGER REFERENCES products(id),
+      quantity NUMERIC(14, 3) NOT NULL,
+      transaction_type VARCHAR(30) NOT NULL,
+      remarks TEXT,
+      user_id INTEGER REFERENCES users(id),
+      branch_id INTEGER REFERENCES branches(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS sale_rate_history (
+      id SERIAL PRIMARY KEY,
+      product_id INTEGER NOT NULL REFERENCES products(id),
+      old_selling_rate NUMERIC(14, 2) NOT NULL,
+      new_selling_rate NUMERIC(14, 2) NOT NULL,
+      changed_by INTEGER NOT NULL REFERENCES users(id),
+      reason TEXT,
+      changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS product_audit_trail (
+      id SERIAL PRIMARY KEY,
+      product_id INTEGER NOT NULL REFERENCES products(id),
+      action VARCHAR(30) NOT NULL,
+      old_value JSONB,
+      new_value JSONB,
+      reason TEXT NOT NULL,
+      edited_by INTEGER REFERENCES users(id),
+      edited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS product_categories_name_lower_unique_idx
+      ON product_categories (LOWER(category_name));
+    CREATE UNIQUE INDEX IF NOT EXISTS products_category_name_lower_unique_idx
+      ON products (LOWER(COALESCE(category, 'Fruit')), LOWER(product_name))
+      WHERE active IS DISTINCT FROM FALSE;
+    CREATE UNIQUE INDEX IF NOT EXISTS products_barcode_unique_idx
+      ON products (barcode)
+      WHERE barcode IS NOT NULL AND barcode <> '';
+  `);
+};
+
+const getProductPersistenceErrorMessage = (error, fallback) => {
+  if (error.code === "42703") return `Product database column missing: ${error.message}`;
+  if (error.code === "42P01") return `Product database table missing: ${error.message}`;
+  if (error.code === "23503") return "The selected branch, category, supplier, or user no longer exists.";
+  return cleanText(error.message) || fallback;
+};
+
 app.get("/products", async (req, res) => {
   try {
+    await ensureProductEntrySchema();
     const result = await pool.query(`
       SELECT
         p.*,
@@ -8523,11 +8637,13 @@ app.get("/products", async (req, res) => {
 app.post("/products", async (req, res) => {
   const client = await pool.connect();
   try {
+    await ensureProductEntrySchema(client);
     const { product_name, selling_rate, unit, barcode, origin_type, category, category_id, minimum_stock, active, created_by, remarks, branch_id } = req.body;
     const parsedSellingRate = parsePositiveNumber(selling_rate);
     const parsedMinimumStock = parseNonNegativeNumber(minimum_stock);
     const parsedOriginType = String(origin_type || "LOCAL").toUpperCase();
     const parsedUnit = normalizeProductUnit(unit);
+    const normalizedCategory = cleanText(category) || "Fruit";
     const rateManager = await requireRateManager(created_by, client);
 
     if (!rateManager) return res.status(403).json({ message: "Only Owner or Admin can create owner-approved selling rates" });
@@ -8537,12 +8653,12 @@ app.post("/products", async (req, res) => {
     await client.query("BEGIN");
     let selectedCategory = await getCategoryById(client, parsePositiveInteger(category_id));
     if (!selectedCategory) {
-      selectedCategory = await findCategoryByName(client, category || "Fruit");
+      selectedCategory = await findCategoryByName(client, normalizedCategory);
     }
     if (!selectedCategory) {
       const categoryResult = await client.query(
         "INSERT INTO product_categories (global_id, category_name, active, created_by, updated_by) VALUES ($1, $2, TRUE, $3, $3) RETURNING *",
-        [`category-${crypto.randomUUID()}`, cleanText(category || "Fruit"), rateManager.id]
+        [`category-${crypto.randomUUID()}`, normalizedCategory, rateManager.id]
       );
       selectedCategory = categoryResult.rows[0];
       await logSyncChange(client, {
@@ -8598,7 +8714,19 @@ app.post("/products", async (req, res) => {
       version: product.entity_version || 1,
       payload: product,
     });
-    const openingLots = Array.isArray(req.body.opening_stock_lots) ? req.body.opening_stock_lots : [];
+    const openingLots = (Array.isArray(req.body.opening_stock_lots) ? req.body.opening_stock_lots : [])
+      .filter((lot) => lot && [
+        lot.lot_name,
+        lot.lot_number,
+        lot.quantity,
+        lot.purchase_rate,
+        lot.opening_cost,
+        lot.sale_rate,
+        lot.supplier_id,
+        lot.opening_stock_date,
+        lot.purchase_date,
+        lot.remarks,
+      ].some((value) => cleanText(value) !== ""));
     const createdLots = [];
     for (const lot of openingLots) {
       const lotResult = await insertOpeningStockLot(client, {
@@ -8614,14 +8742,22 @@ app.post("/products", async (req, res) => {
       createdLots.push(lotResult.batch);
     }
     await client.query("COMMIT");
-    return res.status(201).json({ ...product, opening_stock_lots: createdLots });
+    return res.status(201).json({
+      success: true,
+      product: { ...product, opening_stock_lots: createdLots },
+    });
   } catch (error) {
     await client.query("ROLLBACK");
-    console.error(error);
+    console.error("Product creation failed", {
+      code: error.code,
+      message: error.message,
+      detail: error.detail,
+      constraint: error.constraint,
+    });
     if (error.code === "23505") {
-      return res.status(409).json({ message: "This product already exists." });
+      return res.status(409).json({ success: false, message: "This product already exists." });
     }
-    return res.status(500).json({ message: "Error Adding Product" });
+    return res.status(500).json({ success: false, message: getProductPersistenceErrorMessage(error, "Error Adding Product") });
   } finally {
     client.release();
   }
@@ -8630,6 +8766,7 @@ app.post("/products", async (req, res) => {
 app.put("/products/:id", async (req, res) => {
   const client = await pool.connect();
   try {
+    await ensureProductEntrySchema(client);
     const productId = parsePositiveInteger(req.params.id);
     const { product_name, selling_rate, unit, barcode, origin_type, category, category_id, minimum_stock, active, updated_by, rate_change_reason, remarks } = req.body;
     const parsedSellingRate = parsePositiveNumber(selling_rate);
@@ -8732,6 +8869,7 @@ app.put("/products/:id", async (req, res) => {
 const addOpeningStockLotsForProduct = async (req, res, productIdParam = "id") => {
   const client = await pool.connect();
   try {
+    await ensureProductEntrySchema(client);
     const productId = parsePositiveInteger(req.params[productIdParam]);
     const manager = await requireRateManager(req.body.created_by || req.body.updated_by, client);
     const lots = Array.isArray(req.body.opening_stock_lots) ? req.body.opening_stock_lots : [req.body];
@@ -16188,6 +16326,7 @@ const prepareDatabaseForStartup = async () => {
       }
     }
   }
+  await ensureProductEntrySchema();
   await verifyRequiredDatabaseSchema();
   console.log("schema bootstrap completed");
   console.log(`business counts after bootstrap: ${JSON.stringify(await readBusinessCounts())}`);

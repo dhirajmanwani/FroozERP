@@ -2533,25 +2533,53 @@ function App() {
         alert("Enter a valid minimum stock quantity.");
         return;
       }
-      if (addOpeningStock && !editingProductId && openingStockLots.length === 0) {
-        alert("Please add at least one opening stock lot.");
-        return;
-      }
+      const normalizedOpeningStockLots = (addOpeningStock ? openingStockLots : [])
+        .filter((lot) => [
+          lot.lot_name,
+          lot.lot_size,
+          lot.quantity,
+          lot.purchase_rate,
+          lot.sale_rate,
+          lot.opening_stock_date,
+          lot.supplier_id,
+          lot.remarks,
+        ].some((value) => String(value ?? "").trim() !== ""))
+        .map((lot) => {
+          const quantity = Number(lot.quantity);
+          const purchaseRate = Number(lot.purchase_rate ?? lot.opening_cost);
+          const saleRate = Number(lot.sale_rate ?? parsedSellingRate);
+          return {
+            ...lot,
+            quantity: Number.isFinite(quantity) ? quantity : 0,
+            purchase_rate: Number.isFinite(purchaseRate) ? purchaseRate : 0,
+            opening_cost: Number.isFinite(purchaseRate) ? purchaseRate : 0,
+            sale_rate: Number.isFinite(saleRate) ? saleRate : parsedSellingRate,
+            supplier_id: lot.supplier_id || null,
+            opening_stock_date: lot.opening_stock_date || null,
+            lot_name: String(lot.lot_name || "").trim(),
+            lot_size: String(lot.lot_size || "").trim(),
+            remarks: String(lot.remarks || "").trim(),
+          };
+        });
       const payload = {
-        product_name: productName,
+        product_name: productName.trim(),
         unit,
         barcode: productBarcode,
         origin_type: productOriginType,
-        category: finalCategoryName,
+        category: finalCategoryName || "Fruit",
         category_id: productCategoryId || null,
         minimum_stock: parsedMinimumStock,
         selling_rate: parsedSellingRate,
+        sale_rate: parsedSellingRate,
+        purchase_rate: normalizedOpeningStockLots[0]?.purchase_rate || 0,
+        opening_stock: normalizedOpeningStockLots.reduce((sum, lot) => sum + lot.quantity, 0),
+        quantity: normalizedOpeningStockLots.reduce((sum, lot) => sum + lot.quantity, 0),
         active: productActive,
         remarks: productRemarks,
-        branch_id: user.branch_id,
+        branch_id: Number(user.branch_id) || 1,
         created_by: user.id,
         updated_by: user.id,
-        opening_stock_lots: addOpeningStock && !editingProductId ? openingStockLots : [],
+        opening_stock_lots: !editingProductId ? normalizedOpeningStockLots : [],
       };
       if (editingProductId) {
         await axios.put(`${API_URL}/products/${editingProductId}`, payload);
@@ -2569,6 +2597,12 @@ function App() {
       await Promise.all([loadProducts(), loadProductCategories(), loadDashboardData()]);
       alert(wasEditing ? "Product Updated" : "Product Added");
     } catch (error) {
+      console.error("Product save failed", {
+        status: error.response?.status,
+        data: error.response?.data,
+        message: error.message,
+        error,
+      });
       alert(getErrorMessage(error, "Error Adding Product"));
     }
   };
