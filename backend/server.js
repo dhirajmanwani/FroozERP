@@ -8646,9 +8646,9 @@ app.post("/products", async (req, res) => {
     const normalizedCategory = cleanText(category) || "Fruit";
     const rateManager = await requireRateManager(created_by, client);
 
-    if (!rateManager) return res.status(403).json({ message: "Only Owner or Admin can create owner-approved selling rates" });
+    if (!rateManager) return res.status(403).json({ success: false, message: "Only Owner or Admin can create owner-approved selling rates" });
     if (!product_name?.trim() || !parsedUnit || !parsedSellingRate || parsedMinimumStock === null || !["LOCAL", "IMPORTED"].includes(parsedOriginType)) {
-      return res.status(400).json({ message: "Enter valid product details" });
+      return res.status(400).json({ success: false, message: "Enter valid product details" });
     }
     await client.query("BEGIN");
     let selectedCategory = await getCategoryById(client, parsePositiveInteger(category_id));
@@ -8672,7 +8672,7 @@ app.post("/products", async (req, res) => {
     }
     if (selectedCategory.active === false) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ message: "Selected category is inactive." });
+      return res.status(400).json({ success: false, message: "Selected category is inactive." });
     }
     const duplicateResult = await client.query(
       "SELECT id FROM products WHERE LOWER(product_name) = LOWER($1) AND active IS DISTINCT FROM FALSE LIMIT 1",
@@ -8680,7 +8680,7 @@ app.post("/products", async (req, res) => {
     );
     if (duplicateResult.rows.length > 0) {
       await client.query("ROLLBACK");
-      return res.status(409).json({ message: "This product already exists." });
+      return res.status(409).json({ success: false, message: "This product already exists." });
     }
 
     const result = await client.query(
@@ -8737,7 +8737,7 @@ app.post("/products", async (req, res) => {
       });
       if (lotResult.error) {
         await client.query("ROLLBACK");
-        return res.status(400).json({ message: lotResult.error });
+        return res.status(400).json({ success: false, message: lotResult.error });
       }
       createdLots.push(lotResult.batch);
     }
