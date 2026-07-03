@@ -8726,7 +8726,7 @@ app.post("/products", async (req, res) => {
         lot.opening_stock_date,
         lot.purchase_date,
         lot.remarks,
-      ].some((value) => cleanText(value) !== ""));
+      ].some((value) => String(value ?? "").trim() !== ""));
     const createdLots = [];
     for (const lot of openingLots) {
       const lotResult = await insertOpeningStockLot(client, {

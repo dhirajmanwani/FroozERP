@@ -4089,17 +4089,17 @@ function App() {
                       <Field label="Lot Remarks"><input value={openingStockDraft.remarks} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, remarks: event.target.value })} /></Field>
                     </div>
                     <button className="secondary-button" onClick={addOpeningStockLot}>Add Opening Stock Lot</button>
-                    <DataTable headers={["Supplier", "Lot", "Size", "Qty", "Cost", "Sale Rate", "Date", "Remarks", "Actions"]}>
+                    <DataTable className="product-entry-table product-entry-lot-table" headers={["Supplier", "Lot", "Size", "Qty", "Cost", "Sale Rate", "Date", "Remarks", "Actions"]}>
                       {openingStockLots.map((lot, index) => (
                         <tr key={`${lot.lot_name}-${lot.opening_stock_date}-${index}`}>
                           <td>{lot.supplier_name || "-"}</td>
-                          <td className="primary-cell">{lot.lot_name}</td>
-                          <td>{lot.lot_size || "-"}</td>
+                          <td className="primary-cell product-name-cell" title={lot.lot_name || "-"}>{lot.lot_name || "-"}</td>
+                          <td title={lot.lot_size || "-"}>{lot.lot_size || "-"}</td>
                           <td>{lot.quantity}</td>
                           <td>{currency.format(Number(lot.purchase_rate || 0))}</td>
                           <td>{currency.format(Number(lot.sale_rate || sellingRate || 0))}</td>
                           <td>{lot.opening_stock_date}</td>
-                          <td>{lot.remarks || "-"}</td>
+                          <td title={lot.remarks || "-"}>{lot.remarks || "-"}</td>
                           <td><button className="remove-button" onClick={() => setOpeningStockLots((current) => current.filter((_, lotIndex) => lotIndex !== index))}>Remove</button></td>
                         </tr>
                       ))}
@@ -4129,19 +4129,19 @@ function App() {
                       <input checked={showEmptyLots} type="checkbox" onChange={(event) => setShowEmptyLots(event.target.checked)} />
                       <span>Show Empty Lots</span>
                     </label>
-                    <DataTable headers={["Supplier", "Lot", "Size/Grade", "Opening Date", "Opening Qty", "Sold Qty", "Balance Qty", "Cost", "Sale Rate", "Remarks", "Actions"]}>
+                    <DataTable className="product-entry-table product-entry-lot-table" headers={["Supplier", "Lot", "Size/Grade", "Opening Date", "Opening Qty", "Sold Qty", "Balance Qty", "Cost", "Sale Rate", "Remarks", "Actions"]}>
                       {filteredProductLots.length ? filteredProductLots.map((lot) => (
                         <tr key={lot.id}>
-                          <td>{lot.supplier_name || "No supplier payable"}</td>
-                          <td className="primary-cell">{lot.lot_name || lot.batch_no || `Lot #${lot.id}`}<small className={`cell-note ${lotStatusClass(lot)}`}>{lotStatusLabel(lot)}</small></td>
-                          <td>{lot.lot_size || "-"}</td>
+                          <td title={lot.supplier_name || "No supplier payable"}>{lot.supplier_name || "No supplier payable"}</td>
+                          <td className="primary-cell product-name-cell" title={lot.lot_name || lot.batch_no || `Lot #${lot.id}`}>{lot.lot_name || lot.batch_no || `Lot #${lot.id}`}<small className={`cell-note ${lotStatusClass(lot)}`}>{lotStatusLabel(lot)}</small></td>
+                          <td title={lot.lot_size || "-"}>{lot.lot_size || "-"}</td>
                           <td>{formatDisplayDate(lot.purchase_date)}</td>
                           <td>{Number(lot.purchase_qty || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
                           <td>{Number(lot.sold_qty || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
                           <td>{Number(lot.balance_qty ?? lot.remaining_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
                           <td>{currency.format(Number(lot.purchase_rate || lot.effective_cost_per_unit || 0))}</td>
                           <td>{currency.format(Number(lot.temporary_sale_rate || lot.selling_rate || 0))}</td>
-                          <td>{lot.remarks || "-"}</td>
+                          <td title={lot.remarks || "-"}>{lot.remarks || "-"}</td>
                           <td>
                             <div className="button-row table-actions-row">
                               <button className="table-action" onClick={() => openLotAction("edit", lot)}>Edit</button>
@@ -4235,12 +4235,12 @@ function App() {
                     onChange={(event) => setProductListSearch(event.target.value)}
                   />
                 </label>
-                <DataTable headers={["Category", "Item", "Barcode", "Origin", "Sale Rate", "Min Stock", "Stock", "Lots", "Unit", "Status", "Actions"]}>
+                <DataTable className="product-entry-table product-entry-item-table" headers={["Category", "Item", "Barcode", "Origin", "Sale Rate", "Min Stock", "Stock", "Lots", "Unit", "Status", "Actions"]}>
                   {filteredProducts.map((product) => (
                     <tr key={product.id}>
-                      <td>{product.category_name || product.category || "Fruit"}</td>
-                      <td className="primary-cell">{product.product_name}<small className="cell-note">{product.remarks || ""}</small></td>
-                      <td>{product.barcode || "-"}</td>
+                      <td title={product.category_name || product.category || "Fruit"}>{product.category_name || product.category || "Fruit"}</td>
+                      <td className="primary-cell product-name-cell" title={product.product_name || "-"}>{product.product_name}<small className="cell-note">{product.remarks || ""}</small></td>
+                      <td title={product.barcode || "-"}>{product.barcode || "-"}</td>
                       <td><span className="tag">{product.origin_type || "LOCAL"}</span></td>
                       <td>{currency.format(Number(product.selling_rate))}</td>
                       <td>{product.minimum_stock || 0}</td>
@@ -11003,7 +11003,6 @@ function SyncSettingsSection({
   const syncSummary = connectionStatus?.syncSummary || "Backend status not checked";
   const branchRecord = (settingsData?.branches || []).find((branch) => String(branch.id) === String(user?.branch_id || draft.branch_id || "1"));
   const branchLabel = branchRecord?.branch_name || user?.branch_name || draft.branch_name || "Main Branch";
-  const deviceLabel = draft.device_display_name || localDbStatus?.deviceName || localDbStatus?.deviceIdentity?.device_name || "This Device";
   const fieldRemoteWarning = API_MODE === API_MODES.FIELD_REMOTE_DEVICE
     ? "Field Remote Device requires Cloud Production + purchase offline sync. Current version can prepare configuration but cannot safely sync remote purchase entries yet."
     : "";
@@ -11015,37 +11014,11 @@ function SyncSettingsSection({
   const lastPull = syncStatus?.lastPullAt;
   return (
     <ModuleCard eyebrow="Sync & Connection" title="Connection Status" subtitle="Owner view for live internet, local server and cloud sync readiness.">
-      <div className="sync-diagnostics-panel">
-        <div>
-          <span className="eyebrow">Connection Mode Setup</span>
-          <h3>Connection Mode Setup</h3>
-        </div>
-        <div className="form-grid supplier-form-grid">
-          <Field label="Select App Mode">
-            <select disabled={!canManage} value={configDraft.mode} onChange={(event) => setConfigDraft({ ...configDraft, mode: event.target.value })}>
-              {API_MODE_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-            </select>
-          </Field>
-        </div>
-        {configDraft.mode === API_MODES.LOCAL_SINGLE_DEVICE && <p className="form-note">Local Single Device uses this computer's local backend.</p>}
-        {configDraft.mode === API_MODES.BRANCH_LAN_SERVER && <p className="form-note">Branch LAN Server is for the main shop computer serving same-branch devices over Wi-Fi/LAN.</p>}
-        {configDraft.mode === API_MODES.BRANCH_LAN_CLIENT && <p className="form-note">Branch LAN Client must use the main branch server IP. It is same Wi-Fi/LAN only, not cloud.</p>}
-        {configDraft.mode === API_MODES.CLOUD_PRODUCTION && <p className="form-note">Cloud Production requires a real hosted backend URL. Blank, localhost, and LAN URLs remain Cloud Not Configured.</p>}
-        {configDraft.mode === API_MODES.FIELD_REMOTE_DEVICE && <p className="form-note stock-low">Field Remote Device is not ready without hosted cloud plus purchase offline sync.</p>}
-        {configDraft.mode === API_MODES.CUSTOM_API_URL && <p className="form-note">Custom API URL must pass the FroozERP health check before production use.</p>}
-        {configMessage && <p className="form-note">{configMessage}</p>}
-        <div className="toolbar-actions">
-          <button className="primary-button" disabled={!canManage} onClick={saveApiConfig}>Save Mode</button>
-          <button className="secondary-button" disabled={!canManage || !selectedTestUrl} onClick={() => testApiUrl(selectedTestUrl, "Selected API")}>Test Connection</button>
-        </div>
-      </div>
       <div className="sync-owner-summary">
         {[
           ["App Mode", appMode],
-          ["Branch", branchLabel],
-          ["Device", deviceLabel],
           ["Internet", internetStatus],
-          ["Local Branch Server", localServerStatus],
+          ["Local Server", localServerStatus],
           ["Cloud", cloudStatus],
           ["Sync Status", syncSummary],
           ["Pending Sync", pending],
@@ -11057,10 +11030,10 @@ function SyncSettingsSection({
           </div>
         ))}
       </div>
-      {fieldRemoteWarning && <p className="form-note stock-low">{fieldRemoteWarning}</p>}
       <div className="toolbar-actions">
         <button className="secondary-button" disabled={!onCheckConnection} onClick={onCheckConnection}>Check Connection</button>
         <button className="secondary-button" disabled={!canManage || !onRunSync} onClick={onRunSync}>Sync Now</button>
+        <button className="secondary-button" disabled={!canManage || !onRetrySync} onClick={onRetrySync}>Retry Failed</button>
         <button className="secondary-button" onClick={() => setShowDiagnostics((current) => !current)}>Advanced Diagnostics</button>
       </div>
       {showDiagnostics && cloudReadiness && (
@@ -11070,6 +11043,25 @@ function SyncSettingsSection({
       )}
       {showDiagnostics && (
         <div className="sync-diagnostics-panel">
+          <div>
+            <span className="eyebrow">Connection Mode Setup</span>
+            <h3>Connection Mode Setup</h3>
+          </div>
+          <div className="form-grid supplier-form-grid">
+            <Field label="Select App Mode">
+              <select disabled={!canManage} value={configDraft.mode} onChange={(event) => setConfigDraft({ ...configDraft, mode: event.target.value })}>
+                {API_MODE_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+              </select>
+            </Field>
+          </div>
+          {configDraft.mode === API_MODES.LOCAL_SINGLE_DEVICE && <p className="form-note">Local Single Device uses this computer's local backend.</p>}
+          {configDraft.mode === API_MODES.BRANCH_LAN_SERVER && <p className="form-note">Branch LAN Server is for the main shop computer serving same-branch devices over Wi-Fi/LAN.</p>}
+          {configDraft.mode === API_MODES.BRANCH_LAN_CLIENT && <p className="form-note">Branch LAN Client must use the main branch server IP. It is same Wi-Fi/LAN only, not cloud.</p>}
+          {configDraft.mode === API_MODES.CLOUD_PRODUCTION && <p className="form-note">Cloud Production requires a real hosted backend URL. Blank, localhost, and LAN URLs remain Cloud Not Configured.</p>}
+          {configDraft.mode === API_MODES.FIELD_REMOTE_DEVICE && <p className="form-note stock-low">Field Remote Device is not ready without hosted cloud plus purchase offline sync.</p>}
+          {configDraft.mode === API_MODES.CUSTOM_API_URL && <p className="form-note">Custom API URL must pass the FroozERP health check before production use.</p>}
+          {fieldRemoteWarning && <p className="form-note stock-low">{fieldRemoteWarning}</p>}
+          {configMessage && <p className="form-note">{configMessage}</p>}
           {(statusMessage || syncMessage || syncStatus?.lastError) && <p className="form-note">{syncMessage || statusMessage || syncStatus?.lastError}</p>}
           {localDbStatus?.error && <p className="form-note stock-low">{localDbStatus.error}</p>}
           <div className="form-grid supplier-form-grid">
@@ -11116,9 +11108,10 @@ function SyncSettingsSection({
             <Field label="Notes"><textarea disabled value={draft.notes || "Cloud sync foundation is active for reference data and safe test entities."} /></Field>
           </div>
           <div className="toolbar-actions">
+            <button className="primary-button" disabled={!canManage} onClick={saveApiConfig}>Save Mode</button>
+            <button className="secondary-button" disabled={!canManage || !selectedTestUrl} onClick={() => testApiUrl(selectedTestUrl, "Selected API")}>Test Connection</button>
             <button className="primary-button" disabled={!canManage} onClick={save}>Save Device Name</button>
             <button className="secondary-button" disabled={cloudReadinessBusy} onClick={runCloudReadinessCheck}>{cloudReadinessBusy ? "Checking Cloud..." : "Cloud Readiness Check"}</button>
-            <button className="secondary-button" disabled={!canManage || !onRetrySync} onClick={onRetrySync}>Retry Failed</button>
             <button className="secondary-button" disabled={!canManage || !onQueueSyncTest} onClick={onQueueSyncTest}>Queue Safe Test</button>
           </div>
         </div>
@@ -14066,9 +14059,9 @@ function ModuleCard({ children, eyebrow, subtitle, title }) {
   );
 }
 
-function DataTable({ children, headers }) {
+function DataTable({ children, className = "", headers }) {
   return (
-    <div className="table-wrap">
+    <div className={`table-wrap ${className}`.trim()}>
       <table>
         <thead><tr>{headers.map((header, index) => <th key={typeof header === "string" ? header : index}>{header}</th>)}</tr></thead>
         <tbody>{children}</tbody>

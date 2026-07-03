@@ -1193,6 +1193,51 @@ td .button-row {
   flex-wrap: nowrap;
 }
 
+.product-entry-table {
+  overflow-x: auto;
+}
+
+.product-entry-table table {
+  min-width: 1040px;
+}
+
+.product-entry-lot-table table {
+  min-width: 1180px;
+}
+
+.product-entry-table th,
+.product-entry-table td {
+  word-break: normal;
+}
+
+.product-entry-table .product-name-cell {
+  min-width: 220px;
+  max-width: 320px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.product-entry-table .product-name-cell .cell-note {
+  display: block;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.product-entry-table td:last-child {
+  min-width: 240px;
+}
+
+.product-entry-lot-table td:last-child {
+  min-width: 360px;
+}
+
 th {
   position: sticky;
   top: 0;
