@@ -12,5 +12,9 @@
     "build": "npm --prefix frontend run build",
     "backend:check": "node --check backend/server.js",
     "cloud:verify": "node scripts/cloud/verify-hosted-cloud.mjs"
+  },
+  "engines": {
+    "node": ">=22",
+    "npm": ">=10"
   }
 }
