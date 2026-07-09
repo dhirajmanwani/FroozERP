@@ -2,10 +2,10 @@
   "$schema": "https://railway.com/railway.schema.json",
   "build": {
     "builder": "NIXPACKS",
-    "buildCommand": "npm install --omit=dev"
+    "buildCommand": "npm --prefix backend ci --omit=dev && npm --prefix frontend ci && npm --prefix frontend run build"
   },
   "deploy": {
-    "startCommand": "node server.js",
+    "startCommand": "npm --prefix backend start",
     "healthcheckPath": "/api/health",
     "healthcheckTimeout": 300,
     "restartPolicyType": "ON_FAILURE",

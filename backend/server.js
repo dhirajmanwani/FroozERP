@@ -13,6 +13,10 @@ types.setTypeParser(1082, (value) => value);
 const app = express();
 app.use(express.json({ limit: "25mb" }));
 
+const frontendDistPath = path.resolve(__dirname, "../frontend/dist");
+const frontendIndexPath = path.join(frontendDistPath, "index.html");
+const frontendDistAvailable = () => fs.existsSync(frontendIndexPath);
+
 const primaryDatabaseUrl = String(process.env.DATABASE_URL || "").trim();
 const cloudDatabaseUrl = String(process.env.CLOUD_DATABASE_URL || "").trim();
 const runtimeNodeEnv = String(process.env.NODE_ENV || "").trim().toLowerCase();
@@ -6374,7 +6378,10 @@ app.delete("/settings/rebate-rules/:id", async (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  res.send("FroozERP Backend Running");
+  if (frontendDistAvailable()) {
+    return res.sendFile(frontendIndexPath);
+  }
+  return res.send("FroozERP Backend Running");
 });
 
 const readDevicePayload = (body = {}, req = {}) => ({
@@ -16332,6 +16339,16 @@ const prepareDatabaseForStartup = async () => {
   console.log(`business counts after bootstrap: ${JSON.stringify(await readBusinessCounts())}`);
 };
 
+if (frontendDistAvailable()) {
+  console.log(`Serving React frontend from ${frontendDistPath}`);
+  app.use(express.static(frontendDistPath));
+  app.get(/^\/(?!api\/).*/, (req, res, next) => {
+    if (req.path.includes(".")) return next();
+    return res.sendFile(frontendIndexPath);
+  });
+} else {
+  console.log(`React frontend build not found at ${frontendDistPath}; serving API only.`);
+}
 prepareDatabaseForStartup()
   .then(async () => {
     if (runStartupReferenceSeed) {
