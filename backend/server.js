@@ -14,8 +14,11 @@ const app = express();
 app.use(express.json({ limit: "25mb" }));
 
 const frontendDistCandidates = [
-  path.resolve(__dirname, "../frontend/dist"),
+  path.resolve(process.cwd(), "frontend/dist"),
+  path.resolve(__dirname, "frontend/dist"),
   path.resolve(process.cwd(), "../frontend/dist"),
+  path.resolve(__dirname, "../frontend/dist"),
+  path.resolve(process.cwd(), "backend/public"),
   path.resolve(__dirname, "public"),
   path.resolve(process.cwd(), "public"),
   path.resolve(__dirname, "dist"),
