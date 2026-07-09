@@ -13,9 +13,20 @@ types.setTypeParser(1082, (value) => value);
 const app = express();
 app.use(express.json({ limit: "25mb" }));
 
-const frontendDistPath = path.resolve(__dirname, "../frontend/dist");
+const frontendDistCandidates = [
+  path.resolve(__dirname, "../frontend/dist"),
+  path.resolve(process.cwd(), "../frontend/dist"),
+  path.resolve(__dirname, "public"),
+  path.resolve(process.cwd(), "public"),
+  path.resolve(__dirname, "dist"),
+  path.resolve(process.cwd(), "dist"),
+].filter((candidate, index, candidates) => candidates.indexOf(candidate) === index);
+const resolveFrontendDistPath = () => frontendDistCandidates.find((candidate) => fs.existsSync(path.join(candidate, "index.html"))) || frontendDistCandidates[0];
+const frontendDistPath = resolveFrontendDistPath();
 const frontendIndexPath = path.join(frontendDistPath, "index.html");
-const frontendDistAvailable = () => fs.existsSync(frontendIndexPath);
+const frontendDistExists = fs.existsSync(frontendDistPath);
+const frontendIndexExists = fs.existsSync(frontendIndexPath);
+const frontendDistAvailable = () => frontendIndexExists;
 
 const primaryDatabaseUrl = String(process.env.DATABASE_URL || "").trim();
 const cloudDatabaseUrl = String(process.env.CLOUD_DATABASE_URL || "").trim();
@@ -16339,6 +16350,11 @@ const prepareDatabaseForStartup = async () => {
   console.log(`business counts after bootstrap: ${JSON.stringify(await readBusinessCounts())}`);
 };
 
+console.log(`process.cwd(): ${process.cwd()}`);
+console.log(`__dirname: ${__dirname}`);
+console.log(`resolved frontendDistPath: ${frontendDistPath}`);
+console.log(`frontendDistPath exists: ${frontendDistExists}`);
+console.log(`frontend index.html exists: ${frontendIndexExists}`);
 if (frontendDistAvailable()) {
   console.log(`Serving React frontend from ${frontendDistPath}`);
   app.use(express.static(frontendDistPath));
@@ -16347,7 +16363,8 @@ if (frontendDistAvailable()) {
     return res.sendFile(frontendIndexPath);
   });
 } else {
-  console.log(`React frontend build not found at ${frontendDistPath}; serving API only.`);
+  console.log(`React frontend build not found at ${frontendDistPath}; serving API only fallback.`);
+  console.log(`Frontend dist candidates: ${frontendDistCandidates.join(", ")}`);
 }
 prepareDatabaseForStartup()
   .then(async () => {
