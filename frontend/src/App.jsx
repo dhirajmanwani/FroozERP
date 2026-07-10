@@ -1300,6 +1300,7 @@ function App() {
     memories: [],
     predictions: { inventory: [], sales: [], cashflow: [], waste: [] },
     profitAdvisor: [],
+    autonomous: null,
     dailyPlan: null,
     period: { range: "today", label: "Today" },
     loading: false,
@@ -2309,7 +2310,7 @@ function App() {
     setAiAssistantData((current) => ({ ...current, loading: true, error: "" }));
     try {
       const params = { user_id: user?.id, device_id: deviceInfo.device_id, range };
-      const [briefingResponse, alertsResponse, remindersResponse, questionsResponse, statusResponse, memoryResponse, predictionsResponse, profitResponse, planResponse] = await Promise.all([
+      const [briefingResponse, alertsResponse, remindersResponse, questionsResponse, statusResponse, memoryResponse, predictionsResponse, profitResponse, planResponse, autonomousResponse] = await Promise.all([
         axios.get(`${API_URL}/api/ai/briefing`, { params }),
         axios.get(`${API_URL}/api/ai/alerts`, { params }),
         axios.get(`${API_URL}/api/ai/reminders`, { params }),
@@ -2319,6 +2320,7 @@ function App() {
         axios.get(`${API_URL}/api/ai/predictions`, { params }).catch(() => ({ data: { predictions: { inventory: [], sales: [], cashflow: [], waste: [] } } })),
         axios.get(`${API_URL}/api/ai/profit-advisor`, { params }).catch(() => ({ data: { recommendations: [] } })),
         axios.get(`${API_URL}/api/ai/daily-plan`, { params }).catch(() => ({ data: null })),
+        axios.get(`${API_URL}/api/ai/autonomous`, { params }).catch(() => ({ data: null })),
       ]);
       setAiAssistantData((current) => ({
         ...current,
@@ -2334,6 +2336,7 @@ function App() {
         memories: memoryResponse.data.memories || [],
         predictions: predictionsResponse.data.predictions || { inventory: [], sales: [], cashflow: [], waste: [] },
         profitAdvisor: profitResponse.data.recommendations || [],
+        autonomous: autonomousResponse.data,
         dailyPlan: planResponse.data,
         period: { range, ...(briefingResponse.data.period || {}) },
         loading: false,
@@ -5198,6 +5201,7 @@ function AiBusinessAssistantModule({
   const money = (value) => currency.format(Number(value || 0));
   const tabItems = [
     ["briefing", "Briefing"],
+    ["decision", "Decision Center"],
     ["ask", "Ask FROST"],
     ["alerts", "Alerts"],
     ["predictions", "Predictions"],
@@ -5291,6 +5295,7 @@ function AiBusinessAssistantModule({
         <ModuleCard eyebrow="Daily Owner Brief" title="Top Recommendations" subtitle="Deterministic alerts remain available even when external AI providers are disabled.">
           <div className="ai-recommendations">
             {(data.dailyPlan?.top_priorities || []).slice(0, 5).map((item) => <p key={`priority-${item}`}>Start My Day: {item}</p>)}
+            {(data.dailyPlan?.topPriorities || []).slice(0, 5).map((item) => <p key={`priority-${item}`}>Start My Day: {item}</p>)}
             {(briefing.recommendations || ["No briefing loaded yet."]).map((item) => <p key={item}>{item}</p>)}
             {(data.dailyPlan?.can_wait || []).slice(0, 3).map((item) => <p key={`wait-${item}`}>Can wait: {item}</p>)}
           </div>
@@ -5306,6 +5311,10 @@ function AiBusinessAssistantModule({
 
       {activeTab === "predictions" && (
         <FrostPredictionsPanel predictions={data.predictions || {}} onProposeAction={onProposeAction} />
+      )}
+
+      {activeTab === "decision" && (
+        <FrostAutonomousDecisionCenter data={data.autonomous || {}} onProposeAction={onProposeAction} />
       )}
 
       {activeTab === "profit" && (
@@ -5434,6 +5443,139 @@ function FrostPredictionsPanel({ predictions = {}, onProposeAction }) {
           </div>
         </ModuleCard>
       ))}
+    </div>
+  );
+}
+
+function FrostAutonomousDecisionCenter({ data = {}, onProposeAction }) {
+  const health = data.health || data.decisionCenter?.health || {};
+  const policy = data.policy || data.decisionCenter?.approval_policy || "All recommendations require owner approval before execution.";
+  const topPricing = data.pricing || [];
+  const topPurchases = data.purchases || [];
+  const topWaste = data.waste || [];
+  const topCustomers = data.customers || [];
+  const topSuppliers = data.suppliers || [];
+  const cashflow = data.cashflow || [];
+  const demand = data.demand || [];
+  const propose = (action, payload) => onProposeAction?.(action, { ...payload, source: "autonomous_decision_center" });
+  return (
+    <div className="frost-panel-stack">
+      <ModuleCard eyebrow="Owner Decision Center" title="Autonomous Business Intelligence" subtitle={policy}>
+        <div className="ai-brief-grid">
+          <SummaryMetric featured label="Business Health" value={health.score !== undefined ? `${health.score}/100` : "n/a"} />
+          <SummaryMetric label="Status" value={health.color || "Not scored"} />
+          <SummaryMetric label="Pricing Ideas" value={topPricing.length} />
+          <SummaryMetric label="Purchase Suggestions" value={topPurchases.length} />
+          <SummaryMetric label="Waste Alerts" value={topWaste.filter((item) => item.color_status !== "Green").length} />
+          <SummaryMetric label="Customer Opportunities" value={topCustomers.filter((item) => ["VIP", "INACTIVE", "GROWING"].includes(item.segment)).length} />
+        </div>
+      </ModuleCard>
+
+      <ModuleCard eyebrow="Dynamic Pricing" title="Approval-Only Price Intelligence" subtitle="No sale rate changes are applied automatically.">
+        <DataTable headers={["Fruit", "Recommendation", "Impact", "Priority", "Action"]}>
+          {topPricing.slice(0, 8).map((item) => (
+            <tr key={item.product_id}>
+              <td className="primary-cell">{item.product_name}<small className="cell-note">Rate {currency.format(item.current_selling_rate)} - margin {item.margin_percent ?? "n/a"}%</small></td>
+              <td>{item.action_text}<small className="cell-note">{item.reason}</small></td>
+              <td>{currency.format(item.expected_revenue_impact)} revenue<small className="cell-note">{currency.format(item.expected_profit_impact)} profit - {Math.round(Number(item.confidence || 0) * 100)}%</small></td>
+              <td><span className={aiSeverityClass(item.priority)}>{item.priority}</span></td>
+              <td><button className="table-action" onClick={() => propose(item.action_text, { product_id: item.product_id })}>Review</button></td>
+            </tr>
+          ))}
+          {topPricing.length === 0 && <tr><td colSpan="5" className="empty-cell">No pricing recommendations available.</td></tr>}
+        </DataTable>
+      </ModuleCard>
+
+      <div className="ai-layout">
+        <ModuleCard eyebrow="Smart Purchase Planner" title="Recommended Purchases" subtitle="FROST recommends quantities only; purchase bills still need owner approval.">
+          <DataTable headers={["Fruit", "Qty", "Supplier", "Cost", "Action"]}>
+            {topPurchases.slice(0, 8).map((item) => (
+              <tr key={item.product_id}>
+                <td className="primary-cell">{item.product_name}<small className="cell-note">{item.reason}</small></td>
+                <td>{item.recommended_quantity}</td>
+                <td>{item.suggested_supplier}</td>
+                <td>{currency.format(item.expected_cost)}<small className="cell-note">{item.expected_stock_days || "n/a"} stock days</small></td>
+                <td><button className="table-action" onClick={() => propose("review purchase suggestion", { product_id: item.product_id })}>Review</button></td>
+              </tr>
+            ))}
+            {topPurchases.length === 0 && <tr><td colSpan="5" className="empty-cell">No purchase suggestions available.</td></tr>}
+          </DataTable>
+        </ModuleCard>
+
+        <ModuleCard eyebrow="Waste Prevention" title="Lot Risk Monitor" subtitle="Discounts and display actions are recommendations only.">
+          <DataTable headers={["Lot", "Risk", "Priority", "Action"]}>
+            {topWaste.slice(0, 8).map((item) => (
+              <tr key={item.lot_id}>
+                <td className="primary-cell">{item.product_name}<small className="cell-note">{item.batch_no} - {item.remaining_qty} left</small></td>
+                <td>{item.color_status}<small className="cell-note">Freshness {item.freshness_score}/100 - waste {Math.round(Number(item.waste_probability || 0) * 100)}%</small></td>
+                <td>{item.selling_priority}</td>
+                <td><button className="table-action" onClick={() => propose(item.discount_recommendation, { lot_id: item.lot_id, product_id: item.product_id })}>Review</button></td>
+              </tr>
+            ))}
+            {topWaste.length === 0 && <tr><td colSpan="4" className="empty-cell">No lot risk rows available.</td></tr>}
+          </DataTable>
+        </ModuleCard>
+      </div>
+
+      <div className="ai-layout">
+        <ModuleCard eyebrow="Customer Intelligence" title="Customer Opportunities" subtitle="FROST suggests follow-ups; no messages are sent automatically.">
+          <DataTable headers={["Customer", "Segment", "Value", "Action"]}>
+            {topCustomers.slice(0, 8).map((item) => (
+              <tr key={item.customer_id}>
+                <td className="primary-cell">{item.customer_name}<small className="cell-note">{item.favourite_fruits}</small></td>
+                <td>{item.segment}<small className="cell-note">{item.recommendation}</small></td>
+                <td>{currency.format(item.lifetime_value)}<small className="cell-note">Avg {currency.format(item.average_basket_value)}</small></td>
+                <td><button className="table-action" onClick={() => propose(item.recommendation, { customer_id: item.customer_id })}>Review</button></td>
+              </tr>
+            ))}
+            {topCustomers.length === 0 && <tr><td colSpan="4" className="empty-cell">No customer intelligence available.</td></tr>}
+          </DataTable>
+        </ModuleCard>
+
+        <ModuleCard eyebrow="Supplier Intelligence" title="Supplier Scorecards" subtitle="Supplier scores use available purchase and profit data.">
+          <DataTable headers={["Supplier", "Score", "Profit", "Action"]}>
+            {topSuppliers.slice(0, 8).map((item) => (
+              <tr key={`${item.supplier_id || item.supplier_name}`}>
+                <td className="primary-cell">{item.supplier_name}<small className="cell-note">{item.reliability} reliability</small></td>
+                <td>{item.supplier_score}/100</td>
+                <td>{currency.format(item.profit_contribution)}</td>
+                <td><button className="table-action" onClick={() => propose(item.recommendation, { supplier_id: item.supplier_id, supplier_name: item.supplier_name })}>{item.recommendation}</button></td>
+              </tr>
+            ))}
+            {topSuppliers.length === 0 && <tr><td colSpan="4" className="empty-cell">No supplier intelligence available.</td></tr>}
+          </DataTable>
+        </ModuleCard>
+      </div>
+
+      <div className="ai-layout">
+        <ModuleCard eyebrow="Cash Flow Predictor" title="Working Capital Windows" subtitle="Prediction ranges are deterministic and conservative.">
+          <DataTable headers={["Period", "Incoming", "Outgoing", "Working Capital"]}>
+            {cashflow.map((item) => (
+              <tr key={item.period}>
+                <td>{item.period}</td>
+                <td>{currency.format(item.incoming_cash)}</td>
+                <td>{currency.format(item.outgoing_cash)}</td>
+                <td>{currency.format(item.working_capital)}<small className="cell-note">{item.future_shortage ? "Shortage risk" : "Manageable"}</small></td>
+              </tr>
+            ))}
+            {cashflow.length === 0 && <tr><td colSpan="4" className="empty-cell">No cashflow prediction available.</td></tr>}
+          </DataTable>
+        </ModuleCard>
+
+        <ModuleCard eyebrow="Demand Forecast" title="Shortage and Slow-Moving Signals" subtitle="Uses recent sales trends; festival calendar can be added later.">
+          <DataTable headers={["Fruit", "7-Day Sales", "Purchase Need", "Signal"]}>
+            {demand.slice(0, 8).map((item) => (
+              <tr key={item.product_id}>
+                <td className="primary-cell">{item.product_name}<small className="cell-note">{Math.round(Number(item.confidence || 0) * 100)}% confidence</small></td>
+                <td>{item.expected_sales_7_days}</td>
+                <td>{item.expected_purchase}</td>
+                <td>{item.stock_shortage_warning ? "Shortage warning" : item.slow_moving ? "Slow moving" : "Normal"}</td>
+              </tr>
+            ))}
+            {demand.length === 0 && <tr><td colSpan="4" className="empty-cell">No demand forecast available.</td></tr>}
+          </DataTable>
+        </ModuleCard>
+      </div>
     </div>
   );
 }

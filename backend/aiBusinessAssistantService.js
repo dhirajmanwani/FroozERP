@@ -20,6 +20,12 @@ const {
   grossMarginPercent,
   wasteAdjustedMargin,
   dedupeAlertKey,
+  dynamicPriceRecommendation,
+  purchasePlannerRecommendation,
+  wastePreventionScore,
+  customerIntelligenceSegment,
+  supplierIntelligenceScore,
+  businessHealthScore,
 } = require("./frostIntelligence");
 
 const DEFAULT_THRESHOLDS = {
@@ -59,6 +65,7 @@ const parsePositiveInteger = (value) => {
 };
 const toNumber = (value) => Number(value || 0);
 const roundCurrency = (value) => Number(toNumber(value).toFixed(2));
+const clampNumber = (value, min = 0, max = 100) => Math.max(min, Math.min(max, Number(value || 0)));
 const toDateKey = (value = new Date()) => {
   const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) return new Date().toISOString().slice(0, 10);
@@ -704,6 +711,406 @@ const getProfitAdvisorRows = async (pool) => {
   });
 };
 
+const getAutonomousProductMetrics = async (pool) => {
+  const result = await pool.query(`
+    WITH stock AS (
+      SELECT product_id,
+             SUM(CASE WHEN COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED' THEN remaining_qty ELSE 0 END) AS available_stock,
+             AVG(NULLIF(purchase_rate, 0)) AS avg_purchase_cost,
+             MAX(supplier_name) AS suggested_supplier
+      FROM inventory_batches
+      GROUP BY product_id
+    ),
+    sales30 AS (
+      SELECT si.product_id, SUM(si.quantity) AS sold_qty, SUM(si.amount) AS sale_amount,
+             SUM(si.cost_amount) AS cost_amount, SUM(si.profit) AS profit_amount,
+             COUNT(DISTINCT s.sale_date) AS sale_days
+      FROM sale_items si
+      JOIN sales s ON s.id = si.sale_id
+      WHERE s.sale_date >= CURRENT_DATE - INTERVAL '30 days'
+        AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
+      GROUP BY si.product_id
+    ),
+    sales7 AS (
+      SELECT si.product_id, SUM(si.quantity) AS sold_qty
+      FROM sale_items si
+      JOIN sales s ON s.id = si.sale_id
+      WHERE s.sale_date >= CURRENT_DATE - INTERVAL '7 days'
+        AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
+      GROUP BY si.product_id
+    ),
+    waste30 AS (
+      SELECT product_id, SUM(quantity) AS waste_qty, SUM(cost_amount) AS waste_cost
+      FROM waste_entries
+      WHERE waste_date >= CURRENT_DATE - INTERVAL '30 days'
+      GROUP BY product_id
+    ),
+    pending AS (
+      SELECT pi.product_id, SUM(pi.quantity) AS pending_qty
+      FROM purchase_items pi
+      JOIN purchases pu ON pu.id = pi.purchase_id
+      WHERE COALESCE(pu.purchase_status, '') IN ('BILL_PENDING', 'PENDING')
+      GROUP BY pi.product_id
+    )
+    SELECT p.id AS product_id, p.product_name, p.unit, p.selling_rate, p.minimum_stock,
+           COALESCE(stock.available_stock, 0) AS available_stock,
+           COALESCE(stock.avg_purchase_cost, 0) AS avg_purchase_cost,
+           COALESCE(stock.suggested_supplier, '') AS suggested_supplier,
+           COALESCE(sales30.sold_qty, 0) AS sold_qty_30,
+           COALESCE(sales7.sold_qty, 0) AS sold_qty_7,
+           COALESCE(sales30.sale_amount, 0) AS sale_amount_30,
+           COALESCE(sales30.cost_amount, 0) AS cost_amount_30,
+           COALESCE(sales30.profit_amount, 0) AS profit_amount_30,
+           COALESCE(sales30.sale_days, 0) AS sale_days_30,
+           COALESCE(waste30.waste_qty, 0) AS waste_qty_30,
+           COALESCE(waste30.waste_cost, 0) AS waste_cost_30,
+           COALESCE(pending.pending_qty, 0) AS pending_purchase_qty
+    FROM products p
+    LEFT JOIN stock ON stock.product_id = p.id
+    LEFT JOIN sales30 ON sales30.product_id = p.id
+    LEFT JOIN sales7 ON sales7.product_id = p.id
+    LEFT JOIN waste30 ON waste30.product_id = p.id
+    LEFT JOIN pending ON pending.product_id = p.id
+    WHERE p.active IS DISTINCT FROM FALSE
+    ORDER BY p.product_name
+    LIMIT 120
+  `);
+  return result.rows.map((row) => {
+    const averageDailySale = Number(row.sold_qty_30 || 0) / 30;
+    const recentAverageDailySale = Number(row.sold_qty_7 || 0) / 7;
+    const demandTrend = averageDailySale > 0 ? (recentAverageDailySale - averageDailySale) / averageDailySale : 0;
+    const wasteProbability = Number(row.sold_qty_30 || 0) + Number(row.waste_qty_30 || 0) > 0
+      ? Number(row.waste_qty_30 || 0) / (Number(row.sold_qty_30 || 0) + Number(row.waste_qty_30 || 0))
+      : 0;
+    return {
+      ...row,
+      selling_rate: roundCurrency(row.selling_rate),
+      available_stock: Number(row.available_stock || 0),
+      avg_purchase_cost: roundCurrency(row.avg_purchase_cost),
+      average_daily_sale: Number(averageDailySale.toFixed(3)),
+      demand_trend: Number(demandTrend.toFixed(3)),
+      waste_probability: Number(wasteProbability.toFixed(3)),
+      margin_percent: grossMarginPercent({ sellingRate: row.selling_rate, purchaseCost: row.avg_purchase_cost }),
+    };
+  });
+};
+
+const getDynamicPricingIntelligence = async (pool) => {
+  const rows = await getAutonomousProductMetrics(pool);
+  return rows.map((row) => {
+    const recommendation = dynamicPriceRecommendation({
+      sellingRate: row.selling_rate,
+      purchaseCost: row.avg_purchase_cost,
+      availableStock: row.available_stock,
+      averageDailySale: row.average_daily_sale,
+      wasteProbability: row.waste_probability,
+      demandTrend: row.demand_trend,
+    });
+    const verb = recommendation.action === "INCREASE" ? "Increase" : recommendation.action === "REDUCE" ? "Reduce" : "Keep";
+    const actionText = recommendation.action === "KEEP"
+      ? `Keep ${row.product_name} unchanged`
+      : `${verb} ${row.product_name} ${roundCurrency(recommendation.changeAmount)}/${row.unit || "unit"}`;
+    return {
+      product_id: row.product_id,
+      product_name: row.product_name,
+      current_selling_rate: row.selling_rate,
+      current_purchase_rate: row.avg_purchase_cost,
+      current_stock: row.available_stock,
+      margin_percent: row.margin_percent,
+      waste_probability: row.waste_probability,
+      seasonal_demand: row.demand_trend,
+      action: recommendation.action,
+      action_text: actionText,
+      reason: recommendation.reason,
+      expected_revenue_impact: roundCurrency(recommendation.expectedRevenueImpact),
+      expected_profit_impact: roundCurrency(recommendation.expectedProfitImpact),
+      confidence: recommendation.confidence,
+      priority: recommendation.priority,
+      approval_required: true,
+    };
+  }).sort((a, b) => Number(b.confidence) - Number(a.confidence)).slice(0, 50);
+};
+
+const getSmartPurchasePlanner = async (pool) => {
+  const rows = await getAutonomousProductMetrics(pool);
+  return rows.map((row) => {
+    const recommendation = purchasePlannerRecommendation({
+      availableStock: row.available_stock,
+      pendingPurchaseQty: row.pending_purchase_qty,
+      averageDailySale: row.average_daily_sale,
+      purchaseCost: row.avg_purchase_cost,
+      sellingRate: row.selling_rate,
+    });
+    return {
+      product_id: row.product_id,
+      product_name: row.product_name,
+      recommended_quantity: recommendation.recommendedQuantity || 0,
+      suggested_supplier: row.suggested_supplier || "Review latest supplier",
+      expected_cost: roundCurrency(recommendation.expectedCost),
+      expected_margin: recommendation.expectedMargin,
+      expected_stock_days: recommendation.expectedStockDays || null,
+      current_stock: row.available_stock,
+      pending_purchase_qty: Number(row.pending_purchase_qty || 0),
+      average_daily_sale: row.average_daily_sale,
+      status: recommendation.status,
+      priority: recommendation.priority || "INFO",
+      confidence: recommendation.confidence || 0,
+      reason: recommendation.reason,
+      approval_required: true,
+    };
+  }).filter((item) => item.status !== "WAIT").sort((a, b) => Number(b.recommended_quantity) - Number(a.recommended_quantity)).slice(0, 50);
+};
+
+const getWastePreventionIntelligence = async (pool) => {
+  const velocityRows = await getAutonomousProductMetrics(pool);
+  const velocity = new Map(velocityRows.map((row) => [Number(row.product_id), row.average_daily_sale]));
+  const result = await pool.query(`
+    SELECT ib.id AS lot_id, ib.product_id, p.product_name, ib.batch_no, ib.purchase_qty, ib.remaining_qty,
+           ib.purchase_rate, ib.purchase_date, ib.supplier_name,
+           EXTRACT(DAY FROM CURRENT_DATE - ib.purchase_date)::INTEGER AS age_days
+    FROM inventory_batches ib
+    JOIN products p ON p.id = ib.product_id
+    WHERE COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+      AND COALESCE(ib.remaining_qty, 0) > 0
+    ORDER BY ib.purchase_date, ib.id
+    LIMIT 120
+  `);
+  return result.rows.map((row) => {
+    const remainingRatio = Number(row.purchase_qty || 0) > 0 ? Number(row.remaining_qty || 0) / Number(row.purchase_qty || 0) : 0;
+    const risk = wastePreventionScore({ ageDays: row.age_days, remainingRatio, averageDailySale: velocity.get(Number(row.product_id)) || 0 });
+    return {
+      lot_id: row.lot_id,
+      product_id: row.product_id,
+      product_name: row.product_name,
+      batch_no: row.batch_no,
+      supplier_name: row.supplier_name,
+      purchase_date: row.purchase_date,
+      remaining_qty: Number(row.remaining_qty || 0),
+      freshness_score: risk.freshnessScore,
+      expiry_risk: risk.expiryRisk,
+      waste_probability: risk.wasteProbability,
+      selling_priority: risk.sellingPriority,
+      discount_recommendation: risk.discountRecommendation,
+      color_status: risk.colorStatus,
+      approval_required: true,
+    };
+  });
+};
+
+const getCustomerIntelligence = async (pool) => {
+  const result = await pool.query(`
+    SELECT c.id AS customer_id, c.customer_name,
+           COUNT(DISTINCT s.id) AS purchase_count,
+           MAX(s.sale_date) AS last_purchase_date,
+           COALESCE(SUM(s.total_amount), 0) AS lifetime_value,
+           CASE WHEN COUNT(DISTINCT s.id) > 0 THEN COALESCE(SUM(s.total_amount), 0) / COUNT(DISTINCT s.id) ELSE 0 END AS average_basket_value,
+           STRING_AGG(DISTINCT p.product_name, ', ' ORDER BY p.product_name) AS favourite_fruits
+    FROM customers c
+    LEFT JOIN sales s ON s.customer_id = c.id AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
+    LEFT JOIN sale_items si ON si.sale_id = s.id
+    LEFT JOIN products p ON p.id = si.product_id
+    WHERE c.active IS DISTINCT FROM FALSE
+    GROUP BY c.id, c.customer_name
+    ORDER BY lifetime_value DESC, c.customer_name
+    LIMIT 80
+  `);
+  return result.rows.map((row) => {
+    const daysSincePurchase = row.last_purchase_date ? Math.floor((Date.now() - new Date(row.last_purchase_date).getTime()) / 86400000) : null;
+    const segment = customerIntelligenceSegment({
+      daysSincePurchase,
+      purchaseCount: row.purchase_count,
+      lifetimeValue: row.lifetime_value,
+      averageBasketValue: row.average_basket_value,
+    });
+    return {
+      customer_id: row.customer_id,
+      customer_name: row.customer_name,
+      favourite_fruits: row.favourite_fruits || "Not enough product history",
+      purchase_frequency: Number(row.purchase_count || 0),
+      average_basket_value: roundCurrency(row.average_basket_value),
+      lifetime_value: roundCurrency(row.lifetime_value),
+      last_purchase_date: row.last_purchase_date,
+      days_since_purchase: daysSincePurchase,
+      segment: segment.segment,
+      risk: segment.risk,
+      recommendation: segment.recommendation,
+      expected_future_value: roundCurrency(Number(row.average_basket_value || 0) * Math.min(Number(row.purchase_count || 0) + 1, 6)),
+      approval_required: true,
+    };
+  });
+};
+
+const getSupplierIntelligence = async (pool) => {
+  const result = await pool.query(`
+    WITH supplier_profit AS (
+      SELECT COALESCE(sup.id, ib.supplier_id) AS supplier_id,
+             COALESCE(sup.supplier_name, ib.supplier_name, 'Supplier') AS supplier_name,
+             SUM(si.profit) AS profit_amount,
+             SUM(si.amount) AS sale_amount
+      FROM sale_batch_allocations siba
+      JOIN sale_items si ON si.id = siba.sale_item_id
+      LEFT JOIN inventory_batches ib ON ib.id = siba.inventory_batch_id
+      LEFT JOIN suppliers sup ON sup.id = ib.supplier_id
+      GROUP BY COALESCE(sup.id, ib.supplier_id), COALESCE(sup.supplier_name, ib.supplier_name, 'Supplier')
+    ),
+    supplier_purchases AS (
+      SELECT COALESCE(s.id, ib.supplier_id) AS supplier_id,
+             COALESCE(s.supplier_name, ib.supplier_name, 'Supplier') AS supplier_name,
+             AVG(ib.purchase_rate) AS average_purchase_rate,
+             COUNT(DISTINCT ib.id) AS purchase_count,
+             MIN(ib.purchase_rate) AS lowest_rate,
+             MAX(ib.purchase_rate) AS highest_rate
+      FROM inventory_batches ib
+      LEFT JOIN suppliers s ON s.id = ib.supplier_id
+      GROUP BY COALESCE(s.id, ib.supplier_id), COALESCE(s.supplier_name, ib.supplier_name, 'Supplier')
+    )
+    SELECT COALESCE(sp.supplier_id, pp.supplier_id) AS supplier_id,
+           COALESCE(sp.supplier_name, pp.supplier_name) AS supplier_name,
+           COALESCE(pp.average_purchase_rate, 0) AS average_purchase_rate,
+           COALESCE(pp.purchase_count, 0) AS purchase_count,
+           COALESCE(sp.profit_amount, 0) AS profit_contribution,
+           CASE WHEN COALESCE(sp.sale_amount, 0) > 0 THEN (sp.profit_amount / sp.sale_amount) * 100 ELSE 0 END AS margin_percent,
+           CASE WHEN COALESCE(pp.lowest_rate, 0) > 0 THEN ((pp.highest_rate - pp.lowest_rate) / pp.lowest_rate) * 100 ELSE 0 END AS cost_spread_percent
+    FROM supplier_profit sp
+    FULL OUTER JOIN supplier_purchases pp ON pp.supplier_id IS NOT DISTINCT FROM sp.supplier_id AND pp.supplier_name = sp.supplier_name
+    ORDER BY profit_contribution DESC, purchase_count DESC
+    LIMIT 80
+  `);
+  return result.rows.map((row) => {
+    const score = supplierIntelligenceScore({
+      marginPercent: row.margin_percent,
+      costIncreasePercent: row.cost_spread_percent,
+      purchaseCount: row.purchase_count,
+    });
+    return {
+      supplier_id: row.supplier_id,
+      supplier_name: row.supplier_name,
+      average_purchase_rate: roundCurrency(row.average_purchase_rate),
+      quality: "Use return and waste history for manual review",
+      delivery_timing: "Not enough delivery timestamp data",
+      payment_behaviour: "Review supplier ledger",
+      return_percent: 0,
+      reliability: score.reliability,
+      profit_contribution: roundCurrency(row.profit_contribution),
+      supplier_score: score.score,
+      recommendation: score.recommendation,
+      approval_required: true,
+    };
+  });
+};
+
+const getProfitOptimizer = async (pool) => {
+  const products = await getProfitAdvisorRows(pool);
+  const supplierRows = await getSupplierIntelligence(pool);
+  const topOpportunities = products.filter((item) => ["review sale rate", "review waste cause"].includes(item.proposed_action)).slice(0, 8);
+  return {
+    overall: {
+      estimated_monthly_gain: roundCurrency(topOpportunities.reduce((sum, item) => sum + Math.max(0, Number(item.current_selling_rate || 0) - Number(item.current_purchase_cost || 0)) * Math.max(1, Number(item.recent_sales_quantity || 0)) * 0.05, 0)),
+    },
+    top_profit_opportunities: topOpportunities,
+    top_loss_areas: products.filter((item) => Number(item.estimated_gross_margin || 0) < 10).slice(0, 8),
+    highest_margin_fruits: [...products].sort((a, b) => Number(b.estimated_gross_margin || 0) - Number(a.estimated_gross_margin || 0)).slice(0, 8),
+    lowest_margin_fruits: [...products].sort((a, b) => Number(a.estimated_gross_margin || 999) - Number(b.estimated_gross_margin || 999)).slice(0, 8),
+    supplier_profitability: supplierRows.slice(0, 8),
+    approval_required: true,
+  };
+};
+
+const getCashFlowPredictor = async (pool, settings) => {
+  const base = (await getCashflowPredictions(pool, settings))[0];
+  const requirement = Number(base.payload.projectedCashRequirement || 0);
+  const collectionHigh = Number(base.payload.expectedCustomerCollectionsRange?.[1] || 0);
+  const windows = [
+    ["Today", 1],
+    ["Tomorrow", 2],
+    ["7 Days", 7],
+    ["30 Days", 30],
+  ];
+  return windows.map(([label, days]) => ({
+    period: label,
+    incoming_cash: roundCurrency(collectionHigh * (days / 7)),
+    outgoing_cash: roundCurrency(requirement * (days / 7)),
+    working_capital: roundCurrency(collectionHigh * (days / 7) - requirement * (days / 7)),
+    future_shortage: collectionHigh < requirement,
+    supplier_payments_due: roundCurrency(requirement * (days / 7)),
+    collection_expectations: roundCurrency(collectionHigh * (days / 7)),
+    confidence: base.confidence,
+    reason: base.reason,
+  }));
+};
+
+const getDemandForecast = async (pool) => {
+  const rows = await getAutonomousProductMetrics(pool);
+  return rows.map((row) => ({
+    product_id: row.product_id,
+    product_name: row.product_name,
+    expected_sales_7_days: Number((row.average_daily_sale * 7).toFixed(2)),
+    expected_purchase: Math.max(0, Number((row.average_daily_sale * 7 - row.available_stock - Number(row.pending_purchase_qty || 0)).toFixed(2))),
+    stock_shortage_warning: row.available_stock < row.average_daily_sale * 3,
+    slow_moving: row.average_daily_sale < 0.1 && row.available_stock > 0,
+    weekly_trend: row.demand_trend,
+    monthly_trend: row.average_daily_sale,
+    seasonality: "Recent trend only; festival calendar not configured",
+    confidence: row.sale_days_30 >= 7 ? 0.62 : 0.35,
+  })).sort((a, b) => Number(b.stock_shortage_warning) - Number(a.stock_shortage_warning) || b.expected_sales_7_days - a.expected_sales_7_days).slice(0, 60);
+};
+
+const getBusinessHealth = async (pool, settings) => {
+  const range = getRange({ range: "today" });
+  const [sales, lowStock, waste, customers, suppliers, cashflow] = await Promise.all([
+    getDailySalesSummary(pool, range),
+    getLowStockProducts(pool),
+    getWasteSummary(pool, range),
+    getCustomerIntelligence(pool),
+    getSupplierIntelligence(pool),
+    getCashFlowPredictor(pool, settings),
+  ]);
+  const salesScore = clampNumber(Number(sales.summary.totalSales || 0) > 0 ? 75 : 40, 0, 100);
+  const profitScore = clampNumber(Number(sales.summary.estimatedGrossProfit || 0) > 0 ? 70 : 35, 0, 100);
+  const inventoryScore = clampNumber(100 - lowStock.summary.count * 8, 0, 100);
+  const wasteScore = clampNumber(100 - Number(waste.summary.totalWasteCost || 0) / 100, 0, 100);
+  const customerScore = clampNumber(100 - customers.filter((item) => item.segment === "INACTIVE").length * 4, 0, 100);
+  const supplierScoreValue = suppliers.length ? suppliers.reduce((sum, row) => sum + Number(row.supplier_score || 0), 0) / suppliers.length : 55;
+  const cashFlowScore = cashflow[0]?.future_shortage ? 45 : 70;
+  const outstandingScore = cashflow[0]?.future_shortage ? 45 : 70;
+  const health = businessHealthScore({ salesScore, profitScore, inventoryScore, cashFlowScore, wasteScore, customerScore, supplierScore: supplierScoreValue, outstandingScore });
+  return {
+    ...health,
+    components: { salesScore, profitScore, inventoryScore, cashFlowScore, wasteScore, customerScore, supplierScore: supplierScoreValue, outstandingScore },
+    reason: "Weighted deterministic score across sales, profit, inventory, cashflow, waste, customers, suppliers and outstanding risk.",
+  };
+};
+
+const buildOwnerDecisionCenterFromParts = ({ pricing, purchases, waste, customers, suppliers, profit, cashflow, demand, health }) => ({
+  health,
+  critical_alerts: [...waste.filter((item) => item.color_status === "Red"), ...demand.filter((item) => item.stock_shortage_warning)].slice(0, 8),
+  warnings: pricing.filter((item) => ["HIGH", "ATTENTION"].includes(item.priority)).slice(0, 8),
+  todays_opportunities: demand.filter((item) => item.expected_sales_7_days > 0).slice(0, 6),
+  profit_opportunities: profit.top_profit_opportunities,
+  waste_alerts: waste.filter((item) => item.color_status !== "Green").slice(0, 8),
+  stock_alerts: purchases.slice(0, 8),
+  payment_alerts: cashflow.filter((item) => item.future_shortage),
+  purchase_suggestions: purchases.slice(0, 8),
+  customer_opportunities: customers.filter((item) => ["VIP", "INACTIVE", "GROWING"].includes(item.segment)).slice(0, 8),
+  supplier_opportunities: suppliers.filter((item) => item.recommendation !== "Monitor supplier").slice(0, 8),
+  approval_policy: "All actions are recommendations only. Owner must approve, reject, modify or schedule.",
+});
+
+const getOwnerDecisionCenter = async (pool, settings) => {
+  const [pricing, purchases, waste, customers, suppliers, profit, cashflow, demand, health] = await Promise.all([
+    getDynamicPricingIntelligence(pool),
+    getSmartPurchasePlanner(pool),
+    getWastePreventionIntelligence(pool),
+    getCustomerIntelligence(pool),
+    getSupplierIntelligence(pool),
+    getProfitOptimizer(pool),
+    getCashFlowPredictor(pool, settings),
+    getDemandForecast(pool),
+    getBusinessHealth(pool, settings),
+  ]);
+  return buildOwnerDecisionCenterFromParts({ pricing, purchases, waste, customers, suppliers, profit, cashflow, demand, health });
+};
+
 const getProductMarginSummary = async (pool, range) => {
   const result = await pool.query(`
     SELECT p.id AS product_id, p.product_name,
@@ -1296,6 +1703,108 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
       wasteReview: profit.filter((item) => item.proposed_action === "review waste cause").slice(0, 5),
       expectedCashRequirement: (await getCashflowPredictions(pool, settings))[0],
       recommendedActions: ["Start with critical stock and overdue collections.", "Review margin risks before changing rates.", "Approve only the actions you want FROST to execute later."],
+    });
+  });
+
+  const requireOwnerIntelligence = async (req, res) => requireAiPermission({
+    req,
+    res,
+    getPermissionUser,
+    permission: "ai_financial_insights",
+    fallbackRoles: ["Owner", "Admin"],
+  });
+
+  app.get("/api/ai/intelligence/pricing", async (req, res) => {
+    const user = await requireOwnerIntelligence(req, res);
+    if (!user) return;
+    return res.json({ recommendations: await getDynamicPricingIntelligence(pool), approval_required: true });
+  });
+
+  app.get("/api/ai/intelligence/purchase-planner", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
+    if (!user) return;
+    return res.json({ recommendations: await getSmartPurchasePlanner(pool), approval_required: true });
+  });
+
+  app.get("/api/ai/intelligence/waste-prevention", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
+    if (!user) return;
+    return res.json({ lots: await getWastePreventionIntelligence(pool), approval_required: true });
+  });
+
+  app.get("/api/ai/intelligence/customers", async (req, res) => {
+    const user = await requireOwnerIntelligence(req, res);
+    if (!user) return;
+    return res.json({ customers: await getCustomerIntelligence(pool), approval_required: true });
+  });
+
+  app.get("/api/ai/intelligence/suppliers", async (req, res) => {
+    const user = await requireOwnerIntelligence(req, res);
+    if (!user) return;
+    return res.json({ suppliers: await getSupplierIntelligence(pool), approval_required: true });
+  });
+
+  app.get("/api/ai/intelligence/profit-optimizer", async (req, res) => {
+    const user = await requireOwnerIntelligence(req, res);
+    if (!user) return;
+    return res.json(await getProfitOptimizer(pool));
+  });
+
+  app.get("/api/ai/intelligence/cashflow", async (req, res) => {
+    const user = await requireOwnerIntelligence(req, res);
+    if (!user) return;
+    const settings = await getAiSettings(pool, frost);
+    return res.json({ predictions: await getCashFlowPredictor(pool, settings), approval_required: true });
+  });
+
+  app.get("/api/ai/intelligence/demand", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
+    if (!user) return;
+    return res.json({ forecasts: await getDemandForecast(pool), approval_required: true });
+  });
+
+  app.get("/api/ai/intelligence/health", async (req, res) => {
+    const user = await requireOwnerIntelligence(req, res);
+    if (!user) return;
+    const settings = await getAiSettings(pool, frost);
+    return res.json({ health: await getBusinessHealth(pool, settings) });
+  });
+
+  app.get("/api/ai/intelligence/decision-center", async (req, res) => {
+    const user = await requireOwnerIntelligence(req, res);
+    if (!user) return;
+    const settings = await getAiSettings(pool, frost);
+    return res.json(await getOwnerDecisionCenter(pool, settings));
+  });
+
+  app.get("/api/ai/autonomous", async (req, res) => {
+    const user = await requireOwnerIntelligence(req, res);
+    if (!user) return;
+    const settings = await getAiSettings(pool, frost);
+    const [pricing, purchases, waste, customers, suppliers, profit, cashflow, demand, health] = await Promise.all([
+      getDynamicPricingIntelligence(pool),
+      getSmartPurchasePlanner(pool),
+      getWastePreventionIntelligence(pool),
+      getCustomerIntelligence(pool),
+      getSupplierIntelligence(pool),
+      getProfitOptimizer(pool),
+      getCashFlowPredictor(pool, settings),
+      getDemandForecast(pool),
+      getBusinessHealth(pool, settings),
+    ]);
+    const decisionCenter = buildOwnerDecisionCenterFromParts({ pricing, purchases, waste, customers, suppliers, profit, cashflow, demand, health });
+    return res.json({
+      pricing,
+      purchases,
+      waste,
+      customers,
+      suppliers,
+      profit,
+      cashflow,
+      demand,
+      health,
+      decisionCenter,
+      policy: "FROST never changes prices, creates purchases, sends messages, updates inventory or modifies financial data without owner approval.",
     });
   });
 
