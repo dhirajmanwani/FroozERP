@@ -106,10 +106,19 @@ const readReleaseVersion = () => {
   }
 };
 const appVersion = process.env.APP_VERSION || readReleaseVersion();
-const allowedCorsOrigins = String(process.env.ALLOWED_ORIGINS || process.env.CORS_ORIGINS || "")
+const productionRailwayOrigin = "https://froozerp-production.up.railway.app";
+const defaultCorsOrigins = [
+  productionRailwayOrigin,
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:5000",
+  "http://127.0.0.1:5000",
+];
+const configuredCorsOrigins = String(process.env.ALLOWED_ORIGINS || process.env.CORS_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim())
-  .filter(Boolean);
+  .filter((origin) => origin && origin !== "*");
+const allowedCorsOrigins = [...new Set([...defaultCorsOrigins, ...configuredCorsOrigins])];
 const apiContractVersion = "1";
 const APP_MODES = new Set([
   "LOCAL_SINGLE_DEVICE",
@@ -199,19 +208,23 @@ const isPrivateNetworkHost = (hostname) =>
   /^172\.(1[6-9]|2\d|3[0-1])\./.test(hostname);
 
 app.use(cors({
+  credentials: true,
   origin(origin, callback) {
     if (!origin) return callback(null, true);
-    if (allowedCorsOrigins.includes("*") || allowedCorsOrigins.includes(origin)) return callback(null, true);
+    if (allowedCorsOrigins.includes(origin)) return callback(null, true);
     if (allowedTauriCorsOrigins.has(origin)) return callback(null, true);
     try {
       const parsed = new URL(origin);
-      if (isPrivateNetworkHost(parsed.hostname)) return callback(null, true);
+      if (!productionDatabaseRequired && isPrivateNetworkHost(parsed.hostname)) return callback(null, true);
     } catch {
       return callback(new Error("Invalid CORS origin"));
     }
     return callback(new Error("Origin not allowed by FroozERP CORS"));
   },
 }));
+
+console.log(`CORS allowed origins: ${allowedCorsOrigins.join(", ")}`);
+console.log("CORS missing Origin allowed: true");
 
 const parsePositiveNumber = (value) => {
   const number = Number(value);
