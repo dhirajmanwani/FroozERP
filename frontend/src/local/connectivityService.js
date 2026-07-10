@@ -30,9 +30,7 @@ const hasExpectedCloudIdentity = (data = {}) =>
   data.app === "FroozERP"
   && String(data.api_version) === "1"
   && Boolean(data.version)
-  && data.deployment_type === "cloud"
-  && data.cloud_ready === true
-  && Boolean(data.company_id);
+  && data.deployment_type === "cloud";
 
 const isTauriRuntime = () =>
   typeof window !== "undefined" && (Boolean(window.__TAURI_INTERNALS__) || Boolean(window.__TAURI__));
