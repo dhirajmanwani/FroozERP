@@ -41,6 +41,16 @@ const normalizeApiUrl = (apiUrl) => String(apiUrl || "").replace(/\/$/, "");
 
 const endpointUrl = (apiUrl, path) => `${normalizeApiUrl(apiUrl)}${path}`;
 
+const isRailwayProductionHost = () => {
+  if (typeof window === "undefined" || !window.location) return false;
+  return String(window.location.hostname || "").toLowerCase().endsWith(".up.railway.app");
+};
+
+const getCurrentOrigin = () => {
+  if (typeof window === "undefined" || !window.location) return "";
+  return normalizeApiUrl(window.location.origin || `${window.location.protocol}//${window.location.host}`);
+};
+
 const readSavedApiConfig = () => {
   const defaults = {
     mode: String(import.meta.env.VITE_API_MODE || "LOCAL_SINGLE_DEVICE").trim().toUpperCase(),
@@ -55,9 +65,20 @@ const readSavedApiConfig = () => {
   };
   if (typeof window === "undefined" || !window.localStorage) return defaults;
   try {
-    return { ...defaults, ...(JSON.parse(window.localStorage.getItem("froozerp.apiConfig") || "{}") || {}) };
+    const saved = JSON.parse(window.localStorage.getItem("froozerp.apiConfig") || "{}") || {};
+    if (isRailwayProductionHost()) {
+      return {
+        ...defaults,
+        ...saved,
+        mode: "CLOUD_PRODUCTION",
+        cloudApiUrl: getCurrentOrigin(),
+      };
+    }
+    return { ...defaults, ...saved };
   } catch {
-    return defaults;
+    return isRailwayProductionHost()
+      ? { ...defaults, mode: "CLOUD_PRODUCTION", cloudApiUrl: getCurrentOrigin() }
+      : defaults;
   }
 };
 

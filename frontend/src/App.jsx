@@ -40,6 +40,14 @@ const isDesktopShell = () => Boolean(window.__TAURI_INTERNALS__ || window.__TAUR
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 const normalizeApiBase = (value) => String(value || "").trim().replace(/\/$/, "");
+const getCurrentOrigin = () => {
+  if (typeof window === "undefined" || !window.location) return "";
+  return normalizeApiBase(window.location.origin || `${window.location.protocol}//${window.location.host}`);
+};
+const isRailwayProductionHost = () => {
+  if (typeof window === "undefined" || !window.location) return false;
+  return String(window.location.hostname || "").toLowerCase().endsWith(".up.railway.app");
+};
 const API_MODES = Object.freeze({
   LOCAL_SINGLE_DEVICE: "LOCAL_SINGLE_DEVICE",
   BRANCH_LAN_SERVER: "BRANCH_LAN_SERVER",
@@ -73,8 +81,40 @@ const writeSavedApiConfig = (config) => {
   if (typeof window === "undefined" || !window.localStorage) return;
   window.localStorage.setItem("froozerp.apiConfig", JSON.stringify(config));
 };
-const SAVED_API_CONFIG = readSavedApiConfig();
+const sanitizeSavedApiConfigForRuntime = (config) => {
+  if (!isRailwayProductionHost()) return config;
+  const railwayOrigin = getCurrentOrigin();
+  const savedMode = normalizeApiMode(config.mode);
+  const localModeSaved = [
+    API_MODES.LOCAL_SINGLE_DEVICE,
+    API_MODES.BRANCH_LAN_SERVER,
+    API_MODES.BRANCH_LAN_CLIENT,
+  ].includes(savedMode);
+  const pointsToLocalApi = [config.localApiUrl, config.branchLanApiUrl, config.cloudApiUrl, config.customApiUrl]
+    .some((value) => {
+      const url = String(value || "").trim();
+      return /localhost|127\.0\.0\.1|\[::1\]|:5000/i.test(url);
+    });
+  if (localModeSaved || pointsToLocalApi) {
+    const nextConfig = {
+      ...config,
+      mode: API_MODES.CLOUD_PRODUCTION,
+      cloudApiUrl: railwayOrigin,
+    };
+    writeSavedApiConfig(nextConfig);
+    return nextConfig;
+  }
+  return {
+    ...config,
+    mode: API_MODES.CLOUD_PRODUCTION,
+    cloudApiUrl: railwayOrigin,
+  };
+};
+const RAILWAY_PRODUCTION_HOST = isRailwayProductionHost();
+const RAILWAY_PRODUCTION_API_URL = RAILWAY_PRODUCTION_HOST ? getCurrentOrigin() : "";
+const SAVED_API_CONFIG = sanitizeSavedApiConfigForRuntime(readSavedApiConfig());
 const API_MODE = normalizeApiMode(
+  RAILWAY_PRODUCTION_HOST ? API_MODES.CLOUD_PRODUCTION :
   SAVED_API_CONFIG.mode ||
   import.meta.env.VITE_API_MODE ||
   window.__FROOZERP_API_MODE__ ||
@@ -93,6 +133,7 @@ const BRANCH_LAN_API_URL = normalizeApiBase(
   ""
 );
 const CLOUD_API_URL = normalizeApiBase(
+  RAILWAY_PRODUCTION_API_URL ||
   SAVED_API_CONFIG.cloudApiUrl ||
   import.meta.env.VITE_CLOUD_API_URL ||
   window.__FROOZERP_CLOUD_API_URL__ ||
@@ -122,6 +163,7 @@ const CONFIGURED_SUB_BRANCH_ID = String(SAVED_API_CONFIG.subBranchId || import.m
 const CONFIGURED_DEVICE_ID = String(SAVED_API_CONFIG.deviceId || import.meta.env.VITE_DEVICE_ID || "").trim();
 const CONFIGURED_DEVICE_NAME = String(SAVED_API_CONFIG.deviceName || import.meta.env.VITE_DEVICE_NAME || "").trim();
 const resolveConfiguredApiUrl = () => {
+  if (RAILWAY_PRODUCTION_API_URL) return RAILWAY_PRODUCTION_API_URL;
   if (API_MODE === API_MODES.BRANCH_LAN_CLIENT && BRANCH_LAN_API_URL) return BRANCH_LAN_API_URL;
   if (API_MODE === API_MODES.CLOUD_PRODUCTION && CLOUD_API_URL) return CLOUD_API_URL;
   if (API_MODE === API_MODES.FIELD_REMOTE_DEVICE && CLOUD_API_URL) return CLOUD_API_URL;
