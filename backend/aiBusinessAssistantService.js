@@ -867,7 +867,7 @@ const getWastePreventionIntelligence = async (pool) => {
   const result = await pool.query(`
     SELECT ib.id AS lot_id, ib.product_id, p.product_name, ib.batch_no, ib.purchase_qty, ib.remaining_qty,
            ib.purchase_rate, ib.purchase_date, ib.supplier_name,
-           EXTRACT(DAY FROM CURRENT_DATE - ib.purchase_date)::INTEGER AS age_days
+           (CURRENT_DATE - ib.purchase_date)::INTEGER AS age_days
     FROM inventory_batches ib
     JOIN products p ON p.id = ib.product_id
     WHERE COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
