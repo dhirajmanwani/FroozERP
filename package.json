@@ -1,7 +1,7 @@
 {
   "name": "froozerp-workspace",
   "private": true,
-  "version": "1.0.30",
+  "version": "1.0.31",
   "scripts": {
     "app": "frontend\\node_modules\\.bin\\tauri.cmd dev",
     "app:dev": "frontend\\node_modules\\.bin\\tauri.cmd dev",
@@ -9,6 +9,9 @@
     "build:windows": "frontend\\node_modules\\.bin\\tauri.cmd build --bundles nsis",
     "verify:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\verify-windows.ps1",
     "release:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\copy-windows-release.ps1",
+    "release:manifest": "node scripts\\generate-tauri-update-manifest.mjs",
+    "release:set-version": "node scripts\\set-release-version.mjs",
+    "verify:update-safety": "node scripts\\verify-update-safety.mjs",
     "build": "npm --prefix frontend run build",
     "backend:check": "node --check backend/server.js",
     "cloud:verify": "node scripts/cloud/verify-hosted-cloud.mjs"

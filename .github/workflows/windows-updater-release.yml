@@ -1,0 +1,83 @@
+name: Windows updater release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example 1.0.31"
+        required: true
+      channel:
+        description: "Update channel"
+        required: true
+        default: "stable"
+        type: choice
+        options:
+          - stable
+          - beta
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      FROOZERP_UPDATE_CHANNEL: ${{ github.event.inputs.channel || 'stable' }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Validate signing secret
+        shell: pwsh
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) {
+            throw "TAURI_SIGNING_PRIVATE_KEY must be configured as a GitHub Actions secret."
+          }
+
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+
+      - name: Set release version
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: npm run release:set-version -- ${{ github.event.inputs.version }}
+
+      - name: Verify updater safety gates
+        run: npm run verify:update-safety
+        env:
+          FROOZERP_REQUIRE_UPDATER_KEY: "1"
+
+      - name: Build Windows installer and updater signature
+        run: npm run build:windows
+
+      - name: Copy release artifacts
+        run: npm run release:windows
+
+      - name: Generate updater manifest
+        run: npm run release:manifest -- ${{ github.event.inputs.channel || 'stable' }}
+
+      - name: Upload GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', github.event.inputs.version) || github.ref_name }}
+          draft: false
+          prerelease: ${{ (github.event.inputs.channel || 'stable') == 'beta' }}
+          files: |
+            release/windows/FroozERP-Setup-*.exe
+            release/windows/FroozERP-Setup-*.exe.sig
+            release/windows/latest*.json

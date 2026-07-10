@@ -12,16 +12,23 @@ $tauriConfigPath = Join-Path $root "src-tauri\tauri.conf.json"
 $tauriConfig = Get-Content -LiteralPath $tauriConfigPath -Raw | ConvertFrom-Json
 $version = $tauriConfig.version
 $installer = Get-ChildItem -Path $bundleDir -Recurse -File -Include "*.exe" |
-  Where-Object { $_.Name -match "FroozERP|froozerp|setup|Setup" } |
-  Sort-Object @{ Expression = { $_.Name -like "*$version*" }; Descending = $true }, LastWriteTime -Descending |
+  Where-Object { $_.Name -match "FroozERP|froozerp|setup|Setup" -and $_.Name -like "*$version*" } |
+  Sort-Object LastWriteTime -Descending |
   Select-Object -First 1
 
 if (-not $installer) {
-  throw "No Windows installer artifact was found under $bundleDir. Run npm run build:windows first."
+  throw "No Windows installer artifact for version $version was found under $bundleDir. Run npm run build:windows first and do not reuse older installers."
 }
 
 $target = Join-Path $releaseDir "FroozERP-Setup-$version.exe"
 Copy-Item -LiteralPath $installer.FullName -Destination $target -Force
+$signatureSource = "$($installer.FullName).sig"
+$signatureTarget = "$target.sig"
+$signatureCopied = $false
+if (Test-Path -LiteralPath $signatureSource) {
+  Copy-Item -LiteralPath $signatureSource -Destination $signatureTarget -Force
+  $signatureCopied = $true
+}
 
 $archivedReleaseInstallers = @()
 Get-ChildItem -LiteralPath $releaseDir -File -Filter "FroozERP-Setup-*.exe" |
@@ -35,7 +42,8 @@ Get-ChildItem -LiteralPath $releaseDir -File -Filter "FroozERP-Setup-*.exe" |
 [pscustomobject]@{
   source = $installer.FullName
   target = $target
+  signature = if ($signatureCopied) { $signatureTarget } else { $null }
   archivedReleaseInstallers = $archivedReleaseInstallers
-  signed = $false
-  note = "Unsigned internal-test installer. Production release requires code signing."
+  updaterSigned = $signatureCopied
+  note = if ($signatureCopied) { "Updater signature copied. Production installer code signing is still recommended." } else { "No updater signature found. Configure TAURI_SIGNING_PRIVATE_KEY before production release." }
 } | ConvertTo-Json

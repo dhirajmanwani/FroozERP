@@ -703,6 +703,8 @@ pub fn run() {
     write_app_log("INFO", "FroozERP desktop startup requested");
 
     let result = tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let path = diagnostic_log_path();
             write_app_log(
