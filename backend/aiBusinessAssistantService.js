@@ -10,6 +10,7 @@ const {
   DEFAULT_FROST_SETTINGS,
   FROST_ASSISTANT_NAME,
   FrostServiceLayer,
+  classifyBusinessIntent,
 } = require("./frostCore");
 
 const DEFAULT_THRESHOLDS = {
@@ -335,6 +336,133 @@ const getWasteSummary = async (pool, range) => {
   });
 };
 
+const getProductSalesRanking = async (pool, range) => {
+  const result = await pool.query(`
+    SELECT p.id AS product_id, p.product_name, p.unit,
+           SUM(si.quantity) AS quantity_sold,
+           SUM(si.amount) AS sale_amount,
+           SUM(si.profit) AS profit_amount
+    FROM sale_items si
+    JOIN sales s ON s.id = si.sale_id
+    LEFT JOIN products p ON p.id = si.product_id
+    WHERE s.sale_date BETWEEN $1 AND $2
+      AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
+    GROUP BY p.id, p.product_name, p.unit
+    ORDER BY quantity_sold DESC
+    LIMIT 20
+  `, [range.dateFrom, range.dateTo]);
+  const rows = result.rows.map((row) => ({
+    ...row,
+    quantity_sold: Number(row.quantity_sold || 0),
+    sale_amount: roundCurrency(row.sale_amount),
+    profit_amount: roundCurrency(row.profit_amount),
+  }));
+  return buildFact("product_sales_ranking", "Sales History", range.label, rows, {
+    highestSelling: rows.slice(0, 5),
+    lowestSelling: rows.slice(-5).reverse(),
+  });
+};
+
+const getInventoryNearingExpiry = async (pool, settings) => {
+  const agingDays = Number(settings.thresholds.lotAgingDays || 20);
+  const result = await pool.query(`
+    SELECT ib.id, ib.product_id, p.product_name, ib.lot_name, ib.lot_size, ib.purchase_date,
+           ib.remaining_qty, ib.unit,
+           DATE_PART('day', CURRENT_DATE::timestamp - COALESCE(ib.purchase_date, CURRENT_DATE)::timestamp)::INTEGER AS lot_age_days
+    FROM inventory_batches ib
+    LEFT JOIN products p ON p.id = ib.product_id
+    WHERE COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+      AND COALESCE(ib.remaining_qty, 0) > 0
+      AND COALESCE(ib.purchase_date, CURRENT_DATE) <= CURRENT_DATE - ($1::TEXT || ' days')::interval
+    ORDER BY lot_age_days DESC, ib.remaining_qty DESC
+    LIMIT 30
+  `, [agingDays]);
+  const rows = result.rows.map((row) => ({ ...row, remaining_qty: Number(row.remaining_qty || 0) }));
+  return buildFact("inventory_nearing_expiry", "Inventory Lots", `Lots older than ${agingDays} days`, rows, { count: rows.length });
+};
+
+const getCustomerActivitySummary = async (pool) => {
+  const result = await pool.query(`
+    SELECT c.id AS customer_id, c.customer_name, MAX(s.sale_date) AS last_purchase_date,
+           DATE_PART('day', CURRENT_DATE::timestamp - MAX(s.sale_date)::timestamp)::INTEGER AS days_since_purchase,
+           COUNT(s.id)::INTEGER AS purchase_count,
+           COALESCE(SUM(s.total_amount), 0) AS total_sales
+    FROM customers c
+    LEFT JOIN sales s ON s.customer_id = c.id AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
+    WHERE c.active IS DISTINCT FROM FALSE AND c.system_account IS DISTINCT FROM TRUE
+    GROUP BY c.id, c.customer_name
+    HAVING MAX(s.sale_date) IS NULL OR MAX(s.sale_date) <= CURRENT_DATE - INTERVAL '30 days'
+    ORDER BY last_purchase_date NULLS FIRST, total_sales DESC
+    LIMIT 30
+  `);
+  const rows = result.rows.map((row) => ({ ...row, total_sales: roundCurrency(row.total_sales) }));
+  return buildFact("inactive_customers", "Customer Ledgers", "No purchase in 30+ days", rows, { count: rows.length });
+};
+
+const getCashDrawerSummary = async (pool, range) => {
+  const result = await pool.query(`
+    WITH cash_in AS (
+      SELECT COALESCE(SUM(sp.amount), 0) AS amount
+      FROM sale_payments sp
+      JOIN sales s ON s.id = sp.sale_id
+      WHERE s.sale_date BETWEEN $1 AND $2
+        AND sp.payment_mode = 'CASH'
+        AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
+      UNION ALL
+      SELECT COALESCE(SUM(payment_amount), 0) AS amount
+      FROM customer_payments
+      WHERE payment_date BETWEEN $1 AND $2 AND payment_mode = 'CASH' AND cancelled IS DISTINCT FROM TRUE
+    ),
+    cash_out AS (
+      SELECT COALESCE(SUM(amount), 0) AS amount
+      FROM expenses
+      WHERE expense_date BETWEEN $1 AND $2 AND payment_mode = 'CASH' AND COALESCE(status, 'ACTIVE') <> 'CANCELLED'
+      UNION ALL
+      SELECT COALESCE(SUM(payment_amount), 0) AS amount
+      FROM supplier_payments
+      WHERE payment_date BETWEEN $1 AND $2 AND payment_mode = 'CASH' AND cancelled IS DISTINCT FROM TRUE
+    )
+    SELECT
+      (SELECT COALESCE(SUM(amount), 0) FROM cash_in) AS cash_in,
+      (SELECT COALESCE(SUM(amount), 0) FROM cash_out) AS cash_out
+  `, [range.dateFrom, range.dateTo]);
+  const cashIn = roundCurrency(result.rows[0]?.cash_in);
+  const cashOut = roundCurrency(result.rows[0]?.cash_out);
+  return buildFact("cash_drawer_summary", "Payments", range.label, [], {
+    cashIn,
+    cashOut,
+    expectedDrawerCash: roundCurrency(cashIn - cashOut),
+  });
+};
+
+const getSupplierMarginSummary = async (pool, range) => {
+  const result = await pool.query(`
+    SELECT COALESCE(sup.supplier_name, ib.supplier_name, 'Supplier') AS supplier_name,
+           SUM(si.amount) AS sale_amount,
+           SUM(si.cost_amount) AS cost_amount,
+           SUM(si.profit) AS profit_amount,
+           CASE WHEN SUM(si.amount) > 0 THEN (SUM(si.profit) / SUM(si.amount)) * 100 ELSE 0 END AS margin_percent
+    FROM sale_batch_allocations siba
+    JOIN sale_items si ON si.id = siba.sale_item_id
+    JOIN sales s ON s.id = si.sale_id
+    LEFT JOIN inventory_batches ib ON ib.id = siba.inventory_batch_id
+    LEFT JOIN suppliers sup ON sup.id = ib.supplier_id
+    WHERE s.sale_date BETWEEN $1 AND $2
+      AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
+    GROUP BY COALESCE(sup.supplier_name, ib.supplier_name, 'Supplier')
+    ORDER BY margin_percent DESC, profit_amount DESC
+    LIMIT 20
+  `, [range.dateFrom, range.dateTo]);
+  const rows = result.rows.map((row) => ({
+    ...row,
+    sale_amount: roundCurrency(row.sale_amount),
+    cost_amount: roundCurrency(row.cost_amount),
+    profit_amount: roundCurrency(row.profit_amount),
+    margin_percent: Number(toNumber(row.margin_percent).toFixed(2)),
+  }));
+  return buildFact("supplier_margin_summary", "Purchases", range.label, rows, { count: rows.length });
+};
+
 const getProductMarginSummary = async (pool, range) => {
   const result = await pool.query(`
     SELECT p.id AS product_id, p.product_name,
@@ -490,7 +618,7 @@ const getReminders = async (pool) => {
 
 const buildDailyBriefing = async (pool, settings, range) => {
   await runAlertRules(pool, settings);
-  const [sales, collections, customerOutstanding, supplierOutstanding, pendingPurchases, lowStock, waste, alerts] = await Promise.all([
+  const [sales, collections, customerOutstanding, supplierOutstanding, pendingPurchases, lowStock, waste, expiringLots, salesRanking, alerts] = await Promise.all([
     getDailySalesSummary(pool, range),
     getCollectionSummary(pool, range),
     getCustomerOutstanding(pool, settings),
@@ -498,13 +626,66 @@ const buildDailyBriefing = async (pool, settings, range) => {
     getPendingPurchaseBills(pool),
     getLowStockProducts(pool),
     getWasteSummary(pool, range),
+    getInventoryNearingExpiry(pool, settings),
+    getProductSalesRanking(pool, range),
     getStoredAlerts(pool),
   ]);
   const recommendations = [];
   if (alerts.some((alert) => alert.severity === "CRITICAL")) recommendations.push("Review critical alerts before new credit sales.");
   if (pendingPurchases.rows.length) recommendations.push("Complete oldest pending purchase bills so stock costing stays final.");
   if (lowStock.rows.length) recommendations.push("Reorder or transfer low-stock products before POS demand is affected.");
+  if (expiringLots.rows.length) recommendations.push("Review aging fruit lots and move near-expiry stock before wastage increases.");
   if (!recommendations.length) recommendations.push("No urgent deterministic action found for this period.");
+  const insightCards = [
+    {
+      id: "revenue",
+      priority: "Information",
+      title: "Revenue",
+      value: sales.summary.totalSales,
+      sourceModule: "POS Billing",
+      actions: ["View"],
+    },
+    {
+      id: "receivables",
+      priority: customerOutstanding.summary.totalOutstanding > 0 ? "Warning" : "Information",
+      title: "Outstanding Receivables",
+      value: customerOutstanding.summary.totalOutstanding,
+      sourceModule: "Accounts",
+      actions: ["View", "Open Ledger", "Remind"],
+    },
+    {
+      id: "low-stock",
+      priority: lowStock.summary.count > 0 ? "Critical" : "Information",
+      title: "Low Stock",
+      value: lowStock.summary.count,
+      sourceModule: "Inventory Lots",
+      actions: ["View", "Purchase", "Ignore"],
+    },
+    {
+      id: "expiry",
+      priority: expiringLots.summary.count > 0 ? "Warning" : "Information",
+      title: "Inventory Nearing Expiry",
+      value: expiringLots.summary.count,
+      sourceModule: "Inventory Lots",
+      actions: ["View", "Purchase", "Ignore"],
+    },
+    {
+      id: "waste",
+      priority: waste.summary.totalWasteCost > 0 ? "Warning" : "Information",
+      title: "High Waste",
+      value: waste.summary.totalWasteCost,
+      sourceModule: "Waste",
+      actions: ["View", "Ignore"],
+    },
+    {
+      id: "opportunity",
+      priority: "Opportunity",
+      title: "Best Selling Fruits",
+      value: salesRanking.summary.highestSelling?.[0]?.product_name || "No sales yet",
+      sourceModule: "Sales History",
+      actions: ["View", "Purchase"],
+    },
+  ];
   return {
     period: range,
     cards: {
@@ -515,10 +696,14 @@ const buildDailyBriefing = async (pool, settings, range) => {
       pendingPurchases: pendingPurchases.summary,
       lowStock: lowStock.summary,
       waste: waste.summary,
+      expiringLots: expiringLots.summary,
+      highestSelling: salesRanking.summary.highestSelling || [],
+      lowestSelling: salesRanking.summary.lowestSelling || [],
     },
+    insightCards,
     alerts: alerts.slice(0, 8),
     recommendations: recommendations.slice(0, 3),
-    sourceModules: ["POS Billing", "Payments", "Accounts", "Purchases", "Inventory Lots", "Waste", "AI Alerts"],
+    sourceModules: ["POS Billing", "Payments", "Accounts", "Purchases", "Inventory Lots", "Waste", "Sales History", "AI Alerts"],
   };
 };
 
@@ -549,6 +734,17 @@ const factsForQuestion = async (pool, classification, settings, range) => {
     await getLowStockProducts(pool),
     await getDailySalesSummary(pool, range),
   ];
+};
+
+const factsForBusinessIntent = async (pool, intent, settings, range) => {
+  if (intent === "CASH_DRAWER") return [await getCashDrawerSummary(pool, range), await getCollectionSummary(pool, range)];
+  if (intent === "PAYMENTS") return [await getCustomerOutstanding(pool, settings), await getSupplierOutstanding(pool), await getPendingPurchaseBills(pool)];
+  if (intent === "CUSTOMER_ACTIVITY") return [await getCustomerActivitySummary(pool), await getCustomerOutstanding(pool, settings)];
+  if (intent === "INVENTORY_EXPIRY") return [await getInventoryNearingExpiry(pool, settings), await getLowStockProducts(pool)];
+  if (intent === "SUPPLIER_MARGIN") return [await getSupplierMarginSummary(pool, range), await getSupplierOutstanding(pool)];
+  if (intent === "SALES_FINANCE") return [await getDailySalesSummary(pool, range), await getGrossProfitSummary(pool, range), await getExpenseSummary(pool, range), await getCollectionSummary(pool, range), await getProductSalesRanking(pool, range)];
+  if (intent === "INVENTORY") return [await getLowStockProducts(pool), await getInventoryNearingExpiry(pool, settings), await getWasteSummary(pool, range), await getProductSalesRanking(pool, range)];
+  return [await getDailySalesSummary(pool, range), await getCustomerOutstanding(pool, settings), await getSupplierOutstanding(pool), await getLowStockProducts(pool), await getInventoryNearingExpiry(pool, settings), await getProductSalesRanking(pool, range)];
 };
 
 const buildDeterministicAnswer = (classification, facts, range) => {
@@ -746,16 +942,16 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
     if (!user) return;
     const settings = await getAiSettings(pool, frost);
     const range = getRange(req.body);
-    const classification = classifyQuestion(question);
-    if (classification === "FINANCIAL") {
+    const classification = classifyBusinessIntent(question);
+    if (classification === "SALES_FINANCE" || classification === "CASH_DRAWER" || classification === "SUPPLIER_MARGIN") {
       const allowed = await getPermissionUser(user.id, "ai_financial_insights", ["Owner", "Admin"]);
       if (!allowed) return res.status(403).json({ message: "Financial AI insights require Owner/Admin permission" });
     }
-    if (classification === "INVENTORY") {
+    if (classification === "INVENTORY" || classification === "INVENTORY_EXPIRY") {
       const allowed = await getPermissionUser(user.id, "ai_inventory_insights", ["Owner", "Admin", "Purchase Manager", "Inventory Manager"]);
       if (!allowed) return res.status(403).json({ message: "Inventory AI insights are not enabled for this role" });
     }
-    const facts = await factsForQuestion(pool, classification, settings, range);
+    const facts = await factsForBusinessIntent(pool, classification, settings, range);
     const providerKey = settings.provider?.key || "deterministic";
     const cacheKey = frost.buildCacheKey({ engine: "conversation", question, facts, range, providerKey });
     const cached = settings.frost.cacheEnabled !== false ? await frost.getCache(cacheKey) : null;
@@ -814,8 +1010,8 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
     res.setHeader("Connection", "keep-alive");
     const settings = await getAiSettings(pool, frost);
     const range = getRange(req.body);
-    const classification = classifyQuestion(question);
-    const facts = await factsForQuestion(pool, classification, settings, range);
+    const classification = classifyBusinessIntent(question);
+    const facts = await factsForBusinessIntent(pool, classification, settings, range);
     const answer = buildDeterministicAnswer(classification, facts, range);
     const conversationId = await auditQuestion({
       pool,
@@ -841,6 +1037,42 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
     }
     res.write(`event: done\ndata: ${JSON.stringify({ done: true })}\n\n`);
     return res.end();
+  });
+
+  app.post("/api/ai/actions/propose", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
+    if (!user) return;
+    const actionType = cleanText(req.body.action_type || req.body.action || "").toUpperCase().replace(/\s+/g, "_");
+    if (!actionType) return res.status(400).json({ message: "Action type is required" });
+    const proposal = await frost.createActionProposal({
+      conversationId: parsePositiveInteger(req.body.conversation_id),
+      actionType,
+      payload: req.body.payload || {},
+      proposedBy: user.id,
+    });
+    return res.status(201).json({
+      proposal,
+      approval_required: proposal.approval_status === "PENDING_OWNER_APPROVAL",
+      message: proposal.approval_status === "PENDING_OWNER_APPROVAL"
+        ? "FROST has prepared this action for owner approval. Nothing was executed."
+        : "FROST recorded this read-only action.",
+    });
+  });
+
+  app.post("/api/ai/voice/session", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    if (!user) return;
+    try {
+      const session = await frost.createRealtimeSession({
+        userId: user.id,
+        deviceId: req.body.device_id || req.headers["x-device-id"],
+        providerKey: req.body.provider_key || "openai",
+      });
+      return res.json(session);
+    } catch (error) {
+      console.error("FROST voice session error", error);
+      return res.status(500).json({ configured: false, message: "Unable to prepare FROST voice session" });
+    }
   });
 };
 

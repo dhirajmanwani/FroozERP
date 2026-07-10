@@ -50,10 +50,17 @@ const DEFAULT_FROST_SETTINGS = {
   assistantName: FROST_ASSISTANT_NAME,
   providerKey: "deterministic",
   model: "",
+  realtimeModel: "gpt-realtime",
+  voice: "alloy",
+  languageMode: "hindi_english_hinglish",
   enabled: false,
   streamingEnabled: true,
   cacheEnabled: true,
   voicePrepared: true,
+  wakeWordEnabled: false,
+  voiceActivityDetection: true,
+  noiseSuppression: true,
+  fullDuplexEnabled: true,
   maxInputTokens: 6000,
   maxOutputTokens: 1200,
   costAlertAmount: 500,
@@ -90,6 +97,23 @@ const maskProviderConfig = (config = {}) => {
     }
   }
   return masked;
+};
+
+const classifyBusinessIntent = (question = "") => {
+  const text = String(question || "").toLowerCase();
+  if (/(cash|drawer|till|counter cash)/.test(text)) return "CASH_DRAWER";
+  if (/(today.*sale|sales|revenue|profit|compare|month|last month)/.test(text)) return "SALES_FINANCE";
+  if (/(payment|pending|receivable|outstanding|ledger|customer.*pay|supplier.*pay)/.test(text)) return "PAYMENTS";
+  if (/(customer.*recent|haven.?t purchased|inactive customer|not purchased)/.test(text)) return "CUSTOMER_ACTIVITY";
+  if (/(expiry|expire|close to expiry|near expiry|old lot|lot aging|fruits close)/.test(text)) return "INVENTORY_EXPIRY";
+  if (/(supplier.*margin|best margin|margin supplier)/.test(text)) return "SUPPLIER_MARGIN";
+  if (/(low stock|stock|inventory|run out|waste|lowest-selling|highest-selling|fruit)/.test(text)) return "INVENTORY";
+  return "BUSINESS_BRIEFING";
+};
+
+const actionRequiresApproval = (actionType = "") => {
+  const readOnlyActions = new Set(["VIEW", "OPEN_LEDGER", "OPEN_REPORT", "OPEN_PRODUCT", "IGNORE"]);
+  return !readOnlyActions.has(String(actionType || "").toUpperCase());
 };
 
 class FrostProviderRegistry {
@@ -251,6 +275,117 @@ class FrostServiceLayer {
     return { inputTokens, outputTokens, estimatedCost };
   }
 
+  async createActionProposal({
+    conversationId = null,
+    actionType,
+    payload = {},
+    proposedBy = null,
+    approvalStatus,
+  }) {
+    const status = approvalStatus || (actionRequiresApproval(actionType) ? "PENDING_OWNER_APPROVAL" : "READ_ONLY");
+    const result = await this.pool.query(
+      `
+      INSERT INTO ai_action_proposals (conversation_id, proposed_action, payload, approval_status, proposed_by)
+      VALUES ($1, $2, $3::jsonb, $4, $5)
+      RETURNING *
+      `,
+      [conversationId, actionType, JSON.stringify(payload), status, proposedBy]
+    );
+    await this.audit({
+      userId: proposedBy,
+      eventType: "FROST_ACTION_PROPOSED",
+      answer: `FROST proposed ${actionType}`,
+      suggestedAction: { actionType, payload },
+      approvalStatus: status,
+    });
+    return result.rows[0];
+  }
+
+  async createRealtimeSession({ userId, deviceId = "", providerKey = "openai", instructions = "" }) {
+    const settings = await this.getSettings();
+    const frost = settings.frost || DEFAULT_FROST_SETTINGS;
+    const selectedProvider = providerKey || frost.providerKey || "openai";
+    if (selectedProvider !== "openai") {
+      return {
+        configured: false,
+        provider: selectedProvider,
+        message: "Realtime voice is currently prepared for OpenAI-compatible providers only.",
+      };
+    }
+    const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+    if (!apiKey) {
+      await this.audit({
+        userId,
+        deviceId,
+        eventType: "FROST_VOICE_SESSION_UNAVAILABLE",
+        answer: "OpenAI Realtime voice requested without configured server API key",
+      });
+      return {
+        configured: false,
+        provider: "openai",
+        message: "OpenAI Realtime voice is not configured on this server.",
+      };
+    }
+    const payload = {
+      session: {
+        type: "realtime",
+        model: frost.realtimeModel || "gpt-realtime",
+        audio: {
+          output: { voice: frost.voice || "alloy" },
+          input: {
+            turn_detection: frost.voiceActivityDetection === false ? null : { type: "server_vad" },
+          },
+        },
+        instructions: instructions || "You are FROST, FroozERP's business copilot. Use concise Hindi, English, or Hinglish as the owner speaks. Never execute business actions without explicit owner confirmation.",
+      },
+    };
+    const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      await this.audit({
+        userId,
+        deviceId,
+        eventType: "FROST_VOICE_SESSION_FAILED",
+        answer: `OpenAI Realtime session failed: ${response.status}`,
+        suggestedAction: { status: response.status, body: text.slice(0, 400) },
+      });
+      return {
+        configured: false,
+        provider: "openai",
+        message: "OpenAI Realtime session could not be created.",
+        status: response.status,
+      };
+    }
+    const body = await response.json();
+    await this.audit({
+      userId,
+      deviceId,
+      eventType: "FROST_VOICE_SESSION_CREATED",
+      answer: "OpenAI Realtime voice session created",
+      suggestedAction: { provider: "openai", model: frost.realtimeModel || "gpt-realtime" },
+    });
+    return {
+      configured: true,
+      provider: "openai",
+      realtimeUrl: "https://api.openai.com/v1/realtime/calls",
+      model: frost.realtimeModel || "gpt-realtime",
+      voice: frost.voice || "alloy",
+      clientSecret: body.value || body.client_secret?.value,
+      expiresAt: body.expires_at || body.client_secret?.expires_at,
+      vad: frost.voiceActivityDetection !== false,
+      noiseSuppression: frost.noiseSuppression !== false,
+      fullDuplex: frost.fullDuplexEnabled !== false,
+      wakeWordEnabled: false,
+    };
+  }
+
   async audit({ userId = null, deviceId = "", eventType, question = "", verifiedFacts = [], answer = "", suggestedAction = {}, approvalStatus = "READ_ONLY" }) {
     await this.pool.query(
       `
@@ -283,6 +418,8 @@ module.exports = {
   FROST_ENGINES,
   FrostProviderRegistry,
   FrostServiceLayer,
+  actionRequiresApproval,
+  classifyBusinessIntent,
   estimateCost,
   estimateTokens,
   maskProviderConfig,

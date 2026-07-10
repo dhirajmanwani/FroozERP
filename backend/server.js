@@ -2159,7 +2159,7 @@ const initializeDatabase = async () => {
     )
     ON CONFLICT (id) DO NOTHING;
     UPDATE ai_settings
-    SET frost_settings = COALESCE(NULLIF(frost_settings, '{}'::jsonb), '{"assistantName":"FROST","providerKey":"deterministic","model":"","enabled":false,"streamingEnabled":true,"cacheEnabled":true,"voicePrepared":true,"maxInputTokens":6000,"maxOutputTokens":1200,"costAlertAmount":500}'::jsonb)
+    SET frost_settings = COALESCE(NULLIF(frost_settings, '{}'::jsonb), '{"assistantName":"FROST","providerKey":"deterministic","model":"","realtimeModel":"gpt-realtime","voice":"alloy","languageMode":"hindi_english_hinglish","enabled":false,"streamingEnabled":true,"cacheEnabled":true,"voicePrepared":true,"wakeWordEnabled":false,"voiceActivityDetection":true,"noiseSuppression":true,"fullDuplexEnabled":true,"maxInputTokens":6000,"maxOutputTokens":1200,"costAlertAmount":500}'::jsonb)
     WHERE id = 1;
 
     INSERT INTO role_permission_settings (role_name, permissions)

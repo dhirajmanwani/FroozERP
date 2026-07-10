@@ -1295,12 +1295,14 @@ function App() {
     providers: [],
     engines: [],
     usage: null,
+    voice: { status: "idle", transcript: "", error: "", supported: false },
     period: { range: "today", label: "Today" },
     loading: false,
     error: "",
   });
   const [aiQuestion, setAiQuestion] = useState("");
   const [aiRange, setAiRange] = useState("today");
+  const frostVoiceRef = useRef({ peer: null, stream: null, audio: null, channel: null });
   const [supplierDashboard, setSupplierDashboard] = useState({
     todaySales: 0,
     todayProfit: 0,
@@ -2384,6 +2386,108 @@ function App() {
       frost: frostSettings,
     });
     await loadAiAssistant(aiRange);
+  };
+
+  const stopFrostVoice = () => {
+    const current = frostVoiceRef.current;
+    if (current.channel) current.channel.close();
+    if (current.peer) current.peer.close();
+    if (current.stream) current.stream.getTracks().forEach((track) => track.stop());
+    if (current.audio) current.audio.srcObject = null;
+    frostVoiceRef.current = { peer: null, stream: null, audio: null, channel: null };
+    setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "idle" } }));
+  };
+
+  const startFrostVoice = async () => {
+    if (!navigator.mediaDevices?.getUserMedia || typeof RTCPeerConnection === "undefined") {
+      setAiAssistantData((state) => ({ ...state, voice: { status: "unavailable", supported: false, transcript: "", error: "Voice requires microphone and WebRTC support." } }));
+      return;
+    }
+    setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "connecting", supported: true, error: "" } }));
+    try {
+      const sessionResponse = await axios.post(`${API_URL}/api/ai/voice/session`, {
+        user_id: user?.id,
+        device_id: deviceInfo.device_id,
+        provider_key: "openai",
+      });
+      const session = sessionResponse.data;
+      if (!session.configured || !session.clientSecret) {
+        setAiAssistantData((state) => ({ ...state, voice: { status: "unconfigured", supported: true, transcript: "", error: session.message || "FROST voice is not configured." } }));
+        return;
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: session.noiseSuppression !== false,
+          autoGainControl: true,
+        },
+      });
+      const peer = new RTCPeerConnection();
+      const audio = new Audio();
+      audio.autoplay = true;
+      peer.ontrack = (event) => {
+        audio.srcObject = event.streams[0];
+        setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "speaking" } }));
+      };
+      stream.getTracks().forEach((track) => peer.addTrack(track, stream));
+      const channel = peer.createDataChannel("oai-events");
+      channel.onopen = () => {
+        channel.send(JSON.stringify({
+          type: "session.update",
+          session: {
+            instructions: "You are FROST, FroozERP's business copilot. Speak naturally in Hindi, English, or Hinglish. Use business tools; never execute actions without owner confirmation.",
+          },
+        }));
+        setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "listening" } }));
+      };
+      channel.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data);
+          const delta = message.delta || message.transcript || message.text || "";
+          if (delta) {
+            setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, transcript: `${state.voice.transcript || ""}${delta}` } }));
+          }
+          if (String(message.type || "").includes("input_audio_buffer.speech_started")) {
+            setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "listening" } }));
+          }
+          if (String(message.type || "").includes("response.audio.done")) {
+            setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "listening" } }));
+          }
+        } catch {
+          // Realtime data channel can include provider-specific events; ignore unknown payloads.
+        }
+      };
+      const offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
+      const realtimeResponse = await fetch(session.realtimeUrl, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${session.clientSecret}`,
+          "Content-Type": "application/sdp",
+        },
+        body: offer.sdp,
+      });
+      if (!realtimeResponse.ok) throw new Error("Realtime voice connection failed");
+      const answer = { type: "answer", sdp: await realtimeResponse.text() };
+      await peer.setRemoteDescription(answer);
+      frostVoiceRef.current = { peer, stream, audio, channel };
+    } catch (error) {
+      stopFrostVoice();
+      setAiAssistantData((state) => ({ ...state, voice: { status: "error", supported: true, transcript: "", error: getErrorMessage(error, "Unable to start FROST voice") } }));
+    }
+  };
+
+  const proposeFrostAction = async (action, payload = {}) => {
+    try {
+      const response = await axios.post(`${API_URL}/api/ai/actions/propose`, {
+        user_id: user?.id,
+        action_type: action,
+        payload,
+      });
+      setSyncMessage(response.data.message || "FROST action recorded for approval.");
+    } catch (error) {
+      setSyncMessage(getErrorMessage(error, "Unable to record FROST action."));
+    }
   };
 
   const loadSaleRates = async (desiredMargin = saleDesiredMargin) => {
@@ -4157,6 +4261,9 @@ function App() {
               onRefresh={() => loadAiAssistant(aiRange)}
               onReminderAction={updateAiReminder}
               onSaveSettings={saveFrostSettings}
+              onStartVoice={startFrostVoice}
+              onStopVoice={stopFrostVoice}
+              onProposeAction={proposeFrostAction}
               onSelectQuestion={(question) => askAiAssistant(question)}
               onNavigate={navigate}
               question={aiQuestion}
@@ -5021,6 +5128,9 @@ function AiBusinessAssistantModule({
   onRefresh,
   onReminderAction,
   onSaveSettings,
+  onStartVoice,
+  onStopVoice,
+  onProposeAction,
   onSelectQuestion,
   question,
   range,
@@ -5062,6 +5172,12 @@ function AiBusinessAssistantModule({
 
       {data.error && <div className="startup-status-panel startup-status-error"><p>{data.error}</p></div>}
 
+      <FrostVoicePanel
+        onStart={onStartVoice}
+        onStop={onStopVoice}
+        voice={data.voice || {}}
+      />
+
       <div className="ai-brief-grid">
         <SummaryMetric featured label="Sales" value={money(cardValue("sales", "totalSales"))} />
         <SummaryMetric label="Gross Profit" positive value={money(cardValue("sales", "estimatedGrossProfit"))} />
@@ -5073,6 +5189,7 @@ function AiBusinessAssistantModule({
 
       <div className="ai-layout">
         <ModuleCard eyebrow="Ask FROST" title="Controlled Business Questions" subtitle="Answers use the shared FROST service layer. No write action is performed without owner approval.">
+          {data.loading && <div className="ai-thinking"><span /> FROST is thinking</div>}
           <div className="ai-question-box">
             <textarea value={question} onChange={(event) => onQuestionChange(event.target.value)} placeholder="Ask about overdue payments, low stock, sales, profit, expenses or pending purchase bills." />
             <button className="primary-button" disabled={data.loading || !question.trim()} onClick={() => onAsk()}><Icon name="message" /> Ask</button>
@@ -5110,6 +5227,25 @@ function AiBusinessAssistantModule({
         data={data}
         onSave={onSaveSettings}
       />
+
+      <ModuleCard eyebrow="AI Briefing Cards" title="Owner Copilot Priorities" subtitle="Each action is read-only or recorded for owner approval. FROST never executes business changes directly.">
+        <div className="frost-card-grid">
+          {(briefing.insightCards || []).map((card) => (
+            <article className={`frost-insight-card frost-priority-${String(card.priority || "Information").toLowerCase()}`} key={card.id}>
+              <span>{card.priority}</span>
+              <strong>{card.title}</strong>
+              <p>{typeof card.value === "number" ? money(card.value) : card.value}</p>
+              <small>{card.sourceModule}</small>
+              <div className="button-row">
+                {(card.actions || []).map((action) => (
+                  <button className="table-action" key={action} onClick={() => onProposeAction(action, { card_id: card.id, source_module: card.sourceModule })}>{action}</button>
+                ))}
+              </div>
+            </article>
+          ))}
+          {(!briefing.insightCards || briefing.insightCards.length === 0) && <div className="cart-empty">Refresh FROST to generate briefing cards.</div>}
+        </div>
+      </ModuleCard>
 
       <div className="ai-layout">
         <ModuleCard eyebrow="Priority Alerts" title="Needs Attention" subtitle="Acknowledge, snooze or resolve after reviewing the linked module.">
@@ -5169,16 +5305,47 @@ function AiBusinessAssistantModule({
   );
 }
 
+function FrostVoicePanel({ onStart, onStop, voice }) {
+  const active = ["connecting", "listening", "speaking"].includes(voice.status);
+  return (
+    <section className={`frost-voice-panel frost-voice-${voice.status || "idle"}`}>
+      <div>
+        <span className="eyebrow">Voice Copilot</span>
+        <h3>Push-to-talk with FROST</h3>
+        <p>Hindi, English and Hinglish ready. Wake word architecture is prepared and disabled.</p>
+      </div>
+      <div className="frost-voice-controls">
+        <button className={active ? "remove-button frost-mic-button" : "primary-button frost-mic-button"} onClick={active ? onStop : onStart}>
+          <Icon name={active ? "close" : "message"} /> {active ? "Interrupt / Stop" : "Hold to Talk"}
+        </button>
+        <span className="frost-voice-state">{voice.status || "idle"}</span>
+      </div>
+      {(voice.transcript || voice.error) && (
+        <div className="frost-transcript">
+          {voice.error ? <p>{voice.error}</p> : <p>{voice.transcript}</p>}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function FrostConfigurationPanel({ canManage, data, onSave }) {
   const frost = data.frost?.frost || {};
   const [draft, setDraft] = useState({
     assistantName: "FROST",
     providerKey: frost.providerKey || "deterministic",
     model: frost.model || "",
+    realtimeModel: frost.realtimeModel || "gpt-realtime",
+    voice: frost.voice || "alloy",
+    languageMode: frost.languageMode || "hindi_english_hinglish",
     enabled: frost.enabled === true,
     streamingEnabled: frost.streamingEnabled !== false,
     cacheEnabled: frost.cacheEnabled !== false,
     voicePrepared: frost.voicePrepared !== false,
+    wakeWordEnabled: false,
+    voiceActivityDetection: frost.voiceActivityDetection !== false,
+    noiseSuppression: frost.noiseSuppression !== false,
+    fullDuplexEnabled: frost.fullDuplexEnabled !== false,
     maxInputTokens: frost.maxInputTokens || 6000,
     maxOutputTokens: frost.maxOutputTokens || 1200,
     costAlertAmount: frost.costAlertAmount || 500,
@@ -5189,15 +5356,22 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
       assistantName: "FROST",
       providerKey: frost.providerKey || "deterministic",
       model: frost.model || "",
+      realtimeModel: frost.realtimeModel || "gpt-realtime",
+      voice: frost.voice || "alloy",
+      languageMode: frost.languageMode || "hindi_english_hinglish",
       enabled: frost.enabled === true,
       streamingEnabled: frost.streamingEnabled !== false,
       cacheEnabled: frost.cacheEnabled !== false,
       voicePrepared: frost.voicePrepared !== false,
+      wakeWordEnabled: false,
+      voiceActivityDetection: frost.voiceActivityDetection !== false,
+      noiseSuppression: frost.noiseSuppression !== false,
+      fullDuplexEnabled: frost.fullDuplexEnabled !== false,
       maxInputTokens: frost.maxInputTokens || 6000,
       maxOutputTokens: frost.maxOutputTokens || 1200,
       costAlertAmount: frost.costAlertAmount || 500,
     });
-  }, [frost.providerKey, frost.model, frost.enabled, frost.streamingEnabled, frost.cacheEnabled, frost.voicePrepared, frost.maxInputTokens, frost.maxOutputTokens, frost.costAlertAmount]);
+  }, [frost.providerKey, frost.model, frost.realtimeModel, frost.voice, frost.languageMode, frost.enabled, frost.streamingEnabled, frost.cacheEnabled, frost.voicePrepared, frost.voiceActivityDetection, frost.noiseSuppression, frost.fullDuplexEnabled, frost.maxInputTokens, frost.maxOutputTokens, frost.costAlertAmount]);
 
   const update = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
   const save = async () => {
@@ -5220,11 +5394,31 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
           </select>
         </Field>
         <Field label="Model / Deployment"><input disabled={!canManage} value={draft.model} onChange={(event) => update("model", event.target.value)} placeholder="Configured outside secrets" /></Field>
+        <Field label="Realtime Model"><input disabled={!canManage} value={draft.realtimeModel} onChange={(event) => update("realtimeModel", event.target.value)} /></Field>
+        <Field label="Voice">
+          <select disabled={!canManage} value={draft.voice} onChange={(event) => update("voice", event.target.value)}>
+            <option value="alloy">Alloy</option>
+            <option value="verse">Verse</option>
+            <option value="marin">Marin</option>
+            <option value="cedar">Cedar</option>
+          </select>
+        </Field>
+        <Field label="Language Mode">
+          <select disabled={!canManage} value={draft.languageMode} onChange={(event) => update("languageMode", event.target.value)}>
+            <option value="hindi_english_hinglish">Hindi + English + Hinglish</option>
+            <option value="english">English</option>
+            <option value="hindi">Hindi</option>
+          </select>
+        </Field>
         <Field label="Cost Alert"><input disabled={!canManage} min="0" type="number" value={draft.costAlertAmount} onChange={(event) => update("costAlertAmount", Number(event.target.value || 0))} /></Field>
         <label className="check-field"><input checked={draft.enabled} disabled={!canManage} type="checkbox" onChange={(event) => update("enabled", event.target.checked)} /><span>External provider enabled</span></label>
         <label className="check-field"><input checked={draft.streamingEnabled} disabled={!canManage} type="checkbox" onChange={(event) => update("streamingEnabled", event.target.checked)} /><span>Streaming responses</span></label>
         <label className="check-field"><input checked={draft.cacheEnabled} disabled={!canManage} type="checkbox" onChange={(event) => update("cacheEnabled", event.target.checked)} /><span>Response caching</span></label>
         <label className="check-field"><input checked={draft.voicePrepared} disabled={!canManage} type="checkbox" onChange={(event) => update("voicePrepared", event.target.checked)} /><span>Voice engine prepared</span></label>
+        <label className="check-field"><input checked={draft.voiceActivityDetection} disabled={!canManage} type="checkbox" onChange={(event) => update("voiceActivityDetection", event.target.checked)} /><span>Voice activity detection</span></label>
+        <label className="check-field"><input checked={draft.noiseSuppression} disabled={!canManage} type="checkbox" onChange={(event) => update("noiseSuppression", event.target.checked)} /><span>Noise suppression</span></label>
+        <label className="check-field"><input checked={draft.fullDuplexEnabled} disabled={!canManage} type="checkbox" onChange={(event) => update("fullDuplexEnabled", event.target.checked)} /><span>Full duplex conversation</span></label>
+        <label className="check-field"><input checked={false} disabled type="checkbox" /><span>Wake word disabled</span></label>
       </div>
       <div className="ai-engine-grid">
         {(data.engines || []).map((engine) => (
