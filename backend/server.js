@@ -7,6 +7,15 @@ const path = require("path");
 const { execFile } = require("child_process");
 const { Pool, types } = require("pg");
 const nodemailer = require("nodemailer");
+const {
+  calculateOverdueDays,
+  classifyDueStatus,
+  classifyCustomerRisk,
+  forecastStockRunout,
+  buildReminderDedupKey,
+  assertGroundedAnswer,
+} = require("./aiBusinessAssistantRules");
+const { registerAiBusinessAssistantRoutes } = require("./aiBusinessAssistantService");
 
 types.setTypeParser(1082, (value) => value);
 
@@ -450,6 +459,12 @@ const PERMISSION_KEYS = [
   "system_info",
   "whatsapp_send",
   "whatsapp_settings",
+  "ai_assistant_view",
+  "ai_financial_insights",
+  "ai_inventory_insights",
+  "ai_reminder_manage",
+  "ai_action_approve",
+  "ai_settings_manage",
 ];
 
 const cleanText = (value) => (typeof value === "string" ? value.trim() : "");
@@ -1920,6 +1935,129 @@ const initializeDatabase = async () => {
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS edited_by INTEGER REFERENCES users(id);
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP;
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS edit_reason TEXT;
+
+    CREATE TABLE IF NOT EXISTS ai_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+      company_id INTEGER DEFAULT 1,
+      branch_id INTEGER REFERENCES branches(id),
+      thresholds JSONB NOT NULL DEFAULT '{}'::jsonb,
+      ai_provider_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+      updated_by INTEGER REFERENCES users(id),
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    ALTER TABLE ai_settings ADD COLUMN IF NOT EXISTS company_id INTEGER DEFAULT 1;
+    ALTER TABLE ai_settings ADD COLUMN IF NOT EXISTS branch_id INTEGER REFERENCES branches(id);
+    ALTER TABLE ai_settings ADD COLUMN IF NOT EXISTS thresholds JSONB NOT NULL DEFAULT '{}'::jsonb;
+    ALTER TABLE ai_settings ADD COLUMN IF NOT EXISTS ai_provider_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+
+    CREATE TABLE IF NOT EXISTS ai_alerts (
+      id SERIAL PRIMARY KEY,
+      company_id INTEGER DEFAULT 1,
+      branch_id INTEGER REFERENCES branches(id),
+      dedup_key VARCHAR(240) UNIQUE NOT NULL,
+      alert_type VARCHAR(80) NOT NULL,
+      severity VARCHAR(20) NOT NULL DEFAULT 'INFO',
+      status VARCHAR(20) NOT NULL DEFAULT 'OPEN',
+      source_module VARCHAR(80) NOT NULL,
+      linked_entity_type VARCHAR(80),
+      linked_entity_id VARCHAR(120),
+      title VARCHAR(220) NOT NULL,
+      message TEXT NOT NULL,
+      facts JSONB NOT NULL DEFAULT '{}'::jsonb,
+      detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      acknowledged_at TIMESTAMP,
+      acknowledged_by INTEGER REFERENCES users(id),
+      snoozed_until TIMESTAMP,
+      resolved_at TIMESTAMP,
+      resolved_by INTEGER REFERENCES users(id),
+      owner_notes TEXT,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS ai_alerts_status_severity_idx ON ai_alerts (status, severity, detected_at DESC);
+
+    CREATE TABLE IF NOT EXISTS ai_reminders (
+      id SERIAL PRIMARY KEY,
+      company_id INTEGER DEFAULT 1,
+      branch_id INTEGER REFERENCES branches(id),
+      dedup_key VARCHAR(240) UNIQUE NOT NULL,
+      reminder_type VARCHAR(80) NOT NULL,
+      priority VARCHAR(20) NOT NULL DEFAULT 'ATTENTION',
+      status VARCHAR(20) NOT NULL DEFAULT 'OPEN',
+      due_at TIMESTAMP,
+      linked_entity_type VARCHAR(80),
+      linked_entity_id VARCHAR(120),
+      title VARCHAR(220) NOT NULL,
+      message TEXT NOT NULL,
+      draft_message TEXT,
+      owner_notes TEXT,
+      created_by INTEGER REFERENCES users(id),
+      acknowledged_at TIMESTAMP,
+      acknowledged_by INTEGER REFERENCES users(id),
+      snoozed_until TIMESTAMP,
+      resolved_at TIMESTAMP,
+      resolved_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS ai_reminders_status_due_idx ON ai_reminders (status, due_at, priority);
+
+    CREATE TABLE IF NOT EXISTS ai_conversations (
+      id SERIAL PRIMARY KEY,
+      company_id INTEGER DEFAULT 1,
+      branch_id INTEGER REFERENCES branches(id),
+      user_id INTEGER REFERENCES users(id),
+      device_id VARCHAR(160),
+      question TEXT NOT NULL,
+      classification VARCHAR(80) NOT NULL,
+      period_label VARCHAR(120),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS ai_messages (
+      id SERIAL PRIMARY KEY,
+      conversation_id INTEGER REFERENCES ai_conversations(id) ON DELETE CASCADE,
+      role VARCHAR(20) NOT NULL,
+      content TEXT NOT NULL,
+      facts_used JSONB DEFAULT '[]'::jsonb,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS ai_fact_snapshots (
+      id SERIAL PRIMARY KEY,
+      conversation_id INTEGER REFERENCES ai_conversations(id) ON DELETE CASCADE,
+      fact_type VARCHAR(80) NOT NULL,
+      source_module VARCHAR(80) NOT NULL,
+      period_label VARCHAR(120),
+      facts JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS ai_action_proposals (
+      id SERIAL PRIMARY KEY,
+      conversation_id INTEGER REFERENCES ai_conversations(id) ON DELETE SET NULL,
+      proposed_action VARCHAR(120) NOT NULL,
+      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      approval_status VARCHAR(30) NOT NULL DEFAULT 'PENDING_OWNER_APPROVAL',
+      proposed_by INTEGER REFERENCES users(id),
+      approved_by INTEGER REFERENCES users(id),
+      approved_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS ai_audit_log (
+      id SERIAL PRIMARY KEY,
+      company_id INTEGER DEFAULT 1,
+      branch_id INTEGER REFERENCES branches(id),
+      user_id INTEGER REFERENCES users(id),
+      device_id VARCHAR(160),
+      event_type VARCHAR(80) NOT NULL,
+      question TEXT,
+      verified_facts JSONB DEFAULT '[]'::jsonb,
+      answer TEXT,
+      suggested_action JSONB DEFAULT '{}'::jsonb,
+      approval_status VARCHAR(30) DEFAULT 'READ_ONLY',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS cancelled_by INTEGER REFERENCES users(id);
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP;
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
@@ -1974,6 +2112,16 @@ const initializeDatabase = async () => {
     VALUES (1, '${backupDirectory.replace(/'/g, "''")}')
     ON CONFLICT (id) DO NOTHING;
 
+    INSERT INTO ai_settings (id, company_id, branch_id, thresholds, ai_provider_enabled)
+    VALUES (
+      1,
+      1,
+      1,
+      '{"dueSoonDays":3,"seriousOverdueDays":21,"criticalOverdueDays":45,"criticalOutstandingAmount":100000,"highOutstandingAmount":50000,"lowStockDays":7,"slowMovingDays":30,"lotAgingDays":20,"purchaseBillPendingDays":3,"rebateDeadlineDays":2,"lowMarginPercent":8,"highDiscountPercent":10,"highValueBillAmount":25000,"expenseSpikeMultiplier":2}'::jsonb,
+      FALSE
+    )
+    ON CONFLICT (id) DO NOTHING;
+
     INSERT INTO role_permission_settings (role_name, permissions)
     VALUES
       ('Owner', '{"dashboard":true,"settings":true,"discounts":true,"mandi_tax":true,"rebate_rules":true,"supplier_payments":true,"customer_payments":true,"sale_edit":true,"invoice_cancellation":true,"reports":true,"purchases":true,"supplier_accounts":true,"inventory":true,"waste_management":true,"billing":true}'::jsonb),
@@ -1997,6 +2145,10 @@ const initializeDatabase = async () => {
 
     UPDATE role_permission_settings
     SET permissions = permissions || '{"whatsapp_send":true,"whatsapp_settings":true}'::jsonb
+    WHERE role_name IN ('Owner', 'Admin');
+
+    UPDATE role_permission_settings
+    SET permissions = permissions || '{"ai_assistant_view":true,"ai_financial_insights":true,"ai_inventory_insights":true,"ai_reminder_manage":true,"ai_action_approve":true,"ai_settings_manage":true}'::jsonb
     WHERE role_name IN ('Owner', 'Admin');
 
     UPDATE role_permission_settings
@@ -2028,6 +2180,16 @@ const initializeDatabase = async () => {
     SET permissions = permissions || '{"whatsapp_send":false,"whatsapp_settings":false}'::jsonb
     WHERE role_name IN ('Cashier', 'Purchase Manager', 'Inventory Manager')
       AND NOT (permissions ? 'whatsapp_send');
+
+    UPDATE role_permission_settings
+    SET permissions = permissions || '{"ai_assistant_view":true,"ai_financial_insights":false,"ai_inventory_insights":false,"ai_reminder_manage":false,"ai_action_approve":false,"ai_settings_manage":false}'::jsonb
+    WHERE role_name = 'Cashier'
+      AND NOT (permissions ? 'ai_assistant_view');
+
+    UPDATE role_permission_settings
+    SET permissions = permissions || '{"ai_assistant_view":true,"ai_financial_insights":false,"ai_inventory_insights":true,"ai_reminder_manage":false,"ai_action_approve":false,"ai_settings_manage":false}'::jsonb
+    WHERE role_name IN ('Purchase Manager', 'Inventory Manager')
+      AND NOT (permissions ? 'ai_assistant_view');
 
     UPDATE role_permission_settings
     SET permissions = permissions || '{"dashboard":false}'::jsonb
@@ -4396,6 +4558,13 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
     branchId,
   };
 };
+
+registerAiBusinessAssistantRoutes({
+  app,
+  pool,
+  getPermissionUser,
+  requireRateManager,
+});
 
 app.get("/purchase-rules", async (req, res) => {
   try {
