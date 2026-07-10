@@ -506,10 +506,12 @@ const icons = {
   reports: "chart",
   settings: "settings",
   "sale-rates": "trend",
+  "ai-assistant": "message",
 };
 
 const navigationItems = [
   ["dashboard", "Dashboard"],
+  ["ai-assistant", "AI Business Assistant"],
   ["products", "Products"],
   ["purchase", "Purchase Entry"],
   ["pending-bills", "Pending Bills"],
@@ -525,7 +527,7 @@ const navigationItems = [
 ];
 
 const offlineLocalDataViews = new Set(["dashboard", "products", "sales", "reports", "settings"]);
-const offlineBackendRequiredViews = new Set(["purchase", "pending-bills", "accounts", "returns", "waste", "discounts", "sale-rates", "expenses"]);
+const offlineBackendRequiredViews = new Set(["ai-assistant", "purchase", "pending-bills", "accounts", "returns", "waste", "discounts", "sale-rates", "expenses"]);
 
 const getErrorMessage = (error, fallback) =>
   error.response?.data?.message || fallback;
@@ -923,6 +925,7 @@ const modulePermissionMap = {
   expenses: "reports",
   reports: "reports",
   settings: "settings",
+  "ai-assistant": "ai_assistant_view",
 };
 
 const ledgerModes = [
@@ -1281,6 +1284,18 @@ function App() {
   });
   const [dashboardAnalytics, setDashboardAnalytics] = useState(emptyDashboardAnalytics);
   const [dashboardError, setDashboardError] = useState("");
+  const [aiAssistantData, setAiAssistantData] = useState({
+    briefing: null,
+    alerts: [],
+    reminders: [],
+    suggestedQuestions: [],
+    history: [],
+    period: { range: "today", label: "Today" },
+    loading: false,
+    error: "",
+  });
+  const [aiQuestion, setAiQuestion] = useState("");
+  const [aiRange, setAiRange] = useState("today");
   const [supplierDashboard, setSupplierDashboard] = useState({
     todaySales: 0,
     todayProfit: 0,
@@ -2275,6 +2290,78 @@ function App() {
   const loadCustomerPendingBills = async () => {
     const response = await axios.get(`${API_URL}/pending-bills/customer`);
     setCustomerPendingBills(response.data || { summary: [], invoices: [] });
+  };
+
+  const loadAiAssistant = async (range = aiRange) => {
+    setAiAssistantData((current) => ({ ...current, loading: true, error: "" }));
+    try {
+      const params = { user_id: user?.id, device_id: deviceInfo.device_id, range };
+      const [briefingResponse, alertsResponse, remindersResponse, questionsResponse] = await Promise.all([
+        axios.get(`${API_URL}/api/ai/briefing`, { params }),
+        axios.get(`${API_URL}/api/ai/alerts`, { params }),
+        axios.get(`${API_URL}/api/ai/reminders`, { params }),
+        axios.get(`${API_URL}/api/ai/suggested-questions`, { params }),
+      ]);
+      setAiAssistantData((current) => ({
+        ...current,
+        briefing: briefingResponse.data,
+        alerts: alertsResponse.data.alerts || [],
+        reminders: remindersResponse.data.reminders || [],
+        suggestedQuestions: questionsResponse.data.questions || [],
+        period: { range, ...(briefingResponse.data.period || {}) },
+        loading: false,
+        error: "",
+      }));
+    } catch (error) {
+      setAiAssistantData((current) => ({
+        ...current,
+        loading: false,
+        error: getErrorMessage(error, offlineMode ? "AI explanations are offline. Deterministic local facts will remain available where cached." : "Unable to load AI Business Assistant data."),
+      }));
+    }
+  };
+
+  const askAiAssistant = async (question = aiQuestion) => {
+    const trimmed = question.trim();
+    if (!trimmed) return;
+    setAiAssistantData((current) => ({ ...current, loading: true, error: "" }));
+    try {
+      const response = await axios.post(`${API_URL}/api/ai/query`, {
+        user_id: user?.id,
+        device_id: deviceInfo.device_id,
+        question: trimmed,
+        range: aiRange,
+      });
+      setAiAssistantData((current) => ({
+        ...current,
+        loading: false,
+        period: { range: aiRange, ...(response.data.period || {}) },
+        history: [
+          {
+            id: response.data.conversation_id || Date.now(),
+            question: trimmed,
+            answer: response.data.answer,
+            facts: response.data.facts || [],
+            period: response.data.period,
+            provider: response.data.provider,
+          },
+          ...current.history,
+        ].slice(0, 20),
+      }));
+      setAiQuestion("");
+    } catch (error) {
+      setAiAssistantData((current) => ({ ...current, loading: false, error: getErrorMessage(error, "Unable to answer from verified facts") }));
+    }
+  };
+
+  const updateAiAlert = async (alertId, action) => {
+    await axios.patch(`${API_URL}/api/ai/alerts/${alertId}`, { user_id: user?.id, action });
+    await loadAiAssistant(aiRange);
+  };
+
+  const updateAiReminder = async (reminderId, action) => {
+    await axios.patch(`${API_URL}/api/ai/reminders/${reminderId}`, { user_id: user?.id, action });
+    await loadAiAssistant(aiRange);
   };
 
   const loadSaleRates = async (desiredMargin = saleDesiredMargin) => {
@@ -3709,6 +3796,7 @@ function App() {
         await Promise.all([loadAccounts(), loadCustomerData(), loadSupplierData(), loadAccountOutstanding()]);
       }
       if (view === "reports") await loadReports();
+      if (view === "ai-assistant") await loadAiAssistant();
       if (view === "expenses") await loadExpenses();
       if (view === "returns") await loadSaleReturns();
       if (view === "waste") await loadWasteEntries();
@@ -4032,6 +4120,26 @@ function App() {
                 </div>
               </section>
             </>
+          )}
+
+          {activeView === "ai-assistant" && (
+            <AiBusinessAssistantModule
+              data={aiAssistantData}
+              onAlertAction={updateAiAlert}
+              onAsk={askAiAssistant}
+              onQuestionChange={setAiQuestion}
+              onRangeChange={(range) => {
+                setAiRange(range);
+                loadAiAssistant(range);
+              }}
+              onRefresh={() => loadAiAssistant(aiRange)}
+              onReminderAction={updateAiReminder}
+              onSelectQuestion={(question) => askAiAssistant(question)}
+              onNavigate={navigate}
+              question={aiQuestion}
+              range={aiRange}
+              user={user}
+            />
           )}
 
           {activeView === "products" && (
@@ -4875,6 +4983,158 @@ function App() {
       )}
       {profileOpen && <UserProfilePanel onClose={() => setProfileOpen(false)} onLogout={() => setUser(null)} user={user} />}
     </main>
+  );
+}
+
+const aiSeverityClass = (severity = "INFO") => `ai-severity ai-severity-${String(severity).toLowerCase()}`;
+
+function AiBusinessAssistantModule({
+  data,
+  onAlertAction,
+  onAsk,
+  onNavigate,
+  onQuestionChange,
+  onRangeChange,
+  onRefresh,
+  onReminderAction,
+  onSelectQuestion,
+  question,
+  range,
+  user,
+}) {
+  const briefing = data.briefing || {};
+  const cards = briefing.cards || {};
+  const latestAnswer = data.history[0];
+  const canManageReminders = user?.role === "Owner" || user?.role === "Admin";
+  const periodLabel = data.period?.label || briefing.period?.label || "Current data";
+  const cardValue = (section, key, fallback = 0) => cards[section]?.[key] ?? fallback;
+  const money = (value) => currency.format(Number(value || 0));
+  const openLinkedModule = (type) => {
+    if (type === "customer") return onNavigate("accounts");
+    if (type === "supplier" || type === "purchase") return onNavigate("pending-bills");
+    if (type === "product") return onNavigate("products");
+    return onNavigate("reports");
+  };
+
+  return (
+    <section className="ai-assistant-shell">
+      <div className="ai-toolbar">
+        <div>
+          <span className="eyebrow">Verified Business Facts</span>
+          <h2>AI Business Assistant</h2>
+          <p>Data period: {periodLabel}. Every figure comes from FroozERP modules before explanation.</p>
+        </div>
+        <div className="button-row">
+          <select value={range} onChange={(event) => onRangeChange(event.target.value)}>
+            <option value="today">Today</option>
+            <option value="yesterday">Yesterday</option>
+            <option value="last_7_days">Last 7 Days</option>
+            <option value="this_month">This Month</option>
+          </select>
+          <button className="secondary-button" disabled={data.loading} onClick={onRefresh}><Icon name="history" /> Refresh data</button>
+        </div>
+      </div>
+
+      {data.error && <div className="startup-status-panel startup-status-error"><p>{data.error}</p></div>}
+
+      <div className="ai-brief-grid">
+        <SummaryMetric featured label="Sales" value={money(cardValue("sales", "totalSales"))} />
+        <SummaryMetric label="Gross Profit" positive value={money(cardValue("sales", "estimatedGrossProfit"))} />
+        <SummaryMetric label="Customer Overdue" value={money(cardValue("customerOutstanding", "totalOutstanding"))} />
+        <SummaryMetric label="Supplier Due" value={money(cardValue("supplierOutstanding", "totalOutstanding"))} />
+        <SummaryMetric label="Pending Bills" value={cardValue("pendingPurchases", "count")} />
+        <SummaryMetric label="Low Stock" value={cardValue("lowStock", "count")} />
+      </div>
+
+      <div className="ai-layout">
+        <ModuleCard eyebrow="Ask FroozERP" title="Controlled Business Questions" subtitle="Answers use approved backend tools only. No write action is performed without owner approval.">
+          <div className="ai-question-box">
+            <textarea value={question} onChange={(event) => onQuestionChange(event.target.value)} placeholder="Ask about overdue payments, low stock, sales, profit, expenses or pending purchase bills." />
+            <button className="primary-button" disabled={data.loading || !question.trim()} onClick={() => onAsk()}><Icon name="message" /> Ask</button>
+          </div>
+          <div className="ai-suggestion-grid">
+            {(data.suggestedQuestions || []).map((item) => (
+              <button className="ai-suggestion" key={item} disabled={data.loading} onClick={() => onSelectQuestion(item)}>{item}</button>
+            ))}
+          </div>
+          {latestAnswer && (
+            <article className="ai-answer-panel">
+              <span className="eyebrow">{latestAnswer.period?.label || periodLabel}</span>
+              <h3>{latestAnswer.question}</h3>
+              <p>{latestAnswer.answer}</p>
+              <small>Source modules: {[...new Set((latestAnswer.facts || []).map((fact) => fact.sourceModule))].join(", ") || "Verified FroozERP facts"}</small>
+            </article>
+          )}
+        </ModuleCard>
+
+        <ModuleCard eyebrow="Daily Owner Brief" title="Top Recommendations" subtitle="Deterministic alerts remain available even when external AI is not configured.">
+          <div className="ai-recommendations">
+            {(briefing.recommendations || ["No briefing loaded yet."]).map((item) => <p key={item}>{item}</p>)}
+          </div>
+          <div className="ai-collection-strip">
+            <span>Cash {money(cardValue("collections", "cash"))}</span>
+            <span>UPI {money(cardValue("collections", "upi"))}</span>
+            <span>Card/Bank {money(cardValue("collections", "card"))}</span>
+            <span>Waste {money(cardValue("waste", "totalWasteCost"))}</span>
+          </div>
+        </ModuleCard>
+      </div>
+
+      <div className="ai-layout">
+        <ModuleCard eyebrow="Priority Alerts" title="Needs Attention" subtitle="Acknowledge, snooze or resolve after reviewing the linked module.">
+          <DataTable headers={["Severity", "Alert", "Source", "Actions"]}>
+            {(data.alerts || []).slice(0, 12).map((alert) => (
+              <tr key={alert.id}>
+                <td><span className={aiSeverityClass(alert.severity)}>{alert.severity}</span></td>
+                <td className="primary-cell">{alert.title}<small className="cell-note">{alert.message}</small></td>
+                <td><button className="table-action" onClick={() => openLinkedModule(alert.linked_entity_type)}>{alert.source_module}</button></td>
+                <td>
+                  <div className="button-row table-actions-row">
+                    <button className="table-action" disabled={!canManageReminders} onClick={() => onAlertAction(alert.id, "ACKNOWLEDGE")}>Ack</button>
+                    <button className="table-action" disabled={!canManageReminders} onClick={() => onAlertAction(alert.id, "SNOOZE")}>Snooze</button>
+                    <button className="remove-button" disabled={!canManageReminders} onClick={() => onAlertAction(alert.id, "RESOLVE")}>Resolve</button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+            {(!data.alerts || data.alerts.length === 0) && <tr><td colSpan="4" className="empty-cell">No open AI alerts for this period.</td></tr>}
+          </DataTable>
+        </ModuleCard>
+
+        <ModuleCard eyebrow="Reminder Centre" title="Drafts and Follow-ups" subtitle="WhatsApp messages are drafts only until an owner reviews and approves them.">
+          <DataTable headers={["Priority", "Reminder", "Due", "Actions"]}>
+            {(data.reminders || []).slice(0, 10).map((reminder) => (
+              <tr key={reminder.id}>
+                <td><span className={aiSeverityClass(reminder.priority)}>{reminder.priority}</span></td>
+                <td className="primary-cell">{reminder.title}<small className="cell-note">{reminder.draft_message || reminder.message}</small></td>
+                <td>{formatDisplayDate(reminder.due_at)}</td>
+                <td>
+                  <div className="button-row table-actions-row">
+                    <button className="table-action" disabled={!canManageReminders} onClick={() => onReminderAction(reminder.id, "ACKNOWLEDGE")}>Review</button>
+                    <button className="table-action" disabled={!canManageReminders} onClick={() => onReminderAction(reminder.id, "SNOOZE")}>Snooze</button>
+                    <button className="remove-button" disabled={!canManageReminders} onClick={() => onReminderAction(reminder.id, "RESOLVE")}>Resolve</button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+            {(!data.reminders || data.reminders.length === 0) && <tr><td colSpan="4" className="empty-cell">No reminders queued.</td></tr>}
+          </DataTable>
+        </ModuleCard>
+      </div>
+
+      <ModuleCard eyebrow="Conversation History" title="Audited Answers" subtitle="Questions and verified facts are recorded on the backend for owner review.">
+        <div className="ai-history-list">
+          {data.history.map((item) => (
+            <article key={item.id} className="ai-history-item">
+              <strong>{item.question}</strong>
+              <p>{item.answer}</p>
+              <small>{item.period?.label || periodLabel}</small>
+            </article>
+          ))}
+          {data.history.length === 0 && <div className="cart-empty">Ask a question to start an audited business conversation.</div>}
+        </div>
+      </ModuleCard>
+    </section>
   );
 }
 
@@ -10349,6 +10609,12 @@ const permissionLabels = [
   ["system_info", "System Info"],
   ["whatsapp_send", "WhatsApp Send"],
   ["whatsapp_settings", "WhatsApp Settings"],
+  ["ai_assistant_view", "AI Assistant"],
+  ["ai_financial_insights", "AI Financial"],
+  ["ai_inventory_insights", "AI Inventory"],
+  ["ai_reminder_manage", "AI Reminders"],
+  ["ai_action_approve", "AI Approvals"],
+  ["ai_settings_manage", "AI Settings"],
 ];
 
 function PermissionSettings({ canManage, onReload, roles, user }) {
