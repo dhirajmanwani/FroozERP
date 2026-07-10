@@ -199,29 +199,73 @@ const allowedTauriCorsOrigins = new Set([
   "https://tauri.localhost",
 ]);
 
-const isPrivateNetworkHost = (hostname) =>
-  hostname === "localhost" ||
-  hostname === "127.0.0.1" ||
-  hostname === "::1" ||
-  /^10\./.test(hostname) ||
-  /^192\.168\./.test(hostname) ||
-  /^172\.(1[6-9]|2\d|3[0-1])\./.test(hostname);
+const normalizeCorsHost = (value) => {
+  const hostValue = String(value || "").split(",")[0].trim().toLowerCase();
+  if (!hostValue) return "";
+  try {
+    return new URL(hostValue).host.toLowerCase();
+  } catch {
+    return hostValue.replace(/^\[|\]$/g, "");
+  }
+};
 
-app.use(cors({
+const normalizeCorsHostname = (value) =>
+  String(value || "").trim().toLowerCase().replace(/^\[|\]$/g, "");
+
+const isPrivateNetworkHost = (hostname) => {
+  const hostValue = normalizeCorsHostname(hostname);
+  if (!hostValue) return false;
+  if (hostValue === "localhost" || hostValue === "127.0.0.1" || hostValue === "::1") return true;
+  if (/^10\./.test(hostValue) || /^192\.168\./.test(hostValue)) return true;
+  const private172 = hostValue.match(/^172\.(\d{1,3})\./);
+  return Boolean(private172 && Number(private172[1]) >= 16 && Number(private172[1]) <= 31);
+};
+
+const isSameOriginHost = (parsedOrigin, req) => {
+  const originHost = normalizeCorsHost(parsedOrigin.host);
+  const requestHosts = [
+    normalizeCorsHost(req.headers.host),
+    normalizeCorsHost(req.headers["x-forwarded-host"]),
+  ].filter(Boolean);
+  return requestHosts.includes(originHost);
+};
+
+const isAllowedDynamicCorsOrigin = (origin, req) => {
+  if (!origin) return true;
+  if (allowedCorsOrigins.includes(origin)) return true;
+  if (allowedTauriCorsOrigins.has(origin)) return true;
+  const parsed = new URL(origin);
+  const hostname = normalizeCorsHostname(parsed.hostname);
+  if (isSameOriginHost(parsed, req)) return true;
+  if (parsed.protocol === "https:" && hostname.endsWith(".up.railway.app")) return true;
+  if ((parsed.protocol === "http:" || parsed.protocol === "https:") && isPrivateNetworkHost(hostname)) return true;
+  return false;
+};
+
+app.use((req, res, next) => cors({
   credentials: true,
   origin(origin, callback) {
-    if (!origin) return callback(null, true);
-    if (allowedCorsOrigins.includes(origin)) return callback(null, true);
-    if (allowedTauriCorsOrigins.has(origin)) return callback(null, true);
     try {
-      const parsed = new URL(origin);
-      if (!productionDatabaseRequired && isPrivateNetworkHost(parsed.hostname)) return callback(null, true);
-    } catch {
+      if (isAllowedDynamicCorsOrigin(origin, req)) return callback(null, true);
+    } catch (error) {
+      console.warn("Rejected invalid FroozERP CORS origin", {
+        origin,
+        host: req.headers.host || null,
+        forwardedHost: req.headers["x-forwarded-host"] || null,
+        path: req.originalUrl || req.url,
+        error: error.message,
+      });
       return callback(new Error("Invalid CORS origin"));
     }
+    console.warn("Rejected FroozERP CORS origin", {
+      origin,
+      host: req.headers.host || null,
+      forwardedHost: req.headers["x-forwarded-host"] || null,
+      path: req.originalUrl || req.url,
+    });
     return callback(new Error("Origin not allowed by FroozERP CORS"));
   },
-}));
+})(req, res, next));
 
 console.log(`CORS allowed origins: ${allowedCorsOrigins.join(", ")}`);
 console.log("CORS missing Origin allowed: true");
