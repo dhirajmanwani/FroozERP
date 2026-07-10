@@ -12,6 +12,15 @@ const {
   FrostServiceLayer,
   classifyBusinessIntent,
 } = require("./frostCore");
+const {
+  containsSensitiveMemory,
+  normalizeMemoryType,
+  stockOutPrediction,
+  salesRangePrediction,
+  grossMarginPercent,
+  wasteAdjustedMargin,
+  dedupeAlertKey,
+} = require("./frostIntelligence");
 
 const DEFAULT_THRESHOLDS = {
   dueSoonDays: 3,
@@ -463,6 +472,238 @@ const getSupplierMarginSummary = async (pool, range) => {
   return buildFact("supplier_margin_summary", "Purchases", range.label, rows, { count: rows.length });
 };
 
+const getMemoryRows = async (pool, query = {}) => {
+  const values = [];
+  const filters = ["company_id = 1"];
+  if (query.status) {
+    values.push(String(query.status).toUpperCase());
+    filters.push(`approval_status = $${values.length}`);
+  }
+  if (query.type) {
+    values.push(normalizeMemoryType(query.type));
+    filters.push(`memory_type = $${values.length}`);
+  }
+  if (query.entity_type) {
+    values.push(cleanText(query.entity_type));
+    filters.push(`entity_type = $${values.length}`);
+  }
+  if (query.search) {
+    values.push(`%${cleanText(query.search).toLowerCase()}%`);
+    filters.push(`(LOWER(title) LIKE $${values.length} OR LOWER(content) LIKE $${values.length})`);
+  }
+  const result = await pool.query(
+    `
+    SELECT *
+    FROM frost_memories
+    WHERE ${filters.join(" AND ")}
+    ORDER BY approval_status = 'PENDING_OWNER_APPROVAL' DESC, updated_at DESC, id DESC
+    LIMIT 200
+    `,
+    values
+  );
+  return result.rows;
+};
+
+const buildMemoryDraftFromText = (text = "") => {
+  const content = cleanText(text);
+  const lower = content.toLowerCase();
+  let memoryType = "approved_ai_observations";
+  let entityType = "";
+  if (lower.includes("prefer")) memoryType = "owner_preferences";
+  if (lower.includes("customer") || lower.includes("traders")) {
+    memoryType = "customer_notes";
+    entityType = "customer";
+  }
+  if (lower.includes("supplier")) {
+    memoryType = "supplier_notes";
+    entityType = "supplier";
+  }
+  if (lower.includes("stock") || lower.includes("purchase") || lower.includes("mango") || lower.includes("apple")) {
+    memoryType = "product_notes";
+    entityType = "product";
+  }
+  if (lower.includes("usually") || lower.includes("normally")) memoryType = "recurring_patterns";
+  return {
+    memory_type: memoryType,
+    entity_type: entityType,
+    title: content.slice(0, 90) || "FROST memory proposal",
+    content,
+    confidence: lower.includes("remember") ? 0.85 : 0.55,
+  };
+};
+
+const getInventoryPredictions = async (pool) => {
+  const productResult = await pool.query(`
+    SELECT p.id, p.product_name, p.unit, COALESCE(p.minimum_stock, 0) AS minimum_stock,
+           COALESCE(SUM(CASE WHEN COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED' THEN ib.remaining_qty ELSE 0 END), 0) AS available_stock
+    FROM products p
+    LEFT JOIN inventory_batches ib ON ib.product_id = p.id
+    WHERE p.active IS DISTINCT FROM FALSE
+    GROUP BY p.id
+    ORDER BY p.product_name
+    LIMIT 80
+  `);
+  const predictions = [];
+  for (const product of productResult.rows) {
+    const salesResult = await pool.query(`
+      SELECT s.sale_date, SUM(si.quantity) AS quantity
+      FROM sale_items si
+      JOIN sales s ON s.id = si.sale_id
+      WHERE si.product_id = $1
+        AND s.sale_date >= CURRENT_DATE - INTERVAL '21 days'
+        AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
+      GROUP BY s.sale_date
+      ORDER BY s.sale_date
+    `, [product.id]);
+    const prediction = stockOutPrediction({ availableStock: product.available_stock, dailySales: salesResult.rows });
+    predictions.push({
+      type: "inventory_stockout",
+      entity_type: "product",
+      entity_id: product.id,
+      title: `${product.product_name} stock forecast`,
+      product_name: product.product_name,
+      prediction_period: prediction.predictionPeriod || "Next 7 days",
+      data_used: { sales_days: salesResult.rows.length, available_stock: Number(product.available_stock || 0), minimum_stock: Number(product.minimum_stock || 0) },
+      confidence: prediction.confidence || 0,
+      reason: prediction.reason,
+      minimum_data_requirement: prediction.minimumDataRequirement,
+      recommendation: prediction.status === "READY" && prediction.daysUntilStockOut <= 7 ? "Review purchase or transfer stock." : "No urgent reorder prediction.",
+      payload: prediction,
+    });
+  }
+  return predictions;
+};
+
+const getSalesPredictions = async (pool) => {
+  const result = await pool.query(`
+    SELECT sale_date, SUM(total_amount) AS amount, SUM(profit) AS profit
+    FROM sales
+    WHERE sale_date >= CURRENT_DATE - INTERVAL '35 days'
+      AND COALESCE(sale_status, 'COMPLETED') <> 'CANCELLED'
+    GROUP BY sale_date
+    ORDER BY sale_date
+  `);
+  const nextDay = salesRangePrediction({ dailySales: result.rows, minimumDataDays: 7, periodLabel: "Next day" });
+  const nextWeek = salesRangePrediction({ dailySales: result.rows, minimumDataDays: 14, periodLabel: "Next 7 days" });
+  return [
+    {
+      type: "sales_next_day",
+      title: "Next-day expected sales range",
+      prediction_period: "Next day",
+      data_used: { sales_days: result.rows.length },
+      confidence: nextDay.confidence || 0,
+      reason: nextDay.reason,
+      minimum_data_requirement: nextDay.minimumDataRequirement,
+      recommendation: nextDay.status === "READY" ? "Use this as a planning range, not an exact forecast." : "Collect more sales history before forecasting.",
+      payload: nextDay,
+    },
+    {
+      type: "sales_next_7_days",
+      title: "Next-7-day expected sales range",
+      prediction_period: "Next 7 days",
+      data_used: { sales_days: result.rows.length },
+      confidence: nextWeek.confidence || 0,
+      reason: nextWeek.reason,
+      minimum_data_requirement: nextWeek.minimumDataRequirement,
+      recommendation: nextWeek.status === "READY" ? "Compare purchases and staffing against this range." : "Insufficient history for weekly range.",
+      payload: nextWeek,
+    },
+  ];
+};
+
+const getCashflowPredictions = async (pool, settings) => {
+  const [customers, suppliers, pending] = await Promise.all([
+    getCustomerOutstanding(pool, settings),
+    getSupplierOutstanding(pool),
+    getPendingPurchaseBills(pool),
+  ]);
+  const projectedIn = customers.summary.totalOutstanding * 0.35;
+  const projectedOut = suppliers.summary.totalOutstanding + pending.rows.reduce((sum, row) => sum + Number(row.balance_amount || 0), 0);
+  return [{
+    type: "cashflow_7_day",
+    title: "Projected cash requirement",
+    prediction_period: "Next 7 days",
+    data_used: { customer_outstanding: customers.summary.totalOutstanding, supplier_outstanding: suppliers.summary.totalOutstanding, pending_purchase_bills: pending.summary.count },
+    confidence: customers.summary.count + suppliers.summary.count >= 2 ? 0.55 : 0.25,
+    reason: "Receivable and payable balances with conservative expected collection ratio.",
+    minimum_data_requirement: "At least customer or supplier balances",
+    recommendation: projectedOut > projectedIn ? "Review collections before supplier payouts." : "Cashflow pressure appears manageable.",
+    payload: { expectedCustomerCollectionsRange: [roundCurrency(projectedIn * 0.5), roundCurrency(projectedIn)], projectedCashRequirement: roundCurrency(projectedOut), projectedShortfallRisk: projectedOut > projectedIn ? "ATTENTION" : "LOW" },
+  }];
+};
+
+const getWastePredictions = async (pool) => {
+  const result = await pool.query(`
+    SELECT p.id AS product_id, p.product_name, SUM(w.quantity) AS waste_quantity, SUM(w.cost_amount) AS waste_cost,
+           COUNT(DISTINCT w.waste_date)::INTEGER AS waste_days
+    FROM waste_entries w
+    LEFT JOIN products p ON p.id = w.product_id
+    WHERE w.waste_date >= CURRENT_DATE - INTERVAL '21 days'
+    GROUP BY p.id, p.product_name
+    ORDER BY waste_cost DESC NULLS LAST
+    LIMIT 30
+  `);
+  return result.rows.map((row) => ({
+    type: "waste_trend",
+    entity_type: "product",
+    entity_id: row.product_id,
+    title: `${row.product_name || "Product"} waste trend`,
+    prediction_period: "Next 7 days",
+    data_used: { waste_days: row.waste_days, waste_quantity: Number(row.waste_quantity || 0), waste_cost: roundCurrency(row.waste_cost) },
+    confidence: Number(row.waste_days || 0) >= 3 ? 0.55 : 0.25,
+    reason: Number(row.waste_days || 0) >= 3 ? "Repeated waste entries in recent 21 days." : "Insufficient repeated waste history.",
+    minimum_data_requirement: "3 waste days in last 21 days",
+    recommendation: Number(row.waste_days || 0) >= 3 ? "Investigate lot quality, pricing, and movement." : "Monitor further before acting.",
+    payload: { status: Number(row.waste_days || 0) >= 3 ? "READY" : "INSUFFICIENT_DATA" },
+  }));
+};
+
+const getProfitAdvisorRows = async (pool) => {
+  const result = await pool.query(`
+    SELECT p.id AS product_id, p.product_name, p.selling_rate,
+           COALESCE(AVG(NULLIF(ib.purchase_rate, 0)), 0) AS avg_purchase_cost,
+           COALESCE(SUM(CASE WHEN s.sale_date >= CURRENT_DATE - INTERVAL '30 days' AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED' THEN si.quantity ELSE 0 END), 0) AS recent_sales_quantity,
+           COALESCE(SUM(CASE WHEN w.waste_date >= CURRENT_DATE - INTERVAL '30 days' THEN w.quantity ELSE 0 END), 0) AS recent_waste_quantity,
+           COALESCE(SUM(CASE WHEN w.waste_date >= CURRENT_DATE - INTERVAL '30 days' THEN w.cost_amount ELSE 0 END), 0) AS recent_waste_cost
+    FROM products p
+    LEFT JOIN inventory_batches ib ON ib.product_id = p.id AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+    LEFT JOIN sale_items si ON si.product_id = p.id
+    LEFT JOIN sales s ON s.id = si.sale_id
+    LEFT JOIN waste_entries w ON w.product_id = p.id
+    WHERE p.active IS DISTINCT FROM FALSE
+    GROUP BY p.id, p.product_name, p.selling_rate
+    ORDER BY p.product_name
+    LIMIT 100
+  `);
+  return result.rows.map((row) => {
+    const margin = grossMarginPercent({ sellingRate: row.selling_rate, purchaseCost: row.avg_purchase_cost });
+    const adjusted = wasteAdjustedMargin({
+      saleAmount: Number(row.selling_rate || 0) * Number(row.recent_sales_quantity || 0),
+      costAmount: Number(row.avg_purchase_cost || 0) * Number(row.recent_sales_quantity || 0),
+      wasteCost: row.recent_waste_cost,
+    });
+    const action = margin !== null && margin < 10
+      ? "review sale rate"
+      : Number(row.recent_waste_quantity || 0) > 0
+        ? "review waste cause"
+        : "monitor margin";
+    return {
+      product_id: row.product_id,
+      product_name: row.product_name,
+      current_purchase_cost: roundCurrency(row.avg_purchase_cost),
+      current_selling_rate: roundCurrency(row.selling_rate),
+      estimated_gross_margin: margin,
+      waste_adjusted_margin: adjusted,
+      recent_sales_quantity: Number(row.recent_sales_quantity || 0),
+      recent_waste: Number(row.recent_waste_quantity || 0),
+      proposed_action: action,
+      expected_impact_range: margin !== null && margin < 10 ? "May protect margin; not enough evidence to estimate exact sales lift." : "Operational review only.",
+      confidence: margin === null ? 0.2 : 0.55,
+      assumptions: ["Last 30 days sales and waste", "Average active lot purchase cost"],
+    };
+  });
+};
+
 const getProductMarginSummary = async (pool, range) => {
   const result = await pool.query(`
     SELECT p.id AS product_id, p.product_name,
@@ -887,6 +1128,175 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
     const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
     if (!user) return;
     return res.json({ reminders: await getReminders(pool) });
+  });
+
+  app.get("/api/ai/memory", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    if (!user) return;
+    const memories = await getMemoryRows(pool, req.query);
+    return res.json({ memories });
+  });
+
+  app.post("/api/ai/memory/propose", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    if (!user) return;
+    const draft = req.body.content ? { ...buildMemoryDraftFromText(req.body.content), ...req.body } : req.body;
+    if (containsSensitiveMemory(`${draft.title || ""} ${draft.content || ""}`)) {
+      return res.status(400).json({ message: "FROST memory cannot store secrets, API keys, passwords or payment credentials" });
+    }
+    const result = await pool.query(`
+      INSERT INTO frost_memories (
+        company_id, branch_id, memory_type, entity_type, entity_id, title, content,
+        source_type, source_reference, confidence, approval_status, created_by
+      )
+      VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, 'PENDING_OWNER_APPROVAL', $10)
+      RETURNING *
+    `, [
+      user.branch_id || 1,
+      normalizeMemoryType(draft.memory_type),
+      cleanText(draft.entity_type),
+      cleanText(draft.entity_id),
+      cleanText(draft.title || "FROST memory proposal"),
+      cleanText(draft.content),
+      cleanText(draft.source_type || "owner_statement"),
+      cleanText(draft.source_reference || ""),
+      Number(draft.confidence || 0.55),
+      user.id,
+    ]);
+    await frost.audit({ userId: user.id, deviceId: req.body.device_id || "", eventType: "FROST_MEMORY_PROPOSED", answer: "FROST memory proposed", suggestedAction: result.rows[0], approvalStatus: "PENDING_OWNER_APPROVAL" });
+    return res.status(201).json(result.rows[0]);
+  });
+
+  app.post("/api/ai/memory/:id/approve", async (req, res) => {
+    const manager = await requireRateManager(req.body.user_id || req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner/Admin can approve FROST memories" });
+    const id = parsePositiveInteger(req.params.id);
+    const result = await pool.query(`
+      UPDATE frost_memories
+      SET approval_status = 'APPROVED', approved_by = $2, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+      RETURNING *
+    `, [id, manager.id]);
+    await frost.audit({ userId: manager.id, eventType: "FROST_MEMORY_APPROVED", answer: "FROST memory approved", suggestedAction: result.rows[0], approvalStatus: "APPROVED" });
+    return res.json(result.rows[0]);
+  });
+
+  app.patch("/api/ai/memory/:id", async (req, res) => {
+    const manager = await requireRateManager(req.body.user_id || req.body.updated_by);
+    if (!manager) return res.status(403).json({ message: "Only Owner/Admin can edit FROST memories" });
+    const id = parsePositiveInteger(req.params.id);
+    if (containsSensitiveMemory(`${req.body.title || ""} ${req.body.content || ""}`)) {
+      return res.status(400).json({ message: "FROST memory cannot store secrets, API keys, passwords or payment credentials" });
+    }
+    const result = await pool.query(`
+      UPDATE frost_memories
+      SET memory_type = COALESCE($2, memory_type),
+          entity_type = COALESCE($3, entity_type),
+          entity_id = COALESCE($4, entity_id),
+          title = COALESCE($5, title),
+          content = COALESCE($6, content),
+          confidence = COALESCE($7, confidence),
+          is_active = COALESCE($8, is_active),
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+      RETURNING *
+    `, [
+      id,
+      req.body.memory_type ? normalizeMemoryType(req.body.memory_type) : null,
+      req.body.entity_type === undefined ? null : cleanText(req.body.entity_type),
+      req.body.entity_id === undefined ? null : cleanText(req.body.entity_id),
+      req.body.title === undefined ? null : cleanText(req.body.title),
+      req.body.content === undefined ? null : cleanText(req.body.content),
+      req.body.confidence === undefined ? null : Number(req.body.confidence),
+      req.body.is_active === undefined ? null : req.body.is_active === true,
+    ]);
+    await frost.audit({ userId: manager.id, eventType: "FROST_MEMORY_UPDATED", answer: "FROST memory updated", suggestedAction: result.rows[0] });
+    return res.json(result.rows[0]);
+  });
+
+  app.delete("/api/ai/memory/:id", async (req, res) => {
+    const manager = await requireRateManager(req.body.user_id || req.query.user_id);
+    if (!manager) return res.status(403).json({ message: "Only Owner/Admin can delete FROST memories" });
+    const id = parsePositiveInteger(req.params.id);
+    const result = await pool.query("DELETE FROM frost_memories WHERE id = $1 RETURNING *", [id]);
+    await frost.audit({ userId: manager.id, eventType: "FROST_MEMORY_DELETED", answer: "FROST memory deleted", suggestedAction: { id } });
+    return res.json({ deleted: Boolean(result.rows[0]), memory: result.rows[0] || null });
+  });
+
+  app.get("/api/ai/predictions/inventory", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
+    if (!user) return;
+    return res.json({ predictions: await getInventoryPredictions(pool) });
+  });
+
+  app.get("/api/ai/predictions/sales", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_financial_insights", fallbackRoles: ["Owner", "Admin"] });
+    if (!user) return;
+    return res.json({ predictions: await getSalesPredictions(pool) });
+  });
+
+  app.get("/api/ai/predictions/cashflow", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_financial_insights", fallbackRoles: ["Owner", "Admin"] });
+    if (!user) return;
+    const settings = await getAiSettings(pool, frost);
+    return res.json({ predictions: await getCashflowPredictions(pool, settings) });
+  });
+
+  app.get("/api/ai/predictions/waste", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
+    if (!user) return;
+    return res.json({ predictions: await getWastePredictions(pool) });
+  });
+
+  app.get("/api/ai/predictions", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    if (!user) return;
+    const settings = await getAiSettings(pool, frost);
+    const [inventory, sales, cashflow, waste] = await Promise.all([
+      getInventoryPredictions(pool),
+      getSalesPredictions(pool),
+      getCashflowPredictions(pool, settings),
+      getWastePredictions(pool),
+    ]);
+    return res.json({ predictions: { inventory, sales, cashflow, waste } });
+  });
+
+  app.get("/api/ai/profit-advisor", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_financial_insights", fallbackRoles: ["Owner", "Admin"] });
+    if (!user) return;
+    return res.json({ recommendations: await getProfitAdvisorRows(pool) });
+  });
+
+  app.get("/api/ai/profit-advisor/products/:id", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_financial_insights", fallbackRoles: ["Owner", "Admin"] });
+    if (!user) return;
+    const productId = parsePositiveInteger(req.params.id);
+    const rows = await getProfitAdvisorRows(pool);
+    return res.json(rows.find((row) => Number(row.product_id) === Number(productId)) || null);
+  });
+
+  app.get("/api/ai/daily-plan", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    if (!user) return;
+    const settings = await getAiSettings(pool, frost);
+    const range = getRange(req.query);
+    const [briefing, predictions, profit] = await Promise.all([
+      buildDailyBriefing(pool, settings, range),
+      getInventoryPredictions(pool),
+      getProfitAdvisorRows(pool),
+    ]);
+    return res.json({
+      period: range,
+      topPriorities: briefing.recommendations,
+      overdueCollections: briefing.cards.customerOutstanding,
+      supplierPaymentsDue: briefing.cards.supplierOutstanding,
+      purchaseBills: briefing.cards.pendingPurchases,
+      stockLikelyToRunOut: predictions.filter((item) => item.payload?.status === "READY" && item.payload?.daysUntilStockOut <= 7).slice(0, 5),
+      saleRateReview: profit.filter((item) => item.proposed_action === "review sale rate").slice(0, 5),
+      wasteReview: profit.filter((item) => item.proposed_action === "review waste cause").slice(0, 5),
+      expectedCashRequirement: (await getCashflowPredictions(pool, settings))[0],
+      recommendedActions: ["Start with critical stock and overdue collections.", "Review margin risks before changing rates.", "Approve only the actions you want FROST to execute later."],
+    });
   });
 
   app.post("/api/ai/reminders", async (req, res) => {

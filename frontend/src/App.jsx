@@ -1296,12 +1296,18 @@ function App() {
     engines: [],
     usage: null,
     voice: { status: "idle", transcript: "", error: "", supported: false },
+    activeTab: "briefing",
+    memories: [],
+    predictions: { inventory: [], sales: [], cashflow: [], waste: [] },
+    profitAdvisor: [],
+    dailyPlan: null,
     period: { range: "today", label: "Today" },
     loading: false,
     error: "",
   });
   const [aiQuestion, setAiQuestion] = useState("");
   const [aiRange, setAiRange] = useState("today");
+  const [frostActiveTab, setFrostActiveTab] = useState("briefing");
   const frostVoiceRef = useRef({ peer: null, stream: null, audio: null, channel: null });
   const [supplierDashboard, setSupplierDashboard] = useState({
     todaySales: 0,
@@ -2303,12 +2309,16 @@ function App() {
     setAiAssistantData((current) => ({ ...current, loading: true, error: "" }));
     try {
       const params = { user_id: user?.id, device_id: deviceInfo.device_id, range };
-      const [briefingResponse, alertsResponse, remindersResponse, questionsResponse, statusResponse] = await Promise.all([
+      const [briefingResponse, alertsResponse, remindersResponse, questionsResponse, statusResponse, memoryResponse, predictionsResponse, profitResponse, planResponse] = await Promise.all([
         axios.get(`${API_URL}/api/ai/briefing`, { params }),
         axios.get(`${API_URL}/api/ai/alerts`, { params }),
         axios.get(`${API_URL}/api/ai/reminders`, { params }),
         axios.get(`${API_URL}/api/ai/suggested-questions`, { params }),
         axios.get(`${API_URL}/api/ai/frost/status`, { params }),
+        axios.get(`${API_URL}/api/ai/memory`, { params }).catch(() => ({ data: { memories: [] } })),
+        axios.get(`${API_URL}/api/ai/predictions`, { params }).catch(() => ({ data: { predictions: { inventory: [], sales: [], cashflow: [], waste: [] } } })),
+        axios.get(`${API_URL}/api/ai/profit-advisor`, { params }).catch(() => ({ data: { recommendations: [] } })),
+        axios.get(`${API_URL}/api/ai/daily-plan`, { params }).catch(() => ({ data: null })),
       ]);
       setAiAssistantData((current) => ({
         ...current,
@@ -2321,6 +2331,10 @@ function App() {
         providers: statusResponse.data.providers || [],
         engines: statusResponse.data.engines || [],
         usage: statusResponse.data.usage || null,
+        memories: memoryResponse.data.memories || [],
+        predictions: predictionsResponse.data.predictions || { inventory: [], sales: [], cashflow: [], waste: [] },
+        profitAdvisor: profitResponse.data.recommendations || [],
+        dailyPlan: planResponse.data,
         period: { range, ...(briefingResponse.data.period || {}) },
         loading: false,
         error: "",
@@ -2487,6 +2501,36 @@ function App() {
       setSyncMessage(response.data.message || "FROST action recorded for approval.");
     } catch (error) {
       setSyncMessage(getErrorMessage(error, "Unable to record FROST action."));
+    }
+  };
+
+  const proposeFrostMemory = async (content) => {
+    try {
+      await axios.post(`${API_URL}/api/ai/memory/propose`, {
+        user_id: user?.id,
+        content,
+        source_type: "owner_statement",
+      });
+      setSyncMessage("FROST memory proposed for owner approval.");
+      await loadAiAssistant(aiRange);
+    } catch (error) {
+      setSyncMessage(getErrorMessage(error, "Unable to propose FROST memory."));
+    }
+  };
+
+  const updateFrostMemory = async (memoryId, action, payload = {}) => {
+    try {
+      const nextAction = String(action || "").toLowerCase();
+      if (nextAction === "approve") {
+        await axios.post(`${API_URL}/api/ai/memory/${memoryId}/approve`, { user_id: user?.id });
+      } else if (nextAction === "delete") {
+        await axios.delete(`${API_URL}/api/ai/memory/${memoryId}`, { data: { user_id: user?.id } });
+      } else {
+        await axios.patch(`${API_URL}/api/ai/memory/${memoryId}`, { user_id: user?.id, ...payload });
+      }
+      await loadAiAssistant(aiRange);
+    } catch (error) {
+      setSyncMessage(getErrorMessage(error, "Unable to update FROST memory."));
     }
   };
 
@@ -4250,6 +4294,7 @@ function App() {
 
           {activeView === "ai-assistant" && (
             <AiBusinessAssistantModule
+              activeTab={frostActiveTab}
               data={aiAssistantData}
               onAlertAction={updateAiAlert}
               onAsk={askAiAssistant}
@@ -4260,6 +4305,9 @@ function App() {
               }}
               onRefresh={() => loadAiAssistant(aiRange)}
               onReminderAction={updateAiReminder}
+              onMemoryAction={updateFrostMemory}
+              onProposeMemory={proposeFrostMemory}
+              onTabChange={setFrostActiveTab}
               onSaveSettings={saveFrostSettings}
               onStartVoice={startFrostVoice}
               onStopVoice={stopFrostVoice}
@@ -5119,6 +5167,7 @@ function App() {
 const aiSeverityClass = (severity = "INFO") => `ai-severity ai-severity-${String(severity).toLowerCase()}`;
 
 function AiBusinessAssistantModule({
+  activeTab = "briefing",
   data,
   onAlertAction,
   onAsk,
@@ -5127,9 +5176,12 @@ function AiBusinessAssistantModule({
   onRangeChange,
   onRefresh,
   onReminderAction,
+  onMemoryAction,
+  onProposeMemory,
   onSaveSettings,
   onStartVoice,
   onStopVoice,
+  onTabChange,
   onProposeAction,
   onSelectQuestion,
   question,
@@ -5144,6 +5196,17 @@ function AiBusinessAssistantModule({
   const periodLabel = data.period?.label || briefing.period?.label || "Current data";
   const cardValue = (section, key, fallback = 0) => cards[section]?.[key] ?? fallback;
   const money = (value) => currency.format(Number(value || 0));
+  const tabItems = [
+    ["briefing", "Briefing"],
+    ["ask", "Ask FROST"],
+    ["alerts", "Alerts"],
+    ["predictions", "Predictions"],
+    ["profit", "Profit Advisor"],
+    ["memory", "Memory"],
+    ["reminders", "Reminders"],
+    ["history", "History"],
+    ["settings", "Settings"],
+  ];
   const openLinkedModule = (type) => {
     if (type === "customer") return onNavigate("accounts");
     if (type === "supplier" || type === "purchase") return onNavigate("pending-bills");
@@ -5178,16 +5241,30 @@ function AiBusinessAssistantModule({
         voice={data.voice || {}}
       />
 
-      <div className="ai-brief-grid">
+      <div className="frost-tabs" role="tablist" aria-label="FROST sections">
+        {tabItems.map(([key, label]) => (
+          <button
+            className={activeTab === key ? "frost-tab frost-tab-active" : "frost-tab"}
+            key={key}
+            onClick={() => onTabChange?.(key)}
+            type="button"
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {activeTab === "briefing" && <div className="ai-brief-grid">
         <SummaryMetric featured label="Sales" value={money(cardValue("sales", "totalSales"))} />
         <SummaryMetric label="Gross Profit" positive value={money(cardValue("sales", "estimatedGrossProfit"))} />
         <SummaryMetric label="Customer Overdue" value={money(cardValue("customerOutstanding", "totalOutstanding"))} />
         <SummaryMetric label="Supplier Due" value={money(cardValue("supplierOutstanding", "totalOutstanding"))} />
         <SummaryMetric label="Pending Bills" value={cardValue("pendingPurchases", "count")} />
         <SummaryMetric label="Low Stock" value={cardValue("lowStock", "count")} />
-      </div>
+      </div>}
 
-      <div className="ai-layout">
+      {(activeTab === "ask" || activeTab === "briefing") && <div className="ai-layout">
+        {activeTab === "ask" && (
         <ModuleCard eyebrow="Ask FROST" title="Controlled Business Questions" subtitle="Answers use the shared FROST service layer. No write action is performed without owner approval.">
           {data.loading && <div className="ai-thinking"><span /> FROST is thinking</div>}
           <div className="ai-question-box">
@@ -5208,10 +5285,14 @@ function AiBusinessAssistantModule({
             </article>
           )}
         </ModuleCard>
+        )}
 
+        {activeTab === "briefing" && (
         <ModuleCard eyebrow="Daily Owner Brief" title="Top Recommendations" subtitle="Deterministic alerts remain available even when external AI providers are disabled.">
           <div className="ai-recommendations">
+            {(data.dailyPlan?.top_priorities || []).slice(0, 5).map((item) => <p key={`priority-${item}`}>Start My Day: {item}</p>)}
             {(briefing.recommendations || ["No briefing loaded yet."]).map((item) => <p key={item}>{item}</p>)}
+            {(data.dailyPlan?.can_wait || []).slice(0, 3).map((item) => <p key={`wait-${item}`}>Can wait: {item}</p>)}
           </div>
           <div className="ai-collection-strip">
             <span>Cash {money(cardValue("collections", "cash"))}</span>
@@ -5220,15 +5301,33 @@ function AiBusinessAssistantModule({
             <span>Waste {money(cardValue("waste", "totalWasteCost"))}</span>
           </div>
         </ModuleCard>
-      </div>
+        )}
+      </div>}
 
-      <FrostConfigurationPanel
+      {activeTab === "predictions" && (
+        <FrostPredictionsPanel predictions={data.predictions || {}} onProposeAction={onProposeAction} />
+      )}
+
+      {activeTab === "profit" && (
+        <FrostProfitAdvisorPanel recommendations={data.profitAdvisor || []} onProposeAction={onProposeAction} />
+      )}
+
+      {activeTab === "memory" && (
+        <FrostMemoryPanel
+          canManage={canManageFrost}
+          memories={data.memories || []}
+          onMemoryAction={onMemoryAction}
+          onProposeMemory={onProposeMemory}
+        />
+      )}
+
+      {activeTab === "settings" && <FrostConfigurationPanel
         canManage={canManageFrost}
         data={data}
         onSave={onSaveSettings}
-      />
+      />}
 
-      <ModuleCard eyebrow="AI Briefing Cards" title="Owner Copilot Priorities" subtitle="Each action is read-only or recorded for owner approval. FROST never executes business changes directly.">
+      {activeTab === "briefing" && <ModuleCard eyebrow="AI Briefing Cards" title="Owner Copilot Priorities" subtitle="Each action is read-only or recorded for owner approval. FROST never executes business changes directly.">
         <div className="frost-card-grid">
           {(briefing.insightCards || []).map((card) => (
             <article className={`frost-insight-card frost-priority-${String(card.priority || "Information").toLowerCase()}`} key={card.id}>
@@ -5245,9 +5344,10 @@ function AiBusinessAssistantModule({
           ))}
           {(!briefing.insightCards || briefing.insightCards.length === 0) && <div className="cart-empty">Refresh FROST to generate briefing cards.</div>}
         </div>
-      </ModuleCard>
+      </ModuleCard>}
 
-      <div className="ai-layout">
+      {(activeTab === "alerts" || activeTab === "reminders") && <div className="ai-layout ai-layout-single">
+        {activeTab === "alerts" && (
         <ModuleCard eyebrow="Priority Alerts" title="Needs Attention" subtitle="Acknowledge, snooze or resolve after reviewing the linked module.">
           <DataTable headers={["Severity", "Alert", "Source", "Actions"]}>
             {(data.alerts || []).slice(0, 12).map((alert) => (
@@ -5267,7 +5367,9 @@ function AiBusinessAssistantModule({
             {(!data.alerts || data.alerts.length === 0) && <tr><td colSpan="4" className="empty-cell">No open AI alerts for this period.</td></tr>}
           </DataTable>
         </ModuleCard>
+        )}
 
+        {activeTab === "reminders" && (
         <ModuleCard eyebrow="Reminder Centre" title="Drafts and Follow-ups" subtitle="WhatsApp messages are drafts only until an owner reviews and approves them.">
           <DataTable headers={["Priority", "Reminder", "Due", "Actions"]}>
             {(data.reminders || []).slice(0, 10).map((reminder) => (
@@ -5287,9 +5389,10 @@ function AiBusinessAssistantModule({
             {(!data.reminders || data.reminders.length === 0) && <tr><td colSpan="4" className="empty-cell">No reminders queued.</td></tr>}
           </DataTable>
         </ModuleCard>
-      </div>
+        )}
+      </div>}
 
-      <ModuleCard eyebrow="Conversation History" title="Audited FROST Answers" subtitle="Questions, verified facts, token usage and provider context are recorded on the backend.">
+      {activeTab === "history" && <ModuleCard eyebrow="Conversation History" title="Audited FROST Answers" subtitle="Questions, verified facts, token usage and provider context are recorded on the backend.">
         <div className="ai-history-list">
           {data.history.map((item) => (
             <article key={item.id} className="ai-history-item">
@@ -5300,8 +5403,97 @@ function AiBusinessAssistantModule({
           ))}
           {data.history.length === 0 && <div className="cart-empty">Ask a question to start an audited business conversation.</div>}
         </div>
-      </ModuleCard>
+      </ModuleCard>}
     </section>
+  );
+}
+
+function FrostPredictionsPanel({ predictions = {}, onProposeAction }) {
+  const groups = [
+    ["inventory", "Inventory", predictions.inventory || []],
+    ["sales", "Sales", predictions.sales || []],
+    ["cashflow", "Cash Flow", predictions.cashflow || []],
+    ["waste", "Waste", predictions.waste || []],
+  ];
+  return (
+    <div className="frost-panel-stack">
+      {groups.map(([key, label, rows]) => (
+        <ModuleCard key={key} eyebrow="Predictive Intelligence" title={`${label} Predictions`} subtitle="Deterministic ranges only. FROST returns insufficient data instead of guessing.">
+          <div className="frost-card-grid">
+            {rows.map((item, index) => (
+              <article className="frost-insight-card" key={`${item.type || key}-${item.entity_id || index}`}>
+                <span>{Math.round(Number(item.confidence || 0) * 100)}% confidence</span>
+                <strong>{item.title}</strong>
+                <p>{item.payload?.status === "INSUFFICIENT_DATA" ? "Insufficient data" : item.payload?.range ? `${currency.format(item.payload.range[0])} - ${currency.format(item.payload.range[1])}` : item.payload?.likelyLowStockDate || item.recommendation}</p>
+                <small>{item.prediction_period} - {item.reason}</small>
+                <small>Minimum data: {item.minimum_data_requirement}</small>
+                <button className="table-action" onClick={() => onProposeAction?.("review prediction", { prediction_type: item.type, entity_id: item.entity_id })}>Review</button>
+              </article>
+            ))}
+            {rows.length === 0 && <div className="cart-empty">No {label.toLowerCase()} predictions available yet.</div>}
+          </div>
+        </ModuleCard>
+      ))}
+    </div>
+  );
+}
+
+function FrostProfitAdvisorPanel({ recommendations = [], onProposeAction }) {
+  return (
+    <ModuleCard eyebrow="Profit Advisor" title="Grounded Margin Recommendations" subtitle="Recommendations are proposals only and require owner approval before any business action.">
+      <DataTable headers={["Product", "Margin", "Recent", "Recommendation", "Action"]}>
+        {recommendations.map((item) => (
+          <tr key={item.product_id}>
+            <td className="primary-cell">{item.product_name}<small className="cell-note">Cost {currency.format(item.current_purchase_cost)} - Rate {currency.format(item.current_selling_rate)}</small></td>
+            <td>{item.estimated_gross_margin === null ? "No cost data" : `${item.estimated_gross_margin}%`}<small className="cell-note">Waste adjusted {item.waste_adjusted_margin === null ? "n/a" : `${item.waste_adjusted_margin}%`}</small></td>
+            <td>{item.recent_sales_quantity} sold<small className="cell-note">{item.recent_waste} waste</small></td>
+            <td>{item.proposed_action}<small className="cell-note">{item.expected_impact_range}</small></td>
+            <td><button className="table-action" onClick={() => onProposeAction?.(item.proposed_action, { product_id: item.product_id, source: "profit_advisor" })}>Propose</button></td>
+          </tr>
+        ))}
+        {recommendations.length === 0 && <tr><td colSpan="5" className="empty-cell">No profit recommendations available yet.</td></tr>}
+      </DataTable>
+    </ModuleCard>
+  );
+}
+
+function FrostMemoryPanel({ canManage, memories = [], onMemoryAction, onProposeMemory }) {
+  const [draft, setDraft] = useState("");
+  const [search, setSearch] = useState("");
+  const filtered = memories.filter((memory) => {
+    const text = `${memory.title || ""} ${memory.content || ""} ${memory.memory_type || ""} ${memory.entity_type || ""}`.toLowerCase();
+    return text.includes(search.toLowerCase());
+  });
+  const submit = async () => {
+    if (!draft.trim()) return;
+    await onProposeMemory?.(draft.trim());
+    setDraft("");
+  };
+  return (
+    <ModuleCard eyebrow="Business Memory" title="Owner-Approved FROST Memory" subtitle="FROST proposes memories, but owner approval controls what becomes active. Secrets are rejected.">
+      <div className="frost-memory-tools">
+        <textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Example: Remember Raj Traders is a VIP customer." />
+        <button className="primary-button" disabled={!canManage || !draft.trim()} onClick={submit}><Icon name="message" /> Propose Memory</button>
+        <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search memories" />
+      </div>
+      <DataTable headers={["Status", "Memory", "Source", "Actions"]}>
+        {filtered.map((memory) => (
+          <tr key={memory.id}>
+            <td><span className={aiSeverityClass(memory.approval_status === "APPROVED" && memory.is_active ? "INFO" : "ATTENTION")}>{memory.approval_status}</span></td>
+            <td className="primary-cell">{memory.title}<small className="cell-note">{memory.content}</small><small className="cell-note">{memory.memory_type} - confidence {Math.round(Number(memory.confidence || 0) * 100)}%</small></td>
+            <td>{memory.source_type || "manual"}<small className="cell-note">Created {formatDisplayDate(memory.created_at)} - Last used {memory.last_used_at ? formatDisplayDate(memory.last_used_at) : "not used"}</small></td>
+            <td>
+              <div className="button-row table-actions-row">
+                <button className="table-action" disabled={!canManage || memory.approval_status === "APPROVED"} onClick={() => onMemoryAction?.(memory.id, "APPROVE")}>Approve</button>
+                <button className="table-action" disabled={!canManage} onClick={() => onMemoryAction?.(memory.id, "PATCH", { is_active: !memory.is_active })}>{memory.is_active ? "Disable" : "Enable"}</button>
+                <button className="remove-button" disabled={!canManage} onClick={() => onMemoryAction?.(memory.id, "DELETE")}>Delete</button>
+              </div>
+            </td>
+          </tr>
+        ))}
+        {filtered.length === 0 && <tr><td colSpan="4" className="empty-cell">No matching FROST memories.</td></tr>}
+      </DataTable>
+    </ModuleCard>
   );
 }
 

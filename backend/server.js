@@ -2095,6 +2095,66 @@ const initializeDatabase = async () => {
       created_by INTEGER REFERENCES users(id),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS frost_memories (
+      id SERIAL PRIMARY KEY,
+      company_id INTEGER DEFAULT 1,
+      branch_id INTEGER REFERENCES branches(id),
+      memory_type VARCHAR(80) NOT NULL,
+      entity_type VARCHAR(80),
+      entity_id VARCHAR(120),
+      title VARCHAR(220) NOT NULL,
+      content TEXT NOT NULL,
+      source_type VARCHAR(80) NOT NULL DEFAULT 'owner_statement',
+      source_reference TEXT,
+      confidence NUMERIC(5, 2) NOT NULL DEFAULT 0,
+      approval_status VARCHAR(40) NOT NULL DEFAULT 'PENDING_OWNER_APPROVAL',
+      approved_by INTEGER REFERENCES users(id),
+      created_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      last_used_at TIMESTAMP,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE
+    );
+    CREATE INDEX IF NOT EXISTS frost_memories_lookup_idx ON frost_memories (memory_type, entity_type, entity_id, approval_status, is_active);
+
+    CREATE TABLE IF NOT EXISTS frost_prediction_runs (
+      id SERIAL PRIMARY KEY,
+      company_id INTEGER DEFAULT 1,
+      branch_id INTEGER REFERENCES branches(id),
+      prediction_scope VARCHAR(80) NOT NULL,
+      period_label VARCHAR(120),
+      data_used JSONB NOT NULL DEFAULT '{}'::jsonb,
+      run_status VARCHAR(40) NOT NULL DEFAULT 'COMPLETED',
+      created_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS frost_predictions (
+      id SERIAL PRIMARY KEY,
+      run_id INTEGER REFERENCES frost_prediction_runs(id) ON DELETE SET NULL,
+      company_id INTEGER DEFAULT 1,
+      branch_id INTEGER REFERENCES branches(id),
+      prediction_type VARCHAR(80) NOT NULL,
+      entity_type VARCHAR(80),
+      entity_id VARCHAR(120),
+      title VARCHAR(220) NOT NULL,
+      prediction_period VARCHAR(120),
+      prediction_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      confidence NUMERIC(5, 2) NOT NULL DEFAULT 0,
+      reason TEXT,
+      minimum_data_requirement TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS frost_predictions_type_idx ON frost_predictions (prediction_type, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS frost_prediction_accuracy (
+      id SERIAL PRIMARY KEY,
+      prediction_id INTEGER REFERENCES frost_predictions(id) ON DELETE CASCADE,
+      actual_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      accuracy_score NUMERIC(6, 3),
+      evaluated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS cancelled_by INTEGER REFERENCES users(id);
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP;
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
