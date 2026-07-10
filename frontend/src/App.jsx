@@ -311,7 +311,7 @@ const buildConnectionStatusModel = ({ backendHealth = {}, syncStatus = {}, inter
 
   let syncSummary = "Backend status not checked";
   if (failed > 0 || syncStatus?.lastError) {
-    syncSummary = `Sync Failed${syncStatus?.lastError ? ` - ${syncStatus.lastError}` : ""}`;
+    syncSummary = "Sync Failed";
   } else if (conflicts > 0) {
     syncSummary = "Conflict";
   } else if (syncStatus?.syncing) {

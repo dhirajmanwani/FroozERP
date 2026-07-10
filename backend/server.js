@@ -6522,6 +6522,28 @@ const approveDevice = async ({ deviceId, approvedBy, branchId = 1, counterId = n
   return result.rows[0];
 };
 
+const hasApprovedOwnerDevice = async (client = pool) => {
+  const result = await client.query(
+    `
+    SELECT 1
+    FROM authorized_devices d
+    JOIN auth_audit_log a ON a.device_id = d.device_id
+    JOIN users u ON u.id = a.user_id
+    JOIN roles r ON r.id = u.role_id
+    WHERE d.status = 'APPROVED'
+      AND a.action = 'LOGIN_SUCCESS'
+      AND r.role_name = 'Owner'
+    LIMIT 1
+    `
+  );
+  return result.rows.length > 0;
+};
+
+const isFirstOwnerBootstrapLogin = (user, username, password) =>
+  user?.role_name === "Owner"
+  && cleanText(username).toLowerCase() === "owner"
+  && String(password || "") === "8386";
+
 const normalizeSyncStatus = (value) => String(value || "").trim().toLowerCase();
 const SYNC_OPERATION_TYPES = new Set(["UPSERT", "DELETE", "CREATE", "UPDATE", "SALE_EDIT", "SALE_CANCEL"]);
 const SYNC_ENTITY_TYPES = new Set(["sync_test", "pos_sale"]);
@@ -7960,6 +7982,60 @@ app.post("/devices/activate", async (req, res) => {
   }
 });
 
+app.post("/bootstrap/first-owner-device", async (req, res) => {
+  try {
+    const username = cleanText(req.body.username);
+    const password = String(req.body.password || "");
+    const devicePayload = readDevicePayload(req.body, req);
+    if (!devicePayload.device_id) return res.status(400).json({ message: "device_id is required" });
+
+    const userResult = await pool.query(
+      `
+      SELECT u.id, u.username, u.password_hash, u.branch_id, u.active, r.role_name
+      FROM users u
+      JOIN roles r ON r.id = u.role_id
+      WHERE LOWER(u.username) = LOWER($1)
+      LIMIT 1
+      `,
+      [username]
+    );
+    const user = userResult.rows[0];
+    if (!user || user.active === false || !passwordMatches(password, user.password_hash) || !isFirstOwnerBootstrapLogin(user, username, password)) {
+      return res.status(403).json({ message: "First owner device bootstrap requires valid owner credentials." });
+    }
+
+    const ownerDeviceExists = await hasApprovedOwnerDevice();
+    if (ownerDeviceExists) {
+      return res.status(409).json({ message: "An approved owner device already exists. Use normal device approval." });
+    }
+
+    await upsertDeviceRequest(devicePayload);
+    const device = await approveDevice({
+      deviceId: devicePayload.device_id,
+      approvedBy: user.id,
+      branchId: user.branch_id || devicePayload.assigned_branch_id || 1,
+      counterId: devicePayload.assigned_counter_id,
+      reason: "One-time first owner device bootstrap",
+    });
+    console.info("first owner device auto-approved", {
+      username: user.username,
+      user_id: user.id,
+      device_id: device.device_id,
+      branch_id: user.branch_id || 1,
+      route: "/bootstrap/first-owner-device",
+    });
+    return res.json({
+      success: true,
+      device_id: device.device_id,
+      device_status: device.status,
+      message: "First owner device approved. Sign in again.",
+    });
+  } catch (error) {
+    console.error("First owner device bootstrap failed", error.message);
+    return res.status(500).json({ message: "First owner device bootstrap failed" });
+  }
+});
+
 app.put("/settings/devices/:deviceId", async (req, res) => {
   try {
     const manager = await requireRateManager(req.body.updated_by);
@@ -8273,15 +8349,20 @@ app.post("/login", async (req, res) => {
       });
     }
     let device = await upsertDeviceRequest(devicePayload);
-    const approvedCountResult = await pool.query("SELECT COUNT(*)::INTEGER AS count FROM authorized_devices WHERE status = 'APPROVED'");
-    const approvedCount = Number(approvedCountResult.rows[0]?.count || 0);
-    if (approvedCount === 0 && ["Owner", "Admin"].includes(user.role_name)) {
+    const ownerDeviceExists = await hasApprovedOwnerDevice();
+    if (!ownerDeviceExists && isFirstOwnerBootstrapLogin(user, username, password)) {
       device = await approveDevice({
         deviceId: devicePayload.device_id,
         approvedBy: user.id,
         branchId: user.branch_id || 1,
         counterId: devicePayload.assigned_counter_id,
-        reason: "Bootstrap approval for first Owner/Admin device",
+        reason: "Bootstrap approval for first Owner device",
+      });
+      console.info("first owner device auto-approved", {
+        username: user.username,
+        user_id: user.id,
+        device_id: device.device_id,
+        branch_id: user.branch_id || 1,
       });
     }
     if (device.status !== "APPROVED") {
@@ -8299,6 +8380,13 @@ app.post("/login", async (req, res) => {
         deviceId: device.device_id,
         ipAddress: req.ip,
         details: { stage: "device_authorisation", device_status: device.status },
+      });
+      console.warn("device pending approval", {
+        username: user.username,
+        user_id: user.id,
+        device_id: device.device_id,
+        device_status: device.status,
+        role: user.role_name,
       });
       return res.status(403).json({
         code,
@@ -8326,6 +8414,13 @@ app.post("/login", async (req, res) => {
       deviceId: device.device_id,
       ipAddress: req.ip,
       details: { branch_id: user.branch_id, role: user.role_name },
+    });
+    console.info("login success", {
+      username: user.username,
+      user_id: user.id,
+      device_id: device.device_id,
+      role: user.role_name,
+      branch_id: user.branch_id || 1,
     });
 
     return res.json({
