@@ -1949,6 +1949,7 @@ const initializeDatabase = async () => {
     ALTER TABLE ai_settings ADD COLUMN IF NOT EXISTS branch_id INTEGER REFERENCES branches(id);
     ALTER TABLE ai_settings ADD COLUMN IF NOT EXISTS thresholds JSONB NOT NULL DEFAULT '{}'::jsonb;
     ALTER TABLE ai_settings ADD COLUMN IF NOT EXISTS ai_provider_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE ai_settings ADD COLUMN IF NOT EXISTS frost_settings JSONB NOT NULL DEFAULT '{}'::jsonb;
 
     CREATE TABLE IF NOT EXISTS ai_alerts (
       id SERIAL PRIMARY KEY,
@@ -2058,6 +2059,42 @@ const initializeDatabase = async () => {
       approval_status VARCHAR(30) DEFAULT 'READ_ONLY',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS ai_cache (
+      id SERIAL PRIMARY KEY,
+      cache_key VARCHAR(80) UNIQUE NOT NULL,
+      engine_key VARCHAR(80) NOT NULL,
+      provider_key VARCHAR(80) NOT NULL,
+      request_hash VARCHAR(80) NOT NULL,
+      request_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      response_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      expires_at TIMESTAMP NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS ai_cache_expires_idx ON ai_cache (expires_at);
+
+    CREATE TABLE IF NOT EXISTS ai_token_usage (
+      id SERIAL PRIMARY KEY,
+      conversation_id INTEGER REFERENCES ai_conversations(id) ON DELETE SET NULL,
+      engine_key VARCHAR(80) NOT NULL,
+      provider_key VARCHAR(80) NOT NULL,
+      model VARCHAR(120),
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      estimated_cost NUMERIC(14, 6) NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS ai_token_usage_created_idx ON ai_token_usage (created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS ai_engine_events (
+      id SERIAL PRIMARY KEY,
+      engine_key VARCHAR(80) NOT NULL,
+      event_type VARCHAR(80) NOT NULL,
+      status VARCHAR(40) NOT NULL DEFAULT 'READY',
+      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_by INTEGER REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS cancelled_by INTEGER REFERENCES users(id);
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP;
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;
@@ -2121,6 +2158,9 @@ const initializeDatabase = async () => {
       FALSE
     )
     ON CONFLICT (id) DO NOTHING;
+    UPDATE ai_settings
+    SET frost_settings = COALESCE(NULLIF(frost_settings, '{}'::jsonb), '{"assistantName":"FROST","providerKey":"deterministic","model":"","enabled":false,"streamingEnabled":true,"cacheEnabled":true,"voicePrepared":true,"maxInputTokens":6000,"maxOutputTokens":1200,"costAlertAmount":500}'::jsonb)
+    WHERE id = 1;
 
     INSERT INTO role_permission_settings (role_name, permissions)
     VALUES

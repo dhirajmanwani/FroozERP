@@ -4283,6 +4283,37 @@ tbody tr:last-child td {
   gap: 12px;
 }
 
+.ai-config-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.ai-engine-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  margin-top: 14px;
+}
+
+.ai-engine-chip {
+  align-items: center;
+  background: rgba(15, 23, 42, 0.78);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  color: var(--muted-text);
+  display: flex;
+  justify-content: space-between;
+  padding: 10px 12px;
+  text-transform: capitalize;
+}
+
+.ai-engine-chip strong {
+  color: #86efac;
+  font-size: 0.76rem;
+  letter-spacing: 0;
+}
+
 @media (max-width: 920px) {
   .ai-toolbar,
   .ai-question-box {

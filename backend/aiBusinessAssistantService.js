@@ -6,6 +6,11 @@ const {
   buildReminderDedupKey,
   assertGroundedAnswer,
 } = require("./aiBusinessAssistantRules");
+const {
+  DEFAULT_FROST_SETTINGS,
+  FROST_ASSISTANT_NAME,
+  FrostServiceLayer,
+} = require("./frostCore");
 
 const DEFAULT_THRESHOLDS = {
   dueSoonDays: 3,
@@ -76,14 +81,6 @@ const maskPhone = (value) => {
   return `${"*".repeat(Math.max(0, text.length - 4))}${text.slice(-4)}`;
 };
 
-const getAiProvider = () => ({
-  configured: Boolean(cleanText(process.env.AI_PROVIDER) && cleanText(process.env.AI_API_KEY)),
-  name: cleanText(process.env.AI_PROVIDER) || "deterministic",
-  async explain() {
-    return null;
-  },
-});
-
 const severityFromRisk = (risk) => {
   if (risk === "CRITICAL" || risk === "CRITICAL_OUTSTANDING") return "CRITICAL";
   if (risk === "HIGH" || risk === "SERIOUSLY_OVERDUE") return "HIGH";
@@ -95,19 +92,24 @@ const requireAiPermission = async ({ req, res, getPermissionUser, permission, fa
   const userId = req.query.user_id || req.body?.user_id || req.headers["x-user-id"];
   const user = await getPermissionUser(userId, permission, fallbackRoles);
   if (!user) {
-    res.status(403).json({ message: "You do not have permission to use this AI Business Assistant feature" });
+    res.status(403).json({ message: "You do not have permission to use this FROST feature" });
     return null;
   }
   return user;
 };
 
-const getAiSettings = async (pool) => {
+const getAiSettings = async (pool, frost = new FrostServiceLayer({ pool })) => {
   const result = await pool.query("SELECT * FROM ai_settings WHERE id = 1");
   const row = result.rows[0] || {};
+  const frostSettings = await frost.getSettings();
   return {
     ...row,
     thresholds: { ...DEFAULT_THRESHOLDS, ...(row.thresholds || {}) },
-    provider: getAiProvider(),
+    frost: { ...DEFAULT_FROST_SETTINGS, ...(row.frost_settings || {}), assistantName: FROST_ASSISTANT_NAME },
+    provider: frostSettings.provider,
+    providers: frostSettings.providers,
+    engines: frostSettings.engines,
+    cache: frostSettings.cache,
   };
 };
 
@@ -590,6 +592,29 @@ const auditQuestion = async ({ pool, user, deviceId, question, classification, r
 };
 
 const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requireRateManager }) => {
+  const frost = new FrostServiceLayer({ pool });
+
+  app.get("/api/ai/frost/status", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
+    if (!user) return;
+    const [settings, usage] = await Promise.all([frost.getSettings(), frost.getUsageSummary()]);
+    return res.json({
+      assistant: FROST_ASSISTANT_NAME,
+      frost: settings.frost,
+      engines: settings.engines,
+      provider: settings.provider,
+      providers: settings.providers,
+      cache: settings.cache,
+      usage,
+    });
+  });
+
+  app.get("/api/ai/providers", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_settings_manage" });
+    if (!user) return;
+    return res.json({ assistant: FROST_ASSISTANT_NAME, providers: frost.getProviderOptions() });
+  });
+
   app.get("/api/ai/suggested-questions", async (req, res) => {
     const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
     if (!user) return;
@@ -599,27 +624,43 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
   app.get("/api/ai/settings", async (req, res) => {
     const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_settings_manage" });
     if (!user) return;
-    const settings = await getAiSettings(pool);
-    return res.json({ thresholds: settings.thresholds, provider: { configured: settings.provider.configured, name: settings.provider.name } });
+    const settings = await getAiSettings(pool, frost);
+    const usage = await frost.getUsageSummary();
+    return res.json({
+      assistant: FROST_ASSISTANT_NAME,
+      thresholds: settings.thresholds,
+      frost: settings.frost,
+      provider: settings.provider,
+      providers: settings.providers,
+      engines: settings.engines,
+      cache: settings.cache,
+      usage,
+    });
   });
 
   app.put("/api/ai/settings", async (req, res) => {
     const manager = await requireRateManager(req.body.updated_by || req.body.user_id);
     if (!manager) return res.status(403).json({ message: "Only Owner/Admin can manage AI settings" });
     const thresholds = { ...DEFAULT_THRESHOLDS, ...(req.body.thresholds || {}) };
-    const result = await pool.query(`
-      UPDATE ai_settings
-      SET thresholds = $1::jsonb, ai_provider_enabled = $2, updated_by = $3, updated_at = CURRENT_TIMESTAMP
-      WHERE id = 1
-      RETURNING *
-    `, [JSON.stringify(thresholds), req.body.ai_provider_enabled === true, manager.id]);
-    return res.json(result.rows[0]);
+    const result = await frost.updateSettings({
+      thresholds,
+      frostSettings: req.body.frost || {
+        providerKey: req.body.provider_key || req.body.providerKey,
+        model: req.body.model,
+        enabled: req.body.ai_provider_enabled === true,
+        streamingEnabled: req.body.streaming_enabled !== false,
+        cacheEnabled: req.body.cache_enabled !== false,
+        voicePrepared: true,
+      },
+      updatedBy: manager.id,
+    });
+    return res.json(result);
   });
 
   app.get("/api/ai/briefing", async (req, res) => {
     const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
     if (!user) return;
-    const settings = await getAiSettings(pool);
+    const settings = await getAiSettings(pool, frost);
     const range = getRange(req.query);
     const briefing = await buildDailyBriefing(pool, settings, range);
     return res.json(briefing);
@@ -703,7 +744,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
     if (!question) return res.status(400).json({ message: "Question is required" });
     const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
     if (!user) return;
-    const settings = await getAiSettings(pool);
+    const settings = await getAiSettings(pool, frost);
     const range = getRange(req.body);
     const classification = classifyQuestion(question);
     if (classification === "FINANCIAL") {
@@ -715,7 +756,11 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
       if (!allowed) return res.status(403).json({ message: "Inventory AI insights are not enabled for this role" });
     }
     const facts = await factsForQuestion(pool, classification, settings, range);
-    const providerAnswer = settings.provider.configured ? await settings.provider.explain({ question, facts, range }) : null;
+    const providerKey = settings.provider?.key || "deterministic";
+    const cacheKey = frost.buildCacheKey({ engine: "conversation", question, facts, range, providerKey });
+    const cached = settings.frost.cacheEnabled !== false ? await frost.getCache(cacheKey) : null;
+    const cachedPayload = cached?.response_payload || null;
+    const providerAnswer = cachedPayload?.answer || null;
     const answer = providerAnswer || buildDeterministicAnswer(classification, facts, range);
     if (!assertGroundedAnswer({ answer, facts })) return res.status(500).json({ message: "AI answer was not grounded in verified facts" });
     const conversationId = await auditQuestion({
@@ -728,15 +773,74 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
       facts,
       answer,
     });
+    const usage = await frost.recordTokenUsage({
+      conversationId,
+      engine: "conversation",
+      providerKey,
+      model: settings.frost.model || "",
+      inputPayload: { question, facts, range },
+      outputText: answer,
+    });
+    if (!cachedPayload && settings.frost.cacheEnabled !== false) {
+      await frost.setCache({
+        cacheKey,
+        engine: "conversation",
+        providerKey,
+        requestPayload: { question, facts, range },
+        responsePayload: { answer, facts, period: range },
+      });
+    }
     return res.json({
+      assistant: FROST_ASSISTANT_NAME,
       conversation_id: conversationId,
       classification,
       period: range,
       answer,
       facts,
-      provider: { configured: settings.provider.configured, name: settings.provider.name },
+      provider: settings.provider,
+      cached: Boolean(cachedPayload),
+      usage,
       approval_required_for_writes: true,
     });
+  });
+
+  app.post("/api/ai/query/stream", async (req, res) => {
+    const question = cleanText(req.body.question);
+    if (!question) return res.status(400).json({ message: "Question is required" });
+    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
+    if (!user) return;
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    const settings = await getAiSettings(pool, frost);
+    const range = getRange(req.body);
+    const classification = classifyQuestion(question);
+    const facts = await factsForQuestion(pool, classification, settings, range);
+    const answer = buildDeterministicAnswer(classification, facts, range);
+    const conversationId = await auditQuestion({
+      pool,
+      user,
+      deviceId: req.body.device_id || req.headers["x-device-id"],
+      question,
+      classification,
+      range,
+      facts,
+      answer,
+    });
+    const usage = await frost.recordTokenUsage({
+      conversationId,
+      engine: "conversation",
+      providerKey: settings.provider?.key || "deterministic",
+      model: settings.frost.model || "",
+      inputPayload: { question, facts, range },
+      outputText: answer,
+    });
+    res.write(`event: meta\ndata: ${JSON.stringify({ assistant: FROST_ASSISTANT_NAME, conversation_id: conversationId, period: range, provider: settings.provider, usage })}\n\n`);
+    for (const chunk of answer.match(/.{1,160}(\s|$)/g) || [answer]) {
+      res.write(`event: delta\ndata: ${JSON.stringify({ text: chunk.trim() })}\n\n`);
+    }
+    res.write(`event: done\ndata: ${JSON.stringify({ done: true })}\n\n`);
+    return res.end();
   });
 };
 

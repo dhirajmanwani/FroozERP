@@ -511,7 +511,7 @@ const icons = {
 
 const navigationItems = [
   ["dashboard", "Dashboard"],
-  ["ai-assistant", "AI Business Assistant"],
+  ["ai-assistant", "FROST AI"],
   ["products", "Products"],
   ["purchase", "Purchase Entry"],
   ["pending-bills", "Pending Bills"],
@@ -1290,6 +1290,11 @@ function App() {
     reminders: [],
     suggestedQuestions: [],
     history: [],
+    frost: null,
+    provider: null,
+    providers: [],
+    engines: [],
+    usage: null,
     period: { range: "today", label: "Today" },
     loading: false,
     error: "",
@@ -2296,11 +2301,12 @@ function App() {
     setAiAssistantData((current) => ({ ...current, loading: true, error: "" }));
     try {
       const params = { user_id: user?.id, device_id: deviceInfo.device_id, range };
-      const [briefingResponse, alertsResponse, remindersResponse, questionsResponse] = await Promise.all([
+      const [briefingResponse, alertsResponse, remindersResponse, questionsResponse, statusResponse] = await Promise.all([
         axios.get(`${API_URL}/api/ai/briefing`, { params }),
         axios.get(`${API_URL}/api/ai/alerts`, { params }),
         axios.get(`${API_URL}/api/ai/reminders`, { params }),
         axios.get(`${API_URL}/api/ai/suggested-questions`, { params }),
+        axios.get(`${API_URL}/api/ai/frost/status`, { params }),
       ]);
       setAiAssistantData((current) => ({
         ...current,
@@ -2308,6 +2314,11 @@ function App() {
         alerts: alertsResponse.data.alerts || [],
         reminders: remindersResponse.data.reminders || [],
         suggestedQuestions: questionsResponse.data.questions || [],
+        frost: statusResponse.data,
+        provider: statusResponse.data.provider || null,
+        providers: statusResponse.data.providers || [],
+        engines: statusResponse.data.engines || [],
+        usage: statusResponse.data.usage || null,
         period: { range, ...(briefingResponse.data.period || {}) },
         loading: false,
         error: "",
@@ -2316,7 +2327,7 @@ function App() {
       setAiAssistantData((current) => ({
         ...current,
         loading: false,
-        error: getErrorMessage(error, offlineMode ? "AI explanations are offline. Deterministic local facts will remain available where cached." : "Unable to load AI Business Assistant data."),
+        error: getErrorMessage(error, offlineMode ? "FROST explanations are offline. Deterministic local facts will remain available where cached." : "Unable to load FROST data."),
       }));
     }
   };
@@ -2344,6 +2355,8 @@ function App() {
             facts: response.data.facts || [],
             period: response.data.period,
             provider: response.data.provider,
+            usage: response.data.usage,
+            cached: response.data.cached,
           },
           ...current.history,
         ].slice(0, 20),
@@ -2361,6 +2374,15 @@ function App() {
 
   const updateAiReminder = async (reminderId, action) => {
     await axios.patch(`${API_URL}/api/ai/reminders/${reminderId}`, { user_id: user?.id, action });
+    await loadAiAssistant(aiRange);
+  };
+
+  const saveFrostSettings = async (frostSettings) => {
+    await axios.put(`${API_URL}/api/ai/settings`, {
+      user_id: user?.id,
+      updated_by: user?.id,
+      frost: frostSettings,
+    });
     await loadAiAssistant(aiRange);
   };
 
@@ -4134,6 +4156,7 @@ function App() {
               }}
               onRefresh={() => loadAiAssistant(aiRange)}
               onReminderAction={updateAiReminder}
+              onSaveSettings={saveFrostSettings}
               onSelectQuestion={(question) => askAiAssistant(question)}
               onNavigate={navigate}
               question={aiQuestion}
@@ -4997,6 +5020,7 @@ function AiBusinessAssistantModule({
   onRangeChange,
   onRefresh,
   onReminderAction,
+  onSaveSettings,
   onSelectQuestion,
   question,
   range,
@@ -5006,6 +5030,7 @@ function AiBusinessAssistantModule({
   const cards = briefing.cards || {};
   const latestAnswer = data.history[0];
   const canManageReminders = user?.role === "Owner" || user?.role === "Admin";
+  const canManageFrost = user?.role === "Owner" || user?.role === "Admin";
   const periodLabel = data.period?.label || briefing.period?.label || "Current data";
   const cardValue = (section, key, fallback = 0) => cards[section]?.[key] ?? fallback;
   const money = (value) => currency.format(Number(value || 0));
@@ -5021,8 +5046,8 @@ function AiBusinessAssistantModule({
       <div className="ai-toolbar">
         <div>
           <span className="eyebrow">Verified Business Facts</span>
-          <h2>AI Business Assistant</h2>
-          <p>Data period: {periodLabel}. Every figure comes from FroozERP modules before explanation.</p>
+          <h2>FROST</h2>
+          <p>FroozERP AI operating system. Data period: {periodLabel}. Every figure comes from verified modules before explanation.</p>
         </div>
         <div className="button-row">
           <select value={range} onChange={(event) => onRangeChange(event.target.value)}>
@@ -5047,7 +5072,7 @@ function AiBusinessAssistantModule({
       </div>
 
       <div className="ai-layout">
-        <ModuleCard eyebrow="Ask FroozERP" title="Controlled Business Questions" subtitle="Answers use approved backend tools only. No write action is performed without owner approval.">
+        <ModuleCard eyebrow="Ask FROST" title="Controlled Business Questions" subtitle="Answers use the shared FROST service layer. No write action is performed without owner approval.">
           <div className="ai-question-box">
             <textarea value={question} onChange={(event) => onQuestionChange(event.target.value)} placeholder="Ask about overdue payments, low stock, sales, profit, expenses or pending purchase bills." />
             <button className="primary-button" disabled={data.loading || !question.trim()} onClick={() => onAsk()}><Icon name="message" /> Ask</button>
@@ -5067,7 +5092,7 @@ function AiBusinessAssistantModule({
           )}
         </ModuleCard>
 
-        <ModuleCard eyebrow="Daily Owner Brief" title="Top Recommendations" subtitle="Deterministic alerts remain available even when external AI is not configured.">
+        <ModuleCard eyebrow="Daily Owner Brief" title="Top Recommendations" subtitle="Deterministic alerts remain available even when external AI providers are disabled.">
           <div className="ai-recommendations">
             {(briefing.recommendations || ["No briefing loaded yet."]).map((item) => <p key={item}>{item}</p>)}
           </div>
@@ -5079,6 +5104,12 @@ function AiBusinessAssistantModule({
           </div>
         </ModuleCard>
       </div>
+
+      <FrostConfigurationPanel
+        canManage={canManageFrost}
+        data={data}
+        onSave={onSaveSettings}
+      />
 
       <div className="ai-layout">
         <ModuleCard eyebrow="Priority Alerts" title="Needs Attention" subtitle="Acknowledge, snooze or resolve after reviewing the linked module.">
@@ -5122,19 +5153,95 @@ function AiBusinessAssistantModule({
         </ModuleCard>
       </div>
 
-      <ModuleCard eyebrow="Conversation History" title="Audited Answers" subtitle="Questions and verified facts are recorded on the backend for owner review.">
+      <ModuleCard eyebrow="Conversation History" title="Audited FROST Answers" subtitle="Questions, verified facts, token usage and provider context are recorded on the backend.">
         <div className="ai-history-list">
           {data.history.map((item) => (
             <article key={item.id} className="ai-history-item">
               <strong>{item.question}</strong>
               <p>{item.answer}</p>
-              <small>{item.period?.label || periodLabel}</small>
+              <small>{item.period?.label || periodLabel}{item.cached ? " - cached" : ""}{item.usage ? ` - ${item.usage.inputTokens + item.usage.outputTokens} estimated tokens` : ""}</small>
             </article>
           ))}
           {data.history.length === 0 && <div className="cart-empty">Ask a question to start an audited business conversation.</div>}
         </div>
       </ModuleCard>
     </section>
+  );
+}
+
+function FrostConfigurationPanel({ canManage, data, onSave }) {
+  const frost = data.frost?.frost || {};
+  const [draft, setDraft] = useState({
+    assistantName: "FROST",
+    providerKey: frost.providerKey || "deterministic",
+    model: frost.model || "",
+    enabled: frost.enabled === true,
+    streamingEnabled: frost.streamingEnabled !== false,
+    cacheEnabled: frost.cacheEnabled !== false,
+    voicePrepared: frost.voicePrepared !== false,
+    maxInputTokens: frost.maxInputTokens || 6000,
+    maxOutputTokens: frost.maxOutputTokens || 1200,
+    costAlertAmount: frost.costAlertAmount || 500,
+  });
+
+  useEffect(() => {
+    setDraft({
+      assistantName: "FROST",
+      providerKey: frost.providerKey || "deterministic",
+      model: frost.model || "",
+      enabled: frost.enabled === true,
+      streamingEnabled: frost.streamingEnabled !== false,
+      cacheEnabled: frost.cacheEnabled !== false,
+      voicePrepared: frost.voicePrepared !== false,
+      maxInputTokens: frost.maxInputTokens || 6000,
+      maxOutputTokens: frost.maxOutputTokens || 1200,
+      costAlertAmount: frost.costAlertAmount || 500,
+    });
+  }, [frost.providerKey, frost.model, frost.enabled, frost.streamingEnabled, frost.cacheEnabled, frost.voicePrepared, frost.maxInputTokens, frost.maxOutputTokens, frost.costAlertAmount]);
+
+  const update = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
+  const save = async () => {
+    try {
+      await onSave(draft);
+      alert("FROST settings updated");
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to update FROST settings"));
+    }
+  };
+
+  return (
+    <ModuleCard eyebrow="FROST Configuration" title="AI Operating System" subtitle="Provider, engine and usage controls shared by every future AI module.">
+      <div className="ai-config-grid">
+        <Field label="Assistant"><input readOnly value="FROST" /></Field>
+        <Field label="Provider">
+          <select disabled={!canManage} value={draft.providerKey} onChange={(event) => update("providerKey", event.target.value)}>
+            <option value="deterministic">Deterministic only</option>
+            {(data.providers || []).map((provider) => <option key={provider.key} value={provider.key}>{provider.label}</option>)}
+          </select>
+        </Field>
+        <Field label="Model / Deployment"><input disabled={!canManage} value={draft.model} onChange={(event) => update("model", event.target.value)} placeholder="Configured outside secrets" /></Field>
+        <Field label="Cost Alert"><input disabled={!canManage} min="0" type="number" value={draft.costAlertAmount} onChange={(event) => update("costAlertAmount", Number(event.target.value || 0))} /></Field>
+        <label className="check-field"><input checked={draft.enabled} disabled={!canManage} type="checkbox" onChange={(event) => update("enabled", event.target.checked)} /><span>External provider enabled</span></label>
+        <label className="check-field"><input checked={draft.streamingEnabled} disabled={!canManage} type="checkbox" onChange={(event) => update("streamingEnabled", event.target.checked)} /><span>Streaming responses</span></label>
+        <label className="check-field"><input checked={draft.cacheEnabled} disabled={!canManage} type="checkbox" onChange={(event) => update("cacheEnabled", event.target.checked)} /><span>Response caching</span></label>
+        <label className="check-field"><input checked={draft.voicePrepared} disabled={!canManage} type="checkbox" onChange={(event) => update("voicePrepared", event.target.checked)} /><span>Voice engine prepared</span></label>
+      </div>
+      <div className="ai-engine-grid">
+        {(data.engines || []).map((engine) => (
+          <span key={engine.key} className="ai-engine-chip">{engine.key.replaceAll("_", " ")}<strong>{engine.status}</strong></span>
+        ))}
+      </div>
+      <div className="ai-collection-strip">
+        <span>Provider {data.provider?.name || "Deterministic FROST"}</span>
+        <span>Requests today {data.usage?.request_count || 0}</span>
+        <span>Input tokens {data.usage?.input_tokens || 0}</span>
+        <span>Output tokens {data.usage?.output_tokens || 0}</span>
+        <span>Estimated cost {currency.format(Number(data.usage?.estimated_cost || 0))}</span>
+      </div>
+      <div className="button-row">
+        <button className="primary-button" disabled={!canManage} onClick={save}><Icon name="settings" /> Save FROST Settings</button>
+      </div>
+    </ModuleCard>
   );
 }
 
