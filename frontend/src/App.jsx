@@ -327,9 +327,9 @@ const buildConnectionStatusModel = ({ backendHealth = {}, syncStatus = {}, inter
   } else if (pending > 0) {
     syncSummary = `Pending local changes - ${pending}`;
   } else if (freshSync) {
-    syncSummary = `Synced - last sync ${lastSyncText}`;
+    syncSummary = "Cloud connected - synced";
   } else if (cloudReachable) {
-    syncSummary = "Cloud connected - sync not completed yet";
+    syncSummary = "Cloud connected";
   } else if ((API_MODE === API_MODES.LOCAL_SINGLE_DEVICE || API_MODE === API_MODES.BRANCH_LAN_SERVER || API_MODE === API_MODES.BRANCH_LAN_CLIENT) && backendOnline) {
     syncSummary = "No pending local changes - Cloud sync not active";
   } else if (backendOnline) {
