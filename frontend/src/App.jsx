@@ -453,7 +453,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.34";
+const APP_VERSION = "1.0.35";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -606,6 +606,42 @@ const getFrostDiagnosticMessage = (error, { offlineMode = false, internetAvailab
   if (serverMessage) return serverMessage;
   if (offlineMode) return "FROST explanations are offline. Deterministic local facts remain available where cached.";
   return "FROST data could not be loaded. Check API mode, authentication, and backend diagnostics, then retry.";
+};
+
+const buildFrostRequestDiagnostic = ({ label, method = "GET", url, response, error, context = {} }) => {
+  const status = response?.status || error?.response?.status || null;
+  const body = response?.data || error?.response?.data || null;
+  const message = body?.message || error?.message || (status ? `HTTP ${status}` : "Request did not complete");
+  return {
+    label,
+    method,
+    url,
+    status,
+    ok: Boolean(response && status >= 200 && status < 300),
+    message,
+    code: body?.code || error?.code || "",
+    apiMode: API_CONFIG.mode,
+    apiUrl: API_URL,
+    userId: context.user?.id || "",
+    role: context.user?.role || context.user?.role_name || "",
+    branchId: context.user?.branch_id || API_CONFIG.branchId || "",
+    deviceId: context.deviceId || "",
+    localBackendHealth: context.backendHealth?.online === true ? "connected" : context.backendHealth?.online === false ? "offline" : "not checked",
+    cloudBackendHealth: context.cloudHealth?.online === true ? "connected" : context.cloudHealth?.online === false ? "offline" : "not checked",
+    authStatus: context.user?.id ? "signed in" : "not signed in",
+  };
+};
+
+const frostDiagnosticsSummary = (diagnostics = []) => {
+  const failed = diagnostics.filter((item) => item.ok === false);
+  if (failed.length === 0) return "";
+  const first = failed[0];
+  if (first.status === 401) return "FROST session expired. Sign in again to refresh owner permissions.";
+  if (first.status === 403) return first.message || "FROST is blocked by owner role permissions.";
+  if (first.status === 404) return `${first.label} endpoint is not available in the selected backend. Installed frontend and backend may be out of sync.`;
+  if (first.localBackendHealth === "offline" && !isCloudMode()) return "Local backend is not running. Start FroozERP local server, then refresh FROST.";
+  if (first.cloudBackendHealth === "offline" && isCloudMode()) return "Cloud backend is unavailable. FROST cannot load cloud business data right now.";
+  return `${first.label} failed: ${first.message}`;
 };
 const getAuthErrorMessage = (error, fallback) => {
   const code = error.response?.data?.code;
@@ -1392,6 +1428,7 @@ function App() {
     profitAdvisor: [],
     autonomous: null,
     dailyPlan: null,
+    diagnostics: [],
     period: { range: "today", label: "Today" },
     loading: false,
     error: "",
@@ -2093,7 +2130,15 @@ function App() {
       await invokeTauriCommand("close_froozerp_window", { allowExit: true });
     } catch (error) {
       setExitAttemptCount((count) => count + 1);
-      setExitCodeError(getErrorMessage(error, "Invalid exit code"));
+      if (!error?.response) {
+        setExitCodeError("Local backend is unavailable, so FroozERP cannot verify the Owner exit code. Start/reconnect the local backend, then try again.");
+      } else if (error.response?.status === 409) {
+        setExitCodeError(getErrorMessage(error, "No Owner exit code is configured. Open Settings > Security / Device Control and set a new code with Owner/Admin password."));
+      } else if (error.response?.status === 403) {
+        setExitCodeError("Invalid exit code. Owner/Admin can reset it in Settings > Security / Device Control using the current account password.");
+      } else {
+        setExitCodeError(getErrorMessage(error, "Unable to verify Owner exit code."));
+      }
     }
   };
 
@@ -2119,7 +2164,10 @@ function App() {
               inputMode="numeric"
               type="password"
               value={exitCodeInput}
-              onChange={(event) => setExitCodeInput(event.target.value.replace(/\D/g, ""))}
+              onChange={(event) => {
+                setExitCodeInput(event.target.value.replace(/\D/g, ""));
+                setExitCodeError("");
+              }}
               onKeyDown={(event) => event.key === "Enter" && verifyExitCodeAndClose()}
             />
           </Field>
@@ -2129,7 +2177,7 @@ function App() {
             <button className="primary-button" disabled={!exitCodeInput || exitCodeInput.length < 4} onClick={verifyExitCodeAndClose}>Unlock and Exit</button>
             <button className="secondary-button" onClick={() => setExitCodeModalOpen(false)}>Stay in FroozERP</button>
           </div>
-          <p className="form-note">Emergency note: if the exit code is forgotten, use Owner/Admin recovery or repair the app without deleting business data.</p>
+          <p className="form-note">Emergency note: if the exit code is forgotten, reset it from Settings &gt; Security / Device Control with the Owner/Admin password. Repair/update the app without deleting business data if Settings cannot open.</p>
         </div>
       </section>
     </div>
@@ -2640,37 +2688,78 @@ function App() {
 
   const loadAiAssistant = async (range = aiRange) => {
     setAiAssistantData((current) => ({ ...current, loading: true, error: "" }));
+    const params = { user_id: user?.id, device_id: deviceInfo.device_id, range };
+    const context = { user, deviceId: deviceInfo.device_id, backendHealth, cloudHealth };
+    const requests = [
+      ["briefing", "FROST briefing", `${API_URL}/api/ai/briefing`, { required: true }],
+      ["alerts", "FROST alerts", `${API_URL}/api/ai/alerts`, { required: true }],
+      ["reminders", "FROST reminders", `${API_URL}/api/ai/reminders`, { required: true }],
+      ["questions", "FROST suggested questions", `${API_URL}/api/ai/suggested-questions`, { required: true }],
+      ["status", "FROST status", `${API_URL}/api/ai/frost/status`, { required: true }],
+      ["compatibility", "FROST compatibility", `${API_URL}/api/system/compatibility`, { required: true, params: { frontend_version: APP_VERSION } }],
+      ["memory", "FROST memory", `${API_URL}/api/ai/memory`, { fallback: { memories: [] } }],
+      ["predictions", "FROST predictions", `${API_URL}/api/ai/predictions`, { fallback: { predictions: { inventory: [], sales: [], cashflow: [], waste: [] } } }],
+      ["profit", "FROST profit advisor", `${API_URL}/api/ai/profit-advisor`, { fallback: { recommendations: [] } }],
+      ["plan", "FROST daily plan", `${API_URL}/api/ai/daily-plan`, { fallback: null }],
+      ["autonomous", "FROST decision center", `${API_URL}/api/ai/autonomous`, { fallback: null }],
+    ];
+    const settled = await Promise.all(requests.map(([key, label, url, options]) =>
+      axios.get(url, { params: { ...params, ...(options.params || {}) }, timeout: 12000, headers: { "X-FroozERP-Frontend-Version": APP_VERSION } }).then((response) => ({
+        key,
+        label,
+        response,
+        data: response.data,
+        diagnostic: buildFrostRequestDiagnostic({ label, url, response, context }),
+      })).catch((error) => ({
+        key,
+        label,
+        error,
+        data: Object.prototype.hasOwnProperty.call(options, "fallback") ? options.fallback : null,
+        diagnostic: buildFrostRequestDiagnostic({ label, url, error, context }),
+        required: options.required === true,
+      }))
+    ));
+    const byKey = Object.fromEntries(settled.map((item) => [item.key, item]));
+    const diagnostics = settled.map((item) => item.diagnostic);
+    const compatibility = byKey.compatibility?.data || null;
+    const mismatchFailure = compatibility && compatibility.compatible === false
+      ? {
+          label: "FROST compatibility",
+          error: new Error("FroozERP components are out of sync. Update or restart is required."),
+          diagnostic: {
+            ...byKey.compatibility.diagnostic,
+            ok: false,
+            message: `FroozERP components are out of sync. Frontend ${compatibility.frontendVersion}, backend ${compatibility.backendVersion}.`,
+          },
+          required: true,
+        }
+      : null;
+    if (mismatchFailure) {
+      diagnostics.push(mismatchFailure.diagnostic);
+    }
+    const requiredFailure = mismatchFailure || settled.find((item) => item.required && item.error);
     try {
-      const params = { user_id: user?.id, device_id: deviceInfo.device_id, range };
-      const [briefingResponse, alertsResponse, remindersResponse, questionsResponse, statusResponse, memoryResponse, predictionsResponse, profitResponse, planResponse, autonomousResponse] = await Promise.all([
-        axios.get(`${API_URL}/api/ai/briefing`, { params }),
-        axios.get(`${API_URL}/api/ai/alerts`, { params }),
-        axios.get(`${API_URL}/api/ai/reminders`, { params }),
-        axios.get(`${API_URL}/api/ai/suggested-questions`, { params }),
-        axios.get(`${API_URL}/api/ai/frost/status`, { params }),
-        axios.get(`${API_URL}/api/ai/memory`, { params }).catch(() => ({ data: { memories: [] } })),
-        axios.get(`${API_URL}/api/ai/predictions`, { params }).catch(() => ({ data: { predictions: { inventory: [], sales: [], cashflow: [], waste: [] } } })),
-        axios.get(`${API_URL}/api/ai/profit-advisor`, { params }).catch(() => ({ data: { recommendations: [] } })),
-        axios.get(`${API_URL}/api/ai/daily-plan`, { params }).catch(() => ({ data: null })),
-        axios.get(`${API_URL}/api/ai/autonomous`, { params }).catch(() => ({ data: null })),
-      ]);
+      if (requiredFailure) throw requiredFailure.error;
+      const briefingData = byKey.briefing?.data || {};
+      const statusData = byKey.status?.data || {};
       setAiAssistantData((current) => ({
         ...current,
-        briefing: briefingResponse.data,
-        alerts: alertsResponse.data.alerts || [],
-        reminders: remindersResponse.data.reminders || [],
-        suggestedQuestions: questionsResponse.data.questions || [],
-        frost: statusResponse.data,
-        provider: statusResponse.data.provider || null,
-        providers: statusResponse.data.providers || [],
-        engines: statusResponse.data.engines || [],
-        usage: statusResponse.data.usage || null,
-        memories: memoryResponse.data.memories || [],
-        predictions: predictionsResponse.data.predictions || { inventory: [], sales: [], cashflow: [], waste: [] },
-        profitAdvisor: profitResponse.data.recommendations || [],
-        autonomous: autonomousResponse.data,
-        dailyPlan: planResponse.data,
-        period: { range, ...(briefingResponse.data.period || {}) },
+        briefing: briefingData,
+        alerts: byKey.alerts?.data?.alerts || [],
+        reminders: byKey.reminders?.data?.reminders || [],
+        suggestedQuestions: byKey.questions?.data?.questions || [],
+        frost: statusData,
+        provider: statusData.provider || null,
+        providers: statusData.providers || [],
+        engines: statusData.engines || [],
+        usage: statusData.usage || null,
+        memories: byKey.memory?.data?.memories || [],
+        predictions: byKey.predictions?.data?.predictions || { inventory: [], sales: [], cashflow: [], waste: [] },
+        profitAdvisor: byKey.profit?.data?.recommendations || [],
+        autonomous: byKey.autonomous?.data,
+        dailyPlan: byKey.plan?.data,
+        diagnostics,
+        period: { range, ...(briefingData.period || {}) },
         loading: false,
         error: "",
       }));
@@ -2678,7 +2767,8 @@ function App() {
       setAiAssistantData((current) => ({
         ...current,
         loading: false,
-        error: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth }),
+        diagnostics,
+        error: frostDiagnosticsSummary(diagnostics) || getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth }),
       }));
     }
   };
@@ -4502,10 +4592,9 @@ function App() {
     ["products", "Search Product", () => navigate("products")],
     ["accounts", "Search Customer", () => navigate("accounts")],
     ["accounts", "Search Supplier", () => navigate("accounts")],
-    ["frost", "Ask FROST", () => openFrostDrawer("ask")],
     ["settings", "Open Update Center", () => navigate("settings")],
     ["settings", "Check Connection", () => { navigate("settings"); performConnectivityCheck("command-palette", { force: true }); }],
-  ].filter(([view]) => view === "frost" || (hasModuleAccess(view) && (canManageRates || view !== "sale-rates")));
+  ].filter(([view]) => hasModuleAccess(view) && (canManageRates || view !== "sale-rates"));
   return (
     <main className="erp-shell">
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
@@ -5222,11 +5311,15 @@ function App() {
                 applicationFontSize={applicationFontSize}
                 backendHealth={backendHealth}
                 canManage={canManageRates}
+                cloudDeviceRegistration={cloudDeviceRegistration}
+                cloudDiagnostics={cloudDiagnostics}
+                cloudHealth={cloudHealth}
                 connectionStatus={connectionStatus}
                 localDbStatus={localDbStatus}
                 onCheckConnection={() => performConnectivityCheck("settings-sync-check", { force: true, timeoutMs: 3500 })}
                 onReload={async () => { await Promise.all([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()]); }}
                 onRetrySync={retrySyncFailures}
+                onRunCloudDiagnostics={runCloudDiagnostics}
                 onRunSync={() => runSyncNow({ force: true })}
                 onQueueSyncTest={queuePhase2SyncTest}
                 settingsData={settingsData}
@@ -5704,6 +5797,15 @@ function AiBusinessAssistantModule({
         <div className="startup-status-panel startup-status-error">
           <p>{data.error}</p>
           {Object.keys(cards).length > 0 && <small>Showing last verified local values until refresh succeeds.</small>}
+          {Boolean(data.diagnostics?.length) && (
+            <div className="frost-diagnostics-list">
+              {data.diagnostics.filter((item) => !item.ok).slice(0, 6).map((item) => (
+                <small key={`${item.method}-${item.url}`}>
+                  {item.label}: {item.status || "no response"} - {item.message} ({item.apiMode}, {item.localBackendHealth})
+                </small>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -11145,12 +11247,16 @@ function SettingsModule({
   applicationFontSize,
   backendHealth,
   canManage,
+  cloudDeviceRegistration,
+  cloudDiagnostics,
+  cloudHealth,
   connectionStatus,
   localDbStatus,
   onCheckConnection,
   onQueueSyncTest,
   onReload,
   onRetrySync,
+  onRunCloudDiagnostics,
   onRunSync,
   rules,
   settingsData,
@@ -11187,9 +11293,9 @@ function SettingsModule({
       <SyncSettingsSection
         backendHealth={backendHealth}
         canManage={canManage}
-        cloudDeviceRegistration={cloudDeviceRegistration}
-        cloudDiagnostics={cloudDiagnostics}
-        cloudHealth={cloudHealth}
+        cloudDeviceRegistration={cloudDeviceRegistration || null}
+        cloudDiagnostics={cloudDiagnostics || null}
+        cloudHealth={cloudHealth || null}
         connectionStatus={connectionStatus}
         key={settingsData.syncSettings?.updated_at || "sync-settings"}
         localDbStatus={localDbStatus}
@@ -11197,7 +11303,7 @@ function SettingsModule({
         onQueueSyncTest={onQueueSyncTest}
         onReload={onReload}
         onRetrySync={onRetrySync}
-        onRunCloudDiagnostics={runCloudDiagnostics}
+        onRunCloudDiagnostics={onRunCloudDiagnostics}
         onRunSync={onRunSync}
         syncMessage={syncMessage}
         settingsData={settingsData}
@@ -12630,6 +12736,13 @@ function SyncSettingsSection({
   const lastSync = syncStatus?.lastSuccessfulSyncAt || draft.last_sync_at;
   const lastPush = syncStatus?.lastPushAt;
   const lastPull = syncStatus?.lastPullAt;
+  const cloudRegistrationAvailable = Boolean(cloudDeviceRegistration && typeof cloudDeviceRegistration === "object" && Object.keys(cloudDeviceRegistration).length > 0);
+  const cloudDeviceStatus = cloudRegistrationAvailable
+    ? cloudDeviceRegistration?.status || "Not checked"
+    : "Cloud device registration is not available for the current mode.";
+  const cloudDeviceDetail = cloudRegistrationAvailable
+    ? cloudDeviceRegistration?.message || cloudDeviceRegistration?.detail || "No registration detail available."
+    : "Cloud device registration is not available for the current mode.";
   return (
     <ModuleCard eyebrow="Sync & Connection" title="Connection Status" subtitle="Owner view for live internet, local server and cloud sync readiness.">
       <div className="sync-owner-summary">
@@ -12638,8 +12751,6 @@ function SyncSettingsSection({
           ["Internet", internetStatus],
           ["Local Server", localServerStatus],
           ["Cloud", cloudStatus],
-          ["Authentication", connectionStatus?.authenticationStatus || "Not signed in"],
-          ["Device Registration", connectionStatus?.deviceRegistrationStatus || "Not checked"],
           ["Sync Status", syncSummary],
           ["Pending Sync", pending],
           ["Last Sync", lastSync ? new Date(lastSync).toLocaleString("en-IN") : "Not synced"],
@@ -12654,7 +12765,6 @@ function SyncSettingsSection({
         <button className="secondary-button" disabled={!onCheckConnection} onClick={onCheckConnection}>Check Connection</button>
         <button className="secondary-button" disabled={!canManage || !onRunSync} onClick={onRunSync}>Sync Now</button>
         <button className="secondary-button" disabled={!canManage || !onRetrySync} onClick={onRetrySync}>Retry Failed</button>
-        <button className="secondary-button" disabled={!canManage || !onRunCloudDiagnostics} onClick={onRunCloudDiagnostics}>Run Cloud Diagnostics</button>
         <button className="secondary-button" onClick={() => setShowDiagnostics((current) => !current)}>Advanced Diagnostics</button>
       </div>
       {showDiagnostics && cloudReadiness && (
@@ -12667,6 +12777,9 @@ function SyncSettingsSection({
           <div>
             <span className="eyebrow">Connection Mode Setup</span>
             <h3>Connection Mode Setup</h3>
+          </div>
+          <div className="toolbar-actions">
+            <button className="secondary-button" disabled={!canManage || !onRunCloudDiagnostics} onClick={onRunCloudDiagnostics}>Run Cloud Diagnostics</button>
           </div>
           <div className="form-grid supplier-form-grid">
             <Field label="Select App Mode">
@@ -12725,8 +12838,8 @@ function SyncSettingsSection({
             <Field label="Backend Health URL"><input disabled value={backendHealth?.url || `${API_URL}/api/health`} /></Field>
             <Field label="Cloud Health URL"><input disabled value={cloudHealth?.url || `${CLOUD_API_URL}/api/health`} /></Field>
             <Field label="Cloud Health Detail"><input disabled value={cloudHealth?.message || "Not checked"} /></Field>
-            <Field label="Cloud Device Status"><input disabled value={cloudDeviceRegistration?.status || "Not checked"} /></Field>
-            <Field label="Cloud Device Detail"><input disabled value={cloudDeviceRegistration?.message || "Not checked"} /></Field>
+            <Field label="Cloud Device Status"><input disabled value={cloudDeviceStatus} /></Field>
+            <Field label="Cloud Device Detail"><input disabled value={cloudDeviceDetail} /></Field>
             <Field label="Last Sync Failure"><input disabled value={syncStatus?.lastError || backendHealth?.message || "None"} /></Field>
             <Field label="Current Cursor"><input disabled value={syncStatus?.currentCursor || "0"} /></Field>
             <label className="check-field"><input checked={draft.sync_enabled === true} disabled type="checkbox" /><span>Sync foundation enabled for approved native devices</span></label>

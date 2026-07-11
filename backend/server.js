@@ -129,6 +129,19 @@ const configuredCorsOrigins = String(process.env.ALLOWED_ORIGINS || process.env.
   .filter((origin) => origin && origin !== "*");
 const allowedCorsOrigins = [...new Set([...defaultCorsOrigins, ...configuredCorsOrigins])];
 const apiContractVersion = "1";
+const frostApiVersion = "1";
+const supportedFrostCapabilities = [
+  "briefing",
+  "alerts",
+  "reminders",
+  "memory",
+  "predictions",
+  "profit-advisor",
+  "daily-plan",
+  "autonomous-decision-center",
+  "deterministic-business-query",
+  "voice-session-diagnostics",
+];
 const APP_MODES = new Set([
   "LOCAL_ONLY",
   "CLOUD_ONLY",
@@ -4806,6 +4819,9 @@ app.post("/settings/device-control/verify-exit-code", async (req, res) => {
     const exitCode = cleanText(req.body.exit_code);
     const settingsResult = await pool.query("SELECT * FROM device_control_settings WHERE id = 1");
     const settings = settingsResult.rows[0] || {};
+    if (!settings.exit_code_hash) {
+      return res.status(409).json({ message: "No Owner exit code is configured. Set one in Settings > Security / Device Control." });
+    }
     const valid = Boolean(settings.exit_code_hash) && hashExitCode(exitCode) === settings.exit_code_hash;
     await pool.query(
       `
@@ -7792,6 +7808,32 @@ app.get("/api/version", (_req, res) => {
     company_name: configuredCompanyName,
     branch_id: configuredBranchId,
     api: "FroozERP Cloud Foundation",
+  });
+});
+
+app.get("/api/system/compatibility", async (req, res) => {
+  let databaseReachable = false;
+  try {
+    await pool.query("SELECT 1");
+    databaseReachable = true;
+  } catch (error) {
+    databaseReachable = false;
+  }
+  const frontendVersion = String(req.query.frontend_version || req.headers["x-froozerp-frontend-version"] || "").trim() || appVersion;
+  return res.json({
+    status: "ok",
+    app: "FroozERP",
+    appVersion,
+    frontendVersion,
+    backendVersion: appVersion,
+    schemaVersion: apiContractVersion,
+    frostApiVersion,
+    supportedFrostCapabilities,
+    compatible: frontendVersion === appVersion,
+    database: databaseReachable ? "reachable" : "unreachable",
+    deploymentType,
+    appMode: configuredAppMode,
+    serverTime: new Date().toISOString(),
   });
 });
 

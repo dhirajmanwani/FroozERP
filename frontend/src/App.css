@@ -458,6 +458,18 @@
   margin-top: 7px;
 }
 
+.frost-diagnostics-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+  max-width: 100%;
+}
+
+.frost-diagnostics-list small {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .startup-status-error {
   border-color: rgba(248, 113, 113, 0.45);
   color: #fecaca;
