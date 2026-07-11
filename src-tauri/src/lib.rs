@@ -21,6 +21,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 #[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::Controls::Dialogs::{
     CommDlgExtendedError, GetSaveFileNameW, OPENFILENAMEW, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
 };
@@ -34,6 +36,10 @@ use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 static KIOSK_LOCK_ENABLED: AtomicBool = AtomicBool::new(false);
 static KIOSK_CLOSE_ALLOWED: AtomicBool = AtomicBool::new(false);
 static LOCAL_BACKEND_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
+const LOCAL_BACKEND_PORT: &str = "5000";
+const BACKEND_OWNERSHIP_FILE: &str = "local-backend-owner.json";
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Debug, Serialize, Clone)]
 struct CleanupCandidate {
@@ -63,7 +69,19 @@ struct BackendServiceStatus {
     url: String,
     backend_dir: String,
     node_path: String,
+    startup_source: String,
     message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BackendOwnershipRecord {
+    backend_instance_id: String,
+    app_version: String,
+    pid: u32,
+    ownership_token: String,
+    startup_timestamp: u64,
+    backend_dir: String,
+    node_path: String,
 }
 
 fn diagnostic_log_path() -> PathBuf {
@@ -82,6 +100,21 @@ fn app_data_dir() -> PathBuf {
         .join("com.srtcompany.froozerp")
 }
 
+fn backend_ownership_path() -> PathBuf {
+    app_data_dir().join("runtime").join(BACKEND_OWNERSHIP_FILE)
+}
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn desktop_instance_token() -> String {
+    format!("froozerp-{}-{}", std::process::id(), now_unix_seconds())
+}
+
 fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().replace('/', "\\").to_lowercase()
 }
@@ -98,7 +131,7 @@ fn current_install_dir() -> PathBuf {
 }
 
 fn local_backend_url() -> String {
-    "http://127.0.0.1:5000".to_string()
+    format!("http://127.0.0.1:{}", LOCAL_BACKEND_PORT)
 }
 
 fn probe_local_backend_health(timeout_ms: u64) -> Result<(), String> {
@@ -181,7 +214,18 @@ fn resolve_node_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("node"))
 }
 
-fn backend_status(message: String, healthy: bool, started: bool, reused_existing: bool, pid: Option<u32>, backend_dir: Option<PathBuf>, node_path: Option<PathBuf>) -> BackendServiceStatus {
+fn backend_startup_source(node_path: &Path) -> &'static str {
+    let path = node_path.to_string_lossy().to_lowercase();
+    if path.contains("froozerp-backend-node.exe") {
+        "packaged"
+    } else if path == "node" || path.ends_with("\\node.exe") {
+        "system-fallback"
+    } else {
+        "custom"
+    }
+}
+
+fn backend_status(message: String, healthy: bool, started: bool, reused_existing: bool, pid: Option<u32>, backend_dir: Option<PathBuf>, node_path: Option<PathBuf>, startup_source: &str) -> BackendServiceStatus {
     BackendServiceStatus {
         healthy,
         started,
@@ -194,7 +238,51 @@ fn backend_status(message: String, healthy: bool, started: bool, reused_existing
         node_path: node_path
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_default(),
+        startup_source: startup_source.to_string(),
         message,
+    }
+}
+
+fn write_backend_ownership(pid: u32, token: &str, backend_dir: &Path, node_path: &Path) {
+    let path = backend_ownership_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let record = BackendOwnershipRecord {
+        backend_instance_id: format!("froozerp-local-{}", pid),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        pid,
+        ownership_token: token.to_string(),
+        startup_timestamp: now_unix_seconds(),
+        backend_dir: backend_dir.to_string_lossy().to_string(),
+        node_path: node_path.to_string_lossy().to_string(),
+    };
+    if let Ok(payload) = serde_json::to_string_pretty(&record) {
+        let _ = fs::write(path, payload);
+    }
+}
+
+fn clear_backend_ownership(token: &str) {
+    let path = backend_ownership_path();
+    let content = fs::read_to_string(&path).unwrap_or_default();
+    if token.is_empty() || content.contains(&format!("\"ownership_token\": \"{}\"", token)) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn stop_owned_backend(reason: &str) {
+    let mut stopped_owned_backend = false;
+    if let Ok(mut guard) = LOCAL_BACKEND_PROCESS.lock() {
+        if let Some(mut child) = guard.take() {
+            let pid = child.id();
+            write_app_log("INFO", &format!("Stopping owned local backend PID {} ({})", pid, reason));
+            let _ = child.kill();
+            let _ = child.wait();
+            stopped_owned_backend = true;
+        }
+    }
+    if stopped_owned_backend {
+        clear_backend_ownership("");
     }
 }
 
@@ -209,18 +297,12 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
             None,
             None,
             None,
+            "reused",
         );
     }
 
     if force_restart {
-        if let Ok(mut guard) = LOCAL_BACKEND_PROCESS.lock() {
-            if let Some(mut child) = guard.take() {
-                let pid = child.id();
-                write_app_log("INFO", &format!("Stopping managed local backend PID {}", pid));
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
+        stop_owned_backend("restart requested");
         thread::sleep(Duration::from_millis(300));
         if probe_local_backend_health(900).is_ok() {
             return backend_status(
@@ -231,6 +313,7 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
                 None,
                 None,
                 None,
+                "reused",
             );
         }
     }
@@ -255,6 +338,7 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
                             Some(child.id()),
                             None,
                             None,
+                            "owned",
                         );
                     }
                 }
@@ -270,39 +354,46 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
         Ok(path) => path,
         Err(error) => {
             write_app_log("ERROR", &format!("Local backend launch blocked: {}", error));
-            return backend_status(error, false, false, false, None, None, None);
+            return backend_status(error, false, false, false, None, None, None, "unavailable");
         }
     };
     let node_path = resolve_node_path();
+    let startup_source = backend_startup_source(&node_path);
+    let owner_token = desktop_instance_token();
     write_app_log(
         "INFO",
         &format!(
-            "Launching local backend: node={}, backend_dir={}",
+            "Launching local backend: node={}, backend_dir={}, source={}",
             node_path.to_string_lossy(),
-            backend_dir.to_string_lossy()
+            backend_dir.to_string_lossy(),
+            startup_source
         ),
     );
-    let child = Command::new(&node_path)
-        .arg("server.js")
+    let mut command = Command::new(&node_path);
+    command.arg("server.js")
         .current_dir(&backend_dir)
-        .env("PORT", "5000")
+        .env("PORT", LOCAL_BACKEND_PORT)
         .env("APP_VERSION", env!("CARGO_PKG_VERSION"))
         .env("APP_MODE", "LOCAL_SINGLE_DEVICE")
         .env("FROOZERP_DESKTOP_SERVICE", "1")
+        .env("FROOZERP_BACKEND_OWNER_TOKEN", &owner_token)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+        .stderr(Stdio::null());
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let child = command.spawn();
 
     let child = match child {
         Ok(child) => child,
         Err(error) => {
             let message = format!("Unable to launch local FroozERP service: {}", error);
             write_app_log("ERROR", &message);
-            return backend_status(message, false, false, false, None, Some(backend_dir), Some(node_path));
+            return backend_status(message, false, false, false, None, Some(backend_dir), Some(node_path), startup_source);
         }
     };
     let pid = child.id();
+    write_backend_ownership(pid, &owner_token, &backend_dir, &node_path);
     if let Ok(mut guard) = LOCAL_BACKEND_PROCESS.lock() {
         *guard = Some(child);
     }
@@ -313,7 +404,7 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
             Ok(()) => {
                 let message = format!("Local FroozERP service started on attempt {}", attempt);
                 write_app_log("INFO", &message);
-                return backend_status(message, true, true, false, Some(pid), Some(backend_dir), Some(node_path));
+                return backend_status(message, true, true, false, Some(pid), Some(backend_dir), Some(node_path), startup_source);
             }
             Err(error) => {
                 write_app_log(
@@ -325,7 +416,7 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
     }
     let message = "Local FroozERP service stopped or did not become healthy. Restart service.".to_string();
     write_app_log("ERROR", &message);
-    backend_status(message, false, true, false, Some(pid), Some(backend_dir), Some(node_path))
+    backend_status(message, false, true, false, Some(pid), Some(backend_dir), Some(node_path), startup_source)
 }
 
 fn push_shortcut_candidate(candidates: &mut Vec<CleanupCandidate>, path: PathBuf, reason: &str) {
@@ -759,6 +850,7 @@ fn local_backend_service_status() -> Result<BackendServiceStatus, String> {
         pid,
         None,
         None,
+        if pid.is_some() { "owned" } else if healthy { "reused" } else { "unknown" },
     ))
 }
 
@@ -1096,6 +1188,8 @@ pub fn run() {
                     api.prevent_close();
                     let _ = window.emit("kiosk-exit-required", ());
                     write_app_log("INFO", "Close prevented by kiosk lock");
+                } else {
+                    stop_owned_backend("window close");
                 }
             }
         })

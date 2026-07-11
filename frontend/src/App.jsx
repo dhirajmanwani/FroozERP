@@ -5361,6 +5361,7 @@ function App() {
                 cloudDiagnostics={cloudDiagnostics}
                 cloudHealth={cloudHealth}
                 connectionStatus={connectionStatus}
+                localBackendService={localBackendService}
                 localDbStatus={localDbStatus}
                 onCheckConnection={() => performConnectivityCheck("settings-sync-check", { force: true, timeoutMs: 3500 })}
                 onReload={async () => { await Promise.all([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()]); }}
@@ -11297,6 +11298,7 @@ function SettingsModule({
   cloudDiagnostics,
   cloudHealth,
   connectionStatus,
+  localBackendService,
   localDbStatus,
   onCheckConnection,
   onQueueSyncTest,
@@ -11343,6 +11345,7 @@ function SettingsModule({
         cloudDiagnostics={cloudDiagnostics || null}
         cloudHealth={cloudHealth || null}
         connectionStatus={connectionStatus}
+        localBackendService={localBackendService || null}
         key={settingsData.syncSettings?.updated_at || "sync-settings"}
         localDbStatus={localDbStatus}
         onCheckConnection={onCheckConnection}
@@ -12570,6 +12573,7 @@ function SyncSettingsSection({
   cloudDiagnostics,
   cloudHealth,
   connectionStatus,
+  localBackendService,
   localDbStatus,
   onCheckConnection,
   onQueueSyncTest,
@@ -12882,6 +12886,12 @@ function SyncSettingsSection({
             <Field label="Settings API Base"><input disabled value={backendHealth?.apiUrl || API_URL} /></Field>
             <Field label="Sync Worker API Base"><input disabled value={syncStatus?.apiUrl || API_URL} /></Field>
             <Field label="Backend Health URL"><input disabled value={backendHealth?.url || `${API_URL}/api/health`} /></Field>
+            <Field label="Desktop Backend Status"><input disabled value={localBackendService?.healthy === true ? "Healthy" : localBackendService?.healthy === false ? "Stopped" : "Not checked"} /></Field>
+            <Field label="Desktop Backend PID"><input disabled value={localBackendService?.pid || "Not owned by this app"} /></Field>
+            <Field label="Desktop Backend Startup Source"><input disabled value={localBackendService?.startup_source || localBackendService?.startupSource || "Not checked"} /></Field>
+            <Field label="Desktop Backend Node Runtime"><input disabled value={localBackendService?.node_path || localBackendService?.nodePath || "Not checked"} /></Field>
+            <Field label="Desktop Backend Directory"><input disabled value={localBackendService?.backend_dir || localBackendService?.backendDir || "Not checked"} /></Field>
+            <Field label="Desktop Backend Detail"><input disabled value={localBackendService?.message || "Not checked"} /></Field>
             <Field label="Cloud Health URL"><input disabled value={cloudHealth?.url || `${CLOUD_API_URL}/api/health`} /></Field>
             <Field label="Cloud Health Detail"><input disabled value={cloudHealth?.message || "Not checked"} /></Field>
             <Field label="Cloud Device Status"><input disabled value={cloudDeviceStatus} /></Field>
