@@ -555,8 +555,10 @@ const authFailure = async (res, { status = 401, code = "INVALID_CREDENTIALS", pu
   return res.status(status).json({ code, message: publicMessage });
 };
 
+const getConfiguredSmtpPassword = () => cleanText(process.env.SMTP_PASS || process.env.SMTP_PASSWORD);
+
 const getRecoveryProviderStatus = () => ({
-  email: process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS ? "configured" : "not_configured",
+  email: process.env.SMTP_HOST && process.env.SMTP_USER && getConfiguredSmtpPassword() ? "configured" : "not_configured",
   sms: process.env.SMS_PROVIDER_URL && (process.env.SMS_PROVIDER_TOKEN || process.env.SMS_PROVIDER_API_KEY) ? "configured" : "not_configured",
   development: recoveryDevOtpEnabled ? "enabled" : "disabled",
 });
@@ -566,7 +568,7 @@ const getEmailProviderDiagnostics = () => {
     smtp_host: Boolean(cleanText(process.env.SMTP_HOST)),
     smtp_port: Boolean(cleanText(process.env.SMTP_PORT || "587")),
     smtp_user: Boolean(cleanText(process.env.SMTP_USER)),
-    smtp_password: Boolean(cleanText(process.env.SMTP_PASS || process.env.SMTP_PASSWORD)),
+    smtp_password: Boolean(getConfiguredSmtpPassword()),
     sender: Boolean(cleanText(process.env.SMTP_FROM || process.env.SMTP_USER)),
   };
   const configured = Object.values(required).every(Boolean);
@@ -579,7 +581,7 @@ const getEmailProviderDiagnostics = () => {
     port: Number(process.env.SMTP_PORT || 587),
     secure: /^true$/i.test(process.env.SMTP_SECURE || ""),
     username_configured: Boolean(cleanText(process.env.SMTP_USER)),
-    password_configured: Boolean(cleanText(process.env.SMTP_PASS || process.env.SMTP_PASSWORD)),
+    password_configured: Boolean(getConfiguredSmtpPassword()),
     sender_name: cleanText(process.env.SMTP_SENDER_NAME || "FroozERP"),
     sender_email: cleanText(process.env.SMTP_FROM || process.env.SMTP_USER),
   };
@@ -605,7 +607,8 @@ const getSmsProviderDiagnostics = () => {
 };
 
 const sendEmailOtp = async ({ to, code, purpose }) => {
-  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
+  const smtpPassword = getConfiguredSmtpPassword();
+  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !smtpPassword) {
     return { delivered: false, provider: "EmailOtpProvider", status: "not_configured" };
   }
   const transporter = nodemailer.createTransport({
@@ -614,7 +617,7 @@ const sendEmailOtp = async ({ to, code, purpose }) => {
     secure: /^true$/i.test(process.env.SMTP_SECURE || ""),
     auth: {
       user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
+      pass: smtpPassword,
     },
   });
   const from = process.env.SMTP_FROM || process.env.SMTP_USER;
@@ -671,6 +674,7 @@ const sendRecoveryOtp = async ({ method, contact, code, purpose }) => {
 const sendRecoveryNotification = async ({ method, contact, subject, message, html }) => {
   const providerStatus = getRecoveryProviderStatus();
   if (method === "email") {
+    const smtpPassword = getConfiguredSmtpPassword();
     if (providerStatus.email !== "configured") return { delivered: false, provider: "EmailOtpProvider", status: "not_configured" };
     const transporter = nodemailer.createTransport({
       host: process.env.SMTP_HOST,
@@ -678,7 +682,7 @@ const sendRecoveryNotification = async ({ method, contact, subject, message, htm
       secure: /^true$/i.test(process.env.SMTP_SECURE || ""),
       auth: {
         user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS,
+        pass: smtpPassword,
       },
     });
     const info = await transporter.sendMail({
