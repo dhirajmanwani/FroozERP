@@ -101,9 +101,13 @@ const maskProviderConfig = (config = {}) => {
 
 const classifyBusinessIntent = (question = "") => {
   const text = String(question || "").toLowerCase();
-  if (/(cash|drawer|till|counter cash)/.test(text)) return "CASH_DRAWER";
-  if (/(today.*sale|sales|revenue|profit|compare|month|last month)/.test(text)) return "SALES_FINANCE";
-  if (/(payment|pending|receivable|outstanding|ledger|customer.*pay|supplier.*pay)/.test(text)) return "PAYMENTS";
+  if (/(cash|bank|drawer|till|counter cash|payable|receivable|position)/.test(text)) return "CASH_DRAWER";
+  if (/(purchase tomorrow|what should i purchase|buy tomorrow|reorder|purchase quantity|purchase quantities)/.test(text)) return "PURCHASE_PLANNING";
+  if (/(sale rate|selling rate|rate revision|revise.*rate|price revision|pricing)/.test(text)) return "SALE_RATE_REVIEW";
+  if (/(loss|lose money|lost money|waste|expense|low margin|margin problem)/.test(text)) return "LOSS_REVIEW";
+  if (/(profit.*month|most profit|top profit|generated.*profit)/.test(text)) return "PROFIT_RANKING";
+  if (/(today.*sale|sales|revenue|profit|compare|month|last month|gross profit)/.test(text)) return "SALES_FINANCE";
+  if (/(supplier.*bill|purchase bill|payment|pending|receivable|outstanding|ledger|customer.*pay|supplier.*pay)/.test(text)) return "PAYMENTS";
   if (/(customer.*recent|haven.?t purchased|inactive customer|not purchased)/.test(text)) return "CUSTOMER_ACTIVITY";
   if (/(expiry|expire|close to expiry|near expiry|old lot|lot aging|fruits close)/.test(text)) return "INVENTORY_EXPIRY";
   if (/(supplier.*margin|best margin|margin supplier)/.test(text)) return "SUPPLIER_MARGIN";

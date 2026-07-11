@@ -504,6 +504,12 @@ const normalizeProductUnit = (value) => {
   const unit = String(value || "").trim().toUpperCase();
   return PRODUCT_UNITS.has(unit) ? unit : unit;
 };
+const normalizeRoleName = (value) => String(value || "").trim().toUpperCase().replace(/\s+/g, "_");
+const isOwnerRole = (value) => normalizeRoleName(value) === "OWNER";
+const roleMatches = (value, allowed = []) => {
+  const role = normalizeRoleName(value);
+  return allowed.map(normalizeRoleName).includes(role);
+};
 
 const requireRateManager = async (userId, client = pool) => {
   const parsedUserId = parsePositiveInteger(userId);
@@ -838,6 +844,8 @@ const getPermissionUser = async (userId, permissionKey, defaultRoles = [], clien
     SELECT
       u.id,
       u.full_name,
+      u.username,
+      u.branch_id,
       r.role_name,
       COALESCE(rps.permissions, '{}'::jsonb) AS permissions
     FROM users u
@@ -849,12 +857,59 @@ const getPermissionUser = async (userId, permissionKey, defaultRoles = [], clien
   );
   const user = result.rows[0];
   if (!user) return null;
-  if (user.role_name === "Owner") return user;
+  if (isOwnerRole(user.role_name)) return user;
   const storedPermission = user.permissions?.[permissionKey];
-  if (storedPermission === true || (storedPermission === undefined && defaultRoles.includes(user.role_name))) {
+  if (storedPermission === true || (storedPermission === undefined && roleMatches(user.role_name, defaultRoles))) {
     return user;
   }
   return null;
+};
+
+const buildCanonicalIdentity = (user, { authenticated = true, sessionId = "" } = {}) => {
+  if (!user) {
+    return {
+      user_id: null,
+      username: "",
+      role: "",
+      is_owner: false,
+      branch_id: null,
+      permissions: {},
+      authenticated: false,
+      session_id: "",
+    };
+  }
+  return {
+    user_id: user.id,
+    username: user.username || "",
+    role: normalizeRoleName(user.role_name || user.role),
+    is_owner: isOwnerRole(user.role_name || user.role),
+    branch_id: user.branch_id || 1,
+    permissions: user.permissions || {},
+    authenticated,
+    session_id: sessionId || `local-user-${user.id}`,
+  };
+};
+
+const getCanonicalIdentity = async ({ userId, sessionId = "" } = {}, client = pool) => {
+  const parsedUserId = parsePositiveInteger(userId);
+  if (!parsedUserId) return buildCanonicalIdentity(null);
+  const result = await client.query(
+    `
+    SELECT
+      u.id,
+      u.username,
+      u.branch_id,
+      r.role_name,
+      COALESCE(rps.permissions, '{}'::jsonb) AS permissions
+    FROM users u
+    JOIN roles r ON r.id = u.role_id
+    LEFT JOIN role_permission_settings rps ON UPPER(REPLACE(rps.role_name, ' ', '_')) = UPPER(REPLACE(r.role_name, ' ', '_'))
+    WHERE u.id = $1 AND u.active = TRUE
+    LIMIT 1
+    `,
+    [parsedUserId]
+  );
+  return buildCanonicalIdentity(result.rows[0], { sessionId });
 };
 
 const initializeDatabase = async () => {
@@ -4682,7 +4737,28 @@ registerAiBusinessAssistantRoutes({
   app,
   pool,
   getPermissionUser,
+  getCanonicalIdentity,
   requireRateManager,
+});
+
+app.get("/api/auth/me", async (req, res) => {
+  try {
+    const identity = await getCanonicalIdentity({
+      userId: req.query.user_id || req.headers["x-user-id"],
+      sessionId: req.query.session_id || req.headers["x-session-id"],
+    });
+    if (!identity.authenticated) {
+      return res.status(401).json({
+        code: "AUTHENTICATION_REQUIRED",
+        message: "Sign in to verify your FroozERP identity.",
+        identity,
+      });
+    }
+    return res.json(identity);
+  } catch (error) {
+    console.error("auth/me failed", error);
+    return res.status(500).json({ message: "Unable to resolve authenticated identity." });
+  }
 });
 
 app.get("/purchase-rules", async (req, res) => {

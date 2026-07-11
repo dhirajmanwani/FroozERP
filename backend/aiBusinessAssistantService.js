@@ -48,14 +48,16 @@ const DEFAULT_THRESHOLDS = {
 const SUGGESTED_QUESTIONS = [
   "What needs my attention today?",
   "Which customer payments are overdue?",
-  "Show the oldest outstanding balances.",
-  "Which supplier payments are due?",
-  "Which purchase bills are still pending?",
-  "What products are low in stock?",
-  "What were today's sales and profit?",
-  "Which products had unusually low margins?",
-  "What were the largest expenses this month?",
-  "Which items generated the most waste?",
+  "What supplier bills are pending?",
+  "Which items are low in stock?",
+  "Which stock lots are aging or likely to expire?",
+  "What was today's sales and gross profit?",
+  "Which items generated the most profit this month?",
+  "Where did I lose money this month?",
+  "Which customers have become inactive?",
+  "What should I purchase tomorrow?",
+  "What is my current cash, bank, receivable and payable position?",
+  "Which sale rates may need revision?",
 ];
 
 const cleanText = (value) => (typeof value === "string" ? value.trim() : "");
@@ -105,14 +107,76 @@ const severityFromRisk = (risk) => {
   return "INFO";
 };
 
-const requireAiPermission = async ({ req, res, getPermissionUser, permission, fallbackRoles = ["Owner", "Admin"] }) => {
+const normalizeRoleName = (value) => String(value || "").trim().toUpperCase().replace(/\s+/g, "_");
+const isOwnerIdentity = (identity = {}) => identity.is_owner === true || normalizeRoleName(identity.role) === "OWNER";
+const buildFrostPolicy = (identity = {}, actionClass = "READ_ONLY") => {
+  const authenticated = identity.authenticated === true;
+  if (!authenticated) {
+    return {
+      allowed: false,
+      actionClass,
+      approvalRequired: false,
+      reason: "Authentication is required.",
+      errorCode: "AUTHENTICATION_REQUIRED",
+    };
+  }
+  if (actionClass === "READ_ONLY") {
+    return { allowed: true, actionClass, approvalRequired: false, reason: "Read-only business information." };
+  }
+  if (actionClass === "SAFE_PERSONAL_WRITE") {
+    return { allowed: true, actionClass, approvalRequired: false, reason: "Safe personal FROST action." };
+  }
+  if (actionClass === "BUSINESS_WRITE") {
+    return {
+      allowed: true,
+      actionClass,
+      approvalRequired: true,
+      reason: "Business data changes require a structured confirmation before execution.",
+    };
+  }
+  return {
+    allowed: isOwnerIdentity(identity),
+    actionClass,
+    approvalRequired: true,
+    reason: "High-risk actions require authenticated Owner confirmation.",
+    errorCode: isOwnerIdentity(identity) ? null : "OWNER_CONFIRMATION_REQUIRED",
+  };
+};
+
+const requireAiPermission = async ({ req, res, getPermissionUser, getCanonicalIdentity, permission, fallbackRoles = ["Owner", "Admin"], actionClass = "READ_ONLY" }) => {
   const userId = req.query.user_id || req.body?.user_id || req.headers["x-user-id"];
   const user = await getPermissionUser(userId, permission, fallbackRoles);
   if (!user) {
-    res.status(403).json({ message: "You do not have permission to use this FROST feature" });
+    res.status(403).json({
+      code: "FROST_PERMISSION_DENIED",
+      message: "You do not have permission to use this FROST feature",
+      action_class: actionClass,
+    });
     return null;
   }
-  return user;
+  const identity = getCanonicalIdentity
+    ? await getCanonicalIdentity({ userId: user.id, sessionId: req.body?.session_id || req.headers["x-session-id"] })
+    : {
+        user_id: user.id,
+        username: user.username || "",
+        role: normalizeRoleName(user.role_name),
+        is_owner: normalizeRoleName(user.role_name) === "OWNER",
+        branch_id: user.branch_id || 1,
+        permissions: user.permissions || {},
+        authenticated: true,
+        session_id: `local-user-${user.id}`,
+      };
+  const policy = buildFrostPolicy(identity, actionClass);
+  if (!policy.allowed) {
+    res.status(policy.errorCode === "AUTHENTICATION_REQUIRED" ? 401 : 403).json({
+      code: policy.errorCode || "FROST_ACTION_NOT_ALLOWED",
+      message: policy.reason,
+      identity,
+      policy,
+    });
+    return null;
+  }
+  return { ...user, identity, frostPolicy: policy };
 };
 
 const getAiSettings = async (pool, frost = new FrostServiceLayer({ pool })) => {
@@ -136,6 +200,12 @@ const buildFact = (type, sourceModule, periodLabel, rows, summary = {}) => ({
   periodLabel,
   rows,
   summary,
+  metadata: {
+    source_module: sourceModule,
+    period: periodLabel,
+    record_count: Array.isArray(rows) ? rows.length : 0,
+    last_refreshed_at: new Date().toISOString(),
+  },
 });
 
 const getCustomerOutstanding = async (pool, settings) => {
@@ -826,7 +896,9 @@ const getDynamicPricingIntelligence = async (pool) => {
       expected_profit_impact: roundCurrency(recommendation.expectedProfitImpact),
       confidence: recommendation.confidence,
       priority: recommendation.priority,
-      approval_required: true,
+      action_class: "READ_ONLY",
+      approval_required: false,
+      confirmation_required_for_execution: true,
     };
   }).sort((a, b) => Number(b.confidence) - Number(a.confidence)).slice(0, 50);
 };
@@ -856,7 +928,9 @@ const getSmartPurchasePlanner = async (pool) => {
       priority: recommendation.priority || "INFO",
       confidence: recommendation.confidence || 0,
       reason: recommendation.reason,
-      approval_required: true,
+      action_class: "READ_ONLY",
+      approval_required: false,
+      confirmation_required_for_execution: true,
     };
   }).filter((item) => item.status !== "WAIT").sort((a, b) => Number(b.recommended_quantity) - Number(a.recommended_quantity)).slice(0, 50);
 };
@@ -892,7 +966,9 @@ const getWastePreventionIntelligence = async (pool) => {
       selling_priority: risk.sellingPriority,
       discount_recommendation: risk.discountRecommendation,
       color_status: risk.colorStatus,
-      approval_required: true,
+      action_class: "READ_ONLY",
+      approval_required: false,
+      confirmation_required_for_execution: true,
     };
   });
 };
@@ -935,7 +1011,9 @@ const getCustomerIntelligence = async (pool) => {
       risk: segment.risk,
       recommendation: segment.recommendation,
       expected_future_value: roundCurrency(Number(row.average_basket_value || 0) * Math.min(Number(row.purchase_count || 0) + 1, 6)),
-      approval_required: true,
+      action_class: "READ_ONLY",
+      approval_required: false,
+      confirmation_required_for_execution: true,
     };
   });
 };
@@ -994,7 +1072,9 @@ const getSupplierIntelligence = async (pool) => {
       profit_contribution: roundCurrency(row.profit_contribution),
       supplier_score: score.score,
       recommendation: score.recommendation,
-      approval_required: true,
+      action_class: "READ_ONLY",
+      approval_required: false,
+      confirmation_required_for_execution: true,
     };
   });
 };
@@ -1012,7 +1092,9 @@ const getProfitOptimizer = async (pool) => {
     highest_margin_fruits: [...products].sort((a, b) => Number(b.estimated_gross_margin || 0) - Number(a.estimated_gross_margin || 0)).slice(0, 8),
     lowest_margin_fruits: [...products].sort((a, b) => Number(a.estimated_gross_margin || 999) - Number(b.estimated_gross_margin || 999)).slice(0, 8),
     supplier_profitability: supplierRows.slice(0, 8),
-    approval_required: true,
+    action_class: "READ_ONLY",
+    approval_required: false,
+    confirmation_required_for_execution: true,
   };
 };
 
@@ -1109,6 +1191,22 @@ const getOwnerDecisionCenter = async (pool, settings) => {
     getBusinessHealth(pool, settings),
   ]);
   return buildOwnerDecisionCenterFromParts({ pricing, purchases, waste, customers, suppliers, profit, cashflow, demand, health });
+};
+
+const getPurchaseRecommendationFact = async (pool) => {
+  const rows = await getSmartPurchasePlanner(pool);
+  return buildFact("purchase_recommendations", "Purchase Planner", "Next purchase review", rows, {
+    count: rows.length,
+    estimatedCost: roundCurrency(rows.reduce((sum, row) => sum + Number(row.expected_cost || 0), 0)),
+  });
+};
+
+const getSaleRateReviewFact = async (pool) => {
+  const rows = (await getDynamicPricingIntelligence(pool)).filter((item) => item.action !== "KEEP");
+  return buildFact("sale_rate_review", "Sale Rate Update", "Current pricing review", rows, {
+    count: rows.length,
+    estimatedProfitImpact: roundCurrency(rows.reduce((sum, row) => sum + Number(row.expected_profit_impact || 0), 0)),
+  });
 };
 
 const getProductMarginSummary = async (pool, range) => {
@@ -1408,6 +1506,10 @@ const factsForQuestion = async (pool, classification, settings, range) => {
 
 const factsForBusinessIntent = async (pool, intent, settings, range) => {
   if (intent === "CASH_DRAWER") return [await getCashDrawerSummary(pool, range), await getCollectionSummary(pool, range)];
+  if (intent === "PURCHASE_PLANNING") return [await getPurchaseRecommendationFact(pool), await getLowStockProducts(pool), await getSupplierOutstanding(pool)];
+  if (intent === "SALE_RATE_REVIEW") return [await getSaleRateReviewFact(pool), await getProfitAdvisorRows(pool).then((rows) => buildFact("profit_advisor", "Profit Advisor", "Last 30 days", rows, { count: rows.length }))];
+  if (intent === "LOSS_REVIEW") return [await getExpenseSummary(pool, range), await getWasteSummary(pool, range), await getProfitAdvisorRows(pool).then((rows) => buildFact("margin_risks", "Profit Advisor", "Last 30 days", rows.filter((item) => Number(item.estimated_gross_margin || 0) < 10 || Number(item.recent_waste || 0) > 0), { count: rows.length }))];
+  if (intent === "PROFIT_RANKING") return [await getProductSalesRanking(pool, { ...range, label: range.label || "Selected period" }), await getProductMarginSummary(pool, range)];
   if (intent === "PAYMENTS") return [await getCustomerOutstanding(pool, settings), await getSupplierOutstanding(pool), await getPendingPurchaseBills(pool)];
   if (intent === "CUSTOMER_ACTIVITY") return [await getCustomerActivitySummary(pool), await getCustomerOutstanding(pool, settings)];
   if (intent === "INVENTORY_EXPIRY") return [await getInventoryNearingExpiry(pool, settings), await getLowStockProducts(pool)];
@@ -1457,11 +1559,11 @@ const auditQuestion = async ({ pool, user, deviceId, question, classification, r
   return conversationId;
 };
 
-const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requireRateManager }) => {
+const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCanonicalIdentity, requireRateManager }) => {
   const frost = new FrostServiceLayer({ pool });
 
   app.get("/api/ai/frost/status", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
     if (!user) return;
     const [settings, usage] = await Promise.all([frost.getSettings(), frost.getUsageSummary()]);
     return res.json({
@@ -1476,19 +1578,19 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
   });
 
   app.get("/api/ai/providers", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_settings_manage" });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_settings_manage" });
     if (!user) return;
     return res.json({ assistant: FROST_ASSISTANT_NAME, providers: frost.getProviderOptions() });
   });
 
   app.get("/api/ai/suggested-questions", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
     if (!user) return;
     return res.json({ questions: SUGGESTED_QUESTIONS });
   });
 
   app.get("/api/ai/settings", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_settings_manage" });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_settings_manage" });
     if (!user) return;
     const settings = await getAiSettings(pool, frost);
     const usage = await frost.getUsageSummary();
@@ -1524,7 +1626,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
   });
 
   app.get("/api/ai/briefing", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
     if (!user) return;
     const settings = await getAiSettings(pool, frost);
     const range = getRange(req.query);
@@ -1533,13 +1635,13 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
   });
 
   app.get("/api/ai/alerts", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
     if (!user) return;
     return res.json({ alerts: await getStoredAlerts(pool) });
   });
 
   app.patch("/api/ai/alerts/:id", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_reminder_manage" });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_reminder_manage", actionClass: "SAFE_PERSONAL_WRITE" });
     if (!user) return;
     const id = parsePositiveInteger(req.params.id);
     const action = cleanText(req.body.action).toUpperCase();
@@ -1554,20 +1656,20 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
   });
 
   app.get("/api/ai/reminders", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
     if (!user) return;
     return res.json({ reminders: await getReminders(pool) });
   });
 
   app.get("/api/ai/memory", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
     if (!user) return;
     const memories = await getMemoryRows(pool, req.query);
     return res.json({ memories });
   });
 
   app.post("/api/ai/memory/propose", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
     if (!user) return;
     const draft = req.body.content ? { ...buildMemoryDraftFromText(req.body.content), ...req.body } : req.body;
     if (containsSensitiveMemory(`${draft.title || ""} ${draft.content || ""}`)) {
@@ -1653,32 +1755,32 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
   });
 
   app.get("/api/ai/predictions/inventory", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
     if (!user) return;
     return res.json({ predictions: await getInventoryPredictions(pool) });
   });
 
   app.get("/api/ai/predictions/sales", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_financial_insights", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_financial_insights", fallbackRoles: ["Owner", "Admin"] });
     if (!user) return;
     return res.json({ predictions: await getSalesPredictions(pool) });
   });
 
   app.get("/api/ai/predictions/cashflow", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_financial_insights", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_financial_insights", fallbackRoles: ["Owner", "Admin"] });
     if (!user) return;
     const settings = await getAiSettings(pool, frost);
     return res.json({ predictions: await getCashflowPredictions(pool, settings) });
   });
 
   app.get("/api/ai/predictions/waste", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
     if (!user) return;
     return res.json({ predictions: await getWastePredictions(pool) });
   });
 
   app.get("/api/ai/predictions", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
     if (!user) return;
     const settings = await getAiSettings(pool, frost);
     const [inventory, sales, cashflow, waste] = await Promise.all([
@@ -1691,13 +1793,13 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
   });
 
   app.get("/api/ai/profit-advisor", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_financial_insights", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_financial_insights", fallbackRoles: ["Owner", "Admin"] });
     if (!user) return;
     return res.json({ recommendations: await getProfitAdvisorRows(pool) });
   });
 
   app.get("/api/ai/profit-advisor/products/:id", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_financial_insights", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_financial_insights", fallbackRoles: ["Owner", "Admin"] });
     if (!user) return;
     const productId = parsePositiveInteger(req.params.id);
     const rows = await getProfitAdvisorRows(pool);
@@ -1705,7 +1807,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
   });
 
   app.get("/api/ai/daily-plan", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
     if (!user) return;
     const settings = await getAiSettings(pool, frost);
     const range = getRange(req.query);
@@ -1739,31 +1841,31 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
   app.get("/api/ai/intelligence/pricing", async (req, res) => {
     const user = await requireOwnerIntelligence(req, res);
     if (!user) return;
-    return res.json({ recommendations: await getDynamicPricingIntelligence(pool), approval_required: true });
+    return res.json({ recommendations: await getDynamicPricingIntelligence(pool), action_class: "READ_ONLY", approval_required: false });
   });
 
   app.get("/api/ai/intelligence/purchase-planner", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
     if (!user) return;
-    return res.json({ recommendations: await getSmartPurchasePlanner(pool), approval_required: true });
+    return res.json({ recommendations: await getSmartPurchasePlanner(pool), action_class: "READ_ONLY", approval_required: false });
   });
 
   app.get("/api/ai/intelligence/waste-prevention", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
     if (!user) return;
-    return res.json({ lots: await getWastePreventionIntelligence(pool), approval_required: true });
+    return res.json({ lots: await getWastePreventionIntelligence(pool), action_class: "READ_ONLY", approval_required: false });
   });
 
   app.get("/api/ai/intelligence/customers", async (req, res) => {
     const user = await requireOwnerIntelligence(req, res);
     if (!user) return;
-    return res.json({ customers: await getCustomerIntelligence(pool), approval_required: true });
+    return res.json({ customers: await getCustomerIntelligence(pool), action_class: "READ_ONLY", approval_required: false });
   });
 
   app.get("/api/ai/intelligence/suppliers", async (req, res) => {
     const user = await requireOwnerIntelligence(req, res);
     if (!user) return;
-    return res.json({ suppliers: await getSupplierIntelligence(pool), approval_required: true });
+    return res.json({ suppliers: await getSupplierIntelligence(pool), action_class: "READ_ONLY", approval_required: false });
   });
 
   app.get("/api/ai/intelligence/profit-optimizer", async (req, res) => {
@@ -1776,13 +1878,13 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
     const user = await requireOwnerIntelligence(req, res);
     if (!user) return;
     const settings = await getAiSettings(pool, frost);
-    return res.json({ predictions: await getCashFlowPredictor(pool, settings), approval_required: true });
+    return res.json({ predictions: await getCashFlowPredictor(pool, settings), action_class: "READ_ONLY", approval_required: false });
   });
 
   app.get("/api/ai/intelligence/demand", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
     if (!user) return;
-    return res.json({ forecasts: await getDemandForecast(pool), approval_required: true });
+    return res.json({ forecasts: await getDemandForecast(pool), action_class: "READ_ONLY", approval_required: false });
   });
 
   app.get("/api/ai/intelligence/health", async (req, res) => {
@@ -1831,7 +1933,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
   });
 
   app.post("/api/ai/reminders", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_reminder_manage" });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_reminder_manage", actionClass: "SAFE_PERSONAL_WRITE" });
     if (!user) return;
     const reminderType = cleanText(req.body.reminder_type || "OWNER_NOTE").toUpperCase();
     const entityType = cleanText(req.body.linked_entity_type || "manual");
@@ -1862,7 +1964,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
   });
 
   app.patch("/api/ai/reminders/:id", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_reminder_manage" });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_reminder_manage", actionClass: "SAFE_PERSONAL_WRITE" });
     if (!user) return;
     const id = parsePositiveInteger(req.params.id);
     const action = cleanText(req.body.action).toUpperCase();
@@ -1879,16 +1981,16 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
   app.post("/api/ai/query", async (req, res) => {
     const question = cleanText(req.body.question);
     if (!question) return res.status(400).json({ message: "Question is required" });
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
     if (!user) return;
     const settings = await getAiSettings(pool, frost);
     const range = getRange(req.body);
     const classification = classifyBusinessIntent(question);
-    if (classification === "SALES_FINANCE" || classification === "CASH_DRAWER" || classification === "SUPPLIER_MARGIN") {
+    if (["SALES_FINANCE", "CASH_DRAWER", "SUPPLIER_MARGIN", "PROFIT_RANKING", "LOSS_REVIEW", "SALE_RATE_REVIEW"].includes(classification)) {
       const allowed = await getPermissionUser(user.id, "ai_financial_insights", ["Owner", "Admin"]);
       if (!allowed) return res.status(403).json({ message: "Financial AI insights require Owner/Admin permission" });
     }
-    if (classification === "INVENTORY" || classification === "INVENTORY_EXPIRY") {
+    if (["INVENTORY", "INVENTORY_EXPIRY", "PURCHASE_PLANNING"].includes(classification)) {
       const allowed = await getPermissionUser(user.id, "ai_inventory_insights", ["Owner", "Admin", "Purchase Manager", "Inventory Manager"]);
       if (!allowed) return res.status(403).json({ message: "Inventory AI insights are not enabled for this role" });
     }
@@ -1937,6 +2039,8 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
       provider: settings.provider,
       cached: Boolean(cachedPayload),
       usage,
+      action_class: "READ_ONLY",
+      approval_required: false,
       approval_required_for_writes: true,
     });
   });
@@ -1944,7 +2048,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
   app.post("/api/ai/query/stream", async (req, res) => {
     const question = cleanText(req.body.question);
     if (!question) return res.status(400).json({ message: "Question is required" });
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
     if (!user) return;
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
@@ -1981,7 +2085,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
   });
 
   app.post("/api/ai/actions/propose", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"], actionClass: "BUSINESS_WRITE" });
     if (!user) return;
     const actionType = cleanText(req.body.action_type || req.body.action || "").toUpperCase().replace(/\s+/g, "_");
     if (!actionType) return res.status(400).json({ message: "Action type is required" });
@@ -2001,7 +2105,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
   });
 
   app.post("/api/ai/voice/session", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
     if (!user) return;
     try {
       const session = await frost.createRealtimeSession({
@@ -2019,4 +2123,6 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, requi
 
 module.exports = {
   registerAiBusinessAssistantRoutes,
+  buildFrostPolicy,
+  normalizeRoleName,
 };

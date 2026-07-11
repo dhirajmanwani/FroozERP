@@ -160,6 +160,14 @@ fn node_candidates() -> Vec<PathBuf> {
     if let Some(path) = env::var_os("FROOZERP_NODE_PATH").map(PathBuf::from) {
         candidates.push(path);
     }
+    let install_dir = current_install_dir();
+    candidates.push(install_dir.join("froozerp-backend-node.exe"));
+    candidates.push(install_dir.join("_up_").join("binaries").join("froozerp-backend-node.exe"));
+    candidates.push(install_dir.join("resources").join("binaries").join("froozerp-backend-node.exe"));
+    if let Ok(current_dir) = env::current_dir() {
+        candidates.push(current_dir.join("src-tauri").join("binaries").join("froozerp-backend-node.exe"));
+        candidates.push(current_dir.join("binaries").join("froozerp-backend-node.exe"));
+    }
     candidates.push(PathBuf::from("node"));
     candidates.push(PathBuf::from(r"D:\node.exe"));
     candidates.push(PathBuf::from(r"C:\Program Files\nodejs\node.exe"));
