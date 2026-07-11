@@ -130,6 +130,9 @@ const configuredCorsOrigins = String(process.env.ALLOWED_ORIGINS || process.env.
 const allowedCorsOrigins = [...new Set([...defaultCorsOrigins, ...configuredCorsOrigins])];
 const apiContractVersion = "1";
 const APP_MODES = new Set([
+  "LOCAL_ONLY",
+  "CLOUD_ONLY",
+  "HYBRID",
   "LOCAL_SINGLE_DEVICE",
   "BRANCH_LAN_SERVER",
   "BRANCH_LAN_CLIENT",
@@ -140,20 +143,20 @@ const APP_MODES = new Set([
 const deploymentType = runtimeDeploymentType || "local";
 const requestedAppMode = runtimeAppMode || "LOCAL_SINGLE_DEVICE";
 const configuredAppMode = APP_MODES.has(requestedAppMode) ? requestedAppMode : "LOCAL_SINGLE_DEVICE";
-const configuredCompanyId = String(process.env.COMPANY_ID || process.env.FROOZERP_COMPANY_ID || "").trim() || null;
+const hostedCloudDeployment = deploymentType === "cloud" && configuredAppMode === "CLOUD_PRODUCTION";
+const configuredCompanyId = String(process.env.COMPANY_ID || process.env.FROOZERP_COMPANY_ID || (hostedCloudDeployment ? "1" : "")).trim() || null;
 const configuredCompanyName = String(process.env.FROOZERP_COMPANY_NAME || "").trim() || null;
-const configuredBranchId = String(process.env.BRANCH_ID || "").trim() || null;
+const configuredBranchId = String(process.env.BRANCH_ID || (hostedCloudDeployment ? "1" : "")).trim() || null;
 const configuredDeviceId = String(process.env.DEVICE_ID || "").trim() || null;
 const configuredDeviceName = String(process.env.DEVICE_NAME || "").trim() || null;
-const cloudDeploymentId = String(process.env.FROOZERP_CLOUD_DEPLOYMENT_ID || "").trim() || null;
-const publicCloudApiUrl = String(process.env.CLOUD_API_URL || process.env.FROOZERP_PUBLIC_API_URL || "").trim().replace(/\/$/, "") || null;
-const hostedCloudDeployment = deploymentType === "cloud" && configuredAppMode === "CLOUD_PRODUCTION";
+const cloudDeploymentId = String(process.env.FROOZERP_CLOUD_DEPLOYMENT_ID || (hostedCloudDeployment ? "railway-production" : "")).trim() || null;
+const publicCloudApiUrl = String(process.env.CLOUD_API_URL || process.env.FROOZERP_PUBLIC_API_URL || (hostedCloudDeployment ? productionRailwayOrigin : "")).trim().replace(/\/$/, "") || null;
 const readOptionalBoolean = (value, defaultValue) => {
   const normalized = String(value || "").trim().toLowerCase();
   if (!normalized) return defaultValue;
   return normalized === "true";
 };
-const runStartupSchemaBootstrap = readOptionalBoolean(
+const runStartupSchemaBootstrap = hostedCloudDeployment ? false : readOptionalBoolean(
   process.env.RUN_STARTUP_SCHEMA_BOOTSTRAP,
   !hostedCloudDeployment
 );

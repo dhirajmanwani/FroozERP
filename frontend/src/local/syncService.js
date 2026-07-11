@@ -53,13 +53,13 @@ const getCurrentOrigin = () => {
 
 const readSavedApiConfig = () => {
   const defaults = {
-    mode: String(import.meta.env.VITE_API_MODE || "LOCAL_SINGLE_DEVICE").trim().toUpperCase(),
+    mode: String(import.meta.env.VITE_API_MODE || "HYBRID").trim().toUpperCase(),
     companyId: String(import.meta.env.VITE_COMPANY_ID || "").trim(),
     branchId: String(import.meta.env.VITE_BRANCH_ID || "1").trim(),
     subBranchId: String(import.meta.env.VITE_SUB_BRANCH_ID || "").trim(),
     deviceId: String(import.meta.env.VITE_DEVICE_ID || "").trim(),
     deviceName: String(import.meta.env.VITE_DEVICE_NAME || "").trim(),
-    cloudApiUrl: normalizeApiUrl(import.meta.env.VITE_CLOUD_API_URL || ""),
+    cloudApiUrl: normalizeApiUrl(import.meta.env.VITE_CLOUD_API_URL || "https://froozerp-production.up.railway.app"),
     branchLanApiUrl: normalizeApiUrl(import.meta.env.VITE_BRANCH_LAN_API_URL || ""),
     customApiUrl: normalizeApiUrl(import.meta.env.VITE_CUSTOM_API_URL || ""),
   };
@@ -189,7 +189,7 @@ export async function initialiseSync({ apiUrl, user, deviceInfo, branchId }) {
   const context = syncContext({ user, deviceInfo, branchId });
   if (!isTauriRuntime() || !context.userId || !context.deviceId) return lastStatus;
   const apiConfig = readSavedApiConfig();
-  const requireCloudIdentity = ["CLOUD_PRODUCTION", "FIELD_REMOTE_DEVICE"].includes(apiConfig.mode);
+  const requireCloudIdentity = ["HYBRID", "CLOUD_ONLY", "CLOUD_PRODUCTION", "FIELD_REMOTE_DEVICE"].includes(apiConfig.mode);
   const health = await checkBackendHealth(apiUrl, { details: true, reason: "sync-initialise", requireCloudIdentity });
   lastStatus = {
     ...lastStatus,
@@ -206,7 +206,7 @@ export async function initialiseSync({ apiUrl, user, deviceInfo, branchId }) {
     device_id: context.deviceId,
     device_name: context.deviceName || "FroozERP Device",
     platform: "tauri-windows",
-    app_version: "1.0.30",
+    app_version: String(import.meta.env.VITE_APP_VERSION || "1.0.33"),
     branch_id: context.branchId,
     user_id: context.userId,
     role: user?.role_name || user?.role || "",

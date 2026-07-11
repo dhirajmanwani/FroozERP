@@ -49,6 +49,9 @@ const isRailwayProductionHost = () => {
   return String(window.location.hostname || "").toLowerCase().endsWith(".up.railway.app");
 };
 const API_MODES = Object.freeze({
+  LOCAL_ONLY: "LOCAL_ONLY",
+  CLOUD_ONLY: "CLOUD_ONLY",
+  HYBRID: "HYBRID",
   LOCAL_SINGLE_DEVICE: "LOCAL_SINGLE_DEVICE",
   BRANCH_LAN_SERVER: "BRANCH_LAN_SERVER",
   BRANCH_LAN_CLIENT: "BRANCH_LAN_CLIENT",
@@ -57,6 +60,9 @@ const API_MODES = Object.freeze({
   CUSTOM_API_URL: "CUSTOM_API_URL",
 });
 const API_MODE_OPTIONS = [
+  [API_MODES.HYBRID, "Hybrid: Local + Cloud"],
+  [API_MODES.LOCAL_ONLY, "Local Only"],
+  [API_MODES.CLOUD_ONLY, "Cloud Only"],
   [API_MODES.LOCAL_SINGLE_DEVICE, "Local Single Device"],
   [API_MODES.BRANCH_LAN_SERVER, "Branch LAN Server"],
   [API_MODES.BRANCH_LAN_CLIENT, "Branch LAN Client"],
@@ -67,6 +73,8 @@ const API_MODE_OPTIONS = [
 const normalizeApiMode = (value) => {
   const mode = String(value || "").trim().toUpperCase();
   if (mode === "LOCAL_SHOP_SERVER") return API_MODES.LOCAL_SINGLE_DEVICE;
+  if (mode === "LOCAL") return API_MODES.LOCAL_ONLY;
+  if (mode === "CLOUD") return API_MODES.CLOUD_ONLY;
   return API_MODES[mode] || API_MODES.LOCAL_SINGLE_DEVICE;
 };
 const readSavedApiConfig = () => {
@@ -112,13 +120,19 @@ const sanitizeSavedApiConfigForRuntime = (config) => {
 };
 const RAILWAY_PRODUCTION_HOST = isRailwayProductionHost();
 const RAILWAY_PRODUCTION_API_URL = RAILWAY_PRODUCTION_HOST ? getCurrentOrigin() : "";
+const DEFAULT_PRODUCTION_CLOUD_API_URL = "https://froozerp-production.up.railway.app";
 const SAVED_API_CONFIG = sanitizeSavedApiConfigForRuntime(readSavedApiConfig());
+const savedModeForRuntime = normalizeApiMode(SAVED_API_CONFIG.mode);
+const legacyDesktopLocalMode = isDesktopShell() && [
+  API_MODES.LOCAL_SINGLE_DEVICE,
+  API_MODES.BRANCH_LAN_SERVER,
+].includes(savedModeForRuntime);
 const API_MODE = normalizeApiMode(
   RAILWAY_PRODUCTION_HOST ? API_MODES.CLOUD_PRODUCTION :
-  SAVED_API_CONFIG.mode ||
+  (legacyDesktopLocalMode ? API_MODES.HYBRID : SAVED_API_CONFIG.mode) ||
   import.meta.env.VITE_API_MODE ||
   window.__FROOZERP_API_MODE__ ||
-  API_MODES.LOCAL_SINGLE_DEVICE
+  (isDesktopShell() ? API_MODES.HYBRID : API_MODES.LOCAL_ONLY)
 );
 const LOCAL_API_URL = normalizeApiBase(
   SAVED_API_CONFIG.localApiUrl ||
@@ -137,7 +151,7 @@ const CLOUD_API_URL = normalizeApiBase(
   SAVED_API_CONFIG.cloudApiUrl ||
   import.meta.env.VITE_CLOUD_API_URL ||
   window.__FROOZERP_CLOUD_API_URL__ ||
-  ""
+  (isDesktopShell() ? DEFAULT_PRODUCTION_CLOUD_API_URL : "")
 );
 const CUSTOM_API_URL = normalizeApiBase(
   SAVED_API_CONFIG.customApiUrl ||
@@ -164,6 +178,8 @@ const CONFIGURED_DEVICE_ID = String(SAVED_API_CONFIG.deviceId || import.meta.env
 const CONFIGURED_DEVICE_NAME = String(SAVED_API_CONFIG.deviceName || import.meta.env.VITE_DEVICE_NAME || "").trim();
 const resolveConfiguredApiUrl = () => {
   if (RAILWAY_PRODUCTION_API_URL) return RAILWAY_PRODUCTION_API_URL;
+  if (API_MODE === API_MODES.LOCAL_ONLY || API_MODE === API_MODES.HYBRID) return LOCAL_API_URL;
+  if (API_MODE === API_MODES.CLOUD_ONLY && CLOUD_API_URL) return CLOUD_API_URL;
   if (API_MODE === API_MODES.BRANCH_LAN_CLIENT && BRANCH_LAN_API_URL) return BRANCH_LAN_API_URL;
   if (API_MODE === API_MODES.CLOUD_PRODUCTION && CLOUD_API_URL) return CLOUD_API_URL;
   if (API_MODE === API_MODES.FIELD_REMOTE_DEVICE && CLOUD_API_URL) return CLOUD_API_URL;
@@ -174,9 +190,15 @@ const resolveConfiguredApiUrl = () => {
   return LOCAL_API_URL;
 };
 const API_URL = resolveConfiguredApiUrl();
+const LOCAL_OPERATIONAL_API_URL = API_MODE === API_MODES.CLOUD_ONLY ? API_URL : LOCAL_API_URL;
+const CLOUD_OPERATIONAL_API_URL = CLOUD_API_URL;
+const SYNC_API_URL = CLOUD_OPERATIONAL_API_URL || API_URL;
 const API_CONFIG = {
   mode: API_MODE,
   apiUrl: API_URL,
+  localOperationalApiUrl: LOCAL_OPERATIONAL_API_URL,
+  cloudOperationalApiUrl: CLOUD_OPERATIONAL_API_URL || "Not configured",
+  syncApiUrl: SYNC_API_URL,
   localApiUrl: LOCAL_API_URL,
   branchLanApiUrl: BRANCH_LAN_API_URL || "Not configured",
   cloudApiUrl: CLOUD_API_URL || "Not configured",
@@ -198,10 +220,15 @@ const API_MODE_LABELS = {
   CLOUD_PRODUCTION: "Cloud Production",
   FIELD_REMOTE_DEVICE: "Field Remote Device",
   CUSTOM_API_URL: "Custom API URL",
+  LOCAL_ONLY: "Local Only",
+  CLOUD_ONLY: "Cloud Only",
+  HYBRID: "Hybrid: Local + Cloud",
 };
 
 const getApiModeLabel = () => API_MODE_LABELS[API_MODE] || API_MODE;
-const isCloudMode = (mode = API_MODE) => mode === API_MODES.CLOUD_PRODUCTION || mode === API_MODES.FIELD_REMOTE_DEVICE;
+const isCloudMode = (mode = API_MODE) => [API_MODES.CLOUD_ONLY, API_MODES.CLOUD_PRODUCTION, API_MODES.FIELD_REMOTE_DEVICE].includes(mode);
+const isHybridMode = (mode = API_MODE) => mode === API_MODES.HYBRID;
+const usesCloudBackend = (mode = API_MODE) => isHybridMode(mode) || isCloudMode(mode);
 
 const isLocalEndpoint = (value) => /^(https?:\/\/)?(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::|\/|$)/i.test(String(value || "").trim());
 const isPrivateNetworkHost = (hostname) => {
@@ -269,42 +296,53 @@ const probeRealInternet = async (timeoutMs = 4000) => {
   }
 };
 
-const buildConnectionStatusModel = ({ backendHealth = {}, syncStatus = {}, internetAvailable = true }) => {
+const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, deviceRegistration = null, syncStatus = {}, internetAvailable = true, currentUser = null }) => {
   const pending = Number(syncStatus?.pendingOperations || 0);
   const failed = Number(syncStatus?.failedOperations || 0);
   const conflicts = Number(syncStatus?.conflictOperations || 0);
-  const backendOnline = backendHealth?.online === true;
-  const backendOffline = backendHealth?.online === false;
-  const cloudReachable = isCloudMode() && CLOUD_CONFIGURED && backendOnline;
+  const localOnline = backendHealth?.online === true;
+  const localOffline = backendHealth?.online === false;
+  const cloudOnline = cloudHealth?.online === true;
+  const cloudOffline = cloudHealth?.online === false;
+  const backendOnline = isCloudMode() ? cloudOnline : localOnline;
+  const backendOffline = isCloudMode() ? cloudOffline : localOffline;
+  const cloudReachable = usesCloudBackend() && CLOUD_CONFIGURED && cloudOnline;
+  const deviceApproved = ["APPROVED", "ACTIVE"].includes(String(deviceRegistration?.status || "").toUpperCase());
+  const devicePending = ["PENDING", "PENDING_APPROVAL"].includes(String(deviceRegistration?.status || "").toUpperCase());
+  const cloudSyncActive = cloudReachable && deviceApproved && !syncStatus?.lastError;
   const fieldRemoteMode = API_MODE === API_MODES.FIELD_REMOTE_DEVICE;
   const apiModeLabel = getApiModeLabel();
   const lastSyncAt = syncStatus?.lastSuccessfulSyncAt || syncStatus?.lastPullAt || syncStatus?.lastPushAt;
   const lastSyncText = formatStatusDateTime(lastSyncAt);
-  const freshSync = cloudReachable && isFreshStatusDateTime(lastSyncAt);
+  const freshSync = cloudSyncActive && isFreshStatusDateTime(lastSyncAt);
 
   let localBackendStatus;
   let cloudBackendStatus;
-  if (API_MODE === API_MODES.LOCAL_SINGLE_DEVICE) {
-    localBackendStatus = backendOnline ? "Local Server Connected" : backendOffline ? "Local Server Offline" : "Checking Local Server";
-    cloudBackendStatus = CLOUD_CONFIGURED ? "Cloud Sync Not Active" : "Cloud Not Configured";
+  if (API_MODE === API_MODES.HYBRID || API_MODE === API_MODES.LOCAL_ONLY || API_MODE === API_MODES.LOCAL_SINGLE_DEVICE) {
+    localBackendStatus = localOnline ? "Local Server Connected" : localOffline ? "Local Server Offline" : "Checking Local Server";
+    cloudBackendStatus = !CLOUD_CONFIGURED
+      ? "Cloud Not Configured"
+      : cloudOnline
+        ? devicePending ? "Cloud Connected - Device Approval Pending" : "Cloud Backend Connected"
+        : cloudOffline ? "Cloud Temporarily Unavailable" : "Checking Cloud Backend";
   } else if (API_MODE === API_MODES.BRANCH_LAN_SERVER) {
-    localBackendStatus = backendOnline ? "Branch Server Connected" : backendOffline ? "Branch Server Offline" : "Checking Branch Server";
-    cloudBackendStatus = CLOUD_CONFIGURED ? "Cloud Sync Not Active" : "Cloud Not Configured";
+    localBackendStatus = localOnline ? "Branch Server Connected" : localOffline ? "Branch Server Offline" : "Checking Branch Server";
+    cloudBackendStatus = CLOUD_CONFIGURED ? (cloudOnline ? "Cloud Backend Connected" : cloudOffline ? "Cloud Temporarily Unavailable" : "Checking Cloud Backend") : "Cloud Not Configured";
   } else if (API_MODE === API_MODES.BRANCH_LAN_CLIENT) {
     localBackendStatus = BRANCH_LAN_API_URL
-      ? backendOnline ? "LAN Client Connected" : backendOffline ? "Branch Server Offline" : "Checking Branch Server"
+      ? localOnline ? "LAN Client Connected" : localOffline ? "Branch Server Offline" : "Checking Branch Server"
       : "Branch Server URL Required";
-    cloudBackendStatus = CLOUD_CONFIGURED ? "Cloud Sync Not Active" : "Cloud Not Configured";
-  } else if (API_MODE === API_MODES.CLOUD_PRODUCTION || fieldRemoteMode) {
+    cloudBackendStatus = CLOUD_CONFIGURED ? (cloudOnline ? "Cloud Backend Connected" : cloudOffline ? "Cloud Temporarily Unavailable" : "Checking Cloud Backend") : "Cloud Not Configured";
+  } else if (API_MODE === API_MODES.CLOUD_ONLY || API_MODE === API_MODES.CLOUD_PRODUCTION || fieldRemoteMode) {
     localBackendStatus = "Not Used In This Mode";
     cloudBackendStatus = CLOUD_CONFIGURED
-      ? backendOnline
+      ? cloudOnline
         ? fieldRemoteMode ? "Cloud Connected - Field Remote Not Ready" : "Cloud Connected"
-        : backendOffline ? "Cloud Configured But Offline" : "Checking Cloud"
+        : cloudOffline ? "Cloud Configured But Offline" : "Checking Cloud"
       : "Cloud Not Configured";
   } else {
     localBackendStatus = isLocalEndpoint(API_URL)
-      ? backendOnline ? "Local Server Connected" : backendOffline ? "Local Server Offline" : "Checking Local Server"
+      ? localOnline ? "Local Server Connected" : localOffline ? "Local Server Offline" : "Checking Local Server"
       : "Custom API Selected";
     cloudBackendStatus = CLOUD_CONFIGURED ? "Cloud Configured - Not Checked" : "Cloud Not Configured";
   }
@@ -322,29 +360,39 @@ const buildConnectionStatusModel = ({ backendHealth = {}, syncStatus = {}, inter
     syncSummary = CLOUD_CONFIGURED
       ? "Field Remote Not Ready - purchase offline sync required"
       : "Field Remote Not Ready - Cloud and purchase sync required";
-  } else if (backendOffline) {
-    syncSummary = pending > 0 ? `Pending local changes - ${pending}` : "Cloud sync not active";
+  } else if (devicePending && cloudReachable) {
+    syncSummary = "Cloud connected - device approval pending";
+  } else if (cloudOffline && usesCloudBackend()) {
+    syncSummary = pending > 0 ? `Pending local changes - ${pending}` : "Cloud temporarily unavailable";
   } else if (pending > 0) {
     syncSummary = `Pending local changes - ${pending}`;
   } else if (freshSync) {
     syncSummary = "Cloud connected - synced";
-  } else if (cloudReachable) {
-    syncSummary = "Cloud connected";
-  } else if ((API_MODE === API_MODES.LOCAL_SINGLE_DEVICE || API_MODE === API_MODES.BRANCH_LAN_SERVER || API_MODE === API_MODES.BRANCH_LAN_CLIENT) && backendOnline) {
+  } else if (cloudSyncActive) {
+    syncSummary = "Cloud sync active";
+  } else if ((API_MODE === API_MODES.LOCAL_ONLY || API_MODE === API_MODES.LOCAL_SINGLE_DEVICE || API_MODE === API_MODES.BRANCH_LAN_SERVER || API_MODE === API_MODES.BRANCH_LAN_CLIENT) && localOnline) {
     syncSummary = "No pending local changes - Cloud sync not active";
+  } else if (localOnline && cloudReachable) {
+    syncSummary = "Local ready - cloud connected";
+  } else if (localOnline) {
+    syncSummary = "Local mode active";
   } else if (backendOnline) {
     syncSummary = "Selected backend reachable";
   }
 
   let banner = "Checking FroozERP backend status...";
-  if (backendOffline) {
+  if (localOnline && cloudReachable) {
+    banner = "Local server connected • Cloud backend connected";
+  } else if (localOnline && cloudOffline && usesCloudBackend()) {
+    banner = "Local mode active • Cloud temporarily unavailable.";
+  } else if (backendOffline) {
     banner = isCloudMode()
       ? `Cloud offline. Local work is saved safely. Pending sync: ${pending}.`
       : "Offline mode active. FroozERP is using local SQLite data. Changes will sync when backend/cloud is reachable.";
   } else if (fieldRemoteMode) {
     banner = "Field Remote Device requires Cloud Production and purchase offline sync. Current version only prepares configuration.";
-  } else if ((API_MODE === API_MODES.LOCAL_SINGLE_DEVICE || API_MODE === API_MODES.BRANCH_LAN_SERVER || API_MODE === API_MODES.BRANCH_LAN_CLIENT) && backendOnline) {
-    banner = "Branch/local server connected. Cloud remains separate unless a real cloud API is set.";
+  } else if ((API_MODE === API_MODES.LOCAL_ONLY || API_MODE === API_MODES.LOCAL_SINGLE_DEVICE || API_MODE === API_MODES.BRANCH_LAN_SERVER || API_MODE === API_MODES.BRANCH_LAN_CLIENT) && localOnline) {
+    banner = "Local server connected.";
   } else if (cloudReachable) {
     banner = freshSync ? `Cloud online. Last sync completed at ${lastSyncText}.` : "Cloud online. Sync has not completed recently.";
   } else if (backendOnline) {
@@ -356,7 +404,10 @@ const buildConnectionStatusModel = ({ backendHealth = {}, syncStatus = {}, inter
     internetStatus: internetAvailable ? "Internet Available" : "No Internet",
     localBackendStatus,
     cloudBackendStatus,
+    authenticationStatus: currentUser ? "Signed in" : "Not signed in",
+    deviceRegistrationStatus: deviceRegistration?.status || (CLOUD_CONFIGURED ? "Not checked" : "Not configured"),
     currentApiUrl: backendHealth?.apiUrl || API_URL,
+    cloudApiUrl: cloudHealth?.apiUrl || CLOUD_API_URL,
     lastHealthCheck: formatStatusDateTime(backendHealth?.lastCheckedAt) || "Not checked",
     lastSuccessfulSync: lastSyncText || "Not synced",
     pending,
@@ -402,7 +453,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.32";
+const APP_VERSION = "1.0.33";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -1216,6 +1267,22 @@ function App() {
     lastOnlineAt: "",
     lastErrorAt: "",
   });
+  const [cloudHealth, setCloudHealth] = useState({
+    apiUrl: CLOUD_API_URL,
+    url: CLOUD_API_URL ? `${CLOUD_API_URL}/api/health` : "",
+    online: null,
+    checking: false,
+    reachabilityStatus: CLOUD_CONFIGURED ? "checking" : "not_configured",
+    status: CLOUD_CONFIGURED ? "checking" : "not_configured",
+    httpStatus: null,
+    reasonCode: CLOUD_CONFIGURED ? "NOT_CHECKED" : "CLOUD_NOT_CONFIGURED",
+    message: CLOUD_CONFIGURED ? "Cloud backend reachability has not been checked yet." : "Cloud backend is not configured.",
+    lastCheckedAt: "",
+    lastOnlineAt: "",
+    lastErrorAt: "",
+  });
+  const [cloudDeviceRegistration, setCloudDeviceRegistration] = useState(null);
+  const [cloudDiagnostics, setCloudDiagnostics] = useState(null);
   const [loginBusy, setLoginBusy] = useState(false);
   const [offlineMode, setOfflineMode] = useState(false);
   const [offlineReady, setOfflineReady] = useState(false);
@@ -1516,7 +1583,7 @@ function App() {
     };
   }, []);
 
-  const connectionStatus = buildConnectionStatusModel({ backendHealth, syncStatus, internetAvailable });
+  const connectionStatus = buildConnectionStatusModel({ backendHealth, cloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus, internetAvailable, currentUser: user });
 
   useEffect(() => {
     const fullscreenEnabled = settingsData.deviceControlSettings?.fullscreen_lock_enabled === true;
@@ -1596,6 +1663,196 @@ function App() {
     return status;
   };
 
+  const checkCloudBackendHealth = async (reason = "manual", timeoutMs = 5000) => {
+    if (!CLOUD_CONFIGURED) {
+      const notConfigured = {
+        apiUrl: CLOUD_API_URL,
+        url: CLOUD_API_URL ? `${CLOUD_API_URL}/api/health` : "",
+        online: false,
+        checking: false,
+        reachabilityStatus: "not_configured",
+        status: "not_configured",
+        httpStatus: null,
+        reason,
+        reasonCode: "CLOUD_NOT_CONFIGURED",
+        message: "Cloud backend is not configured.",
+        lastCheckedAt: new Date().toISOString(),
+      };
+      setCloudHealth(notConfigured);
+      return notConfigured;
+    }
+    const url = `${CLOUD_API_URL}/api/health`;
+    try {
+      const response = await axios.get(url, { timeout: timeoutMs, headers: { "Cache-Control": "no-store" }, params: { t: Date.now() } });
+      const health = response.data || {};
+      const identityOk = health.app === "FroozERP" && String(health.api_version) === "1" && health.deployment_type === "cloud";
+      const online = response.status >= 200 && response.status < 300 && String(health.status || "").toLowerCase() === "ok" && identityOk;
+      const next = {
+        apiUrl: CLOUD_API_URL,
+        url,
+        online,
+        checking: false,
+        reachabilityStatus: online ? "online" : "server_error",
+        status: online ? "online" : "server_error",
+        httpStatus: response.status,
+        reason,
+        reasonCode: online ? "ONLINE" : "CLOUD_IDENTITY_INVALID",
+        message: online ? "FroozERP cloud backend is reachable." : "Cloud responded, but FroozERP cloud identity is incomplete.",
+        data: health,
+        lastCheckedAt: new Date().toISOString(),
+        lastOnlineAt: online ? new Date().toISOString() : cloudHealth.lastOnlineAt,
+        lastErrorAt: online ? cloudHealth.lastErrorAt : new Date().toISOString(),
+      };
+      setCloudHealth(next);
+      return next;
+    } catch (error) {
+      const next = {
+        apiUrl: CLOUD_API_URL,
+        url,
+        online: false,
+        checking: false,
+        reachabilityStatus: error.response ? "server_error" : "offline",
+        status: error.response ? "server_error" : "offline",
+        httpStatus: error.response?.status || null,
+        reason,
+        reasonCode: error.response ? "HTTP_FAILURE" : "BACKEND_UNAVAILABLE",
+        message: error.response?.data?.message || error.message || "Cloud backend is unavailable.",
+        lastCheckedAt: new Date().toISOString(),
+        lastErrorAt: new Date().toISOString(),
+      };
+      setCloudHealth(next);
+      return next;
+    }
+  };
+
+  const registerCloudDevice = async (currentUser = user, latestDevice = deviceInfo) => {
+    if (!CLOUD_CONFIGURED || !currentUser?.id || !latestDevice?.device_id) return null;
+    const payload = {
+      device_id: latestDevice.device_id,
+      device_name: latestDevice.device_name || "FroozERP Device",
+      platform: "tauri-windows",
+      app_version: APP_VERSION,
+      branch_id: currentUser.branch_id || 1,
+      user_id: currentUser.id,
+      role: currentUser.role_name || currentUser.role || "",
+      app_mode: API_MODE,
+      company_id: CONFIGURED_COMPANY_ID || "1",
+      sub_branch_id: CONFIGURED_SUB_BRANCH_ID || "",
+      cloud_api_url: CLOUD_API_URL,
+      local_api_url: LOCAL_API_URL,
+    };
+    try {
+      const response = await axios.post(`${CLOUD_API_URL}/api/sync/register-device`, payload, { timeout: 8000 });
+      const registration = { ...(response.data || {}), url: `${CLOUD_API_URL}/api/sync/register-device`, httpStatus: response.status, checkedAt: new Date().toISOString() };
+      setCloudDeviceRegistration(registration);
+      return registration;
+    } catch (error) {
+      const registration = {
+        status: "ERROR",
+        url: `${CLOUD_API_URL}/api/sync/register-device`,
+        httpStatus: error.response?.status || null,
+        message: error.response?.data?.message || error.message || "Cloud device registration failed.",
+        checkedAt: new Date().toISOString(),
+      };
+      setCloudDeviceRegistration(registration);
+      return registration;
+    }
+  };
+
+  const runCloudDiagnostics = async () => {
+    const startedAt = new Date().toISOString();
+    const safeError = (error) => ({
+      httpStatus: error.response?.status || null,
+      message: error.response?.data?.message || error.message || "Request failed",
+    });
+    const check = async (label, url, action) => {
+      const started = Date.now();
+      try {
+        const result = await action();
+        return {
+          label,
+          ok: true,
+          url,
+          httpStatus: result?.status || result?.httpStatus || 200,
+          message: result?.message || "OK",
+          durationMs: Date.now() - started,
+        };
+      } catch (error) {
+        const safe = safeError(error);
+        return {
+          label,
+          ok: false,
+          url,
+          httpStatus: safe.httpStatus,
+          message: safe.message,
+          durationMs: Date.now() - started,
+        };
+      }
+    };
+    const latestDevice = await resolveLocalDeviceInfo(deviceInfo);
+    const localHealthUrl = `${LOCAL_API_URL}/api/health`;
+    const cloudHealthUrl = `${CLOUD_API_URL}/api/health`;
+    const results = [];
+    results.push(await check("Internet", "https://www.gstatic.com/generate_204", async () => {
+      const reachable = await probeRealInternet(5000);
+      if (!reachable) throw new Error("Internet probe failed");
+      return { status: 200, message: "Internet reachable" };
+    }));
+    results.push(await check("Local /api/health", localHealthUrl, async () => {
+      const response = await axios.get(localHealthUrl, { timeout: 5000, headers: { "Cache-Control": "no-store" } });
+      return { status: response.status, message: response.data?.status === "ok" ? "Local backend healthy" : "Local backend health did not report ok" };
+    }));
+    results.push(await check("Railway /api/health", cloudHealthUrl, async () => {
+      const response = await axios.get(cloudHealthUrl, { timeout: 7000, headers: { "Cache-Control": "no-store" } });
+      return { status: response.status, message: response.data?.status === "ok" ? "Cloud backend healthy" : "Cloud backend health did not report ok" };
+    }));
+    results.push(await check("Railway authentication", `${CLOUD_API_URL}/login`, async () => ({
+      status: user?.id ? 200 : 401,
+      message: user?.id ? `Signed in as user ${user.id}` : "No active local session for cloud diagnostics",
+    })));
+    results.push(await check("Device registration/approval", `${CLOUD_API_URL}/api/sync/register-device`, async () => {
+      const registration = await registerCloudDevice(user, latestDevice);
+      return { httpStatus: registration?.httpStatus || 200, message: registration?.message || `Device ${registration?.status || "not checked"}` };
+    }));
+    results.push(await check("FROST briefing endpoint", `${LOCAL_API_URL}/api/ai/briefing`, async () => {
+      const response = await axios.get(`${LOCAL_API_URL}/api/ai/briefing`, {
+        timeout: 8000,
+        params: { user_id: user?.id, device_id: latestDevice.device_id, range: aiRange },
+      });
+      const cards = response.data?.cards || {};
+      return { status: response.status, message: `FROST briefing loaded with ${Object.keys(cards).length} card groups` };
+    }));
+    const status = await getSyncStatus();
+    setSyncStatus(status);
+    results.push({
+      label: "Pending sync count",
+      ok: true,
+      url: "local SQLite sync_outbox",
+      httpStatus: null,
+      message: `${Number(status.pendingOperations || 0)} pending, ${Number(status.failedOperations || 0)} failed`,
+      durationMs: 0,
+    });
+    results.push({
+      label: "Last sync result",
+      ok: !status.lastError,
+      url: SYNC_API_URL,
+      httpStatus: status.lastHttpStatus || null,
+      message: status.lastError || status.lastSuccessfulSyncAt || "No successful sync recorded yet",
+      durationMs: 0,
+    });
+    setCloudDiagnostics({ startedAt, finishedAt: new Date().toISOString(), results });
+    const nextCloud = await checkCloudBackendHealth("cloud-diagnostics", 7000);
+    setStartupNotice(buildConnectionStatusModel({
+      backendHealth,
+      cloudHealth: nextCloud,
+      deviceRegistration: cloudDeviceRegistration,
+      syncStatus: status,
+      internetAvailable,
+      currentUser: user,
+    }).banner);
+    return results;
+  };
+
   const userRef = useRef(user);
   const deviceInfoRef = useRef(deviceInfo);
   const syncStatusRef = useRef(syncStatus);
@@ -1627,13 +1884,13 @@ function App() {
     if (force) lastAutoSyncStartedAtRef.current = Date.now();
     setSyncMessage("Syncing...");
     const status = await syncNow({
-      apiUrl: API_URL,
+      apiUrl: SYNC_API_URL,
       user,
       deviceInfo,
       branchId: user.branch_id || 1,
     });
     setSyncStatus(status);
-    const nextStatus = buildConnectionStatusModel({ backendHealth, syncStatus: status, internetAvailable });
+    const nextStatus = buildConnectionStatusModel({ backendHealth, cloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: status, internetAvailable, currentUser: user });
     setSyncMessage(status.lastError ? `Sync failed: ${status.lastError}` : nextStatus.syncSummary);
     return status;
   };
@@ -1650,8 +1907,8 @@ function App() {
       });
       setStartupNotice((current) => (
         /offline|local sqlite|sync changes later|online login succeeded|local reference data/i.test(current || "")
-          ? buildConnectionStatusModel({ backendHealth: health, syncStatus: statusSyncStatus, internetAvailable: statusInternetAvailable }).banner
-          : current || buildConnectionStatusModel({ backendHealth: health, syncStatus: statusSyncStatus, internetAvailable: statusInternetAvailable }).banner
+          ? buildConnectionStatusModel({ backendHealth: health, cloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: statusSyncStatus, internetAvailable: statusInternetAvailable, currentUser: userRef.current }).banner
+          : current || buildConnectionStatusModel({ backendHealth: health, cloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: statusSyncStatus, internetAvailable: statusInternetAvailable, currentUser: userRef.current }).banner
       ));
     } else {
       setStartupNotice("Offline mode is active. FroozERP loaded your local SQLite data and will sync changes later.");
@@ -1670,18 +1927,22 @@ function App() {
       reason,
       requireCloudIdentity: isCloudMode(),
     });
+    const nextCloudHealth = usesCloudBackend()
+      ? await checkCloudBackendHealth(reason, options.timeoutMs || 5000)
+      : cloudHealth;
     applyConnectivityState(health, realInternet, syncStatusRef.current);
-    if (health.online && userRef.current && !reconnectSyncRef.current && shouldStartBackgroundSync()) {
+    const cloudReadyForSync = !usesCloudBackend() || nextCloudHealth?.online === true;
+    if (health.online && cloudReadyForSync && userRef.current && !reconnectSyncRef.current && shouldStartBackgroundSync()) {
       reconnectSyncRef.current = true;
       syncNow({
-        apiUrl: API_URL,
+        apiUrl: SYNC_API_URL,
         user: userRef.current,
         deviceInfo: deviceInfoRef.current,
         branchId: userRef.current.branch_id || 1,
         })
         .then((status) => {
           setSyncStatus(status);
-          const nextStatus = buildConnectionStatusModel({ backendHealth: health, syncStatus: status, internetAvailable: realInternet });
+          const nextStatus = buildConnectionStatusModel({ backendHealth: health, cloudHealth: nextCloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: status, internetAvailable: realInternet, currentUser: userRef.current });
           setSyncMessage(status.lastError ? `Sync failed: ${status.lastError}` : nextStatus.syncSummary);
         })
         .finally(() => {
@@ -2258,8 +2519,11 @@ function App() {
     }
     setStartupNotice(buildConnectionStatusModel({
       backendHealth: { ...backendHealth, online: true },
+      cloudHealth,
+      deviceRegistration: cloudDeviceRegistration,
       syncStatus,
       internetAvailable,
+      currentUser,
     }).banner);
     return snapshot;
   };
@@ -2799,6 +3063,7 @@ function App() {
       writeDiagnosticLog("INFO", "login-success", { apiUrl: API_URL, endpoint: `${API_URL}/login`, userId: response.data?.id, deviceId: latestDevice.device_id });
       setDeviceGate(null);
       setUser(response.data);
+      await registerCloudDevice(response.data, latestDevice);
       if (response.data?.force_password_change) {
         setStartupNotice("Sign in succeeded. This account must change its temporary password from User Management before regular use.");
       }
@@ -5435,7 +5700,12 @@ function AiBusinessAssistantModule({
         </div>
       </div>
 
-      {data.error && <div className="startup-status-panel startup-status-error"><p>{data.error}</p></div>}
+      {data.error && (
+        <div className="startup-status-panel startup-status-error">
+          <p>{data.error}</p>
+          {Object.keys(cards).length > 0 && <small>Showing last verified local values until refresh succeeds.</small>}
+        </div>
+      )}
 
       <div className="frost-tabs" role="tablist" aria-label="FROST sections">
         {tabItems.map(([key, label]) => (
@@ -10917,6 +11187,9 @@ function SettingsModule({
       <SyncSettingsSection
         backendHealth={backendHealth}
         canManage={canManage}
+        cloudDeviceRegistration={cloudDeviceRegistration}
+        cloudDiagnostics={cloudDiagnostics}
+        cloudHealth={cloudHealth}
         connectionStatus={connectionStatus}
         key={settingsData.syncSettings?.updated_at || "sync-settings"}
         localDbStatus={localDbStatus}
@@ -10924,6 +11197,7 @@ function SettingsModule({
         onQueueSyncTest={onQueueSyncTest}
         onReload={onReload}
         onRetrySync={onRetrySync}
+        onRunCloudDiagnostics={runCloudDiagnostics}
         onRunSync={onRunSync}
         syncMessage={syncMessage}
         settingsData={settingsData}
@@ -12081,12 +12355,16 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
 function SyncSettingsSection({
   backendHealth,
   canManage,
+  cloudDeviceRegistration,
+  cloudDiagnostics,
+  cloudHealth,
   connectionStatus,
   localDbStatus,
   onCheckConnection,
   onQueueSyncTest,
   onReload,
   onRetrySync,
+  onRunCloudDiagnostics,
   onRunSync,
   syncMessage,
   settingsData,
@@ -12301,6 +12579,8 @@ function SyncSettingsSection({
           ["Internet", internetStatus],
           ["Local Server", localServerStatus],
           ["Cloud", cloudStatus],
+          ["Authentication", connectionStatus?.authenticationStatus || "Not signed in"],
+          ["Device Registration", connectionStatus?.deviceRegistrationStatus || "Not checked"],
           ["Sync Status", syncSummary],
           ["Pending Sync", pending],
           ["Last Sync", lastSync ? new Date(lastSync).toLocaleString("en-IN") : "Not synced"],
@@ -12315,6 +12595,7 @@ function SyncSettingsSection({
         <button className="secondary-button" disabled={!onCheckConnection} onClick={onCheckConnection}>Check Connection</button>
         <button className="secondary-button" disabled={!canManage || !onRunSync} onClick={onRunSync}>Sync Now</button>
         <button className="secondary-button" disabled={!canManage || !onRetrySync} onClick={onRetrySync}>Retry Failed</button>
+        <button className="secondary-button" disabled={!canManage || !onRunCloudDiagnostics} onClick={onRunCloudDiagnostics}>Run Cloud Diagnostics</button>
         <button className="secondary-button" onClick={() => setShowDiagnostics((current) => !current)}>Advanced Diagnostics</button>
       </div>
       {showDiagnostics && cloudReadiness && (
@@ -12383,6 +12664,10 @@ function SyncSettingsSection({
             <Field label="Settings API Base"><input disabled value={backendHealth?.apiUrl || API_URL} /></Field>
             <Field label="Sync Worker API Base"><input disabled value={syncStatus?.apiUrl || API_URL} /></Field>
             <Field label="Backend Health URL"><input disabled value={backendHealth?.url || `${API_URL}/api/health`} /></Field>
+            <Field label="Cloud Health URL"><input disabled value={cloudHealth?.url || `${CLOUD_API_URL}/api/health`} /></Field>
+            <Field label="Cloud Health Detail"><input disabled value={cloudHealth?.message || "Not checked"} /></Field>
+            <Field label="Cloud Device Status"><input disabled value={cloudDeviceRegistration?.status || "Not checked"} /></Field>
+            <Field label="Cloud Device Detail"><input disabled value={cloudDeviceRegistration?.message || "Not checked"} /></Field>
             <Field label="Last Sync Failure"><input disabled value={syncStatus?.lastError || backendHealth?.message || "None"} /></Field>
             <Field label="Current Cursor"><input disabled value={syncStatus?.currentCursor || "0"} /></Field>
             <label className="check-field"><input checked={draft.sync_enabled === true} disabled type="checkbox" /><span>Sync foundation enabled for approved native devices</span></label>
@@ -12395,6 +12680,19 @@ function SyncSettingsSection({
             <button className="secondary-button" disabled={cloudReadinessBusy} onClick={runCloudReadinessCheck}>{cloudReadinessBusy ? "Checking Cloud..." : "Cloud Readiness Check"}</button>
             <button className="secondary-button" disabled={!canManage || !onQueueSyncTest} onClick={onQueueSyncTest}>Queue Safe Test</button>
           </div>
+          {cloudDiagnostics?.results?.length > 0 && (
+            <DataTable headers={["Check", "Result", "URL", "HTTP", "Message"]}>
+              {cloudDiagnostics.results.map((row) => (
+                <tr key={row.label}>
+                  <td>{row.label}</td>
+                  <td><span className={row.ok ? "stock-ok" : "stock-low"}>{row.ok ? "Passed" : "Failed"}</span></td>
+                  <td><small>{row.url}</small></td>
+                  <td>{row.httpStatus || "-"}</td>
+                  <td>{row.message}</td>
+                </tr>
+              ))}
+            </DataTable>
+          )}
         </div>
       )}
     </ModuleCard>

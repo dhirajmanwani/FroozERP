@@ -1264,19 +1264,41 @@ const getReminders = async (pool) => {
   return result.rows;
 };
 
+const emptyBriefingFact = (type, sourceModule, periodLabel, summary = {}, error = "") => buildFact(
+  type,
+  sourceModule,
+  periodLabel,
+  [],
+  { ...summary, unavailable: Boolean(error), error }
+);
+
+const safeBriefingFact = async (label, fallback, producer) => {
+  try {
+    return await producer();
+  } catch (error) {
+    console.warn("FROST briefing fact unavailable", { label, message: error.message });
+    return { ...fallback, summary: { ...(fallback.summary || {}), unavailable: true, error: error.message } };
+  }
+};
+
 const buildDailyBriefing = async (pool, settings, range) => {
-  await runAlertRules(pool, settings);
+  await runAlertRules(pool, settings).catch((error) => {
+    console.warn("FROST alert rules skipped during briefing", error.message);
+  });
   const [sales, collections, customerOutstanding, supplierOutstanding, pendingPurchases, lowStock, waste, expiringLots, salesRanking, alerts] = await Promise.all([
-    getDailySalesSummary(pool, range),
-    getCollectionSummary(pool, range),
-    getCustomerOutstanding(pool, settings),
-    getSupplierOutstanding(pool),
-    getPendingPurchaseBills(pool),
-    getLowStockProducts(pool),
-    getWasteSummary(pool, range),
-    getInventoryNearingExpiry(pool, settings),
-    getProductSalesRanking(pool, range),
-    getStoredAlerts(pool),
+    safeBriefingFact("sales", emptyBriefingFact("daily_sales_summary", "POS Billing", range.label, { billCount: 0, totalSales: 0, estimatedGrossProfit: 0, discountAmount: 0 }), () => getDailySalesSummary(pool, range)),
+    safeBriefingFact("collections", emptyBriefingFact("collection_summary", "Payments", range.label, { totalCollected: 0, count: 0 }), () => getCollectionSummary(pool, range)),
+    safeBriefingFact("customerOutstanding", emptyBriefingFact("customer_outstanding", "Accounts", "Current branch", { totalOutstanding: 0, count: 0 }), () => getCustomerOutstanding(pool, settings)),
+    safeBriefingFact("supplierOutstanding", emptyBriefingFact("supplier_outstanding", "Accounts", "Current branch", { totalOutstanding: 0, count: 0 }), () => getSupplierOutstanding(pool)),
+    safeBriefingFact("pendingPurchases", emptyBriefingFact("pending_purchase_bills", "Purchases", "Pending bills", { count: 0, estimatedValue: 0 }), () => getPendingPurchaseBills(pool)),
+    safeBriefingFact("lowStock", emptyBriefingFact("low_stock_products", "Inventory Lots", "Current stock", { count: 0 }), () => getLowStockProducts(pool)),
+    safeBriefingFact("waste", emptyBriefingFact("waste_summary", "Waste", range.label, { totalWasteCost: 0 }), () => getWasteSummary(pool, range)),
+    safeBriefingFact("expiringLots", emptyBriefingFact("inventory_nearing_expiry", "Inventory Lots", "Aging lots", { count: 0 }), () => getInventoryNearingExpiry(pool, settings)),
+    safeBriefingFact("salesRanking", emptyBriefingFact("product_sales_ranking", "Sales History", range.label, { highestSelling: [], lowestSelling: [] }), () => getProductSalesRanking(pool, range)),
+    getStoredAlerts(pool).catch((error) => {
+      console.warn("FROST stored alerts unavailable during briefing", error.message);
+      return [];
+    }),
   ]);
   const recommendations = [];
   if (alerts.some((alert) => alert.severity === "CRITICAL")) recommendations.push("Review critical alerts before new credit sales.");
