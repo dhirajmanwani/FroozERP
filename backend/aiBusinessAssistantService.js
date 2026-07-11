@@ -2119,6 +2119,67 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       return res.status(500).json({ configured: false, message: "Unable to prepare FROST voice session" });
     }
   });
+
+  app.get("/api/ai/voice/status", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    if (!user) return;
+    const apiKeyConfigured = Boolean(String(process.env.OPENAI_API_KEY || "").trim());
+    const provider = String(process.env.AI_PROVIDER || "openai").trim() || "openai";
+    const model = String(process.env.AI_REALTIME_MODEL || process.env.AI_VOICE_MODEL || "gpt-realtime").trim();
+    return res.json({
+      configured: apiKeyConfigured,
+      provider,
+      status: apiKeyConfigured ? "Ready" : "Provider not configured",
+      model: apiKeyConfigured ? model : "",
+      supports_transcription: apiKeyConfigured,
+      supports_speech: apiKeyConfigured,
+      message: apiKeyConfigured
+        ? "FROST Voice provider is configured. Test microphone and transcription in the installed app."
+        : "Voice provider is not configured. Open Settings > Integrations > Voice.",
+    });
+  });
+
+  app.post("/api/ai/voice/transcribe", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    if (!user) return;
+    if (!String(process.env.OPENAI_API_KEY || "").trim()) {
+      return res.status(503).json({
+        configured: false,
+        code: "VOICE_PROVIDER_NOT_CONFIGURED",
+        status: "Provider not configured",
+        message: "Voice provider is not configured. Open Settings > Integrations > Voice.",
+        text_fallback_available: true,
+      });
+    }
+    return res.status(501).json({
+      configured: true,
+      code: "VOICE_TRANSCRIPTION_UPLOAD_NOT_IMPLEMENTED",
+      status: "Error",
+      message: "Server-side audio upload transcription is not enabled in this build. Use the installed app text fallback or Realtime voice session.",
+      text_fallback_available: true,
+    });
+  });
+
+  app.post("/api/ai/voice/speak", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    if (!user) return;
+    if (!String(process.env.OPENAI_API_KEY || "").trim()) {
+      return res.status(503).json({
+        configured: false,
+        code: "VOICE_PROVIDER_NOT_CONFIGURED",
+        status: "Provider not configured",
+        message: "Voice provider is not configured. Open Settings > Integrations > Voice.",
+        text_fallback_available: true,
+      });
+    }
+    return res.status(501).json({
+      configured: true,
+      code: "VOICE_SPEECH_OUTPUT_NOT_IMPLEMENTED",
+      status: "Error",
+      message: "Server-side speech output is not enabled in this build. Use the installed app text answer or Realtime voice session.",
+      text_fallback_available: true,
+    });
+  });
 };
 
 module.exports = {

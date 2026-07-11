@@ -561,6 +561,49 @@ const getRecoveryProviderStatus = () => ({
   development: recoveryDevOtpEnabled ? "enabled" : "disabled",
 });
 
+const getEmailProviderDiagnostics = () => {
+  const required = {
+    smtp_host: Boolean(cleanText(process.env.SMTP_HOST)),
+    smtp_port: Boolean(cleanText(process.env.SMTP_PORT || "587")),
+    smtp_user: Boolean(cleanText(process.env.SMTP_USER)),
+    smtp_password: Boolean(cleanText(process.env.SMTP_PASS || process.env.SMTP_PASSWORD)),
+    sender: Boolean(cleanText(process.env.SMTP_FROM || process.env.SMTP_USER)),
+  };
+  const configured = Object.values(required).every(Boolean);
+  return {
+    provider: "smtp",
+    status: configured ? "configured" : "not_configured",
+    configured,
+    required,
+    host: cleanText(process.env.SMTP_HOST),
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: /^true$/i.test(process.env.SMTP_SECURE || ""),
+    username_configured: Boolean(cleanText(process.env.SMTP_USER)),
+    password_configured: Boolean(cleanText(process.env.SMTP_PASS || process.env.SMTP_PASSWORD)),
+    sender_name: cleanText(process.env.SMTP_SENDER_NAME || "FroozERP"),
+    sender_email: cleanText(process.env.SMTP_FROM || process.env.SMTP_USER),
+  };
+};
+
+const getSmsProviderDiagnostics = () => {
+  const required = {
+    provider_url: Boolean(cleanText(process.env.SMS_PROVIDER_URL)),
+    credential: Boolean(cleanText(process.env.SMS_PROVIDER_TOKEN || process.env.SMS_PROVIDER_API_KEY)),
+  };
+  const configured = Object.values(required).every(Boolean);
+  return {
+    provider: cleanText(process.env.SMS_PROVIDER || "generic_http"),
+    status: configured ? "configured" : "not_configured",
+    configured,
+    required,
+    api_base_configured: Boolean(cleanText(process.env.SMS_PROVIDER_URL)),
+    token_configured: Boolean(cleanText(process.env.SMS_PROVIDER_TOKEN || process.env.SMS_PROVIDER_API_KEY)),
+    sender_id: cleanText(process.env.SMS_SENDER_ID || "FROOZ"),
+    template_id_configured: Boolean(cleanText(process.env.SMS_TEMPLATE_ID)),
+    default_country_code: cleanText(process.env.SMS_DEFAULT_COUNTRY_CODE || "91"),
+  };
+};
+
 const sendEmailOtp = async ({ to, code, purpose }) => {
   if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) {
     return { delivered: false, provider: "EmailOtpProvider", status: "not_configured" };
@@ -4761,6 +4804,111 @@ app.get("/api/auth/me", async (req, res) => {
   }
 });
 
+app.get("/api/integrations/email/status", async (req, res) => {
+  try {
+    const manager = await getPermissionUser(req.query.user_id || req.headers["x-user-id"], "settings", ["Owner", "Admin"]);
+    if (!manager) return res.status(403).json({ code: "OWNER_REQUIRED", message: "Owner/Admin permission is required to view email provider status." });
+    return res.json({
+      ...getEmailProviderDiagnostics(),
+      last_tested: null,
+      last_error: "",
+      message: getEmailProviderDiagnostics().configured
+        ? "Email provider is configured. Use Send Test Email before enabling verification workflows."
+        : "Email verification is unavailable because the email provider has not been configured by the Owner.",
+    });
+  } catch (error) {
+    console.error("Email provider status failed", error);
+    return res.status(500).json({ code: "EMAIL_STATUS_ERROR", message: "Unable to load email provider status." });
+  }
+});
+
+app.post("/api/integrations/email/test", async (req, res) => {
+  try {
+    const manager = await getPermissionUser(req.body.user_id || req.headers["x-user-id"], "settings", ["Owner", "Admin"]);
+    if (!manager) return res.status(403).json({ code: "OWNER_REQUIRED", message: "Owner/Admin permission is required to test email provider." });
+    const status = getEmailProviderDiagnostics();
+    if (!status.configured) {
+      return res.status(503).json({
+        ...status,
+        code: "EMAIL_PROVIDER_NOT_CONFIGURED",
+        message: "Email verification is unavailable because the email provider has not been configured by the Owner.",
+      });
+    }
+    const recipient = normalizeRecoveryEmail(req.body.test_recipient || req.body.to);
+    if (!recipient) return res.status(400).json({ code: "INVALID_TEST_EMAIL", message: "Enter a valid test email recipient." });
+    const delivery = await sendRecoveryNotification({
+      method: "email",
+      contact: recipient,
+      subject: "FroozERP test email",
+      message: "This is a FroozERP email provider test. No business data was changed.",
+      html: "<p>This is a FroozERP email provider test. No business data was changed.</p>",
+    });
+    return res.json({
+      configured: true,
+      delivered: delivery.delivered === true,
+      status: delivery.status,
+      provider: delivery.provider,
+      message: delivery.delivered ? "Test email accepted by provider." : "Email provider test failed.",
+      last_tested: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("Email provider test failed", error);
+    return res.status(500).json({ code: "EMAIL_TEST_ERROR", message: "Unable to test email provider." });
+  }
+});
+
+app.get("/api/integrations/sms/status", async (req, res) => {
+  try {
+    const manager = await getPermissionUser(req.query.user_id || req.headers["x-user-id"], "settings", ["Owner", "Admin"]);
+    if (!manager) return res.status(403).json({ code: "OWNER_REQUIRED", message: "Owner/Admin permission is required to view SMS provider status." });
+    const status = getSmsProviderDiagnostics();
+    return res.json({
+      ...status,
+      last_tested: null,
+      last_error: "",
+      message: status.configured
+        ? "SMS provider is configured. Use Send Test SMS before enabling phone verification workflows."
+        : "SMS verification is unavailable because the SMS provider has not been configured by the Owner.",
+    });
+  } catch (error) {
+    console.error("SMS provider status failed", error);
+    return res.status(500).json({ code: "SMS_STATUS_ERROR", message: "Unable to load SMS provider status." });
+  }
+});
+
+app.post("/api/integrations/sms/test", async (req, res) => {
+  try {
+    const manager = await getPermissionUser(req.body.user_id || req.headers["x-user-id"], "settings", ["Owner", "Admin"]);
+    if (!manager) return res.status(403).json({ code: "OWNER_REQUIRED", message: "Owner/Admin permission is required to test SMS provider." });
+    const status = getSmsProviderDiagnostics();
+    if (!status.configured) {
+      return res.status(503).json({
+        ...status,
+        code: "SMS_PROVIDER_NOT_CONFIGURED",
+        message: "SMS verification is unavailable because the SMS provider has not been configured by the Owner.",
+      });
+    }
+    const mobile = normalizeRecoveryMobile(req.body.test_mobile || req.body.to);
+    if (!mobile) return res.status(400).json({ code: "INVALID_TEST_MOBILE", message: "Enter a valid Indian test mobile number." });
+    const delivery = await sendRecoveryNotification({
+      method: "mobile",
+      contact: mobile,
+      message: "FroozERP SMS provider test. No business data was changed.",
+    });
+    return res.json({
+      configured: true,
+      delivered: delivery.delivered === true,
+      status: delivery.status,
+      provider: delivery.provider,
+      message: delivery.delivered ? "Test SMS accepted by provider." : "SMS provider test failed.",
+      last_tested: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("SMS provider test failed", error);
+    return res.status(500).json({ code: "SMS_TEST_ERROR", message: "Unable to test SMS provider." });
+  }
+});
+
 app.get("/purchase-rules", async (req, res) => {
   try {
     const [mandiResult, rebateResult] = await Promise.all([
@@ -5896,6 +6044,200 @@ app.post("/auth/recovery/contact/verify", async (req, res) => {
     await client.query("ROLLBACK").catch(() => {});
     console.error(error);
     return res.status(500).json({ code: "RECOVERY_CONTACT_VERIFY_ERROR", message: "Unable to verify recovery contact" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/auth/email/send-verification", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = parsePositiveInteger(req.body.user_id);
+    const actor = await requireSelfOrRateManager(userId, req.body.updated_by || req.body.user_id, client);
+    if (!actor) return res.status(403).json({ code: "OWNER_OR_SELF_REQUIRED", message: "Not allowed to update this email verification." });
+    const email = normalizeRecoveryEmail(req.body.email || req.body.contact_value);
+    if (!email) return res.status(400).json({ code: "INVALID_EMAIL", message: "Enter a valid email address." });
+    const providerStatus = getEmailProviderDiagnostics();
+    if (!providerStatus.configured) {
+      return res.status(503).json({
+        code: "EMAIL_PROVIDER_NOT_CONFIGURED",
+        message: "Email verification is unavailable because the email provider has not been configured by the Owner.",
+        provider: providerStatus,
+      });
+    }
+    const userResult = await client.query("SELECT id, username, full_name FROM users WHERE id = $1 AND active = TRUE", [userId]);
+    const user = userResult.rows[0];
+    if (!user) return res.status(404).json({ code: "USER_NOT_FOUND", message: "User not found" });
+    await client.query("BEGIN");
+    const delivery = await createOtpRequest({
+      client,
+      user,
+      purpose: "contact_email",
+      method: "email",
+      contact: email,
+      req,
+      deviceId: cleanText(req.body.device_id),
+    });
+    if (!delivery.delivery.delivered) {
+      await invalidateOtpRequest(delivery.requestId, client);
+      await client.query("ROLLBACK");
+      return res.status(503).json({ code: "EMAIL_DELIVERY_FAILED", message: "Email provider did not accept the verification request.", delivery_status: delivery.delivery.status });
+    }
+    await client.query("UPDATE users SET pending_recovery_email = $1, recovery_email_verified = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $2", [email, userId]);
+    await client.query("COMMIT");
+    return res.json({
+      success: true,
+      code: "EMAIL_VERIFICATION_SENT",
+      request_id: delivery.requestId,
+      masked_email: maskEmail(email),
+      expires_in_seconds: 600,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("Email verification send failed", error);
+    return res.status(500).json({ code: "EMAIL_VERIFICATION_ERROR", message: "Unable to send email verification." });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/auth/email/verify", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = parsePositiveInteger(req.body.user_id);
+    const actor = await requireSelfOrRateManager(userId, req.body.updated_by || req.body.user_id, client);
+    if (!actor) return res.status(403).json({ code: "OWNER_OR_SELF_REQUIRED", message: "Not allowed to verify this email." });
+    await client.query("BEGIN");
+    const verification = await verifyOtpRequest({ requestId: cleanText(req.body.request_id), otp: cleanText(req.body.otp), purpose: "contact_email", client });
+    if (!verification.ok) {
+      await client.query("COMMIT");
+      return res.status(verification.status).json({ code: verification.code, message: verification.message });
+    }
+    if (Number(verification.request.user_id) !== Number(userId)) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ code: "REQUEST_USER_MISMATCH", message: "Verification request does not match this user." });
+    }
+    const pending = await client.query("SELECT pending_recovery_email FROM users WHERE id = $1 FOR UPDATE", [userId]);
+    const email = pending.rows[0]?.pending_recovery_email;
+    if (!email) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ code: "NO_PENDING_EMAIL", message: "No pending email verification exists." });
+    }
+    await client.query(
+      `UPDATE users
+       SET recovery_email = pending_recovery_email,
+           verified_email = pending_recovery_email,
+           recovery_email_verified = TRUE,
+           recovery_email_verified_at = CURRENT_TIMESTAMP,
+           pending_recovery_email = NULL,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [userId]
+    );
+    await client.query("UPDATE account_recovery_requests SET used_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE request_id = $1", [cleanText(req.body.request_id)]);
+    await client.query("COMMIT");
+    return res.json({ success: true, code: "EMAIL_VERIFIED", email_verified_at: new Date().toISOString(), masked_email: maskEmail(email) });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("Email verification failed", error);
+    return res.status(500).json({ code: "EMAIL_VERIFY_ERROR", message: "Unable to verify email." });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/auth/phone/send-otp", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = parsePositiveInteger(req.body.user_id);
+    const actor = await requireSelfOrRateManager(userId, req.body.updated_by || req.body.user_id, client);
+    if (!actor) return res.status(403).json({ code: "OWNER_OR_SELF_REQUIRED", message: "Not allowed to update this phone verification." });
+    const mobile = normalizeRecoveryMobile(req.body.phone || req.body.mobile || req.body.contact_value);
+    if (!mobile) return res.status(400).json({ code: "INVALID_PHONE", message: "Enter a valid Indian mobile number." });
+    const providerStatus = getSmsProviderDiagnostics();
+    if (!providerStatus.configured) {
+      return res.status(503).json({
+        code: "SMS_PROVIDER_NOT_CONFIGURED",
+        message: "SMS verification is unavailable because the SMS provider has not been configured by the Owner.",
+        provider: providerStatus,
+      });
+    }
+    const userResult = await client.query("SELECT id, username, full_name FROM users WHERE id = $1 AND active = TRUE", [userId]);
+    const user = userResult.rows[0];
+    if (!user) return res.status(404).json({ code: "USER_NOT_FOUND", message: "User not found" });
+    await client.query("BEGIN");
+    const delivery = await createOtpRequest({
+      client,
+      user,
+      purpose: "contact_mobile",
+      method: "mobile",
+      contact: mobile,
+      req,
+      deviceId: cleanText(req.body.device_id),
+    });
+    if (!delivery.delivery.delivered) {
+      await invalidateOtpRequest(delivery.requestId, client);
+      await client.query("ROLLBACK");
+      return res.status(503).json({ code: "SMS_DELIVERY_FAILED", message: "SMS provider did not accept the verification request.", delivery_status: delivery.delivery.status });
+    }
+    await client.query("UPDATE users SET pending_recovery_mobile = $1, recovery_mobile_verified = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $2", [mobile, userId]);
+    await client.query("COMMIT");
+    return res.json({
+      success: true,
+      code: "PHONE_OTP_SENT",
+      request_id: delivery.requestId,
+      masked_phone: maskMobile(mobile),
+      expires_in_seconds: 600,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("Phone OTP send failed", error);
+    return res.status(500).json({ code: "PHONE_OTP_ERROR", message: "Unable to send phone verification OTP." });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/auth/phone/verify-otp", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const userId = parsePositiveInteger(req.body.user_id);
+    const actor = await requireSelfOrRateManager(userId, req.body.updated_by || req.body.user_id, client);
+    if (!actor) return res.status(403).json({ code: "OWNER_OR_SELF_REQUIRED", message: "Not allowed to verify this phone." });
+    await client.query("BEGIN");
+    const verification = await verifyOtpRequest({ requestId: cleanText(req.body.request_id), otp: cleanText(req.body.otp), purpose: "contact_mobile", client });
+    if (!verification.ok) {
+      await client.query("COMMIT");
+      return res.status(verification.status).json({ code: verification.code, message: verification.message });
+    }
+    if (Number(verification.request.user_id) !== Number(userId)) {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ code: "REQUEST_USER_MISMATCH", message: "Verification request does not match this user." });
+    }
+    const pending = await client.query("SELECT pending_recovery_mobile FROM users WHERE id = $1 FOR UPDATE", [userId]);
+    const mobile = pending.rows[0]?.pending_recovery_mobile;
+    if (!mobile) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ code: "NO_PENDING_PHONE", message: "No pending phone verification exists." });
+    }
+    await client.query(
+      `UPDATE users
+       SET recovery_mobile = pending_recovery_mobile,
+           verified_mobile = pending_recovery_mobile,
+           recovery_mobile_verified = TRUE,
+           recovery_mobile_verified_at = CURRENT_TIMESTAMP,
+           pending_recovery_mobile = NULL,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [userId]
+    );
+    await client.query("UPDATE account_recovery_requests SET used_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE request_id = $1", [cleanText(req.body.request_id)]);
+    await client.query("COMMIT");
+    return res.json({ success: true, code: "PHONE_VERIFIED", phone_verified_at: new Date().toISOString(), masked_phone: maskMobile(mobile) });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("Phone verification failed", error);
+    return res.status(500).json({ code: "PHONE_VERIFY_ERROR", message: "Unable to verify phone." });
   } finally {
     client.release();
   }

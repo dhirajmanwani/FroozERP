@@ -58,6 +58,11 @@ const API_MODES = Object.freeze({
   CLOUD_PRODUCTION: "CLOUD_PRODUCTION",
   FIELD_REMOTE_DEVICE: "FIELD_REMOTE_DEVICE",
   CUSTOM_API_URL: "CUSTOM_API_URL",
+  SIMULATED_OFFLINE: "SIMULATED_OFFLINE",
+});
+const CLOUD_CONNECTION_MODES = Object.freeze({
+  ONLINE: "ONLINE",
+  SIMULATE_OFFLINE: "SIMULATE_OFFLINE",
 });
 const API_MODE_OPTIONS = [
   [API_MODES.HYBRID, "Hybrid: Local + Cloud"],
@@ -122,6 +127,12 @@ const RAILWAY_PRODUCTION_HOST = isRailwayProductionHost();
 const RAILWAY_PRODUCTION_API_URL = RAILWAY_PRODUCTION_HOST ? getCurrentOrigin() : "";
 const DEFAULT_PRODUCTION_CLOUD_API_URL = "https://froozerp-production.up.railway.app";
 const SAVED_API_CONFIG = sanitizeSavedApiConfigForRuntime(readSavedApiConfig());
+const normalizeCloudConnectionMode = (value) => (
+  String(value || "").trim().toUpperCase() === CLOUD_CONNECTION_MODES.SIMULATE_OFFLINE
+    ? CLOUD_CONNECTION_MODES.SIMULATE_OFFLINE
+    : CLOUD_CONNECTION_MODES.ONLINE
+);
+const FROOZERP_CLOUD_SIMULATED_OFFLINE = normalizeCloudConnectionMode(SAVED_API_CONFIG.cloudConnectionMode) === CLOUD_CONNECTION_MODES.SIMULATE_OFFLINE;
 const savedModeForRuntime = normalizeApiMode(SAVED_API_CONFIG.mode);
 const legacyDesktopLocalMode = isDesktopShell() && [
   API_MODES.LOCAL_SINGLE_DEVICE,
@@ -304,9 +315,10 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
   const localOffline = backendHealth?.online === false;
   const cloudOnline = cloudHealth?.online === true;
   const cloudOffline = cloudHealth?.online === false;
+  const cloudPaused = FROOZERP_CLOUD_SIMULATED_OFFLINE || cloudHealth?.reasonCode === "APP_SIMULATED_OFFLINE" || syncStatus?.lastFailureKind === "APP_SIMULATED_OFFLINE";
   const backendOnline = isCloudMode() ? cloudOnline : localOnline;
   const backendOffline = isCloudMode() ? cloudOffline : localOffline;
-  const cloudReachable = usesCloudBackend() && CLOUD_CONFIGURED && cloudOnline;
+  const cloudReachable = !cloudPaused && usesCloudBackend() && CLOUD_CONFIGURED && cloudOnline;
   const deviceApproved = ["APPROVED", "ACTIVE"].includes(String(deviceRegistration?.status || "").toUpperCase());
   const devicePending = ["PENDING", "PENDING_APPROVAL"].includes(String(deviceRegistration?.status || "").toUpperCase());
   const cloudSyncActive = cloudReachable && deviceApproved && !syncStatus?.lastError;
@@ -320,22 +332,26 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
   let cloudBackendStatus;
   if (API_MODE === API_MODES.HYBRID || API_MODE === API_MODES.LOCAL_ONLY || API_MODE === API_MODES.LOCAL_SINGLE_DEVICE) {
     localBackendStatus = localOnline ? "Local Server Connected" : localOffline ? "Local Server Offline" : "Checking Local Server";
-    cloudBackendStatus = !CLOUD_CONFIGURED
+    cloudBackendStatus = cloudPaused
+      ? "Cloud Backend Paused"
+      : !CLOUD_CONFIGURED
       ? "Cloud Not Configured"
       : cloudOnline
         ? devicePending ? "Cloud Connected - Device Approval Pending" : "Cloud Backend Connected"
         : cloudOffline ? "Cloud Temporarily Unavailable" : "Checking Cloud Backend";
   } else if (API_MODE === API_MODES.BRANCH_LAN_SERVER) {
     localBackendStatus = localOnline ? "Branch Server Connected" : localOffline ? "Branch Server Offline" : "Checking Branch Server";
-    cloudBackendStatus = CLOUD_CONFIGURED ? (cloudOnline ? "Cloud Backend Connected" : cloudOffline ? "Cloud Temporarily Unavailable" : "Checking Cloud Backend") : "Cloud Not Configured";
+    cloudBackendStatus = cloudPaused ? "Cloud Backend Paused" : CLOUD_CONFIGURED ? (cloudOnline ? "Cloud Backend Connected" : cloudOffline ? "Cloud Temporarily Unavailable" : "Checking Cloud Backend") : "Cloud Not Configured";
   } else if (API_MODE === API_MODES.BRANCH_LAN_CLIENT) {
     localBackendStatus = BRANCH_LAN_API_URL
       ? localOnline ? "LAN Client Connected" : localOffline ? "Branch Server Offline" : "Checking Branch Server"
       : "Branch Server URL Required";
-    cloudBackendStatus = CLOUD_CONFIGURED ? (cloudOnline ? "Cloud Backend Connected" : cloudOffline ? "Cloud Temporarily Unavailable" : "Checking Cloud Backend") : "Cloud Not Configured";
+    cloudBackendStatus = cloudPaused ? "Cloud Backend Paused" : CLOUD_CONFIGURED ? (cloudOnline ? "Cloud Backend Connected" : cloudOffline ? "Cloud Temporarily Unavailable" : "Checking Cloud Backend") : "Cloud Not Configured";
   } else if (API_MODE === API_MODES.CLOUD_ONLY || API_MODE === API_MODES.CLOUD_PRODUCTION || fieldRemoteMode) {
     localBackendStatus = "Not Used In This Mode";
-    cloudBackendStatus = CLOUD_CONFIGURED
+    cloudBackendStatus = cloudPaused
+      ? "Cloud Backend Paused"
+      : CLOUD_CONFIGURED
       ? cloudOnline
         ? fieldRemoteMode ? "Cloud Connected - Field Remote Not Ready" : "Cloud Connected"
         : cloudOffline ? "Cloud Configured But Offline" : "Checking Cloud"
@@ -344,11 +360,13 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
     localBackendStatus = isLocalEndpoint(API_URL)
       ? localOnline ? "Local Server Connected" : localOffline ? "Local Server Offline" : "Checking Local Server"
       : "Custom API Selected";
-    cloudBackendStatus = CLOUD_CONFIGURED ? "Cloud Configured - Not Checked" : "Cloud Not Configured";
+    cloudBackendStatus = cloudPaused ? "Cloud Backend Paused" : CLOUD_CONFIGURED ? "Cloud Configured - Not Checked" : "Cloud Not Configured";
   }
 
   let syncSummary = "Backend status not checked";
-  if (failed > 0 || syncStatus?.lastError) {
+  if (cloudPaused) {
+    syncSummary = pending > 0 ? `Sync Paused - ${pending} pending` : "Sync Paused";
+  } else if (failed > 0 || syncStatus?.lastError) {
     syncSummary = "Sync Failed";
   } else if (conflicts > 0) {
     syncSummary = "Conflict";
@@ -381,7 +399,9 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
   }
 
   let banner = "Checking FroozERP backend status...";
-  if (localOnline && cloudReachable) {
+  if (cloudPaused) {
+    banner = "Simulated Offline Mode - Internet is available on this computer, but FroozERP cloud access is intentionally disabled.";
+  } else if (localOnline && cloudReachable) {
     banner = "Local server connected • Cloud backend connected";
   } else if (localOnline && cloudOffline && usesCloudBackend()) {
     banner = "Local mode active • Cloud temporarily unavailable.";
@@ -402,6 +422,7 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
   return {
     apiModeLabel,
     internetStatus: internetAvailable ? "Internet Available" : "No Internet",
+    froozErpCloudAccess: cloudPaused ? "Disabled by Owner" : "Online",
     localBackendStatus,
     cloudBackendStatus,
     authenticationStatus: currentUser ? "Signed in" : "Not signed in",
@@ -414,6 +435,7 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
     failed,
     conflicts,
     syncSummary,
+    cloudConnectionMode: cloudPaused ? "Simulate Offline" : "Online",
     banner,
     detail: `${syncSummary}. API mode: ${apiModeLabel}.`,
   };
@@ -1702,6 +1724,23 @@ function App() {
   };
 
   const checkCloudBackendHealth = async (reason = "manual", timeoutMs = 5000) => {
+    if (FROOZERP_CLOUD_SIMULATED_OFFLINE) {
+      const paused = {
+        apiUrl: CLOUD_API_URL,
+        url: CLOUD_API_URL ? `${CLOUD_API_URL}/api/health` : "",
+        online: false,
+        checking: false,
+        reachabilityStatus: "paused",
+        status: "paused",
+        httpStatus: null,
+        reason,
+        reasonCode: "APP_SIMULATED_OFFLINE",
+        message: "FroozERP cloud access is disabled by the Owner.",
+        lastCheckedAt: new Date().toISOString(),
+      };
+      setCloudHealth(paused);
+      return paused;
+    }
     if (!CLOUD_CONFIGURED) {
       const notConfigured = {
         apiUrl: CLOUD_API_URL,
@@ -1764,6 +1803,16 @@ function App() {
   };
 
   const registerCloudDevice = async (currentUser = user, latestDevice = deviceInfo) => {
+    if (FROOZERP_CLOUD_SIMULATED_OFFLINE) {
+      const registration = {
+        status: "PAUSED",
+        code: "APP_SIMULATED_OFFLINE",
+        message: "FroozERP cloud access is disabled by the Owner.",
+        checkedAt: new Date().toISOString(),
+      };
+      setCloudDeviceRegistration(registration);
+      return registration;
+    }
     if (!CLOUD_CONFIGURED || !currentUser?.id || !latestDevice?.device_id) return null;
     const payload = {
       device_id: latestDevice.device_id,
@@ -1840,18 +1889,25 @@ function App() {
       const response = await axios.get(localHealthUrl, { timeout: 5000, headers: { "Cache-Control": "no-store" } });
       return { status: response.status, message: response.data?.status === "ok" ? "Local backend healthy" : "Local backend health did not report ok" };
     }));
-    results.push(await check("Railway /api/health", cloudHealthUrl, async () => {
-      const response = await axios.get(cloudHealthUrl, { timeout: 7000, headers: { "Cache-Control": "no-store" } });
-      return { status: response.status, message: response.data?.status === "ok" ? "Cloud backend healthy" : "Cloud backend health did not report ok" };
-    }));
-    results.push(await check("Railway authentication", `${CLOUD_API_URL}/login`, async () => ({
-      status: user?.id ? 200 : 401,
-      message: user?.id ? `Signed in as user ${user.id}` : "No active local session for cloud diagnostics",
-    })));
-    results.push(await check("Device registration/approval", `${CLOUD_API_URL}/api/sync/register-device`, async () => {
-      const registration = await registerCloudDevice(user, latestDevice);
-      return { httpStatus: registration?.httpStatus || 200, message: registration?.message || `Device ${registration?.status || "not checked"}` };
-    }));
+    if (FROOZERP_CLOUD_SIMULATED_OFFLINE) {
+      const pausedMessage = "APP_SIMULATED_OFFLINE - FroozERP cloud access is disabled by the Owner.";
+      results.push({ label: "Railway /api/health", ok: false, url: cloudHealthUrl, httpStatus: null, message: pausedMessage, durationMs: 0 });
+      results.push({ label: "Railway authentication", ok: false, url: `${CLOUD_API_URL}/login`, httpStatus: null, message: pausedMessage, durationMs: 0 });
+      results.push({ label: "Device registration/approval", ok: false, url: `${CLOUD_API_URL}/api/sync/register-device`, httpStatus: null, message: pausedMessage, durationMs: 0 });
+    } else {
+      results.push(await check("Railway /api/health", cloudHealthUrl, async () => {
+        const response = await axios.get(cloudHealthUrl, { timeout: 7000, headers: { "Cache-Control": "no-store" } });
+        return { status: response.status, message: response.data?.status === "ok" ? "Cloud backend healthy" : "Cloud backend health did not report ok" };
+      }));
+      results.push(await check("Railway authentication", `${CLOUD_API_URL}/login`, async () => ({
+        status: user?.id ? 200 : 401,
+        message: user?.id ? `Signed in as user ${user.id}` : "No active local session for cloud diagnostics",
+      })));
+      results.push(await check("Device registration/approval", `${CLOUD_API_URL}/api/sync/register-device`, async () => {
+        const registration = await registerCloudDevice(user, latestDevice);
+        return { httpStatus: registration?.httpStatus || 200, message: registration?.message || `Device ${registration?.status || "not checked"}` };
+      }));
+    }
     results.push(await check("FROST briefing endpoint", `${LOCAL_API_URL}/api/ai/briefing`, async () => {
       const response = await axios.get(`${LOCAL_API_URL}/api/ai/briefing`, {
         timeout: 8000,
@@ -1919,6 +1975,19 @@ function App() {
     if (!user) return null;
     const force = Boolean(options.force);
     if (!force && !shouldStartBackgroundSync()) return syncStatus;
+    if (FROOZERP_CLOUD_SIMULATED_OFFLINE) {
+      const status = {
+        ...(await getSyncStatus()),
+        online: false,
+        syncing: false,
+        lastFailureKind: "APP_SIMULATED_OFFLINE",
+        lastError: "FroozERP cloud access is disabled by the Owner.",
+        apiUrl: SYNC_API_URL,
+      };
+      setSyncStatus(status);
+      setSyncMessage("Sync paused - FroozERP cloud access is disabled by the Owner.");
+      return status;
+    }
     if (force) lastAutoSyncStartedAtRef.current = Date.now();
     setSyncMessage("Syncing...");
     const status = await syncNow({
@@ -12594,6 +12663,7 @@ function SyncSettingsSection({
   const [cloudReadinessBusy, setCloudReadinessBusy] = useState(false);
   const [configDraft, setConfigDraft] = useState({
     mode: API_CONFIG.mode,
+    cloudConnectionMode: normalizeCloudConnectionMode(SAVED_API_CONFIG.cloudConnectionMode),
     localApiUrl: API_CONFIG.localApiUrl,
     branchLanApiUrl: BRANCH_LAN_API_URL,
     cloudApiUrl: CLOUD_API_URL,
@@ -12668,6 +12738,9 @@ function SyncSettingsSection({
     if (configDraft.mode === API_MODES.FIELD_REMOTE_DEVICE) {
       return setResult("Field Remote Not Ready", "Remote purchase/offline sync handlers are not implemented. This mode cannot be marked production-ready.");
     }
+    if (normalizeCloudConnectionMode(configDraft.cloudConnectionMode) === CLOUD_CONNECTION_MODES.SIMULATE_OFFLINE) {
+      return setResult("Cloud Paused By Owner", "Simulated Offline Mode is active. FroozERP cloud checks and sync are intentionally blocked while local backend stays usable.");
+    }
     if (!cloudUrl) {
       return setResult("Cloud Not Configured", "Cloud is not configured yet. Local and LAN modes can still work.");
     }
@@ -12727,6 +12800,7 @@ function SyncSettingsSection({
     if (!canManage) return;
     const nextConfig = {
       mode: normalizeApiMode(configDraft.mode),
+      cloudConnectionMode: normalizeCloudConnectionMode(configDraft.cloudConnectionMode),
       localApiUrl: normalizeApiBase(configDraft.localApiUrl) || "http://127.0.0.1:5000",
       branchLanApiUrl: normalizeApiBase(configDraft.branchLanApiUrl),
       cloudApiUrl: normalizeApiBase(configDraft.cloudApiUrl),
@@ -12799,6 +12873,7 @@ function SyncSettingsSection({
         {[
           ["App Mode", appMode],
           ["Internet", internetStatus],
+          ["FroozERP Cloud Access", connectionStatus?.froozErpCloudAccess || "Online"],
           ["Local Server", localServerStatus],
           ["Cloud", cloudStatus],
           ["Sync Status", syncSummary],
@@ -12837,7 +12912,14 @@ function SyncSettingsSection({
                 {API_MODE_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
               </select>
             </Field>
+            <Field label="FroozERP Cloud Connection">
+              <select disabled={!canManage} value={configDraft.cloudConnectionMode} onChange={(event) => setConfigDraft({ ...configDraft, cloudConnectionMode: normalizeCloudConnectionMode(event.target.value) })}>
+                <option value={CLOUD_CONNECTION_MODES.ONLINE}>Online</option>
+                <option value={CLOUD_CONNECTION_MODES.SIMULATE_OFFLINE}>Simulate Offline</option>
+              </select>
+            </Field>
           </div>
+          {configDraft.cloudConnectionMode === CLOUD_CONNECTION_MODES.SIMULATE_OFFLINE && <p className="form-note stock-low">Simulated Offline Mode - Internet stays available, but FroozERP cloud, sync, provider, email and SMS calls are paused inside the app.</p>}
           {configDraft.mode === API_MODES.LOCAL_SINGLE_DEVICE && <p className="form-note">Local Single Device uses this computer's local backend.</p>}
           {configDraft.mode === API_MODES.BRANCH_LAN_SERVER && <p className="form-note">Branch LAN Server is for the main shop computer serving same-branch devices over Wi-Fi/LAN.</p>}
           {configDraft.mode === API_MODES.BRANCH_LAN_CLIENT && <p className="form-note">Branch LAN Client must use the main branch server IP. It is same Wi-Fi/LAN only, not cloud.</p>}
