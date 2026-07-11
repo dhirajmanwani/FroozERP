@@ -453,7 +453,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.33";
+const APP_VERSION = "1.0.34";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -12069,10 +12069,22 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
   const status = busy || draft.update_status || "READY_FOR_FUTURE_UPDATES";
   const feedConfigured = Boolean(UPDATE_FEED_URL);
   const desktopUpdaterAvailable = isDesktopShell();
-  const updateAvailable = ["UPDATE_AVAILABLE", "DOWNLOAD_READY_FUTURE", "DOWNLOADED", "READY_TO_INSTALL"].includes(status) || Boolean(updateObject);
-  const updateDownloaded = ["DOWNLOADED", "READY_TO_INSTALL", "INSTALL_READY_FUTURE"].includes(status) || Boolean(downloadedUpdate);
   const installedVersion = APP_VERSION;
-  const latestHostedVersion = updateObject?.version || (feedConfigured ? (draft.latest_version || "Not Available") : "Not Available");
+  const normalizeVersion = (value) => {
+    const text = String(value || "").trim();
+    const match = text.match(/v?(\d+(?:\.\d+){1,3})(?:[^\d].*)?$/i) || text.match(/v?(\d+(?:\.\d+){1,3})/i);
+    return match ? match[1] : "";
+  };
+  const latestHostedVersion = normalizeVersion(updateObject?.version || draft.latest_version);
+  const latestComparison = latestHostedVersion ? compareVersions(latestHostedVersion, installedVersion) : null;
+  const updateAvailable = latestComparison !== null && latestComparison > 0 && ["UPDATE_AVAILABLE", "DOWNLOAD_READY_FUTURE", "DOWNLOADED", "READY_TO_INSTALL"].includes(status);
+  const updateDownloaded = updateAvailable && (["DOWNLOADED", "READY_TO_INSTALL", "INSTALL_READY_FUTURE"].includes(status) || Boolean(downloadedUpdate));
+  const signatureVerified = updateDownloaded && (status === "READY_TO_INSTALL" || Boolean(downloadedUpdate));
+  const canInstallUpdate = updateAvailable && updateDownloaded && signatureVerified;
+  const displayLatestVersion = latestHostedVersion || "Unable to read update version";
+  const updateFeedStatus = !feedConfigured ? "Not Configured" : status === "VERSION_PARSE_FAILED" ? "Version parse failed" : "Configured";
+  const downloadStatus = busy === "Downloading" ? `Downloading ${progressPercent || 0}%` : updateDownloaded ? "Downloaded" : updateAvailable ? "Ready to download" : "Not required";
+  const signatureStatus = signatureVerified ? "Verified" : updateDownloaded ? "Not verified" : "Not checked";
   const releaseTitle = draft.release_title || "FroozERP Windows release";
   const releaseNotes = updateObject?.body || draft.release_notes || draft.changelog || "Hosted update feed is not configured yet. Local installer updates still work.";
   const releaseDate = updateObject?.date || draft.published_at || draft.release_date || "";
@@ -12088,14 +12100,54 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
     if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
     return `${bytes} bytes`;
   };
-  const compareVersions = (left, right) => {
-    const a = String(left || "0").split(".").map((part) => Number.parseInt(part, 10) || 0);
-    const b = String(right || "0").split(".").map((part) => Number.parseInt(part, 10) || 0);
+  function compareVersions(left, right) {
+    const a = normalizeVersion(left).split(".").map((part) => Number.parseInt(part, 10) || 0);
+    const b = normalizeVersion(right).split(".").map((part) => Number.parseInt(part, 10) || 0);
     for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
       const diff = (a[index] || 0) - (b[index] || 0);
       if (diff !== 0) return diff;
     }
     return 0;
+  }
+  const extractUpdateVersion = (data = {}) => {
+    const candidates = [
+      ["version", data.version],
+      ["tag_name", data.tag_name],
+      ["name", data.name],
+      ["latest_version", data.latest_version],
+      ["release_title", data.release_title],
+    ];
+    for (const [field, value] of candidates) {
+      const parsed = normalizeVersion(value);
+      if (parsed) return { version: parsed, sourceField: field, rawValue: String(value || "") };
+    }
+    return {
+      version: "",
+      sourceField: "",
+      rawValue: "",
+      diagnostic: `No parseable version found in fields: ${candidates.map(([field]) => field).join(", ")}`,
+    };
+  };
+  const buildVersionStatusDraft = (baseDraft, parsed, checkedAt, extra = {}) => {
+    if (!parsed.version) {
+      return {
+        ...baseDraft,
+        ...extra,
+        latest_version: "",
+        update_status: "VERSION_PARSE_FAILED",
+        parsing_diagnostic: parsed.diagnostic || "Unable to read update version.",
+        published_at: checkedAt,
+      };
+    }
+    const comparison = compareVersions(parsed.version, installedVersion);
+    return {
+      ...baseDraft,
+      ...extra,
+      latest_version: parsed.version,
+      update_status: comparison > 0 ? "UPDATE_AVAILABLE" : "NO_UPDATE_AVAILABLE",
+      parsing_diagnostic: `Parsed ${parsed.sourceField}: ${parsed.rawValue}`,
+      published_at: extra.published_at || checkedAt,
+    };
   };
   const saveUpdateRecord = async (nextDraft) => {
     if (!canManage || !user?.id) return;
@@ -12110,19 +12162,18 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
   const readManifestFallback = async (checkedAt) => {
     const response = await axios.get(UPDATE_FEED_URL, { timeout: 8000 });
     const data = response.data || {};
-    const latest = data.version || data.latest_version || "Not Available";
-    const nextDraft = {
-      ...draft,
-      latest_version: latest,
+    const parsed = extractUpdateVersion(data);
+    const nextDraft = buildVersionStatusDraft(draft, parsed, checkedAt, {
       release_title: data.title || data.release_title || releaseTitle,
       release_notes: data.notes || data.body || data.release_notes || releaseNotes,
       published_at: data.pub_date || data.published_at || checkedAt,
       download_size_bytes: data.download_size_bytes || data.size || draft.download_size_bytes || 0,
-      update_status: latest !== "Not Available" && compareVersions(latest, installedVersion) > 0 ? "UPDATE_AVAILABLE" : "NO_UPDATE_AVAILABLE",
-    };
+    });
     setDraft(nextDraft);
     await saveUpdateRecord(nextDraft);
-    setMessage(nextDraft.update_status === "UPDATE_AVAILABLE" ? `FroozERP update available - version ${latest}` : "FroozERP is up to date.");
+    if (nextDraft.update_status === "VERSION_PARSE_FAILED") setMessage("Unable to read update version.");
+    else setMessage(nextDraft.update_status === "UPDATE_AVAILABLE" ? `Update available: ${nextDraft.latest_version}` : "FroozERP is up to date.");
+    return nextDraft;
   };
   const checkForUpdates = async () => {
     const checkedAt = new Date().toISOString();
@@ -12140,26 +12191,27 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
         return;
       }
       const { check } = await import("@tauri-apps/plugin-updater");
+      const manifestDraft = await readManifestFallback(checkedAt);
       const update = await check();
       if (!update) {
-        const nextDraft = { ...draft, latest_version: installedVersion, update_status: "NO_UPDATE_AVAILABLE", published_at: checkedAt };
+        const nextDraft = { ...manifestDraft, update_status: manifestDraft.update_status === "UPDATE_AVAILABLE" ? "UPDATE_AVAILABLE" : manifestDraft.update_status };
         setDraft(nextDraft);
         await saveUpdateRecord(nextDraft);
-        setMessage("FroozERP is up to date.");
+        if (nextDraft.update_status === "VERSION_PARSE_FAILED") setMessage("Unable to read update version.");
+        else setMessage(nextDraft.update_status === "UPDATE_AVAILABLE" ? `Update available: ${nextDraft.latest_version}` : "FroozERP is up to date.");
         return;
       }
       setUpdateObject(update);
-      const nextDraft = {
-        ...draft,
-        latest_version: update.version || draft.latest_version,
+      const parsed = extractUpdateVersion({ version: update.version || manifestDraft.latest_version });
+      const nextDraft = buildVersionStatusDraft(manifestDraft, parsed, checkedAt, {
         release_title: update.version ? `FroozERP ${update.version}` : releaseTitle,
         release_notes: update.body || draft.release_notes || "",
         published_at: update.date || checkedAt,
-        update_status: compareVersions(update.version, installedVersion) > 0 ? "UPDATE_AVAILABLE" : "NO_UPDATE_AVAILABLE",
-      };
+      });
       setDraft(nextDraft);
       await saveUpdateRecord(nextDraft);
-      setMessage(nextDraft.update_status === "UPDATE_AVAILABLE" ? `FroozERP update available - version ${update.version}` : "No downgrade or newer update available.");
+      if (nextDraft.update_status === "VERSION_PARSE_FAILED") setMessage("Unable to read update version.");
+      else setMessage(nextDraft.update_status === "UPDATE_AVAILABLE" ? `Update available: ${nextDraft.latest_version}` : "FroozERP is up to date.");
     } catch (error) {
       setDraft((current) => ({ ...current, update_status: navigator.onLine === false ? "OFFLINE" : "UPDATE_SERVER_UNAVAILABLE" }));
       setMessage(getErrorMessage(error, navigator.onLine === false ? "Offline - unable to check updates" : "Update server unavailable"));
@@ -12216,8 +12268,8 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
   };
   const installAndRestart = async () => {
     const updateToInstall = downloadedUpdate || updateObject;
-    if (!updateToInstall) {
-      setMessage("No downloaded update is ready to install.");
+    if (!canInstallUpdate || !updateToInstall) {
+      setMessage("No newer signature-verified downloaded update is ready to install.");
       return;
     }
     const confirmed = window.confirm(
@@ -12283,16 +12335,20 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
       <div className="purchase-summary-grid supplier-payment-preview">
         <SummaryMetric label="Installed App Version" value={installedVersion} featured />
         <SummaryMetric label="Updater" value={desktopUpdaterAvailable ? "Desktop updater ready" : "Desktop app required"} />
-        <SummaryMetric label="Latest Version" value={latestHostedVersion} />
-        <SummaryMetric label="Status" value={status} />
+        <SummaryMetric label="Latest Available Version" value={displayLatestVersion} />
+        <SummaryMetric label="Update Feed Status" value={updateFeedStatus} />
+        <SummaryMetric label="Download Status" value={downloadStatus} />
+        <SummaryMetric label="Signature Status" value={signatureStatus} />
         <SummaryMetric label="Last Checked" value={lastChecked ? new Date(lastChecked).toLocaleString("en-IN") : "Not checked"} />
         <SummaryMetric label="Download Size" value={formatBytes(downloadSize)} />
       </div>
       <div className={updateAvailable ? "update-available-panel" : "update-foundation-panel"}>
-        <strong>{updateAvailable ? `FroozERP update available - version ${latestHostedVersion}` : releaseTitle}</strong>
+        <strong>{status === "VERSION_PARSE_FAILED" ? "Unable to read update version" : updateAvailable ? `Update available: ${latestHostedVersion}` : "FroozERP is up to date"}</strong>
         <span>{releaseNotes}</span>
         <small>Update Feed: {UPDATE_FEED_URL || "Not Configured"}</small>
         <small>Installed App Version: {installedVersion}</small>
+        <small>Latest Available Version: {displayLatestVersion}</small>
+        {draft.parsing_diagnostic && <small>Parsing: {draft.parsing_diagnostic}</small>}
         <small>Published: {releaseDate ? new Date(releaseDate).toLocaleString("en-IN") : "Pending hosted release metadata"}</small>
       </div>
       <p className="form-note">{updatePanelMessage}</p>
@@ -12304,7 +12360,10 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
       )}
       <div className="form-grid supplier-form-grid">
         <Field label="Installed App Version"><input disabled value={installedVersion} /></Field>
-        <Field label="Latest Available Version"><input disabled value={latestHostedVersion} /></Field>
+        <Field label="Latest Available Version"><input disabled value={displayLatestVersion} /></Field>
+        <Field label="Update Feed Status"><input disabled value={updateFeedStatus} /></Field>
+        <Field label="Download Status"><input disabled value={downloadStatus} /></Field>
+        <Field label="Signature Status"><input disabled value={signatureStatus} /></Field>
         <Field label="Update Feed"><input disabled value={UPDATE_FEED_URL || "Not Configured"} /></Field>
         <Field label="Release Date"><input disabled value={releaseDate ? new Date(releaseDate).toLocaleDateString("en-IN") : "Not available"} /></Field>
         <Field label="Release Notes"><textarea disabled value={releaseNotes} /></Field>
@@ -12312,7 +12371,7 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
       <div className="button-row">
         <button className="secondary-button" disabled={!canManage || !feedConfigured || Boolean(busy)} onClick={checkForUpdates}>Check for Updates</button>
         <button className="secondary-button" disabled={!canManage || !desktopUpdaterAvailable || !updateAvailable || updateDownloaded || Boolean(busy)} onClick={downloadUpdate}>Download Update</button>
-        <button className="primary-button" disabled={!canManage || !desktopUpdaterAvailable || !updateDownloaded || Boolean(busy)} onClick={installAndRestart}>Install and Restart</button>
+        <button className="primary-button" disabled={!canManage || !desktopUpdaterAvailable || !canInstallUpdate || Boolean(busy)} onClick={installAndRestart}>Install and Restart</button>
         {updateAvailable && <button className="secondary-button" disabled={!canManage || Boolean(busy)} onClick={() => setMessage("Reminder saved for this session.")}>Remind Me Later</button>}
       </div>
       <div className="update-foundation-panel maintenance-cleanup-panel">

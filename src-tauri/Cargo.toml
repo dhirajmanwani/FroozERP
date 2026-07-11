@@ -1,6 +1,6 @@
 [package]
 name = "froozerp"
-version = "1.0.33"
+version = "1.0.34"
 description = "FroozERP desktop application shell"
 authors = ["SRT Company"]
 edition = "2021"
