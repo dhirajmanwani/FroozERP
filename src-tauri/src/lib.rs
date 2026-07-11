@@ -278,6 +278,7 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
         .arg("server.js")
         .current_dir(&backend_dir)
         .env("PORT", "5000")
+        .env("APP_VERSION", env!("CARGO_PKG_VERSION"))
         .env("APP_MODE", "LOCAL_SINGLE_DEVICE")
         .env("FROOZERP_DESKTOP_SERVICE", "1")
         .stdin(Stdio::null())

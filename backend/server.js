@@ -108,7 +108,10 @@ const PORT = process.env.PORT || 5000;
 const backupDirectory = process.env.BACKUP_DIR || path.join(__dirname, "..", "backups");
 const readReleaseVersion = () => {
   try {
-    const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
+    const manifestPath = fs.existsSync(path.join(__dirname, "..", "package.json"))
+      ? path.join(__dirname, "..", "package.json")
+      : path.join(__dirname, "package.json");
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
     return manifest.version || "0.0.0";
   } catch {
     return process.env.APP_VERSION || "0.0.0";
