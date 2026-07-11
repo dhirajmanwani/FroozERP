@@ -1303,6 +1303,7 @@ function App() {
     lastOnlineAt: "",
     lastErrorAt: "",
   });
+  const [localBackendService, setLocalBackendService] = useState(null);
   const [cloudHealth, setCloudHealth] = useState({
     apiUrl: CLOUD_API_URL,
     url: CLOUD_API_URL ? `${CLOUD_API_URL}/api/health` : "",
@@ -1953,7 +1954,34 @@ function App() {
     }
   }, [internetAvailable]);
 
+  const ensureLocalBackendService = useCallback(async ({ restart = false, reason = "manual" } = {}) => {
+    if (!isTauriRuntime() || isCloudMode()) return null;
+    const command = restart ? "restart_local_backend_service" : "ensure_local_backend_service";
+    try {
+      const service = await invokeTauriCommand(command);
+      setLocalBackendService({ ...service, reason, checkedAt: new Date().toISOString() });
+      if (service?.healthy) {
+        setStartupNotice(restart ? "Local FroozERP service restarted." : "Local FroozERP service is running.");
+        setStartupError((current) => (/local backend|froozERP service|backend/i.test(current) ? "" : current));
+      } else {
+        setStartupError(service?.message || "Local FroozERP service stopped. Restart service.");
+      }
+      return service;
+    } catch (error) {
+      const message = getErrorMessage(error, "Unable to start local FroozERP service.");
+      setLocalBackendService({ healthy: false, message, reason, checkedAt: new Date().toISOString() });
+      setStartupError(message);
+      return null;
+    }
+  }, []);
+
   const performConnectivityCheck = useCallback(async (reason = "manual", options = {}) => {
+    if (isTauriRuntime() && !isCloudMode() && options.skipServiceStart !== true) {
+      const service = await ensureLocalBackendService({ reason });
+      if (service?.healthy) {
+        await new Promise((resolve) => window.setTimeout(resolve, 250));
+      }
+    }
     const browserOnline = typeof navigator === "undefined" ? true : navigator.onLine !== false;
     const realInternet = browserOnline ? await probeRealInternet(options.timeoutMs || 4000) : false;
     setInternetAvailable(realInternet);
@@ -1987,7 +2015,7 @@ function App() {
         });
     }
     return health;
-  }, [applyConnectivityState]);
+  }, [applyConnectivityState, ensureLocalBackendService]);
 
   useEffect(() => subscribeConnectivity(applyConnectivityState), [applyConnectivityState]);
 
@@ -4448,6 +4476,15 @@ function App() {
             <small>
               {connectionStatus.internetStatus} - {isCloudMode() ? connectionStatus.cloudBackendStatus : connectionStatus.localBackendStatus}
             </small>
+            {isTauriRuntime() && !isCloudMode() && backendHealth.online === false && (
+              <button className="table-action" onClick={async () => {
+                await ensureLocalBackendService({ restart: true, reason: "login-restart-service" });
+                await performConnectivityCheck("login-restart-service", { force: true, skipServiceStart: true });
+              }}>
+                Restart Service
+              </button>
+            )}
+            {localBackendService?.message && <small>{localBackendService.message}</small>}
           </div>
           <div className="startup-actions">
             <button className="primary-button login-button" disabled={loginBusy} onClick={login}>
@@ -4666,6 +4703,15 @@ function App() {
               {startupError && <p>{startupError}</p>}
               {!startupError && <p>{connectionStatus.banner}</p>}
               {!startupError && <small>{connectionStatus.detail}</small>}
+              {isTauriRuntime() && !isCloudMode() && backendHealth.online === false && (
+                <button className="table-action" onClick={async () => {
+                  await ensureLocalBackendService({ restart: true, reason: "shell-restart-service" });
+                  await performConnectivityCheck("shell-restart-service", { force: true, skipServiceStart: true });
+                }}>
+                  Restart Service
+                </button>
+              )}
+              {localBackendService?.message && <small>{localBackendService.message}</small>}
             </div>
           )}
           {activeView === "dashboard" && !hasModuleAccess("dashboard") && (

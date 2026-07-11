@@ -7,11 +7,17 @@ use serde::Serialize;
 use std::{
     env,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
+    net::TcpStream,
     panic,
     path::{Path, PathBuf},
-    process::Command,
-    sync::atomic::{AtomicBool, Ordering},
+    process::{Child, Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+    thread,
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 #[cfg(target_os = "windows")]
@@ -27,6 +33,7 @@ use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
 static KIOSK_LOCK_ENABLED: AtomicBool = AtomicBool::new(false);
 static KIOSK_CLOSE_ALLOWED: AtomicBool = AtomicBool::new(false);
+static LOCAL_BACKEND_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
 
 #[derive(Debug, Serialize, Clone)]
 struct CleanupCandidate {
@@ -44,6 +51,18 @@ struct CleanupResult {
     candidates: Vec<CleanupCandidate>,
     removed: Vec<CleanupCandidate>,
     blocked: Vec<CleanupCandidate>,
+    message: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct BackendServiceStatus {
+    healthy: bool,
+    started: bool,
+    reused_existing: bool,
+    pid: Option<u32>,
+    url: String,
+    backend_dir: String,
+    node_path: String,
     message: String,
 }
 
@@ -76,6 +95,227 @@ fn current_install_dir() -> PathBuf {
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\FroozERP"))
+}
+
+fn local_backend_url() -> String {
+    "http://127.0.0.1:5000".to_string()
+}
+
+fn probe_local_backend_health(timeout_ms: u64) -> Result<(), String> {
+    let address = "127.0.0.1:5000";
+    let timeout = Duration::from_millis(timeout_ms);
+    let mut stream = TcpStream::connect_timeout(
+        &address
+            .parse()
+            .map_err(|error| format!("Invalid backend address: {}", error))?,
+        timeout,
+    )
+    .map_err(|error| format!("Local backend not reachable: {}", error))?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    stream
+        .write_all(b"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:5000\r\nConnection: close\r\n\r\n")
+        .map_err(|error| format!("Local backend health request failed: {}", error))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|error| format!("Local backend health response failed: {}", error))?;
+    if response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200") {
+        if response.contains("\"FroozERP\"") || response.contains("FroozERP") {
+            return Ok(());
+        }
+        return Err("Port 5000 responded, but it is not FroozERP.".to_string());
+    }
+    Err(format!(
+        "Port 5000 responded without healthy status: {}",
+        response.lines().next().unwrap_or("no status line")
+    ))
+}
+
+fn backend_dir_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = env::var_os("FROOZERP_BACKEND_DIR").map(PathBuf::from) {
+        candidates.push(path);
+    }
+    let install_dir = current_install_dir();
+    candidates.push(install_dir.join("backend"));
+    candidates.push(install_dir.join("resources").join("backend"));
+    if let Ok(current_dir) = env::current_dir() {
+        candidates.push(current_dir.join("backend"));
+        candidates.push(current_dir.join("..").join("backend"));
+    }
+    candidates
+}
+
+fn resolve_backend_dir() -> Result<PathBuf, String> {
+    backend_dir_candidates()
+        .into_iter()
+        .find(|path| path.join("server.js").exists())
+        .ok_or_else(|| "Packaged FroozERP backend was not found.".to_string())
+}
+
+fn node_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = env::var_os("FROOZERP_NODE_PATH").map(PathBuf::from) {
+        candidates.push(path);
+    }
+    candidates.push(PathBuf::from("node"));
+    candidates.push(PathBuf::from(r"D:\node.exe"));
+    candidates.push(PathBuf::from(r"C:\Program Files\nodejs\node.exe"));
+    candidates
+}
+
+fn resolve_node_path() -> PathBuf {
+    node_candidates()
+        .into_iter()
+        .find(|path| path == Path::new("node") || path.exists())
+        .unwrap_or_else(|| PathBuf::from("node"))
+}
+
+fn backend_status(message: String, healthy: bool, started: bool, reused_existing: bool, pid: Option<u32>, backend_dir: Option<PathBuf>, node_path: Option<PathBuf>) -> BackendServiceStatus {
+    BackendServiceStatus {
+        healthy,
+        started,
+        reused_existing,
+        pid,
+        url: local_backend_url(),
+        backend_dir: backend_dir
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        node_path: node_path
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        message,
+    }
+}
+
+fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceStatus {
+    if !force_restart && probe_local_backend_health(900).is_ok() {
+        write_app_log("INFO", "Local backend already healthy; reusing existing port 5000 service");
+        return backend_status(
+            "Local FroozERP service is already running.".to_string(),
+            true,
+            false,
+            true,
+            None,
+            None,
+            None,
+        );
+    }
+
+    if force_restart {
+        if let Ok(mut guard) = LOCAL_BACKEND_PROCESS.lock() {
+            if let Some(mut child) = guard.take() {
+                let pid = child.id();
+                write_app_log("INFO", &format!("Stopping managed local backend PID {}", pid));
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        thread::sleep(Duration::from_millis(300));
+        if probe_local_backend_health(900).is_ok() {
+            return backend_status(
+                "An external FroozERP service is already running on port 5000.".to_string(),
+                true,
+                false,
+                true,
+                None,
+                None,
+                None,
+            );
+        }
+    }
+
+    if let Ok(mut guard) = LOCAL_BACKEND_PROCESS.lock() {
+        if let Some(child) = guard.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    write_app_log(
+                        "ERROR",
+                        &format!("Managed local backend exited with status {}", status),
+                    );
+                    *guard = None;
+                }
+                Ok(None) => {
+                    if probe_local_backend_health(900).is_ok() {
+                        return backend_status(
+                            "Managed local FroozERP service is running.".to_string(),
+                            true,
+                            false,
+                            false,
+                            Some(child.id()),
+                            None,
+                            None,
+                        );
+                    }
+                }
+                Err(error) => {
+                    write_app_log("ERROR", &format!("Unable to inspect local backend process: {}", error));
+                    *guard = None;
+                }
+            }
+        }
+    }
+
+    let backend_dir = match resolve_backend_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            write_app_log("ERROR", &format!("Local backend launch blocked: {}", error));
+            return backend_status(error, false, false, false, None, None, None);
+        }
+    };
+    let node_path = resolve_node_path();
+    write_app_log(
+        "INFO",
+        &format!(
+            "Launching local backend: node={}, backend_dir={}",
+            node_path.to_string_lossy(),
+            backend_dir.to_string_lossy()
+        ),
+    );
+    let child = Command::new(&node_path)
+        .arg("server.js")
+        .current_dir(&backend_dir)
+        .env("PORT", "5000")
+        .env("APP_MODE", "LOCAL_SINGLE_DEVICE")
+        .env("FROOZERP_DESKTOP_SERVICE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    let child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            let message = format!("Unable to launch local FroozERP service: {}", error);
+            write_app_log("ERROR", &message);
+            return backend_status(message, false, false, false, None, Some(backend_dir), Some(node_path));
+        }
+    };
+    let pid = child.id();
+    if let Ok(mut guard) = LOCAL_BACKEND_PROCESS.lock() {
+        *guard = Some(child);
+    }
+    write_app_log("INFO", &format!("Local backend launch attempt PID {}", pid));
+    for attempt in 1..=16 {
+        thread::sleep(Duration::from_millis(750));
+        match probe_local_backend_health(900) {
+            Ok(()) => {
+                let message = format!("Local FroozERP service started on attempt {}", attempt);
+                write_app_log("INFO", &message);
+                return backend_status(message, true, true, false, Some(pid), Some(backend_dir), Some(node_path));
+            }
+            Err(error) => {
+                write_app_log(
+                    "INFO",
+                    &format!("Local backend health pending attempt {}: {}", attempt, error),
+                );
+            }
+        }
+    }
+    let message = "Local FroozERP service stopped or did not become healthy. Restart service.".to_string();
+    write_app_log("ERROR", &message);
+    backend_status(message, false, true, false, Some(pid), Some(backend_dir), Some(node_path))
 }
 
 fn push_shortcut_candidate(candidates: &mut Vec<CleanupCandidate>, path: PathBuf, reason: &str) {
@@ -472,6 +712,47 @@ fn close_froozerp_window(app: AppHandle, allow_exit: Option<bool>) -> Result<(),
 }
 
 #[tauri::command]
+fn ensure_local_backend_service() -> Result<BackendServiceStatus, String> {
+    Ok(ensure_local_backend_service_internal(false))
+}
+
+#[tauri::command]
+fn restart_local_backend_service() -> Result<BackendServiceStatus, String> {
+    Ok(ensure_local_backend_service_internal(true))
+}
+
+#[tauri::command]
+fn local_backend_service_status() -> Result<BackendServiceStatus, String> {
+    let healthy = probe_local_backend_health(900).is_ok();
+    let mut pid = None;
+    if let Ok(mut guard) = LOCAL_BACKEND_PROCESS.lock() {
+        if let Some(child) = guard.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    write_app_log("ERROR", &format!("Managed local backend exited with status {}", status));
+                    *guard = None;
+                }
+                Ok(None) => pid = Some(child.id()),
+                Err(error) => write_app_log("ERROR", &format!("Unable to inspect local backend process: {}", error)),
+            }
+        }
+    }
+    Ok(backend_status(
+        if healthy {
+            "Local FroozERP service is healthy.".to_string()
+        } else {
+            "Local FroozERP service stopped. Restart service.".to_string()
+        },
+        healthy,
+        false,
+        pid.is_none() && healthy,
+        pid,
+        None,
+        None,
+    ))
+}
+
+#[tauri::command]
 fn detect_old_froozerp_versions() -> Result<CleanupResult, String> {
     Ok(froozerp_cleanup_candidates())
 }
@@ -749,6 +1030,18 @@ pub fn run() {
                     );
                 }
             }
+            let backend_status = ensure_local_backend_service_internal(false);
+            write_app_log(
+                if backend_status.healthy { "INFO" } else { "ERROR" },
+                &format!(
+                    "Local backend setup result: healthy={}, started={}, reused={}, pid={:?}, message={}",
+                    backend_status.healthy,
+                    backend_status.started,
+                    backend_status.reused_existing,
+                    backend_status.pid,
+                    backend_status.message
+                ),
+            );
             write_app_log("INFO", "Tauri setup completed");
             Ok(())
         })
@@ -759,6 +1052,9 @@ pub fn run() {
             save_pdf_with_dialog,
             set_kiosk_mode,
             close_froozerp_window,
+            ensure_local_backend_service,
+            restart_local_backend_service,
+            local_backend_service_status,
             detect_old_froozerp_versions,
             clean_old_froozerp_versions,
             local_cache_reference_snapshot,

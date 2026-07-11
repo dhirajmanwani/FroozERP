@@ -33,6 +33,15 @@
     "copyright": "Copyright (c) 2026 SRT Company",
     "shortDescription": "FroozERP fruit retail ERP",
     "longDescription": "FroozERP - Feel the Freakin' Frooz. Premium fruit retail ERP for POS, inventory, accounts, reports and local-first sync.",
+    "resources": [
+      "../backend/server.js",
+      "../backend/package.json",
+      "../backend/aiBusinessAssistantRules.js",
+      "../backend/aiBusinessAssistantService.js",
+      "../backend/frostCore.js",
+      "../backend/frostIntelligence.js",
+      "../backend/node_modules/**/*"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
