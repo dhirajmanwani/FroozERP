@@ -53,6 +53,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm --prefix frontend ci
 
+      - name: Install packaged backend dependencies
+        run: npm --prefix backend ci
+
       - name: Set release version
         if: ${{ github.event_name == 'workflow_dispatch' }}
         run: npm run release:set-version -- ${{ github.event.inputs.version }}
