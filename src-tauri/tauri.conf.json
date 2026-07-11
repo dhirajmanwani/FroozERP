@@ -1,63 +1,63 @@
 {
-    "$schema":  "https://schema.tauri.app/config/2",
-    "productName":  "FroozERP",
-    "version":  "1.0.31",
-    "identifier":  "com.srtcompany.froozerp",
-    "build":  {
-                  "beforeDevCommand":  "npm --prefix frontend run dev -- --host 0.0.0.0",
-                  "devUrl":  "http://localhost:5173",
-                  "beforeBuildCommand":  "npm --prefix frontend run build",
-                  "frontendDist":  "../frontend/dist"
-              },
-    "app":  {
-                "windows":  [
-                                {
-                                    "title":  "FroozERP - Feel the Freakin\u0027 Frooz",
-                                    "width":  1280,
-                                    "height":  800,
-                                    "minWidth":  1024,
-                                    "minHeight":  700
-                                }
-                            ],
-                "security":  {
-                                 "csp":  "default-src \u0027self\u0027 asset: http://asset.localhost; script-src \u0027self\u0027; style-src \u0027self\u0027 \u0027unsafe-inline\u0027; img-src \u0027self\u0027 asset: http://asset.localhost data: blob:; font-src \u0027self\u0027 data:; connect-src \u0027self\u0027 ipc: http://ipc.localhost http://127.0.0.1:5000 http://localhost:5000 ws://127.0.0.1:5000 ws://localhost:5000 https:"
-                             }
-            },
-    "bundle":  {
-                   "active":  true,
-                   "targets":  [
-                                   "nsis"
-                               ],
-                   "createUpdaterArtifacts":  true,
-                   "publisher":  "SRT Company",
-                   "copyright":  "Copyright (c) 2026 SRT Company",
-                   "shortDescription":  "FroozERP fruit retail ERP",
-                   "longDescription":  "FroozERP - Feel the Freakin\u0027 Frooz. Premium fruit retail ERP for POS, inventory, accounts, reports and local-first sync.",
-                   "icon":  [
-                                "icons/32x32.png",
-                                "icons/128x128.png",
-                                "icons/128x128@2x.png",
-                                "icons/icon.ico"
-                            ],
-                   "windows":  {
-                                   "nsis":  {
-                                                "installerIcon":  "icons/icon.ico",
-                                                "installMode":  "perMachine",
-                                                "displayLanguageSelector":  false,
-                                                "startMenuFolder":  "FroozERP",
-                                                "installerHooks":  "installer/froozerp-cleanup-hooks.nsh"
-                                            }
-                               }
-               },
-    "plugins":  {
-                    "updater":  {
-                                    "pubkey":  "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk0M0YwRTNEMzdFOEY1MTYKUldRVzllZzNQUTQvbEUyZzB3bG1NMlRVeHZyVXQzY0JNTEQ4N3BBVkRqc2I3QXVpUHAybVR3OSsK",
-                                    "endpoints":  [
-                                                      "https://github.com/dhirajmanwani/FroozERP/releases/latest/download/latest.json"
-                                                  ],
-                                    "windows":  {
-                                                    "installMode":  "basicUi"
-                                                }
-                                }
-                }
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "FroozERP",
+  "version": "1.0.32",
+  "identifier": "com.srtcompany.froozerp",
+  "build": {
+    "beforeDevCommand": "npm --prefix frontend run dev -- --host 0.0.0.0",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm --prefix frontend run build",
+    "frontendDist": "../frontend/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "FroozERP - Feel the Freakin' Frooz",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 1024,
+        "minHeight": 700
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' asset: http://asset.localhost; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:5000 http://localhost:5000 ws://127.0.0.1:5000 ws://localhost:5000 https:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "createUpdaterArtifacts": true,
+    "publisher": "SRT Company",
+    "copyright": "Copyright (c) 2026 SRT Company",
+    "shortDescription": "FroozERP fruit retail ERP",
+    "longDescription": "FroozERP - Feel the Freakin' Frooz. Premium fruit retail ERP for POS, inventory, accounts, reports and local-first sync.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "installMode": "perMachine",
+        "displayLanguageSelector": false,
+        "startMenuFolder": "FroozERP",
+        "installerHooks": "installer/froozerp-cleanup-hooks.nsh"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk0M0YwRTNEMzdFOEY1MTYKUldRVzllZzNQUTQvbEUyZzB3bG1NMlRVeHZyVXQzY0JNTEQ4N3BBVkRqc2I3QXVpUHAybVR3OSsK",
+      "endpoints": [
+        "https://github.com/dhirajmanwani/FroozERP/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "basicUi"
+      }
+    }
+  }
 }

@@ -402,10 +402,20 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.31";
+const APP_VERSION = "1.0.32";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
+const FROST_ACTIVE_TAB_STORAGE_KEY = "froozerp_frost_active_tab";
+const FROST_RECENT_CONVERSATION_STORAGE_KEY = "froozerp_frost_recent_conversation";
+const getStoredFrostConversation = () => {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(FROST_RECENT_CONVERSATION_STORAGE_KEY) || "[]");
+    return Array.isArray(parsed) ? parsed.slice(0, 20) : [];
+  } catch {
+    return [];
+  }
+};
 const applicationFontSizeOptions = [
   { value: "SMALL", label: "Small", scale: "90%" },
   { value: "MEDIUM", label: "Medium", scale: "100%" },
@@ -469,7 +479,7 @@ const schedulePrintPageProfileCleanup = () => {
 const UPDATE_FEED_URL = (
   import.meta.env.VITE_UPDATE_FEED_URL ||
   window.__FROOZERP_UPDATE_FEED_URL__ ||
-  ""
+  "https://github.com/dhirajmanwani/FroozERP/releases/latest/download/latest.json"
 ).trim();
 const roundUi = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 const createPurchaseLineId = () => {
@@ -506,12 +516,11 @@ const icons = {
   reports: "chart",
   settings: "settings",
   "sale-rates": "trend",
-  "ai-assistant": "message",
+  frost: "message",
 };
 
 const navigationItems = [
   ["dashboard", "Dashboard"],
-  ["ai-assistant", "FROST AI"],
   ["products", "Products"],
   ["purchase", "Purchase Entry"],
   ["pending-bills", "Pending Bills"],
@@ -527,11 +536,26 @@ const navigationItems = [
 ];
 
 const offlineLocalDataViews = new Set(["dashboard", "products", "sales", "reports", "settings"]);
-const offlineBackendRequiredViews = new Set(["ai-assistant", "purchase", "pending-bills", "accounts", "returns", "waste", "discounts", "sale-rates", "expenses"]);
+const offlineBackendRequiredViews = new Set(["purchase", "pending-bills", "accounts", "returns", "waste", "discounts", "sale-rates", "expenses"]);
 
 const getErrorMessage = (error, fallback) =>
   error.response?.data?.message || fallback;
 
+const getFrostDiagnosticMessage = (error, { offlineMode = false, internetAvailable = true, backendHealth = {} } = {}) => {
+  const status = error?.response?.status;
+  const serverMessage = error?.response?.data?.message;
+  if (status === 401) return "FROST session expired. Sign in again to refresh owner permissions.";
+  if (status === 403) return serverMessage || "FROST is blocked by this user's role permissions.";
+  if (typeof navigator !== "undefined" && navigator.onLine === false) return "Internet is unavailable. FROST will use local/offline facts where available.";
+  if (!internetAvailable && isCloudMode()) return "Internet is unavailable, so the cloud backend cannot be reached.";
+  if (backendHealth?.online === false) return isCloudMode()
+    ? "Cloud backend unavailable. Check Cloud Backend diagnostics and retry FROST."
+    : "Local backend unavailable. Start or reconnect the local FroozERP server, then retry FROST.";
+  if (error?.code === "ECONNABORTED") return "FROST request timed out. Check backend load and retry without reloading the app.";
+  if (serverMessage) return serverMessage;
+  if (offlineMode) return "FROST explanations are offline. Deterministic local facts remain available where cached.";
+  return "FROST data could not be loaded. Check API mode, authentication, and backend diagnostics, then retry.";
+};
 const getAuthErrorMessage = (error, fallback) => {
   const code = error.response?.data?.code;
   const message = error.response?.data?.message;
@@ -925,7 +949,6 @@ const modulePermissionMap = {
   expenses: "reports",
   reports: "reports",
   settings: "settings",
-  "ai-assistant": "ai_assistant_view",
 };
 
 const ledgerModes = [
@@ -1289,7 +1312,7 @@ function App() {
     alerts: [],
     reminders: [],
     suggestedQuestions: [],
-    history: [],
+    history: getStoredFrostConversation(),
     frost: null,
     provider: null,
     providers: [],
@@ -1308,7 +1331,15 @@ function App() {
   });
   const [aiQuestion, setAiQuestion] = useState("");
   const [aiRange, setAiRange] = useState("today");
-  const [frostActiveTab, setFrostActiveTab] = useState("briefing");
+  const [frostActiveTab, setFrostActiveTab] = useState(() => {
+    try {
+      return localStorage.getItem(FROST_ACTIVE_TAB_STORAGE_KEY) || "briefing";
+    } catch {
+      return "briefing";
+    }
+  });
+  const [frostDrawerOpen, setFrostDrawerOpen] = useState(false);
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const frostVoiceRef = useRef({ peer: null, stream: null, audio: null, channel: null });
   const [supplierDashboard, setSupplierDashboard] = useState({
     todaySales: 0,
@@ -1432,6 +1463,43 @@ function App() {
       // Device-local accessibility preference only; ignore locked storage.
     }
   }, [applicationFontSize]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(FROST_ACTIVE_TAB_STORAGE_KEY, frostActiveTab);
+    } catch {
+      // Device-local FROST preference only.
+    }
+  }, [frostActiveTab]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(FROST_RECENT_CONVERSATION_STORAGE_KEY, JSON.stringify((aiAssistantData.history || []).slice(0, 20)));
+    } catch {
+      // Device-local FROST conversation cache only.
+    }
+  }, [aiAssistantData.history]);
+
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setFrostDrawerOpen(false);
+        setCommandPaletteOpen(false);
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        const target = event.target;
+        const isEditing = ["INPUT", "TEXTAREA", "SELECT"].includes(target?.tagName) || target?.isContentEditable;
+        if (isEditing) return;
+        event.preventDefault();
+        if (user) setCommandPaletteOpen((current) => !current);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [user]);
+
+  useEffect(() => {
+    if (!user || !frostDrawerOpen) return;
+    loadAiAssistant(aiRange);
+  }, [user, frostDrawerOpen]);
 
   useEffect(() => {
     const updateInternetStatus = () => {
@@ -2346,7 +2414,7 @@ function App() {
       setAiAssistantData((current) => ({
         ...current,
         loading: false,
-        error: getErrorMessage(error, offlineMode ? "FROST explanations are offline. Deterministic local facts will remain available where cached." : "Unable to load FROST data."),
+        error: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth }),
       }));
     }
   };
@@ -2382,7 +2450,7 @@ function App() {
       }));
       setAiQuestion("");
     } catch (error) {
-      setAiAssistantData((current) => ({ ...current, loading: false, error: getErrorMessage(error, "Unable to answer from verified facts") }));
+      setAiAssistantData((current) => ({ ...current, loading: false, error: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth }) }));
     }
   };
 
@@ -2490,7 +2558,7 @@ function App() {
       frostVoiceRef.current = { peer, stream, audio, channel };
     } catch (error) {
       stopFrostVoice();
-      setAiAssistantData((state) => ({ ...state, voice: { status: "error", supported: true, transcript: "", error: getErrorMessage(error, "Unable to start FROST voice") } }));
+      setAiAssistantData((state) => ({ ...state, voice: { status: "error", supported: true, transcript: "", error: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth }) } }));
     }
   };
 
@@ -3969,7 +4037,6 @@ function App() {
         await Promise.all([loadAccounts(), loadCustomerData(), loadSupplierData(), loadAccountOutstanding()]);
       }
       if (view === "reports") await loadReports();
-      if (view === "ai-assistant") await loadAiAssistant();
       if (view === "expenses") await loadExpenses();
       if (view === "returns") await loadSaleReturns();
       if (view === "waste") await loadWasteEntries();
@@ -4155,6 +4222,25 @@ function App() {
     ].some((value) => String(value ?? "").toLowerCase().includes(lotSearchText));
   });
 
+  const frostUnreadCount = (aiAssistantData.alerts || []).filter((alert) => ["CRITICAL", "HIGH", "ATTENTION"].includes(String(alert.severity || "").toUpperCase())).length;
+  const openFrostDrawer = (tab = frostActiveTab || "briefing") => {
+    setFrostActiveTab(tab);
+    setFrostDrawerOpen(true);
+  };
+  const commandItems = [
+    ["sales", "Open POS Billing", () => navigate("sales")],
+    ["purchase", "New Purchase Entry", () => navigate("purchase")],
+    ["pending-bills", "Open Pending Bills", () => navigate("pending-bills")],
+    ["accounts", "Open Accounts", () => navigate("accounts")],
+    ["reports", "Open Reports", () => navigate("reports")],
+    ["sale-rates", "Open Sale Rate Update", () => navigate("sale-rates")],
+    ["products", "Search Product", () => navigate("products")],
+    ["accounts", "Search Customer", () => navigate("accounts")],
+    ["accounts", "Search Supplier", () => navigate("accounts")],
+    ["frost", "Ask FROST", () => openFrostDrawer("ask")],
+    ["settings", "Open Update Center", () => navigate("settings")],
+    ["settings", "Check Connection", () => { navigate("settings"); performConnectivityCheck("command-palette", { force: true }); }],
+  ].filter(([view]) => view === "frost" || (hasModuleAccess(view) && (canManageRates || view !== "sale-rates")));
   return (
     <main className="erp-shell">
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
@@ -4293,34 +4379,6 @@ function App() {
                 </div>
               </section>
             </>
-          )}
-
-          {activeView === "ai-assistant" && (
-            <AiBusinessAssistantModule
-              activeTab={frostActiveTab}
-              data={aiAssistantData}
-              onAlertAction={updateAiAlert}
-              onAsk={askAiAssistant}
-              onQuestionChange={setAiQuestion}
-              onRangeChange={(range) => {
-                setAiRange(range);
-                loadAiAssistant(range);
-              }}
-              onRefresh={() => loadAiAssistant(aiRange)}
-              onReminderAction={updateAiReminder}
-              onMemoryAction={updateFrostMemory}
-              onProposeMemory={proposeFrostMemory}
-              onTabChange={setFrostActiveTab}
-              onSaveSettings={saveFrostSettings}
-              onStartVoice={startFrostVoice}
-              onStopVoice={stopFrostVoice}
-              onProposeAction={proposeFrostAction}
-              onSelectQuestion={(question) => askAiAssistant(question)}
-              onNavigate={navigate}
-              question={aiQuestion}
-              range={aiRange}
-              user={user}
-            />
           )}
 
           {activeView === "products" && (
@@ -5162,11 +5220,150 @@ function App() {
           </section>
         </div>
       )}
+      <FrostFloatingCopilot
+        activeTab={frostActiveTab}
+        data={aiAssistantData}
+        onAlertAction={updateAiAlert}
+        onAsk={askAiAssistant}
+        onClose={() => setFrostDrawerOpen(false)}
+        onMemoryAction={updateFrostMemory}
+        onNavigate={navigate}
+        onOpen={() => openFrostDrawer("briefing")}
+        onProposeAction={proposeFrostAction}
+        onProposeMemory={proposeFrostMemory}
+        onQuestionChange={setAiQuestion}
+        onRangeChange={(range) => {
+          setAiRange(range);
+          loadAiAssistant(range);
+        }}
+        onRefresh={() => loadAiAssistant(aiRange)}
+        onReminderAction={updateAiReminder}
+        onSaveSettings={saveFrostSettings}
+        onSelectQuestion={(question) => askAiAssistant(question)}
+        onStartVoice={startFrostVoice}
+        onStopVoice={stopFrostVoice}
+        onTabChange={setFrostActiveTab}
+        open={frostDrawerOpen}
+        question={aiQuestion}
+        range={aiRange}
+        unreadCount={frostUnreadCount}
+        user={user}
+      />
+      {commandPaletteOpen && (
+        <CommandPalette
+          commands={commandItems}
+          onClose={() => setCommandPaletteOpen(false)}
+        />
+      )}
       {profileOpen && <UserProfilePanel onClose={() => setProfileOpen(false)} onLogout={() => setUser(null)} user={user} />}
     </main>
   );
 }
 
+function FrostFloatingCopilot({
+  activeTab,
+  data,
+  onAlertAction,
+  onAsk,
+  onClose,
+  onMemoryAction,
+  onNavigate,
+  onOpen,
+  onProposeAction,
+  onProposeMemory,
+  onQuestionChange,
+  onRangeChange,
+  onRefresh,
+  onReminderAction,
+  onSaveSettings,
+  onSelectQuestion,
+  onStartVoice,
+  onStopVoice,
+  onTabChange,
+  open,
+  question,
+  range,
+  unreadCount = 0,
+  user,
+}) {
+  return (
+    <>
+      <button
+        aria-label="Open FROST"
+        className={`frost-floating-launcher ${unreadCount ? "frost-floating-launcher-alert" : ""}`}
+        onClick={onOpen}
+        type="button"
+      >
+        <span className="frost-orbit" />
+        <strong>F</strong>
+        {unreadCount > 0 && <em>{Math.min(unreadCount, 99)}</em>}
+      </button>
+      {open && <button aria-label="Close FROST" className="frost-drawer-backdrop" onClick={onClose} type="button" />}
+      <aside aria-label="FROST" className={`frost-drawer ${open ? "frost-drawer-open" : ""}`}>
+        <div className="frost-drawer-header">
+          <div>
+            <span className="eyebrow">Floating Copilot</span>
+            <h2>FROST</h2>
+          </div>
+          <button aria-label="Close FROST" className="remove-button" onClick={onClose} type="button"><Icon name="close" /></button>
+        </div>
+        <div className="frost-drawer-body">
+          <AiBusinessAssistantModule
+            activeTab={activeTab}
+            data={data}
+            onAlertAction={onAlertAction}
+            onAsk={onAsk}
+            onMemoryAction={onMemoryAction}
+            onNavigate={onNavigate}
+            onProposeAction={onProposeAction}
+            onProposeMemory={onProposeMemory}
+            onQuestionChange={onQuestionChange}
+            onRangeChange={onRangeChange}
+            onRefresh={onRefresh}
+            onReminderAction={onReminderAction}
+            onSaveSettings={onSaveSettings}
+            onSelectQuestion={onSelectQuestion}
+            onStartVoice={onStartVoice}
+            onStopVoice={onStopVoice}
+            onTabChange={onTabChange}
+            question={question}
+            range={range}
+            user={user}
+          />
+        </div>
+      </aside>
+    </>
+  );
+}
+
+function CommandPalette({ commands = [], onClose }) {
+  const [query, setQuery] = useState("");
+  const filtered = commands.filter(([, label]) => label.toLowerCase().includes(query.trim().toLowerCase()));
+  const runCommand = (command) => {
+    command?.();
+    onClose?.();
+  };
+  return (
+    <div className="command-palette-backdrop" onClick={onClose}>
+      <section className="command-palette" onClick={(event) => event.stopPropagation()}>
+        <div className="command-palette-header">
+          <span className="eyebrow">Command Palette</span>
+          <button aria-label="Close command palette" className="remove-button" onClick={onClose} type="button"><Icon name="close" /></button>
+        </div>
+        <input autoFocus placeholder="Search commands" value={query} onChange={(event) => setQuery(event.target.value)} />
+        <div className="command-list">
+          {filtered.map(([view, label, command]) => (
+            <button key={`${view}-${label}`} onClick={() => runCommand(command)} type="button">
+              <Icon name={icons[view] || "settings"} />
+              <span>{label}</span>
+            </button>
+          ))}
+          {filtered.length === 0 && <div className="cart-empty">No matching command.</div>}
+        </div>
+      </section>
+    </div>
+  );
+}
 const aiSeverityClass = (severity = "INFO") => `ai-severity ai-severity-${String(severity).toLowerCase()}`;
 
 function AiBusinessAssistantModule({
@@ -5201,9 +5398,10 @@ function AiBusinessAssistantModule({
   const money = (value) => currency.format(Number(value || 0));
   const tabItems = [
     ["briefing", "Briefing"],
-    ["decision", "Decision Center"],
     ["ask", "Ask FROST"],
+    ["voice", "Voice"],
     ["alerts", "Alerts"],
+    ["decision", "Decision Center"],
     ["predictions", "Predictions"],
     ["profit", "Profit Advisor"],
     ["memory", "Memory"],
@@ -5238,12 +5436,6 @@ function AiBusinessAssistantModule({
       </div>
 
       {data.error && <div className="startup-status-panel startup-status-error"><p>{data.error}</p></div>}
-
-      <FrostVoicePanel
-        onStart={onStartVoice}
-        onStop={onStopVoice}
-        voice={data.voice || {}}
-      />
 
       <div className="frost-tabs" role="tablist" aria-label="FROST sections">
         {tabItems.map(([key, label]) => (
@@ -5308,6 +5500,14 @@ function AiBusinessAssistantModule({
         </ModuleCard>
         )}
       </div>}
+
+      {activeTab === "voice" && (
+        <FrostVoicePanel
+          onStart={onStartVoice}
+          onStop={onStopVoice}
+          voice={data.voice || {}}
+        />
+      )}
 
       {activeTab === "predictions" && (
         <FrostPredictionsPanel predictions={data.predictions || {}} onProposeAction={onProposeAction} />
@@ -15113,10 +15313,11 @@ function DashboardAnalytics({ analytics, customRange, onApplyCustomRange, onCust
 }
 
 function SummaryMetric({ featured = false, label, positive = false, value }) {
+  const displayValue = value ?? "-";
   return (
-    <div className={featured ? "summary-metric summary-metric-featured" : "summary-metric"}>
+    <div className={featured ? "summary-metric summary-metric-featured" : "summary-metric"} title={`${label}: ${displayValue}`}>
       <span>{label}</span>
-      <strong className={positive ? "profit-cell" : ""}>{value}</strong>
+      <strong className={positive ? "metric-value profit-cell" : "metric-value"}>{displayValue}</strong>
     </div>
   );
 }
