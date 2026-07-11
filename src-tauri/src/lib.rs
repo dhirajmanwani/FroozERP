@@ -139,6 +139,7 @@ fn backend_dir_candidates() -> Vec<PathBuf> {
     }
     let install_dir = current_install_dir();
     candidates.push(install_dir.join("backend"));
+    candidates.push(install_dir.join("_up_").join("backend"));
     candidates.push(install_dir.join("resources").join("backend"));
     if let Ok(current_dir) = env::current_dir() {
         candidates.push(current_dir.join("backend"));
