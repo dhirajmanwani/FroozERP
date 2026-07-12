@@ -38,6 +38,7 @@ static KIOSK_CLOSE_ALLOWED: AtomicBool = AtomicBool::new(false);
 static LOCAL_BACKEND_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
 const LOCAL_BACKEND_PORT: &str = "5000";
 const BACKEND_OWNERSHIP_FILE: &str = "local-backend-owner.json";
+const BACKEND_STARTUP_LOCK_FILE: &str = "local-backend-startup.lock";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -102,6 +103,10 @@ fn app_data_dir() -> PathBuf {
 
 fn backend_ownership_path() -> PathBuf {
     app_data_dir().join("runtime").join(BACKEND_OWNERSHIP_FILE)
+}
+
+fn backend_startup_lock_path() -> PathBuf {
+    app_data_dir().join("runtime").join(BACKEND_STARTUP_LOCK_FILE)
 }
 
 fn now_unix_seconds() -> u64 {
@@ -174,9 +179,16 @@ fn backend_dir_candidates() -> Vec<PathBuf> {
     candidates.push(install_dir.join("backend"));
     candidates.push(install_dir.join("_up_").join("backend"));
     candidates.push(install_dir.join("resources").join("backend"));
-    if let Ok(current_dir) = env::current_dir() {
-        candidates.push(current_dir.join("backend"));
-        candidates.push(current_dir.join("..").join("backend"));
+    if cfg!(debug_assertions) {
+        if let Ok(current_dir) = env::current_dir() {
+            candidates.push(current_dir.join("backend"));
+            candidates.push(current_dir.join("..").join("backend"));
+        }
+    } else if let Ok(current_dir) = env::current_dir() {
+        if is_under(&current_dir, &install_dir) {
+            candidates.push(current_dir.join("backend"));
+            candidates.push(current_dir.join("..").join("backend"));
+        }
     }
     candidates
 }
@@ -194,12 +206,19 @@ fn node_candidates() -> Vec<PathBuf> {
         candidates.push(path);
     }
     let install_dir = current_install_dir();
+    candidates.push(install_dir.join("binaries").join("froozerp-backend-node.exe"));
     candidates.push(install_dir.join("froozerp-backend-node.exe"));
     candidates.push(install_dir.join("_up_").join("binaries").join("froozerp-backend-node.exe"));
     candidates.push(install_dir.join("resources").join("binaries").join("froozerp-backend-node.exe"));
-    if let Ok(current_dir) = env::current_dir() {
-        candidates.push(current_dir.join("src-tauri").join("binaries").join("froozerp-backend-node.exe"));
-        candidates.push(current_dir.join("binaries").join("froozerp-backend-node.exe"));
+    if cfg!(debug_assertions) {
+        if let Ok(current_dir) = env::current_dir() {
+            candidates.push(current_dir.join("src-tauri").join("binaries").join("froozerp-backend-node.exe"));
+            candidates.push(current_dir.join("binaries").join("froozerp-backend-node.exe"));
+        }
+    } else if let Ok(current_dir) = env::current_dir() {
+        if is_under(&current_dir, &install_dir) {
+            candidates.push(current_dir.join("binaries").join("froozerp-backend-node.exe"));
+        }
     }
     candidates.push(PathBuf::from("node"));
     candidates.push(PathBuf::from(r"D:\node.exe"));
@@ -212,6 +231,44 @@ fn resolve_node_path() -> PathBuf {
         .into_iter()
         .find(|path| path == Path::new("node") || path.exists())
         .unwrap_or_else(|| PathBuf::from("node"))
+}
+
+fn acquire_backend_startup_lock() -> Result<fs::File, String> {
+    let path = backend_startup_lock_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    for attempt in 1..=24 {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                let _ = writeln!(
+                    file,
+                    "pid={}\napp_version={}\nstarted_at={}",
+                    std::process::id(),
+                    env!("CARGO_PKG_VERSION"),
+                    now_unix_seconds()
+                );
+                return Ok(file);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if probe_local_backend_health(900).is_ok() {
+                    return Err("Local FroozERP service became healthy while another app instance was starting it.".to_string());
+                }
+                if attempt == 12 {
+                    write_app_log("ERROR", "Backend startup lock appears stale; removing it after repeated failed health checks");
+                    let _ = fs::remove_file(&path);
+                } else {
+                    thread::sleep(Duration::from_millis(500));
+                }
+            }
+            Err(error) => return Err(format!("Unable to create backend startup lock: {}", error)),
+        }
+    }
+    Err("Another FroozERP window is starting the local service. Retry in a few seconds.".to_string())
+}
+
+fn release_backend_startup_lock() {
+    let _ = fs::remove_file(backend_startup_lock_path());
 }
 
 fn backend_startup_source(node_path: &Path) -> &'static str {
@@ -350,9 +407,48 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
         }
     }
 
+    let startup_lock = match acquire_backend_startup_lock() {
+        Ok(lock) => Some(lock),
+        Err(message) => {
+            if probe_local_backend_health(900).is_ok() {
+                write_app_log("INFO", &message);
+                return backend_status(
+                    "Local FroozERP service is already running.".to_string(),
+                    true,
+                    false,
+                    true,
+                    None,
+                    None,
+                    None,
+                    "reused",
+                );
+            }
+            write_app_log("ERROR", &message);
+            return backend_status(message, false, false, false, None, None, None, "startup-lock");
+        }
+    };
+
+    if probe_local_backend_health(900).is_ok() {
+        drop(startup_lock);
+        release_backend_startup_lock();
+        write_app_log("INFO", "Local backend became healthy before launch; reusing it");
+        return backend_status(
+            "Local FroozERP service is already running.".to_string(),
+            true,
+            false,
+            true,
+            None,
+            None,
+            None,
+            "reused",
+        );
+    }
+
     let backend_dir = match resolve_backend_dir() {
         Ok(path) => path,
         Err(error) => {
+            drop(startup_lock);
+            release_backend_startup_lock();
             write_app_log("ERROR", &format!("Local backend launch blocked: {}", error));
             return backend_status(error, false, false, false, None, None, None, "unavailable");
         }
@@ -387,6 +483,8 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
     let child = match child {
         Ok(child) => child,
         Err(error) => {
+            drop(startup_lock);
+            release_backend_startup_lock();
             let message = format!("Unable to launch local FroozERP service: {}", error);
             write_app_log("ERROR", &message);
             return backend_status(message, false, false, false, None, Some(backend_dir), Some(node_path), startup_source);
@@ -402,6 +500,8 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
         thread::sleep(Duration::from_millis(750));
         match probe_local_backend_health(900) {
             Ok(()) => {
+                drop(startup_lock);
+                release_backend_startup_lock();
                 let message = format!("Local FroozERP service started on attempt {}", attempt);
                 write_app_log("INFO", &message);
                 return backend_status(message, true, true, false, Some(pid), Some(backend_dir), Some(node_path), startup_source);
@@ -416,6 +516,8 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
     }
     let message = "Local FroozERP service stopped or did not become healthy. Restart service.".to_string();
     write_app_log("ERROR", &message);
+    drop(startup_lock);
+    release_backend_startup_lock();
     backend_status(message, false, true, false, Some(pid), Some(backend_dir), Some(node_path), startup_source)
 }
 
