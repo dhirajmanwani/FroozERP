@@ -61,6 +61,15 @@ struct CleanupResult {
     message: String,
 }
 
+#[derive(Debug, Serialize)]
+struct InstallDiagnostics {
+    current_executable: String,
+    current_install_dir: String,
+    data_path: String,
+    stale_installations: Vec<String>,
+    cleanup_message: String,
+}
+
 #[derive(Debug, Serialize, Clone)]
 struct BackendServiceStatus {
     healthy: bool,
@@ -605,6 +614,7 @@ fn froozerp_cleanup_candidates() -> CleanupResult {
         old_install_paths.push(program_files_x86.join("FroozERP"));
     }
     if let Some(program_files) = env::var_os("ProgramFiles").map(PathBuf::from) {
+        old_install_paths.push(program_files.join("FroozERP"));
         for old_leaf in [
             "FroozERP-old",
             "FroozERP Old",
@@ -659,6 +669,26 @@ fn froozerp_cleanup_candidates() -> CleanupResult {
         removed: Vec::new(),
         blocked,
         message: "Old application files detected. Business data paths are excluded.".to_string(),
+    }
+}
+
+fn froozerp_install_diagnostics() -> InstallDiagnostics {
+    let cleanup = froozerp_cleanup_candidates();
+    let current_executable = env::current_exe()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let stale_installations = cleanup
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.kind == "install-folder")
+        .map(|candidate| candidate.path.clone())
+        .collect();
+    InstallDiagnostics {
+        current_executable,
+        current_install_dir: cleanup.install_path,
+        data_path: cleanup.data_path,
+        stale_installations,
+        cleanup_message: cleanup.message,
     }
 }
 
@@ -962,6 +992,11 @@ fn detect_old_froozerp_versions() -> Result<CleanupResult, String> {
 }
 
 #[tauri::command]
+fn install_diagnostics() -> Result<InstallDiagnostics, String> {
+    Ok(froozerp_install_diagnostics())
+}
+
+#[tauri::command]
 fn clean_old_froozerp_versions() -> Result<CleanupResult, String> {
     let mut result = froozerp_cleanup_candidates();
     let data_dir = app_data_dir();
@@ -1197,18 +1232,18 @@ pub fn run() {
                 &format!("Application log file: {}", path.to_string_lossy()),
             );
             write_app_log("INFO", "Tauri setup started");
-            match clean_old_froozerp_versions() {
+            match detect_old_froozerp_versions() {
                 Ok(cleanup) => write_app_log(
                     "INFO",
                     &format!(
-                        "Old version cleanup completed: removed={}, blocked={}, data_path={}",
-                        cleanup.removed.len(),
+                        "Old version detection completed: candidates={}, blocked={}, data_path={}",
+                        cleanup.candidates.len(),
                         cleanup.blocked.len(),
                         cleanup.data_path
                     ),
                 ),
                 Err(error) => {
-                    write_app_log("ERROR", &format!("Old version cleanup failed: {}", error))
+                    write_app_log("ERROR", &format!("Old version detection failed: {}", error))
                 }
             }
             let marker = webview_recovery_marker_path();
@@ -1260,6 +1295,7 @@ pub fn run() {
             restart_local_backend_service,
             local_backend_service_status,
             detect_old_froozerp_versions,
+            install_diagnostics,
             clean_old_froozerp_versions,
             local_cache_reference_snapshot,
             local_load_reference_snapshot,
