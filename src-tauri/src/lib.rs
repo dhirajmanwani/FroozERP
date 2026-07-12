@@ -41,6 +41,16 @@ const BACKEND_OWNERSHIP_FILE: &str = "local-backend-owner.json";
 const BACKEND_STARTUP_LOCK_FILE: &str = "local-backend-startup.lock";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(target_os = "windows")]
+const DETACHED_PROCESS: u32 = 0x00000008;
+
+#[cfg(target_os = "windows")]
+fn hide_child_console(command: &mut Command) {
+    command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_child_console(_command: &mut Command) {}
 
 #[derive(Debug, Serialize, Clone)]
 struct CleanupCandidate {
@@ -552,8 +562,7 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    #[cfg(target_os = "windows")]
-    command.creation_flags(CREATE_NO_WINDOW);
+    hide_child_console(&mut command);
     let child = command.spawn();
 
     let child = match child {
@@ -667,7 +676,9 @@ fn froozerp_cleanup_candidates() -> CleanupResult {
     }
 
     let legacy_chrome_uninstall_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\d0400be39e01c338dfc0b992b6a2c220";
-    let legacy_chrome_key_exists = Command::new("reg")
+    let mut reg_query = Command::new("reg");
+    hide_child_console(&mut reg_query);
+    let legacy_chrome_key_exists = reg_query
         .args(["query", legacy_chrome_uninstall_key])
         .output()
         .map(|output| output.status.success())
@@ -789,7 +800,9 @@ fn wait_for_file_unlock(path: &Path, attempts: usize, delay: Duration) -> bool {
 }
 
 fn backend_port_owner_pid() -> Option<u32> {
-    let output = Command::new("netstat")
+    let mut netstat = Command::new("netstat");
+    hide_child_console(&mut netstat);
+    let output = netstat
         .args(["-ano", "-p", "tcp"])
         .output()
         .ok()?;
@@ -1175,7 +1188,9 @@ fn clean_old_froozerp_versions() -> Result<CleanupResult, String> {
                 Ok(())
             }
         } else if candidate.kind == "registry-uninstall-entry" {
-            match Command::new("reg")
+            let mut reg_delete = Command::new("reg");
+            hide_child_console(&mut reg_delete);
+            match reg_delete
                 .args(["delete", &candidate.path, "/f"])
                 .status()
             {
