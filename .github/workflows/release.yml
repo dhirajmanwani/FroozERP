@@ -21,6 +21,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm --prefix frontend ci
 
+      - name: Install backend dependencies
+        run: npm --prefix backend ci --omit=dev
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
