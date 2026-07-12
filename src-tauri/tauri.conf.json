@@ -37,7 +37,7 @@
       "windows": {
         "installMode": "passive"
       },
-      "pubkey": "REPLACE_WITH_YOUR_PUBLIC_KEY_FROM_SIGNER_GENERATE"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZDRTk0OTIzNkE4ODc4NUMKUldSY2VJaHFJMG5wL01jN0UrMTE5WDc4c0RZU29LTFRhSWhRdC91Q2NDbU92aW0wWSsvS2NsWmcK"
     }
   }
 }
