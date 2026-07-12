@@ -4,6 +4,8 @@ use local_db::{
     LocalDbStatus, LocalPosSaleResult, PendingSyncOperation, PulledChange, SyncAck, SyncOperation,
 };
 use serde::Serialize;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::{
     env,
     fs::{self, OpenOptions},
@@ -20,22 +22,23 @@ use std::{
     time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 #[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Threading::CreateMutexW;
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::Controls::Dialogs::{
-    CommDlgExtendedError, GetSaveFileNameW, OPENFILENAMEW, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
+    CommDlgExtendedError, GetSaveFileNameW, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::UI::{
-    Shell::ShellExecuteW,
-    WindowsAndMessaging::SW_SHOWNORMAL,
-};
-use tauri::{AppHandle, Emitter, Manager, WindowEvent};
+use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
 
 static KIOSK_LOCK_ENABLED: AtomicBool = AtomicBool::new(false);
 static KIOSK_CLOSE_ALLOWED: AtomicBool = AtomicBool::new(false);
 static LOCAL_BACKEND_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
+#[cfg(target_os = "windows")]
+static DESKTOP_INSTANCE_MUTEX: Mutex<Option<isize>> = Mutex::new(None);
 const LOCAL_BACKEND_PORT: &str = "5000";
 const BACKEND_OWNERSHIP_FILE: &str = "local-backend-owner.json";
 const BACKEND_STARTUP_LOCK_FILE: &str = "local-backend-startup.lock";
@@ -51,6 +54,56 @@ fn hide_child_console(command: &mut Command) {
 
 #[cfg(not(target_os = "windows"))]
 fn hide_child_console(_command: &mut Command) {}
+
+#[cfg(target_os = "windows")]
+fn acquire_desktop_instance_mutex() -> bool {
+    let mut name: Vec<u16> = "Local\\com.srtcompany.froozerp.desktop.instance"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_mut_ptr()) };
+    if handle.is_null() {
+        write_app_log(
+            "ERROR",
+            "Unable to create FroozERP desktop instance mutex; continuing startup",
+        );
+        return true;
+    }
+    let already_running = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    if already_running {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        write_app_log(
+            "INFO",
+            "Another FroozERP desktop instance is already running; exiting duplicate launch",
+        );
+        return false;
+    }
+    if let Ok(mut guard) = DESKTOP_INSTANCE_MUTEX.lock() {
+        *guard = Some(handle as isize);
+    }
+    true
+}
+
+#[cfg(target_os = "windows")]
+fn release_desktop_instance_mutex() {
+    if let Ok(mut guard) = DESKTOP_INSTANCE_MUTEX.lock() {
+        if let Some(handle) = guard.take() {
+            unsafe {
+                let _ = CloseHandle(handle as _);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn acquire_desktop_instance_mutex() -> bool {
+    true
+}
+
+#[cfg(not(target_os = "windows"))]
+fn release_desktop_instance_mutex() {}
 
 #[derive(Debug, Serialize, Clone)]
 struct CleanupCandidate {
@@ -135,7 +188,9 @@ fn backend_ownership_path() -> PathBuf {
 }
 
 fn backend_startup_lock_path() -> PathBuf {
-    app_data_dir().join("runtime").join(BACKEND_STARTUP_LOCK_FILE)
+    app_data_dir()
+        .join("runtime")
+        .join(BACKEND_STARTUP_LOCK_FILE)
 }
 
 fn now_unix_seconds() -> u64 {
@@ -266,18 +321,45 @@ fn node_candidates() -> Vec<PathBuf> {
         candidates.push(path);
     }
     let install_dir = current_install_dir();
-    candidates.push(install_dir.join("binaries").join("froozerp-backend-node.exe"));
+    candidates.push(
+        install_dir
+            .join("binaries")
+            .join("froozerp-backend-node.exe"),
+    );
     candidates.push(install_dir.join("froozerp-backend-node.exe"));
-    candidates.push(install_dir.join("_up_").join("binaries").join("froozerp-backend-node.exe"));
-    candidates.push(install_dir.join("resources").join("binaries").join("froozerp-backend-node.exe"));
+    candidates.push(
+        install_dir
+            .join("_up_")
+            .join("binaries")
+            .join("froozerp-backend-node.exe"),
+    );
+    candidates.push(
+        install_dir
+            .join("resources")
+            .join("binaries")
+            .join("froozerp-backend-node.exe"),
+    );
     if cfg!(debug_assertions) {
         if let Ok(current_dir) = env::current_dir() {
-            candidates.push(current_dir.join("src-tauri").join("binaries").join("froozerp-backend-node.exe"));
-            candidates.push(current_dir.join("binaries").join("froozerp-backend-node.exe"));
+            candidates.push(
+                current_dir
+                    .join("src-tauri")
+                    .join("binaries")
+                    .join("froozerp-backend-node.exe"),
+            );
+            candidates.push(
+                current_dir
+                    .join("binaries")
+                    .join("froozerp-backend-node.exe"),
+            );
         }
     } else if let Ok(current_dir) = env::current_dir() {
         if is_under(&current_dir, &install_dir) {
-            candidates.push(current_dir.join("binaries").join("froozerp-backend-node.exe"));
+            candidates.push(
+                current_dir
+                    .join("binaries")
+                    .join("froozerp-backend-node.exe"),
+            );
         }
     }
     candidates.push(PathBuf::from("node"));
@@ -324,7 +406,10 @@ fn acquire_backend_startup_lock() -> Result<fs::File, String> {
             Err(error) => return Err(format!("Unable to create backend startup lock: {}", error)),
         }
     }
-    Err("Another FroozERP window is starting the local service. Retry in a few seconds.".to_string())
+    Err(
+        "Another FroozERP window is starting the local service. Retry in a few seconds."
+            .to_string(),
+    )
 }
 
 fn release_backend_startup_lock() {
@@ -342,7 +427,16 @@ fn backend_startup_source(node_path: &Path) -> &'static str {
     }
 }
 
-fn backend_status(message: String, healthy: bool, started: bool, reused_existing: bool, pid: Option<u32>, backend_dir: Option<PathBuf>, node_path: Option<PathBuf>, startup_source: &str) -> BackendServiceStatus {
+fn backend_status(
+    message: String,
+    healthy: bool,
+    started: bool,
+    reused_existing: bool,
+    pid: Option<u32>,
+    backend_dir: Option<PathBuf>,
+    node_path: Option<PathBuf>,
+    startup_source: &str,
+) -> BackendServiceStatus {
     BackendServiceStatus {
         healthy,
         started,
@@ -392,7 +486,10 @@ fn stop_owned_backend(reason: &str) -> bool {
     if let Ok(mut guard) = LOCAL_BACKEND_PROCESS.lock() {
         if let Some(mut child) = guard.take() {
             let pid = child.id();
-            write_app_log("INFO", &format!("Stopping owned local backend PID {} ({})", pid, reason));
+            write_app_log(
+                "INFO",
+                &format!("Stopping owned local backend PID {} ({})", pid, reason),
+            );
             let _ = child.kill();
             let _ = child.wait();
             stopped_owned_backend = true;
@@ -486,7 +583,10 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
                     }
                 }
                 Err(error) => {
-                    write_app_log("ERROR", &format!("Unable to inspect local backend process: {}", error));
+                    write_app_log(
+                        "ERROR",
+                        &format!("Unable to inspect local backend process: {}", error),
+                    );
                     *guard = None;
                 }
             }
@@ -510,14 +610,26 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
                 );
             }
             write_app_log("ERROR", &message);
-            return backend_status(message, false, false, false, None, None, None, "startup-lock");
+            return backend_status(
+                message,
+                false,
+                false,
+                false,
+                None,
+                None,
+                None,
+                "startup-lock",
+            );
         }
     };
 
     if local_backend_version_matches(900).unwrap_or(false) {
         drop(startup_lock);
         release_backend_startup_lock();
-        write_app_log("INFO", "Local backend became healthy before launch; reusing it");
+        write_app_log(
+            "INFO",
+            "Local backend became healthy before launch; reusing it",
+        );
         return backend_status(
             "Local FroozERP service is already running.".to_string(),
             true,
@@ -552,7 +664,8 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
         ),
     );
     let mut command = Command::new(&node_path);
-    command.arg("server.js")
+    command
+        .arg("server.js")
         .current_dir(&backend_dir)
         .env("PORT", LOCAL_BACKEND_PORT)
         .env("APP_VERSION", env!("CARGO_PKG_VERSION"))
@@ -572,7 +685,16 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
             release_backend_startup_lock();
             let message = format!("Unable to launch local FroozERP service: {}", error);
             write_app_log("ERROR", &message);
-            return backend_status(message, false, false, false, None, Some(backend_dir), Some(node_path), startup_source);
+            return backend_status(
+                message,
+                false,
+                false,
+                false,
+                None,
+                Some(backend_dir),
+                Some(node_path),
+                startup_source,
+            );
         }
     };
     let pid = child.id();
@@ -589,7 +711,16 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
                 release_backend_startup_lock();
                 let message = format!("Local FroozERP service started on attempt {}", attempt);
                 write_app_log("INFO", &message);
-                return backend_status(message, true, true, false, Some(pid), Some(backend_dir), Some(node_path), startup_source);
+                return backend_status(
+                    message,
+                    true,
+                    true,
+                    false,
+                    Some(pid),
+                    Some(backend_dir),
+                    Some(node_path),
+                    startup_source,
+                );
             }
             Ok(false) => {
                 write_app_log(
@@ -600,16 +731,29 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
             Err(error) => {
                 write_app_log(
                     "INFO",
-                    &format!("Local backend health pending attempt {}: {}", attempt, error),
+                    &format!(
+                        "Local backend health pending attempt {}: {}",
+                        attempt, error
+                    ),
                 );
             }
         }
     }
-    let message = "Local FroozERP service stopped or did not become healthy. Restart service.".to_string();
+    let message =
+        "Local FroozERP service stopped or did not become healthy. Restart service.".to_string();
     write_app_log("ERROR", &message);
     drop(startup_lock);
     release_backend_startup_lock();
-    backend_status(message, false, true, false, Some(pid), Some(backend_dir), Some(node_path), startup_source)
+    backend_status(
+        message,
+        false,
+        true,
+        false,
+        Some(pid),
+        Some(backend_dir),
+        Some(node_path),
+        startup_source,
+    )
 }
 
 fn push_shortcut_candidate(candidates: &mut Vec<CleanupCandidate>, path: PathBuf, reason: &str) {
@@ -782,11 +926,7 @@ fn is_file_unlocked(path: &Path) -> bool {
     if !path.exists() {
         return true;
     }
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .is_ok()
+    OpenOptions::new().read(true).write(true).open(path).is_ok()
 }
 
 fn wait_for_file_unlock(path: &Path, attempts: usize, delay: Duration) -> bool {
@@ -802,10 +942,7 @@ fn wait_for_file_unlock(path: &Path, attempts: usize, delay: Duration) -> bool {
 fn backend_port_owner_pid() -> Option<u32> {
     let mut netstat = Command::new("netstat");
     hide_child_console(&mut netstat);
-    let output = netstat
-        .args(["-ano", "-p", "tcp"])
-        .output()
-        .ok()?;
+    let output = netstat.args(["-ano", "-p", "tcp"]).output().ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         let normalized = line.split_whitespace().collect::<Vec<_>>();
@@ -924,10 +1061,14 @@ fn open_pdf_in_system_viewer(file_name: String, bytes: Vec<u8>) -> Result<String
     #[cfg(target_os = "windows")]
     open_path_with_windows_shell(&path)?;
     #[cfg(not(target_os = "windows"))]
-    Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" })
-        .arg(&path)
-        .spawn()
-        .map_err(|error| error.to_string())?;
+    Command::new(if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    })
+    .arg(&path)
+    .spawn()
+    .map_err(|error| error.to_string())?;
     Ok(path.to_string_lossy().to_string())
 }
 
@@ -951,7 +1092,10 @@ fn open_path_with_windows_shell(path: &Path) -> Result<(), String> {
         )
     };
     if (result as isize) <= 32 {
-        return Err(format!("Windows shell open failed with code {}", result as isize));
+        return Err(format!(
+            "Windows shell open failed with code {}",
+            result as isize
+        ));
     }
     Ok(())
 }
@@ -988,7 +1132,10 @@ fn save_pdf_path_with_windows_dialog(suggested_name: &str) -> Result<Option<Path
         if error_code == 0 {
             return Ok(None);
         }
-        return Err(format!("Windows save dialog failed with code {}", error_code));
+        return Err(format!(
+            "Windows save dialog failed with code {}",
+            error_code
+        ));
     }
 
     let selected_len = file_buffer
@@ -1112,20 +1259,34 @@ fn local_backend_service_status() -> Result<BackendServiceStatus, String> {
         if let Some(child) = guard.as_mut() {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    write_app_log("ERROR", &format!("Managed local backend exited with status {}", status));
+                    write_app_log(
+                        "ERROR",
+                        &format!("Managed local backend exited with status {}", status),
+                    );
                     *guard = None;
                 }
                 Ok(None) => pid = Some(child.id()),
-                Err(error) => write_app_log("ERROR", &format!("Unable to inspect local backend process: {}", error)),
+                Err(error) => write_app_log(
+                    "ERROR",
+                    &format!("Unable to inspect local backend process: {}", error),
+                ),
             }
         }
     }
     let owned_pid = pid.is_some();
-    let port_pid = if healthy { backend_port_owner_pid() } else { None };
+    let port_pid = if healthy {
+        backend_port_owner_pid()
+    } else {
+        None
+    };
     if pid.is_none() {
         pid = port_pid;
     }
-    let node_path = if healthy { Some(resolve_node_path()) } else { None };
+    let node_path = if healthy {
+        Some(resolve_node_path())
+    } else {
+        None
+    };
     Ok(backend_status(
         if healthy {
             "Local FroozERP service is healthy.".to_string()
@@ -1144,7 +1305,13 @@ fn local_backend_service_status() -> Result<BackendServiceStatus, String> {
         pid,
         None,
         node_path,
-        if owned_pid { "owned" } else if healthy { "reused" } else { "unknown" },
+        if owned_pid {
+            "owned"
+        } else if healthy {
+            "reused"
+        } else {
+            "unknown"
+        },
     ))
 }
 
@@ -1155,7 +1322,9 @@ fn detect_old_froozerp_versions() -> Result<CleanupResult, String> {
 
 #[tauri::command]
 fn install_diagnostics(app: AppHandle) -> Result<InstallDiagnostics, String> {
-    Ok(froozerp_install_diagnostics(app.package_info().version.to_string()))
+    Ok(froozerp_install_diagnostics(
+        app.package_info().version.to_string(),
+    ))
 }
 
 #[tauri::command]
@@ -1190,10 +1359,7 @@ fn clean_old_froozerp_versions() -> Result<CleanupResult, String> {
         } else if candidate.kind == "registry-uninstall-entry" {
             let mut reg_delete = Command::new("reg");
             hide_child_console(&mut reg_delete);
-            match reg_delete
-                .args(["delete", &candidate.path, "/f"])
-                .status()
-            {
+            match reg_delete.args(["delete", &candidate.path, "/f"]).status() {
                 Ok(status) if status.success() => Ok(()),
                 Ok(_) => Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -1378,6 +1544,10 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            if !acquire_desktop_instance_mutex() {
+                app.handle().exit(0);
+                return Ok(());
+            }
             let path = diagnostic_log_path();
             write_app_log(
                 "INFO",
@@ -1492,6 +1662,8 @@ pub fn run() {
             "ERROR",
             &format!("error while running FroozERP desktop app: {}", error),
         );
+        release_desktop_instance_mutex();
         panic!("error while running FroozERP desktop app: {}", error);
     }
+    release_desktop_instance_mutex();
 }
