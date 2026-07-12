@@ -475,7 +475,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.38";
+const APP_VERSION = "1.0.40";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -12280,18 +12280,20 @@ function UpdateCenterSection({ canManage }) {
   const [cleanupResult, setCleanupResult] = useState(null);
   const [cleanupBusy, setCleanupBusy] = useState(false);
   const [installDiagnostics, setInstallDiagnostics] = useState(null);
+  const [backendVersionDiagnostics, setBackendVersionDiagnostics] = useState(null);
   const updateRequestIdRef = useRef(0);
   const autoCheckStartedRef = useRef(false);
   const updateObjectRef = useRef(null);
   const downloadedUpdateRef = useRef(null);
   const feedConfigured = Boolean(UPDATE_FEED_URL);
   const desktopUpdaterAvailable = isDesktopShell();
-  const installedVersion = APP_VERSION;
   const normalizeVersion = useCallback((value) => {
     const text = String(value || "").trim();
     const match = text.match(/v?(\d+(?:\.\d+){1,3})(?:[^\d].*)?$/i) || text.match(/v?(\d+(?:\.\d+){1,3})/i);
     return match ? match[1] : "";
   }, []);
+  const desktopDiagnosticVersion = normalizeVersion(installDiagnostics?.desktop_app_version || installDiagnostics?.package_version || "");
+  const installedVersion = desktopUpdaterAvailable ? desktopDiagnosticVersion : normalizeVersion(APP_VERSION);
   const compareVersions = useCallback((left, right) => {
     const a = normalizeVersion(left).split(".").map((part) => Number.parseInt(part, 10) || 0);
     const b = normalizeVersion(right).split(".").map((part) => Number.parseInt(part, 10) || 0);
@@ -12303,7 +12305,7 @@ function UpdateCenterSection({ canManage }) {
   }, [normalizeVersion]);
   const createInitialUpdaterState = () => ({
     phase: "idle",
-    installedVersion,
+    installedVersion: "",
     latestVersion: "",
     publishedAt: "",
     releaseNotes: "",
@@ -12315,8 +12317,12 @@ function UpdateCenterSection({ canManage }) {
     lastCheckedAt: "",
   });
   const [updaterState, setUpdaterState] = useState(createInitialUpdaterState);
+  useEffect(() => {
+    if (!installedVersion) return;
+    setUpdaterState((current) => ({ ...current, installedVersion }));
+  }, [installedVersion]);
   const updateAvailable = updaterState.phase === "update_available";
-  const updateDownloaded = updaterState.phase === "downloaded";
+  const updateDownloaded = updaterState.phase === "ready_to_install";
   const canInstallUpdate = updateDownloaded && updaterState.signatureVerified;
   const progressPercent = Math.max(0, Math.min(100, Number(updaterState.downloadProgress.percent || 0)));
   const displayLatestVersion = updaterState.latestVersion || (updaterState.phase === "checking" ? "Checking update feed" : "Not checked");
@@ -12324,7 +12330,7 @@ function UpdateCenterSection({ canManage }) {
     if (updaterState.phase === "checking") return "Checking update feed";
     if (updaterState.phase === "update_available") return `Update available: ${updaterState.latestVersion}`;
     if (updaterState.phase === "downloading") return `Downloading ${progressPercent || 0}%`;
-    if (updaterState.phase === "downloaded") return "Update downloaded and signature verified";
+    if (updaterState.phase === "ready_to_install") return "Update downloaded and signature verified";
     if (updaterState.phase === "installing") return "Installing update";
     if (updaterState.phase === "error") return updaterState.errorMessage || "Update check failed";
     if (updaterState.phase === "up_to_date") return "FroozERP is up to date";
@@ -12395,6 +12401,15 @@ function UpdateCenterSection({ canManage }) {
       }));
       return;
     }
+    if (desktopUpdaterAvailable && !installedVersion) {
+      setUpdaterState((current) => ({
+        ...current,
+        phase: "error",
+        errorCode: "DESKTOP_VERSION_UNAVAILABLE",
+        errorMessage: "Desktop app version is still loading from the running FroozERP executable. Retry in a moment.",
+      }));
+      return;
+    }
     if (["checking", "downloading", "installing"].includes(updaterState.phase)) return;
     const requestId = updateRequestIdRef.current + 1;
     updateRequestIdRef.current = requestId;
@@ -12425,13 +12440,26 @@ function UpdateCenterSection({ canManage }) {
       const manifestVersion = manifest ? extractUpdateVersion(manifest).version : "";
       const updateVersion = normalizeVersion(update?.version || "");
       const latestVersion = updateVersion || manifestVersion || "";
-      const comparison = latestVersion ? compareVersions(latestVersion, installedVersion) : 0;
-      const nextPhase = update ? "update_available" : comparison > 0 ? "update_available" : "up_to_date";
+      const desktopVersion = normalizeVersion(installDiagnostics?.desktop_app_version || installDiagnostics?.package_version || installedVersion);
+      const comparison = latestVersion && desktopVersion ? compareVersions(latestVersion, desktopVersion) : 0;
+      if (desktopUpdaterAvailable && !update && comparison > 0) {
+        setUpdaterState((current) => mergeManifestDiagnostics({
+          ...current,
+          phase: "error",
+          installedVersion: desktopVersion,
+          latestVersion,
+          errorCode: "NO_UPDATE_OBJECT",
+          errorMessage: "Tauri updater did not return an installable update object for the newer hosted version.",
+        }, manifest));
+        return;
+      }
+      const nextPhase = update ? "update_available" : "up_to_date";
       updateObjectRef.current = update || null;
       setUpdaterState((current) => mergeManifestDiagnostics({
         ...current,
         phase: nextPhase,
-        latestVersion: latestVersion || installedVersion,
+        installedVersion: desktopVersion,
+        latestVersion: latestVersion || desktopVersion,
         publishedAt: update?.date || current.publishedAt,
         releaseNotes: update?.body || current.releaseNotes,
         signatureVerified: false,
@@ -12454,15 +12482,17 @@ function UpdateCenterSection({ canManage }) {
     feedConfigured,
     fetchUpdateManifestDiagnostics,
     installedVersion,
+    installDiagnostics,
     mergeManifestDiagnostics,
     normalizeVersion,
     updaterState.phase,
   ]);
   useEffect(() => {
     if (autoCheckStartedRef.current) return;
+    if (desktopUpdaterAvailable && !installedVersion) return;
     autoCheckStartedRef.current = true;
     checkForUpdates();
-  }, [checkForUpdates]);
+  }, [checkForUpdates, desktopUpdaterAvailable, installedVersion]);
   useEffect(() => {
     invokeTauriCommand("install_diagnostics")
       .then((diagnostics) => {
@@ -12470,6 +12500,21 @@ function UpdateCenterSection({ canManage }) {
       })
       .catch(() => {});
   }, []);
+  const refreshBackendVersionDiagnostics = useCallback(async () => {
+    const [serviceStatus, health] = await Promise.all([
+      invokeTauriCommand("local_backend_service_status").catch(() => null),
+      axios.get(`${API_URL}/api/health`, { timeout: 5000 }).then((response) => response.data).catch(() => null),
+    ]);
+    setBackendVersionDiagnostics({
+      version: normalizeVersion(health?.version || ""),
+      pid: serviceStatus?.pid || null,
+      executablePath: serviceStatus?.node_path || "",
+      health,
+    });
+  }, [normalizeVersion]);
+  useEffect(() => {
+    refreshBackendVersionDiagnostics();
+  }, [refreshBackendVersionDiagnostics]);
   const downloadUpdate = async () => {
     if (!updateObjectRef.current) {
       setUpdaterState((current) => ({
@@ -12511,7 +12556,7 @@ function UpdateCenterSection({ canManage }) {
       downloadedUpdateRef.current = updateObjectRef.current;
       setUpdaterState((current) => ({
         ...current,
-        phase: "downloaded",
+        phase: "ready_to_install",
         signatureVerified: true,
         downloadProgress: {
           downloaded: downloaded || total,
@@ -12559,6 +12604,10 @@ function UpdateCenterSection({ canManage }) {
     try {
       setUpdaterState((current) => ({ ...current, phase: "installing", errorCode: "", errorMessage: "" }));
       await verifyInstallPreflight();
+      const preparation = await invokeTauriCommand("prepare_update_installation");
+      if (preparation && preparation.unlocked === false) {
+        throw new Error(preparation.message || "Backend sidecar is still locked. Close FroozERP and retry the update.");
+      }
       await updateToInstall.install();
       const { relaunch } = await import("@tauri-apps/plugin-process");
       await relaunch();
@@ -12610,13 +12659,19 @@ function UpdateCenterSection({ canManage }) {
     }
   };
   const buttonsBusy = ["checking", "downloading", "installing"].includes(updaterState.phase);
+  const desktopVersion = updaterState.installedVersion || installedVersion || "Desktop diagnostic pending";
+  const backendVersion = backendVersionDiagnostics?.version || "Unknown";
+  const versionsMatch = normalizeVersion(desktopVersion) && normalizeVersion(desktopVersion) === normalizeVersion(backendVersion);
+  const compatibilityStatus = versionsMatch ? "Compatible" : "Mixed installation detected";
   return (
     <ModuleCard eyebrow="Software Updates" title="FroozERP Windows Updates" subtitle="Signed in-app updates with owner confirmation and local data preservation checks.">
       <div className={updateAvailable ? "update-available-panel" : "update-foundation-panel"}>
         <strong>{updateStatusText}</strong>
         <div className="cleanup-result-grid">
-          <SummaryMetric label="Installed App Version" value={updaterState.installedVersion} featured />
+          <SummaryMetric label="Desktop App Version" value={desktopVersion} featured />
+          <SummaryMetric label="Local Backend Version" value={backendVersion} />
           <SummaryMetric label="Latest Available Version" value={displayLatestVersion} />
+          <SummaryMetric label="Compatibility" value={compatibilityStatus} />
           <SummaryMetric label="Status" value={updateStatusText} />
           <SummaryMetric label="Published" value={updaterState.publishedAt ? new Date(updaterState.publishedAt).toLocaleString("en-IN") : "Not available"} />
           <SummaryMetric label="Download Status" value={downloadStatus} />
@@ -12624,12 +12679,15 @@ function UpdateCenterSection({ canManage }) {
           <SummaryMetric label="Last Checked" value={updaterState.lastCheckedAt ? new Date(updaterState.lastCheckedAt).toLocaleString("en-IN") : "Not checked"} />
           <SummaryMetric label="Download Size" value={formatBytes(updaterState.downloadProgress.total)} />
           <SummaryMetric label="Current Executable" value={installDiagnostics?.current_executable || "Desktop diagnostic pending"} />
+          <SummaryMetric label="Backend PID" value={backendVersionDiagnostics?.pid || "Unknown"} />
+          <SummaryMetric label="Backend Executable" value={backendVersionDiagnostics?.executablePath || "Unknown"} />
         </div>
         {updaterState.releaseNotes && <span>{updaterState.releaseNotes}</span>}
         <small>Update Feed: {updaterState.feedUrl || "Not Configured"}</small>
         {installDiagnostics?.stale_installations?.map((path) => (
           <small key={path}>Another FroozERP installation was detected at {path}.</small>
         ))}
+        {!versionsMatch && <small>Mixed installation detected: desktop {desktopVersion}, backend {backendVersion}.</small>}
         {updaterState.errorCode && <small>Error Code: {updaterState.errorCode}</small>}
       </div>
       <p className="form-note">{updaterState.errorMessage || "Tauri updater is authoritative for availability, signature verification, download and installation. Backend manifest is diagnostics only."}</p>
@@ -12640,7 +12698,7 @@ function UpdateCenterSection({ canManage }) {
         </div>
       )}
       <div className="button-row">
-        <button className="secondary-button" disabled={!canManage || !feedConfigured || buttonsBusy} onClick={checkForUpdates}>Check for Updates</button>
+        <button className="secondary-button" disabled={!canManage || !feedConfigured || buttonsBusy || (desktopUpdaterAvailable && !installedVersion)} onClick={checkForUpdates}>Check for Updates</button>
         <button className="secondary-button" disabled={!canManage || !desktopUpdaterAvailable || !updateAvailable || updateDownloaded || buttonsBusy} onClick={downloadUpdate}>Download Update</button>
         <button className="primary-button" disabled={!canManage || !desktopUpdaterAvailable || !canInstallUpdate || buttonsBusy} onClick={installAndRestart}>Install and Restart</button>
         {updateAvailable && <button className="secondary-button" disabled={!canManage || buttonsBusy} onClick={() => setUpdaterState((current) => ({ ...current, errorMessage: "Reminder saved for this session." }))}>Remind Me Later</button>}

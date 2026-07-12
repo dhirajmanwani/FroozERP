@@ -65,9 +65,19 @@ struct CleanupResult {
 struct InstallDiagnostics {
     current_executable: String,
     current_install_dir: String,
+    desktop_app_version: String,
+    package_version: String,
     data_path: String,
     stale_installations: Vec<String>,
     cleanup_message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateInstallPreparation {
+    stopped_owned_backend: bool,
+    backend_executable: String,
+    unlocked: bool,
+    message: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -148,7 +158,7 @@ fn local_backend_url() -> String {
     format!("http://127.0.0.1:{}", LOCAL_BACKEND_PORT)
 }
 
-fn probe_local_backend_health(timeout_ms: u64) -> Result<(), String> {
+fn local_backend_health_response(timeout_ms: u64) -> Result<String, String> {
     let address = "127.0.0.1:5000";
     let timeout = Duration::from_millis(timeout_ms);
     let mut stream = TcpStream::connect_timeout(
@@ -167,9 +177,22 @@ fn probe_local_backend_health(timeout_ms: u64) -> Result<(), String> {
     stream
         .read_to_string(&mut response)
         .map_err(|error| format!("Local backend health response failed: {}", error))?;
+    Ok(response)
+}
+
+fn extract_http_body(response: &str) -> &str {
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or(response)
+}
+
+fn local_backend_health_json(timeout_ms: u64) -> Result<serde_json::Value, String> {
+    let response = local_backend_health_response(timeout_ms)?;
     if response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200") {
         if response.contains("\"FroozERP\"") || response.contains("FroozERP") {
-            return Ok(());
+            return serde_json::from_str(extract_http_body(&response))
+                .map_err(|error| format!("Local backend health JSON failed: {}", error));
         }
         return Err("Port 5000 responded, but it is not FroozERP.".to_string());
     }
@@ -177,6 +200,24 @@ fn probe_local_backend_health(timeout_ms: u64) -> Result<(), String> {
         "Port 5000 responded without healthy status: {}",
         response.lines().next().unwrap_or("no status line")
     ))
+}
+
+fn probe_local_backend_health(timeout_ms: u64) -> Result<(), String> {
+    local_backend_health_json(timeout_ms).map(|_| ())
+}
+
+fn local_backend_version(timeout_ms: u64) -> Result<String, String> {
+    let health = local_backend_health_json(timeout_ms)?;
+    Ok(health
+        .get("version")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string())
+}
+
+fn local_backend_version_matches(timeout_ms: u64) -> Result<bool, String> {
+    let version = local_backend_version(timeout_ms)?;
+    Ok(version == env!("CARGO_PKG_VERSION"))
 }
 
 fn backend_dir_candidates() -> Vec<PathBuf> {
@@ -336,7 +377,7 @@ fn clear_backend_ownership(token: &str) {
     }
 }
 
-fn stop_owned_backend(reason: &str) {
+fn stop_owned_backend(reason: &str) -> bool {
     let mut stopped_owned_backend = false;
     if let Ok(mut guard) = LOCAL_BACKEND_PROCESS.lock() {
         if let Some(mut child) = guard.take() {
@@ -350,35 +391,61 @@ fn stop_owned_backend(reason: &str) {
     if stopped_owned_backend {
         clear_backend_ownership("");
     }
+    stopped_owned_backend
 }
 
 fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceStatus {
-    if !force_restart && probe_local_backend_health(900).is_ok() {
-        write_app_log("INFO", "Local backend already healthy; reusing existing port 5000 service");
+    if !force_restart && local_backend_version_matches(900).unwrap_or(false) {
+        write_app_log("INFO", "Local backend already healthy with matching version; reusing existing port 5000 service");
         return backend_status(
             "Local FroozERP service is already running.".to_string(),
             true,
             false,
             true,
+            backend_port_owner_pid(),
             None,
-            None,
-            None,
+            Some(resolve_node_path()),
             "reused",
         );
+    } else if !force_restart {
+        if let Ok(version) = local_backend_version(900) {
+            write_app_log(
+                "ERROR",
+                &format!(
+                    "Local backend version mismatch: desktop {}, backend {}",
+                    env!("CARGO_PKG_VERSION"),
+                    version
+                ),
+            );
+            return backend_status(
+                format!(
+                    "Local FroozERP service version mismatch: desktop {}, backend {}. Restart service.",
+                    env!("CARGO_PKG_VERSION"),
+                    version
+                ),
+                false,
+                false,
+                true,
+                backend_port_owner_pid(),
+                None,
+                Some(resolve_node_path()),
+                "version-mismatch",
+            );
+        }
     }
 
     if force_restart {
         stop_owned_backend("restart requested");
         thread::sleep(Duration::from_millis(300));
-        if probe_local_backend_health(900).is_ok() {
+        if local_backend_version_matches(900).unwrap_or(false) {
             return backend_status(
                 "An external FroozERP service is already running on port 5000.".to_string(),
                 true,
                 false,
                 true,
+                backend_port_owner_pid(),
                 None,
-                None,
-                None,
+                Some(resolve_node_path()),
                 "reused",
             );
         }
@@ -395,7 +462,7 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
                     *guard = None;
                 }
                 Ok(None) => {
-                    if probe_local_backend_health(900).is_ok() {
+                    if local_backend_version_matches(900).unwrap_or(false) {
                         return backend_status(
                             "Managed local FroozERP service is running.".to_string(),
                             true,
@@ -403,7 +470,7 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
                             false,
                             Some(child.id()),
                             None,
-                            None,
+                            Some(resolve_node_path()),
                             "owned",
                         );
                     }
@@ -419,16 +486,16 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
     let startup_lock = match acquire_backend_startup_lock() {
         Ok(lock) => Some(lock),
         Err(message) => {
-            if probe_local_backend_health(900).is_ok() {
+            if local_backend_version_matches(900).unwrap_or(false) {
                 write_app_log("INFO", &message);
                 return backend_status(
                     "Local FroozERP service is already running.".to_string(),
                     true,
                     false,
                     true,
+                    backend_port_owner_pid(),
                     None,
-                    None,
-                    None,
+                    Some(resolve_node_path()),
                     "reused",
                 );
             }
@@ -437,7 +504,7 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
         }
     };
 
-    if probe_local_backend_health(900).is_ok() {
+    if local_backend_version_matches(900).unwrap_or(false) {
         drop(startup_lock);
         release_backend_startup_lock();
         write_app_log("INFO", "Local backend became healthy before launch; reusing it");
@@ -446,9 +513,9 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
             true,
             false,
             true,
+            backend_port_owner_pid(),
             None,
-            None,
-            None,
+            Some(resolve_node_path()),
             "reused",
         );
     }
@@ -507,13 +574,19 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
     write_app_log("INFO", &format!("Local backend launch attempt PID {}", pid));
     for attempt in 1..=16 {
         thread::sleep(Duration::from_millis(750));
-        match probe_local_backend_health(900) {
-            Ok(()) => {
+        match local_backend_version_matches(900) {
+            Ok(true) => {
                 drop(startup_lock);
                 release_backend_startup_lock();
                 let message = format!("Local FroozERP service started on attempt {}", attempt);
                 write_app_log("INFO", &message);
                 return backend_status(message, true, true, false, Some(pid), Some(backend_dir), Some(node_path), startup_source);
+            }
+            Ok(false) => {
+                write_app_log(
+                    "INFO",
+                    &format!("Local backend version mismatch pending attempt {}", attempt),
+                );
             }
             Err(error) => {
                 write_app_log(
@@ -672,7 +745,7 @@ fn froozerp_cleanup_candidates() -> CleanupResult {
     }
 }
 
-fn froozerp_install_diagnostics() -> InstallDiagnostics {
+fn froozerp_install_diagnostics(package_version: String) -> InstallDiagnostics {
     let cleanup = froozerp_cleanup_candidates();
     let current_executable = env::current_exe()
         .map(|path| path.to_string_lossy().to_string())
@@ -686,10 +759,54 @@ fn froozerp_install_diagnostics() -> InstallDiagnostics {
     InstallDiagnostics {
         current_executable,
         current_install_dir: cleanup.install_path,
+        desktop_app_version: package_version.clone(),
+        package_version,
         data_path: cleanup.data_path,
         stale_installations,
         cleanup_message: cleanup.message,
     }
+}
+
+fn is_file_unlocked(path: &Path) -> bool {
+    if !path.exists() {
+        return true;
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .is_ok()
+}
+
+fn wait_for_file_unlock(path: &Path, attempts: usize, delay: Duration) -> bool {
+    for _ in 0..attempts {
+        if is_file_unlocked(path) {
+            return true;
+        }
+        thread::sleep(delay);
+    }
+    is_file_unlocked(path)
+}
+
+fn backend_port_owner_pid() -> Option<u32> {
+    let output = Command::new("netstat")
+        .args(["-ano", "-p", "tcp"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let normalized = line.split_whitespace().collect::<Vec<_>>();
+        if normalized.len() >= 5
+            && normalized[0].eq_ignore_ascii_case("TCP")
+            && normalized[1].contains(":5000")
+            && normalized[3].eq_ignore_ascii_case("LISTENING")
+        {
+            if let Ok(pid) = normalized[4].parse::<u32>() {
+                return Some(pid);
+            }
+        }
+    }
+    None
 }
 
 fn webview_recovery_marker_path() -> PathBuf {
@@ -955,8 +1072,28 @@ fn restart_local_backend_service() -> Result<BackendServiceStatus, String> {
 }
 
 #[tauri::command]
+fn prepare_update_installation() -> Result<UpdateInstallPreparation, String> {
+    let backend_executable = resolve_node_path();
+    let stopped_owned_backend = stop_owned_backend("update installation requested");
+    let unlocked = wait_for_file_unlock(&backend_executable, 30, Duration::from_millis(500));
+    let message = if unlocked {
+        "Backend service stopped and sidecar executable is unlocked for update installation."
+    } else {
+        "Backend sidecar executable is still locked. Close FroozERP and retry the update."
+    };
+    Ok(UpdateInstallPreparation {
+        stopped_owned_backend,
+        backend_executable: backend_executable.to_string_lossy().to_string(),
+        unlocked,
+        message: message.to_string(),
+    })
+}
+
+#[tauri::command]
 fn local_backend_service_status() -> Result<BackendServiceStatus, String> {
-    let healthy = probe_local_backend_health(900).is_ok();
+    let reachable = probe_local_backend_health(900).is_ok();
+    let version_matches = local_backend_version_matches(900).unwrap_or(false);
+    let healthy = reachable && version_matches;
     let mut pid = None;
     if let Ok(mut guard) = LOCAL_BACKEND_PROCESS.lock() {
         if let Some(child) = guard.as_mut() {
@@ -970,19 +1107,31 @@ fn local_backend_service_status() -> Result<BackendServiceStatus, String> {
             }
         }
     }
+    let owned_pid = pid.is_some();
+    let port_pid = if healthy { backend_port_owner_pid() } else { None };
+    if pid.is_none() {
+        pid = port_pid;
+    }
+    let node_path = if healthy { Some(resolve_node_path()) } else { None };
     Ok(backend_status(
         if healthy {
             "Local FroozERP service is healthy.".to_string()
+        } else if reachable {
+            format!(
+                "Local FroozERP service version mismatch. Desktop {}, backend {}.",
+                env!("CARGO_PKG_VERSION"),
+                local_backend_version(900).unwrap_or_else(|_| "unknown".to_string())
+            )
         } else {
             "Local FroozERP service stopped. Restart service.".to_string()
         },
         healthy,
         false,
-        pid.is_none() && healthy,
+        !owned_pid && port_pid.is_some() && healthy,
         pid,
         None,
-        None,
-        if pid.is_some() { "owned" } else if healthy { "reused" } else { "unknown" },
+        node_path,
+        if owned_pid { "owned" } else if healthy { "reused" } else { "unknown" },
     ))
 }
 
@@ -992,8 +1141,8 @@ fn detect_old_froozerp_versions() -> Result<CleanupResult, String> {
 }
 
 #[tauri::command]
-fn install_diagnostics() -> Result<InstallDiagnostics, String> {
-    Ok(froozerp_install_diagnostics())
+fn install_diagnostics(app: AppHandle) -> Result<InstallDiagnostics, String> {
+    Ok(froozerp_install_diagnostics(app.package_info().version.to_string()))
 }
 
 #[tauri::command]
@@ -1281,6 +1430,7 @@ pub fn run() {
             close_froozerp_window,
             ensure_local_backend_service,
             restart_local_backend_service,
+            prepare_update_installation,
             local_backend_service_status,
             detect_old_froozerp_versions,
             install_diagnostics,
