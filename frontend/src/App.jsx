@@ -12307,13 +12307,13 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
   const canInstallUpdate = updateAvailable && updateDownloaded && signatureVerified;
   const displayLatestVersion = latestHostedVersion || "Unable to read update version";
   const updateFeedStatus = !feedConfigured ? "Not Configured" : status === "VERSION_PARSE_FAILED" ? "Version parse failed" : "Configured";
+  const progressPercent = Math.max(0, Math.min(100, Number(downloadProgress.percent || 0)));
   const downloadStatus = busy === "Downloading" ? `Downloading ${progressPercent || 0}%` : updateDownloaded ? "Downloaded" : updateAvailable ? "Ready to download" : "Not required";
   const signatureStatus = signatureVerified ? "Verified" : updateDownloaded ? "Not verified" : "Not checked";
   const releaseTitle = draft.release_title || "FroozERP Windows release";
   const releaseNotes = updateObject?.body || draft.release_notes || draft.changelog || "Hosted update feed is not configured yet. Local installer updates still work.";
   const releaseDate = updateObject?.date || draft.published_at || draft.release_date || "";
   const downloadSize = Number(downloadProgress.total || draft.download_size_bytes || 0);
-  const progressPercent = Math.max(0, Math.min(100, Number(downloadProgress.percent || 0)));
   const updatePanelMessage = message || (!feedConfigured
     ? "Hosted update feed is not configured yet. Local installer updates still work."
     : "Updates are downloaded and signature-verified by the Tauri updater. Installation requires owner confirmation.");
@@ -12384,7 +12384,15 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
     }
   };
   const readManifestFallback = async (checkedAt) => {
-    const response = await axios.get(UPDATE_FEED_URL, { timeout: 8000 });
+    let response;
+    try {
+      response = await axios.get(`${API_URL}/api/update/manifest`, {
+        params: { url: UPDATE_FEED_URL },
+        timeout: 12000,
+      });
+    } catch (backendError) {
+      response = await axios.get(UPDATE_FEED_URL, { timeout: 8000 });
+    }
     const data = response.data || {};
     const parsed = extractUpdateVersion(data);
     const nextDraft = buildVersionStatusDraft(draft, parsed, checkedAt, {
@@ -12873,7 +12881,6 @@ function SyncSettingsSection({
         {[
           ["App Mode", appMode],
           ["Internet", internetStatus],
-          ["FroozERP Cloud Access", connectionStatus?.froozErpCloudAccess || "Online"],
           ["Local Server", localServerStatus],
           ["Cloud", cloudStatus],
           ["Sync Status", syncSummary],
@@ -12959,6 +12966,7 @@ function SyncSettingsSection({
             <Field label="Failed Queue Count"><input disabled value={connectionStatus?.failed ?? failed} /></Field>
             <Field label="Conflict Queue Count"><input disabled value={conflicts} /></Field>
             <Field label="Local Database"><input disabled value={nativeDbLabel} /></Field>
+            <Field label="FroozERP Cloud Access"><input disabled value={connectionStatus?.froozErpCloudAccess || "Online"} /></Field>
             <Field label="Local API URL"><input disabled value={API_CONFIG.localApiUrl} /></Field>
             <Field label="Branch LAN API URL"><input disabled value={API_CONFIG.branchLanApiUrl} /></Field>
             <Field label="Cloud API URL"><input disabled value={API_CONFIG.cloudApiUrl} /></Field>

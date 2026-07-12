@@ -5082,6 +5082,58 @@ app.get("/settings/update-center", async (req, res) => {
   }
 });
 
+app.get("/api/update/manifest", async (req, res) => {
+  const feedUrl = cleanText(req.query.url || process.env.FROOZERP_UPDATE_FEED_URL || "https://github.com/dhirajmanwani/FroozERP/releases/latest/download/latest.json");
+  if (!/^https:\/\/github\.com\/dhirajmanwani\/FroozERP\/releases\//i.test(feedUrl)) {
+    return res.status(400).json({
+      code: "UPDATE_FEED_NOT_ALLOWED",
+      message: "Update feed URL is not an allowed FroozERP GitHub release URL.",
+    });
+  }
+  try {
+    const response = await fetch(feedUrl, {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(10000),
+    });
+    const bodyText = await response.text();
+    if (!response.ok) {
+      return res.status(502).json({
+        code: "UPDATE_FEED_HTTP_ERROR",
+        message: `Update feed returned HTTP ${response.status}.`,
+        feed_url: feedUrl,
+        http_status: response.status,
+        body_preview: bodyText.slice(0, 240),
+      });
+    }
+    let manifest = {};
+    try {
+      manifest = JSON.parse(bodyText);
+    } catch (error) {
+      return res.status(502).json({
+        code: "UPDATE_FEED_PARSE_ERROR",
+        message: "Update feed did not return valid JSON.",
+        feed_url: feedUrl,
+        body_preview: bodyText.slice(0, 240),
+      });
+    }
+    const platform = manifest?.platforms?.["windows-x86_64"] || null;
+    return res.json({
+      ...manifest,
+      feed_url: feedUrl,
+      fetched_at: new Date().toISOString(),
+      http_status: response.status,
+      windows_x86_64_available: Boolean(platform?.url && platform?.signature),
+    });
+  } catch (error) {
+    return res.status(502).json({
+      code: "UPDATE_FEED_UNREACHABLE",
+      message: "Update feed could not be reached from the local backend.",
+      feed_url: feedUrl,
+      error: error.message,
+    });
+  }
+});
+
 app.put("/settings/update-center", async (req, res) => {
   try {
     const manager = await requireRateManager(req.body.updated_by);
