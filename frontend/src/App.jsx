@@ -475,7 +475,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.37";
+const APP_VERSION = "1.0.38";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -12290,6 +12290,7 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
   });
   const [cleanupResult, setCleanupResult] = useState(null);
   const [cleanupBusy, setCleanupBusy] = useState(false);
+  const updateFeedRefreshAttemptedRef = useRef(false);
   const status = busy || draft.update_status || "READY_FOR_FUTURE_UPDATES";
   const feedConfigured = Boolean(UPDATE_FEED_URL);
   const desktopUpdaterAvailable = isDesktopShell();
@@ -12305,8 +12306,8 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
   const updateDownloaded = updateAvailable && (["DOWNLOADED", "READY_TO_INSTALL", "INSTALL_READY_FUTURE"].includes(status) || Boolean(downloadedUpdate));
   const signatureVerified = updateDownloaded && (status === "READY_TO_INSTALL" || Boolean(downloadedUpdate));
   const canInstallUpdate = updateAvailable && updateDownloaded && signatureVerified;
-  const displayLatestVersion = latestHostedVersion || "Unable to read update version";
-  const updateFeedStatus = !feedConfigured ? "Not Configured" : status === "VERSION_PARSE_FAILED" ? "Version parse failed" : "Configured";
+  const displayLatestVersion = latestHostedVersion || (feedConfigured ? "Checking update feed" : "Not configured");
+  const updateFeedStatus = !feedConfigured ? "Not Configured" : status === "VERSION_PARSE_FAILED" && !latestHostedVersion ? "Checking feed" : "Configured";
   const progressPercent = Math.max(0, Math.min(100, Number(downloadProgress.percent || 0)));
   const downloadStatus = busy === "Downloading" ? `Downloading ${progressPercent || 0}%` : updateDownloaded ? "Downloaded" : updateAvailable ? "Ready to download" : "Not required";
   const signatureStatus = signatureVerified ? "Verified" : updateDownloaded ? "Not verified" : "Not checked";
@@ -12407,6 +12408,20 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
     else setMessage(nextDraft.update_status === "UPDATE_AVAILABLE" ? `Update available: ${nextDraft.latest_version}` : "FroozERP is up to date.");
     return nextDraft;
   };
+  useEffect(() => {
+    if (!feedConfigured || busy || updateFeedRefreshAttemptedRef.current) return;
+    if (latestHostedVersion && status !== "VERSION_PARSE_FAILED") return;
+    updateFeedRefreshAttemptedRef.current = true;
+    const checkedAt = new Date().toISOString();
+    setLastChecked(checkedAt);
+    readManifestFallback(checkedAt).catch((error) => {
+      setDraft((current) => ({
+        ...current,
+        update_status: navigator.onLine === false ? "OFFLINE" : "UPDATE_SERVER_UNAVAILABLE",
+      }));
+      setMessage(getErrorMessage(error, navigator.onLine === false ? "Offline - unable to check updates" : "Update server unavailable"));
+    });
+  }, [feedConfigured]);
   const checkForUpdates = async () => {
     const checkedAt = new Date().toISOString();
     setLastChecked(checkedAt);
@@ -12575,7 +12590,7 @@ function UpdateCenterSection({ canManage, onReload, updateCenter, user }) {
         <SummaryMetric label="Download Size" value={formatBytes(downloadSize)} />
       </div>
       <div className={updateAvailable ? "update-available-panel" : "update-foundation-panel"}>
-        <strong>{status === "VERSION_PARSE_FAILED" ? "Unable to read update version" : updateAvailable ? `Update available: ${latestHostedVersion}` : "FroozERP is up to date"}</strong>
+        <strong>{status === "VERSION_PARSE_FAILED" && !latestHostedVersion ? "Checking update feed" : updateAvailable ? `Update available: ${latestHostedVersion}` : "FroozERP is up to date"}</strong>
         <span>{releaseNotes}</span>
         <small>Update Feed: {UPDATE_FEED_URL || "Not Configured"}</small>
         <small>Installed App Version: {installedVersion}</small>
