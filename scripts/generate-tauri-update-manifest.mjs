@@ -16,7 +16,9 @@ const version = tauriConfig.version;
 const releaseDir = path.join(root, "release", "windows");
 const bundleDir = path.join(root, "src-tauri", "target", "release", "bundle");
 const repo = process.env.GITHUB_REPOSITORY || "dhirajmanwani/FroozERP";
-const tag = process.env.GITHUB_REF_NAME || `v${version}`;
+const githubRefType = String(process.env.GITHUB_REF_TYPE || "").toLowerCase();
+const githubRefName = String(process.env.GITHUB_REF_NAME || "").trim();
+const tag = githubRefType === "tag" && githubRefName ? githubRefName : `v${version}`;
 
 const walk = (dir) => {
   if (!fs.existsSync(dir)) return [];

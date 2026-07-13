@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 const root = path.resolve(new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
 const appPath = path.join(root, "frontend", "src", "App.jsx");
 const source = fs.readFileSync(appPath, "utf8");
+const manifestScript = fs.readFileSync(path.join(root, "scripts", "generate-tauri-update-manifest.mjs"), "utf8");
 const start = source.indexOf("function UpdateCenterSection");
 const end = source.indexOf("\nfunction ", start + 1);
 assert.notEqual(start, -1, "UpdateCenterSection must exist");
@@ -57,5 +58,8 @@ const compareVersions = (left, right) => {
 assert.equal(compareVersions("1.0.40", "1.0.40"), 0, "Equal semantic versions must compare equal");
 assert.equal(compareVersions("v1.0.41", "1.0.40") > 0, true, "Newer semantic version must compare greater");
 assert.equal(compareVersions("1.0.39", "1.0.40") < 0, true, "Older semantic version must compare lower");
+assert.ok(manifestScript.includes('githubRefType === "tag"'), "Manifest generation must only use GITHUB_REF_NAME for tag refs");
+assert.ok(manifestScript.includes("`v${version}`"), "Workflow-dispatch manifests must target the version tag, not the main branch");
+assert.equal(manifestScript.includes("const tag = process.env.GITHUB_REF_NAME"), false, "Manifest generation must not blindly use GITHUB_REF_NAME as the release tag");
 
 console.log("Update Center static tests passed");
