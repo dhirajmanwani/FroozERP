@@ -57,6 +57,23 @@ jobs:
             Write-Output "TAURI_SIGNING_PRIVATE_KEY_PASSWORD is not configured; continuing with the existing unencrypted signing key path."
           }
 
+      - name: Normalize signing key encoding
+        shell: pwsh
+        run: |
+          $key = [string]$env:TAURI_SIGNING_PRIVATE_KEY
+          $key = ($key.Trim() -replace '\s', '')
+          $padding = (4 - ($key.Length % 4)) % 4
+          if ($padding -gt 0) {
+            $key = $key + ('=' * $padding)
+          }
+          try {
+            [Convert]::FromBase64String($key) | Out-Null
+          } catch {
+            throw "TAURI_SIGNING_PRIVATE_KEY is not valid base64 after whitespace and padding normalization. Re-save the GitHub secret from the Tauri signer output."
+          }
+          Write-Output "::add-mask::$key"
+          "TAURI_SIGNING_PRIVATE_KEY=$key" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Install frontend dependencies
         run: npm --prefix frontend ci
 
