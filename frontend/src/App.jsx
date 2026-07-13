@@ -1724,57 +1724,27 @@ function App() {
   };
 
   const checkCloudBackendHealth = async (reason = "manual", timeoutMs = 5000) => {
-    if (FROOZERP_CLOUD_SIMULATED_OFFLINE) {
-      const paused = {
-        apiUrl: CLOUD_API_URL,
-        url: CLOUD_API_URL ? `${CLOUD_API_URL}/api/health` : "",
-        online: false,
-        checking: false,
-        reachabilityStatus: "paused",
-        status: "paused",
-        httpStatus: null,
-        reason,
-        reasonCode: "APP_SIMULATED_OFFLINE",
-        message: "FroozERP cloud access is disabled by the Owner.",
-        lastCheckedAt: new Date().toISOString(),
-      };
-      setCloudHealth(paused);
-      return paused;
-    }
-    if (!CLOUD_CONFIGURED) {
-      const notConfigured = {
-        apiUrl: CLOUD_API_URL,
-        url: CLOUD_API_URL ? `${CLOUD_API_URL}/api/health` : "",
-        online: false,
-        checking: false,
-        reachabilityStatus: "not_configured",
-        status: "not_configured",
-        httpStatus: null,
-        reason,
-        reasonCode: "CLOUD_NOT_CONFIGURED",
-        message: "Cloud backend is not configured.",
-        lastCheckedAt: new Date().toISOString(),
-      };
-      setCloudHealth(notConfigured);
-      return notConfigured;
-    }
-    const url = `${CLOUD_API_URL}/api/health`;
+    const latestDevice = await resolveLocalDeviceInfo(deviceInfo);
+    const url = `${LOCAL_API_URL}/api/cloud/health`;
     try {
-      const response = await axios.get(url, { timeout: timeoutMs, headers: { "Cache-Control": "no-store" }, params: { t: Date.now() } });
+      const response = await axios.get(url, {
+        timeout: timeoutMs,
+        headers: { "Cache-Control": "no-store", "x-user-id": userRef.current?.id || "", "x-device-id": latestDevice?.device_id || "" },
+        params: { t: Date.now(), user_id: userRef.current?.id, device_id: latestDevice?.device_id, branch_id: userRef.current?.branch_id || 1 },
+      });
       const health = response.data || {};
-      const identityOk = health.app === "FroozERP" && String(health.api_version) === "1" && health.deployment_type === "cloud";
-      const online = response.status >= 200 && response.status < 300 && String(health.status || "").toLowerCase() === "ok" && identityOk;
+      const online = response.status >= 200 && response.status < 300 && health.cloudReachable === true;
       const next = {
-        apiUrl: CLOUD_API_URL,
-        url,
+        apiUrl: health.configuredCloudBaseUrl || CLOUD_API_URL,
+        url: health.configuredCloudBaseUrl ? `${health.configuredCloudBaseUrl}/api/health` : url,
         online,
         checking: false,
-        reachabilityStatus: online ? "online" : "server_error",
-        status: online ? "online" : "server_error",
-        httpStatus: response.status,
+        reachabilityStatus: health.errorCode === "APP_INTERNET_DISABLED" ? "paused" : online ? "online" : "server_error",
+        status: health.errorCode === "APP_INTERNET_DISABLED" ? "paused" : online ? "online" : "server_error",
+        httpStatus: health.railwayHttpStatus || response.status,
         reason,
-        reasonCode: online ? "ONLINE" : "CLOUD_IDENTITY_INVALID",
-        message: online ? "FroozERP cloud backend is reachable." : "Cloud responded, but FroozERP cloud identity is incomplete.",
+        reasonCode: health.errorCode || (online ? "ONLINE" : "CLOUD_UNREACHABLE"),
+        message: health.safeErrorMessage || (online ? "FroozERP cloud backend is reachable." : "Cloud backend is unavailable."),
         data: health,
         lastCheckedAt: new Date().toISOString(),
         lastOnlineAt: online ? new Date().toISOString() : cloudHealth.lastOnlineAt,
@@ -1803,17 +1773,7 @@ function App() {
   };
 
   const registerCloudDevice = async (currentUser = user, latestDevice = deviceInfo) => {
-    if (FROOZERP_CLOUD_SIMULATED_OFFLINE) {
-      const registration = {
-        status: "PAUSED",
-        code: "APP_SIMULATED_OFFLINE",
-        message: "FroozERP cloud access is disabled by the Owner.",
-        checkedAt: new Date().toISOString(),
-      };
-      setCloudDeviceRegistration(registration);
-      return registration;
-    }
-    if (!CLOUD_CONFIGURED || !currentUser?.id || !latestDevice?.device_id) return null;
+    if (!currentUser?.id || !latestDevice?.device_id) return null;
     const payload = {
       device_id: latestDevice.device_id,
       device_name: latestDevice.device_name || "FroozERP Device",
@@ -1829,16 +1789,42 @@ function App() {
       local_api_url: LOCAL_API_URL,
     };
     try {
-      const response = await axios.post(`${CLOUD_API_URL}/api/sync/register-device`, payload, { timeout: 8000 });
-      const registration = { ...(response.data || {}), url: `${CLOUD_API_URL}/api/sync/register-device`, httpStatus: response.status, checkedAt: new Date().toISOString() };
+      const response = await axios.post(`${LOCAL_API_URL}/api/cloud/device/register`, payload, { timeout: 12000, headers: { "x-user-id": currentUser.id, "x-device-id": latestDevice.device_id } });
+      const registration = { ...(response.data || {}), url: `${LOCAL_API_URL}/api/cloud/device/register`, httpStatus: response.status, checkedAt: new Date().toISOString() };
       setCloudDeviceRegistration(registration);
       return registration;
     } catch (error) {
       const registration = {
         status: "ERROR",
-        url: `${CLOUD_API_URL}/api/sync/register-device`,
+        url: `${LOCAL_API_URL}/api/cloud/device/register`,
         httpStatus: error.response?.status || null,
+        code: error.response?.data?.code || "CLOUD_DEVICE_REGISTRATION_FAILED",
         message: error.response?.data?.message || error.message || "Cloud device registration failed.",
+        checkedAt: new Date().toISOString(),
+      };
+      setCloudDeviceRegistration(registration);
+      return registration;
+    }
+  };
+
+  const approveCloudDevice = async (currentUser = user, latestDevice = deviceInfo) => {
+    if (!currentUser?.id || !latestDevice?.device_id) return null;
+    try {
+      const response = await axios.post(`${LOCAL_API_URL}/api/cloud/device/approve`, {
+        user_id: currentUser.id,
+        device_id: latestDevice.device_id,
+        branch_id: currentUser.branch_id || 1,
+      }, { timeout: 12000, headers: { "x-user-id": currentUser.id, "x-device-id": latestDevice.device_id } });
+      const registration = { ...(response.data || {}), status: response.data?.status || "APPROVED", httpStatus: response.status, checkedAt: new Date().toISOString() };
+      setCloudDeviceRegistration(registration);
+      await checkCloudBackendHealth("device-approved", 8000);
+      return registration;
+    } catch (error) {
+      const registration = {
+        status: "ERROR",
+        code: error.response?.data?.code || "CLOUD_DEVICE_APPROVAL_FAILED",
+        httpStatus: error.response?.status || null,
+        message: error.response?.data?.message || error.message || "Cloud device approval failed.",
         checkedAt: new Date().toISOString(),
       };
       setCloudDeviceRegistration(registration);
@@ -1878,7 +1864,7 @@ function App() {
     };
     const latestDevice = await resolveLocalDeviceInfo(deviceInfo);
     const localHealthUrl = `${LOCAL_API_URL}/api/health`;
-    const cloudHealthUrl = `${CLOUD_API_URL}/api/health`;
+    const cloudHealthUrl = `${LOCAL_API_URL}/api/cloud/health`;
     const results = [];
     results.push(await check("Internet", "https://www.gstatic.com/generate_204", async () => {
       const reachable = await probeRealInternet(5000);
@@ -1889,25 +1875,26 @@ function App() {
       const response = await axios.get(localHealthUrl, { timeout: 5000, headers: { "Cache-Control": "no-store" } });
       return { status: response.status, message: response.data?.status === "ok" ? "Local backend healthy" : "Local backend health did not report ok" };
     }));
-    if (FROOZERP_CLOUD_SIMULATED_OFFLINE) {
-      const pausedMessage = "APP_SIMULATED_OFFLINE - FroozERP cloud access is disabled by the Owner.";
-      results.push({ label: "Railway /api/health", ok: false, url: cloudHealthUrl, httpStatus: null, message: pausedMessage, durationMs: 0 });
-      results.push({ label: "Railway authentication", ok: false, url: `${CLOUD_API_URL}/login`, httpStatus: null, message: pausedMessage, durationMs: 0 });
-      results.push({ label: "Device registration/approval", ok: false, url: `${CLOUD_API_URL}/api/sync/register-device`, httpStatus: null, message: pausedMessage, durationMs: 0 });
-    } else {
-      results.push(await check("Railway /api/health", cloudHealthUrl, async () => {
-        const response = await axios.get(cloudHealthUrl, { timeout: 7000, headers: { "Cache-Control": "no-store" } });
-        return { status: response.status, message: response.data?.status === "ok" ? "Cloud backend healthy" : "Cloud backend health did not report ok" };
-      }));
-      results.push(await check("Railway authentication", `${CLOUD_API_URL}/login`, async () => ({
-        status: user?.id ? 200 : 401,
-        message: user?.id ? `Signed in as user ${user.id}` : "No active local session for cloud diagnostics",
-      })));
-      results.push(await check("Device registration/approval", `${CLOUD_API_URL}/api/sync/register-device`, async () => {
-        const registration = await registerCloudDevice(user, latestDevice);
-        return { httpStatus: registration?.httpStatus || 200, message: registration?.message || `Device ${registration?.status || "not checked"}` };
-      }));
-    }
+    results.push(await check("Railway /api/health", cloudHealthUrl, async () => {
+      const response = await axios.get(cloudHealthUrl, {
+        timeout: 8000,
+        headers: { "Cache-Control": "no-store", "x-user-id": user?.id || "", "x-device-id": latestDevice?.device_id || "" },
+        params: { user_id: user?.id, device_id: latestDevice?.device_id, branch_id: user?.branch_id || 1 },
+      });
+      const health = response.data || {};
+      return {
+        status: health.railwayHttpStatus || response.status,
+        message: health.safeErrorMessage || (health.cloudReachable ? "Cloud backend healthy" : `Cloud not ready: ${health.errorCode || "unknown"}`),
+      };
+    }));
+    results.push(await check("Railway authentication", `${LOCAL_API_URL}/api/auth/me`, async () => ({
+      status: user?.id ? 200 : 401,
+      message: user?.id ? `Signed in as user ${user.id}` : "No active local session for cloud diagnostics",
+    })));
+    results.push(await check("Device registration/approval", `${LOCAL_API_URL}/api/cloud/device/register`, async () => {
+      const registration = await registerCloudDevice(user, latestDevice);
+      return { httpStatus: registration?.httpStatus || 200, message: registration?.message || `Device ${registration?.status || "not checked"}` };
+    }));
     results.push(await check("FROST briefing endpoint", `${LOCAL_API_URL}/api/ai/briefing`, async () => {
       const response = await axios.get(`${LOCAL_API_URL}/api/ai/briefing`, {
         timeout: 8000,
@@ -5433,7 +5420,9 @@ function App() {
                 localBackendService={localBackendService}
                 localDbStatus={localDbStatus}
                 onCheckConnection={() => performConnectivityCheck("settings-sync-check", { force: true, timeoutMs: 3500 })}
+                onApproveCloudDevice={approveCloudDevice}
                 onReload={async () => { await Promise.all([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()]); }}
+                onRegisterCloudDevice={registerCloudDevice}
                 onRetrySync={retrySyncFailures}
                 onRunCloudDiagnostics={runCloudDiagnostics}
                 onRunSync={() => runSyncNow({ force: true })}
@@ -11370,7 +11359,9 @@ function SettingsModule({
   localBackendService,
   localDbStatus,
   onCheckConnection,
+  onApproveCloudDevice,
   onQueueSyncTest,
+  onRegisterCloudDevice,
   onReload,
   onRetrySync,
   onRunCloudDiagnostics,
@@ -11418,7 +11409,9 @@ function SettingsModule({
         key={settingsData.syncSettings?.updated_at || "sync-settings"}
         localDbStatus={localDbStatus}
         onCheckConnection={onCheckConnection}
+        onApproveCloudDevice={onApproveCloudDevice}
         onQueueSyncTest={onQueueSyncTest}
+        onRegisterCloudDevice={onRegisterCloudDevice}
         onReload={onReload}
         onRetrySync={onRetrySync}
         onRunCloudDiagnostics={onRunCloudDiagnostics}
@@ -12762,7 +12755,9 @@ function SyncSettingsSection({
   localBackendService,
   localDbStatus,
   onCheckConnection,
+  onApproveCloudDevice,
   onQueueSyncTest,
+  onRegisterCloudDevice,
   onReload,
   onRetrySync,
   onRunCloudDiagnostics,
@@ -12778,6 +12773,7 @@ function SyncSettingsSection({
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [cloudReadiness, setCloudReadiness] = useState(null);
   const [cloudReadinessBusy, setCloudReadinessBusy] = useState(false);
+  const [cloudActionBusy, setCloudActionBusy] = useState("");
   const [configDraft, setConfigDraft] = useState({
     mode: API_CONFIG.mode,
     cloudConnectionMode: normalizeCloudConnectionMode(SAVED_API_CONFIG.cloudConnectionMode),
@@ -12879,34 +12875,25 @@ function SyncSettingsSection({
 
     setCloudReadinessBusy(true);
     try {
-      const response = await axios.get(`${cloudUrl}/api/health`, { timeout: 5000, headers: { "Cache-Control": "no-store" } });
+      const response = await axios.get(`${LOCAL_API_URL}/api/cloud/health`, {
+        timeout: 8000,
+        headers: { "Cache-Control": "no-store", "x-user-id": user?.id || "", "x-device-id": deviceId || "" },
+        params: { user_id: user?.id, device_id: deviceId, branch_id: branchId },
+      });
       const health = response.data || {};
-      const ok = response.status >= 200 && response.status < 300 && String(health.status || "").toLowerCase() === "ok";
-      const version = health.version || health.appVersion;
-      const expectedCloudIdentity = health.app === "FroozERP"
-        && String(health.api_version) === "1"
-        && Boolean(version)
-        && health.deployment_type === "cloud"
-        && health.cloud_ready === true
-        && Boolean(health.company_id);
+      const ok = response.status >= 200 && response.status < 300 && health.cloudReachable === true;
+      const version = health.cloudVersion || "";
+      const expectedCloudIdentity = ok && health.cloudDeploymentType === "cloud";
       if (!ok) {
-        return setResult("Cloud Server Unreachable", "Cloud health endpoint did not report ok.");
+        return setResult("Cloud Server Unreachable", health.safeErrorMessage || "Cloud health endpoint did not report ok.");
       }
       if (!expectedCloudIdentity) {
         return setResult("Cloud Server Unreachable", "Server responded, but the FroozERP app/version/company cloud identity is incomplete.");
       }
-      if (String(health.database || health.dbStatus || "").toLowerCase().includes("error")) {
-        return setResult("Cloud Server Unreachable", "Cloud backend is reachable, but database health is not ready.");
+      if (!health.deviceApproved) {
+        return setResult("Device Approval Required", health.safeErrorMessage || "This device must be approved by the Owner before sync can run.");
       }
-      const readinessResponse = await axios.get(`${cloudUrl}/api/cloud/readiness`, { timeout: 5000, headers: { "Cache-Control": "no-store" } });
-      const readiness = readinessResponse.data || {};
-      if (readiness.cloud_ready !== true || readiness.readiness !== "deployment_ready") {
-        const blockers = Array.isArray(readiness.blockers) && readiness.blockers.length
-          ? ` Missing: ${readiness.blockers.join(", ")}.`
-          : "";
-        return setResult("Cloud Configuration Incomplete", `Hosted backend responded but deployment readiness checks did not pass.${blockers}`);
-      }
-      return setResult("Cloud Deployment Ready", `Hosted API and PostgreSQL readiness checks passed at version ${version}. Full business-module sync is still not production-ready.`);
+      return setResult("Cloud Deployment Ready", `Hosted API and approved device checks passed at version ${version}. Full business-module sync is still limited to enabled sync entities.`);
     } catch (error) {
       return setResult("Cloud Server Unreachable", getErrorMessage(error, "Cloud backend health endpoint is not reachable."));
     } finally {
@@ -12954,9 +12941,65 @@ function SyncSettingsSection({
       setConfigMessage("Custom API URL is invalid. Use http:// or https://.");
       return;
     }
+    try {
+      await axios.put(`${LOCAL_API_URL}/api/cloud/internet-access`, {
+        user_id: user.id,
+        allowInternetAccess: nextConfig.cloudConnectionMode !== CLOUD_CONNECTION_MODES.SIMULATE_OFFLINE,
+      }, { timeout: 5000, headers: { "x-user-id": user.id } });
+    } catch (error) {
+      setConfigMessage(getErrorMessage(error, "Unable to save FroozERP internet access policy."));
+      return;
+    }
     writeSavedApiConfig(nextConfig);
     setConfigMessage("API mode saved. FroozERP will reload to apply it.");
     window.setTimeout(() => window.location.reload(), 500);
+  };
+  const runRegisterDevice = async () => {
+    if (!onRegisterCloudDevice) return;
+    setCloudActionBusy("register");
+    setConfigMessage("Registering this device with FroozERP cloud...");
+    try {
+      const result = await onRegisterCloudDevice(user, localDbStatus?.deviceIdentity || {
+        device_id: localStorage.getItem("froozerp_device_id"),
+        device_name: localStorage.getItem("froozerp_device_name"),
+      });
+      setConfigMessage(result?.message || `Device registration status: ${result?.status || "unknown"}`);
+    } finally {
+      setCloudActionBusy("");
+    }
+  };
+  const runApproveDevice = async () => {
+    if (!onApproveCloudDevice) return;
+    setCloudActionBusy("approve");
+    setConfigMessage("Approving this device for FroozERP cloud sync...");
+    try {
+      const result = await onApproveCloudDevice(user, localDbStatus?.deviceIdentity || {
+        device_id: localStorage.getItem("froozerp_device_id"),
+        device_name: localStorage.getItem("froozerp_device_name"),
+      });
+      setConfigMessage(result?.message || `Device approval status: ${result?.status || "unknown"}`);
+    } finally {
+      setCloudActionBusy("");
+    }
+  };
+  const copySafeDiagnostics = async () => {
+    const diagnostics = {
+      appMode,
+      internetStatus,
+      localServerStatus,
+      cloudStatus,
+      syncSummary,
+      cloudApiUrl: cloudHealth?.data?.configuredCloudBaseUrl || API_CONFIG.cloudApiUrl,
+      cloudReachable: cloudHealth?.data?.cloudReachable === true,
+      deviceRegistrationStatus: cloudDeviceStatus,
+      pendingSync: pending,
+      failedSync: failed,
+      lastSync,
+      lastError: syncStatus?.lastError || cloudHealth?.message || "",
+      checkedAt: new Date().toISOString(),
+    };
+    await navigator.clipboard?.writeText(JSON.stringify(diagnostics, null, 2));
+    setConfigMessage("Safe diagnostics copied without secrets.");
   };
   const pending = Number(syncStatus?.pendingOperations ?? draft.pending_count ?? 0);
   const failed = Number(syncStatus?.failedOperations || 0);
@@ -13004,8 +13047,12 @@ function SyncSettingsSection({
       </div>
       <div className="toolbar-actions">
         <button className="secondary-button" disabled={!onCheckConnection} onClick={onCheckConnection}>Check Connection</button>
+        <button className="secondary-button" disabled={!canManage || !onRunCloudDiagnostics} onClick={onRunCloudDiagnostics}>Test Cloud Connection</button>
+        <button className="secondary-button" disabled={!canManage || !onRegisterCloudDevice || cloudActionBusy === "register"} onClick={runRegisterDevice}>{cloudActionBusy === "register" ? "Registering..." : "Register This Device"}</button>
+        <button className="secondary-button" disabled={!canManage || !onApproveCloudDevice || cloudActionBusy === "approve"} onClick={runApproveDevice}>{cloudActionBusy === "approve" ? "Approving..." : "Approve This Device"}</button>
         <button className="secondary-button" disabled={!canManage || !onRunSync} onClick={onRunSync}>Sync Now</button>
         <button className="secondary-button" disabled={!canManage || !onRetrySync} onClick={onRetrySync}>Retry Failed</button>
+        <button className="secondary-button" onClick={copySafeDiagnostics}>Copy Safe Diagnostics</button>
         <button className="secondary-button" onClick={() => setShowDiagnostics((current) => !current)}>Advanced Diagnostics</button>
       </div>
       {showDiagnostics && cloudReadiness && (
@@ -13028,10 +13075,10 @@ function SyncSettingsSection({
                 {API_MODE_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
               </select>
             </Field>
-            <Field label="FroozERP Cloud Connection">
+            <Field label="Allow FroozERP Internet Access">
               <select disabled={!canManage} value={configDraft.cloudConnectionMode} onChange={(event) => setConfigDraft({ ...configDraft, cloudConnectionMode: normalizeCloudConnectionMode(event.target.value) })}>
-                <option value={CLOUD_CONNECTION_MODES.ONLINE}>Online</option>
-                <option value={CLOUD_CONNECTION_MODES.SIMULATE_OFFLINE}>Simulate Offline</option>
+                <option value={CLOUD_CONNECTION_MODES.ONLINE}>On</option>
+                <option value={CLOUD_CONNECTION_MODES.SIMULATE_OFFLINE}>Off - Simulate Offline</option>
               </select>
             </Field>
           </div>
