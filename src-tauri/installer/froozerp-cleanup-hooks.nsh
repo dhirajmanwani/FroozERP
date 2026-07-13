@@ -4,11 +4,33 @@
 
   ; Stop only the FroozERP backend sidecar located under the selected install directory.
   ; This prevents Retry/Ignore file-write prompts for binaries\froozerp-backend-node.exe.
-  nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$target = [System.IO.Path]::GetFullPath(''$INSTDIR\binaries\froozerp-backend-node.exe''); Get-CimInstance Win32_Process -Filter \"Name=''froozerp-backend-node.exe''\" | ForEach-Object { if ($_.ExecutablePath -and ([System.IO.Path]::GetFullPath($_.ExecutablePath) -ieq $target)) { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } }"'
+  FileOpen $0 "$TEMP\froozerp-stop-backend.ps1" w
+  FileWrite $0 "$$ErrorActionPreference = 'Stop'$\r$\n"
+  FileWrite $0 "$$target = [System.IO.Path]::GetFullPath('$INSTDIR\binaries\froozerp-backend-node.exe')$\r$\n"
+  FileWrite $0 "Get-CimInstance Win32_Process -Filter $\"Name='froozerp-backend-node.exe'$\" | ForEach-Object {$\r$\n"
+  FileWrite $0 "  if ($$_.ExecutablePath -and ([System.IO.Path]::GetFullPath($$_.ExecutablePath) -ieq $$target)) {$\r$\n"
+  FileWrite $0 "    Stop-Process -Id $$_.ProcessId -Force -ErrorAction Stop$\r$\n"
+  FileWrite $0 "  }$\r$\n"
+  FileWrite $0 "}$\r$\n"
+  FileWrite $0 "Start-Sleep -Milliseconds 500$\r$\n"
+  FileWrite $0 "exit 0$\r$\n"
+  FileClose $0
+  nsExec::ExecToLog '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$TEMP\froozerp-stop-backend.ps1"'
   Sleep 1000
 
   ; Confirm the backend executable can be opened for writing before NSIS starts copying files.
-  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$path = ''$INSTDIR\binaries\froozerp-backend-node.exe''; if (!(Test-Path -LiteralPath $path)) { exit 0 }; try { $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None); $stream.Close(); exit 0 } catch { exit 35 }"'
+  FileOpen $0 "$TEMP\froozerp-check-backend-unlock.ps1" w
+  FileWrite $0 "$$path = '$INSTDIR\binaries\froozerp-backend-node.exe'$\r$\n"
+  FileWrite $0 "if (!(Test-Path -LiteralPath $$path)) { exit 0 }$\r$\n"
+  FileWrite $0 "try {$\r$\n"
+  FileWrite $0 "  $$stream = [System.IO.File]::Open($$path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)$\r$\n"
+  FileWrite $0 "  $$stream.Close()$\r$\n"
+  FileWrite $0 "  exit 0$\r$\n"
+  FileWrite $0 "} catch {$\r$\n"
+  FileWrite $0 "  exit 35$\r$\n"
+  FileWrite $0 "}$\r$\n"
+  FileClose $0
+  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$TEMP\froozerp-check-backend-unlock.ps1"'
   Pop $0
   Pop $1
   ${If} $0 != 0
