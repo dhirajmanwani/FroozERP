@@ -475,7 +475,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.48";
+const APP_VERSION = "1.0.49";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -13051,6 +13051,7 @@ function SyncSettingsSection({
         <button className="secondary-button" disabled={!canManage || !onRegisterCloudDevice || cloudActionBusy === "register"} onClick={runRegisterDevice}>{cloudActionBusy === "register" ? "Registering..." : "Register This Device"}</button>
         <button className="secondary-button" disabled={!canManage || !onApproveCloudDevice || cloudActionBusy === "approve"} onClick={runApproveDevice}>{cloudActionBusy === "approve" ? "Approving..." : "Approve This Device"}</button>
         <button className="secondary-button" disabled={!canManage || !onRunSync} onClick={onRunSync}>Sync Now</button>
+        <button className="secondary-button" disabled={!canManage || !onQueueSyncTest} onClick={onQueueSyncTest}>Queue Safe Test</button>
         <button className="secondary-button" disabled={!canManage || !onRetrySync} onClick={onRetrySync}>Retry Failed</button>
         <button className="secondary-button" onClick={copySafeDiagnostics}>Copy Safe Diagnostics</button>
         <button className="secondary-button" onClick={() => setShowDiagnostics((current) => !current)}>Advanced Diagnostics</button>
@@ -13152,7 +13153,6 @@ function SyncSettingsSection({
             <button className="secondary-button" disabled={!canManage || !selectedTestUrl} onClick={() => testApiUrl(selectedTestUrl, "Selected API")}>Test Connection</button>
             <button className="primary-button" disabled={!canManage} onClick={save}>Save Device Name</button>
             <button className="secondary-button" disabled={cloudReadinessBusy} onClick={runCloudReadinessCheck}>{cloudReadinessBusy ? "Checking Cloud..." : "Cloud Readiness Check"}</button>
-            <button className="secondary-button" disabled={!canManage || !onQueueSyncTest} onClick={onQueueSyncTest}>Queue Safe Test</button>
           </div>
           {cloudDiagnostics?.results?.length > 0 && (
             <DataTable headers={["Check", "Result", "URL", "HTTP", "Message"]}>
