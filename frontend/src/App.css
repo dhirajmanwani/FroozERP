@@ -1151,6 +1151,28 @@ button:disabled {
   opacity: 0.58;
 }
 
+.primary-button:disabled,
+.secondary-button:disabled,
+.table-action:disabled,
+.remove-button:disabled,
+.whatsapp-button:disabled {
+  border-color: rgba(100, 116, 139, 0.32);
+  color: #94a3b8;
+  background: rgba(51, 65, 85, 0.58);
+  box-shadow: none;
+  transform: none;
+}
+
+.primary-button:disabled:hover,
+.secondary-button:disabled:hover,
+.table-action:disabled:hover,
+.remove-button:disabled:hover,
+.whatsapp-button:disabled:hover {
+  color: #94a3b8;
+  background: rgba(51, 65, 85, 0.58);
+  transform: none;
+}
+
 textarea {
   min-height: 68px;
   resize: vertical;
