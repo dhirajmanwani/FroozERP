@@ -475,7 +475,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.43";
+const APP_VERSION = "1.0.44";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -12325,15 +12325,26 @@ function UpdateCenterSection({ canManage }) {
   const updateDownloaded = updaterState.phase === "ready_to_install";
   const canInstallUpdate = updateDownloaded && updaterState.signatureVerified;
   const progressPercent = Math.max(0, Math.min(100, Number(updaterState.downloadProgress.percent || 0)));
+  const backendDiagnosticVersion = normalizeVersion(backendVersionDiagnostics?.version || "");
+  const transactionStatus = String(installDiagnostics?.update_transaction_status || "none");
+  const incompleteTransaction = ["installing", "restarting", "verifying_after_restart", "partial", "failed"].includes(transactionStatus);
+  const versionsFullyMatch = Boolean(
+    installedVersion
+      && backendDiagnosticVersion
+      && updaterState.latestVersion
+      && normalizeVersion(installedVersion) === backendDiagnosticVersion
+      && normalizeVersion(installedVersion) === normalizeVersion(updaterState.latestVersion)
+  );
   const displayLatestVersion = updaterState.latestVersion || (updaterState.phase === "checking" ? "Checking update feed" : "Not checked");
   const updateStatusText = (() => {
+    if (incompleteTransaction) return installDiagnostics?.update_transaction_message || "Previous update did not complete. Repair installation required.";
     if (updaterState.phase === "checking") return "Checking update feed";
     if (updaterState.phase === "update_available") return `Update available: ${updaterState.latestVersion}`;
     if (updaterState.phase === "downloading") return `Downloading ${progressPercent || 0}%`;
     if (updaterState.phase === "ready_to_install") return "Update downloaded and signature verified";
     if (updaterState.phase === "installing") return "Installing update";
     if (updaterState.phase === "error") return updaterState.errorMessage || "Update check failed";
-    if (updaterState.phase === "up_to_date") return "FroozERP is up to date";
+    if (updaterState.phase === "up_to_date") return versionsFullyMatch ? "FroozERP is up to date" : "Installation incomplete - desktop/backend/latest versions do not match.";
     return "Ready to check for updates";
   })();
   const downloadStatus = updaterState.phase === "downloading"
@@ -12604,7 +12615,7 @@ function UpdateCenterSection({ canManage }) {
     try {
       setUpdaterState((current) => ({ ...current, phase: "installing", errorCode: "", errorMessage: "" }));
       await verifyInstallPreflight();
-      const preparation = await invokeTauriCommand("prepare_update_installation");
+      const preparation = await invokeTauriCommand("prepare_update_installation", { targetVersion: updateToInstall.version || updaterState.latestVersion || "" });
       if (preparation && preparation.unlocked === false) {
         throw new Error(preparation.message || "Backend sidecar is still locked. Close FroozERP and retry the update.");
       }

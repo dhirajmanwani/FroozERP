@@ -3,7 +3,7 @@ mod local_db;
 use local_db::{
     LocalDbStatus, LocalPosSaleResult, PendingSyncOperation, PulledChange, SyncAck, SyncOperation,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::{
@@ -42,6 +42,7 @@ static DESKTOP_INSTANCE_MUTEX: Mutex<Option<isize>> = Mutex::new(None);
 const LOCAL_BACKEND_PORT: &str = "5000";
 const BACKEND_OWNERSHIP_FILE: &str = "local-backend-owner.json";
 const BACKEND_STARTUP_LOCK_FILE: &str = "local-backend-startup.lock";
+const UPDATE_TRANSACTION_FILE: &str = "update-transaction.json";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(target_os = "windows")]
@@ -133,13 +134,34 @@ struct InstallDiagnostics {
     data_path: String,
     stale_installations: Vec<String>,
     cleanup_message: String,
+    update_transaction_status: String,
+    update_transaction_message: String,
+    update_transaction_target_version: String,
 }
 
 #[derive(Debug, Serialize)]
 struct UpdateInstallPreparation {
     stopped_owned_backend: bool,
+    stopped_port_backend: bool,
+    backend_pid_before: Option<u32>,
     backend_executable: String,
     unlocked: bool,
+    transaction_path: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct UpdateTransactionRecord {
+    state: String,
+    target_version: String,
+    previous_desktop_version: String,
+    previous_backend_version: String,
+    started_at: u64,
+    updated_at: u64,
+    install_dir: String,
+    executable_path: String,
+    backend_executable: String,
+    backend_pid_before: Option<u32>,
     message: String,
 }
 
@@ -246,6 +268,69 @@ fn backend_startup_lock_path() -> PathBuf {
     app_data_dir()
         .join("runtime")
         .join(BACKEND_STARTUP_LOCK_FILE)
+}
+
+fn update_transaction_path() -> PathBuf {
+    app_data_dir().join("runtime").join(UPDATE_TRANSACTION_FILE)
+}
+
+fn read_update_transaction() -> Option<UpdateTransactionRecord> {
+    fs::read_to_string(update_transaction_path())
+        .ok()
+        .and_then(|payload| serde_json::from_str(&payload).ok())
+}
+
+fn write_update_transaction(record: &UpdateTransactionRecord) -> Result<(), String> {
+    let path = update_transaction_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let payload = serde_json::to_string_pretty(record).map_err(|error| error.to_string())?;
+    fs::write(path, payload).map_err(|error| error.to_string())
+}
+
+fn update_transaction_status() -> (String, String, String) {
+    read_update_transaction()
+        .map(|record| (record.state, record.message, record.target_version))
+        .unwrap_or_else(|| ("none".to_string(), String::new(), String::new()))
+}
+
+fn reconcile_update_transaction(backend_status: &BackendServiceStatus) {
+    let Some(mut record) = read_update_transaction() else {
+        return;
+    };
+    if !matches!(
+        record.state.as_str(),
+        "installing" | "restarting" | "verifying_after_restart" | "partial" | "failed"
+    ) {
+        return;
+    }
+    let desktop_version = env!("CARGO_PKG_VERSION").to_string();
+    record.updated_at = now_unix_seconds();
+    if desktop_version == record.target_version && backend_status.healthy {
+        record.state = "success".to_string();
+        record.message = format!(
+            "Update verified after restart: desktop {}, backend healthy at target {}.",
+            desktop_version, record.target_version
+        );
+    } else if desktop_version != record.target_version {
+        record.state = "failed".to_string();
+        record.message = format!(
+            "Previous update did not complete. Expected desktop {}, running {}.",
+            record.target_version, desktop_version
+        );
+    } else {
+        record.state = "partial".to_string();
+        record.message = format!(
+            "Previous update requires repair. Desktop is {}, but backend health is not verified: {}",
+            desktop_version, backend_status.message
+        );
+    }
+    let _ = write_update_transaction(&record);
+    write_app_log(
+        if record.state == "success" { "INFO" } else { "ERROR" },
+        &format!("Update transaction reconciled: {} - {}", record.state, record.message),
+    );
 }
 
 fn now_unix_seconds() -> u64 {
@@ -957,6 +1042,8 @@ fn froozerp_cleanup_candidates() -> CleanupResult {
 
 fn froozerp_install_diagnostics(package_version: String) -> InstallDiagnostics {
     let cleanup = froozerp_cleanup_candidates();
+    let (update_transaction_status, update_transaction_message, update_transaction_target_version) =
+        update_transaction_status();
     let current_executable = env::current_exe()
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_default();
@@ -974,6 +1061,9 @@ fn froozerp_install_diagnostics(package_version: String) -> InstallDiagnostics {
         data_path: cleanup.data_path,
         stale_installations,
         cleanup_message: cleanup.message,
+        update_transaction_status,
+        update_transaction_message,
+        update_transaction_target_version,
     }
 }
 
@@ -1012,6 +1102,98 @@ fn backend_port_owner_pid() -> Option<u32> {
         }
     }
     None
+}
+
+#[cfg(target_os = "windows")]
+fn windows_process_executable_path(pid: u32) -> Option<PathBuf> {
+    let script = format!(
+        "(Get-CimInstance Win32_Process -Filter \"ProcessId={}\").ExecutablePath",
+        pid
+    );
+    let mut command = Command::new("powershell.exe");
+    hide_child_console(&mut command);
+    let output = command
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_process_executable_path(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+fn is_froozerp_backend_process_path(path: &Path) -> bool {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    file_name.eq_ignore_ascii_case("froozerp-backend-node.exe")
+        && is_under(path, &current_install_dir())
+}
+
+fn stop_verified_backend_pid(pid: u32, reason: &str) -> bool {
+    let Some(path) = windows_process_executable_path(pid) else {
+        write_app_log(
+            "ERROR",
+            &format!("Refusing to stop backend PID {} ({}): executable path unavailable", pid, reason),
+        );
+        return false;
+    };
+    if !is_froozerp_backend_process_path(&path) {
+        write_app_log(
+            "ERROR",
+            &format!(
+                "Refusing to stop PID {} ({}): path {} is not the active FroozERP backend",
+                pid,
+                reason,
+                path.to_string_lossy()
+            ),
+        );
+        return false;
+    }
+    let mut command = Command::new("taskkill.exe");
+    hide_child_console(&mut command);
+    let status = command
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status();
+    match status {
+        Ok(status) if status.success() => {
+            write_app_log(
+                "INFO",
+                &format!(
+                    "Stopped verified FroozERP backend PID {} at {} ({})",
+                    pid,
+                    path.to_string_lossy(),
+                    reason
+                ),
+            );
+            true
+        }
+        Ok(status) => {
+            write_app_log(
+                "ERROR",
+                &format!("Unable to stop FroozERP backend PID {}: taskkill exited {}", pid, status),
+            );
+            false
+        }
+        Err(error) => {
+            write_app_log(
+                "ERROR",
+                &format!("Unable to stop FroozERP backend PID {}: {}", pid, error),
+            );
+            false
+        }
+    }
 }
 
 fn webview_recovery_marker_path() -> PathBuf {
@@ -1287,20 +1469,63 @@ fn restart_local_backend_service() -> Result<BackendServiceStatus, String> {
 }
 
 #[tauri::command]
-fn prepare_update_installation() -> Result<UpdateInstallPreparation, String> {
+fn prepare_update_installation(target_version: Option<String>) -> Result<UpdateInstallPreparation, String> {
     let backend_executable = resolve_node_path();
+    let backend_pid_before = backend_port_owner_pid();
     let stopped_owned_backend = stop_owned_backend("update installation requested");
-    let unlocked = wait_for_file_unlock(&backend_executable, 30, Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(500));
+    let mut stopped_port_backend = false;
+    if probe_local_backend_health(900).is_ok() {
+        if let Some(pid) = backend_port_owner_pid() {
+            stopped_port_backend = stop_verified_backend_pid(pid, "update installation requested");
+        }
+    }
+    for _ in 0..30 {
+        if probe_local_backend_health(500).is_err() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    let backend_still_reachable = probe_local_backend_health(500).is_ok();
+    let unlocked = !backend_still_reachable
+        && wait_for_file_unlock(&backend_executable, 60, Duration::from_millis(500));
+    let target_version = target_version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    let transaction_path = update_transaction_path();
     let message = if unlocked {
+        let previous_backend_version = local_backend_version(500).unwrap_or_default();
+        let record = UpdateTransactionRecord {
+            state: "installing".to_string(),
+            target_version: target_version.clone(),
+            previous_desktop_version: env!("CARGO_PKG_VERSION").to_string(),
+            previous_backend_version,
+            started_at: now_unix_seconds(),
+            updated_at: now_unix_seconds(),
+            install_dir: current_install_dir().to_string_lossy().to_string(),
+            executable_path: env::current_exe()
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            backend_executable: backend_executable.to_string_lossy().to_string(),
+            backend_pid_before,
+            message: "Installer launch approved after backend shutdown and file unlock.".to_string(),
+        };
+        write_update_transaction(&record)?;
         "Backend service stopped and sidecar executable is unlocked for update installation."
+            .to_string()
     } else {
-        "Backend sidecar executable is still locked. Close FroozERP and retry the update."
+        format!(
+            "Backend sidecar executable is still locked or reachable. reachable={}, file={}",
+            backend_still_reachable,
+            backend_executable.to_string_lossy()
+        )
     };
     Ok(UpdateInstallPreparation {
         stopped_owned_backend,
+        stopped_port_backend,
+        backend_pid_before,
         backend_executable: backend_executable.to_string_lossy().to_string(),
         unlocked,
-        message: message.to_string(),
+        transaction_path: transaction_path.to_string_lossy().to_string(),
+        message,
     })
 }
 
@@ -1659,6 +1884,7 @@ pub fn run() {
                     backend_status.message
                 ),
             );
+            reconcile_update_transaction(&backend_status);
             write_app_log("INFO", "Tauri setup completed");
             Ok(())
         })

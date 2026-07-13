@@ -6,6 +6,8 @@ const root = path.resolve(new URL("..", import.meta.url).pathname.replace(/^\/([
 const appPath = path.join(root, "frontend", "src", "App.jsx");
 const source = fs.readFileSync(appPath, "utf8");
 const manifestScript = fs.readFileSync(path.join(root, "scripts", "generate-tauri-update-manifest.mjs"), "utf8");
+const tauriConfig = JSON.parse(fs.readFileSync(path.join(root, "src-tauri", "tauri.conf.json"), "utf8"));
+const rustSource = fs.readFileSync(path.join(root, "src-tauri", "src", "lib.rs"), "utf8");
 const start = source.indexOf("function UpdateCenterSection");
 const end = source.indexOf("\nfunction ", start + 1);
 assert.notEqual(start, -1, "UpdateCenterSection must exist");
@@ -35,6 +37,9 @@ assert.ok(section.includes("install_diagnostics"), "Desktop version must come fr
 assert.ok(section.includes("local_backend_service_status"), "Backend PID/path must come from Tauri backend status");
 assert.ok(section.includes("NO_UPDATE_OBJECT"), "Missing Tauri update object must be explicit");
 assert.ok(section.includes("Mixed installation detected"), "Mixed install must be explicitly shown");
+assert.ok(section.includes("update_transaction_status"), "Update transaction status must be surfaced in Update Center");
+assert.ok(section.includes("Previous update did not complete"), "Incomplete updates must not be shown as successful");
+assert.ok(section.includes("versionsFullyMatch"), "Up-to-date status must require desktop, backend and latest versions to match");
 assert.equal(section.includes("readManifestFallback"), false, "Legacy manifest writer must be removed");
 assert.equal(section.includes("/settings/update-center"), false, "Update Center must not persist stale status drafts");
 assert.equal(section.includes("setInterval"), false, "Update Center must not poll");
@@ -61,5 +66,10 @@ assert.equal(compareVersions("1.0.39", "1.0.40") < 0, true, "Older semantic vers
 assert.ok(manifestScript.includes('githubRefType === "tag"'), "Manifest generation must only use GITHUB_REF_NAME for tag refs");
 assert.ok(manifestScript.includes("`v${version}`"), "Workflow-dispatch manifests must target the version tag, not the main branch");
 assert.equal(manifestScript.includes("const tag = process.env.GITHUB_REF_NAME"), false, "Manifest generation must not blindly use GITHUB_REF_NAME as the release tag");
+assert.equal(tauriConfig.plugins?.updater?.windows?.installMode, "quiet", "Windows updater must use quiet install mode");
+assert.ok(rustSource.includes("UPDATE_TRANSACTION_FILE"), "Rust updater lifecycle must persist a transaction file");
+assert.ok(rustSource.includes("reconcile_update_transaction"), "Rust startup must reconcile post-restart update success");
+assert.ok(rustSource.includes("stop_verified_backend_pid"), "Rust updater preflight must stop only verified FroozERP backend processes");
+assert.ok(rustSource.includes("wait_for_file_unlock(&backend_executable"), "Rust updater preflight must verify backend executable unlock");
 
 console.log("Update Center static tests passed");
