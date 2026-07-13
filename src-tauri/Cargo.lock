@@ -879,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "froozerp"
-version = "1.0.47"
+version = "1.0.48"
 dependencies = [
  "rusqlite",
  "serde",
