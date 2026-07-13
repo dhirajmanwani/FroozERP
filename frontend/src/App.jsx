@@ -408,7 +408,9 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
   } else if (backendOffline) {
     banner = isCloudMode()
       ? `Cloud offline. Local work is saved safely. Pending sync: ${pending}.`
-      : "Offline mode active. FroozERP is using local SQLite data. Changes will sync when backend/cloud is reachable.";
+      : internetAvailable
+        ? "Internet available, local service unavailable."
+        : "Local service unavailable. Check the local FroozERP service.";
   } else if (fieldRemoteMode) {
     banner = "Field Remote Device requires Cloud Production and purchase offline sync. Current version only prepares configuration.";
   } else if ((API_MODE === API_MODES.LOCAL_ONLY || API_MODE === API_MODES.LOCAL_SINGLE_DEVICE || API_MODE === API_MODES.BRANCH_LAN_SERVER || API_MODE === API_MODES.BRANCH_LAN_CLIENT) && localOnline) {
@@ -1314,6 +1316,7 @@ function App() {
     isTauriRuntime() ? "Starting local FroozERP service and checking the local database..." : ""
   ));
   const [startupLogPath, setStartupLogPath] = useState("");
+  const [startupTechnicalOpen, setStartupTechnicalOpen] = useState(false);
   const [backendHealth, setBackendHealth] = useState({
     apiUrl: API_URL,
     url: `${API_URL}/api/health`,
@@ -2155,6 +2158,48 @@ function App() {
       }
     };
   }, []);
+
+  const startupDiagnostics = useMemo(() => ({
+    desktopVersion: APP_VERSION,
+    backendExecutablePath: localBackendService?.node_path || localBackendService?.nodePath || "",
+    backendResourcePath: localBackendService?.backend_dir || localBackendService?.backendDir || "",
+    workingDirectory: localBackendService?.backend_dir || localBackendService?.backendDir || "",
+    backendPid: localBackendService?.pid || "",
+    port5000Pid: localBackendService?.port_pid || localBackendService?.portPid || "",
+    databasePath: localBackendService?.database_path || localBackendService?.databasePath || localDbStatus?.databasePath || "",
+    errorCode: localBackendService?.error_code || localBackendService?.errorCode || backendHealth?.reasonCode || "",
+    exitCode: localBackendService?.exit_code ?? localBackendService?.exitCode ?? "",
+    startupError: localBackendService?.message || startupError || backendHealth?.message || "",
+    stderrTail: localBackendService?.stderr_tail || localBackendService?.stderrTail || "",
+    startupLogPath,
+    stdoutLogPath: localBackendService?.stdout_log_path || localBackendService?.stdoutLogPath || "",
+    stderrLogPath: localBackendService?.stderr_log_path || localBackendService?.stderrLogPath || "",
+    apiUrl: backendHealth?.apiUrl || API_URL,
+    healthUrl: backendHealth?.url || `${API_URL}/api/health`,
+    internet: connectionStatus.internetStatus,
+    localServer: connectionStatus.localBackendStatus,
+  }), [API_URL, backendHealth, connectionStatus.internetStatus, connectionStatus.localBackendStatus, localBackendService, localDbStatus, startupError, startupLogPath]);
+
+  const openStartupLogFile = async () => {
+    try {
+      await invokeTauriCommand("open_startup_log");
+    } catch (error) {
+      setStartupError(getErrorMessage(error, "Unable to open startup log."));
+      setStartupTechnicalOpen(true);
+    }
+  };
+
+  const copyStartupDiagnostics = async () => {
+    const text = JSON.stringify(startupDiagnostics, null, 2);
+    try {
+      await navigator.clipboard?.writeText(text);
+      setStartupNotice("Startup diagnostics copied.");
+      setStartupTechnicalOpen(true);
+    } catch {
+      setStartupError("Unable to copy startup diagnostics. Open technical details and the startup log for the same information.");
+      setStartupTechnicalOpen(true);
+    }
+  };
 
   useEffect(() => {
     let unlisten = () => {};
@@ -4566,6 +4611,33 @@ function App() {
     }
   };
 
+  const localServiceUnavailable = isTauriRuntime() && !isCloudMode() && (backendHealth.online === false || localBackendService?.healthy === false);
+  const startupMainMessage = localServiceUnavailable
+    ? "Local service could not start."
+    : (startupError || startupNotice || "");
+  const startupSecondaryMessage = localServiceUnavailable
+    ? "FroozERP cannot sign in on this device until the local service is running."
+    : (startupError && startupNotice ? startupNotice : "");
+  const startupConnectionLabel = localServiceUnavailable
+    ? `${connectionStatus.internetStatus}, local service unavailable`
+    : `${connectionStatus.internetStatus} - ${isCloudMode() ? connectionStatus.cloudBackendStatus : connectionStatus.localBackendStatus}`;
+  const startupDetailRows = [
+    ["Desktop version", startupDiagnostics.desktopVersion],
+    ["Backend executable", startupDiagnostics.backendExecutablePath],
+    ["Backend resources", startupDiagnostics.backendResourcePath],
+    ["Working directory", startupDiagnostics.workingDirectory],
+    ["Backend PID", startupDiagnostics.backendPid || "Not running"],
+    ["Port 5000 PID", startupDiagnostics.port5000Pid || "No listener"],
+    ["Database path", startupDiagnostics.databasePath],
+    ["Error code", startupDiagnostics.errorCode || "Not reported"],
+    ["Exit code", startupDiagnostics.exitCode === "" ? "Not reported" : startupDiagnostics.exitCode],
+    ["Startup error", startupDiagnostics.startupError || "Not reported"],
+    ["Startup log", startupDiagnostics.startupLogPath],
+    ["Stdout log", startupDiagnostics.stdoutLogPath],
+    ["Stderr log", startupDiagnostics.stderrLogPath],
+    ["Stderr tail", startupDiagnostics.stderrTail],
+  ].filter(([, value]) => value !== undefined && value !== null && value !== "");
+
   if (!user) {
     return (
       <main className="login-page">
@@ -4597,29 +4669,48 @@ function App() {
               onKeyDown={(event) => event.key === "Enter" && login()}
             />
           </label>
-          {(startupNotice || startupError || lastReferenceSyncAt) && (
-            <div className={`startup-status-panel ${startupError ? "startup-status-error" : ""}`}>
-              {startupNotice && <p>{startupNotice}</p>}
-              {startupError && <p>{startupError}</p>}
+          {(startupMainMessage || startupSecondaryMessage || lastReferenceSyncAt) && (
+            <div className={`startup-status-panel ${localServiceUnavailable || startupError ? "startup-status-error" : ""}`}>
+              {startupMainMessage && <p><strong>{startupMainMessage}</strong></p>}
+              {startupSecondaryMessage && <p>{startupSecondaryMessage}</p>}
               {lastReferenceSyncAt && <small>Last successful local data sync: {new Date(lastReferenceSyncAt).toLocaleString("en-IN")}</small>}
             </div>
           )}
           <div className="startup-api-panel">
             <span>{connectionStatus.apiModeLabel}</span>
             <code>{backendHealth.apiUrl}</code>
-            <small>
-              {connectionStatus.internetStatus} - {isCloudMode() ? connectionStatus.cloudBackendStatus : connectionStatus.localBackendStatus}
-            </small>
+            <small>{startupConnectionLabel}</small>
             {isTauriRuntime() && !isCloudMode() && backendHealth.online === false && (
-              <button className="table-action" onClick={async () => {
-                await ensureLocalBackendService({ restart: true, reason: "login-restart-service" });
-                await performConnectivityCheck("login-restart-service", { force: true, skipServiceStart: true });
-              }}>
-                Restart Service
-              </button>
+              <div className="startup-service-actions">
+                <button className="table-action" type="button" onClick={async () => {
+                  await ensureLocalBackendService({ restart: true, reason: "login-restart-service" });
+                  await performConnectivityCheck("login-restart-service", { force: true, skipServiceStart: true });
+                  setStartupTechnicalOpen(true);
+                }}>
+                  Restart Service
+                </button>
+                <button className="secondary-button" type="button" onClick={openStartupLogFile}>
+                  Open Startup Log
+                </button>
+                <button className="secondary-button" type="button" onClick={copyStartupDiagnostics}>
+                  Copy Diagnostics
+                </button>
+              </div>
             )}
             {localBackendService?.message && <small>{localBackendService.message}</small>}
-            {startupLogPath && <small>Startup log: {startupLogPath}</small>}
+            <button className="startup-details-toggle" type="button" onClick={() => setStartupTechnicalOpen((open) => !open)}>
+              {startupTechnicalOpen ? "Hide technical details" : "Show technical details"}
+            </button>
+            {startupTechnicalOpen && (
+              <div className="startup-technical-details">
+                {startupDetailRows.map(([label, value]) => (
+                  <div className="startup-detail-row" key={label}>
+                    <span>{label}</span>
+                    <code>{String(value)}</code>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
           <div className="startup-actions">
             <button className="primary-button login-button" disabled={loginBusy} onClick={login}>

@@ -173,10 +173,18 @@ struct BackendServiceStatus {
     started: bool,
     reused_existing: bool,
     pid: Option<u32>,
+    port_pid: Option<u32>,
     url: String,
     backend_dir: String,
     node_path: String,
     startup_source: String,
+    database_path: String,
+    startup_log_path: String,
+    stdout_log_path: String,
+    stderr_log_path: String,
+    error_code: String,
+    exit_code: Option<i32>,
+    stderr_tail: String,
     message: String,
 }
 
@@ -198,6 +206,30 @@ fn diagnostic_log_path() -> PathBuf {
         .join("com.srtcompany.froozerp")
         .join("logs")
         .join("froozerp-startup.log")
+}
+
+fn backend_stdout_log_path() -> PathBuf {
+    app_data_dir()
+        .join("logs")
+        .join("froozerp-backend-stdout.log")
+}
+
+fn backend_stderr_log_path() -> PathBuf {
+    app_data_dir()
+        .join("logs")
+        .join("froozerp-backend-stderr.log")
+}
+
+fn local_sqlite_database_path() -> PathBuf {
+    app_data_dir().join("froozerp-local.sqlite3")
+}
+
+fn tail_text_file(path: &Path, max_bytes: usize) -> String {
+    let Ok(bytes) = fs::read(path) else {
+        return String::new();
+    };
+    let start = bytes.len().saturating_sub(max_bytes);
+    String::from_utf8_lossy(&bytes[start..]).trim().to_string()
 }
 
 fn app_data_dir() -> PathBuf {
@@ -582,11 +614,13 @@ fn backend_status(
     node_path: Option<PathBuf>,
     startup_source: &str,
 ) -> BackendServiceStatus {
+    let stderr_log_path = backend_stderr_log_path();
     BackendServiceStatus {
         healthy,
         started,
         reused_existing,
         pid,
+        port_pid: backend_port_owner_pid(),
         url: local_backend_url(),
         backend_dir: backend_dir
             .map(|path| path.to_string_lossy().to_string())
@@ -595,6 +629,13 @@ fn backend_status(
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_default(),
         startup_source: startup_source.to_string(),
+        database_path: local_sqlite_database_path().to_string_lossy().to_string(),
+        startup_log_path: diagnostic_log_path().to_string_lossy().to_string(),
+        stdout_log_path: backend_stdout_log_path().to_string_lossy().to_string(),
+        stderr_log_path: stderr_log_path.to_string_lossy().to_string(),
+        error_code: if healthy { "OK" } else { "LOCAL_BACKEND_UNHEALTHY" }.to_string(),
+        exit_code: None,
+        stderr_tail: tail_text_file(&stderr_log_path, 4096),
         message,
     }
 }
@@ -687,8 +728,16 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
     }
 
     if force_restart {
+        release_backend_startup_lock();
+        clear_backend_ownership("");
         stop_owned_backend("restart requested");
         thread::sleep(Duration::from_millis(300));
+        if probe_local_backend_health(500).is_ok() {
+            if let Some(pid) = backend_port_owner_pid() {
+                let _ = stop_verified_backend_pid(pid, "restart requested");
+                thread::sleep(Duration::from_millis(500));
+            }
+        }
         if local_backend_version_matches(900).unwrap_or(false) {
             return backend_status(
                 "An external FroozERP service is already running on port 5000.".to_string(),
@@ -793,11 +842,59 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
             drop(startup_lock);
             release_backend_startup_lock();
             write_app_log("ERROR", &format!("Local backend launch blocked: {}", error));
-            return backend_status(error, false, false, false, None, None, None, "unavailable");
+            let mut status = backend_status(error, false, false, false, None, None, None, "unavailable");
+            status.error_code = "BACKEND_RESOURCES_MISSING".to_string();
+            return status;
         }
     };
     let node_path = resolve_node_path();
     let startup_source = backend_startup_source(&node_path);
+    if !node_path.exists() {
+        drop(startup_lock);
+        release_backend_startup_lock();
+        let message = format!(
+            "Packaged FroozERP backend runtime was not found at {}.",
+            node_path.to_string_lossy()
+        );
+        write_app_log("ERROR", &message);
+        let mut status = backend_status(
+            message,
+            false,
+            false,
+            false,
+            None,
+            Some(backend_dir),
+            Some(node_path),
+            startup_source,
+        );
+        status.error_code = "BACKEND_RUNTIME_MISSING".to_string();
+        return status;
+    }
+    let package_json_path = backend_dir.join("package.json");
+    let node_modules_path = backend_dir.join("node_modules");
+    if !package_json_path.exists() || !node_modules_path.exists() {
+        drop(startup_lock);
+        release_backend_startup_lock();
+        let message = format!(
+            "Packaged FroozERP backend resources are incomplete. package_json_exists={}, node_modules_exists={}, backend_dir={}",
+            package_json_path.exists(),
+            node_modules_path.exists(),
+            backend_dir.to_string_lossy()
+        );
+        write_app_log("ERROR", &message);
+        let mut status = backend_status(
+            message,
+            false,
+            false,
+            false,
+            None,
+            Some(backend_dir),
+            Some(node_path),
+            startup_source,
+        );
+        status.error_code = "BACKEND_RESOURCES_INCOMPLETE".to_string();
+        return status;
+    }
     let owner_token = desktop_instance_token();
     write_app_log(
         "INFO",
@@ -808,6 +905,21 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
             startup_source
         ),
     );
+    let stdout_log = backend_stdout_log_path();
+    let stderr_log = backend_stderr_log_path();
+    if let Some(parent) = stdout_log.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let stdout_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stdout_log)
+        .ok();
+    let stderr_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_log)
+        .ok();
     let mut command = Command::new(&node_path);
     command
         .arg("server.js")
@@ -817,20 +929,34 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
         .env("APP_MODE", "LOCAL_SINGLE_DEVICE")
         .env("FROOZERP_DESKTOP_SERVICE", "1")
         .env("FROOZERP_BACKEND_OWNER_TOKEN", &owner_token)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdin(Stdio::null());
+    match stdout_file {
+        Some(file) => {
+            command.stdout(Stdio::from(file));
+        }
+        None => {
+            command.stdout(Stdio::null());
+        }
+    };
+    match stderr_file {
+        Some(file) => {
+            command.stderr(Stdio::from(file));
+        }
+        None => {
+            command.stderr(Stdio::null());
+        }
+    };
     hide_child_console(&mut command);
     let child = command.spawn();
 
-    let child = match child {
+    let mut child = match child {
         Ok(child) => child,
         Err(error) => {
             drop(startup_lock);
             release_backend_startup_lock();
             let message = format!("Unable to launch local FroozERP service: {}", error);
             write_app_log("ERROR", &message);
-            return backend_status(
+            let mut status = backend_status(
                 message,
                 false,
                 false,
@@ -840,22 +966,57 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
                 Some(node_path),
                 startup_source,
             );
+            status.error_code = "BACKEND_SPAWN_FAILED".to_string();
+            return status;
         }
     };
     let pid = child.id();
     write_backend_ownership(pid, &owner_token, &backend_dir, &node_path);
-    if let Ok(mut guard) = LOCAL_BACKEND_PROCESS.lock() {
-        *guard = Some(child);
-    }
     write_app_log("INFO", &format!("Local backend launch attempt PID {}", pid));
     for attempt in 1..=16 {
         thread::sleep(Duration::from_millis(750));
+        match child.try_wait() {
+            Ok(Some(exit_status)) => {
+                drop(startup_lock);
+                release_backend_startup_lock();
+                clear_backend_ownership(&owner_token);
+                let exit_code = exit_status.code();
+                let stderr_tail = tail_text_file(&stderr_log, 4096);
+                let message = format!(
+                    "Local FroozERP service exited before becoming healthy. exit_code={:?}. See backend stderr log: {}",
+                    exit_code,
+                    stderr_log.to_string_lossy()
+                );
+                write_app_log("ERROR", &format!("{} stderr_tail={}", message, stderr_tail));
+                let mut status = backend_status(
+                    message,
+                    false,
+                    true,
+                    false,
+                    Some(pid),
+                    Some(backend_dir),
+                    Some(node_path),
+                    startup_source,
+                );
+                status.error_code = "BACKEND_EXITED_BEFORE_HEALTHY".to_string();
+                status.exit_code = exit_code;
+                status.stderr_tail = stderr_tail;
+                return status;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                write_app_log("ERROR", &format!("Unable to inspect backend PID {}: {}", pid, error));
+            }
+        }
         match local_backend_version_matches(900) {
             Ok(true) => {
                 drop(startup_lock);
                 release_backend_startup_lock();
                 let message = format!("Local FroozERP service started on attempt {}", attempt);
                 write_app_log("INFO", &message);
+                if let Ok(mut guard) = LOCAL_BACKEND_PROCESS.lock() {
+                    *guard = Some(child);
+                }
                 return backend_status(
                     message,
                     true,
@@ -889,7 +1050,10 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
     write_app_log("ERROR", &message);
     drop(startup_lock);
     release_backend_startup_lock();
-    backend_status(
+    if let Ok(mut guard) = LOCAL_BACKEND_PROCESS.lock() {
+        *guard = Some(child);
+    }
+    let mut status = backend_status(
         message,
         false,
         true,
@@ -898,7 +1062,10 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
         Some(backend_dir),
         Some(node_path),
         startup_source,
-    )
+    );
+    status.error_code = "BACKEND_HEALTH_TIMEOUT".to_string();
+    status.stderr_tail = tail_text_file(&stderr_log, 4096);
+    status
 }
 
 fn push_shortcut_candidate(candidates: &mut Vec<CleanupCandidate>, path: PathBuf, reason: &str) {
@@ -1310,6 +1477,31 @@ fn open_pdf_in_system_viewer(file_name: String, bytes: Vec<u8>) -> Result<String
     .spawn()
     .map_err(|error| error.to_string())?;
     Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn open_startup_log() -> Result<String, String> {
+    let path = diagnostic_log_path();
+    if !path.exists() {
+        return Err(format!("Startup log does not exist yet: {}", path.to_string_lossy()));
+    }
+    #[cfg(target_os = "windows")]
+    open_path_with_windows_shell(&path)?;
+    #[cfg(not(target_os = "windows"))]
+    Command::new(if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    })
+    .arg(&path)
+    .spawn()
+    .map_err(|error| error.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn backend_startup_diagnostics() -> Result<BackendServiceStatus, String> {
+    local_backend_service_status()
 }
 
 #[cfg(target_os = "windows")]
@@ -1904,6 +2096,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_log_path,
             app_log,
+            open_startup_log,
+            backend_startup_diagnostics,
             open_pdf_in_system_viewer,
             save_pdf_with_dialog,
             set_kiosk_mode,

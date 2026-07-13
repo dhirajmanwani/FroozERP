@@ -441,6 +441,10 @@
 .startup-status-panel {
   margin-top: 16px;
   padding: 12px 14px;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
   border-radius: 10px;
   background: rgba(15, 23, 42, 0.45);
   border: 1px solid rgba(148, 163, 184, 0.2);
@@ -451,6 +455,9 @@
 .startup-status-panel small {
   margin: 0;
   display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .startup-status-panel p + p,
@@ -478,6 +485,10 @@
 .startup-api-panel {
   margin-top: 10px;
   padding: 9px 12px;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
   border-radius: 8px;
   background: rgba(2, 6, 23, 0.24);
   border: 1px solid rgba(148, 163, 184, 0.16);
@@ -497,12 +508,87 @@
 .startup-api-panel code {
   color: #f8fafc;
   font-size: 12px;
-  word-break: break-all;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .startup-api-panel small {
   color: #cbd5e1;
   line-height: 1.35;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.startup-service-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  width: 100%;
+  max-width: 100%;
+  margin-top: 4px;
+}
+
+.startup-service-actions button {
+  min-width: min(100%, 132px);
+  max-width: 100%;
+}
+
+.startup-details-toggle {
+  width: fit-content;
+  max-width: 100%;
+  margin-top: 2px;
+  padding: 0;
+  border: 0;
+  color: #fbbf24;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 800;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  box-shadow: none;
+}
+
+.startup-details-toggle:hover {
+  color: #fde68a;
+  transform: none;
+  box-shadow: none;
+}
+
+.startup-technical-details {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+  max-width: 100%;
+  margin-top: 8px;
+}
+
+.startup-detail-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.34fr) minmax(0, 1fr);
+  gap: 8px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.startup-detail-row span {
+  color: #94a3b8;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.startup-detail-row code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .startup-actions {
@@ -3582,7 +3668,9 @@ tbody tr:last-child td {
 }
 
 .login-panel {
-  width: min(410px, 100%);
+  width: min(720px, 100%);
+  min-width: min(100%, 360px);
+  max-width: 720px;
   padding: 24px 30px;
   box-sizing: border-box;
   border: 1px solid rgba(148, 163, 184, 0.12);
@@ -3699,6 +3787,30 @@ tbody tr:last-child td {
 
   .startup-api-panel {
     padding: 7px 10px;
+  }
+}
+
+@media (max-width: 720px) {
+  .login-page {
+    padding: 14px;
+  }
+
+  .login-panel {
+    width: 100%;
+    min-width: 0;
+    padding: 18px;
+  }
+
+  .first-launch-steps {
+    grid-template-columns: 1fr;
+  }
+
+  .startup-detail-row {
+    grid-template-columns: 1fr;
+  }
+
+  .startup-service-actions button {
+    width: 100%;
   }
 }
 
