@@ -1,9 +1,11 @@
 name: Release FroozERP
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Emergency manual installer version. Normal releases use Windows updater release."
+        required: true
 
 jobs:
   release:
@@ -27,15 +29,15 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build and release
+      - name: Build emergency manual installer
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "FroozERP ${{ github.ref_name }}"
-          releaseBody: "See the assets to download this version and install."
+          tagName: v${{ github.event.inputs.version }}
+          releaseName: "FroozERP v${{ github.event.inputs.version }} emergency manual installer"
+          releaseBody: "Emergency manual installer only. The canonical owner update asset is FroozERP-Setup-${{ github.event.inputs.version }}.exe from the Windows updater release workflow."
           releaseDraft: false
           prerelease: false

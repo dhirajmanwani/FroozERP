@@ -1,7 +1,7 @@
 {
   "name": "froozerp-workspace",
   "private": true,
-  "version": "1.0.49",
+  "version": "1.0.50",
   "scripts": {
     "app": "frontend\\node_modules\\.bin\\tauri.cmd dev",
     "app:dev": "frontend\\node_modules\\.bin\\tauri.cmd dev",

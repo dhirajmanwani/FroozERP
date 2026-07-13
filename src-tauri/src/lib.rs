@@ -429,14 +429,14 @@ fn local_backend_version_matches(timeout_ms: u64) -> Result<bool, String> {
 
 fn backend_dir_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(path) = env::var_os("FROOZERP_BACKEND_DIR").map(PathBuf::from) {
-        candidates.push(path);
-    }
     let install_dir = current_install_dir();
     candidates.push(install_dir.join("backend"));
     candidates.push(install_dir.join("_up_").join("backend"));
     candidates.push(install_dir.join("resources").join("backend"));
     if cfg!(debug_assertions) {
+        if let Some(path) = env::var_os("FROOZERP_BACKEND_DIR").map(PathBuf::from) {
+            candidates.push(path);
+        }
         if let Ok(current_dir) = env::current_dir() {
             candidates.push(current_dir.join("backend"));
             candidates.push(current_dir.join("..").join("backend"));
@@ -459,9 +459,6 @@ fn resolve_backend_dir() -> Result<PathBuf, String> {
 
 fn node_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(path) = env::var_os("FROOZERP_NODE_PATH").map(PathBuf::from) {
-        candidates.push(path);
-    }
     let install_dir = current_install_dir();
     candidates.push(
         install_dir
@@ -494,6 +491,10 @@ fn node_candidates() -> Vec<PathBuf> {
                     .join("binaries")
                     .join("froozerp-backend-node.exe"),
             );
+            if let Some(path) = env::var_os("FROOZERP_NODE_PATH").map(PathBuf::from) {
+                candidates.push(path);
+            }
+            candidates.push(PathBuf::from("node"));
         }
     } else if let Ok(current_dir) = env::current_dir() {
         if is_under(&current_dir, &install_dir) {
@@ -504,17 +505,19 @@ fn node_candidates() -> Vec<PathBuf> {
             );
         }
     }
-    candidates.push(PathBuf::from("node"));
-    candidates.push(PathBuf::from(r"D:\node.exe"));
-    candidates.push(PathBuf::from(r"C:\Program Files\nodejs\node.exe"));
     candidates
 }
 
 fn resolve_node_path() -> PathBuf {
+    let install_dir = current_install_dir();
     node_candidates()
         .into_iter()
         .find(|path| path == Path::new("node") || path.exists())
-        .unwrap_or_else(|| PathBuf::from("node"))
+        .unwrap_or_else(|| {
+            install_dir
+                .join("binaries")
+                .join("froozerp-backend-node.exe")
+        })
 }
 
 fn acquire_backend_startup_lock() -> Result<fs::File, String> {
@@ -1872,19 +1875,29 @@ pub fn run() {
                     );
                 }
             }
-            let backend_status = ensure_local_backend_service_internal(false);
-            write_app_log(
-                if backend_status.healthy { "INFO" } else { "ERROR" },
-                &format!(
-                    "Local backend setup result: healthy={}, started={}, reused={}, pid={:?}, message={}",
-                    backend_status.healthy,
-                    backend_status.started,
-                    backend_status.reused_existing,
-                    backend_status.pid,
-                    backend_status.message
-                ),
-            );
-            reconcile_update_transaction(&backend_status);
+            let backend_app = app.handle().clone();
+            thread::spawn(move || {
+                write_app_log("INFO", "Starting local backend worker after WebView setup");
+                let backend_status = ensure_local_backend_service_internal(false);
+                write_app_log(
+                    if backend_status.healthy { "INFO" } else { "ERROR" },
+                    &format!(
+                        "Local backend setup result: healthy={}, started={}, reused={}, pid={:?}, message={}",
+                        backend_status.healthy,
+                        backend_status.started,
+                        backend_status.reused_existing,
+                        backend_status.pid,
+                        backend_status.message
+                    ),
+                );
+                reconcile_update_transaction(&backend_status);
+                if let Err(error) = backend_app.emit("local-backend-service-status", backend_status) {
+                    write_app_log(
+                        "ERROR",
+                        &format!("Unable to publish local backend service status: {}", error),
+                    );
+                }
+            });
             write_app_log("INFO", "Tauri setup completed");
             Ok(())
         })

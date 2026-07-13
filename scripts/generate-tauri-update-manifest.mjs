@@ -28,15 +28,21 @@ const walk = (dir) => {
   });
 };
 
-const files = [...walk(releaseDir), ...walk(bundleDir)];
-const installer = files
-  .filter((filePath) => {
-    const name = path.basename(filePath);
-    return /\.exe$/i.test(filePath) && /FroozERP|froozerp|setup/i.test(name) && name.includes(version);
-  })
-  .sort((left, right) => {
-    return fs.statSync(right).mtimeMs - fs.statSync(left).mtimeMs;
-  })[0];
+const canonicalInstallerName = `FroozERP-Setup-${version}.exe`;
+const canonicalInstaller = path.join(releaseDir, canonicalInstallerName);
+const installer = fs.existsSync(canonicalInstaller)
+  ? canonicalInstaller
+  : [...walk(releaseDir), ...walk(bundleDir)]
+    .filter((filePath) => {
+      const name = path.basename(filePath);
+      return /\.exe$/i.test(filePath) && /FroozERP|froozerp|setup/i.test(name) && name.includes(version);
+    })
+    .sort((left, right) => {
+      const leftIsCanonical = path.basename(left) === canonicalInstallerName ? 1 : 0;
+      const rightIsCanonical = path.basename(right) === canonicalInstallerName ? 1 : 0;
+      if (leftIsCanonical !== rightIsCanonical) return rightIsCanonical - leftIsCanonical;
+      return fs.statSync(right).mtimeMs - fs.statSync(left).mtimeMs;
+    })[0];
 
 if (!installer) {
   console.error(`No Windows installer artifact for version ${version} was found. Run npm run build:windows and npm run release:windows first.`);

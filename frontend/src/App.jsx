@@ -475,7 +475,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.49";
+const APP_VERSION = "1.0.50";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -1310,7 +1310,10 @@ function App() {
   const [syncStatus, setSyncStatus] = useState(null);
   const [syncMessage, setSyncMessage] = useState("");
   const [startupError, setStartupError] = useState("");
-  const [startupNotice, setStartupNotice] = useState("");
+  const [startupNotice, setStartupNotice] = useState(() => (
+    isTauriRuntime() ? "Starting local FroozERP service and checking the local database..." : ""
+  ));
+  const [startupLogPath, setStartupLogPath] = useState("");
   const [backendHealth, setBackendHealth] = useState({
     apiUrl: API_URL,
     url: `${API_URL}/api/health`,
@@ -1717,6 +1720,15 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    invokeTauriCommand("app_log_path")
+      .then((path) => {
+        if (path) setStartupLogPath(path);
+      })
+      .catch(() => {});
+  }, []);
+
   const refreshSyncStatus = async () => {
     const status = await getSyncStatus();
     setSyncStatus(status);
@@ -1937,6 +1949,13 @@ function App() {
   const userRef = useRef(user);
   const deviceInfoRef = useRef(deviceInfo);
   const syncStatusRef = useRef(syncStatus);
+  const backendHealthRef = useRef(backendHealth);
+  const cloudHealthRef = useRef(cloudHealth);
+  const cloudDeviceRegistrationRef = useRef(cloudDeviceRegistration);
+  const internetAvailableRef = useRef(internetAvailable);
+  const connectivityCheckRef = useRef(null);
+  const connectivityInFlightRef = useRef(null);
+  const lastConnectivityCheckAtRef = useRef(0);
   const reconnectSyncRef = useRef(false);
   const lastAutoSyncStartedAtRef = useRef(0);
   const shouldStartBackgroundSync = () => {
@@ -1957,6 +1976,22 @@ function App() {
   useEffect(() => {
     syncStatusRef.current = syncStatus;
   }, [syncStatus]);
+
+  useEffect(() => {
+    backendHealthRef.current = backendHealth;
+  }, [backendHealth]);
+
+  useEffect(() => {
+    cloudHealthRef.current = cloudHealth;
+  }, [cloudHealth]);
+
+  useEffect(() => {
+    cloudDeviceRegistrationRef.current = cloudDeviceRegistration;
+  }, [cloudDeviceRegistration]);
+
+  useEffect(() => {
+    internetAvailableRef.current = internetAvailable;
+  }, [internetAvailable]);
 
   const runSyncNow = async (options = {}) => {
     if (!user) return null;
@@ -1989,10 +2024,18 @@ function App() {
     return status;
   };
 
-  const applyConnectivityState = useCallback((health, statusInternetAvailable = internetAvailable, statusSyncStatus = syncStatusRef.current) => {
+  const applyConnectivityState = useCallback((health, statusInternetAvailable = internetAvailableRef.current, statusSyncStatus = syncStatusRef.current) => {
     setBackendHealth(health);
     if (health.online === null || health.checking) return;
     setOfflineMode(!health.online);
+    const modelInput = {
+      backendHealth: health,
+      cloudHealth: cloudHealthRef.current,
+      deviceRegistration: cloudDeviceRegistrationRef.current,
+      syncStatus: statusSyncStatus,
+      internetAvailable: statusInternetAvailable,
+      currentUser: userRef.current,
+    };
     if (health.online) {
       setStartupError((current) => {
         if (!current) return "";
@@ -2001,14 +2044,14 @@ function App() {
       });
       setStartupNotice((current) => (
         /offline|local sqlite|sync changes later|online login succeeded|local reference data/i.test(current || "")
-          ? buildConnectionStatusModel({ backendHealth: health, cloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: statusSyncStatus, internetAvailable: statusInternetAvailable, currentUser: userRef.current }).banner
-          : current || buildConnectionStatusModel({ backendHealth: health, cloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: statusSyncStatus, internetAvailable: statusInternetAvailable, currentUser: userRef.current }).banner
+          ? buildConnectionStatusModel(modelInput).banner
+          : current || buildConnectionStatusModel(modelInput).banner
       ));
     } else {
-      setStartupNotice("Offline mode is active. FroozERP loaded your local SQLite data and will sync changes later.");
-      setSyncMessage("Offline - backend unavailable. Changes will sync later.");
+      setStartupNotice("Local FroozERP service is not ready yet. The login screen remains usable while startup diagnostics continue.");
+      setSyncMessage("Local backend unavailable. Local cached/offline data is available only after this device has completed one successful login.");
     }
-  }, [internetAvailable]);
+  }, []);
 
   const ensureLocalBackendService = useCallback(async ({ restart = false, reason = "manual" } = {}) => {
     if (!isTauriRuntime() || isCloudMode()) return null;
@@ -2032,6 +2075,13 @@ function App() {
   }, []);
 
   const performConnectivityCheck = useCallback(async (reason = "manual", options = {}) => {
+    const now = Date.now();
+    const force = Boolean(options.force);
+    const minGapMs = reason === "startup" || reason.includes("restart") ? 0 : 2500;
+    if (!force && connectivityInFlightRef.current) return connectivityInFlightRef.current;
+    if (!force && now - lastConnectivityCheckAtRef.current < minGapMs) return backendHealthRef.current;
+    lastConnectivityCheckAtRef.current = now;
+    const checkPromise = (async () => {
     if (isTauriRuntime() && !isCloudMode() && options.skipServiceStart !== true) {
       const service = await ensureLocalBackendService({ reason });
       if (service?.healthy) {
@@ -2071,23 +2121,32 @@ function App() {
         });
     }
     return health;
+    })().finally(() => {
+      if (connectivityInFlightRef.current === checkPromise) connectivityInFlightRef.current = null;
+    });
+    connectivityInFlightRef.current = checkPromise;
+    return checkPromise;
   }, [applyConnectivityState, ensureLocalBackendService]);
+
+  useEffect(() => {
+    connectivityCheckRef.current = performConnectivityCheck;
+  }, [performConnectivityCheck]);
 
   useEffect(() => subscribeConnectivity(applyConnectivityState), [applyConnectivityState]);
 
   useEffect(() => {
-    performConnectivityCheck("startup", { force: true });
+    connectivityCheckRef.current?.("startup", { force: true });
     const handleConnectivityEvent = (event) => {
       if (event.type === "visibilitychange" && document.hidden) return;
-      performConnectivityCheck(event.type, { force: true });
+      connectivityCheckRef.current?.(event.type, { force: true });
     };
     for (const eventName of connectivityEventNames) {
       const target = eventName === "visibilitychange" ? document : window;
       target.addEventListener(eventName, handleConnectivityEvent);
     }
     const timer = window.setInterval(() => {
-      performConnectivityCheck(backendHealth.online ? "periodic-online" : "periodic-offline");
-    }, 15_000);
+      connectivityCheckRef.current?.(backendHealthRef.current.online ? "periodic-online" : "periodic-offline");
+    }, 30_000);
     return () => {
       window.clearInterval(timer);
       for (const eventName of connectivityEventNames) {
@@ -2095,7 +2154,26 @@ function App() {
         target.removeEventListener(eventName, handleConnectivityEvent);
       }
     };
-  }, [backendHealth.online, performConnectivityCheck]);
+  }, []);
+
+  useEffect(() => {
+    let unlisten = () => {};
+    listenTauriEvent("local-backend-service-status", (event) => {
+      const service = event?.payload || null;
+      if (!service) return;
+      setLocalBackendService({ ...service, reason: "desktop-startup-worker", checkedAt: new Date().toISOString() });
+      if (service.healthy) {
+        setStartupNotice("Local FroozERP service is running. You can sign in.");
+        setStartupError((current) => (/local backend|froozERP service|backend/i.test(current) ? "" : current));
+        connectivityCheckRef.current?.("desktop-backend-ready", { force: true, skipServiceStart: true });
+      } else {
+        setStartupError(service.message || "Local FroozERP service stopped or did not become healthy. Restart service.");
+      }
+    }).then((cleanup) => {
+      unlisten = cleanup;
+    }).catch(() => {});
+    return () => unlisten();
+  }, []);
 
   const queuePhase2SyncTest = async () => {
     if (!user) return;
@@ -4541,6 +4619,7 @@ function App() {
               </button>
             )}
             {localBackendService?.message && <small>{localBackendService.message}</small>}
+            {startupLogPath && <small>Startup log: {startupLogPath}</small>}
           </div>
           <div className="startup-actions">
             <button className="primary-button login-button" disabled={loginBusy} onClick={login}>
@@ -5419,6 +5498,7 @@ function App() {
                 connectionStatus={connectionStatus}
                 localBackendService={localBackendService}
                 localDbStatus={localDbStatus}
+                startupLogPath={startupLogPath}
                 onCheckConnection={() => performConnectivityCheck("settings-sync-check", { force: true, timeoutMs: 3500 })}
                 onApproveCloudDevice={approveCloudDevice}
                 onReload={async () => { await Promise.all([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()]); }}
@@ -11358,6 +11438,7 @@ function SettingsModule({
   connectionStatus,
   localBackendService,
   localDbStatus,
+  startupLogPath,
   onCheckConnection,
   onApproveCloudDevice,
   onQueueSyncTest,
@@ -11406,6 +11487,7 @@ function SettingsModule({
         cloudHealth={cloudHealth || null}
         connectionStatus={connectionStatus}
         localBackendService={localBackendService || null}
+        startupLogPath={startupLogPath}
         key={settingsData.syncSettings?.updated_at || "sync-settings"}
         localDbStatus={localDbStatus}
         onCheckConnection={onCheckConnection}
@@ -12754,6 +12836,7 @@ function SyncSettingsSection({
   connectionStatus,
   localBackendService,
   localDbStatus,
+  startupLogPath,
   onCheckConnection,
   onApproveCloudDevice,
   onQueueSyncTest,
@@ -13139,6 +13222,7 @@ function SyncSettingsSection({
             <Field label="Desktop Backend Node Runtime"><input disabled value={localBackendService?.node_path || localBackendService?.nodePath || "Not checked"} /></Field>
             <Field label="Desktop Backend Directory"><input disabled value={localBackendService?.backend_dir || localBackendService?.backendDir || "Not checked"} /></Field>
             <Field label="Desktop Backend Detail"><input disabled value={localBackendService?.message || "Not checked"} /></Field>
+            <Field label="Startup Log Path"><input disabled value={startupLogPath || "Not checked"} /></Field>
             <Field label="Cloud Health URL"><input disabled value={cloudHealth?.url || `${CLOUD_API_URL}/api/health`} /></Field>
             <Field label="Cloud Health Detail"><input disabled value={cloudHealth?.message || "Not checked"} /></Field>
             <Field label="Cloud Device Status"><input disabled value={cloudDeviceStatus} /></Field>
