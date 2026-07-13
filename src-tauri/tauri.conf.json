@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "FroozERP",
-  "version": "1.0.42",
+  "version": "1.0.43",
   "identifier": "com.srtcompany.froozerp",
   "build": {
     "beforeDevCommand": "npm --prefix frontend run dev -- --host 0.0.0.0",
@@ -65,7 +65,7 @@
         "https://github.com/dhirajmanwani/FroozERP/releases/latest/download/latest.json"
       ],
       "windows": {
-        "installMode": "passive"
+        "installMode": "quiet"
       },
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZDRTk0OTIzNkE4ODc4NUMKUldSY2VJaHFJMG5wL01jN0UrMTE5WDc4c0RZU29LTFRhSWhRdC91Q2NDbU92aW0wWSsvS2NsWmcK"
     }

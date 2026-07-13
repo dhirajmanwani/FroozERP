@@ -26,6 +26,9 @@ if (tauriConfig.identifier !== "com.srtcompany.froozerp") {
 if (!tauriConfig.bundle?.createUpdaterArtifacts) {
   failures.push("Tauri updater artifacts are not enabled.");
 }
+if (tauriConfig.plugins?.updater?.windows?.installMode !== "quiet") {
+  failures.push("Windows in-app updater installMode must be quiet so no external installer window is left open.");
+}
 if (!tauriConfig.plugins?.updater?.pubkey || /REPLACE_WITH/i.test(tauriConfig.plugins.updater.pubkey)) {
   const message = "Tauri updater public key is not configured.";
   if (process.env.CI === "true" || process.env.FROOZERP_REQUIRE_UPDATER_KEY === "1") {

@@ -183,6 +183,61 @@ fn app_data_dir() -> PathBuf {
         .join("com.srtcompany.froozerp")
 }
 
+fn cleanup_updater_temp_artifacts() {
+    let temp_dir = env::temp_dir();
+    let Ok(entries) = fs::read_dir(&temp_dir) else {
+        write_app_log(
+            "ERROR",
+            &format!(
+                "Unable to inspect updater temp directory: {}",
+                temp_dir.to_string_lossy()
+            ),
+        );
+        return;
+    };
+    let mut removed = 0usize;
+    let mut blocked = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("FroozERP-") || !name.contains("-updater-") {
+            continue;
+        }
+        if !path.is_dir() {
+            continue;
+        }
+        match fs::remove_dir_all(&path) {
+            Ok(_) => {
+                removed += 1;
+                write_app_log(
+                    "INFO",
+                    &format!("Removed completed updater temp folder {}", path.to_string_lossy()),
+                );
+            }
+            Err(error) => {
+                blocked += 1;
+                write_app_log(
+                    "ERROR",
+                    &format!(
+                        "Unable to remove updater temp folder {}: {}",
+                        path.to_string_lossy(),
+                        error
+                    ),
+                );
+            }
+        }
+    }
+    if removed > 0 || blocked > 0 {
+        write_app_log(
+            "INFO",
+            &format!(
+                "Updater temp cleanup finished: removed={}, blocked={}",
+                removed, blocked
+            ),
+        );
+    }
+}
+
 fn backend_ownership_path() -> PathBuf {
     app_data_dir().join("runtime").join(BACKEND_OWNERSHIP_FILE)
 }
@@ -1554,6 +1609,7 @@ pub fn run() {
                 &format!("Application log file: {}", path.to_string_lossy()),
             );
             write_app_log("INFO", "Tauri setup started");
+            cleanup_updater_temp_artifacts();
             match detect_old_froozerp_versions() {
                 Ok(cleanup) => write_app_log(
                     "INFO",
