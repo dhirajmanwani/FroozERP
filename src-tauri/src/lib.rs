@@ -26,7 +26,9 @@ use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::Controls::Dialogs::{
     CommDlgExtendedError, GetSaveFileNameW, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
@@ -1106,24 +1108,22 @@ fn backend_port_owner_pid() -> Option<u32> {
 
 #[cfg(target_os = "windows")]
 fn windows_process_executable_path(pid: u32) -> Option<PathBuf> {
-    let script = format!(
-        "(Get-CimInstance Win32_Process -Filter \"ProcessId={}\").ExecutablePath",
-        pid
-    );
-    let mut command = Command::new("powershell.exe");
-    hide_child_console(&mut command);
-    let output = command
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
         return None;
     }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
+    let mut buffer = vec![0u16; 32768];
+    let mut size = buffer.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) };
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    if ok == 0 || size == 0 {
         None
     } else {
-        Some(PathBuf::from(path))
+        Some(PathBuf::from(String::from_utf16_lossy(
+            &buffer[..size as usize],
+        )))
     }
 }
 
@@ -1472,6 +1472,7 @@ fn restart_local_backend_service() -> Result<BackendServiceStatus, String> {
 fn prepare_update_installation(target_version: Option<String>) -> Result<UpdateInstallPreparation, String> {
     let backend_executable = resolve_node_path();
     let backend_pid_before = backend_port_owner_pid();
+    let previous_backend_version = local_backend_version(900).unwrap_or_default();
     let stopped_owned_backend = stop_owned_backend("update installation requested");
     thread::sleep(Duration::from_millis(500));
     let mut stopped_port_backend = false;
@@ -1492,7 +1493,6 @@ fn prepare_update_installation(target_version: Option<String>) -> Result<UpdateI
     let target_version = target_version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     let transaction_path = update_transaction_path();
     let message = if unlocked {
-        let previous_backend_version = local_backend_version(500).unwrap_or_default();
         let record = UpdateTransactionRecord {
             state: "installing".to_string(),
             target_version: target_version.clone(),
