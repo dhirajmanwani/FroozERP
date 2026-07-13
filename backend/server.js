@@ -279,7 +279,15 @@ const safeCloudError = (error) => {
   const body = error?.response?.data || error?.body || {};
   const message = body?.message || body?.error || error?.message || "Cloud request failed.";
   if (status === 401) return { errorCode: "CLOUD_AUTHENTICATION_REQUIRED", safeErrorMessage: message, httpStatus: status };
-  if (status === 403) return { errorCode: "CLOUD_DEVICE_NOT_APPROVED", safeErrorMessage: message, httpStatus: status };
+  if (status === 403) {
+    const normalized = String(message || "").toLowerCase();
+    const errorCode = normalized.includes("not registered")
+      ? "CLOUD_DEVICE_NOT_REGISTERED"
+      : normalized.includes("not approved") || normalized.includes("pending")
+        ? "CLOUD_DEVICE_NOT_APPROVED"
+        : "CLOUD_FORBIDDEN";
+    return { errorCode, safeErrorMessage: message, httpStatus: status };
+  }
   if (status === 404) return { errorCode: "CLOUD_ENDPOINT_NOT_FOUND", safeErrorMessage: message, httpStatus: status };
   if (status >= 500) return { errorCode: "CLOUD_SERVER_ERROR", safeErrorMessage: message, httpStatus: status };
   if (error?.name === "AbortError") return { errorCode: "CLOUD_TIMEOUT", safeErrorMessage: "Cloud request timed out.", httpStatus: null };
