@@ -221,6 +221,188 @@ const cloudConfigurationChecks = () => ({
   startup_reference_seed_disabled: !runStartupReferenceSeed,
 });
 const cloudConfigurationReady = Object.values(cloudConfigurationChecks()).every(Boolean);
+const canonicalCloudApiUrl = isRealHostedCloudUrl(publicCloudApiUrl) ? publicCloudApiUrl : productionRailwayOrigin;
+const cloudPolicyDirectory = path.join(os.homedir(), "AppData", "Roaming", "com.srtcompany.froozerp");
+const cloudPolicyPath = path.join(cloudPolicyDirectory, "cloud-network-policy.json");
+const defaultCloudPolicy = Object.freeze({
+  allowInternetAccess: true,
+  updatedAt: null,
+});
+
+const readCloudPolicy = () => {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(cloudPolicyPath, "utf8"));
+    return {
+      ...defaultCloudPolicy,
+      allowInternetAccess: parsed.allowInternetAccess !== false,
+      updatedAt: parsed.updatedAt || null,
+    };
+  } catch {
+    return { ...defaultCloudPolicy };
+  }
+};
+
+const writeCloudPolicy = (policy) => {
+  fs.mkdirSync(cloudPolicyDirectory, { recursive: true });
+  const next = {
+    ...defaultCloudPolicy,
+    ...policy,
+    allowInternetAccess: policy.allowInternetAccess !== false,
+    updatedAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(cloudPolicyPath, JSON.stringify(next, null, 2));
+  return next;
+};
+
+const maskDeviceId = (value) => {
+  const text = cleanText(value);
+  if (!text) return "";
+  return text.length <= 8 ? text : `...${text.slice(-8)}`;
+};
+
+const normalizeCloudUrl = (value) => String(value || "").trim().replace(/\/$/, "");
+const resolveCanonicalCloudConfig = () => {
+  const cloudApiUrl = normalizeCloudUrl(canonicalCloudApiUrl);
+  const policy = readCloudPolicy();
+  const cloudApiConfigured = isRealHostedCloudUrl(cloudApiUrl);
+  return {
+    cloudApiUrl,
+    cloudApiConfigured,
+    appInternetAllowed: policy.allowInternetAccess !== false,
+    policyUpdatedAt: policy.updatedAt,
+    policyPath: cloudPolicyPath,
+  };
+};
+
+const safeCloudError = (error) => {
+  const status = error?.response?.status || error?.status || null;
+  const body = error?.response?.data || error?.body || {};
+  const message = body?.message || body?.error || error?.message || "Cloud request failed.";
+  if (status === 401) return { errorCode: "CLOUD_AUTHENTICATION_REQUIRED", safeErrorMessage: message, httpStatus: status };
+  if (status === 403) return { errorCode: "CLOUD_DEVICE_NOT_APPROVED", safeErrorMessage: message, httpStatus: status };
+  if (status === 404) return { errorCode: "CLOUD_ENDPOINT_NOT_FOUND", safeErrorMessage: message, httpStatus: status };
+  if (status >= 500) return { errorCode: "CLOUD_SERVER_ERROR", safeErrorMessage: message, httpStatus: status };
+  if (error?.name === "AbortError") return { errorCode: "CLOUD_TIMEOUT", safeErrorMessage: "Cloud request timed out.", httpStatus: null };
+  return { errorCode: status ? "CLOUD_HTTP_ERROR" : "CLOUD_UNREACHABLE", safeErrorMessage: message, httpStatus: status };
+};
+
+const cloudFetchJson = async (route, options = {}) => {
+  const config = resolveCanonicalCloudConfig();
+  if (!config.cloudApiConfigured) {
+    const error = new Error("Cloud API is not configured.");
+    error.code = "CLOUD_NOT_CONFIGURED";
+    throw error;
+  }
+  if (!config.appInternetAllowed) {
+    const error = new Error("FroozERP cloud access is disabled by the Owner.");
+    error.code = "APP_INTERNET_DISABLED";
+    throw error;
+  }
+  const url = `${config.cloudApiUrl}${route.startsWith("/") ? route : `/${route}`}`;
+  const response = await fetch(url, {
+    method: options.method || "GET",
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      ...(options.headers || {}),
+    },
+    body: options.body ? JSON.stringify(options.body) : undefined,
+    signal: AbortSignal.timeout(options.timeoutMs || 10000),
+  });
+  const text = await response.text();
+  let data = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { message: text.slice(0, 240) };
+  }
+  if (!response.ok) {
+    const error = new Error(data?.message || `Cloud returned HTTP ${response.status}.`);
+    error.status = response.status;
+    error.body = data;
+    throw error;
+  }
+  return { status: response.status, data, url };
+};
+
+const buildCloudHealthPayload = async ({ userId = null, deviceId = "", branchId = null } = {}) => {
+  const config = resolveCanonicalCloudConfig();
+  const now = new Date().toISOString();
+  const base = {
+    status: "ok",
+    localBackendStatus: "ok",
+    configuredCloudBaseUrl: config.cloudApiUrl,
+    cloudApiConfigured: config.cloudApiConfigured,
+    appInternetAllowed: config.appInternetAllowed,
+    physicalInternet: "not_checked_by_backend",
+    railwayHttpStatus: null,
+    cloudReachable: false,
+    cloudAuthenticated: false,
+    deviceRegistered: false,
+    deviceApproved: false,
+    deviceIdSuffix: maskDeviceId(deviceId || configuredDeviceId),
+    syncReady: false,
+    pendingUploadCount: null,
+    pendingDownloadCount: null,
+    pendingSyncCount: null,
+    lastSuccessfulSync: null,
+    lastCheckedAt: now,
+    errorCode: "",
+    safeErrorMessage: "",
+  };
+  if (!config.cloudApiConfigured) {
+    return { ...base, errorCode: "CLOUD_NOT_CONFIGURED", safeErrorMessage: "Cloud backend URL is not configured." };
+  }
+  if (!config.appInternetAllowed) {
+    return { ...base, errorCode: "APP_INTERNET_DISABLED", safeErrorMessage: "FroozERP cloud access is disabled by the Owner." };
+  }
+  try {
+    const health = await cloudFetchJson("/api/health", { timeoutMs: 8000 });
+    const cloudData = health.data || {};
+    const cloudReachable = health.status >= 200
+      && health.status < 300
+      && String(cloudData.status || "").toLowerCase() === "ok"
+      && cloudData.app === "FroozERP";
+    let deviceStatus = null;
+    if (deviceId && userId) {
+      try {
+        const identity = await cloudFetchJson(`/api/device/identity?user_id=${encodeURIComponent(userId)}&device_id=${encodeURIComponent(deviceId)}&branch_id=${encodeURIComponent(branchId || 1)}`, { timeoutMs: 8000 });
+        deviceStatus = identity.data || null;
+      } catch (error) {
+        const safe = safeCloudError(error);
+        deviceStatus = { errorCode: safe.errorCode, message: safe.safeErrorMessage, httpStatus: safe.httpStatus };
+      }
+    }
+    const registrationStatus = String(deviceStatus?.registration_status || deviceStatus?.status || "").toUpperCase();
+    const deviceApproved = registrationStatus === "APPROVED";
+    const deviceRegistered = Boolean(deviceStatus?.device_id || registrationStatus || deviceStatus?.errorCode === "CLOUD_DEVICE_NOT_APPROVED");
+    return {
+      ...base,
+      railwayHttpStatus: health.status,
+      cloudReachable,
+      cloudAuthenticated: !deviceStatus?.errorCode || deviceStatus.errorCode !== "CLOUD_AUTHENTICATION_REQUIRED",
+      deviceRegistered,
+      deviceApproved,
+      deviceRegistrationStatus: registrationStatus || "NOT_CHECKED",
+      lastSuccessfulSync: deviceStatus?.last_sync_at || null,
+      syncReady: cloudReachable && deviceApproved,
+      cloudVersion: cloudData.version || "",
+      cloudDeploymentType: cloudData.deployment_type || "",
+      cloudAppMode: cloudData.app_mode || "",
+      cloudCompanyId: cloudData.company_id || null,
+      cloudBranchId: cloudData.branch_id || null,
+      errorCode: deviceStatus?.errorCode || (cloudReachable ? "" : "CLOUD_IDENTITY_INVALID"),
+      safeErrorMessage: deviceStatus?.message || (cloudReachable ? "Cloud backend is reachable." : "Cloud responded, but FroozERP identity is incomplete."),
+    };
+  } catch (error) {
+    const safe = error.code === "APP_INTERNET_DISABLED"
+      ? { errorCode: "APP_INTERNET_DISABLED", safeErrorMessage: "FroozERP cloud access is disabled by the Owner.", httpStatus: null }
+      : error.code === "CLOUD_NOT_CONFIGURED"
+        ? { errorCode: "CLOUD_NOT_CONFIGURED", safeErrorMessage: "Cloud backend URL is not configured.", httpStatus: null }
+        : safeCloudError(error);
+    return { ...base, railwayHttpStatus: safe.httpStatus, errorCode: safe.errorCode, safeErrorMessage: safe.safeErrorMessage };
+  }
+};
 const allowedTauriCorsOrigins = new Set([
   "tauri://localhost",
   "http://tauri.localhost",
@@ -4808,6 +4990,178 @@ app.get("/api/auth/me", async (req, res) => {
   }
 });
 
+app.get("/api/cloud/internet-access", (_req, res) => {
+  const config = resolveCanonicalCloudConfig();
+  return res.json({
+    allowInternetAccess: config.appInternetAllowed,
+    status: config.appInternetAllowed ? "ONLINE" : "APP_INTERNET_DISABLED",
+    updatedAt: config.policyUpdatedAt,
+    message: config.appInternetAllowed
+      ? "FroozERP cloud access is allowed by the app setting."
+      : "FroozERP cloud access is disabled by the Owner.",
+  });
+});
+
+app.put("/api/cloud/internet-access", async (req, res) => {
+  try {
+    const identity = await getCanonicalIdentity({
+      userId: req.body.user_id || req.headers["x-user-id"],
+      sessionId: req.body.session_id || req.headers["x-session-id"],
+    });
+    if (!identity.authenticated || !identity.is_owner) {
+      return res.status(403).json({
+        code: "OWNER_REQUIRED",
+        message: "Owner permission is required to change FroozERP internet access.",
+      });
+    }
+    const policy = writeCloudPolicy({ allowInternetAccess: req.body.allowInternetAccess !== false });
+    return res.json({
+      allowInternetAccess: policy.allowInternetAccess,
+      status: policy.allowInternetAccess ? "ONLINE" : "APP_INTERNET_DISABLED",
+      updatedAt: policy.updatedAt,
+      message: policy.allowInternetAccess
+        ? "FroozERP cloud access is now allowed."
+        : "FroozERP cloud access is disabled by the Owner.",
+    });
+  } catch (error) {
+    console.error("Cloud internet policy update failed", error.message);
+    return res.status(500).json({ code: "APP_INTERNET_POLICY_ERROR", message: "Unable to save FroozERP internet access setting." });
+  }
+});
+
+app.get("/api/cloud/health", async (req, res) => {
+  try {
+    const payload = await buildCloudHealthPayload({
+      userId: req.query.user_id || req.headers["x-user-id"],
+      deviceId: req.query.device_id || req.headers["x-device-id"] || configuredDeviceId || "",
+      branchId: req.query.branch_id || configuredBranchId || 1,
+    });
+    return res.json(payload);
+  } catch (error) {
+    console.error("Cloud health failed", error.message);
+    return res.status(500).json({ code: "CLOUD_HEALTH_ERROR", message: "Unable to check FroozERP cloud health." });
+  }
+});
+
+app.post("/api/cloud/device/register", async (req, res) => {
+  try {
+    const device = readDevicePayload({
+      ...req.body,
+      device_type: req.body.platform || req.body.device_type || "Desktop",
+    }, req);
+    if (!device.device_id) return res.status(400).json({ code: "DEVICE_ID_REQUIRED", message: "device_id is required." });
+    const payload = {
+      device_id: device.device_id,
+      device_name: device.device_name,
+      platform: req.body.platform || device.device_type,
+      app_version: cleanText(req.body.app_version) || appVersion,
+      branch_id: device.assigned_branch_id || req.body.branch_id || 1,
+      user_id: req.body.user_id,
+      role: req.body.role,
+      app_mode: req.body.app_mode || configuredAppMode,
+      company_id: req.body.company_id || configuredCompanyId || "1",
+      cloud_api_url: resolveCanonicalCloudConfig().cloudApiUrl,
+    };
+    const result = await cloudFetchJson("/api/sync/register-device", {
+      method: "POST",
+      body: payload,
+      timeoutMs: 12000,
+    });
+    return res.json({
+      ...(result.data || {}),
+      httpStatus: result.status,
+      cloudUrl: result.url,
+      deviceIdSuffix: maskDeviceId(device.device_id),
+      checkedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    const safe = error.code === "APP_INTERNET_DISABLED"
+      ? { errorCode: "APP_INTERNET_DISABLED", safeErrorMessage: "FroozERP cloud access is disabled by the Owner.", httpStatus: null }
+      : error.code === "CLOUD_NOT_CONFIGURED"
+        ? { errorCode: "CLOUD_NOT_CONFIGURED", safeErrorMessage: "Cloud backend URL is not configured.", httpStatus: null }
+        : safeCloudError(error);
+    return res.status(safe.httpStatus || 503).json({
+      code: safe.errorCode,
+      message: safe.safeErrorMessage,
+      httpStatus: safe.httpStatus,
+    });
+  }
+});
+
+app.get("/api/cloud/device/status", async (req, res) => {
+  const deviceId = cleanText(req.query.device_id || req.headers["x-device-id"] || configuredDeviceId);
+  const userId = req.query.user_id || req.headers["x-user-id"];
+  const branchId = req.query.branch_id || configuredBranchId || 1;
+  if (!deviceId || !userId) return res.status(400).json({ code: "DEVICE_CONTEXT_REQUIRED", message: "user_id and device_id are required." });
+  try {
+    const result = await cloudFetchJson(`/api/device/identity?user_id=${encodeURIComponent(userId)}&device_id=${encodeURIComponent(deviceId)}&branch_id=${encodeURIComponent(branchId)}`, { timeoutMs: 10000 });
+    return res.json({
+      ...(result.data || {}),
+      httpStatus: result.status,
+      deviceIdSuffix: maskDeviceId(deviceId),
+      checkedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    const safe = error.code === "APP_INTERNET_DISABLED"
+      ? { errorCode: "APP_INTERNET_DISABLED", safeErrorMessage: "FroozERP cloud access is disabled by the Owner.", httpStatus: null }
+      : error.code === "CLOUD_NOT_CONFIGURED"
+        ? { errorCode: "CLOUD_NOT_CONFIGURED", safeErrorMessage: "Cloud backend URL is not configured.", httpStatus: null }
+        : safeCloudError(error);
+    return res.status(safe.httpStatus || 503).json({
+      code: safe.errorCode,
+      message: safe.safeErrorMessage,
+      httpStatus: safe.httpStatus,
+      deviceIdSuffix: maskDeviceId(deviceId),
+    });
+  }
+});
+
+app.post("/api/cloud/device/approve", async (req, res) => {
+  try {
+    const identity = await getCanonicalIdentity({
+      userId: req.body.user_id || req.headers["x-user-id"],
+      sessionId: req.body.session_id || req.headers["x-session-id"],
+    });
+    if (!identity.authenticated || !identity.is_owner) {
+      return res.status(403).json({
+        code: "OWNER_REQUIRED",
+        message: "Authenticated Owner permission is required to approve this cloud device.",
+      });
+    }
+    const deviceId = cleanText(req.body.device_id || configuredDeviceId);
+    if (!deviceId) return res.status(400).json({ code: "DEVICE_ID_REQUIRED", message: "device_id is required." });
+    const branchId = parsePositiveInteger(req.body.branch_id || identity.branch_id) || 1;
+    const result = await cloudFetchJson(`/settings/devices/${encodeURIComponent(deviceId)}`, {
+      method: "PUT",
+      body: {
+        action: "APPROVE",
+        updated_by: identity.user_id,
+        assigned_branch_id: branchId,
+        reason: "Owner approved this device from local FroozERP Settings.",
+      },
+      timeoutMs: 12000,
+    });
+    return res.json({
+      ...(result.data || {}),
+      httpStatus: result.status,
+      deviceIdSuffix: maskDeviceId(deviceId),
+      checkedAt: new Date().toISOString(),
+      message: "This cloud device is approved.",
+    });
+  } catch (error) {
+    const safe = error.code === "APP_INTERNET_DISABLED"
+      ? { errorCode: "APP_INTERNET_DISABLED", safeErrorMessage: "FroozERP cloud access is disabled by the Owner.", httpStatus: null }
+      : error.code === "CLOUD_NOT_CONFIGURED"
+        ? { errorCode: "CLOUD_NOT_CONFIGURED", safeErrorMessage: "Cloud backend URL is not configured.", httpStatus: null }
+        : safeCloudError(error);
+    return res.status(safe.httpStatus || 503).json({
+      code: safe.errorCode,
+      message: safe.safeErrorMessage,
+      httpStatus: safe.httpStatus,
+    });
+  }
+});
+
 app.get("/api/integrations/email/status", async (req, res) => {
   try {
     const manager = await getPermissionUser(req.query.user_id || req.headers["x-user-id"], "settings", ["Owner", "Admin"]);
@@ -8308,6 +8662,9 @@ app.get("/api/system/compatibility", async (req, res) => {
     supportedFrostCapabilities,
     compatible: frontendVersion === appVersion,
     database: databaseReachable ? "reachable" : "unreachable",
+    databaseType: databaseUrl ? "postgresql_url" : "postgresql_local",
+    api_mode: configuredAppMode,
+    app_mode: configuredAppMode,
     deploymentType,
     appMode: configuredAppMode,
     serverTime: new Date().toISOString(),
