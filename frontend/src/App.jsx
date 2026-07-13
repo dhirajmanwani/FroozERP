@@ -475,7 +475,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.46";
+const APP_VERSION = "1.0.47";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -12323,7 +12323,6 @@ function UpdateCenterSection({ canManage }) {
   }, [installedVersion]);
   const updateAvailable = updaterState.phase === "update_available";
   const updateDownloaded = updaterState.phase === "ready_to_install";
-  const canInstallUpdate = updateDownloaded && updaterState.signatureVerified;
   const progressPercent = Math.max(0, Math.min(100, Number(updaterState.downloadProgress.percent || 0)));
   const backendDiagnosticVersion = normalizeVersion(backendVersionDiagnostics?.version || "");
   const transactionStatus = String(installDiagnostics?.update_transaction_status || "none");
@@ -12335,10 +12334,12 @@ function UpdateCenterSection({ canManage }) {
       && normalizeVersion(installedVersion) === backendDiagnosticVersion
       && normalizeVersion(installedVersion) === normalizeVersion(updaterState.latestVersion)
   );
+  const canInstallUpdate = updateDownloaded && updaterState.signatureVerified && !versionsFullyMatch;
   const displayLatestVersion = updaterState.latestVersion || (updaterState.phase === "checking" ? "Checking update feed" : "Not checked");
   const updateStatusText = (() => {
     if (incompleteTransaction) return installDiagnostics?.update_transaction_message || "Previous update did not complete. Repair installation required.";
     if (updaterState.phase === "checking") return "Checking update feed";
+    if (versionsFullyMatch) return "FroozERP is up to date";
     if (updaterState.phase === "update_available") return `Update available: ${updaterState.latestVersion}`;
     if (updaterState.phase === "downloading") return `Downloading ${progressPercent || 0}%`;
     if (updaterState.phase === "ready_to_install") return "Update downloaded and signature verified";
