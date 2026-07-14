@@ -39,6 +39,7 @@ use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWN
 static KIOSK_LOCK_ENABLED: AtomicBool = AtomicBool::new(false);
 static KIOSK_CLOSE_ALLOWED: AtomicBool = AtomicBool::new(false);
 static LOCAL_BACKEND_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
+static LOCAL_BACKEND_START_GUARD: Mutex<()> = Mutex::new(());
 #[cfg(target_os = "windows")]
 static DESKTOP_INSTANCE_MUTEX: Mutex<Option<isize>> = Mutex::new(None);
 const LOCAL_BACKEND_PORT: &str = "5000";
@@ -393,12 +394,23 @@ fn current_install_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\FroozERP"))
 }
 
+fn local_backend_port() -> String {
+    #[cfg(test)]
+    if let Ok(port) = env::var("FROOZERP_TEST_BACKEND_PORT") {
+        if port.parse::<u16>().is_ok() {
+            return port;
+        }
+    }
+    LOCAL_BACKEND_PORT.to_string()
+}
+
 fn local_backend_url() -> String {
-    format!("http://127.0.0.1:{}", LOCAL_BACKEND_PORT)
+    format!("http://127.0.0.1:{}", local_backend_port())
 }
 
 fn local_backend_health_response(timeout_ms: u64) -> Result<String, String> {
-    let address = "127.0.0.1:5000";
+    let port = local_backend_port();
+    let address = format!("127.0.0.1:{}", port);
     let timeout = Duration::from_millis(timeout_ms);
     let mut stream = TcpStream::connect_timeout(
         &address
@@ -410,7 +422,13 @@ fn local_backend_health_response(timeout_ms: u64) -> Result<String, String> {
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
     stream
-        .write_all(b"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:5000\r\nConnection: close\r\n\r\n")
+        .write_all(
+            format!(
+                "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+                port
+            )
+            .as_bytes(),
+        )
         .map_err(|error| format!("Local backend health request failed: {}", error))?;
     let mut response = String::new();
     stream
@@ -433,10 +451,11 @@ fn local_backend_health_json(timeout_ms: u64) -> Result<serde_json::Value, Strin
             return serde_json::from_str(extract_http_body(&response))
                 .map_err(|error| format!("Local backend health JSON failed: {}", error));
         }
-        return Err("Port 5000 responded, but it is not FroozERP.".to_string());
+        return Err(format!("Port {} responded, but it is not FroozERP.", local_backend_port()));
     }
     Err(format!(
-        "Port 5000 responded without healthy status: {}",
+        "Port {} responded without healthy status: {}",
+        local_backend_port(),
         response.lines().next().unwrap_or("no status line")
     ))
 }
@@ -485,7 +504,7 @@ fn backend_dir_candidates() -> Vec<PathBuf> {
 fn resolve_backend_dir() -> Result<PathBuf, String> {
     backend_dir_candidates()
         .into_iter()
-        .find(|path| path.join("server.js").exists())
+        .find(|path| path.join("desktopGateway.js").exists())
         .ok_or_else(|| "Packaged FroozERP backend was not found.".to_string())
 }
 
@@ -688,6 +707,12 @@ fn stop_owned_backend(reason: &str) -> bool {
 }
 
 fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceStatus {
+    // The native startup worker and the React startup check can arrive together.
+    // Serialize them so one valid launch cannot be mistaken for a stale lock.
+    let _start_guard = LOCAL_BACKEND_START_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     if !force_restart && local_backend_version_matches(900).unwrap_or(false) {
         write_app_log("INFO", "Local backend already healthy with matching version; reusing existing port 5000 service");
         return backend_status(
@@ -870,15 +895,13 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
         status.error_code = "BACKEND_RUNTIME_MISSING".to_string();
         return status;
     }
-    let package_json_path = backend_dir.join("package.json");
-    let node_modules_path = backend_dir.join("node_modules");
-    if !package_json_path.exists() || !node_modules_path.exists() {
+    let desktop_gateway_path = backend_dir.join("desktopGateway.js");
+    if !desktop_gateway_path.exists() {
         drop(startup_lock);
         release_backend_startup_lock();
         let message = format!(
-            "Packaged FroozERP backend resources are incomplete. package_json_exists={}, node_modules_exists={}, backend_dir={}",
-            package_json_path.exists(),
-            node_modules_path.exists(),
+            "Packaged FroozERP backend resources are incomplete. desktop_gateway_exists={}, backend_dir={}",
+            desktop_gateway_path.exists(),
             backend_dir.to_string_lossy()
         );
         write_app_log("ERROR", &message);
@@ -896,6 +919,34 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
         return status;
     }
     let owner_token = desktop_instance_token();
+    let sqlite_path = local_sqlite_database_path();
+    match local_db::initialize_path(&sqlite_path) {
+        Ok(status) => write_app_log(
+            "INFO",
+            &format!(
+                "Desktop SQLite initialized: path={}, schema={}",
+                status.database_path, status.schema_version
+            ),
+        ),
+        Err(error) => {
+            drop(startup_lock);
+            release_backend_startup_lock();
+            let message = format!("Unable to initialize desktop SQLite database: {}", error);
+            write_app_log("ERROR", &message);
+            let mut status = backend_status(
+                message,
+                false,
+                false,
+                false,
+                None,
+                Some(backend_dir),
+                Some(node_path),
+                startup_source,
+            );
+            status.error_code = "LOCAL_SQLITE_INITIALIZATION_FAILED".to_string();
+            return status;
+        }
+    }
     write_app_log(
         "INFO",
         &format!(
@@ -922,13 +973,23 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
         .ok();
     let mut command = Command::new(&node_path);
     command
-        .arg("server.js")
+        .arg("desktopGateway.js")
         .current_dir(&backend_dir)
-        .env("PORT", LOCAL_BACKEND_PORT)
+        .env("PORT", local_backend_port())
         .env("APP_VERSION", env!("CARGO_PKG_VERSION"))
         .env("APP_MODE", "LOCAL_SINGLE_DEVICE")
+        .env("FROOZERP_RUNTIME_MODE", "desktop-local")
+        .env("FROOZERP_LOCAL_STORAGE", "sqlite")
+        .env("FROOZERP_SQLITE_PATH", &sqlite_path)
         .env("FROOZERP_DESKTOP_SERVICE", "1")
         .env("FROOZERP_BACKEND_OWNER_TOKEN", &owner_token)
+        .env_remove("DATABASE_URL")
+        .env_remove("CLOUD_DATABASE_URL")
+        .env_remove("DB_HOST")
+        .env_remove("DB_PORT")
+        .env_remove("DB_NAME")
+        .env_remove("DB_USER")
+        .env_remove("DB_PASSWORD")
         .stdin(Stdio::null());
     match stdout_file {
         Some(file) => {
@@ -1261,11 +1322,12 @@ fn backend_port_owner_pid() -> Option<u32> {
     hide_child_console(&mut netstat);
     let output = netstat.args(["-ano", "-p", "tcp"]).output().ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let port_suffix = format!(":{}", local_backend_port());
     for line in stdout.lines() {
         let normalized = line.split_whitespace().collect::<Vec<_>>();
         if normalized.len() >= 5
             && normalized[0].eq_ignore_ascii_case("TCP")
-            && normalized[1].contains(":5000")
+            && normalized[1].ends_with(&port_suffix)
             && normalized[3].eq_ignore_ascii_case("LISTENING")
         {
             if let Ok(pid) = normalized[4].parse::<u32>() {
@@ -1980,6 +2042,101 @@ fn pos_sale_load_local(app: AppHandle, invoice_id: String) -> Result<serde_json:
 #[tauri::command]
 fn pos_sale_list_local(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
     local_db::list_local_pos_sales(&app)
+}
+
+#[cfg(test)]
+mod local_backend_lifecycle_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn forced_restart_replaces_only_the_owned_desktop_sqlite_service() {
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let profile_root = env::temp_dir().join(format!(
+            "froozerp-backend-restart-{}-{}",
+            std::process::id(),
+            timestamp_ms()
+        ));
+        let roaming = profile_root.join("AppData").join("Roaming");
+        let local = profile_root.join("AppData").join("Local");
+        fs::create_dir_all(&roaming).expect("create temporary roaming profile");
+        fs::create_dir_all(&local).expect("create temporary local profile");
+
+        let original_appdata = env::var_os("APPDATA");
+        let original_localappdata = env::var_os("LOCALAPPDATA");
+        let original_database_url = env::var_os("DATABASE_URL");
+        let original_test_port = env::var_os("FROOZERP_TEST_BACKEND_PORT");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("reserve isolated backend test port");
+        let test_port = listener
+            .local_addr()
+            .expect("read isolated backend test port")
+            .port();
+        drop(listener);
+        env::set_var("APPDATA", &roaming);
+        env::set_var("LOCALAPPDATA", &local);
+        env::set_var("FROOZERP_TEST_BACKEND_PORT", test_port.to_string());
+        env::set_var(
+            "DATABASE_URL",
+            "postgresql://poison:poison@127.0.0.1:5432/poison",
+        );
+
+        let database_path = local_sqlite_database_path();
+        local_db::initialize_path(&database_path).expect("initialize desktop SQLite database");
+        let first_thread = thread::spawn(|| ensure_local_backend_service_internal(false));
+        let second_thread = thread::spawn(|| ensure_local_backend_service_internal(false));
+        let first = first_thread.join().expect("first startup thread");
+        let second = second_thread.join().expect("second startup thread");
+        assert!(first.healthy, "first start failed: {}", first.message);
+        assert!(second.healthy, "second start failed: {}", second.message);
+        assert_eq!(
+            [first.started, second.started]
+                .into_iter()
+                .filter(|started| *started)
+                .count(),
+            1,
+            "concurrent startup checks must launch exactly one backend"
+        );
+        let first_pid = first.pid.or(second.pid).expect("first owned backend PID");
+
+        let restarted = ensure_local_backend_service_internal(true);
+        assert!(restarted.healthy, "forced restart failed: {}", restarted.message);
+        let restarted_pid = restarted.pid.expect("restarted owned backend PID");
+        assert_ne!(first_pid, restarted_pid, "restart must replace the owned process");
+
+        let health = local_backend_health_json(2_000).expect("health after forced restart");
+        assert_eq!(health.get("status").and_then(|value| value.as_str()), Some("ok"));
+        assert_eq!(
+            health.get("database_type").and_then(|value| value.as_str()),
+            Some("sqlite")
+        );
+        assert_eq!(
+            health
+                .get("client_postgres_access")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+
+        assert!(stop_owned_backend("lifecycle test cleanup"));
+        match original_appdata {
+            Some(value) => env::set_var("APPDATA", value),
+            None => env::remove_var("APPDATA"),
+        }
+        match original_localappdata {
+            Some(value) => env::set_var("LOCALAPPDATA", value),
+            None => env::remove_var("LOCALAPPDATA"),
+        }
+        match original_database_url {
+            Some(value) => env::set_var("DATABASE_URL", value),
+            None => env::remove_var("DATABASE_URL"),
+        }
+        match original_test_port {
+            Some(value) => env::set_var("FROOZERP_TEST_BACKEND_PORT", value),
+            None => env::remove_var("FROOZERP_TEST_BACKEND_PORT"),
+        }
+    }
 }
 
 pub fn run() {

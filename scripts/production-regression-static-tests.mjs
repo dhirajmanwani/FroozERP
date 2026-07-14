@@ -1,0 +1,50 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+
+const root = path.resolve(new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
+const read = (...parts) => fs.readFileSync(path.join(root, ...parts), "utf8");
+const app = read("frontend", "src", "App.jsx");
+const css = read("frontend", "src", "App.css");
+const gateway = read("backend", "desktopGateway.js");
+const adapters = read("backend", "storageAdapters.js");
+const backend = read("backend", "server.js");
+const rust = read("src-tauri", "src", "lib.rs");
+const localDb = read("src-tauri", "src", "local_db.rs");
+
+assert.ok(app.includes('data && typeof data === "object" ? data : {}'), "Settings updater data must normalize null before reading version");
+assert.ok(app.includes("markLocalServiceHealthy"), "Recovered native backend health must clear stale frontend service errors");
+assert.ok(app.includes("refreshBusinessDataAfterSync"), "Successful sync must refresh dashboard and module state");
+assert.ok(app.includes("cacheLocalReferenceSnapshot(snapshot)"), "Successful sync must refresh the durable offline dashboard cache");
+for (const loader of ["loadDashboardData", "loadProducts", "loadProductCategories", "loadSalesHistory", "loadPurchases", "loadAccounts", "loadExpenses", "loadReports"]) {
+  assert.ok(app.includes(loader), `Post-sync refresh must include ${loader}`);
+}
+
+for (const containment of ["min-width: 0", "max-width: 100%", "box-sizing: border-box", "overflow-wrap: anywhere", "word-break: break-word"]) {
+  assert.ok(css.includes(containment), `Responsive containment must include ${containment}`);
+}
+assert.ok(css.includes(".login-panel"), "Login containment must be explicit");
+assert.ok(css.includes(".settings-layout"), "Settings containment must be explicit");
+
+assert.ok(rust.includes("LOCAL_BACKEND_START_GUARD"), "Concurrent backend starts must be serialized");
+assert.ok(rust.includes('.arg("desktopGateway.js")'), "Desktop must launch the PostgreSQL-free gateway");
+for (const variable of ["DATABASE_URL", "CLOUD_DATABASE_URL", "DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"]) {
+  assert.ok(rust.includes(`.env_remove("${variable}")`), `Desktop child must remove inherited ${variable}`);
+}
+assert.ok(adapters.includes("resolveDesktopSqlitePath"), "Desktop SQLite must resolve without user configuration");
+assert.ok(adapters.includes('require("node:sqlite")'), "Clean development profiles must create a valid SQLite file");
+assert.ok(gateway.includes('"cache-control,content-type'), "WebView health preflight must allow Cache-Control");
+assert.ok(gateway.includes('"access-control-allow-private-network": "true"'), "WebView private-network health requests must be allowed");
+assert.ok(gateway.includes("bypassPolicy: input.allowInternetAccess !== false"), "Owner must be able to re-enable App Internet after it was disabled");
+assert.ok(gateway.includes('method: "GET"'), "App Internet owner authentication must use GET /api/auth/me");
+assert.equal(/127\.0\.0\.1:5432/.test(gateway), false, "Desktop gateway must never target local PostgreSQL");
+
+assert.ok(backend.includes("ON CONFLICT (operation_id) DO NOTHING"), "Cloud operation acknowledgements must be idempotent");
+assert.ok(backend.includes("payload: { ...payload, ...sale"), "Cloud POS change feed must retain invoice items for other devices");
+assert.ok(localDb.includes("ON CONFLICT(operation_id) DO NOTHING"), "Local outbox operation IDs must be unique");
+assert.ok(localDb.includes("ON CONFLICT(id) DO UPDATE"), "Pulled local entities must upsert idempotently");
+assert.ok(localDb.includes('apply_migration(&mut conn, "006_multibranch_identity_foundation"'), "SQLite identity migration must be active");
+assert.ok(localDb.includes('apply_migration(&mut conn, "007_cloud_runtime_and_inbox_foundation"'), "SQLite cloud inbox migration must be active");
+assert.ok(localDb.includes('"pos_sale" => apply_pulled_pos_sale_with_tx'), "Pulled POS sales must be applied to the second-device cache");
+
+console.log("Production regression static tests passed");

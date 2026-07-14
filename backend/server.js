@@ -5,8 +5,8 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { execFile } = require("child_process");
-const { Pool, types } = require("pg");
 const nodemailer = require("nodemailer");
+const { RUNTIME_MODES, createStorageAdapter } = require("./storageAdapters");
 const {
   calculateOverdueDays,
   classifyDueStatus,
@@ -16,8 +16,6 @@ const {
   assertGroundedAnswer,
 } = require("./aiBusinessAssistantRules");
 const { registerAiBusinessAssistantRoutes } = require("./aiBusinessAssistantService");
-
-types.setTypeParser(1082, (value) => value);
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
@@ -41,69 +39,21 @@ const frontendIndexExists = fs.existsSync(frontendIndexPath);
 const frontendDistAvailable = () => frontendIndexExists;
 
 const primaryDatabaseUrl = String(process.env.DATABASE_URL || "").trim();
-const cloudDatabaseUrl = String(process.env.CLOUD_DATABASE_URL || "").trim();
 const runtimeNodeEnv = String(process.env.NODE_ENV || "").trim().toLowerCase();
 const runtimeAppMode = String(process.env.APP_MODE || "").trim().toUpperCase();
 const runtimeDeploymentType = String(process.env.FROOZERP_DEPLOYMENT_TYPE || "").trim().toLowerCase();
-const railwayRuntime = Boolean(
-  process.env.RAILWAY_ENVIRONMENT ||
-  process.env.RAILWAY_PROJECT_ID ||
-  process.env.RAILWAY_ENVIRONMENT_ID ||
-  process.env.RAILWAY_SERVICE_ID
-);
-const productionDatabaseRequired = runtimeNodeEnv === "production"
-  || runtimeAppMode === "CLOUD_PRODUCTION"
-  || runtimeDeploymentType === "cloud"
-  || railwayRuntime;
-const localDatabaseHosts = new Set(["localhost", "127.0.0.1", "::1", "0.0.0.0"]);
-const parseDatabaseUrlCandidate = (value, source) => {
-  if (!value || value.includes("${{")) return null;
-  try {
-    const parsed = new URL(value);
-    if (!["postgres:", "postgresql:"].includes(parsed.protocol)) return null;
-    const host = String(parsed.hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
-    if (!host) return null;
-    return {
-      connectionString: value,
-      source,
-      host,
-      local: localDatabaseHosts.has(host),
-    };
-  } catch {
-    return null;
-  }
-};
-const primaryDatabaseCandidate = parseDatabaseUrlCandidate(primaryDatabaseUrl, "DATABASE_URL");
-const cloudDatabaseCandidate = parseDatabaseUrlCandidate(cloudDatabaseUrl, "CLOUD_DATABASE_URL");
-const databaseCandidate = [primaryDatabaseCandidate, cloudDatabaseCandidate]
-  .find((candidate) => candidate && (!productionDatabaseRequired || !candidate.local));
-if (productionDatabaseRequired && !databaseCandidate) {
-  console.log("DB source used: NONE");
-  console.log("DB host: unavailable");
-  console.log("Local fallback blocked: true");
-  throw new Error("Production database URL missing. Set DATABASE_URL to Railway Postgres DATABASE_URL.");
-}
-const databaseUrl = databaseCandidate?.connectionString || "";
-const databaseSource = databaseCandidate?.source || "LOCAL_FALLBACK";
-const databaseHost = databaseCandidate?.host || String(process.env.DB_HOST || "localhost").trim().toLowerCase();
+const { runtimeMode, adapter: storageAdapter } = createStorageAdapter(process.env);
+const desktopLocalRuntime = runtimeMode === RUNTIME_MODES.DESKTOP_LOCAL;
+const cloudServerRuntime = runtimeMode === RUNTIME_MODES.CLOUD_SERVER;
+const productionDatabaseRequired = cloudServerRuntime;
+const databaseUrl = cloudServerRuntime ? primaryDatabaseUrl : "";
+const databaseSource = cloudServerRuntime ? "DATABASE_URL" : "EMBEDDED_SQLITE";
+const databaseHost = cloudServerRuntime ? storageAdapter.host : "embedded";
 console.log(`DB source used: ${databaseSource}`);
 console.log(`DB host: ${databaseHost}`);
-console.log(`Local fallback blocked: ${productionDatabaseRequired}`);
-const databaseSslEnabled = /^true$/i.test(process.env.DB_SSL || "");
-const databaseSslRejectUnauthorized = !/^false$/i.test(process.env.DB_SSL_REJECT_UNAUTHORIZED || "");
-const pool = new Pool(databaseUrl
-  ? {
-      connectionString: databaseUrl,
-      ssl: databaseSslEnabled ? { rejectUnauthorized: databaseSslRejectUnauthorized } : undefined,
-    }
-  : {
-      user: process.env.DB_USER || "postgres",
-      host: process.env.DB_HOST || "localhost",
-      database: process.env.DB_NAME || "froozerp",
-      password: process.env.DB_PASSWORD || "8386",
-      port: Number(process.env.DB_PORT) || 5432,
-      ssl: databaseSslEnabled ? { rejectUnauthorized: databaseSslRejectUnauthorized } : undefined,
-    });
+console.log(`Runtime mode: ${runtimeMode}`);
+console.log(`Client PostgreSQL access blocked: ${!cloudServerRuntime}`);
+const pool = storageAdapter;
 const PORT = process.env.PORT || 5000;
 const backupDirectory = process.env.BACKUP_DIR || path.join(__dirname, "..", "backups");
 const readReleaseVersion = () => {
@@ -156,7 +106,7 @@ const APP_MODES = new Set([
   "FIELD_REMOTE_DEVICE",
   "CUSTOM_API_URL",
 ]);
-const deploymentType = runtimeDeploymentType || "local";
+const deploymentType = cloudServerRuntime ? "cloud" : "local";
 const requestedAppMode = runtimeAppMode || "LOCAL_SINGLE_DEVICE";
 const configuredAppMode = APP_MODES.has(requestedAppMode) ? requestedAppMode : "LOCAL_SINGLE_DEVICE";
 const hostedCloudDeployment = deploymentType === "cloud" && configuredAppMode === "CLOUD_PRODUCTION";
@@ -487,6 +437,66 @@ app.use((req, res, next) => cors({
 
 console.log(`CORS allowed origins: ${allowedCorsOrigins.join(", ")}`);
 console.log("CORS missing Origin allowed: true");
+
+const desktopLocalRoutes = new Set([
+  "/health",
+  "/api/health",
+  "/api/version",
+  "/api/system/compatibility",
+  "/api/cloud/internet-access",
+  "/api/cloud/health",
+  "/api/cloud/device/register",
+  "/api/cloud/device/status",
+]);
+
+const forwardDesktopRequestToCloud = async (req, res) => {
+  const config = resolveCanonicalCloudConfig();
+  if (!config.appInternetAllowed) {
+    return res.status(503).json({
+      code: "APP_INTERNET_DISABLED",
+      message: "FroozERP cloud access is disabled by the Owner.",
+    });
+  }
+  if (!config.cloudApiConfigured) {
+    return res.status(503).json({ code: "CLOUD_NOT_CONFIGURED", message: "Cloud API is not configured." });
+  }
+  const targetUrl = `${config.cloudApiUrl}${req.originalUrl || req.url}`;
+  const forwardedHeaders = {};
+  for (const [name, value] of Object.entries(req.headers || {})) {
+    if (["host", "content-length", "connection", "accept-encoding"].includes(name.toLowerCase())) continue;
+    if (value !== undefined) forwardedHeaders[name] = Array.isArray(value) ? value.join(", ") : String(value);
+  }
+  forwardedHeaders["x-froozerp-client-runtime"] = runtimeMode;
+  try {
+    const response = await fetch(targetUrl, {
+      method: req.method,
+      headers: forwardedHeaders,
+      body: ["GET", "HEAD"].includes(req.method) ? undefined : JSON.stringify(req.body || {}),
+      signal: AbortSignal.timeout(15000),
+      redirect: "follow",
+    });
+    const responseBody = Buffer.from(await response.arrayBuffer());
+    const contentType = response.headers.get("content-type");
+    if (contentType) res.setHeader("content-type", contentType);
+    res.setHeader("x-froozerp-storage-mode", "desktop-sqlite");
+    return res.status(response.status).send(responseBody);
+  } catch (error) {
+    const safe = safeCloudError(error);
+    return res.status(safe.httpStatus || 503).json({
+      code: safe.errorCode,
+      message: safe.safeErrorMessage,
+      target: config.cloudApiUrl,
+    });
+  }
+};
+
+// Desktop clients own their SQLite database through Tauri. Business API requests
+// travel over HTTPS to the cloud and never connect directly to PostgreSQL.
+app.use((req, res, next) => {
+  if (!desktopLocalRuntime || desktopLocalRoutes.has(req.path)) return next();
+  if (req.method === "GET" && (req.path === "/" || path.extname(req.path))) return next();
+  return forwardDesktopRequestToCloud(req, res);
+});
 
 const parsePositiveNumber = (value) => {
   const number = Number(value);
@@ -1130,6 +1140,23 @@ const buildCanonicalIdentity = (user, { authenticated = true, sessionId = "" } =
 const getCanonicalIdentity = async ({ userId, sessionId = "" } = {}, client = pool) => {
   const parsedUserId = parsePositiveInteger(userId);
   if (!parsedUserId) return buildCanonicalIdentity(null);
+  if (desktopLocalRuntime) {
+    try {
+      const result = await cloudFetchJson(
+        `/api/auth/me?user_id=${encodeURIComponent(parsedUserId)}&session_id=${encodeURIComponent(sessionId || "")}`,
+        {
+          headers: {
+            "x-user-id": String(parsedUserId),
+            "x-session-id": String(sessionId || ""),
+          },
+          timeoutMs: 10000,
+        }
+      );
+      return result.data || buildCanonicalIdentity(null);
+    } catch {
+      return buildCanonicalIdentity(null);
+    }
+  }
   const result = await client.query(
     `
     SELECT
@@ -8252,7 +8279,7 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     entityId: invoiceGlobalId,
     operationType: "UPSERT",
     version: sale.entity_version || row.entity_version || 1,
-    payload: { ...sale, invoice_no: invoiceNo, offline_invoice_ref: offlineInvoiceRef },
+    payload: { ...payload, ...sale, invoice_no: invoiceNo, offline_invoice_ref: offlineInvoiceRef },
   });
   return {
     operation_id: operation.operation_id,
@@ -8481,7 +8508,7 @@ const processPosSaleEditOperation = async (client, operation, context) => {
     entityId: invoiceGlobalId || operation.entity_id,
     operationType: "SALE_EDIT",
     version: updatedSale.entity_version || version,
-    payload: { ...updatedSale, offline_invoice_ref: offlineInvoiceRef },
+    payload: { ...(payload.sale || payload), ...updatedSale, offline_invoice_ref: offlineInvoiceRef },
   });
   return {
     operation_id: operation.operation_id,
@@ -8553,7 +8580,7 @@ const processPosSaleCancelOperation = async (client, operation, context) => {
     entityId: invoiceGlobalId || operation.entity_id,
     operationType: "SALE_CANCEL",
     version: cancelledSale.entity_version || version,
-    payload: { ...cancelledSale, offline_invoice_ref: offlineInvoiceRef },
+    payload: { ...(payload.sale || payload), ...cancelledSale, offline_invoice_ref: offlineInvoiceRef },
   });
   return {
     operation_id: operation.operation_id,
@@ -8603,7 +8630,7 @@ const processSyncOperation = async (client, operation, context) => {
 
 const healthHandler = async (_req, res) => {
   try {
-    await pool.query("SELECT 1");
+    const storageHealth = await storageAdapter.health();
     return res.json({
       status: "ok",
       app: "FroozERP",
@@ -8611,6 +8638,10 @@ const healthHandler = async (_req, res) => {
       server_time: new Date().toISOString(),
       version: appVersion,
       database: "reachable",
+      database_type: storageHealth.databaseType,
+      database_path: storageHealth.databasePath || null,
+      storage_adapter: storageAdapter.kind,
+      client_postgres_access: false,
       mode: process.env.NODE_ENV || "development",
       deployment_type: deploymentType,
       app_mode: configuredAppMode,
@@ -8653,8 +8684,8 @@ app.get("/api/version", (_req, res) => {
 app.get("/api/system/compatibility", async (req, res) => {
   let databaseReachable = false;
   try {
-    await pool.query("SELECT 1");
-    databaseReachable = true;
+    const storageHealth = await storageAdapter.health();
+    databaseReachable = storageHealth.reachable === true;
   } catch (error) {
     databaseReachable = false;
   }
@@ -8670,7 +8701,9 @@ app.get("/api/system/compatibility", async (req, res) => {
     supportedFrostCapabilities,
     compatible: frontendVersion === appVersion,
     database: databaseReachable ? "reachable" : "unreachable",
-    databaseType: databaseUrl ? "postgresql_url" : "postgresql_local",
+    databaseType: storageAdapter.databaseType,
+    storageAdapter: storageAdapter.kind,
+    clientPostgresAccess: false,
     api_mode: configuredAppMode,
     app_mode: configuredAppMode,
     deploymentType,
@@ -17648,6 +17681,12 @@ const readBusinessCounts = async () => {
 
 const prepareDatabaseForStartup = async () => {
   console.log("schema bootstrap started");
+  if (desktopLocalRuntime) {
+    const storageHealth = await storageAdapter.initialize();
+    console.log(`desktop SQLite ready: ${storageHealth.databasePath}`);
+    console.log("schema bootstrap completed by Tauri SQLite migration runner");
+    return;
+  }
   if (runStartupSchemaBootstrap) {
     await initializeDatabase();
   } else {
@@ -17686,36 +17725,41 @@ if (frontendDistAvailable()) {
 }
 prepareDatabaseForStartup()
   .then(async () => {
-    if (runStartupReferenceSeed) {
+    if (!desktopLocalRuntime && runStartupReferenceSeed) {
       await seedReferenceChangeLog();
     }
     let lastScheduledBackupDate = "";
-    setInterval(async () => {
-      try {
-        const settingsResult = await pool.query("SELECT * FROM backup_settings WHERE id = 1");
-        const settings = settingsResult.rows[0] || {};
-        if (settings.auto_backup_enabled === false) return;
-        const now = new Date();
-        const today = toDateKey(now);
-        const currentTime = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
-        if (currentTime === (settings.daily_backup_time || "23:59") && lastScheduledBackupDate !== today) {
-          lastScheduledBackupDate = today;
-          await createDatabaseBackup({ backupType: "Scheduled" });
+    if (!desktopLocalRuntime) {
+      setInterval(async () => {
+        try {
+          const settingsResult = await pool.query("SELECT * FROM backup_settings WHERE id = 1");
+          const settings = settingsResult.rows[0] || {};
+          if (settings.auto_backup_enabled === false) return;
+          const now = new Date();
+          const today = toDateKey(now);
+          const currentTime = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+          if (currentTime === (settings.daily_backup_time || "23:59") && lastScheduledBackupDate !== today) {
+            lastScheduledBackupDate = today;
+            await createDatabaseBackup({ backupType: "Scheduled" });
+          }
+        } catch (error) {
+          console.error("Scheduled backup failed", error);
         }
-      } catch (error) {
-        console.error("Scheduled backup failed", error);
-      }
-    }, 60 * 1000);
+      }, 60 * 1000);
+    }
 
     const runShutdownBackup = async (signal) => {
       try {
-        const settingsResult = await pool.query("SELECT backup_on_shutdown FROM backup_settings WHERE id = 1");
-        if (settingsResult.rows[0]?.backup_on_shutdown !== false) {
-          await createDatabaseBackup({ backupType: "Shutdown" });
+        if (!desktopLocalRuntime) {
+          const settingsResult = await pool.query("SELECT backup_on_shutdown FROM backup_settings WHERE id = 1");
+          if (settingsResult.rows[0]?.backup_on_shutdown !== false) {
+            await createDatabaseBackup({ backupType: "Shutdown" });
+          }
         }
       } catch (error) {
         console.error("Shutdown backup failed", error);
       } finally {
+        await storageAdapter.close().catch(() => {});
         process.exit(signal === "SIGINT" ? 0 : 0);
       }
     };

@@ -1996,6 +1996,41 @@ function App() {
     internetAvailableRef.current = internetAvailable;
   }, [internetAvailable]);
 
+  const refreshBusinessDataAfterSync = async () => {
+    const refreshes = [
+      loadProducts,
+      loadProductCategories,
+      loadDashboardData,
+      loadSalesHistory,
+      loadPurchases,
+      loadSupplierData,
+      loadAccounts,
+      loadAccountOutstanding,
+      loadCustomerData,
+      loadExpenses,
+      loadSaleReturns,
+      loadWasteEntries,
+      loadReports,
+    ];
+    const results = await Promise.allSettled(refreshes.map((refresh) => refresh()));
+    const failures = results.filter((result) => result.status === "rejected");
+    if (isTauriRuntime() && userRef.current?.id) {
+      try {
+        const latestDevice = await resolveLocalDeviceInfo(deviceInfoRef.current);
+        const snapshot = await fetchOnlineReferenceSnapshot(userRef.current, latestDevice);
+        const localStatus = await cacheLocalReferenceSnapshot(snapshot);
+        setLocalDbStatus(localStatus);
+      } catch (error) {
+        failures.push({ status: "rejected", reason: error });
+      }
+    }
+    if (failures.length) {
+      console.warn("Post-sync business refresh partially failed", failures.map((result) => getErrorMessage(result.reason, result.reason?.message || "Unknown refresh error")));
+      setSyncMessage(`Sync completed, but ${failures.length} module refresh request(s) failed. Open the affected module to retry.`);
+    }
+    return { refreshed: refreshes.length - failures.length, failed: failures.length };
+  };
+
   const runSyncNow = async (options = {}) => {
     if (!user) return null;
     const force = Boolean(options.force);
@@ -2022,6 +2057,7 @@ function App() {
       branchId: user.branch_id || 1,
     });
     setSyncStatus(status);
+    if (!status.lastError) await refreshBusinessDataAfterSync();
     const nextStatus = buildConnectionStatusModel({ backendHealth, cloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: status, internetAvailable, currentUser: user });
     setSyncMessage(status.lastError ? `Sync failed: ${status.lastError}` : nextStatus.syncSummary);
     return status;
@@ -2056,6 +2092,22 @@ function App() {
     }
   }, []);
 
+  const markLocalServiceHealthy = useCallback((service, reason) => {
+    const health = {
+      ...backendHealthRef.current,
+      online: true,
+      checking: false,
+      apiUrl: API_URL,
+      reasonCode: "OK",
+      message: service?.message || "Local FroozERP service is running.",
+      checkedAt: new Date().toISOString(),
+      reason,
+    };
+    backendHealthRef.current = health;
+    setBackendHealth(health);
+    setOfflineMode(false);
+  }, [API_URL]);
+
   const ensureLocalBackendService = useCallback(async ({ restart = false, reason = "manual" } = {}) => {
     if (!isTauriRuntime() || isCloudMode()) return null;
     const command = restart ? "restart_local_backend_service" : "ensure_local_backend_service";
@@ -2063,6 +2115,7 @@ function App() {
       const service = await invokeTauriCommand(command);
       setLocalBackendService({ ...service, reason, checkedAt: new Date().toISOString() });
       if (service?.healthy) {
+        markLocalServiceHealthy(service, reason);
         setStartupNotice(restart ? "Local FroozERP service restarted." : "Local FroozERP service is running.");
         setStartupError((current) => (/local backend|froozERP service|backend/i.test(current) ? "" : current));
       } else {
@@ -2075,7 +2128,7 @@ function App() {
       setStartupError(message);
       return null;
     }
-  }, []);
+  }, [markLocalServiceHealthy]);
 
   const performConnectivityCheck = useCallback(async (reason = "manual", options = {}) => {
     const now = Date.now();
@@ -2114,8 +2167,9 @@ function App() {
         deviceInfo: deviceInfoRef.current,
         branchId: userRef.current.branch_id || 1,
         })
-        .then((status) => {
+        .then(async (status) => {
           setSyncStatus(status);
+          if (!status.lastError) await refreshBusinessDataAfterSync();
           const nextStatus = buildConnectionStatusModel({ backendHealth: health, cloudHealth: nextCloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: status, internetAvailable: realInternet, currentUser: userRef.current });
           setSyncMessage(status.lastError ? `Sync failed: ${status.lastError}` : nextStatus.syncSummary);
         })
@@ -2208,6 +2262,7 @@ function App() {
       if (!service) return;
       setLocalBackendService({ ...service, reason: "desktop-startup-worker", checkedAt: new Date().toISOString() });
       if (service.healthy) {
+        markLocalServiceHealthy(service, "desktop-startup-worker");
         setStartupNotice("Local FroozERP service is running. You can sign in.");
         setStartupError((current) => (/local backend|froozERP service|backend/i.test(current) ? "" : current));
         connectivityCheckRef.current?.("desktop-backend-ready", { force: true, skipServiceStart: true });
@@ -2218,7 +2273,7 @@ function App() {
       unlisten = cleanup;
     }).catch(() => {});
     return () => unlisten();
-  }, []);
+  }, [markLocalServiceHealthy]);
 
   const queuePhase2SyncTest = async () => {
     if (!user) return;
@@ -2651,6 +2706,13 @@ function App() {
     setInventory(snapshot?.inventory_lots || []);
     setCustomers(snapshot?.customers || []);
     setSalesHistory(snapshot?.sales_history || []);
+    setPurchases(bundle.offlinePurchases || []);
+    setSuppliers(bundle.offlineSuppliers || []);
+    setAccounts(bundle.offlineAccounts || []);
+    setAccountOutstanding(bundle.offlineAccountOutstanding || {});
+    setExpenses(bundle.offlineExpenses || []);
+    setSaleReturns(bundle.offlineSaleReturns || []);
+    setWasteEntries(bundle.offlineWasteEntries || []);
     applySettingsBundle(bundle);
     setOfflineMode(offline);
     setOfflineReady(Boolean(snapshot?.reference_ready));
@@ -2687,6 +2749,13 @@ function App() {
       salesResponse,
       duplicateLogResponse,
       lotDiscountsResponse,
+      purchasesResponse,
+      suppliersResponse,
+      accountsResponse,
+      accountOutstandingResponse,
+      expensesResponse,
+      saleReturnsResponse,
+      wasteEntriesResponse,
     ] = await Promise.all([
       axios.get(`${API_URL}/products`),
       axios.get(`${API_URL}/product-categories`),
@@ -2696,6 +2765,13 @@ function App() {
       axios.get(`${API_URL}/sales`),
       axios.get(`${API_URL}/product-duplicate-archive-log`).catch(() => ({ data: { message: "" } })),
       axios.get(`${API_URL}/lot-discounts`).catch(() => ({ data: [] })),
+      axios.get(`${API_URL}/purchases`),
+      axios.get(`${API_URL}/suppliers`),
+      axios.get(`${API_URL}/accounts`),
+      axios.get(`${API_URL}/accounts/outstanding`),
+      axios.get(`${API_URL}/expenses`),
+      axios.get(`${API_URL}/sale-returns`),
+      axios.get(`${API_URL}/waste-entries`),
     ]);
 
     const settingsPayload = settingsResponse.data || {};
@@ -2745,6 +2821,13 @@ function App() {
         mandiTaxRules: settingsPayload.mandiTaxRules || [],
         rebateRules: settingsPayload.rebateRules || [],
         lotDiscounts: lotDiscountsResponse.data || [],
+        offlinePurchases: purchasesResponse.data || [],
+        offlineSuppliers: suppliersResponse.data || [],
+        offlineAccounts: accountsResponse.data || [],
+        offlineAccountOutstanding: accountOutstandingResponse.data || {},
+        offlineExpenses: expensesResponse.data || [],
+        offlineSaleReturns: saleReturnsResponse.data || [],
+        offlineWasteEntries: wasteEntriesResponse.data || [],
         productDuplicateWarning: duplicateLogResponse.data?.message || "",
       },
     };
@@ -12530,12 +12613,13 @@ function UpdateCenterSection({ canManage }) {
     return `${bytes} bytes`;
   };
   const extractUpdateVersion = useCallback((data = {}) => {
+    const source = data && typeof data === "object" ? data : {};
     const candidates = [
-      ["version", data.version],
-      ["tag_name", data.tag_name],
-      ["name", data.name],
-      ["latest_version", data.latest_version],
-      ["release_title", data.release_title],
+      ["version", source.version],
+      ["tag_name", source.tag_name],
+      ["name", source.name],
+      ["latest_version", source.latest_version],
+      ["release_title", source.release_title],
     ];
     for (const [field, value] of candidates) {
       const parsed = normalizeVersion(value);

@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "lint": "eslint .",
+    "lint": "eslint src --cache --cache-location ../.cache/eslint/frontend",
+    "test:local-runtime": "node --test src/local/offlineSession.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

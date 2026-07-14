@@ -14,7 +14,8 @@
     "verify:update-safety": "node scripts\\verify-update-safety.mjs",
     "build": "npm --prefix frontend run build",
     "backend:check": "node --check backend/server.js",
-    "cloud:verify": "node scripts/cloud/verify-hosted-cloud.mjs"
+    "cloud:verify": "node scripts/cloud/verify-hosted-cloud.mjs",
+    "verify:production": "node scripts/verify-production.mjs"
   },
   "engines": {
     "node": ">=22",

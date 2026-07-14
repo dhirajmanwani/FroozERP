@@ -5625,6 +5625,56 @@ tbody tr:last-child td {
   min-width: 0;
 }
 
+.login-panel,
+.startup-status-panel,
+.startup-api-panel,
+.settings-layout,
+.settings-layout > *,
+.module-card,
+.content-card,
+.update-foundation-panel,
+.update-available-panel,
+.maintenance-cleanup-panel,
+.cleanup-result-grid,
+.cleanup-result-grid > *,
+.sync-diagnostics-panel,
+.sync-owner-summary,
+.sync-owner-row {
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+:where(
+  .login-panel,
+  .startup-status-panel,
+  .startup-api-panel,
+  .settings-layout,
+  .module-card,
+  .content-card,
+  .update-foundation-panel,
+  .update-available-panel,
+  .maintenance-cleanup-panel,
+  .cleanup-result-grid,
+  .sync-diagnostics-panel,
+  .sync-owner-row
+) :where(p, small, span, strong, code, pre, a) {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+:where(.login-panel, .settings-layout, .module-card) .button-row {
+  max-width: 100%;
+  flex-wrap: wrap;
+}
+
+:where(.login-panel, .settings-layout, .module-card) .button-row > button {
+  min-width: 0;
+  max-width: 100%;
+}
+
 .metric-value,
 .summary-metric strong,
 .kpi-card strong,

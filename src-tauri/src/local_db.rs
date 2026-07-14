@@ -6,13 +6,15 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
-const CURRENT_SCHEMA_VERSION: &str = "005_mandi_tax_sale_details";
+const CURRENT_SCHEMA_VERSION: &str = "007_cloud_runtime_and_inbox_foundation";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
 const MIGRATION_003: &str = include_str!("../migrations/sqlite/003_local_first_pos.sql");
 const MIGRATION_004: &str = include_str!("../migrations/sqlite/004_offline_sale_edit_cancel.sql");
 const MIGRATION_005: &str = include_str!("../migrations/sqlite/005_mandi_tax_sale_details.sql");
+const MIGRATION_006: &str = include_str!("../migrations/sqlite/006_multibranch_identity_foundation.sql");
+const MIGRATION_007: &str = include_str!("../migrations/sqlite/007_cloud_runtime_and_inbox_foundation.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -132,6 +134,11 @@ pub fn initialize(app: &AppHandle) -> Result<LocalDbStatus, String> {
     let path = database_path(app)?;
     initialize_at(&path)?;
     status_at(&path)
+}
+
+pub fn initialize_path(path: &Path) -> Result<LocalDbStatus, String> {
+    initialize_at(path)?;
+    status_at(path)
 }
 
 pub fn status(app: &AppHandle) -> Result<LocalDbStatus, String> {
@@ -1318,6 +1325,8 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "003_local_first_pos", MIGRATION_003)?;
     apply_migration(&mut conn, "004_offline_sale_edit_cancel", MIGRATION_004)?;
     apply_migration(&mut conn, "005_mandi_tax_sale_details", MIGRATION_005)?;
+    apply_migration(&mut conn, "006_multibranch_identity_foundation", MIGRATION_006)?;
+    apply_migration(&mut conn, "007_cloud_runtime_and_inbox_foundation", MIGRATION_007)?;
     Ok(())
 }
 
@@ -1348,7 +1357,7 @@ fn status_at(path: &Path) -> Result<LocalDbStatus, String> {
     let conn = Connection::open(path).map_err(to_error)?;
     let schema_version: Option<String> = conn
         .query_row(
-            "SELECT version FROM local_schema_migrations WHERE status = 'APPLIED' ORDER BY applied_at DESC LIMIT 1",
+            "SELECT version FROM local_schema_migrations WHERE status = 'APPLIED' ORDER BY rowid DESC LIMIT 1",
             [],
             |row| row.get(0),
         )
@@ -1659,6 +1668,105 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                     optional_text(customer, "updated_at"),
                     customer.get("entity_version").or_else(|| customer.get("version")).and_then(|value| value.as_i64()).unwrap_or(1),
                     optional_text(customer, "deleted_at"),
+                ],
+            )
+            .map_err(to_error)?;
+        }
+    }
+
+    if let Some(sales) = snapshot.get("sales_history").and_then(|value| value.as_array()) {
+        for sale in sales {
+            let sale_id = optional_text(sale, "global_id")
+                .or_else(|| optional_text(sale, "id").map(|id| format!("cloud-sale-{id}")))
+                .unwrap_or_else(|| format!("cloud-sale-{}", checksum(&sale.to_string())));
+            let offline_ref = optional_text(sale, "offline_invoice_ref")
+                .unwrap_or_else(|| format!("CLOUD-{}", sale_id));
+            let bill_date = optional_text(sale, "sale_date")
+                .or_else(|| optional_text(sale, "transaction_date"))
+                .unwrap_or_else(|| "1970-01-01".to_string());
+            let bill_datetime = optional_text(sale, "bill_datetime")
+                .unwrap_or_else(|| format!("{}T00:00", bill_date));
+            let gross_total = sale
+                .get("gross_amount")
+                .or_else(|| sale.get("gross_total"))
+                .and_then(json_number)
+                .unwrap_or(0.0);
+            let item_discount_total = sale
+                .get("item_discount_amount")
+                .or_else(|| sale.get("item_discount_total"))
+                .and_then(json_number)
+                .unwrap_or(0.0);
+            let bill_discount_total = sale
+                .get("invoice_discount_amount")
+                .or_else(|| sale.get("bill_discount_total"))
+                .and_then(json_number)
+                .unwrap_or(0.0);
+            let tax_total = sale
+                .get("tax_amount")
+                .or_else(|| sale.get("tax_total"))
+                .and_then(json_number)
+                .unwrap_or(0.0);
+            let net_total = sale
+                .get("total_amount")
+                .or_else(|| sale.get("net_total"))
+                .and_then(json_number)
+                .unwrap_or(0.0);
+            tx.execute(
+                "INSERT INTO local_pos_invoices (
+                    id, offline_invoice_ref, branch_id, device_id, user_id, customer_id,
+                    customer_name, customer_mobile, bill_date, bill_datetime, payment_mode,
+                    gross_total, item_discount_total, bill_discount_total, tax_total, net_total,
+                    status, sync_status, server_invoice_no, server_sale_id, entity_version,
+                    created_at, updated_at, synced_at
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                    ?12, ?13, ?14, ?15, ?16, ?17, 'synced', ?18, ?19, ?20,
+                    COALESCE(?21, datetime('now')), COALESCE(?22, datetime('now')), datetime('now')
+                 )
+                 ON CONFLICT(id) DO UPDATE SET
+                    customer_id = excluded.customer_id,
+                    customer_name = excluded.customer_name,
+                    customer_mobile = excluded.customer_mobile,
+                    bill_date = excluded.bill_date,
+                    bill_datetime = excluded.bill_datetime,
+                    payment_mode = excluded.payment_mode,
+                    gross_total = excluded.gross_total,
+                    item_discount_total = excluded.item_discount_total,
+                    bill_discount_total = excluded.bill_discount_total,
+                    tax_total = excluded.tax_total,
+                    net_total = excluded.net_total,
+                    status = excluded.status,
+                    sync_status = 'synced',
+                    server_invoice_no = excluded.server_invoice_no,
+                    server_sale_id = excluded.server_sale_id,
+                    entity_version = excluded.entity_version,
+                    updated_at = excluded.updated_at,
+                    synced_at = datetime('now')",
+                params![
+                    sale_id,
+                    offline_ref,
+                    branch_id,
+                    optional_text(sale, "source_device_id").unwrap_or_else(|| device_id.clone()),
+                    optional_text(sale, "created_by"),
+                    optional_text(sale, "customer_id"),
+                    optional_text(sale, "customer_name"),
+                    optional_text(sale, "customer_mobile"),
+                    bill_date,
+                    bill_datetime,
+                    optional_text(sale, "payment_mode").unwrap_or_else(|| "UNKNOWN".to_string()),
+                    gross_total,
+                    item_discount_total,
+                    bill_discount_total,
+                    tax_total,
+                    net_total,
+                    optional_text(sale, "sale_status")
+                        .or_else(|| optional_text(sale, "status"))
+                        .unwrap_or_else(|| "COMPLETED".to_string()),
+                    optional_text(sale, "invoice_no"),
+                    optional_text(sale, "id"),
+                    sale.get("entity_version").and_then(|value| value.as_i64()).unwrap_or(1),
+                    optional_text(sale, "created_at"),
+                    optional_text(sale, "updated_at"),
                 ],
             )
             .map_err(to_error)?;
@@ -2189,6 +2297,197 @@ fn record_conflict_with_tx(tx: &rusqlite::Transaction, ack: &SyncAck) -> Result<
     Ok(())
 }
 
+fn apply_pulled_pos_sale_with_tx(
+    tx: &rusqlite::Transaction,
+    change: &PulledChange,
+) -> Result<(), String> {
+    let payload = &change.payload;
+    let existing_version: Option<i64> = tx
+        .query_row(
+            "SELECT entity_version FROM local_pos_invoices WHERE id = ?1",
+            [change.entity_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(to_error)?;
+    let incoming_version = change.version.unwrap_or(1);
+    let cancelled = change.operation_type.eq_ignore_ascii_case("SALE_CANCEL")
+        || payload.get("cancelled").and_then(|value| value.as_bool()) == Some(true)
+        || optional_text(payload, "status")
+            .map(|status| status.eq_ignore_ascii_case("CANCELLED"))
+            .unwrap_or(false);
+    let status = if cancelled {
+        "CANCELLED".to_string()
+    } else {
+        optional_text(payload, "status").unwrap_or_else(|| "COMPLETED".to_string())
+    };
+    let server_sale_id = optional_text(payload, "id");
+    let server_invoice_no = optional_text(payload, "invoice_no");
+
+    if let Some(local_version) = existing_version {
+        if incoming_version >= local_version {
+            tx.execute(
+                "UPDATE local_pos_invoices
+                 SET status = ?2,
+                     sync_status = 'synced',
+                     server_invoice_no = COALESCE(?3, server_invoice_no),
+                     server_sale_id = COALESCE(?4, server_sale_id),
+                     entity_version = ?5,
+                     updated_at = COALESCE(?6, updated_at),
+                     synced_at = datetime('now')
+                 WHERE id = ?1",
+                params![
+                    change.entity_id,
+                    status,
+                    server_invoice_no,
+                    server_sale_id,
+                    incoming_version,
+                    change.updated_at,
+                ],
+            )
+            .map_err(to_error)?;
+        }
+        return Ok(());
+    }
+
+    let offline_invoice_ref = optional_text(payload, "offline_invoice_ref")
+        .unwrap_or_else(|| format!("CLOUD-{}", change.entity_id));
+    let branch_id = optional_text(payload, "branch_id").unwrap_or_else(|| "1".to_string());
+    let device_id = optional_text(payload, "source_device_id")
+        .or_else(|| optional_text(payload, "device_id"))
+        .unwrap_or_else(|| "cloud".to_string());
+    let bill_date = optional_text(payload, "bill_date")
+        .or_else(|| optional_text(payload, "transaction_date"))
+        .or_else(|| optional_text(payload, "sale_date"))
+        .unwrap_or_else(|| "1970-01-01".to_string());
+    let bill_datetime = optional_text(payload, "bill_datetime")
+        .unwrap_or_else(|| format!("{}T00:00", bill_date));
+    let payment_mode = optional_text(payload, "payment_mode").unwrap_or_else(|| "UNKNOWN".to_string());
+    let gross_total = payload
+        .get("gross_total")
+        .or_else(|| payload.get("gross_amount"))
+        .and_then(json_number)
+        .unwrap_or(0.0);
+    let item_discount_total = payload
+        .get("item_discount_total")
+        .or_else(|| payload.get("item_discount_amount"))
+        .and_then(json_number)
+        .unwrap_or(0.0);
+    let bill_discount_total = payload
+        .get("bill_discount_total")
+        .or_else(|| payload.get("invoice_discount_amount"))
+        .and_then(json_number)
+        .unwrap_or(0.0);
+    let tax_total = payload
+        .get("tax_total")
+        .or_else(|| payload.get("tax_amount"))
+        .and_then(json_number)
+        .unwrap_or(0.0);
+    let net_total = payload
+        .get("net_total")
+        .or_else(|| payload.get("total_amount"))
+        .and_then(json_number)
+        .unwrap_or(0.0);
+
+    tx.execute(
+        "INSERT INTO local_pos_invoices (
+            id, offline_invoice_ref, branch_id, device_id, user_id, customer_id,
+            customer_name, customer_mobile, bill_date, bill_datetime, payment_mode,
+            gross_total, item_discount_total, bill_discount_total, tax_total, net_total,
+            status, sync_status, server_invoice_no, server_sale_id, entity_version,
+            created_at, updated_at, synced_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+            ?12, ?13, ?14, ?15, ?16, ?17, 'synced', ?18, ?19, ?20,
+            COALESCE(?21, datetime('now')), COALESCE(?22, datetime('now')), datetime('now')
+         )",
+        params![
+            change.entity_id,
+            offline_invoice_ref,
+            branch_id,
+            device_id,
+            optional_text(payload, "created_by").or_else(|| optional_text(payload, "user_id")),
+            optional_text(payload, "customer_id"),
+            optional_text(payload, "customer_name"),
+            optional_text(payload, "customer_mobile"),
+            bill_date,
+            bill_datetime,
+            payment_mode,
+            gross_total,
+            item_discount_total,
+            bill_discount_total,
+            tax_total,
+            net_total,
+            status,
+            server_invoice_no,
+            server_sale_id,
+            incoming_version,
+            optional_text(payload, "created_at"),
+            change.updated_at,
+        ],
+    )
+    .map_err(to_error)?;
+
+    if let Some(items) = payload.get("items").and_then(|value| value.as_array()) {
+        for (index, item) in items.iter().enumerate() {
+            let product_id = optional_text(item, "product_id").unwrap_or_else(|| "unknown".to_string());
+            let lot_id = optional_text(item, "lot_id")
+                .or_else(|| optional_text(item, "inventory_batch_id"))
+                .unwrap_or_else(|| format!("unknown-lot-{}", index));
+            let item_id = optional_text(item, "item_global_id")
+                .or_else(|| optional_text(item, "id"))
+                .unwrap_or_else(|| format!("{}-item-{}", change.entity_id, index + 1));
+            let quantity = item.get("quantity").and_then(json_number).unwrap_or(0.0).max(0.0);
+            let rate = item
+                .get("rate")
+                .or_else(|| item.get("selling_rate"))
+                .and_then(json_number)
+                .unwrap_or(0.0)
+                .max(0.0);
+            let discount = item
+                .get("discount")
+                .or_else(|| item.get("discount_amount"))
+                .and_then(json_number)
+                .unwrap_or(0.0)
+                .max(0.0);
+            let amount = item
+                .get("amount")
+                .or_else(|| item.get("net_amount"))
+                .and_then(json_number)
+                .unwrap_or((quantity * rate - discount).max(0.0));
+            if quantity <= 0.0 {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO local_pos_invoice_items (
+                    id, invoice_id, product_id, product_name, lot_id, lot_name, lot_size,
+                    quantity, unit, rate, discount, amount, stock_movement_id, entity_version
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ON CONFLICT(id) DO NOTHING",
+                params![
+                    item_id,
+                    change.entity_id,
+                    product_id,
+                    optional_text(item, "product_name"),
+                    lot_id,
+                    optional_text(item, "lot_name"),
+                    optional_text(item, "lot_size"),
+                    quantity,
+                    optional_text(item, "unit"),
+                    rate,
+                    discount,
+                    amount,
+                    optional_text(item, "stock_movement_id")
+                        .unwrap_or_else(|| format!("remote-stock-{}-{}", change.entity_id, index + 1)),
+                    incoming_version,
+                ],
+            )
+            .map_err(to_error)?;
+        }
+    }
+    Ok(())
+}
+
 fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Result<(), String> {
     let _change_id = &change.change_id;
     let operation = change.operation_type.to_uppercase();
@@ -2275,6 +2574,7 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
             )
             .map_err(to_error)?;
         }
+        "pos_sale" => apply_pulled_pos_sale_with_tx(tx, change)?,
         "sync_test" => {
             tx.execute(
                 "INSERT INTO local_sync_test_entities (id, branch_id, device_id, value, server_version, sync_status, updated_at, deleted_at)
@@ -2361,6 +2661,222 @@ mod tests {
                 "amount": amount
             }]
         })
+    }
+
+    #[test]
+    fn clean_profiles_initialize_sqlite_schema_independently_and_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "froozerp-clean-profiles-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let first = root.join("device-a").join(LOCAL_DB_FILE);
+        let second = root.join("device-b").join(LOCAL_DB_FILE);
+
+        for path in [&first, &second] {
+            initialize_at(path).expect("initialize fresh SQLite profile");
+            let status = status_at(path).expect("read fresh SQLite status");
+            assert!(status.initialized);
+            assert_eq!(status.schema_version, CURRENT_SCHEMA_VERSION);
+            let conn = Connection::open(path).expect("open initialized SQLite database");
+            let migration_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM local_schema_migrations WHERE status = 'APPLIED'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("migration count");
+            assert_eq!(migration_count, 7);
+            drop(conn);
+            initialize_at(path).expect("restart with existing SQLite profile");
+        }
+
+        assert_ne!(first, second);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn existing_schema_five_upgrades_additively_without_losing_local_data() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-schema-upgrade-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        let mut conn = Connection::open(&path).expect("open schema upgrade database");
+        conn.execute_batch(
+            "CREATE TABLE local_schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+                checksum TEXT NOT NULL,
+                status TEXT NOT NULL
+            );",
+        )
+        .expect("create legacy migration table");
+        for (version, sql) in [
+            ("001_local_foundation", MIGRATION_001),
+            ("002_sync_engine_foundation", MIGRATION_002),
+            ("003_local_first_pos", MIGRATION_003),
+            ("004_offline_sale_edit_cancel", MIGRATION_004),
+            ("005_mandi_tax_sale_details", MIGRATION_005),
+        ] {
+            apply_migration(&mut conn, version, sql).expect("apply legacy migration");
+        }
+        conn.execute(
+            "INSERT INTO local_kv (key, value) VALUES ('preservation-marker', 'keep-me')",
+            [],
+        )
+        .expect("insert preservation marker");
+        drop(conn);
+
+        initialize_at(&path).expect("upgrade existing SQLite database");
+        let conn = Connection::open(&path).expect("inspect upgraded SQLite database");
+        let migration_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_schema_migrations WHERE status = 'APPLIED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration count");
+        let marker: String = conn
+            .query_row(
+                "SELECT value FROM local_kv WHERE key = 'preservation-marker'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("preserved marker");
+        assert_eq!(migration_count, 7);
+        assert_eq!(marker, "keep-me");
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pulled_pos_sale_is_applied_once_without_double_stock_mutation() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-pulled-sale-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize pull test database");
+        let change = PulledChange {
+            change_id: serde_json::json!(101),
+            entity_type: "pos_sale".to_string(),
+            entity_id: "remote-sale-1".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            updated_at: Some("2026-07-14T12:00:00.000Z".to_string()),
+            payload: serde_json::json!({
+                "id": 501,
+                "offline_invoice_ref": "REMOTE-OFF-1",
+                "branch_id": 1,
+                "source_device_id": "device-b",
+                "created_by": 1,
+                "customer_id": 1,
+                "customer_name": "Walk-in Customer",
+                "sale_date": "2026-07-14",
+                "bill_datetime": "2026-07-14T12:00",
+                "payment_mode": "CASH",
+                "gross_amount": 50,
+                "total_amount": 50,
+                "invoice_no": "FZ-REMOTE-1",
+                "items": [{
+                    "item_global_id": "remote-sale-item-1",
+                    "product_id": 10,
+                    "product_name": "Remote Test Product",
+                    "inventory_batch_id": 20,
+                    "quantity": 1,
+                    "selling_rate": 50,
+                    "net_amount": 50
+                }]
+            }),
+        };
+        for _ in 0..2 {
+            let mut conn = Connection::open(&path).expect("open pull test database");
+            let tx = conn.transaction().expect("start pull transaction");
+            apply_change_with_tx(&tx, &change).expect("apply pulled sale");
+            tx.commit().expect("commit pulled sale");
+        }
+        let conn = Connection::open(&path).expect("inspect pull test database");
+        let invoice_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_pos_invoices WHERE id = 'remote-sale-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("remote invoice count");
+        let item_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_pos_invoice_items WHERE invoice_id = 'remote-sale-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("remote item count");
+        let movement_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_stock_movements WHERE invoice_id = 'remote-sale-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("remote stock movement count");
+        assert_eq!(invoice_count, 1);
+        assert_eq!(item_count, 1);
+        assert_eq!(movement_count, 0, "pulled sales must not deduct a separately refreshed stock snapshot");
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn online_reference_snapshot_caches_dashboard_sales_idempotently() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-snapshot-sales-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize sales snapshot database");
+        let snapshot = serde_json::json!({
+            "branch_context": { "branch_id": "1", "branch_name": "Main" },
+            "device_identity": { "device_id": "device-b", "device_name": "Device B" },
+            "products": [],
+            "categories": [],
+            "inventory_lots": [],
+            "customers": [],
+            "sales_history": [{
+                "id": 700,
+                "global_id": "cloud-sale-global-700",
+                "invoice_no": "FZ-700",
+                "sale_date": "2026-07-14",
+                "payment_mode": "CASH",
+                "gross_amount": 75,
+                "total_amount": 75,
+                "customer_name": "Walk-in Customer",
+                "created_at": "2026-07-14T13:00:00.000Z"
+            }],
+            "settings_bundle": {}
+        });
+        cache_reference_snapshot_at(&path, &snapshot).expect("cache first sales snapshot");
+        cache_reference_snapshot_at(&path, &snapshot).expect("cache repeated sales snapshot");
+        let conn = Connection::open(&path).expect("inspect sales snapshot database");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_pos_invoices WHERE id = 'cloud-sale-global-700'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("cached sale count");
+        let total: f64 = conn
+            .query_row(
+                "SELECT net_total FROM local_pos_invoices WHERE id = 'cloud-sale-global-700'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("cached sale total");
+        assert_eq!(count, 1);
+        assert_eq!(total, 75.0);
+        drop(conn);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

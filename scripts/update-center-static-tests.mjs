@@ -33,6 +33,7 @@ for (const phase of ["idle", "checking", "update_available", "up_to_date", "down
 }
 
 assert.ok(section.includes("updateRequestIdRef.current !== requestId"), "Stale updater responses must be ignored");
+assert.ok(section.includes('data && typeof data === "object" ? data : {}'), "Null updater/manifest responses must be normalized before reading version fields");
 assert.ok(section.includes("install_diagnostics"), "Desktop version must come from Tauri install diagnostics");
 assert.ok(section.includes("local_backend_service_status"), "Backend PID/path must come from Tauri backend status");
 assert.ok(section.includes("NO_UPDATE_OBJECT"), "Missing Tauri update object must be explicit");
