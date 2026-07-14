@@ -5,7 +5,14 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
-COPY --chown=node:node server.js ./
+COPY --chown=node:node \
+  server.js \
+  storageAdapters.js \
+  aiBusinessAssistantRules.js \
+  aiBusinessAssistantService.js \
+  frostCore.js \
+  frostIntelligence.js \
+  ./
 RUN mkdir -p /app/backups && chown -R node:node /app
 
 ENV NODE_ENV=production
