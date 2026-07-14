@@ -38,6 +38,12 @@ const withTimeout = (timeoutMs = 10000) => ({
 });
 
 const normalizeApiUrl = (apiUrl) => String(apiUrl || "").replace(/\/$/, "");
+const LEGACY_PRODUCTION_CLOUD_API_URLS = new Set(["https://froozerp-production.up.railway.app"]);
+const DEFAULT_PRODUCTION_CLOUD_API_URL = "https://froozerp-production-27bb.up.railway.app";
+const canonicalizeCloudApiUrl = (apiUrl) => {
+  const normalized = normalizeApiUrl(apiUrl);
+  return LEGACY_PRODUCTION_CLOUD_API_URLS.has(normalized) ? DEFAULT_PRODUCTION_CLOUD_API_URL : normalized;
+};
 
 const endpointUrl = (apiUrl, path) => `${normalizeApiUrl(apiUrl)}${path}`;
 
@@ -59,7 +65,7 @@ const readSavedApiConfig = () => {
     subBranchId: String(import.meta.env.VITE_SUB_BRANCH_ID || "").trim(),
     deviceId: String(import.meta.env.VITE_DEVICE_ID || "").trim(),
     deviceName: String(import.meta.env.VITE_DEVICE_NAME || "").trim(),
-    cloudApiUrl: normalizeApiUrl(import.meta.env.VITE_CLOUD_API_URL || "https://froozerp-production.up.railway.app"),
+    cloudApiUrl: canonicalizeCloudApiUrl(import.meta.env.VITE_CLOUD_API_URL || DEFAULT_PRODUCTION_CLOUD_API_URL),
     branchLanApiUrl: normalizeApiUrl(import.meta.env.VITE_BRANCH_LAN_API_URL || ""),
     customApiUrl: normalizeApiUrl(import.meta.env.VITE_CUSTOM_API_URL || ""),
   };
@@ -74,7 +80,7 @@ const readSavedApiConfig = () => {
         cloudApiUrl: getCurrentOrigin(),
       };
     }
-    return { ...defaults, ...saved };
+    return { ...defaults, ...saved, cloudApiUrl: canonicalizeCloudApiUrl(saved.cloudApiUrl || defaults.cloudApiUrl) };
   } catch {
     return isRailwayProductionHost()
       ? { ...defaults, mode: "CLOUD_PRODUCTION", cloudApiUrl: getCurrentOrigin() }

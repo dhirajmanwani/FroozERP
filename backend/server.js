@@ -68,7 +68,12 @@ const readReleaseVersion = () => {
   }
 };
 const appVersion = process.env.APP_VERSION || readReleaseVersion();
-const productionRailwayOrigin = "https://froozerp-production.up.railway.app";
+const legacyProductionRailwayOrigins = new Set(["https://froozerp-production.up.railway.app"]);
+const productionRailwayOrigin = "https://froozerp-production-27bb.up.railway.app";
+const canonicalizeCloudApiUrl = (value) => {
+  const normalized = String(value || "").trim().replace(/\/$/, "");
+  return legacyProductionRailwayOrigins.has(normalized) ? productionRailwayOrigin : normalized;
+};
 const defaultCorsOrigins = [
   productionRailwayOrigin,
   "http://localhost:5173",
@@ -110,13 +115,13 @@ const deploymentType = cloudServerRuntime ? "cloud" : "local";
 const requestedAppMode = runtimeAppMode || "LOCAL_SINGLE_DEVICE";
 const configuredAppMode = APP_MODES.has(requestedAppMode) ? requestedAppMode : "LOCAL_SINGLE_DEVICE";
 const hostedCloudDeployment = deploymentType === "cloud" && configuredAppMode === "CLOUD_PRODUCTION";
-const configuredCompanyId = String(process.env.COMPANY_ID || process.env.FROOZERP_COMPANY_ID || (hostedCloudDeployment ? "1" : "")).trim() || null;
+const configuredCompanyId = String(process.env.COMPANY_ID || process.env.FROOZERP_COMPANY_ID || "").trim() || null;
 const configuredCompanyName = String(process.env.FROOZERP_COMPANY_NAME || "").trim() || null;
-const configuredBranchId = String(process.env.BRANCH_ID || (hostedCloudDeployment ? "1" : "")).trim() || null;
+const configuredBranchId = String(process.env.BRANCH_ID || "").trim() || null;
 const configuredDeviceId = String(process.env.DEVICE_ID || "").trim() || null;
 const configuredDeviceName = String(process.env.DEVICE_NAME || "").trim() || null;
 const cloudDeploymentId = String(process.env.FROOZERP_CLOUD_DEPLOYMENT_ID || (hostedCloudDeployment ? "railway-production" : "")).trim() || null;
-const publicCloudApiUrl = String(process.env.CLOUD_API_URL || process.env.FROOZERP_PUBLIC_API_URL || (hostedCloudDeployment ? productionRailwayOrigin : "")).trim().replace(/\/$/, "") || null;
+const publicCloudApiUrl = canonicalizeCloudApiUrl(process.env.CLOUD_API_URL || process.env.FROOZERP_PUBLIC_API_URL || (hostedCloudDeployment ? productionRailwayOrigin : "")) || null;
 const readOptionalBoolean = (value, defaultValue) => {
   const normalized = String(value || "").trim().toLowerCase();
   if (!normalized) return defaultValue;
@@ -157,20 +162,37 @@ const isRealHostedCloudUrl = (value) => {
   }
 };
 const cloudApiConfigured = isRealHostedCloudUrl(publicCloudApiUrl);
-const cloudConfigurationChecks = () => ({
+const resolveCloudDeploymentIdentity = async (client = pool) => {
+  const [companyResult, branchResult] = await Promise.all([
+    configuredCompanyId
+      ? Promise.resolve({ rows: [{ id: configuredCompanyId, company_name: configuredCompanyName }] })
+      : client.query("SELECT id, company_name FROM companies ORDER BY id LIMIT 1").catch(() => ({ rows: [] })),
+    configuredBranchId
+      ? Promise.resolve({ rows: [{ id: configuredBranchId }] })
+      : client.query("SELECT id, branch_name, company_id FROM branches WHERE active IS DISTINCT FROM FALSE ORDER BY id LIMIT 1").catch(() => ({ rows: [] })),
+  ]);
+  const company = companyResult.rows[0] || {};
+  const branch = branchResult.rows[0] || {};
+  return {
+    companyId: String(company.id || branch.company_id || "").trim() || null,
+    companyName: configuredCompanyName || company.company_name || null,
+    branchId: String(branch.id || "").trim() || null,
+    branchName: branch.branch_name || null,
+  };
+};
+const cloudConfigurationChecks = (identity = {}) => ({
   deployment_type_cloud: deploymentType === "cloud",
   node_env_production: process.env.NODE_ENV === "production",
   app_mode_cloud_production: configuredAppMode === "CLOUD_PRODUCTION",
   public_https_cloud_api: cloudApiConfigured,
   hosted_database_configured: databaseConfigurationProvided,
-  company_id_configured: Boolean(configuredCompanyId),
-  branch_id_configured: Boolean(configuredBranchId),
+  company_id_configured: Boolean(identity.companyId || configuredCompanyId),
+  branch_id_configured: Boolean(identity.branchId || configuredBranchId),
   cloud_deployment_id_configured: Boolean(cloudDeploymentId),
   allowed_origins_configured: allowedCorsOrigins.length > 0 && !allowedCorsOrigins.includes("*"),
   startup_schema_bootstrap_disabled: !runStartupSchemaBootstrap,
   startup_reference_seed_disabled: !runStartupReferenceSeed,
 });
-const cloudConfigurationReady = Object.values(cloudConfigurationChecks()).every(Boolean);
 const canonicalCloudApiUrl = isRealHostedCloudUrl(publicCloudApiUrl) ? publicCloudApiUrl : productionRailwayOrigin;
 const cloudPolicyDirectory = path.join(os.homedir(), "AppData", "Roaming", "com.srtcompany.froozerp");
 const cloudPolicyPath = path.join(cloudPolicyDirectory, "cloud-network-policy.json");
@@ -2046,7 +2068,7 @@ const initializeDatabase = async () => {
       last_sync_at TIMESTAMP,
       pending_count INTEGER NOT NULL DEFAULT 0 CHECK (pending_count >= 0),
       device_id VARCHAR(120) DEFAULT 'LOCAL-STORE',
-      notes TEXT DEFAULT 'Cloud sync architecture prepared. Online sync delivery is not enabled yet.',
+      notes TEXT DEFAULT 'Cloud sync push/pull is enabled for approved devices and supported sync entities.',
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     ALTER TABLE sync_settings ADD COLUMN IF NOT EXISTS device_display_name VARCHAR(160) DEFAULT 'Main Counter Device';
@@ -5090,11 +5112,11 @@ app.post("/api/cloud/device/register", async (req, res) => {
       device_name: device.device_name,
       platform: req.body.platform || device.device_type,
       app_version: cleanText(req.body.app_version) || appVersion,
-      branch_id: device.assigned_branch_id || req.body.branch_id || 1,
+      branch_id: device.assigned_branch_id || req.body.branch_id,
       user_id: req.body.user_id,
       role: req.body.role,
       app_mode: req.body.app_mode || configuredAppMode,
-      company_id: req.body.company_id || configuredCompanyId || "1",
+      company_id: req.body.company_id || configuredCompanyId || "",
       cloud_api_url: resolveCanonicalCloudConfig().cloudApiUrl,
     };
     const result = await cloudFetchJson("/api/sync/register-device", {
@@ -5126,8 +5148,8 @@ app.post("/api/cloud/device/register", async (req, res) => {
 app.get("/api/cloud/device/status", async (req, res) => {
   const deviceId = cleanText(req.query.device_id || req.headers["x-device-id"] || configuredDeviceId);
   const userId = req.query.user_id || req.headers["x-user-id"];
-  const branchId = req.query.branch_id || configuredBranchId || 1;
-  if (!deviceId || !userId) return res.status(400).json({ code: "DEVICE_CONTEXT_REQUIRED", message: "user_id and device_id are required." });
+  const branchId = req.query.branch_id || configuredBranchId;
+  if (!deviceId || !userId || !branchId) return res.status(400).json({ code: "DEVICE_CONTEXT_REQUIRED", message: "user_id, device_id and branch_id are required." });
   try {
     const result = await cloudFetchJson(`/api/device/identity?user_id=${encodeURIComponent(userId)}&device_id=${encodeURIComponent(deviceId)}&branch_id=${encodeURIComponent(branchId)}`, { timeoutMs: 10000 });
     return res.json({
@@ -5165,7 +5187,7 @@ app.post("/api/cloud/device/approve", async (req, res) => {
     }
     const deviceId = cleanText(req.body.device_id || configuredDeviceId);
     if (!deviceId) return res.status(400).json({ code: "DEVICE_ID_REQUIRED", message: "device_id is required." });
-    const branchId = parsePositiveInteger(req.body.branch_id || identity.branch_id) || 1;
+    const branchId = parsePositiveInteger(req.body.branch_id || identity.branch_id);
     const result = await cloudFetchJson(`/settings/devices/${encodeURIComponent(deviceId)}`, {
       method: "PUT",
       body: {
@@ -7709,14 +7731,14 @@ const syncRateWindow = new Map();
 
 const requireSyncContext = async ({ userId, deviceId, branchId }, client = pool) => {
   const parsedUserId = parsePositiveInteger(userId);
-  const parsedBranchId = parsePositiveInteger(branchId) || 1;
+  const parsedBranchId = parsePositiveInteger(branchId);
   const cleanDeviceId = cleanText(deviceId);
-  if (!parsedUserId || !cleanDeviceId) {
-    return { error: { status: 401, message: "Sync requires user_id and device_id" } };
+  if (!parsedUserId || !cleanDeviceId || !parsedBranchId) {
+    return { error: { status: 401, message: "Sync requires user_id, device_id and branch_id" } };
   }
   const userResult = await client.query(
     `
-    SELECT u.id, u.full_name, u.branch_id, u.active, r.role_name
+    SELECT u.id, u.full_name, u.company_id, u.branch_id, u.active, r.role_name
     FROM users u
     JOIN roles r ON r.id = u.role_id
     WHERE u.id = $1 AND u.active = TRUE
@@ -7737,11 +7759,22 @@ const requireSyncContext = async ({ userId, deviceId, branchId }, client = pool)
   if (["DISABLED", "REVOKED"].includes(String(device.status || "").toUpperCase())) {
     return { error: { status: 403, message: "Device is disabled or revoked" } };
   }
-  const deviceBranchId = Number(device.assigned_branch_id || parsedBranchId || 1);
+  const branchResult = await client.query("SELECT id, company_id, active FROM branches WHERE id = $1 LIMIT 1", [parsedBranchId]);
+  const branch = branchResult.rows[0];
+  if (!branch || branch.active === false) {
+    return { error: { status: 403, message: "Branch is not active for sync" } };
+  }
+  const deviceBranchId = Number(device.assigned_branch_id || 0);
   if (deviceBranchId !== parsedBranchId) {
     return { error: { status: 403, message: "Device is not assigned to this branch" } };
   }
-  return { user, device, branchId: parsedBranchId, deviceId: cleanDeviceId };
+  const userCompanyId = Number(user.company_id || branch.company_id || 0);
+  const branchCompanyId = Number(branch.company_id || userCompanyId || 0);
+  const deviceCompanyId = Number(device.company_id || branchCompanyId || 0);
+  if (!userCompanyId || !branchCompanyId || userCompanyId !== branchCompanyId || deviceCompanyId !== branchCompanyId) {
+    return { error: { status: 403, message: "Company or branch scope does not match this device" } };
+  }
+  return { user, device, branch, companyId: branchCompanyId, branchId: parsedBranchId, deviceId: cleanDeviceId };
 };
 
 const rateLimitSyncRequest = (req, res, next) => {
@@ -8631,6 +8664,9 @@ const processSyncOperation = async (client, operation, context) => {
 const healthHandler = async (_req, res) => {
   try {
     const storageHealth = await storageAdapter.health();
+    const cloudIdentity = await resolveCloudDeploymentIdentity();
+    const cloudChecks = cloudConfigurationChecks(cloudIdentity);
+    const cloudReady = Object.values(cloudChecks).every(Boolean);
     return res.json({
       status: "ok",
       app: "FroozERP",
@@ -8647,10 +8683,10 @@ const healthHandler = async (_req, res) => {
       app_mode: configuredAppMode,
       cloud_api_configured: cloudApiConfigured,
       device_identity_configured: Boolean(configuredDeviceId && configuredDeviceName),
-      cloud_ready: cloudConfigurationReady,
-      company_id: configuredCompanyId,
-      company_name: configuredCompanyName,
-      branch_id: configuredBranchId,
+      cloud_ready: cloudReady,
+      company_id: cloudIdentity.companyId,
+      company_name: cloudIdentity.companyName,
+      branch_id: cloudIdentity.branchId,
     });
   } catch (error) {
     console.error("Health check failed", error.message);
@@ -8661,7 +8697,9 @@ const healthHandler = async (_req, res) => {
 app.get("/api/health", healthHandler);
 app.get("/health", healthHandler);
 
-app.get("/api/version", (_req, res) => {
+app.get("/api/version", async (_req, res) => {
+  const cloudIdentity = await resolveCloudDeploymentIdentity();
+  const cloudReady = Object.values(cloudConfigurationChecks(cloudIdentity)).every(Boolean);
   res.json({
     status: "ok",
     app: "FroozERP",
@@ -8673,10 +8711,10 @@ app.get("/api/version", (_req, res) => {
     app_mode: configuredAppMode,
     cloud_api_configured: cloudApiConfigured,
     device_identity_configured: Boolean(configuredDeviceId && configuredDeviceName),
-    cloud_ready: cloudConfigurationReady,
-    company_id: configuredCompanyId,
-    company_name: configuredCompanyName,
-    branch_id: configuredBranchId,
+    cloud_ready: cloudReady,
+    company_id: cloudIdentity.companyId,
+    company_name: cloudIdentity.companyName,
+    branch_id: cloudIdentity.branchId,
     api: "FroozERP Cloud Foundation",
   });
 });
@@ -8714,6 +8752,7 @@ app.get("/api/system/compatibility", async (req, res) => {
 
 app.get("/api/cloud/readiness", async (_req, res) => {
   let databaseReachable = false;
+  const cloudIdentity = await resolveCloudDeploymentIdentity();
   try {
     await pool.query("SELECT 1");
     databaseReachable = true;
@@ -8721,7 +8760,7 @@ app.get("/api/cloud/readiness", async (_req, res) => {
     console.error("Cloud readiness database check failed", error.message);
   }
   const checks = {
-    ...cloudConfigurationChecks(),
+    ...cloudConfigurationChecks(cloudIdentity),
     database_reachable: databaseReachable,
   };
   const blockers = Object.entries(checks)
@@ -8739,8 +8778,8 @@ app.get("/api/cloud/readiness", async (_req, res) => {
     blockers,
     deployment_type: deploymentType,
     app_mode: configuredAppMode,
-    company_id: configuredCompanyId,
-    branch_id: configuredBranchId,
+    company_id: cloudIdentity.companyId,
+    branch_id: cloudIdentity.branchId,
     cloud_api_url: publicCloudApiUrl,
     allowed_origin_count: allowedCorsOrigins.filter((origin) => origin !== "*").length,
     server_time: new Date().toISOString(),
@@ -8755,21 +8794,27 @@ const registerSyncDeviceHandler = async (req, res) => {
     }, req);
     if (!device.device_id) return res.status(400).json({ message: "device_id is required" });
     const saved = await upsertDeviceRequest(device);
+    const branchId = parsePositiveInteger(saved.assigned_branch_id || device.assigned_branch_id);
+    const branchResult = branchId
+      ? await pool.query("SELECT id, company_id FROM branches WHERE id = $1 AND active IS DISTINCT FROM FALSE LIMIT 1", [branchId])
+      : { rows: [] };
+    const branch = branchResult.rows[0] || {};
     await pool.query(
       `
       UPDATE authorized_devices
       SET platform = $2,
           app_version = $3,
+          company_id = COALESCE($4, company_id),
           updated_at = CURRENT_TIMESTAMP
       WHERE device_id = $1
       `,
-      [device.device_id, cleanText(req.body.platform) || device.device_type, cleanText(req.body.app_version) || "1.0.0"]
+      [device.device_id, cleanText(req.body.platform) || device.device_type, cleanText(req.body.app_version) || "1.0.0", parsePositiveInteger(branch.company_id)]
     );
     return res.json({
       device_id: saved.device_id,
       status: saved.status,
-      branch_id: saved.assigned_branch_id || 1,
-      company_id: configuredCompanyId || "1",
+      branch_id: branch.id || saved.assigned_branch_id || null,
+      company_id: branch.company_id || null,
       sub_branch_id: null,
       app_mode: cleanText(req.body.app_mode) || null,
       role: cleanText(req.body.role) || null,
@@ -8802,7 +8847,7 @@ app.get("/api/device/identity", rateLimitSyncRequest, async (req, res) => {
       app: "FroozERP",
       api_version: apiContractVersion,
       app_version: appVersion,
-      company_id: configuredCompanyId || "1",
+      company_id: context.companyId,
       company_name: configuredCompanyName,
       branch_id: context.branchId,
       branch_name: branch.branch_name || null,
@@ -8861,7 +8906,7 @@ app.get("/api/branch/status", rateLimitSyncRequest, async (req, res) => {
       app: "FroozERP",
       api_version: apiContractVersion,
       version: appVersion,
-      company_id: configuredCompanyId || "1",
+      company_id: context.companyId,
       branch_id: branch.id,
       branch_name: branch.branch_name,
       parent_branch_id: branch.parent_branch_id,
@@ -8874,7 +8919,7 @@ app.get("/api/branch/status", rateLimitSyncRequest, async (req, res) => {
       last_branch_sync_at: devices.last_branch_sync_at || null,
       deployment_type: deploymentType,
       app_mode: configuredAppMode,
-      cloud_ready: cloudConfigurationReady,
+      cloud_ready: Object.values(cloudConfigurationChecks({ companyId: context.companyId, branchId: context.branchId })).every(Boolean),
       server_time: new Date().toISOString(),
     });
   } catch (error) {
@@ -8914,6 +8959,7 @@ app.post("/api/sync/push", rateLimitSyncRequest, async (req, res) => {
     await client.query("COMMIT");
     return res.json({
       device_id: context.deviceId,
+      company_id: context.companyId,
       branch_id: context.branchId,
       server_time: new Date().toISOString(),
       acknowledgements,
@@ -8956,6 +9002,8 @@ app.get("/api/sync/pull", rateLimitSyncRequest, async (req, res) => {
       [context.deviceId]
     );
     return res.json({
+      company_id: context.companyId,
+      branch_id: context.branchId,
       changes: rows,
       next_cursor: nextCursor,
       server_time: new Date().toISOString(),
@@ -8984,7 +9032,7 @@ app.get("/api/sync/status", rateLimitSyncRequest, async (req, res) => {
       status: "ok",
       app: "FroozERP",
       api_version: apiContractVersion,
-      company_id: configuredCompanyId || "1",
+      company_id: context.companyId,
       device_id: context.deviceId,
       branch_id: context.branchId,
       user_id: context.user.id,
@@ -9459,17 +9507,20 @@ app.post("/login", async (req, res) => {
         u.joining_date,
         u.notes,
         u.last_login_at,
+        u.company_id,
         u.branch_id,
         u.active,
         u.force_password_change,
         u.session_revocation_version,
         u.locked_until,
         r.role_name,
+        co.company_name,
         b.branch_name,
         b.active AS branch_active
       FROM users u
       JOIN roles r ON u.role_id = r.id
       LEFT JOIN branches b ON b.id = COALESCE(u.branch_id, 1)
+      LEFT JOIN companies co ON co.id = COALESCE(u.company_id, b.company_id)
       WHERE LOWER(u.username) = LOWER($1)
       `,
       [username]
@@ -9616,6 +9667,8 @@ app.post("/login", async (req, res) => {
       user_id: user.id,
       device_id: device.device_id,
       role: user.role_name,
+      company_id: user.company_id || device.company_id || null,
+      company_name: user.company_name || configuredCompanyName || null,
       branch_id: user.branch_id || 1,
     });
 

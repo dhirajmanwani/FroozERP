@@ -5,7 +5,13 @@ const path = require("path");
 
 const PORT = Number(process.env.PORT || 5000);
 const APP_VERSION = String(process.env.APP_VERSION || "0.0.0");
-const CLOUD_API_URL = String(process.env.CLOUD_API_URL || process.env.FROOZERP_PUBLIC_API_URL || "https://froozerp-production.up.railway.app").trim().replace(/\/$/, "");
+const LEGACY_CLOUD_API_URLS = new Set(["https://froozerp-production.up.railway.app"]);
+const DEFAULT_CLOUD_API_URL = "https://froozerp-production-27bb.up.railway.app";
+const normalizeCloudApiUrl = (value) => {
+  const normalized = String(value || "").trim().replace(/\/$/, "");
+  return LEGACY_CLOUD_API_URLS.has(normalized) ? DEFAULT_CLOUD_API_URL : normalized;
+};
+const CLOUD_API_URL = normalizeCloudApiUrl(process.env.CLOUD_API_URL || process.env.FROOZERP_PUBLIC_API_URL || DEFAULT_CLOUD_API_URL);
 const APP_DATA = process.env.APPDATA
   ? path.join(process.env.APPDATA, "com.srtcompany.froozerp")
   : path.join(os.homedir(), "AppData", "Roaming", "com.srtcompany.froozerp");

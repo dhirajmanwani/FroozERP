@@ -94,16 +94,29 @@ const writeSavedApiConfig = (config) => {
   if (typeof window === "undefined" || !window.localStorage) return;
   window.localStorage.setItem("froozerp.apiConfig", JSON.stringify(config));
 };
+const LEGACY_PRODUCTION_CLOUD_API_URLS = new Set([
+  "https://froozerp-production.up.railway.app",
+]);
+const DEFAULT_PRODUCTION_CLOUD_API_URL = "https://froozerp-production-27bb.up.railway.app";
+const canonicalizeCloudApiUrl = (value) => {
+  const normalized = normalizeApiBase(value);
+  return LEGACY_PRODUCTION_CLOUD_API_URLS.has(normalized) ? DEFAULT_PRODUCTION_CLOUD_API_URL : normalized;
+};
 const sanitizeSavedApiConfigForRuntime = (config) => {
-  if (!isRailwayProductionHost()) return config;
+  const migratedConfig = {
+    ...config,
+    cloudApiUrl: canonicalizeCloudApiUrl(config.cloudApiUrl || DEFAULT_PRODUCTION_CLOUD_API_URL),
+  };
+  if (migratedConfig.cloudApiUrl !== config.cloudApiUrl) writeSavedApiConfig(migratedConfig);
+  if (!isRailwayProductionHost()) return migratedConfig;
   const railwayOrigin = getCurrentOrigin();
-  const savedMode = normalizeApiMode(config.mode);
+  const savedMode = normalizeApiMode(migratedConfig.mode);
   const localModeSaved = [
     API_MODES.LOCAL_SINGLE_DEVICE,
     API_MODES.BRANCH_LAN_SERVER,
     API_MODES.BRANCH_LAN_CLIENT,
   ].includes(savedMode);
-  const pointsToLocalApi = [config.localApiUrl, config.branchLanApiUrl, config.cloudApiUrl, config.customApiUrl]
+  const pointsToLocalApi = [migratedConfig.localApiUrl, migratedConfig.branchLanApiUrl, migratedConfig.cloudApiUrl, migratedConfig.customApiUrl]
     .some((value) => {
       const url = String(value || "").trim();
       return /localhost|127\.0\.0\.1|\[::1\]|:5000/i.test(url);
@@ -118,14 +131,27 @@ const sanitizeSavedApiConfigForRuntime = (config) => {
     return nextConfig;
   }
   return {
-    ...config,
+    ...migratedConfig,
     mode: API_MODES.CLOUD_PRODUCTION,
     cloudApiUrl: railwayOrigin,
   };
 };
 const RAILWAY_PRODUCTION_HOST = isRailwayProductionHost();
 const RAILWAY_PRODUCTION_API_URL = RAILWAY_PRODUCTION_HOST ? getCurrentOrigin() : "";
-const DEFAULT_PRODUCTION_CLOUD_API_URL = "https://froozerp-production.up.railway.app";
+const mergeCloudIdentityIntoSavedConfig = (identity = {}) => {
+  const current = readSavedApiConfig();
+  const next = {
+    ...current,
+    cloudApiUrl: canonicalizeCloudApiUrl(identity.cloud_api_url || current.cloudApiUrl || DEFAULT_PRODUCTION_CLOUD_API_URL),
+    companyId: String(identity.company_id || current.companyId || "").trim(),
+    branchId: String(identity.branch_id || current.branchId || "").trim(),
+    subBranchId: String(identity.sub_branch_id || current.subBranchId || "").trim(),
+    deviceId: String(identity.device_id || current.deviceId || "").trim(),
+    deviceName: String(identity.device_name || current.deviceName || "").trim(),
+  };
+  writeSavedApiConfig(next);
+  return next;
+};
 const SAVED_API_CONFIG = sanitizeSavedApiConfigForRuntime(readSavedApiConfig());
 const normalizeCloudConnectionMode = (value) => (
   String(value || "").trim().toUpperCase() === CLOUD_CONNECTION_MODES.SIMULATE_OFFLINE
@@ -159,7 +185,7 @@ const BRANCH_LAN_API_URL = normalizeApiBase(
 );
 const CLOUD_API_URL = normalizeApiBase(
   RAILWAY_PRODUCTION_API_URL ||
-  SAVED_API_CONFIG.cloudApiUrl ||
+  canonicalizeCloudApiUrl(SAVED_API_CONFIG.cloudApiUrl) ||
   import.meta.env.VITE_CLOUD_API_URL ||
   window.__FROOZERP_CLOUD_API_URL__ ||
   (isDesktopShell() ? DEFAULT_PRODUCTION_CLOUD_API_URL : "")
@@ -183,7 +209,7 @@ const BRANCH_SERVER_PORT = String(
   "5000"
 ).trim();
 const CONFIGURED_COMPANY_ID = String(SAVED_API_CONFIG.companyId || import.meta.env.VITE_COMPANY_ID || "").trim();
-const CONFIGURED_BRANCH_ID = String(SAVED_API_CONFIG.branchId || import.meta.env.VITE_BRANCH_ID || "1").trim();
+const CONFIGURED_BRANCH_ID = String(SAVED_API_CONFIG.branchId || import.meta.env.VITE_BRANCH_ID || "").trim();
 const CONFIGURED_SUB_BRANCH_ID = String(SAVED_API_CONFIG.subBranchId || import.meta.env.VITE_SUB_BRANCH_ID || "").trim();
 const CONFIGURED_DEVICE_ID = String(SAVED_API_CONFIG.deviceId || import.meta.env.VITE_DEVICE_ID || "").trim();
 const CONFIGURED_DEVICE_NAME = String(SAVED_API_CONFIG.deviceName || import.meta.env.VITE_DEVICE_NAME || "").trim();
@@ -216,8 +242,8 @@ const API_CONFIG = {
   customApiUrl: CUSTOM_API_URL || "Not configured",
   branchServerBindHost: BRANCH_SERVER_BIND_HOST,
   branchServerPort: BRANCH_SERVER_PORT,
-  companyId: CONFIGURED_COMPANY_ID || "Not configured",
-  branchId: CONFIGURED_BRANCH_ID || "Not configured",
+  companyId: CONFIGURED_COMPANY_ID || "Resolved after login",
+  branchId: CONFIGURED_BRANCH_ID || "Resolved after login",
   subBranchId: CONFIGURED_SUB_BRANCH_ID || "Not configured",
   deviceId: CONFIGURED_DEVICE_ID || "Local SQLite identity",
   deviceName: CONFIGURED_DEVICE_NAME || "Local SQLite identity",
@@ -313,7 +339,7 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
   const conflicts = Number(syncStatus?.conflictOperations || 0);
   const localOnline = backendHealth?.online === true;
   const localOffline = backendHealth?.online === false;
-  const cloudOnline = cloudHealth?.online === true;
+  const cloudOnline = cloudHealth?.online === true && normalizeApiBase(cloudHealth?.apiUrl || cloudHealth?.data?.configuredCloudBaseUrl || "") === CLOUD_API_URL;
   const cloudOffline = cloudHealth?.online === false;
   const cloudPaused = FROOZERP_CLOUD_SIMULATED_OFFLINE || cloudHealth?.reasonCode === "APP_SIMULATED_OFFLINE" || syncStatus?.lastFailureKind === "APP_SIMULATED_OFFLINE";
   const backendOnline = isCloudMode() ? cloudOnline : localOnline;
@@ -1798,7 +1824,7 @@ function App() {
       user_id: currentUser.id,
       role: currentUser.role_name || currentUser.role || "",
       app_mode: API_MODE,
-      company_id: CONFIGURED_COMPANY_ID || "1",
+      company_id: CONFIGURED_COMPANY_ID || "",
       sub_branch_id: CONFIGURED_SUB_BRANCH_ID || "",
       cloud_api_url: CLOUD_API_URL,
       local_api_url: LOCAL_API_URL,
@@ -1806,6 +1832,7 @@ function App() {
     try {
       const response = await axios.post(`${LOCAL_API_URL}/api/cloud/device/register`, payload, { timeout: 12000, headers: { "x-user-id": currentUser.id, "x-device-id": latestDevice.device_id } });
       const registration = { ...(response.data || {}), url: `${LOCAL_API_URL}/api/cloud/device/register`, httpStatus: response.status, checkedAt: new Date().toISOString() };
+      mergeCloudIdentityIntoSavedConfig(registration);
       setCloudDeviceRegistration(registration);
       return registration;
     } catch (error) {
@@ -3442,6 +3469,12 @@ function App() {
       const response = await axios.post(`${API_URL}/login`, { username: username.trim(), password, ...latestDevice }, { timeout: 8000 });
       writeDiagnosticLog("INFO", "login-success", { apiUrl: API_URL, endpoint: `${API_URL}/login`, userId: response.data?.id, deviceId: latestDevice.device_id });
       setDeviceGate(null);
+      mergeCloudIdentityIntoSavedConfig({
+        ...response.data,
+        device_id: latestDevice.device_id,
+        device_name: latestDevice.device_name,
+        cloud_api_url: CLOUD_API_URL,
+      });
       setUser(response.data);
       await registerCloudDevice(response.data, latestDevice);
       if (response.data?.force_password_change) {
@@ -13161,6 +13194,7 @@ function SyncSettingsSection({
   const saveApiConfig = async () => {
     if (!canManage) return;
     const nextConfig = {
+      ...readSavedApiConfig(),
       mode: normalizeApiMode(configDraft.mode),
       cloudConnectionMode: normalizeCloudConnectionMode(configDraft.cloudConnectionMode),
       localApiUrl: normalizeApiBase(configDraft.localApiUrl) || "http://127.0.0.1:5000",
@@ -13169,11 +13203,6 @@ function SyncSettingsSection({
       customApiUrl: normalizeApiBase(configDraft.customApiUrl),
       branchServerBindHost: String(configDraft.branchServerBindHost || "0.0.0.0").trim(),
       branchServerPort: String(configDraft.branchServerPort || "5000").trim(),
-      companyId: CONFIGURED_COMPANY_ID,
-      branchId: CONFIGURED_BRANCH_ID,
-      subBranchId: CONFIGURED_SUB_BRANCH_ID,
-      deviceId: CONFIGURED_DEVICE_ID,
-      deviceName: CONFIGURED_DEVICE_NAME,
     };
     if (nextConfig.mode === API_MODES.BRANCH_LAN_CLIENT) {
       if (!isValidHttpApiUrl(nextConfig.branchLanApiUrl)) {
