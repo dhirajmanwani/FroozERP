@@ -1,6 +1,7 @@
 import {
   applyPulledChanges,
   applyPushAcknowledgements,
+  recordSyncCycleCompleted,
   completeLocalPosSale,
   enqueueSyncOperation,
   getPendingOutbox,
@@ -38,8 +39,8 @@ export class SyncOutboxRepository {
     return getPendingOutbox(limit);
   }
 
-  async applyAcks(acks) {
-    return applyPushAcknowledgements(acks);
+  async applyAcks(acks, deviceId, serverTime) {
+    return applyPushAcknowledgements(acks, deviceId, serverTime);
   }
 
   async retryFailed() {
@@ -80,6 +81,9 @@ export const repositories = {
   status: {
     get: getLocalDatabaseStatus,
     fail: markSyncFailed,
+  },
+  cycle: {
+    complete: recordSyncCycleCompleted,
   },
   outbox: new SyncOutboxRepository(),
 };

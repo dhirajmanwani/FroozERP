@@ -70,7 +70,9 @@ const readReleaseVersion = () => {
     return process.env.APP_VERSION || "0.0.0";
   }
 };
-const appVersion = process.env.APP_VERSION || readReleaseVersion();
+// Package metadata is deployed with the service. Prefer it over a stale
+// Railway APP_VERSION variable so diagnostics identify the running source.
+const appVersion = readReleaseVersion();
 const utcNowIso = () => new Date().toISOString();
 const serverTimePayload = () => {
   const now = new Date();

@@ -18,6 +18,7 @@ let lastStatus = {
   lastError: "",
   lastPushAt: "",
   lastPullAt: "",
+  lastPushResult: "",
   lastSuccessfulSyncAt: "",
   currentCursor: "",
   pendingOperations: 0,
@@ -134,6 +135,7 @@ const normalizeLocalStatus = (status = {}) => ({
   ...lastStatus,
   lastPushAt: status.lastPushAt || lastStatus.lastPushAt,
   lastPullAt: status.lastPullAt || lastStatus.lastPullAt,
+  lastPushResult: status.lastPushResult || lastStatus.lastPushResult,
   lastSuccessfulSyncAt: status.lastSuccessfulSyncAt || lastStatus.lastSuccessfulSyncAt,
   currentCursor: status.currentCursor || lastStatus.currentCursor || "0",
   pendingOperations: Number(status.pendingOperations || 0),
@@ -289,7 +291,7 @@ export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId
       endpoint: endpointUrl(apiUrl, "/api/sync/push"),
       reason: "no-pending-operations",
     });
-    return normalizeLocalStatus(await repositories.status.get());
+    return { ...normalizeLocalStatus(await repositories.status.get()), lastPushResult: "NO_PENDING_CHANGES" };
   }
   logSyncEndpoint("push", apiUrl, "/api/sync/push", { count: operations.length });
   lastStatus = {
@@ -329,6 +331,7 @@ export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId
   });
   const status = await repositories.outbox.applyAcks(
     response.data?.acknowledgements || [],
+    context.deviceId,
     response.data?.server_time,
   );
   lastStatus = {
@@ -420,11 +423,17 @@ export async function syncNow({ apiUrl, user, deviceInfo, branchId }) {
         offlineError.froozConnectivity = true;
         throw offlineError;
       }
-      await pushPendingOperations({ apiUrl, user, deviceInfo, branchId });
+      const pushStatus = await pushPendingOperations({ apiUrl, user, deviceInfo, branchId });
       let pullStatus = await pullServerChanges({ apiUrl, user, deviceInfo, branchId });
       while (pullStatus.hasMore) {
         pullStatus = await pullServerChanges({ apiUrl, user, deviceInfo, branchId });
       }
+      const completed = await repositories.cycle.complete(
+        syncContext({ user, deviceInfo, branchId }).deviceId,
+        pullStatus.timeDiagnostics?.railwayServerUtcTime || pullStatus.lastPullAt,
+        pushStatus.lastPushResult || "ACKNOWLEDGED",
+      );
+      lastStatus = { ...lastStatus, ...normalizeLocalStatus(completed) };
       resetBackoff();
       lastStatus = { ...lastStatus, syncing: false, online: true, lastError: "", syncStage: "idle", syncProgressDone: 0, syncProgressTotal: 0 };
       return lastStatus;

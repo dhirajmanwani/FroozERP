@@ -14,6 +14,7 @@ const emptyStatus = {
   lastSuccessfulSyncAt: "",
   lastPushAt: "",
   lastPullAt: "",
+  lastPushResult: "",
   currentCursor: "",
   error: "",
 };
@@ -37,6 +38,7 @@ const normalizeStatus = (status, fallback = {}) => ({
   lastSuccessfulSyncAt: status?.last_successful_sync_at || "",
   lastPushAt: status?.last_push_at || "",
   lastPullAt: status?.last_pull_at || "",
+  lastPushResult: status?.last_push_result || "",
   currentCursor: status?.current_cursor || "",
   error: status?.error || "",
 });
@@ -113,9 +115,15 @@ export async function getPendingOutbox(limit = 50) {
   return invokeLocal("sync_outbox_pending", { limit });
 }
 
-export async function applyPushAcknowledgements(acks, serverTime) {
+export async function applyPushAcknowledgements(acks, deviceId, serverTime) {
   if (!isTauriRuntime()) return emptyStatus;
-  const status = await invokeLocal("sync_apply_push_acks", { acks, serverTime });
+  const status = await invokeLocal("sync_apply_push_acks", { acks, deviceId, serverTime });
+  return normalizeStatus(status);
+}
+
+export async function recordSyncCycleCompleted(deviceId, serverTime, pushResult) {
+  if (!isTauriRuntime()) return emptyStatus;
+  const status = await invokeLocal("sync_record_cycle_completed", { deviceId, serverTime, pushResult });
   return normalizeStatus(status);
 }
 

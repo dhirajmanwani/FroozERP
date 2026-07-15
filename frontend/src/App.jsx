@@ -358,7 +358,7 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
   const cloudSyncActive = cloudReachable && deviceApproved && !syncStatus?.lastError;
   const fieldRemoteMode = API_MODE === API_MODES.FIELD_REMOTE_DEVICE;
   const apiModeLabel = getApiModeLabel();
-  const lastSyncAt = syncStatus?.lastSuccessfulSyncAt || syncStatus?.lastPullAt || syncStatus?.lastPushAt;
+  const lastSyncAt = syncStatus?.lastSuccessfulSyncAt;
   const lastSyncText = formatStatusDateTime(lastSyncAt);
   const freshSync = cloudSyncActive && isFreshStatusDateTime(lastSyncAt);
 
@@ -511,7 +511,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.53";
+const APP_VERSION = "1.0.54";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -2083,6 +2083,12 @@ function App() {
     mergeCloudIdentityIntoSavedConfig({
       ...status.canonicalIdentity,
       cloud_api_url: CLOUD_API_URL,
+    });
+    setCloudDeviceRegistration({
+      ...status.canonicalIdentity,
+      status: status.canonicalIdentity.registration_status || status.canonicalIdentity.status || "Not checked",
+      detail: `Server-confirmed cloud device ${status.canonicalIdentity.device_id || "unknown"}.`,
+      checkedAt: new Date().toISOString(),
     });
     return canonicalUser;
   };
@@ -11768,6 +11774,7 @@ function SettingsModule({
         canManage={canManage}
         cloudDeviceRegistration={cloudDeviceRegistration || null}
         cloudDiagnostics={cloudDiagnostics || null}
+        deviceInfo={deviceInfo}
         cloudHealth={cloudHealth || null}
         connectionStatus={connectionStatus}
         localBackendService={localBackendService || null}
@@ -13127,6 +13134,7 @@ function SyncSettingsSection({
   cloudDeviceRegistration,
   cloudDiagnostics,
   cloudHealth,
+  deviceInfo,
   connectionStatus,
   localBackendService,
   localDbStatus,
@@ -13392,16 +13400,19 @@ function SyncSettingsSection({
   const nativeDbLabel = localDbStatus?.available
     ? localDbStatus.initialized ? "Local SQLite Ready" : "Local SQLite Error"
     : "Browser Mode";
-  const lastSync = syncStatus?.lastSuccessfulSyncAt || draft.last_sync_at;
+  const lastSync = syncStatus?.lastSuccessfulSyncAt;
   const lastPush = syncStatus?.lastPushAt;
   const lastPull = syncStatus?.lastPullAt;
-  const cloudRegistrationAvailable = Boolean(cloudDeviceRegistration && typeof cloudDeviceRegistration === "object" && Object.keys(cloudDeviceRegistration).length > 0);
+  const cloudIdentity = syncStatus?.canonicalIdentity || cloudDeviceRegistration || null;
+  const localDeviceId = deviceInfo?.device_id || "Not initialized";
+  const canonicalCloudDeviceId = cloudIdentity?.device_id || "Not verified";
+  const cloudRegistrationAvailable = Boolean(cloudIdentity && typeof cloudIdentity === "object" && Object.keys(cloudIdentity).length > 0);
   const cloudDeviceStatus = cloudRegistrationAvailable
-    ? cloudDeviceRegistration?.status || "Not checked"
-    : "Cloud device registration is not available for the current mode.";
+    ? cloudIdentity?.registration_status || cloudIdentity?.status || "Not checked"
+    : "Not checked against the cloud service.";
   const cloudDeviceDetail = cloudRegistrationAvailable
-    ? cloudDeviceRegistration?.message || cloudDeviceRegistration?.detail || "No registration detail available."
-    : "Cloud device registration is not available for the current mode.";
+    ? cloudIdentity?.message || cloudIdentity?.detail || `Server-confirmed cloud device ${canonicalCloudDeviceId}.`
+    : "Run Sync Now to verify the approved cloud device.";
   return (
     <ModuleCard eyebrow="Sync & Connection" title="Connection Status" subtitle="Owner view for live internet, local server and cloud sync readiness.">
       <div className="sync-owner-summary">
@@ -13479,11 +13490,13 @@ function SyncSettingsSection({
               <Field label="Custom API URL"><input disabled={!canManage} placeholder="https://backend.example.com" value={configDraft.customApiUrl} onChange={(event) => setConfigDraft({ ...configDraft, customApiUrl: event.target.value })} /></Field>
             )}
             <Field label="Branch"><input disabled value={branchLabel} /></Field>
-            <Field label="Device ID"><input disabled value={draft.device_id || "LOCAL-STORE"} /></Field>
+            <Field label="Local SQLite Device ID"><input disabled value={localDeviceId} /></Field>
+            <Field label="Canonical Cloud Device ID"><input disabled value={canonicalCloudDeviceId} /></Field>
+            <Field label="Legacy Settings Device ID"><input disabled value={draft.device_id || "Not set"} /></Field>
             <Field label="Device Display Name"><input disabled={!canManage} value={draft.device_display_name || ""} onChange={(event) => setDraft({ ...draft, device_display_name: event.target.value })} /></Field>
             <Field label="Local SQLite Path"><input disabled value={localDbStatus?.databasePath || "Available in FroozERP desktop app"} /></Field>
             <Field label="Local Schema Version"><input disabled value={localDbStatus?.schemaVersion || "Not initialized"} /></Field>
-            <Field label="Last Push"><input disabled value={lastPush ? formatKolkataDateTime(lastPush) : "Not pushed"} /></Field>
+            <Field label="Last Push"><input disabled value={lastPush ? `${formatKolkataDateTime(lastPush)} (server acknowledged)` : syncStatus?.lastPushResult === "NO_PENDING_CHANGES" ? "No pending changes; no server push yet" : "No server-acknowledged push yet"} /></Field>
             <Field label="Last Pull"><input disabled value={lastPull ? formatKolkataDateTime(lastPull) : "Not pulled"} /></Field>
             <Field label="API Mode"><input disabled value={API_CONFIG.mode} /></Field>
             <Field label="Configured Company ID"><input disabled value={user?.company_id || API_CONFIG.companyId} /></Field>
@@ -13528,7 +13541,7 @@ function SyncSettingsSection({
             <Field label="Last Sync Failure"><input disabled value={syncStatus?.lastError || backendHealth?.message || "None"} /></Field>
             <Field label="Current Cursor"><input disabled value={syncStatus?.currentCursor || "0"} /></Field>
             <label className="check-field"><input checked={draft.sync_enabled === true} disabled type="checkbox" /><span>Sync foundation enabled for approved native devices</span></label>
-            <Field label="Notes"><textarea disabled value={draft.notes || "Cloud sync foundation is active for reference data and safe test entities."} /></Field>
+            <Field label="Notes"><textarea disabled value={draft.notes || "Cloud push/pull delivery is active for approved devices and supported sync entities."} /></Field>
           </div>
           <div className="toolbar-actions">
             <button className="primary-button" disabled={!canManage} onClick={saveApiConfig}>Save Mode</button>

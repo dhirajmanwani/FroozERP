@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
-const CURRENT_SCHEMA_VERSION: &str = "009_canonical_utc_timestamps";
+const CURRENT_SCHEMA_VERSION: &str = "010_sync_delivery_state";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -16,6 +16,7 @@ const MIGRATION_005: &str = include_str!("../migrations/sqlite/005_mandi_tax_sal
 const MIGRATION_006: &str = include_str!("../migrations/sqlite/006_multibranch_identity_foundation.sql");
 const MIGRATION_007: &str = include_str!("../migrations/sqlite/007_cloud_runtime_and_inbox_foundation.sql");
 const MIGRATION_009: &str = include_str!("../migrations/sqlite/009_canonical_utc_timestamps.sql");
+const MIGRATION_010: &str = include_str!("../migrations/sqlite/010_sync_delivery_state.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -28,6 +29,7 @@ pub struct LocalDbStatus {
     pub last_successful_sync_at: Option<String>,
     pub last_push_at: Option<String>,
     pub last_pull_at: Option<String>,
+    pub last_push_result: Option<String>,
     pub current_cursor: Option<String>,
     pub error: Option<String>,
 }
@@ -155,6 +157,7 @@ pub fn status(app: &AppHandle) -> Result<LocalDbStatus, String> {
             last_successful_sync_at: None,
             last_push_at: None,
             last_pull_at: None,
+            last_push_result: None,
             current_cursor: None,
             error: None,
         });
@@ -189,7 +192,7 @@ pub fn pending_outbox(app: &AppHandle, limit: i64) -> Result<Vec<PendingSyncOper
     pending_outbox_at(&conn, limit)
 }
 
-pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck], server_time: Option<String>) -> Result<LocalDbStatus, String> {
+pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck], device_id: Option<String>, server_time: Option<String>) -> Result<LocalDbStatus, String> {
     let path = database_path(app)?;
     initialize_at(&path)?;
     let mut conn = Connection::open(&path).map_err(to_error)?;
@@ -268,17 +271,35 @@ pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck], server_time: Option<St
         }
     }
     tx.execute(
-        "INSERT INTO sync_state (device_id, last_push_at, last_successful_sync_at, current_sync_status, updated_at)
-         VALUES ('default', ?1, ?1, 'IDLE', ?1)
+        "INSERT INTO sync_state (device_id, last_push_at, last_push_result, current_sync_status, updated_at)
+         VALUES (?1, ?2, 'ACKNOWLEDGED', 'IDLE', ?2)
          ON CONFLICT(device_id) DO UPDATE SET
            last_push_at = excluded.last_push_at,
-           last_successful_sync_at = excluded.last_successful_sync_at,
+           last_push_result = excluded.last_push_result,
            current_sync_status = 'IDLE',
            updated_at = excluded.updated_at",
-        params![confirmed_at],
+        params![device_id.unwrap_or_else(|| "default".to_string()), confirmed_at],
     )
     .map_err(to_error)?;
     tx.commit().map_err(to_error)?;
+    status_at(&path)
+}
+
+pub fn record_sync_cycle_completed(app: &AppHandle, device_id: &str, server_time: Option<String>, push_result: &str) -> Result<LocalDbStatus, String> {
+    let path = database_path(app)?;
+    initialize_at(&path)?;
+    let confirmed_at = require_server_time(server_time)?;
+    let conn = Connection::open(&path).map_err(to_error)?;
+    conn.execute(
+        "INSERT INTO sync_state (device_id, last_successful_sync_at, last_push_result, current_sync_status, updated_at)
+         VALUES (?1, ?2, ?3, 'IDLE', ?2)
+         ON CONFLICT(device_id) DO UPDATE SET
+           last_successful_sync_at = excluded.last_successful_sync_at,
+           last_push_result = excluded.last_push_result,
+           current_sync_status = 'IDLE',
+           updated_at = excluded.updated_at",
+        params![device_id, confirmed_at, push_result],
+    ).map_err(to_error)?;
     status_at(&path)
 }
 
@@ -301,13 +322,12 @@ pub fn apply_pull_changes(
     tx.execute(
         "INSERT INTO sync_state (
             device_id, last_server_cursor, last_pull_cursor, last_pull_at,
-            last_successful_sync_at, current_sync_status, updated_at
-         ) VALUES (?1, ?2, ?2, ?3, ?3, 'IDLE', ?3)
+            current_sync_status, updated_at
+         ) VALUES (?1, ?2, ?2, ?3, 'IDLE', ?3)
          ON CONFLICT(device_id) DO UPDATE SET
            last_server_cursor = excluded.last_server_cursor,
            last_pull_cursor = excluded.last_pull_cursor,
            last_pull_at = excluded.last_pull_at,
-           last_successful_sync_at = excluded.last_successful_sync_at,
            current_sync_status = 'IDLE',
            updated_at = excluded.updated_at",
         params![state_device, next_cursor, confirmed_at],
@@ -1334,6 +1354,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "006_multibranch_identity_foundation", MIGRATION_006)?;
     apply_migration(&mut conn, "007_cloud_runtime_and_inbox_foundation", MIGRATION_007)?;
     apply_migration(&mut conn, "009_canonical_utc_timestamps", MIGRATION_009)?;
+    apply_migration(&mut conn, "010_sync_delivery_state", MIGRATION_010)?;
     Ok(())
 }
 
@@ -1372,7 +1393,7 @@ fn status_at(path: &Path) -> Result<LocalDbStatus, String> {
         .map_err(to_error)?;
     let last_sync: Option<String> = conn
         .query_row(
-            "SELECT last_successful_sync_at FROM sync_state ORDER BY last_successful_sync_at DESC LIMIT 1",
+            "SELECT last_successful_sync_at FROM sync_state WHERE last_successful_sync_at IS NOT NULL ORDER BY last_successful_sync_at DESC LIMIT 1",
             [],
             |row| row.get(0),
         )
@@ -1389,19 +1410,20 @@ fn status_at(path: &Path) -> Result<LocalDbStatus, String> {
         last_successful_sync_at: last_sync,
         last_push_at: single_optional_string(
             &conn,
-            "SELECT last_push_at FROM sync_state ORDER BY updated_at DESC LIMIT 1",
+            "SELECT last_push_at FROM sync_state WHERE last_push_at IS NOT NULL ORDER BY last_push_at DESC LIMIT 1",
             &[],
         )?,
         last_pull_at: single_optional_string(
             &conn,
-            "SELECT last_pull_at FROM sync_state ORDER BY updated_at DESC LIMIT 1",
+            "SELECT last_pull_at FROM sync_state WHERE last_pull_at IS NOT NULL ORDER BY last_pull_at DESC LIMIT 1",
             &[],
         )?,
         current_cursor: single_optional_string(
             &conn,
-            "SELECT COALESCE(last_pull_cursor, last_server_cursor) FROM sync_state ORDER BY updated_at DESC LIMIT 1",
+            "SELECT COALESCE(last_pull_cursor, last_server_cursor) FROM sync_state WHERE device_id <> 'default' ORDER BY updated_at DESC LIMIT 1",
             &[],
         )?,
+        last_push_result: single_optional_string(&conn, "SELECT last_push_result FROM sync_state WHERE device_id <> 'default' ORDER BY updated_at DESC LIMIT 1", &[])?,
         error: None,
     })
 }
@@ -2711,7 +2733,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("migration count");
-            assert_eq!(migration_count, 8);
+            assert_eq!(migration_count, 9);
             drop(conn);
             initialize_at(path).expect("restart with existing SQLite profile");
         }
@@ -2770,7 +2792,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("preserved marker");
-        assert_eq!(migration_count, 8);
+        assert_eq!(migration_count, 9);
         assert_eq!(marker, "keep-me");
         drop(conn);
         let _ = fs::remove_file(&path);

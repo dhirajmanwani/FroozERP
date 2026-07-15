@@ -2010,8 +2010,8 @@ fn sync_outbox_pending(
     local_db::pending_outbox(&app, limit.unwrap_or(50))
 }
 #[tauri::command]
-fn sync_apply_push_acks(app: AppHandle, acks: Vec<SyncAck>, server_time: Option<String>) -> Result<LocalDbStatus, String> {
-    local_db::apply_push_acks(&app, &acks, server_time)
+fn sync_apply_push_acks(app: AppHandle, acks: Vec<SyncAck>, device_id: Option<String>, server_time: Option<String>) -> Result<LocalDbStatus, String> {
+    local_db::apply_push_acks(&app, &acks, device_id, server_time)
 }
 #[tauri::command]
 fn sync_apply_pull_changes(
@@ -2022,6 +2022,10 @@ fn sync_apply_pull_changes(
     server_time: Option<String>,
 ) -> Result<LocalDbStatus, String> {
     local_db::apply_pull_changes(&app, &changes, &next_cursor, device_id, server_time)
+}
+#[tauri::command]
+fn sync_record_cycle_completed(app: AppHandle, device_id: String, server_time: Option<String>, push_result: String) -> Result<LocalDbStatus, String> {
+    local_db::record_sync_cycle_completed(&app, &device_id, server_time, &push_result)
 }
 #[tauri::command]
 fn sync_mark_failed(app: AppHandle, message: String) -> Result<LocalDbStatus, String> {
@@ -2317,6 +2321,7 @@ pub fn run() {
             sync_outbox_pending,
             sync_apply_push_acks,
             sync_apply_pull_changes,
+            sync_record_cycle_completed,
             sync_mark_failed,
             sync_retry_failed_operations,
             sync_queue_test_entity,
