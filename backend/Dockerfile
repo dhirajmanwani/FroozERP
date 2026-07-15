@@ -7,6 +7,7 @@ RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --chown=node:node \
   server.js \
+  identityPolicy.js \
   storageAdapters.js \
   aiBusinessAssistantRules.js \
   aiBusinessAssistantService.js \
