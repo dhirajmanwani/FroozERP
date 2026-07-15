@@ -7811,9 +7811,9 @@ const logSyncChange = async (client, { branchId = 1, entityType, entityId, opera
   const result = await client.query(
     `
     INSERT INTO sync_change_log (
-      branch_id, entity_type, entity_id, operation_type, entity_version, payload
+      company_id, branch_id, entity_type, entity_id, operation_type, entity_version, payload
     )
-    VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+    VALUES ((SELECT company_id FROM branches WHERE id = $1), $1, $2, $3, $4, $5, $6::jsonb)
     RETURNING change_id, created_at
     `,
     [branchId, entityType, String(entityId), operationType, version, JSON.stringify(payload)]
@@ -7864,18 +7864,22 @@ const processedAckFromRow = (row) => ({
   message: row.result_payload?.message || "Already processed",
 });
 
-const storeProcessedOperation = async (client, operation, deviceId, ack) => {
+const storeProcessedOperation = async (client, operation, context, ack) => {
   await client.query(
     `
     INSERT INTO sync_processed_operations (
-      operation_id, device_id, entity_type, entity_id, result_status, result_payload, processed_at
+      operation_id, device_id, company_id, branch_id, created_by_user_id,
+      source_device_id, entity_type, entity_id, result_status, result_payload, processed_at
     )
-    VALUES ($1, $2, $3, $4, $5, $6::jsonb, CURRENT_TIMESTAMP)
+    VALUES ($1, $2, $3, $4, $5, $2, $6, $7, $8, $9::jsonb, CURRENT_TIMESTAMP)
     ON CONFLICT (operation_id) DO NOTHING
     `,
     [
       operation.operation_id,
-      deviceId,
+      context.deviceId,
+      context.companyId,
+      context.branchId,
+      context.user.id,
       operation.entity_type,
       operation.entity_id,
       ack.status,
@@ -8660,8 +8664,8 @@ const processSyncOperation = async (client, operation, context) => {
     return rejectOperation(operation, "UNSUPPORTED_OPERATION", `Unsupported operation type: ${operation.operation_type}`);
   }
   const processed = await client.query(
-    "SELECT * FROM sync_processed_operations WHERE operation_id = $1 FOR UPDATE",
-    [operation.operation_id]
+    "SELECT * FROM sync_processed_operations WHERE operation_id = $1 AND company_id = $2 AND branch_id = $3 FOR UPDATE",
+    [operation.operation_id, context.companyId, context.branchId]
   );
   if (processed.rows[0]) return processedAckFromRow(processed.rows[0]);
   const ack = operation.entity_type === "sync_test"
@@ -8671,7 +8675,7 @@ const processSyncOperation = async (client, operation, context) => {
       : operation.operation_type === "SALE_CANCEL"
         ? await processPosSaleCancelOperation(client, operation, context)
         : await processPosSaleFoundationOperation(client, operation, context);
-  await storeProcessedOperation(client, operation, context.deviceId, ack);
+  await storeProcessedOperation(client, operation, context, ack);
   return ack;
 };
 
@@ -9008,12 +9012,13 @@ app.get("/api/sync/pull", rateLimitSyncRequest, async (req, res) => {
       SELECT change_id, branch_id, entity_type, entity_id, operation_type,
              entity_version AS version, payload, created_at AS updated_at
       FROM sync_change_log
-      WHERE branch_id = $1
-        AND change_id > $2
+      WHERE company_id = $1
+        AND branch_id = $2
+        AND change_id > $3
       ORDER BY change_id
-      LIMIT $3
+      LIMIT $4
       `,
-      [context.branchId, cursor, limit + 1]
+      [context.companyId, context.branchId, cursor, limit + 1]
     );
     const rows = result.rows.slice(0, limit);
     const nextCursor = rows.length ? String(rows[rows.length - 1].change_id) : String(cursor);
@@ -9044,9 +9049,9 @@ app.get("/api/sync/status", rateLimitSyncRequest, async (req, res) => {
     });
     if (context.error) return res.status(context.error.status).json({ message: context.error.message });
     const [processed, conflicts, changes] = await Promise.all([
-      pool.query("SELECT COUNT(*)::INTEGER AS count FROM sync_processed_operations WHERE device_id = $1", [context.deviceId]),
-      pool.query("SELECT COUNT(*)::INTEGER AS count FROM sync_conflict_log WHERE device_id = $1 AND status = 'open'", [context.deviceId]),
-      pool.query("SELECT COALESCE(MAX(change_id), 0)::BIGINT AS cursor FROM sync_change_log WHERE branch_id = $1", [context.branchId]),
+      pool.query("SELECT COUNT(*)::INTEGER AS count FROM sync_processed_operations WHERE device_id = $1 AND company_id = $2 AND branch_id = $3", [context.deviceId, context.companyId, context.branchId]),
+      pool.query("SELECT COUNT(*)::INTEGER AS count FROM sync_conflict_log WHERE device_id = $1 AND company_id = $2 AND branch_id = $3 AND status = 'open'", [context.deviceId, context.companyId, context.branchId]),
+      pool.query("SELECT COALESCE(MAX(change_id), 0)::BIGINT AS cursor FROM sync_change_log WHERE company_id = $1 AND branch_id = $2", [context.companyId, context.branchId]),
     ]);
     return res.json({
       status: "ok",
