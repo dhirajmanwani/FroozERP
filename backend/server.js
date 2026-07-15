@@ -9048,8 +9048,10 @@ app.get("/api/sync/status", rateLimitSyncRequest, async (req, res) => {
       branchId: req.query.branch_id,
     });
     if (context.error) return res.status(context.error.status).json({ message: context.error.message });
-    const [processed, conflicts, changes] = await Promise.all([
+    const [processed, pending, failed, conflicts, changes] = await Promise.all([
       pool.query("SELECT COUNT(*)::INTEGER AS count FROM sync_processed_operations WHERE device_id = $1 AND company_id = $2 AND branch_id = $3", [context.deviceId, context.companyId, context.branchId]),
+      pool.query("SELECT COUNT(*)::INTEGER AS count FROM sync_inbox_operations WHERE source_device_id = $1 AND company_id = $2 AND branch_id = $3 AND LOWER(sync_status) IN ('pending', 'received')", [context.deviceId, context.companyId, context.branchId]),
+      pool.query("SELECT COUNT(*)::INTEGER AS count FROM sync_processed_operations WHERE device_id = $1 AND company_id = $2 AND branch_id = $3 AND LOWER(result_status) IN ('failed', 'rejected')", [context.deviceId, context.companyId, context.branchId]),
       pool.query("SELECT COUNT(*)::INTEGER AS count FROM sync_conflict_log WHERE device_id = $1 AND company_id = $2 AND branch_id = $3 AND status = 'open'", [context.deviceId, context.companyId, context.branchId]),
       pool.query("SELECT COALESCE(MAX(change_id), 0)::BIGINT AS cursor FROM sync_change_log WHERE company_id = $1 AND branch_id = $2", [context.companyId, context.branchId]),
     ]);
@@ -9064,8 +9066,9 @@ app.get("/api/sync/status", rateLimitSyncRequest, async (req, res) => {
       role: context.user.role_name,
       last_sync_at: context.device.last_sync_at || null,
       sync_status: context.device.sync_status || "IDLE",
-      pending_queue_count: null,
-      failed_queue_count: null,
+      pending_queue_count: pending.rows[0]?.count || 0,
+      failed_queue_count: failed.rows[0]?.count || 0,
+      conflict_queue_count: conflicts.rows[0]?.count || 0,
       processed_operations: processed.rows[0]?.count || 0,
       open_conflicts: conflicts.rows[0]?.count || 0,
       latest_cursor: String(changes.rows[0]?.cursor || 0),
