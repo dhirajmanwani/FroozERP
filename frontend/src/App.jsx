@@ -25,6 +25,7 @@ import {
   verifyOfflineSessionRecord,
 } from "./local/offlineSession";
 import { reconcileCanonicalIdentity } from "./local/canonicalIdentity";
+import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { describeUpdateAvailability, normalizeUpdateMetadata } from "./local/updateMetadata";
 import {
   connectivityEventNames,
@@ -3428,6 +3429,24 @@ function App() {
 
   const loadDashboardAnalytics = async (range = dashboardRange, customRange = dashboardCustomRange) => {
     if (user && !hasModuleAccess("dashboard")) return;
+    if (isTauriRuntime()) {
+      const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id });
+      const localRows = await listLocalPosSales();
+      const localSales = localRows.map(localSnapshotToInvoice);
+      const localDashboard = buildLocalDashboardSnapshot({
+        inventoryLots: snapshot?.inventory_lots || [],
+        sales: localSales,
+        range,
+        customRange,
+        today: toDateKey(new Date()),
+      });
+      setInventory(snapshot?.inventory_lots || []);
+      setSalesHistory(localSales);
+      setSupplierDashboard(localDashboard.metrics);
+      setDashboardAnalytics(localDashboard.analytics);
+      setDashboardError("");
+      return;
+    }
     const response = await axios.get(`${API_URL}/dashboard-analytics`, {
       params: getDashboardParams(range, customRange),
     });
@@ -3438,16 +3457,7 @@ function App() {
 
   const loadDashboardData = async () => {
     if (user && !hasModuleAccess("dashboard")) return;
-    if (isTauriRuntime() && offlineMode) {
-      const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id }).catch(() => null);
-      const localRows = await listLocalPosSales().catch(() => []);
-      setInventory(snapshot?.inventory_lots || inventory);
-      setSalesHistory(localRows.map(localSnapshotToInvoice));
-      setSupplierDashboard((current) => current || {});
-      setDashboardAnalytics((current) => current || {});
-      setDashboardError("");
-      return;
-    }
+    if (isTauriRuntime()) return loadDashboardAnalytics(dashboardRange, dashboardCustomRange);
     const requests = await Promise.allSettled([
       axios.get(`${API_URL}/inventory`),
       axios.get(`${API_URL}/sales`),
@@ -5758,6 +5768,7 @@ function App() {
                 cloudDiagnostics={cloudDiagnostics}
                 cloudHealth={cloudHealth}
                 connectionStatus={connectionStatus}
+                deviceInfo={deviceInfo}
                 localBackendService={localBackendService}
                 localDbStatus={localDbStatus}
                 startupLogPath={startupLogPath}
@@ -11723,6 +11734,7 @@ function SettingsModule({
   cloudDiagnostics,
   cloudHealth,
   connectionStatus,
+  deviceInfo,
   localBackendService,
   localDbStatus,
   startupLogPath,

@@ -1251,12 +1251,12 @@ const getHighValueEditedBills = async (pool, settings, range) => {
 
 const getCollectionSummary = async (pool, range) => {
   const result = await pool.query(`
-    SELECT payment_mode, SUM(amount) AS amount
+    SELECT sp.payment_mode, SUM(sp.amount) AS amount
     FROM sale_payments sp
     JOIN sales s ON s.id = sp.sale_id
     WHERE s.sale_date BETWEEN $1 AND $2
       AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
-    GROUP BY payment_mode
+    GROUP BY sp.payment_mode
   `, [range.dateFrom, range.dateTo]);
   const customerPayments = await pool.query(`
     SELECT payment_mode, SUM(payment_amount) AS amount

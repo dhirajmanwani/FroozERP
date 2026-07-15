@@ -19,6 +19,7 @@ const {
   assertGroundedAnswer,
 } = require("./aiBusinessAssistantRules");
 const { registerAiBusinessAssistantRoutes } = require("./aiBusinessAssistantService");
+const { ensureAiBusinessAssistantSchema } = require("./aiBusinessAssistantSchema");
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
@@ -17788,6 +17789,10 @@ const prepareDatabaseForStartup = async () => {
   }
   await ensureProductEntrySchema();
   await verifyRequiredDatabaseSchema();
+  if (!desktopLocalRuntime) {
+    const aiSchema = await ensureAiBusinessAssistantSchema(pool);
+    if (aiSchema.created) console.log(`FROST schema prepared: ${aiSchema.missingBefore.join(", ")}`);
+  }
   console.log("schema bootstrap completed");
   console.log(`business counts after bootstrap: ${JSON.stringify(await readBusinessCounts())}`);
 };
@@ -17808,6 +17813,14 @@ if (frontendDistAvailable()) {
   console.log(`React frontend build not found at ${frontendDistPath}; serving API only fallback.`);
   console.log(`Frontend dist candidates: ${frontendDistCandidates.join(", ")}`);
 }
+app.use((error, req, res, next) => {
+  if (res.headersSent) return next(error);
+  console.error(`Unhandled ${req.method} ${req.originalUrl}`, error);
+  return res.status(500).json({
+    code: "INTERNAL_SERVER_ERROR",
+    message: "The FroozERP backend could not complete this request.",
+  });
+});
 prepareDatabaseForStartup()
   .then(async () => {
     if (!desktopLocalRuntime && runStartupReferenceSeed) {

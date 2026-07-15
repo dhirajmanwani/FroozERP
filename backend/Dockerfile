@@ -10,6 +10,7 @@ COPY --chown=node:node \
   identityPolicy.js \
   storageAdapters.js \
   aiBusinessAssistantRules.js \
+  aiBusinessAssistantSchema.js \
   aiBusinessAssistantService.js \
   frostCore.js \
   frostIntelligence.js \
