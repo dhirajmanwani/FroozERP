@@ -9,6 +9,7 @@ const path = require("path");
 const { execFile } = require("child_process");
 const nodemailer = require("nodemailer");
 const { RUNTIME_MODES, createStorageAdapter } = require("./storageAdapters");
+const { isOwnerBootstrapEligible } = require("./identityPolicy");
 const {
   calculateOverdueDays,
   classifyDueStatus,
@@ -7729,11 +7730,6 @@ const hasApprovedOwnerDevice = async (client = pool) => {
   return result.rows.length > 0;
 };
 
-const isFirstOwnerBootstrapLogin = (user, username, password) =>
-  user?.role_name === "Owner"
-  && cleanText(username).toLowerCase() === "owner"
-  && String(password || "") === "8386";
-
 const ownerBootstrapDeviceAllowlist = new Set([
   "FZDEV-1783665039063-f9033e34",
 ]);
@@ -9269,7 +9265,7 @@ app.post("/bootstrap/first-owner-device", async (req, res) => {
       [username]
     );
     const user = userResult.rows[0];
-    if (!user || user.active === false || !passwordMatches(password, user.password_hash) || !isFirstOwnerBootstrapLogin(user, username, password)) {
+    if (!user || user.active === false || !passwordMatches(password, user.password_hash) || !isOwnerBootstrapEligible(user)) {
       return res.status(403).json({ message: "First owner device bootstrap requires valid owner credentials." });
     }
 
@@ -9625,7 +9621,7 @@ app.post("/login", async (req, res) => {
     }
     let device = await upsertDeviceRequest(devicePayload);
     const ownerDeviceExists = await hasApprovedOwnerDevice();
-    if (!ownerDeviceExists && isFirstOwnerBootstrapLogin(user, username, password)) {
+    if (!ownerDeviceExists && isOwnerBootstrapEligible(user)) {
       device = await approveDevice({
         deviceId: devicePayload.device_id,
         approvedBy: user.id,

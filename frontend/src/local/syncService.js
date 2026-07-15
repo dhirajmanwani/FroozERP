@@ -30,6 +30,7 @@ let lastStatus = {
   syncStage: "",
   syncProgressDone: 0,
   syncProgressTotal: 0,
+  canonicalIdentity: null,
   timeDiagnostics: getTimeDiagnostics(),
 };
 
@@ -244,7 +245,7 @@ export async function initialiseSync({ apiUrl, user, deviceInfo, branchId }) {
   await checkRailwayServerTime(apiUrl).catch(() => markServerTimeOffline());
   lastStatus = { ...lastStatus, timeDiagnostics: getTimeDiagnostics() };
   logSyncEndpoint("register-device", apiUrl, "/api/sync/register-device", { deviceId: context.deviceId });
-  await axios.post(endpointUrl(apiUrl, "/api/sync/register-device"), {
+  const registrationResponse = await axios.post(endpointUrl(apiUrl, "/api/sync/register-device"), {
     device_id: context.deviceId,
     device_name: context.deviceName || "FroozERP Device",
     platform: "tauri-windows",
@@ -259,6 +260,18 @@ export async function initialiseSync({ apiUrl, user, deviceInfo, branchId }) {
     branch_lan_api_url: apiConfig.branchLanApiUrl || "",
     custom_api_url: apiConfig.customApiUrl || "",
   }, withTimeout());
+  const identityResponse = await axios.get(endpointUrl(apiUrl, "/api/device/identity"), {
+    ...withTimeout(),
+    params: {
+      user_id: context.userId,
+      device_id: context.deviceId,
+      branch_id: context.branchId,
+    },
+  });
+  lastStatus = {
+    ...lastStatus,
+    canonicalIdentity: identityResponse.data || registrationResponse.data || null,
+  };
   return lastStatus;
 }
 

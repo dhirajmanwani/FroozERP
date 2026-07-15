@@ -24,6 +24,8 @@ import {
   readOfflineSession,
   verifyOfflineSessionRecord,
 } from "./local/offlineSession";
+import { reconcileCanonicalIdentity } from "./local/canonicalIdentity";
+import { describeUpdateAvailability, normalizeUpdateMetadata } from "./local/updateMetadata";
 import {
   connectivityEventNames,
   subscribeConnectivity,
@@ -456,7 +458,7 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
   return {
     apiModeLabel,
     internetStatus: internetAvailable ? "Internet Available" : "No Internet",
-    froozErpCloudAccess: cloudPaused ? "Disabled by Owner" : "Online",
+    froozErpCloudAccess: cloudPaused ? "Disabled by Owner" : cloudReachable ? "Online" : "Not Verified",
     localBackendStatus,
     cloudBackendStatus,
     authenticationStatus: currentUser ? "Signed in" : "Not signed in",
@@ -509,7 +511,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.52";
+const APP_VERSION = "1.0.53";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -2069,6 +2071,22 @@ function App() {
     return { refreshed: refreshes.length - failures.length, failed: failures.length };
   };
 
+  const applyCanonicalIdentityFromSync = (status) => {
+    if (!status?.canonicalIdentity || !userRef.current) return userRef.current;
+    const canonicalUser = reconcileCanonicalIdentity({
+      authenticatedUser: userRef.current,
+      cloudIdentity: status.canonicalIdentity,
+      deviceInfo: deviceInfoRef.current,
+    });
+    userRef.current = canonicalUser;
+    setUser(canonicalUser);
+    mergeCloudIdentityIntoSavedConfig({
+      ...status.canonicalIdentity,
+      cloud_api_url: CLOUD_API_URL,
+    });
+    return canonicalUser;
+  };
+
   const runSyncNow = async (options = {}) => {
     if (!user) return null;
     const force = Boolean(options.force);
@@ -2095,6 +2113,7 @@ function App() {
       branchId: user.branch_id || 1,
     });
     setSyncStatus(status);
+    applyCanonicalIdentityFromSync(status);
     if (!status.lastError) await refreshBusinessDataAfterSync();
     const nextStatus = buildConnectionStatusModel({ backendHealth, cloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: status, internetAvailable, currentUser: user });
     setSyncMessage(status.lastError ? `Sync failed: ${status.lastError}` : nextStatus.syncSummary);
@@ -2207,6 +2226,7 @@ function App() {
         })
         .then(async (status) => {
           setSyncStatus(status);
+          applyCanonicalIdentityFromSync(status);
           if (!status.lastError) await refreshBusinessDataAfterSync();
           const nextStatus = buildConnectionStatusModel({ backendHealth: health, cloudHealth: nextCloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: status, internetAvailable: realInternet, currentUser: userRef.current });
           setSyncMessage(status.lastError ? `Sync failed: ${status.lastError}` : nextStatus.syncSummary);
@@ -11665,6 +11685,30 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
   );
 }
 
+class SettingsSectionErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { failed: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  componentDidCatch(error) {
+    console.error(`${this.props.sectionName || "Settings section"} failed`, error);
+  }
+
+  render() {
+    if (!this.state.failed) return this.props.children;
+    return (
+      <ModuleCard eyebrow="Settings" title={`${this.props.sectionName || "Section"} Unavailable`} subtitle="This section could not load. Other Settings sections remain available.">
+        <p className="form-note">No published update information is available right now. Advanced Diagnostics remains available below.</p>
+      </ModuleCard>
+    );
+  }
+}
+
 function SettingsModule({
   applicationFontSize,
   backendHealth,
@@ -11716,7 +11760,9 @@ function SettingsModule({
       <DeviceControlSettingsSection canManage={canManage} deviceControlSettings={settingsData.deviceControlSettings} exitAttemptLogs={settingsData.exitAttemptLogs || []} onReload={onReload} user={user} />
       <SecurityDevicesSection activationCodes={settingsData.activationCodes || []} branches={settingsData.branches || []} canManage={canManage} counters={settingsData.counters || []} devices={settingsData.authorizedDevices || []} onReload={onReload} user={user} />
       <BranchCounterSettings branches={settingsData.branches || []} canManage={canManage} counters={settingsData.counters || []} onReload={onReload} user={user} />
-      <UpdateCenterSection canManage={canManage} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
+      <SettingsSectionErrorBoundary sectionName="Update Center">
+        <UpdateCenterSection canManage={canManage} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
+      </SettingsSectionErrorBoundary>
       <SyncSettingsSection
         backendHealth={backendHealth}
         canManage={canManage}
@@ -12649,10 +12695,17 @@ function UpdateCenterSection({ canManage }) {
       && normalizeVersion(installedVersion) === normalizeVersion(updaterState.latestVersion)
   );
   const canInstallUpdate = updateDownloaded && updaterState.signatureVerified && !versionsFullyMatch;
-  const displayLatestVersion = updaterState.latestVersion || (updaterState.phase === "checking" ? "Checking update feed" : "Not checked");
+  const displayLatestVersion = updaterState.latestVersion
+    || (updaterState.phase === "checking"
+      ? "Checking update feed"
+      : updaterState.phase === "no_published_update"
+        ? "No published update"
+        : "Not checked");
   const updateStatusText = (() => {
     if (incompleteTransaction) return installDiagnostics?.update_transaction_message || "Previous update did not complete. Repair installation required.";
     if (updaterState.phase === "checking") return "Checking update feed";
+    if (updaterState.phase === "no_published_update") return "No published update available";
+    if (updaterState.phase === "offline") return "Offline - update status unavailable";
     if (versionsFullyMatch) return "FroozERP is up to date";
     if (updaterState.phase === "update_available") return `Update available: ${updaterState.latestVersion}`;
     if (updaterState.phase === "downloading") return `Downloading ${progressPercent || 0}%`;
@@ -12703,19 +12756,20 @@ function UpdateCenterSection({ canManage }) {
         params: { url: UPDATE_FEED_URL },
         timeout: 12000,
       });
-      return response.data || {};
+      return response.data && typeof response.data === "object" ? response.data : null;
     } catch {
       const response = await axios.get(UPDATE_FEED_URL, { timeout: 8000 });
-      return response.data || {};
+      return response.data && typeof response.data === "object" ? response.data : null;
     }
   }, []);
   const mergeManifestDiagnostics = useCallback((baseState, manifest) => {
-    const parsed = extractUpdateVersion(manifest);
+    const metadata = normalizeUpdateMetadata(manifest);
+    const parsed = extractUpdateVersion(manifest || {});
     return {
       ...baseState,
       latestVersion: baseState.latestVersion || parsed.version || "",
-      publishedAt: baseState.publishedAt || manifest.pub_date || manifest.published_at || "",
-      releaseNotes: baseState.releaseNotes || manifest.notes || manifest.body || manifest.release_notes || "",
+      publishedAt: baseState.publishedAt || metadata.publishedAt,
+      releaseNotes: baseState.releaseNotes || metadata.releaseNotes,
     };
   }, [extractUpdateVersion]);
   const checkForUpdates = useCallback(async () => {
@@ -12780,13 +12834,13 @@ function UpdateCenterSection({ canManage }) {
         }, manifest));
         return;
       }
-      const nextPhase = update ? "update_available" : "up_to_date";
+      const nextPhase = describeUpdateAvailability({ metadata: manifest, online: true, update }).phase;
       updateObjectRef.current = update || null;
       setUpdaterState((current) => mergeManifestDiagnostics({
         ...current,
         phase: nextPhase,
         installedVersion: desktopVersion,
-        latestVersion: latestVersion || desktopVersion,
+        latestVersion,
         publishedAt: update?.date || current.publishedAt,
         releaseNotes: update?.body || current.releaseNotes,
         signatureVerified: false,
@@ -12797,7 +12851,7 @@ function UpdateCenterSection({ canManage }) {
       if (updateRequestIdRef.current !== requestId) return;
       setUpdaterState((current) => ({
         ...current,
-        phase: "error",
+        phase: navigator.onLine === false ? "offline" : "error",
         errorCode: navigator.onLine === false ? "OFFLINE" : "UPDATE_CHECK_FAILED",
         errorMessage: getErrorMessage(error, navigator.onLine === false ? "Offline - unable to check updates" : "Update check failed"),
       }));
@@ -13443,7 +13497,7 @@ function SyncSettingsSection({
             <Field label="Failed Queue Count"><input disabled value={connectionStatus?.failed ?? failed} /></Field>
             <Field label="Conflict Queue Count"><input disabled value={conflicts} /></Field>
             <Field label="Local Database"><input disabled value={nativeDbLabel} /></Field>
-            <Field label="FroozERP Cloud Access"><input disabled value={connectionStatus?.froozErpCloudAccess || "Online"} /></Field>
+            <Field label="FroozERP Cloud Access"><input disabled value={connectionStatus?.froozErpCloudAccess || "Not Verified"} /></Field>
             <Field label="Local API URL"><input disabled value={API_CONFIG.localApiUrl} /></Field>
             <Field label="Branch LAN API URL"><input disabled value={API_CONFIG.branchLanApiUrl} /></Field>
             <Field label="Cloud API URL"><input disabled value={API_CONFIG.cloudApiUrl} /></Field>

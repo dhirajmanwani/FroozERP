@@ -1,13 +1,13 @@
 {
   "name": "frontend",
   "private": true,
-  "version": "1.0.52",
+  "version": "1.0.53",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint src --cache --cache-location ../.cache/eslint/frontend",
-    "test:local-runtime": "node --test src/local/offlineSession.test.mjs src/local/serverTime.test.mjs",
+    "test:local-runtime": "node --test src/local/offlineSession.test.mjs src/local/serverTime.test.mjs src/local/updateMetadata.test.mjs src/local/canonicalIdentity.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

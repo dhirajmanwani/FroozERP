@@ -28,12 +28,16 @@ assert.equal(count("update-foundation-panel"), 1, "There must be one update stat
 assert.equal(count("form-grid supplier-form-grid"), 0, "Legacy disabled duplicate form grid must not render");
 assert.equal(count("purchase-summary-grid supplier-payment-preview"), 0, "Legacy duplicate summary grid must not render");
 
-for (const phase of ["idle", "checking", "update_available", "up_to_date", "downloading", "ready_to_install", "installing", "error"]) {
+for (const phase of ["idle", "checking", "update_available", "up_to_date", "no_published_update", "offline", "downloading", "ready_to_install", "installing", "error"]) {
   assert.ok(section.includes(`"${phase}"`), `Updater state phase ${phase} must be represented`);
 }
 
 assert.ok(section.includes("updateRequestIdRef.current !== requestId"), "Stale updater responses must be ignored");
-assert.ok(section.includes('data && typeof data === "object" ? data : {}'), "Null updater/manifest responses must be normalized before reading version fields");
+assert.ok(section.includes("normalizeUpdateMetadata(manifest)"), "Null updater/manifest responses must be normalized before reading metadata fields");
+assert.equal(section.includes("manifest.pub_date"), false, "Update Center must not dereference pub_date on nullable metadata");
+assert.ok(section.includes("No published update available"), "Unpublished RCs must show a truthful no-published-update state");
+assert.ok(source.includes('<SettingsSectionErrorBoundary sectionName="Update Center">'), "Update Center must be isolated from the rest of Settings");
+assert.ok(source.indexOf("<SyncSettingsSection") > source.indexOf('<SettingsSectionErrorBoundary sectionName="Update Center">'), "Advanced Diagnostics must remain after the isolated Update Center section");
 assert.ok(section.includes("install_diagnostics"), "Desktop version must come from Tauri install diagnostics");
 assert.ok(section.includes("local_backend_service_status"), "Backend PID/path must come from Tauri backend status");
 assert.ok(section.includes("NO_UPDATE_OBJECT"), "Missing Tauri update object must be explicit");
