@@ -475,7 +475,11 @@ fn local_backend_version(timeout_ms: u64) -> Result<String, String> {
 
 fn local_backend_version_matches(timeout_ms: u64) -> Result<bool, String> {
     let version = local_backend_version(timeout_ms)?;
-    Ok(version == env!("CARGO_PKG_VERSION"))
+    Ok(version.trim() == env!("CARGO_PKG_VERSION"))
+}
+
+fn spawned_backend_owns_port(spawned_pid: u32, port_owner_pid: Option<u32>) -> bool {
+    port_owner_pid == Some(spawned_pid)
 }
 
 fn backend_dir_candidates() -> Vec<PathBuf> {
@@ -1071,6 +1075,33 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
         }
         match local_backend_version_matches(900) {
             Ok(true) => {
+                let port_owner_pid = backend_port_owner_pid();
+                if !spawned_backend_owns_port(pid, port_owner_pid) {
+                    let competing_pid = port_owner_pid;
+                    write_app_log(
+                        "ERROR",
+                        &format!(
+                            "Backend PID {} became healthy through competing port owner {:?}; stopping losing child",
+                            pid, competing_pid
+                        ),
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    clear_backend_ownership(&owner_token);
+                    drop(startup_lock);
+                    release_backend_startup_lock();
+                    return backend_status(
+                        "Existing FroozERP service won the startup race; duplicate child was stopped."
+                            .to_string(),
+                        competing_pid.is_some(),
+                        false,
+                        true,
+                        competing_pid,
+                        Some(backend_dir),
+                        Some(node_path),
+                        "reused-race-winner",
+                    );
+                }
                 drop(startup_lock);
                 release_backend_startup_lock();
                 let message = format!("Local FroozERP service started on attempt {}", attempt);
@@ -2051,6 +2082,13 @@ mod local_backend_lifecycle_tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn spawned_backend_must_own_the_port_before_it_is_accepted() {
+        assert!(spawned_backend_owns_port(42, Some(42)));
+        assert!(!spawned_backend_owns_port(42, Some(84)));
+        assert!(!spawned_backend_owns_port(42, None));
+    }
 
     #[test]
     fn forced_restart_replaces_only_the_owned_desktop_sqlite_service() {

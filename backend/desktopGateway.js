@@ -186,6 +186,14 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+server.once("error", (error) => {
+  if (error?.code === "EADDRINUSE") {
+    console.error(`FroozERP desktop gateway port ${PORT} is already owned; duplicate process exiting.`);
+    process.exit(0);
+  }
+  throw error;
+});
+
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`FroozERP desktop gateway ready on 127.0.0.1:${PORT}`);
   console.log(`Storage adapter: desktop-sqlite`);
