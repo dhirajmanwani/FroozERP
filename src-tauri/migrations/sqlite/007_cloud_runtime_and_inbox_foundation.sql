@@ -18,8 +18,8 @@ CREATE TABLE IF NOT EXISTS sync_devices (
   sync_status TEXT NOT NULL DEFAULT 'IDLE',
   pending_queue_count INTEGER NOT NULL DEFAULT 0,
   failed_queue_count INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_sync_devices_company_branch
@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS sync_runtime_config (
   sync_status TEXT NOT NULL DEFAULT 'IDLE',
   pending_queue_count INTEGER NOT NULL DEFAULT 0,
   failed_queue_count INTEGER NOT NULL DEFAULT 0,
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE TABLE IF NOT EXISTS sync_inbox (
@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS sync_inbox (
   created_at TEXT NOT NULL,
   processed_at TEXT,
   failed_reason TEXT,
-  received_at TEXT NOT NULL DEFAULT (datetime('now'))
+  received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_sync_inbox_scope

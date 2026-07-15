@@ -35,6 +35,12 @@ import {
   retryFailedOperations,
   syncNow,
 } from "./local/syncService";
+import {
+  formatKolkataDateTime,
+  getTimeDiagnostics,
+  markServerTimeOffline,
+  observeServerTime,
+} from "./local/serverTime";
 
 const isDesktopShell = () => Boolean(window.__TAURI_INTERNALS__ || window.__TAURI__);
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
@@ -230,6 +236,8 @@ const API_URL = resolveConfiguredApiUrl();
 const LOCAL_OPERATIONAL_API_URL = API_MODE === API_MODES.CLOUD_ONLY ? API_URL : LOCAL_API_URL;
 const CLOUD_OPERATIONAL_API_URL = CLOUD_API_URL;
 const SYNC_API_URL = CLOUD_OPERATIONAL_API_URL || API_URL;
+const AUTH_API_URL = [API_MODES.HYBRID, API_MODES.CLOUD_ONLY, API_MODES.CLOUD_PRODUCTION, API_MODES.FIELD_REMOTE_DEVICE].includes(API_MODE)
+  && CLOUD_OPERATIONAL_API_URL ? CLOUD_OPERATIONAL_API_URL : API_URL;
 const API_CONFIG = {
   mode: API_MODE,
   apiUrl: API_URL,
@@ -303,9 +311,7 @@ const isRealCloudUrl = (value) => {
 const CLOUD_CONFIGURED = isRealCloudUrl(CLOUD_API_URL);
 
 const formatStatusDateTime = (value) => {
-  if (!value) return "";
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? "" : date.toLocaleString("en-IN");
+  return value ? formatKolkataDateTime(value) : "";
 };
 
 const isFreshStatusDateTime = (value, maxAgeMs = SYNC_FRESHNESS_MS) => {
@@ -1767,6 +1773,7 @@ function App() {
   const checkCloudBackendHealth = async (reason = "manual", timeoutMs = 5000) => {
     const latestDevice = await resolveLocalDeviceInfo(deviceInfo);
     const url = `${LOCAL_API_URL}/api/cloud/health`;
+    const requestStartedAt = Date.now();
     try {
       const response = await axios.get(url, {
         timeout: timeoutMs,
@@ -1774,6 +1781,9 @@ function App() {
         params: { t: Date.now(), user_id: userRef.current?.id, device_id: latestDevice?.device_id, branch_id: userRef.current?.branch_id || 1 },
       });
       const health = response.data || {};
+      if (health.cloudServerTime) {
+        observeServerTime({ serverTime: health.cloudServerTime, requestStartedAt, responseReceivedAt: Date.now() });
+      }
       const online = response.status >= 200 && response.status < 300 && health.cloudReachable === true;
       const next = {
         apiUrl: health.configuredCloudBaseUrl || CLOUD_API_URL,
@@ -1794,6 +1804,7 @@ function App() {
       setCloudHealth(next);
       return next;
     } catch (error) {
+      markServerTimeOffline();
       const next = {
         apiUrl: CLOUD_API_URL,
         url,
@@ -2926,7 +2937,12 @@ function App() {
     const offlineUser = hasObjectContent(snapshot?.user_profile)
       ? snapshot.user_profile
       : offlineAuth.session?.user;
-    setUser({ ...offlineUser, offline_session: true });
+    setUser({
+      ...offlineUser,
+      offline_session: true,
+      authentication_source: "secure_offline_cache",
+      canonical_user_id: offlineUser?.id,
+    });
     await applyReferenceSnapshot(snapshot, { offline: true, nextView: "sales" });
     return true;
   };
@@ -3453,21 +3469,34 @@ function App() {
     try {
       const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
       setDeviceInfo(latestDevice);
-      const health = await performConnectivityCheck("login", { force: true, timeoutMs: 4000 });
-      const backendOnline = health.online;
+      await performConnectivityCheck("login", { force: true, timeoutMs: 4000 });
+      const authHealth = FROOZERP_CLOUD_SIMULATED_OFFLINE
+        ? {
+            online: false,
+            url: `${AUTH_API_URL}/api/health`,
+            message: "FroozERP cloud access is disabled by the Owner.",
+          }
+        : await checkBackendHealth(AUTH_API_URL, {
+            details: true,
+            timeoutMs: 5000,
+            force: true,
+            reason: "canonical-cloud-login",
+            requireCloudIdentity: usesCloudBackend(),
+          });
+      const backendOnline = authHealth.online;
 
       if (!backendOnline) {
         setOfflineMode(true);
         const opened = await continueOffline(latestDevice);
         if (!opened) {
-          setStartupError((current) => current || `Backend health check failed at ${health.url}: ${health.message}.`);
+          setStartupError((current) => current || `Authentication backend health check failed at ${authHealth.url}: ${authHealth.message}.`);
         }
         return;
       }
 
-      writeDiagnosticLog("INFO", "login-request", { apiUrl: API_URL, endpoint: `${API_URL}/login`, deviceId: latestDevice.device_id });
-      const response = await axios.post(`${API_URL}/login`, { username: username.trim(), password, ...latestDevice }, { timeout: 8000 });
-      writeDiagnosticLog("INFO", "login-success", { apiUrl: API_URL, endpoint: `${API_URL}/login`, userId: response.data?.id, deviceId: latestDevice.device_id });
+      writeDiagnosticLog("INFO", "login-request", { apiUrl: AUTH_API_URL, endpoint: `${AUTH_API_URL}/login`, deviceId: latestDevice.device_id });
+      const response = await axios.post(`${AUTH_API_URL}/login`, { username: username.trim(), password, ...latestDevice }, { timeout: 8000 });
+      writeDiagnosticLog("INFO", "login-success", { apiUrl: AUTH_API_URL, endpoint: `${AUTH_API_URL}/login`, userId: response.data?.id, deviceId: latestDevice.device_id });
       setDeviceGate(null);
       mergeCloudIdentityIntoSavedConfig({
         ...response.data,
@@ -3492,8 +3521,8 @@ function App() {
       }
     } catch (error) {
       writeDiagnosticLog("ERROR", "login-failed", {
-        apiUrl: API_URL,
-        endpoint: `${API_URL}/login`,
+        apiUrl: AUTH_API_URL,
+        endpoint: `${AUTH_API_URL}/login`,
         status: error.response?.status || null,
         code: error.response?.data?.code || "",
         message: error.response?.data?.message || error.message || "Login failed",
@@ -3508,7 +3537,7 @@ function App() {
         const opened = await continueOffline(latestDevice);
         if (opened) return;
       }
-      setStartupError(getAuthErrorMessage(error, `Unable to sign in through ${API_URL}. Connect once to the FroozERP backend to authorise this device.`));
+      setStartupError(getAuthErrorMessage(error, `Unable to sign in through ${AUTH_API_URL}. Connect once to the FroozERP cloud backend to authorise this device.`));
     } finally {
       setLoginBusy(false);
     }
@@ -5718,6 +5747,7 @@ function App() {
                 setApplicationFontSize={setApplicationFontSize}
                 syncMessage={syncMessage}
                 syncStatus={syncStatus}
+                timeDiagnostics={syncStatus?.timeDiagnostics || getTimeDiagnostics()}
                 rules={settingsRules}
                 user={user}
               />
@@ -11659,6 +11689,7 @@ function SettingsModule({
   setApplicationFontSize,
   syncMessage,
   syncStatus,
+  timeDiagnostics,
   user,
 }) {
   return (
@@ -11709,6 +11740,7 @@ function SettingsModule({
         settingsData={settingsData}
         syncSettings={settingsData.syncSettings}
         syncStatus={syncStatus}
+        timeDiagnostics={timeDiagnostics}
         user={user}
       />
       <BackupSettings backupLogs={settingsData.backupLogs || []} backupSettings={settingsData.backupSettings} canManage={canManage} onReload={onReload} user={user} />
@@ -13057,6 +13089,7 @@ function SyncSettingsSection({
   settingsData,
   syncSettings,
   syncStatus,
+  timeDiagnostics,
   user,
 }) {
   const [draft, setDraft] = useState(syncSettings || {});
@@ -13282,6 +13315,7 @@ function SyncSettingsSection({
       pendingSync: pending,
       failedSync: failed,
       lastSync,
+      timeDiagnostics,
       lastError: syncStatus?.lastError || cloudHealth?.message || "",
       checkedAt: new Date().toISOString(),
     };
@@ -13324,7 +13358,7 @@ function SyncSettingsSection({
           ["Cloud", cloudStatus],
           ["Sync Status", syncSummary],
           ["Pending Sync", pending],
-          ["Last Sync", lastSync ? new Date(lastSync).toLocaleString("en-IN") : "Not synced"],
+          ["Last Sync", lastSync ? formatKolkataDateTime(lastSync) : "Not synced"],
         ].map(([label, value]) => (
           <div className="sync-owner-row" key={label}>
             <span>{label}</span>
@@ -13334,13 +13368,8 @@ function SyncSettingsSection({
       </div>
       <div className="toolbar-actions">
         <button className="secondary-button" disabled={!onCheckConnection} onClick={onCheckConnection}>Check Connection</button>
-        <button className="secondary-button" disabled={!canManage || !onRunCloudDiagnostics} onClick={onRunCloudDiagnostics}>Test Cloud Connection</button>
-        <button className="secondary-button" disabled={!canManage || !onRegisterCloudDevice || cloudActionBusy === "register"} onClick={runRegisterDevice}>{cloudActionBusy === "register" ? "Registering..." : "Register This Device"}</button>
-        <button className="secondary-button" disabled={!canManage || !onApproveCloudDevice || cloudActionBusy === "approve"} onClick={runApproveDevice}>{cloudActionBusy === "approve" ? "Approving..." : "Approve This Device"}</button>
         <button className="secondary-button" disabled={!canManage || !onRunSync} onClick={onRunSync}>Sync Now</button>
-        <button className="secondary-button" disabled={!canManage || !onQueueSyncTest} onClick={onQueueSyncTest}>Queue Safe Test</button>
         <button className="secondary-button" disabled={!canManage || !onRetrySync} onClick={onRetrySync}>Retry Failed</button>
-        <button className="secondary-button" onClick={copySafeDiagnostics}>Copy Safe Diagnostics</button>
         <button className="secondary-button" onClick={() => setShowDiagnostics((current) => !current)}>Advanced Diagnostics</button>
       </div>
       {showDiagnostics && cloudReadiness && (
@@ -13356,6 +13385,10 @@ function SyncSettingsSection({
           </div>
           <div className="toolbar-actions">
             <button className="secondary-button" disabled={!canManage || !onRunCloudDiagnostics} onClick={onRunCloudDiagnostics}>Run Cloud Diagnostics</button>
+            <button className="secondary-button" disabled={!canManage || !onRegisterCloudDevice || cloudActionBusy === "register"} onClick={runRegisterDevice}>{cloudActionBusy === "register" ? "Registering..." : "Register This Device"}</button>
+            <button className="secondary-button" disabled={!canManage || !onApproveCloudDevice || cloudActionBusy === "approve"} onClick={runApproveDevice}>{cloudActionBusy === "approve" ? "Approving..." : "Approve This Device"}</button>
+            <button className="secondary-button" disabled={!canManage || !onQueueSyncTest} onClick={onQueueSyncTest}>Queue Safe Test</button>
+            <button className="secondary-button" onClick={copySafeDiagnostics}>Copy Safe Diagnostics</button>
           </div>
           <div className="form-grid supplier-form-grid">
             <Field label="Select App Mode">
@@ -13396,11 +13429,11 @@ function SyncSettingsSection({
             <Field label="Device Display Name"><input disabled={!canManage} value={draft.device_display_name || ""} onChange={(event) => setDraft({ ...draft, device_display_name: event.target.value })} /></Field>
             <Field label="Local SQLite Path"><input disabled value={localDbStatus?.databasePath || "Available in FroozERP desktop app"} /></Field>
             <Field label="Local Schema Version"><input disabled value={localDbStatus?.schemaVersion || "Not initialized"} /></Field>
-            <Field label="Last Push"><input disabled value={lastPush ? new Date(lastPush).toLocaleString("en-IN") : "Not pushed"} /></Field>
-            <Field label="Last Pull"><input disabled value={lastPull ? new Date(lastPull).toLocaleString("en-IN") : "Not pulled"} /></Field>
+            <Field label="Last Push"><input disabled value={lastPush ? formatKolkataDateTime(lastPush) : "Not pushed"} /></Field>
+            <Field label="Last Pull"><input disabled value={lastPull ? formatKolkataDateTime(lastPull) : "Not pulled"} /></Field>
             <Field label="API Mode"><input disabled value={API_CONFIG.mode} /></Field>
-            <Field label="Configured Company ID"><input disabled value={API_CONFIG.companyId} /></Field>
-            <Field label="Configured Branch ID"><input disabled value={API_CONFIG.branchId} /></Field>
+            <Field label="Configured Company ID"><input disabled value={user?.company_id || API_CONFIG.companyId} /></Field>
+            <Field label="Configured Branch ID"><input disabled value={user?.branch_id || API_CONFIG.branchId} /></Field>
             <Field label="Configured Sub-Branch ID"><input disabled value={API_CONFIG.subBranchId} /></Field>
             <Field label="Configured Device ID"><input disabled value={API_CONFIG.deviceId} /></Field>
             <Field label="Configured Device Name"><input disabled value={API_CONFIG.deviceName} /></Field>
@@ -13431,6 +13464,13 @@ function SyncSettingsSection({
             <Field label="Cloud Health Detail"><input disabled value={cloudHealth?.message || "Not checked"} /></Field>
             <Field label="Cloud Device Status"><input disabled value={cloudDeviceStatus} /></Field>
             <Field label="Cloud Device Detail"><input disabled value={cloudDeviceDetail} /></Field>
+            <Field label="Device Local Time"><input disabled value={timeDiagnostics?.deviceLocalTime || formatKolkataDateTime(new Date())} /></Field>
+            <Field label="Device UTC Time"><input disabled value={timeDiagnostics?.deviceUtcTime || new Date().toISOString()} /></Field>
+            <Field label="Railway Server UTC Time"><input disabled value={timeDiagnostics?.railwayServerUtcTime || "Unavailable"} /></Field>
+            <Field label="Detected Timezone"><input disabled value={timeDiagnostics?.detectedTimezone || "Unknown"} /></Field>
+            <Field label="Clock Offset (seconds)"><input disabled value={timeDiagnostics?.clockOffsetSeconds ?? "Unavailable"} /></Field>
+            <Field label="Last Server-Time Check"><input disabled value={timeDiagnostics?.lastSuccessfulServerTimeCheck ? formatKolkataDateTime(timeDiagnostics.lastSuccessfulServerTimeCheck) : "Not checked"} /></Field>
+            <Field label="Time Status"><input disabled value={timeDiagnostics?.timeStatus || "Offline"} /></Field>
             <Field label="Last Sync Failure"><input disabled value={syncStatus?.lastError || backendHealth?.message || "None"} /></Field>
             <Field label="Current Cursor"><input disabled value={syncStatus?.currentCursor || "0"} /></Field>
             <label className="check-field"><input checked={draft.sync_enabled === true} disabled type="checkbox" /><span>Sync foundation enabled for approved native devices</span></label>

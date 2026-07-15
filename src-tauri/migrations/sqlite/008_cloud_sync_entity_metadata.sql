@@ -16,8 +16,8 @@ CREATE TABLE IF NOT EXISTS cloud_sync_entity_metadata (
   updated_by_device_id TEXT,
   sync_status TEXT NOT NULL DEFAULT 'pending',
   synced_at TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   PRIMARY KEY (entity_type, entity_id),
   UNIQUE (idempotency_key)
 );

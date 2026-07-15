@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS local_sale_audit_log (
   reason TEXT,
   old_value TEXT,
   new_value TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   sync_status TEXT NOT NULL DEFAULT 'pending'
 );
 
@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS local_customer_ledger_entries (
   credit_amount REAL NOT NULL DEFAULT 0,
   balance_delta REAL NOT NULL DEFAULT 0,
   remarks TEXT,
-  transaction_time TEXT NOT NULL DEFAULT (datetime('now')),
+  transaction_time TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   sync_status TEXT NOT NULL DEFAULT 'pending'
 );
 

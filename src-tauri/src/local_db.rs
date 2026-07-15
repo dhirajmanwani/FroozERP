@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
-const CURRENT_SCHEMA_VERSION: &str = "007_cloud_runtime_and_inbox_foundation";
+const CURRENT_SCHEMA_VERSION: &str = "009_canonical_utc_timestamps";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -15,6 +15,7 @@ const MIGRATION_004: &str = include_str!("../migrations/sqlite/004_offline_sale_
 const MIGRATION_005: &str = include_str!("../migrations/sqlite/005_mandi_tax_sale_details.sql");
 const MIGRATION_006: &str = include_str!("../migrations/sqlite/006_multibranch_identity_foundation.sql");
 const MIGRATION_007: &str = include_str!("../migrations/sqlite/007_cloud_runtime_and_inbox_foundation.sql");
+const MIGRATION_009: &str = include_str!("../migrations/sqlite/009_canonical_utc_timestamps.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -188,11 +189,12 @@ pub fn pending_outbox(app: &AppHandle, limit: i64) -> Result<Vec<PendingSyncOper
     pending_outbox_at(&conn, limit)
 }
 
-pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck]) -> Result<LocalDbStatus, String> {
+pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck], server_time: Option<String>) -> Result<LocalDbStatus, String> {
     let path = database_path(app)?;
     initialize_at(&path)?;
     let mut conn = Connection::open(&path).map_err(to_error)?;
     let tx = conn.transaction().map_err(to_error)?;
+    let confirmed_at = require_server_time(server_time)?;
     for ack in acks {
         let status = ack.status.to_lowercase();
         let server_ack = serde_json::to_string(ack).map_err(to_error)?;
@@ -200,10 +202,10 @@ pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck]) -> Result<LocalDbStatu
             "accepted" | "success" | "synced" | "duplicate" => {
                 tx.execute(
                     "UPDATE sync_outbox
-                     SET status = 'synced', synced_at = datetime('now'), last_attempt_at = datetime('now'),
+                     SET status = 'synced', synced_at = ?4, last_attempt_at = ?4,
                          last_error = NULL, server_ack = ?2, entity_version = COALESCE(?3, entity_version)
                      WHERE operation_id = ?1",
-                    params![ack.operation_id, server_ack, ack.server_entity_version],
+                    params![ack.operation_id, server_ack, ack.server_entity_version, confirmed_at],
                 )
                 .map_err(to_error)?;
                 tx.execute(
@@ -211,31 +213,32 @@ pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck]) -> Result<LocalDbStatu
                      SET sync_status = 'synced',
                          server_invoice_no = json_extract(?2, '$.result_payload.invoice_no'),
                          server_sale_id = json_extract(?2, '$.result_payload.sale_id'),
-                         synced_at = datetime('now'),
-                         updated_at = datetime('now'),
+                         synced_at = ?4,
+                         updated_at = ?4,
                          entity_version = COALESCE(?3, entity_version)
                      WHERE id = (SELECT entity_id FROM sync_outbox WHERE operation_id = ?1 AND entity_type = 'pos_sale')",
-                    params![ack.operation_id, server_ack, ack.server_entity_version],
+                    params![ack.operation_id, server_ack, ack.server_entity_version, confirmed_at],
                 )
                 .map_err(to_error)?;
             }
             "conflict" => {
                 tx.execute(
                     "UPDATE sync_outbox
-                     SET status = 'conflict', last_attempt_at = datetime('now'), last_error = ?2, server_ack = ?3
+                     SET status = 'conflict', last_attempt_at = ?4, last_error = ?2, server_ack = ?3
                      WHERE operation_id = ?1",
                     params![
                         ack.operation_id,
                         ack.message.clone().unwrap_or_else(|| "Conflict".to_string()),
-                        server_ack
+                        server_ack,
+                        confirmed_at
                     ],
                 )
                 .map_err(to_error)?;
                 tx.execute(
                     "UPDATE local_pos_invoices
-                     SET sync_status = 'conflict', updated_at = datetime('now')
+                     SET sync_status = 'conflict', updated_at = ?2
                      WHERE id = (SELECT entity_id FROM sync_outbox WHERE operation_id = ?1 AND entity_type = 'pos_sale')",
-                    params![ack.operation_id],
+                    params![ack.operation_id, confirmed_at],
                 )
                 .map_err(to_error)?;
                 record_conflict_with_tx(&tx, ack)?;
@@ -243,21 +246,22 @@ pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck]) -> Result<LocalDbStatu
             _ => {
                 tx.execute(
                     "UPDATE sync_outbox
-                     SET status = 'failed', retry_count = retry_count + 1, last_attempt_at = datetime('now'),
+                     SET status = 'failed', retry_count = retry_count + 1, last_attempt_at = ?4,
                          last_error = ?2, server_ack = ?3
                      WHERE operation_id = ?1",
                     params![
                         ack.operation_id,
                         ack.message.clone().unwrap_or_else(|| "Sync operation failed".to_string()),
-                        server_ack
+                        server_ack,
+                        confirmed_at
                     ],
                 )
                 .map_err(to_error)?;
                 tx.execute(
                     "UPDATE local_pos_invoices
-                     SET sync_status = 'failed', updated_at = datetime('now')
+                     SET sync_status = 'failed', updated_at = ?2
                      WHERE id = (SELECT entity_id FROM sync_outbox WHERE operation_id = ?1 AND entity_type = 'pos_sale')",
-                    params![ack.operation_id],
+                    params![ack.operation_id, confirmed_at],
                 )
                 .map_err(to_error)?;
             }
@@ -265,13 +269,13 @@ pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck]) -> Result<LocalDbStatu
     }
     tx.execute(
         "INSERT INTO sync_state (device_id, last_push_at, last_successful_sync_at, current_sync_status, updated_at)
-         VALUES ('default', datetime('now'), datetime('now'), 'IDLE', datetime('now'))
+         VALUES ('default', ?1, ?1, 'IDLE', ?1)
          ON CONFLICT(device_id) DO UPDATE SET
            last_push_at = excluded.last_push_at,
            last_successful_sync_at = excluded.last_successful_sync_at,
            current_sync_status = 'IDLE',
            updated_at = excluded.updated_at",
-        [],
+        params![confirmed_at],
     )
     .map_err(to_error)?;
     tx.commit().map_err(to_error)?;
@@ -283,11 +287,13 @@ pub fn apply_pull_changes(
     changes: &[PulledChange],
     next_cursor: &str,
     device_id: Option<String>,
+    server_time: Option<String>,
 ) -> Result<LocalDbStatus, String> {
     let path = database_path(app)?;
     initialize_at(&path)?;
     let mut conn = Connection::open(&path).map_err(to_error)?;
     let tx = conn.transaction().map_err(to_error)?;
+    let confirmed_at = require_server_time(server_time)?;
     for change in changes {
         apply_change_with_tx(&tx, change)?;
     }
@@ -296,7 +302,7 @@ pub fn apply_pull_changes(
         "INSERT INTO sync_state (
             device_id, last_server_cursor, last_pull_cursor, last_pull_at,
             last_successful_sync_at, current_sync_status, updated_at
-         ) VALUES (?1, ?2, ?2, datetime('now'), datetime('now'), 'IDLE', datetime('now'))
+         ) VALUES (?1, ?2, ?2, ?3, ?3, 'IDLE', ?3)
          ON CONFLICT(device_id) DO UPDATE SET
            last_server_cursor = excluded.last_server_cursor,
            last_pull_cursor = excluded.last_pull_cursor,
@@ -304,7 +310,7 @@ pub fn apply_pull_changes(
            last_successful_sync_at = excluded.last_successful_sync_at,
            current_sync_status = 'IDLE',
            updated_at = excluded.updated_at",
-        params![state_device, next_cursor],
+        params![state_device, next_cursor, confirmed_at],
     )
     .map_err(to_error)?;
     tx.commit().map_err(to_error)?;
@@ -317,7 +323,7 @@ pub fn mark_sync_failed(app: &AppHandle, message: &str) -> Result<LocalDbStatus,
     let conn = Connection::open(&path).map_err(to_error)?;
     conn.execute(
         "INSERT INTO sync_state (device_id, current_sync_status, last_error, updated_at)
-         VALUES ('default', 'FAILED', ?1, datetime('now'))
+         VALUES ('default', 'FAILED', ?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
          ON CONFLICT(device_id) DO UPDATE SET
            current_sync_status = 'FAILED',
            last_error = excluded.last_error,
@@ -342,7 +348,7 @@ pub fn queue_sync_test_entity(
     let tx = conn.transaction().map_err(to_error)?;
     tx.execute(
         "INSERT INTO local_sync_test_entities (id, branch_id, device_id, value, sync_status, updated_at)
-         VALUES (?1, COALESCE(?2, '1'), ?3, ?4, 'pending', datetime('now'))
+         VALUES (?1, COALESCE(?2, '1'), ?3, ?4, 'pending', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
          ON CONFLICT(id) DO UPDATE SET
            value = excluded.value,
            branch_id = excluded.branch_id,
@@ -470,7 +476,7 @@ fn complete_local_pos_sale_at(path: &Path, sale: serde_json::Value) -> Result<Lo
             taxable_amount, mandi_tax_rate, mandi_tax_basis, tax_config_snapshot,
             status, sync_status, entity_version, created_at, updated_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                   ?17, ?18, ?19, ?20, 'COMPLETED', 'pending', ?21, datetime('now'), datetime('now'))",
+                   ?17, ?18, ?19, ?20, 'COMPLETED', 'pending', ?21, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
         params![
             invoice_id,
             offline_ref,
@@ -531,7 +537,7 @@ fn complete_local_pos_sale_at(path: &Path, sale: serde_json::Value) -> Result<Lo
 
         tx.execute(
             "INSERT INTO local_products (id, cloud_id, branch_id, product_name, unit, sale_rate, sync_status, updated_at)
-             VALUES (?1, ?1, ?2, ?3, ?4, ?5, 'synced', datetime('now'))
+             VALUES (?1, ?1, ?2, ?3, ?4, ?5, 'synced', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
              ON CONFLICT(id) DO UPDATE SET
                product_name = COALESCE(excluded.product_name, local_products.product_name),
                unit = COALESCE(excluded.unit, local_products.unit),
@@ -551,7 +557,7 @@ fn complete_local_pos_sale_at(path: &Path, sale: serde_json::Value) -> Result<Lo
             "INSERT INTO local_inventory_lots (
                 id, cloud_id, branch_id, device_id, product_id, product_name, lot_no, size_grade,
                 opening_qty, balance_qty, sale_rate, status, sync_status, updated_at
-             ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, 'ACTIVE', 'synced', datetime('now'))
+             ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, 'ACTIVE', 'synced', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
              ON CONFLICT(id) DO NOTHING",
             params![
                 lot_id,
@@ -571,7 +577,7 @@ fn complete_local_pos_sale_at(path: &Path, sale: serde_json::Value) -> Result<Lo
             "UPDATE local_inventory_lots
              SET sold_qty = sold_qty + ?2,
                  balance_qty = balance_qty - ?2,
-                 updated_at = datetime('now'),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                  sync_status = CASE WHEN LOWER(sync_status) = 'pending' THEN sync_status ELSE 'synced' END
              WHERE id = ?1 AND balance_qty >= ?2",
             params![lot_id, quantity],
@@ -609,7 +615,7 @@ fn complete_local_pos_sale_at(path: &Path, sale: serde_json::Value) -> Result<Lo
             "INSERT INTO local_stock_movements (
                 id, invoice_id, item_id, product_id, lot_id, branch_id, device_id,
                 movement_type, quantity, quantity_delta, movement_time, sync_status
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'SALE_OUT', ?8, ?9, datetime('now'), 'pending')",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'SALE_OUT', ?8, ?9, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'pending')",
             params![
                 stock_movement_id,
                 invoice_id,
@@ -648,7 +654,7 @@ fn complete_local_pos_sale_at(path: &Path, sale: serde_json::Value) -> Result<Lo
             "INSERT INTO local_payment_postings (
                 id, invoice_id, posting_type, payment_mode, account_id, customer_id,
                 amount, branch_id, device_id, posting_time, sync_status
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'), 'pending')",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'pending')",
             params![
                 posting_id,
                 invoice_id,
@@ -843,7 +849,7 @@ fn restore_invoice_stock(tx: &rusqlite::Transaction<'_>, invoice_id: &str, devic
             "UPDATE local_inventory_lots
              SET sold_qty = MAX(sold_qty - ?2, 0),
                  balance_qty = balance_qty + ?2,
-                 updated_at = datetime('now')
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ?1",
             params![lot_id, quantity],
         )
@@ -855,7 +861,7 @@ fn restore_invoice_stock(tx: &rusqlite::Transaction<'_>, invoice_id: &str, devic
             "INSERT INTO local_stock_movements (
                 id, invoice_id, item_id, product_id, lot_id, branch_id, device_id,
                 movement_type, quantity, quantity_delta, movement_time, sync_status
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'SALE_REVERSAL', ?8, ?8, datetime('now'), 'pending')",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'SALE_REVERSAL', ?8, ?8, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'pending')",
             params![
                 unique_local_id("stock-reversal"),
                 invoice_id,
@@ -920,7 +926,7 @@ fn insert_local_sale_items_and_stock(
             "UPDATE local_inventory_lots
              SET sold_qty = sold_qty + ?2,
                  balance_qty = balance_qty - ?2,
-                 updated_at = datetime('now')
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ?1 AND balance_qty >= ?2",
             params![lot_id, quantity],
         )
@@ -959,7 +965,7 @@ fn insert_local_sale_items_and_stock(
             "INSERT INTO local_stock_movements (
                 id, invoice_id, item_id, product_id, lot_id, branch_id, device_id,
                 movement_type, quantity, quantity_delta, movement_time, sync_status
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'SALE_OUT', ?8, ?9, datetime('now'), 'pending')",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'SALE_OUT', ?8, ?9, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'pending')",
             params![
                 stock_movement_id,
                 invoice_id,
@@ -1013,7 +1019,7 @@ fn replace_local_payment_postings(
                     "INSERT INTO local_payment_postings (
                         id, invoice_id, posting_type, payment_mode, account_id, customer_id,
                         amount, branch_id, device_id, posting_time, sync_status
-                     ) VALUES (?1, ?2, 'PAYMENT_REVERSAL', ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'), 'pending')",
+                     ) VALUES (?1, ?2, 'PAYMENT_REVERSAL', ?3, ?4, ?5, ?6, ?7, ?8, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'pending')",
                     params![unique_local_id("payment-reversal"), invoice_id, mode, account_id, customer, amount, branch_id, device_id],
                 )
                 .map_err(to_error)?;
@@ -1038,7 +1044,7 @@ fn replace_local_payment_postings(
             "INSERT INTO local_payment_postings (
                 id, invoice_id, posting_type, payment_mode, account_id, customer_id,
                 amount, branch_id, device_id, posting_time, sync_status
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'), 'pending')",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'pending')",
             params![
                 posting_id,
                 invoice_id,
@@ -1119,7 +1125,7 @@ fn edit_local_pos_sale_at(path: &Path, edit: serde_json::Value) -> Result<LocalP
              tax_total = ?11, net_total = ?12, taxable_amount = ?13,
              mandi_tax_rate = ?14, mandi_tax_basis = ?15, tax_config_snapshot = ?16,
              status = 'EDITED', sync_status = 'pending', entity_version = ?17, base_version = ?18,
-             edit_reason = ?19, updated_at = datetime('now')
+             edit_reason = ?19, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE id = ?1",
         params![
             invoice_id,
@@ -1210,10 +1216,10 @@ fn cancel_local_pos_sale_at(path: &Path, cancellation: serde_json::Value) -> Res
              sync_status = 'pending',
              cancellation_reason = ?2,
              cancelled_by = ?3,
-             cancelled_at = datetime('now'),
+             cancelled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
              entity_version = ?4,
              base_version = ?5,
-             updated_at = datetime('now')
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE id = ?1",
         params![invoice_id, reason, user_id, new_version, old_version],
     )
@@ -1270,7 +1276,7 @@ fn enqueue_sync_operation_with_conn(conn: &Connection, operation: &SyncOperation
         "INSERT INTO sync_outbox (
             id, operation_id, entity_type, entity_id, operation_type, payload, payload_json,
             branch_id, device_id, user_id, version, entity_version, created_at, status
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?10, COALESCE(?11, datetime('now')), 'pending')
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?10, COALESCE(?11, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), 'pending')
          ON CONFLICT(operation_id) DO NOTHING",
         params![
             operation.id,
@@ -1313,7 +1319,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS local_schema_migrations (
             version TEXT PRIMARY KEY,
-            applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+            applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
             checksum TEXT NOT NULL,
             status TEXT NOT NULL
         );",
@@ -1327,6 +1333,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "005_mandi_tax_sale_details", MIGRATION_005)?;
     apply_migration(&mut conn, "006_multibranch_identity_foundation", MIGRATION_006)?;
     apply_migration(&mut conn, "007_cloud_runtime_and_inbox_foundation", MIGRATION_007)?;
+    apply_migration(&mut conn, "009_canonical_utc_timestamps", MIGRATION_009)?;
     Ok(())
 }
 
@@ -1414,29 +1421,39 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
     let platform = optional_text(&device_identity, "platform").unwrap_or_else(|| "tauri-windows".to_string());
     let app_version = optional_text(&device_identity, "app_version").unwrap_or_else(|| "1.0.0".to_string());
     let registration_status = optional_text(&device_identity, "registration_status").unwrap_or_else(|| "approved".to_string());
+    let user_profile = snapshot.get("user_profile").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let company_id = optional_text(&user_profile, "company_id")
+        .or_else(|| optional_text(&device_identity, "company_id"));
+    let canonical_user_id = optional_text(&user_profile, "id");
+    let canonical_role = optional_text(&user_profile, "role_name")
+        .or_else(|| optional_text(&user_profile, "role"));
 
     tx.execute(
         "INSERT INTO local_device_identity (
-            device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now'))
+            device_id, device_name, platform, app_version, branch_id, registration_status,
+            company_id, user_id, role, last_seen_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                   strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
          ON CONFLICT(device_id) DO UPDATE SET
            device_name = excluded.device_name,
            platform = excluded.platform,
            app_version = excluded.app_version,
            branch_id = excluded.branch_id,
            registration_status = excluded.registration_status,
+           company_id = COALESCE(excluded.company_id, local_device_identity.company_id),
+           user_id = COALESCE(excluded.user_id, local_device_identity.user_id),
+           role = COALESCE(excluded.role, local_device_identity.role),
            last_seen_at = excluded.last_seen_at,
            updated_at = excluded.updated_at",
-        params![device_id, device_name, platform, app_version, branch_id, registration_status],
+        params![device_id, device_name, platform, app_version, branch_id, registration_status, company_id, canonical_user_id, canonical_role],
     )
     .map_err(to_error)?;
 
-    let user_profile = snapshot.get("user_profile").cloned().unwrap_or_else(|| serde_json::json!({}));
     if let Some(username) = optional_text(&user_profile, "username") {
         let key = format!("offline_user_profile::{}::{}", device_id, username.to_lowercase());
         tx.execute(
             "INSERT INTO local_kv (key, value, updated_at)
-             VALUES (?1, ?2, datetime('now'))
+             VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             params![key, serde_json::to_string(&user_profile).map_err(to_error)?],
         )
@@ -1450,7 +1467,7 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
             let key = format!("offline_auth::{}::{}", device_id, username_lower.to_lowercase());
             tx.execute(
                 "INSERT INTO local_kv (key, value, updated_at)
-                 VALUES (?1, ?2, datetime('now'))
+                 VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
                 params![key, serde_json::to_string(&offline_auth).map_err(to_error)?],
             )
@@ -1460,7 +1477,7 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
 
     tx.execute(
         "INSERT INTO local_kv (key, value, updated_at)
-         VALUES ('offline_branch_context', ?1, datetime('now'))
+         VALUES ('offline_branch_context', ?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         [serde_json::to_string(snapshot.get("branch_context").unwrap_or(&serde_json::json!({}))).map_err(to_error)?],
     )
@@ -1474,7 +1491,7 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
     });
     tx.execute(
         "INSERT INTO local_kv (key, value, updated_at)
-         VALUES ('offline_reference_meta', ?1, datetime('now'))
+         VALUES ('offline_reference_meta', ?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         [serde_json::to_string(&reference_meta).map_err(to_error)?],
     )
@@ -1515,7 +1532,7 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
             tx.execute(
                 "INSERT INTO local_categories (
                     id, cloud_id, branch_id, name, active, created_at, updated_at, version, sync_status, deleted_at
-                 ) VALUES (?1, ?1, ?2, ?3, ?4, COALESCE(?5, datetime('now')), COALESCE(?6, datetime('now')), ?7, 'synced', ?8)",
+                 ) VALUES (?1, ?1, ?2, ?3, ?4, COALESCE(?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?7, 'synced', ?8)",
                 params![
                     category_id,
                     branch_id,
@@ -1563,7 +1580,7 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                 "INSERT INTO local_products (
                     id, cloud_id, branch_id, product_name, category_id, category_name, unit, barcode,
                     sale_rate, minimum_stock, active, remarks, created_at, updated_at, version, sync_status, deleted_at
-                 ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, datetime('now')), COALESCE(?13, datetime('now')), ?14, 'synced', ?15)",
+                 ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?13, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?14, 'synced', ?15)",
                 params![
                     product_id,
                     branch_id,
@@ -1607,7 +1624,7 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                     remarks, created_at, updated_at, version, sync_status, deleted_at
                  ) VALUES (
                     ?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                    ?20, ?21, COALESCE(?22, datetime('now')), COALESCE(?23, datetime('now')), ?24, 'synced', ?25
+                    ?20, ?21, COALESCE(?22, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?23, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?24, 'synced', ?25
                  )",
                 params![
                     lot_id,
@@ -1655,7 +1672,7 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                 "INSERT INTO local_customers (
                     id, cloud_id, branch_id, account_name, mobile_number, account_type,
                     active, system_account, created_at, updated_at, version, sync_status, deleted_at
-                 ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(?8, datetime('now')), COALESCE(?9, datetime('now')), ?10, 'synced', ?11)",
+                 ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(?8, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?9, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?10, 'synced', ?11)",
                 params![
                     customer_id,
                     branch_id,
@@ -1721,7 +1738,7 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                     ?12, ?13, ?14, ?15, ?16, ?17, 'synced', ?18, ?19, ?20,
-                    COALESCE(?21, datetime('now')), COALESCE(?22, datetime('now')), datetime('now')
+                    COALESCE(?21, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?22, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                  )
                  ON CONFLICT(id) DO UPDATE SET
                     customer_id = excluded.customer_id,
@@ -1741,7 +1758,7 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                     server_sale_id = excluded.server_sale_id,
                     entity_version = excluded.entity_version,
                     updated_at = excluded.updated_at,
-                    synced_at = datetime('now')",
+                    synced_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
                 params![
                     sale_id,
                     offline_ref,
@@ -1778,7 +1795,7 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
             tx.execute(
                 "INSERT INTO local_settings (
                     id, cloud_id, branch_id, setting_key, setting_value, created_at, updated_at, version, sync_status
-                 ) VALUES (?1, ?1, ?2, ?3, ?4, datetime('now'), datetime('now'), 1, 'synced')",
+                 ) VALUES (?1, ?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 1, 'synced')",
                 params![
                     format!("setting-{}-{}", branch_id, key),
                     branch_id,
@@ -1792,7 +1809,7 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
 
     tx.execute(
         "INSERT INTO sync_state (device_id, last_successful_sync_at, current_sync_status, updated_at)
-         VALUES (?1, COALESCE(?2, datetime('now')), 'IDLE', datetime('now'))
+         VALUES (?1, COALESCE(?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), 'IDLE', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
          ON CONFLICT(device_id) DO UPDATE SET
            last_successful_sync_at = COALESCE(excluded.last_successful_sync_at, sync_state.last_successful_sync_at),
            current_sync_status = 'IDLE',
@@ -2096,7 +2113,7 @@ fn set_smoke_value_at(path: &Path, value: &str) -> Result<(), String> {
     let conn = Connection::open(path).map_err(to_error)?;
     conn.execute(
         "INSERT INTO local_kv (key, value, updated_at)
-         VALUES ('phase1_smoke_test', ?1, datetime('now'))
+         VALUES ('phase1_smoke_test', ?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         [value],
     )
@@ -2179,7 +2196,7 @@ pub fn ensure_device_identity_at(path: &Path) -> Result<serde_json::Value, Strin
     conn.execute(
         "INSERT INTO local_device_identity (
             device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at, updated_at
-         ) VALUES (?1, ?2, 'tauri-windows', '1.0.0', '1', 'pending', datetime('now'), datetime('now'))",
+         ) VALUES (?1, ?2, 'tauri-windows', '1.0.0', '1', 'pending', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
         params![device_id, device_name],
     )
     .map_err(to_error)?;
@@ -2281,7 +2298,7 @@ fn record_conflict_with_tx(tx: &rusqlite::Transaction, ack: &SyncAck) -> Result<
          )
          SELECT
             ?1, entity_type, entity_id, COALESCE(payload_json, payload), ?2,
-            entity_version, ?3, ?4, 'open', 'OPEN', datetime('now')
+            entity_version, ?3, ?4, 'open', 'OPEN', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          FROM sync_outbox
          WHERE operation_id = ?5
          ON CONFLICT(id) DO NOTHING",
@@ -2334,7 +2351,7 @@ fn apply_pulled_pos_sale_with_tx(
                      server_sale_id = COALESCE(?4, server_sale_id),
                      entity_version = ?5,
                      updated_at = COALESCE(?6, updated_at),
-                     synced_at = datetime('now')
+                     synced_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                  WHERE id = ?1",
                 params![
                     change.entity_id,
@@ -2399,7 +2416,7 @@ fn apply_pulled_pos_sale_with_tx(
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
             ?12, ?13, ?14, ?15, ?16, ?17, 'synced', ?18, ?19, ?20,
-            COALESCE(?21, datetime('now')), COALESCE(?22, datetime('now')), datetime('now')
+            COALESCE(?21, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?22, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          )",
         params![
             change.entity_id,
@@ -2495,14 +2512,14 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
         "product_category" => {
             if operation == "DELETE" {
                 tx.execute(
-                    "UPDATE local_categories SET deleted_at = COALESCE(?2, datetime('now')), sync_status = 'synced' WHERE id = ?1",
+                    "UPDATE local_categories SET deleted_at = COALESCE(?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), sync_status = 'synced' WHERE id = ?1",
                     params![change.entity_id, change.updated_at],
                 )
                 .map_err(to_error)?;
             } else {
                 tx.execute(
                     "INSERT INTO local_categories (id, cloud_id, branch_id, name, active, updated_at, version, sync_status, deleted_at)
-                     VALUES (?1, ?1, ?2, ?3, ?4, COALESCE(?5, datetime('now')), ?6, 'synced', NULL)
+                     VALUES (?1, ?1, ?2, ?3, ?4, COALESCE(?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?6, 'synced', NULL)
                      ON CONFLICT(id) DO UPDATE SET
                        name = excluded.name,
                        active = excluded.active,
@@ -2541,7 +2558,7 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                 "INSERT INTO local_products (
                     id, cloud_id, branch_id, product_name, category_id, category_name, unit,
                     barcode, sale_rate, minimum_stock, active, remarks, updated_at, version, sync_status, deleted_at
-                 ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, datetime('now')), ?13, 'synced', NULL)
+                 ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?13, 'synced', NULL)
                  ON CONFLICT(id) DO UPDATE SET
                    product_name = excluded.product_name,
                    category_id = excluded.category_id,
@@ -2578,7 +2595,7 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
         "sync_test" => {
             tx.execute(
                 "INSERT INTO local_sync_test_entities (id, branch_id, device_id, value, server_version, sync_status, updated_at, deleted_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'synced', COALESCE(?6, datetime('now')), NULL)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'synced', COALESCE(?6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), NULL)
                  ON CONFLICT(id) DO UPDATE SET
                    value = excluded.value,
                    server_version = excluded.server_version,
@@ -2616,6 +2633,14 @@ fn path_to_string(path: &Path) -> String {
 
 fn to_error(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+fn require_server_time(server_time: Option<String>) -> Result<String, String> {
+    let value = server_time.unwrap_or_default();
+    if value.len() < 24 || !value.ends_with('Z') || !value.contains('T') {
+        return Err("Cloud sync response did not include canonical server UTC time".to_string());
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -2686,7 +2711,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("migration count");
-            assert_eq!(migration_count, 7);
+            assert_eq!(migration_count, 8);
             drop(conn);
             initialize_at(path).expect("restart with existing SQLite profile");
         }
@@ -2707,7 +2732,7 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE local_schema_migrations (
                 version TEXT PRIMARY KEY,
-                applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                 checksum TEXT NOT NULL,
                 status TEXT NOT NULL
             );",
@@ -2745,7 +2770,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("preserved marker");
-        assert_eq!(migration_count, 7);
+        assert_eq!(migration_count, 8);
         assert_eq!(marker, "keep-me");
         drop(conn);
         let _ = fs::remove_file(&path);

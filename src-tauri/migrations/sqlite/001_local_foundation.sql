@@ -1,7 +1,7 @@
 CREATE TABLE IF NOT EXISTS local_kv (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL,
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE TABLE IF NOT EXISTS sync_outbox (
@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS sync_outbox (
   branch_id TEXT,
   device_id TEXT,
   version INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   retry_count INTEGER NOT NULL DEFAULT 0,
   last_error TEXT,
   status TEXT NOT NULL DEFAULT 'PENDING'
@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
   last_successful_sync_at TEXT,
   current_sync_status TEXT NOT NULL DEFAULT 'IDLE',
   last_error TEXT,
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE TABLE IF NOT EXISTS sync_conflicts (
@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS sync_conflicts (
   entity_id TEXT NOT NULL,
   local_payload TEXT NOT NULL,
   server_payload TEXT NOT NULL,
-  detected_at TEXT NOT NULL DEFAULT (datetime('now')),
+  detected_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   resolution_status TEXT NOT NULL DEFAULT 'OPEN',
   resolved_by TEXT,
   resolution_notes TEXT,
@@ -53,8 +53,8 @@ CREATE TABLE IF NOT EXISTS local_categories (
   name TEXT NOT NULL,
   active INTEGER NOT NULL DEFAULT 1,
   created_by TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   version INTEGER NOT NULL DEFAULT 1,
   sync_status TEXT NOT NULL DEFAULT 'SYNCED',
   deleted_at TEXT
@@ -76,8 +76,8 @@ CREATE TABLE IF NOT EXISTS local_products (
   active INTEGER NOT NULL DEFAULT 1,
   remarks TEXT,
   created_by TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   version INTEGER NOT NULL DEFAULT 1,
   sync_status TEXT NOT NULL DEFAULT 'SYNCED',
   deleted_at TEXT,
@@ -114,8 +114,8 @@ CREATE TABLE IF NOT EXISTS local_inventory_lots (
   status TEXT NOT NULL DEFAULT 'ACTIVE',
   remarks TEXT,
   created_by TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   version INTEGER NOT NULL DEFAULT 1,
   sync_status TEXT NOT NULL DEFAULT 'SYNCED',
   deleted_at TEXT,
@@ -137,8 +137,8 @@ CREATE TABLE IF NOT EXISTS local_customers (
   active INTEGER NOT NULL DEFAULT 1,
   system_account INTEGER NOT NULL DEFAULT 0,
   created_by TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   version INTEGER NOT NULL DEFAULT 1,
   sync_status TEXT NOT NULL DEFAULT 'SYNCED',
   deleted_at TEXT
@@ -153,8 +153,8 @@ CREATE TABLE IF NOT EXISTS local_settings (
   setting_key TEXT NOT NULL,
   setting_value TEXT NOT NULL,
   created_by TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   version INTEGER NOT NULL DEFAULT 1,
   sync_status TEXT NOT NULL DEFAULT 'SYNCED',
   deleted_at TEXT

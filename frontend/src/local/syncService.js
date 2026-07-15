@@ -2,6 +2,13 @@ import axios from "axios";
 import { checkFroozBackendHealth, getConnectivitySnapshot } from "./connectivityService";
 import { isTauriRuntime } from "./localDatabase";
 import { repositories } from "./repositories";
+import {
+  authoritativeUtcNowIso,
+  checkRailwayServerTime,
+  getTimeDiagnostics,
+  markServerTimeOffline,
+  observeServerTime,
+} from "./serverTime";
 
 let runningSync = null;
 let backoffMs = 2000;
@@ -23,6 +30,7 @@ let lastStatus = {
   syncStage: "",
   syncProgressDone: 0,
   syncProgressTotal: 0,
+  timeDiagnostics: getTimeDiagnostics(),
 };
 
 const clampBackoff = () => {
@@ -131,6 +139,7 @@ const normalizeLocalStatus = (status = {}) => ({
   failedOperations: Number(status.failedOperations || 0),
   conflictOperations: Number(status.conflictOperations || 0),
   lastError: status.error || "",
+  timeDiagnostics: getTimeDiagnostics(),
 });
 
 const classifySyncError = (error) => {
@@ -202,7 +211,7 @@ const syncContext = ({ user, deviceInfo, branchId }) => ({
   userId: user?.id,
   deviceId: deviceInfo?.device_id,
   deviceName: deviceInfo?.device_name,
-  branchId: String(branchId || user?.branch_id || 1),
+  branchId: String(branchId || user?.branch_id || ""),
 });
 
 export async function checkBackendHealth(apiUrl, options = {}) {
@@ -232,6 +241,8 @@ export async function initialiseSync({ apiUrl, user, deviceInfo, branchId }) {
     lastError: health.online ? "" : health.message,
   };
   if (!health.online) return lastStatus;
+  await checkRailwayServerTime(apiUrl).catch(() => markServerTimeOffline());
+  lastStatus = { ...lastStatus, timeDiagnostics: getTimeDiagnostics() };
   logSyncEndpoint("register-device", apiUrl, "/api/sync/register-device", { deviceId: context.deviceId });
   await axios.post(endpointUrl(apiUrl, "/api/sync/register-device"), {
     device_id: context.deviceId,
@@ -274,11 +285,12 @@ export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId
     syncProgressDone: 0,
     syncProgressTotal: operations.length,
   };
+  const pushStartedAt = Date.now();
   const response = await axios.post(endpointUrl(apiUrl, "/api/sync/push"), {
     user_id: context.userId,
     device_id: context.deviceId,
     branch_id: context.branchId,
-    client_timestamp: new Date().toISOString(),
+    client_timestamp: authoritativeUtcNowIso(),
     operations: operations.map((operation) => ({
       operation_id: operation.operation_id,
       idempotency_key: operation.operation_id,
@@ -290,6 +302,11 @@ export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId
       created_at: operation.created_at,
     })),
   }, withTimeout(15000));
+  observeServerTime({
+    serverTime: response.data?.server_time,
+    requestStartedAt: pushStartedAt,
+    responseReceivedAt: Date.now(),
+  });
   writeSyncLog("INFO", "push-result", {
     apiUrl: normalizeApiUrl(apiUrl),
     endpoint: endpointUrl(apiUrl, "/api/sync/push"),
@@ -297,7 +314,10 @@ export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId
     operationCount: operations.length,
     acknowledgementCount: (response.data?.acknowledgements || []).length,
   });
-  const status = await repositories.outbox.applyAcks(response.data?.acknowledgements || []);
+  const status = await repositories.outbox.applyAcks(
+    response.data?.acknowledgements || [],
+    response.data?.server_time,
+  );
   lastStatus = {
     ...normalizeLocalStatus(status),
     online: true,
@@ -320,6 +340,7 @@ export async function pullServerChanges({ apiUrl, user, deviceInfo, branchId }) 
   const localStatus = await repositories.status.get();
   const cursor = localStatus.currentCursor || "0";
   logSyncEndpoint("pull", apiUrl, "/api/sync/pull", { cursor });
+  const pullStartedAt = Date.now();
   const response = await axios.get(endpointUrl(apiUrl, "/api/sync/pull"), {
     ...withTimeout(15000),
     params: {
@@ -329,6 +350,12 @@ export async function pullServerChanges({ apiUrl, user, deviceInfo, branchId }) 
       cursor,
       limit: 50,
     },
+  });
+  const pullReceivedAt = Date.now();
+  observeServerTime({
+    serverTime: response.data?.server_time,
+    requestStartedAt: pullStartedAt,
+    responseReceivedAt: pullReceivedAt,
   });
   writeSyncLog("INFO", "pull-result", {
     apiUrl: normalizeApiUrl(apiUrl),
@@ -342,13 +369,14 @@ export async function pullServerChanges({ apiUrl, user, deviceInfo, branchId }) 
     changes: response.data?.changes || [],
     nextCursor: response.data?.next_cursor || cursor,
     deviceId: context.deviceId,
+    serverTime: response.data?.server_time,
   });
   lastStatus = { ...normalizeLocalStatus(status), online: true, lastError: "", apiUrl: normalizeApiUrl(apiUrl), syncStage: "pull" };
   return { ...lastStatus, hasMore: Boolean(response.data?.has_more) };
 }
 
-export async function applyPulledChanges({ changes, nextCursor, deviceId }) {
-  return repositories.pull.apply({ changes, nextCursor, deviceId });
+export async function applyPulledChanges({ changes, nextCursor, deviceId, serverTime }) {
+  return repositories.pull.apply({ changes, nextCursor, deviceId, serverTime });
 }
 
 export async function retryFailedOperations() {
@@ -428,7 +456,7 @@ export async function queueSafeSyncTest({ value, user, deviceInfo, branchId }) {
   await repositories.syncTest.queue({
     entityId,
     value,
-    branchId: String(branchId || user?.branch_id || 1),
+    branchId: String(branchId || user?.branch_id || ""),
     deviceId: deviceInfo?.device_id,
     userId: user?.id ? String(user.id) : "",
   });

@@ -141,6 +141,11 @@ class CloudPostgresAdapter extends StorageAdapter {
       connectionString,
       ssl: sslEnabled ? { rejectUnauthorized } : undefined,
     });
+    this.pool.on("connect", (client) => {
+      client.query("SET TIME ZONE 'UTC'").catch((error) => {
+        console.error("Unable to enforce PostgreSQL UTC session timezone", error.message);
+      });
+    });
   }
 
   query(...args) {

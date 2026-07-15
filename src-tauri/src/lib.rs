@@ -1979,8 +1979,8 @@ fn sync_outbox_pending(
     local_db::pending_outbox(&app, limit.unwrap_or(50))
 }
 #[tauri::command]
-fn sync_apply_push_acks(app: AppHandle, acks: Vec<SyncAck>) -> Result<LocalDbStatus, String> {
-    local_db::apply_push_acks(&app, &acks)
+fn sync_apply_push_acks(app: AppHandle, acks: Vec<SyncAck>, server_time: Option<String>) -> Result<LocalDbStatus, String> {
+    local_db::apply_push_acks(&app, &acks, server_time)
 }
 #[tauri::command]
 fn sync_apply_pull_changes(
@@ -1988,8 +1988,9 @@ fn sync_apply_pull_changes(
     changes: Vec<PulledChange>,
     next_cursor: String,
     device_id: Option<String>,
+    server_time: Option<String>,
 ) -> Result<LocalDbStatus, String> {
-    local_db::apply_pull_changes(&app, &changes, &next_cursor, device_id)
+    local_db::apply_pull_changes(&app, &changes, &next_cursor, device_id, server_time)
 }
 #[tauri::command]
 fn sync_mark_failed(app: AppHandle, message: String) -> Result<LocalDbStatus, String> {

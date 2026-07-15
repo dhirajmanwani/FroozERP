@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS local_device_identity (
   registration_status TEXT NOT NULL DEFAULT 'pending',
   last_seen_at TEXT,
   last_sync_at TEXT,
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE TABLE IF NOT EXISTS local_sync_test_entities (
@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS local_sync_test_entities (
   value TEXT NOT NULL,
   server_version INTEGER NOT NULL DEFAULT 0,
   sync_status TEXT NOT NULL DEFAULT 'pending',
-  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   deleted_at TEXT
 );
 
@@ -62,6 +62,6 @@ CREATE TABLE IF NOT EXISTS local_pos_sale_drafts (
   payload_json TEXT NOT NULL,
   server_version INTEGER NOT NULL DEFAULT 0,
   sync_status TEXT NOT NULL DEFAULT 'pending',
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );

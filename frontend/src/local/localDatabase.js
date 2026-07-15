@@ -113,18 +113,19 @@ export async function getPendingOutbox(limit = 50) {
   return invokeLocal("sync_outbox_pending", { limit });
 }
 
-export async function applyPushAcknowledgements(acks) {
+export async function applyPushAcknowledgements(acks, serverTime) {
   if (!isTauriRuntime()) return emptyStatus;
-  const status = await invokeLocal("sync_apply_push_acks", { acks });
+  const status = await invokeLocal("sync_apply_push_acks", { acks, serverTime });
   return normalizeStatus(status);
 }
 
-export async function applyPulledChanges({ changes, nextCursor, deviceId }) {
+export async function applyPulledChanges({ changes, nextCursor, deviceId, serverTime }) {
   if (!isTauriRuntime()) return emptyStatus;
   const status = await invokeLocal("sync_apply_pull_changes", {
     changes,
     nextCursor,
     deviceId,
+    serverTime,
   });
   return normalizeStatus(status);
 }

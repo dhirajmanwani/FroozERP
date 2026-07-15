@@ -1,3 +1,5 @@
+process.env.TZ = "UTC";
+
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
@@ -68,6 +70,15 @@ const readReleaseVersion = () => {
   }
 };
 const appVersion = process.env.APP_VERSION || readReleaseVersion();
+const utcNowIso = () => new Date().toISOString();
+const serverTimePayload = () => {
+  const now = new Date();
+  return {
+    server_time: now.toISOString(),
+    server_time_epoch_ms: now.getTime(),
+    server_timezone: "UTC",
+  };
+};
 const legacyProductionRailwayOrigins = new Set(["https://froozerp-production.up.railway.app"]);
 const productionRailwayOrigin = "https://froozerp-production-27bb.up.railway.app";
 const canonicalizeCloudApiUrl = (value) => {
@@ -307,7 +318,7 @@ const cloudFetchJson = async (route, options = {}) => {
 
 const buildCloudHealthPayload = async ({ userId = null, deviceId = "", branchId = null } = {}) => {
   const config = resolveCanonicalCloudConfig();
-  const now = new Date().toISOString();
+  const now = utcNowIso();
   const base = {
     status: "ok",
     localBackendStatus: "ok",
@@ -367,6 +378,8 @@ const buildCloudHealthPayload = async ({ userId = null, deviceId = "", branchId 
       lastSuccessfulSync: deviceStatus?.last_sync_at || null,
       syncReady: cloudReachable && deviceApproved,
       cloudVersion: cloudData.version || "",
+      cloudServerTime: cloudData.server_time || null,
+      cloudServerTimeEpochMs: cloudData.server_time_epoch_ms || null,
       cloudDeploymentType: cloudData.deployment_type || "",
       cloudAppMode: cloudData.app_mode || "",
       cloudCompanyId: cloudData.company_id || null,
@@ -464,6 +477,7 @@ const desktopLocalRoutes = new Set([
   "/health",
   "/api/health",
   "/api/version",
+  "/api/time",
   "/api/system/compatibility",
   "/api/cloud/internet-access",
   "/api/cloud/health",
@@ -8671,7 +8685,7 @@ const healthHandler = async (_req, res) => {
       status: "ok",
       app: "FroozERP",
       api_version: apiContractVersion,
-      server_time: new Date().toISOString(),
+      ...serverTimePayload(),
       version: appVersion,
       database: "reachable",
       database_type: storageHealth.databaseType,
@@ -8697,6 +8711,11 @@ const healthHandler = async (_req, res) => {
 app.get("/api/health", healthHandler);
 app.get("/health", healthHandler);
 
+app.get("/api/time", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  return res.json({ status: "ok", app: "FroozERP", ...serverTimePayload() });
+});
+
 app.get("/api/version", async (_req, res) => {
   const cloudIdentity = await resolveCloudDeploymentIdentity();
   const cloudReady = Object.values(cloudConfigurationChecks(cloudIdentity)).every(Boolean);
@@ -8705,7 +8724,7 @@ app.get("/api/version", async (_req, res) => {
     app: "FroozERP",
     api_version: apiContractVersion,
     version: appVersion,
-    server_time: new Date().toISOString(),
+    ...serverTimePayload(),
     node_env: process.env.NODE_ENV || "development",
     deployment_type: deploymentType,
     app_mode: configuredAppMode,
@@ -8782,7 +8801,7 @@ app.get("/api/cloud/readiness", async (_req, res) => {
     branch_id: cloudIdentity.branchId,
     cloud_api_url: publicCloudApiUrl,
     allowed_origin_count: allowedCorsOrigins.filter((origin) => origin !== "*").length,
-    server_time: new Date().toISOString(),
+    ...serverTimePayload(),
   });
 });
 
@@ -8866,7 +8885,7 @@ app.get("/api/device/identity", rateLimitSyncRequest, async (req, res) => {
       pending_queue_count: null,
       failed_queue_count: null,
       registration_status: context.device.status,
-      server_time: new Date().toISOString(),
+    ...serverTimePayload(),
     });
   } catch (error) {
     console.error("Device identity lookup failed", error.message);
@@ -8920,7 +8939,7 @@ app.get("/api/branch/status", rateLimitSyncRequest, async (req, res) => {
       deployment_type: deploymentType,
       app_mode: configuredAppMode,
       cloud_ready: Object.values(cloudConfigurationChecks({ companyId: context.companyId, branchId: context.branchId })).every(Boolean),
-      server_time: new Date().toISOString(),
+      ...serverTimePayload(),
     });
   } catch (error) {
     console.error("Branch status lookup failed", error.message);
@@ -8943,8 +8962,9 @@ app.post("/api/sync/push", rateLimitSyncRequest, async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(context.error.status).json({ message: context.error.message });
     }
+    // Client clocks are diagnostic only. Server-side entity versions and stable
+    // operation IDs determine processing and conflict behavior.
     const sorted = [...operations].sort((a, b) =>
-      String(a.created_at || "").localeCompare(String(b.created_at || "")) ||
       String(a.operation_id || "").localeCompare(String(b.operation_id || ""))
     );
     const acknowledgements = [];
@@ -8961,7 +8981,7 @@ app.post("/api/sync/push", rateLimitSyncRequest, async (req, res) => {
       device_id: context.deviceId,
       company_id: context.companyId,
       branch_id: context.branchId,
-      server_time: new Date().toISOString(),
+      ...serverTimePayload(),
       acknowledgements,
     });
   } catch (error) {
@@ -9006,7 +9026,7 @@ app.get("/api/sync/pull", rateLimitSyncRequest, async (req, res) => {
       branch_id: context.branchId,
       changes: rows,
       next_cursor: nextCursor,
-      server_time: new Date().toISOString(),
+      ...serverTimePayload(),
       has_more: result.rows.length > limit,
     });
   } catch (error) {
@@ -9044,7 +9064,7 @@ app.get("/api/sync/status", rateLimitSyncRequest, async (req, res) => {
       processed_operations: processed.rows[0]?.count || 0,
       open_conflicts: conflicts.rows[0]?.count || 0,
       latest_cursor: String(changes.rows[0]?.cursor || 0),
-      server_time: new Date().toISOString(),
+      ...serverTimePayload(),
     });
   } catch (error) {
     console.error("Sync status failed", error.message);
@@ -9134,7 +9154,7 @@ app.get("/api/owner/dashboard-foundation", async (req, res) => {
     return res.json({
       status: "ok",
       branch_id: branchId,
-      server_time: new Date().toISOString(),
+      ...serverTimePayload(),
       data_freshness: {
         source: "cloud-postgresql",
         live: true,
@@ -9677,6 +9697,10 @@ app.post("/login", async (req, res) => {
       full_name: user.full_name,
       username: user.username,
       role: user.role_name,
+      role_name: user.role_name,
+      normalized_role: String(user.role_name || "").trim().toUpperCase(),
+      company_id: user.company_id || device.company_id || null,
+      company_name: user.company_name || configuredCompanyName || null,
       branch_id: user.branch_id || 1,
       branch: user.branch_name || "Main Branch",
       counter_id: device.assigned_counter_id || 1,
@@ -9685,7 +9709,9 @@ app.post("/login", async (req, res) => {
       email: user.email,
       joining_date: user.joining_date,
       notes: user.notes,
-      last_login_at: new Date().toISOString(),
+      last_login_at: utcNowIso(),
+      authentication_source: cloudServerRuntime ? "cloud_postgresql" : "cloud_api_proxy",
+      canonical_cloud_api_url: productionRailwayOrigin,
       force_password_change: user.force_password_change === true,
       session_revocation_version: user.session_revocation_version || 0,
     });

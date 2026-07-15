@@ -9,13 +9,12 @@ import {
   queueSyncTestEntity,
   retryFailedLocalOperations,
 } from "./localDatabase";
+import { authoritativeUtcNowIso } from "./serverTime";
 
 const newId = () =>
   typeof crypto !== "undefined" && crypto.randomUUID
     ? crypto.randomUUID()
     : `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
-const nowIso = () => new Date().toISOString();
 
 export class SyncOutboxRepository {
   async enqueue({ entityType, entityId, operationType, payload, branchId, deviceId, userId, version = 1 }) {
@@ -30,7 +29,7 @@ export class SyncOutboxRepository {
       device_id: deviceId || "",
       user_id: userId ? String(userId) : "",
       version,
-      created_at: nowIso(),
+      created_at: authoritativeUtcNowIso(),
     };
     return enqueueSyncOperation(operation);
   }

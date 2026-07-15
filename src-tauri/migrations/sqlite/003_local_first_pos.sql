@@ -20,8 +20,8 @@ CREATE TABLE IF NOT EXISTS local_pos_invoices (
   server_invoice_no TEXT,
   server_sale_id TEXT,
   entity_version INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   synced_at TEXT
 );
 
@@ -59,9 +59,9 @@ CREATE TABLE IF NOT EXISTS local_stock_movements (
   movement_type TEXT NOT NULL,
   quantity REAL NOT NULL CHECK (quantity > 0),
   quantity_delta REAL NOT NULL,
-  movement_time TEXT NOT NULL DEFAULT (datetime('now')),
+  movement_time TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   sync_status TEXT NOT NULL DEFAULT 'pending',
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_local_stock_movements_lot
@@ -77,9 +77,9 @@ CREATE TABLE IF NOT EXISTS local_payment_postings (
   amount REAL NOT NULL CHECK (amount > 0),
   branch_id TEXT NOT NULL,
   device_id TEXT NOT NULL,
-  posting_time TEXT NOT NULL DEFAULT (datetime('now')),
+  posting_time TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   sync_status TEXT NOT NULL DEFAULT 'pending',
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_local_payment_postings_invoice
