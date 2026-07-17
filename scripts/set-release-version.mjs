@@ -16,12 +16,13 @@ const writeJson = (filePath, data) => {
 };
 
 const rootPackagePath = path.join(root, "package.json");
+const backendPackagePath = path.join(root, "backend", "package.json");
 const frontendPackagePath = path.join(root, "frontend", "package.json");
 const tauriConfigPath = path.join(root, "src-tauri", "tauri.conf.json");
 const cargoPath = path.join(root, "src-tauri", "Cargo.toml");
 const appPath = path.join(root, "frontend", "src", "App.jsx");
 
-for (const filePath of [rootPackagePath, frontendPackagePath, tauriConfigPath, cargoPath, appPath]) {
+for (const filePath of [rootPackagePath, backendPackagePath, frontendPackagePath, tauriConfigPath, cargoPath, appPath]) {
   if (!fs.existsSync(filePath)) {
     console.error(`Missing expected version file: ${filePath}`);
     process.exit(1);
@@ -31,6 +32,10 @@ for (const filePath of [rootPackagePath, frontendPackagePath, tauriConfigPath, c
 const rootPackage = readJson(rootPackagePath);
 rootPackage.version = nextVersion;
 writeJson(rootPackagePath, rootPackage);
+
+const backendPackage = readJson(backendPackagePath);
+backendPackage.version = nextVersion;
+writeJson(backendPackagePath, backendPackage);
 
 const frontendPackage = readJson(frontendPackagePath);
 frontendPackage.version = nextVersion;

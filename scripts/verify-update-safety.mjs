@@ -3,11 +3,20 @@ import path from "node:path";
 
 const root = path.resolve(new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
 const tauriConfigPath = path.join(root, "src-tauri", "tauri.conf.json");
+const rootPackagePath = path.join(root, "package.json");
+const backendPackagePath = path.join(root, "backend", "package.json");
+const frontendPackagePath = path.join(root, "frontend", "package.json");
 const hookPath = path.join(root, "src-tauri", "installer", "froozerp-cleanup-hooks.nsh");
 const appDataDir = path.join(process.env.APPDATA || path.join(process.env.USERPROFILE || "", "AppData", "Roaming"), "com.srtcompany.froozerp");
 const installDir = path.join(process.env.ProgramFiles || "C:\\Program Files", "FroozERP");
 
 const tauriConfig = JSON.parse(fs.readFileSync(tauriConfigPath, "utf8"));
+const releaseVersions = {
+  workspace: JSON.parse(fs.readFileSync(rootPackagePath, "utf8")).version,
+  backend: JSON.parse(fs.readFileSync(backendPackagePath, "utf8")).version,
+  frontend: JSON.parse(fs.readFileSync(frontendPackagePath, "utf8")).version,
+  tauri: tauriConfig.version,
+};
 const hook = fs.existsSync(hookPath) ? fs.readFileSync(hookPath, "utf8") : "";
 const forbiddenPatterns = [
   /froozerp-local\.sqlite3/i,
@@ -25,6 +34,9 @@ if (tauriConfig.identifier !== "com.srtcompany.froozerp") {
 }
 if (!tauriConfig.bundle?.createUpdaterArtifacts) {
   failures.push("Tauri updater artifacts are not enabled.");
+}
+if (new Set(Object.values(releaseVersions)).size !== 1) {
+  failures.push(`Release versions are inconsistent: ${JSON.stringify(releaseVersions)}`);
 }
 if (tauriConfig.plugins?.updater?.windows?.installMode !== "quiet") {
   failures.push("Windows in-app updater installMode must be quiet so no external installer window is left open.");
@@ -56,6 +68,7 @@ console.log(JSON.stringify({
   ok: true,
   identifier: tauriConfig.identifier,
   version: tauriConfig.version,
+  releaseVersions,
   installDir,
   appDataDir,
   preservedData: [
