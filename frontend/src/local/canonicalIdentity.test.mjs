@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { findConflictingCloudUsers, reconcileCanonicalIdentity } from "./canonicalIdentity.js";
+import { buildCanonicalAliasLoginClaim, findConflictingCloudUsers, reconcileCanonicalIdentity } from "./canonicalIdentity.js";
 
 test("authenticated dhirajmanwani session adopts canonical cloud scope without renaming", () => {
   const result = reconcileCanonicalIdentity({
@@ -40,4 +40,21 @@ test("different cloud user IDs are rejected", () => {
     cloudIdentity: { user_id: 2, company_id: 1, branch_id: 1, device_id: "device-a" },
     deviceInfo: { device_id: "device-a" },
   }), /canonical cloud user ID/);
+});
+
+test("offline identity can claim its canonical user only on the same device", () => {
+  const snapshot = {
+    user_profile: { id: 1, username: "dhirajmanwani", role: "Owner" },
+    device_identity: { device_id: "FZDEV-DELL-1781852580596" },
+  };
+  assert.deepEqual(buildCanonicalAliasLoginClaim({
+    username: "DhirajManwani",
+    deviceInfo: { device_id: "FZDEV-DELL-1781852580596" },
+    snapshot,
+  }), { canonical_user_id: "1" });
+  assert.deepEqual(buildCanonicalAliasLoginClaim({
+    username: "dhirajmanwani",
+    deviceInfo: { device_id: "different-device" },
+    snapshot,
+  }), {});
 });

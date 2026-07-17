@@ -9,7 +9,7 @@ const path = require("path");
 const { execFile } = require("child_process");
 const nodemailer = require("nodemailer");
 const { RUNTIME_MODES, createStorageAdapter } = require("./storageAdapters");
-const { isOwnerBootstrapEligible } = require("./identityPolicy");
+const { canonicalAliasClaim, isOwnerBootstrapEligible } = require("./identityPolicy");
 const {
   calculateOverdueDays,
   classifyDueStatus,
@@ -9521,6 +9521,11 @@ app.post("/login", async (req, res) => {
     const username = cleanText(req.body.username);
     const password = String(req.body.password || "");
     const devicePayload = readDevicePayload(req.body, req);
+    const aliasClaim = canonicalAliasClaim({
+      canonicalUserId: req.body.canonical_user_id,
+      deviceId: devicePayload.device_id,
+      requestedUsername: username,
+    });
 
     const result = await pool.query(
       `
@@ -9549,8 +9554,21 @@ app.post("/login", async (req, res) => {
       LEFT JOIN branches b ON b.id = COALESCE(u.branch_id, 1)
       LEFT JOIN companies co ON co.id = COALESCE(u.company_id, b.company_id)
       WHERE LOWER(u.username) = LOWER($1)
+         OR (
+           u.id = $2
+           AND EXISTS (
+             SELECT 1
+             FROM authorized_devices d
+             WHERE d.device_id = $3
+               AND d.status = 'APPROVED'
+               AND d.approved_by = u.id
+               AND d.assigned_branch_id = COALESCE(u.branch_id, 1)
+           )
+         )
+      ORDER BY CASE WHEN LOWER(u.username) = LOWER($1) THEN 0 ELSE 1 END
+      LIMIT 1
       `,
-      [username]
+      [username, aliasClaim?.userId || null, aliasClaim?.deviceId || null]
     );
 
     if (result.rows.length === 0) {
@@ -9564,6 +9582,7 @@ app.post("/login", async (req, res) => {
     }
 
     const user = result.rows[0];
+    const canonicalAliasUsed = normalizeUsername(user.username) !== normalizeUsername(username);
     if (user.active === false) {
       return authFailure(res, {
         status: 403,
@@ -9608,7 +9627,7 @@ app.post("/login", async (req, res) => {
         username: user.username,
         deviceId: devicePayload.device_id,
         ipAddress: req.ip,
-        details: { stage: "password_verification" },
+        details: { stage: "password_verification", canonical_alias_used: canonicalAliasUsed },
       });
     }
     if (!devicePayload.device_id) {
@@ -9687,7 +9706,12 @@ app.post("/login", async (req, res) => {
       safeCode: "OK",
       deviceId: device.device_id,
       ipAddress: req.ip,
-      details: { branch_id: user.branch_id, role: user.role_name },
+      details: {
+        branch_id: user.branch_id,
+        role: user.role_name,
+        canonical_alias_used: canonicalAliasUsed,
+        requested_username: canonicalAliasUsed ? normalizeUsername(username) : null,
+      },
     });
     console.info("login success", {
       username: user.username,
@@ -9697,12 +9721,16 @@ app.post("/login", async (req, res) => {
       company_id: user.company_id || device.company_id || null,
       company_name: user.company_name || configuredCompanyName || null,
       branch_id: user.branch_id || 1,
+      canonical_alias_used: canonicalAliasUsed,
     });
 
     return res.json({
       id: user.id,
       full_name: user.full_name,
-      username: user.username,
+      username: canonicalAliasUsed ? username : user.username,
+      canonical_username: user.username,
+      login_alias: canonicalAliasUsed ? username : null,
+      canonical_alias_used: canonicalAliasUsed,
       role: user.role_name,
       role_name: user.role_name,
       normalized_role: String(user.role_name || "").trim().toUpperCase(),
@@ -9717,7 +9745,9 @@ app.post("/login", async (req, res) => {
       joining_date: user.joining_date,
       notes: user.notes,
       last_login_at: utcNowIso(),
-      authentication_source: cloudServerRuntime ? "cloud_postgresql" : "cloud_api_proxy",
+      authentication_source: canonicalAliasUsed
+        ? "cloud_canonical_alias"
+        : cloudServerRuntime ? "cloud_postgresql" : "cloud_api_proxy",
       canonical_cloud_api_url: productionRailwayOrigin,
       force_password_change: user.force_password_change === true,
       session_revocation_version: user.session_revocation_version || 0,

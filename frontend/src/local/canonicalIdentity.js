@@ -45,3 +45,18 @@ export const findConflictingCloudUsers = (users, { authenticatedUsername, canoni
     clean(user.username).toLowerCase() === username && clean(user.user_id || user.id) !== canonicalId
   ));
 };
+
+export const buildCanonicalAliasLoginClaim = ({ deviceInfo, snapshot, username }) => {
+  const profile = snapshot?.user_profile && typeof snapshot.user_profile === "object"
+    ? snapshot.user_profile
+    : {};
+  const requestedUsername = clean(username).toLowerCase();
+  const profileUsername = clean(profile.username).toLowerCase();
+  const canonicalUserId = clean(profile.canonical_user_id || profile.id || profile.user_id);
+  const snapshotDeviceId = clean(snapshot?.device_identity?.device_id || deviceInfo?.device_id);
+  const deviceId = clean(deviceInfo?.device_id);
+  if (!requestedUsername || requestedUsername !== profileUsername || !canonicalUserId || !deviceId || snapshotDeviceId !== deviceId) {
+    return {};
+  }
+  return { canonical_user_id: canonicalUserId };
+};

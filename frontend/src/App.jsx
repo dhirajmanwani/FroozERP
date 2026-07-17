@@ -24,7 +24,7 @@ import {
   readOfflineSession,
   verifyOfflineSessionRecord,
 } from "./local/offlineSession";
-import { reconcileCanonicalIdentity } from "./local/canonicalIdentity";
+import { buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { describeUpdateAvailability, normalizeUpdateMetadata } from "./local/updateMetadata";
 import { RUNTIME_FAILURE_EVENT, describeRequestFailure, settleNamedRequests } from "./local/startupResilience";
@@ -513,7 +513,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.55";
+const APP_VERSION = "1.0.56";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -2257,6 +2257,10 @@ function App() {
           const nextStatus = buildConnectionStatusModel({ backendHealth: health, cloudHealth: nextCloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: status, internetAvailable: realInternet, currentUser: userRef.current });
           setSyncMessage(status.lastError ? `Sync failed: ${status.lastError}` : nextStatus.syncSummary);
         })
+        .catch((error) => {
+          writeDiagnosticLog("WARN", "connectivity-recovery-sync-failed", describeRequestFailure(error, { url: `${SYNC_API_URL}/api/sync/push` }));
+          setSyncMessage("Cloud sync is temporarily unavailable. Local changes remain queued safely.");
+        })
         .finally(() => {
           reconnectSyncRef.current = false;
         });
@@ -2276,19 +2280,20 @@ function App() {
   useEffect(() => subscribeConnectivity(applyConnectivityState), [applyConnectivityState]);
 
   useEffect(() => {
-    connectivityCheckRef.current?.("startup", { force: true }).catch((error) => {
+    const runConnectivityCheck = (reason, options = {}) => Promise.resolve(connectivityCheckRef.current?.(reason, options)).catch((error) => {
       writeDiagnosticLog("WARN", "startup-connectivity-check-failed", describeRequestFailure(error, { url: `${API_URL}/api/health` }));
     });
+    runConnectivityCheck("startup", { force: true });
     const handleConnectivityEvent = (event) => {
       if (event.type === "visibilitychange" && document.hidden) return;
-      connectivityCheckRef.current?.(event.type, { force: true });
+      runConnectivityCheck(event.type, { force: true });
     };
     for (const eventName of connectivityEventNames) {
       const target = eventName === "visibilitychange" ? document : window;
       target.addEventListener(eventName, handleConnectivityEvent);
     }
     const timer = window.setInterval(() => {
-      connectivityCheckRef.current?.(backendHealthRef.current.online ? "periodic-online" : "periodic-offline");
+      runConnectivityCheck(backendHealthRef.current.online ? "periodic-online" : "periodic-offline");
     }, 30_000);
     return () => {
       window.clearInterval(timer);
@@ -2351,7 +2356,9 @@ function App() {
         markLocalServiceHealthy(service, "desktop-startup-worker");
         setStartupNotice("Local FroozERP service is running. You can sign in.");
         setStartupError((current) => (/local backend|froozERP service|backend/i.test(current) ? "" : current));
-        connectivityCheckRef.current?.("desktop-backend-ready", { force: true, skipServiceStart: true });
+        Promise.resolve(connectivityCheckRef.current?.("desktop-backend-ready", { force: true, skipServiceStart: true })).catch((error) => {
+          writeDiagnosticLog("WARN", "backend-ready-connectivity-check-failed", describeRequestFailure(error, { url: `${API_URL}/api/health` }));
+        });
       } else {
         setStartupError(service.message || "Local FroozERP service stopped or did not become healthy. Restart service.");
       }
@@ -3545,6 +3552,14 @@ function App() {
     try {
       const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
       setDeviceInfo(latestDevice);
+      const cachedIdentitySnapshot = isTauriRuntime()
+        ? await loadLocalReferenceSnapshot({ username: username.trim(), deviceId: latestDevice.device_id }).catch(() => null)
+        : null;
+      const canonicalAliasClaim = buildCanonicalAliasLoginClaim({
+        username,
+        deviceInfo: latestDevice,
+        snapshot: cachedIdentitySnapshot,
+      });
       await performConnectivityCheck("login", { force: true, timeoutMs: 4000 });
       const authHealth = FROOZERP_CLOUD_SIMULATED_OFFLINE
         ? {
@@ -3571,7 +3586,12 @@ function App() {
       }
 
       writeDiagnosticLog("INFO", "login-request", { apiUrl: AUTH_API_URL, endpoint: `${AUTH_API_URL}/login`, deviceId: latestDevice.device_id });
-      const response = await axios.post(`${AUTH_API_URL}/login`, { username: username.trim(), password, ...latestDevice }, { timeout: 8000 });
+      const response = await axios.post(`${AUTH_API_URL}/login`, {
+        username: username.trim(),
+        password,
+        ...latestDevice,
+        ...canonicalAliasClaim,
+      }, { timeout: 8000 });
       writeDiagnosticLog("INFO", "login-success", { apiUrl: AUTH_API_URL, endpoint: `${AUTH_API_URL}/login`, userId: response.data?.id, deviceId: latestDevice.device_id });
       setDeviceGate(null);
       mergeCloudIdentityIntoSavedConfig({
@@ -6867,7 +6887,7 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
   useEffect(() => {
     let cancelled = false;
     setStatus("Checking FroozERP service...");
-    onCheckOnline?.("recovery-open", { force: true, timeoutMs: 3500 }).then((health) => {
+    Promise.resolve(onCheckOnline?.("recovery-open", { force: true, timeoutMs: 3500 })).then((health) => {
       if (cancelled) return;
       if (health?.online) {
         setStatus("FroozERP service is online. Choose a recovery option.");
@@ -6875,6 +6895,8 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
       } else {
         setError(`Account recovery requires internet access. ${health?.message || "Backend is unavailable."}`);
       }
+    }).catch((requestError) => {
+      if (!cancelled) setError(`Account recovery requires internet access. ${getErrorMessage(requestError, "Backend is unavailable.")}`);
     });
     return () => {
       cancelled = true;
@@ -12931,7 +12953,14 @@ function UpdateCenterSection({ canManage }) {
     if (autoCheckStartedRef.current) return;
     if (desktopUpdaterAvailable && !installedVersion) return;
     autoCheckStartedRef.current = true;
-    checkForUpdates();
+    checkForUpdates().catch((error) => {
+      setUpdaterState((current) => ({
+        ...current,
+        phase: "unavailable",
+        errorCode: "UPDATE_CHECK_UNAVAILABLE",
+        errorMessage: getErrorMessage(error, "No published update information is available."),
+      }));
+    });
   }, [checkForUpdates, desktopUpdaterAvailable, installedVersion]);
   useEffect(() => {
     invokeTauriCommand("install_diagnostics")
@@ -12953,7 +12982,9 @@ function UpdateCenterSection({ canManage }) {
     });
   }, [normalizeVersion]);
   useEffect(() => {
-    refreshBackendVersionDiagnostics();
+    refreshBackendVersionDiagnostics().catch(() => {
+      setBackendVersionDiagnostics((current) => ({ ...current, health: null }));
+    });
   }, [refreshBackendVersionDiagnostics]);
   const downloadUpdate = async () => {
     if (!updateObjectRef.current) {
