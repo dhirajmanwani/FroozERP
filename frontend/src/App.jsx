@@ -27,6 +27,7 @@ import {
 import { reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { describeUpdateAvailability, normalizeUpdateMetadata } from "./local/updateMetadata";
+import { RUNTIME_FAILURE_EVENT, describeRequestFailure, settleNamedRequests } from "./local/startupResilience";
 import {
   connectivityEventNames,
   subscribeConnectivity,
@@ -1666,8 +1667,22 @@ function App() {
 
   useEffect(() => {
     if (!user || !frostDrawerOpen) return;
-    loadAiAssistant(aiRange);
+    loadAiAssistant(aiRange).catch((error) => {
+      const failure = describeRequestFailure(error, { url: `${API_URL}/api/ai/briefing` });
+      writeDiagnosticLog("ERROR", "optional-frost-load-failed", failure);
+      setSyncMessage("FROST is temporarily unavailable. Local FroozERP modules remain usable.");
+    });
   }, [user, frostDrawerOpen]);
+
+  useEffect(() => {
+    const onRuntimeFailure = (event) => {
+      const failure = event?.detail || {};
+      writeDiagnosticLog("ERROR", "nonfatal-runtime-request-failed", failure);
+      setSyncMessage(`An optional request failed${failure.url ? ` at ${failure.url}` : ""}. FroozERP remains available with preserved local data.`);
+    };
+    window.addEventListener(RUNTIME_FAILURE_EVENT, onRuntimeFailure);
+    return () => window.removeEventListener(RUNTIME_FAILURE_EVENT, onRuntimeFailure);
+  }, []);
 
   useEffect(() => {
     const updateInternetStatus = () => {
@@ -1752,6 +1767,10 @@ function App() {
         device_name: identity.device_name || current.device_name,
         device_type: identity.platform || current.device_type,
       }));
+    }).catch((error) => {
+      if (cancelled) return;
+      writeDiagnosticLog("ERROR", "mandatory-local-database-initialization-failed", { message: error?.message || String(error) });
+      setStartupError("The local FroozERP database could not be initialized. Restart the local service and retry.");
     });
     return () => {
       cancelled = true;
@@ -2257,7 +2276,9 @@ function App() {
   useEffect(() => subscribeConnectivity(applyConnectivityState), [applyConnectivityState]);
 
   useEffect(() => {
-    connectivityCheckRef.current?.("startup", { force: true });
+    connectivityCheckRef.current?.("startup", { force: true }).catch((error) => {
+      writeDiagnosticLog("WARN", "startup-connectivity-check-failed", describeRequestFailure(error, { url: `${API_URL}/api/health` }));
+    });
     const handleConnectivityEvent = (event) => {
       if (event.type === "visibilitychange" && document.hidden) return;
       connectivityCheckRef.current?.(event.type, { force: true });
@@ -2367,11 +2388,20 @@ function App() {
     let cancelled = false;
     refreshSyncStatus().then((status) => {
       if (!cancelled) setSyncStatus(status);
+    }).catch((error) => {
+      if (!cancelled) {
+        writeDiagnosticLog("WARN", "optional-sync-status-failed", describeRequestFailure(error));
+        setSyncMessage("Sync status is temporarily unavailable. Local modules remain usable.");
+      }
+    });
+    const runBackgroundSync = () => runSyncNow().catch((error) => {
+      writeDiagnosticLog("WARN", "background-sync-failed", describeRequestFailure(error, { url: `${SYNC_API_URL}/api/sync/push` }));
+      setSyncMessage("Cloud sync is temporarily unavailable. Local changes remain queued safely.");
     });
     const timer = window.setInterval(() => {
-      if (backendHealth.online) runSyncNow();
+      if (backendHealth.online) runBackgroundSync();
     }, 60_000);
-    if (backendHealth.online) runSyncNow();
+    if (backendHealth.online) runBackgroundSync();
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -2805,41 +2835,44 @@ function App() {
   };
 
   const fetchOnlineReferenceSnapshot = async (currentUser, latestDevice) => {
-    const [
-      productsResponse,
-      categoriesResponse,
-      settingsResponse,
-      inventoryResponse,
-      customersResponse,
-      salesResponse,
-      duplicateLogResponse,
-      lotDiscountsResponse,
-      purchasesResponse,
-      suppliersResponse,
-      accountsResponse,
-      accountOutstandingResponse,
-      expensesResponse,
-      saleReturnsResponse,
-      wasteEntriesResponse,
-    ] = await Promise.all([
-      axios.get(`${API_URL}/products`),
-      axios.get(`${API_URL}/product-categories`),
-      axios.get(`${API_URL}/settings`, { params: { user_id: currentUser?.id, device_id: latestDevice.device_id } }),
-      axios.get(`${API_URL}/inventory`, { params: { include_cancelled: true } }),
-      axios.get(`${API_URL}/customers`),
-      axios.get(`${API_URL}/sales`),
-      axios.get(`${API_URL}/product-duplicate-archive-log`).catch(() => ({ data: { message: "" } })),
-      axios.get(`${API_URL}/lot-discounts`).catch(() => ({ data: [] })),
-      axios.get(`${API_URL}/purchases`),
-      axios.get(`${API_URL}/suppliers`),
-      axios.get(`${API_URL}/accounts`),
-      axios.get(`${API_URL}/accounts/outstanding`),
-      axios.get(`${API_URL}/expenses`),
-      axios.get(`${API_URL}/sale-returns`),
-      axios.get(`${API_URL}/waste-entries`),
-    ]);
+    const localSnapshot = isTauriRuntime()
+      ? await loadLocalReferenceSnapshot({ username: currentUser?.username, deviceId: latestDevice.device_id }).catch(() => null)
+      : null;
+    const localBundle = localSnapshot?.settings_bundle || {};
+    const definitions = [
+      ["products", "/products", localSnapshot?.products || products],
+      ["categories", "/product-categories", localSnapshot?.categories || productCategories],
+      ["settings", "/settings", localBundle],
+      ["inventory", "/inventory", localSnapshot?.inventory_lots || inventory],
+      ["customers", "/customers", localSnapshot?.customers || customers],
+      ["sales", "/sales", localSnapshot?.sales_history || salesHistory],
+      ["duplicateLog", "/product-duplicate-archive-log", { message: localBundle.productDuplicateWarning || "" }],
+      ["lotDiscounts", "/lot-discounts", localBundle.lotDiscounts || lotDiscounts],
+      ["purchases", "/purchases", localBundle.offlinePurchases || purchases],
+      ["suppliers", "/suppliers", localBundle.offlineSuppliers || suppliers],
+      ["accounts", "/accounts", localBundle.offlineAccounts || accounts],
+      ["accountOutstanding", "/accounts/outstanding", localBundle.offlineAccountOutstanding || accountOutstanding],
+      ["expenses", "/expenses", localBundle.offlineExpenses || expenses],
+      ["saleReturns", "/sale-returns", localBundle.offlineSaleReturns || saleReturns],
+      ["wasteEntries", "/waste-entries", localBundle.offlineWasteEntries || wasteEntries],
+    ];
+    const { values, failures } = await settleNamedRequests(definitions.map(([key, path, fallback]) => ({
+      key,
+      method: "GET",
+      url: `${API_URL}${path}`,
+      fallback,
+      run: () => axios.get(`${API_URL}${path}`, {
+        params: path === "/settings"
+          ? { user_id: currentUser?.id, device_id: latestDevice.device_id }
+          : path === "/inventory" ? { include_cancelled: true } : undefined,
+      }).then((response) => response.data),
+    })));
+    failures.forEach((failure) => writeDiagnosticLog("WARN", "reference-request-fallback", failure));
+    if (failures.length) {
+      setSyncMessage(`${failures.length} optional reference request(s) failed. Preserved local SQLite values are being used.`);
+    }
 
-    const settingsPayload = settingsResponse.data || {};
+    const settingsPayload = values.settings || {};
     const branchId = String(currentUser?.branch_id || 1);
     const branchRecord = (settingsPayload.branches || []).find((row) => String(row.id) === branchId);
 
@@ -2858,11 +2891,11 @@ function App() {
         branch_id: branchId,
         registration_status: "approved",
       },
-      products: productsResponse.data || [],
-      categories: categoriesResponse.data || [],
-      inventory_lots: inventoryResponse.data || [],
-      customers: customersResponse.data || [],
-      sales_history: salesResponse.data || [],
+      products: values.products || [],
+      categories: values.categories || [],
+      inventory_lots: values.inventory || [],
+      customers: values.customers || [],
+      sales_history: values.sales || [],
       settings_bundle: {
         businessSettings: settingsPayload.businessSettings || {},
         saleRateSettings: settingsPayload.saleRateSettings || {},
@@ -2885,15 +2918,15 @@ function App() {
         canManageSettings: Boolean(settingsPayload.canManageSettings),
         mandiTaxRules: settingsPayload.mandiTaxRules || [],
         rebateRules: settingsPayload.rebateRules || [],
-        lotDiscounts: lotDiscountsResponse.data || [],
-        offlinePurchases: purchasesResponse.data || [],
-        offlineSuppliers: suppliersResponse.data || [],
-        offlineAccounts: accountsResponse.data || [],
-        offlineAccountOutstanding: accountOutstandingResponse.data || {},
-        offlineExpenses: expensesResponse.data || [],
-        offlineSaleReturns: saleReturnsResponse.data || [],
-        offlineWasteEntries: wasteEntriesResponse.data || [],
-        productDuplicateWarning: duplicateLogResponse.data?.message || "",
+        lotDiscounts: values.lotDiscounts || [],
+        offlinePurchases: values.purchases || [],
+        offlineSuppliers: values.suppliers || [],
+        offlineAccounts: values.accounts || [],
+        offlineAccountOutstanding: values.accountOutstanding || {},
+        offlineExpenses: values.expenses || [],
+        offlineSaleReturns: values.saleReturns || [],
+        offlineWasteEntries: values.wasteEntries || [],
+        productDuplicateWarning: values.duplicateLog?.message || "",
       },
     };
   };
@@ -3384,12 +3417,19 @@ function App() {
       }));
       return;
     }
-    const [response, inventoryResponse, cashBookResponse] = await Promise.all([
-      axios.get(`${API_URL}/reports/summary`, { params }),
-      axios.get(`${API_URL}/inventory`, { params: { include_cancelled: true } }),
-      axios.get(`${API_URL}/reports/cash-book`, { params }),
+    const { values, failures } = await settleNamedRequests([
+      { key: "summary", method: "GET", url: `${API_URL}/reports/summary`, fallback: reportsData, run: () => axios.get(`${API_URL}/reports/summary`, { params }).then((response) => response.data) },
+      { key: "inventory", method: "GET", url: `${API_URL}/inventory`, fallback: reportsData.stockLotReport || inventory, run: () => axios.get(`${API_URL}/inventory`, { params: { include_cancelled: true } }).then((response) => response.data) },
+      { key: "cashBook", method: "GET", url: `${API_URL}/reports/cash-book`, fallback: reportsData.cashBookReport || [], run: () => axios.get(`${API_URL}/reports/cash-book`, { params }).then((response) => response.data) },
     ]);
-    setReportsData({ ...response.data, stockLotReport: inventoryResponse.data, cashBookReport: cashBookResponse.data });
+    failures.forEach((failure) => writeDiagnosticLog("WARN", "report-request-fallback", failure));
+    setReportsData((current) => ({
+      ...current,
+      ...(values.summary || {}),
+      stockLotReport: values.inventory || current.stockLotReport || [],
+      cashBookReport: values.cashBook || current.cashBookReport || [],
+    }));
+    if (failures.length) setSyncMessage(`${failures.length} report request(s) failed. Showing the last preserved local values.`);
   };
 
   const loadExpenses = async () => {

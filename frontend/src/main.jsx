@@ -1,6 +1,17 @@
-import { StrictMode } from 'react'
+import { StrictMode, useEffect } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
+import { RUNTIME_FAILURE_EVENT, describeRequestFailure, shouldShowFatalStartup } from './local/startupResilience'
+
+let reactMounted = false
+
+export const RuntimeMountGuard = ({ children }) => {
+  useEffect(() => {
+    reactMounted = true
+    writeLog('INFO', 'React mounted successfully')
+  }, [])
+  return children
+}
 
 const showStartupFailure = (error, logPath = '') => {
   const root = document.getElementById('root')
@@ -51,14 +62,24 @@ const writeLog = async (level, message) => {
 window.onerror = (message, source, lineno, colno, error) => {
   const detail = error?.stack || `${message} at ${source}:${lineno}:${colno}`
   writeLog('ERROR', `window.onerror: ${detail}`)
-  readLogPath().then((logPath) => showStartupFailure(error || detail, logPath))
+  if (shouldShowFatalStartup({ reactMounted })) {
+    readLogPath().then((logPath) => showStartupFailure(error || detail, logPath))
+    return
+  }
+  window.dispatchEvent(new CustomEvent(RUNTIME_FAILURE_EVENT, { detail: { message: error?.message || String(message), source } }))
 }
 
 window.onunhandledrejection = (event) => {
   const reason = event?.reason
   const detail = reason?.stack || reason?.message || String(reason || 'Unhandled rejection')
-  writeLog('ERROR', `unhandledrejection: ${detail}`)
-  readLogPath().then((logPath) => showStartupFailure(reason || detail, logPath))
+  const request = describeRequestFailure(reason)
+  writeLog('ERROR', `unhandledrejection: ${detail}; request=${JSON.stringify(request)}`)
+  if (shouldShowFatalStartup({ reactMounted })) {
+    readLogPath().then((logPath) => showStartupFailure(reason || detail, logPath))
+    return
+  }
+  event.preventDefault?.()
+  window.dispatchEvent(new CustomEvent(RUNTIME_FAILURE_EVENT, { detail: request }))
 }
 
 const boot = async () => {
@@ -72,10 +93,11 @@ const boot = async () => {
     const { default: App } = await import('./App.jsx')
     createRoot(document.getElementById('root')).render(
       <StrictMode>
-        <App />
+        <RuntimeMountGuard>
+          <App />
+        </RuntimeMountGuard>
       </StrictMode>,
     )
-    writeLog('INFO', 'React mounted successfully')
   } catch (error) {
     await writeLog('ERROR', `React startup failed: ${error?.stack || error?.message || String(error)}`)
     showStartupFailure(error, logPath)

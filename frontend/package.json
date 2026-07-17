@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint src --cache --cache-location ../.cache/eslint/frontend",
-    "test:local-runtime": "node --test src/local/offlineSession.test.mjs src/local/serverTime.test.mjs src/local/updateMetadata.test.mjs src/local/canonicalIdentity.test.mjs src/local/dashboardSnapshot.test.mjs src/local/mainNavigationSmoke.test.mjs",
+    "test:local-runtime": "node --test src/local/offlineSession.test.mjs src/local/serverTime.test.mjs src/local/updateMetadata.test.mjs src/local/canonicalIdentity.test.mjs src/local/dashboardSnapshot.test.mjs src/local/mainNavigationSmoke.test.mjs src/local/startupResilience.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
