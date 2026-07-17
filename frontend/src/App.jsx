@@ -27,7 +27,7 @@ import {
 import { buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { describeUpdateAvailability, normalizeUpdateMetadata } from "./local/updateMetadata";
-import { RUNTIME_FAILURE_EVENT, describeRequestFailure, initialiseMandatoryRuntime, settleNamedRequests } from "./local/startupResilience";
+import { RUNTIME_FAILURE_EVENT, describeRequestFailure, initialiseMandatoryRuntime, resolveMandatoryRuntimeRenderState, settleNamedRequests } from "./local/startupResilience";
 import {
   connectivityEventNames,
   describeCloudUnavailableSync,
@@ -526,7 +526,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.57";
+const APP_VERSION = "1.0.58";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -1348,6 +1348,29 @@ class ModuleErrorBoundary extends React.Component {
   }
 }
 
+const NeutralStartupScreen = ({ state = "checking" }) => (
+  <main className="login-page" data-startup-state={`mandatory-runtime-${state}`}>
+    <section className="login-panel" style={{ minHeight: 280, display: "grid", placeItems: "center", textAlign: "center" }}>
+      <div>
+        <BrandLogo />
+        <h1>Starting local services</h1>
+        <p>Preparing the local database and application shell.</p>
+      </div>
+    </section>
+  </main>
+);
+
+const ConfirmedLocalRuntimeFailure = ({ message }) => (
+  <main className="login-page" data-startup-state="fatal-local-runtime" data-fatal-startup="true" style={{ background: "#7f0000" }}>
+    <section className="login-panel startup-status-panel startup-status-error">
+      <span className="eyebrow">Local Runtime Failure</span>
+      <h1>FroozERP could not start</h1>
+      <p>The local SQLite database or runtime could not be initialized after bounded recovery attempts.</p>
+      <pre>{message || "Local runtime initialization failed."}</pre>
+    </section>
+  </main>
+);
+
 function App() {
   const initialView = (() => {
     const requestedView = new URLSearchParams(window.location.search).get("view");
@@ -1358,6 +1381,8 @@ function App() {
   const [user, setUser] = useState(null);
   const [deviceInfo, setDeviceInfo] = useState(() => getClientDeviceInfo());
   const [localDbStatus, setLocalDbStatus] = useState(null);
+  const [mandatoryRuntimeState, setMandatoryRuntimeState] = useState(() => (isTauriRuntime() ? "checking" : "ready"));
+  const startupRenderStateRef = useRef("");
   const [syncStatus, setSyncStatus] = useState(null);
   const [syncMessage, setSyncMessage] = useState("");
   const [startupError, setStartupError] = useState("");
@@ -1769,6 +1794,7 @@ function App() {
     initialiseMandatoryRuntime({ initialize: initializeLocalDatabase }).then(async ({ status, attemptsUsed, retriesExhausted }) => {
       if (cancelled) return;
       setLocalDbStatus(status);
+      setMandatoryRuntimeState(resolveMandatoryRuntimeRenderState({ status, retriesExhausted }));
       if (retriesExhausted || !status?.initialized) {
         writeDiagnosticLog("ERROR", "mandatory-local-database-initialization-failed", {
           attempts: attemptsUsed,
@@ -1791,12 +1817,29 @@ function App() {
     }).catch((error) => {
       if (cancelled) return;
       writeDiagnosticLog("ERROR", "mandatory-local-database-initialization-failed", { message: error?.message || String(error) });
+      setMandatoryRuntimeState("fatal");
       setStartupError("The local FroozERP database could not be initialized. Restart the local service and retry.");
     });
     return () => {
       cancelled = true;
     };
   }, []);
+
+  const renderedStartupState = mandatoryRuntimeState === "checking"
+    ? "mandatory-runtime-checking"
+    : mandatoryRuntimeState === "fatal"
+      ? "fatal-local-runtime"
+      : user
+        ? "application-ready"
+        : "login-ready";
+  if (startupRenderStateRef.current !== renderedStartupState) {
+    startupRenderStateRef.current = renderedStartupState;
+    const root = document.getElementById("root");
+    if (root) root.dataset.startupState = renderedStartupState;
+    window.__FROOZERP_STARTUP_TRANSITIONS__ = window.__FROOZERP_STARTUP_TRANSITIONS__ || [];
+    window.__FROOZERP_STARTUP_TRANSITIONS__.push({ state: renderedStartupState, rendered: true, at: new Date().toISOString() });
+    window.__FROOZERP_RECORD_STARTUP_TRANSITION__?.(renderedStartupState, "rendered");
+  }
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -4912,6 +4955,10 @@ function App() {
     ["Stderr tail", startupDiagnostics.stderrTail],
   ].filter(([, value]) => value !== undefined && value !== null && value !== "");
 
+  if (mandatoryRuntimeState === "checking") return <NeutralStartupScreen />;
+  if (mandatoryRuntimeState === "fatal") {
+    return <ConfirmedLocalRuntimeFailure message={localDbStatus?.error || startupError} />;
+  }
   if (!user) {
     return (
       <main className="login-page">

@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   describeRequestFailure,
   initialiseMandatoryRuntime,
+  resolveMandatoryRuntimeRenderState,
   settleNamedRequests,
   shouldShowFatalStartup,
 } from "./startupResilience.js";
@@ -19,6 +20,37 @@ test("transient startup failures never replace the loading screen with a fatal s
   assert.match(mainSource, /RUNTIME_FAILURE_EVENT/);
   assert.doesNotMatch(mainSource, /shouldShowFatalStartup/);
   assert.doesNotMatch(mainSource, /onunhandledrejection[\s\S]{0,800}showStartupFailure/);
+  assert.doesNotMatch(mainSource, /FroozERP could not start/);
+  assert.match(mainSource, /neutral-shell-visible/);
+});
+
+test("only confirmed SQLite exhaustion can render the fatal startup state", () => {
+  assert.equal(resolveMandatoryRuntimeRenderState({ status: null }), "checking");
+  assert.equal(resolveMandatoryRuntimeRenderState({ status: { initialized: false }, retriesExhausted: false }), "checking");
+  assert.equal(resolveMandatoryRuntimeRenderState({ status: { initialized: true }, retriesExhausted: true }), "ready");
+  assert.equal(resolveMandatoryRuntimeRenderState({ status: { initialized: false, error: "sqlite unavailable" }, retriesExhausted: true }), "fatal");
+  assert.match(appSource, /data-fatal-startup="true"/);
+  assert.match(appSource, /mandatoryRuntimeState === "fatal"/);
+});
+
+test("native window stays hidden until neutral shell paint", async () => {
+  const tauriConfig = await readFile(new URL("../../../src-tauri/tauri.conf.json", import.meta.url), "utf8");
+  assert.match(tauriConfig, /"visible": false/);
+  assert.match(mainSource, /requestAnimationFrame/);
+  assert.match(mainSource, /show_main_window/);
+});
+
+test("self-contained cold-start runner has an independent recovery watchdog", async () => {
+  const runner = await readFile(new URL("../../../scripts/phase4-cold-start-runner.ps1", import.meta.url), "utf8");
+  const watchdog = await readFile(new URL("../../../scripts/phase4-wifi-recovery.ps1", import.meta.url), "utf8");
+  assert.match(runner, /Start-Process powershell\.exe/);
+  assert.match(runner, /phase4-wifi-recovery/);
+  assert.match(runner, /HasExited/);
+  assert.match(runner, /Disable-NetAdapter/);
+  assert.match(runner, /finally/);
+  assert.match(runner, /ImageFormat\]\:\:Jpeg/);
+  assert.match(watchdog, /Enable-NetAdapter/);
+  assert.match(watchdog, /DEADLINE=/);
 });
 
 test("mandatory local runtime waits through transient failures before succeeding", async () => {

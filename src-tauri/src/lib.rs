@@ -209,6 +209,12 @@ fn diagnostic_log_path() -> PathBuf {
         .join("froozerp-startup.log")
 }
 
+fn startup_transition_log_path() -> PathBuf {
+    app_data_dir()
+        .join("logs")
+        .join("froozerp-startup-transitions.jsonl")
+}
+
 fn backend_stdout_log_path() -> PathBuf {
     app_data_dir()
         .join("logs")
@@ -1491,6 +1497,58 @@ fn app_log(level: Option<String>, message: String) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Serialize)]
+struct StartupTransitionRecord {
+    timestamp_ms: u128,
+    process_id: u32,
+    state: String,
+    detail: String,
+}
+
+#[tauri::command]
+fn record_startup_transition(state: String, detail: Option<String>) -> Result<(), String> {
+    let normalized_state = state.trim().chars().take(80).collect::<String>();
+    if normalized_state.is_empty() {
+        return Err("Startup transition state is required".to_string());
+    }
+    let normalized_detail = detail
+        .unwrap_or_default()
+        .replace('\r', " ")
+        .replace('\n', " ")
+        .chars()
+        .take(500)
+        .collect::<String>();
+    let record = StartupTransitionRecord {
+        timestamp_ms: timestamp_ms(),
+        process_id: std::process::id(),
+        state: normalized_state.clone(),
+        detail: normalized_detail,
+    };
+    let path = startup_transition_log_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let payload = serde_json::to_string(&record).map_err(|error| error.to_string())?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    writeln!(file, "{}", payload).map_err(|error| error.to_string())?;
+    write_app_log("INFO", &format!("Startup render state: {}", normalized_state));
+    Ok(())
+}
+
+#[tauri::command]
+fn show_main_window(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Main window not available".to_string())?;
+    window.show().map_err(|error| error.to_string())?;
+    write_app_log("INFO", "Main window revealed after neutral shell paint");
+    Ok(())
+}
+
 fn sanitize_file_name(value: &str) -> String {
     let normalized_source = value.replace('&', " and ");
     let cleaned: String = normalized_source
@@ -2296,6 +2354,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_log_path,
             app_log,
+            record_startup_transition,
+            show_main_window,
             open_startup_log,
             backend_startup_diagnostics,
             open_pdf_in_system_viewer,

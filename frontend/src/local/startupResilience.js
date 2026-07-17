@@ -4,6 +4,12 @@ export const shouldShowFatalStartup = ({ mandatoryRuntimeFailed, retriesExhauste
   mandatoryRuntimeFailed === true && retriesExhausted === true
 );
 
+export const resolveMandatoryRuntimeRenderState = ({ status, retriesExhausted = false }) => {
+  if (!status) return "checking";
+  if (status.initialized) return "ready";
+  return retriesExhausted ? "fatal" : "checking";
+};
+
 export const initialiseMandatoryRuntime = async ({ initialize, attempts = 4, delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) }) => {
   let status = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {

@@ -6,24 +6,9 @@ import { RUNTIME_FAILURE_EVENT, describeRequestFailure } from './local/startupRe
 export const RuntimeMountGuard = ({ children }) => {
   useEffect(() => {
     writeLog('INFO', 'React mounted successfully')
+    recordStartupTransition('react-mounted')
   }, [])
   return children
-}
-
-const showStartupFailure = (error, logPath = '') => {
-  const root = document.getElementById('root')
-  if (!root) return
-  const message = error?.stack || error?.message || String(error || 'Unknown startup error')
-  root.innerHTML = `
-    <main style="min-height:100vh;display:grid;place-items:center;background:#0f172a;color:#f8fafc;font-family:Inter,Segoe UI,Arial,sans-serif;padding:32px;">
-      <section style="max-width:760px;width:100%;background:#111827;border:1px solid #334155;border-radius:12px;padding:24px;box-shadow:0 24px 60px rgba(0,0,0,.35);">
-        <h1 style="font-size:24px;margin:0 0 10px;">FroozERP could not start</h1>
-        <p style="margin:0 0 16px;color:#cbd5e1;">The application hit a startup error. Share this screen and the log file with support.</p>
-        ${logPath ? `<p style="margin:0 0 16px;color:#e2e8f0;"><strong>Log file:</strong><br><code style="word-break:break-all;">${logPath}</code></p>` : ''}
-        <pre style="white-space:pre-wrap;word-break:break-word;background:#020617;border:1px solid #1e293b;border-radius:8px;padding:14px;color:#fecaca;max-height:360px;overflow:auto;">${message.replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]))}</pre>
-      </section>
-    </main>
-  `
 }
 
 const invokeTauri = async (command, payload) => {
@@ -56,6 +41,16 @@ const writeLog = async (level, message) => {
   }
 }
 
+const recordStartupTransition = (state, detail = '') => {
+  const root = document.getElementById('root')
+  if (root) root.dataset.startupState = state
+  window.__FROOZERP_STARTUP_TRANSITIONS__ = window.__FROOZERP_STARTUP_TRANSITIONS__ || []
+  window.__FROOZERP_STARTUP_TRANSITIONS__.push({ state, detail, at: new Date().toISOString() })
+  void withTimeout(invokeTauri('record_startup_transition', { state, detail }), 1600)
+}
+
+window.__FROOZERP_RECORD_STARTUP_TRANSITION__ = recordStartupTransition
+
 window.onerror = (message, source, lineno, colno, error) => {
   const detail = error?.stack || `${message} at ${source}:${lineno}:${colno}`
   writeLog('ERROR', `window.onerror: ${detail}`)
@@ -78,7 +73,13 @@ const boot = async () => {
     return writeLog('INFO', `Frontend boot started. Log path: ${logPath || 'not available'}`)
   })
 
+  recordStartupTransition('neutral-shell-painting')
+  await new Promise((resolve) => window.requestAnimationFrame(() => window.requestAnimationFrame(resolve)))
+  await withTimeout(invokeTauri('show_main_window'), 1600)
+  recordStartupTransition('neutral-shell-visible')
+
   try {
+    recordStartupTransition('app-module-loading')
     const { default: App } = await import('./App.jsx')
     createRoot(document.getElementById('root')).render(
       <StrictMode>
@@ -87,9 +88,10 @@ const boot = async () => {
         </RuntimeMountGuard>
       </StrictMode>,
     )
+    recordStartupTransition('react-render-scheduled')
   } catch (error) {
     await writeLog('ERROR', `React startup failed: ${error?.stack || error?.message || String(error)}`)
-    showStartupFailure(error, logPath)
+    recordStartupTransition('bootstrap-stalled', error?.message || String(error))
   }
 }
 
