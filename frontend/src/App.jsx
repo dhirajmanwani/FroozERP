@@ -27,9 +27,10 @@ import {
 import { buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { describeUpdateAvailability, normalizeUpdateMetadata } from "./local/updateMetadata";
-import { RUNTIME_FAILURE_EVENT, describeRequestFailure, settleNamedRequests } from "./local/startupResilience";
+import { RUNTIME_FAILURE_EVENT, describeRequestFailure, initialiseMandatoryRuntime, settleNamedRequests } from "./local/startupResilience";
 import {
   connectivityEventNames,
+  describeCloudUnavailableSync,
   subscribeConnectivity,
 } from "./local/connectivityService";
 import {
@@ -358,6 +359,14 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
   const deviceApproved = ["APPROVED", "ACTIVE"].includes(String(deviceRegistration?.status || "").toUpperCase());
   const devicePending = ["PENDING", "PENDING_APPROVAL"].includes(String(deviceRegistration?.status || "").toUpperCase());
   const cloudSyncActive = cloudReachable && deviceApproved && !syncStatus?.lastError;
+  const cloudUnavailableSummary = describeCloudUnavailableSync({
+    localOnline,
+    usesCloud: usesCloudBackend(),
+    internetAvailable,
+    cloudOffline,
+    lastFailureKind: syncStatus?.lastFailureKind,
+    pending,
+  });
   const fieldRemoteMode = API_MODE === API_MODES.FIELD_REMOTE_DEVICE;
   const apiModeLabel = getApiModeLabel();
   const lastSyncAt = syncStatus?.lastSuccessfulSyncAt;
@@ -402,10 +411,14 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
   let syncSummary = "Backend status not checked";
   if (cloudPaused) {
     syncSummary = pending > 0 ? `Sync Paused - ${pending} pending` : "Sync Paused";
-  } else if (failed > 0 || syncStatus?.lastError) {
+  } else if (failed > 0) {
     syncSummary = "Sync Failed";
   } else if (conflicts > 0) {
     syncSummary = "Conflict";
+  } else if (cloudUnavailableSummary) {
+    syncSummary = cloudUnavailableSummary;
+  } else if (syncStatus?.lastError) {
+    syncSummary = "Sync Failed";
   } else if (syncStatus?.syncing) {
     const done = Number(syncStatus?.syncProgressDone || 0);
     const total = Number(syncStatus?.syncProgressTotal || pending || 0);
@@ -459,7 +472,7 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
 
   return {
     apiModeLabel,
-    internetStatus: internetAvailable ? "Internet Available" : "No Internet",
+    internetStatus: internetAvailable ? "Internet Available" : "Internet Offline",
     froozErpCloudAccess: cloudPaused ? "Disabled by Owner" : cloudReachable ? "Online" : "Not Verified",
     localBackendStatus,
     cloudBackendStatus,
@@ -513,7 +526,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.56";
+const APP_VERSION = "1.0.57";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -1753,9 +1766,17 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
-    initializeLocalDatabase().then(async (status) => {
+    initialiseMandatoryRuntime({ initialize: initializeLocalDatabase }).then(async ({ status, attemptsUsed, retriesExhausted }) => {
       if (cancelled) return;
       setLocalDbStatus(status);
+      if (retriesExhausted || !status?.initialized) {
+        writeDiagnosticLog("ERROR", "mandatory-local-database-initialization-failed", {
+          attempts: attemptsUsed,
+          message: status?.error || "Local SQLite initialization failed after retries.",
+        });
+        setStartupError("The local FroozERP database could not be initialized after repeated attempts. Restart the local service and retry.");
+        return;
+      }
       if (!isTauriRuntime()) return;
       const identity = await getOrCreateLocalDeviceIdentity().catch(() => null);
       if (!identity?.device_id || cancelled) return;
@@ -1869,15 +1890,21 @@ function App() {
       setCloudDeviceRegistration(registration);
       return registration;
     } catch (error) {
-      const registration = {
-        status: "ERROR",
+      const failure = {
         url: `${LOCAL_API_URL}/api/cloud/device/register`,
         httpStatus: error.response?.status || null,
         code: error.response?.data?.code || "CLOUD_DEVICE_REGISTRATION_FAILED",
         message: error.response?.data?.message || error.message || "Cloud device registration failed.",
         checkedAt: new Date().toISOString(),
       };
-      setCloudDeviceRegistration(registration);
+      let registration = failure;
+      setCloudDeviceRegistration((current) => {
+        const confirmedStatus = String(current?.registration_status || current?.status || "").toUpperCase();
+        registration = ["APPROVED", "ACTIVE"].includes(confirmedStatus)
+          ? { ...current, ...failure, status: current.status || current.registration_status, current_check_status: "UNAVAILABLE", last_confirmed_status: confirmedStatus }
+          : { ...failure, status: "ERROR" };
+        return registration;
+      });
       return registration;
     }
   };
@@ -1895,14 +1922,20 @@ function App() {
       await checkCloudBackendHealth("device-approved", 8000);
       return registration;
     } catch (error) {
-      const registration = {
-        status: "ERROR",
+      const failure = {
         code: error.response?.data?.code || "CLOUD_DEVICE_APPROVAL_FAILED",
         httpStatus: error.response?.status || null,
         message: error.response?.data?.message || error.message || "Cloud device approval failed.",
         checkedAt: new Date().toISOString(),
       };
-      setCloudDeviceRegistration(registration);
+      let registration = failure;
+      setCloudDeviceRegistration((current) => {
+        const confirmedStatus = String(current?.registration_status || current?.status || "").toUpperCase();
+        registration = ["APPROVED", "ACTIVE"].includes(confirmedStatus)
+          ? { ...current, ...failure, status: current.status || current.registration_status, current_check_status: "UNAVAILABLE", last_confirmed_status: confirmedStatus }
+          : { ...failure, status: "ERROR" };
+        return registration;
+      });
       return registration;
     }
   };
@@ -2142,7 +2175,7 @@ function App() {
     applyCanonicalIdentityFromSync(status);
     if (!status.lastError) await refreshBusinessDataAfterSync();
     const nextStatus = buildConnectionStatusModel({ backendHealth, cloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: status, internetAvailable, currentUser: user });
-    setSyncMessage(status.lastError ? `Sync failed: ${status.lastError}` : nextStatus.syncSummary);
+    setSyncMessage(nextStatus.syncSummary);
     return status;
   };
 
@@ -2255,7 +2288,7 @@ function App() {
           applyCanonicalIdentityFromSync(status);
           if (!status.lastError) await refreshBusinessDataAfterSync();
           const nextStatus = buildConnectionStatusModel({ backendHealth: health, cloudHealth: nextCloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: status, internetAvailable: realInternet, currentUser: userRef.current });
-          setSyncMessage(status.lastError ? `Sync failed: ${status.lastError}` : nextStatus.syncSummary);
+          setSyncMessage(nextStatus.syncSummary);
         })
         .catch((error) => {
           writeDiagnosticLog("WARN", "connectivity-recovery-sync-failed", describeRequestFailure(error, { url: `${SYNC_API_URL}/api/sync/push` }));

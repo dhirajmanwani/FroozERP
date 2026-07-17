@@ -47,12 +47,13 @@ const writeConnectivityLog = async (level, message, details = {}) => {
   }
 };
 
-const classifyHealthError = (error) => {
+export const classifyHealthError = (error, { requireCloudIdentity = false } = {}) => {
+  const serviceLabel = requireCloudIdentity ? "FroozERP cloud" : "local FroozERP service";
   if (axios.isCancel?.(error) || error.name === "CanceledError" || error.code === "ERR_CANCELED") {
     return { reasonCode: "ABORTED", reachabilityStatus: "checking", message: "Previous health check was cancelled." };
   }
   if (error.code === "ECONNABORTED") {
-    return { reasonCode: "TIMEOUT", reachabilityStatus: "timeout", message: "FroozERP backend health check timed out." };
+    return { reasonCode: "TIMEOUT", reachabilityStatus: "timeout", message: `${serviceLabel} health check timed out.` };
   }
   if (error.response) {
     const status = error.response.status;
@@ -77,9 +78,40 @@ const classifyHealthError = (error) => {
     };
   }
   if (error.message?.toLowerCase().includes("network")) {
-    return { reasonCode: "NO_NETWORK", reachabilityStatus: "offline", message: "Network is available to Windows, but FroozERP backend is unreachable." };
+    return {
+      reasonCode: "NO_NETWORK",
+      reachabilityStatus: "offline",
+      message: requireCloudIdentity
+        ? "Internet is offline or FroozERP cloud is temporarily unavailable."
+        : "The local FroozERP service is unreachable.",
+    };
   }
-  return { reasonCode: "BACKEND_UNAVAILABLE", reachabilityStatus: "offline", message: error.message || "FroozERP backend is unavailable." };
+  return { reasonCode: "BACKEND_UNAVAILABLE", reachabilityStatus: "offline", message: error.message || `${serviceLabel} is unavailable.` };
+};
+
+export const isCloudTransportFailure = (kind) => [
+  "NO_NETWORK",
+  "BACKEND_UNREACHABLE",
+  "CLOUD_UNAVAILABLE",
+  "TIMEOUT",
+].includes(String(kind || "").toUpperCase());
+
+export const describeCloudUnavailableSync = ({
+  localOnline,
+  usesCloud,
+  internetAvailable,
+  cloudOffline,
+  lastFailureKind,
+  pending = 0,
+}) => {
+  const unavailable = usesCloud === true
+    && localOnline === true
+    && (internetAvailable === false || cloudOffline === true || isCloudTransportFailure(lastFailureKind));
+  if (!unavailable) return "";
+  const pendingCount = Number(pending || 0);
+  return pendingCount > 0
+    ? `Local ready - cloud unavailable; sync paused with ${pendingCount} pending until internet returns.`
+    : "Local ready - cloud unavailable; sync paused until internet returns.";
 };
 
 const emit = () => {
@@ -168,7 +200,7 @@ export async function checkFroozBackendHealth(apiUrl, options = {}) {
       });
       return latestState;
     } catch (error) {
-      const classified = classifyHealthError(error);
+      const classified = classifyHealthError(error, options);
       if (requestId !== latestRequestId || classified.reasonCode === "ABORTED") {
         return latestState;
       }

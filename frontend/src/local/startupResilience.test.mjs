@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   describeRequestFailure,
+  initialiseMandatoryRuntime,
   settleNamedRequests,
   shouldShowFatalStartup,
 } from "./startupResilience.js";
@@ -10,11 +11,39 @@ import {
 const appSource = await readFile(new URL("../App.jsx", import.meta.url), "utf8");
 const mainSource = await readFile(new URL("../main.jsx", import.meta.url), "utf8");
 
-test("only a pre-mount failure may replace the application with the fatal screen", () => {
-  assert.equal(shouldShowFatalStartup({ reactMounted: false }), true);
-  assert.equal(shouldShowFatalStartup({ reactMounted: true }), false);
+test("transient startup failures never replace the loading screen with a fatal screen", () => {
+  assert.equal(shouldShowFatalStartup({ mandatoryRuntimeFailed: true, retriesExhausted: false }), false);
+  assert.equal(shouldShowFatalStartup({ mandatoryRuntimeFailed: false, retriesExhausted: true }), false);
+  assert.equal(shouldShowFatalStartup({ mandatoryRuntimeFailed: true, retriesExhausted: true }), true);
   assert.match(mainSource, /event\.preventDefault\?\.\(\)/);
   assert.match(mainSource, /RUNTIME_FAILURE_EVENT/);
+  assert.doesNotMatch(mainSource, /shouldShowFatalStartup/);
+  assert.doesNotMatch(mainSource, /onunhandledrejection[\s\S]{0,800}showStartupFailure/);
+});
+
+test("mandatory local runtime waits through transient failures before succeeding", async () => {
+  let calls = 0;
+  const result = await initialiseMandatoryRuntime({
+    initialize: async () => {
+      calls += 1;
+      return calls < 3 ? { initialized: false, error: "not ready" } : { initialized: true };
+    },
+    attempts: 4,
+    delay: async () => {},
+  });
+  assert.equal(result.status.initialized, true);
+  assert.equal(result.attemptsUsed, 3);
+  assert.equal(result.retriesExhausted, false);
+});
+
+test("mandatory local runtime reports exhaustion only after all bounded attempts", async () => {
+  const result = await initialiseMandatoryRuntime({
+    initialize: async () => ({ initialized: false, error: "sqlite unavailable" }),
+    attempts: 3,
+    delay: async () => {},
+  });
+  assert.equal(result.attemptsUsed, 3);
+  assert.equal(result.retriesExhausted, true);
 });
 
 test("one failed optional startup request keeps successful and preserved values", async () => {
@@ -45,7 +74,7 @@ test("cloud login HTTP 401 is diagnosed without becoming a fatal runtime error",
     code: "INVALID_CREDENTIALS",
     message: "Invalid username or password.",
   });
-  assert.equal(shouldShowFatalStartup({ reactMounted: true }), false);
+  assert.equal(shouldShowFatalStartup({ mandatoryRuntimeFailed: false, retriesExhausted: false }), false);
 });
 
 test("reference and report startup loads are isolated and retain SQLite fallbacks", () => {
@@ -54,6 +83,8 @@ test("reference and report startup loads are isolated and retain SQLite fallback
   assert.match(appSource, /report-request-fallback/);
   assert.match(appSource, /Showing the last preserved local values/);
   assert.match(appSource, /Cloud sync is temporarily unavailable\. Local changes remain queued safely/);
+  assert.match(appSource, /describeCloudUnavailableSync/);
+  assert.doesNotMatch(appSource, /Online sync delivery is not enabled yet/);
 });
 
 test("degraded mode keeps every main module and POS render path reachable", () => {

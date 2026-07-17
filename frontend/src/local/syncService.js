@@ -2,6 +2,7 @@ import axios from "axios";
 import { checkFroozBackendHealth, getConnectivitySnapshot } from "./connectivityService";
 import { isTauriRuntime } from "./localDatabase";
 import { repositories } from "./repositories";
+import { classifySyncError } from "./syncClassification";
 import {
   authoritativeUtcNowIso,
   checkRailwayServerTime,
@@ -144,62 +145,6 @@ const normalizeLocalStatus = (status = {}) => ({
   lastError: status.error || "",
   timeDiagnostics: getTimeDiagnostics(),
 });
-
-const classifySyncError = (error) => {
-  const status = error.response?.status || null;
-  const serverMessage = error.response?.data?.message || error.response?.data?.error;
-  if (status) {
-    if (status === 401) {
-      return {
-        online: true,
-        kind: "AUTHORIZATION",
-        message: `Authorisation required - ${serverMessage || "sync user session is not valid."}`,
-        status,
-      };
-    }
-    if (status === 403) {
-      return {
-        online: true,
-        kind: "DEVICE_AUTHORIZATION",
-        message: `Authorisation required - ${serverMessage || "device is not authorised for sync."}`,
-        status,
-      };
-    }
-    if (status === 404) {
-      return {
-        online: true,
-        kind: "WRONG_ENDPOINT",
-        message: `Sync failed - endpoint not found (${status}). Check the sync API route and API base.`,
-        status,
-      };
-    }
-    if (status === 409) {
-      return {
-        online: true,
-        kind: "CONFLICT",
-        message: `Conflict - ${serverMessage || "server reported a sync conflict."}`,
-        status,
-      };
-    }
-    return {
-      online: true,
-      kind: status >= 500 ? "SERVER_ERROR" : "HTTP_ERROR",
-      message: `Sync failed - ${serverMessage || `backend returned HTTP ${status}.`}`,
-      status,
-    };
-  }
-  if (error.code === "ECONNABORTED") {
-    return { online: false, kind: "TIMEOUT", message: "Offline - backend sync request timed out.", status: null };
-  }
-  const message = typeof error === "string" ? error : error.message || "Sync failed";
-  const networkFailure = /network|refused|failed to fetch|timeout|unreachable|offline/i.test(message);
-  return {
-    online: !networkFailure,
-    kind: networkFailure ? "BACKEND_UNREACHABLE" : "CLIENT_ERROR",
-    message: networkFailure ? `Offline - backend unreachable (${message})` : `Sync failed - ${message}`,
-    status: null,
-  };
-};
 
 const logSyncEndpoint = (phase, apiUrl, path, extra = {}) => {
   writeSyncLog("INFO", "endpoint", {
@@ -439,7 +384,7 @@ export async function syncNow({ apiUrl, user, deviceInfo, branchId }) {
       return lastStatus;
     } catch (error) {
       clampBackoff();
-      const classified = classifySyncError(error);
+      const classified = classifySyncError(error, apiUrl);
       const message = classified.message;
       writeSyncLog(classified.online ? "WARN" : "ERROR", "sync-failed", {
         apiUrl: normalizeApiUrl(apiUrl),

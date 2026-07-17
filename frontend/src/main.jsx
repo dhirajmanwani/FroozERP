@@ -1,13 +1,10 @@
 import { StrictMode, useEffect } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
-import { RUNTIME_FAILURE_EVENT, describeRequestFailure, shouldShowFatalStartup } from './local/startupResilience'
-
-let reactMounted = false
+import { RUNTIME_FAILURE_EVENT, describeRequestFailure } from './local/startupResilience'
 
 export const RuntimeMountGuard = ({ children }) => {
   useEffect(() => {
-    reactMounted = true
     writeLog('INFO', 'React mounted successfully')
   }, [])
   return children
@@ -62,10 +59,6 @@ const writeLog = async (level, message) => {
 window.onerror = (message, source, lineno, colno, error) => {
   const detail = error?.stack || `${message} at ${source}:${lineno}:${colno}`
   writeLog('ERROR', `window.onerror: ${detail}`)
-  if (shouldShowFatalStartup({ reactMounted })) {
-    readLogPath().then((logPath) => showStartupFailure(error || detail, logPath))
-    return
-  }
   window.dispatchEvent(new CustomEvent(RUNTIME_FAILURE_EVENT, { detail: { message: error?.message || String(message), source } }))
 }
 
@@ -74,10 +67,6 @@ window.onunhandledrejection = (event) => {
   const detail = reason?.stack || reason?.message || String(reason || 'Unhandled rejection')
   const request = describeRequestFailure(reason)
   writeLog('ERROR', `unhandledrejection: ${detail}; request=${JSON.stringify(request)}`)
-  if (shouldShowFatalStartup({ reactMounted })) {
-    readLogPath().then((logPath) => showStartupFailure(reason || detail, logPath))
-    return
-  }
   event.preventDefault?.()
   window.dispatchEvent(new CustomEvent(RUNTIME_FAILURE_EVENT, { detail: request }))
 }

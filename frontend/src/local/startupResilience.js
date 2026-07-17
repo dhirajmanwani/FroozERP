@@ -1,6 +1,22 @@
 export const RUNTIME_FAILURE_EVENT = "froozerp-runtime-failure";
 
-export const shouldShowFatalStartup = ({ reactMounted }) => reactMounted !== true;
+export const shouldShowFatalStartup = ({ mandatoryRuntimeFailed, retriesExhausted }) => (
+  mandatoryRuntimeFailed === true && retriesExhausted === true
+);
+
+export const initialiseMandatoryRuntime = async ({ initialize, attempts = 4, delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) }) => {
+  let status = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      status = await initialize();
+    } catch (error) {
+      status = { initialized: false, error: error?.message || String(error) };
+    }
+    if (status?.initialized) return { status, attemptsUsed: attempt, retriesExhausted: false };
+    if (attempt < attempts) await delay(250 * attempt);
+  }
+  return { status, attemptsUsed: attempts, retriesExhausted: true };
+};
 
 export const describeRequestFailure = (error, fallback = {}) => ({
   method: String(error?.config?.method || fallback.method || "GET").toUpperCase(),
