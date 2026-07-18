@@ -13,7 +13,7 @@ const commands = [
   ["Update Center static tests", "node scripts/update-center-static-tests.mjs"],
   ["Production regression static tests", "node scripts/production-regression-static-tests.mjs"],
   ["Updater safety", "npm run verify:update-safety"],
-  ["Rust tests", "cargo test --manifest-path src-tauri/Cargo.toml --lib"],
+  ["Rust tests", "cargo test --manifest-path src-tauri/Cargo.toml --lib -- --test-threads=1"],
   ["Rust check", "cargo check --manifest-path src-tauri/Cargo.toml"],
   ["Whitespace check", "git diff --check"],
 ];

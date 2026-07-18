@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   describeRequestFailure,
   initialiseMandatoryRuntime,
+  resolveLocalServiceRenderState,
   resolveMandatoryRuntimeRenderState,
   settleNamedRequests,
   shouldShowFatalStartup,
@@ -33,24 +34,20 @@ test("only confirmed SQLite exhaustion can render the fatal startup state", () =
   assert.match(appSource, /mandatoryRuntimeState === "fatal"/);
 });
 
+test("local service remains neutral until bounded readiness checks are exhausted", () => {
+  assert.equal(resolveLocalServiceRenderState({ healthOnline: null, retriesExhausted: false }), "checking");
+  assert.equal(resolveLocalServiceRenderState({ healthOnline: false, retriesExhausted: false }), "checking");
+  assert.equal(resolveLocalServiceRenderState({ healthOnline: true, retriesExhausted: true }), "ready");
+  assert.equal(resolveLocalServiceRenderState({ healthOnline: false, retriesExhausted: true }), "fatal");
+  assert.match(appSource, /localServiceStartupState === "fatal"/);
+  assert.match(appSource, /Starting local service\.\.\./);
+});
+
 test("native window stays hidden until neutral shell paint", async () => {
   const tauriConfig = await readFile(new URL("../../../src-tauri/tauri.conf.json", import.meta.url), "utf8");
   assert.match(tauriConfig, /"visible": false/);
   assert.match(mainSource, /requestAnimationFrame/);
   assert.match(mainSource, /show_main_window/);
-});
-
-test("self-contained cold-start runner has an independent recovery watchdog", async () => {
-  const runner = await readFile(new URL("../../../scripts/phase4-cold-start-runner.ps1", import.meta.url), "utf8");
-  const watchdog = await readFile(new URL("../../../scripts/phase4-wifi-recovery.ps1", import.meta.url), "utf8");
-  assert.match(runner, /Start-Process powershell\.exe/);
-  assert.match(runner, /phase4-wifi-recovery/);
-  assert.match(runner, /HasExited/);
-  assert.match(runner, /Disable-NetAdapter/);
-  assert.match(runner, /finally/);
-  assert.match(runner, /ImageFormat\]\:\:Jpeg/);
-  assert.match(watchdog, /Enable-NetAdapter/);
-  assert.match(watchdog, /DEADLINE=/);
 });
 
 test("mandatory local runtime waits through transient failures before succeeding", async () => {

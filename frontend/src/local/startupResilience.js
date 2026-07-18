@@ -10,6 +10,11 @@ export const resolveMandatoryRuntimeRenderState = ({ status, retriesExhausted = 
   return retriesExhausted ? "fatal" : "checking";
 };
 
+export const resolveLocalServiceRenderState = ({ healthOnline, retriesExhausted = false }) => {
+  if (healthOnline === true) return "ready";
+  return retriesExhausted ? "fatal" : "checking";
+};
+
 export const initialiseMandatoryRuntime = async ({ initialize, attempts = 4, delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) }) => {
   let status = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {

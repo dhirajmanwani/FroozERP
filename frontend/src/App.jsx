@@ -27,7 +27,7 @@ import {
 import { buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { describeUpdateAvailability, normalizeUpdateMetadata } from "./local/updateMetadata";
-import { RUNTIME_FAILURE_EVENT, describeRequestFailure, initialiseMandatoryRuntime, resolveMandatoryRuntimeRenderState, settleNamedRequests } from "./local/startupResilience";
+import { RUNTIME_FAILURE_EVENT, describeRequestFailure, initialiseMandatoryRuntime, resolveLocalServiceRenderState, resolveMandatoryRuntimeRenderState, settleNamedRequests } from "./local/startupResilience";
 import {
   connectivityEventNames,
   describeCloudUnavailableSync,
@@ -526,7 +526,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.58";
+const APP_VERSION = "1.0.59";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -1406,6 +1406,10 @@ function App() {
     lastErrorAt: "",
   });
   const [localBackendService, setLocalBackendService] = useState(null);
+  const [localServiceStartupState, setLocalServiceStartupState] = useState(() => (
+    isTauriRuntime() && !isCloudMode() ? "checking" : "ready"
+  ));
+  const localServiceStartupStateRef = useRef(localServiceStartupState);
   const [cloudHealth, setCloudHealth] = useState({
     apiUrl: CLOUD_API_URL,
     url: CLOUD_API_URL ? `${CLOUD_API_URL}/api/health` : "",
@@ -1830,8 +1834,8 @@ function App() {
     : mandatoryRuntimeState === "fatal"
       ? "fatal-local-runtime"
       : user
-        ? "application-ready"
-        : "login-ready";
+        ? `application-ready-${localServiceStartupState}`
+        : `login-ready-${localServiceStartupState}`;
   if (startupRenderStateRef.current !== renderedStartupState) {
     startupRenderStateRef.current = renderedStartupState;
     const root = document.getElementById("root");
@@ -2245,9 +2249,12 @@ function App() {
           ? buildConnectionStatusModel(modelInput).banner
           : current || buildConnectionStatusModel(modelInput).banner
       ));
+    } else if (localServiceStartupStateRef.current === "checking") {
+      setStartupNotice("Starting local service...");
+      setSyncMessage("Local service is starting. Cached login remains available while readiness is checked.");
     } else {
-      setStartupNotice("Local FroozERP service is not ready yet. The login screen remains usable while startup diagnostics continue.");
-      setSyncMessage("Local backend unavailable. Local cached/offline data is available only after this device has completed one successful login.");
+      setStartupNotice("Local FroozERP service is not ready. Retry local service readiness before signing in.");
+      setSyncMessage("Local service unavailable. Local cached/offline data remains available after a successful prior login.");
     }
   }, []);
 
@@ -2265,26 +2272,55 @@ function App() {
     backendHealthRef.current = health;
     setBackendHealth(health);
     setOfflineMode(false);
+    localServiceStartupStateRef.current = "ready";
+    setLocalServiceStartupState("ready");
+  }, [API_URL]);
+
+  const waitForLocalBackendReady = useCallback(async (reason, timeoutMs) => {
+    let latestHealth = backendHealthRef.current;
+    const retryDelays = [0, 250, 500, 750];
+    for (let attempt = 0; attempt < retryDelays.length; attempt += 1) {
+      if (retryDelays[attempt] > 0) {
+        await new Promise((resolve) => window.setTimeout(resolve, retryDelays[attempt]));
+      }
+      latestHealth = await checkBackendHealth(API_URL, {
+        details: true,
+        timeoutMs,
+        force: true,
+        reason: `${reason}-local-readiness-${attempt + 1}`,
+        requireCloudIdentity: false,
+      });
+      if (latestHealth.online === true) return latestHealth;
+    }
+    return latestHealth;
   }, [API_URL]);
 
   const ensureLocalBackendService = useCallback(async ({ restart = false, reason = "manual" } = {}) => {
     if (!isTauriRuntime() || isCloudMode()) return null;
+    localServiceStartupStateRef.current = "checking";
+    setLocalServiceStartupState("checking");
     const command = restart ? "restart_local_backend_service" : "ensure_local_backend_service";
     try {
       const service = await invokeTauriCommand(command);
-      setLocalBackendService({ ...service, reason, checkedAt: new Date().toISOString() });
+      setLocalBackendService({
+        ...service,
+        healthy: service?.healthy === true ? true : null,
+        startup_state: service?.healthy === true ? "ready" : "checking",
+        reason,
+        checkedAt: new Date().toISOString(),
+      });
       if (service?.healthy) {
         markLocalServiceHealthy(service, reason);
         setStartupNotice(restart ? "Local FroozERP service restarted." : "Local FroozERP service is running.");
         setStartupError((current) => (/local backend|froozERP service|backend/i.test(current) ? "" : current));
       } else {
-        setStartupError(service?.message || "Local FroozERP service stopped. Restart service.");
+        setStartupNotice("Starting local service...");
       }
       return service;
     } catch (error) {
       const message = getErrorMessage(error, "Unable to start local FroozERP service.");
-      setLocalBackendService({ healthy: false, message, reason, checkedAt: new Date().toISOString() });
-      setStartupError(message);
+      setLocalBackendService({ healthy: null, startup_state: "checking", message, reason, checkedAt: new Date().toISOString() });
+      setStartupNotice("Starting local service...");
       return null;
     }
   }, [markLocalServiceHealthy]);
@@ -2297,22 +2333,44 @@ function App() {
     if (!force && now - lastConnectivityCheckAtRef.current < minGapMs) return backendHealthRef.current;
     lastConnectivityCheckAtRef.current = now;
     const checkPromise = (async () => {
-    if (isTauriRuntime() && !isCloudMode() && options.skipServiceStart !== true) {
-      const service = await ensureLocalBackendService({ reason });
-      if (service?.healthy) {
-        await new Promise((resolve) => window.setTimeout(resolve, 250));
+    const localRuntime = isTauriRuntime() && !isCloudMode();
+    if (localRuntime) {
+      if (options.skipServiceStart !== true) {
+        await ensureLocalBackendService({ reason });
       }
+      localServiceStartupStateRef.current = "checking";
+      setLocalServiceStartupState("checking");
     }
     const browserOnline = typeof navigator === "undefined" ? true : navigator.onLine !== false;
     const realInternet = browserOnline ? await probeRealInternet(options.timeoutMs || 4000) : false;
     setInternetAvailable(realInternet);
-    const health = await checkBackendHealth(API_URL, {
-      details: true,
-      timeoutMs: options.timeoutMs || 3500,
-      force: Boolean(options.force),
-      reason,
-      requireCloudIdentity: isCloudMode(),
-    });
+    const health = localRuntime
+      ? await waitForLocalBackendReady(reason, options.timeoutMs || 3500)
+      : await checkBackendHealth(API_URL, {
+        details: true,
+        timeoutMs: options.timeoutMs || 3500,
+        force: Boolean(options.force),
+        reason,
+        requireCloudIdentity: isCloudMode(),
+      });
+    if (localRuntime) {
+      const nextLocalState = resolveLocalServiceRenderState({ healthOnline: health.online, retriesExhausted: health.online !== true });
+      localServiceStartupStateRef.current = nextLocalState;
+      setLocalServiceStartupState(nextLocalState);
+      if (nextLocalState === "fatal") {
+        setLocalBackendService((current) => ({
+          ...(current || {}),
+          healthy: false,
+          startup_state: "fatal",
+          message: health.message || "Local FroozERP service could not be reached after bounded readiness retries.",
+          reason,
+          checkedAt: new Date().toISOString(),
+        }));
+        setStartupError(health.message || "Local FroozERP service could not be reached after bounded readiness retries.");
+      } else {
+        setStartupError((current) => (/local backend|froozERP service|backend/i.test(current) ? "" : current));
+      }
+    }
     const nextCloudHealth = usesCloudBackend()
       ? await checkCloudBackendHealth(reason, options.timeoutMs || 5000)
       : cloudHealth;
@@ -2347,7 +2405,7 @@ function App() {
     });
     connectivityInFlightRef.current = checkPromise;
     return checkPromise;
-  }, [applyConnectivityState, ensureLocalBackendService]);
+  }, [applyConnectivityState, ensureLocalBackendService, waitForLocalBackendReady]);
 
   useEffect(() => {
     connectivityCheckRef.current = performConnectivityCheck;
@@ -2436,7 +2494,9 @@ function App() {
           writeDiagnosticLog("WARN", "backend-ready-connectivity-check-failed", describeRequestFailure(error, { url: `${API_URL}/api/health` }));
         });
       } else {
-        setStartupError(service.message || "Local FroozERP service stopped or did not become healthy. Restart service.");
+        localServiceStartupStateRef.current = "checking";
+        setLocalServiceStartupState("checking");
+        setStartupNotice("Starting local service...");
       }
     }).then((cleanup) => {
       unlisten = cleanup;
@@ -4928,8 +4988,11 @@ function App() {
     }
   };
 
-  const localServiceUnavailable = isTauriRuntime() && !isCloudMode() && (backendHealth.online === false || localBackendService?.healthy === false);
-  const startupMainMessage = localServiceUnavailable
+  const localServiceStarting = isTauriRuntime() && !isCloudMode() && localServiceStartupState === "checking";
+  const localServiceUnavailable = isTauriRuntime() && !isCloudMode() && localServiceStartupState === "fatal";
+  const startupMainMessage = localServiceStarting
+    ? "Starting local service..."
+    : localServiceUnavailable
     ? "Local service could not start."
     : (startupError || startupNotice || "");
   const startupSecondaryMessage = localServiceUnavailable
