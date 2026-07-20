@@ -88,8 +88,8 @@ const readBody = async (req) => {
 
 const cloudRequest = async (req, body, route = req.url, options = {}) => {
   if (!options.bypassPolicy && !readPolicy().allowInternetAccess) {
-    const error = new Error("FroozERP cloud access is disabled by the Owner.");
-    error.code = "APP_INTERNET_DISABLED";
+    const error = new Error("Local Only mode selected - cloud sync paused.");
+    error.code = "APP_LOCAL_ONLY";
     throw error;
   }
   const headers = {};
@@ -150,7 +150,7 @@ const localRoute = async (req, res, url, body) => {
   }
   if (url.pathname === "/api/cloud/internet-access" && req.method === "GET") {
     const policy = readPolicy();
-    return sendJson(res, 200, { ...policy, status: policy.allowInternetAccess ? "ONLINE" : "APP_INTERNET_DISABLED" });
+    return sendJson(res, 200, { ...policy, status: policy.allowInternetAccess ? "AUTO" : "LOCAL_ONLY" });
   }
   if (url.pathname === "/api/cloud/internet-access" && req.method === "PUT") {
     const input = body.length ? JSON.parse(body.toString("utf8")) : {};
@@ -162,10 +162,10 @@ const localRoute = async (req, res, url, body) => {
     const identity = await response.json().catch(() => ({}));
     if (!response.ok || identity.is_owner !== true) return sendJson(res, 403, { code: "OWNER_REQUIRED", message: "Authenticated Owner permission is required." });
     const policy = writePolicy(input.allowInternetAccess !== false);
-    return sendJson(res, 200, { ...policy, status: policy.allowInternetAccess ? "ONLINE" : "APP_INTERNET_DISABLED" });
+    return sendJson(res, 200, { ...policy, status: policy.allowInternetAccess ? "AUTO" : "LOCAL_ONLY" });
   }
   if (url.pathname === "/api/cloud/health") {
-    if (!readPolicy().allowInternetAccess) return sendJson(res, 200, { status: "ok", localBackendStatus: "ok", appInternetAllowed: false, cloudReachable: false, syncReady: false, errorCode: "APP_INTERNET_DISABLED", safeErrorMessage: "FroozERP cloud access is disabled by the Owner." });
+    if (!readPolicy().allowInternetAccess) return sendJson(res, 200, { status: "ok", localBackendStatus: "ok", appInternetAllowed: false, cloudReachable: false, syncReady: false, errorCode: "APP_LOCAL_ONLY", safeErrorMessage: "Local Only mode selected - cloud sync paused." });
     try {
       const response = await fetch(`${CLOUD_API_URL}/api/health`, { signal: AbortSignal.timeout(8000) });
       const value = await response.json().catch(() => ({}));

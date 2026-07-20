@@ -2045,6 +2045,30 @@ fn local_db_status(app: AppHandle) -> Result<LocalDbStatus, String> {
     local_db::status(&app)
 }
 #[tauri::command]
+fn local_db_audit(app: AppHandle) -> Result<serde_json::Value, String> {
+    local_db::database_audit(&app)
+}
+#[tauri::command]
+fn local_record_connectivity_mode_change(
+    app: AppHandle,
+    user_id: String,
+    username: Option<String>,
+    role: String,
+    device_id: String,
+    previous_mode: String,
+    next_mode: String,
+) -> Result<(), String> {
+    local_db::record_connectivity_mode_change(
+        &app,
+        &user_id,
+        username.as_deref(),
+        &role,
+        &device_id,
+        &previous_mode,
+        &next_mode,
+    )
+}
+#[tauri::command]
 fn local_db_set_smoke_value(app: AppHandle, value: String) -> Result<(), String> {
     local_db::set_smoke_value(&app, &value)
 }
@@ -2374,6 +2398,8 @@ pub fn run() {
             local_get_or_create_device_identity,
             local_db_initialize,
             local_db_status,
+            local_db_audit,
+            local_record_connectivity_mode_change,
             local_db_set_smoke_value,
             local_db_get_smoke_value,
             sync_outbox_enqueue,

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
-const CURRENT_SCHEMA_VERSION: &str = "010_sync_delivery_state";
+const CURRENT_SCHEMA_VERSION: &str = "011_connectivity_mode_audit";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -17,6 +17,7 @@ const MIGRATION_006: &str = include_str!("../migrations/sqlite/006_multibranch_i
 const MIGRATION_007: &str = include_str!("../migrations/sqlite/007_cloud_runtime_and_inbox_foundation.sql");
 const MIGRATION_009: &str = include_str!("../migrations/sqlite/009_canonical_utc_timestamps.sql");
 const MIGRATION_010: &str = include_str!("../migrations/sqlite/010_sync_delivery_state.sql");
+const MIGRATION_011: &str = include_str!("../migrations/sqlite/011_connectivity_mode_audit.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -283,6 +284,69 @@ pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck], device_id: Option<Stri
     .map_err(to_error)?;
     tx.commit().map_err(to_error)?;
     status_at(&path)
+}
+
+pub fn database_audit(app: &AppHandle) -> Result<serde_json::Value, String> {
+    let path = database_path(app)?;
+    initialize_at(&path)?;
+    let conn = Connection::open(&path).map_err(to_error)?;
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0)).map_err(to_error)?;
+    let count = |table: &str| -> Result<i64, String> {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0)).map_err(to_error)
+    };
+    let sellable_lots: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM local_inventory_lots
+         WHERE deleted_at IS NULL
+           AND balance_qty > 0
+           AND UPPER(COALESCE(status, 'ACTIVE')) NOT IN ('CANCELLED', 'INACTIVE')",
+        [],
+        |row| row.get(0),
+    ).map_err(to_error)?;
+    let stock_value: f64 = conn.query_row(
+        "SELECT COALESCE(SUM(balance_qty * cost_rate), 0) FROM local_inventory_lots WHERE deleted_at IS NULL",
+        [],
+        |row| row.get(0),
+    ).map_err(to_error)?;
+    Ok(serde_json::json!({
+        "database_path": path_to_string(&path),
+        "integrity": integrity,
+        "products": count("local_products")?,
+        "inventory_lots": count("local_inventory_lots")?,
+        "sellable_lots": sellable_lots,
+        "categories": count("local_categories")?,
+        "customers": count("local_customers")?,
+        "invoices": count("local_pos_invoices")?,
+        "invoice_items": count("local_pos_invoice_items")?,
+        "payments": count("local_payment_postings")?,
+        "stock_movements": count("local_stock_movements")?,
+        "outbox": count("sync_outbox")?,
+        "conflicts": count("sync_conflicts")?,
+        "stock_value": stock_value,
+    }))
+}
+
+pub fn record_connectivity_mode_change(
+    app: &AppHandle,
+    user_id: &str,
+    username: Option<&str>,
+    role: &str,
+    device_id: &str,
+    previous_mode: &str,
+    next_mode: &str,
+) -> Result<(), String> {
+    if role.trim().to_uppercase() != "OWNER" {
+        return Err("Only Owner may change Connectivity Mode.".to_string());
+    }
+    let path = database_path(app)?;
+    initialize_at(&path)?;
+    let conn = Connection::open(path).map_err(to_error)?;
+    conn.execute(
+        "INSERT INTO local_connectivity_mode_audit (
+           id, user_id, username, role, device_id, previous_mode, next_mode, changed_at
+         ) VALUES (?1, ?2, ?3, 'OWNER', ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        params![unique_local_id("connectivity-mode"), user_id, username, device_id, previous_mode, next_mode],
+    ).map_err(to_error)?;
+    Ok(())
 }
 
 pub fn record_sync_cycle_completed(app: &AppHandle, device_id: &str, server_time: Option<String>, push_result: &str) -> Result<LocalDbStatus, String> {
@@ -1355,6 +1419,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "007_cloud_runtime_and_inbox_foundation", MIGRATION_007)?;
     apply_migration(&mut conn, "009_canonical_utc_timestamps", MIGRATION_009)?;
     apply_migration(&mut conn, "010_sync_delivery_state", MIGRATION_010)?;
+    apply_migration(&mut conn, "011_connectivity_mode_audit", MIGRATION_011)?;
     Ok(())
 }
 
@@ -2733,7 +2798,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("migration count");
-            assert_eq!(migration_count, 9);
+            assert_eq!(migration_count, 10);
             drop(conn);
             initialize_at(path).expect("restart with existing SQLite profile");
         }
@@ -2792,7 +2857,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("preserved marker");
-        assert_eq!(migration_count, 9);
+        assert_eq!(migration_count, 10);
         assert_eq!(marker, "keep-me");
         drop(conn);
         let _ = fs::remove_file(&path);

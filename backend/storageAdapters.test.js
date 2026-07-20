@@ -194,7 +194,7 @@ test("desktop App Internet policy can reconnect without allowing ordinary bypass
     assert.equal((await updatePolicy(false)).status, 200);
     const blocked = await fetch(`http://127.0.0.1:${port}/api/auth/me?user_id=1`);
     assert.equal(blocked.status, 503);
-    assert.equal((await blocked.json()).code, "APP_INTERNET_DISABLED");
+    assert.equal((await blocked.json()).code, "APP_LOCAL_ONLY");
     assert.equal((await updatePolicy(true)).status, 200);
     const allowed = await fetch(`http://127.0.0.1:${port}/api/auth/me?user_id=1`);
     assert.equal(allowed.status, 200);

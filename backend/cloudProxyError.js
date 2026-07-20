@@ -11,14 +11,14 @@ const CLOUD_NETWORK_CODES = new Set([
 const CLOUD_UNAVAILABLE_MESSAGE = "FroozERP cloud is temporarily unavailable. Local modules remain available.";
 
 const normalizeCloudProxyError = (error = {}) => {
-  if (error.code === "APP_INTERNET_DISABLED") {
+  if (["APP_INTERNET_DISABLED", "APP_LOCAL_ONLY"].includes(error.code)) {
     return {
       status: 503,
       payload: {
-        code: "APP_INTERNET_DISABLED",
+        code: "APP_LOCAL_ONLY",
         failure_kind: "CLOUD_UNAVAILABLE",
         cloud_connected: false,
-        message: "FroozERP cloud access is disabled by the Owner. Local modules remain available.",
+        message: "Local Only mode selected - cloud sync paused. Local modules remain available.",
       },
     };
   }

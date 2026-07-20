@@ -23,7 +23,7 @@ test("local backend and cloud connectivity remain independent", () => {
 });
 
 test("DNS, timeout, connection, and upstream gateway failures are cloud unavailable", () => {
-  for (const code of ["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "ERR_NETWORK"]) {
+  for (const code of ["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "ECONNABORTED", "ETIMEDOUT", "ERR_NETWORK", "APP_LOCAL_ONLY"]) {
     assert.equal(isCloudUnavailableError({ code }), true, code);
   }
   for (const status of [502, 503, 504]) {
@@ -52,6 +52,7 @@ test("cloud recovery enables sync only after all independent prerequisites recov
 test("empty optional cloud collections never replace verified local business data", () => {
   const localProducts = [{ id: 1, name: "Preserved product" }];
   assert.equal(preserveVerifiedLocalCollection([], localProducts), localProducts);
+  assert.equal(preserveVerifiedLocalCollection(undefined, localProducts), localProducts);
   assert.deepEqual(preserveVerifiedLocalCollection([{ id: 2 }], localProducts), [{ id: 2 }]);
   assert.deepEqual(preserveVerifiedLocalCollection([], []), []);
 });

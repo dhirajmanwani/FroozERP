@@ -101,7 +101,7 @@ const readSavedApiConfig = () => {
 
 const cloudAccessDisabledByOwner = () => {
   const config = readSavedApiConfig();
-  return String(config.cloudConnectionMode || "").trim().toUpperCase() === "SIMULATE_OFFLINE";
+  return ["LOCAL_ONLY", "SIMULATE_OFFLINE"].includes(String(config.connectivityMode || config.cloudConnectionMode || "").trim().toUpperCase());
 };
 
 const simulatedOfflineStatus = async (apiUrl, stage = "sync") => {
@@ -112,10 +112,10 @@ const simulatedOfflineStatus = async (apiUrl, stage = "sync") => {
     syncing: false,
     apiUrl: normalizeApiUrl(apiUrl),
     backendUrl: endpointUrl(apiUrl, "/api/health"),
-    lastFailureKind: "APP_SIMULATED_OFFLINE",
+    lastFailureKind: "APP_LOCAL_ONLY",
     lastHttpStatus: null,
     syncStage: stage,
-    lastError: "FroozERP cloud access is disabled by the Owner.",
+    lastError: "Local Only mode selected - cloud sync paused.",
   };
   return lastStatus;
 };
@@ -171,7 +171,7 @@ export async function initialiseSync({ apiUrl, user, deviceInfo, branchId }) {
   const localStatus = await repositories.status.get();
   lastStatus = normalizeLocalStatus(localStatus);
   if (cloudAccessDisabledByOwner()) {
-    writeSyncLog("INFO", "sync-paused", { code: "APP_SIMULATED_OFFLINE", apiUrl: normalizeApiUrl(apiUrl) });
+    writeSyncLog("INFO", "sync-paused", { code: "APP_LOCAL_ONLY", apiUrl: normalizeApiUrl(apiUrl) });
     return simulatedOfflineStatus(apiUrl, "initialise");
   }
   const context = syncContext({ user, deviceInfo, branchId });
@@ -225,7 +225,7 @@ export async function initialiseSync({ apiUrl, user, deviceInfo, branchId }) {
 export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId }) {
   const context = syncContext({ user, deviceInfo, branchId });
   if (cloudAccessDisabledByOwner()) {
-    writeSyncLog("INFO", "push-blocked", { code: "APP_SIMULATED_OFFLINE", apiUrl: normalizeApiUrl(apiUrl) });
+    writeSyncLog("INFO", "push-blocked", { code: "APP_LOCAL_ONLY", apiUrl: normalizeApiUrl(apiUrl) });
     return simulatedOfflineStatus(apiUrl, "push");
   }
   if (!isTauriRuntime() || !context.userId || !context.deviceId) return lastStatus;
@@ -293,7 +293,7 @@ export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId
 
 export async function pullServerChanges({ apiUrl, user, deviceInfo, branchId }) {
   if (cloudAccessDisabledByOwner()) {
-    writeSyncLog("INFO", "pull-blocked", { code: "APP_SIMULATED_OFFLINE", apiUrl: normalizeApiUrl(apiUrl) });
+    writeSyncLog("INFO", "pull-blocked", { code: "APP_LOCAL_ONLY", apiUrl: normalizeApiUrl(apiUrl) });
     return simulatedOfflineStatus(apiUrl, "pull");
   }
   const context = syncContext({ user, deviceInfo, branchId });
@@ -355,7 +355,7 @@ export async function getSyncStatus() {
 
 export async function syncNow({ apiUrl, user, deviceInfo, branchId }) {
   if (cloudAccessDisabledByOwner()) {
-    writeSyncLog("INFO", "sync-blocked", { code: "APP_SIMULATED_OFFLINE", apiUrl: normalizeApiUrl(apiUrl) });
+    writeSyncLog("INFO", "sync-blocked", { code: "APP_LOCAL_ONLY", apiUrl: normalizeApiUrl(apiUrl) });
     return simulatedOfflineStatus(apiUrl, "sync");
   }
   if (runningSync) return runningSync;

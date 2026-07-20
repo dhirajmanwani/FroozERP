@@ -7,6 +7,7 @@ import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
 import QRCode from "qrcode";
 import "./App.css";
 import {
+  auditLocalDatabase,
   cacheLocalReferenceSnapshot,
   cancelLocalPosSale,
   completeLocalPosSale,
@@ -17,6 +18,7 @@ import {
   listLocalPosSales,
   loadLocalReferenceSnapshot,
   loadLocalPosSale,
+  recordConnectivityModeChange,
 } from "./local/localDatabase";
 import {
   authenticateOfflineSession,
@@ -26,6 +28,8 @@ import {
 } from "./local/offlineSession";
 import { buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
+import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode, writeConnectivityMode } from "./local/connectivityMode";
+import { selectLocalPosInventory } from "./local/posInventory";
 import { describeUpdateAvailability, normalizeUpdateMetadata } from "./local/updateMetadata";
 import { RUNTIME_FAILURE_EVENT, describeRequestFailure, initialiseMandatoryRuntime, resolveLocalServiceRenderState, resolveMandatoryRuntimeRenderState, settleNamedRequests } from "./local/startupResilience";
 import {
@@ -77,10 +81,6 @@ const API_MODES = Object.freeze({
   FIELD_REMOTE_DEVICE: "FIELD_REMOTE_DEVICE",
   CUSTOM_API_URL: "CUSTOM_API_URL",
   SIMULATED_OFFLINE: "SIMULATED_OFFLINE",
-});
-const CLOUD_CONNECTION_MODES = Object.freeze({
-  ONLINE: "ONLINE",
-  SIMULATE_OFFLINE: "SIMULATE_OFFLINE",
 });
 const API_MODE_OPTIONS = [
   [API_MODES.HYBRID, "Hybrid: Local + Cloud"],
@@ -171,12 +171,8 @@ const mergeCloudIdentityIntoSavedConfig = (identity = {}) => {
   return next;
 };
 const SAVED_API_CONFIG = sanitizeSavedApiConfigForRuntime(readSavedApiConfig());
-const normalizeCloudConnectionMode = (value) => (
-  String(value || "").trim().toUpperCase() === CLOUD_CONNECTION_MODES.SIMULATE_OFFLINE
-    ? CLOUD_CONNECTION_MODES.SIMULATE_OFFLINE
-    : CLOUD_CONNECTION_MODES.ONLINE
-);
-const FROOZERP_CLOUD_SIMULATED_OFFLINE = normalizeCloudConnectionMode(SAVED_API_CONFIG.cloudConnectionMode) === CLOUD_CONNECTION_MODES.SIMULATE_OFFLINE;
+const normalizeCloudConnectionMode = normalizeConnectivityMode;
+const isLocalOnlyConnectivitySelected = () => readConnectivityMode() === CONNECTIVITY_MODES.LOCAL_ONLY;
 const savedModeForRuntime = normalizeApiMode(SAVED_API_CONFIG.mode);
 const legacyDesktopLocalMode = isDesktopShell() && [
   API_MODES.LOCAL_SINGLE_DEVICE,
@@ -360,7 +356,9 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
   const localOffline = backendHealth?.online === false && !localStarting;
   const cloudOnline = cloudHealth?.online === true && normalizeApiBase(cloudHealth?.apiUrl || cloudHealth?.data?.configuredCloudBaseUrl || "") === CLOUD_API_URL;
   const cloudOffline = cloudHealth?.online === false;
-  const cloudPaused = FROOZERP_CLOUD_SIMULATED_OFFLINE || cloudHealth?.reasonCode === "APP_SIMULATED_OFFLINE" || syncStatus?.lastFailureKind === "APP_SIMULATED_OFFLINE";
+  const cloudPaused = isLocalOnlyConnectivitySelected()
+    || ["APP_SIMULATED_OFFLINE", "APP_LOCAL_ONLY"].includes(cloudHealth?.reasonCode)
+    || ["APP_SIMULATED_OFFLINE", "APP_LOCAL_ONLY"].includes(syncStatus?.lastFailureKind);
   const backendOnline = isCloudMode() ? cloudOnline : localOnline;
   const backendOffline = isCloudMode() ? cloudOffline : localOffline;
   const cloudReachable = !cloudPaused && usesCloudBackend() && CLOUD_CONFIGURED && cloudOnline;
@@ -461,7 +459,7 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
   if (localStarting) {
     banner = "Starting local service...";
   } else if (cloudPaused) {
-    banner = "Simulated Offline Mode - Internet is available on this computer, but FroozERP cloud access is intentionally disabled.";
+    banner = "Local Only mode selected - cloud sync paused. Local SQLite modules remain available.";
   } else if (localOnline && cloudReachable) {
     banner = "Local server connected • Cloud backend connected";
   } else if (localOnline && cloudOffline && usesCloudBackend()) {
@@ -498,7 +496,7 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
     failed,
     conflicts,
     syncSummary,
-    cloudConnectionMode: cloudPaused ? "Simulate Offline" : "Online",
+    cloudConnectionMode: cloudPaused ? "Local Only" : "Auto",
     banner,
     detail: `${syncSummary}. API mode: ${apiModeLabel}.`,
   };
@@ -538,7 +536,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.61";
+const APP_VERSION = "1.0.62";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -1398,6 +1396,7 @@ function App() {
   const [user, setUser] = useState(null);
   const [deviceInfo, setDeviceInfo] = useState(() => getClientDeviceInfo());
   const [localDbStatus, setLocalDbStatus] = useState(null);
+  const [localDbAudit, setLocalDbAudit] = useState(null);
   const [mandatoryRuntimeState, setMandatoryRuntimeState] = useState(() => (isTauriRuntime() ? "checking" : "ready"));
   const startupRenderStateRef = useRef("");
   const [syncStatus, setSyncStatus] = useState(null);
@@ -1446,6 +1445,7 @@ function App() {
   const [cloudDiagnostics, setCloudDiagnostics] = useState(null);
   const [loginBusy, setLoginBusy] = useState(false);
   const [offlineMode, setOfflineMode] = useState(false);
+  const [connectivityMode, setConnectivityMode] = useState(readConnectivityMode);
   const [offlineReady, setOfflineReady] = useState(false);
   const [lastReferenceSyncAt, setLastReferenceSyncAt] = useState("");
   const [deviceGate, setDeviceGate] = useState(null);
@@ -2227,17 +2227,17 @@ function App() {
     if (!user) return null;
     const force = Boolean(options.force);
     if (!force && !shouldStartBackgroundSync()) return syncStatus;
-    if (FROOZERP_CLOUD_SIMULATED_OFFLINE) {
+    if (isLocalOnlyConnectivitySelected()) {
       const status = {
         ...(await getSyncStatus()),
         online: false,
         syncing: false,
-        lastFailureKind: "APP_SIMULATED_OFFLINE",
-        lastError: "FroozERP cloud access is disabled by the Owner.",
+        lastFailureKind: "APP_LOCAL_ONLY",
+        lastError: "Local Only mode selected - cloud sync paused.",
         apiUrl: SYNC_API_URL,
       };
       setSyncStatus(status);
-      setSyncMessage("Sync paused - FroozERP cloud access is disabled by the Owner.");
+      setSyncMessage("Local Only mode selected - cloud sync paused.");
       return status;
     }
     if (force) lastAutoSyncStartedAtRef.current = Date.now();
@@ -2254,6 +2254,63 @@ function App() {
     const nextStatus = buildConnectionStatusModel({ backendHealth, cloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: status, internetAvailable, currentUser: user, localServiceState: localServiceStartupStateRef.current });
     setSyncMessage(nextStatus.syncSummary);
     return status;
+  };
+
+  const changeConnectivityMode = async (requestedMode) => {
+    const nextMode = normalizeConnectivityMode(requestedMode);
+    const previousMode = connectivityMode;
+    if (String(user?.role || "").toUpperCase() !== "OWNER") {
+      throw new Error("Only Owner may change Connectivity Mode.");
+    }
+    if (nextMode === previousMode) return nextMode;
+    const allowInternetAccess = nextMode === CONNECTIVITY_MODES.AUTO;
+    await axios.put(`${LOCAL_API_URL}/api/cloud/internet-access`, {
+      user_id: user.id,
+      allowInternetAccess,
+    }, { timeout: 8000, headers: { "x-user-id": user.id, "x-device-id": deviceInfo.device_id } });
+    try {
+      await recordConnectivityModeChange({
+        userId: user.id,
+        username: user.username,
+        role: user.role,
+        deviceId: deviceInfo.device_id,
+        previousMode,
+        nextMode,
+      });
+    } catch (error) {
+      await axios.put(`${LOCAL_API_URL}/api/cloud/internet-access`, {
+        user_id: user.id,
+        allowInternetAccess: previousMode === CONNECTIVITY_MODES.AUTO,
+      }, { timeout: 8000, headers: { "x-user-id": user.id, "x-device-id": deviceInfo.device_id } }).catch(() => null);
+      throw error;
+    }
+    writeConnectivityMode(nextMode);
+    setConnectivityMode(nextMode);
+    setSyncMessage(connectivityModeMessage(nextMode));
+    await refreshPosInventoryFromSQLite("connectivity-mode-change");
+    if (nextMode === CONNECTIVITY_MODES.LOCAL_ONLY) {
+      setCloudHealth((current) => ({
+        ...current,
+        online: false,
+        checking: false,
+        reachabilityStatus: "paused",
+        status: "paused",
+        reasonCode: "APP_LOCAL_ONLY",
+        message: "Local Only mode selected - cloud sync paused.",
+        lastCheckedAt: new Date().toISOString(),
+      }));
+      setAiAssistantData((current) => ({ ...current, loading: false, error: FROST_CLOUD_UNAVAILABLE_MESSAGE }));
+      setSyncStatus((current) => ({ ...(current || {}), online: false, syncing: false, lastFailureKind: "APP_LOCAL_ONLY", lastError: "" }));
+      return nextMode;
+    }
+    const health = await performConnectivityCheck("connectivity-mode-auto", { force: true, timeoutMs: 5000 });
+    if (health?.online) {
+      await runSyncNow({ force: true }).catch((error) => {
+        writeDiagnosticLog("WARN", "connectivity-mode-auto-sync-failed", describeRequestFailure(error, { url: `${SYNC_API_URL}/api/sync/push` }));
+      });
+      if (frostDrawerOpen) await loadAiAssistant(aiRange).catch(() => null);
+    }
+    return nextMode;
   };
 
   const applyConnectivityState = useCallback((health, statusInternetAvailable = internetAvailableRef.current, statusSyncStatus = syncStatusRef.current) => {
@@ -2587,6 +2644,16 @@ function App() {
       window.clearInterval(timer);
     };
   }, [user, deviceInfo.device_id, backendHealth.online, performConnectivityCheck]);
+
+  useEffect(() => {
+    if (!user?.id || !isTauriRuntime()) return;
+    auditLocalDatabase().then((audit) => {
+      setLocalDbAudit(audit);
+      writeDiagnosticLog("INFO", "local-sqlite-audit", audit || {});
+    }).catch((error) => {
+      writeDiagnosticLog("ERROR", "local-sqlite-audit-failed", { message: error?.message || String(error) });
+    });
+  }, [user?.id, connectivityMode]);
 
   const rolePermissionMap = useMemo(() => {
     const map = new Map();
@@ -2974,13 +3041,13 @@ function App() {
     setSaleDesiredMargin(String(nextSaleRateSettings.desired_margin_percent || 25));
   };
 
-  const applyReferenceSnapshot = async (snapshot, { offline = false, nextView = null } = {}) => {
+  const applyReferenceSnapshot = async (snapshot, { offline = false, localOnly = false, nextView = null } = {}) => {
     const bundle = snapshot?.settings_bundle || {};
-    setProducts(snapshot?.products || []);
-    setProductCategories(snapshot?.categories || []);
-    setInventory(snapshot?.inventory_lots || []);
-    setCustomers(snapshot?.customers || []);
-    setSalesHistory(snapshot?.sales_history || []);
+    setProducts((current) => preserveVerifiedLocalCollection(snapshot?.products, current));
+    setProductCategories((current) => preserveVerifiedLocalCollection(snapshot?.categories, current));
+    setInventory((current) => preserveVerifiedLocalCollection(snapshot?.inventory_lots, current));
+    setCustomers((current) => preserveVerifiedLocalCollection(snapshot?.customers, current));
+    setSalesHistory((current) => preserveVerifiedLocalCollection(snapshot?.sales_history, current));
     setPurchases(bundle.offlinePurchases || []);
     setSuppliers(bundle.offlineSuppliers || []);
     setAccounts(bundle.offlineAccounts || []);
@@ -2994,7 +3061,7 @@ function App() {
     setLastReferenceSyncAt(snapshot?.last_successful_sync_at || "");
     setSyncStatus((current) => ({
       ...(current || {}),
-      online: !offline,
+      online: !offline && !localOnly,
       syncing: false,
       pendingOperations: Number(snapshot?.pending_operations ?? current?.pendingOperations ?? 0),
       failedOperations: Number(snapshot?.failed_operations ?? current?.failedOperations ?? 0),
@@ -3006,13 +3073,42 @@ function App() {
       lastError: "",
     }));
     if (nextView) setActiveView(nextView);
-    if (offline) {
+    if (localOnly) {
+      setSyncMessage("Local Only mode selected - cloud sync paused.");
+      setStartupNotice("Local Only mode selected. FroozERP loaded local SQLite data; cloud sync will resume in Auto mode.");
+    } else if (offline) {
       setSyncMessage("Offline - changes will sync later");
       setStartupNotice("Offline mode is active. FroozERP loaded your local SQLite data and will sync changes later.");
     } else {
       setSyncMessage("");
     }
   };
+
+  const refreshPosInventoryFromSQLite = async (reason = "pos-open") => {
+    if (!isTauriRuntime() || !user?.id) return null;
+    const snapshot = await loadLocalReferenceSnapshot({ username: user.username, deviceId: deviceInfo.device_id });
+    const selected = selectLocalPosInventory(snapshot);
+    if (!selected.products.length || !selected.inventoryLots.length) {
+      throw new Error("Local SQLite POS inventory snapshot is not ready.");
+    }
+    setProducts(selected.products);
+    setInventory(selected.inventoryLots);
+    writeDiagnosticLog("INFO", "pos-local-inventory-loaded", {
+      reason,
+      products: selected.products.length,
+      inventoryLots: selected.inventoryLots.length,
+      connectivityMode: readConnectivityMode(),
+    });
+    return selected;
+  };
+
+  useEffect(() => {
+    if (!user?.id || activeView !== "sales" || !isTauriRuntime()) return;
+    refreshPosInventoryFromSQLite("pos-view-or-connectivity-change").catch((error) => {
+      writeDiagnosticLog("ERROR", "pos-local-inventory-load-failed", { message: error?.message || String(error) });
+      setSyncMessage("POS could not refresh its local SQLite inventory. Existing values remain visible.");
+    });
+  }, [activeView, connectivityMode, deviceInfo.device_id, posRefreshToken, user?.id]);
 
   const fetchOnlineReferenceSnapshot = async (currentUser, latestDevice) => {
     const localSnapshot = isTauriRuntime()
@@ -3199,12 +3295,12 @@ function App() {
       axios.get(`${API_URL}/products`),
       axios.get(`${API_URL}/product-duplicate-archive-log`).catch(() => ({ data: { message: "" } })),
     ]);
-    setProducts(response.data);
+    setProducts((current) => preserveVerifiedLocalCollection(response.data, current));
     setProductDuplicateWarning(duplicateLogResponse.data?.message || "");
   };
   const loadProductCategories = async () => {
     const response = await axios.get(`${API_URL}/product-categories`);
-    setProductCategories(response.data);
+    setProductCategories((current) => preserveVerifiedLocalCollection(response.data, current));
   };
 
   const loadPurchaseRules = async () => {
@@ -3708,7 +3804,9 @@ function App() {
       axios.get(`${API_URL}/dashboard-analytics`, { params: getDashboardParams() }),
     ]);
     const [inventoryResult, salesResult, metricsResult, analyticsResult] = requests;
-    if (inventoryResult.status === "fulfilled") setInventory(inventoryResult.value.data || []);
+    if (inventoryResult.status === "fulfilled") {
+      setInventory((current) => preserveVerifiedLocalCollection(inventoryResult.value.data, current));
+    }
     if (salesResult.status === "fulfilled") setSalesHistory(salesResult.value.data || []);
     if (metricsResult.status === "fulfilled") setSupplierDashboard(metricsResult.value.data || {});
     if (analyticsResult.status === "fulfilled") setDashboardAnalytics(analyticsResult.value.data || emptyDashboardAnalytics);
@@ -3757,7 +3855,7 @@ function App() {
         snapshot: cachedIdentitySnapshot,
       });
       await performConnectivityCheck("login", { force: true, timeoutMs: 4000 });
-      const authHealth = FROOZERP_CLOUD_SIMULATED_OFFLINE
+      const authHealth = isLocalOnlyConnectivitySelected()
         ? {
             online: false,
             url: `${AUTH_API_URL}/api/health`,
@@ -4226,7 +4324,7 @@ function App() {
 
   const refreshLotContext = async (product = lotPanelProduct) => {
     const inventoryResponse = await axios.get(`${API_URL}/inventory`, { params: { include_cancelled: true } });
-    setInventory(inventoryResponse.data);
+    setInventory((current) => preserveVerifiedLocalCollection(inventoryResponse.data, current));
     await Promise.all([loadProducts(), loadDashboardData(), loadReports()]);
     if (product?.id) await loadProductLots(product, true);
   };
@@ -4671,7 +4769,7 @@ function App() {
       return;
     }
     const inventoryRefresh = axios.get(`${API_URL}/inventory`, { params: { include_cancelled: true } })
-      .then((response) => setInventory(response.data));
+      .then((response) => setInventory((current) => preserveVerifiedLocalCollection(response.data, current)));
     await Promise.all([
       loadProducts().catch(() => null),
       inventoryRefresh.catch(() => null),
@@ -4970,7 +5068,7 @@ function App() {
     if (!inventory.length && !localEligible) {
       preloadTasks.push(
         axios.get(`${API_URL}/inventory`, { params: { include_cancelled: true } })
-          .then((response) => setInventory(response.data))
+          .then((response) => setInventory((current) => preserveVerifiedLocalCollection(response.data, current)))
       );
     }
     if (!inventory.length && localEligible) {
@@ -4997,22 +5095,29 @@ function App() {
       nextUrl.searchParams.set("view", view);
       window.history.pushState({ view }, "", nextUrl);
     }
-    if (offlineMode) {
+    const localDataMode = offlineMode || connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY;
+    if (localDataMode) {
       const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id });
       if (!snapshot?.reference_ready) {
         setStartupError("This device must connect to the internet once before offline use.");
         return;
       }
       setSidebarOpen(false);
-      await applyReferenceSnapshot(snapshot, { offline: true, nextView: view });
-      if (offlineBackendRequiredViews.has(view)) {
+      const localOnly = connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY;
+      await applyReferenceSnapshot(snapshot, { offline: offlineMode, localOnly, nextView: view });
+      if (localOnly) {
+        setSyncMessage("Local Only mode selected - cloud sync paused.");
+      } else if (offlineBackendRequiredViews.has(view)) {
         setSyncMessage("Offline - this module opens with local cached data where available. Some actions require the FroozERP backend.");
       } else if (offlineLocalDataViews.has(view)) {
         setSyncMessage("Offline - loaded local SQLite data for this module.");
       }
       if (view === "reports") await loadReports().catch(() => null);
       if (view === "dashboard") await loadDashboardData().catch(() => null);
-      if (view === "sales") await Promise.all([loadSalesHistory(), loadReports()]).catch(() => null);
+      if (view === "sales") {
+        await refreshPosInventoryFromSQLite("navigate-local-pos");
+        await Promise.all([loadSalesHistory(), loadReports()]).catch(() => null);
+      }
       return;
     }
     setSidebarOpen(false);
@@ -5021,10 +5126,13 @@ function App() {
       if (view === "products") {
         await Promise.all([loadProducts(), loadProductCategories(), loadSupplierData(), loadDashboardData()]);
       }
-      if (view === "sales") await Promise.all([loadDiscountRules(), loadLotDiscounts(), loadCustomerData()]);
+      if (view === "sales") {
+        await refreshPosInventoryFromSQLite("navigate-auto-pos");
+        await Promise.all([loadDiscountRules(), loadLotDiscounts(), loadCustomerData()]);
+      }
       if (view === "discounts") {
         const inventoryResponse = await axios.get(`${API_URL}/inventory`);
-        setInventory(inventoryResponse.data);
+        setInventory((current) => preserveVerifiedLocalCollection(inventoryResponse.data, current));
         await Promise.all([loadLotDiscounts(), loadProducts(), loadSupplierData()]);
       }
       if (["purchase", "pending-bills", "accounts"].includes(view)) {
@@ -5368,6 +5476,17 @@ function App() {
         </header>
 
         <div className="content-area">
+          {connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY && (
+            <div className="local-only-banner" data-connectivity-mode="LOCAL_ONLY">
+              <div>
+                <strong>Local Only mode selected - cloud sync paused</strong>
+                <span>Business modules use local SQLite. Windows internet remains connected.</span>
+              </div>
+              <button className="primary-button" onClick={() => changeConnectivityMode(CONNECTIVITY_MODES.AUTO).catch((error) => setSyncMessage(getErrorMessage(error, "Unable to return to Auto mode")))}>
+                Return to Auto
+              </button>
+            </div>
+          )}
           {(startupNotice || startupError || syncMessage) && (
             <div className={`startup-status-panel ${startupError ? "startup-status-error" : ""}`}>
               {startupError && <p>{startupError}</p>}
@@ -6030,12 +6149,15 @@ function App() {
                 cloudDeviceRegistration={cloudDeviceRegistration}
                 cloudDiagnostics={cloudDiagnostics}
                 cloudHealth={cloudHealth}
+                connectivityMode={connectivityMode}
                 connectionStatus={connectionStatus}
                 deviceInfo={deviceInfo}
                 localBackendService={localBackendService}
+                localDbAudit={localDbAudit}
                 localDbStatus={localDbStatus}
                 startupLogPath={startupLogPath}
                 onCheckConnection={() => performConnectivityCheck("settings-sync-check", { force: true, timeoutMs: 3500 })}
+                onConnectivityModeChange={changeConnectivityMode}
                 onApproveCloudDevice={approveCloudDevice}
                 onReload={async () => { await Promise.all([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()]); }}
                 onRegisterCloudDevice={registerCloudDevice}
@@ -11990,12 +12112,15 @@ function SettingsModule({
   cloudDeviceRegistration,
   cloudDiagnostics,
   cloudHealth,
+  connectivityMode,
   connectionStatus,
   deviceInfo,
   localBackendService,
+  localDbAudit,
   localDbStatus,
   startupLogPath,
   onCheckConnection,
+  onConnectivityModeChange,
   onApproveCloudDevice,
   onQueueSyncTest,
   onRegisterCloudDevice,
@@ -12045,12 +12170,15 @@ function SettingsModule({
         cloudDiagnostics={cloudDiagnostics || null}
         deviceInfo={deviceInfo}
         cloudHealth={cloudHealth || null}
+        connectivityMode={connectivityMode}
         connectionStatus={connectionStatus}
         localBackendService={localBackendService || null}
+        localDbAudit={localDbAudit}
         startupLogPath={startupLogPath}
         key={settingsData.syncSettings?.updated_at || "sync-settings"}
         localDbStatus={localDbStatus}
         onCheckConnection={onCheckConnection}
+        onConnectivityModeChange={onConnectivityModeChange}
         onApproveCloudDevice={onApproveCloudDevice}
         onQueueSyncTest={onQueueSyncTest}
         onRegisterCloudDevice={onRegisterCloudDevice}
@@ -13412,12 +13540,15 @@ function SyncSettingsSection({
   cloudDeviceRegistration,
   cloudDiagnostics,
   cloudHealth,
+  connectivityMode,
   deviceInfo,
   connectionStatus,
   localBackendService,
+  localDbAudit,
   localDbStatus,
   startupLogPath,
   onCheckConnection,
+  onConnectivityModeChange,
   onApproveCloudDevice,
   onQueueSyncTest,
   onRegisterCloudDevice,
@@ -13438,6 +13569,7 @@ function SyncSettingsSection({
   const [cloudReadiness, setCloudReadiness] = useState(null);
   const [cloudReadinessBusy, setCloudReadinessBusy] = useState(false);
   const [cloudActionBusy, setCloudActionBusy] = useState("");
+  const [connectivityModeBusy, setConnectivityModeBusy] = useState(false);
   const [configDraft, setConfigDraft] = useState({
     mode: API_CONFIG.mode,
     cloudConnectionMode: normalizeCloudConnectionMode(SAVED_API_CONFIG.cloudConnectionMode),
@@ -13449,6 +13581,19 @@ function SyncSettingsSection({
     branchServerPort: API_CONFIG.branchServerPort,
   });
   const [configMessage, setConfigMessage] = useState("");
+  const applyConnectivityMode = async (nextMode) => {
+    if (String(user?.role || "").toUpperCase() !== "OWNER" || !onConnectivityModeChange) return;
+    setConnectivityModeBusy(true);
+    try {
+      const savedMode = await onConnectivityModeChange(nextMode);
+      setConfigDraft((current) => ({ ...current, cloudConnectionMode: savedMode }));
+      setConfigMessage(connectivityModeMessage(savedMode));
+    } catch (error) {
+      setConfigMessage(getErrorMessage(error, "Unable to change Connectivity Mode"));
+    } finally {
+      setConnectivityModeBusy(false);
+    }
+  };
   const save = async () => {
     try {
       const response = await axios.put(`${API_URL}/settings/sync-status`, {
@@ -13515,8 +13660,8 @@ function SyncSettingsSection({
     if (configDraft.mode === API_MODES.FIELD_REMOTE_DEVICE) {
       return setResult("Field Remote Not Ready", "Remote purchase/offline sync handlers are not implemented. This mode cannot be marked production-ready.");
     }
-    if (normalizeCloudConnectionMode(configDraft.cloudConnectionMode) === CLOUD_CONNECTION_MODES.SIMULATE_OFFLINE) {
-      return setResult("Cloud Paused By Owner", "Simulated Offline Mode is active. FroozERP cloud checks and sync are intentionally blocked while local backend stays usable.");
+    if (normalizeCloudConnectionMode(configDraft.cloudConnectionMode) === CONNECTIVITY_MODES.LOCAL_ONLY) {
+      return setResult("Cloud Paused By Owner", "Local Only mode is active. FroozERP cloud checks and sync are intentionally blocked while local SQLite stays usable.");
     }
     if (!cloudUrl) {
       return setResult("Cloud Not Configured", "Cloud is not configured yet. Local and LAN modes can still work.");
@@ -13570,6 +13715,7 @@ function SyncSettingsSection({
       ...readSavedApiConfig(),
       mode: normalizeApiMode(configDraft.mode),
       cloudConnectionMode: normalizeCloudConnectionMode(configDraft.cloudConnectionMode),
+      connectivityMode: normalizeConnectivityMode(configDraft.cloudConnectionMode),
       localApiUrl: normalizeApiBase(configDraft.localApiUrl) || "http://127.0.0.1:5000",
       branchLanApiUrl: normalizeApiBase(configDraft.branchLanApiUrl),
       cloudApiUrl: normalizeApiBase(configDraft.cloudApiUrl),
@@ -13604,7 +13750,7 @@ function SyncSettingsSection({
     try {
       await axios.put(`${LOCAL_API_URL}/api/cloud/internet-access`, {
         user_id: user.id,
-        allowInternetAccess: nextConfig.cloudConnectionMode !== CLOUD_CONNECTION_MODES.SIMULATE_OFFLINE,
+        allowInternetAccess: nextConfig.cloudConnectionMode !== CONNECTIVITY_MODES.LOCAL_ONLY,
       }, { timeout: 5000, headers: { "x-user-id": user.id } });
     } catch (error) {
       setConfigMessage(getErrorMessage(error, "Unable to save FroozERP internet access policy."));
@@ -13739,14 +13885,14 @@ function SyncSettingsSection({
                 {API_MODE_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
               </select>
             </Field>
-            <Field label="Allow FroozERP Internet Access">
-              <select disabled={!canManage} value={configDraft.cloudConnectionMode} onChange={(event) => setConfigDraft({ ...configDraft, cloudConnectionMode: normalizeCloudConnectionMode(event.target.value) })}>
-                <option value={CLOUD_CONNECTION_MODES.ONLINE}>On</option>
-                <option value={CLOUD_CONNECTION_MODES.SIMULATE_OFFLINE}>Off - Simulate Offline</option>
-              </select>
+            <Field label="Connectivity Mode">
+              <div className="connectivity-segmented" role="group" aria-label="Connectivity Mode">
+                <button className={connectivityMode === CONNECTIVITY_MODES.AUTO ? "selected" : ""} disabled={connectivityModeBusy || String(user?.role || "").toUpperCase() !== "OWNER"} type="button" onClick={() => applyConnectivityMode(CONNECTIVITY_MODES.AUTO)}>AUTO</button>
+                <button className={connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY ? "selected" : ""} disabled={connectivityModeBusy || String(user?.role || "").toUpperCase() !== "OWNER"} type="button" onClick={() => applyConnectivityMode(CONNECTIVITY_MODES.LOCAL_ONLY)}>LOCAL ONLY</button>
+              </div>
             </Field>
           </div>
-          {configDraft.cloudConnectionMode === CLOUD_CONNECTION_MODES.SIMULATE_OFFLINE && <p className="form-note stock-low">Simulated Offline Mode - Internet stays available, but FroozERP cloud, sync, provider, email and SMS calls are paused inside the app.</p>}
+          {configDraft.cloudConnectionMode === CONNECTIVITY_MODES.LOCAL_ONLY && <p className="form-note stock-low">Local Only mode selected - cloud sync paused. Windows networking remains unchanged.</p>}
           {configDraft.mode === API_MODES.LOCAL_SINGLE_DEVICE && <p className="form-note">Local Single Device uses this computer's local backend.</p>}
           {configDraft.mode === API_MODES.BRANCH_LAN_SERVER && <p className="form-note">Branch LAN Server is for the main shop computer serving same-branch devices over Wi-Fi/LAN.</p>}
           {configDraft.mode === API_MODES.BRANCH_LAN_CLIENT && <p className="form-note">Branch LAN Client must use the main branch server IP. It is same Wi-Fi/LAN only, not cloud.</p>}
@@ -13774,6 +13920,11 @@ function SyncSettingsSection({
             <Field label="Device Display Name"><input disabled={!canManage} value={draft.device_display_name || ""} onChange={(event) => setDraft({ ...draft, device_display_name: event.target.value })} /></Field>
             <Field label="Local SQLite Path"><input disabled value={localDbStatus?.databasePath || "Available in FroozERP desktop app"} /></Field>
             <Field label="Local Schema Version"><input disabled value={localDbStatus?.schemaVersion || "Not initialized"} /></Field>
+            <Field label="SQLite Integrity"><input disabled value={localDbAudit?.integrity || "Not checked"} /></Field>
+            <Field label="Local Product Count"><input disabled value={localDbAudit?.products ?? "Not checked"} /></Field>
+            <Field label="Local Inventory Lot Count"><input disabled value={localDbAudit?.inventory_lots ?? "Not checked"} /></Field>
+            <Field label="Sellable Local Lot Count"><input disabled value={localDbAudit?.sellable_lots ?? "Not checked"} /></Field>
+            <Field label="Local Stock Value"><input disabled value={localDbAudit?.stock_value == null ? "Not checked" : currency.format(Number(localDbAudit.stock_value || 0))} /></Field>
             <Field label="Last Push"><input disabled value={lastPush ? `${formatKolkataDateTime(lastPush)} (server acknowledged)` : syncStatus?.lastPushResult === "NO_PENDING_CHANGES" ? "No pending changes; no server push yet" : "No server-acknowledged push yet"} /></Field>
             <Field label="Last Pull"><input disabled value={lastPull ? formatKolkataDateTime(lastPull) : "Not pulled"} /></Field>
             <Field label="API Mode"><input disabled value={API_CONFIG.mode} /></Field>

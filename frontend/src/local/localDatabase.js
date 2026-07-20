@@ -121,6 +121,23 @@ export async function applyPushAcknowledgements(acks, deviceId, serverTime) {
   return normalizeStatus(status);
 }
 
+export async function auditLocalDatabase() {
+  if (!isTauriRuntime()) return null;
+  return invokeLocal("local_db_audit");
+}
+
+export async function recordConnectivityModeChange({ userId, username, role, deviceId, previousMode, nextMode }) {
+  if (!isTauriRuntime()) return null;
+  return invokeLocal("local_record_connectivity_mode_change", {
+    user_id: String(userId || ""),
+    username: username || null,
+    role: String(role || ""),
+    device_id: String(deviceId || ""),
+    previous_mode: String(previousMode || ""),
+    next_mode: String(nextMode || ""),
+  });
+}
+
 export async function recordSyncCycleCompleted(deviceId, serverTime, pushResult) {
   if (!isTauriRuntime()) return emptyStatus;
   const status = await invokeLocal("sync_record_cycle_completed", { deviceId, serverTime, pushResult });

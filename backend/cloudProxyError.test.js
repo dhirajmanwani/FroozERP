@@ -17,3 +17,11 @@ test("desktop gateway converts upstream 502 to structured cloud unavailable", ()
   assert.equal(result.status, 503);
   assert.equal(result.payload.failure_kind, "CLOUD_UNAVAILABLE");
 });
+
+test("Local Only policy returns a clean structured cloud pause", () => {
+  const result = normalizeCloudProxyError({ code: "APP_LOCAL_ONLY" });
+  assert.equal(result.status, 503);
+  assert.equal(result.payload.code, "APP_LOCAL_ONLY");
+  assert.equal(result.payload.failure_kind, "CLOUD_UNAVAILABLE");
+  assert.doesNotMatch(result.payload.message, /ENOTFOUND|502|railway\.app/);
+});

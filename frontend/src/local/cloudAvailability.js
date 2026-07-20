@@ -4,6 +4,8 @@ export const FROST_CLOUD_UNAVAILABLE_MESSAGE =
 const CLOUD_TRANSPORT_CODES = new Set([
   "CLOUD_UNAVAILABLE",
   "CLOUD_UNREACHABLE",
+  "APP_LOCAL_ONLY",
+  "APP_INTERNET_DISABLED",
   "ENOTFOUND",
   "EAI_AGAIN",
   "ECONNREFUSED",
@@ -53,8 +55,8 @@ export const getFrostAvailabilityMessage = ({
 };
 
 export const preserveVerifiedLocalCollection = (remoteValue, localValue) => {
-  if (Array.isArray(localValue) && localValue.length > 0 && Array.isArray(remoteValue) && remoteValue.length === 0) {
+  if (Array.isArray(localValue) && localValue.length > 0 && (!Array.isArray(remoteValue) || remoteValue.length === 0)) {
     return localValue;
   }
-  return remoteValue;
+  return Array.isArray(remoteValue) ? remoteValue : (Array.isArray(localValue) ? localValue : []);
 };
