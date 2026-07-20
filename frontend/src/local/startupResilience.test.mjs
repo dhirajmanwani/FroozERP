@@ -12,6 +12,7 @@ import {
 
 const appSource = await readFile(new URL("../App.jsx", import.meta.url), "utf8");
 const mainSource = await readFile(new URL("../main.jsx", import.meta.url), "utf8");
+const tauriConfigSource = await readFile(new URL("../../../src-tauri/tauri.conf.json", import.meta.url), "utf8");
 
 test("transient startup failures never replace the loading screen with a fatal screen", () => {
   assert.equal(shouldShowFatalStartup({ mandatoryRuntimeFailed: true, retriesExhausted: false }), false);
@@ -32,6 +33,25 @@ test("only confirmed SQLite exhaustion can render the fatal startup state", () =
   assert.equal(resolveMandatoryRuntimeRenderState({ status: { initialized: false, error: "sqlite unavailable" }, retriesExhausted: true }), "fatal");
   assert.match(appSource, /data-fatal-startup="true"/);
   assert.match(appSource, /mandatoryRuntimeState === "fatal"/);
+});
+
+test("delayed local backend remains in starting state until readiness retries finish", () => {
+  assert.equal(resolveLocalServiceRenderState({ healthOnline: false, retriesExhausted: false }), "checking");
+  assert.equal(resolveLocalServiceRenderState({ healthOnline: true, retriesExhausted: false }), "ready");
+  assert.equal(resolveLocalServiceRenderState({ healthOnline: false, retriesExhausted: true }), "fatal");
+  assert.match(appSource, /localStarting \? "Starting Local Server"/);
+  assert.match(appSource, /if \(localStarting\) \{\s+syncSummary = "Starting local service"/);
+  assert.match(appSource, /if \(localStarting\) \{\s+banner = "Starting local service\.\.\."/);
+  assert.match(appSource, /readinessDeadline = Date\.now\(\) \+ 20_000/);
+  assert.match(appSource, /while \(Date\.now\(\) < readinessDeadline\)/);
+  assert.match(appSource, /generation !== connectivityGenerationRef\.current/);
+});
+
+test("FROST cloud failure details are not rendered in the user interface", () => {
+  assert.match(appSource, /FROST_CLOUD_UNAVAILABLE_MESSAGE/);
+  assert.doesNotMatch(appSource, /\{item\.label\}: \{item\.status/);
+  assert.match(appSource, /frost-cloud-recovery-refresh-failed/);
+  assert.match(tauriConfigSource, /backend\/cloudProxyError\.js/);
 });
 
 test("local service remains neutral until bounded readiness checks are exhausted", () => {

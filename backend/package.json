@@ -1,12 +1,12 @@
 {
   "name": "backend",
-  "version": "1.0.59",
+  "version": "1.0.60",
   "description": "",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "check": "node --check server.js",
-    "test": "node --test aiBusinessAssistantRules.test.js aiBusinessAssistantSchema.test.js frostAuthorization.test.js frostCore.test.js frostIntelligence.test.js identityPolicy.test.js storageAdapters.test.js"
+    "test": "node --test aiBusinessAssistantRules.test.js aiBusinessAssistantSchema.test.js cloudProxyError.test.js frostAuthorization.test.js frostCore.test.js frostIntelligence.test.js identityPolicy.test.js storageAdapters.test.js"
   },
   "keywords": [],
   "author": "",

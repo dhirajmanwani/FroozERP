@@ -34,6 +34,12 @@ import {
   subscribeConnectivity,
 } from "./local/connectivityService";
 import {
+  FROST_CLOUD_UNAVAILABLE_MESSAGE,
+  deriveRuntimeConnectivity,
+  getFrostAvailabilityMessage,
+  isCloudUnavailableError,
+} from "./local/cloudAvailability";
+import {
   checkBackendHealth,
   getSyncStatus,
   queueSafeSyncTest,
@@ -344,12 +350,13 @@ const probeRealInternet = async (timeoutMs = 4000) => {
   }
 };
 
-const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, deviceRegistration = null, syncStatus = {}, internetAvailable = true, currentUser = null }) => {
+const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, deviceRegistration = null, syncStatus = {}, internetAvailable = true, currentUser = null, localServiceState = null }) => {
   const pending = Number(syncStatus?.pendingOperations || 0);
   const failed = Number(syncStatus?.failedOperations || 0);
   const conflicts = Number(syncStatus?.conflictOperations || 0);
-  const localOnline = backendHealth?.online === true;
-  const localOffline = backendHealth?.online === false;
+  const localStarting = localServiceState === "checking" || backendHealth?.checking === true;
+  const localOnline = backendHealth?.online === true && !localStarting;
+  const localOffline = backendHealth?.online === false && !localStarting;
   const cloudOnline = cloudHealth?.online === true && normalizeApiBase(cloudHealth?.apiUrl || cloudHealth?.data?.configuredCloudBaseUrl || "") === CLOUD_API_URL;
   const cloudOffline = cloudHealth?.online === false;
   const cloudPaused = FROOZERP_CLOUD_SIMULATED_OFFLINE || cloudHealth?.reasonCode === "APP_SIMULATED_OFFLINE" || syncStatus?.lastFailureKind === "APP_SIMULATED_OFFLINE";
@@ -376,7 +383,7 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
   let localBackendStatus;
   let cloudBackendStatus;
   if (API_MODE === API_MODES.HYBRID || API_MODE === API_MODES.LOCAL_ONLY || API_MODE === API_MODES.LOCAL_SINGLE_DEVICE) {
-    localBackendStatus = localOnline ? "Local Server Connected" : localOffline ? "Local Server Offline" : "Checking Local Server";
+    localBackendStatus = localStarting ? "Starting Local Server" : localOnline ? "Local Server Connected" : localOffline ? "Local Server Offline" : "Checking Local Server";
     cloudBackendStatus = cloudPaused
       ? "Cloud Backend Paused"
       : !CLOUD_CONFIGURED
@@ -409,7 +416,9 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
   }
 
   let syncSummary = "Backend status not checked";
-  if (cloudPaused) {
+  if (localStarting) {
+    syncSummary = "Starting local service";
+  } else if (cloudPaused) {
     syncSummary = pending > 0 ? `Sync Paused - ${pending} pending` : "Sync Paused";
   } else if (failed > 0) {
     syncSummary = "Sync Failed";
@@ -448,7 +457,9 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
   }
 
   let banner = "Checking FroozERP backend status...";
-  if (cloudPaused) {
+  if (localStarting) {
+    banner = "Starting local service...";
+  } else if (cloudPaused) {
     banner = "Simulated Offline Mode - Internet is available on this computer, but FroozERP cloud access is intentionally disabled.";
   } else if (localOnline && cloudReachable) {
     banner = "Local server connected • Cloud backend connected";
@@ -526,7 +537,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.59";
+const APP_VERSION = "1.0.60";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -665,17 +676,18 @@ const offlineBackendRequiredViews = new Set(["purchase", "pending-bills", "accou
 const getErrorMessage = (error, fallback) =>
   error.response?.data?.message || fallback;
 
-const getFrostDiagnosticMessage = (error, { offlineMode = false, internetAvailable = true, backendHealth = {} } = {}) => {
+const getFrostDiagnosticMessage = (error, { offlineMode = false, internetAvailable = true, backendHealth = {}, cloudHealth = {} } = {}) => {
   const status = error?.response?.status;
   const serverMessage = error?.response?.data?.message;
   if (status === 401) return "FROST session expired. Sign in again to refresh owner permissions.";
   if (status === 403) return serverMessage || "FROST is blocked by this user's role permissions.";
-  if (typeof navigator !== "undefined" && navigator.onLine === false) return "Internet is unavailable. FROST will use local/offline facts where available.";
-  if (!internetAvailable && isCloudMode()) return "Internet is unavailable, so the cloud backend cannot be reached.";
-  if (backendHealth?.online === false) return isCloudMode()
-    ? "Cloud backend unavailable. Check Cloud Backend diagnostics and retry FROST."
-    : "Local backend unavailable. Start or reconnect the local FroozERP server, then retry FROST.";
-  if (error?.code === "ECONNABORTED") return "FROST request timed out. Check backend load and retry without reloading the app.";
+  const cloudUnavailable = getFrostAvailabilityMessage({
+    error,
+    internetAvailable: internetAvailable && (typeof navigator === "undefined" || navigator.onLine !== false),
+    cloudConnected: cloudHealth?.online === false ? false : null,
+  });
+  if (cloudUnavailable) return cloudUnavailable;
+  if (backendHealth?.online === false) return "Local backend unavailable. Start or reconnect the local FroozERP server, then retry FROST.";
   if (serverMessage) return serverMessage;
   if (offlineMode) return "FROST explanations are offline. Deterministic local facts remain available where cached.";
   return "FROST data could not be loaded. Check API mode, authentication, and backend diagnostics, then retry.";
@@ -684,7 +696,10 @@ const getFrostDiagnosticMessage = (error, { offlineMode = false, internetAvailab
 const buildFrostRequestDiagnostic = ({ label, method = "GET", url, response, error, context = {} }) => {
   const status = response?.status || error?.response?.status || null;
   const body = response?.data || error?.response?.data || null;
-  const message = body?.message || error?.message || (status ? `HTTP ${status}` : "Request did not complete");
+  const cloudUnavailable = isCloudUnavailableError(error || { response: { status, data: body } });
+  const message = cloudUnavailable
+    ? FROST_CLOUD_UNAVAILABLE_MESSAGE
+    : body?.message || error?.message || (status ? `HTTP ${status}` : "Request did not complete");
   return {
     label,
     method,
@@ -692,7 +707,7 @@ const buildFrostRequestDiagnostic = ({ label, method = "GET", url, response, err
     status,
     ok: Boolean(response && status >= 200 && status < 300),
     message,
-    code: body?.code || error?.code || "",
+    code: cloudUnavailable ? "CLOUD_UNAVAILABLE" : body?.code || error?.code || "",
     apiMode: API_CONFIG.mode,
     apiUrl: API_URL,
     userId: context.user?.id || "",
@@ -712,9 +727,10 @@ const frostDiagnosticsSummary = (diagnostics = []) => {
   if (first.status === 401) return "FROST session expired. Sign in again to refresh owner permissions.";
   if (first.status === 403) return first.message || "FROST is blocked by owner role permissions.";
   if (first.status === 404) return `${first.label} endpoint is not available in the selected backend. Installed frontend and backend may be out of sync.`;
+  if (first.code === "CLOUD_UNAVAILABLE" || [502, 503, 504].includes(Number(first.status))) return FROST_CLOUD_UNAVAILABLE_MESSAGE;
   if (first.localBackendHealth === "offline" && !isCloudMode()) return "Local backend is not running. Start FroozERP local server, then refresh FROST.";
-  if (first.cloudBackendHealth === "offline" && isCloudMode()) return "Cloud backend is unavailable. FROST cannot load cloud business data right now.";
-  return `${first.label} failed: ${first.message}`;
+  if (first.cloudBackendHealth === "offline") return FROST_CLOUD_UNAVAILABLE_MESSAGE;
+  return "FROST data could not be loaded. Local FroozERP modules remain available.";
 };
 const getAuthErrorMessage = (error, fallback) => {
   const code = error.response?.data?.code;
@@ -1410,6 +1426,7 @@ function App() {
     isTauriRuntime() && !isCloudMode() ? "checking" : "ready"
   ));
   const localServiceStartupStateRef = useRef(localServiceStartupState);
+  const previousFrostCloudOnlineRef = useRef(null);
   const [cloudHealth, setCloudHealth] = useState({
     apiUrl: CLOUD_API_URL,
     url: CLOUD_API_URL ? `${CLOUD_API_URL}/api/health` : "",
@@ -1717,6 +1734,16 @@ function App() {
   }, [user, frostDrawerOpen]);
 
   useEffect(() => {
+    const cloudOnline = internetAvailable === true && cloudHealth?.online === true;
+    const previousCloudOnline = previousFrostCloudOnlineRef.current;
+    previousFrostCloudOnlineRef.current = cloudOnline;
+    if (!user || !frostDrawerOpen || !cloudOnline || previousCloudOnline !== false) return;
+    loadAiAssistant(aiRange).catch((error) => {
+      writeDiagnosticLog("WARN", "frost-cloud-recovery-refresh-failed", describeRequestFailure(error, { url: `${API_URL}/api/ai/briefing` }));
+    });
+  }, [internetAvailable, cloudHealth?.online, user, frostDrawerOpen, aiRange]);
+
+  useEffect(() => {
     const onRuntimeFailure = (event) => {
       const failure = event?.detail || {};
       writeDiagnosticLog("ERROR", "nonfatal-runtime-request-failed", failure);
@@ -1741,7 +1768,7 @@ function App() {
     };
   }, []);
 
-  const connectionStatus = buildConnectionStatusModel({ backendHealth, cloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus, internetAvailable, currentUser: user });
+  const connectionStatus = buildConnectionStatusModel({ backendHealth, cloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus, internetAvailable, currentUser: user, localServiceState: localServiceStartupState });
 
   useEffect(() => {
     const fullscreenEnabled = settingsData.deviceControlSettings?.fullscreen_lock_enabled === true;
@@ -2085,6 +2112,7 @@ function App() {
       syncStatus: status,
       internetAvailable,
       currentUser: user,
+      localServiceState: localServiceStartupState,
     }).banner);
     return results;
   };
@@ -2098,6 +2126,7 @@ function App() {
   const internetAvailableRef = useRef(internetAvailable);
   const connectivityCheckRef = useRef(null);
   const connectivityInFlightRef = useRef(null);
+  const connectivityGenerationRef = useRef(0);
   const lastConnectivityCheckAtRef = useRef(0);
   const reconnectSyncRef = useRef(false);
   const lastAutoSyncStartedAtRef = useRef(0);
@@ -2221,12 +2250,13 @@ function App() {
     setSyncStatus(status);
     applyCanonicalIdentityFromSync(status);
     if (!status.lastError) await refreshBusinessDataAfterSync();
-    const nextStatus = buildConnectionStatusModel({ backendHealth, cloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: status, internetAvailable, currentUser: user });
+    const nextStatus = buildConnectionStatusModel({ backendHealth, cloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: status, internetAvailable, currentUser: user, localServiceState: localServiceStartupStateRef.current });
     setSyncMessage(nextStatus.syncSummary);
     return status;
   };
 
   const applyConnectivityState = useCallback((health, statusInternetAvailable = internetAvailableRef.current, statusSyncStatus = syncStatusRef.current) => {
+    backendHealthRef.current = health;
     setBackendHealth(health);
     if (health.online === null || health.checking) return;
     setOfflineMode(!health.online);
@@ -2237,6 +2267,7 @@ function App() {
       syncStatus: statusSyncStatus,
       internetAvailable: statusInternetAvailable,
       currentUser: userRef.current,
+      localServiceState: localServiceStartupStateRef.current,
     };
     if (health.online) {
       setStartupError((current) => {
@@ -2278,16 +2309,17 @@ function App() {
 
   const waitForLocalBackendReady = useCallback(async (reason, timeoutMs) => {
     let latestHealth = backendHealthRef.current;
-    const retryDelays = [0, 250, 500, 750];
-    for (let attempt = 0; attempt < retryDelays.length; attempt += 1) {
-      if (retryDelays[attempt] > 0) {
-        await new Promise((resolve) => window.setTimeout(resolve, retryDelays[attempt]));
-      }
+    const readinessDeadline = Date.now() + 20_000;
+    let attempt = 0;
+    while (Date.now() < readinessDeadline) {
+      if (attempt > 0) await new Promise((resolve) => window.setTimeout(resolve, 500));
+      const remainingMs = Math.max(500, readinessDeadline - Date.now());
+      attempt += 1;
       latestHealth = await checkBackendHealth(API_URL, {
         details: true,
-        timeoutMs,
+        timeoutMs: Math.min(timeoutMs, remainingMs),
         force: true,
-        reason: `${reason}-local-readiness-${attempt + 1}`,
+        reason: `${reason}-local-readiness-${attempt}`,
         requireCloudIdentity: false,
       });
       if (latestHealth.online === true) return latestHealth;
@@ -2332,6 +2364,8 @@ function App() {
     if (!force && connectivityInFlightRef.current) return connectivityInFlightRef.current;
     if (!force && now - lastConnectivityCheckAtRef.current < minGapMs) return backendHealthRef.current;
     lastConnectivityCheckAtRef.current = now;
+    const generation = connectivityGenerationRef.current + 1;
+    connectivityGenerationRef.current = generation;
     const checkPromise = (async () => {
     const localRuntime = isTauriRuntime() && !isCloudMode();
     if (localRuntime) {
@@ -2353,6 +2387,7 @@ function App() {
         reason,
         requireCloudIdentity: isCloudMode(),
       });
+    if (generation !== connectivityGenerationRef.current) return backendHealthRef.current;
     if (localRuntime) {
       const nextLocalState = resolveLocalServiceRenderState({ healthOnline: health.online, retriesExhausted: health.online !== true });
       localServiceStartupStateRef.current = nextLocalState;
@@ -2374,6 +2409,7 @@ function App() {
     const nextCloudHealth = usesCloudBackend()
       ? await checkCloudBackendHealth(reason, options.timeoutMs || 5000)
       : cloudHealth;
+    if (generation !== connectivityGenerationRef.current) return backendHealthRef.current;
     applyConnectivityState(health, realInternet, syncStatusRef.current);
     const cloudReadyForSync = !usesCloudBackend() || nextCloudHealth?.online === true;
     if (health.online && cloudReadyForSync && userRef.current && !reconnectSyncRef.current && shouldStartBackgroundSync()) {
@@ -2388,7 +2424,7 @@ function App() {
           setSyncStatus(status);
           applyCanonicalIdentityFromSync(status);
           if (!status.lastError) await refreshBusinessDataAfterSync();
-          const nextStatus = buildConnectionStatusModel({ backendHealth: health, cloudHealth: nextCloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: status, internetAvailable: realInternet, currentUser: userRef.current });
+          const nextStatus = buildConnectionStatusModel({ backendHealth: health, cloudHealth: nextCloudHealth, deviceRegistration: cloudDeviceRegistration, syncStatus: status, internetAvailable: realInternet, currentUser: userRef.current, localServiceState: localServiceStartupStateRef.current });
           setSyncMessage(nextStatus.syncSummary);
         })
         .catch((error) => {
@@ -3103,6 +3139,7 @@ function App() {
       syncStatus,
       internetAvailable,
       currentUser,
+      localServiceState: localServiceStartupStateRef.current,
     }).banner);
     return snapshot;
   };
@@ -3223,6 +3260,22 @@ function App() {
   };
 
   const loadAiAssistant = async (range = aiRange) => {
+    const approved = ["APPROVED", "ACTIVE"].includes(String(cloudDeviceRegistration?.status || "").toUpperCase());
+    const runtimeConnectivity = deriveRuntimeConnectivity({
+      localHealth: backendHealth,
+      internetAvailable,
+      cloudHealth,
+      deviceApproved: approved,
+    });
+    if (!runtimeConnectivity.internetAvailable || cloudHealth?.online === false) {
+      setAiAssistantData((current) => ({
+        ...current,
+        loading: false,
+        error: FROST_CLOUD_UNAVAILABLE_MESSAGE,
+        diagnostics: [],
+      }));
+      return;
+    }
     setAiAssistantData((current) => ({ ...current, loading: true, error: "" }));
     const params = { user_id: user?.id, device_id: deviceInfo.device_id, range };
     const context = { user, deviceId: deviceInfo.device_id, backendHealth, cloudHealth };
@@ -3304,7 +3357,7 @@ function App() {
         ...current,
         loading: false,
         diagnostics,
-        error: frostDiagnosticsSummary(diagnostics) || getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth }),
+        error: frostDiagnosticsSummary(diagnostics) || getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth }),
       }));
     }
   };
@@ -3340,7 +3393,7 @@ function App() {
       }));
       setAiQuestion("");
     } catch (error) {
-      setAiAssistantData((current) => ({ ...current, loading: false, error: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth }) }));
+      setAiAssistantData((current) => ({ ...current, loading: false, error: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth }) }));
     }
   };
 
@@ -6459,15 +6512,7 @@ function AiBusinessAssistantModule({
         <div className="startup-status-panel startup-status-error">
           <p>{data.error}</p>
           {Object.keys(cards).length > 0 && <small>Showing last verified local values until refresh succeeds.</small>}
-          {Boolean(data.diagnostics?.length) && (
-            <div className="frost-diagnostics-list">
-              {data.diagnostics.filter((item) => !item.ok).slice(0, 6).map((item) => (
-                <small key={`${item.method}-${item.url}`}>
-                  {item.label}: {item.status || "no response"} - {item.message} ({item.apiMode}, {item.localBackendHealth})
-                </small>
-              ))}
-            </div>
-          )}
+          {data.error === FROST_CLOUD_UNAVAILABLE_MESSAGE && <small>Cloud access will be retried automatically.</small>}
         </div>
       )}
 

@@ -2,6 +2,7 @@ const fs = require("fs");
 const http = require("http");
 const os = require("os");
 const path = require("path");
+const { CLOUD_UNAVAILABLE_MESSAGE, normalizeCloudProxyError } = require("./cloudProxyError");
 
 const PORT = Number(process.env.PORT || 5000);
 const APP_VERSION = String(process.env.APP_VERSION || "0.0.0");
@@ -120,6 +121,14 @@ const cloudRequest = async (req, body, route = req.url, options = {}) => {
 };
 
 const proxy = async (res, response) => {
+  if ([502, 503, 504].includes(response.status)) {
+    return sendJson(res, 503, {
+      code: "CLOUD_UNAVAILABLE",
+      failure_kind: "CLOUD_UNAVAILABLE",
+      cloud_connected: false,
+      message: CLOUD_UNAVAILABLE_MESSAGE,
+    });
+  }
   const body = Buffer.from(await response.arrayBuffer());
   res.writeHead(response.status, {
     "content-type": response.headers.get("content-type") || "application/json; charset=utf-8",
@@ -177,12 +186,8 @@ const server = http.createServer(async (req, res) => {
     if (await localRoute(req, res, url, body) !== false) return;
     return proxy(res, await cloudRequest(req, body));
   } catch (error) {
-    const causeCode = String(error?.cause?.code || "").trim();
-    const causeMessage = String(error?.cause?.message || "").trim();
-    return sendJson(res, error.code === "APP_INTERNET_DISABLED" ? 503 : 502, {
-      code: error.code || causeCode || "DESKTOP_GATEWAY_ERROR",
-      message: causeMessage || error.message || "Desktop gateway request failed.",
-    });
+    const normalized = normalizeCloudProxyError(error);
+    return sendJson(res, normalized.status, normalized.payload);
   }
 });
 

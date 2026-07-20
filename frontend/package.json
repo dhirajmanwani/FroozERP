@@ -1,13 +1,13 @@
 {
   "name": "frontend",
   "private": true,
-  "version": "1.0.59",
+  "version": "1.0.60",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint src --cache --cache-location ../.cache/eslint/frontend",
-    "test:local-runtime": "node --test src/local/offlineSession.test.mjs src/local/serverTime.test.mjs src/local/updateMetadata.test.mjs src/local/canonicalIdentity.test.mjs src/local/dashboardSnapshot.test.mjs src/local/mainNavigationSmoke.test.mjs src/local/startupResilience.test.mjs",
+    "test:local-runtime": "node --test src/local/offlineSession.test.mjs src/local/serverTime.test.mjs src/local/updateMetadata.test.mjs src/local/canonicalIdentity.test.mjs src/local/dashboardSnapshot.test.mjs src/local/mainNavigationSmoke.test.mjs src/local/startupResilience.test.mjs src/local/cloudAvailability.test.mjs src/local/connectivityClassification.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

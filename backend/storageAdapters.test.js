@@ -204,3 +204,33 @@ test("desktop App Internet policy can reconnect without allowing ordinary bypass
     await new Promise((resolve) => cloudServer.close(resolve));
   }
 });
+
+test("desktop gateway converts upstream 502 into a clean cloud unavailable response", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "froozerp-cloud-unavailable-"));
+  const databasePath = path.join(root, "profile", "froozerp-local.sqlite3");
+  writeSQLiteFixture(databasePath);
+  const cloudPort = await reservePort();
+  const cloudServer = require("node:http").createServer((_req, res) => {
+    const body = Buffer.from("upstream infrastructure detail");
+    res.writeHead(502, { "content-type": "text/plain", "content-length": body.length });
+    res.end(body);
+  });
+  await new Promise((resolve, reject) => cloudServer.listen(cloudPort, "127.0.0.1", resolve).once("error", reject));
+  const port = await reservePort();
+  const runtime = await startDesktopBackend({
+    databasePath,
+    port,
+    extraEnv: { CLOUD_API_URL: `http://127.0.0.1:${cloudPort}` },
+  });
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/api/ai/briefing`);
+    const body = await response.json();
+    assert.equal(response.status, 503);
+    assert.equal(body.code, "CLOUD_UNAVAILABLE");
+    assert.equal(body.cloud_connected, false);
+    assert.doesNotMatch(JSON.stringify(body), /upstream infrastructure detail|ENOTFOUND/);
+  } finally {
+    await stopChild(runtime.child);
+    await new Promise((resolve) => cloudServer.close(resolve));
+  }
+});
