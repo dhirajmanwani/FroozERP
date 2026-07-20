@@ -20,6 +20,7 @@ const SQLITE_PATH = path.resolve(String(
   process.env.FROOZERP_SQLITE_PATH || path.join(APP_DATA, "froozerp-local.sqlite3")
 ));
 const POLICY_PATH = path.join(APP_DATA, "cloud-network-policy.json");
+const CLOUD_REQUEST_AUDIT_PATH = path.join(APP_DATA, "logs", "cloud-request-audit.jsonl");
 
 const sendJson = (res, status, payload, headers = {}) => {
   const body = Buffer.from(JSON.stringify(payload));
@@ -30,17 +31,47 @@ const sendJson = (res, status, payload, headers = {}) => {
 const readPolicy = () => {
   try {
     const value = JSON.parse(fs.readFileSync(POLICY_PATH, "utf8"));
-    return { allowInternetAccess: value.allowInternetAccess !== false, updatedAt: value.updatedAt || null };
+    return {
+      allowInternetAccess: value.allowInternetAccess !== false,
+      updatedAt: value.updatedAt || null,
+      confirmedAt: value.confirmedAt || value.updatedAt || null,
+      timeSource: value.timeSource || "device",
+      changedBy: value.changedBy || null,
+      deviceId: value.deviceId || null,
+    };
   } catch {
-    return { allowInternetAccess: true, updatedAt: null };
+    return { allowInternetAccess: true, updatedAt: null, confirmedAt: null, timeSource: "device", changedBy: null, deviceId: null };
   }
 };
 
-const writePolicy = (allowed) => {
+const writePolicy = (allowed, metadata = {}) => {
   fs.mkdirSync(path.dirname(POLICY_PATH), { recursive: true });
-  const value = { allowInternetAccess: allowed !== false, updatedAt: new Date().toISOString() };
+  const value = {
+    allowInternetAccess: allowed !== false,
+    updatedAt: new Date().toISOString(),
+    confirmedAt: metadata.confirmedAt || new Date().toISOString(),
+    timeSource: metadata.timeSource || "device",
+    changedBy: metadata.changedBy || null,
+    deviceId: metadata.deviceId || null,
+  };
   fs.writeFileSync(POLICY_PATH, JSON.stringify(value, null, 2));
   return value;
+};
+
+const auditCloudRequest = (entry) => {
+  try {
+    fs.mkdirSync(path.dirname(CLOUD_REQUEST_AUDIT_PATH), { recursive: true });
+    fs.appendFileSync(CLOUD_REQUEST_AUDIT_PATH, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`);
+  } catch {}
+};
+
+const readAuthoritativeTime = async () => {
+  try {
+    const response = await fetch(`${CLOUD_API_URL}/api/health`, { signal: AbortSignal.timeout(5000) });
+    const value = await response.json().catch(() => ({}));
+    if (response.ok && value.server_time) return { confirmedAt: new Date(value.server_time).toISOString(), timeSource: "railway" };
+  } catch {}
+  return { confirmedAt: new Date().toISOString(), timeSource: "device" };
 };
 
 const validateSQLite = () => {
@@ -88,6 +119,7 @@ const readBody = async (req) => {
 
 const cloudRequest = async (req, body, route = req.url, options = {}) => {
   if (!options.bypassPolicy && !readPolicy().allowInternetAccess) {
+    auditCloudRequest({ method: options.method || req.method, route, blocked: true, reachedCloud: false, reason: "APP_LOCAL_ONLY" });
     const error = new Error("Local Only mode selected - cloud sync paused.");
     error.code = "APP_LOCAL_ONLY";
     throw error;
@@ -111,6 +143,7 @@ const cloudRequest = async (req, body, route = req.url, options = {}) => {
     if (value !== undefined) headers[name] = Array.isArray(value) ? value.join(", ") : String(value);
   }
   headers["x-froozerp-client-runtime"] = "desktop-local";
+  auditCloudRequest({ method: options.method || req.method, route, blocked: false, reachedCloud: true });
   return fetch(`${CLOUD_API_URL}${route}`, {
     method: options.method || req.method,
     headers,
@@ -154,14 +187,14 @@ const localRoute = async (req, res, url, body) => {
   }
   if (url.pathname === "/api/cloud/internet-access" && req.method === "PUT") {
     const input = body.length ? JSON.parse(body.toString("utf8")) : {};
-    const route = `/api/auth/me?user_id=${encodeURIComponent(input.user_id || req.headers["x-user-id"] || "")}&session_id=${encodeURIComponent(input.session_id || req.headers["x-session-id"] || "")}`;
-    const response = await cloudRequest(req, Buffer.alloc(0), route, {
-      method: "GET",
-      bypassPolicy: input.allowInternetAccess !== false,
-    });
-    const identity = await response.json().catch(() => ({}));
-    if (!response.ok || identity.is_owner !== true) return sendJson(res, 403, { code: "OWNER_REQUIRED", message: "Authenticated Owner permission is required." });
-    const policy = writePolicy(input.allowInternetAccess !== false);
+    const userId = String(input.user_id || req.headers["x-user-id"] || "").trim();
+    const role = String(input.role || req.headers["x-user-role"] || "").trim().toUpperCase();
+    const deviceId = String(input.device_id || req.headers["x-device-id"] || "").trim();
+    if (!userId || !deviceId || role !== "OWNER") {
+      return sendJson(res, 403, { code: "OWNER_REQUIRED", message: "Authenticated Owner permission is required." });
+    }
+    const time = await readAuthoritativeTime();
+    const policy = writePolicy(input.allowInternetAccess !== false, { ...time, changedBy: userId, deviceId });
     return sendJson(res, 200, { ...policy, status: policy.allowInternetAccess ? "AUTO" : "LOCAL_ONLY" });
   }
   if (url.pathname === "/api/cloud/health") {
@@ -179,7 +212,7 @@ const localRoute = async (req, res, url, body) => {
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
-    res.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-private-network": "true", "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS", "access-control-allow-headers": "cache-control,content-type,authorization,x-user-id,x-session-id,x-device-id,x-froozerp-frontend-version" });
+    res.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-private-network": "true", "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS", "access-control-allow-headers": "cache-control,content-type,authorization,x-user-id,x-user-role,x-session-id,x-device-id,x-froozerp-frontend-version" });
     return res.end();
   }
   try {

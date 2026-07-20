@@ -2057,6 +2057,8 @@ fn local_record_connectivity_mode_change(
     device_id: String,
     previous_mode: String,
     next_mode: String,
+    server_confirmed_at: String,
+    time_source: String,
 ) -> Result<(), String> {
     local_db::record_connectivity_mode_change(
         &app,
@@ -2066,6 +2068,8 @@ fn local_record_connectivity_mode_change(
         &device_id,
         &previous_mode,
         &next_mode,
+        &server_confirmed_at,
+        &time_source,
     )
 }
 #[tauri::command]

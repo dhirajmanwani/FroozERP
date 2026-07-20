@@ -126,7 +126,7 @@ export async function auditLocalDatabase() {
   return invokeLocal("local_db_audit");
 }
 
-export async function recordConnectivityModeChange({ userId, username, role, deviceId, previousMode, nextMode }) {
+export async function recordConnectivityModeChange({ userId, username, role, deviceId, previousMode, nextMode, serverConfirmedAt, timeSource }) {
   if (!isTauriRuntime()) return null;
   return invokeLocal("local_record_connectivity_mode_change", {
     user_id: String(userId || ""),
@@ -135,6 +135,8 @@ export async function recordConnectivityModeChange({ userId, username, role, dev
     device_id: String(deviceId || ""),
     previous_mode: String(previousMode || ""),
     next_mode: String(nextMode || ""),
+    server_confirmed_at: String(serverConfirmedAt || ""),
+    time_source: String(timeSource || "device"),
   });
 }
 

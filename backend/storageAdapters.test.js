@@ -163,7 +163,7 @@ test("separate clean device profiles initialize independently", async () => {
   assert.notEqual(firstAdapter.databasePath, secondAdapter.databasePath);
 });
 
-test("desktop App Internet policy can reconnect without allowing ordinary bypasses", async () => {
+test("desktop Auto and Local Only policy confirms twenty transitions without cloud leakage", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "froozerp-network-policy-"));
   const databasePath = path.join(root, "profile", "froozerp-local.sqlite3");
   writeSQLiteFixture(databasePath);
@@ -171,7 +171,7 @@ test("desktop App Internet policy can reconnect without allowing ordinary bypass
   const cloudMethods = [];
   const cloudServer = require("node:http").createServer((req, res) => {
     cloudMethods.push(`${req.method} ${req.url}`);
-    const body = Buffer.from(JSON.stringify({ authenticated: true, is_owner: true, role: "OWNER" }));
+    const body = Buffer.from(JSON.stringify({ status: "ok", server_time: new Date().toISOString(), version: "test" }));
     res.writeHead(200, { "content-type": "application/json", "content-length": body.length });
     res.end(body);
   });
@@ -188,17 +188,25 @@ test("desktop App Internet policy can reconnect without allowing ordinary bypass
   try {
     const updatePolicy = (allowInternetAccess) => fetch(`http://127.0.0.1:${port}/api/cloud/internet-access`, {
       method: "PUT",
-      headers: { "content-type": "application/json", "x-user-id": "1" },
-      body: JSON.stringify({ allowInternetAccess, user_id: 1 }),
+      headers: { "content-type": "application/json", "x-user-id": "1", "x-user-role": "OWNER", "x-device-id": "device-test" },
+      body: JSON.stringify({ allowInternetAccess, user_id: 1, role: "OWNER", device_id: "device-test" }),
     });
-    assert.equal((await updatePolicy(false)).status, 200);
-    const blocked = await fetch(`http://127.0.0.1:${port}/api/auth/me?user_id=1`);
-    assert.equal(blocked.status, 503);
-    assert.equal((await blocked.json()).code, "APP_LOCAL_ONLY");
-    assert.equal((await updatePolicy(true)).status, 200);
-    const allowed = await fetch(`http://127.0.0.1:${port}/api/auth/me?user_id=1`);
-    assert.equal(allowed.status, 200);
-    assert.deepEqual(cloudMethods.slice(0, 2), ["GET /api/auth/me?user_id=1&session_id=", "GET /api/auth/me?user_id=1&session_id="]);
+    for (let transition = 0; transition < 20; transition += 1) {
+      const allowInternetAccess = transition % 2 === 1;
+      const response = await updatePolicy(allowInternetAccess);
+      assert.equal(response.status, 200);
+      const policy = await response.json();
+      assert.equal(policy.status, allowInternetAccess ? "AUTO" : "LOCAL_ONLY");
+      assert.equal(policy.timeSource, "railway");
+      if (!allowInternetAccess) {
+        const requestsBeforeBlockedProbe = cloudMethods.length;
+        const blocked = await fetch(`http://127.0.0.1:${port}/api/auth/me?user_id=1`);
+        assert.equal(blocked.status, 503);
+        assert.equal((await blocked.json()).code, "APP_LOCAL_ONLY");
+        assert.equal(cloudMethods.length, requestsBeforeBlockedProbe, "Local Only must not reach the cloud server");
+      }
+    }
+    assert.equal((await (await fetch(`http://127.0.0.1:${port}/api/cloud/internet-access`)).json()).status, "AUTO");
   } finally {
     await stopChild(runtime.child);
     await new Promise((resolve) => cloudServer.close(resolve));

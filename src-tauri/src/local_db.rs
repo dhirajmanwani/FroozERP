@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
-const CURRENT_SCHEMA_VERSION: &str = "011_connectivity_mode_audit";
+const CURRENT_SCHEMA_VERSION: &str = "012_connectivity_mode_server_time";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -18,6 +18,7 @@ const MIGRATION_007: &str = include_str!("../migrations/sqlite/007_cloud_runtime
 const MIGRATION_009: &str = include_str!("../migrations/sqlite/009_canonical_utc_timestamps.sql");
 const MIGRATION_010: &str = include_str!("../migrations/sqlite/010_sync_delivery_state.sql");
 const MIGRATION_011: &str = include_str!("../migrations/sqlite/011_connectivity_mode_audit.sql");
+const MIGRATION_012: &str = include_str!("../migrations/sqlite/012_connectivity_mode_server_time.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -333,6 +334,8 @@ pub fn record_connectivity_mode_change(
     device_id: &str,
     previous_mode: &str,
     next_mode: &str,
+    server_confirmed_at: &str,
+    time_source: &str,
 ) -> Result<(), String> {
     if role.trim().to_uppercase() != "OWNER" {
         return Err("Only Owner may change Connectivity Mode.".to_string());
@@ -342,9 +345,10 @@ pub fn record_connectivity_mode_change(
     let conn = Connection::open(path).map_err(to_error)?;
     conn.execute(
         "INSERT INTO local_connectivity_mode_audit (
-           id, user_id, username, role, device_id, previous_mode, next_mode, changed_at
-         ) VALUES (?1, ?2, ?3, 'OWNER', ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-        params![unique_local_id("connectivity-mode"), user_id, username, device_id, previous_mode, next_mode],
+           id, user_id, username, role, device_id, previous_mode, next_mode,
+           changed_at, server_confirmed_at, time_source
+         ) VALUES (?1, ?2, ?3, 'OWNER', ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?7, ?8)",
+        params![unique_local_id("connectivity-mode"), user_id, username, device_id, previous_mode, next_mode, server_confirmed_at, time_source],
     ).map_err(to_error)?;
     Ok(())
 }
@@ -605,7 +609,11 @@ fn complete_local_pos_sale_at(path: &Path, sale: serde_json::Value) -> Result<Lo
 
         let existing_balance: Option<f64> = tx
             .query_row(
-                "SELECT balance_qty FROM local_inventory_lots WHERE id = ?1 OR cloud_id = ?1 LIMIT 1",
+                "SELECT balance_qty FROM local_inventory_lots
+                 WHERE (id = ?1 OR cloud_id = ?1)
+                   AND deleted_at IS NULL
+                   AND UPPER(COALESCE(status, 'ACTIVE')) NOT IN ('CANCELLED', 'INACTIVE', 'EXPIRED', 'RESERVED', 'BLOCKED', 'EXHAUSTED')
+                 LIMIT 1",
                 [&lot_id],
                 |row| row.get(0),
             )
@@ -663,7 +671,10 @@ fn complete_local_pos_sale_at(path: &Path, sale: serde_json::Value) -> Result<Lo
                  balance_qty = balance_qty - ?2,
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                  sync_status = CASE WHEN LOWER(sync_status) = 'pending' THEN sync_status ELSE 'synced' END
-             WHERE id = ?1 AND balance_qty >= ?2",
+             WHERE id = ?1
+               AND deleted_at IS NULL
+               AND UPPER(COALESCE(status, 'ACTIVE')) NOT IN ('CANCELLED', 'INACTIVE', 'EXPIRED', 'RESERVED', 'BLOCKED', 'EXHAUSTED')
+               AND balance_qty >= ?2",
             params![lot_id, quantity],
         )
         .map_err(to_error)?;
@@ -1011,7 +1022,10 @@ fn insert_local_sale_items_and_stock(
              SET sold_qty = sold_qty + ?2,
                  balance_qty = balance_qty - ?2,
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE id = ?1 AND balance_qty >= ?2",
+             WHERE id = ?1
+               AND deleted_at IS NULL
+               AND UPPER(COALESCE(status, 'ACTIVE')) NOT IN ('CANCELLED', 'INACTIVE', 'EXPIRED', 'RESERVED', 'BLOCKED', 'EXHAUSTED')
+               AND balance_qty >= ?2",
             params![lot_id, quantity],
         )
         .map_err(to_error)?;
@@ -1420,6 +1434,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "009_canonical_utc_timestamps", MIGRATION_009)?;
     apply_migration(&mut conn, "010_sync_delivery_state", MIGRATION_010)?;
     apply_migration(&mut conn, "011_connectivity_mode_audit", MIGRATION_011)?;
+    apply_migration(&mut conn, "012_connectivity_mode_server_time", MIGRATION_012)?;
     Ok(())
 }
 
@@ -2798,7 +2813,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("migration count");
-            assert_eq!(migration_count, 10);
+            assert_eq!(migration_count, 11);
             drop(conn);
             initialize_at(path).expect("restart with existing SQLite profile");
         }
@@ -2857,7 +2872,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("preserved marker");
-        assert_eq!(migration_count, 10);
+        assert_eq!(migration_count, 11);
         assert_eq!(marker, "keep-me");
         drop(conn);
         let _ = fs::remove_file(&path);
@@ -3052,6 +3067,44 @@ mod tests {
         assert_eq!(payment_count, 1);
         assert_eq!(balance_qty, 3.0);
         assert_eq!(outbox_count, 1);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn local_pos_checkout_rejects_cancelled_or_zero_stock_lots() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-pos-stock-guard-{}.sqlite3",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize local db");
+        let conn = Connection::open(&path).expect("open sqlite");
+        conn.execute(
+            "INSERT INTO local_products (id, product_name) VALUES ('product-test', 'Test Product')",
+            [],
+        ).expect("insert product");
+        conn.execute(
+            "INSERT INTO local_inventory_lots (id, product_id, balance_qty, status) VALUES ('lot-test', 'product-test', 5, 'CANCELLED')",
+            [],
+        ).expect("insert cancelled lot");
+        drop(conn);
+
+        let cancelled = complete_local_pos_sale_at(
+            &path,
+            test_sale_payload("invoice-stock-guard-1", "op-stock-guard-1", 1.0, 10.0),
+        ).expect_err("cancelled lot must be rejected");
+        assert!(cancelled.contains("enough local stock"));
+
+        let conn = Connection::open(&path).expect("reopen sqlite");
+        conn.execute("UPDATE local_inventory_lots SET status = 'ACTIVE', balance_qty = 0 WHERE id = 'lot-test'", [])
+            .expect("set zero stock");
+        drop(conn);
+        let exhausted = complete_local_pos_sale_at(
+            &path,
+            test_sale_payload("invoice-stock-guard-2", "op-stock-guard-2", 1.0, 10.0),
+        ).expect_err("zero-stock lot must be rejected");
+        assert!(exhausted.contains("enough local stock"));
 
         let _ = fs::remove_file(&path);
     }

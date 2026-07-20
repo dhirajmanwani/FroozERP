@@ -35,8 +35,9 @@ assert.ok(adapters.includes("resolveDesktopSqlitePath"), "Desktop SQLite must re
 assert.ok(adapters.includes('require("node:sqlite")'), "Clean development profiles must create a valid SQLite file");
 assert.ok(gateway.includes('"cache-control,content-type'), "WebView health preflight must allow Cache-Control");
 assert.ok(gateway.includes('"access-control-allow-private-network": "true"'), "WebView private-network health requests must be allowed");
-assert.ok(gateway.includes("bypassPolicy: input.allowInternetAccess !== false"), "Owner must be able to re-enable App Internet after it was disabled");
-assert.ok(gateway.includes('method: "GET"'), "App Internet owner authentication must use GET /api/auth/me");
+assert.ok(gateway.includes("writePolicy(input.allowInternetAccess !== false"), "Owner must be able to request either confirmed connectivity mode");
+assert.ok(gateway.includes("readAuthoritativeTime"), "Connectivity mode audit must use server-confirmed time when Railway is available");
+assert.ok(gateway.includes('role !== "OWNER"'), "App Internet mode changes must remain Owner-only");
 assert.equal(/127\.0\.0\.1:5432/.test(gateway), false, "Desktop gateway must never target local PostgreSQL");
 
 assert.ok(backend.includes("ON CONFLICT (operation_id) DO NOTHING"), "Cloud operation acknowledgements must be idempotent");

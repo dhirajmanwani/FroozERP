@@ -313,7 +313,7 @@
 }
 
 .topbar {
-  height: 76px;
+  min-height: 76px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -370,6 +370,30 @@
 }
 
 .kiosk-exit-button {
+  white-space: nowrap;
+}
+
+.topbar-status-group {
+  display: grid;
+  justify-items: end;
+  gap: 6px;
+  min-width: 0;
+}
+
+.topbar-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.global-clock {
+  color: #e2e8f0;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 750;
+  line-height: 1.2;
   white-space: nowrap;
 }
 
@@ -4075,7 +4099,8 @@ tbody tr:last-child td {
   }
 
   .topbar {
-    height: 68px;
+    min-height: 68px;
+    height: auto;
     padding: 0 19px;
     position: sticky;
     top: 0;
@@ -4188,6 +4213,21 @@ tbody tr:last-child td {
 
   .topbar-heading {
     min-width: 0;
+  }
+
+  .topbar-status-group {
+    max-width: 48vw;
+  }
+
+  .global-clock {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 10px;
+  }
+
+  .topbar-status-row .offline-pill {
+    display: none;
   }
 
   .topbar-heading > div:last-child {

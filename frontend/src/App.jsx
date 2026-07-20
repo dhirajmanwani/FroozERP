@@ -29,7 +29,8 @@ import {
 import { buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode, writeConnectivityMode } from "./local/connectivityMode";
-import { selectLocalPosInventory } from "./local/posInventory";
+import { filterSellableProducts, isSellableLot, lotAvailableQuantity, selectLocalPosInventory } from "./local/posInventory";
+import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, resolveReportDateRange } from "./local/reportRefresh";
 import { describeUpdateAvailability, normalizeUpdateMetadata } from "./local/updateMetadata";
 import { RUNTIME_FAILURE_EVENT, describeRequestFailure, initialiseMandatoryRuntime, resolveLocalServiceRenderState, resolveMandatoryRuntimeRenderState, settleNamedRequests } from "./local/startupResilience";
 import {
@@ -52,6 +53,8 @@ import {
   syncNow,
 } from "./local/syncService";
 import {
+  authoritativeUtcNowIso,
+  formatKolkataHeaderClock,
   formatKolkataDateTime,
   getTimeDiagnostics,
   markServerTimeOffline,
@@ -536,7 +539,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.62";
+const APP_VERSION = "1.0.63";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -1446,6 +1449,8 @@ function App() {
   const [loginBusy, setLoginBusy] = useState(false);
   const [offlineMode, setOfflineMode] = useState(false);
   const [connectivityMode, setConnectivityMode] = useState(readConnectivityMode);
+  const [connectivityModeSwitching, setConnectivityModeSwitching] = useState(false);
+  const [headerClock, setHeaderClock] = useState(() => authoritativeUtcNowIso());
   const [offlineReady, setOfflineReady] = useState(false);
   const [lastReferenceSyncAt, setLastReferenceSyncAt] = useState("");
   const [deviceGate, setDeviceGate] = useState(null);
@@ -1692,6 +1697,12 @@ function App() {
       // Device-local accessibility preference only; ignore locked storage.
     }
   }, [applicationFontSize]);
+  useEffect(() => {
+    const updateClock = () => setHeaderClock(authoritativeUtcNowIso());
+    updateClock();
+    const timer = window.setInterval(updateClock, 1000);
+    return () => window.clearInterval(timer);
+  }, []);
   useEffect(() => {
     try {
       localStorage.setItem(FROST_ACTIVE_TAB_STORAGE_KEY, frostActiveTab);
@@ -2264,11 +2275,18 @@ function App() {
     }
     if (nextMode === previousMode) return nextMode;
     const allowInternetAccess = nextMode === CONNECTIVITY_MODES.AUTO;
-    await axios.put(`${LOCAL_API_URL}/api/cloud/internet-access`, {
-      user_id: user.id,
-      allowInternetAccess,
-    }, { timeout: 8000, headers: { "x-user-id": user.id, "x-device-id": deviceInfo.device_id } });
+    setConnectivityModeSwitching(true);
     try {
+      const response = await axios.put(`${LOCAL_API_URL}/api/cloud/internet-access`, {
+        user_id: user.id,
+        role: user.role,
+        device_id: deviceInfo.device_id,
+        allowInternetAccess,
+      }, { timeout: 8000, headers: { "x-user-id": user.id, "x-user-role": user.role, "x-device-id": deviceInfo.device_id } });
+      const confirmedMode = normalizeConnectivityMode(response.data?.status);
+      if (confirmedMode !== nextMode || response.data?.allowInternetAccess !== allowInternetAccess) {
+        throw new Error(`Local backend confirmed ${response.data?.status || "an unknown mode"} instead of ${nextMode}.`);
+      }
       await recordConnectivityModeChange({
         userId: user.id,
         username: user.username,
@@ -2276,41 +2294,39 @@ function App() {
         deviceId: deviceInfo.device_id,
         previousMode,
         nextMode,
-      });
-    } catch (error) {
-      await axios.put(`${LOCAL_API_URL}/api/cloud/internet-access`, {
-        user_id: user.id,
-        allowInternetAccess: previousMode === CONNECTIVITY_MODES.AUTO,
-      }, { timeout: 8000, headers: { "x-user-id": user.id, "x-device-id": deviceInfo.device_id } }).catch(() => null);
-      throw error;
-    }
-    writeConnectivityMode(nextMode);
-    setConnectivityMode(nextMode);
-    setSyncMessage(connectivityModeMessage(nextMode));
-    await refreshPosInventoryFromSQLite("connectivity-mode-change");
-    if (nextMode === CONNECTIVITY_MODES.LOCAL_ONLY) {
-      setCloudHealth((current) => ({
-        ...current,
-        online: false,
-        checking: false,
-        reachabilityStatus: "paused",
-        status: "paused",
-        reasonCode: "APP_LOCAL_ONLY",
-        message: "Local Only mode selected - cloud sync paused.",
-        lastCheckedAt: new Date().toISOString(),
-      }));
-      setAiAssistantData((current) => ({ ...current, loading: false, error: FROST_CLOUD_UNAVAILABLE_MESSAGE }));
-      setSyncStatus((current) => ({ ...(current || {}), online: false, syncing: false, lastFailureKind: "APP_LOCAL_ONLY", lastError: "" }));
+        serverConfirmedAt: response.data?.confirmedAt || response.data?.updatedAt,
+        timeSource: response.data?.timeSource || "device",
+      }).catch((error) => writeDiagnosticLog("WARN", "connectivity-mode-local-audit-failed", { message: getErrorMessage(error, "Unable to write local connectivity audit") }));
+      writeConnectivityMode(nextMode);
+      setConnectivityMode(nextMode);
+      setSyncMessage(connectivityModeMessage(nextMode));
+      await refreshPosInventoryFromSQLite("connectivity-mode-change");
+      if (nextMode === CONNECTIVITY_MODES.LOCAL_ONLY) {
+        setCloudHealth((current) => ({
+          ...current,
+          online: false,
+          checking: false,
+          reachabilityStatus: "paused",
+          status: "paused",
+          reasonCode: "APP_LOCAL_ONLY",
+          message: "Local Only mode selected - cloud sync paused.",
+          lastCheckedAt: response.data?.confirmedAt || new Date().toISOString(),
+        }));
+        setAiAssistantData((current) => ({ ...current, loading: false, error: FROST_CLOUD_UNAVAILABLE_MESSAGE }));
+        setSyncStatus((current) => ({ ...(current || {}), online: false, syncing: false, lastFailureKind: "APP_LOCAL_ONLY", lastError: "" }));
+        return nextMode;
+      }
+      const health = await performConnectivityCheck("connectivity-mode-auto", { force: true, timeoutMs: 5000 });
+      if (health?.online) {
+        await runSyncNow({ force: true }).catch((error) => {
+          writeDiagnosticLog("WARN", "connectivity-mode-auto-sync-failed", describeRequestFailure(error, { url: `${SYNC_API_URL}/api/sync/push` }));
+        });
+        if (frostDrawerOpen) await loadAiAssistant(aiRange).catch(() => null);
+      }
       return nextMode;
+    } finally {
+      setConnectivityModeSwitching(false);
     }
-    const health = await performConnectivityCheck("connectivity-mode-auto", { force: true, timeoutMs: 5000 });
-    if (health?.online) {
-      await runSyncNow({ force: true }).catch((error) => {
-        writeDiagnosticLog("WARN", "connectivity-mode-auto-sync-failed", describeRequestFailure(error, { url: `${SYNC_API_URL}/api/sync/push` }));
-      });
-      if (frostDrawerOpen) await loadAiAssistant(aiRange).catch(() => null);
-    }
-    return nextMode;
   };
 
   const applyConnectivityState = useCallback((health, statusInternetAvailable = internetAvailableRef.current, statusSyncStatus = syncStatusRef.current) => {
@@ -3697,10 +3713,11 @@ function App() {
   };
 
   const loadReports = async (params = {}) => {
-    if (isTauriRuntime() && offlineMode) {
+    const normalizedParams = { ...params, ...resolveReportDateRange(params) };
+    if (isTauriRuntime() && (offlineMode || readConnectivityMode() === CONNECTIVITY_MODES.LOCAL_ONLY)) {
       const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id }).catch(() => null);
       const localRows = await listLocalPosSales().catch(() => []);
-      const salesRows = localRows.map(localSnapshotToInvoice);
+      const salesRows = filterRowsForReportRange(localRows.map(localSnapshotToInvoice), normalizedParams);
       setReportsData((current) => ({
         ...current,
         salesHistoryReport: salesRows,
@@ -3713,22 +3730,30 @@ function App() {
           total_amount: Number(payment.amount || sale.total_amount || 0),
           transaction_count: 1,
         }))),
+        dateFrom: normalizedParams.date_from,
+        dateTo: normalizedParams.date_to,
       }));
-      return;
+      return { params: normalizedParams, source: "LOCAL_SQLITE", failures: [] };
     }
     const { values, failures } = await settleNamedRequests([
-      { key: "summary", method: "GET", url: `${API_URL}/reports/summary`, fallback: reportsData, run: () => axios.get(`${API_URL}/reports/summary`, { params }).then((response) => response.data) },
+      { key: "summary", method: "GET", url: `${API_URL}/reports/summary`, fallback: reportsData, run: () => axios.get(`${API_URL}/reports/summary`, { params: normalizedParams }).then((response) => response.data) },
       { key: "inventory", method: "GET", url: `${API_URL}/inventory`, fallback: reportsData.stockLotReport || inventory, run: () => axios.get(`${API_URL}/inventory`, { params: { include_cancelled: true } }).then((response) => response.data) },
-      { key: "cashBook", method: "GET", url: `${API_URL}/reports/cash-book`, fallback: reportsData.cashBookReport || [], run: () => axios.get(`${API_URL}/reports/cash-book`, { params }).then((response) => response.data) },
+      { key: "cashBook", method: "GET", url: `${API_URL}/reports/cash-book`, fallback: reportsData.cashBookReport || [], run: () => axios.get(`${API_URL}/reports/cash-book`, { params: normalizedParams }).then((response) => response.data) },
     ]);
     failures.forEach((failure) => writeDiagnosticLog("WARN", "report-request-fallback", failure));
+    if (failures.length) {
+      setSyncMessage(`${failures.length} report request(s) failed. Showing the last preserved local values.`);
+      return { params: normalizedParams, source: "HYBRID_LOCAL", failures };
+    }
     setReportsData((current) => ({
       ...current,
       ...(values.summary || {}),
       stockLotReport: values.inventory || current.stockLotReport || [],
       cashBookReport: values.cashBook || current.cashBookReport || [],
+      dateFrom: normalizedParams.date_from,
+      dateTo: normalizedParams.date_to,
     }));
-    if (failures.length) setSyncMessage(`${failures.length} report request(s) failed. Showing the last preserved local values.`);
+    return { params: normalizedParams, source: "HYBRID_LOCAL", failures };
   };
 
   const loadExpenses = async () => {
@@ -5463,16 +5488,21 @@ function App() {
               <h1>{activeLabel}</h1>
             </div>
           </div>
-          <div className="branch-pill">
-            <span className="status-dot" />
-            {user.branch}
+          <div className="topbar-status-group">
+            <time className="global-clock" dateTime={headerClock}>{formatKolkataHeaderClock(headerClock)}</time>
+            <div className="topbar-status-row">
+              <div className="branch-pill">
+                <span className="status-dot" />
+                {user.branch}
+              </div>
+              <div className="offline-pill">{connectionStatus.syncSummary}</div>
+              {settingsData.deviceControlSettings?.fullscreen_lock_enabled && (
+                <button className="secondary-button kiosk-exit-button" onClick={requestControlledExit}>
+                  Owner Exit
+                </button>
+              )}
+            </div>
           </div>
-          <div className="offline-pill">{connectionStatus.syncSummary}</div>
-          {settingsData.deviceControlSettings?.fullscreen_lock_enabled && (
-            <button className="secondary-button kiosk-exit-button" onClick={requestControlledExit}>
-              Owner Exit
-            </button>
-          )}
         </header>
 
         <div className="content-area">
@@ -5482,8 +5512,8 @@ function App() {
                 <strong>Local Only mode selected - cloud sync paused</strong>
                 <span>Business modules use local SQLite. Windows internet remains connected.</span>
               </div>
-              <button className="primary-button" onClick={() => changeConnectivityMode(CONNECTIVITY_MODES.AUTO).catch((error) => setSyncMessage(getErrorMessage(error, "Unable to return to Auto mode")))}>
-                Return to Auto
+              <button className="primary-button" disabled={connectivityModeSwitching} onClick={() => changeConnectivityMode(CONNECTIVITY_MODES.AUTO).catch((error) => setSyncMessage(getErrorMessage(error, "Unable to return to Auto mode")))}>
+                {connectivityModeSwitching ? "Switching..." : "Return to Auto"}
               </button>
             </div>
           )}
@@ -8661,6 +8691,10 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     date_from: toDateKey(new Date()),
     date_to: toDateKey(new Date()),
   });
+  const [refreshBusy, setRefreshBusy] = useState(false);
+  const [refreshError, setRefreshError] = useState("");
+  const [appliedQuery, setAppliedQuery] = useState(() => resolveReportDateRange({ range: "today" }));
+  const lastSuccessfulFilters = useRef({ range: "today", customRange: { date_from: toDateKey(new Date()), date_to: toDateKey(new Date()) }, search: "", salesFilters: { ...salesFilters }, purchaseFilters: { ...purchaseFilters }, accountReportFilters: { ...accountReportFilters }, cashBookFilters: { ...cashBookFilters }, inventoryLotReportFilter: "ACTIVE" });
   const currentReportParams = () => range === "custom" ? customRange : { range };
   const currentCashBookParams = (overrides = {}) => {
     const nextFilters = { ...cashBookFilters, ...(overrides.filters || {}) };
@@ -8677,8 +8711,36 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       search,
     };
   };
+  const currentRefreshParams = () => {
+    const base = buildReportRefreshParams({ range, customRange, search, selectedReport, salesFilters, purchaseFilters, accountReportFilters, cashBookFilters, inventoryLotReportFilter });
+    return selectedReport === "cashBook" ? { ...base, ...currentCashBookParams() } : base;
+  };
   const refreshReports = async () => {
-    await onReload(selectedReport === "cashBook" ? currentCashBookParams() : currentReportParams());
+    if (refreshBusy) return;
+    setRefreshBusy(true);
+    setRefreshError("");
+    try {
+      const params = currentRefreshParams();
+      const result = await onReload(params);
+      if (result?.failures?.length) throw new Error(result.failures.map((failure) => `${failure.key}: ${failure.message}`).join("; "));
+      setAppliedQuery(params);
+      lastSuccessfulFilters.current = { range, customRange: { ...customRange }, search, salesFilters: { ...salesFilters }, purchaseFilters: { ...purchaseFilters }, accountReportFilters: { ...accountReportFilters }, cashBookFilters: { ...cashBookFilters }, inventoryLotReportFilter };
+    } catch (error) {
+      const previous = lastSuccessfulFilters.current;
+      if (previous) {
+        setRange(previous.range);
+        setCustomRange(previous.customRange);
+        setSearch(previous.search);
+        setSalesFilters(previous.salesFilters);
+        setPurchaseFilters(previous.purchaseFilters);
+        setAccountReportFilters(previous.accountReportFilters);
+        setCashBookFilters(previous.cashBookFilters);
+        setInventoryLotReportFilter(previous.inventoryLotReportFilter);
+      }
+      setRefreshError(getErrorMessage(error, "Unable to refresh report"));
+    } finally {
+      setRefreshBusy(false);
+    }
   };
   const reloadCashBook = async (filters = cashBookFilters) => {
     await onReload(currentCashBookParams({ filters }));
@@ -8701,9 +8763,10 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       setBalanceSheetDetailLoading(false);
     }
   };
-  const matchesSearch = (row) => !search.trim() || Object.values(row || {}).some((value) => {
+  const appliedSearch = String(appliedQuery.search ?? search).trim();
+  const matchesSearch = (row) => !appliedSearch || Object.values(row || {}).some((value) => {
     const text = typeof value === "object" && value !== null ? JSON.stringify(value) : String(value ?? "");
-    return text.toLowerCase().includes(search.trim().toLowerCase());
+    return text.toLowerCase().includes(appliedSearch.toLowerCase());
   });
   const filterRows = (rows) => {
     const safeRows = Array.isArray(rows)
@@ -10154,7 +10217,8 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
           <button className="secondary-button" onClick={() => setPurchaseFilters({ supplier: "", product: "", status: "ACTIVE", paymentType: "", date: "" })}>Clear Purchase Filters</button>
         </>
       )}
-      <button className="secondary-button" onClick={refreshReports}>Refresh</button>
+      <button className="secondary-button" disabled={refreshBusy} onClick={refreshReports}>{refreshBusy ? "Refreshing..." : "Refresh"}</button>
+      {refreshError && <div className="field-error" role="alert">{refreshError}</div>}
     </div>
   );
   const balanceDetailColumnValue = (row, column) => {
@@ -10460,8 +10524,8 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       return renderedRows;
     };
     const reportFileName = (() => {
-      const from = formatFileDate(data.dateFrom || customRange.date_from);
-      const to = formatFileDate(data.dateTo || customRange.date_to);
+      const from = formatFileDate(appliedQuery.date_from || data.dateFrom);
+      const to = formatFileDate(appliedQuery.date_to || data.dateTo);
       const title = safeFileName(currentReport.title);
       if (selectedReport === "balanceSheet") return `Balance_Sheet_As_At_${to}.pdf`;
       if (selectedReport === "cashBook") {
@@ -10472,10 +10536,10 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     })();
     const reportFilterSummary = (() => {
       const parts = [];
-      if (data.dateFrom || data.dateTo || customRange.date_from || customRange.date_to) {
-        parts.push(`Range: ${formatDisplayDate(data.dateFrom || customRange.date_from)} to ${formatDisplayDate(data.dateTo || customRange.date_to)}`);
+      if (appliedQuery.date_from || appliedQuery.date_to) {
+        parts.push(`Range: ${formatIndianReportDate(appliedQuery.date_from)} to ${formatIndianReportDate(appliedQuery.date_to)}`);
       }
-      if (search.trim()) parts.push(`Search: ${search.trim()}`);
+      if (appliedSearch) parts.push(`Search: ${appliedSearch}`);
       if (selectedReport === "salesHistory") {
         parts.push(`View: ${salesFilters.viewMode === "CUSTOMER" ? "Customer-wise" : salesFilters.viewMode === "INVOICE" ? "Invoice-wise" : salesFilters.viewMode === "LOT" ? "Lot-wise" : "Item-wise"}`);
         parts.push(`Status: ${salesFilters.status}`);
@@ -10529,7 +10593,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
                   <DataTable headers={currentReport.headers}>
                     {selectedReport === "purchaseHistory" ? renderPurchaseHistoryRows() : rows.map((row, index) => currentReport.render(row, index))}
                   </DataTable>
-                  {rows.length === 0 && <div className="cart-empty">No records found for the selected filters.</div>}
+                  {rows.length === 0 && <div className="cart-empty">No records found for the selected range {formatIndianReportDate(appliedQuery.date_from)} to {formatIndianReportDate(appliedQuery.date_to)}.</div>}
                 </>
               )}
             </PrintableReport>
@@ -13581,9 +13645,13 @@ function SyncSettingsSection({
     branchServerPort: API_CONFIG.branchServerPort,
   });
   const [configMessage, setConfigMessage] = useState("");
+  useEffect(() => {
+    setConfigDraft((current) => ({ ...current, cloudConnectionMode: normalizeConnectivityMode(connectivityMode) }));
+  }, [connectivityMode]);
   const applyConnectivityMode = async (nextMode) => {
     if (String(user?.role || "").toUpperCase() !== "OWNER" || !onConnectivityModeChange) return;
     setConnectivityModeBusy(true);
+    setConfigMessage("Switching...");
     try {
       const savedMode = await onConnectivityModeChange(nextMode);
       setConfigDraft((current) => ({ ...current, cloudConnectionMode: savedMode }));
@@ -13887,12 +13955,12 @@ function SyncSettingsSection({
             </Field>
             <Field label="Connectivity Mode">
               <div className="connectivity-segmented" role="group" aria-label="Connectivity Mode">
-                <button className={connectivityMode === CONNECTIVITY_MODES.AUTO ? "selected" : ""} disabled={connectivityModeBusy || String(user?.role || "").toUpperCase() !== "OWNER"} type="button" onClick={() => applyConnectivityMode(CONNECTIVITY_MODES.AUTO)}>AUTO</button>
-                <button className={connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY ? "selected" : ""} disabled={connectivityModeBusy || String(user?.role || "").toUpperCase() !== "OWNER"} type="button" onClick={() => applyConnectivityMode(CONNECTIVITY_MODES.LOCAL_ONLY)}>LOCAL ONLY</button>
+                <button className={connectivityMode === CONNECTIVITY_MODES.AUTO ? "selected" : ""} disabled={connectivityModeBusy || String(user?.role || "").toUpperCase() !== "OWNER"} type="button" onClick={() => applyConnectivityMode(CONNECTIVITY_MODES.AUTO)}>{connectivityModeBusy ? "Switching..." : "AUTO"}</button>
+                <button className={connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY ? "selected" : ""} disabled={connectivityModeBusy || String(user?.role || "").toUpperCase() !== "OWNER"} type="button" onClick={() => applyConnectivityMode(CONNECTIVITY_MODES.LOCAL_ONLY)}>{connectivityModeBusy ? "Switching..." : "LOCAL ONLY"}</button>
               </div>
             </Field>
           </div>
-          {configDraft.cloudConnectionMode === CONNECTIVITY_MODES.LOCAL_ONLY && <p className="form-note stock-low">Local Only mode selected - cloud sync paused. Windows networking remains unchanged.</p>}
+          {connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY && <p className="form-note stock-low">Local Only mode selected - cloud sync paused. Windows networking remains unchanged.</p>}
           {configDraft.mode === API_MODES.LOCAL_SINGLE_DEVICE && <p className="form-note">Local Single Device uses this computer's local backend.</p>}
           {configDraft.mode === API_MODES.BRANCH_LAN_SERVER && <p className="form-note">Branch LAN Server is for the main shop computer serving same-branch devices over Wi-Fi/LAN.</p>}
           {configDraft.mode === API_MODES.BRANCH_LAN_CLIENT && <p className="form-note">Branch LAN Client must use the main branch server IP. It is same Wi-Fi/LAN only, not cloud.</p>}
@@ -14513,7 +14581,6 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
   const [lotUnitFilter, setLotUnitFilter] = useState("");
   const [lotRateMin, setLotRateMin] = useState("");
   const [lotRateMax, setLotRateMax] = useState("");
-  const [showSoldOutLots, setShowSoldOutLots] = useState(false);
   const [cart, setCart] = useState([]);
   const [paymentMode, setPaymentMode] = useState("CASH");
   const [quantityMode, setQuantityMode] = useState(posSettings.enable_weighing_scale ? "SCALE" : "MANUAL");
@@ -14536,22 +14603,22 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     setLotSelectorProduct(null);
     setLotSelectorSearch("");
     setLotFilter("AVAILABLE");
-    setShowSoldOutLots(false);
     searchRef.current?.focus();
   }, [refreshToken]);
 
   const effectiveQuantityMode = posSettings.enable_weighing_scale ? quantityMode : "MANUAL";
   const lotSelectionMode = String(saleRateSettings.pos_lot_selection_mode || "ASK_MULTIPLE").toUpperCase();
-  const canViewSoldOutLots = ["Owner", "Admin"].includes(user?.role);
-  const lotBalance = (lot) => Number(lot?.remaining_qty ?? lot?.balance_qty ?? 0);
+  const rawLotBalance = (lot) => Number(lot?.remaining_qty ?? lot?.balance_qty ?? 0);
+  const lotBalance = (lot) => lotAvailableQuantity(lot);
   const lotStatus = (lot) => {
     const status = String(lot?.batch_status || lot?.status || "ACTIVE").toUpperCase();
     if (status === "CANCELLED") return "Cancelled";
     if (status === "INACTIVE") return "Inactive";
-    if (lotBalance(lot) <= 0) return "Sold Out";
+    if (rawLotBalance(lot) <= 0) return "Sold Out";
+    if (!isSellableLot(lot)) return "Unavailable";
     return "Active";
   };
-  const isSelectableLot = (lot) => lotStatus(lot) === "Active" && lotBalance(lot) > 0;
+  const isSelectableLot = (lot) => lotStatus(lot) === "Active" && isSellableLot(lot);
   const lotSaleRateValue = (lot, product) => {
     const rate = Number(lot?.temporary_sale_rate ?? lot?.sale_rate ?? lot?.selling_rate ?? 0);
     return rate > 0 ? rate : Number(product?.selling_rate ?? product?.sale_rate ?? 0);
@@ -14624,11 +14691,11 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
         ]),
       ].some((value) => String(value ?? "").toLowerCase().includes(query));
     };
-    return products
+    return filterSellableProducts(products, inventory)
       .filter((product) => matchesProduct(product))
       .map((product) => ({ key: `product-${product.id}`, product, lotCount: (lotsByProduct.get(product.id) || []).filter(isSelectableLot).length }))
       .slice(0, 12);
-  }, [lotsByProduct, products, search]);
+  }, [inventory, lotsByProduct, products, search]);
 
   const salesMandiTaxBasisLabel = {
     GROSS_BEFORE_DISCOUNTS: "Gross item value before discounts",
@@ -14745,7 +14812,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     const productLots = (lotsByProduct.get(product.id) || []).filter((lot) => {
       const status = lotStatus(lot);
       if (status === "Cancelled" || status === "Inactive") return false;
-      return showSoldOutLots && canViewSoldOutLots ? true : lotBalance(lot) > 0;
+      return isSelectableLot(lot);
     });
     if (productLots.length === 0) {
       alert(`No available stock lots found for ${product.product_name}.`);
@@ -14758,7 +14825,6 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     setLotUnitFilter("");
     setLotRateMin("");
     setLotRateMax("");
-    setShowSoldOutLots(false);
   };
 
   const closeLotSelector = () => {
@@ -14877,9 +14943,9 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
   const scanBarcode = () => {
     const code = barcode.trim();
     if (!code) return;
-    const product = products.find((item) => item.barcode === code);
+    const product = filterSellableProducts(products, inventory).find((item) => item.barcode === code);
     if (!product) {
-      alert(`No product is assigned to barcode ${code}`);
+      alert(`No sellable stock is available for barcode ${code}`);
       barcodeRef.current?.focus();
     } else {
       openLotSelector(product);
@@ -15235,10 +15301,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     return (lotsByProduct.get(lotSelectorProduct.id) || [])
       .filter((lot) => {
         const status = lotStatus(lot);
-        if (status === "Cancelled" || status === "Inactive") return false;
-        if (!showSoldOutLots || !canViewSoldOutLots) {
-          if (lotBalance(lot) <= 0) return false;
-        }
+        if (!isSelectableLot(lot)) return false;
         if (lotFilter === "ACTIVE" && status !== "Active") return false;
         if (lotFilter === "DISCOUNTED" && !getActiveLotDiscount(lot.id)) return false;
         if (lotFilter === "AVAILABLE" && lotBalance(lot) <= 0) return false;
@@ -15271,7 +15334,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
         if (lotCompare !== 0) return lotCompare;
         return Number(left.id || 0) - Number(right.id || 0);
       });
-  }, [canViewSoldOutLots, lotFilter, lotRateMax, lotRateMin, lotSelectorProduct, lotSelectorSearch, lotSizeFilter, lotUnitFilter, lotsByProduct, showSoldOutLots]);
+  }, [lotFilter, lotRateMax, lotRateMin, lotSelectorProduct, lotSelectorSearch, lotSizeFilter, lotUnitFilter, lotsByProduct]);
 
   const lotSelectorSizeOptions = useMemo(() => {
     if (!lotSelectorProduct) return [];
@@ -15614,12 +15677,6 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
               </Field>
               <Field label="Min Rate"><input min="0" step="0.01" type="number" value={lotRateMin} onChange={(event) => setLotRateMin(event.target.value)} /></Field>
               <Field label="Max Rate"><input min="0" step="0.01" type="number" value={lotRateMax} onChange={(event) => setLotRateMax(event.target.value)} /></Field>
-              {canViewSoldOutLots && (
-                <label className="toggle-line lot-sold-out-toggle">
-                  <input type="checkbox" checked={showSoldOutLots} onChange={(event) => setShowSoldOutLots(event.target.checked)} />
-                  Show Sold-Out Lots
-                </label>
-              )}
             </div>
             <div className="lot-selector-table-wrap">
               <table className="lot-selector-table">

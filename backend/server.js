@@ -4882,7 +4882,7 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
         AND branch_id = $2
         ${batchFilter}
         AND remaining_qty > 0
-        AND COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'
+        AND UPPER(COALESCE(batch_status, 'ACTIVE')) NOT IN ('CANCELLED', 'INACTIVE', 'EXPIRED', 'RESERVED', 'BLOCKED', 'EXHAUSTED')
       ORDER BY purchase_date, created_at, id
       FOR UPDATE
       `,
@@ -8133,13 +8133,13 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
   }
   const lotIds = [...stockRequests.values()].map((request) => request.lotId);
   const lotsResult = await client.query(
-    "SELECT id, product_id, remaining_qty FROM inventory_batches WHERE id = ANY($1::int[]) AND branch_id = $2 FOR UPDATE",
+    "SELECT id, product_id, remaining_qty, batch_status FROM inventory_batches WHERE id = ANY($1::int[]) AND branch_id = $2 FOR UPDATE",
     [lotIds, context.branchId]
   );
   const lotsById = new Map(lotsResult.rows.map((row) => [Number(row.id), row]));
   for (const request of stockRequests.values()) {
     const lot = lotsById.get(request.lotId);
-    if (!lot || Number(lot.product_id) !== Number(request.productId)) {
+    if (!lot || Number(lot.product_id) !== Number(request.productId) || ['CANCELLED', 'INACTIVE', 'EXPIRED', 'RESERVED', 'BLOCKED', 'EXHAUSTED'].includes(String(lot.batch_status || 'ACTIVE').toUpperCase())) {
       return conflict("Server lot is unavailable or belongs to another product", { lot_id: request.lotId });
     }
     if (Number(lot.remaining_qty || 0) < request.quantity) {

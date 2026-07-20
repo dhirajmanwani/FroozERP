@@ -53,6 +53,23 @@ export const formatKolkataDateTime = (value) => {
   }).format(date).replace(",", "");
 };
 
+export const formatKolkataHeaderClock = (value) => {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const parts = new Intl.DateTimeFormat("en-IN", {
+    timeZone: "Asia/Kolkata",
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+  }).formatToParts(date);
+  const part = (type) => parts.find((entry) => entry.type === type)?.value || "";
+  return `${part("day")} ${part("month")} ${part("year")} \u00b7 ${part("hour")}:${part("minute")}:${part("second")} ${part("dayPeriod").toUpperCase()} \u00b7 IST`;
+};
+
 export const observeServerTime = ({ serverTime, requestStartedAt, responseReceivedAt = Date.now() }) => {
   const serverMs = new Date(serverTime).getTime();
   const startedMs = Number(requestStartedAt);
