@@ -51,3 +51,10 @@ export const getFrostAvailabilityMessage = ({
   }
   return "";
 };
+
+export const preserveVerifiedLocalCollection = (remoteValue, localValue) => {
+  if (Array.isArray(localValue) && localValue.length > 0 && Array.isArray(remoteValue) && remoteValue.length === 0) {
+    return localValue;
+  }
+  return remoteValue;
+};

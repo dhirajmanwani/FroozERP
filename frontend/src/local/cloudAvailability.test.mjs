@@ -5,6 +5,7 @@ import {
   deriveRuntimeConnectivity,
   getFrostAvailabilityMessage,
   isCloudUnavailableError,
+  preserveVerifiedLocalCollection,
 } from "./cloudAvailability.js";
 
 test("local backend and cloud connectivity remain independent", () => {
@@ -46,4 +47,11 @@ test("cloud recovery enables sync only after all independent prerequisites recov
   });
   assert.equal(recovered.cloudConnected, true);
   assert.equal(recovered.syncAvailable, true);
+});
+
+test("empty optional cloud collections never replace verified local business data", () => {
+  const localProducts = [{ id: 1, name: "Preserved product" }];
+  assert.equal(preserveVerifiedLocalCollection([], localProducts), localProducts);
+  assert.deepEqual(preserveVerifiedLocalCollection([{ id: 2 }], localProducts), [{ id: 2 }]);
+  assert.deepEqual(preserveVerifiedLocalCollection([], []), []);
 });

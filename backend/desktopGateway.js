@@ -134,6 +134,8 @@ const proxy = async (res, response) => {
     "content-type": response.headers.get("content-type") || "application/json; charset=utf-8",
     "content-length": body.length,
     "cache-control": "no-store",
+    "access-control-allow-origin": "*",
+    "access-control-allow-private-network": "true",
     "x-froozerp-storage-mode": "desktop-sqlite",
   });
   res.end(body);

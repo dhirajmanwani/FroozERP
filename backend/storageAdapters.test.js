@@ -226,6 +226,8 @@ test("desktop gateway converts upstream 502 into a clean cloud unavailable respo
     const response = await fetch(`http://127.0.0.1:${port}/api/ai/briefing`);
     const body = await response.json();
     assert.equal(response.status, 503);
+    assert.equal(response.headers.get("access-control-allow-origin"), "*");
+    assert.equal(response.headers.get("access-control-allow-private-network"), "true");
     assert.equal(body.code, "CLOUD_UNAVAILABLE");
     assert.equal(body.cloud_connected, false);
     assert.doesNotMatch(JSON.stringify(body), /upstream infrastructure detail|ENOTFOUND/);
