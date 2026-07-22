@@ -1391,6 +1391,8 @@ const initializeDatabase = async () => {
       unit VARCHAR(30) NOT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    ALTER TABLE products ADD COLUMN IF NOT EXISTS global_id VARCHAR(180);
+    ALTER TABLE products ALTER COLUMN selling_rate DROP NOT NULL;
     ALTER TABLE products ADD COLUMN IF NOT EXISTS category_id INTEGER REFERENCES product_categories(id);
     ALTER TABLE products ADD COLUMN IF NOT EXISTS barcode VARCHAR(100);
     ALTER TABLE products ADD COLUMN IF NOT EXISTS origin_type VARCHAR(20) DEFAULT 'LOCAL';
@@ -1429,7 +1431,7 @@ const initializeDatabase = async () => {
           PARTITION BY LOWER(COALESCE(NULLIF(TRIM(category), ''), 'Fruit')), LOWER(TRIM(product_name))
         ) AS duplicate_count
       FROM products
-      WHERE product_name IS NOT NULL AND TRIM(product_name) <> ''
+      WHERE product_name IS NOT NULL AND TRIM(product_name) <> '' AND global_id IS NULL
     ),
     archived_products AS (
       UPDATE products p
@@ -1459,9 +1461,10 @@ const initializeDatabase = async () => {
       'Archived duplicate product during startup migration'
     FROM archived_products
     ON CONFLICT (duplicate_product_id) DO NOTHING;
-    CREATE UNIQUE INDEX IF NOT EXISTS products_category_name_lower_unique_idx
+    DROP INDEX IF EXISTS products_category_name_lower_unique_idx;
+    CREATE UNIQUE INDEX products_category_name_lower_unique_idx
       ON products (LOWER(COALESCE(category, 'Fruit')), LOWER(product_name))
-      WHERE active IS DISTINCT FROM FALSE;
+      WHERE active IS DISTINCT FROM FALSE AND global_id IS NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS products_barcode_unique_idx
       ON products (barcode)
       WHERE barcode IS NOT NULL AND barcode <> '';

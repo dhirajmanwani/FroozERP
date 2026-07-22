@@ -96,3 +96,10 @@ test("fresh-device reference seed includes branch-scoped inventory lots", () => 
   assert.match(source, /scl\.company_id = b\.company_id/);
   assert.match(source, /scl\.branch_id = ib\.branch_id/);
 });
+
+test("stable product identities survive historical duplicate names and null rates", () => {
+  const source = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
+  assert.match(source, /ALTER TABLE products ALTER COLUMN selling_rate DROP NOT NULL/);
+  assert.match(source, /product_name IS NOT NULL AND TRIM\(product_name\) <> '' AND global_id IS NULL/);
+  assert.match(source, /WHERE active IS DISTINCT FROM FALSE AND global_id IS NULL/);
+});
