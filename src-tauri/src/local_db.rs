@@ -83,6 +83,7 @@ pub struct SyncAck {
 #[derive(Debug, Deserialize)]
 pub struct PulledChange {
     pub change_id: serde_json::Value,
+    pub branch_id: Option<i64>,
     pub entity_type: String,
     pub entity_id: String,
     pub operation_type: String,
@@ -2288,18 +2289,15 @@ pub fn ensure_device_identity_at(path: &Path) -> Result<serde_json::Value, Strin
         return Ok(existing);
     }
 
-    let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-Device".to_string());
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default();
-    let device_id = format!("FZDEV-{}-{}", hostname.replace(' ', "-").to_uppercase(), timestamp);
+    let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows Device".to_string());
+    let device_id = generate_opaque_device_id()?;
     let device_name = format!("{} - FroozERP", hostname);
+    let app_version = env!("CARGO_PKG_VERSION");
     conn.execute(
         "INSERT INTO local_device_identity (
             device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at, updated_at
-         ) VALUES (?1, ?2, 'tauri-windows', '1.0.0', '1', 'pending', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-        params![device_id, device_name],
+         ) VALUES (?1, ?2, 'tauri-windows', ?3, 'unassigned', 'pending', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        params![device_id, device_name, app_version],
     )
     .map_err(to_error)?;
 
@@ -2307,8 +2305,8 @@ pub fn ensure_device_identity_at(path: &Path) -> Result<serde_json::Value, Strin
         "device_id": device_id,
         "device_name": device_name,
         "platform": "tauri-windows",
-        "app_version": "1.0.0",
-        "branch_id": "1",
+        "app_version": app_version,
+        "branch_id": "unassigned",
         "registration_status": "pending",
         "last_seen_at": null,
         "last_sync_at": null,
@@ -2414,6 +2412,37 @@ fn record_conflict_with_tx(tx: &rusqlite::Transaction, ack: &SyncAck) -> Result<
     )
     .map_err(to_error)?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn generate_opaque_device_id() -> Result<String, String> {
+    use windows_sys::core::GUID;
+    use windows_sys::Win32::System::Com::CoCreateGuid;
+
+    let mut guid = GUID::from_u128(0);
+    let result = unsafe { CoCreateGuid(&mut guid) };
+    if result < 0 {
+        return Err(format!("Windows could not generate a device identity (HRESULT {result})."));
+    }
+    Ok(format!(
+        "FZDEV-{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        guid.data1,
+        guid.data2,
+        guid.data3,
+        guid.data4[0],
+        guid.data4[1],
+        guid.data4[2],
+        guid.data4[3],
+        guid.data4[4],
+        guid.data4[5],
+        guid.data4[6],
+        guid.data4[7],
+    ))
+}
+
+#[cfg(not(windows))]
+fn generate_opaque_device_id() -> Result<String, String> {
+    Ok(format!("FZDEV-{}", unique_local_id("installation")))
 }
 
 fn apply_pulled_pos_sale_with_tx(
@@ -2693,6 +2722,91 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
             )
             .map_err(to_error)?;
         }
+        "inventory_lot" => {
+            if operation == "DELETE" {
+                tx.execute(
+                    "UPDATE local_inventory_lots SET deleted_at = COALESCE(?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), sync_status = 'synced' WHERE id = ?1",
+                    params![change.entity_id, change.updated_at],
+                )
+                .map_err(to_error)?;
+            } else {
+                let product_id = optional_text(&change.payload, "product_global_id")
+                    .or_else(|| optional_text(&change.payload, "product_id"))
+                    .unwrap_or_default();
+                if product_id.is_empty() {
+                    return Err(format!("Inventory lot {} has no canonical product identity", change.entity_id));
+                }
+                let purchase_qty = change.payload.get("purchase_qty").and_then(json_number).unwrap_or(0.0);
+                let balance_qty = change.payload.get("remaining_qty").or_else(|| change.payload.get("balance_qty")).and_then(json_number).unwrap_or(0.0);
+                let sold_qty = (purchase_qty - balance_qty).max(0.0);
+                tx.execute(
+                    "INSERT INTO local_inventory_lots (
+                        id, cloud_id, branch_id, product_id, product_name, supplier_id, supplier_name,
+                        lot_no, size_grade, opening_date, opening_qty, purchased_qty, sold_qty, returned_qty,
+                        waste_qty, adjusted_qty, transfer_in_qty, transfer_out_qty, balance_qty, cost_rate,
+                        sale_rate, status, remarks, created_at, updated_at, version, sync_status, deleted_at
+                     ) VALUES (
+                        ?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15,
+                        ?16, ?17, ?18, ?19, ?20, ?21, COALESCE(?22, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                        COALESCE(?23, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?24, 'synced', NULL
+                     ) ON CONFLICT(id) DO UPDATE SET
+                        branch_id = excluded.branch_id,
+                        product_id = excluded.product_id,
+                        product_name = excluded.product_name,
+                        supplier_id = excluded.supplier_id,
+                        supplier_name = excluded.supplier_name,
+                        lot_no = excluded.lot_no,
+                        size_grade = excluded.size_grade,
+                        opening_date = excluded.opening_date,
+                        opening_qty = excluded.opening_qty,
+                        purchased_qty = excluded.purchased_qty,
+                        sold_qty = excluded.sold_qty,
+                        returned_qty = excluded.returned_qty,
+                        waste_qty = excluded.waste_qty,
+                        adjusted_qty = excluded.adjusted_qty,
+                        transfer_in_qty = excluded.transfer_in_qty,
+                        transfer_out_qty = excluded.transfer_out_qty,
+                        balance_qty = excluded.balance_qty,
+                        cost_rate = excluded.cost_rate,
+                        sale_rate = excluded.sale_rate,
+                        status = excluded.status,
+                        remarks = excluded.remarks,
+                        updated_at = excluded.updated_at,
+                        version = excluded.version,
+                        sync_status = 'synced',
+                        deleted_at = NULL",
+                    params![
+                        change.entity_id,
+                        optional_text(&change.payload, "branch_id")
+                            .or_else(|| change.branch_id.map(|value| value.to_string()))
+                            .unwrap_or_else(|| "unassigned".to_string()),
+                        product_id,
+                        optional_text(&change.payload, "product_name"),
+                        optional_text(&change.payload, "supplier_id"),
+                        optional_text(&change.payload, "supplier_name"),
+                        optional_text(&change.payload, "lot_no").or_else(|| optional_text(&change.payload, "batch_no")).or_else(|| optional_text(&change.payload, "lot_name")),
+                        optional_text(&change.payload, "size_grade").or_else(|| optional_text(&change.payload, "lot_size")),
+                        optional_text(&change.payload, "opening_date").or_else(|| optional_text(&change.payload, "purchase_date")),
+                        purchase_qty,
+                        sold_qty,
+                        change.payload.get("returned_qty").and_then(json_number).unwrap_or(0.0),
+                        change.payload.get("waste_qty").and_then(json_number).unwrap_or(0.0),
+                        change.payload.get("adjusted_qty").and_then(json_number).unwrap_or(0.0),
+                        change.payload.get("transfer_in_qty").and_then(json_number).unwrap_or(0.0),
+                        change.payload.get("transfer_out_qty").and_then(json_number).unwrap_or(0.0),
+                        balance_qty,
+                        change.payload.get("effective_cost_per_unit").or_else(|| change.payload.get("purchase_rate")).and_then(json_number).unwrap_or(0.0),
+                        change.payload.get("temporary_sale_rate").or_else(|| change.payload.get("sale_rate")).and_then(json_number),
+                        optional_text(&change.payload, "batch_status").or_else(|| optional_text(&change.payload, "status")).unwrap_or_else(|| "ACTIVE".to_string()),
+                        optional_text(&change.payload, "remarks"),
+                        optional_text(&change.payload, "created_at"),
+                        change.updated_at.clone(),
+                        change.version.unwrap_or(1),
+                    ],
+                )
+                .map_err(to_error)?;
+            }
+        }
         "pos_sale" => apply_pulled_pos_sale_with_tx(tx, change)?,
         "sync_test" => {
             tx.execute(
@@ -2797,11 +2911,19 @@ mod tests {
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&root);
-        let first = root.join("device-a").join(LOCAL_DB_FILE);
-        let second = root.join("device-b").join(LOCAL_DB_FILE);
+        let first = root.join("profile-a").join(LOCAL_DB_FILE);
+        let second = root.join("profile-b").join(LOCAL_DB_FILE);
 
+        let mut device_ids = Vec::new();
         for path in [&first, &second] {
             initialize_at(path).expect("initialize fresh SQLite profile");
+            let identity = ensure_device_identity_at(path).expect("create fresh device identity");
+            let device_id = identity["device_id"].as_str().expect("device id").to_string();
+            assert!(device_id.starts_with("FZDEV-"));
+            assert!(!device_id.to_lowercase().contains("profile-a"));
+            assert!(!device_id.to_lowercase().contains("profile-b"));
+            assert_eq!(identity["branch_id"], "unassigned");
+            device_ids.push(device_id.clone());
             let status = status_at(path).expect("read fresh SQLite status");
             assert!(status.initialized);
             assert_eq!(status.schema_version, CURRENT_SCHEMA_VERSION);
@@ -2816,9 +2938,12 @@ mod tests {
             assert_eq!(migration_count, 11);
             drop(conn);
             initialize_at(path).expect("restart with existing SQLite profile");
+            let restored = ensure_device_identity_at(path).expect("restore device identity");
+            assert_eq!(restored["device_id"], device_id);
         }
 
         assert_ne!(first, second);
+        assert_ne!(device_ids[0], device_ids[1]);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2889,6 +3014,7 @@ mod tests {
         initialize_at(&path).expect("initialize pull test database");
         let change = PulledChange {
             change_id: serde_json::json!(101),
+            branch_id: Some(1),
             entity_type: "pos_sale".to_string(),
             entity_id: "remote-sale-1".to_string(),
             operation_type: "UPSERT".to_string(),
@@ -2950,6 +3076,71 @@ mod tests {
         assert_eq!(invoice_count, 1);
         assert_eq!(item_count, 1);
         assert_eq!(movement_count, 0, "pulled sales must not deduct a separately refreshed stock snapshot");
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fresh_initial_pull_applies_inventory_lots_idempotently() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-initial-lot-pull-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize initial pull database");
+        let product = PulledChange {
+            change_id: serde_json::json!(1),
+            branch_id: Some(7),
+            entity_type: "product".to_string(),
+            entity_id: "product-fresh".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            payload: serde_json::json!({
+                "branch_id": 7,
+                "product_name": "Fresh Product",
+                "unit": "KG",
+                "selling_rate": 25,
+                "active": true
+            }),
+            updated_at: Some("2026-07-22T12:00:00.000Z".to_string()),
+        };
+        let lot = PulledChange {
+            change_id: serde_json::json!(2),
+            branch_id: Some(7),
+            entity_type: "inventory_lot".to_string(),
+            entity_id: "inventory-lot-fresh".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            payload: serde_json::json!({
+                "branch_id": 7,
+                "product_global_id": "product-fresh",
+                "product_name": "Fresh Product",
+                "batch_no": "LOT-FRESH",
+                "purchase_qty": 12,
+                "remaining_qty": 9,
+                "purchase_rate": 10,
+                "batch_status": "ACTIVE"
+            }),
+            updated_at: Some("2026-07-22T12:00:01.000Z".to_string()),
+        };
+        for _ in 0..2 {
+            let mut conn = Connection::open(&path).expect("open initial pull database");
+            let tx = conn.transaction().expect("start initial pull transaction");
+            apply_change_with_tx(&tx, &product).expect("apply pulled product");
+            apply_change_with_tx(&tx, &lot).expect("apply pulled inventory lot");
+            tx.commit().expect("commit initial pull");
+        }
+        let conn = Connection::open(&path).expect("inspect initial pull database");
+        let (count, balance): (i64, f64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(balance_qty), 0) FROM local_inventory_lots WHERE id = 'inventory-lot-fresh'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("inventory lot result");
+        assert_eq!(count, 1);
+        assert_eq!(balance, 9.0);
         drop(conn);
         let _ = fs::remove_file(&path);
     }

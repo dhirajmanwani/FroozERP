@@ -21,10 +21,29 @@ test("successful approved-device login provisions a device-bound offline session
   const hydrateStart = appSource.indexOf("const hydrateOnlineSession = async");
   const hydrateEnd = appSource.indexOf("const continueOffline = async", hydrateStart);
   const hydrateSource = appSource.slice(hydrateStart, hydrateEnd);
+  assert.match(hydrateSource, /initialPullForApprovedDevice\(\{/);
+  assert.match(hydrateSource, /branchId: currentUser\?\.branch_id/);
   assert.match(hydrateSource, /cacheOfflineSession\(\{/);
   assert.match(hydrateSource, /deviceId: latestDevice\.device_id/);
   assert.match(hydrateSource, /cacheLocalReferenceSnapshot\(\{/);
   assert.match(hydrateSource, /offline_auth: offlineSession/);
+});
+
+test("fresh onboarding performs a pull-only cycle before provisioning", () => {
+  const syncSource = fs.readFileSync(path.join(here, "syncService.js"), "utf8");
+  const start = syncSource.indexOf("export async function initialPullForApprovedDevice");
+  const end = syncSource.indexOf("export function getNextRetryDelay", start);
+  const initialPullSource = syncSource.slice(start, end);
+  assert.ok(start > 0 && end > start);
+  assert.match(initialPullSource, /await initialiseSync\(/);
+  assert.match(initialPullSource, /await pullServerChanges\(/);
+  assert.doesNotMatch(initialPullSource, /pushPendingOperations\(/);
+  assert.match(initialPullSource, /INITIAL_PULL_ACKNOWLEDGED/);
+});
+
+test("device identity is generated per installation without machine-specific constants", () => {
+  assert.match(appSource, /crypto\?\.randomUUID\?\.\(\)/);
+  assert.doesNotMatch(appSource, /FZDEV-SECOND-LAPTOP/);
 });
 
 test("pending approval is shown distinctly from invalid credentials", () => {

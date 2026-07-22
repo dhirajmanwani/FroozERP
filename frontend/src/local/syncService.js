@@ -414,6 +414,35 @@ export async function syncNow({ apiUrl, user, deviceInfo, branchId }) {
   return runningSync;
 }
 
+export async function initialPullForApprovedDevice({ apiUrl, user, deviceInfo, branchId }) {
+  if (cloudAccessDisabledByOwner()) {
+    throw new Error("Initial device provisioning requires FroozERP cloud access.");
+  }
+  await initialiseSync({ apiUrl, user, deviceInfo, branchId });
+  if (!lastStatus.online || !lastStatus.canonicalIdentity) {
+    throw new Error(lastStatus.lastError || "The approved cloud device identity could not be confirmed.");
+  }
+  let pullStatus = await pullServerChanges({ apiUrl, user, deviceInfo, branchId });
+  while (pullStatus.hasMore) {
+    pullStatus = await pullServerChanges({ apiUrl, user, deviceInfo, branchId });
+  }
+  const completed = await repositories.cycle.complete(
+    syncContext({ user, deviceInfo, branchId }).deviceId,
+    pullStatus.timeDiagnostics?.railwayServerUtcTime || pullStatus.lastPullAt,
+    "INITIAL_PULL_ACKNOWLEDGED",
+  );
+  lastStatus = {
+    ...lastStatus,
+    ...normalizeLocalStatus(completed),
+    canonicalIdentity: lastStatus.canonicalIdentity,
+    syncing: false,
+    online: true,
+    lastError: "",
+    syncStage: "idle",
+  };
+  return lastStatus;
+}
+
 export function getNextRetryDelay() {
   return backoffMs;
 }

@@ -48,6 +48,7 @@ import {
 import {
   checkBackendHealth,
   getSyncStatus,
+  initialPullForApprovedDevice,
   queueSafeSyncTest,
   retryFailedOperations,
   syncNow,
@@ -805,7 +806,8 @@ const getClientDeviceInfo = () => {
   const storageKey = "froozerp_device_id";
   let deviceId = localStorage.getItem(storageKey);
   if (!deviceId) {
-    deviceId = `FZDEV-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+    const opaqueId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2, 14)}`;
+    deviceId = `FZDEV-${opaqueId.toUpperCase()}`;
     localStorage.setItem(storageKey, deviceId);
   }
   const userAgent = navigator.userAgent || "Browser";
@@ -3230,6 +3232,19 @@ function App() {
   };
 
   const hydrateOnlineSession = async (currentUser, latestDevice) => {
+    const existingSnapshot = isTauriRuntime()
+      ? await loadLocalReferenceSnapshot({ username, deviceId: latestDevice.device_id }).catch(() => null)
+      : null;
+    const isFreshDevice = isTauriRuntime() && !existingSnapshot?.user_profile?.id;
+    if (isFreshDevice) {
+      const initialSyncStatus = await initialPullForApprovedDevice({
+        apiUrl: SYNC_API_URL,
+        user: currentUser,
+        deviceInfo: latestDevice,
+        branchId: currentUser?.branch_id,
+      });
+      applyCanonicalIdentityFromSync(initialSyncStatus);
+    }
     const snapshot = await fetchOnlineReferenceSnapshot(currentUser, latestDevice);
     await applyReferenceSnapshot(snapshot, { offline: false, nextView: initialView });
     try {

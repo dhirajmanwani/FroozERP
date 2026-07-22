@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
@@ -7,6 +8,8 @@ const {
   isOwnerBootstrapEligible,
   unresolvedLoginDeviceGate,
 } = require("./identityPolicy");
+
+const freshDeviceId = () => `FZDEV-${crypto.randomUUID().toUpperCase()}`;
 
 test("owner eligibility is role based and does not force a username", () => {
   assert.equal(isOwnerBootstrapEligible({ username: "dhirajmanwani", role_name: "Owner", active: true }), true);
@@ -47,7 +50,7 @@ test("fresh alias login registers one pending device without authenticating a us
   assert.deepEqual(unresolvedLoginDeviceGate({
     username: "dhirajmanwani",
     password: "entered-but-never-stored",
-    device: { device_id: "FZDEV-SECOND-LAPTOP", status: "PENDING" },
+    device: { device_id: freshDeviceId(), status: "PENDING" },
   }), { code: "DEVICE_PENDING_APPROVAL", status: 403 });
 
   const source = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
@@ -60,7 +63,7 @@ test("approval state cannot bypass canonical password verification", () => {
   assert.deepEqual(unresolvedLoginDeviceGate({
     username: "dhirajmanwani",
     password: "wrong",
-    device: { device_id: "FZDEV-SECOND-LAPTOP", status: "APPROVED", approved_by: 1 },
+    device: { device_id: freshDeviceId(), status: "APPROVED", approved_by: 1 },
   }), { code: "INVALID_CREDENTIALS", status: 401 });
 
   const source = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
@@ -81,4 +84,12 @@ test("disabled and revoked fresh devices are never returned to pending", () => {
     password: "entered",
     device: { device_id: "revoked", status: "REVOKED" },
   }), { code: "DEVICE_REVOKED", status: 403 });
+});
+
+test("fresh-device reference seed includes branch-scoped inventory lots", () => {
+  const source = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
+  assert.match(source, /'inventory_lot'/);
+  assert.match(source, /'product_global_id', p\.global_id/);
+  assert.match(source, /scl\.company_id = b\.company_id/);
+  assert.match(source, /scl\.branch_id = ib\.branch_id/);
 });

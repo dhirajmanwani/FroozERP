@@ -2236,6 +2236,14 @@ const initializeDatabase = async () => {
     CREATE UNIQUE INDEX IF NOT EXISTS products_global_id_unique_idx
       ON products (global_id);
 
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS global_id VARCHAR(180);
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS entity_version INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP;
+    UPDATE inventory_batches SET global_id = 'inventory-lot-' || id WHERE global_id IS NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS inventory_batches_global_id_unique_idx
+      ON inventory_batches (global_id);
+
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS global_id VARCHAR(180);
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS offline_invoice_ref VARCHAR(180);
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS source_device_id VARCHAR(160);
@@ -7851,6 +7859,33 @@ const seedReferenceChangeLog = async () => {
       SELECT 1 FROM sync_change_log scl
       WHERE scl.entity_type = 'product' AND scl.entity_id = p.global_id
     );
+
+    INSERT INTO sync_change_log (
+      company_id, branch_id, entity_type, entity_id, operation_type, entity_version, payload, created_at
+    )
+    SELECT
+      b.company_id,
+      ib.branch_id,
+      'inventory_lot',
+      ib.global_id,
+      CASE WHEN ib.deleted_at IS NULL THEN 'UPSERT' ELSE 'DELETE' END,
+      ib.entity_version,
+      TO_JSONB(ib) || JSONB_BUILD_OBJECT(
+        'product_global_id', p.global_id,
+        'product_name', p.product_name
+      ),
+      COALESCE(ib.updated_at, ib.created_at, CURRENT_TIMESTAMP)
+    FROM inventory_batches ib
+    JOIN branches b ON b.id = ib.branch_id
+    JOIN products p ON p.id = ib.product_id
+    WHERE ib.global_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM sync_change_log scl
+        WHERE scl.company_id = b.company_id
+          AND scl.branch_id = ib.branch_id
+          AND scl.entity_type = 'inventory_lot'
+          AND scl.entity_id = ib.global_id
+      );
   `);
 };
 
