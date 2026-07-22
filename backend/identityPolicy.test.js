@@ -105,6 +105,8 @@ test("stable product identities survive historical duplicate names and null rate
 
   const activeSchemaInitializer = source.match(/const ensureProductEntrySchema = async[\s\S]*?\n};/)?.[0] || "";
   assert.match(activeSchemaInitializer, /ALTER TABLE products ALTER COLUMN selling_rate DROP NOT NULL/);
+  assert.match(activeSchemaInitializer, /ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS global_id VARCHAR\(180\)/);
   assert.match(activeSchemaInitializer, /DROP INDEX IF EXISTS products_category_name_lower_unique_idx/);
   assert.match(activeSchemaInitializer, /WHERE active IS DISTINCT FROM FALSE AND global_id IS NULL/);
+  assert.match(activeSchemaInitializer, /CREATE UNIQUE INDEX IF NOT EXISTS inventory_batches_global_id_unique_idx/);
 });

@@ -10108,6 +10108,10 @@ const ensureProductEntrySchema = async (client = pool) => {
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS lot_size VARCHAR(120);
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS stock_source VARCHAR(40) DEFAULT 'PURCHASE';
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS remarks TEXT;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS global_id VARCHAR(180);
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS entity_version INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP;
 
     CREATE TABLE IF NOT EXISTS stock_transactions (
       id SERIAL PRIMARY KEY,
@@ -10143,13 +10147,19 @@ const ensureProductEntrySchema = async (client = pool) => {
 
     CREATE UNIQUE INDEX IF NOT EXISTS product_categories_name_lower_unique_idx
       ON product_categories (LOWER(category_name));
+    CREATE UNIQUE INDEX IF NOT EXISTS product_categories_global_id_unique_idx
+      ON product_categories (global_id);
     DROP INDEX IF EXISTS products_category_name_lower_unique_idx;
     CREATE UNIQUE INDEX products_category_name_lower_unique_idx
       ON products (LOWER(COALESCE(category, 'Fruit')), LOWER(product_name))
       WHERE active IS DISTINCT FROM FALSE AND global_id IS NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS products_global_id_unique_idx
+      ON products (global_id);
     CREATE UNIQUE INDEX IF NOT EXISTS products_barcode_unique_idx
       ON products (barcode)
       WHERE barcode IS NOT NULL AND barcode <> '';
+    CREATE UNIQUE INDEX IF NOT EXISTS inventory_batches_global_id_unique_idx
+      ON inventory_batches (global_id);
   `);
 };
 
