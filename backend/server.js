@@ -9,7 +9,7 @@ const path = require("path");
 const { execFile } = require("child_process");
 const nodemailer = require("nodemailer");
 const { RUNTIME_MODES, createStorageAdapter } = require("./storageAdapters");
-const { canonicalAliasClaim, isOwnerBootstrapEligible } = require("./identityPolicy");
+const { canonicalAliasClaim, isOwnerBootstrapEligible, unresolvedLoginDeviceGate } = require("./identityPolicy");
 const {
   calculateOverdueDays,
   classifyDueStatus,
@@ -9555,7 +9555,7 @@ app.post("/login", async (req, res) => {
       LEFT JOIN companies co ON co.id = COALESCE(u.company_id, b.company_id)
       WHERE LOWER(u.username) = LOWER($1)
          OR (
-           u.id = $2
+           ($2::INTEGER IS NULL OR u.id = $2)
            AND EXISTS (
              SELECT 1
              FROM authorized_devices d
@@ -9568,16 +9568,50 @@ app.post("/login", async (req, res) => {
       ORDER BY CASE WHEN LOWER(u.username) = LOWER($1) THEN 0 ELSE 1 END
       LIMIT 1
       `,
-      [username, aliasClaim?.userId || null, aliasClaim?.deviceId || null]
+      [username, aliasClaim?.userId || null, devicePayload.device_id || null]
     );
 
     if (result.rows.length === 0) {
+      if (!devicePayload.device_id) {
+        return authFailure(res, {
+          status: 403,
+          code: "DEVICE_ID_REQUIRED",
+          publicMessage: "Device ID is required for FroozERP access.",
+          username,
+          ipAddress: req.ip,
+          details: { stage: "device_identity" },
+        });
+      }
+      const device = await upsertDeviceRequest(devicePayload);
+      const gate = unresolvedLoginDeviceGate({ device, username, password });
+      if (gate.code !== "INVALID_CREDENTIALS") {
+        await writeAuthAudit({
+          username,
+          action: "LOGIN_FAILED",
+          safeCode: gate.code,
+          deviceId: device.device_id,
+          ipAddress: req.ip,
+          details: {
+            stage: "fresh_device_bootstrap",
+            device_status: device.status,
+            password_verified: false,
+          },
+        });
+        return res.status(gate.status).json({
+          code: gate.code,
+          message: gate.code === "DEVICE_PENDING_APPROVAL"
+            ? "Device awaiting owner approval."
+            : "This device is disabled for FroozERP access.",
+          device_id: device.device_id,
+          device_status: device.status,
+        });
+      }
       return authFailure(res, {
-        code: "INVALID_CREDENTIALS",
+        code: gate.code,
         username,
         deviceId: devicePayload.device_id,
         ipAddress: req.ip,
-        details: { stage: "user_lookup" },
+        details: { stage: "user_lookup", device_status: device.status },
       });
     }
 

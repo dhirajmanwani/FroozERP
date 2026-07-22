@@ -539,7 +539,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.63";
+const APP_VERSION = "1.0.64";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -5316,9 +5316,9 @@ function App() {
           {deviceGate && (
             <div className="device-activation-panel">
               <span className="eyebrow">Device Activation Required</span>
-              <strong>This device is not approved.</strong>
+              <strong>{deviceGate.code === "DEVICE_PENDING_APPROVAL" ? "Device awaiting owner approval." : "This device is not approved."}</strong>
               <small>Device ID: {deviceGate.device_id || deviceInfo.device_id}</small>
-              <p>Ask the owner to approve this device from Settings, or enter a one-time activation code.</p>
+              <p>Ask the owner to approve this device from Settings, then sign in again. A one-time activation code may also be used.</p>
               <input
                 placeholder="Activation code"
                 value={activationCode}

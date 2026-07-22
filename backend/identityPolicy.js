@@ -13,4 +13,23 @@ const canonicalAliasClaim = ({ canonicalUserId, deviceId, requestedUsername }) =
   return { userId, deviceId: device, requestedUsername: alias };
 };
 
-module.exports = { canonicalAliasClaim, isOwnerBootstrapEligible, normalizeRole };
+const unresolvedLoginDeviceGate = ({ device, username, password }) => {
+  if (!String(username || "").trim() || !String(password || "")) {
+    return { code: "INVALID_CREDENTIALS", status: 401 };
+  }
+  if (!device?.device_id) {
+    return { code: "DEVICE_ID_REQUIRED", status: 403 };
+  }
+  const deviceStatus = String(device.status || "PENDING").trim().toUpperCase();
+  if (deviceStatus === "DISABLED") return { code: "DEVICE_DISABLED", status: 403 };
+  if (deviceStatus === "REVOKED") return { code: "DEVICE_REVOKED", status: 403 };
+  if (deviceStatus === "PENDING") return { code: "DEVICE_PENDING_APPROVAL", status: 403 };
+  return { code: "INVALID_CREDENTIALS", status: 401 };
+};
+
+module.exports = {
+  canonicalAliasClaim,
+  isOwnerBootstrapEligible,
+  normalizeRole,
+  unresolvedLoginDeviceGate,
+};
