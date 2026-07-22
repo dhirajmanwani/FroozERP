@@ -7741,10 +7741,6 @@ const hasApprovedOwnerDevice = async (client = pool) => {
   return result.rows.length > 0;
 };
 
-const ownerBootstrapDeviceAllowlist = new Set([
-  "FZDEV-1783665039063-f9033e34",
-]);
-
 const normalizeSyncStatus = (value) => String(value || "").trim().toLowerCase();
 const SYNC_OPERATION_TYPES = new Set(["UPSERT", "DELETE", "CREATE", "UPDATE", "SALE_EDIT", "SALE_CANCEL"]);
 const SYNC_ENTITY_TYPES = new Set(["sync_test", "pos_sale"]);
@@ -9308,8 +9304,7 @@ app.post("/bootstrap/first-owner-device", async (req, res) => {
     }
 
     const ownerDeviceExists = await hasApprovedOwnerDevice();
-    const allowlistedOwnerDevice = ownerBootstrapDeviceAllowlist.has(devicePayload.device_id);
-    if (ownerDeviceExists && !allowlistedOwnerDevice) {
+    if (ownerDeviceExists) {
       return res.status(409).json({ message: "An approved owner device already exists. Use normal device approval." });
     }
 
@@ -9319,9 +9314,7 @@ app.post("/bootstrap/first-owner-device", async (req, res) => {
       approvedBy: user.id,
       branchId: user.branch_id || devicePayload.assigned_branch_id || 1,
       counterId: devicePayload.assigned_counter_id,
-      reason: allowlistedOwnerDevice
-        ? "One-time owner bootstrap for current production browser device"
-        : "One-time first owner device bootstrap",
+      reason: "One-time first owner device bootstrap",
     });
     console.info("first owner device auto-approved", {
       username: user.username,

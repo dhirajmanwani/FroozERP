@@ -21,16 +21,19 @@ test("production authentication source contains no bootstrap password literal", 
   const source = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
   assert.equal(source.includes('String(password || "") ==='), false);
   assert.equal(source.includes('toLowerCase() === "owner"'), false);
+  assert.doesNotMatch(source, /ownerBootstrapDeviceAllowlist/);
+  assert.doesNotMatch(source, /FZDEV-[A-Z0-9-]{8,}/);
 });
 
 test("canonical login alias requires an existing user claim and device identity", () => {
+  const deviceId = freshDeviceId();
   assert.deepEqual(canonicalAliasClaim({
     canonicalUserId: 1,
-    deviceId: "FZDEV-DELL-1781852580596",
+    deviceId,
     requestedUsername: "DhirajManwani",
   }), {
     userId: 1,
-    deviceId: "FZDEV-DELL-1781852580596",
+    deviceId,
     requestedUsername: "dhirajmanwani",
   });
   assert.equal(canonicalAliasClaim({ canonicalUserId: 1, requestedUsername: "dhirajmanwani" }), null);
