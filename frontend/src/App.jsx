@@ -32,6 +32,7 @@ import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode,
 import { filterSellableProducts, isSellableLot, lotAvailableQuantity, selectLocalPosInventory } from "./local/posInventory";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, resolveReportDateRange } from "./local/reportRefresh";
 import { approvedDeviceCredentialMessage, normalizeDeviceBootstrapStatus } from "./local/freshDeviceOnboarding";
+import { getUserDisplayName, getUserInitial, getUserRoleLabel } from "./local/userPresentation";
 import { describeUpdateAvailability, normalizeUpdateMetadata } from "./local/updateMetadata";
 import { RUNTIME_FAILURE_EVENT, describeRequestFailure, initialiseMandatoryRuntime, resolveLocalServiceRenderState, resolveMandatoryRuntimeRenderState, settleNamedRequests } from "./local/startupResilience";
 import {
@@ -5403,6 +5404,8 @@ function App() {
 
   const activeLabel = navigationItems.find(([view]) => view === activeView)?.[1];
   const canManageRates = ["Owner", "Admin"].includes(user.role);
+  const userDisplayName = getUserDisplayName(user);
+  const userRoleLabel = getUserRoleLabel(user);
   const canEditSales = ["Owner", "Admin"].includes(user.role) || hasRolePermission("sale_edit");
   const canCancelSales = ["Owner", "Admin"].includes(user.role) || hasRolePermission("invoice_cancellation");
   const canManageStock = ["Owner", "Admin", "Inventory Manager"].includes(user.role);
@@ -5513,10 +5516,10 @@ function App() {
           ))}
         </nav>
           <div className="sidebar-profile" onClick={() => setProfileOpen(true)} role="button" tabIndex={0} onKeyDown={(event) => event.key === "Enter" && setProfileOpen(true)}>
-          <div className="user-avatar">{user.full_name.charAt(0)}</div>
+          <div className="user-avatar">{getUserInitial(user)}</div>
           <div>
-            <strong>{user.full_name}</strong>
-            <small>{user.role}</small>
+            <strong>{userDisplayName}</strong>
+            <small>{userRoleLabel}</small>
           </div>
           <button aria-label="Log out" className="logout-button" onClick={(event) => { event.stopPropagation(); setUser(null); setOfflineMode(false); setStartupError(""); setStartupNotice(""); }}>
             <Icon name="logout" size={17} />
@@ -5612,7 +5615,7 @@ function App() {
                 <div>
                   <BrandLogo />
                   <span className="eyebrow">Retail Intelligence</span>
-                  <h2>Good to see you, {user.full_name.split(" ")[0]}.</h2>
+                  <h2>Good to see you, {userDisplayName.split(" ")[0]}.</h2>
                   <p>Monitor today's performance and keep your inventory moving.</p>
                 </div>
                 <button className="primary-button" onClick={() => navigate("sales")}>
@@ -7937,6 +7940,8 @@ function UserProfilePanel({ onClose, onLogout, user }) {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const userDisplayName = getUserDisplayName(user);
+  const userRoleLabel = getUserRoleLabel(user);
   const loadRecoveryProfile = async () => {
     try {
       const response = await axios.get(`${API_URL}/auth/recovery/profile`, {
@@ -8023,13 +8028,13 @@ function UserProfilePanel({ onClose, onLogout, user }) {
         <div className="invoice-toolbar">
           <div>
             <span className="eyebrow">User Profile</span>
-            <strong>{user.full_name}</strong>
+            <strong>{userDisplayName}</strong>
           </div>
           <button aria-label="Close profile" className="remove-button" onClick={onClose}><Icon name="close" /></button>
         </div>
         <div className="sale-edit-body">
           <div className="purchase-summary-grid supplier-payment-preview">
-            <SummaryMetric label="Role" value={user.role} featured />
+            <SummaryMetric label="Role" value={userRoleLabel} featured />
             <SummaryMetric label="Branch" value={user.branch || "Main Branch"} />
             <SummaryMetric label="Last Login" value={user.last_login_at ? new Date(user.last_login_at).toLocaleString("en-IN") : "Not recorded"} />
             <SummaryMetric label="Device" value="Local Counter" />
