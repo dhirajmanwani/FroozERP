@@ -31,6 +31,7 @@ import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode, writeConnectivityMode } from "./local/connectivityMode";
 import { filterSellableProducts, isSellableLot, lotAvailableQuantity, selectLocalPosInventory } from "./local/posInventory";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, resolveReportDateRange } from "./local/reportRefresh";
+import { approvedDeviceCredentialMessage, normalizeDeviceBootstrapStatus } from "./local/freshDeviceOnboarding";
 import { describeUpdateAvailability, normalizeUpdateMetadata } from "./local/updateMetadata";
 import { RUNTIME_FAILURE_EVENT, describeRequestFailure, initialiseMandatoryRuntime, resolveLocalServiceRenderState, resolveMandatoryRuntimeRenderState, settleNamedRequests } from "./local/startupResilience";
 import {
@@ -829,7 +830,9 @@ const getClientDeviceInfo = () => {
 const resolveLocalDeviceInfo = async (fallback = getClientDeviceInfo()) => {
   if (!isTauriRuntime()) return fallback;
   const identity = await getOrCreateLocalDeviceIdentity().catch(() => null);
-  if (!identity?.device_id) return fallback;
+  if (!identity?.device_id) {
+    throw new Error("The local device identity is not ready. Wait for the local service and retry.");
+  }
   localStorage.setItem("froozerp_device_id", identity.device_id);
   if (identity.device_name) localStorage.setItem("froozerp_device_name", identity.device_name);
   return {
@@ -3919,6 +3922,20 @@ function App() {
         return;
       }
 
+      const bootstrapResponse = await axios.post(`${AUTH_API_URL}/api/auth/device-bootstrap-status`, latestDevice, {
+        timeout: 8000,
+      });
+      const bootstrapStatus = normalizeDeviceBootstrapStatus(bootstrapResponse.data, latestDevice.device_id);
+      if (!bootstrapStatus.approved && bootstrapStatus.device_status !== "NOT_REGISTERED") {
+        setDeviceGate(bootstrapStatus);
+        setStartupError(
+          bootstrapStatus.device_status === "PENDING"
+            ? "Device awaiting owner approval."
+            : "This device is not approved for FroozERP access."
+        );
+        return;
+      }
+
       writeDiagnosticLog("INFO", "login-request", { apiUrl: AUTH_API_URL, endpoint: `${AUTH_API_URL}/login`, deviceId: latestDevice.device_id });
       const response = await axios.post(`${AUTH_API_URL}/login`, {
         username: username.trim(),
@@ -3962,6 +3979,17 @@ function App() {
         setStartupError(error.response.data.message || "This device is not approved.");
         return;
       }
+      const credentialMessage = approvedDeviceCredentialMessage(error.response?.data);
+      if (credentialMessage) {
+        if (isTauriRuntime()) {
+          const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
+          const opened = await continueOffline(latestDevice);
+          if (opened) return;
+        }
+        setDeviceGate(null);
+        setStartupError(credentialMessage);
+        return;
+      }
       if (isTauriRuntime()) {
         const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
         const opened = await continueOffline(latestDevice);
@@ -3982,7 +4010,22 @@ function App() {
       setDeviceInfo(latestDevice);
       const health = await performConnectivityCheck("retry-online", { force: true, timeoutMs: 4000 });
       if (health.online) {
-        setStartupNotice(`Backend online at ${health.url}. Enter credentials and click Sign In to complete first online login.`);
+        const response = await axios.post(`${AUTH_API_URL}/api/auth/device-bootstrap-status`, latestDevice, {
+          timeout: 8000,
+        });
+        const bootstrapStatus = normalizeDeviceBootstrapStatus(response.data, latestDevice.device_id);
+        setDeviceGate(bootstrapStatus.approved ? null : bootstrapStatus);
+        if (bootstrapStatus.approved) {
+          if (username.trim() && password) {
+            setStartupNotice("Device approval confirmed. Completing secure provisioning...");
+            return await login();
+          }
+          setStartupNotice("Device approval confirmed. Enter credentials and click Sign In to complete secure provisioning and the initial pull.");
+        } else if (bootstrapStatus.device_status === "PENDING") {
+          setStartupNotice("Device awaiting owner approval.");
+        } else {
+          setStartupNotice("Cloud is online. Sign in once to register this installation for approval.");
+        }
       } else {
         setStartupError(`Backend health check failed at ${health.url}: ${health.message}`);
       }

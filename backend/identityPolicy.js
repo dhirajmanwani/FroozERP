@@ -27,7 +27,20 @@ const unresolvedLoginDeviceGate = ({ device, username, password }) => {
   return { code: "INVALID_CREDENTIALS", status: 401 };
 };
 
+const approvedAliasCredentialFailure = ({ canonicalAliasUsed, device }) => {
+  const status = String(device?.status || "").trim().toUpperCase();
+  if (!canonicalAliasUsed || status !== "APPROVED" || !device?.approved_by) {
+    return null;
+  }
+  return {
+    code: "CANONICAL_CREDENTIALS_REQUIRED",
+    status: 401,
+    message: "Device approved. Enter the password for the canonical FroozERP account to finish secure provisioning.",
+  };
+};
+
 module.exports = {
+  approvedAliasCredentialFailure,
   canonicalAliasClaim,
   isOwnerBootstrapEligible,
   normalizeRole,

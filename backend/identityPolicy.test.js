@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 const {
+  approvedAliasCredentialFailure,
   canonicalAliasClaim,
   isOwnerBootstrapEligible,
   unresolvedLoginDeviceGate,
@@ -74,6 +75,36 @@ test("approval state cannot bypass canonical password verification", () => {
   assert.match(source, /d\.approved_by = u\.id/);
   assert.match(source, /passwordMatches\(password, user\.password_hash\)/);
   assert.match(source, /canonical_alias_used: canonicalAliasUsed/);
+});
+
+test("approved alias password mismatch requests canonical verification without bypassing it", () => {
+  assert.deepEqual(approvedAliasCredentialFailure({
+    canonicalAliasUsed: true,
+    device: { status: "APPROVED", approved_by: 1 },
+  }), {
+    code: "CANONICAL_CREDENTIALS_REQUIRED",
+    status: 401,
+    message: "Device approved. Enter the password for the canonical FroozERP account to finish secure provisioning.",
+  });
+  assert.equal(approvedAliasCredentialFailure({
+    canonicalAliasUsed: false,
+    device: { status: "APPROVED", approved_by: 1 },
+  }), null);
+  assert.equal(approvedAliasCredentialFailure({
+    canonicalAliasUsed: true,
+    device: { status: "PENDING", approved_by: 1 },
+  }), null);
+});
+
+test("post-approval status route is read-only and does not provision identities", () => {
+  const source = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
+  const start = source.indexOf('app.post("/api/auth/device-bootstrap-status"');
+  const end = source.indexOf('app.post("/login"', start);
+  const route = source.slice(start, end);
+  assert.ok(start > 0 && end > start);
+  assert.match(route, /SELECT device_id, status FROM authorized_devices/);
+  assert.doesNotMatch(route, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE)\b/i);
+  assert.doesNotMatch(route, /password_hash|token|approved_by/);
 });
 
 test("disabled and revoked fresh devices are never returned to pending", () => {

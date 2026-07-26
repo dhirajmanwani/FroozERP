@@ -9,7 +9,12 @@ const path = require("path");
 const { execFile } = require("child_process");
 const nodemailer = require("nodemailer");
 const { RUNTIME_MODES, createStorageAdapter } = require("./storageAdapters");
-const { canonicalAliasClaim, isOwnerBootstrapEligible, unresolvedLoginDeviceGate } = require("./identityPolicy");
+const {
+  approvedAliasCredentialFailure,
+  canonicalAliasClaim,
+  isOwnerBootstrapEligible,
+  unresolvedLoginDeviceGate,
+} = require("./identityPolicy");
 const {
   calculateOverdueDays,
   classifyDueStatus,
@@ -9547,6 +9552,48 @@ app.get("/settings/system-info", async (req, res) => {
   }
 });
 
+app.post("/api/auth/device-bootstrap-status", async (req, res) => {
+  try {
+    const devicePayload = readDevicePayload(req.body, req);
+    if (!devicePayload.device_id) {
+      return res.status(400).json({
+        code: "DEVICE_ID_REQUIRED",
+        message: "Device ID is required for FroozERP access.",
+      });
+    }
+    const result = await pool.query(
+      "SELECT device_id, status FROM authorized_devices WHERE device_id = $1 LIMIT 1",
+      [devicePayload.device_id]
+    );
+    const device = result.rows[0];
+    if (!device) {
+      return res.json({
+        code: "DEVICE_NOT_REGISTERED",
+        device_id: devicePayload.device_id,
+        device_status: "NOT_REGISTERED",
+        approved: false,
+      });
+    }
+    const status = String(device.status || "PENDING").toUpperCase();
+    return res.json({
+      code: status === "APPROVED"
+        ? "DEVICE_APPROVED"
+        : status === "PENDING"
+          ? "DEVICE_PENDING_APPROVAL"
+          : `DEVICE_${status}`,
+      device_id: device.device_id,
+      device_status: status,
+      approved: status === "APPROVED",
+    });
+  } catch (error) {
+    console.error("Device bootstrap status failed", error);
+    return res.status(500).json({
+      code: "DEVICE_STATUS_UNAVAILABLE",
+      message: "Device approval status is temporarily unavailable.",
+    });
+  }
+});
+
 app.post("/login", async (req, res) => {
   try {
     const username = cleanText(req.body.username);
@@ -9685,9 +9732,20 @@ app.post("/login", async (req, res) => {
       });
     }
     if (!passwordMatches(password, user.password_hash)) {
+      const approvedDeviceResult = canonicalAliasUsed
+        ? await pool.query(
+            "SELECT status, approved_by FROM authorized_devices WHERE device_id = $1 LIMIT 1",
+            [devicePayload.device_id]
+          )
+        : { rows: [] };
+      const aliasFailure = approvedAliasCredentialFailure({
+        canonicalAliasUsed,
+        device: approvedDeviceResult.rows[0],
+      });
       return authFailure(res, {
-        code: "INVALID_CREDENTIALS",
-        publicMessage: "Invalid username or password.",
+        status: aliasFailure?.status || 401,
+        code: aliasFailure?.code || "INVALID_CREDENTIALS",
+        publicMessage: aliasFailure?.message || "Invalid username or password.",
         userId: user.id,
         username: user.username,
         deviceId: devicePayload.device_id,
