@@ -32,6 +32,7 @@ const {
   requiresOperationalProtocolUpgrade,
   validateSyncBatchScope,
 } = require("./operationalScope");
+const { registerOperationalV3Routes } = require("./operationalV3");
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
@@ -9192,6 +9193,15 @@ app.get("/api/v3/inventory", rateLimitSyncRequest, async (req, res) => {
     console.error("Location inventory lookup failed", error.message);
     return res.status(500).json({ code: "LOCATION_INVENTORY_LOOKUP_FAILED", message: "Location inventory lookup failed" });
   }
+});
+
+registerOperationalV3Routes({
+  app,
+  database: pool,
+  resolveContext: resolveV3OperationalContext,
+  middleware: [rateLimitSyncRequest],
+  sendScopeError: sendOperationalScopeError,
+  serverTimePayload,
 });
 
 app.get("/api/device/identity", rateLimitSyncRequest, async (req, res) => {

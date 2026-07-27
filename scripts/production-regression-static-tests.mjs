@@ -9,6 +9,7 @@ const css = read("frontend", "src", "App.css");
 const gateway = read("backend", "desktopGateway.js");
 const adapters = read("backend", "storageAdapters.js");
 const backend = read("backend", "server.js");
+const operationalV3 = read("backend", "operationalV3.js");
 const rust = read("src-tauri", "src", "lib.rs");
 const localDb = read("src-tauri", "src", "local_db.rs");
 
@@ -52,5 +53,11 @@ assert.ok(backend.includes('"/api/v3/operational-context"'), "Protocol v3 must e
 assert.ok(backend.includes('"/api/v3/inventory"'), "Protocol v3 inventory must be location-scoped");
 assert.ok(backend.includes("validateSyncBatchScope"), "Strict sync must reject mixed-location batches");
 assert.ok(backend.includes("SCOPE_MODES.ENFORCE"), "Operational-location enforcement must remain feature-gated");
+assert.ok(operationalV3.includes('"/api/v3/purchase-orders"'), "Protocol v3 purchase-order CRUD must remain registered");
+assert.ok(operationalV3.includes('"/api/v3/goods-receipts"'), "Protocol v3 GRN CRUD must remain registered");
+assert.ok(operationalV3.includes('"/api/v3/payment-allocations"'), "Protocol v3 payment-allocation CRUD must remain registered");
+assert.ok(operationalV3.includes('"/api/v3/transfers/:transferId/actions/:action"'), "Protocol v3 transfer transitions must remain registered");
+assert.ok(operationalV3.includes('"/api/v3/reports/consolidated"'), "Owner consolidated reporting must remain registered");
+assert.ok(operationalV3.includes("applyTransferStockEffect"), "Transfer transitions must retain stock effects");
 
 console.log("Production regression static tests passed");
