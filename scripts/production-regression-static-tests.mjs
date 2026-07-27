@@ -46,6 +46,11 @@ assert.ok(localDb.includes("ON CONFLICT(operation_id) DO NOTHING"), "Local outbo
 assert.ok(localDb.includes("ON CONFLICT(id) DO UPDATE"), "Pulled local entities must upsert idempotently");
 assert.ok(localDb.includes('apply_migration(&mut conn, "006_multibranch_identity_foundation"'), "SQLite identity migration must be active");
 assert.ok(localDb.includes('apply_migration(&mut conn, "007_cloud_runtime_and_inbox_foundation"'), "SQLite cloud inbox migration must be active");
+assert.ok(localDb.includes('apply_migration(&mut conn, "013_operational_location_foundation"'), "SQLite operational-location migration must be active");
 assert.ok(localDb.includes('"pos_sale" => apply_pulled_pos_sale_with_tx'), "Pulled POS sales must be applied to the second-device cache");
+assert.ok(backend.includes('"/api/v3/operational-context"'), "Protocol v3 must expose canonical operational context");
+assert.ok(backend.includes('"/api/v3/inventory"'), "Protocol v3 inventory must be location-scoped");
+assert.ok(backend.includes("validateSyncBatchScope"), "Strict sync must reject mixed-location batches");
+assert.ok(backend.includes("SCOPE_MODES.ENFORCE"), "Operational-location enforcement must remain feature-gated");
 
 console.log("Production regression static tests passed");

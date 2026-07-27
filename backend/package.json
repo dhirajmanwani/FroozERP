@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "check": "node --check server.js",
-    "test": "node --test aiBusinessAssistantRules.test.js aiBusinessAssistantSchema.test.js cloudProxyError.test.js frostAuthorization.test.js frostCore.test.js frostIntelligence.test.js identityPolicy.test.js storageAdapters.test.js"
+    "test": "node --test aiBusinessAssistantRules.test.js aiBusinessAssistantSchema.test.js cloudProxyError.test.js frostAuthorization.test.js frostCore.test.js frostIntelligence.test.js identityPolicy.test.js operationalMigration.test.js operationalScope.test.js storageAdapters.test.js"
   },
   "keywords": [],
   "author": "",
@@ -17,5 +17,8 @@
     "express": "^5.2.1",
     "nodemailer": "^9.0.0",
     "pg": "^8.21.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.4"
   }
 }

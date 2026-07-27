@@ -6,6 +6,7 @@ const migrationFiles = [
   "backend/migrations/cloud/005_multibranch_identity_foundation.sql",
   "backend/migrations/cloud/006_cloud_device_runtime_foundation.sql",
   "backend/migrations/cloud/008_canonical_utc_timestamps.sql",
+  "backend/migrations/cloud/009_operational_location_foundation.sql",
 ];
 
 async function main() {

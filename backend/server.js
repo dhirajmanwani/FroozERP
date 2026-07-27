@@ -25,6 +25,13 @@ const {
 } = require("./aiBusinessAssistantRules");
 const { registerAiBusinessAssistantRoutes } = require("./aiBusinessAssistantService");
 const { ensureAiBusinessAssistantSchema } = require("./aiBusinessAssistantSchema");
+const {
+  SCOPE_MODES,
+  createOperationalScopeService,
+  normalizeScopeMode,
+  requiresOperationalProtocolUpgrade,
+  validateSyncBatchScope,
+} = require("./operationalScope");
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
@@ -63,6 +70,8 @@ console.log(`DB host: ${databaseHost}`);
 console.log(`Runtime mode: ${runtimeMode}`);
 console.log(`Client PostgreSQL access blocked: ${!cloudServerRuntime}`);
 const pool = storageAdapter;
+const operationalScopeMode = normalizeScopeMode(process.env.FROOZERP_OPERATIONAL_SCOPE_MODE);
+const operationalScopeService = createOperationalScopeService(pool);
 const PORT = process.env.PORT || 5000;
 const backupDirectory = process.env.BACKUP_DIR || path.join(__dirname, "..", "backups");
 const readReleaseVersion = () => {
@@ -478,6 +487,20 @@ app.use((req, res, next) => cors({
     return callback(new Error("Origin not allowed by FroozERP CORS"));
   },
 })(req, res, next));
+
+app.use((req, res, next) => {
+  if (
+    operationalScopeMode === SCOPE_MODES.ENFORCE
+    && requiresOperationalProtocolUpgrade(req.path)
+  ) {
+    return res.status(426).json({
+      code: "CLIENT_UPGRADE_REQUIRED",
+      message: "This operational route requires a protocol-v3 client with an approved operational location.",
+      minimum_protocol_version: 3,
+    });
+  }
+  return next();
+});
 
 console.log(`CORS allowed origins: ${allowedCorsOrigins.join(", ")}`);
 console.log("CORS missing Origin allowed: true");
@@ -4681,14 +4704,23 @@ const calculateSalesMandiTax = ({ grossAmount, itemDiscountAmount, invoiceDiscou
   };
 };
 
-const insertSalePaymentAllocation = async (client, { saleId, payment, userId, branchId, deviceId }) => {
+const insertSalePaymentAllocation = async (client, {
+  saleId,
+  payment,
+  userId,
+  branchId,
+  deviceId,
+  companyId = null,
+  operationalLocationId = null,
+}) => {
   await client.query(
     `
     INSERT INTO sale_payments (
       sale_id, payment_mode, amount, reference_number, payment_time,
-      user_id, branch_id, device_id, status
+      user_id, company_id, branch_id, operational_location_id, device_id, status
     )
-    VALUES ($1, $2, $3, $4, COALESCE($5::timestamp, CURRENT_TIMESTAMP), $6, $7, $8, 'POSTED')
+    VALUES ($1, $2, $3, $4, COALESCE($5::timestamp, CURRENT_TIMESTAMP),
+            $6, $7, $8, $9, $10, 'POSTED')
     `,
     [
       saleId,
@@ -4697,7 +4729,9 @@ const insertSalePaymentAllocation = async (client, { saleId, payment, userId, br
       nullableText(payment.reference_number || payment.reference || payment.transaction_reference),
       payment.payment_time || payment.paid_at || null,
       userId || null,
+      companyId,
       branchId || null,
+      operationalLocationId,
       cleanText(deviceId || payment.device_id),
     ]
   );
@@ -4754,7 +4788,9 @@ const getSaleSnapshot = async (client, saleId) => {
 const restoreSaleInventory = async (client, saleId, userId, reason, transactionType = "IN") => {
   const allocationsResult = await client.query(
     `
-    SELECT sba.inventory_batch_id, sba.quantity, si.product_id, s.invoice_no, s.branch_id
+    SELECT
+      sba.inventory_batch_id, sba.quantity, si.product_id, s.invoice_no,
+      s.company_id, s.branch_id, s.operational_location_id
     FROM sale_batch_allocations sba
     JOIN sale_items si ON si.id = sba.sale_item_id
     JOIN sales s ON s.id = si.sale_id
@@ -4771,8 +4807,11 @@ const restoreSaleInventory = async (client, saleId, userId, reason, transactionT
     );
     await client.query(
       `
-      INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id)
-      VALUES ($1, $2, $3, $4, $5, $6)
+      INSERT INTO stock_transactions (
+        product_id, quantity, transaction_type, remarks, user_id,
+        company_id, branch_id, operational_location_id
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       `,
       [
         allocation.product_id,
@@ -4780,13 +4819,23 @@ const restoreSaleInventory = async (client, saleId, userId, reason, transactionT
         transactionType,
         `${reason} ${allocation.invoice_no || `#${saleId}`}`,
         userId,
+        allocation.company_id,
         allocation.branch_id,
+        allocation.operational_location_id,
       ]
     );
   }
 };
 
-const insertCustomerLedgerEntry = async (client, sale, transactionType, amount, userId, remarks) => {
+const insertCustomerLedgerEntry = async (
+  client,
+  sale,
+  transactionType,
+  amount,
+  userId,
+  remarks,
+  operationalContext = {}
+) => {
   const ledgerAmount = roundCurrency(Math.abs(Number(amount || 0)));
   if (!ledgerAmount && !sale.customer_mobile && !sale.customer_name) return;
   const isCredit = ["SALE_EDIT_CREDIT", "SALE_CANCELLED"].includes(transactionType);
@@ -4794,9 +4843,10 @@ const insertCustomerLedgerEntry = async (client, sale, transactionType, amount, 
     `
     INSERT INTO customer_ledger (
       sale_id, customer_id, customer_name, customer_mobile, transaction_type,
-      debit_amount, credit_amount, balance_delta, remarks, created_by, transaction_date
+      debit_amount, credit_amount, balance_delta, remarks, created_by, transaction_date,
+      company_id, branch_id, operational_location_id
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
     `,
     [
       sale.id,
@@ -4810,6 +4860,9 @@ const insertCustomerLedgerEntry = async (client, sale, transactionType, amount, 
       remarks,
       userId,
       sale.sale_date || sale.transaction_date || toDateKey(new Date()),
+      operationalContext.companyId || sale.company_id || null,
+      operationalContext.branchId || sale.branch_id || null,
+      operationalContext.operationalLocationId || sale.operational_location_id || null,
     ]
   );
 };
@@ -7754,7 +7807,7 @@ const SYNC_OPERATION_TYPES = new Set(["UPSERT", "DELETE", "CREATE", "UPDATE", "S
 const SYNC_ENTITY_TYPES = new Set(["sync_test", "pos_sale"]);
 const syncRateWindow = new Map();
 
-const requireSyncContext = async ({ userId, deviceId, branchId }, client = pool) => {
+const requireSyncContext = async ({ userId, deviceId, branchId, operationalLocationId }, client = pool) => {
   const parsedUserId = parsePositiveInteger(userId);
   const parsedBranchId = parsePositiveInteger(branchId);
   const cleanDeviceId = cleanText(deviceId);
@@ -7799,7 +7852,35 @@ const requireSyncContext = async ({ userId, deviceId, branchId }, client = pool)
   if (!userCompanyId || !branchCompanyId || userCompanyId !== branchCompanyId || deviceCompanyId !== branchCompanyId) {
     return { error: { status: 403, message: "Company or branch scope does not match this device" } };
   }
-  return { user, device, branch, companyId: branchCompanyId, branchId: parsedBranchId, deviceId: cleanDeviceId };
+  const legacyContext = {
+    user,
+    device,
+    branch,
+    companyId: branchCompanyId,
+    branchId: parsedBranchId,
+    deviceId: cleanDeviceId,
+    operationalLocationId: null,
+    assignmentGeneration: null,
+  };
+  if (operationalScopeMode !== SCOPE_MODES.ENFORCE) return legacyContext;
+  const scoped = await createOperationalScopeService(client).resolve({
+    userId: parsedUserId,
+    deviceId: cleanDeviceId,
+    submitted: {
+      company_id: branchCompanyId,
+      branch_id: parsedBranchId,
+      operational_location_id: operationalLocationId,
+    },
+    requireWrite: true,
+  });
+  if (scoped.error) return { error: scoped.error };
+  return {
+    ...legacyContext,
+    companyId: scoped.context.company_id,
+    branchId: scoped.context.branch_id,
+    operationalLocationId: scoped.context.operational_location_id,
+    assignmentGeneration: scoped.context.assignment_generation,
+  };
 };
 
 const rateLimitSyncRequest = (req, res, next) => {
@@ -7818,16 +7899,35 @@ const rateLimitSyncRequest = (req, res, next) => {
   return next();
 };
 
-const logSyncChange = async (client, { branchId = 1, entityType, entityId, operationType = "UPSERT", version = 1, payload = {} }) => {
+const logSyncChange = async (client, {
+  branchId = 1,
+  operationalLocationId = null,
+  assignmentGeneration = null,
+  entityType,
+  entityId,
+  operationType = "UPSERT",
+  version = 1,
+  payload = {},
+}) => {
   const result = await client.query(
     `
     INSERT INTO sync_change_log (
-      company_id, branch_id, entity_type, entity_id, operation_type, entity_version, payload
+      company_id, branch_id, operational_location_id, assignment_generation,
+      entity_type, entity_id, operation_type, entity_version, payload
     )
-    VALUES ((SELECT company_id FROM branches WHERE id = $1), $1, $2, $3, $4, $5, $6::jsonb)
+    VALUES ((SELECT company_id FROM branches WHERE id = $1), $1, $2, $3, $4, $5, $6, $7, $8::jsonb)
     RETURNING change_id, created_at
     `,
-    [branchId, entityType, String(entityId), operationType, version, JSON.stringify(payload)]
+    [
+      branchId,
+      operationalLocationId,
+      assignmentGeneration,
+      entityType,
+      String(entityId),
+      operationType,
+      version,
+      JSON.stringify(payload),
+    ]
   );
   return result.rows[0];
 };
@@ -7906,10 +8006,11 @@ const storeProcessedOperation = async (client, operation, context, ack) => {
   await client.query(
     `
     INSERT INTO sync_processed_operations (
-      operation_id, device_id, company_id, branch_id, created_by_user_id,
-      source_device_id, entity_type, entity_id, result_status, result_payload, processed_at
+      operation_id, device_id, company_id, branch_id, operational_location_id,
+      assignment_generation, created_by_user_id, source_device_id,
+      entity_type, entity_id, result_status, result_payload, processed_at
     )
-    VALUES ($1, $2, $3, $4, $5, $2, $6, $7, $8, $9::jsonb, CURRENT_TIMESTAMP)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $2, $8, $9, $10, $11::jsonb, CURRENT_TIMESTAMP)
     ON CONFLICT (operation_id) DO NOTHING
     `,
     [
@@ -7917,6 +8018,8 @@ const storeProcessedOperation = async (client, operation, context, ack) => {
       context.deviceId,
       context.companyId,
       context.branchId,
+      context.operationalLocationId,
+      context.assignmentGeneration,
       context.user.id,
       operation.entity_type,
       operation.entity_id,
@@ -7959,6 +8062,8 @@ const processSyncTestOperation = async (client, operation, context) => {
     if (!row) return rejectOperation(operation, "NOT_FOUND", "Sync test entity not found");
     const change = await logSyncChange(client, {
       branchId: context.branchId,
+      operationalLocationId: context.operationalLocationId,
+      assignmentGeneration: context.assignmentGeneration,
       entityType: "sync_test",
       entityId: row.id,
       operationType: "DELETE",
@@ -7991,6 +8096,8 @@ const processSyncTestOperation = async (client, operation, context) => {
   const row = result.rows[0];
   const change = await logSyncChange(client, {
     branchId: context.branchId,
+    operationalLocationId: context.operationalLocationId,
+    assignmentGeneration: context.assignmentGeneration,
     entityType: "sync_test",
     entityId: row.id,
     operationType: "UPSERT",
@@ -8067,20 +8174,31 @@ const syncSaleEnvelope = (operation) => {
   };
 };
 
-const findSyncedSaleForOperation = async (client, operation) => {
+const findSyncedSaleForOperation = async (client, operation, context) => {
   const { invoiceGlobalId, offlineInvoiceRef } = syncSaleEnvelope(operation);
   if (!invoiceGlobalId && !offlineInvoiceRef) return null;
   const result = await client.query(
     `
     SELECT *
     FROM sales
-    WHERE ($1 <> '' AND global_id = $1)
-       OR ($2 <> '' AND offline_invoice_ref = $2)
+    WHERE (
+      ($1 <> '' AND global_id = $1)
+      OR ($2 <> '' AND offline_invoice_ref = $2)
+    )
+      AND ($3::INTEGER IS NULL OR company_id = $3)
+      AND ($4::INTEGER IS NULL OR branch_id = $4)
+      AND ($5::INTEGER IS NULL OR operational_location_id = $5)
     ORDER BY id DESC
     LIMIT 1
     FOR UPDATE
     `,
-    [invoiceGlobalId, offlineInvoiceRef]
+    [
+      invoiceGlobalId,
+      offlineInvoiceRef,
+      context?.companyId || null,
+      context?.branchId || null,
+      context?.operationalLocationId || null,
+    ]
   );
   return result.rows[0] || null;
 };
@@ -8096,8 +8214,20 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     return rejectOperation(operation, "VALIDATION_ERROR", "POS sale requires at least one item");
   }
   const existingSale = await client.query(
-    "SELECT id, invoice_no, entity_version, created_at FROM sales WHERE global_id = $1 OR offline_invoice_ref = $2 LIMIT 1",
-    [invoiceGlobalId, offlineInvoiceRef]
+    `SELECT id, invoice_no, entity_version, created_at
+     FROM sales
+     WHERE (global_id = $1 OR offline_invoice_ref = $2)
+       AND ($3::INTEGER IS NULL OR company_id = $3)
+       AND ($4::INTEGER IS NULL OR branch_id = $4)
+       AND ($5::INTEGER IS NULL OR operational_location_id = $5)
+     LIMIT 1`,
+    [
+      invoiceGlobalId,
+      offlineInvoiceRef,
+      context.companyId,
+      context.branchId,
+      context.operationalLocationId,
+    ]
   );
   if (existingSale.rows[0]) {
     return {
@@ -8115,8 +8245,19 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     };
   }
   const duplicate = await client.query(
-    "SELECT * FROM sync_pos_sale_staging WHERE invoice_global_id = $1 OR offline_invoice_ref = $2 LIMIT 1",
-    [invoiceGlobalId, offlineInvoiceRef]
+    `SELECT * FROM sync_pos_sale_staging
+     WHERE (invoice_global_id = $1 OR offline_invoice_ref = $2)
+       AND ($3::INTEGER IS NULL OR company_id = $3)
+       AND ($4::INTEGER IS NULL OR branch_id = $4)
+       AND ($5::INTEGER IS NULL OR operational_location_id = $5)
+     LIMIT 1`,
+    [
+      invoiceGlobalId,
+      offlineInvoiceRef,
+      context.companyId,
+      context.branchId,
+      context.operationalLocationId,
+    ]
   );
   if (duplicate.rows[0]) {
     return {
@@ -8133,15 +8274,19 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     await client.query(
       `
       INSERT INTO sync_conflict_log (
-        operation_id, device_id, branch_id, entity_type, entity_id,
+        operation_id, device_id, company_id, branch_id, operational_location_id,
+        assignment_generation, entity_type, entity_id,
         local_version, server_version, local_payload, server_payload, reason
       )
-      VALUES ($1, $2, $3, 'pos_sale', $4, $5, $6, $7::jsonb, $8::jsonb, $9)
+      VALUES ($1, $2, $3, $4, $5, $6, 'pos_sale', $7, $8, $9, $10::jsonb, $11::jsonb, $12)
       `,
       [
         operation.operation_id,
         context.deviceId,
+        context.companyId,
         context.branchId,
+        context.operationalLocationId,
+        context.assignmentGeneration,
         invoiceGlobalId,
         operation.version || 1,
         null,
@@ -8172,8 +8317,14 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
   }
   const lotIds = [...stockRequests.values()].map((request) => request.lotId);
   const lotsResult = await client.query(
-    "SELECT id, product_id, remaining_qty, batch_status FROM inventory_batches WHERE id = ANY($1::int[]) AND branch_id = $2 FOR UPDATE",
-    [lotIds, context.branchId]
+    `SELECT id, product_id, remaining_qty, batch_status
+     FROM inventory_batches
+     WHERE id = ANY($1::int[])
+       AND branch_id = $2
+       AND ($3::INTEGER IS NULL OR company_id = $3)
+       AND ($4::INTEGER IS NULL OR operational_location_id = $4)
+     FOR UPDATE`,
+    [lotIds, context.branchId, context.companyId, context.operationalLocationId]
   );
   const lotsById = new Map(lotsResult.rows.map((row) => [Number(row.id), row]));
   for (const request of stockRequests.values()) {
@@ -8227,11 +8378,12 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
       discount_rule_id, discount_rule_name, discount_rule_type, discount_rule_value,
       discount_rule_payment_mode, profit_status, sale_date, transaction_date,
       bill_datetime, backdated_bill, backdate_reason, due_date, credit_remarks, credit_status,
-      global_id, offline_invoice_ref, source_device_id, entity_version
+      global_id, offline_invoice_ref, source_device_id,
+      company_id, operational_location_id, entity_version
     )
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
             $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
-            $32, $33, $34, $35, $36, 1)
+            $32, $33, $34, $35, $36, $37, $38, 1)
     RETURNING *
     `,
     [
@@ -8271,6 +8423,8 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
       invoiceGlobalId,
       offlineInvoiceRef,
       context.deviceId,
+      context.companyId,
+      context.operationalLocationId,
     ]
   );
   const sale = saleResult.rows[0];
@@ -8325,10 +8479,21 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     }
     await client.query(
       `
-      INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id)
-      VALUES ($1, $2, 'OUT', $3, $4, $5)
+      INSERT INTO stock_transactions (
+        product_id, quantity, transaction_type, remarks, user_id,
+        company_id, branch_id, operational_location_id
+      )
+      VALUES ($1, $2, 'OUT', $3, $4, $5, $6, $7)
       `,
-      [item.productId, item.quantity, `Offline invoice ${offlineInvoiceRef} synced as ${invoiceNo}`, context.user.id, context.branchId]
+      [
+        item.productId,
+        item.quantity,
+        `Offline invoice ${offlineInvoiceRef} synced as ${invoiceNo}`,
+        context.user.id,
+        context.companyId,
+        context.branchId,
+        context.operationalLocationId,
+      ]
     );
   }
 
@@ -8339,6 +8504,8 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
       userId: context.user.id,
       branchId: context.branchId,
       deviceId: context.deviceId,
+      companyId: context.companyId,
+      operationalLocationId: context.operationalLocationId,
     });
   }
 
@@ -8348,22 +8515,37 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     "SALE",
     salePayload.totalAmount,
     context.user.id,
-    `Offline invoice ${offlineInvoiceRef} synced as ${invoiceNo}`
+    `Offline invoice ${offlineInvoiceRef} synced as ${invoiceNo}`,
+    context
   );
 
   const result = await client.query(
     `
     INSERT INTO sync_pos_sale_staging (
-      invoice_global_id, offline_invoice_ref, branch_id, device_id, created_by, payload, result_status
+      invoice_global_id, offline_invoice_ref, company_id, branch_id,
+      operational_location_id, assignment_generation,
+      device_id, created_by, payload, result_status
     )
-    VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'live_sale_created')
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, 'live_sale_created')
     RETURNING *
     `,
-    [invoiceGlobalId, offlineInvoiceRef, context.branchId, context.deviceId, context.user.id, JSON.stringify(payload)]
+    [
+      invoiceGlobalId,
+      offlineInvoiceRef,
+      context.companyId,
+      context.branchId,
+      context.operationalLocationId,
+      context.assignmentGeneration,
+      context.deviceId,
+      context.user.id,
+      JSON.stringify(payload),
+    ]
   );
   const row = result.rows[0];
   const change = await logSyncChange(client, {
     branchId: context.branchId,
+    operationalLocationId: context.operationalLocationId,
+    assignmentGeneration: context.assignmentGeneration,
     entityType: "pos_sale",
     entityId: invoiceGlobalId,
     operationType: "UPSERT",
@@ -8391,7 +8573,7 @@ const processPosSaleEditOperation = async (client, operation, context) => {
   if (!reason) return rejectOperation(operation, "VALIDATION_ERROR", "Offline sale edit requires a reason");
   const editor = await getSalePermissionUser(context.user.id, "edit", client);
   if (!editor) return rejectOperation(operation, "AUTHORIZATION_ERROR", "Sync user is not allowed to edit sales");
-  const currentSale = await findSyncedSaleForOperation(client, operation);
+  const currentSale = await findSyncedSaleForOperation(client, operation, context);
   if (!currentSale) {
     return rejectOperation(operation, "DEPENDENCY_MISSING", "Original offline sale must sync before its edit can be applied");
   }
@@ -8593,6 +8775,8 @@ const processPosSaleEditOperation = async (client, operation, context) => {
   }
   const change = await logSyncChange(client, {
     branchId: context.branchId,
+    operationalLocationId: context.operationalLocationId,
+    assignmentGeneration: context.assignmentGeneration,
     entityType: "pos_sale",
     entityId: invoiceGlobalId || operation.entity_id,
     operationType: "SALE_EDIT",
@@ -8615,7 +8799,7 @@ const processPosSaleCancelOperation = async (client, operation, context) => {
   const cancelReason = reason || "Offline invoice cancelled";
   const canceller = await getSalePermissionUser(context.user.id, "cancel", client);
   if (!canceller) return rejectOperation(operation, "AUTHORIZATION_ERROR", "Sync user is not allowed to cancel sales");
-  const currentSale = await findSyncedSaleForOperation(client, operation);
+  const currentSale = await findSyncedSaleForOperation(client, operation, context);
   if (!currentSale) {
     return rejectOperation(operation, "DEPENDENCY_MISSING", "Original offline sale must sync before its cancellation can be applied");
   }
@@ -8665,6 +8849,8 @@ const processPosSaleCancelOperation = async (client, operation, context) => {
   );
   const change = await logSyncChange(client, {
     branchId: context.branchId,
+    operationalLocationId: context.operationalLocationId,
+    assignmentGeneration: context.assignmentGeneration,
     entityType: "pos_sale",
     entityId: invoiceGlobalId || operation.entity_id,
     operationType: "SALE_CANCEL",
@@ -8796,6 +8982,10 @@ app.get("/api/system/compatibility", async (req, res) => {
     frontendVersion,
     backendVersion: appVersion,
     schemaVersion: apiContractVersion,
+    operationalLocationProtocolVersion: 3,
+    operationalScopeMode,
+    strictLocationWrites: operationalScopeMode === SCOPE_MODES.ENFORCE,
+    minimumLocationCompatibleClient: "first client implementing protocol v3",
     frostApiVersion,
     supportedFrostCapabilities,
     compatible: frontendVersion === appVersion,
@@ -8890,12 +9080,127 @@ const registerSyncDeviceHandler = async (req, res) => {
 app.post("/api/sync/register-device", rateLimitSyncRequest, registerSyncDeviceHandler);
 app.post("/api/device/register", rateLimitSyncRequest, registerSyncDeviceHandler);
 
+const sendOperationalScopeError = (res, error) => res.status(error.status || 403).json({
+  code: error.code || "OPERATIONAL_SCOPE_REJECTED",
+  message: error.message,
+});
+
+const resolveV3OperationalContext = async (req, { requireWrite = false } = {}) => {
+  try {
+    return await operationalScopeService.resolve({
+      userId: req.body?.user_id || req.query?.user_id || req.headers["x-user-id"],
+      deviceId: req.body?.device_id || req.query?.device_id || req.headers["x-device-id"],
+      submitted: {
+        company_id: req.body?.company_id || req.query?.company_id,
+        branch_id: req.body?.branch_id || req.query?.branch_id,
+        operational_location_id:
+          req.body?.operational_location_id || req.query?.operational_location_id,
+        scope: req.body?.scope || req.query?.scope,
+      },
+      requireWrite,
+    });
+  } catch (error) {
+    if (error.code === "42P01" || /does not exist/i.test(error.message || "")) {
+      return {
+        error: {
+          status: 409,
+          code: "LOCATION_SCOPE_NOT_PROVISIONED",
+          message: "Operational-location schema has not been provisioned.",
+        },
+      };
+    }
+    throw error;
+  }
+};
+
+app.get("/api/v3/operational-context", rateLimitSyncRequest, async (req, res) => {
+  try {
+    const resolved = await resolveV3OperationalContext(req);
+    if (resolved.error) return sendOperationalScopeError(res, resolved.error);
+    return res.json({
+      status: "ok",
+      protocol_version: 3,
+      scope_mode: operationalScopeMode,
+      context: resolved.context,
+      ...serverTimePayload(),
+    });
+  } catch (error) {
+    console.error("Operational context lookup failed", error.message);
+    return res.status(500).json({ code: "OPERATIONAL_CONTEXT_FAILED", message: "Operational context lookup failed" });
+  }
+});
+
+app.get("/api/v3/operational-locations", rateLimitSyncRequest, async (req, res) => {
+  try {
+    const resolved = await resolveV3OperationalContext(req);
+    if (resolved.error) return sendOperationalScopeError(res, resolved.error);
+    const context = resolved.context;
+    const result = await pool.query(
+      `
+      SELECT id, company_id, branch_id, location_code, location_name,
+             location_type, timezone, active, is_default
+      FROM operational_locations
+      WHERE id = $1 AND company_id = $2 AND branch_id = $3
+      `,
+      [context.operational_location_id, context.company_id, context.branch_id]
+    );
+    return res.json({ scope: context, locations: result.rows });
+  } catch (error) {
+    console.error("Operational location lookup failed", error.message);
+    return res.status(500).json({ code: "OPERATIONAL_LOCATION_LOOKUP_FAILED", message: "Operational location lookup failed" });
+  }
+});
+
+app.get("/api/v3/inventory", rateLimitSyncRequest, async (req, res) => {
+  try {
+    const resolved = await resolveV3OperationalContext(req);
+    if (resolved.error) return sendOperationalScopeError(res, resolved.error);
+    const context = resolved.context;
+    const result = await pool.query(
+      `
+      SELECT
+        p.id AS product_id,
+        p.global_id AS product_global_id,
+        p.product_name,
+        olp.enabled,
+        olp.pos_available,
+        COALESCE(olp.selling_rate, p.selling_rate) AS selling_rate,
+        olp.reorder_level,
+        ib.id AS inventory_lot_id,
+        ib.global_id AS lot_global_id,
+        ib.remaining_qty,
+        ib.purchase_rate,
+        ib.effective_cost_per_unit,
+        ib.batch_status
+      FROM operational_location_products olp
+      JOIN products p ON p.id = olp.product_id AND p.company_id = olp.company_id
+      LEFT JOIN inventory_batches ib
+        ON ib.product_id = p.id
+       AND ib.company_id = olp.company_id
+       AND ib.branch_id = olp.branch_id
+       AND ib.operational_location_id = olp.operational_location_id
+       AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+      WHERE olp.company_id = $1
+        AND olp.branch_id = $2
+        AND olp.operational_location_id = $3
+      ORDER BY p.product_name, ib.purchase_date, ib.id
+      `,
+      [context.company_id, context.branch_id, context.operational_location_id]
+    );
+    return res.json({ scope: context, inventory: result.rows });
+  } catch (error) {
+    console.error("Location inventory lookup failed", error.message);
+    return res.status(500).json({ code: "LOCATION_INVENTORY_LOOKUP_FAILED", message: "Location inventory lookup failed" });
+  }
+});
+
 app.get("/api/device/identity", rateLimitSyncRequest, async (req, res) => {
   try {
     const context = await requireSyncContext({
       userId: req.query.user_id,
       deviceId: req.query.device_id,
       branchId: req.query.branch_id,
+      operationalLocationId: req.query.operational_location_id,
     });
     if (context.error) return res.status(context.error.status).json({ message: context.error.message });
     const branchResult = await pool.query(
@@ -8941,6 +9246,7 @@ app.get("/api/branch/status", rateLimitSyncRequest, async (req, res) => {
       userId: req.query.user_id,
       deviceId: req.query.device_id,
       branchId: req.query.branch_id,
+      operationalLocationId: req.query.operational_location_id,
     });
     if (context.error) return res.status(context.error.status).json({ message: context.error.message });
     const [branchResult, deviceSummaryResult] = await Promise.all([
@@ -8999,10 +9305,22 @@ app.post("/api/sync/push", rateLimitSyncRequest, async (req, res) => {
       userId: req.body.user_id,
       deviceId: req.body.device_id,
       branchId: req.body.branch_id,
+      operationalLocationId: req.body.operational_location_id,
     }, client);
     if (context.error) {
       await client.query("ROLLBACK");
       return res.status(context.error.status).json({ message: context.error.message });
+    }
+    if (operationalScopeMode === SCOPE_MODES.ENFORCE) {
+      const scopeValidationError = validateSyncBatchScope(operations, {
+        company_id: context.companyId,
+        branch_id: context.branchId,
+        operational_location_id: context.operationalLocationId,
+      });
+      if (scopeValidationError) {
+        await client.query("ROLLBACK");
+        return sendOperationalScopeError(res, scopeValidationError);
+      }
     }
     // Client clocks are diagnostic only. Server-side entity versions and stable
     // operation IDs determine processing and conflict behavior.
@@ -9023,6 +9341,8 @@ app.post("/api/sync/push", rateLimitSyncRequest, async (req, res) => {
       device_id: context.deviceId,
       company_id: context.companyId,
       branch_id: context.branchId,
+      operational_location_id: context.operationalLocationId,
+      assignment_generation: context.assignmentGeneration,
       ...serverTimePayload(),
       acknowledgements,
     });
@@ -9041,6 +9361,7 @@ app.get("/api/sync/pull", rateLimitSyncRequest, async (req, res) => {
       userId: req.query.user_id,
       deviceId: req.query.device_id,
       branchId: req.query.branch_id,
+      operationalLocationId: req.query.operational_location_id,
     });
     if (context.error) return res.status(context.error.status).json({ message: context.error.message });
     const cursor = Math.max(0, Number(req.query.cursor || 0));
@@ -9053,10 +9374,17 @@ app.get("/api/sync/pull", rateLimitSyncRequest, async (req, res) => {
       WHERE company_id = $1
         AND branch_id = $2
         AND change_id > $3
+        AND ($5::INTEGER IS NULL OR operational_location_id = $5)
       ORDER BY change_id
       LIMIT $4
       `,
-      [context.companyId, context.branchId, cursor, limit + 1]
+      [
+        context.companyId,
+        context.branchId,
+        cursor,
+        limit + 1,
+        operationalScopeMode === SCOPE_MODES.ENFORCE ? context.operationalLocationId : null,
+      ]
     );
     const rows = result.rows.slice(0, limit);
     const nextCursor = rows.length ? String(rows[rows.length - 1].change_id) : String(cursor);
@@ -9067,6 +9395,7 @@ app.get("/api/sync/pull", rateLimitSyncRequest, async (req, res) => {
     return res.json({
       company_id: context.companyId,
       branch_id: context.branchId,
+      operational_location_id: context.operationalLocationId,
       changes: rows,
       next_cursor: nextCursor,
       ...serverTimePayload(),
@@ -9084,14 +9413,18 @@ app.get("/api/sync/status", rateLimitSyncRequest, async (req, res) => {
       userId: req.query.user_id,
       deviceId: req.query.device_id,
       branchId: req.query.branch_id,
+      operationalLocationId: req.query.operational_location_id,
     });
     if (context.error) return res.status(context.error.status).json({ message: context.error.message });
+    const enforcedLocationId = operationalScopeMode === SCOPE_MODES.ENFORCE
+      ? context.operationalLocationId
+      : null;
     const [processed, pending, failed, conflicts, changes] = await Promise.all([
-      pool.query("SELECT COUNT(*)::INTEGER AS count FROM sync_processed_operations WHERE device_id = $1 AND company_id = $2 AND branch_id = $3", [context.deviceId, context.companyId, context.branchId]),
-      pool.query("SELECT COUNT(*)::INTEGER AS count FROM sync_inbox_operations WHERE source_device_id = $1 AND company_id = $2 AND branch_id = $3 AND LOWER(sync_status) IN ('pending', 'received')", [context.deviceId, context.companyId, context.branchId]),
-      pool.query("SELECT COUNT(*)::INTEGER AS count FROM sync_processed_operations WHERE device_id = $1 AND company_id = $2 AND branch_id = $3 AND LOWER(result_status) IN ('failed', 'rejected')", [context.deviceId, context.companyId, context.branchId]),
-      pool.query("SELECT COUNT(*)::INTEGER AS count FROM sync_conflict_log WHERE device_id = $1 AND company_id = $2 AND branch_id = $3 AND status = 'open'", [context.deviceId, context.companyId, context.branchId]),
-      pool.query("SELECT COALESCE(MAX(change_id), 0)::BIGINT AS cursor FROM sync_change_log WHERE company_id = $1 AND branch_id = $2", [context.companyId, context.branchId]),
+      pool.query("SELECT COUNT(*)::INTEGER AS count FROM sync_processed_operations WHERE device_id = $1 AND company_id = $2 AND branch_id = $3 AND ($4::INTEGER IS NULL OR operational_location_id = $4)", [context.deviceId, context.companyId, context.branchId, enforcedLocationId]),
+      pool.query("SELECT COUNT(*)::INTEGER AS count FROM sync_inbox_operations WHERE source_device_id = $1 AND company_id = $2 AND branch_id = $3 AND ($4::INTEGER IS NULL OR operational_location_id = $4) AND LOWER(sync_status) IN ('pending', 'received')", [context.deviceId, context.companyId, context.branchId, enforcedLocationId]),
+      pool.query("SELECT COUNT(*)::INTEGER AS count FROM sync_processed_operations WHERE device_id = $1 AND company_id = $2 AND branch_id = $3 AND ($4::INTEGER IS NULL OR operational_location_id = $4) AND LOWER(result_status) IN ('failed', 'rejected')", [context.deviceId, context.companyId, context.branchId, enforcedLocationId]),
+      pool.query("SELECT COUNT(*)::INTEGER AS count FROM sync_conflict_log WHERE device_id = $1 AND company_id = $2 AND branch_id = $3 AND ($4::INTEGER IS NULL OR operational_location_id = $4) AND status = 'open'", [context.deviceId, context.companyId, context.branchId, enforcedLocationId]),
+      pool.query("SELECT COALESCE(MAX(change_id), 0)::BIGINT AS cursor FROM sync_change_log WHERE company_id = $1 AND branch_id = $2 AND ($3::INTEGER IS NULL OR operational_location_id = $3)", [context.companyId, context.branchId, enforcedLocationId]),
     ]);
     return res.json({
       status: "ok",
@@ -9100,6 +9433,7 @@ app.get("/api/sync/status", rateLimitSyncRequest, async (req, res) => {
       company_id: context.companyId,
       device_id: context.deviceId,
       branch_id: context.branchId,
+      operational_location_id: context.operationalLocationId,
       user_id: context.user.id,
       role: context.user.role_name,
       last_sync_at: context.device.last_sync_at || null,

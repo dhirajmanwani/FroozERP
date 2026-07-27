@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
-const CURRENT_SCHEMA_VERSION: &str = "012_connectivity_mode_server_time";
+const CURRENT_SCHEMA_VERSION: &str = "013_operational_location_foundation";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -19,6 +19,7 @@ const MIGRATION_009: &str = include_str!("../migrations/sqlite/009_canonical_utc
 const MIGRATION_010: &str = include_str!("../migrations/sqlite/010_sync_delivery_state.sql");
 const MIGRATION_011: &str = include_str!("../migrations/sqlite/011_connectivity_mode_audit.sql");
 const MIGRATION_012: &str = include_str!("../migrations/sqlite/012_connectivity_mode_server_time.sql");
+const MIGRATION_013: &str = include_str!("../migrations/sqlite/013_operational_location_foundation.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -1436,6 +1437,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "010_sync_delivery_state", MIGRATION_010)?;
     apply_migration(&mut conn, "011_connectivity_mode_audit", MIGRATION_011)?;
     apply_migration(&mut conn, "012_connectivity_mode_server_time", MIGRATION_012)?;
+    apply_migration(&mut conn, "013_operational_location_foundation", MIGRATION_013)?;
     Ok(())
 }
 
@@ -2935,7 +2937,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("migration count");
-            assert_eq!(migration_count, 11);
+            assert_eq!(migration_count, 12);
             drop(conn);
             initialize_at(path).expect("restart with existing SQLite profile");
             let restored = ensure_device_identity_at(path).expect("restore device identity");
@@ -2997,7 +2999,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("preserved marker");
-        assert_eq!(migration_count, 11);
+        assert_eq!(migration_count, 12);
         assert_eq!(marker, "keep-me");
         drop(conn);
         let _ = fs::remove_file(&path);
