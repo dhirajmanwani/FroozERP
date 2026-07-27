@@ -14,8 +14,9 @@ if (!sqlitePath || !outputPath || !connectionString) {
 }
 
 const parsedUrl = new URL(connectionString);
-if (!["127.0.0.1", "localhost"].includes(parsedUrl.hostname) || parsedUrl.pathname !== "/froozerp_staging") {
-  throw new Error("Customer reconciliation is restricted to localhost/froozerp_staging");
+if (!["127.0.0.1", "localhost"].includes(parsedUrl.hostname) ||
+    !/^\/froozerp_(?:current_)?staging$/.test(parsedUrl.pathname)) {
+  throw new Error("Customer reconciliation is restricted to a localhost FroozERP staging database");
 }
 
 const normalizeText = (value) => String(value ?? "").trim().replace(/\s+/g, " ").toLowerCase();
@@ -48,7 +49,7 @@ const run = async () => {
   const cloud = new Client({ connectionString });
   await cloud.connect();
   const currentDatabase = await cloud.query("SELECT current_database() AS name");
-  if (currentDatabase.rows[0]?.name !== "froozerp_staging") {
+  if (!/^froozerp_(?:current_)?staging$/.test(currentDatabase.rows[0]?.name || "")) {
     throw new Error("Unexpected staging database");
   }
   await cloud.query("BEGIN TRANSACTION READ ONLY");

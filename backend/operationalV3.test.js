@@ -249,3 +249,49 @@ test("payment allocation rejects payment over-allocation", async () => {
     (error) => error.code === "PAYMENT_OVER_ALLOCATION"
   );
 });
+
+test("payment source validation uses deployed payment_amount columns", async () => {
+  const calls = [];
+  const responses = [
+    { rows: [{ amount: "100" }] },
+    { rows: [{ amount: "100" }] },
+    { rows: [{ payment_allocated: "0", target_allocated: "0" }] },
+  ];
+  const database = {
+    query: async (sql) => {
+      calls.push(sql);
+      return responses.shift();
+    },
+  };
+  const result = await validatePaymentAllocation(database, ownerContext, {
+    payment_entity_type: "CUSTOMER_PAYMENT",
+    payment_entity_id: 1,
+    target_entity_type: "SALE",
+    target_entity_id: 2,
+    allocated_amount: 40,
+  });
+  assert.equal(result.amount, 40);
+  assert.match(calls[0], /SELECT payment_amount AS amount FROM customer_payments/);
+});
+
+test("assignment preview separates target scope from authenticated caller scope", async () => {
+  const responses = [
+    { rows: [{ id: 20, company_id: 1, branch_id: 2, location_name: "Mansarovar", active: true }] },
+    { rows: [{ device_id: "DEVICE-2", device_name: "Counter", device_type: "laptop", status: "APPROVED" }] },
+    { rows: [{ count: 0 }] },
+  ];
+  let index = 0;
+  const preview = await validateAssignmentPreview(
+    { query: async () => responses[index++] },
+    ownerContext,
+    {
+      device_id: ownerContext.device_id,
+      target_device_id: "DEVICE-2",
+      target_branch_id: 2,
+      target_operational_location_id: 20,
+    },
+    "device"
+  );
+  assert.equal(preview.subject.device_id, "DEVICE-2");
+  assert.equal(preview.reassignment_allowed, true);
+});

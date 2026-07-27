@@ -129,14 +129,16 @@ const validateAssignmentPreview = async (database, context, body, type) => {
   if (!canManageAssignments(context)) {
     throw routeError(403, "ASSIGNMENT_ADMIN_REQUIRED", "Owner assignment permission is required");
   }
-  const branchId = positiveId(body?.branch_id);
-  const locationId = positiveId(body?.operational_location_id);
+  const branchId = positiveId(body?.target_branch_id || body?.branch_id);
+  const locationId = positiveId(
+    body?.target_operational_location_id || body?.operational_location_id
+  );
   if (!branchId || !locationId) {
     throw routeError(400, "ASSIGNMENT_SCOPE_REQUIRED", "Branch and operational location are required");
   }
   const location = await validateLocation(database, context.company_id, branchId, locationId);
   if (type === "staff") {
-    const userId = positiveId(body?.user_id);
+    const userId = positiveId(body?.target_user_id || body?.user_id);
     if (!userId) throw routeError(400, "USER_REQUIRED", "A user is required");
     const user = await database.query(
       `SELECT u.id, u.username, u.active, r.role_name
@@ -149,7 +151,7 @@ const validateAssignmentPreview = async (database, context, body, type) => {
     }
     return { type, location, subject: user.rows[0], would_write: false };
   }
-  const deviceId = cleanText(body?.device_id, 160);
+  const deviceId = cleanText(body?.target_device_id || body?.device_id, 160);
   if (!deviceId) throw routeError(400, "DEVICE_REQUIRED", "A canonical device ID is required");
   const device = await database.query(
     `SELECT device_id, device_name, device_type, status
@@ -163,7 +165,8 @@ const validateAssignmentPreview = async (database, context, body, type) => {
   const pending = await database.query(
     `SELECT COUNT(*)::int AS count
      FROM sync_inbox_operations
-     WHERE device_id = $1 AND COALESCE(status, 'pending') IN ('pending', 'failed', 'conflict')`,
+     WHERE source_device_id = $1
+       AND COALESCE(sync_status, 'pending') IN ('pending', 'failed', 'conflict')`,
     [deviceId]
   );
   const pendingCount = Number(pending.rows?.[0]?.count || 0);
@@ -178,8 +181,8 @@ const validateAssignmentPreview = async (database, context, body, type) => {
 };
 
 const PAYMENT_SOURCES = Object.freeze({
-  CUSTOMER_PAYMENT: { table: "customer_payments", amount: "amount" },
-  SUPPLIER_PAYMENT: { table: "supplier_payments", amount: "amount" },
+  CUSTOMER_PAYMENT: { table: "customer_payments", amount: "payment_amount" },
+  SUPPLIER_PAYMENT: { table: "supplier_payments", amount: "payment_amount" },
   SALE_PAYMENT: { table: "sale_payments", amount: "amount" },
 });
 const PAYMENT_TARGETS = Object.freeze({
@@ -700,6 +703,13 @@ const registerOperationalV3Routes = ({
 
   use("post", "/api/v3/payment-allocations", async (req, res, context) => {
     const key = requiredIdempotencyKey(req.body);
+    const existing = await database.query(
+      "SELECT * FROM payment_allocations WHERE idempotency_key = $1",
+      [key]
+    );
+    if (existing.rows?.[0]) {
+      return res.json({ payment_allocation: existing.rows[0], scope: context, ...serverTimePayload() });
+    }
     const targetBranchId = positiveId(req.body.target_branch_id);
     const targetLocationId = positiveId(req.body.target_operational_location_id);
     if (!targetBranchId || !targetLocationId) {
