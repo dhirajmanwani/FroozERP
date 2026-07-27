@@ -2,6 +2,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
 const { Pool } = require("../../backend/node_modules/pg");
 const { createOperationalScopeService } = require("../../backend/operationalScope");
 const {
@@ -17,6 +18,7 @@ const {
 } = require("../../backend/syncReferenceBootstrap");
 
 const connectionString = process.env.STAGING_DATABASE_URL;
+const deviceSessionSecret = String(process.env.DEVICE_SESSION_SECRET || "");
 const outputPath = path.resolve(process.argv[2] || "");
 const MAIN_DEVICE = "FZDEV-DELL-1781852580596";
 const SECOND_DEVICE = "FZDEV-B138C714-C159-40BB-BDBF-5588ECC04756";
@@ -25,6 +27,9 @@ const LOCATION_TWO = 1002;
 
 if (!connectionString || !outputPath) {
   throw new Error("Usage: STAGING_DATABASE_URL=... node isolated-reference-bootstrap-integration.js <output-json>");
+}
+if (deviceSessionSecret.length < 48) {
+  throw new Error("A strong dedicated DEVICE_SESSION_SECRET is required");
 }
 const parsed = new URL(connectionString);
 if (!["127.0.0.1", "localhost"].includes(parsed.hostname) || parsed.pathname !== "/froozerp_bootstrap_staging") {
@@ -135,6 +140,12 @@ const applyFoundationAndFixtures = async () => {
       DELETE FROM sync_change_log
       WHERE entity_type IN ('product_category', 'product', 'sale_rate', 'inventory_lot');
     `);
+    await client.query(
+      fs.readFileSync(
+        path.resolve(__dirname, "../../backend/migrations/cloud/011_inventory_incremental_publication.sql"),
+        "utf8"
+      )
+    );
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK");
@@ -239,25 +250,45 @@ const run = async () => {
     if (unknown?.code !== "DEVICE_LOCATION_MISMATCH") {
       throw new Error("Unknown/unapproved device was not rejected");
     }
-    const secret = "isolated-bootstrap-device-session";
     const token = issueDeviceSession({
       userId: 1,
       deviceId: SECOND_DEVICE,
       companyId: 1,
       branchId: 2,
-      secret,
+      secret: deviceSessionSecret,
     });
-    const claims = verifyDeviceSession(token, secret).claims;
+    const claims = verifyDeviceSession(token, deviceSessionSecret).claims;
     const deviceSubstitution = rejectDeviceSessionSubstitution(claims, { device_id: MAIN_DEVICE });
     if (deviceSubstitution?.code !== "DEVICE_SESSION_SUBSTITUTION_REJECTED") {
       throw new Error("Signed canonical device substitution was not rejected");
+    }
+    const expiredToken = issueDeviceSession({
+      userId: 1,
+      deviceId: SECOND_DEVICE,
+      companyId: 1,
+      branchId: 2,
+      secret: deviceSessionSecret,
+      nowMs: 1_000_000,
+      ttlSeconds: 1,
+    });
+    const expired = verifyDeviceSession(expiredToken, deviceSessionSecret, 1_002_000);
+    const substitutedSecret = crypto.randomBytes(48).toString("base64url");
+    const substituted = verifyDeviceSession(token, substitutedSecret);
+    if (expired.error?.code !== "DEVICE_SESSION_EXPIRED") {
+      throw new Error("Expired signed session was not rejected");
+    }
+    if (substituted.error?.code !== "DEVICE_SESSION_INVALID") {
+      throw new Error("Session signed by another secret was not rejected");
     }
     return {
       device_id: SECOND_DEVICE,
       location: second.operationalLocationId,
       substitution: substitution.code,
       signed_device_substitution: deviceSubstitution.code,
+      expired_session: expired.error.code,
+      substituted_session: substituted.error.code,
       unknown: unknown.code,
+      dedicated_session_secret_supplied: true,
     };
   });
 
@@ -279,18 +310,31 @@ const run = async () => {
       await lockReferenceBootstrapBoundary(snapshotClient);
       const context = await resolve(SECOND_DEVICE);
       const snapshot = await captureReferenceBootstrap(snapshotClient, context);
+      const lot = await writer.query(
+        "SELECT id, global_id FROM inventory_batches WHERE operational_location_id = $1 ORDER BY id LIMIT 1",
+        [LOCATION_TWO]
+      );
+      if (!lot.rows[0]) throw new Error("Concurrent mutation fixture lot is missing");
       let writerCompleted = false;
-      const write = writer.query(
-        `INSERT INTO sync_change_log
-          (company_id, branch_id, operational_location_id, assignment_generation,
-           entity_type, entity_id, operation_type, entity_version, payload)
-         VALUES (1, 1, NULL, NULL, 'product', 'concurrent-company-reference', 'UPSERT', 1,
-                 '{\"company_id\":1,\"product_name\":\"Concurrent Reference\"}'::JSONB)
-         RETURNING change_id`
-      ).then((result) => {
+      const write = (async () => {
+        await writer.query("BEGIN");
+        await writer.query(
+          "SELECT SET_CONFIG('froozerp.operation_id', 'bootstrap-concurrent-lot', TRUE)"
+        );
+        await writer.query(
+          "UPDATE inventory_batches SET remaining_qty = remaining_qty + 0.125 WHERE id = $1",
+          [lot.rows[0].id]
+        );
+        await writer.query("COMMIT");
         writerCompleted = true;
-        return result.rows[0];
-      });
+        return (await writer.query(
+          `SELECT change_id FROM sync_change_log
+           WHERE entity_type = 'inventory_lot' AND entity_id = $1
+             AND payload->>'source_operation_id' = 'bootstrap-concurrent-lot'
+           ORDER BY change_id DESC LIMIT 1`,
+          [lot.rows[0].global_id]
+        )).rows[0];
+      })();
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 150));
       if (writerCompleted) throw new Error("Concurrent writer crossed the snapshot boundary before commit");
       await snapshotClient.query("COMMIT");
@@ -301,11 +345,20 @@ const run = async () => {
         Number(snapshot.high_watermark),
         50
       );
-      const matches = incremental.rows.filter((row) => row.entity_id === "concurrent-company-reference");
+      const matches = incremental.rows.filter(
+        (row) =>
+          row.entity_id === lot.rows[0].global_id &&
+          row.payload?.source_operation_id === "bootstrap-concurrent-lot"
+      );
       if (Number(written.change_id) <= Number(snapshot.high_watermark) || matches.length !== 1) {
-        throw new Error("Concurrent reference was lost or duplicated at snapshot handoff");
+        throw new Error("Concurrent inventory mutation was lost or duplicated at snapshot handoff");
       }
-      return { high_watermark: snapshot.high_watermark, concurrent_change_id: String(written.change_id), delivered: matches.length };
+      return {
+        high_watermark: snapshot.high_watermark,
+        concurrent_change_id: String(written.change_id),
+        entity_id: lot.rows[0].global_id,
+        delivered: matches.length,
+      };
     } catch (error) {
       await snapshotClient.query("ROLLBACK").catch(() => {});
       throw error;

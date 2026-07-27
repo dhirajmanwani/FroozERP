@@ -2956,6 +2956,50 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
             )
             .map_err(to_error)?;
         }
+        "location_product" => {
+            let location_id = change
+                .payload
+                .get("operational_location_id")
+                .and_then(json_number)
+                .map(|value| (value as i64).to_string())
+                .ok_or_else(|| "Location product change has no operational location".to_string())?;
+            let product_id = change
+                .payload
+                .get("product_global_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| "Location product change has no product identity".to_string())?;
+            if operation == "DELETE" {
+                tx.execute(
+                    "DELETE FROM local_operational_location_products
+                     WHERE operational_location_id = ?1 AND product_id = ?2",
+                    params![location_id, product_id],
+                )
+                .map_err(to_error)?;
+            } else {
+                tx.execute(
+                    "INSERT INTO local_operational_location_products (
+                       operational_location_id, product_id, enabled, pos_available,
+                       selling_rate, reorder_level, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(operational_location_id, product_id) DO UPDATE SET
+                       enabled = excluded.enabled,
+                       pos_available = excluded.pos_available,
+                       selling_rate = excluded.selling_rate,
+                       reorder_level = excluded.reorder_level,
+                       updated_at = excluded.updated_at",
+                    params![
+                        location_id,
+                        product_id,
+                        if change.payload.get("enabled").and_then(|value| value.as_bool()).unwrap_or(true) { 1 } else { 0 },
+                        if change.payload.get("pos_available").and_then(|value| value.as_bool()).unwrap_or(true) { 1 } else { 0 },
+                        change.payload.get("selling_rate").and_then(json_number),
+                        change.payload.get("reorder_level").and_then(json_number).unwrap_or(0.0),
+                        change.updated_at,
+                    ],
+                )
+                .map_err(to_error)?;
+            }
+        }
         "inventory_lot" => {
             if operation == "DELETE" {
                 tx.execute(
@@ -3301,12 +3345,31 @@ mod tests {
             }),
             updated_at: Some("2026-07-27T10:03:00.000Z".to_string()),
         };
+        let location_product_incremental = PulledChange {
+            change_id: serde_json::json!(46),
+            branch_id: Some(1),
+            entity_type: "location_product".to_string(),
+            entity_id: "1001:product-276".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(2),
+            payload: serde_json::json!({
+                "company_id": 1,
+                "branch_id": 1,
+                "operational_location_id": 1001,
+                "product_global_id": "product-276",
+                "enabled": true,
+                "pos_available": true,
+                "selling_rate": 130.0,
+                "reorder_level": 4.0
+            }),
+            updated_at: Some("2026-07-27T10:03:01.000Z".to_string()),
+        };
         apply_pull_changes_at(
             &path,
-            &[incremental],
-            "45",
+            &[incremental, location_product_incremental],
+            "46",
             Some("device-bootstrap".to_string()),
-            Some("2026-07-27T10:03:01.000Z".to_string()),
+            Some("2026-07-27T10:03:02.000Z".to_string()),
         )
         .expect("apply incremental after bootstrap");
 
@@ -3330,11 +3393,20 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read incremental cursor");
-        assert_eq!(cursor, "45");
+        assert_eq!(cursor, "46");
         let updated_name: String = conn
             .query_row("SELECT product_name FROM local_products WHERE id = 'product-276'", [], |row| row.get(0))
             .expect("read incrementally updated product");
         assert_eq!(updated_name, "Langda Updated");
+        let location_rate: f64 = conn
+            .query_row(
+                "SELECT selling_rate FROM local_operational_location_products
+                 WHERE operational_location_id = '1001' AND product_id = 'product-276'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read incrementally updated location selling rate");
+        assert_eq!(location_rate, 130.0);
         drop(conn);
         let _ = fs::remove_file(&path);
     }
@@ -3623,6 +3695,106 @@ mod tests {
         assert_eq!(balance, 9.0);
         drop(conn);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn isolated_staging_lifecycle_reaches_disposable_sqlite_exactly_once() {
+        let evidence_path = match std::env::var("FROOZERP_ISOLATED_SYNC_EVIDENCE") {
+            Ok(value) if !value.trim().is_empty() => value,
+            _ => return,
+        };
+        let evidence: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&evidence_path).expect("read isolated lifecycle evidence"),
+        )
+        .expect("parse isolated lifecycle evidence");
+        assert_eq!(evidence.get("passed").and_then(|value| value.as_bool()), Some(true));
+
+        for device_label in ["main", "second"] {
+            let device_evidence = evidence
+                .pointer(&format!("/sync_evidence/{device_label}"))
+                .expect("device sync evidence");
+            let bootstrap: ReferenceBootstrap = serde_json::from_value(
+                device_evidence.get("bootstrap").cloned().expect("bootstrap payload"),
+            )
+            .expect("deserialize bootstrap payload");
+            let changes: Vec<PulledChange> = serde_json::from_value(
+                device_evidence
+                    .get("incremental_changes")
+                    .cloned()
+                    .expect("incremental changes"),
+            )
+            .expect("deserialize incremental changes");
+            assert!(!changes.is_empty(), "staging device must receive incremental mutations");
+
+            let path = std::env::temp_dir().join(format!(
+                "froozerp-isolated-lifecycle-{device_label}-{}-{}.sqlite3",
+                std::process::id(),
+                unique_local_id("test")
+            ));
+            let _ = fs::remove_file(&path);
+            initialize_at(&path).expect("initialize disposable lifecycle SQLite");
+            apply_reference_bootstrap_at(
+                &path,
+                &bootstrap,
+                &bootstrap.device_id,
+                Some("2026-07-27T16:00:00.000Z".to_string()),
+            )
+            .expect("apply isolated bootstrap");
+            let cursor = changes
+                .last()
+                .map(|change| change.change_id.to_string().trim_matches('"').to_string())
+                .unwrap_or_else(|| bootstrap.high_watermark.clone());
+            for _ in 0..2 {
+                apply_pull_changes_at(
+                    &path,
+                    &changes,
+                    &cursor,
+                    Some(bootstrap.device_id.clone()),
+                    Some("2026-07-27T16:00:01.000Z".to_string()),
+                )
+                .expect("apply isolated incremental batch idempotently");
+            }
+
+            let expected_lots = bootstrap
+                .records
+                .iter()
+                .chain(changes.iter())
+                .filter(|change| {
+                    change.entity_type == "inventory_lot"
+                        && change.operation_type.to_uppercase() != "DELETE"
+                })
+                .map(|change| change.entity_id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            let conn = Connection::open(&path).expect("inspect disposable lifecycle SQLite");
+            let lot_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM local_inventory_lots WHERE deleted_at IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count lifecycle lots");
+            assert_eq!(lot_count as usize, expected_lots.len());
+            let duplicate_lots: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM (
+                       SELECT id FROM local_inventory_lots GROUP BY id HAVING COUNT(*) > 1
+                     )",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count duplicate lifecycle lots");
+            assert_eq!(duplicate_lots, 0);
+            let stored_cursor: String = conn
+                .query_row(
+                    "SELECT last_pull_cursor FROM sync_state WHERE device_id = ?1",
+                    [&bootstrap.device_id],
+                    |row| row.get(0),
+                )
+                .expect("read lifecycle cursor");
+            assert_eq!(stored_cursor, cursor);
+            drop(conn);
+            let _ = fs::remove_file(&path);
+        }
     }
 
     #[test]

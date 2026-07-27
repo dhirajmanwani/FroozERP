@@ -172,10 +172,6 @@ const runStartupSchemaBootstrap = hostedCloudDeployment ? false : readOptionalBo
   process.env.RUN_STARTUP_SCHEMA_BOOTSTRAP,
   !hostedCloudDeployment
 );
-const runStartupReferenceSeed = readOptionalBoolean(
-  process.env.RUN_STARTUP_REFERENCE_SEED,
-  !hostedCloudDeployment
-);
 const databaseConfigurationProvided = Boolean(
   databaseUrl ||
   (process.env.DB_HOST && process.env.DB_NAME && process.env.DB_USER)
@@ -232,7 +228,7 @@ const cloudConfigurationChecks = (identity = {}) => ({
   cloud_deployment_id_configured: Boolean(cloudDeploymentId),
   allowed_origins_configured: allowedCorsOrigins.length > 0 && !allowedCorsOrigins.includes("*"),
   startup_schema_bootstrap_disabled: !runStartupSchemaBootstrap,
-  startup_reference_seed_disabled: !runStartupReferenceSeed,
+  startup_reference_seed_disabled: true,
 });
 const canonicalCloudApiUrl = isRealHostedCloudUrl(publicCloudApiUrl) ? publicCloudApiUrl : productionRailwayOrigin;
 const cloudPolicyDirectory = path.join(os.homedir(), "AppData", "Roaming", "com.srtcompany.froozerp");
@@ -7950,67 +7946,6 @@ const logSyncChange = async (client, {
   return result.rows[0];
 };
 
-const seedReferenceChangeLog = async () => {
-  await pool.query(`
-    INSERT INTO sync_change_log (branch_id, entity_type, entity_id, operation_type, entity_version, payload, created_at)
-    SELECT
-      1,
-      'product_category',
-      pc.global_id,
-      CASE WHEN pc.deleted_at IS NULL AND pc.active IS DISTINCT FROM FALSE THEN 'UPSERT' ELSE 'DELETE' END,
-      pc.entity_version,
-      TO_JSONB(pc),
-      COALESCE(pc.updated_at, pc.created_at, CURRENT_TIMESTAMP)
-    FROM product_categories pc
-    WHERE NOT EXISTS (
-      SELECT 1 FROM sync_change_log scl
-      WHERE scl.entity_type = 'product_category' AND scl.entity_id = pc.global_id
-    );
-
-    INSERT INTO sync_change_log (branch_id, entity_type, entity_id, operation_type, entity_version, payload, created_at)
-    SELECT
-      1,
-      'product',
-      p.global_id,
-      CASE WHEN p.deleted_at IS NULL AND p.active IS DISTINCT FROM FALSE THEN 'UPSERT' ELSE 'DELETE' END,
-      p.entity_version,
-      TO_JSONB(p),
-      COALESCE(p.selling_rate_updated_at, p.created_at, CURRENT_TIMESTAMP)
-    FROM products p
-    WHERE NOT EXISTS (
-      SELECT 1 FROM sync_change_log scl
-      WHERE scl.entity_type = 'product' AND scl.entity_id = p.global_id
-    );
-
-    INSERT INTO sync_change_log (
-      company_id, branch_id, entity_type, entity_id, operation_type, entity_version, payload, created_at
-    )
-    SELECT
-      b.company_id,
-      ib.branch_id,
-      'inventory_lot',
-      ib.global_id,
-      CASE WHEN ib.deleted_at IS NULL THEN 'UPSERT' ELSE 'DELETE' END,
-      ib.entity_version,
-      TO_JSONB(ib) || JSONB_BUILD_OBJECT(
-        'product_global_id', p.global_id,
-        'product_name', p.product_name
-      ),
-      COALESCE(ib.updated_at, ib.created_at, CURRENT_TIMESTAMP)
-    FROM inventory_batches ib
-    JOIN branches b ON b.id = ib.branch_id
-    JOIN products p ON p.id = ib.product_id
-    WHERE ib.global_id IS NOT NULL
-      AND NOT EXISTS (
-        SELECT 1 FROM sync_change_log scl
-        WHERE scl.company_id = b.company_id
-          AND scl.branch_id = ib.branch_id
-          AND scl.entity_type = 'inventory_lot'
-          AND scl.entity_id = ib.global_id
-      );
-  `);
-};
-
 const processedAckFromRow = (row) => ({
   operation_id: row.operation_id,
   status: row.result_status,
@@ -9349,6 +9284,12 @@ app.post("/api/sync/push", rateLimitSyncRequest, async (req, res) => {
         return sendOperationalScopeError(res, scopeValidationError);
       }
     }
+    await client.query(
+      `SELECT
+         SET_CONFIG('froozerp.device_id', $1, TRUE),
+         SET_CONFIG('froozerp.user_id', $2, TRUE)`,
+      [context.deviceId, String(context.user.id)]
+    );
     // Client clocks are diagnostic only. Server-side entity versions and stable
     // operation IDs determine processing and conflict behavior.
     const sorted = [...operations].sort((a, b) =>
@@ -9356,6 +9297,10 @@ app.post("/api/sync/push", rateLimitSyncRequest, async (req, res) => {
     );
     const acknowledgements = [];
     for (const operation of sorted) {
+      await client.query(
+        "SELECT SET_CONFIG('froozerp.operation_id', $1, TRUE)",
+        [cleanText(operation.operation_id)]
+      );
       const ack = await processSyncOperation(client, operation, context);
       acknowledgements.push(ack);
     }
@@ -18441,9 +18386,6 @@ app.use((error, req, res, next) => {
 });
 prepareDatabaseForStartup()
   .then(async () => {
-    if (!desktopLocalRuntime && runStartupReferenceSeed) {
-      await seedReferenceChangeLog();
-    }
     let lastScheduledBackupDate = "";
     if (!desktopLocalRuntime) {
       setInterval(async () => {

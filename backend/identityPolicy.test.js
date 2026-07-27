@@ -120,12 +120,15 @@ test("disabled and revoked fresh devices are never returned to pending", () => {
   }), { code: "DEVICE_REVOKED", status: 403 });
 });
 
-test("fresh-device reference seed includes branch-scoped inventory lots", () => {
-  const source = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
-  assert.match(source, /'inventory_lot'/);
-  assert.match(source, /'product_global_id', p\.global_id/);
-  assert.match(source, /scl\.company_id = b\.company_id/);
-  assert.match(source, /scl\.branch_id = ib\.branch_id/);
+test("fresh-device bootstrap snapshots scoped lots without manufacturing history", () => {
+  const serverSource = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
+  const bootstrapSource = fs.readFileSync(path.join(__dirname, "syncReferenceBootstrap.js"), "utf8");
+  assert.match(bootstrapSource, /"inventory_lot"/);
+  assert.match(bootstrapSource, /'product_global_id', COALESCE\(p\.global_id/);
+  assert.match(bootstrapSource, /ib\.company_id = \$1/);
+  assert.match(bootstrapSource, /ib\.branch_id = \$2/);
+  assert.match(bootstrapSource, /ib\.operational_location_id = \$3/);
+  assert.doesNotMatch(serverSource, /seedReferenceChangeLog/);
 });
 
 test("stable product identities survive historical duplicate names and null rates", () => {

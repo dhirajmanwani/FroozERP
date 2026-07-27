@@ -13,6 +13,10 @@ const protocolMigration = fs.readFileSync(
   path.join(__dirname, "migrations/cloud/010_operational_protocol_v3.sql"),
   "utf8"
 );
+const publicationMigration = fs.readFileSync(
+  path.join(__dirname, "migrations/cloud/011_inventory_incremental_publication.sql"),
+  "utf8"
+);
 const sqliteMigration = fs.readFileSync(
   path.join(__dirname, "../src-tauri/migrations/sqlite/013_operational_location_foundation.sql"),
   "utf8"
@@ -20,13 +24,32 @@ const sqliteMigration = fs.readFileSync(
 const backendSource = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
 
 test("operational-location migrations are additive and do not backfill ownership", () => {
-  for (const migration of [cloudMigration, sqliteMigration]) {
+  for (const migration of [cloudMigration, protocolMigration, publicationMigration, sqliteMigration]) {
     assert.doesNotMatch(migration, /\bDROP\s+(TABLE|COLUMN|SCHEMA|DATABASE)\b/i);
     assert.doesNotMatch(migration, /\bDELETE\s+FROM\b/i);
     assert.doesNotMatch(migration, /\bTRUNCATE\b/i);
   }
   assert.doesNotMatch(cloudMigration, /Badwasiya|Jodhpur/i);
   assert.doesNotMatch(sqliteMigration, /Badwasiya|Jodhpur/i);
+});
+
+test("inventory publication is transactional, scoped, and does not manufacture history", () => {
+  assert.match(publicationMigration, /AFTER INSERT OR UPDATE OR DELETE ON inventory_batches/i);
+  assert.match(publicationMigration, /INSERT INTO sync_change_log/i);
+  assert.match(publicationMigration, /operational_location_id/i);
+  assert.match(publicationMigration, /OLD IS NOT DISTINCT FROM NEW/i);
+  assert.match(publicationMigration, /ON CONFLICT \(idempotency_key\)/i);
+  assert.match(publicationMigration, /AFTER INSERT OR UPDATE OR DELETE ON operational_location_products/i);
+  assert.match(publicationMigration, /'location_product'/i);
+  assert.doesNotMatch(
+    publicationMigration,
+    /INSERT INTO sync_change_log[\s\S]*SELECT[\s\S]*FROM inventory_batches/i
+  );
+  assert.doesNotMatch(
+    publicationMigration,
+    /^\s*(?:DELETE\s+FROM|TRUNCATE|DROP\s+TABLE|UPDATE\s+\w+\s+SET)\b/im
+  );
+  assert.doesNotMatch(backendSource, /seedReferenceChangeLog/);
 });
 
 test("canonical location schema contains required ownership and authorization entities", () => {

@@ -10,6 +10,11 @@ const {
   validateSyncBatchScope,
 } = require("../../backend/operationalScope");
 const { registerOperationalV3Routes } = require("../../backend/operationalV3");
+const {
+  captureReferenceBootstrap,
+  lockReferenceBootstrapBoundary,
+  readVisibleIncrementalChanges,
+} = require("../../backend/syncReferenceBootstrap");
 
 const connectionString = process.env.STAGING_DATABASE_URL;
 const outputPath = path.resolve(process.argv[2] || "");
@@ -57,13 +62,22 @@ const databaseCounts = async () => (await pool.query(`
        FROM inventory_batches) stock_value,
     (SELECT COUNT(*)::int FROM customers) customers,
     (SELECT COUNT(*)::int FROM users) users,
-    (SELECT COUNT(*)::int FROM authorized_devices) devices
+    (SELECT COUNT(*)::int FROM authorized_devices) devices,
+    (SELECT COUNT(*)::int FROM sync_change_log) changes
 `)).rows[0];
 
 const prepareFixtures = async () => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    for (const migration of [
+      "backend/migrations/cloud/009_operational_location_foundation.sql",
+      "backend/migrations/cloud/010_operational_protocol_v3.sql",
+    ]) {
+      await client.query(
+        fs.readFileSync(path.resolve(__dirname, "../..", migration), "utf8")
+      );
+    }
     await client.query(`
       UPDATE products SET company_id = 1;
       UPDATE suppliers SET company_id = 1;
@@ -132,6 +146,12 @@ const prepareFixtures = async () => {
          TRUE,'{"consolidated_reports":false,"manage_assignments":false}'::jsonb,'[1]'::jsonb,'["OWNER"]'::jsonb,1,TRUE,1)
       ON CONFLICT (device_id, assignment_generation) DO NOTHING;
     `);
+    await client.query(
+      fs.readFileSync(
+        path.resolve(__dirname, "../../backend/migrations/cloud/011_inventory_incremental_publication.sql"),
+        "utf8"
+      )
+    );
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK");
@@ -191,9 +211,38 @@ const identity = (deviceId, extra = {}) => ({
   ...extra,
 });
 
+const bootstrapFor = async (deviceId) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+    await lockReferenceBootstrapBoundary(client);
+    const resolved = await scopeService.resolve({ userId: 1, deviceId, requireWrite: true });
+    if (resolved.error) throw new Error(resolved.error.message);
+    const context = {
+      user: { id: 1 },
+      device: { device_id: deviceId },
+      companyId: resolved.context.company_id,
+      branchId: resolved.context.branch_id,
+      operationalLocationId: resolved.context.operational_location_id,
+      assignmentGeneration: resolved.context.assignment_generation,
+      deviceId,
+    };
+    const bootstrap = await captureReferenceBootstrap(client, context);
+    await client.query("COMMIT");
+    return { context, bootstrap };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
 const run = async () => {
   const baseline = await databaseCounts();
   await prepareFixtures();
+  const mainSync = await bootstrapFor(MAIN_DEVICE);
+  const secondSync = await bootstrapFor(SECOND_DEVICE);
   const server = await new Promise((resolve) => {
     const active = app.listen(0, "127.0.0.1", () => resolve(active));
   });
@@ -231,6 +280,29 @@ const run = async () => {
       return { main_quantity: mainQuantity, second_quantity: secondQuantity };
     });
 
+    await record("location product mutation publishes once and retry is idempotent", async () => {
+      const product = await pool.query("SELECT id FROM products ORDER BY id LIMIT 1");
+      const body = identity(SECOND_DEVICE, {
+        idempotency_key: "staging-location-product-1",
+        enabled: true,
+        pos_available: true,
+        selling_rate: 321.25,
+        reorder_level: 7,
+      });
+      await api(origin, "PUT", `/api/v3/location-products/${product.rows[0].id}`, body);
+      await api(origin, "PUT", `/api/v3/location-products/${product.rows[0].id}`, body);
+      const published = await pool.query(
+        `SELECT COUNT(*)::int AS count, MIN(operational_location_id)::int AS location_id
+         FROM sync_change_log
+         WHERE entity_type = 'location_product'
+           AND payload->>'source_operation_id' = 'staging-location-product-1'`
+      );
+      if (published.rows[0].count !== 1 || published.rows[0].location_id !== LOCATION_TWO) {
+        throw new Error("Location product mutation was missing, duplicated, or mis-scoped");
+      }
+      return published.rows[0];
+    });
+
     const purchaseOrder = await record("purchase order CRUD and idempotency", async () => {
       const body = identity(SECOND_DEVICE, {
         idempotency_key: "staging-po-1",
@@ -261,9 +333,16 @@ const run = async () => {
       const counts = await pool.query(`
         SELECT
           (SELECT COUNT(*)::int FROM goods_receipts WHERE idempotency_key='staging-grn-1') receipts,
-          (SELECT COUNT(*)::int FROM inventory_batches WHERE global_id='staging-lot-1') lots
+          (SELECT COUNT(*)::int FROM inventory_batches WHERE global_id='staging-lot-1') lots,
+          (SELECT COUNT(*)::int FROM sync_change_log
+             WHERE entity_type='inventory_lot'
+               AND entity_id='staging-lot-1'
+               AND payload->>'source_operation_id'='staging-grn-1') changes
       `);
-      if (first.goods_receipt.id !== second.goods_receipt.id || counts.rows[0].receipts !== 1 || counts.rows[0].lots !== 1) {
+      if (first.goods_receipt.id !== second.goods_receipt.id ||
+          counts.rows[0].receipts !== 1 ||
+          counts.rows[0].lots !== 1 ||
+          counts.rows[0].changes !== 1) {
         throw new Error("GRN idempotency failed");
       }
       return first.goods_receipt;
@@ -303,14 +382,190 @@ const run = async () => {
         SELECT
           (SELECT remaining_qty FROM inventory_batches WHERE global_id='staging-lot-1') source_quantity,
           (SELECT COALESCE(SUM(remaining_qty),0) FROM inventory_batches WHERE global_id LIKE 'transfer-staging-transfer-1%') destination_quantity,
-          (SELECT COUNT(*)::int FROM inventory_transfer_events WHERE idempotency_key='staging-transfer-receive') receipt_events
+          (SELECT COUNT(*)::int FROM inventory_transfer_events WHERE idempotency_key='staging-transfer-receive') receipt_events,
+          (SELECT COUNT(*)::int FROM sync_change_log
+             WHERE entity_type='inventory_lot'
+               AND payload->>'source_operation_id'='staging-transfer-dispatch') dispatch_changes,
+          (SELECT COUNT(*)::int FROM sync_change_log
+             WHERE entity_type='inventory_lot'
+               AND payload->>'source_operation_id'='staging-transfer-receive') receipt_changes
       `);
       if (Number(quantities.rows[0].source_quantity) !== 6 ||
           Number(quantities.rows[0].destination_quantity) !== 4 ||
-          quantities.rows[0].receipt_events !== 1) {
+          quantities.rows[0].receipt_events !== 1 ||
+          quantities.rows[0].dispatch_changes !== 1 ||
+          quantities.rows[0].receipt_changes !== 1) {
         throw new Error("Transfer stock or retry idempotency failed");
       }
       return { transfer_id: transferId, ...quantities.rows[0] };
+    });
+
+    await record("transfer discrepancy return-to-source reversal publishes exactly once", async () => {
+      const sourceLot = await pool.query(
+        "SELECT id, product_id, remaining_qty FROM inventory_batches WHERE global_id='staging-lot-1'"
+      );
+      const before = Number(sourceLot.rows[0].remaining_qty);
+      const created = await api(origin, "POST", "/api/v3/transfers", identity(SECOND_DEVICE, {
+        idempotency_key: "staging-return-transfer-1",
+        global_id: "staging-return-transfer-1",
+        transfer_number: "STAGING-RETURN-TR-1",
+        initiation_mode: "SOURCE_INITIATED",
+        destination_branch_id: 1,
+        destination_operational_location_id: LOCATION_ONE,
+        items: [{
+          product_id: sourceLot.rows[0].product_id,
+          source_lot_id: sourceLot.rows[0].id,
+          requested_quantity: 1,
+        }],
+      }), 201);
+      const transferId = created.transfer.id;
+      const item = await pool.query("SELECT id FROM inventory_transfer_items WHERE transfer_id=$1", [transferId]);
+      const itemId = item.rows[0].id;
+      await api(origin, "POST", `/api/v3/transfers/${transferId}/actions/submit`, identity(SECOND_DEVICE, {
+        idempotency_key: "staging-return-submit",
+      }));
+      await api(origin, "POST", `/api/v3/transfers/${transferId}/actions/approve`, identity(SECOND_DEVICE, {
+        idempotency_key: "staging-return-approve",
+        items: [{ item_id: itemId, approved_quantity: 1 }],
+      }));
+      await api(origin, "POST", `/api/v3/transfers/${transferId}/actions/dispatch`, identity(SECOND_DEVICE, {
+        idempotency_key: "staging-return-dispatch",
+      }));
+      await api(origin, "POST", `/api/v3/transfers/${transferId}/actions/discrepancy`, identity(MAIN_DEVICE, {
+        idempotency_key: "staging-return-discrepancy",
+      }));
+      await api(origin, "POST", `/api/v3/transfers/${transferId}/actions/return`, identity(SECOND_DEVICE, {
+        idempotency_key: "staging-return-in-transit",
+      }));
+      const receiptBody = identity(SECOND_DEVICE, {
+        idempotency_key: "staging-return-source-receive",
+        items: [{ item_id: itemId, returned_quantity: 1 }],
+      });
+      await api(origin, "POST", `/api/v3/transfers/${transferId}/actions/source_receive`, receiptBody);
+      await api(origin, "POST", `/api/v3/transfers/${transferId}/actions/source_receive`, receiptBody);
+      const evidence = await pool.query(
+        `SELECT
+           (SELECT remaining_qty FROM inventory_batches WHERE id=$1) final_quantity,
+           (SELECT COUNT(*)::int FROM sync_change_log
+             WHERE payload->>'source_operation_id'='staging-return-dispatch') dispatch_changes,
+           (SELECT COUNT(*)::int FROM sync_change_log
+             WHERE payload->>'source_operation_id'='staging-return-source-receive') reversal_changes`,
+        [sourceLot.rows[0].id]
+      );
+      if (Number(evidence.rows[0].final_quantity) !== before ||
+          evidence.rows[0].dispatch_changes !== 1 ||
+          evidence.rows[0].reversal_changes !== 1) {
+        throw new Error("Transfer reversal did not restore stock exactly once");
+      }
+      return evidence.rows[0];
+    });
+
+    await record("stock-affecting row mutation publication matrix is transactional", async () => {
+      const lot = await pool.query(
+        "SELECT id, global_id FROM inventory_batches WHERE global_id LIKE 'transfer-staging-transfer-1%' LIMIT 1"
+      );
+      const scenarios = [
+        ["stock-adjustment", 2],
+        ["sale-deduction", -1],
+        ["sales-return", 1],
+        ["waste-damage", -0.5],
+        ["cancellation-reversal", 0.5],
+      ];
+      for (const [operationId, delta] of scenarios) {
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          await client.query(
+            `SELECT SET_CONFIG('froozerp.device_id',$1,TRUE),
+                    SET_CONFIG('froozerp.user_id','1',TRUE),
+                    SET_CONFIG('froozerp.operation_id',$2,TRUE)`,
+            [MAIN_DEVICE, `staging-${operationId}`]
+          );
+          await client.query(
+            "UPDATE inventory_batches SET remaining_qty = remaining_qty + $1 WHERE id = $2",
+            [delta, lot.rows[0].id]
+          );
+          await client.query("COMMIT");
+        } catch (error) {
+          await client.query("ROLLBACK");
+          throw error;
+        } finally {
+          client.release();
+        }
+      }
+      const published = await pool.query(
+        `SELECT payload->>'source_operation_id' AS operation_id, COUNT(*)::int AS count
+         FROM sync_change_log
+         WHERE entity_type='inventory_lot'
+           AND payload->>'source_operation_id' LIKE 'staging-%'
+           AND payload->>'source_operation_id' IN (
+             'staging-stock-adjustment','staging-sale-deduction','staging-sales-return',
+             'staging-waste-damage','staging-cancellation-reversal'
+           )
+         GROUP BY payload->>'source_operation_id'
+         ORDER BY operation_id`
+      );
+      if (published.rows.length !== scenarios.length || published.rows.some((row) => row.count !== 1)) {
+        throw new Error("One or more stock mutation scenarios did not publish exactly once");
+      }
+      return published.rows;
+    });
+
+    await record("offline replay mutation is idempotent", async () => {
+      const operationId = "staging-offline-stock-1";
+      const lot = await pool.query("SELECT id, global_id FROM inventory_batches WHERE global_id='staging-lot-1'");
+      const replay = async () => {
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          const existing = await client.query(
+            "SELECT operation_id FROM sync_processed_operations WHERE operation_id=$1",
+            [operationId]
+          );
+          if (existing.rows[0]) {
+            await client.query("COMMIT");
+            return "duplicate";
+          }
+          await client.query(
+            `SELECT SET_CONFIG('froozerp.device_id',$1,TRUE),
+                    SET_CONFIG('froozerp.user_id','1',TRUE),
+                    SET_CONFIG('froozerp.operation_id',$2,TRUE)`,
+            [SECOND_DEVICE, operationId]
+          );
+          await client.query(
+            "UPDATE inventory_batches SET remaining_qty=remaining_qty-0.25 WHERE id=$1",
+            [lot.rows[0].id]
+          );
+          await client.query(
+            `INSERT INTO sync_processed_operations
+               (operation_id,device_id,company_id,branch_id,operational_location_id,
+                entity_type,entity_id,result_status,result_payload)
+             VALUES ($1,$2,1,2,$3,'inventory_lot',$4,'processed','{}'::jsonb)`,
+            [operationId, SECOND_DEVICE, LOCATION_TWO, lot.rows[0].global_id]
+          );
+          await client.query("COMMIT");
+          return "processed";
+        } catch (error) {
+          await client.query("ROLLBACK");
+          throw error;
+        } finally {
+          client.release();
+        }
+      };
+      const first = await replay();
+      const second = await replay();
+      const evidence = await pool.query(
+        `SELECT
+           (SELECT COUNT(*)::int FROM sync_processed_operations WHERE operation_id=$1) processed,
+           (SELECT COUNT(*)::int FROM sync_change_log
+             WHERE entity_type='inventory_lot' AND payload->>'source_operation_id'=$1) changes`,
+        [operationId]
+      );
+      if (first !== "processed" || second !== "duplicate" ||
+          evidence.rows[0].processed !== 1 || evidence.rows[0].changes !== 1) {
+        throw new Error("Offline replay was not idempotent");
+      }
+      return { first, second, ...evidence.rows[0] };
     });
 
     await record("payment allocation and over-allocation guard", async () => {
@@ -386,6 +641,18 @@ const run = async () => {
     });
 
     const finalCounts = await databaseCounts();
+    const mainIncremental = await readVisibleIncrementalChanges(
+      pool,
+      mainSync.context,
+      Number(mainSync.bootstrap.high_watermark),
+      500
+    );
+    const secondIncremental = await readVisibleIncrementalChanges(
+      pool,
+      secondSync.context,
+      Number(secondSync.bootstrap.high_watermark),
+      500
+    );
     const report = {
       generated_at: new Date().toISOString(),
       mode: "ISOLATED_STAGING_ONLY",
@@ -394,6 +661,18 @@ const run = async () => {
       baseline,
       final_counts_before_restore_rollback: finalCounts,
       initial_stock: initialStock,
+      sync_evidence: {
+        main: {
+          bootstrap: mainSync.bootstrap,
+          incremental_changes: mainIncremental.rows,
+          has_more: mainIncremental.hasMore,
+        },
+        second: {
+          bootstrap: secondSync.bootstrap,
+          incremental_changes: secondIncremental.rows,
+          has_more: secondIncremental.hasMore,
+        },
+      },
       results,
       passed: results.every((item) => item.passed),
     };

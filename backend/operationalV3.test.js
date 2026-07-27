@@ -274,6 +274,53 @@ test("payment source validation uses deployed payment_amount columns", async () 
   assert.match(calls[0], /SELECT payment_amount AS amount FROM customer_payments/);
 });
 
+test("protocol-v3 stock transactions set canonical publication attribution", async () => {
+  const routes = [];
+  const app = {};
+  for (const method of ["get", "post", "put"]) {
+    app[method] = (path, ...handlers) => routes.push({ method, path, handler: handlers.at(-1) });
+  }
+  const calls = [];
+  const client = {
+    query: async (sql, params) => {
+      calls.push({ sql, params });
+      if (sql.includes("FROM purchase_orders") && sql.includes("idempotency_key")) return { rows: [] };
+      if (sql.includes("INSERT INTO purchase_orders")) return { rows: [{ id: 1 }] };
+      if (sql.includes("INSERT INTO purchase_order_items")) return { rows: [{ id: 2 }] };
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const database = {
+    connect: async () => client,
+    query: async (sql, params) => client.query(sql, params),
+  };
+  registerOperationalV3Routes({
+    app,
+    database,
+    resolveContext: async () => ({ context: ownerContext }),
+    sendScopeError: () => {
+      throw new Error("unexpected");
+    },
+  });
+  const route = routes.find(
+    (entry) => entry.method === "post" && entry.path === "/api/v3/purchase-orders"
+  );
+  const res = fakeResponse();
+  await route.handler({
+    method: "POST",
+    path: route.path,
+    query: {},
+    body: {
+      idempotency_key: "po-attribution-1",
+      supplier_id: 1,
+      items: [{ product_id: 276, ordered_quantity: 1 }],
+    },
+  }, res);
+  const attribution = calls.find((entry) => entry.sql.includes("SET_CONFIG('froozerp.device_id'"));
+  assert.deepEqual(attribution.params, ["DEVICE-1", "1", "po-attribution-1"]);
+});
+
 test("assignment preview separates target scope from authenticated caller scope", async () => {
   const responses = [
     { rows: [{ id: 20, company_id: 1, branch_id: 2, location_name: "Mansarovar", active: true }] },

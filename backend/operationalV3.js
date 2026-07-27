@@ -65,10 +65,23 @@ const requiredIdempotencyKey = (body) => {
   return key;
 };
 
-const withTransaction = async (database, work) => {
+const withTransaction = async (database, work, context = null, operationId = null) => {
   const client = typeof database.connect === "function" ? await database.connect() : database;
   try {
     await client.query("BEGIN");
+    if (context) {
+      await client.query(
+        `SELECT
+           SET_CONFIG('froozerp.device_id', $1, TRUE),
+           SET_CONFIG('froozerp.user_id', $2, TRUE),
+           SET_CONFIG('froozerp.operation_id', $3, TRUE)`,
+        [
+          cleanText(context.device_id, 160),
+          String(positiveId(context.user_id) || ""),
+          cleanText(operationId, 220),
+        ]
+      );
+    }
     const result = await work(client);
     await client.query("COMMIT");
     return result;
@@ -476,34 +489,75 @@ const registerOperationalV3Routes = ({
   use("put", "/api/v3/location-products/:productId", async (req, res, context) => {
     const productId = positiveId(req.params.productId);
     if (!productId) throw routeError(400, "PRODUCT_REQUIRED", "A product is required");
-    const result = await database.query(
-      `INSERT INTO operational_location_products
-         (company_id, branch_id, operational_location_id, product_id, enabled, pos_available,
-          selling_rate, reorder_level, effective_from, updated_by)
-       SELECT $1, $2, $3, p.id, $5, $6, $7, $8, CURRENT_TIMESTAMP, $9
-       FROM products p WHERE p.id = $4 AND p.company_id = $1
-       ON CONFLICT (operational_location_id, product_id) DO UPDATE SET
-         enabled = EXCLUDED.enabled,
-         pos_available = EXCLUDED.pos_available,
-         selling_rate = EXCLUDED.selling_rate,
-         reorder_level = EXCLUDED.reorder_level,
-         updated_by = EXCLUDED.updated_by,
-         updated_at = CURRENT_TIMESTAMP
-       RETURNING *`,
-      [
-        context.company_id,
-        context.branch_id,
-        context.operational_location_id,
-        productId,
-        req.body.enabled !== false,
-        req.body.pos_available !== false,
-        req.body.selling_rate == null ? null : Number(req.body.selling_rate),
-        Math.max(0, Number(req.body.reorder_level || 0)),
-        context.user_id,
-      ]
-    );
-    if (!result.rows?.[0]) throw routeError(404, "PRODUCT_NOT_FOUND", "Product does not belong to this company");
-    return res.json({ product: result.rows[0], scope: context, ...serverTimePayload() });
+    const key = requiredIdempotencyKey(req.body);
+    const saved = await withTransaction(database, async (client) => {
+      const prior = await client.query(
+        `SELECT olp.*
+         FROM sync_change_log scl
+         JOIN operational_location_products olp
+           ON olp.operational_location_id = scl.operational_location_id
+          AND scl.entity_id = olp.operational_location_id::TEXT || ':' ||
+              (SELECT p.global_id FROM products p WHERE p.id = olp.product_id)
+         WHERE scl.company_id = $1
+           AND scl.branch_id = $2
+           AND scl.operational_location_id = $3
+           AND scl.entity_type = 'location_product'
+           AND scl.payload->>'source_operation_id' = $4
+         ORDER BY scl.change_id DESC
+         LIMIT 1`,
+        [context.company_id, context.branch_id, context.operational_location_id, key]
+      );
+      if (prior.rows?.[0]) return prior.rows[0];
+      const result = await client.query(
+        `INSERT INTO operational_location_products
+           (company_id, branch_id, operational_location_id, product_id, enabled, pos_available,
+            selling_rate, reorder_level, effective_from, updated_by)
+         SELECT $1, $2, $3, p.id, $5, $6, $7, $8, CURRENT_TIMESTAMP, $9
+         FROM products p WHERE p.id = $4 AND p.company_id = $1
+         ON CONFLICT (operational_location_id, product_id) DO UPDATE SET
+           enabled = EXCLUDED.enabled,
+           pos_available = EXCLUDED.pos_available,
+           selling_rate = EXCLUDED.selling_rate,
+           reorder_level = EXCLUDED.reorder_level,
+           updated_by = EXCLUDED.updated_by,
+           updated_at = CURRENT_TIMESTAMP
+         WHERE (
+           operational_location_products.enabled,
+           operational_location_products.pos_available,
+           operational_location_products.selling_rate,
+           operational_location_products.reorder_level
+         ) IS DISTINCT FROM (
+           EXCLUDED.enabled,
+           EXCLUDED.pos_available,
+           EXCLUDED.selling_rate,
+           EXCLUDED.reorder_level
+         )
+         RETURNING *`,
+        [
+          context.company_id,
+          context.branch_id,
+          context.operational_location_id,
+          productId,
+          req.body.enabled !== false,
+          req.body.pos_available !== false,
+          req.body.selling_rate == null ? null : Number(req.body.selling_rate),
+          Math.max(0, Number(req.body.reorder_level || 0)),
+          context.user_id,
+        ]
+      );
+      if (result.rows?.[0]) return result.rows[0];
+      const current = await client.query(
+        `SELECT * FROM operational_location_products
+         WHERE company_id = $1 AND branch_id = $2
+           AND operational_location_id = $3 AND product_id = $4`,
+        [context.company_id, context.branch_id, context.operational_location_id, productId]
+      );
+      if (!current.rows?.[0]) {
+        throw routeError(404, "PRODUCT_NOT_FOUND", "Product does not belong to this company");
+      }
+      return current.rows[0];
+    }, context, key);
+    return res.json({ product: saved, scope: context, ...serverTimePayload() });
   }, { write: true });
 
   use("get", "/api/v3/purchase-orders", async (_req, res, context) => {
@@ -560,7 +614,7 @@ const registerOperationalV3Routes = ({
         );
       }
       return header.rows[0];
-    });
+    }, context, key);
     return res.status(201).json({ purchase_order: saved, scope: context, ...serverTimePayload() });
   }, { write: true });
 
@@ -646,7 +700,7 @@ const registerOperationalV3Routes = ({
         );
       }
       return header.rows[0];
-    });
+    }, context, key);
     return res.status(201).json({ goods_receipt: saved, scope: context, ...serverTimePayload() });
   }, { write: true });
 
@@ -798,7 +852,7 @@ const registerOperationalV3Routes = ({
         );
       }
       return transfer.rows[0];
-    });
+    }, context, key);
     return res.status(201).json({ transfer: saved, scope: context, ...serverTimePayload() });
   }, { write: true });
 
@@ -859,7 +913,7 @@ const registerOperationalV3Routes = ({
         ]
       );
       return updated.rows[0];
-    });
+    }, context, key);
     return res.json({ transfer: saved, scope: context, ...serverTimePayload() });
   }, { write: true });
 
