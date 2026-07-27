@@ -157,6 +157,16 @@ export async function applyPulledChanges({ changes, nextCursor, deviceId, server
   return normalizeStatus(status);
 }
 
+export async function applyReferenceBootstrap({ bootstrap, deviceId, serverTime }) {
+  if (!isTauriRuntime()) return emptyStatus;
+  const status = await invokeLocal("sync_apply_reference_bootstrap", {
+    bootstrap,
+    deviceId,
+    serverTime,
+  });
+  return normalizeStatus(status);
+}
+
 export async function markSyncFailed(message) {
   if (!isTauriRuntime()) return emptyStatus;
   const status = await invokeLocal("sync_mark_failed", { message });

@@ -93,6 +93,21 @@ pub struct PulledChange {
     pub updated_at: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ReferenceBootstrap {
+    pub protocol: String,
+    pub high_watermark: String,
+    pub device_id: String,
+    pub company_id: i64,
+    pub branch_id: i64,
+    pub operational_location_id: i64,
+    pub assignment_generation: i64,
+    pub operational_location: serde_json::Value,
+    pub device_assignment: serde_json::Value,
+    pub location_products: Vec<serde_json::Value>,
+    pub records: Vec<PulledChange>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct LocalPosSaleResult {
     pub invoice: serde_json::Value,
@@ -382,6 +397,17 @@ pub fn apply_pull_changes(
 ) -> Result<LocalDbStatus, String> {
     let path = database_path(app)?;
     initialize_at(&path)?;
+    apply_pull_changes_at(&path, changes, next_cursor, device_id, server_time)?;
+    status_at(&path)
+}
+
+fn apply_pull_changes_at(
+    path: &Path,
+    changes: &[PulledChange],
+    next_cursor: &str,
+    device_id: Option<String>,
+    server_time: Option<String>,
+) -> Result<(), String> {
     let mut conn = Connection::open(&path).map_err(to_error)?;
     let tx = conn.transaction().map_err(to_error)?;
     let confirmed_at = require_server_time(server_time)?;
@@ -403,8 +429,206 @@ pub fn apply_pull_changes(
         params![state_device, next_cursor, confirmed_at],
     )
     .map_err(to_error)?;
-    tx.commit().map_err(to_error)?;
+    tx.commit().map_err(to_error)
+}
+
+pub fn apply_reference_bootstrap(
+    app: &AppHandle,
+    bootstrap: &ReferenceBootstrap,
+    expected_device_id: &str,
+    server_time: Option<String>,
+) -> Result<LocalDbStatus, String> {
+    let path = database_path(app)?;
+    initialize_at(&path)?;
+    apply_reference_bootstrap_at(&path, bootstrap, expected_device_id, server_time)?;
     status_at(&path)
+}
+
+fn apply_reference_bootstrap_at(
+    path: &Path,
+    bootstrap: &ReferenceBootstrap,
+    expected_device_id: &str,
+    server_time: Option<String>,
+) -> Result<(), String> {
+    if bootstrap.protocol != "reference-v1" {
+        return Err("Unsupported reference bootstrap protocol".to_string());
+    }
+    if bootstrap.device_id != expected_device_id {
+        return Err("Reference bootstrap device identity does not match this device".to_string());
+    }
+    if bootstrap.company_id <= 0
+        || bootstrap.branch_id <= 0
+        || bootstrap.operational_location_id <= 0
+        || bootstrap.assignment_generation <= 0
+    {
+        return Err("Reference bootstrap canonical scope is incomplete".to_string());
+    }
+    let confirmed_at = require_server_time(server_time)?;
+    let mut conn = Connection::open(path).map_err(to_error)?;
+    let tx = conn.transaction().map_err(to_error)?;
+
+    let location_id = optional_text(&bootstrap.operational_location, "id")
+        .ok_or_else(|| "Reference bootstrap operational location has no identity".to_string())?;
+    if location_id != bootstrap.operational_location_id.to_string() {
+        return Err("Reference bootstrap operational location does not match canonical scope".to_string());
+    }
+    tx.execute(
+        "INSERT INTO local_operational_locations (
+           id, company_id, branch_id, location_code, location_name, location_type,
+           timezone, active, is_default, assignment_generation, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(id) DO UPDATE SET
+           company_id = excluded.company_id,
+           branch_id = excluded.branch_id,
+           location_code = excluded.location_code,
+           location_name = excluded.location_name,
+           location_type = excluded.location_type,
+           timezone = excluded.timezone,
+           active = excluded.active,
+           is_default = excluded.is_default,
+           assignment_generation = excluded.assignment_generation,
+           updated_at = excluded.updated_at",
+        params![
+            location_id,
+            bootstrap.company_id.to_string(),
+            bootstrap.branch_id.to_string(),
+            optional_text(&bootstrap.operational_location, "location_code").unwrap_or_else(|| "LOCATION".to_string()),
+            optional_text(&bootstrap.operational_location, "location_name").unwrap_or_else(|| "Operational Location".to_string()),
+            optional_text(&bootstrap.operational_location, "location_type").unwrap_or_else(|| "STORE".to_string()),
+            optional_text(&bootstrap.operational_location, "timezone").unwrap_or_else(|| "Asia/Kolkata".to_string()),
+            if bootstrap.operational_location.get("active").and_then(|value| value.as_bool()).unwrap_or(true) { 1 } else { 0 },
+            if bootstrap.operational_location.get("is_default").and_then(|value| value.as_bool()).unwrap_or(false) { 1 } else { 0 },
+            bootstrap.assignment_generation,
+            optional_text(&bootstrap.operational_location, "updated_at").unwrap_or_else(|| confirmed_at.clone()),
+        ],
+    )
+    .map_err(to_error)?;
+
+    let assignment_device = optional_text(&bootstrap.device_assignment, "device_id")
+        .ok_or_else(|| "Reference bootstrap device assignment has no device identity".to_string())?;
+    if assignment_device != bootstrap.device_id {
+        return Err("Reference bootstrap assignment does not match canonical device".to_string());
+    }
+    tx.execute(
+        "INSERT INTO local_device_assignment (
+           device_id, company_id, branch_id, operational_location_id, intended_usage,
+           fixed_operational, permission_set_json, assignment_generation, active, server_confirmed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(device_id) DO UPDATE SET
+           company_id = excluded.company_id,
+           branch_id = excluded.branch_id,
+           operational_location_id = excluded.operational_location_id,
+           intended_usage = excluded.intended_usage,
+           fixed_operational = excluded.fixed_operational,
+           permission_set_json = excluded.permission_set_json,
+           assignment_generation = excluded.assignment_generation,
+           active = excluded.active,
+           server_confirmed_at = excluded.server_confirmed_at",
+        params![
+            bootstrap.device_id,
+            bootstrap.company_id.to_string(),
+            bootstrap.branch_id.to_string(),
+            bootstrap.operational_location_id.to_string(),
+            optional_text(&bootstrap.device_assignment, "intended_usage").unwrap_or_else(|| "GENERAL".to_string()),
+            if bootstrap.device_assignment.get("fixed_operational").and_then(|value| value.as_bool()).unwrap_or(true) { 1 } else { 0 },
+            serde_json::to_string(bootstrap.device_assignment.get("permission_set").unwrap_or(&serde_json::json!({}))).map_err(to_error)?,
+            bootstrap.assignment_generation,
+            if bootstrap.device_assignment.get("active").and_then(|value| value.as_bool()).unwrap_or(true) { 1 } else { 0 },
+            confirmed_at,
+        ],
+    )
+    .map_err(to_error)?;
+
+    for change in &bootstrap.records {
+        let payload_company = change.payload.get("company_id").and_then(json_number).map(|value| value as i64);
+        if payload_company != Some(bootstrap.company_id) {
+            return Err(format!("Reference record {} has invalid company scope", change.entity_id));
+        }
+        if change.entity_type == "inventory_lot" {
+            let payload_branch = change.payload.get("branch_id").and_then(json_number).map(|value| value as i64);
+            let payload_location = change.payload.get("operational_location_id").and_then(json_number).map(|value| value as i64);
+            if payload_branch != Some(bootstrap.branch_id)
+                || payload_location != Some(bootstrap.operational_location_id)
+            {
+                return Err(format!("Inventory lot {} is outside the canonical device scope", change.entity_id));
+            }
+        }
+        apply_change_with_tx(&tx, change)?;
+    }
+
+    for location_product in &bootstrap.location_products {
+        let location_product_location = optional_text(location_product, "operational_location_id")
+            .ok_or_else(|| "Location product has no operational location".to_string())?;
+        if location_product_location != bootstrap.operational_location_id.to_string() {
+            return Err("Location product is outside the canonical device scope".to_string());
+        }
+        let product_id = optional_text(location_product, "product_id")
+            .ok_or_else(|| "Location product has no product identity".to_string())?;
+        tx.execute(
+            "INSERT INTO local_operational_location_products (
+               operational_location_id, product_id, enabled, pos_available,
+               selling_rate, reorder_level, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(operational_location_id, product_id) DO UPDATE SET
+               enabled = excluded.enabled,
+               pos_available = excluded.pos_available,
+               selling_rate = excluded.selling_rate,
+               reorder_level = excluded.reorder_level,
+               updated_at = excluded.updated_at",
+            params![
+                location_product_location,
+                product_id,
+                if location_product.get("enabled").and_then(|value| value.as_bool()).unwrap_or(true) { 1 } else { 0 },
+                if location_product.get("pos_available").and_then(|value| value.as_bool()).unwrap_or(true) { 1 } else { 0 },
+                location_product.get("selling_rate").and_then(json_number),
+                location_product.get("reorder_level").and_then(json_number).unwrap_or(0.0),
+                optional_text(location_product, "updated_at").unwrap_or_else(|| confirmed_at.clone()),
+            ],
+        )
+        .map_err(to_error)?;
+    }
+
+    let bootstrap_meta = serde_json::json!({
+        "protocol": bootstrap.protocol,
+        "device_id": bootstrap.device_id,
+        "company_id": bootstrap.company_id,
+        "branch_id": bootstrap.branch_id,
+        "operational_location_id": bootstrap.operational_location_id,
+        "assignment_generation": bootstrap.assignment_generation,
+        "high_watermark": bootstrap.high_watermark,
+        "server_confirmed_at": confirmed_at,
+    });
+    tx.execute(
+        "INSERT INTO local_kv (key, value, updated_at)
+         VALUES ('reference_bootstrap_meta', ?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![serde_json::to_string(&bootstrap_meta).map_err(to_error)?, confirmed_at],
+    )
+    .map_err(to_error)?;
+    tx.execute(
+        "INSERT INTO sync_state (
+           device_id, last_server_cursor, last_pull_cursor, last_pull_at,
+           operational_location_id, assignment_generation, current_sync_status, updated_at
+         ) VALUES (?1, ?2, ?2, ?3, ?4, ?5, 'IDLE', ?3)
+         ON CONFLICT(device_id) DO UPDATE SET
+           last_server_cursor = excluded.last_server_cursor,
+           last_pull_cursor = excluded.last_pull_cursor,
+           last_pull_at = excluded.last_pull_at,
+           operational_location_id = excluded.operational_location_id,
+           assignment_generation = excluded.assignment_generation,
+           current_sync_status = 'IDLE',
+           last_error = NULL,
+           updated_at = excluded.updated_at",
+        params![
+            bootstrap.device_id,
+            bootstrap.high_watermark,
+            confirmed_at,
+            bootstrap.operational_location_id.to_string(),
+            bootstrap.assignment_generation,
+        ],
+    )
+    .map_err(to_error)?;
+    tx.commit().map_err(to_error)
 }
 
 pub fn mark_sync_failed(app: &AppHandle, message: &str) -> Result<LocalDbStatus, String> {
@@ -2723,6 +2947,14 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                 ],
             )
             .map_err(to_error)?;
+            tx.execute(
+                "UPDATE local_products SET company_id = ?2 WHERE id = ?1",
+                params![
+                    change.entity_id,
+                    optional_text(&change.payload, "company_id"),
+                ],
+            )
+            .map_err(to_error)?;
         }
         "inventory_lot" => {
             if operation == "DELETE" {
@@ -2804,6 +3036,17 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                         optional_text(&change.payload, "created_at"),
                         change.updated_at.clone(),
                         change.version.unwrap_or(1),
+                    ],
+                )
+                .map_err(to_error)?;
+                tx.execute(
+                    "UPDATE local_inventory_lots
+                     SET company_id = ?2, operational_location_id = ?3
+                     WHERE id = ?1",
+                    params![
+                        change.entity_id,
+                        optional_text(&change.payload, "company_id"),
+                        optional_text(&change.payload, "operational_location_id"),
                     ],
                 )
                 .map_err(to_error)?;
@@ -2904,6 +3147,241 @@ mod tests {
                 "amount": amount
             }]
         })
+    }
+
+    fn test_reference_bootstrap(device_id: &str, location_id: i64) -> ReferenceBootstrap {
+        ReferenceBootstrap {
+            protocol: "reference-v1".to_string(),
+            high_watermark: "44".to_string(),
+            device_id: device_id.to_string(),
+            company_id: 1,
+            branch_id: 1,
+            operational_location_id: location_id,
+            assignment_generation: 3,
+            operational_location: serde_json::json!({
+                "id": location_id,
+                "company_id": 1,
+                "branch_id": 1,
+                "location_code": "BADWASIYA",
+                "location_name": "Badwasiya Fruit Market",
+                "location_type": "STORE",
+                "timezone": "Asia/Kolkata",
+                "active": true,
+                "is_default": true,
+                "updated_at": "2026-07-27T10:00:00.000Z"
+            }),
+            device_assignment: serde_json::json!({
+                "device_id": device_id,
+                "company_id": 1,
+                "branch_id": 1,
+                "operational_location_id": location_id,
+                "intended_usage": "POS",
+                "fixed_operational": true,
+                "permission_set": { "pos": true },
+                "assignment_generation": 3,
+                "active": true
+            }),
+            location_products: vec![serde_json::json!({
+                "operational_location_id": location_id,
+                "product_id": "product-276",
+                "enabled": true,
+                "pos_available": true,
+                "selling_rate": 120.0,
+                "reorder_level": 5.0,
+                "updated_at": "2026-07-27T10:00:00.000Z"
+            })],
+            records: vec![
+                PulledChange {
+                    change_id: serde_json::Value::Null,
+                    branch_id: Some(1),
+                    entity_type: "product_category".to_string(),
+                    entity_id: "category-mango".to_string(),
+                    operation_type: "UPSERT".to_string(),
+                    version: Some(1),
+                    payload: serde_json::json!({
+                        "company_id": 1,
+                        "branch_id": 1,
+                        "category_name": "Mango",
+                        "active": true
+                    }),
+                    updated_at: Some("2026-07-27T10:00:00.000Z".to_string()),
+                },
+                PulledChange {
+                    change_id: serde_json::Value::Null,
+                    branch_id: Some(1),
+                    entity_type: "product".to_string(),
+                    entity_id: "product-276".to_string(),
+                    operation_type: "UPSERT".to_string(),
+                    version: Some(2),
+                    payload: serde_json::json!({
+                        "company_id": 1,
+                        "branch_id": 1,
+                        "product_name": "Langda",
+                        "category_global_id": "category-mango",
+                        "category_name": "Mango",
+                        "unit": "KG",
+                        "selling_rate": 120.0,
+                        "minimum_stock": 5.0,
+                        "active": true
+                    }),
+                    updated_at: Some("2026-07-27T10:00:00.000Z".to_string()),
+                },
+                PulledChange {
+                    change_id: serde_json::Value::Null,
+                    branch_id: Some(1),
+                    entity_type: "inventory_lot".to_string(),
+                    entity_id: "lot-276-a".to_string(),
+                    operation_type: "UPSERT".to_string(),
+                    version: Some(4),
+                    payload: serde_json::json!({
+                        "company_id": 1,
+                        "branch_id": 1,
+                        "operational_location_id": location_id,
+                        "product_global_id": "product-276",
+                        "product_name": "Langda",
+                        "batch_no": "L-276-A",
+                        "purchase_qty": 10.0,
+                        "remaining_qty": 7.5,
+                        "purchase_rate": 80.0,
+                        "batch_status": "ACTIVE"
+                    }),
+                    updated_at: Some("2026-07-27T10:00:00.000Z".to_string()),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn reference_bootstrap_is_atomic_idempotent_and_preserves_existing_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-reference-bootstrap-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize bootstrap database");
+        {
+            let conn = Connection::open(&path).expect("open bootstrap database");
+            conn.execute(
+                "INSERT INTO local_products (id, product_name, sync_status) VALUES ('local-preserved', 'Preserved Local Product', 'synced')",
+                [],
+            )
+            .expect("insert preserved product");
+        }
+        let bootstrap = test_reference_bootstrap("device-bootstrap", 1001);
+        apply_reference_bootstrap_at(
+            &path,
+            &bootstrap,
+            "device-bootstrap",
+            Some("2026-07-27T10:01:00.000Z".to_string()),
+        )
+        .expect("apply first bootstrap");
+        apply_reference_bootstrap_at(
+            &path,
+            &bootstrap,
+            "device-bootstrap",
+            Some("2026-07-27T10:02:00.000Z".to_string()),
+        )
+        .expect("retry bootstrap");
+
+        let incremental = PulledChange {
+            change_id: serde_json::json!(45),
+            branch_id: Some(1),
+            entity_type: "product".to_string(),
+            entity_id: "product-276".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(3),
+            payload: serde_json::json!({
+                "company_id": 1,
+                "branch_id": 1,
+                "product_name": "Langda Updated",
+                "unit": "KG",
+                "selling_rate": 125.0,
+                "active": true
+            }),
+            updated_at: Some("2026-07-27T10:03:00.000Z".to_string()),
+        };
+        apply_pull_changes_at(
+            &path,
+            &[incremental],
+            "45",
+            Some("device-bootstrap".to_string()),
+            Some("2026-07-27T10:03:01.000Z".to_string()),
+        )
+        .expect("apply incremental after bootstrap");
+
+        let conn = Connection::open(&path).expect("inspect bootstrap database");
+        let counts: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM local_products),
+                   (SELECT COUNT(*) FROM local_products WHERE id = 'product-276'),
+                   (SELECT COUNT(*) FROM local_inventory_lots WHERE id = 'lot-276-a'),
+                   (SELECT COUNT(*) FROM local_operational_location_products WHERE product_id = 'product-276')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read idempotency counts");
+        assert_eq!(counts, (2, 1, 1, 1));
+        let cursor: String = conn
+            .query_row(
+                "SELECT last_pull_cursor FROM sync_state WHERE device_id = 'device-bootstrap'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read incremental cursor");
+        assert_eq!(cursor, "45");
+        let updated_name: String = conn
+            .query_row("SELECT product_name FROM local_products WHERE id = 'product-276'", [], |row| row.get(0))
+            .expect("read incrementally updated product");
+        assert_eq!(updated_name, "Langda Updated");
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rejected_or_interrupted_reference_bootstrap_rolls_back_every_local_write() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-reference-bootstrap-reject-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize rejected bootstrap database");
+        let mut bootstrap = test_reference_bootstrap("device-bootstrap", 1001);
+        bootstrap.records[2].payload["operational_location_id"] = serde_json::json!(2002);
+        let error = apply_reference_bootstrap_at(
+            &path,
+            &bootstrap,
+            "device-bootstrap",
+            Some("2026-07-27T10:01:00.000Z".to_string()),
+        )
+        .expect_err("cross-location lot must be rejected");
+        assert!(error.contains("outside the canonical device scope"));
+        let conn = Connection::open(&path).expect("inspect rolled back bootstrap");
+        let count: i64 = conn
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM local_products) +
+                   (SELECT COUNT(*) FROM local_inventory_lots) +
+                   (SELECT COUNT(*) FROM local_operational_locations) +
+                   (SELECT COUNT(*) FROM local_device_assignment)",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read rollback counts");
+        assert_eq!(count, 0);
+        drop(conn);
+
+        let identity_error = apply_reference_bootstrap_at(
+            &path,
+            &test_reference_bootstrap("device-bootstrap", 1001),
+            "different-device",
+            Some("2026-07-27T10:01:00.000Z".to_string()),
+        )
+        .expect_err("substituted device must be rejected");
+        assert!(identity_error.contains("device identity"));
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

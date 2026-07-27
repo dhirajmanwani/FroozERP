@@ -33,6 +33,17 @@ const {
   validateSyncBatchScope,
 } = require("./operationalScope");
 const { registerOperationalV3Routes } = require("./operationalV3");
+const {
+  issueDeviceSession,
+  rejectDeviceSessionSubstitution,
+  verifyDeviceSession,
+} = require("./deviceSession");
+const {
+  REFERENCE_BOOTSTRAP_PROTOCOL,
+  captureReferenceBootstrap,
+  lockReferenceBootstrapBoundary,
+  readVisibleIncrementalChanges,
+} = require("./syncReferenceBootstrap");
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
@@ -612,6 +623,11 @@ const maskAccessToken = (value) => {
 const hashSensitiveValue = (value) =>
   crypto.createHash("sha256").update(String(value || "").trim().toLowerCase(), "utf8").digest("hex");
 const recoveryOtpSecret = process.env.RECOVERY_OTP_HASH_SECRET || process.env.OTP_HASH_SECRET || process.env.DB_PASSWORD || "froozerp-local-dev-otp-secret";
+const deviceSessionSecret =
+  process.env.DEVICE_SESSION_SECRET ||
+  process.env.DB_PASSWORD ||
+  primaryDatabaseUrl ||
+  recoveryOtpSecret;
 const recoveryGenericMessage = "If the provided information matches an eligible account, a verification code will be sent.";
 const recoveryDevOtpEnabled = /^true$/i.test(process.env.RECOVERY_DEV_OTP_ENABLED || "") && process.env.NODE_ENV !== "production";
 const generateOtpCode = () => String(crypto.randomInt(0, 1000000)).padStart(6, "0");
@@ -7817,7 +7833,8 @@ const requireSyncContext = async ({ userId, deviceId, branchId, operationalLocat
   }
   const userResult = await client.query(
     `
-    SELECT u.id, u.full_name, u.company_id, u.branch_id, u.active, r.role_name
+    SELECT u.id, u.full_name, u.company_id, u.branch_id, u.active,
+           u.session_revocation_version, r.role_name
     FROM users u
     JOIN roles r ON r.id = u.role_id
     WHERE u.id = $1 AND u.active = TRUE
@@ -9366,6 +9383,87 @@ app.post("/api/sync/push", rateLimitSyncRequest, async (req, res) => {
 });
 
 app.get("/api/sync/pull", rateLimitSyncRequest, async (req, res) => {
+  const cursor = Math.max(0, Number(req.query.cursor || 0));
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
+  const bootstrapRequested =
+    cursor === 0 && cleanText(req.query.bootstrap_protocol) === REFERENCE_BOOTSTRAP_PROTOCOL;
+  if (bootstrapRequested) {
+    if (operationalScopeMode !== SCOPE_MODES.ENFORCE) {
+      return res.status(409).json({
+        code: "OPERATIONAL_SCOPE_REQUIRED",
+        message: "Reference bootstrap requires enforced operational-location scope",
+      });
+    }
+    const deviceSession = verifyDeviceSession(
+      req.headers["x-froozerp-device-session"],
+      deviceSessionSecret
+    );
+    if (deviceSession.error) {
+      return res.status(deviceSession.error.status).json(deviceSession.error);
+    }
+    const substitution = rejectDeviceSessionSubstitution(deviceSession.claims, {
+      user_id: req.query.user_id,
+      device_id: req.query.device_id,
+      company_id: req.query.company_id,
+      branch_id: req.query.branch_id,
+    });
+    if (substitution) return res.status(substitution.status).json(substitution);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+      await lockReferenceBootstrapBoundary(client);
+      const context = await requireSyncContext({
+        userId: deviceSession.claims.user_id,
+        deviceId: deviceSession.claims.device_id,
+        branchId: deviceSession.claims.branch_id,
+        operationalLocationId: req.query.operational_location_id,
+      }, client);
+      if (context.error) {
+        await client.query("ROLLBACK");
+        return res.status(context.error.status).json({
+          code: context.error.code,
+          message: context.error.message,
+        });
+      }
+      if (
+        context.companyId !== deviceSession.claims.company_id ||
+        Number(context.user.session_revocation_version || 0) !==
+          Number(deviceSession.claims.session_revocation_version || 0)
+      ) {
+        await client.query("ROLLBACK");
+        return res.status(401).json({
+          code: "DEVICE_SESSION_SCOPE_STALE",
+          message: "Authenticated device session no longer matches canonical server scope",
+        });
+      }
+      const referenceBootstrap = await captureReferenceBootstrap(client, context);
+      await client.query("COMMIT");
+      await pool.query(
+        "UPDATE authorized_devices SET last_sync_at = CURRENT_TIMESTAMP, sync_status = 'PULLED', updated_at = CURRENT_TIMESTAMP WHERE device_id = $1",
+        [context.deviceId]
+      );
+      return res.json({
+        company_id: context.companyId,
+        branch_id: context.branchId,
+        operational_location_id: context.operationalLocationId,
+        changes: [],
+        reference_bootstrap: referenceBootstrap,
+        next_cursor: referenceBootstrap.high_watermark,
+        ...serverTimePayload(),
+        // Force one ordinary incremental pull after the atomically applied snapshot.
+        has_more: Number(referenceBootstrap.high_watermark) > 0,
+      });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error("Reference bootstrap failed", error.message);
+      return res.status(500).json({
+        code: error.code || "REFERENCE_BOOTSTRAP_FAILED",
+        message: "Reference bootstrap failed",
+      });
+    } finally {
+      client.release();
+    }
+  }
   try {
     const context = await requireSyncContext({
       userId: req.query.user_id,
@@ -9374,29 +9472,29 @@ app.get("/api/sync/pull", rateLimitSyncRequest, async (req, res) => {
       operationalLocationId: req.query.operational_location_id,
     });
     if (context.error) return res.status(context.error.status).json({ message: context.error.message });
-    const cursor = Math.max(0, Number(req.query.cursor || 0));
-    const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
-    const result = await pool.query(
-      `
-      SELECT change_id, branch_id, entity_type, entity_id, operation_type,
-             entity_version AS version, payload, created_at AS updated_at
-      FROM sync_change_log
-      WHERE company_id = $1
-        AND branch_id = $2
-        AND change_id > $3
-        AND ($5::INTEGER IS NULL OR operational_location_id = $5)
-      ORDER BY change_id
-      LIMIT $4
-      `,
-      [
-        context.companyId,
-        context.branchId,
-        cursor,
-        limit + 1,
-        operationalScopeMode === SCOPE_MODES.ENFORCE ? context.operationalLocationId : null,
-      ]
-    );
-    const rows = result.rows.slice(0, limit);
+    let rows;
+    let hasMore;
+    if (operationalScopeMode === SCOPE_MODES.ENFORCE) {
+      const visible = await readVisibleIncrementalChanges(pool, context, cursor, limit);
+      rows = visible.rows;
+      hasMore = visible.hasMore;
+    } else {
+      const result = await pool.query(
+        `
+        SELECT change_id, branch_id, entity_type, entity_id, operation_type,
+               entity_version AS version, payload, created_at AS updated_at
+        FROM sync_change_log
+        WHERE company_id = $1
+          AND branch_id = $2
+          AND change_id > $3
+        ORDER BY change_id
+        LIMIT $4
+        `,
+        [context.companyId, context.branchId, cursor, limit + 1]
+      );
+      rows = result.rows.slice(0, limit);
+      hasMore = result.rows.length > limit;
+    }
     const nextCursor = rows.length ? String(rows[rows.length - 1].change_id) : String(cursor);
     await pool.query(
       "UPDATE authorized_devices SET last_sync_at = CURRENT_TIMESTAMP, sync_status = 'PULLED', updated_at = CURRENT_TIMESTAMP WHERE device_id = $1",
@@ -9409,7 +9507,7 @@ app.get("/api/sync/pull", rateLimitSyncRequest, async (req, res) => {
       changes: rows,
       next_cursor: nextCursor,
       ...serverTimePayload(),
-      has_more: result.rows.length > limit,
+      has_more: hasMore,
     });
   } catch (error) {
     console.error("Sync pull failed", error.message);
@@ -10190,6 +10288,16 @@ app.post("/login", async (req, res) => {
       branch_id: user.branch_id || 1,
       canonical_alias_used: canonicalAliasUsed,
     });
+    const canonicalCompanyId = user.company_id || device.company_id || null;
+    const canonicalBranchId = device.assigned_branch_id || user.branch_id || 1;
+    const deviceSessionToken = issueDeviceSession({
+      userId: user.id,
+      deviceId: device.device_id,
+      companyId: canonicalCompanyId,
+      branchId: canonicalBranchId,
+      sessionRevocationVersion: user.session_revocation_version || 0,
+      secret: deviceSessionSecret,
+    });
 
     return res.json({
       id: user.id,
@@ -10218,6 +10326,7 @@ app.post("/login", async (req, res) => {
       canonical_cloud_api_url: productionRailwayOrigin,
       force_password_change: user.force_password_change === true,
       session_revocation_version: user.session_revocation_version || 0,
+      device_session_token: deviceSessionToken,
     });
   } catch (error) {
     console.error(error);

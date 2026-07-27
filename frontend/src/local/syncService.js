@@ -160,6 +160,7 @@ const syncContext = ({ user, deviceInfo, branchId }) => ({
   deviceId: deviceInfo?.device_id,
   deviceName: deviceInfo?.device_name,
   branchId: String(branchId || user?.branch_id || ""),
+  deviceSessionToken: user?.device_session_token || "",
 });
 
 export async function checkBackendHealth(apiUrl, options = {}) {
@@ -304,12 +305,16 @@ export async function pullServerChanges({ apiUrl, user, deviceInfo, branchId }) 
   const pullStartedAt = Date.now();
   const response = await axios.get(endpointUrl(apiUrl, "/api/sync/pull"), {
     ...withTimeout(15000),
+    headers: cursor === "0" && context.deviceSessionToken
+      ? { "x-froozerp-device-session": context.deviceSessionToken }
+      : undefined,
     params: {
       user_id: context.userId,
       device_id: context.deviceId,
       branch_id: context.branchId,
       cursor,
       limit: 50,
+      bootstrap_protocol: cursor === "0" ? "reference-v1" : undefined,
     },
   });
   const pullReceivedAt = Date.now();
@@ -323,15 +328,22 @@ export async function pullServerChanges({ apiUrl, user, deviceInfo, branchId }) 
     endpoint: endpointUrl(apiUrl, "/api/sync/pull"),
     status: response.status,
     changeCount: (response.data?.changes || []).length,
+    bootstrapRecordCount: (response.data?.reference_bootstrap?.records || []).length,
     nextCursor: response.data?.next_cursor || cursor,
     hasMore: Boolean(response.data?.has_more),
   });
-  const status = await applyPulledChanges({
-    changes: response.data?.changes || [],
-    nextCursor: response.data?.next_cursor || cursor,
-    deviceId: context.deviceId,
-    serverTime: response.data?.server_time,
-  });
+  const status = response.data?.reference_bootstrap
+    ? await repositories.pull.bootstrap({
+        bootstrap: response.data.reference_bootstrap,
+        deviceId: context.deviceId,
+        serverTime: response.data?.server_time,
+      })
+    : await applyPulledChanges({
+        changes: response.data?.changes || [],
+        nextCursor: response.data?.next_cursor || cursor,
+        deviceId: context.deviceId,
+        serverTime: response.data?.server_time,
+      });
   lastStatus = { ...normalizeLocalStatus(status), online: true, lastError: "", apiUrl: normalizeApiUrl(apiUrl), syncStage: "pull" };
   return { ...lastStatus, hasMore: Boolean(response.data?.has_more) };
 }

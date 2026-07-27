@@ -2110,6 +2110,15 @@ fn sync_apply_pull_changes(
     local_db::apply_pull_changes(&app, &changes, &next_cursor, device_id, server_time)
 }
 #[tauri::command]
+fn sync_apply_reference_bootstrap(
+    app: AppHandle,
+    bootstrap: local_db::ReferenceBootstrap,
+    device_id: String,
+    server_time: Option<String>,
+) -> Result<LocalDbStatus, String> {
+    local_db::apply_reference_bootstrap(&app, &bootstrap, &device_id, server_time)
+}
+#[tauri::command]
 fn sync_record_cycle_completed(app: AppHandle, device_id: String, server_time: Option<String>, push_result: String) -> Result<LocalDbStatus, String> {
     local_db::record_sync_cycle_completed(&app, &device_id, server_time, &push_result)
 }
@@ -2411,6 +2420,7 @@ pub fn run() {
             sync_outbox_pending,
             sync_apply_push_acks,
             sync_apply_pull_changes,
+            sync_apply_reference_bootstrap,
             sync_record_cycle_completed,
             sync_mark_failed,
             sync_retry_failed_operations,

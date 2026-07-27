@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "check": "node --check server.js",
-    "test": "node --test aiBusinessAssistantRules.test.js aiBusinessAssistantSchema.test.js cloudProxyError.test.js frostAuthorization.test.js frostCore.test.js frostIntelligence.test.js identityPolicy.test.js operationalMigration.test.js operationalScope.test.js operationalV3.test.js storageAdapters.test.js"
+    "test": "node --test aiBusinessAssistantRules.test.js aiBusinessAssistantSchema.test.js cloudProxyError.test.js deviceSession.test.js frostAuthorization.test.js frostCore.test.js frostIntelligence.test.js identityPolicy.test.js operationalMigration.test.js operationalScope.test.js operationalV3.test.js storageAdapters.test.js syncReferenceBootstrap.test.js"
   },
   "keywords": [],
   "author": "",

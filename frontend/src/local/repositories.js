@@ -1,5 +1,6 @@
 import {
   applyPulledChanges,
+  applyReferenceBootstrap,
   applyPushAcknowledgements,
   recordSyncCycleCompleted,
   completeLocalPosSale,
@@ -77,6 +78,7 @@ export const repositories = {
   },
   pull: {
     apply: applyPulledChanges,
+    bootstrap: applyReferenceBootstrap,
   },
   status: {
     get: getLocalDatabaseStatus,
