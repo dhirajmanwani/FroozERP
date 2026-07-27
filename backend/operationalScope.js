@@ -81,11 +81,13 @@ const createOperationalScopeService = (database) => {
         da.assignment_generation,
         da.fixed_operational,
         da.intended_usage,
+        da.permission_set AS device_permissions,
         da.active AS device_assignment_active,
         ol.active AS location_active,
         b.active AS branch_active,
         sla.role_id,
         sla.is_default,
+        sla.permission_set AS staff_permissions,
         sla.active AS staff_assignment_active,
         COALESCE(r.role_name, '') AS role_name
       FROM authorized_devices d
@@ -134,6 +136,8 @@ const createOperationalScopeService = (database) => {
       assignment_generation: Number(row.assignment_generation || 1),
       fixed_operational: row.fixed_operational !== false,
       intended_usage: row.intended_usage || null,
+      device_permissions: row.device_permissions || {},
+      staff_permissions: row.staff_permissions || {},
       role: row.role_name || null,
       is_default: row.is_default === true,
     };

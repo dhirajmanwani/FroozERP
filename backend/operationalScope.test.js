@@ -91,6 +91,8 @@ test("service resolves the intersection of approved user and device assignments"
     assignment_generation: 2,
     fixed_operational: true,
     intended_usage: "POS",
+    device_permissions: {},
+    staff_permissions: {},
     role: "Owner",
     is_default: true,
   });

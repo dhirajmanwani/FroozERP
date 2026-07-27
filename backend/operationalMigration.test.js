@@ -9,6 +9,10 @@ const cloudMigration = fs.readFileSync(
   path.join(__dirname, "migrations/cloud/009_operational_location_foundation.sql"),
   "utf8"
 );
+const protocolMigration = fs.readFileSync(
+  path.join(__dirname, "migrations/cloud/010_operational_protocol_v3.sql"),
+  "utf8"
+);
 const sqliteMigration = fs.readFileSync(
   path.join(__dirname, "../src-tauri/migrations/sqlite/013_operational_location_foundation.sql"),
   "utf8"
@@ -75,4 +79,14 @@ test("branch aggregates cannot be persisted as inventory in the new schema", () 
   assert.match(cloudMigration, /inventory_batches ADD COLUMN IF NOT EXISTS operational_location_id/);
   assert.doesNotMatch(cloudMigration, /CREATE TABLE IF NOT EXISTS branch_inventory\b/);
   assert.doesNotMatch(cloudMigration, /CREATE TABLE IF NOT EXISTS branch_stock\b/);
+});
+
+test("protocol v3 constraints remain additive and preserve pending-bill cost semantics", () => {
+  assert.match(protocolMigration, /ALTER TABLE inventory_batches ALTER COLUMN purchase_rate DROP NOT NULL/i);
+  assert.match(protocolMigration, /ALTER TABLE products ALTER COLUMN selling_rate DROP NOT NULL/i);
+  assert.match(protocolMigration, /DROP INDEX IF EXISTS products_category_name_lower_unique_idx/i);
+  assert.match(protocolMigration, /products_company_name_search_idx/i);
+  assert.match(protocolMigration, /goods_receipt_items_lot_global_id_idx/i);
+  assert.match(protocolMigration, /inventory_transfers_status_v3_check/i);
+  assert.doesNotMatch(protocolMigration, /\b(?:DELETE|TRUNCATE|DROP TABLE|UPDATE\s+\w+\s+SET)\b/i);
 });
