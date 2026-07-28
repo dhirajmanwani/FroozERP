@@ -1,7 +1,7 @@
 mod local_db;
 
 use local_db::{
-    LocalDbStatus, LocalPosSaleResult, PendingSyncOperation, PulledChange, SyncAck, SyncOperation,
+    LocalDbStatus, LocalPosSaleResult, LocalPurchaseIntentResult, PendingSyncOperation, PulledChange, SyncAck, SyncOperation,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "windows")]
@@ -2096,6 +2096,18 @@ fn sync_outbox_pending(
     local_db::pending_outbox(&app, limit.unwrap_or(50))
 }
 #[tauri::command]
+fn sync_outbox_mark_syncing(app: AppHandle, operation_ids: Vec<String>) -> Result<LocalDbStatus, String> {
+    local_db::mark_outbox_syncing(&app, &operation_ids)
+}
+#[tauri::command]
+fn sync_outbox_release_syncing(
+    app: AppHandle,
+    operation_ids: Vec<String>,
+    message: Option<String>,
+) -> Result<LocalDbStatus, String> {
+    local_db::release_syncing_operations(&app, &operation_ids, message)
+}
+#[tauri::command]
 fn sync_apply_push_acks(app: AppHandle, acks: Vec<SyncAck>, device_id: Option<String>, server_time: Option<String>) -> Result<LocalDbStatus, String> {
     local_db::apply_push_acks(&app, &acks, device_id, server_time)
 }
@@ -2173,6 +2185,19 @@ fn pos_sale_load_local(app: AppHandle, invoice_id: String) -> Result<serde_json:
 #[tauri::command]
 fn pos_sale_list_local(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
     local_db::list_local_pos_sales(&app)
+}
+
+#[tauri::command]
+fn purchase_queue_local(
+    app: AppHandle,
+    purchase: serde_json::Value,
+) -> Result<LocalPurchaseIntentResult, String> {
+    local_db::queue_local_purchase(&app, purchase)
+}
+
+#[tauri::command]
+fn purchase_list_local(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
+    local_db::list_local_purchase_intents(&app)
 }
 
 #[cfg(test)]
@@ -2418,6 +2443,8 @@ pub fn run() {
             sync_outbox_enqueue,
             sync_outbox_count,
             sync_outbox_pending,
+            sync_outbox_mark_syncing,
+            sync_outbox_release_syncing,
             sync_apply_push_acks,
             sync_apply_pull_changes,
             sync_apply_reference_bootstrap,
@@ -2429,7 +2456,9 @@ pub fn run() {
             pos_sale_edit_local,
             pos_sale_cancel_local,
             pos_sale_load_local,
-            pos_sale_list_local
+            pos_sale_list_local,
+            purchase_queue_local,
+            purchase_list_local
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

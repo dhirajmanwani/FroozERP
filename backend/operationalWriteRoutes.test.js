@@ -100,4 +100,21 @@ test("legacy operational routes remain registered for explicit HTTP 426 enforcem
   assert.match(backendSource, /app\.post\("\/waste-entries", createWasteEntryHandler\)/);
   assert.match(backendSource, /requiresOperationalProtocolUpgrade\(req\.path\)/);
   assert.match(backendSource, /status\(426\)/);
+  assert.match(backendSource, /app\.post\("\/lots\/transfer-stock"/);
+  assert.doesNotMatch(frontendSource, /openLotAction\("transfer"/);
+  assert.doesNotMatch(frontendSource, /lotAction\.type === "transfer"/);
+});
+
+test("offline purchase replay preserves signed operation identities and canonical scope", () => {
+  assert.match(backendSource, /productGlobalId: nullableText\(body\.product_global_id\)/);
+  assert.match(backendSource, /offline-purchase-\$\{operationId\}-\$\{lineIndex\}/);
+  assert.match(backendSource, /offline-lot-\$\{operationId\}-\$\{lineIndex\}/);
+  assert.match(backendSource, /OFFLINE_PURCHASE_IDENTITY_MISMATCH/);
+  assert.match(
+    backendSource,
+    /WHERE global_id = \$1[\s\S]*AND company_id = \$2[\s\S]*active IS DISTINCT FROM FALSE/
+  );
+  assert.match(backendSource, /company_id, operational_location_id, global_id/);
+  assert.match(backendSource, /lots: createdLots/);
+  assert.match(backendSource, /\.\.\.serverTimePayload\(\)/);
 });

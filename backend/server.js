@@ -16015,6 +16015,10 @@ const readPurchaseEntryPayload = (body) => {
   return {
     supplierId: parsePositiveInteger(body.supplier_id),
     productId: parsePositiveInteger(body.product_id),
+    productGlobalId: nullableText(body.product_global_id),
+    purchaseGlobalId: nullableText(body.purchase_global_id),
+    lotGlobalId: nullableText(body.lot_global_id),
+    lineIndex: parsePositiveInteger(body.line_index),
     quantity: parsePositiveNumber(body.quantity),
     purchaseRate: parsePositiveNumber(body.purchase_rate),
     expectedPurchaseRate: parseNonNegativeNumber(body.expected_purchase_rate),
@@ -16627,6 +16631,10 @@ const createPurchaseBillHandler = async (req, res) => {
     const entries = rawItems.map((item) => readPurchaseEntryPayload({
       ...req.body,
       product_id: item.product_id,
+      product_global_id: item.product_global_id,
+      purchase_global_id: item.purchase_global_id,
+      lot_global_id: item.lot_global_id,
+      line_index: item.line_index,
       quantity: item.quantity,
       purchase_rate: item.purchase_rate,
       expected_purchase_rate: item.expected_purchase_rate,
@@ -16640,13 +16648,52 @@ const createPurchaseBillHandler = async (req, res) => {
       purchase_type: baseEntry.purchaseBillStatus === "BILL_COMPLETED" ? "CREDIT" : "PENDING_BILL",
     }));
 
-    const validationMessages = entries.map(validatePurchaseEntry).filter(Boolean);
-    if (validationMessages.length) return res.status(400).json({ message: validationMessages[0] });
-
     await client.query("BEGIN");
     const replay = await beginV3BusinessOperation(client, req, "purchase");
     if (replay) return sendV3Replay(client, res, replay);
     const context = req.v3OperationalContext;
+    if (context) {
+      const operationId = v3OperationKey(req);
+      for (let index = 0; index < entries.length; index += 1) {
+        const entry = entries[index];
+        if (!entry.productId && entry.productGlobalId) {
+          const productByGlobalId = await client.query(
+            `SELECT id
+             FROM products
+             WHERE global_id = $1
+               AND company_id = $2
+               AND active IS DISTINCT FROM FALSE
+             FOR SHARE`,
+            [entry.productGlobalId, context.company_id]
+          );
+          entry.productId = productByGlobalId.rows[0]?.id || null;
+        }
+        const lineIndex = index + 1;
+        const expectedPurchaseGlobalId = `offline-purchase-${operationId}-${lineIndex}`;
+        const expectedLotGlobalId = `offline-lot-${operationId}-${lineIndex}`;
+        if (
+          (entry.purchaseGlobalId && entry.purchaseGlobalId !== expectedPurchaseGlobalId) ||
+          (entry.lotGlobalId && entry.lotGlobalId !== expectedLotGlobalId) ||
+          (entry.lineIndex && entry.lineIndex !== lineIndex)
+        ) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            code: "OFFLINE_PURCHASE_IDENTITY_MISMATCH",
+            message: "Offline purchase line identity does not match its signed operation.",
+          });
+        }
+        if (entry.purchaseGlobalId || entry.lotGlobalId || entry.lineIndex) {
+          entry.purchaseGlobalId = expectedPurchaseGlobalId;
+          entry.lotGlobalId = expectedLotGlobalId;
+          entry.lineIndex = lineIndex;
+        }
+      }
+    }
+    const validationMessages = entries.map(validatePurchaseEntry).filter(Boolean);
+    if (validationMessages.length) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: validationMessages[0] });
+    }
     if (context) {
       const productIds = [...new Set(entries.map((entry) => entry.productId))];
       const [supplierScope, productScope] = await Promise.all([
@@ -16675,6 +16722,7 @@ const createPurchaseBillHandler = async (req, res) => {
       }
 
       const createdPurchases = [];
+      const createdLots = [];
       for (const entry of entries) {
         const arrival = await getPurchasePartiesForArrival(client, entry);
         if (arrival.error) {
@@ -16717,22 +16765,23 @@ const createPurchaseBillHandler = async (req, res) => {
           [purchase.id, entry.productId, entry.quantity, provisionalCost, provisionalAmount, entry.lotName, entry.lotSize, itemUnit, itemOriginType]
         );
         const batchNo = `PENDING-${Date.now()}-${purchase.id}`;
-        await client.query(
+        const lotResult = await client.query(
           `
           INSERT INTO inventory_batches (
             product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
             supplier_id, supplier_name, branch_id, gross_amount, net_payable, balance_amount,
             purchase_id, batch_status, purchase_bill_status, temporary_sale_rate, lot_name, lot_size,
             stock_source, remarks, purchase_date, unit, origin_type,
-            company_id, operational_location_id
+            company_id, operational_location_id, global_id
           )
-          VALUES ($1, $2, $3, $3, $4, $4, $5, $6, $7, 0, 0, 0, $8, 'ACTIVE', 'BILL_PENDING', $9, $10, $11, 'PURCHASE', $12, $13, $14, $15, $16, $17)
+          VALUES ($1, $2, $3, $3, $4, $4, $5, $6, $7, 0, 0, 0, $8, 'ACTIVE', 'BILL_PENDING', $9, $10, $11, 'PURCHASE', $12, $13, $14, $15, $16, $17, $18)
+          RETURNING *
           `,
           [
             entry.productId, batchNo, entry.quantity, provisionalCost, arrival.supplier.id,
             arrival.supplier.supplier_name, entry.branchId, purchase.id, entry.temporarySaleRate,
             entry.lotName, entry.lotSize, entry.remarks, entry.purchaseDate, itemUnit, itemOriginType,
-            context?.company_id || null, context?.operational_location_id || null,
+            context?.company_id || null, context?.operational_location_id || null, entry.lotGlobalId || null,
           ]
         );
         const productRateResult = await client.query(
@@ -16776,13 +16825,20 @@ const createPurchaseBillHandler = async (req, res) => {
           "INSERT INTO purchase_audit_trail (purchase_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'ADDED_ITEM', NULL, $2::jsonb, $3, $4)",
           [purchase.id, JSON.stringify({ purchase, product_name: arrival.product.product_name }), "Purchase cart item added", manager.id]
         );
-        createdPurchases.push({ ...purchase, product_name: arrival.product.product_name });
+        createdPurchases.push({
+          ...purchase,
+          global_id: entry.purchaseGlobalId || null,
+          product_name: arrival.product.product_name,
+        });
+        createdLots.push(lotResult.rows[0]);
       }
       const responsePayload = {
         success: true,
         message: "Stock Arrival Saved - Bill Pending",
         purchase_ids: createdPurchases.map((purchase) => purchase.id),
         purchases: createdPurchases,
+        lots: createdLots,
+        ...serverTimePayload(),
       };
       await completeV3BusinessOperation(
         client,
@@ -16831,6 +16887,7 @@ const createPurchaseBillHandler = async (req, res) => {
     }
     let usedPaid = 0;
     const createdPurchases = [];
+    const createdLots = [];
     for (let index = 0; index < completedEntries.length; index += 1) {
       const item = completedEntries[index];
       const { entry, supplier, product, originType, unit, rebateRule } = item;
@@ -16892,23 +16949,24 @@ const createPurchaseBillHandler = async (req, res) => {
         ]
       );
       const batchNo = `BATCH-${Date.now()}-${purchase.id}`;
-      await client.query(
+      const lotResult = await client.query(
         `
         INSERT INTO inventory_batches (
           product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
           supplier_id, supplier_name, branch_id, mandi_tax_amount, freight_charges, labour_charges,
           other_charges, gross_amount, rebate_amount, net_payable, payment_timing, balance_amount,
           purchase_id, batch_status, purchase_bill_status, lot_name, lot_size, stock_source, remarks, purchase_date, unit, origin_type,
-          company_id, operational_location_id
+          company_id, operational_location_id, global_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'ACTIVE', 'BILL_COMPLETED', $20, $21, 'PURCHASE', $22, $23, $24, $25, $26, $27)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'ACTIVE', 'BILL_COMPLETED', $20, $21, 'PURCHASE', $22, $23, $24, $25, $26, $27, $28)
+        RETURNING *
         `,
         [
           entry.productId, batchNo, entry.quantity, entry.quantity, entry.purchaseRate, financials.effectiveCostPerUnit,
           supplier.id, supplier.supplier_name, entry.branchId, financials.mandiTaxAmount, entry.freightCharges, entry.labourCharges,
           entry.otherCharges, financials.grossAmount, financials.rebateAmount, financials.netPayable, rebateRule.rule_name,
           financials.balanceAmount, purchase.id, entry.lotName, entry.lotSize, entry.remarks, entry.purchaseDate, itemUnit, itemOriginType,
-          context?.company_id || null, context?.operational_location_id || null,
+          context?.company_id || null, context?.operational_location_id || null, entry.lotGlobalId || null,
         ]
       );
       await client.query(
@@ -16930,7 +16988,13 @@ const createPurchaseBillHandler = async (req, res) => {
         "INSERT INTO purchase_audit_trail (purchase_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'ADDED_ITEM', NULL, $2::jsonb, $3, $4)",
         [purchase.id, JSON.stringify({ purchase, product_name: product.product_name, origin_type: originType }), "Purchase cart item added", entry.actorId]
       );
-      createdPurchases.push({ ...purchase, product_name: product.product_name, origin_type: originType });
+      createdPurchases.push({
+        ...purchase,
+        global_id: entry.purchaseGlobalId || null,
+        product_name: product.product_name,
+        origin_type: originType,
+      });
+      createdLots.push(lotResult.rows[0]);
     }
 
     const responsePayload = {
@@ -16938,6 +17002,8 @@ const createPurchaseBillHandler = async (req, res) => {
       message: "Purchase Saved",
       purchase_ids: createdPurchases.map((purchase) => purchase.id),
       purchases: createdPurchases,
+      lots: createdLots,
+      ...serverTimePayload(),
     };
     await completeV3BusinessOperation(
       client,

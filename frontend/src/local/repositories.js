@@ -7,8 +7,12 @@ import {
   enqueueSyncOperation,
   getPendingOutbox,
   getLocalDatabaseStatus,
+  listLocalPurchases,
+  markOutboxOperationsSyncing,
   markSyncFailed,
+  queueLocalPurchase,
   queueSyncTestEntity,
+  releaseOutboxOperations,
   retryFailedLocalOperations,
 } from "./localDatabase";
 import { authoritativeUtcNowIso } from "./serverTime";
@@ -44,6 +48,14 @@ export class SyncOutboxRepository {
     return applyPushAcknowledgements(acks, deviceId, serverTime);
   }
 
+  async markSyncing(operationIds) {
+    return markOutboxOperationsSyncing(operationIds);
+  }
+
+  async release(operationIds, message) {
+    return releaseOutboxOperations(operationIds, message);
+  }
+
   async retryFailed() {
     return retryFailedLocalOperations();
   }
@@ -75,6 +87,10 @@ export const repositories = {
   },
   pos: {
     completeSale: completeLocalPosSale,
+  },
+  purchases: {
+    queue: queueLocalPurchase,
+    list: listLocalPurchases,
   },
   pull: {
     apply: applyPulledChanges,

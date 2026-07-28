@@ -115,6 +115,18 @@ export async function getPendingOutbox(limit = 50) {
   return invokeLocal("sync_outbox_pending", { limit });
 }
 
+export async function markOutboxOperationsSyncing(operationIds) {
+  if (!isTauriRuntime()) return emptyStatus;
+  const status = await invokeLocal("sync_outbox_mark_syncing", { operationIds });
+  return normalizeStatus(status);
+}
+
+export async function releaseOutboxOperations(operationIds, message = "") {
+  if (!isTauriRuntime()) return emptyStatus;
+  const status = await invokeLocal("sync_outbox_release_syncing", { operationIds, message: message || null });
+  return normalizeStatus(status);
+}
+
 export async function applyPushAcknowledgements(acks, deviceId, serverTime) {
   if (!isTauriRuntime()) return emptyStatus;
   const status = await invokeLocal("sync_apply_push_acks", { acks, deviceId, serverTime });
@@ -223,4 +235,16 @@ export async function loadLocalPosSale(invoiceId) {
 export async function listLocalPosSales() {
   if (!isTauriRuntime()) return [];
   return invokeLocal("pos_sale_list_local");
+}
+
+export async function queueLocalPurchase(purchase) {
+  if (!isTauriRuntime()) {
+    throw new Error("Offline purchase entry is only available inside the FroozERP desktop app.");
+  }
+  return invokeLocal("purchase_queue_local", { purchase });
+}
+
+export async function listLocalPurchases() {
+  if (!isTauriRuntime()) return [];
+  return invokeLocal("purchase_list_local");
 }

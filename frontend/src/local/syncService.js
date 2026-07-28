@@ -223,6 +223,61 @@ export async function initialiseSync({ apiUrl, user, deviceInfo, branchId }) {
   return lastStatus;
 }
 
+const replayOfflinePurchase = async ({ apiUrl, operation, context }) => {
+  const requestStartedAt = Date.now();
+  try {
+    const response = await axios.post(
+      endpointUrl(apiUrl, "/api/v3/purchase-bills"),
+      {
+        ...(operation.payload || {}),
+        idempotency_key: operation.operation_id,
+        operation_id: operation.operation_id,
+      },
+      {
+        ...withTimeout(20000),
+        headers: {
+          "x-froozerp-device-session": context.deviceSessionToken,
+          "x-idempotency-key": operation.operation_id,
+        },
+      },
+    );
+    const responseReceivedAt = Date.now();
+    observeServerTime({
+      serverTime: response.data?.server_time,
+      requestStartedAt,
+      responseReceivedAt,
+    });
+    return {
+      acknowledgement: {
+        operation_id: operation.operation_id,
+        status: "accepted",
+        server_entity_version: 1,
+        server_updated_at: response.data?.server_time || authoritativeUtcNowIso(),
+        error_code: null,
+        message: response.data?.message || "Purchase acknowledged",
+        result_payload: response.data || {},
+      },
+      serverTime: response.data?.server_time || "",
+    };
+  } catch (error) {
+    if (!error?.response) throw error;
+    const status = Number(error.response.status || 0);
+    const data = error.response.data || {};
+    return {
+      acknowledgement: {
+        operation_id: operation.operation_id,
+        status: status === 409 ? "conflict" : "rejected",
+        server_entity_version: null,
+        server_updated_at: data.server_time || authoritativeUtcNowIso(),
+        error_code: data.code || `HTTP_${status || 500}`,
+        message: data.message || "Offline purchase replay was rejected",
+        result_payload: data,
+      },
+      serverTime: data.server_time || "",
+    };
+  }
+};
+
 export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId }) {
   const context = syncContext({ user, deviceInfo, branchId });
   if (cloudAccessDisabledByOwner()) {
@@ -239,6 +294,8 @@ export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId
     });
     return { ...normalizeLocalStatus(await repositories.status.get()), lastPushResult: "NO_PENDING_CHANGES" };
   }
+  const operationIds = operations.map((operation) => operation.operation_id);
+  await repositories.outbox.markSyncing(operationIds);
   logSyncEndpoint("push", apiUrl, "/api/sync/push", { count: operations.length });
   lastStatus = {
     ...lastStatus,
@@ -246,50 +303,75 @@ export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId
     syncProgressDone: 0,
     syncProgressTotal: operations.length,
   };
-  const pushStartedAt = Date.now();
-  const response = await axios.post(endpointUrl(apiUrl, "/api/sync/push"), {
-    user_id: context.userId,
-    device_id: context.deviceId,
-    branch_id: context.branchId,
-    client_timestamp: authoritativeUtcNowIso(),
-    operations: operations.map((operation) => ({
-      operation_id: operation.operation_id,
-      idempotency_key: operation.operation_id,
-      entity_type: operation.entity_type,
-      entity_id: operation.entity_id,
-      operation_type: operation.operation_type,
-      version: operation.version,
-      payload: operation.payload,
-      created_at: operation.created_at,
-    })),
-  }, withTimeout(15000));
-  observeServerTime({
-    serverTime: response.data?.server_time,
-    requestStartedAt: pushStartedAt,
-    responseReceivedAt: Date.now(),
-  });
-  writeSyncLog("INFO", "push-result", {
-    apiUrl: normalizeApiUrl(apiUrl),
-    endpoint: endpointUrl(apiUrl, "/api/sync/push"),
-    status: response.status,
-    operationCount: operations.length,
-    acknowledgementCount: (response.data?.acknowledgements || []).length,
-  });
-  const status = await repositories.outbox.applyAcks(
-    response.data?.acknowledgements || [],
-    context.deviceId,
-    response.data?.server_time,
-  );
-  lastStatus = {
-    ...normalizeLocalStatus(status),
-    online: true,
-    lastError: "",
-    apiUrl: normalizeApiUrl(apiUrl),
-    syncStage: "push",
-    syncProgressDone: operations.length,
-    syncProgressTotal: operations.length,
-  };
-  return lastStatus;
+  try {
+    const acknowledgements = [];
+    let serverTime = "";
+    const regularOperations = operations.filter((operation) => operation.entity_type !== "purchase_grn");
+    if (regularOperations.length > 0) {
+      const pushStartedAt = Date.now();
+      const response = await axios.post(endpointUrl(apiUrl, "/api/sync/push"), {
+        user_id: context.userId,
+        device_id: context.deviceId,
+        branch_id: context.branchId,
+        client_timestamp: authoritativeUtcNowIso(),
+        operations: regularOperations.map((operation) => ({
+          operation_id: operation.operation_id,
+          idempotency_key: operation.operation_id,
+          entity_type: operation.entity_type,
+          entity_id: operation.entity_id,
+          operation_type: operation.operation_type,
+          version: operation.version,
+          payload: operation.payload,
+          created_at: operation.created_at,
+        })),
+      }, {
+        ...withTimeout(15000),
+        headers: context.deviceSessionToken
+          ? { "x-froozerp-device-session": context.deviceSessionToken }
+          : undefined,
+      });
+      serverTime = response.data?.server_time || serverTime;
+      observeServerTime({
+        serverTime,
+        requestStartedAt: pushStartedAt,
+        responseReceivedAt: Date.now(),
+      });
+      acknowledgements.push(...(response.data?.acknowledgements || []));
+    }
+    for (const operation of operations.filter((item) => item.entity_type === "purchase_grn")) {
+      const result = await replayOfflinePurchase({ apiUrl, operation, context });
+      acknowledgements.push(result.acknowledgement);
+      serverTime = result.serverTime || serverTime;
+    }
+    writeSyncLog("INFO", "push-result", {
+      apiUrl: normalizeApiUrl(apiUrl),
+      endpoint: endpointUrl(apiUrl, "/api/sync/push"),
+      status: 200,
+      operationCount: operations.length,
+      acknowledgementCount: acknowledgements.length,
+    });
+    const status = await repositories.outbox.applyAcks(
+      acknowledgements,
+      context.deviceId,
+      serverTime || authoritativeUtcNowIso(),
+    );
+    lastStatus = {
+      ...normalizeLocalStatus(status),
+      online: true,
+      lastError: "",
+      apiUrl: normalizeApiUrl(apiUrl),
+      syncStage: "push",
+      syncProgressDone: operations.length,
+      syncProgressTotal: operations.length,
+    };
+    return lastStatus;
+  } catch (error) {
+    await repositories.outbox.release(
+      operationIds,
+      error?.message || "Network interruption; purchase remains queued",
+    );
+    throw error;
+  }
 }
 
 export async function pullServerChanges({ apiUrl, user, deviceInfo, branchId }) {

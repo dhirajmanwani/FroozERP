@@ -15,9 +15,11 @@ import {
   getOrCreateLocalDeviceIdentity,
   initializeLocalDatabase,
   isTauriRuntime,
+  listLocalPurchases,
   listLocalPosSales,
   loadLocalReferenceSnapshot,
   loadLocalPosSale,
+  queueLocalPurchase,
   recordConnectivityModeChange,
 } from "./local/localDatabase";
 import {
@@ -433,7 +435,7 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
       ? "Cloud Backend Paused"
       : CLOUD_CONFIGURED
       ? cloudOnline
-        ? fieldRemoteMode ? "Cloud Connected - Field Remote Not Ready" : "Cloud Connected"
+        ? "Cloud Connected"
         : cloudOffline ? "Cloud Configured But Offline" : "Checking Cloud"
       : "Cloud Not Configured";
   } else {
@@ -462,8 +464,8 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
     syncSummary = total ? `Sync Active - ${done} of ${total}` : "Sync Active";
   } else if (fieldRemoteMode) {
     syncSummary = CLOUD_CONFIGURED
-      ? "Field Remote Not Ready - purchase offline sync required"
-      : "Field Remote Not Ready - Cloud and purchase sync required";
+      ? "Field Remote ready - offline purchases queue until cloud returns"
+      : "Field Remote requires Cloud configuration";
   } else if (devicePending && cloudReachable) {
     syncSummary = "Cloud connected - device approval pending";
   } else if (cloudOffline && usesCloudBackend()) {
@@ -500,7 +502,9 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
         ? "Internet available, local service unavailable."
         : "Local service unavailable. Check the local FroozERP service.";
   } else if (fieldRemoteMode) {
-    banner = "Field Remote Device requires Cloud Production and purchase offline sync. Current version only prepares configuration.";
+    banner = CLOUD_CONFIGURED
+      ? "Field Remote Device saves new purchases locally while cloud is unavailable."
+      : "Field Remote Device requires a configured Cloud Production URL.";
   } else if ((API_MODE === API_MODES.LOCAL_ONLY || API_MODE === API_MODES.LOCAL_SINGLE_DEVICE || API_MODE === API_MODES.BRANCH_LAN_SERVER || API_MODE === API_MODES.BRANCH_LAN_CLIENT) && localOnline) {
     banner = "Local server connected.";
   } else if (cloudReachable) {
@@ -1531,6 +1535,8 @@ function App() {
   const [suppliers, setSuppliers] = useState([]);
   const [customers, setCustomers] = useState([]);
   const [purchases, setPurchases] = useState([]);
+  const [purchaseSaveBusy, setPurchaseSaveBusy] = useState(false);
+  const purchaseSaveInFlightRef = useRef(false);
   const [accounts, setAccounts] = useState([]);
   const [accountLedger, setAccountLedger] = useState({ account: null, ledger: [] });
   const [accountPayments, setAccountPayments] = useState([]);
@@ -3093,7 +3099,7 @@ function App() {
     setInventory((current) => preserveVerifiedLocalCollection(snapshot?.inventory_lots, current));
     setCustomers((current) => preserveVerifiedLocalCollection(snapshot?.customers, current));
     setSalesHistory((current) => preserveVerifiedLocalCollection(snapshot?.sales_history, current));
-    setPurchases(bundle.offlinePurchases || []);
+    setPurchases(snapshot?.offline_purchases || bundle.offlinePurchases || []);
     setSuppliers(bundle.offlineSuppliers || []);
     setAccounts(bundle.offlineAccounts || []);
     setAccountOutstanding(bundle.offlineAccountOutstanding || {});
@@ -3370,6 +3376,11 @@ function App() {
   };
 
   const loadPurchases = async () => {
+    if (isTauriRuntime() && (offlineMode || readConnectivityMode() === CONNECTIVITY_MODES.LOCAL_ONLY)) {
+      const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id });
+      setPurchases(snapshot?.offline_purchases || snapshot?.settings_bundle?.offlinePurchases || await listLocalPurchases());
+      return;
+    }
     const response = await axios.get(`${API_URL}/purchases`);
     setPurchases(response.data);
   };
@@ -4433,8 +4444,6 @@ function App() {
       quantity: "",
       new_quantity: String(lot.balance_qty ?? lot.remaining_qty ?? 0),
       adjustment_type: "Physical Count Correction",
-      transfer_to_lot_id: "",
-      transfer_quantity: "",
       adjustment_date: toDateKey(new Date()),
       reason: "",
     });
@@ -4454,8 +4463,6 @@ function App() {
       quantity: "",
       new_quantity: "",
       adjustment_type: "Physical Count Correction",
-      transfer_to_lot_id: "",
-      transfer_quantity: "",
       adjustment_date: toDateKey(new Date()),
       reason: "",
     });
@@ -4553,10 +4560,6 @@ function App() {
           adjustmentWrite.config
         );
         alert("Lot adjusted");
-      }
-      if (lotAction.type === "transfer") {
-        alert("Lot-to-lot transfer remains unavailable until its product and cost-accounting rules are approved.");
-        return;
       }
       if (lotAction.type === "deactivate") {
         if (!lotDraft.reason.trim()) {
@@ -4770,6 +4773,9 @@ function App() {
   };
 
   const savePurchase = async () => {
+    if (purchaseSaveInFlightRef.current) return;
+    purchaseSaveInFlightRef.current = true;
+    setPurchaseSaveBusy(true);
     try {
       const wasEditing = Boolean(editingPurchaseId);
       const validationMessage = validatePurchaseBeforeSave();
@@ -4807,6 +4813,41 @@ function App() {
         reason,
         remarks: purchaseRemarks,
       };
+      const shouldQueueOfflinePurchase = isTauriRuntime() && !editingPurchaseId && (
+        offlineMode ||
+        internetAvailable === false ||
+        cloudHealth?.online === false ||
+        connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY
+      );
+      if (shouldQueueOfflinePurchase) {
+        const operationId = globalThis.crypto?.randomUUID?.() ||
+          `offline-purchase-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        await queueLocalPurchase({
+          ...payload,
+          operation_id: operationId,
+          provisional_reference: `OFF-PUR-${operationId}`,
+          items: purchaseCart,
+          company_id: user?.company_id || syncStatus?.canonicalIdentity?.company_id || "",
+          branch_id: user?.branch_id || syncStatus?.canonicalIdentity?.branch_id || "",
+          operational_location_id:
+            user?.operational_location_id ||
+            syncStatus?.canonicalIdentity?.operational_location_id ||
+            "",
+          assignment_generation: syncStatus?.canonicalIdentity?.assignment_generation || 1,
+          device_id: deviceInfo?.device_id || "",
+          user_id: user?.id ? String(user.id) : "",
+        });
+        const snapshot = await loadLocalReferenceSnapshot({
+          username: user?.username,
+          deviceId: deviceInfo.device_id,
+        });
+        setPurchases(snapshot?.offline_purchases || snapshot?.settings_bundle?.offlinePurchases || []);
+        setInventory(snapshot?.inventory_lots || inventory);
+        resetPurchaseForm();
+        await refreshSyncStatus();
+        alert("Purchase saved locally — pending cloud acknowledgement.");
+        return;
+      }
       if (editingPurchaseId && purchaseBillStatus === "BILL_COMPLETED" && purchases.find((purchase) => Number(purchase.id) === Number(editingPurchaseId))?.purchase_bill_status === "BILL_PENDING") {
         const completionWrite = createOperationalWrite(user, payload);
         await axios.post(
@@ -4843,6 +4884,9 @@ function App() {
       alert(purchaseBillStatus === "BILL_PENDING" ? "Stock Arrival Saved - Bill Pending" : wasEditing ? "Purchase Updated" : "Purchase Saved");
     } catch (error) {
       alert(getErrorMessage(error, "Purchase Error"));
+    } finally {
+      purchaseSaveInFlightRef.current = false;
+      setPurchaseSaveBusy(false);
     }
   };
 
@@ -5907,7 +5951,6 @@ function App() {
                               <button className="table-action" onClick={() => openLotAction("edit", lot)}>Edit</button>
                               <button className="table-action" disabled={lot.batch_status === "CANCELLED"} onClick={() => openLotAction("add", lot)}>Add Quantity</button>
                               <button className="table-action" disabled={lot.batch_status === "CANCELLED"} onClick={() => openLotAction("adjust", lot)}>Adjust</button>
-                              <button className="table-action" disabled={lot.batch_status === "CANCELLED" || lotBalanceQuantity(lot) <= 0} onClick={() => openLotAction("transfer", lot)}>Transfer</button>
                               <button className="remove-button" disabled={lot.batch_status === "CANCELLED"} onClick={() => openLotAction("deactivate", lot)}>Deactivate</button>
                             </div>
                           </td>
@@ -6025,6 +6068,21 @@ function App() {
 
           {activeView === "purchase" && (
             <section className="settings-layout">
+              {purchases.some((purchase) => purchase.operation_id) && (
+                <ModuleCard eyebrow="Offline Replay" title="Queued Purchase Arrivals" subtitle="Local purchase intent remains visible until the cloud acknowledges it.">
+                  <DataTable headers={["Reference", "Purchase Date", "Bill State", "Sync State", "Detail"]}>
+                    {purchases.filter((purchase) => purchase.operation_id).map((purchase) => (
+                      <tr key={purchase.operation_id}>
+                        <td className="primary-cell">{purchase.provisional_reference}</td>
+                        <td>{purchase.purchase_date}</td>
+                        <td>{purchase.purchase_bill_status === "BILL_PENDING" ? "Pending Bill" : purchase.purchase_type === "CASH" ? "Paid Purchase" : "Credit Purchase"}</td>
+                        <td><span className={purchase.sync_status === "completed" ? "stock-ok" : purchase.sync_status === "failed" || purchase.sync_status === "conflict" ? "stock-low" : "origin-rate"}>{purchase.sync_status === "syncing" ? "Syncing" : purchase.sync_status === "completed" ? "Cloud Confirmed" : purchase.sync_status === "failed" ? "Failed - Retry Available" : purchase.sync_status === "conflict" ? "Conflict - Review Required" : "Pending Cloud Acknowledgement"}</span></td>
+                        <td>{purchase.last_error || (purchase.sync_status === "completed" ? "Canonical purchase and lot IDs reconciled" : "Stored safely in local SQLite")}</td>
+                      </tr>
+                    ))}
+                  </DataTable>
+                </ModuleCard>
+              )}
               {purchaseAmendmentMode && (
                 <ModuleCard eyebrow="Purchase Amendment" title="Add / Edit Purchase" subtitle="Select date and supplier to amend old purchase entries without deleting history.">
                   <div className="form-grid supplier-form-grid">
@@ -6192,7 +6250,13 @@ function App() {
                 {purchaseBillStatus === "BILL_PENDING" && <p className="form-note">Purchase bill pending. Inventory will increase immediately and profit from this stock will be provisional until the bill is completed.</p>}
                 <PurchaseSummary summary={editingPurchaseId ? purchaseSummary : purchaseCartSummary} />
                 <div className="button-row">
-                  <button className="primary-button" onClick={savePurchase}>{purchaseBillStatus === "BILL_PENDING" ? editingPurchaseId ? "Update Arrival Entry" : "Save Stock Arrival" : editingPurchaseId ? "Complete / Update Purchase" : "Save Purchase"}</button>
+                  <button className="primary-button" disabled={purchaseSaveBusy} onClick={savePurchase}>
+                    {purchaseSaveBusy
+                      ? "Saving..."
+                      : purchaseBillStatus === "BILL_PENDING"
+                        ? editingPurchaseId ? "Update Arrival Entry" : "Save Stock Arrival"
+                        : editingPurchaseId ? "Complete / Update Purchase" : "Save Purchase"}
+                  </button>
                   {editingPurchaseId && <button className="secondary-button" onClick={purchaseAmendmentMode ? cancelPurchaseAmendment : resetPurchaseForm}>Cancel Amendment</button>}
                   <button className="secondary-button" onClick={() => navigate("accounts")}>Add New Supplier</button>
                 </div>
@@ -6501,7 +6565,6 @@ function App() {
                   {lotAction.type === "edit" && "Edit Lot"}
                   {lotAction.type === "add" && "Add Quantity"}
                   {lotAction.type === "adjust" && "Adjust Quantity"}
-                  {lotAction.type === "transfer" && "Transfer Stock"}
                   {lotAction.type === "deactivate" && "Deactivate Lot"}
                   {lotAction.type === "reactivate" && "Reactivate Lot"}
                 </strong>
@@ -6561,28 +6624,6 @@ function App() {
                     </select>
                   </Field>
                   <Field label="Adjustment Date"><input type="date" value={lotDraft.adjustment_date} onChange={(event) => setLotDraft({ ...lotDraft, adjustment_date: event.target.value })} /></Field>
-                  <Field label="Reason"><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Reason is mandatory" /></Field>
-                  <Field label="Remarks"><input value={lotDraft.remarks} onChange={(event) => setLotDraft({ ...lotDraft, remarks: event.target.value })} /></Field>
-                </div>
-              )}
-
-              {lotAction.type === "transfer" && (
-                <div className="form-grid supplier-form-grid">
-                  <Field label="From Lot"><input readOnly value={`${lotAction.lot.product_name || ""} - ${lotAction.lot.lot_name || lotAction.lot.batch_no || `Lot #${lotAction.lot.id}`}`} /></Field>
-                  <Field label="Available Qty"><input readOnly value={Number(lotAction.lot.balance_qty ?? lotAction.lot.remaining_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })} /></Field>
-                  <Field label="To Lot">
-                    <select value={lotDraft.transfer_to_lot_id} onChange={(event) => setLotDraft({ ...lotDraft, transfer_to_lot_id: event.target.value })}>
-                      <option value="">Select destination lot</option>
-                      {inventory
-                        .filter((lot) => Number(lot.id) !== Number(lotAction.lot.id) && String(lot.batch_status || "ACTIVE").toUpperCase() !== "CANCELLED")
-                        .map((lot) => (
-                          <option key={lot.id} value={lot.id}>
-                            {lot.product_name} - {lot.lot_name || lot.batch_no || `Lot #${lot.id}`}{lot.lot_size ? ` / ${lot.lot_size}` : ""} - Bal {Number(lot.balance_qty ?? lot.remaining_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}
-                          </option>
-                        ))}
-                    </select>
-                  </Field>
-                  <Field label="Quantity To Move"><input min="0" step="0.001" type="number" value={lotDraft.transfer_quantity} onChange={(event) => setLotDraft({ ...lotDraft, transfer_quantity: event.target.value })} /></Field>
                   <Field label="Reason"><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Reason is mandatory" /></Field>
                   <Field label="Remarks"><input value={lotDraft.remarks} onChange={(event) => setLotDraft({ ...lotDraft, remarks: event.target.value })} /></Field>
                 </div>
@@ -11074,7 +11115,6 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
       <div className="table-actions">
         <button className="table-action" disabled={!canManageStock} onClick={() => onLotAction?.("edit", lot)}>Edit Lot</button>
         <button className="table-action" disabled={!canManageStock || status === "Cancelled"} onClick={() => onLotAction?.("adjust", lot)}>Adjust Stock</button>
-        <button className="table-action" disabled={!canManageStock || status === "Cancelled" || lotBalance(lot) <= 0} onClick={() => onLotAction?.("transfer", lot)}>Transfer</button>
         <button className="table-action" disabled={!canManageStock || status === "Cancelled"} onClick={() => onLotAction?.("add", lot)}>Add Qty</button>
         {status === "Cancelled" || status === "Inactive" ? (
           <button className="table-action" disabled={!canManageStock} onClick={() => onLotAction?.("reactivate", lot)}>Reactivate</button>
@@ -13881,9 +13921,6 @@ function SyncSettingsSection({
       setCloudReadiness({ status, detail, checkedAt: new Date().toISOString() });
       return status;
     };
-    if (configDraft.mode === API_MODES.FIELD_REMOTE_DEVICE) {
-      return setResult("Field Remote Not Ready", "Remote purchase/offline sync handlers are not implemented. This mode cannot be marked production-ready.");
-    }
     if (normalizeCloudConnectionMode(configDraft.cloudConnectionMode) === CONNECTIVITY_MODES.LOCAL_ONLY) {
       return setResult("Cloud Paused By Owner", "Local Only mode is active. FroozERP cloud checks and sync are intentionally blocked while local SQLite stays usable.");
     }
@@ -13961,7 +13998,7 @@ function SyncSettingsSection({
     }
     if (nextConfig.mode === API_MODES.FIELD_REMOTE_DEVICE) {
       if (!nextConfig.cloudApiUrl) {
-        setConfigMessage("Field Remote Device saved as not ready: Cloud Production URL and purchase offline sync are required.");
+        setConfigMessage("Field Remote Device requires a configured Cloud Production URL.");
       } else if (!isRealCloudUrl(nextConfig.cloudApiUrl)) {
         setConfigMessage("Field Remote Device requires a real hosted cloud URL, not localhost or LAN.");
         return;
@@ -14042,9 +14079,6 @@ function SyncSettingsSection({
   const syncSummary = connectionStatus?.syncSummary || "Backend status not checked";
   const branchRecord = (settingsData?.branches || []).find((branch) => String(branch.id) === String(user?.branch_id || draft.branch_id || "1"));
   const branchLabel = branchRecord?.branch_name || user?.branch_name || draft.branch_name || "Main Branch";
-  const fieldRemoteWarning = API_MODE === API_MODES.FIELD_REMOTE_DEVICE
-    ? "Field Remote Device requires Cloud Production + purchase offline sync. Current version can prepare configuration but cannot safely sync remote purchase entries yet."
-    : "";
   const nativeDbLabel = localDbStatus?.available
     ? localDbStatus.initialized ? "Local SQLite Ready" : "Local SQLite Error"
     : "Browser Mode";
@@ -14121,9 +14155,8 @@ function SyncSettingsSection({
           {configDraft.mode === API_MODES.BRANCH_LAN_SERVER && <p className="form-note">Branch LAN Server is for the main shop computer serving same-branch devices over Wi-Fi/LAN.</p>}
           {configDraft.mode === API_MODES.BRANCH_LAN_CLIENT && <p className="form-note">Branch LAN Client must use the main branch server IP. It is same Wi-Fi/LAN only, not cloud.</p>}
           {configDraft.mode === API_MODES.CLOUD_PRODUCTION && <p className="form-note">Cloud Production requires a real hosted backend URL. Blank, localhost, and LAN URLs remain Cloud Not Configured.</p>}
-          {configDraft.mode === API_MODES.FIELD_REMOTE_DEVICE && <p className="form-note stock-low">Field Remote Device is not ready without hosted cloud plus purchase offline sync.</p>}
+          {configDraft.mode === API_MODES.FIELD_REMOTE_DEVICE && <p className="form-note">Field Remote Device queues new purchase arrivals locally and replays them after cloud connectivity returns.</p>}
           {configDraft.mode === API_MODES.CUSTOM_API_URL && <p className="form-note">Custom API URL must pass the FroozERP health check before production use.</p>}
-          {fieldRemoteWarning && <p className="form-note stock-low">{fieldRemoteWarning}</p>}
           {configMessage && <p className="form-note">{configMessage}</p>}
           {(statusMessage || syncMessage || syncStatus?.lastError) && <p className="form-note">{syncMessage || statusMessage || syncStatus?.lastError}</p>}
           {localDbStatus?.error && <p className="form-note stock-low">{localDbStatus.error}</p>}

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
-const CURRENT_SCHEMA_VERSION: &str = "013_operational_location_foundation";
+const CURRENT_SCHEMA_VERSION: &str = "014_offline_purchase_grn";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -20,6 +20,7 @@ const MIGRATION_010: &str = include_str!("../migrations/sqlite/010_sync_delivery
 const MIGRATION_011: &str = include_str!("../migrations/sqlite/011_connectivity_mode_audit.sql");
 const MIGRATION_012: &str = include_str!("../migrations/sqlite/012_connectivity_mode_server_time.sql");
 const MIGRATION_013: &str = include_str!("../migrations/sqlite/013_operational_location_foundation.sql");
+const MIGRATION_014: &str = include_str!("../migrations/sqlite/014_offline_purchase_grn.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -111,6 +112,12 @@ pub struct ReferenceBootstrap {
 #[derive(Debug, Serialize)]
 pub struct LocalPosSaleResult {
     pub invoice: serde_json::Value,
+    pub pending_operations: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LocalPurchaseIntentResult {
+    pub intent: serde_json::Value,
     pub pending_operations: i64,
 }
 
@@ -242,6 +249,7 @@ pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck], device_id: Option<Stri
                     params![ack.operation_id, server_ack, ack.server_entity_version, confirmed_at],
                 )
                 .map_err(to_error)?;
+                apply_purchase_ack_with_tx(&tx, ack, "completed", &server_ack, &confirmed_at)?;
             }
             "conflict" => {
                 tx.execute(
@@ -263,6 +271,7 @@ pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck], device_id: Option<Stri
                     params![ack.operation_id, confirmed_at],
                 )
                 .map_err(to_error)?;
+                apply_purchase_ack_with_tx(&tx, ack, "conflict", &server_ack, &confirmed_at)?;
                 record_conflict_with_tx(&tx, ack)?;
             }
             _ => {
@@ -286,6 +295,7 @@ pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck], device_id: Option<Stri
                     params![ack.operation_id, confirmed_at],
                 )
                 .map_err(to_error)?;
+                apply_purchase_ack_with_tx(&tx, ack, "failed", &server_ack, &confirmed_at)?;
             }
         }
     }
@@ -701,6 +711,80 @@ pub fn retry_failed_operations(app: &AppHandle) -> Result<LocalDbStatus, String>
         [],
     )
     .map_err(to_error)?;
+    conn.execute(
+        "UPDATE local_purchase_intents
+         SET state = 'pending', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE state = 'failed'",
+        [],
+    )
+    .map_err(to_error)?;
+    status_at(&path)
+}
+
+pub fn mark_outbox_syncing(app: &AppHandle, operation_ids: &[String]) -> Result<LocalDbStatus, String> {
+    let path = database_path(app)?;
+    mark_outbox_syncing_at(&path, operation_ids)
+}
+
+fn mark_outbox_syncing_at(path: &Path, operation_ids: &[String]) -> Result<LocalDbStatus, String> {
+    initialize_at(&path)?;
+    let mut conn = Connection::open(&path).map_err(to_error)?;
+    let tx = conn.transaction().map_err(to_error)?;
+    for operation_id in operation_ids {
+        tx.execute(
+            "UPDATE sync_outbox
+             SET status = 'syncing', last_attempt_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE operation_id = ?1 AND status IN ('pending', 'failed')",
+            [operation_id],
+        )
+        .map_err(to_error)?;
+        tx.execute(
+            "UPDATE local_purchase_intents
+             SET state = 'syncing', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE operation_id = ?1 AND state IN ('pending', 'failed')",
+            [operation_id],
+        )
+        .map_err(to_error)?;
+    }
+    tx.commit().map_err(to_error)?;
+    status_at(&path)
+}
+
+pub fn release_syncing_operations(
+    app: &AppHandle,
+    operation_ids: &[String],
+    message: Option<String>,
+) -> Result<LocalDbStatus, String> {
+    let path = database_path(app)?;
+    release_syncing_operations_at(&path, operation_ids, message)
+}
+
+fn release_syncing_operations_at(
+    path: &Path,
+    operation_ids: &[String],
+    message: Option<String>,
+) -> Result<LocalDbStatus, String> {
+    initialize_at(&path)?;
+    let mut conn = Connection::open(&path).map_err(to_error)?;
+    let tx = conn.transaction().map_err(to_error)?;
+    for operation_id in operation_ids {
+        tx.execute(
+            "UPDATE sync_outbox
+             SET status = 'pending', last_error = ?2
+             WHERE operation_id = ?1 AND status = 'syncing'",
+            params![operation_id, message],
+        )
+        .map_err(to_error)?;
+        tx.execute(
+            "UPDATE local_purchase_intents
+             SET state = 'pending', last_error = ?2,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE operation_id = ?1 AND state = 'syncing'",
+            params![operation_id, message],
+        )
+        .map_err(to_error)?;
+    }
+    tx.commit().map_err(to_error)?;
     status_at(&path)
 }
 
@@ -742,6 +826,320 @@ pub fn list_local_pos_sales(app: &AppHandle) -> Result<Vec<serde_json::Value>, S
     ids.into_iter()
         .map(|id| load_invoice_snapshot(&conn, &id))
         .collect()
+}
+
+pub fn queue_local_purchase(app: &AppHandle, purchase: serde_json::Value) -> Result<LocalPurchaseIntentResult, String> {
+    let path = database_path(app)?;
+    queue_local_purchase_at(&path, purchase)
+}
+
+pub fn list_local_purchase_intents(app: &AppHandle) -> Result<Vec<serde_json::Value>, String> {
+    let path = database_path(app)?;
+    initialize_at(&path)?;
+    let conn = Connection::open(path).map_err(to_error)?;
+    list_local_purchase_intents_with_conn(&conn)
+}
+
+fn queue_local_purchase_at(path: &Path, mut purchase: serde_json::Value) -> Result<LocalPurchaseIntentResult, String> {
+    initialize_at(path)?;
+    let submitted_payload = serde_json::to_string(&purchase).map_err(to_error)?;
+    let intent_checksum = checksum(&submitted_payload);
+    let operation_id = required_text(&purchase, "operation_id")?;
+    let provisional_reference = optional_text(&purchase, "provisional_reference")
+        .unwrap_or_else(|| format!("OFF-PUR-{operation_id}"));
+    let supplier_id = required_text(&purchase, "supplier_id")?;
+    let purchase_date = required_text(&purchase, "purchase_date")?;
+    let purchase_bill_status = required_text(&purchase, "purchase_bill_status")?.to_uppercase();
+    let purchase_type = required_text(&purchase, "purchase_type")?.to_uppercase();
+    let branch_id = required_text(&purchase, "branch_id")?;
+    let device_id = required_text(&purchase, "device_id")?;
+    let user_id = required_text(&purchase, "user_id")?;
+    let company_id = optional_text(&purchase, "company_id");
+    let operational_location_id = optional_text(&purchase, "operational_location_id");
+    let assignment_generation = purchase.get("assignment_generation").and_then(|value| value.as_i64());
+    let raw_items = purchase
+        .get("items")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .ok_or_else(|| "Offline purchase requires at least one item".to_string())?;
+    if raw_items.is_empty() {
+        return Err("Offline purchase requires at least one item".to_string());
+    }
+    if !matches!(purchase_bill_status.as_str(), "BILL_PENDING" | "BILL_COMPLETED") {
+        return Err("Offline purchase bill status is invalid".to_string());
+    }
+    if purchase_bill_status == "BILL_COMPLETED" && !matches!(purchase_type.as_str(), "CASH" | "CREDIT") {
+        return Err("Offline completed purchase must be Cash or Credit".to_string());
+    }
+
+    let mut conn = Connection::open(path).map_err(to_error)?;
+    conn.pragma_update(None, "foreign_keys", "ON").map_err(to_error)?;
+    let tx = conn.transaction().map_err(to_error)?;
+    if let Some(existing_checksum) = tx
+        .query_row(
+            "SELECT intent_checksum FROM local_purchase_intents WHERE operation_id = ?1",
+            [&operation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(to_error)?
+    {
+        if existing_checksum != intent_checksum {
+            return Err("Offline purchase operation already exists with different financial intent".to_string());
+        }
+        drop(tx);
+        let conn = Connection::open(path).map_err(to_error)?;
+        let intent = load_local_purchase_intent_with_conn(&conn, &operation_id)?;
+        return Ok(LocalPurchaseIntentResult {
+            intent,
+            pending_operations: pending_outbox_count_at(&conn)?,
+        });
+    }
+
+    let intent_id = format!("purchase-intent-{operation_id}");
+    tx.execute(
+        "INSERT INTO local_purchase_intents (
+            id, operation_id, provisional_reference, supplier_id, purchase_date,
+            purchase_bill_status, purchase_type, intent_checksum, payload_json, state
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'pending')",
+        params![
+            intent_id,
+            operation_id,
+            provisional_reference,
+            supplier_id,
+            purchase_date,
+            purchase_bill_status,
+            purchase_type,
+            intent_checksum,
+            submitted_payload,
+        ],
+    )
+    .map_err(to_error)?;
+    let mut normalized_items = Vec::with_capacity(raw_items.len());
+    for (index, item) in raw_items.iter().enumerate() {
+        let supplied_product_id = required_text(item, "product_id")?;
+        let product = tx
+            .query_row(
+                "SELECT id, product_name, unit
+                 FROM local_products
+                 WHERE id = ?1 OR cloud_id = ?1
+                 LIMIT 1",
+                [&supplied_product_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)),
+            )
+            .optional()
+            .map_err(to_error)?
+            .ok_or_else(|| format!("Offline purchase product {supplied_product_id} is not available locally"))?;
+        let quantity = required_number(item, "quantity")?;
+        if quantity <= 0.0 {
+            return Err("Offline purchase quantities must be greater than zero".to_string());
+        }
+        let line_index = index + 1;
+        let provisional_purchase_id = optional_text(item, "purchase_global_id")
+            .unwrap_or_else(|| format!("offline-purchase-{operation_id}-{line_index}"));
+        let provisional_lot_id = optional_text(item, "lot_global_id")
+            .unwrap_or_else(|| format!("offline-lot-{operation_id}-{line_index}"));
+        let purchase_rate = item.get("purchase_rate").and_then(json_number);
+        let expected_purchase_rate = item.get("expected_purchase_rate").and_then(json_number);
+        let temporary_sale_rate = item.get("temporary_sale_rate").and_then(json_number);
+        let cost_rate = if purchase_bill_status == "BILL_PENDING" {
+            expected_purchase_rate.unwrap_or(0.0)
+        } else {
+            purchase_rate.unwrap_or(0.0)
+        };
+        let mut normalized = item.clone();
+        let normalized_object = normalized
+            .as_object_mut()
+            .ok_or_else(|| "Offline purchase item is invalid".to_string())?;
+        normalized_object.insert("product_id".to_string(), serde_json::Value::String(product.0.clone()));
+        normalized_object.insert("product_global_id".to_string(), serde_json::Value::String(product.0.clone()));
+        normalized_object.insert("product_name".to_string(), serde_json::Value::String(product.1.clone()));
+        normalized_object.insert("purchase_global_id".to_string(), serde_json::Value::String(provisional_purchase_id.clone()));
+        normalized_object.insert("lot_global_id".to_string(), serde_json::Value::String(provisional_lot_id.clone()));
+        normalized_object.insert("line_index".to_string(), serde_json::json!(line_index));
+        if normalized_object.get("unit").and_then(|value| value.as_str()).unwrap_or("").is_empty() {
+            normalized_object.insert("unit".to_string(), serde_json::Value::String(product.2.clone().unwrap_or_default()));
+        }
+        let normalized_json = serde_json::to_string(&normalized).map_err(to_error)?;
+        tx.execute(
+            "INSERT INTO local_purchase_intent_lines (
+                id, intent_id, line_index, provisional_purchase_id, provisional_lot_id,
+                product_id, quantity, unit, purchase_rate, expected_purchase_rate,
+                temporary_sale_rate, lot_name, lot_size, payload_json
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            params![
+                format!("purchase-intent-line-{operation_id}-{line_index}"),
+                intent_id,
+                line_index as i64,
+                provisional_purchase_id,
+                provisional_lot_id,
+                product.0,
+                quantity,
+                optional_text(&normalized, "unit"),
+                purchase_rate,
+                expected_purchase_rate,
+                temporary_sale_rate,
+                optional_text(&normalized, "lot_name"),
+                optional_text(&normalized, "lot_size"),
+                normalized_json,
+            ],
+        )
+        .map_err(to_error)?;
+        tx.execute(
+            "INSERT INTO local_inventory_lots (
+                id, cloud_id, branch_id, device_id, product_id, product_name, supplier_id,
+                lot_no, size_grade, opening_date, opening_qty, purchased_qty, balance_qty,
+                cost_rate, sale_rate, status, remarks, created_by, version, sync_status,
+                company_id, operational_location_id
+             ) VALUES (?1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10,?10,?11,?12,'ACTIVE',?13,?14,1,'pending',?15,?16)
+             ON CONFLICT(id) DO NOTHING",
+            params![
+                provisional_lot_id,
+                branch_id,
+                device_id,
+                product.0,
+                product.1,
+                supplier_id,
+                optional_text(&normalized, "lot_name").unwrap_or_else(|| format!("Offline GRN {provisional_reference}")),
+                optional_text(&normalized, "lot_size"),
+                purchase_date,
+                quantity,
+                cost_rate,
+                temporary_sale_rate,
+                optional_text(&purchase, "remarks"),
+                user_id,
+                company_id,
+                operational_location_id,
+            ],
+        )
+        .map_err(to_error)?;
+        normalized_items.push(normalized);
+    }
+
+    purchase
+        .as_object_mut()
+        .ok_or_else(|| "Offline purchase payload is invalid".to_string())?
+        .insert("items".to_string(), serde_json::Value::Array(normalized_items));
+    purchase
+        .as_object_mut()
+        .unwrap()
+        .insert("provisional_reference".to_string(), serde_json::Value::String(provisional_reference.clone()));
+    let payload_json = serde_json::to_string(&purchase).map_err(to_error)?;
+    tx.execute(
+        "UPDATE local_purchase_intents SET payload_json = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE operation_id = ?1",
+        params![operation_id, payload_json],
+    )
+    .map_err(to_error)?;
+    enqueue_sync_operation_with_conn(
+        &tx,
+        &SyncOperation {
+            id: operation_id.clone(),
+            operation_id: Some(operation_id.clone()),
+            entity_type: "purchase_grn".to_string(),
+            entity_id: intent_id,
+            operation_type: "PURCHASE_GRN_CREATE".to_string(),
+            payload: purchase,
+            branch_id: Some(branch_id),
+            device_id: Some(device_id),
+            user_id: Some(user_id),
+            version: Some(1),
+            created_at: None,
+        },
+    )?;
+    tx.execute(
+        "UPDATE sync_outbox
+         SET company_id = ?2, operational_location_id = ?3, assignment_generation = ?4
+         WHERE operation_id = ?1",
+        params![operation_id, company_id, operational_location_id, assignment_generation],
+    )
+    .map_err(to_error)?;
+    tx.commit().map_err(to_error)?;
+    let conn = Connection::open(path).map_err(to_error)?;
+    let intent = load_local_purchase_intent_with_conn(&conn, &operation_id)?;
+    Ok(LocalPurchaseIntentResult {
+        intent,
+        pending_operations: pending_outbox_count_at(&conn)?,
+    })
+}
+
+fn load_local_purchase_intent_with_conn(conn: &Connection, operation_id: &str) -> Result<serde_json::Value, String> {
+    conn.query_row(
+        "SELECT operation_id, provisional_reference, supplier_id, purchase_date,
+                purchase_bill_status, purchase_type, state, server_purchase_ids_json,
+                last_error, retry_count, created_at, updated_at, completed_at
+         FROM local_purchase_intents WHERE operation_id = ?1",
+        [operation_id],
+        |row| {
+            let server_ids: Option<String> = row.get(7)?;
+            Ok(serde_json::json!({
+                "operation_id": row.get::<_, String>(0)?,
+                "provisional_reference": row.get::<_, String>(1)?,
+                "supplier_id": row.get::<_, String>(2)?,
+                "purchase_date": row.get::<_, String>(3)?,
+                "purchase_bill_status": row.get::<_, String>(4)?,
+                "purchase_type": row.get::<_, String>(5)?,
+                "sync_status": row.get::<_, String>(6)?,
+                "server_purchase_ids": server_ids
+                    .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                    .unwrap_or_else(|| serde_json::json!([])),
+                "last_error": row.get::<_, Option<String>>(8)?,
+                "retry_count": row.get::<_, i64>(9)?,
+                "created_at": row.get::<_, String>(10)?,
+                "updated_at": row.get::<_, String>(11)?,
+                "completed_at": row.get::<_, Option<String>>(12)?,
+            }))
+        },
+    )
+    .map_err(to_error)
+}
+
+fn list_local_purchase_intents_with_conn(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT i.operation_id, i.provisional_reference, i.supplier_id, i.purchase_date,
+                    i.purchase_bill_status, i.purchase_type, i.state, i.last_error,
+                    i.created_at, l.provisional_purchase_id, l.provisional_lot_id,
+                    l.product_id, p.product_name, l.quantity, l.unit, l.purchase_rate,
+                    l.expected_purchase_rate, l.temporary_sale_rate, l.lot_name, l.lot_size,
+                    l.server_purchase_id, l.server_lot_id
+             FROM local_purchase_intents i
+             JOIN local_purchase_intent_lines l ON l.intent_id = i.id
+             LEFT JOIN local_products p ON p.id = l.product_id
+             ORDER BY datetime(i.created_at) DESC, l.line_index",
+        )
+        .map_err(to_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(9)?,
+                "global_id": row.get::<_, String>(9)?,
+                "operation_id": row.get::<_, String>(0)?,
+                "offline_purchase_ref": row.get::<_, String>(1)?,
+                "supplier_id": row.get::<_, String>(2)?,
+                "purchase_date": row.get::<_, String>(3)?,
+                "purchase_bill_status": row.get::<_, String>(4)?,
+                "purchase_type": row.get::<_, String>(5)?,
+                "sync_status": row.get::<_, String>(6)?,
+                "last_error": row.get::<_, Option<String>>(7)?,
+                "created_at": row.get::<_, String>(8)?,
+                "lot_global_id": row.get::<_, String>(10)?,
+                "product_id": row.get::<_, String>(11)?,
+                "product_name": row.get::<_, Option<String>>(12)?,
+                "quantity": row.get::<_, f64>(13)?,
+                "unit": row.get::<_, Option<String>>(14)?,
+                "purchase_rate": row.get::<_, Option<f64>>(15)?,
+                "expected_purchase_rate": row.get::<_, Option<f64>>(16)?,
+                "temporary_sale_rate": row.get::<_, Option<f64>>(17)?,
+                "lot_name": row.get::<_, Option<String>>(18)?,
+                "lot_size": row.get::<_, Option<String>>(19)?,
+                "server_purchase_id": row.get::<_, Option<String>>(20)?,
+                "server_lot_id": row.get::<_, Option<String>>(21)?,
+                "purchase_status": "ACTIVE",
+            }))
+        })
+        .map_err(to_error)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_error)
 }
 
 fn complete_local_pos_sale_at(path: &Path, sale: serde_json::Value) -> Result<LocalPosSaleResult, String> {
@@ -1662,6 +2060,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "011_connectivity_mode_audit", MIGRATION_011)?;
     apply_migration(&mut conn, "012_connectivity_mode_server_time", MIGRATION_012)?;
     apply_migration(&mut conn, "013_operational_location_foundation", MIGRATION_013)?;
+    apply_migration(&mut conn, "014_offline_purchase_grn", MIGRATION_014)?;
     Ok(())
 }
 
@@ -2350,7 +2749,7 @@ fn load_reference_snapshot_at(
         rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?
     };
 
-    let settings_bundle = {
+    let mut settings_bundle = {
         let mut statement = conn
             .prepare("SELECT setting_key, setting_value FROM local_settings WHERE deleted_at IS NULL ORDER BY setting_key")
             .map_err(to_error)?;
@@ -2369,6 +2768,20 @@ fn load_reference_snapshot_at(
         }
         serde_json::Value::Object(map)
     };
+    let mut offline_purchases = settings_bundle
+        .get("offlinePurchases")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for purchase in list_local_purchase_intents_with_conn(&conn)? {
+        let purchase_id = optional_text(&purchase, "id").unwrap_or_default();
+        if !offline_purchases.iter().any(|row| optional_text(row, "id").unwrap_or_default() == purchase_id) {
+            offline_purchases.push(purchase);
+        }
+    }
+    if let Some(bundle) = settings_bundle.as_object_mut() {
+        bundle.insert("offlinePurchases".to_string(), serde_json::Value::Array(offline_purchases.clone()));
+    }
 
     let sales_history = {
         let mut statement = conn
@@ -2431,6 +2844,7 @@ fn load_reference_snapshot_at(
         "inventory_lots": inventory_lots,
         "customers": customers,
         "settings_bundle": settings_bundle,
+        "offline_purchases": offline_purchases,
         "sales_history": sales_history,
         "pending_operations": pending_operations,
         "failed_operations": count_outbox_status(&conn, &["failed"])?,
@@ -2614,6 +3028,104 @@ fn pending_outbox_at(conn: &Connection, limit: i64) -> Result<Vec<PendingSyncOpe
         })
         .map_err(to_error)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(to_error)
+}
+
+fn apply_purchase_ack_with_tx(
+    tx: &rusqlite::Transaction,
+    ack: &SyncAck,
+    state: &str,
+    server_ack: &str,
+    confirmed_at: &str,
+) -> Result<(), String> {
+    let exists: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM local_purchase_intents WHERE operation_id = ?1",
+            [&ack.operation_id],
+            |row| row.get(0),
+        )
+        .map_err(to_error)?;
+    if exists == 0 {
+        return Ok(());
+    }
+    let message = ack.message.clone().unwrap_or_else(|| {
+        if state == "completed" { "Server acknowledged purchase".to_string() } else { "Purchase replay requires attention".to_string() }
+    });
+    let server_purchase_ids = ack
+        .result_payload
+        .as_ref()
+        .and_then(|payload| payload.get("purchase_ids"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    tx.execute(
+        "UPDATE local_purchase_intents
+         SET state = ?2,
+             server_purchase_ids_json = CASE WHEN ?2 = 'completed' THEN ?3 ELSE server_purchase_ids_json END,
+             server_ack_json = ?4,
+             last_error = CASE WHEN ?2 = 'completed' THEN NULL ELSE ?5 END,
+             retry_count = retry_count + CASE WHEN ?2 IN ('failed', 'conflict') THEN 1 ELSE 0 END,
+             updated_at = ?6,
+             completed_at = CASE WHEN ?2 = 'completed' THEN ?6 ELSE completed_at END
+         WHERE operation_id = ?1",
+        params![
+            ack.operation_id,
+            state,
+            serde_json::to_string(&server_purchase_ids).map_err(to_error)?,
+            server_ack,
+            message,
+            confirmed_at,
+        ],
+    )
+    .map_err(to_error)?;
+    tx.execute(
+        "UPDATE local_purchase_intent_lines
+         SET sync_status = ?2, updated_at = ?3
+         WHERE intent_id = (SELECT id FROM local_purchase_intents WHERE operation_id = ?1)",
+        params![ack.operation_id, state, confirmed_at],
+    )
+    .map_err(to_error)?;
+    if state == "completed" {
+        tx.execute(
+            "UPDATE local_inventory_lots
+             SET sync_status = 'synced', updated_at = ?2
+             WHERE id IN (
+               SELECT provisional_lot_id FROM local_purchase_intent_lines
+               WHERE intent_id = (SELECT id FROM local_purchase_intents WHERE operation_id = ?1)
+             )",
+            params![ack.operation_id, confirmed_at],
+        )
+        .map_err(to_error)?;
+        if let Some(payload) = ack.result_payload.as_ref() {
+            for purchase in payload.get("purchases").and_then(|value| value.as_array()).into_iter().flatten() {
+                if let (Some(global_id), Some(server_id)) = (
+                    optional_text(purchase, "global_id"),
+                    optional_text(purchase, "id"),
+                ) {
+                    tx.execute(
+                        "UPDATE local_purchase_intent_lines
+                         SET server_purchase_id = ?2, updated_at = ?3
+                         WHERE provisional_purchase_id = ?1",
+                        params![global_id, server_id, confirmed_at],
+                    )
+                    .map_err(to_error)?;
+                }
+            }
+            for lot in payload.get("lots").and_then(|value| value.as_array()).into_iter().flatten() {
+                if let (Some(global_id), Some(server_id)) = (
+                    optional_text(lot, "global_id"),
+                    optional_text(lot, "id"),
+                ) {
+                    tx.execute(
+                        "UPDATE local_purchase_intent_lines
+                         SET server_lot_id = ?2, updated_at = ?3
+                         WHERE provisional_lot_id = ?1",
+                        params![global_id, server_id, confirmed_at],
+                    )
+                    .map_err(to_error)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn record_conflict_with_tx(tx: &rusqlite::Transaction, ack: &SyncAck) -> Result<(), String> {
@@ -3295,6 +3807,158 @@ mod tests {
         }
     }
 
+    fn test_offline_purchase_payload(operation_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "operation_id": operation_id,
+            "provisional_reference": format!("OFF-PUR-{operation_id}"),
+            "supplier_id": "1",
+            "purchase_date": "2026-07-28",
+            "purchase_bill_status": "BILL_COMPLETED",
+            "purchase_type": "CREDIT",
+            "freight_charges": 10.0,
+            "labour_charges": 5.0,
+            "other_charges": 0.0,
+            "paid_amount": 0.0,
+            "rebate_rule_id": "1",
+            "remarks": "Offline multi-line GRN",
+            "company_id": "1",
+            "branch_id": "1",
+            "operational_location_id": "1001",
+            "assignment_generation": 3,
+            "device_id": "device-bootstrap",
+            "user_id": "1",
+            "items": [
+                {
+                    "product_id": "product-276",
+                    "quantity": 2.5,
+                    "purchase_rate": 80.0,
+                    "unit": "KG",
+                    "lot_name": "Offline Lot A",
+                    "lot_size": "A"
+                },
+                {
+                    "product_id": "product-276",
+                    "quantity": 3.0,
+                    "purchase_rate": 82.0,
+                    "unit": "KG",
+                    "lot_name": "Offline Lot B",
+                    "lot_size": "B"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn offline_purchase_intent_is_durable_idempotent_and_reconciles_canonical_ids() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-offline-purchase-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize offline purchase database");
+        apply_reference_bootstrap_at(
+            &path,
+            &test_reference_bootstrap("device-bootstrap", 1001),
+            "device-bootstrap",
+            Some("2026-07-28T08:00:00.000Z".to_string()),
+        )
+        .expect("bootstrap local references");
+
+        let operation_id = "offline-purchase-op-1";
+        let payload = test_offline_purchase_payload(operation_id);
+        let queued = queue_local_purchase_at(&path, payload.clone()).expect("queue offline purchase");
+        assert_eq!(queued.intent["sync_status"], "pending");
+        queue_local_purchase_at(&path, payload.clone()).expect("idempotent repeated queue");
+
+        let conn = Connection::open(&path).expect("inspect queued purchase");
+        let counts: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM local_purchase_intents),
+                   (SELECT COUNT(*) FROM local_purchase_intent_lines),
+                   (SELECT COUNT(*) FROM local_inventory_lots WHERE id LIKE 'offline-lot-%'),
+                   (SELECT COUNT(*) FROM sync_outbox WHERE entity_type = 'purchase_grn')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read queue counts");
+        assert_eq!(counts, (1, 2, 2, 1));
+        drop(conn);
+
+        let mut altered = payload;
+        altered["items"][0]["quantity"] = serde_json::json!(9.0);
+        let error = queue_local_purchase_at(&path, altered)
+            .expect_err("same operation cannot change financial intent");
+        assert!(error.contains("different financial intent"));
+
+        mark_outbox_syncing_at(&path, &[operation_id.to_string()]).expect("mark replay syncing");
+        let restarted = list_local_purchase_intents_with_conn(
+            &Connection::open(&path).expect("reopen after restart"),
+        )
+        .expect("list after restart");
+        assert_eq!(restarted[0]["sync_status"], "syncing");
+        release_syncing_operations_at(
+            &path,
+            &[operation_id.to_string()],
+            Some("Network interrupted".to_string()),
+        )
+        .expect("release interrupted replay");
+        let released = list_local_purchase_intents_with_conn(
+            &Connection::open(&path).expect("reopen after release"),
+        )
+        .expect("list released purchase");
+        assert_eq!(released[0]["sync_status"], "pending");
+        assert_eq!(released[0]["last_error"], "Network interrupted");
+
+        let ack = SyncAck {
+            operation_id: operation_id.to_string(),
+            status: "accepted".to_string(),
+            server_entity_version: Some(1),
+            server_updated_at: Some("2026-07-28T08:05:00.000Z".to_string()),
+            error_code: None,
+            message: Some("Purchase Saved".to_string()),
+            result_payload: Some(serde_json::json!({
+                "purchase_ids": [901, 902],
+                "purchases": [
+                    { "id": 901, "global_id": format!("offline-purchase-{operation_id}-1") },
+                    { "id": 902, "global_id": format!("offline-purchase-{operation_id}-2") }
+                ],
+                "lots": [
+                    { "id": 801, "global_id": format!("offline-lot-{operation_id}-1") },
+                    { "id": 802, "global_id": format!("offline-lot-{operation_id}-2") }
+                ]
+            })),
+        };
+        let mut conn = Connection::open(&path).expect("open for acknowledgement");
+        let tx = conn.transaction().expect("begin acknowledgement");
+        apply_purchase_ack_with_tx(
+            &tx,
+            &ack,
+            "completed",
+            &serde_json::to_string(&ack).expect("serialize acknowledgement"),
+            "2026-07-28T08:05:00.000Z",
+        )
+        .expect("apply canonical mapping");
+        tx.commit().expect("commit acknowledgement");
+
+        let conn = Connection::open(&path).expect("inspect reconciliation");
+        let result: (String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                   (SELECT state FROM local_purchase_intents WHERE operation_id = ?1),
+                   (SELECT COUNT(*) FROM local_purchase_intent_lines WHERE server_purchase_id IS NOT NULL),
+                   (SELECT COUNT(*) FROM local_purchase_intent_lines WHERE server_lot_id IS NOT NULL),
+                   (SELECT COUNT(*) FROM local_inventory_lots WHERE id LIKE 'offline-lot-%' AND sync_status = 'synced')",
+                [operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read reconciled state");
+        assert_eq!(result, ("completed".to_string(), 2, 2, 2));
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn reference_bootstrap_is_atomic_idempotent_and_preserves_existing_rows() {
         let path = std::env::temp_dir().join(format!(
@@ -3487,7 +4151,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("migration count");
-            assert_eq!(migration_count, 12);
+            assert_eq!(migration_count, 13);
             drop(conn);
             initialize_at(path).expect("restart with existing SQLite profile");
             let restored = ensure_device_identity_at(path).expect("restore device identity");
@@ -3549,7 +4213,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("preserved marker");
-        assert_eq!(migration_count, 12);
+        assert_eq!(migration_count, 13);
         assert_eq!(marker, "keep-me");
         drop(conn);
         let _ = fs::remove_file(&path);

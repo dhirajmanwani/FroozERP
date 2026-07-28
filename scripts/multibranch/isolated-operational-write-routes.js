@@ -729,6 +729,184 @@ const run = async () => {
       return { purchase_id: first.purchase_ids[0], ...evidence };
     });
 
+    await record("offline multi-line purchase replay reconciles stable purchase and lot identities", async () => {
+      const [supplier, rebate] = await Promise.all([
+        pool.query("SELECT id FROM suppliers WHERE active=TRUE ORDER BY id LIMIT 1"),
+        pool.query("SELECT id FROM rebate_rules WHERE active=TRUE ORDER BY id LIMIT 1"),
+      ]);
+      const operationId = "v3-offline-purchase-multiline";
+      const body = op(operationId, {
+        supplier_id: supplier.rows[0].id,
+        purchase_bill_status: "BILL_COMPLETED",
+        purchase_date: "2026-07-28",
+        purchase_type: "CREDIT",
+        freight_charges: 0,
+        labour_charges: 0,
+        other_charges: 0,
+        paid_amount: 0,
+        rebate_rule_id: rebate.rows[0].id,
+        remarks: "isolated offline multi-line GRN",
+        items: [1, 2].map((lineIndex) => ({
+          product_id: created.global_id,
+          product_global_id: created.global_id,
+          purchase_global_id: `offline-purchase-${operationId}-${lineIndex}`,
+          lot_global_id: `offline-lot-${operationId}-${lineIndex}`,
+          line_index: lineIndex,
+          quantity: lineIndex + 1,
+          purchase_rate: 50 + lineIndex,
+          unit: "KG",
+          lot_name: `OFFLINE-MULTI-${lineIndex}`,
+        })),
+      });
+      const first = await api({
+        method: "POST",
+        route: "/api/v3/purchase-bills",
+        body,
+        expected: 201,
+      });
+      const retry = await api({
+        method: "POST",
+        route: "/api/v3/purchase-bills",
+        body,
+        expected: 201,
+      });
+      if (
+        first.purchase_ids.length !== 2 ||
+        first.lots.length !== 2 ||
+        !retry.idempotent_replay ||
+        retry.purchase_ids.join(",") !== first.purchase_ids.join(",")
+      ) {
+        throw new Error("Offline multi-line replay did not return one canonical result");
+      }
+      const rows = await pool.query(
+        `SELECT
+           (SELECT COUNT(*)::int FROM purchases WHERE id=ANY($1::int[])) purchases,
+           (SELECT COUNT(*)::int FROM inventory_batches
+             WHERE global_id=ANY($2::text[])
+               AND company_id=1 AND operational_location_id=$3) lots,
+           (SELECT COALESCE(SUM(remaining_qty),0)::numeric FROM inventory_batches
+             WHERE global_id=ANY($2::text[])) quantity`,
+        [
+          first.purchase_ids,
+          [`offline-lot-${operationId}-1`, `offline-lot-${operationId}-2`],
+          LOCATION_ONE,
+        ]
+      );
+      if (
+        rows.rows[0].purchases !== 2 ||
+        rows.rows[0].lots !== 2 ||
+        Number(rows.rows[0].quantity) !== 5
+      ) {
+        throw new Error("Offline multi-line purchase or stock reconciliation mismatch");
+      }
+      const identityMismatch = await api({
+        method: "POST",
+        route: "/api/v3/purchase-bills",
+        body: op("v3-offline-purchase-identity-rejected", {
+          ...body,
+          items: [{ ...body.items[0], lot_global_id: "offline-lot-substituted" }],
+        }),
+        expected: 409,
+      });
+      if (identityMismatch.code !== "OFFLINE_PURCHASE_IDENTITY_MISMATCH") {
+        throw new Error("Altered offline lot identity was not rejected");
+      }
+      const evidence = await requireExactlyOnce(operationId, 2);
+      return {
+        purchase_ids: first.purchase_ids,
+        lot_ids: first.lots.map((lot) => lot.id),
+        identity_rejection: identityMismatch.code,
+        ...evidence,
+      };
+    });
+
+    await record("offline pending-bill and paid purchases replay concurrently without duplication", async () => {
+      const [supplier, rebate] = await Promise.all([
+        pool.query("SELECT id FROM suppliers WHERE active=TRUE ORDER BY id LIMIT 1"),
+        pool.query("SELECT id FROM rebate_rules WHERE active=TRUE ORDER BY id LIMIT 1"),
+      ]);
+      const pendingOperation = "v3-offline-purchase-pending";
+      const paidOperation = "v3-offline-purchase-paid";
+      const pendingBody = op(pendingOperation, {
+        supplier_id: supplier.rows[0].id,
+        purchase_bill_status: "BILL_PENDING",
+        purchase_date: "2026-07-28",
+        purchase_type: "PENDING_BILL",
+        remarks: "offline pending supplier bill",
+        items: [{
+          product_id: created.global_id,
+          product_global_id: created.global_id,
+          purchase_global_id: `offline-purchase-${pendingOperation}-1`,
+          lot_global_id: `offline-lot-${pendingOperation}-1`,
+          line_index: 1,
+          quantity: 2,
+          expected_purchase_rate: 48,
+          temporary_sale_rate: 100,
+          unit: "KG",
+          lot_name: "OFFLINE-PENDING",
+        }],
+      });
+      const paidBody = op(paidOperation, {
+        supplier_id: supplier.rows[0].id,
+        purchase_bill_status: "BILL_COMPLETED",
+        purchase_date: "2026-07-28",
+        purchase_type: "CASH",
+        payment_mode: "CASH",
+        paid_amount: 50,
+        payment_date: "2026-07-28",
+        freight_charges: 0,
+        labour_charges: 0,
+        other_charges: 0,
+        rebate_rule_id: rebate.rows[0].id,
+        remarks: "offline paid supplier bill",
+        items: [{
+          product_id: created.global_id,
+          product_global_id: created.global_id,
+          purchase_global_id: `offline-purchase-${paidOperation}-1`,
+          lot_global_id: `offline-lot-${paidOperation}-1`,
+          line_index: 1,
+          quantity: 2,
+          purchase_rate: 50,
+          unit: "KG",
+          lot_name: "OFFLINE-PAID",
+        }],
+      });
+      const [pending, paid] = await Promise.all([
+        api({ method: "POST", route: "/api/v3/purchase-bills", body: pendingBody, expected: 201 }),
+        api({ method: "POST", route: "/api/v3/purchase-bills", body: paidBody, expected: 201 }),
+      ]);
+      const [pendingRetry, paidRetry] = await Promise.all([
+        api({ method: "POST", route: "/api/v3/purchase-bills", body: pendingBody, expected: 201 }),
+        api({ method: "POST", route: "/api/v3/purchase-bills", body: paidBody, expected: 201 }),
+      ]);
+      if (!pendingRetry.idempotent_replay || !paidRetry.idempotent_replay) {
+        throw new Error("Offline pending or paid purchase retry was not idempotent");
+      }
+      const rows = await pool.query(
+        `SELECT purchase_bill_status, purchase_type, paid_amount, operational_location_id
+         FROM purchases
+         WHERE id=ANY($1::int[])
+         ORDER BY id`,
+        [[pending.purchase_ids[0], paid.purchase_ids[0]]]
+      );
+      if (
+        rows.rows.length !== 2 ||
+        !rows.rows.some((row) => row.purchase_bill_status === "BILL_PENDING") ||
+        !rows.rows.some((row) => row.purchase_type === "CASH" && Number(row.paid_amount) === 50) ||
+        rows.rows.some((row) => Number(row.operational_location_id) !== LOCATION_ONE)
+      ) {
+        throw new Error("Offline pending/paid purchase state or scope mismatch");
+      }
+      const pendingEvidence = await requireExactlyOnce(pendingOperation, 2);
+      const paidEvidence = await requireExactlyOnce(paidOperation, 1);
+      return {
+        pending_purchase_id: pending.purchase_ids[0],
+        paid_purchase_id: paid.purchase_ids[0],
+        pending: pendingEvidence,
+        paid: paidEvidence,
+      };
+    });
+
     await record("interrupted direct purchase response retries exactly once", async () => {
       const supplier = await pool.query("SELECT id FROM suppliers WHERE active=TRUE ORDER BY id LIMIT 1");
       const rebate = await pool.query("SELECT id FROM rebate_rules WHERE active=TRUE ORDER BY id LIMIT 1");
