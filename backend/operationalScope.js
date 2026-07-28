@@ -50,7 +50,7 @@ const validateSyncBatchScope = (operations, canonical) => {
   return null;
 };
 
-const LEGACY_OPERATIONAL_ROUTE = /^\/(?:api\/owner\/dashboard-foundation|dashboard|products?|product-categories|inventory|lots?|purchases?|purchase-returns?|sales?|sale-returns?|waste|customers?|suppliers?|payments?|accounts?|expenses?|contra|reports?)(?:\/|$)/i;
+const LEGACY_OPERATIONAL_ROUTE = /^\/(?:api\/owner\/dashboard-foundation|dashboard|products?|product-categories|inventory|inventory-lots|lots?|purchases?|purchase-bill|purchase-returns?|sales?|sale-returns?|waste|customers?|suppliers?|payments?|accounts?|expenses?|contra|reports?)(?:\/|$)/i;
 
 const requiresOperationalProtocolUpgrade = (requestPath) => {
   const normalized = String(requestPath || "").split("?")[0];

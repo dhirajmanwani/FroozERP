@@ -332,6 +332,68 @@ const run = async () => {
       return requireExactlyOnce("v3-product-deactivate", 1, null);
     });
 
+    const category = await record("product category create, update, deactivate, and retries", async () => {
+      const createBody = op("v3-category-create", {
+        category_name: "V3 Isolated Category",
+        reason: "isolated category create",
+      });
+      const createdCategory = await api({
+        method: "POST",
+        route: "/api/v3/product-categories",
+        body: createBody,
+        expected: 201,
+      });
+      const createRetry = await api({
+        method: "POST",
+        route: "/api/v3/product-categories",
+        body: createBody,
+        expected: 201,
+      });
+      if (createdCategory.id !== createRetry.id) throw new Error("Category create retry duplicated");
+      await requireExactlyOnce("v3-category-create", 1, null);
+
+      const updateBody = op("v3-category-update", {
+        category_name: "V3 Isolated Category Updated",
+        active: true,
+        reason: "isolated category update",
+      });
+      const updatedCategory = await api({
+        method: "PUT",
+        route: `/api/v3/product-categories/${createdCategory.id}`,
+        body: updateBody,
+      });
+      const updateRetry = await api({
+        method: "PUT",
+        route: `/api/v3/product-categories/${createdCategory.id}`,
+        body: updateBody,
+      });
+      if (updatedCategory.id !== updateRetry.id) throw new Error("Category update retry duplicated");
+      await requireExactlyOnce("v3-category-update", 1, null);
+
+      const deactivateBody = op("v3-category-deactivate", {
+        reason: "isolated category deactivation",
+      });
+      const deactivated = await api({
+        method: "DELETE",
+        route: `/api/v3/product-categories/${createdCategory.id}`,
+        body: deactivateBody,
+      });
+      const deactivateRetry = await api({
+        method: "DELETE",
+        route: `/api/v3/product-categories/${createdCategory.id}`,
+        body: deactivateBody,
+      });
+      if (!deactivated.success || !deactivateRetry.success) {
+        throw new Error("Category deactivation retry mismatch");
+      }
+      const visible = await api({ route: "/api/v3/product-categories" });
+      if (visible.some((category) => Number(category.id) === Number(createdCategory.id) && category.active !== false)) {
+        throw new Error("Deactivated category remained active");
+      }
+      await requireExactlyOnce("v3-category-deactivate", 1, null);
+      return { category_id: createdCategory.id, company_id: createdCategory.company_id };
+    });
+
     const lot = await record("opening lot create and retry", async () => {
       const body = op("v3-opening-lot", {
         quantity: 20,
@@ -355,6 +417,100 @@ const run = async () => {
       if (retry.lots[0].id !== first.lots[0].id) throw new Error("Opening lot retry duplicated");
       await requireExactlyOnce("v3-opening-lot");
       return first.lots[0];
+    });
+
+    await record("lot metadata, quantity, deactivate, and reactivate lifecycle", async () => {
+      const editBody = op("v3-lot-edit", {
+        lot_name: "V3-LOT-1-EDITED",
+        purchase_qty: 21,
+        purchase_rate: 50,
+        sale_rate: 105,
+        opening_stock_date: "2026-07-28",
+        reason: "isolated lot metadata edit",
+      });
+      await api({ method: "PUT", route: `/api/v3/inventory-lots/${lot.id}`, body: editBody });
+      const editRetry = await api({ method: "PUT", route: `/api/v3/inventory-lots/${lot.id}`, body: editBody });
+      if (!editRetry.idempotent_replay) throw new Error("Lot metadata retry was not recognized");
+      await requireExactlyOnce("v3-lot-edit", 2);
+
+      const addBody = op("v3-lot-add-quantity", {
+        quantity: 2,
+        reason: "isolated quantity addition",
+      });
+      await api({
+        method: "POST",
+        route: `/api/v3/inventory-lots/${lot.id}/add-quantity`,
+        body: addBody,
+      });
+      const addRetry = await api({
+        method: "POST",
+        route: `/api/v3/inventory-lots/${lot.id}/add-quantity`,
+        body: addBody,
+      });
+      if (!addRetry.idempotent_replay) throw new Error("Lot quantity retry was not recognized");
+      await requireExactlyOnce("v3-lot-add-quantity");
+
+      const deactivateBody = op("v3-lot-deactivate", { reason: "isolated lot deactivation" });
+      await api({
+        method: "POST",
+        route: `/api/v3/inventory-lots/${lot.id}/deactivate`,
+        body: deactivateBody,
+      });
+      await api({
+        method: "POST",
+        route: `/api/v3/inventory-lots/${lot.id}/deactivate`,
+        body: deactivateBody,
+      });
+      await requireExactlyOnce("v3-lot-deactivate");
+
+      const reactivateBody = op("v3-lot-reactivate", { reason: "isolated lot reactivation" });
+      await api({
+        method: "POST",
+        route: `/api/v3/inventory-lots/${lot.id}/reactivate`,
+        body: reactivateBody,
+      });
+      const reactivateRetry = await api({
+        method: "POST",
+        route: `/api/v3/inventory-lots/${lot.id}/reactivate`,
+        body: reactivateBody,
+      });
+      if (!reactivateRetry.idempotent_replay) throw new Error("Lot reactivation retry was not recognized");
+      const current = await pool.query(
+        "SELECT lot_name, purchase_qty, remaining_qty, batch_status FROM inventory_batches WHERE id=$1",
+        [lot.id]
+      );
+      if (
+        current.rows[0].lot_name !== "V3-LOT-1-EDITED" ||
+        Number(current.rows[0].purchase_qty) !== 23 ||
+        Number(current.rows[0].remaining_qty) !== 23 ||
+        current.rows[0].batch_status !== "ACTIVE"
+      ) {
+        throw new Error("Lot maintenance lifecycle produced incorrect stock");
+      }
+      await requireExactlyOnce("v3-lot-reactivate");
+      return current.rows[0];
+    });
+
+    await record("cross-location lot maintenance is rejected", async () => {
+      const foreignLot = await pool.query(
+        "SELECT id FROM inventory_batches WHERE operational_location_id=$1 ORDER BY id LIMIT 1",
+        [LOCATION_TWO]
+      );
+      if (!foreignLot.rows[0]) throw new Error("Second-location lot fixture is missing");
+      const rejected = await api({
+        method: "POST",
+        route: `/api/v3/inventory-lots/${foreignLot.rows[0].id}/add-quantity`,
+        body: op("v3-foreign-lot-rejected", {
+          quantity: 1,
+          reason: "must not cross location",
+        }),
+        expected: 404,
+      });
+      const evidence = await operationEvidence("v3-foreign-lot-rejected");
+      if (evidence.processed !== 0 || evidence.changes !== 0) {
+        throw new Error("Rejected cross-location lot mutation left records");
+      }
+      return { status: 404, message: rejected.message };
     });
 
     await record("positive and negative administrative adjustments", async () => {
@@ -509,6 +665,118 @@ const run = async () => {
       return requireExactlyOnce("v3-purchase-complete");
     });
 
+    await record("direct completed purchase receipt and retry", async () => {
+      await pool.query(
+        "UPDATE suppliers SET active=TRUE WHERE id=(SELECT id FROM suppliers ORDER BY id LIMIT 1)"
+      );
+      const [supplier, rebate] = await Promise.all([
+        pool.query("SELECT id FROM suppliers WHERE active=TRUE ORDER BY id LIMIT 1"),
+        pool.query("SELECT id FROM rebate_rules WHERE active=TRUE ORDER BY id LIMIT 1"),
+      ]);
+      if (!supplier.rows[0] || !rebate.rows[0]) {
+        throw new Error("Purchase receipt fixtures are missing");
+      }
+      const body = op("v3-direct-purchase", {
+        supplier_id: supplier.rows[0].id,
+        purchase_bill_status: "BILL_COMPLETED",
+        purchase_date: "2026-07-28",
+        purchase_type: "CREDIT",
+        freight_charges: 0,
+        labour_charges: 0,
+        other_charges: 0,
+        paid_amount: 0,
+        rebate_rule_id: rebate.rows[0].id,
+        items: [{
+          product_id: created.id,
+          quantity: 4,
+          purchase_rate: 50,
+          lot_name: "V3-DIRECT-PURCHASE",
+        }],
+      });
+      const first = await api({
+        method: "POST",
+        route: "/api/v3/purchase-bills",
+        body,
+        expected: 201,
+      });
+      const retry = await api({
+        method: "POST",
+        route: "/api/v3/purchase-bills",
+        body,
+        expected: 201,
+      });
+      if (
+        first.purchase_ids.length !== 1 ||
+        retry.purchase_ids[0] !== first.purchase_ids[0]
+      ) {
+        throw new Error("Direct purchase retry duplicated");
+      }
+      const rows = await pool.query(
+        `SELECT p.company_id, p.operational_location_id, ib.remaining_qty
+         FROM purchases p JOIN inventory_batches ib ON ib.purchase_id=p.id
+         WHERE p.id=$1`,
+        [first.purchase_ids[0]]
+      );
+      if (
+        rows.rows.length !== 1 ||
+        Number(rows.rows[0].company_id) !== 1 ||
+        Number(rows.rows[0].operational_location_id) !== LOCATION_ONE ||
+        Number(rows.rows[0].remaining_qty) !== 4
+      ) {
+        throw new Error("Direct purchase receipt scope or stock mismatch");
+      }
+      const evidence = await requireExactlyOnce("v3-direct-purchase");
+      return { purchase_id: first.purchase_ids[0], ...evidence };
+    });
+
+    await record("interrupted direct purchase response retries exactly once", async () => {
+      const supplier = await pool.query("SELECT id FROM suppliers WHERE active=TRUE ORDER BY id LIMIT 1");
+      const rebate = await pool.query("SELECT id FROM rebate_rules WHERE active=TRUE ORDER BY id LIMIT 1");
+      const operationId = "v3-direct-purchase-interrupted";
+      const body = op(operationId, {
+        supplier_id: supplier.rows[0].id,
+        purchase_bill_status: "BILL_COMPLETED",
+        purchase_date: "2026-07-28",
+        purchase_type: "CREDIT",
+        freight_charges: 0,
+        labour_charges: 0,
+        other_charges: 0,
+        paid_amount: 0,
+        rebate_rule_id: rebate.rows[0].id,
+        items: [{
+          product_id: created.id,
+          quantity: 3,
+          purchase_rate: 50,
+          lot_name: "V3-INTERRUPTED-PURCHASE",
+        }],
+      });
+      await abortAfterRequestWrite({
+        method: "POST",
+        route: "/api/v3/purchase-bills",
+        body,
+      });
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        const evidence = await operationEvidence(operationId);
+        if (evidence.processed === 1) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const retry = await api({
+        method: "POST",
+        route: "/api/v3/purchase-bills",
+        body,
+        expected: 201,
+      });
+      if (!retry.idempotent_replay || retry.purchase_ids.length !== 1) {
+        throw new Error("Interrupted purchase response did not replay committed result");
+      }
+      const count = await pool.query(
+        "SELECT COUNT(*)::int count FROM purchases WHERE id=$1",
+        [retry.purchase_ids[0]]
+      );
+      if (count.rows[0].count !== 1) throw new Error("Interrupted purchase duplicated");
+      return requireExactlyOnce(operationId);
+    });
+
     const saleLot = await pool.query(
       `INSERT INTO inventory_batches (
          global_id,product_id,batch_no,purchase_qty,remaining_qty,purchase_rate,
@@ -639,16 +907,32 @@ const run = async () => {
     });
 
     await record("legacy unsafe writes remain blocked", async () => {
-      const response = await fetch(`${origin}/sales`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: "{}",
-      });
-      const payload = await response.json();
-      if (response.status !== 426 || payload.code !== "CLIENT_UPGRADE_REQUIRED") {
-        throw new Error("Legacy write was not blocked");
+      const legacyWrites = [
+        ["POST", "/sales"],
+        ["POST", "/purchase-bill"],
+        ["PUT", `/inventory-lots/${lot.id}`],
+        ["POST", `/inventory-lots/${lot.id}/add-quantity`],
+        ["POST", `/inventory-lots/${lot.id}/deactivate`],
+        ["POST", `/inventory-lots/${lot.id}/reactivate`],
+        ["POST", "/lots/transfer-stock"],
+        ["POST", "/product-categories"],
+        ["PUT", `/product-categories/${category.category_id}`],
+        ["DELETE", `/product-categories/${category.category_id}`],
+      ];
+      const evidence = [];
+      for (const [method, route] of legacyWrites) {
+        const response = await fetch(`${origin}${route}`, {
+          method,
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        });
+        const payload = await response.json();
+        if (response.status !== 426 || payload.code !== "CLIENT_UPGRADE_REQUIRED") {
+          throw new Error(`Legacy write was not blocked: ${method} ${route}`);
+        }
+        evidence.push({ method, route, status: response.status, code: payload.code });
       }
-      return { status: response.status, code: payload.code };
+      return evidence;
     });
 
     await record("customer master unchanged", async () => {

@@ -27,6 +27,8 @@ test("scope modes default off and accept only supported values", () => {
 test("strict mode can block unsafe legacy operational routes without blocking v3", () => {
   assert.equal(requiresOperationalProtocolUpgrade("/products"), true);
   assert.equal(requiresOperationalProtocolUpgrade("/sales/42"), true);
+  assert.equal(requiresOperationalProtocolUpgrade("/purchase-bill"), true);
+  assert.equal(requiresOperationalProtocolUpgrade("/inventory-lots/42"), true);
   assert.equal(requiresOperationalProtocolUpgrade("/api/owner/dashboard-foundation"), true);
   assert.equal(requiresOperationalProtocolUpgrade("/api/v3/inventory"), false);
   assert.equal(requiresOperationalProtocolUpgrade("/api/sync/push"), false);

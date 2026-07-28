@@ -17,7 +17,14 @@ const requiredV3Routes = [
   '"/api/v3/products/:id/deactivate"',
   '"/api/v3/products/:id/opening-stock"',
   '"/api/v3/products/:productId/opening-stock-lots"',
+  '"/api/v3/product-categories"',
+  '"/api/v3/product-categories/:id"',
+  '"/api/v3/inventory-lots/:lotId"',
+  '"/api/v3/inventory-lots/:lotId/add-quantity"',
   '"/api/v3/inventory-lots/:lotId/adjust"',
+  '"/api/v3/inventory-lots/:lotId/deactivate"',
+  '"/api/v3/inventory-lots/:lotId/reactivate"',
+  '"/api/v3/purchase-bills"',
   '"/api/v3/purchases/:id"',
   '"/api/v3/purchases/:id/complete-bill"',
   '"/api/v3/purchases/:id/cancel"',
@@ -33,6 +40,9 @@ test("confirmed operational writes have protocol-v3 route replacements", () => {
     assert.match(backendSource, new RegExp(route.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
   assert.match(backendSource, /v3WriteAdapter\(createProductHandler\)/);
+  assert.match(backendSource, /v3WriteAdapter\(createProductCategoryHandler\)/);
+  assert.match(backendSource, /v3WriteAdapter\(updateInventoryLotHandler\)/);
+  assert.match(backendSource, /v3WriteAdapter\(createPurchaseBillHandler\)/);
   assert.match(backendSource, /v3WriteAdapter\(updatePurchaseHandler\)/);
   assert.match(backendSource, /v3WriteAdapter\(createSaleHandler\)/);
   assert.match(backendSource, /v3WriteAdapter\(createSaleReturnHandler\)/);
@@ -67,7 +77,9 @@ test("frontend confirmed workflows call protocol-v3 routes with operational writ
   assert.match(frontendSource, /const createOperationalWrite =/);
   for (const route of [
     "/api/v3/products",
+    "/api/v3/product-categories",
     "/api/v3/inventory-lots/",
+    "/api/v3/purchase-bills",
     "/api/v3/purchases/",
     "/api/v3/sales",
     "/api/v3/sale-returns",
@@ -78,6 +90,8 @@ test("frontend confirmed workflows call protocol-v3 routes with operational writ
   assert.doesNotMatch(frontendSource, /axios\.post\(`\$\{API_URL\}\/sales`/);
   assert.doesNotMatch(frontendSource, /axios\.post\(`\$\{API_URL\}\/sale-returns`/);
   assert.doesNotMatch(frontendSource, /axios\.post\(`\$\{API_URL\}\/waste-entries`/);
+  assert.doesNotMatch(frontendSource, /axios\.post\(`\$\{API_URL\}\/purchase-bill`/);
+  assert.doesNotMatch(frontendSource, /axios\.post\(`\$\{API_URL\}\/lots\/transfer-stock`/);
 });
 
 test("legacy operational routes remain registered for explicit HTTP 426 enforcement", () => {

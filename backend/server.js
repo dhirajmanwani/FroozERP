@@ -9242,6 +9242,21 @@ const v3WriteAdapter = (handler) => async (req, res) => {
   }
 };
 
+const v3ReadAdapter = (handler) => async (req, res) => {
+  try {
+    const resolved = await resolveV3OperationalContext(req);
+    if (resolved.error) return sendOperationalScopeError(res, resolved.error);
+    req.v3OperationalContext = resolved.context;
+    return handler(req, res);
+  } catch (error) {
+    console.error(`Protocol v3 ${req.method} ${req.path} failed`, error.code || error.message);
+    return res.status(error.status || 500).json({
+      code: error.code || "OPERATIONAL_READ_FAILED",
+      message: error.status ? error.message : "Operational read failed",
+    });
+  }
+};
+
 app.get("/api/v3/operational-context", rateLimitSyncRequest, async (req, res) => {
   try {
     const resolved = await resolveV3OperationalContext(req);
@@ -10455,9 +10470,10 @@ app.post("/login", async (req, res) => {
   }
 });
 
-app.get("/product-categories", async (req, res) => {
+const listProductCategoriesHandler = async (req, res) => {
   try {
     await ensureProductEntrySchema();
+    const context = req.v3OperationalContext;
     const result = await pool.query(
       `
       SELECT
@@ -10466,18 +10482,23 @@ app.get("/product-categories", async (req, res) => {
         COALESCE(SUM(CASE WHEN p.active IS DISTINCT FROM FALSE THEN 1 ELSE 0 END), 0)::INTEGER AS active_item_count
       FROM product_categories pc
       LEFT JOIN products p ON p.category_id = pc.id
+        AND ($1::INTEGER IS NULL OR p.company_id = $1)
+      WHERE ($1::INTEGER IS NULL OR pc.company_id = $1)
       GROUP BY pc.id
       ORDER BY pc.active DESC, pc.category_name
-      `
+      `,
+      [context?.company_id || null]
     );
     return res.json(result.rows);
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Database Error" });
   }
-});
+};
+app.get("/product-categories", listProductCategoriesHandler);
+app.get("/api/v3/product-categories", rateLimitSyncRequest, v3ReadAdapter(listProductCategoriesHandler));
 
-app.post("/product-categories", async (req, res) => {
+const createProductCategoryHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const manager = await requireRateManager(req.body.created_by || req.body.updated_by, client);
@@ -10485,18 +10506,37 @@ app.post("/product-categories", async (req, res) => {
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage categories" });
     if (!categoryName) return res.status(400).json({ message: "Please enter category name." });
     await client.query("BEGIN");
-    const duplicate = await findCategoryByName(client, categoryName);
+    const replay = await beginV3BusinessOperation(client, req, "product_category");
+    if (replay) return sendV3Replay(client, res, replay);
+    const context = req.v3OperationalContext;
+    const duplicateResult = await client.query(
+      `SELECT * FROM product_categories
+       WHERE LOWER(category_name) = LOWER($1)
+         AND ($2::INTEGER IS NULL OR company_id = $2)
+       LIMIT 1`,
+      [categoryName, context?.company_id || null]
+    );
+    const duplicate = duplicateResult.rows[0];
     if (duplicate) {
       await client.query("ROLLBACK");
       return res.status(409).json({ message: "Category already exists." });
     }
     const result = await client.query(
       `
-      INSERT INTO product_categories (global_id, category_name, active, remarks, created_by, updated_by)
-      VALUES ($5, $1, $2, $3, $4, $4)
+      INSERT INTO product_categories (
+        global_id, category_name, active, remarks, created_by, updated_by, company_id
+      )
+      VALUES ($5, $1, $2, $3, $4, $4, $6)
       RETURNING *
       `,
-      [categoryName, req.body.active !== false, nullableText(req.body.remarks), manager.id, `category-${crypto.randomUUID()}`]
+      [
+        categoryName,
+        req.body.active !== false,
+        nullableText(req.body.remarks),
+        manager.id,
+        `category-${crypto.randomUUID()}`,
+        context?.company_id || null,
+      ]
     );
     await client.query(
       `
@@ -10506,13 +10546,21 @@ app.post("/product-categories", async (req, res) => {
       [result.rows[0].id, JSON.stringify(result.rows[0]), cleanText(req.body.reason) || "Category created", manager.id]
     );
     await logSyncChange(client, {
-      branchId: req.v3OperationalContext?.branch_id || 1,
+      branchId: context?.branch_id || 1,
       entityType: "product_category",
       entityId: result.rows[0].global_id,
       operationType: "UPSERT",
       version: result.rows[0].entity_version || 1,
       payload: result.rows[0],
     });
+    await completeV3BusinessOperation(
+      client,
+      req,
+      "product_category",
+      result.rows[0].global_id,
+      result.rows[0],
+      201
+    );
     await client.query("COMMIT");
     return res.status(201).json(result.rows[0]);
   } catch (error) {
@@ -10523,9 +10571,11 @@ app.post("/product-categories", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.post("/product-categories", createProductCategoryHandler);
+app.post("/api/v3/product-categories", rateLimitSyncRequest, v3WriteAdapter(createProductCategoryHandler));
 
-app.put("/product-categories/:id", async (req, res) => {
+const updateProductCategoryHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const categoryId = parsePositiveInteger(req.params.id);
@@ -10535,13 +10585,28 @@ app.put("/product-categories/:id", async (req, res) => {
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage categories" });
     if (!categoryId || !categoryName) return res.status(400).json({ message: "Please enter category name." });
     await client.query("BEGIN");
-    const currentResult = await client.query("SELECT * FROM product_categories WHERE id = $1 FOR UPDATE", [categoryId]);
+    const replay = await beginV3BusinessOperation(client, req, "product_category");
+    if (replay) return sendV3Replay(client, res, replay);
+    const context = req.v3OperationalContext;
+    const currentResult = await client.query(
+      `SELECT * FROM product_categories
+       WHERE id = $1 AND ($2::INTEGER IS NULL OR company_id = $2)
+       FOR UPDATE`,
+      [categoryId, context?.company_id || null]
+    );
     const current = currentResult.rows[0];
     if (!current) {
       await client.query("ROLLBACK");
       return res.status(404).json({ message: "Category not found" });
     }
-    const duplicate = await client.query("SELECT id FROM product_categories WHERE LOWER(category_name) = LOWER($1) AND id <> $2 LIMIT 1", [categoryName, categoryId]);
+    const duplicate = await client.query(
+      `SELECT id FROM product_categories
+       WHERE LOWER(category_name) = LOWER($1)
+         AND id <> $2
+         AND ($3::INTEGER IS NULL OR company_id = $3)
+       LIMIT 1`,
+      [categoryName, categoryId, context?.company_id || null]
+    );
     if (duplicate.rows.length > 0) {
       await client.query("ROLLBACK");
       return res.status(409).json({ message: "Category already exists." });
@@ -10557,7 +10622,10 @@ app.put("/product-categories/:id", async (req, res) => {
       `,
       [categoryName, req.body.active !== false, nullableText(req.body.remarks), manager.id, categoryId]
     );
-    await client.query("UPDATE products SET category = $1 WHERE category_id = $2", [categoryName, categoryId]);
+    await client.query(
+      "UPDATE products SET category = $1 WHERE category_id = $2 AND ($3::INTEGER IS NULL OR company_id = $3)",
+      [categoryName, categoryId, context?.company_id || null]
+    );
     await client.query(
       `
       INSERT INTO product_category_audit_trail (category_id, action, old_value, new_value, reason, edited_by)
@@ -10566,13 +10634,20 @@ app.put("/product-categories/:id", async (req, res) => {
       [categoryId, JSON.stringify(current), JSON.stringify(result.rows[0]), reason, manager.id]
     );
     await logSyncChange(client, {
-      branchId: req.v3OperationalContext?.branch_id || 1,
+      branchId: context?.branch_id || 1,
       entityType: "product_category",
       entityId: result.rows[0].global_id,
       operationType: "UPSERT",
       version: result.rows[0].entity_version || 1,
       payload: result.rows[0],
     });
+    await completeV3BusinessOperation(
+      client,
+      req,
+      "product_category",
+      result.rows[0].global_id,
+      result.rows[0]
+    );
     await client.query("COMMIT");
     return res.json(result.rows[0]);
   } catch (error) {
@@ -10583,9 +10658,11 @@ app.put("/product-categories/:id", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.put("/product-categories/:id", updateProductCategoryHandler);
+app.put("/api/v3/product-categories/:id", rateLimitSyncRequest, v3WriteAdapter(updateProductCategoryHandler));
 
-app.delete("/product-categories/:id", async (req, res) => {
+const deactivateProductCategoryHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const categoryId = parsePositiveInteger(req.params.id);
@@ -10594,13 +10671,25 @@ app.delete("/product-categories/:id", async (req, res) => {
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage categories" });
     if (!categoryId) return res.status(400).json({ message: "Invalid category" });
     await client.query("BEGIN");
-    const currentResult = await client.query("SELECT * FROM product_categories WHERE id = $1 FOR UPDATE", [categoryId]);
+    const replay = await beginV3BusinessOperation(client, req, "product_category");
+    if (replay) return sendV3Replay(client, res, replay);
+    const context = req.v3OperationalContext;
+    const currentResult = await client.query(
+      `SELECT * FROM product_categories
+       WHERE id = $1 AND ($2::INTEGER IS NULL OR company_id = $2)
+       FOR UPDATE`,
+      [categoryId, context?.company_id || null]
+    );
     const current = currentResult.rows[0];
     if (!current) {
       await client.query("ROLLBACK");
       return res.status(404).json({ message: "Category not found" });
     }
-    const usageResult = await client.query("SELECT COUNT(*)::INTEGER AS usage_count FROM products WHERE category_id = $1", [categoryId]);
+    const usageResult = await client.query(
+      `SELECT COUNT(*)::INTEGER AS usage_count FROM products
+       WHERE category_id = $1 AND ($2::INTEGER IS NULL OR company_id = $2)`,
+      [categoryId, context?.company_id || null]
+    );
     if (Number(usageResult.rows[0].usage_count || 0) > 0) {
       const result = await client.query("UPDATE product_categories SET active = FALSE, deleted_at = CURRENT_TIMESTAMP, entity_version = entity_version + 1, updated_by = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *", [manager.id, categoryId]);
       await client.query(
@@ -10611,15 +10700,27 @@ app.delete("/product-categories/:id", async (req, res) => {
         [categoryId, JSON.stringify(current), JSON.stringify(result.rows[0]), "This category has items or transactions. It can only be deactivated.", manager.id]
       );
       await logSyncChange(client, {
-        branchId: 1,
+        branchId: context?.branch_id || 1,
         entityType: "product_category",
         entityId: result.rows[0].global_id,
         operationType: "DELETE",
         version: result.rows[0].entity_version || 1,
         payload: result.rows[0],
       });
+      const responsePayload = {
+        message: "This category has items or transactions. It can only be deactivated.",
+        category: result.rows[0],
+      };
+      await completeV3BusinessOperation(
+        client,
+        req,
+        "product_category",
+        result.rows[0].global_id,
+        responsePayload,
+        409
+      );
       await client.query("COMMIT");
-      return res.status(409).json({ message: "This category has items or transactions. It can only be deactivated.", category: result.rows[0] });
+      return res.status(409).json(responsePayload);
     }
     const tombstoneResult = await client.query(
       "UPDATE product_categories SET active = FALSE, deleted_at = CURRENT_TIMESTAMP, entity_version = entity_version + 1, updated_by = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *",
@@ -10630,18 +10731,26 @@ app.delete("/product-categories/:id", async (req, res) => {
       INSERT INTO product_category_audit_trail (category_id, action, old_value, new_value, reason, edited_by)
       VALUES ($1, 'DELETE', $2::jsonb, NULL, $3, $4)
       `,
-      [null, JSON.stringify(current), reason, manager.id]
+      [categoryId, JSON.stringify(current), reason, manager.id]
     );
     await logSyncChange(client, {
-      branchId: req.v3OperationalContext?.branch_id || 1,
+      branchId: context?.branch_id || 1,
       entityType: "product_category",
       entityId: tombstoneResult.rows[0].global_id,
       operationType: "DELETE",
       version: tombstoneResult.rows[0].entity_version || 1,
       payload: tombstoneResult.rows[0],
     });
+    const responsePayload = { success: true, category: tombstoneResult.rows[0] };
+    await completeV3BusinessOperation(
+      client,
+      req,
+      "product_category",
+      tombstoneResult.rows[0].global_id,
+      responsePayload
+    );
     await client.query("COMMIT");
-    return res.json({ success: true });
+    return res.json(responsePayload);
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
@@ -10649,7 +10758,9 @@ app.delete("/product-categories/:id", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.delete("/product-categories/:id", deactivateProductCategoryHandler);
+app.delete("/api/v3/product-categories/:id", rateLimitSyncRequest, v3WriteAdapter(deactivateProductCategoryHandler));
 
 app.get("/product-duplicate-archive-log", async (req, res) => {
   try {
@@ -10847,14 +10958,21 @@ const createProductHandler = async (req, res) => {
     await client.query("BEGIN");
     const replay = await beginV3BusinessOperation(client, req, "product");
     if (replay) return sendV3Replay(client, res, replay);
-    let selectedCategory = await getCategoryById(client, parsePositiveInteger(category_id));
+    const context = req.v3OperationalContext;
+    let selectedCategory = await getCategoryById(
+      client,
+      parsePositiveInteger(category_id),
+      context?.company_id || null
+    );
     if (!selectedCategory) {
-      selectedCategory = await findCategoryByName(client, normalizedCategory);
+      selectedCategory = await findCategoryByName(client, normalizedCategory, context?.company_id || null);
     }
     if (!selectedCategory) {
       const categoryResult = await client.query(
-        "INSERT INTO product_categories (global_id, category_name, active, created_by, updated_by) VALUES ($1, $2, TRUE, $3, $3) RETURNING *",
-        [`category-${crypto.randomUUID()}`, normalizedCategory, rateManager.id]
+        `INSERT INTO product_categories (
+           global_id, category_name, active, created_by, updated_by, company_id
+         ) VALUES ($1, $2, TRUE, $3, $3, $4) RETURNING *`,
+        [`category-${crypto.randomUUID()}`, normalizedCategory, rateManager.id, context?.company_id || null]
       );
       selectedCategory = categoryResult.rows[0];
       await logSyncChange(client, {
@@ -10871,8 +10989,12 @@ const createProductHandler = async (req, res) => {
       return res.status(400).json({ success: false, message: "Selected category is inactive." });
     }
     const duplicateResult = await client.query(
-      "SELECT id FROM products WHERE LOWER(product_name) = LOWER($1) AND active IS DISTINCT FROM FALSE LIMIT 1",
-      [product_name.trim()]
+      `SELECT id FROM products
+       WHERE LOWER(product_name) = LOWER($1)
+         AND active IS DISTINCT FROM FALSE
+         AND ($2::INTEGER IS NULL OR company_id = $2)
+       LIMIT 1`,
+      [product_name.trim(), context?.company_id || null]
     );
     if (duplicateResult.rows.length > 0) {
       await client.query("ROLLBACK");
@@ -10996,17 +11118,31 @@ const updateProductHandler = async (req, res) => {
       return res.status(404).json({ message: "Product not found" });
     }
     const current = currentResult.rows[0];
-    let selectedCategory = await getCategoryById(client, parsePositiveInteger(category_id));
+    const context = req.v3OperationalContext;
+    let selectedCategory = await getCategoryById(
+      client,
+      parsePositiveInteger(category_id),
+      context?.company_id || null
+    );
     if (!selectedCategory) {
-      selectedCategory = await findCategoryByName(client, category || current.category || "Fruit");
+      selectedCategory = await findCategoryByName(
+        client,
+        category || current.category || "Fruit",
+        context?.company_id || null
+      );
     }
     if (!selectedCategory || selectedCategory.active === false) {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Selected category is inactive or missing." });
     }
     const duplicateResult = await client.query(
-      "SELECT id FROM products WHERE LOWER(product_name) = LOWER($1) AND id <> $2 AND active IS DISTINCT FROM FALSE LIMIT 1",
-      [product_name.trim(), productId]
+      `SELECT id FROM products
+       WHERE LOWER(product_name) = LOWER($1)
+         AND id <> $2
+         AND active IS DISTINCT FROM FALSE
+         AND ($3::INTEGER IS NULL OR company_id = $3)
+       LIMIT 1`,
+      [product_name.trim(), productId, context?.company_id || null]
     );
     if (duplicateResult.rows.length > 0) {
       await client.query("ROLLBACK");
@@ -11260,7 +11396,7 @@ app.get("/products/:id/lots", async (req, res) => {
   }
 });
 
-app.put(["/inventory-lots/:lotId", "/lots/:lotId"], async (req, res) => {
+const updateInventoryLotHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const lotId = parsePositiveInteger(req.params.lotId);
@@ -11271,7 +11407,23 @@ app.put(["/inventory-lots/:lotId", "/lots/:lotId"], async (req, res) => {
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can edit opening stock lots" });
     if (!lotId || !purchaseRate) return res.status(400).json({ message: "Enter valid lot details and cost rate" });
     await client.query("BEGIN");
-    const lotResult = await client.query("SELECT * FROM inventory_batches WHERE id = $1 FOR UPDATE", [lotId]);
+    const replay = await beginV3BusinessOperation(client, req, "inventory_lot");
+    if (replay) return sendV3Replay(client, res, replay);
+    const context = req.v3OperationalContext;
+    const lotResult = await client.query(
+      `SELECT * FROM inventory_batches
+       WHERE id = $1
+         AND ($2::INTEGER IS NULL OR (
+           company_id = $2 AND branch_id = $3 AND operational_location_id = $4
+         ))
+       FOR UPDATE`,
+      [
+        lotId,
+        context?.company_id || null,
+        context?.branch_id || null,
+        context?.operational_location_id || null,
+      ]
+    );
     const lot = lotResult.rows[0];
     if (!lot) {
       await client.query("ROLLBACK");
@@ -11324,16 +11476,52 @@ app.put(["/inventory-lots/:lotId", "/lots/:lotId"], async (req, res) => {
     );
     if (quantityDiff !== 0) {
       await client.query(
-        "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, $3, $4, $5, $6)",
-        [lot.product_id, Math.abs(quantityDiff), quantityDiff > 0 ? "IN" : "OUT", `Lot opening quantity edited: ${reason}`, manager.id, lot.branch_id || 1]
+        `INSERT INTO stock_transactions (
+           product_id, quantity, transaction_type, remarks, user_id, branch_id,
+           company_id, operational_location_id
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [
+          lot.product_id,
+          Math.abs(quantityDiff),
+          quantityDiff > 0 ? "IN" : "OUT",
+          `Lot opening quantity edited: ${reason}`,
+          manager.id,
+          context?.branch_id || lot.branch_id || 1,
+          context?.company_id || lot.company_id || null,
+          context?.operational_location_id || lot.operational_location_id || null,
+        ]
       );
     }
     if (saleRate && Number(saleRate) !== Number(lot.temporary_sale_rate || 0)) {
-      await client.query("UPDATE products SET selling_rate = $1, selling_rate_updated_at = CURRENT_TIMESTAMP, selling_rate_updated_by = $2 WHERE id = $3", [saleRate, manager.id, lot.product_id]);
+      const productResult = await client.query(
+        `UPDATE products
+         SET selling_rate = $1, selling_rate_updated_at = CURRENT_TIMESTAMP,
+             selling_rate_updated_by = $2, entity_version = entity_version + 1
+         WHERE id = $3 AND ($4::INTEGER IS NULL OR company_id = $4)
+         RETURNING *`,
+        [saleRate, manager.id, lot.product_id, context?.company_id || null]
+      );
+      if (productResult.rows[0]) {
+        await logSyncChange(client, {
+          branchId: context?.branch_id || lot.branch_id || 1,
+          entityType: "sale_rate",
+          entityId: productResult.rows[0].global_id,
+          operationType: "UPSERT",
+          version: productResult.rows[0].entity_version || 1,
+          payload: productResult.rows[0],
+        });
+      }
     }
     await client.query(
       "INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'INVENTORY_LOT_EDIT', $2::jsonb, $3::jsonb, $4, $5)",
       [lot.product_id, JSON.stringify(lot), JSON.stringify(updateResult.rows[0]), reason, manager.id]
+    );
+    await completeV3BusinessOperation(
+      client,
+      req,
+      "inventory_lot",
+      updateResult.rows[0].global_id || updateResult.rows[0].id,
+      updateResult.rows[0]
     );
     await client.query("COMMIT");
     return res.json(updateResult.rows[0]);
@@ -11344,9 +11532,11 @@ app.put(["/inventory-lots/:lotId", "/lots/:lotId"], async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.put(["/inventory-lots/:lotId", "/lots/:lotId"], updateInventoryLotHandler);
+app.put("/api/v3/inventory-lots/:lotId", rateLimitSyncRequest, v3WriteAdapter(updateInventoryLotHandler));
 
-app.post("/inventory-lots/:lotId/add-quantity", async (req, res) => {
+const addInventoryLotQuantityHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const lotId = parsePositiveInteger(req.params.lotId);
@@ -11356,7 +11546,23 @@ app.post("/inventory-lots/:lotId/add-quantity", async (req, res) => {
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can add lot quantity" });
     if (!lotId || !quantity) return res.status(400).json({ message: "Enter quantity to add" });
     await client.query("BEGIN");
-    const lotResult = await client.query("SELECT * FROM inventory_batches WHERE id = $1 FOR UPDATE", [lotId]);
+    const replay = await beginV3BusinessOperation(client, req, "inventory_lot");
+    if (replay) return sendV3Replay(client, res, replay);
+    const context = req.v3OperationalContext;
+    const lotResult = await client.query(
+      `SELECT * FROM inventory_batches
+       WHERE id = $1
+         AND ($2::INTEGER IS NULL OR (
+           company_id = $2 AND branch_id = $3 AND operational_location_id = $4
+         ))
+       FOR UPDATE`,
+      [
+        lotId,
+        context?.company_id || null,
+        context?.branch_id || null,
+        context?.operational_location_id || null,
+      ]
+    );
     const lot = lotResult.rows[0];
     if (!lot) {
       await client.query("ROLLBACK");
@@ -11366,8 +11572,29 @@ app.post("/inventory-lots/:lotId/add-quantity", async (req, res) => {
       "UPDATE inventory_batches SET purchase_qty = purchase_qty + $1, remaining_qty = remaining_qty + $1, gross_amount = ROUND(((purchase_qty + $1) * purchase_rate)::NUMERIC, 2), net_payable = ROUND(((purchase_qty + $1) * purchase_rate)::NUMERIC, 2) WHERE id = $2 RETURNING *",
       [quantity, lotId]
     );
-    await client.query("INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, 'IN', $3, $4, $5)", [lot.product_id, quantity, reason, manager.id, lot.branch_id || 1]);
+    await client.query(
+      `INSERT INTO stock_transactions (
+         product_id, quantity, transaction_type, remarks, user_id, branch_id,
+         company_id, operational_location_id
+       ) VALUES ($1,$2,'IN',$3,$4,$5,$6,$7)`,
+      [
+        lot.product_id,
+        quantity,
+        reason,
+        manager.id,
+        context?.branch_id || lot.branch_id || 1,
+        context?.company_id || lot.company_id || null,
+        context?.operational_location_id || lot.operational_location_id || null,
+      ]
+    );
     await client.query("INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'INVENTORY_LOT_ADD_QTY', $2::jsonb, $3::jsonb, $4, $5)", [lot.product_id, JSON.stringify(lot), JSON.stringify(updateResult.rows[0]), reason, manager.id]);
+    await completeV3BusinessOperation(
+      client,
+      req,
+      "inventory_lot",
+      updateResult.rows[0].global_id || updateResult.rows[0].id,
+      updateResult.rows[0]
+    );
     await client.query("COMMIT");
     return res.json(updateResult.rows[0]);
   } catch (error) {
@@ -11377,7 +11604,9 @@ app.post("/inventory-lots/:lotId/add-quantity", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.post("/inventory-lots/:lotId/add-quantity", addInventoryLotQuantityHandler);
+app.post("/api/v3/inventory-lots/:lotId/add-quantity", rateLimitSyncRequest, v3WriteAdapter(addInventoryLotQuantityHandler));
 
 const adjustInventoryLotHandler = async (req, res) => {
   const client = await pool.connect();
@@ -11497,7 +11726,7 @@ const adjustInventoryLotHandler = async (req, res) => {
 app.post(["/inventory-lots/:lotId/adjust", "/lots/:lotId/adjust-stock"], adjustInventoryLotHandler);
 app.post("/api/v3/inventory-lots/:lotId/adjust", rateLimitSyncRequest, v3WriteAdapter(adjustInventoryLotHandler));
 
-app.post("/inventory-lots/:lotId/deactivate", async (req, res) => {
+const deactivateInventoryLotHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const lotId = parsePositiveInteger(req.params.lotId);
@@ -11506,7 +11735,23 @@ app.post("/inventory-lots/:lotId/deactivate", async (req, res) => {
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can deactivate lots" });
     if (!lotId || !reason) return res.status(400).json({ message: "Reason is required" });
     await client.query("BEGIN");
-    const lotResult = await client.query("SELECT * FROM inventory_batches WHERE id = $1 FOR UPDATE", [lotId]);
+    const replay = await beginV3BusinessOperation(client, req, "inventory_lot");
+    if (replay) return sendV3Replay(client, res, replay);
+    const context = req.v3OperationalContext;
+    const lotResult = await client.query(
+      `SELECT * FROM inventory_batches
+       WHERE id = $1
+         AND ($2::INTEGER IS NULL OR (
+           company_id = $2 AND branch_id = $3 AND operational_location_id = $4
+         ))
+       FOR UPDATE`,
+      [
+        lotId,
+        context?.company_id || null,
+        context?.branch_id || null,
+        context?.operational_location_id || null,
+      ]
+    );
     const lot = lotResult.rows[0];
     if (!lot) {
       await client.query("ROLLBACK");
@@ -11517,11 +11762,35 @@ app.post("/inventory-lots/:lotId/deactivate", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Cannot deactivate this lot because stock from this lot has already been used." });
     }
-    const updateResult = await client.query("UPDATE inventory_batches SET batch_status = 'CANCELLED', remaining_qty = 0 WHERE id = $1 RETURNING *", [lotId]);
+    const updateResult = await client.query(
+      "UPDATE inventory_batches SET batch_status = 'CANCELLED' WHERE id = $1 RETURNING *",
+      [lotId]
+    );
     if (Number(lot.remaining_qty || 0) > 0) {
-      await client.query("INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, 'OUT', $3, $4, $5)", [lot.product_id, Number(lot.remaining_qty), reason, manager.id, lot.branch_id || 1]);
+      await client.query(
+        `INSERT INTO stock_transactions (
+           product_id, quantity, transaction_type, remarks, user_id, branch_id,
+           company_id, operational_location_id
+         ) VALUES ($1,$2,'OUT',$3,$4,$5,$6,$7)`,
+        [
+          lot.product_id,
+          Number(lot.remaining_qty),
+          reason,
+          manager.id,
+          context?.branch_id || lot.branch_id || 1,
+          context?.company_id || lot.company_id || null,
+          context?.operational_location_id || lot.operational_location_id || null,
+        ]
+      );
     }
     await client.query("INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'INVENTORY_LOT_DEACTIVATE', $2::jsonb, $3::jsonb, $4, $5)", [lot.product_id, JSON.stringify(lot), JSON.stringify(updateResult.rows[0]), reason, manager.id]);
+    await completeV3BusinessOperation(
+      client,
+      req,
+      "inventory_lot",
+      updateResult.rows[0].global_id || updateResult.rows[0].id,
+      updateResult.rows[0]
+    );
     await client.query("COMMIT");
     return res.json(updateResult.rows[0]);
   } catch (error) {
@@ -11531,9 +11800,11 @@ app.post("/inventory-lots/:lotId/deactivate", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.post("/inventory-lots/:lotId/deactivate", deactivateInventoryLotHandler);
+app.post("/api/v3/inventory-lots/:lotId/deactivate", rateLimitSyncRequest, v3WriteAdapter(deactivateInventoryLotHandler));
 
-app.post("/inventory-lots/:lotId/reactivate", async (req, res) => {
+const reactivateInventoryLotHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const lotId = parsePositiveInteger(req.params.lotId);
@@ -11542,7 +11813,23 @@ app.post("/inventory-lots/:lotId/reactivate", async (req, res) => {
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can reactivate lots" });
     if (!lotId || !reason) return res.status(400).json({ message: "Reason is required" });
     await client.query("BEGIN");
-    const lotResult = await client.query("SELECT * FROM inventory_batches WHERE id = $1 FOR UPDATE", [lotId]);
+    const replay = await beginV3BusinessOperation(client, req, "inventory_lot");
+    if (replay) return sendV3Replay(client, res, replay);
+    const context = req.v3OperationalContext;
+    const lotResult = await client.query(
+      `SELECT * FROM inventory_batches
+       WHERE id = $1
+         AND ($2::INTEGER IS NULL OR (
+           company_id = $2 AND branch_id = $3 AND operational_location_id = $4
+         ))
+       FOR UPDATE`,
+      [
+        lotId,
+        context?.company_id || null,
+        context?.branch_id || null,
+        context?.operational_location_id || null,
+      ]
+    );
     const lot = lotResult.rows[0];
     if (!lot) {
       await client.query("ROLLBACK");
@@ -11554,15 +11841,33 @@ app.post("/inventory-lots/:lotId/reactivate", async (req, res) => {
       "UPDATE inventory_batches SET batch_status = 'ACTIVE', remaining_qty = $1 WHERE id = $2 RETURNING *",
       [nextRemaining, lotId]
     );
-    if (nextRemaining > Number(lot.remaining_qty || 0)) {
+    if (lot.batch_status === "CANCELLED" && nextRemaining > 0) {
       await client.query(
-        "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, 'IN', $3, $4, $5)",
-        [lot.product_id, nextRemaining - Number(lot.remaining_qty || 0), reason, manager.id, lot.branch_id || 1]
+        `INSERT INTO stock_transactions (
+           product_id, quantity, transaction_type, remarks, user_id, branch_id,
+           company_id, operational_location_id
+         ) VALUES ($1,$2,'IN',$3,$4,$5,$6,$7)`,
+        [
+          lot.product_id,
+          nextRemaining,
+          reason,
+          manager.id,
+          context?.branch_id || lot.branch_id || 1,
+          context?.company_id || lot.company_id || null,
+          context?.operational_location_id || lot.operational_location_id || null,
+        ]
       );
     }
     await client.query(
       "INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'INVENTORY_LOT_REACTIVATE', $2::jsonb, $3::jsonb, $4, $5)",
       [lot.product_id, JSON.stringify(lot), JSON.stringify(updateResult.rows[0]), reason, manager.id]
+    );
+    await completeV3BusinessOperation(
+      client,
+      req,
+      "inventory_lot",
+      updateResult.rows[0].global_id || updateResult.rows[0].id,
+      updateResult.rows[0]
     );
     await client.query("COMMIT");
     return res.json(updateResult.rows[0]);
@@ -11573,7 +11878,9 @@ app.post("/inventory-lots/:lotId/reactivate", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.post("/inventory-lots/:lotId/reactivate", reactivateInventoryLotHandler);
+app.post("/api/v3/inventory-lots/:lotId/reactivate", rateLimitSyncRequest, v3WriteAdapter(reactivateInventoryLotHandler));
 
 app.post("/lots/transfer-stock", async (req, res) => {
   const client = await pool.connect();
@@ -15823,16 +16130,26 @@ const buildPurchaseFinancials = async (client, entry) => {
   };
 };
 
-const getCategoryById = async (client, categoryId) => {
+const getCategoryById = async (client, categoryId, companyId = null) => {
   if (!categoryId) return null;
-  const result = await client.query("SELECT * FROM product_categories WHERE id = $1 AND active = TRUE", [categoryId]);
+  const result = await client.query(
+    `SELECT * FROM product_categories
+     WHERE id = $1 AND active = TRUE
+       AND ($2::INTEGER IS NULL OR company_id = $2)`,
+    [categoryId, companyId]
+  );
   return result.rows[0] || null;
 };
 
-const findCategoryByName = async (client, categoryName) => {
+const findCategoryByName = async (client, categoryName, companyId = null) => {
   const name = cleanText(categoryName);
   if (!name) return null;
-  const result = await client.query("SELECT * FROM product_categories WHERE LOWER(category_name) = LOWER($1)", [name]);
+  const result = await client.query(
+    `SELECT * FROM product_categories
+     WHERE LOWER(category_name) = LOWER($1)
+       AND ($2::INTEGER IS NULL OR company_id = $2)`,
+    [name, companyId]
+  );
   return result.rows[0] || null;
 };
 
@@ -16281,7 +16598,7 @@ app.post("/purchase", async (req, res) => {
   }
 });
 
-app.post("/purchase-bill", async (req, res) => {
+const createPurchaseBillHandler = async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -16327,6 +16644,29 @@ app.post("/purchase-bill", async (req, res) => {
     if (validationMessages.length) return res.status(400).json({ message: validationMessages[0] });
 
     await client.query("BEGIN");
+    const replay = await beginV3BusinessOperation(client, req, "purchase");
+    if (replay) return sendV3Replay(client, res, replay);
+    const context = req.v3OperationalContext;
+    if (context) {
+      const productIds = [...new Set(entries.map((entry) => entry.productId))];
+      const [supplierScope, productScope] = await Promise.all([
+        client.query(
+          "SELECT id FROM suppliers WHERE id = $1 AND company_id = $2 AND active IS DISTINCT FROM FALSE",
+          [baseEntry.supplierId, context.company_id]
+        ),
+        client.query(
+          "SELECT id FROM products WHERE id = ANY($1::int[]) AND company_id = $2 AND active IS DISTINCT FROM FALSE",
+          [productIds, context.company_id]
+        ),
+      ]);
+      if (!supplierScope.rows[0] || productScope.rows.length !== productIds.length) {
+        await client.query("ROLLBACK");
+        return res.status(422).json({
+          code: "PURCHASE_REFERENCE_SCOPE_MISMATCH",
+          message: "Supplier or product does not belong to the authenticated company.",
+        });
+      }
+    }
     if (baseEntry.purchaseBillStatus === "BILL_PENDING") {
       const manager = await requireRateManager(baseEntry.actorId, client);
       if (!manager) {
@@ -16352,15 +16692,17 @@ app.post("/purchase-bill", async (req, res) => {
             basic_amount, gross_amount, net_payable, paid_amount, balance_amount,
             effective_cost_per_unit, purchase_type, payment_status, purchase_date,
             remarks, purchase_bill_status, temporary_sale_rate, expected_purchase_rate,
-            bill_number, bill_date, lot_name, lot_size, stock_source
+            bill_number, bill_date, lot_name, lot_size, stock_source,
+            company_id, operational_location_id
           )
-          VALUES ($1, $2, 0, $3, $4, 0, 0, 0, 0, 0, $5, 'PENDING_BILL', 'BILL_PENDING', $6, $7, 'BILL_PENDING', $8, $9, $10, $11, $12, $13, 'PURCHASE')
+          VALUES ($1, $2, 0, $3, $4, 0, 0, 0, 0, 0, $5, 'PENDING_BILL', 'BILL_PENDING', $6, $7, 'BILL_PENDING', $8, $9, $10, $11, $12, $13, 'PURCHASE', $14, $15)
           RETURNING *
           `,
           [
             arrival.supplier.id, arrival.supplier.supplier_name, entry.branchId, entry.actorId,
             provisionalCost, entry.purchaseDate, entry.remarks, entry.temporarySaleRate, provisionalCost,
             entry.billNumber, entry.billDate, entry.lotName, entry.lotSize,
+            context?.company_id || null, context?.operational_location_id || null,
           ]
         );
         const purchase = purchaseResult.rows[0];
@@ -16381,27 +16723,54 @@ app.post("/purchase-bill", async (req, res) => {
             product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
             supplier_id, supplier_name, branch_id, gross_amount, net_payable, balance_amount,
             purchase_id, batch_status, purchase_bill_status, temporary_sale_rate, lot_name, lot_size,
-            stock_source, remarks, purchase_date, unit, origin_type
+            stock_source, remarks, purchase_date, unit, origin_type,
+            company_id, operational_location_id
           )
-          VALUES ($1, $2, $3, $3, $4, $4, $5, $6, $7, 0, 0, 0, $8, 'ACTIVE', 'BILL_PENDING', $9, $10, $11, 'PURCHASE', $12, $13, $14, $15)
+          VALUES ($1, $2, $3, $3, $4, $4, $5, $6, $7, 0, 0, 0, $8, 'ACTIVE', 'BILL_PENDING', $9, $10, $11, 'PURCHASE', $12, $13, $14, $15, $16, $17)
           `,
           [
             entry.productId, batchNo, entry.quantity, provisionalCost, arrival.supplier.id,
             arrival.supplier.supplier_name, entry.branchId, purchase.id, entry.temporarySaleRate,
             entry.lotName, entry.lotSize, entry.remarks, entry.purchaseDate, itemUnit, itemOriginType,
+            context?.company_id || null, context?.operational_location_id || null,
           ]
         );
-        await client.query(
-          "UPDATE products SET selling_rate = $1, selling_rate_updated_at = CURRENT_TIMESTAMP, selling_rate_updated_by = $2 WHERE id = $3",
-          [entry.temporarySaleRate, manager.id, entry.productId]
+        const productRateResult = await client.query(
+          `UPDATE products
+           SET selling_rate = $1, selling_rate_updated_at = CURRENT_TIMESTAMP,
+               selling_rate_updated_by = $2, entity_version = entity_version + 1
+           WHERE id = $3 AND ($4::INTEGER IS NULL OR company_id = $4)
+           RETURNING *`,
+          [entry.temporarySaleRate, manager.id, entry.productId, context?.company_id || null]
         );
+        if (productRateResult.rows[0]) {
+          await logSyncChange(client, {
+            branchId: context?.branch_id || entry.branchId,
+            entityType: "sale_rate",
+            entityId: productRateResult.rows[0].global_id,
+            operationType: "UPSERT",
+            version: productRateResult.rows[0].entity_version || 1,
+            payload: productRateResult.rows[0],
+          });
+        }
         await client.query(
           "INSERT INTO sale_rate_history (product_id, old_selling_rate, new_selling_rate, changed_by, reason) VALUES ($1, $2, $3, $4, $5)",
           [entry.productId, arrival.product.selling_rate || 0, entry.temporarySaleRate, manager.id, `Temporary sale rate for pending purchase #${purchase.id}`]
         );
         await client.query(
-          "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, 'IN', $3, $4, $5)",
-          [entry.productId, entry.quantity, `Stock arrival pending bill #${purchase.id}`, entry.actorId, entry.branchId]
+          `INSERT INTO stock_transactions (
+             product_id, quantity, transaction_type, remarks, user_id, branch_id,
+             company_id, operational_location_id
+           ) VALUES ($1,$2,'IN',$3,$4,$5,$6,$7)`,
+          [
+            entry.productId,
+            entry.quantity,
+            `Stock arrival pending bill #${purchase.id}`,
+            entry.actorId,
+            entry.branchId,
+            context?.company_id || null,
+            context?.operational_location_id || null,
+          ]
         );
         await client.query(
           "INSERT INTO purchase_audit_trail (purchase_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'ADDED_ITEM', NULL, $2::jsonb, $3, $4)",
@@ -16409,13 +16778,22 @@ app.post("/purchase-bill", async (req, res) => {
         );
         createdPurchases.push({ ...purchase, product_name: arrival.product.product_name });
       }
-      await client.query("COMMIT");
-      return res.status(201).json({
+      const responsePayload = {
         success: true,
         message: "Stock Arrival Saved - Bill Pending",
         purchase_ids: createdPurchases.map((purchase) => purchase.id),
         purchases: createdPurchases,
-      });
+      };
+      await completeV3BusinessOperation(
+        client,
+        req,
+        "purchase",
+        createdPurchases.map((purchase) => purchase.id).join(","),
+        responsePayload,
+        201
+      );
+      await client.query("COMMIT");
+      return res.status(201).json(responsePayload);
     }
 
     const completedEntries = [];
@@ -16481,9 +16859,9 @@ app.post("/purchase-bill", async (req, res) => {
           payment_timing, effective_cost_per_unit, freight_charges, labour_charges,
           rebate_rule_id, payment_due_days, payment_status, payment_date,
           purchase_type, payment_mode, payment_reference_number, remarks, purchase_bill_status, bill_number, bill_date,
-          lot_name, lot_size, stock_source
+          lot_name, lot_size, stock_source, company_id, operational_location_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, 'BILL_COMPLETED', $28, $29, $30, $31, 'PURCHASE')
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, 'BILL_COMPLETED', $28, $29, $30, $31, 'PURCHASE', $32, $33)
         RETURNING *
         `,
         [
@@ -16494,6 +16872,7 @@ app.post("/purchase-bill", async (req, res) => {
           rebateRule.id, rebateRule.pay_within_days, financials.paymentStatus, baseEntry.purchaseType === "CREDIT" ? null : baseEntry.paymentDate,
           baseEntry.purchaseType, baseEntry.purchaseType === "CASH" ? baseEntry.paymentMode : null, baseEntry.purchaseType === "CASH" ? baseEntry.paymentReferenceNumber : null,
           entry.remarks, entry.billNumber, entry.billDate, entry.lotName, entry.lotSize,
+          context?.company_id || null, context?.operational_location_id || null,
         ]
       );
       const purchase = purchaseResult.rows[0];
@@ -16519,20 +16898,33 @@ app.post("/purchase-bill", async (req, res) => {
           product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
           supplier_id, supplier_name, branch_id, mandi_tax_amount, freight_charges, labour_charges,
           other_charges, gross_amount, rebate_amount, net_payable, payment_timing, balance_amount,
-          purchase_id, batch_status, purchase_bill_status, lot_name, lot_size, stock_source, remarks, purchase_date, unit, origin_type
+          purchase_id, batch_status, purchase_bill_status, lot_name, lot_size, stock_source, remarks, purchase_date, unit, origin_type,
+          company_id, operational_location_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'ACTIVE', 'BILL_COMPLETED', $20, $21, 'PURCHASE', $22, $23, $24, $25)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'ACTIVE', 'BILL_COMPLETED', $20, $21, 'PURCHASE', $22, $23, $24, $25, $26, $27)
         `,
         [
           entry.productId, batchNo, entry.quantity, entry.quantity, entry.purchaseRate, financials.effectiveCostPerUnit,
           supplier.id, supplier.supplier_name, entry.branchId, financials.mandiTaxAmount, entry.freightCharges, entry.labourCharges,
           entry.otherCharges, financials.grossAmount, financials.rebateAmount, financials.netPayable, rebateRule.rule_name,
           financials.balanceAmount, purchase.id, entry.lotName, entry.lotSize, entry.remarks, entry.purchaseDate, itemUnit, itemOriginType,
+          context?.company_id || null, context?.operational_location_id || null,
         ]
       );
       await client.query(
-        "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, 'IN', $3, $4, $5)",
-        [entry.productId, entry.quantity, `Purchase #${purchase.id}`, entry.actorId, entry.branchId]
+        `INSERT INTO stock_transactions (
+           product_id, quantity, transaction_type, remarks, user_id, branch_id,
+           company_id, operational_location_id
+         ) VALUES ($1,$2,'IN',$3,$4,$5,$6,$7)`,
+        [
+          entry.productId,
+          entry.quantity,
+          `Purchase #${purchase.id}`,
+          entry.actorId,
+          entry.branchId,
+          context?.company_id || null,
+          context?.operational_location_id || null,
+        ]
       );
       await client.query(
         "INSERT INTO purchase_audit_trail (purchase_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'ADDED_ITEM', NULL, $2::jsonb, $3, $4)",
@@ -16541,13 +16933,22 @@ app.post("/purchase-bill", async (req, res) => {
       createdPurchases.push({ ...purchase, product_name: product.product_name, origin_type: originType });
     }
 
-    await client.query("COMMIT");
-    return res.status(201).json({
+    const responsePayload = {
       success: true,
       message: "Purchase Saved",
       purchase_ids: createdPurchases.map((purchase) => purchase.id),
       purchases: createdPurchases,
-    });
+    };
+    await completeV3BusinessOperation(
+      client,
+      req,
+      "purchase",
+      createdPurchases.map((purchase) => purchase.id).join(","),
+      responsePayload,
+      201
+    );
+    await client.query("COMMIT");
+    return res.status(201).json(responsePayload);
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
@@ -16555,7 +16956,9 @@ app.post("/purchase-bill", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.post("/purchase-bill", createPurchaseBillHandler);
+app.post("/api/v3/purchase-bills", rateLimitSyncRequest, v3WriteAdapter(createPurchaseBillHandler));
 
 const updatePurchaseHandler = async (req, res) => {
   const client = await pool.connect();

@@ -270,6 +270,11 @@ const createOperationalWrite = (user, payload = {}, operationId = "") => {
     operationId: idempotencyKey,
   };
 };
+const createOperationalReadConfig = (user) => ({
+  headers: {
+    "x-froozerp-device-session": user?.device_session_token || "",
+  },
+});
 const API_CONFIG = {
   mode: API_MODE,
   apiUrl: API_URL,
@@ -3352,7 +3357,10 @@ function App() {
     setProductDuplicateWarning(duplicateLogResponse.data?.message || "");
   };
   const loadProductCategories = async () => {
-    const response = await axios.get(`${API_URL}/product-categories`);
+    const response = await axios.get(
+      `${API_URL}/api/v3/product-categories`,
+      createOperationalReadConfig(user)
+    );
     setProductCategories((current) => preserveVerifiedLocalCollection(response.data, current));
   };
 
@@ -4229,10 +4237,15 @@ function App() {
         setProductCategory(duplicate.category_name);
         return;
       }
-      const response = await axios.post(`${API_URL}/product-categories`, {
+      const categoryWrite = createOperationalWrite(user, {
         category_name: categoryName,
         created_by: user.id,
       });
+      const response = await axios.post(
+        `${API_URL}/api/v3/product-categories`,
+        categoryWrite.body,
+        categoryWrite.config
+      );
       await loadProductCategories();
       setProductCategoryId(String(response.data.id));
       setProductCategory(response.data.category_name);
@@ -4247,13 +4260,18 @@ function App() {
     const nextName = window.prompt("Edit category name", category.category_name);
     if (!nextName?.trim()) return;
     try {
-      await axios.put(`${API_URL}/product-categories/${category.id}`, {
+      const categoryWrite = createOperationalWrite(user, {
         category_name: nextName,
         active: category.active !== false,
         remarks: category.remarks || "",
         updated_by: user.id,
         reason: "Category renamed from Product Master",
       });
+      await axios.put(
+        `${API_URL}/api/v3/product-categories/${category.id}`,
+        categoryWrite.body,
+        categoryWrite.config
+      );
       await Promise.all([loadProductCategories(), loadProducts()]);
       alert("Category updated");
     } catch (error) {
@@ -4265,8 +4283,10 @@ function App() {
     const reason = window.prompt(`Enter reason to remove/deactivate ${category.category_name}`);
     if (!reason?.trim()) return;
     try {
-      await axios.delete(`${API_URL}/product-categories/${category.id}`, {
-        data: { updated_by: user.id, reason },
+      const categoryWrite = createOperationalWrite(user, { updated_by: user.id, reason });
+      await axios.delete(`${API_URL}/api/v3/product-categories/${category.id}`, {
+        ...categoryWrite.config,
+        data: categoryWrite.body,
       });
       await loadProductCategories();
       alert("Category removed");
@@ -4472,7 +4492,7 @@ function App() {
           alert("Please enter a valid opening cost / purchase rate.");
           return;
         }
-        await axios.put(`${API_URL}/inventory-lots/${lotAction.lot.id}`, {
+        const lotWrite = createOperationalWrite(user, {
           ...basePayload,
           lot_name: lotDraft.lot_name,
           lot_size: lotDraft.lot_size,
@@ -4485,6 +4505,11 @@ function App() {
           remarks: lotDraft.remarks,
           reason: lotDraft.reason || "Opening stock lot edited",
         });
+        await axios.put(
+          `${API_URL}/api/v3/inventory-lots/${lotAction.lot.id}`,
+          lotWrite.body,
+          lotWrite.config
+        );
         alert("Lot updated");
       }
       if (lotAction.type === "add") {
@@ -4492,11 +4517,16 @@ function App() {
           alert("Enter quantity to add.");
           return;
         }
-        await axios.post(`${API_URL}/inventory-lots/${lotAction.lot.id}/add-quantity`, {
+        const lotWrite = createOperationalWrite(user, {
           ...basePayload,
           quantity: lotDraft.quantity,
           reason: lotDraft.reason || "Quantity added to opening stock lot",
         });
+        await axios.post(
+          `${API_URL}/api/v3/inventory-lots/${lotAction.lot.id}/add-quantity`,
+          lotWrite.body,
+          lotWrite.config
+        );
         alert("Quantity added");
       }
       if (lotAction.type === "adjust") {
@@ -4525,38 +4555,24 @@ function App() {
         alert("Lot adjusted");
       }
       if (lotAction.type === "transfer") {
-        if (!lotDraft.reason.trim()) {
-          alert("Transfer reason is required.");
-          return;
-        }
-        if (!lotDraft.transfer_to_lot_id) {
-          alert("Select destination lot.");
-          return;
-        }
-        if (Number(lotDraft.transfer_quantity || 0) <= 0) {
-          alert("Enter quantity to move.");
-          return;
-        }
-        await axios.post(`${API_URL}/lots/transfer-stock`, {
-          from_lot_id: lotAction.lot.id,
-          to_lot_id: lotDraft.transfer_to_lot_id,
-          quantity: lotDraft.transfer_quantity,
-          reason: lotDraft.reason,
-          remarks: lotDraft.remarks,
-          updated_by: user.id,
-        });
-        alert("Stock transferred");
+        alert("Lot-to-lot transfer remains unavailable until its product and cost-accounting rules are approved.");
+        return;
       }
       if (lotAction.type === "deactivate") {
         if (!lotDraft.reason.trim()) {
           alert("Reason is required to deactivate a lot.");
           return;
         }
-        await axios.post(`${API_URL}/inventory-lots/${lotAction.lot.id}/deactivate`, {
+        const lotWrite = createOperationalWrite(user, {
           ...basePayload,
           reason: lotDraft.reason,
           deactivated_by: user.id,
         });
+        await axios.post(
+          `${API_URL}/api/v3/inventory-lots/${lotAction.lot.id}/deactivate`,
+          lotWrite.body,
+          lotWrite.config
+        );
         alert("Lot deactivated");
       }
       if (lotAction.type === "reactivate") {
@@ -4564,11 +4580,16 @@ function App() {
           alert("Reason is required to reactivate a lot.");
           return;
         }
-        await axios.post(`${API_URL}/inventory-lots/${lotAction.lot.id}/reactivate`, {
+        const lotWrite = createOperationalWrite(user, {
           ...basePayload,
           reason: lotDraft.reason,
           reactivated_by: user.id,
         });
+        await axios.post(
+          `${API_URL}/api/v3/inventory-lots/${lotAction.lot.id}/reactivate`,
+          lotWrite.body,
+          lotWrite.config
+        );
         alert("Lot reactivated");
       }
       closeLotAction();
@@ -4805,7 +4826,12 @@ function App() {
           alert("Add at least one purchase item before saving.");
           return;
         }
-        await axios.post(`${API_URL}/purchase-bill`, { ...payload, items: purchaseCart });
+        const purchaseWrite = createOperationalWrite(user, { ...payload, items: purchaseCart });
+        await axios.post(
+          `${API_URL}/api/v3/purchase-bills`,
+          purchaseWrite.body,
+          purchaseWrite.config
+        );
       }
       if (purchaseAmendmentMode) {
         setPurchaseCart([]);
