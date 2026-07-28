@@ -103,6 +103,33 @@ test("missing deployment configuration fails safe to desktop-local instead of lo
   assert.equal(resolveRuntimeMode({ DATABASE_URL: "postgresql://wrong@127.0.0.1:5432/wrong" }), RUNTIME_MODES.DESKTOP_LOCAL);
 });
 
+test("loopback PostgreSQL is allowed only for explicitly isolated staging tests", async () => {
+  const base = {
+    FROOZERP_RUNTIME_MODE: "cloud-server",
+    DATABASE_URL: "postgresql://postgres@127.0.0.1:55441/froozerp_current_staging",
+  };
+  assert.throws(
+    () => createStorageAdapter(base),
+    /cannot use a loopback host/
+  );
+  assert.throws(
+    () => createStorageAdapter({
+      ...base,
+      NODE_ENV: "test",
+      FROOZERP_ALLOW_LOOPBACK_POSTGRES_FOR_ISOLATED_TESTS: "true",
+      DATABASE_URL: "postgresql://postgres@127.0.0.1:55441/froozerp_production",
+    }),
+    /cannot use a loopback host/
+  );
+  const { adapter } = createStorageAdapter({
+    ...base,
+    NODE_ENV: "test",
+    FROOZERP_ALLOW_LOOPBACK_POSTGRES_FOR_ISOLATED_TESTS: "true",
+  });
+  assert.equal(adapter.host, "127.0.0.1");
+  await adapter.pool.end();
+});
+
 test("desktop SQLite path resolves from a clean profile without user configuration", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "froozerp-default-profile-"));
   const appData = path.join(root, "AppData", "Roaming");

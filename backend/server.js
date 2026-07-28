@@ -4880,7 +4880,20 @@ const insertCustomerLedgerEntry = async (
   );
 };
 
-const buildSalePayload = async (client, { items, branchId, createdBy, customer, invoiceDiscount, payments, allowRateOverride }) => {
+const buildSalePayload = async (
+  client,
+  {
+    items,
+    branchId,
+    createdBy,
+    customer,
+    invoiceDiscount,
+    payments,
+    allowRateOverride,
+    companyId = null,
+    operationalLocationId = null,
+  }
+) => {
   const parsedItems = (Array.isArray(items) ? items : []).map((item) => ({
     saleItemId: parsePositiveInteger(item.id || item.sale_item_id),
     productId: parsePositiveInteger(item.product_id),
@@ -4962,13 +4975,17 @@ const buildSalePayload = async (client, { items, branchId, createdBy, customer, 
       FROM inventory_batches
       WHERE product_id = $1
         AND branch_id = $2
+        AND ($${batchParams.length + 1}::INTEGER IS NULL OR (
+          company_id = $${batchParams.length + 1}
+          AND operational_location_id = $${batchParams.length + 2}
+        ))
         ${batchFilter}
         AND remaining_qty > 0
         AND UPPER(COALESCE(batch_status, 'ACTIVE')) NOT IN ('CANCELLED', 'INACTIVE', 'EXPIRED', 'RESERVED', 'BLOCKED', 'EXHAUSTED')
       ORDER BY purchase_date, created_at, id
       FOR UPDATE
       `,
-      batchParams
+      [...batchParams, companyId, operationalLocationId]
     );
     const availableStock = batchesResult.rows.reduce((total, batch) => total + Number(batch.remaining_qty), 0);
     if (availableStock < requestedItem.quantity) {
@@ -7929,7 +7946,15 @@ const logSyncChange = async (client, {
       company_id, branch_id, operational_location_id, assignment_generation,
       entity_type, entity_id, operation_type, entity_version, payload
     )
-    VALUES ((SELECT company_id FROM branches WHERE id = $1), $1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+    VALUES (
+      (SELECT company_id FROM branches WHERE id = $1),
+      $1,$2,$3,$4,$5,$6,$7,
+      $8::jsonb || jsonb_strip_nulls(jsonb_build_object(
+        'source_operation_id', NULLIF(CURRENT_SETTING('froozerp.operation_id', TRUE), ''),
+        'source_device_id', NULLIF(CURRENT_SETTING('froozerp.device_id', TRUE), ''),
+        'source_user_id', NULLIF(CURRENT_SETTING('froozerp.user_id', TRUE), '')
+      ))
+    )
     RETURNING change_id, created_at
     `,
     [
@@ -8311,6 +8336,8 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     invoiceDiscount: payload.bill_discount_total || payload.invoice_discount || 0,
     payments: payload.payments || [],
     allowRateOverride: true,
+    companyId: context.companyId,
+    operationalLocationId: context.operationalLocationId,
   });
   if (salePayload.error) {
     if (salePayload.error.status === 409) {
@@ -8569,6 +8596,8 @@ const processPosSaleEditOperation = async (client, operation, context) => {
     invoiceDiscount: invoice.bill_discount_total || invoice.invoice_discount_amount || 0,
     payments: (sale.payments || []).filter((payment) => payment.posting_type !== "PAYMENT_REVERSAL"),
     allowRateOverride: ["Owner", "Admin"].includes(editor.role_name),
+    companyId: context.companyId,
+    operationalLocationId: context.operationalLocationId,
   });
   if (salePayload.error) {
     return rejectOperation(operation, salePayload.error.status === 409 ? "CONFLICT" : "VALIDATION_ERROR", salePayload.error.message || "Offline sale edit validation failed");
@@ -9040,9 +9069,21 @@ const sendOperationalScopeError = (res, error) => res.status(error.status || 403
 
 const resolveV3OperationalContext = async (req, { requireWrite = false } = {}) => {
   try {
-    return await operationalScopeService.resolve({
-      userId: req.body?.user_id || req.query?.user_id || req.headers["x-user-id"],
-      deviceId: req.body?.device_id || req.query?.device_id || req.headers["x-device-id"],
+    const deviceSession = verifyDeviceSession(
+      req.headers["x-froozerp-device-session"],
+      deviceSessionSecret
+    );
+    if (deviceSession.error) return { error: deviceSession.error };
+    const substitution = rejectDeviceSessionSubstitution(deviceSession.claims, {
+      user_id: req.body?.user_id || req.query?.user_id || req.headers["x-user-id"],
+      device_id: req.body?.device_id || req.query?.device_id || req.headers["x-device-id"],
+      company_id: req.body?.company_id || req.query?.company_id,
+      branch_id: req.body?.branch_id || req.query?.branch_id,
+    });
+    if (substitution) return { error: substitution };
+    const resolved = await operationalScopeService.resolve({
+      userId: deviceSession.claims.user_id,
+      deviceId: deviceSession.claims.device_id,
       submitted: {
         company_id: req.body?.company_id || req.query?.company_id,
         branch_id: req.body?.branch_id || req.query?.branch_id,
@@ -9052,6 +9093,28 @@ const resolveV3OperationalContext = async (req, { requireWrite = false } = {}) =
       },
       requireWrite,
     });
+    if (resolved.error) return resolved;
+    const userResult = await pool.query(
+      "SELECT session_revocation_version FROM users WHERE id = $1 AND active IS DISTINCT FROM FALSE",
+      [deviceSession.claims.user_id]
+    );
+    const user = userResult.rows[0];
+    if (
+      !user ||
+      Number(deviceSession.claims.company_id) !== resolved.context.company_id ||
+      Number(deviceSession.claims.branch_id) !== resolved.context.branch_id ||
+      Number(deviceSession.claims.session_revocation_version || 0) !==
+        Number(user.session_revocation_version || 0)
+    ) {
+      return {
+        error: {
+          status: 401,
+          code: "DEVICE_SESSION_SCOPE_STALE",
+          message: "Authenticated device session no longer matches canonical server scope",
+        },
+      };
+    }
+    return resolved;
   } catch (error) {
     if (error.code === "42P01" || /does not exist/i.test(error.message || "")) {
       return {
@@ -9063,6 +9126,119 @@ const resolveV3OperationalContext = async (req, { requireWrite = false } = {}) =
       };
     }
     throw error;
+  }
+};
+
+const v3OperationKey = (req) =>
+  cleanText(req.body?.idempotency_key || req.body?.operation_id || req.headers["x-idempotency-key"]);
+
+const beginV3BusinessOperation = async (client, req, entityType) => {
+  if (!req.v3OperationalContext) return null;
+  const operationId = v3OperationKey(req);
+  if (!operationId) {
+    const error = new Error("An idempotency key is required");
+    error.status = 400;
+    error.code = "IDEMPOTENCY_KEY_REQUIRED";
+    throw error;
+  }
+  const context = req.v3OperationalContext;
+  await client.query(
+    `SELECT
+       SET_CONFIG('froozerp.device_id', $1, TRUE),
+       SET_CONFIG('froozerp.user_id', $2, TRUE),
+       SET_CONFIG('froozerp.operation_id', $3, TRUE)`,
+    [context.device_id, String(context.user_id), operationId]
+  );
+  await client.query(
+    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+    [`${context.company_id}:${context.branch_id}:${operationId}`]
+  );
+  const prior = await client.query(
+    `SELECT result_payload
+     FROM sync_processed_operations
+     WHERE operation_id = $1 AND company_id = $2 AND branch_id = $3
+     FOR UPDATE`,
+    [operationId, context.company_id, context.branch_id]
+  );
+  return prior.rows[0]?.result_payload || null;
+};
+
+const completeV3BusinessOperation = async (
+  client,
+  req,
+  entityType,
+  entityId,
+  responsePayload,
+  statusCode = 200
+) => {
+  if (!req.v3OperationalContext) return;
+  const context = req.v3OperationalContext;
+  const operationId = v3OperationKey(req);
+  await client.query(
+    `INSERT INTO sync_processed_operations (
+       operation_id, device_id, company_id, branch_id, operational_location_id,
+       assignment_generation, created_by_user_id, source_device_id,
+       entity_type, entity_id, result_status, result_payload, processed_at
+     )
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$2,$8,$9,'accepted',$10::jsonb,CURRENT_TIMESTAMP)
+     ON CONFLICT (operation_id) DO NOTHING`,
+    [
+      operationId,
+      context.device_id,
+      context.company_id,
+      context.branch_id,
+      context.operational_location_id,
+      context.assignment_generation,
+      context.user_id,
+      entityType,
+      String(entityId),
+      JSON.stringify({ http_status: statusCode, body: responsePayload }),
+    ]
+  );
+};
+
+const sendV3Replay = async (client, res, replay) => {
+  await client.query("ROLLBACK");
+  return res.status(Number(replay.http_status || 200)).json({
+    ...(replay.body || {}),
+    idempotent_replay: true,
+  });
+};
+
+const v3WriteAdapter = (handler) => async (req, res) => {
+  try {
+    const resolved = await resolveV3OperationalContext(req, { requireWrite: true });
+    if (resolved.error) return sendOperationalScopeError(res, resolved.error);
+    const operationId = v3OperationKey(req);
+    if (!operationId) {
+      return res.status(400).json({
+        code: "IDEMPOTENCY_KEY_REQUIRED",
+        message: "An idempotency key is required",
+      });
+    }
+    req.v3OperationalContext = resolved.context;
+    req.body = {
+      ...(req.body || {}),
+      company_id: resolved.context.company_id,
+      branch_id: resolved.context.branch_id,
+      operational_location_id: resolved.context.operational_location_id,
+      user_id: resolved.context.user_id,
+      created_by: resolved.context.user_id,
+      updated_by: resolved.context.user_id,
+      edited_by: resolved.context.user_id,
+      cancelled_by: resolved.context.user_id,
+      device_id: resolved.context.device_id,
+      source_device_id: resolved.context.device_id,
+      idempotency_key: operationId,
+      operation_id: operationId,
+    };
+    return handler(req, res);
+  } catch (error) {
+    console.error(`Protocol v3 ${req.method} ${req.path} failed`, error.code || error.message);
+    return res.status(error.status || 500).json({
+      code: error.code || "OPERATIONAL_WRITE_FAILED",
+      message: error.status ? error.message : "Operational write failed",
+    });
   }
 };
 
@@ -10330,7 +10506,7 @@ app.post("/product-categories", async (req, res) => {
       [result.rows[0].id, JSON.stringify(result.rows[0]), cleanText(req.body.reason) || "Category created", manager.id]
     );
     await logSyncChange(client, {
-      branchId: 1,
+      branchId: req.v3OperationalContext?.branch_id || 1,
       entityType: "product_category",
       entityId: result.rows[0].global_id,
       operationType: "UPSERT",
@@ -10390,7 +10566,7 @@ app.put("/product-categories/:id", async (req, res) => {
       [categoryId, JSON.stringify(current), JSON.stringify(result.rows[0]), reason, manager.id]
     );
     await logSyncChange(client, {
-      branchId: 1,
+      branchId: req.v3OperationalContext?.branch_id || 1,
       entityType: "product_category",
       entityId: result.rows[0].global_id,
       operationType: "UPSERT",
@@ -10457,7 +10633,7 @@ app.delete("/product-categories/:id", async (req, res) => {
       [null, JSON.stringify(current), reason, manager.id]
     );
     await logSyncChange(client, {
-      branchId: 1,
+      branchId: req.v3OperationalContext?.branch_id || 1,
       entityType: "product_category",
       entityId: tombstoneResult.rows[0].global_id,
       operationType: "DELETE",
@@ -10652,7 +10828,7 @@ app.get("/products", async (req, res) => {
   }
 });
 
-app.post("/products", async (req, res) => {
+const createProductHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     await ensureProductEntrySchema(client);
@@ -10669,6 +10845,8 @@ app.post("/products", async (req, res) => {
       return res.status(400).json({ success: false, message: "Enter valid product details" });
     }
     await client.query("BEGIN");
+    const replay = await beginV3BusinessOperation(client, req, "product");
+    if (replay) return sendV3Replay(client, res, replay);
     let selectedCategory = await getCategoryById(client, parsePositiveInteger(category_id));
     if (!selectedCategory) {
       selectedCategory = await findCategoryByName(client, normalizedCategory);
@@ -10705,15 +10883,18 @@ app.post("/products", async (req, res) => {
       `
       INSERT INTO products (
         global_id, product_name, selling_rate, unit, barcode, origin_type, category, category_id,
-        minimum_stock, active, remarks, selling_rate_updated_by
+        minimum_stock, active, remarks, selling_rate_updated_by, company_id
       )
-      VALUES ($12, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      VALUES ($12,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$13)
       RETURNING *
       `,
       [
         product_name.trim(), parsedSellingRate, parsedUnit, barcode?.trim() || null, parsedOriginType,
         selectedCategory.category_name, selectedCategory.id, parsedMinimumStock, active !== false,
-        nullableText(remarks), rateManager.id, `product-${crypto.randomUUID()}`,
+        nullableText(remarks),
+        rateManager.id,
+        `product-${crypto.randomUUID()}`,
+        req.v3OperationalContext?.company_id || null,
       ]
     );
     const product = result.rows[0];
@@ -10752,6 +10933,7 @@ app.post("/products", async (req, res) => {
         lot,
         actorId: rateManager.id,
         branchId: parsePositiveInteger(branch_id) || 1,
+        operationalContext: req.v3OperationalContext,
       });
       if (lotResult.error) {
         await client.query("ROLLBACK");
@@ -10759,11 +10941,13 @@ app.post("/products", async (req, res) => {
       }
       createdLots.push(lotResult.batch);
     }
-    await client.query("COMMIT");
-    return res.status(201).json({
+    const responsePayload = {
       success: true,
       product: { ...product, opening_stock_lots: createdLots },
-    });
+    };
+    await completeV3BusinessOperation(client, req, "product", product.global_id, responsePayload, 201);
+    await client.query("COMMIT");
+    return res.status(201).json(responsePayload);
   } catch (error) {
     await client.query("ROLLBACK");
     console.error("Product creation failed", {
@@ -10779,9 +10963,11 @@ app.post("/products", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.post("/products", createProductHandler);
+app.post("/api/v3/products", rateLimitSyncRequest, v3WriteAdapter(createProductHandler));
 
-app.put("/products/:id", async (req, res) => {
+const updateProductHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     await ensureProductEntrySchema(client);
@@ -10797,7 +10983,14 @@ app.put("/products/:id", async (req, res) => {
     }
 
     await client.query("BEGIN");
-    const currentResult = await client.query("SELECT * FROM products WHERE id = $1 FOR UPDATE", [productId]);
+    const replay = await beginV3BusinessOperation(client, req, "product");
+    if (replay) return sendV3Replay(client, res, replay);
+    const currentResult = await client.query(
+      `SELECT * FROM products
+       WHERE id = $1 AND ($2::INTEGER IS NULL OR company_id = $2)
+       FOR UPDATE`,
+      [productId, req.v3OperationalContext?.company_id || null]
+    );
     if (currentResult.rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ message: "Product not found" });
@@ -10863,13 +11056,14 @@ app.put("/products/:id", async (req, res) => {
       [productId, JSON.stringify(current), JSON.stringify(result.rows[0]), rate_change_reason?.trim() || "Product master update", parsePositiveInteger(updated_by) || rateManager?.id || null]
     );
     await logSyncChange(client, {
-      branchId: 1,
+      branchId: req.v3OperationalContext?.branch_id || 1,
       entityType: sellingRateChanged ? "sale_rate" : "product",
       entityId: result.rows[0].global_id,
       operationType: "UPSERT",
       version: result.rows[0].entity_version || 1,
       payload: result.rows[0],
     });
+    await completeV3BusinessOperation(client, req, "product", result.rows[0].global_id, result.rows[0]);
     await client.query("COMMIT");
     return res.json(result.rows[0]);
   } catch (error) {
@@ -10882,7 +11076,9 @@ app.put("/products/:id", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.put("/products/:id", updateProductHandler);
+app.put("/api/v3/products/:id", rateLimitSyncRequest, v3WriteAdapter(updateProductHandler));
 
 const addOpeningStockLotsForProduct = async (req, res, productIdParam = "id") => {
   const client = await pool.connect();
@@ -10894,7 +11090,16 @@ const addOpeningStockLotsForProduct = async (req, res, productIdParam = "id") =>
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can add opening stock" });
     if (!productId || lots.length === 0) return res.status(400).json({ message: "Please add opening stock lots." });
     await client.query("BEGIN");
-    const productResult = await client.query("SELECT * FROM products WHERE id = $1 AND active IS DISTINCT FROM FALSE FOR UPDATE", [productId]);
+    const replay = await beginV3BusinessOperation(client, req, "inventory_lot");
+    if (replay) return sendV3Replay(client, res, replay);
+    const productResult = await client.query(
+      `SELECT * FROM products
+       WHERE id = $1
+         AND active IS DISTINCT FROM FALSE
+         AND ($2::INTEGER IS NULL OR company_id = $2)
+       FOR UPDATE`,
+      [productId, req.v3OperationalContext?.company_id || null]
+    );
     const product = productResult.rows[0];
     if (!product) {
       await client.query("ROLLBACK");
@@ -10907,6 +11112,7 @@ const addOpeningStockLotsForProduct = async (req, res, productIdParam = "id") =>
         lot,
         actorId: manager.id,
         branchId: parsePositiveInteger(req.body.branch_id) || 1,
+        operationalContext: req.v3OperationalContext,
       });
       if (lotResult.error) {
         await client.query("ROLLBACK");
@@ -10914,8 +11120,17 @@ const addOpeningStockLotsForProduct = async (req, res, productIdParam = "id") =>
       }
       createdLots.push(lotResult.batch);
     }
+    const responsePayload = { success: true, lots: createdLots };
+    await completeV3BusinessOperation(
+      client,
+      req,
+      "inventory_lot",
+      createdLots.map((lot) => lot.global_id || lot.id).join(","),
+      responsePayload,
+      201
+    );
     await client.query("COMMIT");
-    return res.status(201).json({ success: true, lots: createdLots });
+    return res.status(201).json(responsePayload);
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
@@ -10928,6 +11143,12 @@ const addOpeningStockLotsForProduct = async (req, res, productIdParam = "id") =>
 app.post("/products/:id/opening-stock", (req, res) => addOpeningStockLotsForProduct(req, res, "id"));
 
 app.post("/products/:productId/opening-stock-lots", (req, res) => addOpeningStockLotsForProduct(req, res, "productId"));
+app.post("/api/v3/products/:id/opening-stock", rateLimitSyncRequest, v3WriteAdapter(
+  (req, res) => addOpeningStockLotsForProduct(req, res, "id")
+));
+app.post("/api/v3/products/:productId/opening-stock-lots", rateLimitSyncRequest, v3WriteAdapter(
+  (req, res) => addOpeningStockLotsForProduct(req, res, "productId")
+));
 
 const lotUsage = (lot) => Math.max(0, Number(lot.purchase_qty || 0) - Number(lot.remaining_qty || 0));
 
@@ -11158,7 +11379,7 @@ app.post("/inventory-lots/:lotId/add-quantity", async (req, res) => {
   }
 });
 
-app.post(["/inventory-lots/:lotId/adjust", "/lots/:lotId/adjust-stock"], async (req, res) => {
+const adjustInventoryLotHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const lotId = parsePositiveInteger(req.params.lotId);
@@ -11171,7 +11392,23 @@ app.post(["/inventory-lots/:lotId/adjust", "/lots/:lotId/adjust-stock"], async (
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can adjust lot quantity" });
     if (!lotId || physicalQuantity === null || !reason) return res.status(400).json({ message: "Enter physical quantity and adjustment reason" });
     await client.query("BEGIN");
-    const lotResult = await client.query("SELECT * FROM inventory_batches WHERE id = $1 FOR UPDATE", [lotId]);
+    const replay = await beginV3BusinessOperation(client, req, "stock_adjustment");
+    if (replay) return sendV3Replay(client, res, replay);
+    const context = req.v3OperationalContext;
+    const lotResult = await client.query(
+      `SELECT * FROM inventory_batches
+       WHERE id = $1
+         AND ($2::INTEGER IS NULL OR (
+           company_id = $2 AND branch_id = $3 AND operational_location_id = $4
+         ))
+       FOR UPDATE`,
+      [
+        lotId,
+        context?.company_id || null,
+        context?.branch_id || null,
+        context?.operational_location_id || null,
+      ]
+    );
     const lot = lotResult.rows[0];
     if (!lot) {
       await client.query("ROLLBACK");
@@ -11197,8 +11434,20 @@ app.post(["/inventory-lots/:lotId/adjust", "/lots/:lotId/adjust-stock"], async (
     );
     if (diff !== 0) {
       await client.query(
-        "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, $3, $4, $5, $6)",
-        [lot.product_id, Math.abs(diff), diff > 0 ? "IN" : "OUT", `${adjustmentType}: ${reason}`, manager.id, lot.branch_id || 1]
+        `INSERT INTO stock_transactions (
+           product_id, quantity, transaction_type, remarks, user_id, branch_id,
+           company_id, operational_location_id
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [
+          lot.product_id,
+          Math.abs(diff),
+          diff > 0 ? "IN" : "OUT",
+          `${adjustmentType}: ${reason}`,
+          manager.id,
+          lot.branch_id || 1,
+          context?.company_id || lot.company_id || null,
+          context?.operational_location_id || lot.operational_location_id || null,
+        ]
       );
     }
     await client.query(
@@ -11206,9 +11455,9 @@ app.post(["/inventory-lots/:lotId/adjust", "/lots/:lotId/adjust-stock"], async (
       INSERT INTO stock_adjustments (
         product_id, inventory_batch_id, adjustment_date, adjustment_type,
         quantity_before, physical_quantity, adjustment_quantity,
-        reason, remarks, adjusted_by
+        reason, remarks, adjusted_by, company_id, branch_id, operational_location_id
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
       `,
       [
         lot.product_id,
@@ -11221,10 +11470,20 @@ app.post(["/inventory-lots/:lotId/adjust", "/lots/:lotId/adjust-stock"], async (
         reason,
         remarks,
         manager.id,
+        context?.company_id || lot.company_id || null,
+        context?.branch_id || lot.branch_id || null,
+        context?.operational_location_id || lot.operational_location_id || null,
       ]
     );
     const newValue = { ...updateResult.rows[0], adjustment_type: adjustmentType, adjustment_qty: diff, physical_quantity: physicalQuantity, remarks };
     await client.query("INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'INVENTORY_LOT_ADJUST', $2::jsonb, $3::jsonb, $4, $5)", [lot.product_id, JSON.stringify(lot), JSON.stringify(newValue), reason, manager.id]);
+    await completeV3BusinessOperation(
+      client,
+      req,
+      "stock_adjustment",
+      `${lot.global_id || lot.id}:${v3OperationKey(req)}`,
+      updateResult.rows[0]
+    );
     await client.query("COMMIT");
     return res.json(updateResult.rows[0]);
   } catch (error) {
@@ -11234,7 +11493,9 @@ app.post(["/inventory-lots/:lotId/adjust", "/lots/:lotId/adjust-stock"], async (
   } finally {
     client.release();
   }
-});
+};
+app.post(["/inventory-lots/:lotId/adjust", "/lots/:lotId/adjust-stock"], adjustInventoryLotHandler);
+app.post("/api/v3/inventory-lots/:lotId/adjust", rateLimitSyncRequest, v3WriteAdapter(adjustInventoryLotHandler));
 
 app.post("/inventory-lots/:lotId/deactivate", async (req, res) => {
   const client = await pool.connect();
@@ -11506,7 +11767,7 @@ app.get("/lots/:lotId/audit-trail", async (req, res) => {
   }
 });
 
-app.post("/products/:id/cancel", async (req, res) => {
+const cancelProductHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const productId = parsePositiveInteger(req.params.id);
@@ -11516,7 +11777,14 @@ app.post("/products/:id/cancel", async (req, res) => {
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can deactivate products" });
     if (!productId || !reason) return res.status(400).json({ message: "Reason is required" });
     await client.query("BEGIN");
-    const productResult = await client.query("SELECT * FROM products WHERE id = $1 FOR UPDATE", [productId]);
+    const replay = await beginV3BusinessOperation(client, req, "product");
+    if (replay) return sendV3Replay(client, res, replay);
+    const productResult = await client.query(
+      `SELECT * FROM products
+       WHERE id = $1 AND ($2::INTEGER IS NULL OR company_id = $2)
+       FOR UPDATE`,
+      [productId, req.v3OperationalContext?.company_id || null]
+    );
     const product = productResult.rows[0];
     if (!product) {
       await client.query("ROLLBACK");
@@ -11545,15 +11813,21 @@ app.post("/products/:id/cancel", async (req, res) => {
       [productId, Number(usageResult.rows[0].usage_count || 0) > 0 ? "DEACTIVATE" : "CANCEL", JSON.stringify(product), JSON.stringify(result.rows[0]), reason, manager.id]
     );
     await logSyncChange(client, {
-      branchId: 1,
+      branchId: req.v3OperationalContext?.branch_id || 1,
       entityType: "product",
       entityId: result.rows[0].global_id,
       operationType: "DELETE",
       version: result.rows[0].entity_version || 1,
       payload: result.rows[0],
     });
+    const responsePayload = {
+      success: true,
+      product: result.rows[0],
+      had_transactions: Number(usageResult.rows[0].usage_count || 0) > 0,
+    };
+    await completeV3BusinessOperation(client, req, "product", result.rows[0].global_id, responsePayload);
     await client.query("COMMIT");
-    return res.json({ success: true, product: result.rows[0], had_transactions: Number(usageResult.rows[0].usage_count || 0) > 0 });
+    return res.json(responsePayload);
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
@@ -11561,7 +11835,9 @@ app.post("/products/:id/cancel", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.post("/products/:id/cancel", cancelProductHandler);
+app.post("/api/v3/products/:id/deactivate", rateLimitSyncRequest, v3WriteAdapter(cancelProductHandler));
 
 app.get("/inventory", async (req, res) => {
   try {
@@ -15560,7 +15836,7 @@ const findCategoryByName = async (client, categoryName) => {
   return result.rows[0] || null;
 };
 
-const insertOpeningStockLot = async (client, { product, lot, actorId, branchId }) => {
+const insertOpeningStockLot = async (client, { product, lot, actorId, branchId, operationalContext = null }) => {
   const quantity = parsePositiveNumber(lot.quantity);
   const purchaseRate = parsePositiveNumber(lot.purchase_rate || lot.opening_cost);
   const saleRate = parsePositiveNumber(lot.sale_rate) || Number(product.selling_rate || 0);
@@ -15605,25 +15881,39 @@ const insertOpeningStockLot = async (client, { product, lot, actorId, branchId }
   const batchResult = await client.query(
     `
     INSERT INTO inventory_batches (
-      product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
+      global_id, product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
       supplier_id, supplier_name, branch_id, gross_amount, net_payable, balance_amount,
       batch_status, purchase_bill_status, temporary_sale_rate, lot_name, lot_size,
-      stock_source, remarks, purchase_date
+      stock_source, remarks, purchase_date, company_id, operational_location_id
     )
-    VALUES ($1, $2, $3, $3, $4, $4, $5, $6, $7, $8, $8, 0, 'ACTIVE', 'BILL_COMPLETED', $9, $10, $11, 'OPENING_STOCK', $12, $13)
+    VALUES ($14, $1, $2, $3, $3, $4, $4, $5, $6, $7, $8, $8, 0, 'ACTIVE', 'BILL_COMPLETED', $9, $10, $11, 'OPENING_STOCK', $12, $13, $15, $16)
     RETURNING *
     `,
     [
       product.id, batchNo, quantity, purchaseRate, supplierId, supplierName,
       branchId || 1, netPayable, saleRate, lotName, lotSize, remarks, openingDate,
+      `lot-${crypto.randomUUID()}`,
+      operationalContext?.company_id || null,
+      operationalContext?.operational_location_id || null,
     ]
   );
   await client.query(
     `
-    INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id)
-    VALUES ($1, $2, 'IN', $3, $4, $5)
+    INSERT INTO stock_transactions (
+      product_id, quantity, transaction_type, remarks, user_id, branch_id,
+      company_id, operational_location_id
+    )
+    VALUES ($1, $2, 'IN', $3, $4, $5, $6, $7)
     `,
-    [product.id, quantity, `Opening stock ${lotName}`, actorId || null, branchId || 1]
+    [
+      product.id,
+      quantity,
+      `Opening stock ${lotName}`,
+      actorId || null,
+      branchId || 1,
+      operationalContext?.company_id || null,
+      operationalContext?.operational_location_id || null,
+    ]
   );
   if (saleRate > 0 && Number(product.selling_rate || 0) !== saleRate) {
     await client.query(
@@ -16267,7 +16557,7 @@ app.post("/purchase-bill", async (req, res) => {
   }
 });
 
-app.put("/purchase/:id", async (req, res) => {
+const updatePurchaseHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const purchaseId = parsePositiveInteger(Number(req.params.id));
@@ -16279,13 +16569,29 @@ app.put("/purchase/:id", async (req, res) => {
     if (validationMessage) return res.status(400).json({ message: validationMessage });
 
     await client.query("BEGIN");
+    const replay = await beginV3BusinessOperation(client, req, "purchase");
+    if (replay) return sendV3Replay(client, res, replay);
     const manager = await requireRateManager(req.body.edited_by || entry.actorId, client);
     if (!manager) {
       await client.query("ROLLBACK");
       return res.status(403).json({ message: "Only Owner or Admin can edit purchases" });
     }
 
-    const oldPurchaseResult = await client.query("SELECT * FROM purchases WHERE id = $1 FOR UPDATE", [purchaseId]);
+    const context = req.v3OperationalContext;
+    const oldPurchaseResult = await client.query(
+      `SELECT * FROM purchases
+       WHERE id = $1
+         AND ($2::INTEGER IS NULL OR (
+           company_id = $2 AND branch_id = $3 AND operational_location_id = $4
+         ))
+       FOR UPDATE`,
+      [
+        purchaseId,
+        context?.company_id || null,
+        context?.branch_id || null,
+        context?.operational_location_id || null,
+      ]
+    );
     const oldPurchase = oldPurchaseResult.rows[0];
     if (!oldPurchase) {
       await client.query("ROLLBACK");
@@ -16413,8 +16719,10 @@ app.put("/purchase/:id", async (req, res) => {
         "INSERT INTO purchase_audit_trail (purchase_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'EDIT_PENDING_ARRIVAL', $2::jsonb, $3::jsonb, $4, $5)",
         [purchaseId, JSON.stringify(oldSnapshot), JSON.stringify(newSnapshot), reason, manager.id]
       );
+      const responsePayload = { success: true, purchase: purchaseResult.rows[0] };
+      await completeV3BusinessOperation(client, req, "purchase", purchaseId, responsePayload);
       await client.query("COMMIT");
-      return res.json({ success: true, purchase: purchaseResult.rows[0] });
+      return res.json(responsePayload);
     }
     if (productChanged && soldQuantity > 0) {
       await client.query("ROLLBACK");
@@ -16541,8 +16849,10 @@ app.put("/purchase/:id", async (req, res) => {
       [purchaseId, JSON.stringify(oldSnapshot), JSON.stringify(newSnapshot), reason, manager.id]
     );
 
+    const responsePayload = { success: true, purchase: newSnapshot.purchase };
+    await completeV3BusinessOperation(client, req, "purchase", purchaseId, responsePayload);
     await client.query("COMMIT");
-    return res.json({ success: true, purchase: newSnapshot.purchase });
+    return res.json(responsePayload);
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
@@ -16550,9 +16860,11 @@ app.put("/purchase/:id", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.put("/purchase/:id", updatePurchaseHandler);
+app.put("/api/v3/purchases/:id", rateLimitSyncRequest, v3WriteAdapter(updatePurchaseHandler));
 
-app.post("/purchase/:id/complete-bill", async (req, res) => {
+const completePurchaseBillHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const purchaseId = parsePositiveInteger(Number(req.params.id));
@@ -16562,12 +16874,28 @@ app.post("/purchase/:id/complete-bill", async (req, res) => {
     if (validationMessage) return res.status(400).json({ message: validationMessage });
 
     await client.query("BEGIN");
+    const replay = await beginV3BusinessOperation(client, req, "purchase");
+    if (replay) return sendV3Replay(client, res, replay);
     const manager = await requireRateManager(req.body.edited_by || entry.actorId, client);
     if (!manager) {
       await client.query("ROLLBACK");
       return res.status(403).json({ message: "Only Owner or Admin can complete pending purchase bills" });
     }
-    const oldPurchaseResult = await client.query("SELECT * FROM purchases WHERE id = $1 FOR UPDATE", [purchaseId]);
+    const context = req.v3OperationalContext;
+    const oldPurchaseResult = await client.query(
+      `SELECT * FROM purchases
+       WHERE id = $1
+         AND ($2::INTEGER IS NULL OR (
+           company_id = $2 AND branch_id = $3 AND operational_location_id = $4
+         ))
+       FOR UPDATE`,
+      [
+        purchaseId,
+        context?.company_id || null,
+        context?.branch_id || null,
+        context?.operational_location_id || null,
+      ]
+    );
     const oldPurchase = oldPurchaseResult.rows[0];
     if (!oldPurchase) {
       await client.query("ROLLBACK");
@@ -16688,8 +17016,20 @@ app.post("/purchase/:id/complete-bill", async (req, res) => {
     if (entry.quantity !== oldQuantity) {
       const delta = roundUnitCost(entry.quantity - oldQuantity);
       await client.query(
-        "INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id) VALUES ($1, $2, $3, $4, $5, $6)",
-        [entry.productId, Math.abs(delta), delta > 0 ? "IN" : "OUT", `Pending bill #${purchaseId} completed quantity adjustment`, manager.id, entry.branchId]
+        `INSERT INTO stock_transactions (
+           product_id, quantity, transaction_type, remarks, user_id, branch_id,
+           company_id, operational_location_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          entry.productId,
+          Math.abs(delta),
+          delta > 0 ? "IN" : "OUT",
+          `Pending bill #${purchaseId} completed quantity adjustment`,
+          manager.id,
+          entry.branchId,
+          context?.company_id || oldPurchase.company_id || null,
+          context?.operational_location_id || oldPurchase.operational_location_id || null,
+        ]
       );
     }
     const newSnapshot = { purchase: purchaseResult.rows[0], batch: batchUpdateResult.rows[0] };
@@ -16697,8 +17037,10 @@ app.post("/purchase/:id/complete-bill", async (req, res) => {
       "INSERT INTO purchase_audit_trail (purchase_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'COMPLETE_BILL', $2::jsonb, $3::jsonb, $4, $5)",
       [purchaseId, JSON.stringify(oldSnapshot), JSON.stringify(newSnapshot), cleanText(req.body.reason) || "Pending purchase bill completed", manager.id]
     );
+    const responsePayload = { success: true, purchase: purchaseResult.rows[0] };
+    await completeV3BusinessOperation(client, req, "purchase", purchaseId, responsePayload);
     await client.query("COMMIT");
-    return res.json({ success: true, purchase: purchaseResult.rows[0] });
+    return res.json(responsePayload);
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
@@ -16706,9 +17048,11 @@ app.post("/purchase/:id/complete-bill", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.post("/purchase/:id/complete-bill", completePurchaseBillHandler);
+app.post("/api/v3/purchases/:id/complete-bill", rateLimitSyncRequest, v3WriteAdapter(completePurchaseBillHandler));
 
-app.post("/purchase/:id/cancel", async (req, res) => {
+const cancelPurchaseHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const purchaseId = parsePositiveInteger(Number(req.params.id));
@@ -16717,12 +17061,28 @@ app.post("/purchase/:id/cancel", async (req, res) => {
     if (!purchaseId || !reason) return res.status(400).json({ message: "Cancellation reason is required" });
 
     await client.query("BEGIN");
+    const replay = await beginV3BusinessOperation(client, req, "purchase");
+    if (replay) return sendV3Replay(client, res, replay);
     const manager = await requireRateManager(cancelledBy, client);
     if (!manager) {
       await client.query("ROLLBACK");
       return res.status(403).json({ message: "Only Owner or Admin can cancel purchases" });
     }
-    const purchaseResult = await client.query("SELECT * FROM purchases WHERE id = $1 FOR UPDATE", [purchaseId]);
+    const context = req.v3OperationalContext;
+    const purchaseResult = await client.query(
+      `SELECT * FROM purchases
+       WHERE id = $1
+         AND ($2::INTEGER IS NULL OR (
+           company_id = $2 AND branch_id = $3 AND operational_location_id = $4
+         ))
+       FOR UPDATE`,
+      [
+        purchaseId,
+        context?.company_id || null,
+        context?.branch_id || null,
+        context?.operational_location_id || null,
+      ]
+    );
     const purchase = purchaseResult.rows[0];
     if (!purchase) {
       await client.query("ROLLBACK");
@@ -16795,8 +17155,10 @@ app.post("/purchase/:id/cancel", async (req, res) => {
       `,
       [purchaseId, JSON.stringify(oldSnapshot), JSON.stringify(newSnapshot), reason, manager.id]
     );
+    const responsePayload = { success: true, purchase: updatedPurchase.rows[0] };
+    await completeV3BusinessOperation(client, req, "purchase", purchaseId, responsePayload);
     await client.query("COMMIT");
-    return res.json({ success: true, purchase: updatedPurchase.rows[0] });
+    return res.json(responsePayload);
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
@@ -16804,9 +17166,11 @@ app.post("/purchase/:id/cancel", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.post("/purchase/:id/cancel", cancelPurchaseHandler);
+app.post("/api/v3/purchases/:id/cancel", rateLimitSyncRequest, v3WriteAdapter(cancelPurchaseHandler));
 
-app.post("/sales", async (req, res) => {
+const createSaleHandler = async (req, res) => {
   const client = await pool.connect();
 
   try {
@@ -16905,6 +17269,9 @@ app.post("/sales", async (req, res) => {
     }
 
     await client.query("BEGIN");
+    const replay = await beginV3BusinessOperation(client, req, "pos_sale");
+    if (replay) return sendV3Replay(client, res, replay);
+    const context = req.v3OperationalContext;
 
     let customerAccount;
     if (selectedCustomerId) {
@@ -16961,13 +17328,21 @@ app.post("/sales", async (req, res) => {
           FROM inventory_batches
           WHERE product_id = $1
             AND branch_id = $2
+            AND ($${batchParams.length + 1}::INTEGER IS NULL OR (
+              company_id = $${batchParams.length + 1}
+              AND operational_location_id = $${batchParams.length + 2}
+            ))
             ${batchFilter}
             AND remaining_qty > 0
             AND COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'
           ORDER BY purchase_date, created_at, id
         FOR UPDATE
         `,
-        batchParams
+        [
+          ...batchParams,
+          context?.company_id || null,
+          context?.operational_location_id || null,
+        ]
       );
       if (requestedItem.inventoryBatchId && batchesResult.rows.length === 0) {
         await client.query("ROLLBACK");
@@ -17153,9 +17528,10 @@ app.post("/sales", async (req, res) => {
         taxable_amount, mandi_tax_rate, mandi_tax_basis, mandi_tax_effective_date, tax_config_snapshot,
         discount_rule_id, discount_rule_name, discount_rule_type, discount_rule_value,
         discount_rule_payment_mode, profit_status, sale_date, transaction_date,
-        bill_datetime, backdated_bill, backdate_reason, due_date, credit_remarks, credit_status
+        bill_datetime, backdated_bill, backdate_reason, due_date, credit_remarks, credit_status,
+        global_id, source_device_id, company_id, operational_location_id
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37)
       RETURNING *
       `,
       [
@@ -17181,6 +17557,10 @@ app.post("/sales", async (req, res) => {
         creditDueDate,
         creditRemarks,
         paymentMode === "CREDIT" ? "PENDING" : "PAID",
+        cleanText(req.body.global_id) || `sale-${crypto.randomUUID()}`,
+        context?.device_id || cleanText(req.body.device_id || req.body.source_device_id) || null,
+        context?.company_id || null,
+        context?.operational_location_id || null,
       ]
     );
     const sale = saleResult.rows[0];
@@ -17259,10 +17639,21 @@ app.post("/sales", async (req, res) => {
 
       await client.query(
         `
-        INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id)
-        VALUES ($1, $2, 'OUT', $3, $4, $5)
+        INSERT INTO stock_transactions (
+          product_id, quantity, transaction_type, remarks, user_id, branch_id,
+          company_id, operational_location_id
+        )
+        VALUES ($1,$2,'OUT',$3,$4,$5,$6,$7)
         `,
-        [item.productId, item.quantity, `Invoice ${invoiceNo}`, parsedCreatedBy, parsedBranchId]
+        [
+          item.productId,
+          item.quantity,
+          `Invoice ${invoiceNo}`,
+          parsedCreatedBy,
+          parsedBranchId,
+          context?.company_id || null,
+          context?.operational_location_id || null,
+        ]
       );
     }
 
@@ -17285,8 +17676,7 @@ app.post("/sales", async (req, res) => {
       `Invoice ${invoiceNo}`
     );
 
-    await client.query("COMMIT");
-    return res.status(201).json({
+    const responsePayload = {
       success: true,
       message: "Invoice Saved",
       sale: {
@@ -17313,7 +17703,22 @@ app.post("/sales", async (req, res) => {
         })),
         payments: parsedPayments,
       },
-    });
+    };
+    if (context) {
+      await logSyncChange(client, {
+        branchId: context.branch_id,
+        operationalLocationId: context.operational_location_id,
+        assignmentGeneration: context.assignment_generation,
+        entityType: "pos_sale",
+        entityId: sale.global_id,
+        operationType: "UPSERT",
+        version: sale.entity_version || 1,
+        payload: responsePayload.sale,
+      });
+    }
+    await completeV3BusinessOperation(client, req, "pos_sale", sale.global_id, responsePayload, 201);
+    await client.query("COMMIT");
+    return res.status(201).json(responsePayload);
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
@@ -17321,7 +17726,9 @@ app.post("/sales", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.post("/sales", createSaleHandler);
+app.post("/api/v3/sales", rateLimitSyncRequest, v3WriteAdapter(createSaleHandler));
 
 app.get("/sales", async (req, res) => {
   try {
@@ -17649,7 +18056,7 @@ app.get("/sale-returns/options/:saleId", async (req, res) => {
   }
 });
 
-app.post("/sale-returns", async (req, res) => {
+const createSaleReturnHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const saleId = parsePositiveInteger(req.body.sale_id);
@@ -17662,7 +18069,23 @@ app.post("/sale-returns", async (req, res) => {
       return res.status(400).json({ message: "Select invoice, products, refund type and return reason" });
     }
     await client.query("BEGIN");
-    const saleResult = await client.query("SELECT * FROM sales WHERE id = $1 FOR SHARE", [saleId]);
+    const replay = await beginV3BusinessOperation(client, req, "sale_return");
+    if (replay) return sendV3Replay(client, res, replay);
+    const context = req.v3OperationalContext;
+    const saleResult = await client.query(
+      `SELECT * FROM sales
+       WHERE id = $1
+         AND ($2::INTEGER IS NULL OR (
+           company_id = $2 AND branch_id = $3 AND operational_location_id = $4
+         ))
+       FOR SHARE`,
+      [
+        saleId,
+        context?.company_id || null,
+        context?.branch_id || null,
+        context?.operational_location_id || null,
+      ]
+    );
     const sale = saleResult.rows[0];
     if (!sale || sale.sale_status === "CANCELLED") {
       await client.query("ROLLBACK");
@@ -17674,9 +18097,9 @@ app.post("/sale-returns", async (req, res) => {
       INSERT INTO sale_returns (
         return_no, sale_id, customer_name, customer_mobile, return_date,
         refund_type, return_reason, total_return_amount, total_cost_amount,
-        branch_id, created_by
+        branch_id, created_by, company_id, operational_location_id
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, $8, $9)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,0,0,$8,$9,$10,$11)
       RETURNING *
       `,
       [
@@ -17684,6 +18107,8 @@ app.post("/sale-returns", async (req, res) => {
         nullableText(req.body.customer_mobile) || sale.customer_mobile,
         req.body.return_date || toDateKey(new Date()), refundType, returnReason,
         branchId || sale.branch_id, createdBy,
+        context?.company_id || sale.company_id || null,
+        context?.operational_location_id || sale.operational_location_id || null,
       ]
     );
     const saleReturn = returnResult.rows[0];
@@ -17696,6 +18121,10 @@ app.post("/sale-returns", async (req, res) => {
         await client.query("ROLLBACK");
         return res.status(400).json({ message: "Enter valid return quantities" });
       }
+      await client.query(
+        "SELECT id FROM sale_items WHERE id = $1 AND sale_id = $2 FOR UPDATE",
+        [saleItemId, saleId]
+      );
       const itemResult = await client.query(
         `
         SELECT
@@ -17710,7 +18139,6 @@ app.post("/sale-returns", async (req, res) => {
           GROUP BY sale_item_id
         ) returned ON returned.sale_item_id = si.id
         WHERE si.id = $1 AND si.sale_id = $2
-        FOR SHARE
         `,
         [saleItemId, saleId]
       );
@@ -17759,10 +18187,21 @@ app.post("/sale-returns", async (req, res) => {
       );
       await client.query(
         `
-        INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id)
-        VALUES ($1, $2, 'IN', $3, $4, $5)
+        INSERT INTO stock_transactions (
+          product_id, quantity, transaction_type, remarks, user_id, branch_id,
+          company_id, operational_location_id
+        )
+        VALUES ($1,$2,'IN',$3,$4,$5,$6,$7)
         `,
-        [saleItem.product_id, returnQuantity, `Sale return ${returnNo}: ${returnReason}`, createdBy, branchId || sale.branch_id]
+        [
+          saleItem.product_id,
+          returnQuantity,
+          `Sale return ${returnNo}: ${returnReason}`,
+          createdBy,
+          branchId || sale.branch_id,
+          context?.company_id || sale.company_id || null,
+          context?.operational_location_id || sale.operational_location_id || null,
+        ]
       );
       totalReturnAmount += returnAmount;
       totalCostAmount += costAmount;
@@ -17776,6 +18215,26 @@ app.post("/sale-returns", async (req, res) => {
       `,
       [roundCurrency(totalReturnAmount), roundCurrency(totalCostAmount), saleReturn.id]
     );
+    if (context) {
+      await logSyncChange(client, {
+        branchId: context.branch_id,
+        operationalLocationId: context.operational_location_id,
+        assignmentGeneration: context.assignment_generation,
+        entityType: "sale_return",
+        entityId: String(updateResult.rows[0].id),
+        operationType: "UPSERT",
+        version: 1,
+        payload: updateResult.rows[0],
+      });
+    }
+    await completeV3BusinessOperation(
+      client,
+      req,
+      "sale_return",
+      updateResult.rows[0].id,
+      updateResult.rows[0],
+      201
+    );
     await client.query("COMMIT");
     return res.status(201).json(updateResult.rows[0]);
   } catch (error) {
@@ -17785,7 +18244,9 @@ app.post("/sale-returns", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.post("/sale-returns", createSaleReturnHandler);
+app.post("/api/v3/sale-returns", rateLimitSyncRequest, v3WriteAdapter(createSaleReturnHandler));
 
 app.get("/waste-entries", async (req, res) => {
   try {
@@ -17805,7 +18266,7 @@ app.get("/waste-entries", async (req, res) => {
   }
 });
 
-app.post("/waste-entries", async (req, res) => {
+const createWasteEntryHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const productId = parsePositiveInteger(req.body.product_id);
@@ -17817,18 +18278,29 @@ app.post("/waste-entries", async (req, res) => {
       return res.status(400).json({ message: "Enter valid waste details" });
     }
     await client.query("BEGIN");
+    const replay = await beginV3BusinessOperation(client, req, "waste_entry");
+    if (replay) return sendV3Replay(client, res, replay);
+    const context = req.v3OperationalContext;
     const batchesResult = await client.query(
       `
       SELECT id, remaining_qty, COALESCE(effective_cost_per_unit, purchase_rate) AS purchase_rate
       FROM inventory_batches
       WHERE product_id = $1
         AND branch_id = $2
+        AND ($3::INTEGER IS NULL OR (
+          company_id = $3 AND operational_location_id = $4
+        ))
         AND remaining_qty > 0
         AND COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'
       ORDER BY purchase_date, created_at, id
       FOR UPDATE
       `,
-      [productId, branchId]
+      [
+        productId,
+        branchId,
+        context?.company_id || null,
+        context?.operational_location_id || null,
+      ]
     );
     const availableStock = batchesResult.rows.reduce((sum, batch) => sum + Number(batch.remaining_qty), 0);
     if (availableStock < quantity) {
@@ -17851,22 +18323,55 @@ app.post("/waste-entries", async (req, res) => {
       `
       INSERT INTO waste_entries (
         product_id, waste_date, quantity, waste_type, remarks,
-        cost_amount, branch_id, created_by
+        cost_amount, branch_id, created_by, company_id, operational_location_id
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
       RETURNING *
       `,
       [
         productId, req.body.waste_date || toDateKey(new Date()), quantity, wasteType,
         nullableText(req.body.remarks), roundCurrency(costAmount), branchId, createdBy,
+        context?.company_id || null,
+        context?.operational_location_id || null,
       ]
     );
     await client.query(
       `
-      INSERT INTO stock_transactions (product_id, quantity, transaction_type, remarks, user_id, branch_id)
-      VALUES ($1, $2, 'OUT', $3, $4, $5)
+      INSERT INTO stock_transactions (
+        product_id, quantity, transaction_type, remarks, user_id, branch_id,
+        company_id, operational_location_id
+      )
+      VALUES ($1,$2,'OUT',$3,$4,$5,$6,$7)
       `,
-      [productId, quantity, `Waste entry ${wasteType}`, createdBy, branchId]
+      [
+        productId,
+        quantity,
+        `Waste entry ${wasteType}`,
+        createdBy,
+        branchId,
+        context?.company_id || null,
+        context?.operational_location_id || null,
+      ]
+    );
+    if (context) {
+      await logSyncChange(client, {
+        branchId: context.branch_id,
+        operationalLocationId: context.operational_location_id,
+        assignmentGeneration: context.assignment_generation,
+        entityType: "waste_entry",
+        entityId: String(result.rows[0].id),
+        operationType: "UPSERT",
+        version: 1,
+        payload: result.rows[0],
+      });
+    }
+    await completeV3BusinessOperation(
+      client,
+      req,
+      "waste_entry",
+      result.rows[0].id,
+      result.rows[0],
+      201
     );
     await client.query("COMMIT");
     return res.status(201).json(result.rows[0]);
@@ -17877,7 +18382,9 @@ app.post("/waste-entries", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.post("/waste-entries", createWasteEntryHandler);
+app.post("/api/v3/waste-entries", rateLimitSyncRequest, v3WriteAdapter(createWasteEntryHandler));
 
 app.get("/sales/:id/audit", async (req, res) => {
   try {
@@ -17900,7 +18407,7 @@ app.get("/sales/:id/audit", async (req, res) => {
   }
 });
 
-app.put("/sales/:id", async (req, res) => {
+const updateSaleHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const saleId = parsePositiveInteger(req.params.id);
@@ -17911,7 +18418,23 @@ app.put("/sales/:id", async (req, res) => {
     if (!editor) return res.status(403).json({ message: "You do not have permission to edit completed sales" });
 
     await client.query("BEGIN");
-    const saleLockResult = await client.query("SELECT * FROM sales WHERE id = $1 FOR UPDATE", [saleId]);
+    const replay = await beginV3BusinessOperation(client, req, "pos_sale");
+    if (replay) return sendV3Replay(client, res, replay);
+    const context = req.v3OperationalContext;
+    const saleLockResult = await client.query(
+      `SELECT * FROM sales
+       WHERE id = $1
+         AND ($2::INTEGER IS NULL OR (
+           company_id = $2 AND branch_id = $3 AND operational_location_id = $4
+         ))
+       FOR UPDATE`,
+      [
+        saleId,
+        context?.company_id || null,
+        context?.branch_id || null,
+        context?.operational_location_id || null,
+      ]
+    );
     const currentSale = saleLockResult.rows[0];
     if (!currentSale) {
       await client.query("ROLLBACK");
@@ -17947,6 +18470,8 @@ app.put("/sales/:id", async (req, res) => {
       invoiceDiscount: req.body.invoice_discount,
       payments: req.body.payments,
       allowRateOverride: ["Owner", "Admin"].includes(editor.role_name),
+      companyId: context?.company_id || null,
+      operationalLocationId: context?.operational_location_id || null,
     });
     if (salePayload.error) {
       await client.query("ROLLBACK");
@@ -18127,8 +18652,22 @@ app.put("/sales/:id", async (req, res) => {
       );
     }
 
+    const responsePayload = { success: true, message: "Invoice Updated", sale: updatedSale };
+    if (context) {
+      await logSyncChange(client, {
+        branchId: context.branch_id,
+        operationalLocationId: context.operational_location_id,
+        assignmentGeneration: context.assignment_generation,
+        entityType: "pos_sale",
+        entityId: updatedSale.global_id,
+        operationType: "SALE_EDIT",
+        version: updatedSale.entity_version || 1,
+        payload: updatedSale,
+      });
+    }
+    await completeV3BusinessOperation(client, req, "pos_sale", updatedSale.global_id, responsePayload);
     await client.query("COMMIT");
-    return res.json({ success: true, message: "Invoice Updated", sale: updatedSale });
+    return res.json(responsePayload);
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
@@ -18136,9 +18675,11 @@ app.put("/sales/:id", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.put("/sales/:id", updateSaleHandler);
+app.put("/api/v3/sales/:id", rateLimitSyncRequest, v3WriteAdapter(updateSaleHandler));
 
-app.post("/sales/:id/cancel", async (req, res) => {
+const cancelSaleHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const saleId = parsePositiveInteger(req.params.id);
@@ -18149,7 +18690,23 @@ app.post("/sales/:id/cancel", async (req, res) => {
     if (!canceller) return res.status(403).json({ message: "You do not have permission to cancel completed sales" });
 
     await client.query("BEGIN");
-    const saleLockResult = await client.query("SELECT * FROM sales WHERE id = $1 FOR UPDATE", [saleId]);
+    const replay = await beginV3BusinessOperation(client, req, "pos_sale");
+    if (replay) return sendV3Replay(client, res, replay);
+    const context = req.v3OperationalContext;
+    const saleLockResult = await client.query(
+      `SELECT * FROM sales
+       WHERE id = $1
+         AND ($2::INTEGER IS NULL OR (
+           company_id = $2 AND branch_id = $3 AND operational_location_id = $4
+         ))
+       FOR UPDATE`,
+      [
+        saleId,
+        context?.company_id || null,
+        context?.branch_id || null,
+        context?.operational_location_id || null,
+      ]
+    );
     const currentSale = saleLockResult.rows[0];
     if (!currentSale) {
       await client.query("ROLLBACK");
@@ -18191,8 +18748,22 @@ app.post("/sales/:id/cancel", async (req, res) => {
       canceller.id,
       `Invoice ${cancelledSale.invoice_no} cancelled: ${reason}`
     );
+    const responsePayload = { success: true, message: "Invoice Cancelled", sale: cancelledSale };
+    if (context) {
+      await logSyncChange(client, {
+        branchId: context.branch_id,
+        operationalLocationId: context.operational_location_id,
+        assignmentGeneration: context.assignment_generation,
+        entityType: "pos_sale",
+        entityId: cancelledSale.global_id,
+        operationType: "SALE_CANCEL",
+        version: cancelledSale.entity_version || 1,
+        payload: cancelledSale,
+      });
+    }
+    await completeV3BusinessOperation(client, req, "pos_sale", cancelledSale.global_id, responsePayload);
     await client.query("COMMIT");
-    return res.json({ success: true, message: "Invoice Cancelled", sale: cancelledSale });
+    return res.json(responsePayload);
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
@@ -18200,7 +18771,9 @@ app.post("/sales/:id/cancel", async (req, res) => {
   } finally {
     client.release();
   }
-});
+};
+app.post("/sales/:id/cancel", cancelSaleHandler);
+app.post("/api/v3/sales/:id/cancel", rateLimitSyncRequest, v3WriteAdapter(cancelSaleHandler));
 
 app.get("/sales/:id", async (req, res) => {
   try {

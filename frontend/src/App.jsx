@@ -252,6 +252,24 @@ const CLOUD_OPERATIONAL_API_URL = CLOUD_API_URL;
 const SYNC_API_URL = CLOUD_OPERATIONAL_API_URL || API_URL;
 const AUTH_API_URL = [API_MODES.HYBRID, API_MODES.CLOUD_ONLY, API_MODES.CLOUD_PRODUCTION, API_MODES.FIELD_REMOTE_DEVICE].includes(API_MODE)
   && CLOUD_OPERATIONAL_API_URL ? CLOUD_OPERATIONAL_API_URL : API_URL;
+const createOperationalWrite = (user, payload = {}, operationId = "") => {
+  const idempotencyKey = operationId || globalThis.crypto?.randomUUID?.() ||
+    `op-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return {
+    body: {
+      ...payload,
+      idempotency_key: idempotencyKey,
+      operation_id: idempotencyKey,
+    },
+    config: {
+      headers: {
+        "x-froozerp-device-session": user?.device_session_token || "",
+        "x-idempotency-key": idempotencyKey,
+      },
+    },
+    operationId: idempotencyKey,
+  };
+};
 const API_CONFIG = {
   mode: API_MODE,
   apiUrl: API_URL,
@@ -4133,16 +4151,23 @@ function App() {
         opening_stock_lots: !editingProductId ? normalizedOpeningStockLots : [],
       };
       if (editingProductId) {
-        await axios.put(`${API_URL}/products/${editingProductId}`, payload);
+        const updateWrite = createOperationalWrite(user, payload);
+        await axios.put(`${API_URL}/api/v3/products/${editingProductId}`, updateWrite.body, updateWrite.config);
         if (addOpeningStock && openingStockLots.length > 0) {
-          await axios.post(`${API_URL}/products/${editingProductId}/opening-stock`, {
+          const openingWrite = createOperationalWrite(user, {
             opening_stock_lots: openingStockLots,
             branch_id: user.branch_id,
             created_by: user.id,
           });
+          await axios.post(
+            `${API_URL}/api/v3/products/${editingProductId}/opening-stock`,
+            openingWrite.body,
+            openingWrite.config
+          );
         }
       } else {
-        await axios.post(`${API_URL}/products`, payload);
+        const createWrite = createOperationalWrite(user, payload);
+        await axios.post(`${API_URL}/api/v3/products`, createWrite.body, createWrite.config);
       }
       resetProductForm();
       await Promise.all([loadProducts(), loadProductCategories(), loadDashboardData()]);
@@ -4334,11 +4359,21 @@ function App() {
         branch_id: user.branch_id,
       };
       try {
-        await axios.post(`${API_URL}/products/${activeProductId}/opening-stock-lots`, payload);
+        const openingWrite = createOperationalWrite(user, payload);
+        await axios.post(
+          `${API_URL}/api/v3/products/${activeProductId}/opening-stock-lots`,
+          openingWrite.body,
+          openingWrite.config
+        );
       } catch (error) {
         const message = getErrorMessage(error, "Unable to add opening stock lot");
         if (message.includes("Add as separate lot anyway?") && window.confirm("This lot already exists. Add as separate lot anyway?")) {
-          await axios.post(`${API_URL}/products/${activeProductId}/opening-stock-lots`, { ...payload, allow_duplicate_lot: true });
+          const duplicateWrite = createOperationalWrite(user, { ...payload, allow_duplicate_lot: true });
+          await axios.post(
+            `${API_URL}/api/v3/products/${activeProductId}/opening-stock-lots`,
+            duplicateWrite.body,
+            duplicateWrite.config
+          );
         } else {
           throw error;
         }
@@ -4474,7 +4509,7 @@ function App() {
           alert("Please enter a valid physical quantity.");
           return;
         }
-        await axios.post(`${API_URL}/inventory-lots/${lotAction.lot.id}/adjust`, {
+        const adjustmentWrite = createOperationalWrite(user, {
           ...basePayload,
           physical_quantity: lotDraft.new_quantity,
           adjustment_type: lotDraft.adjustment_type,
@@ -4482,6 +4517,11 @@ function App() {
           remarks: lotDraft.remarks,
           reason: lotDraft.reason,
         });
+        await axios.post(
+          `${API_URL}/api/v3/inventory-lots/${lotAction.lot.id}/adjust`,
+          adjustmentWrite.body,
+          adjustmentWrite.config
+        );
         alert("Lot adjusted");
       }
       if (lotAction.type === "transfer") {
@@ -4747,9 +4787,19 @@ function App() {
         remarks: purchaseRemarks,
       };
       if (editingPurchaseId && purchaseBillStatus === "BILL_COMPLETED" && purchases.find((purchase) => Number(purchase.id) === Number(editingPurchaseId))?.purchase_bill_status === "BILL_PENDING") {
-        await axios.post(`${API_URL}/purchase/${editingPurchaseId}/complete-bill`, payload);
+        const completionWrite = createOperationalWrite(user, payload);
+        await axios.post(
+          `${API_URL}/api/v3/purchases/${editingPurchaseId}/complete-bill`,
+          completionWrite.body,
+          completionWrite.config
+        );
       } else if (editingPurchaseId) {
-        await axios.put(`${API_URL}/purchase/${editingPurchaseId}`, payload);
+        const updateWrite = createOperationalWrite(user, payload);
+        await axios.put(
+          `${API_URL}/api/v3/purchases/${editingPurchaseId}`,
+          updateWrite.body,
+          updateWrite.config
+        );
       } else {
         if (purchaseCart.length === 0) {
           alert("Add at least one purchase item before saving.");
@@ -4913,7 +4963,12 @@ function App() {
         await refreshAfterSaleCancellation({ local: true });
         return true;
       }
-      await axios.post(`${API_URL}/sales/${saleId}/cancel`, { reason, cancelled_by: user.id });
+      const cancellationWrite = createOperationalWrite(user, { reason, cancelled_by: user.id });
+      await axios.post(
+        `${API_URL}/api/v3/sales/${saleId}/cancel`,
+        cancellationWrite.body,
+        cancellationWrite.config
+      );
       await refreshAfterSaleCancellation();
       alert("Invoice cancelled");
       setCancelDraft(null);
@@ -4958,7 +5013,12 @@ function App() {
     const reason = window.prompt(`Enter reason to deactivate/cancel ${product.product_name}`);
     if (!reason?.trim()) return;
     try {
-      await axios.post(`${API_URL}/products/${product.id}/cancel`, { reason, cancelled_by: user.id });
+      const deactivationWrite = createOperationalWrite(user, { reason, cancelled_by: user.id });
+      await axios.post(
+        `${API_URL}/api/v3/products/${product.id}/deactivate`,
+        deactivationWrite.body,
+        deactivationWrite.config
+      );
       await Promise.all([loadProducts(), loadDashboardData()]);
       alert("Product marked inactive");
     } catch (error) {
@@ -5082,7 +5142,12 @@ function App() {
     const reason = window.prompt(`Enter cancellation reason for Purchase #${purchase.id}`);
     if (!reason?.trim()) return;
     try {
-      await axios.post(`${API_URL}/purchase/${purchase.id}/cancel`, { reason, cancelled_by: user.id });
+      const cancellationWrite = createOperationalWrite(user, { reason, cancelled_by: user.id });
+      await axios.post(
+        `${API_URL}/api/v3/purchases/${purchase.id}/cancel`,
+        cancellationWrite.body,
+        cancellationWrite.config
+      );
       await Promise.all([loadPurchases(), loadDashboardData(), loadSupplierData(), loadAccounts(), loadAccountOutstanding()]);
       alert("Purchase cancelled");
     } catch (error) {
@@ -11334,7 +11399,7 @@ function SaleReturnModule({ onReload, returns, salesHistory, user }) {
 
   const saveReturn = async () => {
     try {
-      await axios.post(`${API_URL}/sale-returns`, {
+      const returnWrite = createOperationalWrite(user, {
         sale_id: Number(invoiceId),
         customer_name: returnOptions.sale?.customer_name,
         customer_mobile: returnOptions.sale?.customer_mobile,
@@ -11348,6 +11413,7 @@ function SaleReturnModule({ onReload, returns, salesHistory, user }) {
           return_quantity: item.return_quantity,
         })),
       });
+      await axios.post(`${API_URL}/api/v3/sale-returns`, returnWrite.body, returnWrite.config);
       setInvoiceId("");
       setReturnOptions({ sale: null, items: [] });
       setReturnReason("");
@@ -11447,13 +11513,14 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
   const mostWastedProducts = [...mostWasted.values()].sort((left, right) => right.quantity - left.quantity).slice(0, 5);
   const saveWaste = async () => {
     try {
-      await axios.post(`${API_URL}/waste-entries`, {
+      const wasteWrite = createOperationalWrite(user, {
         ...draft,
         product_id: Number(draft.product_id),
         quantity: Number(draft.quantity || 0),
         branch_id: user.branch_id,
         created_by: user.id,
       });
+      await axios.post(`${API_URL}/api/v3/waste-entries`, wasteWrite.body, wasteWrite.config);
       setDraft({ product_id: "", quantity: "", waste_type: "DAAGI", waste_date: toDateKey(new Date()), remarks: "" });
       await onReload();
       alert("Waste entry saved and stock reduced");
@@ -15264,7 +15331,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
         }
         return;
       }
-      const response = await axios.post(`${API_URL}/sales`, {
+      const saleWrite = createOperationalWrite(user, {
         items: cart.map((item) => ({
           product_id: item.product_id,
           inventory_batch_id: item.inventory_batch_id,
@@ -15296,6 +15363,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
         below_cost_confirmed: belowCostConfirmed,
         zero_rate_confirmed: zeroRateConfirmed,
       });
+      const response = await axios.post(`${API_URL}/api/v3/sales`, saleWrite.body, saleWrite.config);
       setCart([]);
       setMixedPayments({ CASH: "", UPI: "", CARD: "", BANK_TRANSFER: "" });
       setPaymentMode("CASH");
@@ -16127,7 +16195,7 @@ function SaleEditModal({ canSaleDateEdit = false, customers = [], deviceInfo, in
         await onSaved({ localSale: localSnapshotToInvoice(result.invoice), pendingOperations: result.pending_operations });
         alert("Invoice updated locally. Pending sync.");
       } else {
-        await axios.put(`${API_URL}/sales/${invoice.id}`, {
+        const saleEditWrite = createOperationalWrite(user, {
           ...payload,
           items: editItems.map((item) => ({
             id: Number(item.id || 0) || undefined,
@@ -16141,6 +16209,11 @@ function SaleEditModal({ canSaleDateEdit = false, customers = [], deviceInfo, in
             lot_discount_value: Number(item.lot_discount_value || 0),
           })),
         });
+        await axios.put(
+          `${API_URL}/api/v3/sales/${invoice.id}`,
+          saleEditWrite.body,
+          saleEditWrite.config
+        );
         await onSaved();
         alert("Invoice updated");
       }

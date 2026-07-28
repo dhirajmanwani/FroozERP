@@ -119,7 +119,7 @@ class WebIndexedDBAdapter extends StorageAdapter {
 }
 
 class CloudPostgresAdapter extends StorageAdapter {
-  constructor({ connectionString, sslEnabled, rejectUnauthorized }) {
+  constructor({ connectionString, sslEnabled, rejectUnauthorized, allowIsolatedLoopback = false }) {
     super({ kind: "cloud-postgres", databaseType: "postgresql", clientPlatform: "cloud", localFirst: false });
     if (!connectionString) {
       throw new Error("Cloud-server runtime requires DATABASE_URL.");
@@ -129,7 +129,11 @@ class CloudPostgresAdapter extends StorageAdapter {
       throw new Error("Cloud-server DATABASE_URL must use PostgreSQL.");
     }
     const host = String(parsed.hostname || "").toLowerCase();
-    if (["localhost", "127.0.0.1", "::1", "0.0.0.0"].includes(host)) {
+    const isolatedStaging =
+      allowIsolatedLoopback &&
+      ["localhost", "127.0.0.1", "::1"].includes(host) &&
+      parsed.pathname.endsWith("_staging");
+    if (["localhost", "127.0.0.1", "::1", "0.0.0.0"].includes(host) && !isolatedStaging) {
       throw new Error("Cloud-server PostgreSQL cannot use a loopback host.");
     }
     // PostgreSQL is loaded only for the explicit cloud-server runtime.
@@ -180,6 +184,9 @@ const createStorageAdapter = (env = process.env) => {
         connectionString: String(env.DATABASE_URL || "").trim(),
         sslEnabled: /^true$/i.test(env.DB_SSL || ""),
         rejectUnauthorized: !/^false$/i.test(env.DB_SSL_REJECT_UNAUTHORIZED || ""),
+        allowIsolatedLoopback:
+          String(env.NODE_ENV || "").trim().toLowerCase() === "test" &&
+          /^true$/i.test(env.FROOZERP_ALLOW_LOOPBACK_POSTGRES_FOR_ISOLATED_TESTS || ""),
       }),
     };
   }
