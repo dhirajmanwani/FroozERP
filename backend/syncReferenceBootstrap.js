@@ -1,7 +1,7 @@
 "use strict";
 
 const REFERENCE_BOOTSTRAP_PROTOCOL = "reference-v1";
-const COMPANY_REFERENCE_ENTITY_TYPES = Object.freeze(["product_category", "product", "sale_rate"]);
+const COMPANY_REFERENCE_ENTITY_TYPES = Object.freeze(["product_category", "product", "sale_rate", "supplier"]);
 
 const visibleChangePredicate = (offset = 1) => `
   company_id = $${offset}
@@ -125,6 +125,27 @@ const captureReferenceBootstrap = async (client, context) => {
     `,
     [context.companyId]
   );
+  const suppliersResult = await client.query(
+    `
+    SELECT s.id::TEXT AS entity_id,
+           1 AS version,
+           JSONB_BUILD_OBJECT(
+             'id', s.id,
+             'company_id', s.company_id,
+             'supplier_name', s.supplier_name,
+             'firm_name', s.firm_name,
+             'supplier_type', s.supplier_type,
+             'active', s.active,
+             'created_at', s.created_at,
+             'updated_at', s.updated_at
+           ) AS payload,
+           COALESCE(s.updated_at, s.created_at) AS updated_at
+    FROM suppliers s
+    WHERE s.company_id = $1
+    ORDER BY s.id
+    `,
+    [context.companyId]
+  );
   const locationProductsResult = await client.query(
     `
     SELECT olp.operational_location_id,
@@ -186,6 +207,7 @@ const captureReferenceBootstrap = async (client, context) => {
     records: [
       ...categoriesResult.rows.map((row) => record("product_category", row)),
       ...productsResult.rows.map((row) => record("product", row)),
+      ...suppliersResult.rows.map((row) => record("supplier", row)),
       ...lotsResult.rows.map((row) => record("inventory_lot", row)),
     ],
   };

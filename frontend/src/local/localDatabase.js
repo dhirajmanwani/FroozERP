@@ -83,9 +83,11 @@ export async function loadLocalReferenceSnapshot({ username, deviceId } = {}) {
   });
 }
 
-export async function getOrCreateLocalDeviceIdentity() {
+export async function getOrCreateLocalDeviceIdentity(preferredDeviceId = "") {
   if (!isTauriRuntime()) return null;
-  return invokeLocal("local_get_or_create_device_identity");
+  return invokeLocal("local_get_or_create_device_identity", {
+    preferredDeviceId: String(preferredDeviceId || "").trim() || null,
+  });
 }
 
 export async function setLocalSmokeValue(value) {

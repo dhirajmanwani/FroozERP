@@ -188,7 +188,20 @@ const isPrivateCloudHostname = (hostname) => {
   }
   return /^(fc|fd|fe80:)/i.test(hostValue);
 };
+const allowLoopbackCloudForIsolatedTests =
+  process.env.NODE_ENV === "test"
+  && /^true$/i.test(String(process.env.FROOZERP_ALLOW_LOOPBACK_CLOUD_FOR_ISOLATED_TESTS || "").trim());
+const isLoopbackCloudUrl = (value) => {
+  try {
+    const parsed = new URL(String(value || "").trim());
+    return ["http:", "https:"].includes(parsed.protocol)
+      && ["localhost", "127.0.0.1", "::1"].includes(parsed.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+};
 const isRealHostedCloudUrl = (value) => {
+  if (allowLoopbackCloudForIsolatedTests && isLoopbackCloudUrl(value)) return true;
   try {
     const parsed = new URL(String(value || "").trim());
     return parsed.protocol === "https:"
@@ -16075,7 +16088,7 @@ const validatePurchaseEntry = (entry) => {
 
 const buildPurchaseFinancials = async (client, entry) => {
   const supplierResult = await client.query(
-    "SELECT id, supplier_name FROM suppliers WHERE id = $1 AND active = TRUE FOR SHARE",
+    "SELECT id, supplier_name FROM suppliers WHERE id = $1 AND active IS DISTINCT FROM FALSE FOR SHARE",
     [entry.supplierId]
   );
   if (supplierResult.rows.length === 0) return { error: "Add New Supplier" };
@@ -16273,7 +16286,7 @@ const insertOpeningStockLot = async (client, { product, lot, actorId, branchId, 
 
 const getPurchasePartiesForArrival = async (client, entry) => {
   const [supplierResult, productResult] = await Promise.all([
-    client.query("SELECT id, supplier_name FROM suppliers WHERE id = $1 AND active = TRUE FOR SHARE", [entry.supplierId]),
+    client.query("SELECT id, supplier_name FROM suppliers WHERE id = $1 AND active IS DISTINCT FROM FALSE FOR SHARE", [entry.supplierId]),
     client.query("SELECT id, product_name, origin_type, unit, selling_rate FROM products WHERE id = $1 AND active = TRUE FOR SHARE", [entry.productId]),
   ]);
   if (supplierResult.rows.length === 0) return { error: "Add New Supplier" };
@@ -16628,64 +16641,92 @@ const createPurchaseBillHandler = async (req, res) => {
       return res.status(400).json({ message: "Cash purchase requires payment mode and paid amount" });
     }
 
-    const entries = rawItems.map((item) => readPurchaseEntryPayload({
-      ...req.body,
-      product_id: item.product_id,
-      product_global_id: item.product_global_id,
-      purchase_global_id: item.purchase_global_id,
-      lot_global_id: item.lot_global_id,
-      line_index: item.line_index,
-      quantity: item.quantity,
-      purchase_rate: item.purchase_rate,
-      expected_purchase_rate: item.expected_purchase_rate,
-      temporary_sale_rate: item.temporary_sale_rate,
-      unit: item.unit,
-      origin_type: item.origin_type,
-      lot_name: item.lot_name,
-      lot_size: item.lot_size,
-      remarks: cleanText(item.remarks) || baseEntry.remarks,
-      paid_amount: 0,
-      purchase_type: baseEntry.purchaseBillStatus === "BILL_COMPLETED" ? "CREDIT" : "PENDING_BILL",
-    }));
-
     await client.query("BEGIN");
     const replay = await beginV3BusinessOperation(client, req, "purchase");
     if (replay) return sendV3Replay(client, res, replay);
     const context = req.v3OperationalContext;
+    const operationId = v3OperationKey(req);
+    const hasLegacyOfflineIdentity = rawItems.some((item, index) =>
+      cleanText(item.purchase_global_id) === `offline-purchase-${operationId}-${index + 1}`
+    );
+    const offlinePurchaseGlobalId = `offline-purchase-${operationId}`;
+    const onlinePurchaseGlobalId = `purchase-${operationId}`;
+    const suppliedPurchaseGlobalId = nullableText(req.body.purchase_global_id);
+    if (
+      suppliedPurchaseGlobalId &&
+      ![offlinePurchaseGlobalId, onlinePurchaseGlobalId].includes(suppliedPurchaseGlobalId)
+    ) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        code: "OFFLINE_PURCHASE_IDENTITY_MISMATCH",
+        message: "Offline purchase identity does not match its signed operation.",
+      });
+    }
+    const purchaseGlobalId = suppliedPurchaseGlobalId || (
+      hasLegacyOfflineIdentity ? offlinePurchaseGlobalId : onlinePurchaseGlobalId
+    );
+
+    const entries = rawItems.map((item, index) => {
+      const lineIndex = index + 1;
+      const legacyLineIdentity = `offline-purchase-${operationId}-${lineIndex}`;
+      const expectedLineGlobalId = purchaseGlobalId.startsWith("offline-purchase-")
+        ? `offline-purchase-line-${operationId}-${lineIndex}`
+        : `purchase-line-${operationId}-${lineIndex}`;
+      const expectedLotGlobalId = purchaseGlobalId.startsWith("offline-purchase-")
+        ? `offline-lot-${operationId}-${lineIndex}`
+        : `purchase-lot-${operationId}-${lineIndex}`;
+      const suppliedLineGlobalId = nullableText(item.line_global_id);
+      const suppliedLegacyPurchaseGlobalId = nullableText(item.purchase_global_id);
+      const suppliedLotGlobalId = nullableText(item.lot_global_id);
+      if (
+        (suppliedLineGlobalId && suppliedLineGlobalId !== expectedLineGlobalId) ||
+        (suppliedLegacyPurchaseGlobalId && ![purchaseGlobalId, legacyLineIdentity].includes(suppliedLegacyPurchaseGlobalId)) ||
+        (suppliedLotGlobalId && suppliedLotGlobalId !== expectedLotGlobalId) ||
+        (parsePositiveInteger(item.line_index) && parsePositiveInteger(item.line_index) !== lineIndex)
+      ) {
+        const error = new Error("Offline purchase line identity does not match its signed operation.");
+        error.status = 409;
+        error.code = "OFFLINE_PURCHASE_IDENTITY_MISMATCH";
+        throw error;
+      }
+      return {
+        ...readPurchaseEntryPayload({
+          ...req.body,
+          product_id: item.product_id,
+          product_global_id: item.product_global_id,
+          purchase_global_id: purchaseGlobalId,
+          line_global_id: suppliedLineGlobalId || expectedLineGlobalId,
+          lot_global_id: suppliedLotGlobalId || expectedLotGlobalId,
+          line_index: lineIndex,
+          quantity: item.quantity,
+          purchase_rate: item.purchase_rate,
+          expected_purchase_rate: item.expected_purchase_rate,
+          temporary_sale_rate: item.temporary_sale_rate,
+          unit: item.unit,
+          origin_type: item.origin_type,
+          lot_name: item.lot_name,
+          lot_size: item.lot_size,
+          remarks: cleanText(item.remarks) || baseEntry.remarks,
+          paid_amount: 0,
+          purchase_type: baseEntry.purchaseBillStatus === "BILL_COMPLETED" ? "CREDIT" : "PENDING_BILL",
+        }),
+        lineGlobalId: suppliedLineGlobalId || expectedLineGlobalId,
+        purchaseGlobalId,
+        lotGlobalId: suppliedLotGlobalId || expectedLotGlobalId,
+        lineIndex,
+      };
+    });
+
     if (context) {
-      const operationId = v3OperationKey(req);
-      for (let index = 0; index < entries.length; index += 1) {
-        const entry = entries[index];
+      for (const entry of entries) {
         if (!entry.productId && entry.productGlobalId) {
           const productByGlobalId = await client.query(
-            `SELECT id
-             FROM products
-             WHERE global_id = $1
-               AND company_id = $2
-               AND active IS DISTINCT FROM FALSE
+            `SELECT id FROM products
+             WHERE global_id = $1 AND company_id = $2 AND active IS DISTINCT FROM FALSE
              FOR SHARE`,
             [entry.productGlobalId, context.company_id]
           );
           entry.productId = productByGlobalId.rows[0]?.id || null;
-        }
-        const lineIndex = index + 1;
-        const expectedPurchaseGlobalId = `offline-purchase-${operationId}-${lineIndex}`;
-        const expectedLotGlobalId = `offline-lot-${operationId}-${lineIndex}`;
-        if (
-          (entry.purchaseGlobalId && entry.purchaseGlobalId !== expectedPurchaseGlobalId) ||
-          (entry.lotGlobalId && entry.lotGlobalId !== expectedLotGlobalId) ||
-          (entry.lineIndex && entry.lineIndex !== lineIndex)
-        ) {
-          await client.query("ROLLBACK");
-          return res.status(409).json({
-            code: "OFFLINE_PURCHASE_IDENTITY_MISMATCH",
-            message: "Offline purchase line identity does not match its signed operation.",
-          });
-        }
-        if (entry.purchaseGlobalId || entry.lotGlobalId || entry.lineIndex) {
-          entry.purchaseGlobalId = expectedPurchaseGlobalId;
-          entry.lotGlobalId = expectedLotGlobalId;
-          entry.lineIndex = lineIndex;
         }
       }
     }
@@ -16714,87 +16755,133 @@ const createPurchaseBillHandler = async (req, res) => {
         });
       }
     }
+
+    const createdItems = [];
+    const createdLots = [];
+    let purchase;
+
     if (baseEntry.purchaseBillStatus === "BILL_PENDING") {
       const manager = await requireRateManager(baseEntry.actorId, client);
       if (!manager) {
         await client.query("ROLLBACK");
         return res.status(403).json({ message: "Only Owner or Admin can set temporary sale rates for pending stock" });
       }
-
-      const createdPurchases = [];
-      const createdLots = [];
+      const arrivals = [];
+      const productRates = new Map();
       for (const entry of entries) {
         const arrival = await getPurchasePartiesForArrival(client, entry);
         if (arrival.error) {
           await client.query("ROLLBACK");
           return res.status(arrival.status || 400).json({ message: arrival.error });
         }
+        const existingRate = productRates.get(entry.productId);
+        if (existingRate !== undefined && existingRate !== entry.temporarySaleRate) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            code: "PURCHASE_PRODUCT_RATE_CONFLICT",
+            message: "Lines for the same product must use the same temporary sale rate.",
+          });
+        }
+        productRates.set(entry.productId, entry.temporarySaleRate);
+        arrivals.push(arrival);
+      }
+      const provisionalBasic = roundCurrency(entries.reduce(
+        (sum, entry) => sum + Number(entry.quantity || 0) * Number(entry.expectedPurchaseRate || 0),
+        0
+      ));
+      const totalQuantity = entries.reduce((sum, entry) => sum + Number(entry.quantity || 0), 0);
+      const aggregateExpectedRate = totalQuantity > 0 ? roundUnitCost(provisionalBasic / totalQuantity) : 0;
+      const singleTemporaryRate = new Set(entries.map((entry) => Number(entry.temporarySaleRate || 0))).size === 1
+        ? Number(entries[0].temporarySaleRate || 0)
+        : null;
+      const singleLotName = entries.length === 1 ? entries[0].lotName : null;
+      const singleLotSize = entries.length === 1 ? entries[0].lotSize : null;
+      const supplier = arrivals[0].supplier;
+      const purchaseResult = await client.query(
+        `INSERT INTO purchases (
+           supplier_id, supplier_name, total_amount, branch_id, created_by,
+           basic_amount, gross_amount, net_payable, paid_amount, balance_amount,
+           effective_cost_per_unit, purchase_type, payment_status, purchase_date,
+           remarks, purchase_bill_status, temporary_sale_rate, expected_purchase_rate,
+           bill_number, bill_date, lot_name, lot_size, stock_source,
+           company_id, operational_location_id
+         ) VALUES (
+           $1,$2,0,$3,$4,0,0,0,0,0,$5,'PENDING_BILL','BILL_PENDING',$6,$7,
+           'BILL_PENDING',$8,$9,$10,$11,$12,$13,'PURCHASE',$14,$15
+         ) RETURNING *`,
+        [
+          supplier.id, supplier.supplier_name, baseEntry.branchId, baseEntry.actorId,
+          aggregateExpectedRate, baseEntry.purchaseDate, baseEntry.remarks,
+          singleTemporaryRate, aggregateExpectedRate, baseEntry.billNumber, baseEntry.billDate,
+          singleLotName, singleLotSize, context?.company_id || null,
+          context?.operational_location_id || null,
+        ]
+      );
+      purchase = purchaseResult.rows[0];
+
+      for (let index = 0; index < entries.length; index += 1) {
+        const entry = entries[index];
+        const arrival = arrivals[index];
         const provisionalCost = Number(entry.expectedPurchaseRate || 0);
         const provisionalAmount = roundCurrency(entry.quantity * provisionalCost);
         const itemUnit = entry.unit || arrival.product.unit || "";
         const itemOriginType = entry.originType || arrival.product.origin_type || "LOCAL";
-        const purchaseResult = await client.query(
-          `
-          INSERT INTO purchases (
-            supplier_id, supplier_name, total_amount, branch_id, created_by,
-            basic_amount, gross_amount, net_payable, paid_amount, balance_amount,
-            effective_cost_per_unit, purchase_type, payment_status, purchase_date,
-            remarks, purchase_bill_status, temporary_sale_rate, expected_purchase_rate,
-            bill_number, bill_date, lot_name, lot_size, stock_source,
-            company_id, operational_location_id
-          )
-          VALUES ($1, $2, 0, $3, $4, 0, 0, 0, 0, 0, $5, 'PENDING_BILL', 'BILL_PENDING', $6, $7, 'BILL_PENDING', $8, $9, $10, $11, $12, $13, 'PURCHASE', $14, $15)
-          RETURNING *
-          `,
-          [
-            arrival.supplier.id, arrival.supplier.supplier_name, entry.branchId, entry.actorId,
-            provisionalCost, entry.purchaseDate, entry.remarks, entry.temporarySaleRate, provisionalCost,
-            entry.billNumber, entry.billDate, entry.lotName, entry.lotSize,
-            context?.company_id || null, context?.operational_location_id || null,
-          ]
-        );
-        const purchase = purchaseResult.rows[0];
-        await client.query(
-          `
-          INSERT INTO purchase_items (
-            purchase_id, product_id, quantity, purchase_rate, amount, basic_amount,
-            net_payable, effective_cost_per_unit, lot_name, lot_size, unit, origin_type
-          )
-          VALUES ($1, $2, $3, $4, $5, 0, 0, $4, $6, $7, $8, $9)
-          `,
+        const itemResult = await client.query(
+          `INSERT INTO purchase_items (
+             purchase_id, product_id, quantity, purchase_rate, amount, basic_amount,
+             net_payable, effective_cost_per_unit, lot_name, lot_size, unit, origin_type
+           ) VALUES ($1,$2,$3,$4,$5,0,0,$4,$6,$7,$8,$9) RETURNING *`,
           [purchase.id, entry.productId, entry.quantity, provisionalCost, provisionalAmount, entry.lotName, entry.lotSize, itemUnit, itemOriginType]
         );
-        const batchNo = `PENDING-${Date.now()}-${purchase.id}`;
+        const batchNo = `PENDING-${Date.now()}-${purchase.id}-${entry.lineIndex}`;
         const lotResult = await client.query(
-          `
-          INSERT INTO inventory_batches (
-            product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
-            supplier_id, supplier_name, branch_id, gross_amount, net_payable, balance_amount,
-            purchase_id, batch_status, purchase_bill_status, temporary_sale_rate, lot_name, lot_size,
-            stock_source, remarks, purchase_date, unit, origin_type,
-            company_id, operational_location_id, global_id
-          )
-          VALUES ($1, $2, $3, $3, $4, $4, $5, $6, $7, 0, 0, 0, $8, 'ACTIVE', 'BILL_PENDING', $9, $10, $11, 'PURCHASE', $12, $13, $14, $15, $16, $17, $18)
-          RETURNING *
-          `,
+          `INSERT INTO inventory_batches (
+             product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
+             supplier_id, supplier_name, branch_id, gross_amount, net_payable, balance_amount,
+             purchase_id, batch_status, purchase_bill_status, temporary_sale_rate, lot_name, lot_size,
+             stock_source, remarks, purchase_date, unit, origin_type,
+             company_id, operational_location_id, global_id
+           ) VALUES (
+             $1,$2,$3,$3,$4,$4,$5,$6,$7,0,0,0,$8,'ACTIVE','BILL_PENDING',$9,$10,$11,
+             'PURCHASE',$12,$13,$14,$15,$16,$17,$18
+           ) RETURNING *`,
           [
-            entry.productId, batchNo, entry.quantity, provisionalCost, arrival.supplier.id,
-            arrival.supplier.supplier_name, entry.branchId, purchase.id, entry.temporarySaleRate,
-            entry.lotName, entry.lotSize, entry.remarks, entry.purchaseDate, itemUnit, itemOriginType,
-            context?.company_id || null, context?.operational_location_id || null, entry.lotGlobalId || null,
+            entry.productId, batchNo, entry.quantity, provisionalCost, supplier.id,
+            supplier.supplier_name, baseEntry.branchId, purchase.id, entry.temporarySaleRate,
+            entry.lotName, entry.lotSize, entry.remarks, baseEntry.purchaseDate, itemUnit,
+            itemOriginType, context?.company_id || null, context?.operational_location_id || null,
+            entry.lotGlobalId,
           ]
         );
+        await client.query(
+          `INSERT INTO stock_transactions (
+             product_id, quantity, transaction_type, remarks, user_id, branch_id,
+             company_id, operational_location_id
+           ) VALUES ($1,$2,'IN',$3,$4,$5,$6,$7)`,
+          [entry.productId, entry.quantity, `Stock arrival pending bill #${purchase.id}`, baseEntry.actorId,
+            baseEntry.branchId, context?.company_id || null, context?.operational_location_id || null]
+        );
+        createdItems.push({
+          ...itemResult.rows[0],
+          line_global_id: entry.lineGlobalId,
+          lot_global_id: entry.lotGlobalId,
+        });
+        createdLots.push(lotResult.rows[0]);
+      }
+
+      for (const [productId, temporaryRate] of productRates.entries()) {
+        const arrival = arrivals.find((candidate) => Number(candidate.product.id) === Number(productId));
         const productRateResult = await client.query(
           `UPDATE products
            SET selling_rate = $1, selling_rate_updated_at = CURRENT_TIMESTAMP,
                selling_rate_updated_by = $2, entity_version = entity_version + 1
            WHERE id = $3 AND ($4::INTEGER IS NULL OR company_id = $4)
            RETURNING *`,
-          [entry.temporarySaleRate, manager.id, entry.productId, context?.company_id || null]
+          [temporaryRate, manager.id, productId, context?.company_id || null]
         );
         if (productRateResult.rows[0]) {
           await logSyncChange(client, {
-            branchId: context?.branch_id || entry.branchId,
+            branchId: context?.branch_id || baseEntry.branchId,
             entityType: "sale_rate",
             entityId: productRateResult.rows[0].global_id,
             operationType: "UPSERT",
@@ -16803,222 +16890,186 @@ const createPurchaseBillHandler = async (req, res) => {
           });
         }
         await client.query(
-          "INSERT INTO sale_rate_history (product_id, old_selling_rate, new_selling_rate, changed_by, reason) VALUES ($1, $2, $3, $4, $5)",
-          [entry.productId, arrival.product.selling_rate || 0, entry.temporarySaleRate, manager.id, `Temporary sale rate for pending purchase #${purchase.id}`]
+          "INSERT INTO sale_rate_history (product_id, old_selling_rate, new_selling_rate, changed_by, reason) VALUES ($1,$2,$3,$4,$5)",
+          [productId, arrival?.product?.selling_rate || 0, temporaryRate, manager.id, `Temporary sale rate for pending purchase #${purchase.id}`]
+        );
+      }
+    } else {
+      const itemBasicTotal = entries.reduce(
+        (sum, entry) => sum + Number(entry.quantity || 0) * Number(entry.purchaseRate || 0),
+        0
+      );
+      if (itemBasicTotal <= 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Completed purchase items require valid purchase rates" });
+      }
+      const completedEntries = [];
+      let usedFreight = 0;
+      let usedLabour = 0;
+      let usedOther = 0;
+      for (let index = 0; index < entries.length; index += 1) {
+        const entry = entries[index];
+        const itemBasic = Number(entry.quantity || 0) * Number(entry.purchaseRate || 0);
+        const isLast = index === entries.length - 1;
+        const freight = isLast ? roundCurrency(baseEntry.freightCharges - usedFreight) : roundCurrency(baseEntry.freightCharges * itemBasic / itemBasicTotal);
+        const labour = isLast ? roundCurrency(baseEntry.labourCharges - usedLabour) : roundCurrency(baseEntry.labourCharges * itemBasic / itemBasicTotal);
+        const other = isLast ? roundCurrency(baseEntry.otherCharges - usedOther) : roundCurrency(baseEntry.otherCharges * itemBasic / itemBasicTotal);
+        usedFreight = roundCurrency(usedFreight + freight);
+        usedLabour = roundCurrency(usedLabour + labour);
+        usedOther = roundCurrency(usedOther + other);
+        const itemEntry = { ...entry, freightCharges: freight, labourCharges: labour, otherCharges: other, purchaseType: "CREDIT", paidAmountInput: 0 };
+        const calculation = await buildPurchaseFinancials(client, itemEntry);
+        if (calculation.error) {
+          await client.query("ROLLBACK");
+          return res.status(calculation.status || 400).json({ message: calculation.error });
+        }
+        completedEntries.push({ entry: itemEntry, ...calculation });
+      }
+
+      const basicTotal = roundCurrency(completedEntries.reduce((sum, item) => sum + Number(item.financials.basicAmount || 0), 0));
+      const mandiTaxTotal = roundCurrency(completedEntries.reduce((sum, item) => sum + Number(item.financials.mandiTaxAmount || 0), 0));
+      const grossTotal = roundCurrency(completedEntries.reduce((sum, item) => sum + Number(item.financials.grossAmount || 0), 0));
+      const rebateTotal = roundCurrency(completedEntries.reduce((sum, item) => sum + Number(item.financials.rebateAmount || 0), 0));
+      const netTotal = roundCurrency(completedEntries.reduce((sum, item) => sum + Number(item.financials.netPayable || 0), 0));
+      const totalQuantity = entries.reduce((sum, entry) => sum + Number(entry.quantity || 0), 0);
+      const paidAmount = baseEntry.purchaseType === "CASH" ? Number(baseEntry.paidAmountInput || 0) : 0;
+      if (paidAmount > netTotal) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: "Paid amount cannot exceed net payable amount" });
+      }
+      const balanceAmount = roundCurrency(netTotal - paidAmount);
+      const paymentStatus = balanceAmount === 0 ? "PAID" : paidAmount > 0 ? "PARTIAL" : "PENDING";
+      const mandiTaxPercent = basicTotal > 0 ? roundUnitCost(mandiTaxTotal * 100 / basicTotal) : 0;
+      const rebatePercent = grossTotal > 0 ? roundUnitCost(rebateTotal * 100 / grossTotal) : 0;
+      const effectiveCostPerUnit = totalQuantity > 0 ? roundUnitCost(netTotal / totalQuantity) : 0;
+      const first = completedEntries[0];
+      const purchaseResult = await client.query(
+        `INSERT INTO purchases (
+           supplier_id, supplier_name, total_amount, branch_id, created_by, basic_amount,
+           mandi_tax_percent, mandi_tax_amount, other_charges, gross_amount,
+           rebate_percent, rebate_amount, net_payable, paid_amount, balance_amount,
+           payment_timing, effective_cost_per_unit, freight_charges, labour_charges,
+           rebate_rule_id, payment_due_days, payment_status, payment_date,
+           purchase_type, payment_mode, payment_reference_number, remarks, purchase_bill_status,
+           bill_number, bill_date, lot_name, lot_size, stock_source, company_id, operational_location_id
+         ) VALUES (
+           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,
+           $24,$25,$26,$27,'BILL_COMPLETED',$28,$29,$30,$31,'PURCHASE',$32,$33
+         ) RETURNING *`,
+        [
+          first.supplier.id, first.supplier.supplier_name, netTotal, baseEntry.branchId, baseEntry.actorId,
+          basicTotal, mandiTaxPercent, mandiTaxTotal, baseEntry.otherCharges, grossTotal,
+          rebatePercent, rebateTotal, netTotal, paidAmount, balanceAmount,
+          first.rebateRule.rule_name, effectiveCostPerUnit, baseEntry.freightCharges, baseEntry.labourCharges,
+          first.rebateRule.id, first.rebateRule.pay_within_days, paymentStatus,
+          baseEntry.purchaseType === "CREDIT" ? null : baseEntry.paymentDate,
+          baseEntry.purchaseType, baseEntry.purchaseType === "CASH" ? baseEntry.paymentMode : null,
+          baseEntry.purchaseType === "CASH" ? baseEntry.paymentReferenceNumber : null,
+          baseEntry.remarks, baseEntry.billNumber, baseEntry.billDate,
+          entries.length === 1 ? entries[0].lotName : null,
+          entries.length === 1 ? entries[0].lotSize : null,
+          context?.company_id || null, context?.operational_location_id || null,
+        ]
+      );
+      purchase = purchaseResult.rows[0];
+
+      for (const item of completedEntries) {
+        const { entry, product, originType, unit, rebateRule, financials } = item;
+        const itemUnit = entry.unit || unit || product.unit || "";
+        const itemOriginType = entry.originType || originType || product.origin_type || "LOCAL";
+        const itemResult = await client.query(
+          `INSERT INTO purchase_items (
+             purchase_id, product_id, quantity, purchase_rate, amount, basic_amount,
+             mandi_tax_amount, other_charges, rebate_amount, net_payable, effective_cost_per_unit,
+             freight_charges, labour_charges, lot_name, lot_size, unit, origin_type
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
+          [purchase.id, entry.productId, entry.quantity, entry.purchaseRate, financials.netPayable,
+            financials.basicAmount, financials.mandiTaxAmount, entry.otherCharges,
+            financials.rebateAmount, financials.netPayable, financials.effectiveCostPerUnit,
+            entry.freightCharges, entry.labourCharges, entry.lotName, entry.lotSize,
+            itemUnit, itemOriginType]
+        );
+        const batchNo = `BATCH-${Date.now()}-${purchase.id}-${entry.lineIndex}`;
+        const lotResult = await client.query(
+          `INSERT INTO inventory_batches (
+             product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
+             supplier_id, supplier_name, branch_id, mandi_tax_amount, freight_charges, labour_charges,
+             other_charges, gross_amount, rebate_amount, net_payable, payment_timing, balance_amount,
+             purchase_id, batch_status, purchase_bill_status, lot_name, lot_size, stock_source, remarks,
+             purchase_date, unit, origin_type, company_id, operational_location_id, global_id
+           ) VALUES (
+             $1,$2,$3,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'ACTIVE',
+             'BILL_COMPLETED',$19,$20,'PURCHASE',$21,$22,$23,$24,$25,$26,$27
+           ) RETURNING *`,
+          [
+            entry.productId, batchNo, entry.quantity, entry.purchaseRate, financials.effectiveCostPerUnit,
+            first.supplier.id, first.supplier.supplier_name, baseEntry.branchId,
+            financials.mandiTaxAmount, entry.freightCharges, entry.labourCharges, entry.otherCharges,
+            financials.grossAmount, financials.rebateAmount, financials.netPayable, rebateRule.rule_name,
+            financials.balanceAmount, purchase.id, entry.lotName, entry.lotSize, entry.remarks,
+            baseEntry.purchaseDate, itemUnit, itemOriginType, context?.company_id || null,
+            context?.operational_location_id || null, entry.lotGlobalId,
+          ]
         );
         await client.query(
           `INSERT INTO stock_transactions (
              product_id, quantity, transaction_type, remarks, user_id, branch_id,
              company_id, operational_location_id
            ) VALUES ($1,$2,'IN',$3,$4,$5,$6,$7)`,
-          [
-            entry.productId,
-            entry.quantity,
-            `Stock arrival pending bill #${purchase.id}`,
-            entry.actorId,
-            entry.branchId,
-            context?.company_id || null,
-            context?.operational_location_id || null,
-          ]
+          [entry.productId, entry.quantity, `Purchase #${purchase.id}`, baseEntry.actorId,
+            baseEntry.branchId, context?.company_id || null, context?.operational_location_id || null]
         );
-        await client.query(
-          "INSERT INTO purchase_audit_trail (purchase_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'ADDED_ITEM', NULL, $2::jsonb, $3, $4)",
-          [purchase.id, JSON.stringify({ purchase, product_name: arrival.product.product_name }), "Purchase cart item added", manager.id]
-        );
-        createdPurchases.push({
-          ...purchase,
-          global_id: entry.purchaseGlobalId || null,
-          product_name: arrival.product.product_name,
+        createdItems.push({
+          ...itemResult.rows[0],
+          line_global_id: entry.lineGlobalId,
+          lot_global_id: entry.lotGlobalId,
         });
         createdLots.push(lotResult.rows[0]);
       }
-      const responsePayload = {
-        success: true,
-        message: "Stock Arrival Saved - Bill Pending",
-        purchase_ids: createdPurchases.map((purchase) => purchase.id),
-        purchases: createdPurchases,
-        lots: createdLots,
-        ...serverTimePayload(),
-      };
-      await completeV3BusinessOperation(
-        client,
-        req,
-        "purchase",
-        createdPurchases.map((purchase) => purchase.id).join(","),
-        responsePayload,
-        201
-      );
-      await client.query("COMMIT");
-      return res.status(201).json(responsePayload);
     }
 
-    const completedEntries = [];
-    const itemBasicTotal = entries.reduce((sum, entry) => sum + Number(entry.quantity || 0) * Number(entry.purchaseRate || 0), 0);
-    if (itemBasicTotal <= 0) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ message: "Completed purchase items require valid purchase rates" });
-    }
-    let usedFreight = 0;
-    let usedLabour = 0;
-    let usedOther = 0;
-    for (let index = 0; index < entries.length; index += 1) {
-      const entry = entries[index];
-      const itemBasic = Number(entry.quantity || 0) * Number(entry.purchaseRate || 0);
-      const isLast = index === entries.length - 1;
-      const freight = isLast ? roundCurrency(baseEntry.freightCharges - usedFreight) : roundCurrency(baseEntry.freightCharges * itemBasic / itemBasicTotal);
-      const labour = isLast ? roundCurrency(baseEntry.labourCharges - usedLabour) : roundCurrency(baseEntry.labourCharges * itemBasic / itemBasicTotal);
-      const other = isLast ? roundCurrency(baseEntry.otherCharges - usedOther) : roundCurrency(baseEntry.otherCharges * itemBasic / itemBasicTotal);
-      usedFreight = roundCurrency(usedFreight + freight);
-      usedLabour = roundCurrency(usedLabour + labour);
-      usedOther = roundCurrency(usedOther + other);
-      const itemEntry = { ...entry, freightCharges: freight, labourCharges: labour, otherCharges: other, purchaseType: "CREDIT", paidAmountInput: 0 };
-      const calculation = await buildPurchaseFinancials(client, itemEntry);
-      if (calculation.error) {
-        await client.query("ROLLBACK");
-        return res.status(calculation.status || 400).json({ message: calculation.error });
-      }
-      completedEntries.push({ entry: itemEntry, ...calculation });
-    }
-
-    const netTotal = roundCurrency(completedEntries.reduce((sum, item) => sum + Number(item.financials.netPayable || 0), 0));
-    if (baseEntry.purchaseType === "CASH" && baseEntry.paidAmountInput > netTotal) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({ message: "Paid amount cannot exceed net payable amount" });
-    }
-    let usedPaid = 0;
-    const createdPurchases = [];
-    const createdLots = [];
-    for (let index = 0; index < completedEntries.length; index += 1) {
-      const item = completedEntries[index];
-      const { entry, supplier, product, originType, unit, rebateRule } = item;
-      const itemUnit = entry.unit || unit || product.unit || "";
-      const itemOriginType = entry.originType || originType || product.origin_type || "LOCAL";
-      const isLast = index === completedEntries.length - 1;
-      const paidAmount = baseEntry.purchaseType === "CASH"
-        ? isLast
-          ? roundCurrency(baseEntry.paidAmountInput - usedPaid)
-          : roundCurrency(baseEntry.paidAmountInput * Number(item.financials.netPayable || 0) / netTotal)
-        : 0;
-      usedPaid = roundCurrency(usedPaid + paidAmount);
-      const balanceAmount = roundCurrency(Number(item.financials.netPayable || 0) - paidAmount);
-      const financials = {
-        ...item.financials,
-        paidAmount,
-        balanceAmount,
-        paymentStatus: balanceAmount === 0 ? "PAID" : paidAmount > 0 ? "PARTIAL" : "PENDING",
-      };
-      const purchaseResult = await client.query(
-        `
-        INSERT INTO purchases (
-          supplier_id, supplier_name, total_amount, branch_id, created_by, basic_amount,
-          mandi_tax_percent, mandi_tax_amount, other_charges, gross_amount,
-          rebate_percent, rebate_amount, net_payable, paid_amount, balance_amount,
-          payment_timing, effective_cost_per_unit, freight_charges, labour_charges,
-          rebate_rule_id, payment_due_days, payment_status, payment_date,
-          purchase_type, payment_mode, payment_reference_number, remarks, purchase_bill_status, bill_number, bill_date,
-          lot_name, lot_size, stock_source, company_id, operational_location_id
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, 'BILL_COMPLETED', $28, $29, $30, $31, 'PURCHASE', $32, $33)
-        RETURNING *
-        `,
-        [
-          supplier.id, supplier.supplier_name, financials.netPayable, entry.branchId, entry.actorId, financials.basicAmount,
-          financials.mandiTaxPercent, financials.mandiTaxAmount, entry.otherCharges, financials.grossAmount,
-          financials.rebatePercent, financials.rebateAmount, financials.netPayable, financials.paidAmount, financials.balanceAmount,
-          rebateRule.rule_name, financials.effectiveCostPerUnit, entry.freightCharges, entry.labourCharges,
-          rebateRule.id, rebateRule.pay_within_days, financials.paymentStatus, baseEntry.purchaseType === "CREDIT" ? null : baseEntry.paymentDate,
-          baseEntry.purchaseType, baseEntry.purchaseType === "CASH" ? baseEntry.paymentMode : null, baseEntry.purchaseType === "CASH" ? baseEntry.paymentReferenceNumber : null,
-          entry.remarks, entry.billNumber, entry.billDate, entry.lotName, entry.lotSize,
-          context?.company_id || null, context?.operational_location_id || null,
-        ]
-      );
-      const purchase = purchaseResult.rows[0];
-      await client.query(
-        `
-        INSERT INTO purchase_items (
-          purchase_id, product_id, quantity, purchase_rate, amount, basic_amount,
-          mandi_tax_amount, other_charges, rebate_amount, net_payable, effective_cost_per_unit,
-          freight_charges, labour_charges, lot_name, lot_size, unit, origin_type
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-        `,
-        [
-          purchase.id, entry.productId, entry.quantity, entry.purchaseRate, financials.netPayable, financials.basicAmount,
-          financials.mandiTaxAmount, entry.otherCharges, financials.rebateAmount, financials.netPayable, financials.effectiveCostPerUnit,
-          entry.freightCharges, entry.labourCharges, entry.lotName, entry.lotSize, itemUnit, itemOriginType,
-        ]
-      );
-      const batchNo = `BATCH-${Date.now()}-${purchase.id}`;
-      const lotResult = await client.query(
-        `
-        INSERT INTO inventory_batches (
-          product_id, batch_no, purchase_qty, remaining_qty, purchase_rate, effective_cost_per_unit,
-          supplier_id, supplier_name, branch_id, mandi_tax_amount, freight_charges, labour_charges,
-          other_charges, gross_amount, rebate_amount, net_payable, payment_timing, balance_amount,
-          purchase_id, batch_status, purchase_bill_status, lot_name, lot_size, stock_source, remarks, purchase_date, unit, origin_type,
-          company_id, operational_location_id, global_id
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'ACTIVE', 'BILL_COMPLETED', $20, $21, 'PURCHASE', $22, $23, $24, $25, $26, $27, $28)
-        RETURNING *
-        `,
-        [
-          entry.productId, batchNo, entry.quantity, entry.quantity, entry.purchaseRate, financials.effectiveCostPerUnit,
-          supplier.id, supplier.supplier_name, entry.branchId, financials.mandiTaxAmount, entry.freightCharges, entry.labourCharges,
-          entry.otherCharges, financials.grossAmount, financials.rebateAmount, financials.netPayable, rebateRule.rule_name,
-          financials.balanceAmount, purchase.id, entry.lotName, entry.lotSize, entry.remarks, entry.purchaseDate, itemUnit, itemOriginType,
-          context?.company_id || null, context?.operational_location_id || null, entry.lotGlobalId || null,
-        ]
-      );
-      await client.query(
-        `INSERT INTO stock_transactions (
-           product_id, quantity, transaction_type, remarks, user_id, branch_id,
-           company_id, operational_location_id
-         ) VALUES ($1,$2,'IN',$3,$4,$5,$6,$7)`,
-        [
-          entry.productId,
-          entry.quantity,
-          `Purchase #${purchase.id}`,
-          entry.actorId,
-          entry.branchId,
-          context?.company_id || null,
-          context?.operational_location_id || null,
-        ]
-      );
-      await client.query(
-        "INSERT INTO purchase_audit_trail (purchase_id, action, old_value, new_value, reason, edited_by) VALUES ($1, 'ADDED_ITEM', NULL, $2::jsonb, $3, $4)",
-        [purchase.id, JSON.stringify({ purchase, product_name: product.product_name, origin_type: originType }), "Purchase cart item added", entry.actorId]
-      );
-      createdPurchases.push({
-        ...purchase,
-        global_id: entry.purchaseGlobalId || null,
-        product_name: product.product_name,
-        origin_type: originType,
-      });
-      createdLots.push(lotResult.rows[0]);
-    }
-
+    const canonicalPurchase = { ...purchase, global_id: purchaseGlobalId };
+    const aggregatePayload = {
+      purchase: canonicalPurchase,
+      items: createdItems,
+      lots: createdLots,
+    };
+    await client.query(
+      "INSERT INTO purchase_audit_trail (purchase_id, action, old_value, new_value, reason, edited_by) VALUES ($1,'ADDED_ITEMS',NULL,$2::jsonb,$3,$4)",
+      [purchase.id, JSON.stringify(aggregatePayload), "Purchase aggregate created", baseEntry.actorId]
+    );
+    const purchaseChange = await logSyncChange(client, {
+      branchId: context?.branch_id || baseEntry.branchId,
+      operationalLocationId: context?.operational_location_id || null,
+      assignmentGeneration: context?.assignment_generation || null,
+      entityType: "purchase",
+      entityId: purchaseGlobalId,
+      operationType: "UPSERT",
+      version: 1,
+      payload: aggregatePayload,
+    });
     const responsePayload = {
       success: true,
-      message: "Purchase Saved",
-      purchase_ids: createdPurchases.map((purchase) => purchase.id),
-      purchases: createdPurchases,
+      message: baseEntry.purchaseBillStatus === "BILL_PENDING" ? "Stock Arrival Saved - Bill Pending" : "Purchase Saved",
+      purchase_id: purchase.id,
+      purchase_ids: [purchase.id],
+      purchase: canonicalPurchase,
+      purchases: [canonicalPurchase],
+      items: createdItems,
       lots: createdLots,
+      aggregate_change_id: purchaseChange.change_id,
       ...serverTimePayload(),
     };
-    await completeV3BusinessOperation(
-      client,
-      req,
-      "purchase",
-      createdPurchases.map((purchase) => purchase.id).join(","),
-      responsePayload,
-      201
-    );
+    await completeV3BusinessOperation(client, req, "purchase", purchase.id, responsePayload, 201);
     await client.query("COMMIT");
     return res.status(201).json(responsePayload);
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(error);
-    return res.status(500).json({ message: "Purchase Bill Error" });
+    return res.status(error.status || 500).json({
+      code: error.code || undefined,
+      message: error.status ? error.message : "Purchase Bill Error",
+    });
   } finally {
     client.release();
   }

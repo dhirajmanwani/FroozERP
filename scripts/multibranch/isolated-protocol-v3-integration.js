@@ -124,7 +124,12 @@ const prepareFixtures = async () => {
              '{"consolidated_reports":true,"manage_assignments":true}'::jsonb,
              TRUE, TRUE, 1
       FROM users u WHERE u.id = 1
-      ON CONFLICT (user_id, operational_location_id) DO NOTHING;
+      ON CONFLICT (user_id, operational_location_id) DO UPDATE SET
+        company_id = EXCLUDED.company_id,
+        branch_id = EXCLUDED.branch_id,
+        role_id = EXCLUDED.role_id,
+        permission_set = EXCLUDED.permission_set,
+        active = TRUE;
 
       INSERT INTO staff_location_assignments
         (user_id, company_id, branch_id, operational_location_id, role_id, permission_set,
@@ -133,7 +138,12 @@ const prepareFixtures = async () => {
              '{"consolidated_reports":true,"manage_assignments":true}'::jsonb,
              FALSE, TRUE, 1
       FROM users u WHERE u.id = 1
-      ON CONFLICT (user_id, operational_location_id) DO NOTHING;
+      ON CONFLICT (user_id, operational_location_id) DO UPDATE SET
+        company_id = EXCLUDED.company_id,
+        branch_id = EXCLUDED.branch_id,
+        role_id = EXCLUDED.role_id,
+        permission_set = EXCLUDED.permission_set,
+        active = TRUE;
 
       INSERT INTO device_assignments
         (device_id, company_id, branch_id, operational_location_id, physical_label, device_type,
@@ -144,7 +154,15 @@ const prepareFixtures = async () => {
          FALSE,'{"consolidated_reports":true,"manage_assignments":true}'::jsonb,'[1]'::jsonb,'["OWNER"]'::jsonb,1,TRUE,1),
         ('${SECOND_DEVICE}',1,2,${LOCATION_TWO},'Second staging device','laptop','POS',
          TRUE,'{"consolidated_reports":false,"manage_assignments":false}'::jsonb,'[1]'::jsonb,'["OWNER"]'::jsonb,1,TRUE,1)
-      ON CONFLICT (device_id, assignment_generation) DO NOTHING;
+      ON CONFLICT (device_id, assignment_generation) DO UPDATE SET
+        company_id = EXCLUDED.company_id,
+        branch_id = EXCLUDED.branch_id,
+        operational_location_id = EXCLUDED.operational_location_id,
+        fixed_operational = EXCLUDED.fixed_operational,
+        permission_set = EXCLUDED.permission_set,
+        permitted_user_ids = EXCLUDED.permitted_user_ids,
+        permitted_roles = EXCLUDED.permitted_roles,
+        active = TRUE;
     `);
     await client.query(
       fs.readFileSync(

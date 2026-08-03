@@ -65,6 +65,62 @@ const requiredIdempotencyKey = (body) => {
   return key;
 };
 
+const SUPPLIER_ACCOUNT_TYPES = new Set([
+  "SUPPLIER",
+  "TRANSPORT_VENDOR",
+  "COMMISSION_AGENT",
+]);
+const SUPPLIER_TYPES = new Set([
+  "LOCAL_SUPPLIER",
+  "IMPORTED_SUPPLIER",
+  "COMMISSION_AGENT",
+  "TRANSPORT_VENDOR",
+]);
+const supplierTypeFromAccountType = (value) => ({
+  SUPPLIER: "LOCAL_SUPPLIER",
+  TRANSPORT_VENDOR: "TRANSPORT_VENDOR",
+  COMMISSION_AGENT: "COMMISSION_AGENT",
+})[cleanText(value).toUpperCase()] || cleanText(value).toUpperCase();
+const readSupplierMasterPayload = (body = {}) => {
+  const supplierType = supplierTypeFromAccountType(body.supplier_type || body.account_type || "SUPPLIER");
+  const openingBalance = Number(body.opening_balance || 0);
+  if (!SUPPLIER_TYPES.has(supplierType) || !Number.isFinite(openingBalance) || openingBalance < 0) {
+    throw routeError(400, "SUPPLIER_INVALID", "Enter valid supplier account details");
+  }
+  const supplierName = cleanText(body.supplier_name || body.account_name, 160);
+  if (!supplierName) throw routeError(400, "SUPPLIER_NAME_REQUIRED", "Supplier name is required");
+  return {
+    supplier_name: supplierName,
+    firm_name: cleanText(body.firm_name, 160) || null,
+    mobile_number: cleanText(body.mobile_number, 30) || null,
+    alternate_number: cleanText(body.alternate_number, 30) || null,
+    address: cleanText(body.address, 2000) || null,
+    city: cleanText(body.city, 100) || null,
+    gst_number: cleanText(body.gst_number, 60) || null,
+    bank_name: cleanText(body.bank_name, 120) || null,
+    account_number: cleanText(body.account_number, 80) || null,
+    ifsc_code: cleanText(body.ifsc_code, 30) || null,
+    upi_id: cleanText(body.upi_id, 120) || null,
+    notes: cleanText(body.notes, 2000) || null,
+    opening_balance: openingBalance,
+    supplier_type: supplierType,
+    active: body.active !== false,
+    whatsapp_number: cleanText(body.whatsapp_number, 30) || null,
+    whatsapp_opt_in: body.whatsapp_opt_in !== false,
+  };
+};
+
+const supplierReferencePayload = (supplier) => ({
+  id: Number(supplier.id),
+  company_id: Number(supplier.company_id),
+  supplier_name: supplier.supplier_name,
+  firm_name: supplier.firm_name || null,
+  supplier_type: supplier.supplier_type,
+  active: supplier.active !== false,
+  created_at: supplier.created_at,
+  updated_at: supplier.updated_at,
+});
+
 const withTransaction = async (database, work, context = null, operationId = null) => {
   const client = typeof database.connect === "function" ? await database.connect() : database;
   try {
@@ -485,6 +541,192 @@ const registerOperationalV3Routes = ({
     );
     return res.json({ scope: context, products: result.rows, ...serverTimePayload() });
   });
+
+  use("get", "/api/v3/suppliers", async (_req, res, context) => {
+    const result = await database.query(
+      `SELECT id, company_id, supplier_name, firm_name, supplier_type, active, created_at, updated_at
+       FROM suppliers
+       WHERE company_id = $1
+       ORDER BY active DESC, supplier_name, id`,
+      [context.company_id]
+    );
+    return res.json({
+      suppliers: result.rows.map(supplierReferencePayload),
+      scope: { company_id: context.company_id },
+      ...serverTimePayload(),
+    });
+  });
+
+  const persistSupplierMaster = async (req, context, supplierId = null, deactivate = false) => {
+    const key = requiredIdempotencyKey(req.body);
+    return withTransaction(database, async (client) => {
+      const prior = await client.query(
+        `SELECT result_payload
+         FROM sync_processed_operations
+         WHERE operation_id = $1 AND company_id = $2 AND entity_type = 'supplier'
+         LIMIT 1`,
+        [key, context.company_id]
+      );
+      if (prior.rows?.[0]) return prior.rows[0].result_payload.supplier;
+
+      let supplier;
+      if (supplierId) {
+        const current = await client.query(
+          "SELECT * FROM suppliers WHERE id = $1 AND company_id = $2 FOR UPDATE",
+          [supplierId, context.company_id]
+        );
+        if (!current.rows?.[0]) {
+          throw routeError(404, "SUPPLIER_NOT_FOUND", "Supplier does not belong to the authenticated company");
+        }
+        if (deactivate) {
+          const result = await client.query(
+            `UPDATE suppliers
+             SET active = FALSE, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1 AND company_id = $2
+             RETURNING *`,
+            [supplierId, context.company_id]
+          );
+          supplier = result.rows[0];
+        } else {
+          const input = readSupplierMasterPayload(req.body);
+          const duplicate = await client.query(
+            `SELECT id FROM suppliers
+             WHERE company_id = $1 AND id <> $2
+               AND (
+                 LOWER(supplier_name) = LOWER($3)
+                 OR ($4::TEXT IS NOT NULL AND LOWER(COALESCE(firm_name, '')) = LOWER($4))
+               )
+             LIMIT 1`,
+            [context.company_id, supplierId, input.supplier_name, input.firm_name]
+          );
+          if (duplicate.rows?.[0]) {
+            throw routeError(409, "SUPPLIER_DUPLICATE", "This supplier already exists");
+          }
+          const result = await client.query(
+            `UPDATE suppliers
+             SET supplier_name = $3, firm_name = $4, mobile_number = $5,
+                 alternate_number = $6, address = $7, city = $8, gst_number = $9,
+                 bank_name = $10, account_number = $11, ifsc_code = $12, upi_id = $13,
+                 notes = $14, opening_balance = $15, supplier_type = $16, active = $17,
+                 whatsapp_number = $18, whatsapp_opt_in = $19, updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1 AND company_id = $2
+             RETURNING *`,
+            [
+              supplierId, context.company_id, input.supplier_name, input.firm_name,
+              input.mobile_number, input.alternate_number, input.address, input.city,
+              input.gst_number, input.bank_name, input.account_number, input.ifsc_code,
+              input.upi_id, input.notes, input.opening_balance, input.supplier_type,
+              input.active, input.whatsapp_number, input.whatsapp_opt_in,
+            ]
+          );
+          supplier = result.rows[0];
+        }
+      } else {
+        const input = readSupplierMasterPayload(req.body);
+        const duplicate = await client.query(
+          `SELECT id FROM suppliers
+           WHERE company_id = $1
+             AND (
+               LOWER(supplier_name) = LOWER($2)
+               OR ($3::TEXT IS NOT NULL AND LOWER(COALESCE(firm_name, '')) = LOWER($3))
+             )
+           LIMIT 1`,
+          [context.company_id, input.supplier_name, input.firm_name]
+        );
+        if (duplicate.rows?.[0]) {
+          throw routeError(409, "SUPPLIER_DUPLICATE", "This supplier already exists");
+        }
+        const result = await client.query(
+          `INSERT INTO suppliers (
+             company_id, supplier_name, firm_name, mobile_number, alternate_number,
+             address, city, gst_number, bank_name, account_number, ifsc_code, upi_id,
+             notes, opening_balance, supplier_type, active, whatsapp_number, whatsapp_opt_in
+           ) VALUES (
+             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18
+           ) RETURNING *`,
+          [
+            context.company_id, input.supplier_name, input.firm_name, input.mobile_number,
+            input.alternate_number, input.address, input.city, input.gst_number,
+            input.bank_name, input.account_number, input.ifsc_code, input.upi_id,
+            input.notes, input.opening_balance, input.supplier_type, input.active,
+            input.whatsapp_number, input.whatsapp_opt_in,
+          ]
+        );
+        supplier = result.rows[0];
+      }
+
+      const reference = supplierReferencePayload(supplier);
+      await client.query(
+        `INSERT INTO sync_change_log (
+           company_id, branch_id, operational_location_id, assignment_generation,
+           entity_type, entity_id, operation_type, entity_version, payload,
+           device_id, source_device_id, created_by_user_id, updated_by_user_id,
+           idempotency_key, created_at
+         ) VALUES (
+           $1,$2,NULL,NULL,'supplier',$3,'UPSERT',1,$4::jsonb,
+           $5,$5,$6,$6,$7,CURRENT_TIMESTAMP
+         )
+         ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING`,
+        [
+          context.company_id,
+          context.branch_id,
+          String(supplier.id),
+          JSON.stringify({
+            ...reference,
+            source_operation_id: key,
+            source_device_id: context.device_id,
+            source_user_id: context.user_id,
+          }),
+          context.device_id,
+          context.user_id,
+          `supplier:${key}`,
+        ]
+      );
+      const resultPayload = {
+        supplier: reference,
+        server_entity_version: 1,
+        server_updated_at: supplier.updated_at,
+      };
+      await client.query(
+        `INSERT INTO sync_processed_operations (
+           operation_id, device_id, company_id, branch_id, operational_location_id,
+           assignment_generation, created_by_user_id, source_device_id,
+           entity_type, entity_id, result_status, result_payload, processed_at
+         ) VALUES (
+           $1,$2,$3,$4,NULL,NULL,$5,$2,'supplier',$6,'processed',$7::jsonb,CURRENT_TIMESTAMP
+         )`,
+        [
+          key,
+          context.device_id,
+          context.company_id,
+          context.branch_id,
+          context.user_id,
+          String(supplier.id),
+          JSON.stringify(resultPayload),
+        ]
+      );
+      return reference;
+    }, context, key);
+  };
+
+  use("post", "/api/v3/suppliers", async (req, res, context) => {
+    const supplier = await persistSupplierMaster(req, context);
+    return res.status(201).json({ supplier, scope: { company_id: context.company_id }, ...serverTimePayload() });
+  }, { write: true });
+
+  use("put", "/api/v3/suppliers/:supplierId", async (req, res, context) => {
+    const supplierId = positiveId(req.params.supplierId);
+    if (!supplierId) throw routeError(400, "SUPPLIER_REQUIRED", "A supplier is required");
+    const supplier = await persistSupplierMaster(req, context, supplierId);
+    return res.json({ supplier, scope: { company_id: context.company_id }, ...serverTimePayload() });
+  }, { write: true });
+
+  use("delete", "/api/v3/suppliers/:supplierId", async (req, res, context) => {
+    const supplierId = positiveId(req.params.supplierId);
+    if (!supplierId) throw routeError(400, "SUPPLIER_REQUIRED", "A supplier is required");
+    const supplier = await persistSupplierMaster(req, context, supplierId, true);
+    return res.json({ supplier, scope: { company_id: context.company_id }, ...serverTimePayload() });
+  }, { write: true });
 
   use("put", "/api/v3/location-products/:productId", async (req, res, context) => {
     const productId = positiveId(req.params.productId);
@@ -1024,7 +1266,9 @@ module.exports = {
   canUseConsolidatedReports,
   nextTransferStatus,
   applyTransferStockEffect,
+  readSupplierMasterPayload,
   registerOperationalV3Routes,
+  supplierReferencePayload,
   validateAssignmentPreview,
   validatePaymentAllocation,
   validateTransferScope,

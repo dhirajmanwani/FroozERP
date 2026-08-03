@@ -7,7 +7,9 @@ const {
   canManageAssignments,
   canUseConsolidatedReports,
   nextTransferStatus,
+  readSupplierMasterPayload,
   registerOperationalV3Routes,
+  supplierReferencePayload,
   validateAssignmentPreview,
   validatePaymentAllocation,
   validateTransferScope,
@@ -117,7 +119,7 @@ const fakeResponse = () => ({
 test("location product route queries only canonical company, branch, and location", async () => {
   const routes = [];
   const app = {};
-  for (const method of ["get", "post", "put"]) {
+  for (const method of ["get", "post", "put", "delete"]) {
     app[method] = (path, ...handlers) => routes.push({ method, path, handler: handlers.at(-1) });
   }
   const calls = [];
@@ -145,7 +147,7 @@ test("location product route queries only canonical company, branch, and locatio
 test("consolidated report rejects an unauthorized selected location", async () => {
   const routes = [];
   const app = {};
-  for (const method of ["get", "post", "put"]) {
+  for (const method of ["get", "post", "put", "delete"]) {
     app[method] = (path, ...handlers) => routes.push({ method, path, handler: handlers.at(-1) });
   }
   const database = {
@@ -277,7 +279,7 @@ test("payment source validation uses deployed payment_amount columns", async () 
 test("protocol-v3 stock transactions set canonical publication attribution", async () => {
   const routes = [];
   const app = {};
-  for (const method of ["get", "post", "put"]) {
+  for (const method of ["get", "post", "put", "delete"]) {
     app[method] = (path, ...handlers) => routes.push({ method, path, handler: handlers.at(-1) });
   }
   const calls = [];
@@ -319,6 +321,119 @@ test("protocol-v3 stock transactions set canonical publication attribution", asy
   }, res);
   const attribution = calls.find((entry) => entry.sql.includes("SET_CONFIG('froozerp.device_id'"));
   assert.deepEqual(attribution.params, ["DEVICE-1", "1", "po-attribution-1"]);
+});
+
+test("supplier reference payload excludes financial, banking, contact, and note fields", () => {
+  const input = readSupplierMasterPayload({
+    account_name: "Safe Supplier",
+    account_type: "SUPPLIER",
+    opening_balance: 123,
+    bank_name: "Private Bank",
+    mobile_number: "9999999999",
+    notes: "Private note",
+  });
+  assert.equal(input.supplier_name, "Safe Supplier");
+  assert.equal(input.supplier_type, "LOCAL_SUPPLIER");
+  const reference = supplierReferencePayload({
+    id: 9,
+    company_id: 1,
+    supplier_name: input.supplier_name,
+    firm_name: null,
+    supplier_type: input.supplier_type,
+    active: true,
+    created_at: "2026-07-29T00:00:00.000Z",
+    updated_at: "2026-07-29T00:00:00.000Z",
+    opening_balance: input.opening_balance,
+    bank_name: input.bank_name,
+    mobile_number: input.mobile_number,
+    notes: input.notes,
+  });
+  assert.deepEqual(Object.keys(reference), [
+    "id",
+    "company_id",
+    "supplier_name",
+    "firm_name",
+    "supplier_type",
+    "active",
+    "created_at",
+    "updated_at",
+  ]);
+});
+
+test("supplier create uses canonical company attribution and one transactional publication", async () => {
+  const routes = [];
+  const app = {};
+  for (const method of ["get", "post", "put", "delete"]) {
+    app[method] = (path, ...handlers) => routes.push({ method, path, handler: handlers.at(-1) });
+  }
+  const calls = [];
+  const client = {
+    query: async (sql, params) => {
+      calls.push({ sql, params });
+      if (sql.includes("FROM sync_processed_operations")) return { rows: [] };
+      if (sql.includes("SELECT id FROM suppliers")) return { rows: [] };
+      if (sql.includes("INSERT INTO suppliers")) {
+        return {
+          rows: [{
+            id: 9,
+            company_id: 1,
+            supplier_name: "Safe Supplier",
+            firm_name: "Safe Firm",
+            supplier_type: "LOCAL_SUPPLIER",
+            active: true,
+            created_at: "2026-07-29T00:00:00.000Z",
+            updated_at: "2026-07-29T00:00:00.000Z",
+          }],
+        };
+      }
+      return { rows: [] };
+    },
+    release() {},
+  };
+  registerOperationalV3Routes({
+    app,
+    database: {
+      connect: async () => client,
+      query: async (sql, params) => client.query(sql, params),
+    },
+    resolveContext: async () => ({ context: ownerContext }),
+    sendScopeError: () => {
+      throw new Error("unexpected");
+    },
+  });
+  const route = routes.find(
+    (entry) => entry.method === "post" && entry.path === "/api/v3/suppliers"
+  );
+  const res = fakeResponse();
+  await route.handler({
+    method: "POST",
+    path: route.path,
+    query: {},
+    body: {
+      idempotency_key: "supplier-create-1",
+      account_name: "Safe Supplier",
+      account_type: "SUPPLIER",
+      firm_name: "Safe Firm",
+      opening_balance: 100,
+      bank_name: "Private Bank",
+      notes: "Private note",
+      company_id: 999,
+      operational_location_id: 999,
+    },
+  }, res);
+  assert.equal(res.statusCode, 201);
+  assert.equal(res.payload.supplier.company_id, 1);
+  const supplierInsert = calls.find((entry) => entry.sql.includes("INSERT INTO suppliers"));
+  assert.equal(supplierInsert.params[0], 1);
+  const publication = calls.find((entry) => entry.sql.includes("INSERT INTO sync_change_log"));
+  assert.deepEqual(publication.params.slice(0, 3), [1, 1, "9"]);
+  const publishedPayload = JSON.parse(publication.params[3]);
+  assert.equal("opening_balance" in publishedPayload, false);
+  assert.equal("bank_name" in publishedPayload, false);
+  assert.equal("notes" in publishedPayload, false);
+  assert.equal(calls.filter((entry) => entry.sql.includes("INSERT INTO sync_change_log")).length, 1);
+  assert.equal(calls.filter((entry) => entry.sql.includes("INSERT INTO sync_processed_operations")).length, 1);
+  assert.ok(calls.some((entry) => entry.sql === "COMMIT"));
 });
 
 test("assignment preview separates target scope from authenticated caller scope", async () => {

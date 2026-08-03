@@ -118,3 +118,25 @@ test("offline purchase replay preserves signed operation identities and canonica
   assert.match(backendSource, /lots: createdLots/);
   assert.match(backendSource, /\.\.\.serverTimePayload\(\)/);
 });
+
+test("protocol-v3 purchases accept established suppliers unless explicitly inactive", () => {
+  assert.match(
+    backendSource,
+    /const buildPurchaseFinancials[\s\S]*suppliers WHERE id = \$1 AND active IS DISTINCT FROM FALSE FOR SHARE/
+  );
+  assert.match(
+    backendSource,
+    /const getPurchasePartiesForArrival[\s\S]*suppliers WHERE id = \$1 AND active IS DISTINCT FROM FALSE FOR SHARE/
+  );
+});
+
+test("multi-line purchase aggregate creates one canonical header with child items and lots", () => {
+  const handler = backendSource.match(/const createPurchaseBillHandler[\s\S]*?app\.post\("\/purchase-bill"/)[0];
+  assert.match(handler, /const purchaseResult = await client\.query[\s\S]*purchase = purchaseResult\.rows\[0\]/);
+  assert.match(handler, /for \(const item of completedEntries\)[\s\S]*INSERT INTO purchase_items/);
+  assert.match(handler, /purchase_ids: \[purchase\.id\]/);
+  assert.match(handler, /purchases: \[canonicalPurchase\]/);
+  assert.match(handler, /entityType: "purchase"/);
+  assert.match(handler, /action, old_value, new_value[\s\S]*'ADDED_ITEMS'/);
+  assert.doesNotMatch(handler, /createdPurchases\.map/);
+});

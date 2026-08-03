@@ -255,7 +255,11 @@ test("desktop gateway converts upstream 502 into a clean cloud unavailable respo
   const runtime = await startDesktopBackend({
     databasePath,
     port,
-    extraEnv: { CLOUD_API_URL: `http://127.0.0.1:${cloudPort}` },
+    extraEnv: {
+      APPDATA: path.join(root, "AppData", "Roaming"),
+      LOCALAPPDATA: path.join(root, "AppData", "Local"),
+      CLOUD_API_URL: `http://127.0.0.1:${cloudPort}`,
+    },
   });
   try {
     const response = await fetch(`http://127.0.0.1:${port}/api/ai/briefing`);

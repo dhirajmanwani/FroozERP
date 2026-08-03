@@ -42,6 +42,19 @@ test("bootstrap captures canonical scope and reference records without writing c
     { rows: [{ high_watermark: "44" }] },
     { rows: [{ entity_id: "category-1", version: 1, payload: { company_id: 1 }, updated_at: "2026-07-27T00:00:00.000Z" }] },
     { rows: [{ entity_id: "product-276", version: 3, payload: { company_id: 1 }, updated_at: "2026-07-27T00:00:00.000Z" }] },
+    { rows: [{
+      entity_id: "5",
+      version: 1,
+      payload: {
+        id: 5,
+        company_id: 1,
+        supplier_name: "Reference Supplier",
+        firm_name: "Reference Firm",
+        supplier_type: "LOCAL_SUPPLIER",
+        active: true,
+      },
+      updated_at: "2026-07-27T00:00:00.000Z",
+    }] },
     { rows: [{ operational_location_id: 1001, product_id: "product-276", enabled: true }] },
     { rows: [{ entity_id: "lot-1", version: 2, payload: { company_id: 1, operational_location_id: 1001 }, updated_at: "2026-07-27T00:00:00.000Z" }] },
   ];
@@ -55,7 +68,13 @@ test("bootstrap captures canonical scope and reference records without writing c
   assert.equal(snapshot.protocol, REFERENCE_BOOTSTRAP_PROTOCOL);
   assert.equal(snapshot.high_watermark, "44");
   assert.equal(snapshot.device_id, "device-a");
-  assert.deepEqual(snapshot.records.map((row) => row.entity_type), ["product_category", "product", "inventory_lot"]);
+  assert.deepEqual(snapshot.records.map((row) => row.entity_type), ["product_category", "product", "supplier", "inventory_lot"]);
+  assert.equal(COMPANY_REFERENCE_ENTITY_TYPES.includes("supplier"), true);
+  assert.equal(snapshot.records[2].entity_id, "5");
+  assert.equal(snapshot.records[2].operational_location_id, null);
+  assert.equal("opening_balance" in snapshot.records[2].payload, false);
+  assert.equal("bank_name" in snapshot.records[2].payload, false);
+  assert.equal("notes" in snapshot.records[2].payload, false);
   assert.equal(statements.some((sql) => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(sql)), false);
 });
 

@@ -32,6 +32,7 @@ import { buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./loc
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode, writeConnectivityMode } from "./local/connectivityMode";
 import { filterSellableProducts, isSellableLot, lotAvailableQuantity, selectLocalPosInventory } from "./local/posInventory";
+import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, resolveReportDateRange } from "./local/reportRefresh";
 import { approvedDeviceCredentialMessage, normalizeDeviceBootstrapStatus } from "./local/freshDeviceOnboarding";
 import { getUserDisplayName, getUserInitial, getUserRoleLabel } from "./local/userPresentation";
@@ -124,6 +125,19 @@ const LEGACY_PRODUCTION_CLOUD_API_URLS = new Set([
   "https://froozerp-production.up.railway.app",
 ]);
 const DEFAULT_PRODUCTION_CLOUD_API_URL = "https://froozerp-production-27bb.up.railway.app";
+const ISOLATED_LOOPBACK_CLOUD_API_URL = (() => {
+  if (!import.meta.env.DEV || import.meta.env.VITE_ALLOW_LOOPBACK_CLOUD_FOR_ISOLATED_TESTS !== "true") return "";
+  const candidate = normalizeApiBase(import.meta.env.VITE_CLOUD_API_URL || "");
+  try {
+    const parsed = new URL(candidate);
+    return ["http:", "https:"].includes(parsed.protocol)
+      && ["localhost", "127.0.0.1", "::1"].includes(parsed.hostname.toLowerCase())
+      ? candidate
+      : "";
+  } catch {
+    return "";
+  }
+})();
 const canonicalizeCloudApiUrl = (value) => {
   const normalized = normalizeApiBase(value);
   return LEGACY_PRODUCTION_CLOUD_API_URLS.has(normalized) ? DEFAULT_PRODUCTION_CLOUD_API_URL : normalized;
@@ -131,7 +145,8 @@ const canonicalizeCloudApiUrl = (value) => {
 const sanitizeSavedApiConfigForRuntime = (config) => {
   const migratedConfig = {
     ...config,
-    cloudApiUrl: canonicalizeCloudApiUrl(config.cloudApiUrl || DEFAULT_PRODUCTION_CLOUD_API_URL),
+    cloudApiUrl: ISOLATED_LOOPBACK_CLOUD_API_URL
+      || canonicalizeCloudApiUrl(config.cloudApiUrl || DEFAULT_PRODUCTION_CLOUD_API_URL),
   };
   if (migratedConfig.cloudApiUrl !== config.cloudApiUrl) writeSavedApiConfig(migratedConfig);
   if (!isRailwayProductionHost()) return migratedConfig;
@@ -207,6 +222,7 @@ const BRANCH_LAN_API_URL = normalizeApiBase(
 );
 const CLOUD_API_URL = normalizeApiBase(
   RAILWAY_PRODUCTION_API_URL ||
+  ISOLATED_LOOPBACK_CLOUD_API_URL ||
   canonicalizeCloudApiUrl(SAVED_API_CONFIG.cloudApiUrl) ||
   import.meta.env.VITE_CLOUD_API_URL ||
   window.__FROOZERP_CLOUD_API_URL__ ||
@@ -337,6 +353,7 @@ const isValidHttpApiUrl = (value) => {
 };
 const isRealCloudUrl = (value) => {
   const url = String(value || "").trim();
+  if (ISOLATED_LOOPBACK_CLOUD_API_URL && normalizeApiBase(url) === ISOLATED_LOOPBACK_CLOUD_API_URL) return true;
   try {
     const parsed = new URL(url);
     return parsed.protocol === "https:"
@@ -833,7 +850,8 @@ const localSnapshotToInvoice = (snapshot) => {
 
 const getClientDeviceInfo = () => {
   const storageKey = "froozerp_device_id";
-  let deviceId = localStorage.getItem(storageKey);
+  const provisionedDeviceId = readOfflineSession()?.deviceId;
+  let deviceId = String(provisionedDeviceId || SAVED_API_CONFIG.deviceId || localStorage.getItem(storageKey) || "").trim();
   if (!deviceId) {
     const opaqueId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2, 14)}`;
     deviceId = `FZDEV-${opaqueId.toUpperCase()}`;
@@ -857,7 +875,7 @@ const getClientDeviceInfo = () => {
 
 const resolveLocalDeviceInfo = async (fallback = getClientDeviceInfo()) => {
   if (!isTauriRuntime()) return fallback;
-  const identity = await getOrCreateLocalDeviceIdentity().catch(() => null);
+  const identity = await getOrCreateLocalDeviceIdentity(fallback?.device_id).catch(() => null);
   if (!identity?.device_id) {
     throw new Error("The local device identity is not ready. Wait for the local service and retry.");
   }
@@ -1537,6 +1555,7 @@ function App() {
   const [purchases, setPurchases] = useState([]);
   const [purchaseSaveBusy, setPurchaseSaveBusy] = useState(false);
   const purchaseSaveInFlightRef = useRef(false);
+  const purchaseSubmissionRef = useRef(createPurchaseSubmissionTracker());
   const [accounts, setAccounts] = useState([]);
   const [accountLedger, setAccountLedger] = useState({ account: null, ledger: [] });
   const [accountPayments, setAccountPayments] = useState([]);
@@ -3058,6 +3077,10 @@ function App() {
 
   const applySettingsBundle = (bundle = {}) => {
     const nextSaleRateSettings = { ...defaultSaleRateSettings, ...(bundle.saleRateSettings || {}) };
+    const nextPurchaseRules = {
+      mandiTaxRules: bundle.mandiTaxRules || [],
+      rebateRules: bundle.rebateRules || [],
+    };
     setSettingsData({
       businessSettings: { ...defaultBusinessSettings, ...(bundle.businessSettings || {}) },
       saleRateSettings: nextSaleRateSettings,
@@ -3080,10 +3103,8 @@ function App() {
       systemInfo: bundle.systemInfo || {},
       canManageSettings: Boolean(bundle.canManageSettings),
     });
-    setSettingsRules({
-      mandiTaxRules: bundle.mandiTaxRules || [],
-      rebateRules: bundle.rebateRules || [],
-    });
+    setSettingsRules(nextPurchaseRules);
+    setPurchaseRules(nextPurchaseRules);
     setDiscountRules((bundle.discountRules || []).filter((rule) => rule.active !== false));
     setLotDiscounts(bundle.lotDiscounts || []);
     setProductDuplicateWarning(bundle.productDuplicateWarning || "");
@@ -3208,6 +3229,30 @@ function App() {
     const settingsPayload = values.settings || {};
     const branchId = String(currentUser?.branch_id || 1);
     const branchRecord = (settingsPayload.branches || []).find((row) => String(row.id) === branchId);
+    const cachedSupplierReferences = Array.isArray(localBundle.offlineSuppliers)
+      ? localBundle.offlineSuppliers
+      : [];
+    const supplierReferences = (
+      cachedSupplierReferences.length ? cachedSupplierReferences : (values.suppliers || [])
+    ).map((supplier) => ({
+      id: supplier.id,
+      company_id: supplier.company_id || currentUser?.company_id,
+      supplier_name: supplier.supplier_name || supplier.account_name || "",
+      firm_name: supplier.firm_name || "",
+      supplier_type: supplier.supplier_type || "LOCAL_SUPPLIER",
+      active: supplier.active !== false,
+      created_at: supplier.created_at || null,
+      updated_at: supplier.updated_at || null,
+      entity_version: supplier.entity_version || supplier.version || 1,
+    }));
+    const cachedMandiTaxRules = preserveVerifiedLocalCollection(
+      localBundle.mandiTaxRules,
+      purchaseRules.mandiTaxRules || []
+    );
+    const cachedRebateRules = preserveVerifiedLocalCollection(
+      localBundle.rebateRules,
+      purchaseRules.rebateRules || []
+    );
 
     return {
       cached_at: new Date().toISOString(),
@@ -3249,11 +3294,17 @@ function App() {
         counters: settingsPayload.counters || [],
         systemInfo: settingsPayload.systemInfo || {},
         canManageSettings: Boolean(settingsPayload.canManageSettings),
-        mandiTaxRules: settingsPayload.mandiTaxRules || [],
-        rebateRules: settingsPayload.rebateRules || [],
+        mandiTaxRules: preserveVerifiedLocalCollection(
+          settingsPayload.mandiTaxRules,
+          cachedMandiTaxRules
+        ),
+        rebateRules: preserveVerifiedLocalCollection(
+          settingsPayload.rebateRules,
+          cachedRebateRules
+        ),
         lotDiscounts: values.lotDiscounts || [],
         offlinePurchases: values.purchases || [],
-        offlineSuppliers: values.suppliers || [],
+        offlineSuppliers: supplierReferences,
         offlineAccounts: values.accounts || [],
         offlineAccountOutstanding: values.accountOutstanding || {},
         offlineExpenses: values.expenses || [],
@@ -3279,6 +3330,19 @@ function App() {
       applyCanonicalIdentityFromSync(initialSyncStatus);
     }
     const snapshot = await fetchOnlineReferenceSnapshot(currentUser, latestDevice);
+    const purchaseRulePayload = await loadPurchaseRules().catch((error) => {
+      writeDiagnosticLog("WARN", "purchase-rules-hydration-failed", {
+        message: error?.message || String(error),
+      });
+      return null;
+    });
+    if (purchaseRulePayload) {
+      snapshot.settings_bundle = {
+        ...(snapshot.settings_bundle || {}),
+        mandiTaxRules: purchaseRulePayload.mandiTaxRules || [],
+        rebateRules: purchaseRulePayload.rebateRules || [],
+      };
+    }
     await applyReferenceSnapshot(snapshot, { offline: false, nextView: initialView });
     try {
       const offlineSession = await cacheOfflineSession({
@@ -3371,8 +3435,32 @@ function App() {
   };
 
   const loadPurchaseRules = async () => {
-    const response = await axios.get(`${API_URL}/purchase-rules`);
+    const useCloudRules = readConnectivityMode() !== CONNECTIVITY_MODES.LOCAL_ONLY
+      && Boolean(CLOUD_OPERATIONAL_API_URL);
+    const rulesApiUrl = useCloudRules ? SYNC_API_URL : API_URL;
+    const response = await axios.get(
+      `${rulesApiUrl}/purchase-rules`,
+      useCloudRules ? createOperationalReadConfig(user) : undefined
+    );
     setPurchaseRules(response.data);
+    if (isTauriRuntime()) {
+      const latestDevice = await resolveLocalDeviceInfo(deviceInfo);
+      const snapshot = await loadLocalReferenceSnapshot({
+        username: user?.username || username,
+        deviceId: latestDevice.device_id,
+      }).catch(() => null);
+      if (snapshot?.reference_ready) {
+        await cacheLocalReferenceSnapshot({
+          ...snapshot,
+          settings_bundle: {
+            ...(snapshot.settings_bundle || {}),
+            mandiTaxRules: response.data?.mandiTaxRules || [],
+            rebateRules: response.data?.rebateRules || [],
+          },
+        });
+      }
+    }
+    return response.data;
   };
 
   const loadPurchases = async () => {
@@ -3733,6 +3821,22 @@ function App() {
   };
 
   const loadSupplierData = async (search = "") => {
+    if (isTauriRuntime()) {
+      const snapshot = await loadLocalReferenceSnapshot({
+        username: user?.username,
+        deviceId: deviceInfo.device_id,
+      }).catch(() => null);
+      const localSuppliers = snapshot?.settings_bundle?.offlineSuppliers;
+      if (Array.isArray(localSuppliers) && localSuppliers.length > 0) {
+        const normalizedSearch = String(search || "").trim().toLowerCase();
+        setSuppliers(normalizedSearch
+          ? localSuppliers.filter((supplier) =>
+              `${supplier.supplier_name || ""} ${supplier.firm_name || ""}`.toLowerCase().includes(normalizedSearch)
+            )
+          : localSuppliers);
+        return;
+      }
+    }
     const params = search ? { search } : {};
     const suppliersResponse = await axios.get(`${API_URL}/suppliers`, { params });
     setSuppliers(suppliersResponse.data);
@@ -4675,6 +4779,7 @@ function App() {
     const item = {
       line_id: editingPurchaseItemLineId || createPurchaseLineId(),
       product_id: product.id,
+      product_global_id: product.global_id || product.id,
       product_name: product.product_name,
       unit: product.unit,
       origin_type: product.origin_type || "LOCAL",
@@ -4813,19 +4918,20 @@ function App() {
         reason,
         remarks: purchaseRemarks,
       };
+      const aggregatePayload = { ...payload, items: purchaseCart };
+      const aggregateOperationId = purchaseSubmissionRef.current.resolve(aggregatePayload);
       const shouldQueueOfflinePurchase = isTauriRuntime() && !editingPurchaseId && (
         offlineMode ||
         internetAvailable === false ||
         cloudHealth?.online === false ||
-        connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY
+        connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY ||
+        readConnectivityMode() === CONNECTIVITY_MODES.LOCAL_ONLY
       );
       if (shouldQueueOfflinePurchase) {
-        const operationId = globalThis.crypto?.randomUUID?.() ||
-          `offline-purchase-${Date.now()}-${Math.random().toString(16).slice(2)}`;
         await queueLocalPurchase({
           ...payload,
-          operation_id: operationId,
-          provisional_reference: `OFF-PUR-${operationId}`,
+          operation_id: aggregateOperationId,
+          provisional_reference: `OFF-PUR-${aggregateOperationId}`,
           items: purchaseCart,
           company_id: user?.company_id || syncStatus?.canonicalIdentity?.company_id || "",
           branch_id: user?.branch_id || syncStatus?.canonicalIdentity?.branch_id || "",
@@ -4837,6 +4943,7 @@ function App() {
           device_id: deviceInfo?.device_id || "",
           user_id: user?.id ? String(user.id) : "",
         });
+        purchaseSubmissionRef.current.complete(aggregateOperationId);
         const snapshot = await loadLocalReferenceSnapshot({
           username: user?.username,
           deviceId: deviceInfo.device_id,
@@ -4851,14 +4958,14 @@ function App() {
       if (editingPurchaseId && purchaseBillStatus === "BILL_COMPLETED" && purchases.find((purchase) => Number(purchase.id) === Number(editingPurchaseId))?.purchase_bill_status === "BILL_PENDING") {
         const completionWrite = createOperationalWrite(user, payload);
         await axios.post(
-          `${API_URL}/api/v3/purchases/${editingPurchaseId}/complete-bill`,
+          `${SYNC_API_URL}/api/v3/purchases/${editingPurchaseId}/complete-bill`,
           completionWrite.body,
           completionWrite.config
         );
       } else if (editingPurchaseId) {
         const updateWrite = createOperationalWrite(user, payload);
         await axios.put(
-          `${API_URL}/api/v3/purchases/${editingPurchaseId}`,
+          `${SYNC_API_URL}/api/v3/purchases/${editingPurchaseId}`,
           updateWrite.body,
           updateWrite.config
         );
@@ -4867,12 +4974,13 @@ function App() {
           alert("Add at least one purchase item before saving.");
           return;
         }
-        const purchaseWrite = createOperationalWrite(user, { ...payload, items: purchaseCart });
+        const purchaseWrite = createOperationalWrite(user, aggregatePayload, aggregateOperationId);
         await axios.post(
-          `${API_URL}/api/v3/purchase-bills`,
+          `${SYNC_API_URL}/api/v3/purchase-bills`,
           purchaseWrite.body,
           purchaseWrite.config
         );
+        purchaseSubmissionRef.current.complete(aggregateOperationId);
       }
       if (purchaseAmendmentMode) {
         setPurchaseCart([]);
@@ -4880,7 +4988,20 @@ function App() {
       } else {
         resetPurchaseForm();
       }
-      await Promise.all([loadDashboardData(), loadPurchases(), loadSupplierData(), loadAccounts(), loadAccountOutstanding()]);
+      const postSaveRefreshResults = await Promise.allSettled([
+        loadDashboardData(),
+        loadPurchases(),
+        loadSupplierData(),
+        loadAccounts(),
+        loadAccountOutstanding(),
+      ]);
+      const postSaveRefreshFailures = postSaveRefreshResults.filter((result) => result.status === "rejected");
+      if (postSaveRefreshFailures.length) {
+        console.warn(
+          "Purchase saved, but optional module refreshes failed",
+          postSaveRefreshFailures.map((result) => getErrorMessage(result.reason, "Refresh failed"))
+        );
+      }
       alert(purchaseBillStatus === "BILL_PENDING" ? "Stock Arrival Saved - Bill Pending" : wasEditing ? "Purchase Updated" : "Purchase Saved");
     } catch (error) {
       alert(getErrorMessage(error, "Purchase Error"));
@@ -5214,7 +5335,7 @@ function App() {
     try {
       const cancellationWrite = createOperationalWrite(user, { reason, cancelled_by: user.id });
       await axios.post(
-        `${API_URL}/api/v3/purchases/${purchase.id}/cancel`,
+        `${SYNC_API_URL}/api/v3/purchases/${purchase.id}/cancel`,
         cancellationWrite.body,
         cancellationWrite.config
       );
@@ -5357,7 +5478,9 @@ function App() {
       if (["purchase", "pending-bills", "accounts"].includes(view)) {
         await loadSupplierData();
       }
-      if (["purchase", "pending-bills"].includes(view)) await loadPurchases();
+      if (["purchase", "pending-bills"].includes(view)) {
+        await Promise.all([loadPurchases(), loadPurchaseRules()]);
+      }
       if (view === "pending-bills") await Promise.all([loadCustomerPendingBills(), loadCustomerData()]);
       if (view === "accounts") {
         await Promise.all([loadAccounts(), loadCustomerData(), loadSupplierData(), loadAccountOutstanding()]);
@@ -6071,9 +6194,13 @@ function App() {
               {purchases.some((purchase) => purchase.operation_id) && (
                 <ModuleCard eyebrow="Offline Replay" title="Queued Purchase Arrivals" subtitle="Local purchase intent remains visible until the cloud acknowledges it.">
                   <DataTable headers={["Reference", "Purchase Date", "Bill State", "Sync State", "Detail"]}>
-                    {purchases.filter((purchase) => purchase.operation_id).map((purchase) => (
+                    {Array.from(new Map(
+                      purchases
+                        .filter((purchase) => purchase.operation_id)
+                        .map((purchase) => [purchase.operation_id, purchase])
+                    ).values()).map((purchase) => (
                       <tr key={purchase.operation_id}>
-                        <td className="primary-cell">{purchase.provisional_reference}</td>
+                        <td className="primary-cell">{purchase.provisional_reference || purchase.offline_purchase_ref}</td>
                         <td>{purchase.purchase_date}</td>
                         <td>{purchase.purchase_bill_status === "BILL_PENDING" ? "Pending Bill" : purchase.purchase_type === "CASH" ? "Paid Purchase" : "Credit Purchase"}</td>
                         <td><span className={purchase.sync_status === "completed" ? "stock-ok" : purchase.sync_status === "failed" || purchase.sync_status === "conflict" ? "stock-low" : "origin-rate"}>{purchase.sync_status === "syncing" ? "Syncing" : purchase.sync_status === "completed" ? "Cloud Confirmed" : purchase.sync_status === "failed" ? "Failed - Retry Available" : purchase.sync_status === "conflict" ? "Conflict - Review Required" : "Pending Cloud Acknowledgement"}</span></td>
@@ -11966,8 +12093,23 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
         alert(payload.account_type === "CUSTOMER" ? "This customer already exists." : "This supplier already exists.");
         return;
       }
-      if (editingKey) await axios.put(`${API_URL}/accounts/${editingKey}`, payload);
-      else await axios.post(`${API_URL}/accounts`, payload);
+      const supplierAccount = ["SUPPLIER", "TRANSPORT_VENDOR", "COMMISSION_AGENT"].includes(payload.account_type);
+      if (supplierAccount) {
+        if (readConnectivityMode() === CONNECTIVITY_MODES.LOCAL_ONLY) {
+          throw new Error("Supplier master changes require Auto mode. Existing suppliers remain available for local purchases.");
+        }
+        const supplierId = editingKey.startsWith("SUPPLIER-") ? editingKey.slice("SUPPLIER-".length) : "";
+        const write = createOperationalWrite(user, payload);
+        if (supplierId) {
+          await axios.put(`${SYNC_API_URL}/api/v3/suppliers/${supplierId}`, write.body, write.config);
+        } else {
+          await axios.post(`${SYNC_API_URL}/api/v3/suppliers`, write.body, write.config);
+        }
+      } else if (editingKey) {
+        await axios.put(`${API_URL}/accounts/${editingKey}`, payload);
+      } else {
+        await axios.post(`${API_URL}/accounts`, payload);
+      }
       setDraft(emptyAccount);
       setEditingKey("");
       await onReload();

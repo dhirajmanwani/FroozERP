@@ -201,10 +201,7 @@ struct BackendOwnershipRecord {
 }
 
 fn diagnostic_log_path() -> PathBuf {
-    env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| env::temp_dir())
-        .join("com.srtcompany.froozerp")
+    app_data_dir()
         .join("logs")
         .join("froozerp-startup.log")
 }
@@ -240,6 +237,14 @@ fn tail_text_file(path: &Path, max_bytes: usize) -> String {
 }
 
 fn app_data_dir() -> PathBuf {
+    if env::var("NODE_ENV").ok().as_deref() == Some("test") {
+        if let Some(path) = env::var_os("FROOZERP_ISOLATED_SQLITE_DIR")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+        {
+            return path;
+        }
+    }
     env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| env::temp_dir())
@@ -2032,8 +2037,11 @@ fn local_load_reference_snapshot(
 }
 
 #[tauri::command]
-fn local_get_or_create_device_identity(app: AppHandle) -> Result<serde_json::Value, String> {
-    local_db::ensure_device_identity(&app)
+fn local_get_or_create_device_identity(
+    app: AppHandle,
+    preferred_device_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    local_db::ensure_device_identity(&app, preferred_device_id.as_deref())
 }
 
 #[tauri::command]
@@ -2212,6 +2220,36 @@ mod local_backend_lifecycle_tests {
         assert!(spawned_backend_owns_port(42, Some(42)));
         assert!(!spawned_backend_owns_port(42, Some(84)));
         assert!(!spawned_backend_owns_port(42, None));
+    }
+
+    #[test]
+    fn test_runtime_uses_the_isolated_sqlite_directory_for_backend_and_logs() {
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let original_node_env = env::var_os("NODE_ENV");
+        let original_isolated_dir = env::var_os("FROOZERP_ISOLATED_SQLITE_DIR");
+        let isolated_dir = env::temp_dir().join(format!(
+            "froozerp-isolated-app-data-{}-{}",
+            std::process::id(),
+            timestamp_ms()
+        ));
+        env::set_var("NODE_ENV", "test");
+        env::set_var("FROOZERP_ISOLATED_SQLITE_DIR", &isolated_dir);
+
+        assert_eq!(app_data_dir(), isolated_dir);
+        assert_eq!(local_sqlite_database_path(), isolated_dir.join("froozerp-local.sqlite3"));
+        assert_eq!(
+            diagnostic_log_path(),
+            isolated_dir.join("logs").join("froozerp-startup.log")
+        );
+
+        match original_node_env {
+            Some(value) => env::set_var("NODE_ENV", value),
+            None => env::remove_var("NODE_ENV"),
+        }
+        match original_isolated_dir {
+            Some(value) => env::set_var("FROOZERP_ISOLATED_SQLITE_DIR", value),
+            None => env::remove_var("FROOZERP_ISOLATED_SQLITE_DIR"),
+        }
     }
 
     #[test]

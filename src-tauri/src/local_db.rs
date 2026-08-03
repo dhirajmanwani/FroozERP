@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
-const CURRENT_SCHEMA_VERSION: &str = "014_offline_purchase_grn";
+const CURRENT_SCHEMA_VERSION: &str = "016_purchase_aggregate_reconciliation";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -21,6 +21,8 @@ const MIGRATION_011: &str = include_str!("../migrations/sqlite/011_connectivity_
 const MIGRATION_012: &str = include_str!("../migrations/sqlite/012_connectivity_mode_server_time.sql");
 const MIGRATION_013: &str = include_str!("../migrations/sqlite/013_operational_location_foundation.sql");
 const MIGRATION_014: &str = include_str!("../migrations/sqlite/014_offline_purchase_grn.sql");
+const MIGRATION_015: &str = include_str!("../migrations/sqlite/015_supplier_reference_cache.sql");
+const MIGRATION_016: &str = include_str!("../migrations/sqlite/016_purchase_aggregate_reconciliation.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -121,10 +123,13 @@ pub struct LocalPurchaseIntentResult {
     pub pending_operations: i64,
 }
 
-pub fn ensure_device_identity(app: &AppHandle) -> Result<serde_json::Value, String> {
+pub fn ensure_device_identity(
+    app: &AppHandle,
+    preferred_device_id: Option<&str>,
+) -> Result<serde_json::Value, String> {
     let path = database_path(app)?;
     initialize_at(&path)?;
-    ensure_device_identity_at(&path)
+    ensure_device_identity_with_preference_at(&path, preferred_device_id)
 }
 
 pub fn cache_reference_snapshot(app: &AppHandle, snapshot: &serde_json::Value) -> Result<LocalDbStatus, String> {
@@ -842,9 +847,18 @@ pub fn list_local_purchase_intents(app: &AppHandle) -> Result<Vec<serde_json::Va
 
 fn queue_local_purchase_at(path: &Path, mut purchase: serde_json::Value) -> Result<LocalPurchaseIntentResult, String> {
     initialize_at(path)?;
+    let operation_id = required_text(&purchase, "operation_id")?;
+    let provisional_purchase_id = optional_text(&purchase, "purchase_global_id")
+        .unwrap_or_else(|| format!("offline-purchase-{operation_id}"));
+    purchase
+        .as_object_mut()
+        .ok_or_else(|| "Offline purchase payload is invalid".to_string())?
+        .insert(
+            "purchase_global_id".to_string(),
+            serde_json::Value::String(provisional_purchase_id.clone()),
+        );
     let submitted_payload = serde_json::to_string(&purchase).map_err(to_error)?;
     let intent_checksum = checksum(&submitted_payload);
-    let operation_id = required_text(&purchase, "operation_id")?;
     let provisional_reference = optional_text(&purchase, "provisional_reference")
         .unwrap_or_else(|| format!("OFF-PUR-{operation_id}"));
     let supplier_id = required_text(&purchase, "supplier_id")?;
@@ -899,13 +913,15 @@ fn queue_local_purchase_at(path: &Path, mut purchase: serde_json::Value) -> Resu
     let intent_id = format!("purchase-intent-{operation_id}");
     tx.execute(
         "INSERT INTO local_purchase_intents (
-            id, operation_id, provisional_reference, supplier_id, purchase_date,
-            purchase_bill_status, purchase_type, intent_checksum, payload_json, state
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'pending')",
+            id, operation_id, provisional_reference, provisional_purchase_id,
+            supplier_id, purchase_date, purchase_bill_status, purchase_type,
+            intent_checksum, payload_json, state
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'pending')",
         params![
             intent_id,
             operation_id,
             provisional_reference,
+            provisional_purchase_id,
             supplier_id,
             purchase_date,
             purchase_bill_status,
@@ -935,8 +951,10 @@ fn queue_local_purchase_at(path: &Path, mut purchase: serde_json::Value) -> Resu
             return Err("Offline purchase quantities must be greater than zero".to_string());
         }
         let line_index = index + 1;
-        let provisional_purchase_id = optional_text(item, "purchase_global_id")
-            .unwrap_or_else(|| format!("offline-purchase-{operation_id}-{line_index}"));
+        let provisional_line_id = optional_text(item, "line_global_id")
+            .or_else(|| optional_text(item, "purchase_global_id"))
+            .filter(|value| value != &provisional_purchase_id)
+            .unwrap_or_else(|| format!("offline-purchase-line-{operation_id}-{line_index}"));
         let provisional_lot_id = optional_text(item, "lot_global_id")
             .unwrap_or_else(|| format!("offline-lot-{operation_id}-{line_index}"));
         let purchase_rate = item.get("purchase_rate").and_then(json_number);
@@ -955,6 +973,7 @@ fn queue_local_purchase_at(path: &Path, mut purchase: serde_json::Value) -> Resu
         normalized_object.insert("product_global_id".to_string(), serde_json::Value::String(product.0.clone()));
         normalized_object.insert("product_name".to_string(), serde_json::Value::String(product.1.clone()));
         normalized_object.insert("purchase_global_id".to_string(), serde_json::Value::String(provisional_purchase_id.clone()));
+        normalized_object.insert("line_global_id".to_string(), serde_json::Value::String(provisional_line_id.clone()));
         normalized_object.insert("lot_global_id".to_string(), serde_json::Value::String(provisional_lot_id.clone()));
         normalized_object.insert("line_index".to_string(), serde_json::json!(line_index));
         if normalized_object.get("unit").and_then(|value| value.as_str()).unwrap_or("").is_empty() {
@@ -963,15 +982,15 @@ fn queue_local_purchase_at(path: &Path, mut purchase: serde_json::Value) -> Resu
         let normalized_json = serde_json::to_string(&normalized).map_err(to_error)?;
         tx.execute(
             "INSERT INTO local_purchase_intent_lines (
-                id, intent_id, line_index, provisional_purchase_id, provisional_lot_id,
-                product_id, quantity, unit, purchase_rate, expected_purchase_rate,
-                temporary_sale_rate, lot_name, lot_size, payload_json
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                id, intent_id, line_index, provisional_purchase_id, provisional_line_id,
+                provisional_lot_id, product_id, quantity, unit, purchase_rate,
+                expected_purchase_rate, temporary_sale_rate, lot_name, lot_size, payload_json
+             ) VALUES (?1,?2,?3,?4,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 format!("purchase-intent-line-{operation_id}-{line_index}"),
                 intent_id,
                 line_index as i64,
-                provisional_purchase_id,
+                provisional_line_id,
                 provisional_lot_id,
                 product.0,
                 quantity,
@@ -2026,9 +2045,31 @@ pub fn pending_outbox_count(app: &AppHandle) -> Result<i64, String> {
 }
 
 fn database_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_dir = app.path().app_data_dir().map_err(to_error)?;
+    let default_app_dir = app.path().app_data_dir().map_err(to_error)?;
+    let app_dir = resolve_app_data_dir(
+        default_app_dir,
+        std::env::var("NODE_ENV").ok().as_deref(),
+        std::env::var_os("FROOZERP_ISOLATED_SQLITE_DIR").map(PathBuf::from),
+    )?;
     fs::create_dir_all(&app_dir).map_err(to_error)?;
     Ok(app_dir.join(LOCAL_DB_FILE))
+}
+
+fn resolve_app_data_dir(
+    default_app_dir: PathBuf,
+    node_env: Option<&str>,
+    isolated_dir: Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    if node_env != Some("test") {
+        return Ok(default_app_dir);
+    }
+    let Some(isolated_dir) = isolated_dir else {
+        return Ok(default_app_dir);
+    };
+    if !isolated_dir.is_absolute() {
+        return Err("FROOZERP_ISOLATED_SQLITE_DIR must be an absolute path.".to_string());
+    }
+    Ok(isolated_dir)
 }
 
 fn initialize_at(path: &Path) -> Result<(), String> {
@@ -2061,6 +2102,8 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "012_connectivity_mode_server_time", MIGRATION_012)?;
     apply_migration(&mut conn, "013_operational_location_foundation", MIGRATION_013)?;
     apply_migration(&mut conn, "014_offline_purchase_grn", MIGRATION_014)?;
+    apply_migration(&mut conn, "015_supplier_reference_cache", MIGRATION_015)?;
+    apply_migration(&mut conn, "016_purchase_aggregate_reconciliation", MIGRATION_016)?;
     Ok(())
 }
 
@@ -2144,7 +2187,9 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
         .or_else(|| snapshot.get("device_identity").and_then(|value| optional_text(value, "branch_id")))
         .unwrap_or_else(|| "1".to_string());
     let device_identity = snapshot.get("device_identity").cloned().unwrap_or_else(|| serde_json::json!({}));
-    let device_id = optional_text(&device_identity, "device_id").unwrap_or_else(|| "default".to_string());
+    let device_id = optional_text(&device_identity, "device_id")
+        .filter(|value| value != "default")
+        .ok_or_else(|| "Reference snapshot has no canonical device identity".to_string())?;
     let device_name = optional_text(&device_identity, "device_name").unwrap_or_else(|| "FroozERP Device".to_string());
     let platform = optional_text(&device_identity, "platform").unwrap_or_else(|| "tauri-windows".to_string());
     let app_version = optional_text(&device_identity, "app_version").unwrap_or_else(|| "1.0.0".to_string());
@@ -2224,6 +2269,17 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
         [serde_json::to_string(&reference_meta).map_err(to_error)?],
     )
     .map_err(to_error)?;
+
+    let canonical_scope: Option<(String, String)> = tx
+        .query_row(
+            "SELECT company_id, operational_location_id
+             FROM local_device_assignment
+             WHERE device_id = ?1 AND active = 1",
+            [device_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(to_error)?;
 
     tx.execute("DELETE FROM local_inventory_lots WHERE COALESCE(branch_id, '1') = ?1", [branch_id.as_str()])
         .map_err(to_error)?;
@@ -2307,8 +2363,9 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
             tx.execute(
                 "INSERT INTO local_products (
                     id, cloud_id, branch_id, product_name, category_id, category_name, unit, barcode,
-                    sale_rate, minimum_stock, active, remarks, created_at, updated_at, version, sync_status, deleted_at
-                 ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?13, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?14, 'synced', ?15)",
+                    sale_rate, minimum_stock, active, remarks, created_at, updated_at, version, sync_status,
+                    deleted_at, company_id
+                 ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?13, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?14, 'synced', ?15, ?16)",
                 params![
                     product_id,
                     branch_id,
@@ -2325,6 +2382,8 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                     optional_text(product, "updated_at"),
                     product.get("entity_version").or_else(|| product.get("version")).and_then(|value| value.as_i64()).unwrap_or(1),
                     optional_text(product, "deleted_at"),
+                    optional_text(product, "company_id")
+                        .or_else(|| canonical_scope.as_ref().map(|scope| scope.0.clone())),
                 ],
             )
             .map_err(to_error)?;
@@ -2349,10 +2408,12 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                     id, cloud_id, branch_id, product_id, product_name, supplier_id, supplier_name,
                     lot_no, size_grade, opening_date, opening_qty, purchased_qty, sold_qty, returned_qty, waste_qty,
                     adjusted_qty, transfer_in_qty, transfer_out_qty, balance_qty, cost_rate, sale_rate, status,
-                    remarks, created_at, updated_at, version, sync_status, deleted_at
+                    remarks, created_at, updated_at, version, sync_status, deleted_at,
+                    company_id, operational_location_id
                  ) VALUES (
                     ?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                    ?20, ?21, COALESCE(?22, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?23, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?24, 'synced', ?25
+                    ?20, ?21, COALESCE(?22, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?23, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?24, 'synced', ?25,
+                    ?26, ?27
                  )",
                 params![
                     lot_id,
@@ -2384,6 +2445,10 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                     optional_text(lot, "updated_at"),
                     lot.get("entity_version").or_else(|| lot.get("version")).and_then(|value| value.as_i64()).unwrap_or(1),
                     optional_text(lot, "deleted_at"),
+                    optional_text(lot, "company_id")
+                        .or_else(|| canonical_scope.as_ref().map(|scope| scope.0.clone())),
+                    optional_text(lot, "operational_location_id")
+                        .or_else(|| canonical_scope.as_ref().map(|scope| scope.1.clone())),
                 ],
             )
             .map_err(to_error)?;
@@ -2518,12 +2583,42 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
         }
     }
 
+    if let Some(suppliers) = snapshot
+        .get("settings_bundle")
+        .and_then(|value| value.get("offlineSuppliers"))
+        .and_then(|value| value.as_array())
+    {
+        for supplier in suppliers {
+            let supplier_id = optional_text(supplier, "id")
+                .ok_or_else(|| "Supplier reference has no canonical identity".to_string())?;
+            upsert_supplier_reference_with_tx(
+                &tx,
+                &supplier_id,
+                supplier,
+                optional_text(supplier, "updated_at"),
+                supplier.get("entity_version").or_else(|| supplier.get("version")).and_then(|value| value.as_i64()).unwrap_or(1),
+                false,
+            )?;
+        }
+    }
+
     if let Some(settings_bundle) = snapshot.get("settings_bundle").and_then(|value| value.as_object()) {
         for (key, value) in settings_bundle {
+            if key == "offlineSuppliers" {
+                continue;
+            }
             tx.execute(
                 "INSERT INTO local_settings (
                     id, cloud_id, branch_id, setting_key, setting_value, created_at, updated_at, version, sync_status
-                 ) VALUES (?1, ?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 1, 'synced')",
+                 ) VALUES (?1, ?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 1, 'synced')
+                 ON CONFLICT(id) DO UPDATE SET
+                   branch_id = excluded.branch_id,
+                   setting_key = excluded.setting_key,
+                   setting_value = excluded.setting_value,
+                   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                   version = local_settings.version + 1,
+                   sync_status = 'synced',
+                   deleted_at = NULL",
                 params![
                     format!("setting-{}-{}", branch_id, key),
                     branch_id,
@@ -2768,6 +2863,33 @@ fn load_reference_snapshot_at(
         }
         serde_json::Value::Object(map)
     };
+    let offline_suppliers = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id, company_id, supplier_name, firm_name, supplier_type, active,
+                        created_at, updated_at, version
+                 FROM local_supplier_references
+                 WHERE deleted_at IS NULL
+                 ORDER BY supplier_name, id",
+            )
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "company_id": row.get::<_, String>(1)?,
+                    "supplier_name": row.get::<_, String>(2)?,
+                    "firm_name": row.get::<_, Option<String>>(3)?,
+                    "supplier_type": row.get::<_, String>(4)?,
+                    "active": row.get::<_, i64>(5)? == 1,
+                    "created_at": row.get::<_, Option<String>>(6)?,
+                    "updated_at": row.get::<_, String>(7)?,
+                    "entity_version": row.get::<_, i64>(8)?,
+                }))
+            })
+            .map_err(to_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?
+    };
     let mut offline_purchases = settings_bundle
         .get("offlinePurchases")
         .and_then(|value| value.as_array())
@@ -2781,6 +2903,7 @@ fn load_reference_snapshot_at(
     }
     if let Some(bundle) = settings_bundle.as_object_mut() {
         bundle.insert("offlinePurchases".to_string(), serde_json::Value::Array(offline_purchases.clone()));
+        bundle.insert("offlineSuppliers".to_string(), serde_json::Value::Array(offline_suppliers));
     }
 
     let sales_history = {
@@ -2902,26 +3025,62 @@ fn single_optional_string(conn: &Connection, sql: &str, params: &[&dyn rusqlite:
 }
 
 pub fn ensure_device_identity_at(path: &Path) -> Result<serde_json::Value, String> {
+    ensure_device_identity_with_preference_at(path, None)
+}
+
+fn ensure_device_identity_with_preference_at(
+    path: &Path,
+    preferred_device_id: Option<&str>,
+) -> Result<serde_json::Value, String> {
     let conn = Connection::open(path).map_err(to_error)?;
+    let preferred_device_id = preferred_device_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"));
+    if let Some(preferred_device_id) = preferred_device_id {
+        if let Some(existing) = conn
+            .query_row(
+                "SELECT device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at, last_sync_at
+                 FROM local_device_identity
+                 WHERE device_id = ?1
+                 LIMIT 1",
+                [preferred_device_id],
+                device_identity_from_row,
+            )
+            .optional()
+            .map_err(to_error)?
+        {
+            return Ok(existing);
+        }
+
+        let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows Device".to_string());
+        let device_name = format!("{} - FroozERP", hostname);
+        let app_version = env!("CARGO_PKG_VERSION");
+        conn.execute(
+            "INSERT INTO local_device_identity (
+                device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at, updated_at
+             ) VALUES (?1, ?2, 'tauri-windows', ?3, 'unassigned', 'pending', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            params![preferred_device_id, device_name, app_version],
+        )
+        .map_err(to_error)?;
+        return Ok(serde_json::json!({
+            "device_id": preferred_device_id,
+            "device_name": device_name,
+            "platform": "tauri-windows",
+            "app_version": app_version,
+            "branch_id": "unassigned",
+            "registration_status": "pending",
+        }));
+    }
+
     if let Some(existing) = conn
         .query_row(
             "SELECT device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at, last_sync_at
              FROM local_device_identity
-             ORDER BY updated_at DESC, rowid DESC
+             ORDER BY CASE WHEN device_id = 'default' THEN 1 ELSE 0 END,
+                      updated_at DESC, rowid DESC
              LIMIT 1",
             [],
-            |row| {
-                Ok(serde_json::json!({
-                    "device_id": row.get::<_, String>(0)?,
-                    "device_name": row.get::<_, String>(1)?,
-                    "platform": row.get::<_, String>(2)?,
-                    "app_version": row.get::<_, String>(3)?,
-                    "branch_id": row.get::<_, String>(4)?,
-                    "registration_status": row.get::<_, String>(5)?,
-                    "last_seen_at": row.get::<_, Option<String>>(6)?,
-                    "last_sync_at": row.get::<_, Option<String>>(7)?,
-                }))
-            },
+            device_identity_from_row,
         )
         .optional()
         .map_err(to_error)?
@@ -3095,16 +3254,41 @@ fn apply_purchase_ack_with_tx(
         )
         .map_err(to_error)?;
         if let Some(payload) = ack.result_payload.as_ref() {
-            for purchase in payload.get("purchases").and_then(|value| value.as_array()).into_iter().flatten() {
-                if let (Some(global_id), Some(server_id)) = (
-                    optional_text(purchase, "global_id"),
-                    optional_text(purchase, "id"),
+            let canonical_purchase_id = payload
+                .get("purchase")
+                .and_then(|purchase| optional_text(purchase, "id"))
+                .or_else(|| {
+                    payload
+                        .get("purchase_ids")
+                        .and_then(|value| value.as_array())
+                        .and_then(|ids| ids.first())
+                        .and_then(|value| match value {
+                            serde_json::Value::String(text) => Some(text.clone()),
+                            serde_json::Value::Number(number) => Some(number.to_string()),
+                            _ => None,
+                        })
+                });
+            if let Some(server_id) = canonical_purchase_id {
+                tx.execute(
+                    "UPDATE local_purchase_intent_lines
+                     SET server_purchase_id = ?2, updated_at = ?3
+                     WHERE intent_id = (
+                       SELECT id FROM local_purchase_intents WHERE operation_id = ?1
+                     )",
+                    params![ack.operation_id, server_id, confirmed_at],
+                )
+                .map_err(to_error)?;
+            }
+            for item in payload.get("items").and_then(|value| value.as_array()).into_iter().flatten() {
+                if let (Some(line_global_id), Some(server_item_id)) = (
+                    optional_text(item, "line_global_id"),
+                    optional_text(item, "id"),
                 ) {
                     tx.execute(
                         "UPDATE local_purchase_intent_lines
-                         SET server_purchase_id = ?2, updated_at = ?3
-                         WHERE provisional_purchase_id = ?1",
-                        params![global_id, server_id, confirmed_at],
+                         SET server_purchase_item_id = ?2, updated_at = ?3
+                         WHERE provisional_line_id = ?1 OR provisional_purchase_id = ?1",
+                        params![line_global_id, server_item_id, confirmed_at],
                     )
                     .map_err(to_error)?;
                 }
@@ -3409,20 +3593,25 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
             }
         }
         "product" | "sale_rate" => {
-            let category_id = change
-                .payload
-                .get("category_global_id")
-                .and_then(|v| v.as_str())
-                .map(|v| v.to_string())
-                .or_else(|| {
-                    change.payload.get("category_id").and_then(|v| {
-                        if let Some(raw) = v.as_str() {
-                            Some(if raw.starts_with("category-") { raw.to_string() } else { format!("category-{raw}") })
+            let category_id = if change.payload.get("category_global_id").is_some() {
+                change
+                    .payload
+                    .get("category_global_id")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string())
+            } else {
+                change.payload.get("category_id").and_then(|value| {
+                    if let Some(raw) = value.as_str() {
+                        Some(if raw.starts_with("category-") {
+                            raw.to_string()
                         } else {
-                            v.as_i64().map(|id| format!("category-{id}"))
-                        }
-                    })
-                });
+                            format!("category-{raw}")
+                        })
+                    } else {
+                        value.as_i64().map(|id| format!("category-{id}"))
+                    }
+                })
+            };
             tx.execute(
                 "INSERT INTO local_products (
                     id, cloud_id, branch_id, product_name, category_id, category_name, unit,
@@ -3467,6 +3656,16 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                 ],
             )
             .map_err(to_error)?;
+        }
+        "supplier" => {
+            upsert_supplier_reference_with_tx(
+                tx,
+                &change.entity_id,
+                &change.payload,
+                change.updated_at.clone(),
+                change.version.unwrap_or(1),
+                operation == "DELETE",
+            )?;
         }
         "location_product" => {
             let location_id = change
@@ -3635,6 +3834,75 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
     Ok(())
 }
 
+fn device_identity_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "device_id": row.get::<_, String>(0)?,
+        "device_name": row.get::<_, String>(1)?,
+        "platform": row.get::<_, String>(2)?,
+        "app_version": row.get::<_, String>(3)?,
+        "branch_id": row.get::<_, String>(4)?,
+        "registration_status": row.get::<_, String>(5)?,
+        "last_seen_at": row.get::<_, Option<String>>(6)?,
+        "last_sync_at": row.get::<_, Option<String>>(7)?,
+    }))
+}
+
+fn upsert_supplier_reference_with_tx(
+    tx: &rusqlite::Transaction,
+    entity_id: &str,
+    payload: &serde_json::Value,
+    updated_at: Option<String>,
+    version: i64,
+    deleted: bool,
+) -> Result<(), String> {
+    let company_id = optional_text(payload, "company_id")
+        .ok_or_else(|| format!("Supplier reference {entity_id} has no company scope"))?;
+    let supplier_name = optional_text(payload, "supplier_name")
+        .ok_or_else(|| format!("Supplier reference {entity_id} has no name"))?;
+    let confirmed_updated_at = updated_at
+        .or_else(|| optional_text(payload, "updated_at"))
+        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string());
+    let deleted_at = if deleted {
+        optional_text(payload, "deleted_at").or_else(|| Some(confirmed_updated_at.clone()))
+    } else {
+        None
+    };
+    tx.execute(
+        "INSERT INTO local_supplier_references (
+           id, cloud_id, company_id, supplier_name, firm_name, supplier_type, active,
+           created_at, updated_at, version, sync_status, deleted_at
+         ) VALUES (
+           ?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+           COALESCE(?8, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?9, 'synced', ?10
+         )
+         ON CONFLICT(id) DO UPDATE SET
+           company_id = excluded.company_id,
+           supplier_name = excluded.supplier_name,
+           firm_name = excluded.firm_name,
+           supplier_type = excluded.supplier_type,
+           active = excluded.active,
+           created_at = COALESCE(local_supplier_references.created_at, excluded.created_at),
+           updated_at = excluded.updated_at,
+           version = excluded.version,
+           sync_status = 'synced',
+           deleted_at = excluded.deleted_at",
+        params![
+            entity_id,
+            company_id,
+            supplier_name,
+            optional_text(payload, "firm_name"),
+            optional_text(payload, "supplier_type").unwrap_or_else(|| "LOCAL_SUPPLIER".to_string()),
+            if deleted || !payload.get("active").and_then(|value| value.as_bool()).unwrap_or(true) { 0 } else { 1 },
+            optional_text(payload, "created_at"),
+            confirmed_updated_at,
+            version.max(1),
+            deleted_at,
+        ],
+    )
+    .map_err(to_error)?;
+    Ok(())
+}
+
 fn checksum(input: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in input.as_bytes() {
@@ -3759,6 +4027,25 @@ mod tests {
                         "branch_id": 1,
                         "category_name": "Mango",
                         "active": true
+                    }),
+                    updated_at: Some("2026-07-27T10:00:00.000Z".to_string()),
+                },
+                PulledChange {
+                    change_id: serde_json::Value::Null,
+                    branch_id: Some(1),
+                    entity_type: "supplier".to_string(),
+                    entity_id: "1".to_string(),
+                    operation_type: "UPSERT".to_string(),
+                    version: Some(1),
+                    payload: serde_json::json!({
+                        "id": 1,
+                        "company_id": 1,
+                        "supplier_name": "Bootstrap Supplier",
+                        "firm_name": "Bootstrap Firm",
+                        "supplier_type": "LOCAL_SUPPLIER",
+                        "active": true,
+                        "created_at": "2026-07-27T09:00:00.000Z",
+                        "updated_at": "2026-07-27T10:00:00.000Z"
                     }),
                     updated_at: Some("2026-07-27T10:00:00.000Z".to_string()),
                 },
@@ -3919,10 +4206,15 @@ mod tests {
             error_code: None,
             message: Some("Purchase Saved".to_string()),
             result_payload: Some(serde_json::json!({
-                "purchase_ids": [901, 902],
+                "purchase_id": 901,
+                "purchase_ids": [901],
+                "purchase": { "id": 901, "global_id": format!("offline-purchase-{operation_id}") },
                 "purchases": [
-                    { "id": 901, "global_id": format!("offline-purchase-{operation_id}-1") },
-                    { "id": 902, "global_id": format!("offline-purchase-{operation_id}-2") }
+                    { "id": 901, "global_id": format!("offline-purchase-{operation_id}") }
+                ],
+                "items": [
+                    { "id": 701, "line_global_id": format!("offline-purchase-line-{operation_id}-1") },
+                    { "id": 702, "line_global_id": format!("offline-purchase-line-{operation_id}-2") }
                 ],
                 "lots": [
                     { "id": 801, "global_id": format!("offline-lot-{operation_id}-1") },
@@ -3943,18 +4235,19 @@ mod tests {
         tx.commit().expect("commit acknowledgement");
 
         let conn = Connection::open(&path).expect("inspect reconciliation");
-        let result: (String, i64, i64, i64) = conn
+        let result: (String, i64, i64, i64, i64) = conn
             .query_row(
                 "SELECT
                    (SELECT state FROM local_purchase_intents WHERE operation_id = ?1),
-                   (SELECT COUNT(*) FROM local_purchase_intent_lines WHERE server_purchase_id IS NOT NULL),
+                   (SELECT COUNT(DISTINCT server_purchase_id) FROM local_purchase_intent_lines WHERE server_purchase_id IS NOT NULL),
+                   (SELECT COUNT(*) FROM local_purchase_intent_lines WHERE server_purchase_item_id IS NOT NULL),
                    (SELECT COUNT(*) FROM local_purchase_intent_lines WHERE server_lot_id IS NOT NULL),
                    (SELECT COUNT(*) FROM local_inventory_lots WHERE id LIKE 'offline-lot-%' AND sync_status = 'synced')",
                 [operation_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
-            .expect("read reconciled state");
-        assert_eq!(result, ("completed".to_string(), 2, 2, 2));
+            .expect("read reconciled aggregate state");
+        assert_eq!(result, ("completed".to_string(), 1, 2, 2, 2));
         drop(conn);
         let _ = fs::remove_file(&path);
     }
@@ -4071,6 +4364,323 @@ mod tests {
             )
             .expect("read incrementally updated location selling rate");
         assert_eq!(location_rate, 130.0);
+        let supplier_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_supplier_references WHERE id = '1' AND company_id = '1' AND active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read bootstrapped supplier");
+        assert_eq!(supplier_count, 1);
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn supplier_references_bootstrap_and_increment_without_duplication_or_financial_fields() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-supplier-reference-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize supplier reference database");
+        let bootstrap = test_reference_bootstrap("device-bootstrap", 1001);
+        apply_reference_bootstrap_at(
+            &path,
+            &bootstrap,
+            "device-bootstrap",
+            Some("2026-07-27T10:01:00.000Z".to_string()),
+        )
+        .expect("apply supplier bootstrap");
+        apply_reference_bootstrap_at(
+            &path,
+            &bootstrap,
+            "device-bootstrap",
+            Some("2026-07-27T10:02:00.000Z".to_string()),
+        )
+        .expect("retry supplier bootstrap");
+
+        let updated = PulledChange {
+            change_id: serde_json::json!(45),
+            branch_id: Some(1),
+            entity_type: "supplier".to_string(),
+            entity_id: "1".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            payload: serde_json::json!({
+                "id": 1,
+                "company_id": 1,
+                "supplier_name": "Bootstrap Supplier Updated",
+                "firm_name": "Bootstrap Firm",
+                "supplier_type": "LOCAL_SUPPLIER",
+                "active": false,
+                "opening_balance": 999999,
+                "bank_name": "must-not-be-stored",
+                "notes": "must-not-be-stored"
+            }),
+            updated_at: Some("2026-07-27T10:03:00.000Z".to_string()),
+        };
+        apply_pull_changes_at(
+            &path,
+            &[updated],
+            "45",
+            Some("device-bootstrap".to_string()),
+            Some("2026-07-27T10:03:01.000Z".to_string()),
+        )
+        .expect("apply supplier incremental");
+
+        let conn = Connection::open(&path).expect("inspect supplier reference database");
+        let supplier: (i64, String, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(supplier_name), MAX(active) FROM local_supplier_references WHERE id = '1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read supplier reference");
+        assert_eq!(supplier, (1, "Bootstrap Supplier Updated".to_string(), 0));
+        let columns: Vec<String> = {
+            let mut statement = conn.prepare("PRAGMA table_info(local_supplier_references)").expect("read supplier schema");
+            statement
+                .query_map([], |row| row.get(1))
+                .expect("query supplier schema")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect supplier schema")
+        };
+        assert!(!columns.contains(&"opening_balance".to_string()));
+        assert!(!columns.contains(&"bank_name".to_string()));
+        assert!(!columns.contains(&"notes".to_string()));
+        drop(conn);
+
+        let snapshot = load_reference_snapshot_at(&path, None, Some("device-bootstrap"))
+            .expect("load supplier snapshot");
+        let suppliers = snapshot["settings_bundle"]["offlineSuppliers"]
+            .as_array()
+            .expect("offline supplier list");
+        assert_eq!(suppliers.len(), 1);
+        assert_eq!(suppliers[0]["supplier_name"], "Bootstrap Supplier Updated");
+        assert_eq!(suppliers[0]["active"], false);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn product_with_explicitly_missing_canonical_category_keeps_label_without_invalid_fk() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-product-missing-category-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize missing-category database");
+        let product = PulledChange {
+            change_id: serde_json::json!(1),
+            branch_id: Some(1),
+            entity_type: "product".to_string(),
+            entity_id: "product-legacy-category".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            payload: serde_json::json!({
+                "company_id": 1,
+                "branch_id": 1,
+                "product_name": "Legacy Category Product",
+                "category_id": 999,
+                "category_global_id": null,
+                "category_name": "Legacy Category",
+                "unit": "KG",
+                "active": true
+            }),
+            updated_at: Some("2026-07-29T10:00:00.000Z".to_string()),
+        };
+
+        apply_pull_changes_at(
+            &path,
+            &[product],
+            "1",
+            Some("device-bootstrap".to_string()),
+            Some("2026-07-29T10:00:01.000Z".to_string()),
+        )
+        .expect("apply product without canonical category");
+
+        let conn = Connection::open(&path).expect("inspect missing-category database");
+        let result: (Option<String>, String) = conn
+            .query_row(
+                "SELECT category_id, category_name FROM local_products WHERE id = 'product-legacy-category'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read product category compatibility state");
+        assert_eq!(result, (None, "Legacy Category".to_string()));
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn online_snapshot_refresh_preserves_bootstrapped_company_and_location_scope() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-reference-scope-refresh-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize scoped snapshot database");
+        let bootstrap = test_reference_bootstrap("device-bootstrap", 1001);
+        apply_reference_bootstrap_at(
+            &path,
+            &bootstrap,
+            "device-bootstrap",
+            Some("2026-07-27T10:02:00.000Z".to_string()),
+        )
+        .expect("apply reference bootstrap");
+
+        let records = |entity_type: &str| {
+            bootstrap
+                .records
+                .iter()
+                .filter(|change| change.entity_type == entity_type)
+                .map(|change| {
+                    let mut payload = change.payload.clone();
+                    payload["global_id"] = serde_json::json!(change.entity_id);
+                    payload
+                })
+                .collect::<Vec<_>>()
+        };
+        cache_reference_snapshot_at(
+            &path,
+            &serde_json::json!({
+                "branch_context": { "branch_id": "1", "branch_name": "Main" },
+                "device_identity": { "device_id": "device-bootstrap", "device_name": "Bootstrap Device" },
+                "products": records("product"),
+                "categories": [],
+                "inventory_lots": records("inventory_lot"),
+                "customers": [],
+                "sales_history": [],
+                "settings_bundle": {}
+            }),
+        )
+        .expect("refresh online snapshot after bootstrap");
+
+        let conn = Connection::open(&path).expect("inspect scoped snapshot database");
+        let scoped_lots: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_inventory_lots
+                 WHERE company_id = '1' AND operational_location_id = '1001'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read scoped cached lots");
+        assert_eq!(scoped_lots, 1);
+        let scoped_products: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_products WHERE company_id = '1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read company-scoped cached products");
+        assert_eq!(scoped_products, 1);
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn online_snapshot_refresh_updates_cached_purchase_rules_idempotently() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-purchase-rules-refresh-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize purchase-rule snapshot database");
+
+        let snapshot = |rebate_percent: i64| {
+            serde_json::json!({
+                "branch_context": { "branch_id": "1", "branch_name": "Main" },
+                "device_identity": { "device_id": "device-rules", "device_name": "Rules Device" },
+                "products": [],
+                "categories": [],
+                "inventory_lots": [],
+                "customers": [],
+                "sales_history": [],
+                "settings_bundle": {
+                    "mandiTaxRules": [{ "id": 1, "origin_type": "LOCAL", "tax_percent": 2, "active": true }],
+                    "rebateRules": [{ "id": 4, "rule_name": "Later", "pay_within_days": 15, "rebate_percent": rebate_percent, "active": true }]
+                }
+            })
+        };
+
+        cache_reference_snapshot_at(&path, &snapshot(0)).expect("cache initial purchase rules");
+        cache_reference_snapshot_at(&path, &snapshot(1)).expect("refresh purchase rules");
+
+        let loaded = load_reference_snapshot_at(&path, None, Some("device-rules"))
+            .expect("load refreshed purchase rules");
+        assert_eq!(loaded["settings_bundle"]["mandiTaxRules"].as_array().unwrap().len(), 1);
+        assert_eq!(loaded["settings_bundle"]["rebateRules"].as_array().unwrap().len(), 1);
+        assert_eq!(loaded["settings_bundle"]["rebateRules"][0]["rebate_percent"], 1);
+
+        let conn = Connection::open(&path).expect("inspect purchase-rule cache");
+        let rule_setting_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_settings WHERE setting_key IN ('mandiTaxRules', 'rebateRules')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count cached purchase-rule settings");
+        assert_eq!(rule_setting_count, 2);
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn snapshot_cache_never_creates_or_prefers_a_default_device_identity() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-no-default-device-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize device identity database");
+
+        let missing_identity = serde_json::json!({
+            "branch_context": { "branch_id": "1" },
+            "products": [],
+            "categories": [],
+            "inventory_lots": [],
+            "customers": [],
+            "sales_history": [],
+            "settings_bundle": {}
+        });
+        assert!(cache_reference_snapshot_at(&path, &missing_identity)
+            .expect_err("missing canonical identity must fail closed")
+            .contains("no canonical device identity"));
+
+        let conn = Connection::open(&path).expect("seed identity compatibility rows");
+        conn.execute(
+            "INSERT INTO local_device_identity (
+                device_id, device_name, platform, app_version, branch_id, registration_status, updated_at
+             ) VALUES
+               ('canonical-device', 'Canonical', 'tauri-windows', '1.0.65', '1', 'approved', '2026-07-29T10:00:00.000Z'),
+               ('other-device', 'Other', 'tauri-windows', '1.0.65', '2', 'approved', '2026-07-29T12:00:00.000Z'),
+               ('default', 'Legacy Default', 'tauri-windows', '1.0.65', '1', 'approved', '2026-07-29T11:00:00.000Z')",
+            [],
+        )
+        .expect("seed canonical and legacy default identities");
+        drop(conn);
+
+        let selected = ensure_device_identity_with_preference_at(&path, Some("canonical-device"))
+            .expect("select configured canonical identity");
+        assert_eq!(selected["device_id"], "canonical-device");
+        let created = ensure_device_identity_with_preference_at(&path, Some("fresh-device"))
+            .expect("create configured fresh identity");
+        assert_eq!(created["device_id"], "fresh-device");
+        assert_eq!(created["registration_status"], "pending");
+        let conn = Connection::open(&path).expect("inspect device identities");
+        let default_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_device_identity WHERE device_id = 'default'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count retained legacy default rows");
+        assert_eq!(default_count, 1);
         drop(conn);
         let _ = fs::remove_file(&path);
     }
@@ -4085,7 +4695,10 @@ mod tests {
         let _ = fs::remove_file(&path);
         initialize_at(&path).expect("initialize rejected bootstrap database");
         let mut bootstrap = test_reference_bootstrap("device-bootstrap", 1001);
-        bootstrap.records[2].payload["operational_location_id"] = serde_json::json!(2002);
+        let lot = bootstrap.records.iter_mut()
+            .find(|change| change.entity_type == "inventory_lot")
+            .expect("inventory lot fixture");
+        lot.payload["operational_location_id"] = serde_json::json!(2002);
         let error = apply_reference_bootstrap_at(
             &path,
             &bootstrap,
@@ -4099,6 +4712,7 @@ mod tests {
             .query_row(
                 "SELECT
                    (SELECT COUNT(*) FROM local_products) +
+                   (SELECT COUNT(*) FROM local_supplier_references) +
                    (SELECT COUNT(*) FROM local_inventory_lots) +
                    (SELECT COUNT(*) FROM local_operational_locations) +
                    (SELECT COUNT(*) FROM local_device_assignment)",
@@ -4118,6 +4732,38 @@ mod tests {
         .expect_err("substituted device must be rejected");
         assert!(identity_error.contains("device identity"));
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn isolated_sqlite_override_is_absolute_and_test_only() {
+        let default_dir = PathBuf::from(r"C:\Users\Example\AppData\Roaming\com.srtcompany.froozerp");
+        let isolated_dir = PathBuf::from(r"F:\FroozERP\_recovery_backups\disposable-profile");
+
+        assert_eq!(
+            resolve_app_data_dir(
+                default_dir.clone(),
+                Some("test"),
+                Some(isolated_dir.clone()),
+            )
+            .expect("accept isolated test directory"),
+            isolated_dir
+        );
+        assert_eq!(
+            resolve_app_data_dir(
+                default_dir.clone(),
+                Some("production"),
+                Some(PathBuf::from(r"F:\ignored")),
+            )
+            .expect("ignore override outside tests"),
+            default_dir
+        );
+        assert!(resolve_app_data_dir(
+            PathBuf::from(r"C:\default"),
+            Some("test"),
+            Some(PathBuf::from("relative-profile")),
+        )
+        .expect_err("reject relative isolated directory")
+        .contains("absolute path"));
     }
 
     #[test]
@@ -4151,7 +4797,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("migration count");
-            assert_eq!(migration_count, 13);
+            assert_eq!(migration_count, 15);
             drop(conn);
             initialize_at(path).expect("restart with existing SQLite profile");
             let restored = ensure_device_identity_at(path).expect("restore device identity");
@@ -4213,7 +4859,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("preserved marker");
-        assert_eq!(migration_count, 13);
+        assert_eq!(migration_count, 15);
         assert_eq!(marker, "keep-me");
         drop(conn);
         let _ = fs::remove_file(&path);

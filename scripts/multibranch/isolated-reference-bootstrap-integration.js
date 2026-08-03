@@ -5,6 +5,7 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { Pool } = require("../../backend/node_modules/pg");
 const { createOperationalScopeService } = require("../../backend/operationalScope");
+const { registerOperationalV3Routes } = require("../../backend/operationalV3");
 const {
   issueDeviceSession,
   rejectDeviceSessionSubstitution,
@@ -55,6 +56,7 @@ const record = async (name, work) => {
 const counts = async () => (await pool.query(`
   SELECT
     (SELECT COUNT(*)::INTEGER FROM products) AS products,
+    (SELECT COUNT(*)::INTEGER FROM suppliers) AS suppliers,
     (SELECT COUNT(*)::INTEGER FROM inventory_batches) AS lots,
     (SELECT ROUND(COALESCE(SUM(remaining_qty), 0), 3) FROM inventory_batches) AS quantity,
     (SELECT ROUND(COALESCE(SUM(remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate, 0)), 0), 2)
@@ -84,6 +86,7 @@ const applyFoundationAndFixtures = async () => {
     await client.query(`
       UPDATE product_categories SET company_id = 1;
       UPDATE products SET company_id = 1;
+      UPDATE suppliers SET company_id = 1;
 
       INSERT INTO branches (id, branch_name, location, active, company_id)
       VALUES (2, 'Isolated Jaipur', 'Test-only staging', TRUE, 1)
@@ -138,7 +141,7 @@ const applyFoundationAndFixtures = async () => {
       ON CONFLICT (device_id, assignment_generation) DO NOTHING;
 
       DELETE FROM sync_change_log
-      WHERE entity_type IN ('product_category', 'product', 'sale_rate', 'inventory_lot');
+      WHERE entity_type IN ('product_category', 'product', 'sale_rate', 'supplier', 'inventory_lot');
     `);
     await client.query(
       fs.readFileSync(
@@ -209,6 +212,7 @@ const run = async () => {
       protocol: snapshot.protocol,
       high_watermark: snapshot.high_watermark,
       products: snapshot.records.filter((row) => row.entity_type === "product").length,
+      suppliers: snapshot.records.filter((row) => row.entity_type === "supplier").length,
       lots: snapshot.records.filter((row) => row.entity_type === "inventory_lot").length,
       quantity: snapshot.records
         .filter((row) => row.entity_type === "inventory_lot")
@@ -222,6 +226,9 @@ const run = async () => {
     }
     if (mainSummary.products !== Number(baseline.products) || secondSummary.products !== Number(baseline.products)) {
       throw new Error("Company product visibility mismatch");
+    }
+    if (mainSummary.suppliers !== Number(baseline.suppliers) || secondSummary.suppliers !== Number(baseline.suppliers)) {
+      throw new Error("Company supplier visibility mismatch");
     }
     if (mainSummary.lots + secondSummary.lots !== Number(baseline.lots) || secondSummary.lots !== 1) {
       throw new Error(`Location lot isolation mismatch: ${mainSummary.lots}/${secondSummary.lots}`);
@@ -300,6 +307,128 @@ const run = async () => {
     if (JSON.stringify(first.records) !== JSON.stringify(second.records)) throw new Error("Bootstrap retry changed reference records");
     if (Number(before.changes) !== Number(after.changes)) throw new Error("Bootstrap manufactured sync history");
     return { records: first.records.length, changes_before: before.changes, changes_after: after.changes };
+  });
+
+  await record("supplier master changes publish company references once without financial data", async () => {
+    const context = await resolve(MAIN_DEVICE);
+    const routeContext = {
+      user_id: 1,
+      device_id: MAIN_DEVICE,
+      company_id: context.companyId,
+      branch_id: context.branchId,
+      operational_location_id: context.operationalLocationId,
+      assignment_generation: context.assignmentGeneration,
+      role: "Owner",
+      fixed_operational: false,
+      device_permissions: {},
+      staff_permissions: {},
+    };
+    const app = {};
+    const routes = [];
+    for (const method of ["get", "post", "put", "delete"]) {
+      app[method] = (routePath, ...handlers) => routes.push({
+        method,
+        path: routePath,
+        handler: handlers.at(-1),
+      });
+    }
+    registerOperationalV3Routes({
+      app,
+      database: pool,
+      resolveContext: async () => ({ context: routeContext }),
+      middleware: [],
+      sendScopeError: (res, error) => res.status(error.status).json(error),
+    });
+    const response = () => ({
+      statusCode: 200,
+      payload: null,
+      status(code) {
+        this.statusCode = code;
+        return this;
+      },
+      json(payload) {
+        this.payload = payload;
+        return this;
+      },
+    });
+    const call = async (method, routePath, body, params = {}) => {
+      const route = routes.find((entry) => entry.method === method && entry.path === routePath);
+      if (!route) throw new Error(`Missing protocol-v3 route ${method} ${routePath}`);
+      const res = response();
+      await route.handler({ method: method.toUpperCase(), path: routePath, body, params, query: {} }, res);
+      if (res.statusCode >= 400) throw new Error(`${routePath} failed: ${JSON.stringify(res.payload)}`);
+      return res.payload;
+    };
+
+    const before = await counts();
+    const snapshot = await snapshotFor(MAIN_DEVICE);
+    const createBody = {
+      idempotency_key: "isolated-supplier-create",
+      account_name: "Isolated Bootstrap Supplier",
+      firm_name: "Isolated Supplier Firm",
+      account_type: "SUPPLIER",
+      opening_balance: 1234,
+      bank_name: "Excluded Bank",
+      notes: "Excluded note",
+      active: true,
+    };
+    const created = await call("post", "/api/v3/suppliers", createBody);
+    const repeated = await call("post", "/api/v3/suppliers", createBody);
+    if (created.supplier.id !== repeated.supplier.id) throw new Error("Supplier create retry duplicated identity");
+    const supplierId = created.supplier.id;
+    await call("put", "/api/v3/suppliers/:supplierId", {
+      ...createBody,
+      idempotency_key: "isolated-supplier-update",
+      account_name: "Isolated Bootstrap Supplier Updated",
+    }, { supplierId: String(supplierId) });
+    await call("delete", "/api/v3/suppliers/:supplierId", {
+      idempotency_key: "isolated-supplier-deactivate",
+    }, { supplierId: String(supplierId) });
+
+    const stored = (await pool.query(
+      "SELECT id, company_id, supplier_name, active FROM suppliers WHERE id = $1",
+      [supplierId]
+    )).rows[0];
+    const publications = (await pool.query(
+      `SELECT change_id, operational_location_id, payload
+       FROM sync_change_log
+       WHERE entity_type = 'supplier' AND entity_id = $1
+       ORDER BY change_id`,
+      [String(supplierId)]
+    )).rows;
+    const processed = (await pool.query(
+      `SELECT COUNT(*)::INTEGER AS count
+       FROM sync_processed_operations
+       WHERE entity_type = 'supplier' AND entity_id = $1`,
+      [String(supplierId)]
+    )).rows[0];
+    if (Number(stored.company_id) !== 1 || stored.active !== false || publications.length !== 3 || Number(processed.count) !== 3) {
+      throw new Error("Supplier mutation count, scope, or status mismatch");
+    }
+    for (const publication of publications) {
+      if (publication.operational_location_id !== null) throw new Error("Supplier reference was incorrectly location-scoped");
+      for (const excluded of ["opening_balance", "bank_name", "account_number", "notes"]) {
+        if (Object.hasOwn(publication.payload, excluded)) throw new Error(`Supplier publication exposed ${excluded}`);
+      }
+    }
+    const mainIncremental = await readVisibleIncrementalChanges(pool, context, Number(snapshot.high_watermark), 50);
+    const otherContext = await resolve(SECOND_DEVICE);
+    const otherIncremental = await readVisibleIncrementalChanges(pool, otherContext, Number(snapshot.high_watermark), 50);
+    const mainSupplierChanges = mainIncremental.rows.filter((row) => row.entity_type === "supplier" && row.entity_id === String(supplierId));
+    const otherSupplierChanges = otherIncremental.rows.filter((row) => row.entity_type === "supplier" && row.entity_id === String(supplierId));
+    if (mainSupplierChanges.length !== 3 || otherSupplierChanges.length !== 3) {
+      throw new Error("Company supplier changes were not delivered equally to both authorized locations");
+    }
+    const after = await counts();
+    if (Number(after.suppliers) !== Number(before.suppliers) + 1) throw new Error("Supplier create count mismatch");
+    return {
+      supplier_id: supplierId,
+      publications: publications.length,
+      processed_operations: Number(processed.count),
+      main_location_deliveries: mainSupplierChanges.length,
+      other_location_deliveries: otherSupplierChanges.length,
+      financial_fields_excluded: true,
+    };
   });
 
   await record("snapshot high-watermark admits a concurrent change exactly once", async () => {
