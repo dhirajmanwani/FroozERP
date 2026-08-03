@@ -8,6 +8,7 @@ const migrationFiles = [
   "backend/migrations/cloud/008_canonical_utc_timestamps.sql",
   "backend/migrations/cloud/009_operational_location_foundation.sql",
   "backend/migrations/cloud/010_operational_protocol_v3.sql",
+  "backend/migrations/cloud/012_scope_management.sql",
 ];
 
 async function main() {

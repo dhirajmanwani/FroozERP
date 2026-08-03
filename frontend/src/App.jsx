@@ -12560,8 +12560,7 @@ function SettingsModule({
       <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />
       <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />
       <DeviceControlSettingsSection canManage={canManage} deviceControlSettings={settingsData.deviceControlSettings} exitAttemptLogs={settingsData.exitAttemptLogs || []} onReload={onReload} user={user} />
-      <SecurityDevicesSection activationCodes={settingsData.activationCodes || []} branches={settingsData.branches || []} canManage={canManage} counters={settingsData.counters || []} devices={settingsData.authorizedDevices || []} onReload={onReload} user={user} />
-      <BranchCounterSettings branches={settingsData.branches || []} canManage={canManage} counters={settingsData.counters || []} onReload={onReload} user={user} />
+      <OperationalScopeManagement canManage={canManage} user={user} />
       <SettingsSectionErrorBoundary sectionName="Update Center">
         <UpdateCenterSection canManage={canManage} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
       </SettingsSectionErrorBoundary>
@@ -14396,7 +14395,231 @@ function SyncSettingsSection({
   );
 }
 
-function SecurityDevicesSection({ activationCodes, branches, canManage, counters, devices, onReload, user }) {
+const EMPTY_OPERATIONAL_SCOPE_DATA = Object.freeze({
+  branches: [],
+  operational_locations: [],
+  staff_assignments: [],
+  device_assignments: [],
+  users: [],
+  pending_devices: [],
+  roles: [],
+});
+
+function OperationalScopeManagement({ canManage, user }) {
+  const [data, setData] = useState(EMPTY_OPERATIONAL_SCOPE_DATA);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [branchDraft, setBranchDraft] = useState({ branch_name: "", address: "", phone_number: "", gst_number: "" });
+  const [locationDraft, setLocationDraft] = useState({ branch_id: "", location_code: "", location_name: "", location_type: "STORE", address: "", is_default: false });
+  const [staffDraft, setStaffDraft] = useState({ user_id: "", branch_id: "", operational_location_id: "", role_id: "", is_default: true, effective_from: "", effective_to: "" });
+  const [approvalDrafts, setApprovalDrafts] = useState({});
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const response = await axios.get(`${SYNC_API_URL}/api/v3/admin/scope-management`, createOperationalReadConfig(user));
+      setData({ ...EMPTY_OPERATIONAL_SCOPE_DATA, ...(response.data || {}) });
+    } catch (requestError) {
+      setError(getErrorMessage(requestError, "Unable to load branch and device assignments"));
+    } finally {
+      setLoading(false);
+    }
+  }, [user]);
+  useEffect(() => { load(); }, [load]);
+
+  const activeBranches = data.branches.filter((branch) => branch.active !== false);
+  const locationsForBranch = (branchId) => data.operational_locations.filter(
+    (location) => location.active !== false && String(location.branch_id) === String(branchId)
+  );
+  const saveWrite = async (method, path, payload) => {
+    const write = createOperationalWrite(user, payload);
+    await axios({ method, url: `${SYNC_API_URL}${path}`, data: write.body, ...write.config });
+    await load();
+  };
+  const createBranch = async () => {
+    try {
+      await saveWrite("post", "/api/v3/admin/branches", { ...branchDraft, reason: "Owner created branch" });
+      setBranchDraft({ branch_name: "", address: "", phone_number: "", gst_number: "" });
+    } catch (requestError) { setError(getErrorMessage(requestError, "Unable to create branch")); }
+  };
+  const updateBranch = async (branch, active = branch.active !== false) => {
+    const branchName = window.prompt("Branch name", branch.branch_name);
+    if (!branchName?.trim()) return;
+    const reason = window.prompt(active ? "Reason for branch change" : "Reason for branch deactivation");
+    if (!reason?.trim()) return;
+    try {
+      await saveWrite("put", `/api/v3/admin/branches/${branch.id}`, {
+        ...branch,
+        branch_name: branchName,
+        active,
+        reason,
+      });
+    } catch (requestError) { setError(getErrorMessage(requestError, "Unable to update branch")); }
+  };
+  const createLocation = async () => {
+    try {
+      await saveWrite("post", "/api/v3/admin/operational-locations", {
+        ...locationDraft,
+        branch_id: undefined,
+        target_branch_id: locationDraft.branch_id,
+        reason: "Owner created operational location",
+      });
+      setLocationDraft({ branch_id: "", location_code: "", location_name: "", location_type: "STORE", address: "", is_default: false });
+    } catch (requestError) { setError(getErrorMessage(requestError, "Unable to create operational location")); }
+  };
+  const updateLocation = async (location, active = location.active !== false) => {
+    const locationName = window.prompt("Operational location name", location.location_name);
+    if (!locationName?.trim()) return;
+    const reason = window.prompt(active ? "Reason for location change" : "Reason for location deactivation");
+    if (!reason?.trim()) return;
+    try {
+      await saveWrite("put", `/api/v3/admin/operational-locations/${location.id}`, {
+        target_branch_id: location.branch_id,
+        location_code: location.location_code,
+        location_name: locationName,
+        location_type: location.location_type,
+        address: location.address || "",
+        timezone: location.timezone || "Asia/Kolkata",
+        is_default: location.is_default === true,
+        active,
+        reason,
+      });
+    } catch (requestError) { setError(getErrorMessage(requestError, "Unable to update operational location")); }
+  };
+  const saveStaffAssignment = async () => {
+    try {
+      await saveWrite("put", `/api/v3/admin/staff-assignments/${staffDraft.user_id}`, {
+        ...staffDraft,
+        branch_id: undefined,
+        operational_location_id: undefined,
+        target_branch_id: staffDraft.branch_id,
+        target_operational_location_id: staffDraft.operational_location_id,
+        permission_set: { operational_access: true },
+        reason: "Owner confirmed staff operational-location assignment",
+      });
+      setStaffDraft({ user_id: "", branch_id: "", operational_location_id: "", role_id: "", is_default: true, effective_from: "", effective_to: "" });
+    } catch (requestError) { setError(getErrorMessage(requestError, "Unable to save staff assignment")); }
+  };
+  const deactivateStaffAssignment = async (assignment) => {
+    const reason = window.prompt("Reason for removing this operational-location assignment");
+    if (!reason?.trim()) return;
+    try {
+      await saveWrite("put", `/api/v3/admin/staff-assignments/${assignment.user_id}`, {
+        target_branch_id: assignment.branch_id,
+        target_operational_location_id: assignment.operational_location_id,
+        role_id: assignment.role_id,
+        permission_set: assignment.permission_set || {},
+        is_default: false,
+        effective_from: assignment.effective_from || null,
+        effective_to: assignment.effective_to || null,
+        active: false,
+        reason,
+      });
+    } catch (requestError) { setError(getErrorMessage(requestError, "Unable to deactivate staff assignment")); }
+  };
+  const approvalDraft = (device) => approvalDrafts[device.device_id] || {
+    branch_id: "",
+    operational_location_id: "",
+    physical_label: device.requested_physical_location || device.device_name || "",
+    device_type: device.device_type || "LAPTOP",
+    intended_usage: device.requested_intended_usage || "POS",
+    permitted_user_id: device.requested_user_id ? String(device.requested_user_id) : "",
+    role_id: device.requested_role_id ? String(device.requested_role_id) : "",
+    fixed_operational: true,
+  };
+  const updateApprovalDraft = (device, field, value) => {
+    const current = approvalDraft(device);
+    const next = { ...current, [field]: value };
+    if (field === "branch_id") next.operational_location_id = "";
+    if (field === "permitted_user_id") {
+      const selected = data.users.find((candidate) => String(candidate.id) === String(value));
+      next.role_id = selected?.role_id ? String(selected.role_id) : "";
+    }
+    setApprovalDrafts((drafts) => ({ ...drafts, [device.device_id]: next }));
+  };
+  const approveDeviceAssignment = async (device) => {
+    const draft = approvalDraft(device);
+    try {
+      await saveWrite("post", `/api/v3/admin/devices/${encodeURIComponent(device.device_id)}/approve`, {
+        ...draft,
+        branch_id: undefined,
+        operational_location_id: undefined,
+        target_branch_id: draft.branch_id,
+        target_operational_location_id: draft.operational_location_id,
+        permission_set: { operational_access: true, sync: true },
+        reason: "Owner confirmed device branch, location, usage, user and role",
+      });
+      setApprovalDrafts((drafts) => {
+        const next = { ...drafts };
+        delete next[device.device_id];
+        return next;
+      });
+    } catch (requestError) { setError(getErrorMessage(requestError, "Unable to approve device assignment")); }
+  };
+
+  if (loading) return <ModuleCard eyebrow="Operational Scope" title="Branch and Location Control"><p>Loading assignments...</p></ModuleCard>;
+  return (
+    <ModuleCard eyebrow="Operational Scope" title="Branch, Location, Staff and Device Control" subtitle="Branches group reporting. Every operational transaction and fixed device belongs to one exact operational location.">
+      {error && <div className="startup-status-panel"><p>{error}</p></div>}
+      <div className="form-grid supplier-form-grid">
+        <Field label="Branch Name"><input disabled={!canManage} value={branchDraft.branch_name} onChange={(event) => setBranchDraft({ ...branchDraft, branch_name: event.target.value })} /></Field>
+        <Field label="Address"><input disabled={!canManage} value={branchDraft.address} onChange={(event) => setBranchDraft({ ...branchDraft, address: event.target.value })} /></Field>
+        <Field label="Phone"><input disabled={!canManage} value={branchDraft.phone_number} onChange={(event) => setBranchDraft({ ...branchDraft, phone_number: event.target.value })} /></Field>
+        <Field label="GST Number"><input disabled={!canManage} value={branchDraft.gst_number} onChange={(event) => setBranchDraft({ ...branchDraft, gst_number: event.target.value })} /></Field>
+        <button className="primary-button" disabled={!canManage || !branchDraft.branch_name.trim()} onClick={createBranch}>Add Branch</button>
+      </div>
+      <DataTable headers={["Branch", "Address", "Status", "Locations", "Actions"]}>
+        {data.branches.map((branch) => <tr key={branch.id}><td className="primary-cell">{branch.branch_name}</td><td>{branch.address || "-"}</td><td><span className={branch.active !== false ? "stock-ok" : "stock-low"}>{branch.active !== false ? "Active" : "Inactive"}</span></td><td>{data.operational_locations.filter((location) => Number(location.branch_id) === Number(branch.id)).length}</td><td><div className="button-row table-actions-row"><button className="table-action" disabled={!canManage} onClick={() => updateBranch(branch, branch.active !== false)}>Rename</button>{branch.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => updateBranch(branch, false)}>Deactivate</button>}</div></td></tr>)}
+      </DataTable>
+      <div className="form-grid supplier-form-grid">
+        <Field label="Branch"><select disabled={!canManage} value={locationDraft.branch_id} onChange={(event) => setLocationDraft({ ...locationDraft, branch_id: event.target.value })}><option value="">Select branch</option>{activeBranches.map((branch) => <option key={branch.id} value={branch.id}>{branch.branch_name}</option>)}</select></Field>
+        <Field label="Location Code"><input disabled={!canManage} value={locationDraft.location_code} onChange={(event) => setLocationDraft({ ...locationDraft, location_code: event.target.value.toUpperCase() })} /></Field>
+        <Field label="Operational Location"><input disabled={!canManage} value={locationDraft.location_name} onChange={(event) => setLocationDraft({ ...locationDraft, location_name: event.target.value })} /></Field>
+        <Field label="Type"><select disabled={!canManage} value={locationDraft.location_type} onChange={(event) => setLocationDraft({ ...locationDraft, location_type: event.target.value })}><option value="STORE">Store</option><option value="WAREHOUSE">Warehouse</option><option value="MANDI_COUNTER">Mandi Counter</option><option value="OFFICE">Office</option></select></Field>
+        <Field label="Address"><input disabled={!canManage} value={locationDraft.address} onChange={(event) => setLocationDraft({ ...locationDraft, address: event.target.value })} /></Field>
+        <label className="check-field"><input disabled={!canManage} type="checkbox" checked={locationDraft.is_default} onChange={(event) => setLocationDraft({ ...locationDraft, is_default: event.target.checked })} /><span>Default location for branch</span></label>
+        <button className="primary-button" disabled={!canManage || !locationDraft.branch_id || !locationDraft.location_code.trim() || !locationDraft.location_name.trim()} onClick={createLocation}>Add Operational Location</button>
+      </div>
+      <DataTable headers={["Operational Location", "Branch", "Type", "Default", "Status", "Actions"]}>
+        {data.operational_locations.map((location) => <tr key={location.id}><td className="primary-cell">{location.location_name}<small className="cell-note">{location.location_code}</small></td><td>{location.branch_name}</td><td>{location.location_type}</td><td>{location.is_default ? "Yes" : "No"}</td><td><span className={location.active !== false ? "stock-ok" : "stock-low"}>{location.active !== false ? "Active" : "Inactive"}</span></td><td><div className="button-row table-actions-row"><button className="table-action" disabled={!canManage} onClick={() => updateLocation(location, location.active !== false)}>Rename</button>{location.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => updateLocation(location, false)}>Deactivate</button>}</div></td></tr>)}
+      </DataTable>
+      <div className="form-grid supplier-form-grid">
+        <Field label="Staff"><select disabled={!canManage} value={staffDraft.user_id} onChange={(event) => { const selected = data.users.find((candidate) => String(candidate.id) === event.target.value); setStaffDraft({ ...staffDraft, user_id: event.target.value, role_id: selected?.role_id ? String(selected.role_id) : "" }); }}><option value="">Select staff</option>{data.users.map((member) => <option key={member.id} value={member.id}>{member.full_name} ({member.role_name})</option>)}</select></Field>
+        <Field label="Default Branch"><select disabled={!canManage} value={staffDraft.branch_id} onChange={(event) => setStaffDraft({ ...staffDraft, branch_id: event.target.value, operational_location_id: "" })}><option value="">Select branch</option>{activeBranches.map((branch) => <option key={branch.id} value={branch.id}>{branch.branch_name}</option>)}</select></Field>
+        <Field label="Default Operational Location"><select disabled={!canManage} value={staffDraft.operational_location_id} onChange={(event) => setStaffDraft({ ...staffDraft, operational_location_id: event.target.value })}><option value="">Select location</option>{locationsForBranch(staffDraft.branch_id).map((location) => <option key={location.id} value={location.id}>{location.location_name}</option>)}</select></Field>
+        <Field label="Effective From"><input disabled={!canManage} type="date" value={staffDraft.effective_from} onChange={(event) => setStaffDraft({ ...staffDraft, effective_from: event.target.value })} /></Field>
+        <Field label="Effective To"><input disabled={!canManage} type="date" value={staffDraft.effective_to} onChange={(event) => setStaffDraft({ ...staffDraft, effective_to: event.target.value })} /></Field>
+        <button className="primary-button" disabled={!canManage || !staffDraft.user_id || !staffDraft.operational_location_id || !staffDraft.role_id} onClick={saveStaffAssignment}>Assign Staff Location</button>
+      </div>
+      <DataTable headers={["Staff", "Role", "Branch", "Operational Location", "Default", "Status", "Actions"]}>
+        {data.staff_assignments.map((assignment) => <tr key={assignment.id}><td className="primary-cell">{assignment.full_name}<small className="cell-note">{assignment.username}</small></td><td>{assignment.role_name || "-"}</td><td>{assignment.branch_name}</td><td>{assignment.location_name}</td><td>{assignment.is_default ? "Yes" : "No"}</td><td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "Active" : "Inactive"}</span></td><td>{assignment.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => deactivateStaffAssignment(assignment)}>Deactivate</button>}</td></tr>)}
+      </DataTable>
+      <h3>Pending Device Approval</h3>
+      {data.pending_devices.map((device) => {
+        const draft = approvalDraft(device);
+        return <section className="settings-inline-panel" key={device.device_id}>
+          <div><strong>{device.device_name}</strong><small className="cell-note">{device.device_id} - {device.device_type || device.platform || "Other"}</small></div>
+          <div className="form-grid supplier-form-grid">
+            <Field label="Branch"><select disabled={!canManage} value={draft.branch_id} onChange={(event) => updateApprovalDraft(device, "branch_id", event.target.value)}><option value="">Select branch</option>{activeBranches.map((branch) => <option key={branch.id} value={branch.id}>{branch.branch_name}</option>)}</select></Field>
+            <Field label="Operational Location"><select disabled={!canManage} value={draft.operational_location_id} onChange={(event) => updateApprovalDraft(device, "operational_location_id", event.target.value)}><option value="">Select location</option>{locationsForBranch(draft.branch_id).map((location) => <option key={location.id} value={location.id}>{location.location_name}</option>)}</select></Field>
+            <Field label="Physical / Counter Label"><input disabled={!canManage} value={draft.physical_label} onChange={(event) => updateApprovalDraft(device, "physical_label", event.target.value)} /></Field>
+            <Field label="Device Type"><select disabled={!canManage} value={draft.device_type} onChange={(event) => updateApprovalDraft(device, "device_type", event.target.value)}><option value="LAPTOP">Laptop</option><option value="DESKTOP">Desktop</option><option value="TABLET">Tablet</option><option value="ANDROID_PHONE">Android Phone</option><option value="IPHONE">iPhone</option><option value="OTHER">Other</option></select></Field>
+            <Field label="Intended Usage"><select disabled={!canManage} value={draft.intended_usage} onChange={(event) => updateApprovalDraft(device, "intended_usage", event.target.value)}><option value="POS">POS</option><option value="PURCHASE_ENTRY">Purchase Entry</option><option value="INVENTORY">Inventory</option><option value="ACCOUNTS">Accounts</option><option value="REPORTS">Reports</option><option value="OWNER_DASHBOARD">Owner Dashboard</option></select></Field>
+            <Field label="Permitted User"><select disabled={!canManage} value={draft.permitted_user_id} onChange={(event) => updateApprovalDraft(device, "permitted_user_id", event.target.value)}><option value="">Select user</option>{data.users.map((member) => <option key={member.id} value={member.id}>{member.full_name} ({member.role_name})</option>)}</select></Field>
+            <Field label="Confirmed Role"><select disabled value={draft.role_id}><option value="">Select user first</option>{data.roles.map((role) => <option key={role.id} value={role.id}>{role.role_name}</option>)}</select></Field>
+            <button className="primary-button" disabled={!canManage || !draft.branch_id || !draft.operational_location_id || !draft.physical_label.trim() || !draft.intended_usage || !draft.permitted_user_id || !draft.role_id} onClick={() => approveDeviceAssignment(device)}>Approve Assigned Device</button>
+          </div>
+        </section>;
+      })}
+      {data.pending_devices.length === 0 && <p className="form-note">No pending device requests.</p>}
+      <DataTable headers={["Approved Device", "Branch", "Operational Location", "Usage", "Generation", "Status"]}>
+        {data.device_assignments.map((assignment) => <tr key={`${assignment.device_id}-${assignment.assignment_generation}`}><td className="primary-cell">{assignment.device_name}<small className="cell-note">{assignment.device_id}</small></td><td>{assignment.branch_name}</td><td>{assignment.location_name}</td><td>{assignment.intended_usage}</td><td>{assignment.assignment_generation}</td><td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "Active" : "Inactive"}</span></td></tr>)}
+      </DataTable>
+    </ModuleCard>
+  );
+}
+
+function _LegacySecurityDevicesSection({ activationCodes, branches, canManage, counters, devices, onReload, user }) {
   const [generatedCode, setGeneratedCode] = useState("");
   const [codeDraft, setCodeDraft] = useState({ code_label: "Counter device activation", expires_in_hours: 24, branch_id: "1", counter_id: "" });
   const deviceAction = async (device, action) => {
@@ -14498,7 +14721,7 @@ function SecurityDevicesSection({ activationCodes, branches, canManage, counters
   );
 }
 
-function BranchCounterSettings({ branches, canManage, counters, onReload, user }) {
+function _LegacyBranchCounterSettings({ branches, canManage, counters, onReload, user }) {
   const [branchDraft, setBranchDraft] = useState({ branch_name: "", address: "", phone_number: "", gst_number: "", active: true });
   const [counterDraft, setCounterDraft] = useState({ branch_id: "1", counter_name: "", counter_type: "RETAIL_COUNTER", active: true });
   const addBranch = async () => {

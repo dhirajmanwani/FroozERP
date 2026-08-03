@@ -9943,18 +9943,16 @@ app.put("/settings/devices/:deviceId", async (req, res) => {
     if (!deviceId || !["APPROVE", "REJECT", "DISABLE", "RENAME"].includes(action)) {
       return res.status(400).json({ message: "Select valid device action" });
     }
+    if (action === "APPROVE") {
+      return res.status(426).json({
+        code: "PROTOCOL_V3_DEVICE_APPROVAL_REQUIRED",
+        message: "Use protocol-v3 device approval with an explicit operational location, usage, user and role.",
+      });
+    }
     const beforeResult = await pool.query("SELECT * FROM authorized_devices WHERE device_id = $1", [deviceId]);
     if (!beforeResult.rows[0]) return res.status(404).json({ message: "Device not found" });
     let result;
-    if (action === "APPROVE") {
-      result = { rows: [await approveDevice({
-        deviceId,
-        approvedBy: manager.id,
-        branchId: parsePositiveInteger(req.body.assigned_branch_id) || 1,
-        counterId: parsePositiveInteger(req.body.assigned_counter_id),
-        reason: cleanText(req.body.reason) || "Owner/Admin approval",
-      })] };
-    } else if (action === "RENAME") {
+    if (action === "RENAME") {
       result = await pool.query(
         `
         UPDATE authorized_devices

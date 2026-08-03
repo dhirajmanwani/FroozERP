@@ -17,6 +17,10 @@ const publicationMigration = fs.readFileSync(
   path.join(__dirname, "migrations/cloud/011_inventory_incremental_publication.sql"),
   "utf8"
 );
+const scopeManagementMigration = fs.readFileSync(
+  path.join(__dirname, "migrations/cloud/012_scope_management.sql"),
+  "utf8"
+);
 const sqliteMigration = fs.readFileSync(
   path.join(__dirname, "../src-tauri/migrations/sqlite/013_operational_location_foundation.sql"),
   "utf8"
@@ -24,7 +28,7 @@ const sqliteMigration = fs.readFileSync(
 const backendSource = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
 
 test("operational-location migrations are additive and do not backfill ownership", () => {
-  for (const migration of [cloudMigration, protocolMigration, publicationMigration, sqliteMigration]) {
+  for (const migration of [cloudMigration, protocolMigration, publicationMigration, scopeManagementMigration, sqliteMigration]) {
     assert.doesNotMatch(migration, /\bDROP\s+(TABLE|COLUMN|SCHEMA|DATABASE)\b/i);
     assert.doesNotMatch(migration, /\bDELETE\s+FROM\b/i);
     assert.doesNotMatch(migration, /\bTRUNCATE\b/i);

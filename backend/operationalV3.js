@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("crypto");
+const { registerScopeManagementRoutes } = require("./scopeManagement");
 
 const TRANSFER_TRANSITIONS = Object.freeze({
   DRAFT: Object.freeze({ submit: "APPROVAL_PENDING", cancel: "CANCELLED" }),
@@ -1258,6 +1259,8 @@ const registerOperationalV3Routes = ({
     const preview = await validateAssignmentPreview(database, context, req.body, "device");
     return res.json({ preview, ...serverTimePayload() });
   });
+
+  registerScopeManagementRoutes({ use, database, serverTimePayload });
 };
 
 module.exports = {
