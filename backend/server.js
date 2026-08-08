@@ -10435,8 +10435,37 @@ app.post("/login", async (req, res) => {
       branch_id: user.branch_id || 1,
       canonical_alias_used: canonicalAliasUsed,
     });
-    const canonicalCompanyId = user.company_id || device.company_id || null;
-    const canonicalBranchId = device.assigned_branch_id || user.branch_id || 1;
+    const operationalAssignmentResult = await pool.query(
+      `SELECT
+         da.company_id,
+         da.branch_id,
+         da.operational_location_id,
+         b.branch_name,
+         ol.location_name
+       FROM device_assignments da
+       JOIN branches b
+         ON b.id = da.branch_id
+        AND b.company_id = da.company_id
+       JOIN operational_locations ol
+         ON ol.id = da.operational_location_id
+        AND ol.branch_id = da.branch_id
+        AND ol.company_id = da.company_id
+       WHERE da.device_id = $1
+         AND da.active = TRUE
+       ORDER BY da.assignment_generation DESC, da.id DESC
+       LIMIT 1`,
+      [device.device_id]
+    );
+    const operationalAssignment = operationalAssignmentResult.rows[0] || null;
+    const canonicalCompanyId = operationalAssignment?.company_id
+      || user.company_id
+      || device.company_id
+      || null;
+    const canonicalBranchId = operationalAssignment?.branch_id
+      || device.assigned_branch_id
+      || user.branch_id
+      || 1;
+    const canonicalOperationalLocationId = operationalAssignment?.operational_location_id || null;
     const deviceSessionToken = issueDeviceSession({
       userId: user.id,
       deviceId: device.device_id,
@@ -10456,10 +10485,14 @@ app.post("/login", async (req, res) => {
       role: user.role_name,
       role_name: user.role_name,
       normalized_role: String(user.role_name || "").trim().toUpperCase(),
-      company_id: user.company_id || device.company_id || null,
+      company_id: canonicalCompanyId,
       company_name: user.company_name || configuredCompanyName || null,
-      branch_id: user.branch_id || 1,
-      branch: user.branch_name || "Main Branch",
+      branch_id: canonicalBranchId,
+      branch: operationalAssignment?.branch_name || user.branch_name || "Main Branch",
+      operational_location_id: canonicalOperationalLocationId,
+      operational_location: operationalAssignment?.location_name || null,
+      device_id: device.device_id,
+      device_status: device.status,
       counter_id: device.assigned_counter_id || 1,
       counter: device.counter_name || "Main Counter",
       mobile_number: user.mobile_number,

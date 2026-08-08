@@ -77,6 +77,22 @@ test("approval state cannot bypass canonical password verification", () => {
   assert.match(source, /canonical_alias_used: canonicalAliasUsed/);
 });
 
+test("approved login returns the active server-authorized operational assignment", () => {
+  const source = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
+  const start = source.indexOf('app.post("/login"');
+  const end = source.indexOf('const listProductCategoriesHandler', start);
+  const loginRoute = source.slice(start, end);
+
+  assert.ok(start > 0 && end > start);
+  assert.match(loginRoute, /FROM device_assignments da/);
+  assert.match(loginRoute, /WHERE da\.device_id = \$1[\s\S]*da\.active = TRUE/);
+  assert.match(loginRoute, /canonicalCompanyId = operationalAssignment\?\.company_id/);
+  assert.match(loginRoute, /canonicalBranchId = operationalAssignment\?\.branch_id/);
+  assert.match(loginRoute, /operational_location_id: canonicalOperationalLocationId/);
+  assert.match(loginRoute, /operational_location: operationalAssignment\?\.location_name/);
+  assert.match(loginRoute, /device_id: device\.device_id/);
+});
+
 test("approved alias password mismatch requests canonical verification without bypassing it", () => {
   assert.deepEqual(approvedAliasCredentialFailure({
     canonicalAliasUsed: true,
