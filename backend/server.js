@@ -10222,14 +10222,34 @@ app.post("/login", async (req, res) => {
       LEFT JOIN companies co ON co.id = COALESCE(u.company_id, b.company_id)
       WHERE LOWER(u.username) = LOWER($1)
          OR (
-           ($2::INTEGER IS NULL OR u.id = $2)
+           $2::INTEGER IS NOT NULL
+           AND u.id = $2
            AND EXISTS (
              SELECT 1
              FROM authorized_devices d
+             JOIN device_assignments da
+               ON da.device_id = d.device_id
+              AND da.active = TRUE
+             JOIN operational_locations ol
+               ON ol.id = da.operational_location_id
+              AND ol.company_id = da.company_id
+              AND ol.branch_id = da.branch_id
+              AND ol.active = TRUE
+             JOIN branches assigned_branch
+               ON assigned_branch.id = da.branch_id
+              AND assigned_branch.company_id = da.company_id
+              AND assigned_branch.active = TRUE
+             JOIN staff_location_assignments sla
+               ON sla.user_id = u.id
+              AND sla.company_id = da.company_id
+              AND sla.branch_id = da.branch_id
+              AND sla.operational_location_id = da.operational_location_id
+              AND sla.active = TRUE
+              AND (sla.effective_from IS NULL OR sla.effective_from <= CURRENT_DATE)
+              AND (sla.effective_to IS NULL OR sla.effective_to >= CURRENT_DATE)
              WHERE d.device_id = $3
                AND d.status = 'APPROVED'
-               AND d.approved_by = u.id
-               AND d.assigned_branch_id = COALESCE(u.branch_id, 1)
+               AND u.company_id = da.company_id
            )
          )
       ORDER BY CASE WHEN LOWER(u.username) = LOWER($1) THEN 0 ELSE 1 END
@@ -10294,18 +10314,6 @@ app.post("/login", async (req, res) => {
         deviceId: devicePayload.device_id,
         ipAddress: req.ip,
         details: { stage: "user_status" },
-      });
-    }
-    if (user.branch_active === false) {
-      return authFailure(res, {
-        status: 403,
-        code: "BRANCH_ACCESS_DENIED",
-        publicMessage: "This branch is not authorised for login.",
-        userId: user.id,
-        username: user.username,
-        deviceId: devicePayload.device_id,
-        ipAddress: req.ip,
-        details: { stage: "branch_status", branch_id: user.branch_id },
       });
     }
     if (user.locked_until && new Date(user.locked_until).getTime() > Date.now()) {
@@ -10402,6 +10410,92 @@ app.post("/login", async (req, res) => {
         device_status: device.status,
       });
     }
+    const operationalAssignmentResult = await pool.query(
+      `SELECT
+         da.company_id,
+         da.branch_id,
+         da.operational_location_id,
+         b.branch_name,
+         b.active AS branch_active,
+         ol.location_name,
+         ol.active AS location_active,
+         sla.id AS staff_assignment_id
+       FROM device_assignments da
+       JOIN branches b
+         ON b.id = da.branch_id
+        AND b.company_id = da.company_id
+       JOIN operational_locations ol
+         ON ol.id = da.operational_location_id
+        AND ol.branch_id = da.branch_id
+        AND ol.company_id = da.company_id
+       LEFT JOIN staff_location_assignments sla
+         ON sla.user_id = $2
+        AND sla.company_id = da.company_id
+        AND sla.branch_id = da.branch_id
+        AND sla.operational_location_id = da.operational_location_id
+        AND sla.active = TRUE
+        AND (sla.effective_from IS NULL OR sla.effective_from <= CURRENT_DATE)
+        AND (sla.effective_to IS NULL OR sla.effective_to >= CURRENT_DATE)
+       WHERE da.device_id = $1
+         AND da.active = TRUE
+         AND da.company_id = COALESCE($3::INTEGER, da.company_id)
+       ORDER BY da.assignment_generation DESC, da.id DESC
+       LIMIT 1`,
+      [device.device_id, user.id, user.company_id]
+    );
+    const operationalAssignment = operationalAssignmentResult.rows[0] || null;
+    if (operationalAssignment && !operationalAssignment.staff_assignment_id) {
+      return authFailure(res, {
+        status: 403,
+        code: "DEVICE_LOCATION_MISMATCH",
+        publicMessage: "This user is not authorised for the device's assigned operational location.",
+        userId: user.id,
+        username: user.username,
+        deviceId: device.device_id,
+        ipAddress: req.ip,
+        details: { stage: "operational_assignment" },
+      });
+    }
+    if ((operationalAssignment ? operationalAssignment.branch_active : user.branch_active) === false) {
+      return authFailure(res, {
+        status: 403,
+        code: "BRANCH_ACCESS_DENIED",
+        publicMessage: "This branch is not authorised for login.",
+        userId: user.id,
+        username: user.username,
+        deviceId: device.device_id,
+        ipAddress: req.ip,
+        details: {
+          stage: "branch_status",
+          branch_id: operationalAssignment?.branch_id || user.branch_id,
+        },
+      });
+    }
+    if (operationalAssignment?.location_active === false) {
+      return authFailure(res, {
+        status: 403,
+        code: "OPERATIONAL_SCOPE_INACTIVE",
+        publicMessage: "This operational location is inactive.",
+        userId: user.id,
+        username: user.username,
+        deviceId: device.device_id,
+        ipAddress: req.ip,
+        details: {
+          stage: "location_status",
+          branch_id: operationalAssignment.branch_id,
+          operational_location_id: operationalAssignment.operational_location_id,
+        },
+      });
+    }
+    const canonicalCompanyId = operationalAssignment?.company_id
+      || user.company_id
+      || device.company_id
+      || null;
+    const canonicalBranchId = operationalAssignment?.branch_id
+      || device.assigned_branch_id
+      || user.branch_id
+      || 1;
+    const canonicalOperationalLocationId = operationalAssignment?.operational_location_id || null;
     await pool.query(
       "UPDATE authorized_devices SET last_active_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE device_id = $1",
       [device.device_id]
@@ -10419,7 +10513,11 @@ app.post("/login", async (req, res) => {
       deviceId: device.device_id,
       ipAddress: req.ip,
       details: {
-        branch_id: user.branch_id,
+        company_id: canonicalCompanyId,
+        user_id: user.id,
+        device_id: device.device_id,
+        branch_id: canonicalBranchId,
+        operational_location_id: canonicalOperationalLocationId,
         role: user.role_name,
         canonical_alias_used: canonicalAliasUsed,
         requested_username: canonicalAliasUsed ? normalizeUsername(username) : null,
@@ -10430,42 +10528,12 @@ app.post("/login", async (req, res) => {
       user_id: user.id,
       device_id: device.device_id,
       role: user.role_name,
-      company_id: user.company_id || device.company_id || null,
+      company_id: canonicalCompanyId,
       company_name: user.company_name || configuredCompanyName || null,
-      branch_id: user.branch_id || 1,
+      branch_id: canonicalBranchId,
+      operational_location_id: canonicalOperationalLocationId,
       canonical_alias_used: canonicalAliasUsed,
     });
-    const operationalAssignmentResult = await pool.query(
-      `SELECT
-         da.company_id,
-         da.branch_id,
-         da.operational_location_id,
-         b.branch_name,
-         ol.location_name
-       FROM device_assignments da
-       JOIN branches b
-         ON b.id = da.branch_id
-        AND b.company_id = da.company_id
-       JOIN operational_locations ol
-         ON ol.id = da.operational_location_id
-        AND ol.branch_id = da.branch_id
-        AND ol.company_id = da.company_id
-       WHERE da.device_id = $1
-         AND da.active = TRUE
-       ORDER BY da.assignment_generation DESC, da.id DESC
-       LIMIT 1`,
-      [device.device_id]
-    );
-    const operationalAssignment = operationalAssignmentResult.rows[0] || null;
-    const canonicalCompanyId = operationalAssignment?.company_id
-      || user.company_id
-      || device.company_id
-      || null;
-    const canonicalBranchId = operationalAssignment?.branch_id
-      || device.assigned_branch_id
-      || user.branch_id
-      || 1;
-    const canonicalOperationalLocationId = operationalAssignment?.operational_location_id || null;
     const deviceSessionToken = issueDeviceSession({
       userId: user.id,
       deviceId: device.device_id,

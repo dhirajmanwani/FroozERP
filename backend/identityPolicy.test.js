@@ -41,12 +41,23 @@ test("canonical login alias requires an existing user claim and device identity"
   assert.equal(canonicalAliasClaim({ canonicalUserId: 0, deviceId: "device", requestedUsername: "alias" }), null);
 });
 
-test("canonical alias SQL remains device-bound and password verification remains mandatory", () => {
+test("canonical alias SQL uses the explicit claim and server-authorized location intersection", () => {
   const source = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
-  assert.match(source, /d\.device_id = \$3/);
-  assert.match(source, /d\.status = 'APPROVED'/);
-  assert.match(source, /d\.approved_by = u\.id/);
-  assert.match(source, /passwordMatches\(password, user\.password_hash\)/);
+  const start = source.indexOf('app.post("/login"');
+  const end = source.indexOf('const listProductCategoriesHandler', start);
+  const loginRoute = source.slice(start, end);
+
+  assert.ok(start > 0 && end > start);
+  assert.match(loginRoute, /\$2::INTEGER IS NOT NULL[\s\S]*u\.id = \$2/);
+  assert.match(loginRoute, /d\.device_id = \$3/);
+  assert.match(loginRoute, /d\.status = 'APPROVED'/);
+  assert.match(loginRoute, /JOIN device_assignments da/);
+  assert.match(loginRoute, /JOIN staff_location_assignments sla/);
+  assert.match(loginRoute, /sla\.user_id = u\.id/);
+  assert.match(loginRoute, /u\.company_id = da\.company_id/);
+  assert.doesNotMatch(loginRoute, /d\.approved_by = u\.id/);
+  assert.doesNotMatch(loginRoute, /d\.assigned_branch_id = COALESCE\(u\.branch_id, 1\)/);
+  assert.match(loginRoute, /passwordMatches\(password, user\.password_hash\)/);
   assert.doesNotMatch(source, /INSERT INTO users[\s\S]{0,300}canonical.*alias/i);
 });
 
@@ -72,7 +83,7 @@ test("approval state cannot bypass canonical password verification", () => {
 
   const source = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
   assert.match(source, /d\.device_id = \$3/);
-  assert.match(source, /d\.approved_by = u\.id/);
+  assert.match(source, /\$2::INTEGER IS NOT NULL/);
   assert.match(source, /passwordMatches\(password, user\.password_hash\)/);
   assert.match(source, /canonical_alias_used: canonicalAliasUsed/);
 });
@@ -85,12 +96,18 @@ test("approved login returns the active server-authorized operational assignment
 
   assert.ok(start > 0 && end > start);
   assert.match(loginRoute, /FROM device_assignments da/);
+  assert.match(loginRoute, /LEFT JOIN staff_location_assignments sla/);
   assert.match(loginRoute, /WHERE da\.device_id = \$1[\s\S]*da\.active = TRUE/);
+  assert.match(loginRoute, /DEVICE_LOCATION_MISMATCH/);
   assert.match(loginRoute, /canonicalCompanyId = operationalAssignment\?\.company_id/);
   assert.match(loginRoute, /canonicalBranchId = operationalAssignment\?\.branch_id/);
   assert.match(loginRoute, /operational_location_id: canonicalOperationalLocationId/);
   assert.match(loginRoute, /operational_location: operationalAssignment\?\.location_name/);
   assert.match(loginRoute, /device_id: device\.device_id/);
+  const assignmentIndex = loginRoute.indexOf("const operationalAssignmentResult");
+  const auditIndex = loginRoute.indexOf('action: "LOGIN_SUCCESS"');
+  assert.ok(assignmentIndex > 0 && auditIndex > assignmentIndex);
+  assert.match(loginRoute, /details:\s*\{[\s\S]*company_id: canonicalCompanyId[\s\S]*user_id: user\.id[\s\S]*device_id: device\.device_id[\s\S]*branch_id: canonicalBranchId[\s\S]*operational_location_id: canonicalOperationalLocationId/);
 });
 
 test("approved alias password mismatch requests canonical verification without bypassing it", () => {
