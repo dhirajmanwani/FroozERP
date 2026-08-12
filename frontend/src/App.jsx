@@ -586,7 +586,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.66";
+const APP_VERSION = "1.0.67";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -852,7 +852,7 @@ const getClientDeviceInfo = () => {
   const storageKey = "froozerp_device_id";
   const provisionedDeviceId = readOfflineSession()?.deviceId;
   let deviceId = String(provisionedDeviceId || SAVED_API_CONFIG.deviceId || localStorage.getItem(storageKey) || "").trim();
-  if (!deviceId) {
+  if (!deviceId && !isTauriRuntime()) {
     const opaqueId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2, 14)}`;
     deviceId = `FZDEV-${opaqueId.toUpperCase()}`;
     localStorage.setItem(storageKey, deviceId);
@@ -875,7 +875,7 @@ const getClientDeviceInfo = () => {
 
 const resolveLocalDeviceInfo = async (fallback = getClientDeviceInfo()) => {
   if (!isTauriRuntime()) return fallback;
-  const identity = await getOrCreateLocalDeviceIdentity(fallback?.device_id).catch(() => null);
+  const identity = await getOrCreateLocalDeviceIdentity(fallback?.device_id);
   if (!identity?.device_id) {
     throw new Error("The local device identity is not ready. Wait for the local service and retry.");
   }
@@ -1901,7 +1901,7 @@ function App() {
         return;
       }
       if (!isTauriRuntime()) return;
-      const identity = await getOrCreateLocalDeviceIdentity().catch(() => null);
+      const identity = await getOrCreateLocalDeviceIdentity();
       if (!identity?.device_id || cancelled) return;
       localStorage.setItem("froozerp_device_id", identity.device_id);
       if (identity.device_name) localStorage.setItem("froozerp_device_name", identity.device_name);
@@ -1913,6 +1913,12 @@ function App() {
       }));
     }).catch((error) => {
       if (cancelled) return;
+      if (String(error?.message || error).includes("DEVICE_IDENTITY_CONFLICT")) {
+        writeDiagnosticLog("ERROR", "canonical-device-identity-conflict", { message: error?.message || String(error) });
+        setMandatoryRuntimeState("ready");
+        setStartupNotice("Device identity conflict detected. FroozERP preserved the existing identities and did not create or select another device. Restore the canonical device backup or reconcile the identities before continuing.");
+        return;
+      }
       writeDiagnosticLog("ERROR", "mandatory-local-database-initialization-failed", { message: error?.message || String(error) });
       setMandatoryRuntimeState("fatal");
       setStartupError("The local FroozERP database could not be initialized. Restart the local service and retry.");

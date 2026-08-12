@@ -46,6 +46,15 @@ test("fresh onboarding performs a pull-only cycle before provisioning", () => {
 test("device identity is generated per installation without machine-specific constants", () => {
   assert.match(appSource, /crypto\?\.randomUUID\?\.\(\)/);
   assert.doesNotMatch(appSource, /FZDEV-SECOND-LAPTOP/);
+  assert.match(appSource, /if \(!deviceId && !isTauriRuntime\(\)\)/);
+  assert.match(appSource, /getOrCreateLocalDeviceIdentity\(fallback\?\.device_id\)/);
+  assert.doesNotMatch(appSource, /getOrCreateLocalDeviceIdentity\(fallback\?\.device_id\)\.catch/);
+});
+
+test("desktop identity conflicts remain recoverable without a new approval request", () => {
+  assert.match(appSource, /DEVICE_IDENTITY_CONFLICT/);
+  assert.match(appSource, /canonical-device-identity-conflict/);
+  assert.match(appSource, /preserved the existing identities and did not create or select another device/);
 });
 
 test("pending approval is shown distinctly from invalid credentials", () => {

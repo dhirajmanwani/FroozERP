@@ -3036,60 +3036,45 @@ fn ensure_device_identity_with_preference_at(
     let preferred_device_id = preferred_device_id
         .map(str::trim)
         .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"));
-    if let Some(preferred_device_id) = preferred_device_id {
-        if let Some(existing) = conn
-            .query_row(
-                "SELECT device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at, last_sync_at
-                 FROM local_device_identity
-                 WHERE device_id = ?1
-                 LIMIT 1",
-                [preferred_device_id],
-                device_identity_from_row,
-            )
-            .optional()
-            .map_err(to_error)?
-        {
-            return Ok(existing);
-        }
-
-        let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows Device".to_string());
-        let device_name = format!("{} - FroozERP", hostname);
-        let app_version = env!("CARGO_PKG_VERSION");
-        conn.execute(
-            "INSERT INTO local_device_identity (
-                device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at, updated_at
-             ) VALUES (?1, ?2, 'tauri-windows', ?3, 'unassigned', 'pending', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-            params![preferred_device_id, device_name, app_version],
-        )
-        .map_err(to_error)?;
-        return Ok(serde_json::json!({
-            "device_id": preferred_device_id,
-            "device_name": device_name,
-            "platform": "tauri-windows",
-            "app_version": app_version,
-            "branch_id": "unassigned",
-            "registration_status": "pending",
-        }));
-    }
-
-    if let Some(existing) = conn
-        .query_row(
+    let mut statement = conn
+        .prepare(
             "SELECT device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at, last_sync_at
              FROM local_device_identity
-             ORDER BY CASE WHEN device_id = 'default' THEN 1 ELSE 0 END,
-                      updated_at DESC, rowid DESC
-             LIMIT 1",
-            [],
-            device_identity_from_row,
+             WHERE LOWER(device_id) <> 'default'
+             ORDER BY device_id",
         )
-        .optional()
+        .map_err(to_error)?;
+    let identities = statement
+        .query_map([], device_identity_from_row)
         .map_err(to_error)?
-    {
-        return Ok(existing);
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_error)?;
+    let approved = identities
+        .iter()
+        .filter(|identity| {
+            optional_text(identity, "registration_status")
+                .map(|status| status.eq_ignore_ascii_case("approved"))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    if approved.len() > 1 {
+        return Err("DEVICE_IDENTITY_CONFLICT: Multiple approved local device identities exist. Restore the canonical device backup or reconcile the identities before continuing.".to_string());
+    }
+    if let Some(identity) = approved.first() {
+        return Ok((*identity).clone());
+    }
+    if identities.len() > 1 {
+        return Err("DEVICE_IDENTITY_CONFLICT: Multiple provisional local device identities exist and no approved canonical identity is available.".to_string());
+    }
+    if let Some(identity) = identities.first() {
+        return Ok(identity.clone());
     }
 
     let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows Device".to_string());
-    let device_id = generate_opaque_device_id()?;
+    let device_id = preferred_device_id
+        .map(ToOwned::to_owned)
+        .map(Ok)
+        .unwrap_or_else(generate_opaque_device_id)?;
     let device_name = format!("{} - FroozERP", hostname);
     let app_version = env!("CARGO_PKG_VERSION");
     conn.execute(
@@ -4658,7 +4643,7 @@ mod tests {
                 device_id, device_name, platform, app_version, branch_id, registration_status, updated_at
              ) VALUES
                ('canonical-device', 'Canonical', 'tauri-windows', '1.0.65', '1', 'approved', '2026-07-29T10:00:00.000Z'),
-               ('other-device', 'Other', 'tauri-windows', '1.0.65', '2', 'approved', '2026-07-29T12:00:00.000Z'),
+               ('other-device', 'Other', 'tauri-windows', '1.0.65', '2', 'pending', '2026-07-29T12:00:00.000Z'),
                ('default', 'Legacy Default', 'tauri-windows', '1.0.65', '1', 'approved', '2026-07-29T11:00:00.000Z')",
             [],
         )
@@ -4668,11 +4653,18 @@ mod tests {
         let selected = ensure_device_identity_with_preference_at(&path, Some("canonical-device"))
             .expect("select configured canonical identity");
         assert_eq!(selected["device_id"], "canonical-device");
-        let created = ensure_device_identity_with_preference_at(&path, Some("fresh-device"))
-            .expect("create configured fresh identity");
-        assert_eq!(created["device_id"], "fresh-device");
-        assert_eq!(created["registration_status"], "pending");
+        let preserved = ensure_device_identity_with_preference_at(&path, Some("fresh-device"))
+            .expect("approved canonical identity wins over a provisional preference");
+        assert_eq!(preserved["device_id"], "canonical-device");
         let conn = Connection::open(&path).expect("inspect device identities");
+        let fresh_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_device_identity WHERE device_id = 'fresh-device'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rejected fresh identities");
+        assert_eq!(fresh_count, 0);
         let default_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM local_device_identity WHERE device_id = 'default'",
@@ -4681,6 +4673,54 @@ mod tests {
             )
             .expect("count retained legacy default rows");
         assert_eq!(default_count, 1);
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn conflicting_approved_identities_fail_without_creating_or_overwriting() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-device-conflict-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize conflict profile");
+        let conn = Connection::open(&path).expect("seed conflicts");
+        conn.execute(
+            "INSERT INTO local_device_identity (device_id, device_name, platform, app_version, branch_id, registration_status)
+             VALUES ('approved-a', 'A', 'tauri-windows', '1.0.65', '1', 'approved'),
+                    ('approved-b', 'B', 'tauri-windows', '1.0.65', '1', 'approved')",
+            [],
+        )
+        .expect("insert conflicts");
+        drop(conn);
+        let error = ensure_device_identity_with_preference_at(&path, Some("approved-a"))
+            .expect_err("ambiguous approved identities must fail");
+        assert!(error.contains("DEVICE_IDENTITY_CONFLICT"));
+        let conn = Connection::open(&path).expect("inspect conflicts");
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM local_device_identity", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 2);
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clean_install_generates_exactly_one_identity_and_reuses_it() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-clean-device-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize clean profile");
+        let created = ensure_device_identity_with_preference_at(&path, None).expect("create one identity");
+        let reused = ensure_device_identity_with_preference_at(&path, created["device_id"].as_str())
+            .expect("reuse generated identity");
+        assert_eq!(created["device_id"], reused["device_id"]);
+        let conn = Connection::open(&path).expect("inspect clean profile");
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM local_device_identity", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1);
         drop(conn);
         let _ = fs::remove_file(&path);
     }
@@ -4908,6 +4948,13 @@ mod tests {
             )
             .expect("insert released device identity");
             conn.execute(
+                "INSERT INTO local_device_identity
+                   (device_id,device_name,platform,app_version,branch_id,registration_status)
+                 VALUES ('legacy-pending-device','Legacy Pending','windows',?1,'unassigned','pending')",
+                [released_version],
+            )
+            .expect("insert released provisional identity");
+            conn.execute(
                 "INSERT INTO local_products (id,branch_id,device_id,product_name,unit,sync_status)
                  VALUES ('upgrade-product','1',?1,'Preserved Product','KG','synced')",
                 [&device_id],
@@ -4939,8 +4986,14 @@ mod tests {
             drop(conn);
 
             initialize_at(&path).expect("upgrade released profile");
+            let selected = ensure_device_identity_with_preference_at(&path, Some("webview-generated-device"))
+                .expect("upgrade selects the established approved identity");
+            assert_eq!(selected["device_id"], device_id);
+            let restarted = ensure_device_identity_with_preference_at(&path, None)
+                .expect("restart retains the established approved identity");
+            assert_eq!(restarted["device_id"], device_id);
             let conn = Connection::open(&path).expect("inspect upgraded profile");
-            let preserved: (i64, i64, f64, i64, String, String) = conn
+            let preserved: (i64, i64, f64, i64, String, String, i64, String) = conn
                 .query_row(
                     "SELECT
                        (SELECT COUNT(*) FROM local_device_identity WHERE device_id=?1 AND registration_status='APPROVED'),
@@ -4948,12 +5001,14 @@ mod tests {
                        (SELECT balance_qty FROM local_inventory_lots WHERE id='upgrade-lot'),
                        (SELECT COUNT(*) FROM sync_outbox WHERE operation_id='upgrade-operation' AND status='pending'),
                        (SELECT device_id FROM sync_runtime_config WHERE id=1),
-                       (SELECT app_mode FROM sync_runtime_config WHERE id=1)",
+                       (SELECT app_mode FROM sync_runtime_config WHERE id=1),
+                       (SELECT COUNT(*) FROM local_device_identity WHERE device_id='webview-generated-device'),
+                       (SELECT device_id FROM sync_outbox WHERE operation_id='upgrade-operation')",
                     [&device_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
                 )
                 .expect("read preserved released state");
-            assert_eq!(preserved, (1, 1, 7.5, 1, device_id, "HYBRID".to_string()));
+            assert_eq!(preserved, (1, 1, 7.5, 1, device_id.clone(), "HYBRID".to_string(), 0, device_id));
             let migrations: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM local_schema_migrations WHERE status='APPLIED'",
