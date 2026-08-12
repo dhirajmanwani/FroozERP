@@ -159,7 +159,11 @@ const syncContext = ({ user, deviceInfo, branchId }) => ({
   userId: user?.id,
   deviceId: deviceInfo?.device_id,
   deviceName: deviceInfo?.device_name,
+  companyId: String(user?.company_id || deviceInfo?.company_id || ""),
   branchId: String(branchId || user?.branch_id || ""),
+  operationalLocationId: String(
+    user?.operational_location_id || deviceInfo?.operational_location_id || ""
+  ),
   deviceSessionToken: user?.device_session_token || "",
 });
 
@@ -312,7 +316,9 @@ export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId
       const response = await axios.post(endpointUrl(apiUrl, "/api/sync/push"), {
         user_id: context.userId,
         device_id: context.deviceId,
+        company_id: context.companyId,
         branch_id: context.branchId,
+        operational_location_id: context.operationalLocationId,
         client_timestamp: authoritativeUtcNowIso(),
         operations: regularOperations.map((operation) => ({
           operation_id: operation.operation_id,
@@ -387,13 +393,15 @@ export async function pullServerChanges({ apiUrl, user, deviceInfo, branchId }) 
   const pullStartedAt = Date.now();
   const response = await axios.get(endpointUrl(apiUrl, "/api/sync/pull"), {
     ...withTimeout(15000),
-    headers: cursor === "0" && context.deviceSessionToken
+    headers: context.deviceSessionToken
       ? { "x-froozerp-device-session": context.deviceSessionToken }
       : undefined,
     params: {
       user_id: context.userId,
       device_id: context.deviceId,
+      company_id: context.companyId,
       branch_id: context.branchId,
+      operational_location_id: context.operationalLocationId,
       cursor,
       limit: 50,
       bootstrap_protocol: cursor === "0" ? "reference-v1" : undefined,

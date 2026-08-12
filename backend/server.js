@@ -9080,6 +9080,76 @@ const sendOperationalScopeError = (res, error) => res.status(error.status || 403
   message: error.message,
 });
 
+// Enforced sync derives authority from the signed session and canonical device assignment.
+const resolveSyncRequestContext = async (req, client = pool) => {
+  const submitted = {
+    user_id: req.body?.user_id ?? req.query?.user_id,
+    device_id: req.body?.device_id ?? req.query?.device_id,
+    company_id: req.body?.company_id ?? req.query?.company_id,
+    branch_id: req.body?.branch_id ?? req.query?.branch_id,
+    operational_location_id:
+      req.body?.operational_location_id ?? req.query?.operational_location_id,
+  };
+  if (operationalScopeMode !== SCOPE_MODES.ENFORCE) {
+    return requireSyncContext({
+      userId: submitted.user_id,
+      deviceId: submitted.device_id,
+      branchId: submitted.branch_id,
+      operationalLocationId: submitted.operational_location_id,
+    }, client);
+  }
+
+  const deviceSession = verifyDeviceSession(
+    req.headers["x-froozerp-device-session"],
+    deviceSessionSecret
+  );
+  if (deviceSession.error) return { error: deviceSession.error };
+  const requiredScope = [
+    ["user_id", submitted.user_id],
+    ["device_id", submitted.device_id],
+    ["company_id", submitted.company_id],
+    ["branch_id", submitted.branch_id],
+    ["operational_location_id", submitted.operational_location_id],
+  ];
+  const missing = requiredScope
+    .filter(([, value]) => value == null || String(value).trim() === "")
+    .map(([field]) => field);
+  if (missing.length) {
+    return {
+      error: {
+        status: 400,
+        code: "SYNC_SCOPE_REQUIRED",
+        message: `Sync requires canonical scope fields: ${missing.join(", ")}`,
+      },
+    };
+  }
+  const substitution = rejectDeviceSessionSubstitution(deviceSession.claims, submitted);
+  if (substitution) return { error: substitution };
+
+  const context = await requireSyncContext({
+    userId: deviceSession.claims.user_id,
+    deviceId: deviceSession.claims.device_id,
+    branchId: deviceSession.claims.branch_id,
+    operationalLocationId: submitted.operational_location_id,
+  }, client);
+  if (context.error) return context;
+  if (
+    Number(context.companyId) !== Number(deviceSession.claims.company_id) ||
+    Number(context.branchId) !== Number(deviceSession.claims.branch_id) ||
+    Number(context.user.session_revocation_version || 0) !==
+      Number(deviceSession.claims.session_revocation_version || 0)
+  ) {
+    return {
+      error: {
+        status: 401,
+        code: "DEVICE_SESSION_SCOPE_STALE",
+        message: "Authenticated device session no longer matches canonical server scope",
+      },
+    };
+  }
+  return context;
+};
+
 const resolveV3OperationalContext = async (req, { requireWrite = false } = {}) => {
   try {
     const deviceSession = verifyDeviceSession(
@@ -9467,15 +9537,10 @@ app.post("/api/sync/push", rateLimitSyncRequest, async (req, res) => {
     const operations = Array.isArray(req.body.operations) ? req.body.operations : [];
     if (operations.length > 100) return res.status(413).json({ message: "Sync push batch is too large" });
     await client.query("BEGIN");
-    const context = await requireSyncContext({
-      userId: req.body.user_id,
-      deviceId: req.body.device_id,
-      branchId: req.body.branch_id,
-      operationalLocationId: req.body.operational_location_id,
-    }, client);
+    const context = await resolveSyncRequestContext(req, client);
     if (context.error) {
       await client.query("ROLLBACK");
-      return res.status(context.error.status).json({ message: context.error.message });
+      return sendOperationalScopeError(res, context.error);
     }
     if (operationalScopeMode === SCOPE_MODES.ENFORCE) {
       const scopeValidationError = validateSyncBatchScope(operations, {
@@ -9543,48 +9608,15 @@ app.get("/api/sync/pull", rateLimitSyncRequest, async (req, res) => {
         message: "Reference bootstrap requires enforced operational-location scope",
       });
     }
-    const deviceSession = verifyDeviceSession(
-      req.headers["x-froozerp-device-session"],
-      deviceSessionSecret
-    );
-    if (deviceSession.error) {
-      return res.status(deviceSession.error.status).json(deviceSession.error);
-    }
-    const substitution = rejectDeviceSessionSubstitution(deviceSession.claims, {
-      user_id: req.query.user_id,
-      device_id: req.query.device_id,
-      company_id: req.query.company_id,
-      branch_id: req.query.branch_id,
-    });
-    if (substitution) return res.status(substitution.status).json(substitution);
     const client = await pool.connect();
     try {
       await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
-      await lockReferenceBootstrapBoundary(client);
-      const context = await requireSyncContext({
-        userId: deviceSession.claims.user_id,
-        deviceId: deviceSession.claims.device_id,
-        branchId: deviceSession.claims.branch_id,
-        operationalLocationId: req.query.operational_location_id,
-      }, client);
+      const context = await resolveSyncRequestContext(req, client);
       if (context.error) {
         await client.query("ROLLBACK");
-        return res.status(context.error.status).json({
-          code: context.error.code,
-          message: context.error.message,
-        });
+        return sendOperationalScopeError(res, context.error);
       }
-      if (
-        context.companyId !== deviceSession.claims.company_id ||
-        Number(context.user.session_revocation_version || 0) !==
-          Number(deviceSession.claims.session_revocation_version || 0)
-      ) {
-        await client.query("ROLLBACK");
-        return res.status(401).json({
-          code: "DEVICE_SESSION_SCOPE_STALE",
-          message: "Authenticated device session no longer matches canonical server scope",
-        });
-      }
+      await lockReferenceBootstrapBoundary(client);
       const referenceBootstrap = await captureReferenceBootstrap(client, context);
       await client.query("COMMIT");
       await pool.query(
@@ -9614,13 +9646,8 @@ app.get("/api/sync/pull", rateLimitSyncRequest, async (req, res) => {
     }
   }
   try {
-    const context = await requireSyncContext({
-      userId: req.query.user_id,
-      deviceId: req.query.device_id,
-      branchId: req.query.branch_id,
-      operationalLocationId: req.query.operational_location_id,
-    });
-    if (context.error) return res.status(context.error.status).json({ message: context.error.message });
+    const context = await resolveSyncRequestContext(req);
+    if (context.error) return sendOperationalScopeError(res, context.error);
     let rows;
     let hasMore;
     if (operationalScopeMode === SCOPE_MODES.ENFORCE) {
@@ -9666,13 +9693,8 @@ app.get("/api/sync/pull", rateLimitSyncRequest, async (req, res) => {
 
 app.get("/api/sync/status", rateLimitSyncRequest, async (req, res) => {
   try {
-    const context = await requireSyncContext({
-      userId: req.query.user_id,
-      deviceId: req.query.device_id,
-      branchId: req.query.branch_id,
-      operationalLocationId: req.query.operational_location_id,
-    });
-    if (context.error) return res.status(context.error.status).json({ message: context.error.message });
+    const context = await resolveSyncRequestContext(req);
+    if (context.error) return sendOperationalScopeError(res, context.error);
     const enforcedLocationId = operationalScopeMode === SCOPE_MODES.ENFORCE
       ? context.operationalLocationId
       : null;

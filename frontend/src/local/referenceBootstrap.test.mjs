@@ -21,6 +21,15 @@ test("cursor zero opts into reference bootstrap and applies it atomically", () =
   assert.match(repositories, /bootstrap: applyReferenceBootstrap/);
 });
 
+test("all sync requests carry the canonical signed scope after bootstrap", () => {
+  assert.match(syncService, /companyId: String\(user\?\.company_id \|\| deviceInfo\?\.company_id/);
+  assert.match(syncService, /operationalLocationId: String\(/);
+  assert.match(syncService, /company_id: context\.companyId/);
+  assert.match(syncService, /operational_location_id: context\.operationalLocationId/);
+  assert.doesNotMatch(syncService, /headers: cursor === "0" && context\.deviceSessionToken/);
+  assert.match(syncService, /headers: context\.deviceSessionToken/);
+});
+
 test("ordinary incremental pulls retain the existing apply path", () => {
   assert.match(syncService, /applyPulledChanges\(\{/);
   assert.match(syncService, /nextCursor: response\.data\?\.next_cursor \|\| cursor/);

@@ -97,8 +97,9 @@ test("protocol v3 inventory and sync enforce exact operational scope", () => {
   assert.match(inventoryRoute, /ib\.operational_location_id = olp\.operational_location_id/);
   assert.match(inventoryRoute, /olp\.operational_location_id = \$3/);
   assert.match(backendSource, /validateSyncBatchScope\(operations/);
-  assert.match(backendSource, /operationalLocationId: req\.body\.operational_location_id/);
-  assert.match(backendSource, /operationalLocationId: req\.query\.operational_location_id/);
+  assert.match(backendSource, /const resolveSyncRequestContext = async/);
+  assert.match(backendSource, /operationalLocationId: submitted\.operational_location_id/);
+  assert.match(backendSource, /rejectDeviceSessionSubstitution\(deviceSession\.claims, submitted\)/);
 });
 
 test("branch aggregates cannot be persisted as inventory in the new schema", () => {
