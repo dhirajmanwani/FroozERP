@@ -4866,6 +4866,108 @@ mod tests {
     }
 
     #[test]
+    fn released_1063_and_1065_profiles_upgrade_without_losing_scope_data_or_queue() {
+        for released_version in ["1.0.63", "1.0.65"] {
+            let path = std::env::temp_dir().join(format!(
+                "froozerp-{released_version}-upgrade-{}-{}.sqlite3",
+                std::process::id(),
+                unique_local_id("test")
+            ));
+            let _ = fs::remove_file(&path);
+            let mut conn = Connection::open(&path).expect("open released profile");
+            conn.execute_batch(
+                "CREATE TABLE local_schema_migrations (
+                    version TEXT PRIMARY KEY,
+                    applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    checksum TEXT NOT NULL,
+                    status TEXT NOT NULL
+                );",
+            )
+            .expect("create released migration table");
+            for (version, sql) in [
+                ("001_local_foundation", MIGRATION_001),
+                ("002_sync_engine_foundation", MIGRATION_002),
+                ("003_local_first_pos", MIGRATION_003),
+                ("004_offline_sale_edit_cancel", MIGRATION_004),
+                ("005_mandi_tax_sale_details", MIGRATION_005),
+                ("006_multibranch_identity_foundation", MIGRATION_006),
+                ("007_cloud_runtime_and_inbox_foundation", MIGRATION_007),
+                ("009_canonical_utc_timestamps", MIGRATION_009),
+                ("010_sync_delivery_state", MIGRATION_010),
+                ("011_connectivity_mode_audit", MIGRATION_011),
+                ("012_connectivity_mode_server_time", MIGRATION_012),
+            ] {
+                apply_migration(&mut conn, version, sql).expect("apply released migration");
+            }
+            let device_id = format!("FZDEV-UPGRADE-{released_version}");
+            conn.execute(
+                "INSERT INTO local_device_identity
+                   (device_id,device_name,platform,app_version,branch_id,registration_status,company_id,user_id,role)
+                 VALUES (?1,'Upgrade Device','windows',?2,'1','APPROVED','1','1','OWNER')",
+                params![device_id, released_version],
+            )
+            .expect("insert released device identity");
+            conn.execute(
+                "INSERT INTO local_products (id,branch_id,device_id,product_name,unit,sync_status)
+                 VALUES ('upgrade-product','1',?1,'Preserved Product','KG','synced')",
+                [&device_id],
+            )
+            .expect("insert released product");
+            conn.execute(
+                "INSERT INTO local_inventory_lots
+                   (id,branch_id,device_id,product_id,product_name,balance_qty,cost_rate,status,sync_status)
+                 VALUES ('upgrade-lot','1',?1,'upgrade-product','Preserved Product',7.5,20,'ACTIVE','synced')",
+                [&device_id],
+            )
+            .expect("insert released lot");
+            conn.execute(
+                "INSERT INTO sync_runtime_config
+                   (id,company_id,branch_id,device_id,user_id,role,app_mode,cloud_api_url,sync_status)
+                 VALUES (1,'1','1',?1,'1','OWNER','HYBRID','https://example.invalid','IDLE')",
+                [&device_id],
+            )
+            .expect("insert released runtime config");
+            conn.execute(
+                "INSERT INTO sync_outbox
+                   (id,entity_type,entity_id,operation_type,payload,branch_id,device_id,status,
+                    operation_id,payload_json,user_id,company_id,idempotency_key,sync_status)
+                 VALUES ('upgrade-outbox','sync_test','upgrade-entity','UPSERT','{}','1',?1,'pending',
+                    'upgrade-operation','{}','1','1','upgrade-operation','pending')",
+                [&device_id],
+            )
+            .expect("insert released queued operation");
+            drop(conn);
+
+            initialize_at(&path).expect("upgrade released profile");
+            let conn = Connection::open(&path).expect("inspect upgraded profile");
+            let preserved: (i64, i64, f64, i64, String, String) = conn
+                .query_row(
+                    "SELECT
+                       (SELECT COUNT(*) FROM local_device_identity WHERE device_id=?1 AND registration_status='APPROVED'),
+                       (SELECT COUNT(*) FROM local_products WHERE id='upgrade-product'),
+                       (SELECT balance_qty FROM local_inventory_lots WHERE id='upgrade-lot'),
+                       (SELECT COUNT(*) FROM sync_outbox WHERE operation_id='upgrade-operation' AND status='pending'),
+                       (SELECT device_id FROM sync_runtime_config WHERE id=1),
+                       (SELECT app_mode FROM sync_runtime_config WHERE id=1)",
+                    [&device_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                )
+                .expect("read preserved released state");
+            assert_eq!(preserved, (1, 1, 7.5, 1, device_id, "HYBRID".to_string()));
+            let migrations: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM local_schema_migrations WHERE status='APPLIED'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read upgraded migration count");
+            assert_eq!(migrations, 15);
+            drop(conn);
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    #[test]
     fn pulled_pos_sale_is_applied_once_without_double_stock_mutation() {
         let path = std::env::temp_dir().join(format!(
             "froozerp-pulled-sale-{}-{}.sqlite3",
