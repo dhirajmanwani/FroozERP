@@ -25,6 +25,27 @@ const invokeLocal = async (command, payload) => {
   return invoke(command, payload);
 };
 
+export const sanitizeLocalSnapshotLoadError = (error) => {
+  const rawMessage = String(error?.message || error || "");
+  let code = "LOCAL_SNAPSHOT_LOAD_FAILED";
+  let message = "Saved offline data could not be loaded. Retry local service readiness.";
+
+  if (/missing required key\s+deviceId|invalid args.*local_load_reference_snapshot/i.test(rawMessage)) {
+    code = "LOCAL_SNAPSHOT_BRIDGE_CONTRACT";
+    message = "Saved offline data could not be loaded because the desktop runtime is incompatible with this application build.";
+  } else if (/database disk image is malformed|file is not a database|database corruption/i.test(rawMessage)) {
+    code = "LOCAL_SNAPSHOT_CORRUPT";
+    message = "Saved offline data is damaged. FroozERP preserved it and did not create a replacement database.";
+  } else if (/no such table|no such column|unsupported schema|incompatible schema|schema.*incompatible/i.test(rawMessage)) {
+    code = "LOCAL_SNAPSHOT_INCOMPATIBLE";
+    message = "Saved offline data uses an incompatible schema. FroozERP preserved it and did not create a replacement database.";
+  }
+
+  const diagnostic = new Error(`${message} (${code})`);
+  diagnostic.code = code;
+  return diagnostic;
+};
+
 const normalizeStatus = (status, fallback = {}) => ({
   ...emptyStatus,
   ...fallback,
@@ -77,10 +98,14 @@ export async function cacheLocalReferenceSnapshot(snapshot) {
 
 export async function loadLocalReferenceSnapshot({ username, deviceId } = {}) {
   if (!isTauriRuntime()) return null;
-  return invokeLocal("local_load_reference_snapshot", {
-    username: username || null,
-    device_id: deviceId || null,
-  });
+  try {
+    return await invokeLocal("local_load_reference_snapshot", {
+      username: username || null,
+      deviceId: deviceId || null,
+    });
+  } catch (error) {
+    throw sanitizeLocalSnapshotLoadError(error);
+  }
 }
 
 export async function getOrCreateLocalDeviceIdentity(preferredDeviceId = "") {

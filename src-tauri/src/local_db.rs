@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -151,7 +151,6 @@ pub fn load_reference_snapshot(
     device_id: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let path = database_path(app)?;
-    initialize_at(&path)?;
     load_reference_snapshot_at(&path, username, device_id)
 }
 
@@ -160,7 +159,6 @@ pub fn load_reference_snapshot_path(
     username: Option<&str>,
     device_id: Option<&str>,
 ) -> Result<serde_json::Value, String> {
-    initialize_at(path)?;
     load_reference_snapshot_at(path, username, device_id)
 }
 
@@ -2649,6 +2647,7 @@ fn load_reference_snapshot_at(
     username: Option<&str>,
     device_id: Option<&str>,
 ) -> Result<serde_json::Value, String> {
+    validate_reference_snapshot_source_at(path)?;
     initialize_at(path)?;
     let conn = Connection::open(path).map_err(to_error)?;
     let requested_device = device_id.unwrap_or("default");
@@ -2973,6 +2972,43 @@ fn load_reference_snapshot_at(
         "failed_operations": count_outbox_status(&conn, &["failed"])?,
         "conflict_operations": count_outbox_status(&conn, &["conflict"])?,
     }))
+}
+
+fn validate_reference_snapshot_source_at(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| "Local snapshot database corruption: unable to open the existing database read-only".to_string())?;
+    let integrity = conn
+        .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+        .map_err(|_| "Local snapshot database corruption: integrity check could not be completed".to_string())?;
+    if !integrity.eq_ignore_ascii_case("ok") {
+        return Err("Local snapshot database corruption: integrity check failed".to_string());
+    }
+
+    for table in [
+        "local_schema_migrations",
+        "local_kv",
+        "local_device_identity",
+        "local_products",
+        "local_inventory_lots",
+        "local_supplier_references",
+        "sync_outbox",
+    ] {
+        let present = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(to_error)?;
+        if present != 1 {
+            return Err(format!("Local snapshot has an incompatible schema: missing required table {table}"));
+        }
+    }
+    Ok(())
 }
 
 fn set_smoke_value_at(path: &Path, value: &str) -> Result<(), String> {
@@ -3916,6 +3952,46 @@ fn require_server_time(server_time: Option<String>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_preflight_rejects_malformed_database_without_replacing_it() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-malformed-snapshot-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let original = b"not a sqlite database".to_vec();
+        fs::write(&path, &original).expect("write malformed disposable database");
+
+        let error = load_reference_snapshot_path(&path, Some("offline-user"), Some("device-test"))
+            .expect_err("malformed snapshot must fail");
+        assert!(error.contains("database corruption"));
+        assert_eq!(fs::read(&path).expect("read preserved malformed database"), original);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn snapshot_preflight_rejects_incompatible_schema_without_migrating_it() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-incompatible-snapshot-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        initialize_at(&path).expect("initialize disposable database");
+        {
+            let conn = Connection::open(&path).expect("open disposable database");
+            conn.execute_batch("DROP TABLE local_supplier_references")
+                .expect("remove required table from disposable database");
+        }
+        let before = fs::read(&path).expect("read incompatible database before load");
+
+        let error = load_reference_snapshot_path(&path, Some("offline-user"), Some("device-test"))
+            .expect_err("incompatible snapshot must fail");
+        assert!(error.contains("incompatible schema"));
+        assert!(error.contains("local_supplier_references"));
+        assert_eq!(fs::read(&path).expect("read incompatible database after load"), before);
+        let _ = fs::remove_file(&path);
+    }
 
     fn test_sale_payload(invoice_id: &str, operation_id: &str, quantity: f64, amount: f64) -> serde_json::Value {
         serde_json::json!({

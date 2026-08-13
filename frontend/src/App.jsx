@@ -586,7 +586,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.67";
+const APP_VERSION = "1.0.68";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -3383,10 +3383,20 @@ function App() {
 
   const continueOffline = async (latestDevice = deviceInfo) => {
     latestDevice = await resolveLocalDeviceInfo(latestDevice || getClientDeviceInfo());
-    const snapshot = await loadLocalReferenceSnapshot({
-      username,
-      deviceId: latestDevice.device_id,
-    }).catch(() => null);
+    let snapshot;
+    try {
+      snapshot = await loadLocalReferenceSnapshot({
+        username,
+        deviceId: latestDevice.device_id,
+      });
+    } catch (error) {
+      writeDiagnosticLog("ERROR", "local-reference-snapshot-load-failed", {
+        code: error?.code || "LOCAL_SNAPSHOT_LOAD_FAILED",
+        message: error?.message || "Saved offline data could not be loaded.",
+      });
+      setStartupError(error?.message || "Saved offline data could not be loaded. Retry local service readiness.");
+      return false;
+    }
     const cachedOfflineRecord = hasObjectContent(snapshot?.offline_auth)
       ? snapshot.offline_auth
       : readOfflineSession();
@@ -14625,7 +14635,11 @@ function OperationalScopeManagement({ canManage, user }) {
   );
 }
 
-function _LegacySecurityDevicesSection({ activationCodes, branches, canManage, counters, devices, onReload, user }) {
+function _LegacySecurityDevicesSection(props) {
+  return <LegacySecurityDevicesSection {...props} />;
+}
+
+function LegacySecurityDevicesSection({ activationCodes, branches, canManage, counters, devices, onReload, user }) {
   const [generatedCode, setGeneratedCode] = useState("");
   const [codeDraft, setCodeDraft] = useState({ code_label: "Counter device activation", expires_in_hours: 24, branch_id: "1", counter_id: "" });
   const deviceAction = async (device, action) => {
@@ -14727,7 +14741,11 @@ function _LegacySecurityDevicesSection({ activationCodes, branches, canManage, c
   );
 }
 
-function _LegacyBranchCounterSettings({ branches, canManage, counters, onReload, user }) {
+function _LegacyBranchCounterSettings(props) {
+  return <LegacyBranchCounterSettings {...props} />;
+}
+
+function LegacyBranchCounterSettings({ branches, canManage, counters, onReload, user }) {
   const [branchDraft, setBranchDraft] = useState({ branch_name: "", address: "", phone_number: "", gst_number: "", active: true });
   const [counterDraft, setCounterDraft] = useState({ branch_id: "1", counter_name: "", counter_type: "RETAIL_COUNTER", active: true });
   const addBranch = async () => {
