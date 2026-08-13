@@ -23,6 +23,15 @@ const SQLITE_PATH = path.resolve(String(
 const POLICY_PATH = path.join(APP_DATA, "cloud-network-policy.json");
 const CLOUD_REQUEST_AUDIT_PATH = path.join(APP_DATA, "logs", "cloud-request-audit.jsonl");
 
+const failClosedPolicy = () => ({
+  allowInternetAccess: false,
+  updatedAt: null,
+  confirmedAt: null,
+  timeSource: "device",
+  changedBy: null,
+  deviceId: null,
+});
+
 const sendJson = (res, status, payload, headers = {}) => {
   const body = Buffer.from(JSON.stringify(payload));
   res.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": body.length, "cache-control": "no-store", "access-control-allow-origin": "*", "access-control-allow-private-network": "true", ...headers });
@@ -32,8 +41,9 @@ const sendJson = (res, status, payload, headers = {}) => {
 const readPolicy = () => {
   try {
     const value = JSON.parse(fs.readFileSync(POLICY_PATH, "utf8"));
+    if (typeof value?.allowInternetAccess !== "boolean") return failClosedPolicy();
     return {
-      allowInternetAccess: value.allowInternetAccess !== false,
+      allowInternetAccess: value.allowInternetAccess,
       updatedAt: value.updatedAt || null,
       confirmedAt: value.confirmedAt || value.updatedAt || null,
       timeSource: value.timeSource || "device",
@@ -41,7 +51,7 @@ const readPolicy = () => {
       deviceId: value.deviceId || null,
     };
   } catch {
-    return { allowInternetAccess: true, updatedAt: null, confirmedAt: null, timeSource: "device", changedBy: null, deviceId: null };
+    return failClosedPolicy();
   }
 };
 

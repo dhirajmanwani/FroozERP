@@ -339,6 +339,49 @@ test("packaged desktop Local Only settings stay in SQLite without invoking cloud
   }
 });
 
+test("packaged settings fail closed before cloud routing when policy is missing or malformed", async () => {
+  for (const policyState of ["missing", "malformed", "invalid-shape"]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `froozerp-settings-fail-closed-${policyState}-`));
+    const appData = path.join(root, "AppData", "Roaming");
+    const databasePath = path.join(root, "profile", "froozerp-local.sqlite3");
+    writePopulatedSQLiteFixture(databasePath);
+    const cloudPort = await reservePort();
+    let cloudRequests = 0;
+    const cloudServer = require("node:http").createServer((_req, res) => {
+      cloudRequests += 1;
+      res.writeHead(500).end();
+    });
+    await new Promise((resolve, reject) => cloudServer.listen(cloudPort, "127.0.0.1", resolve).once("error", reject));
+    const policyPath = path.join(appData, "com.srtcompany.froozerp", "cloud-network-policy.json");
+    fs.mkdirSync(path.dirname(policyPath), { recursive: true });
+    if (policyState === "malformed") fs.writeFileSync(policyPath, "{broken");
+    if (policyState === "invalid-shape") fs.writeFileSync(policyPath, JSON.stringify({ status: "AUTO" }));
+    const port = await reservePort();
+    const runtime = await startDesktopBackend({
+      databasePath,
+      port,
+      extraEnv: { APPDATA: appData, CLOUD_API_URL: `http://127.0.0.1:${cloudPort}` },
+    });
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/settings?device_id=FZDEV-DELL-1781852580596`);
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get("x-froozerp-settings-source"), "local-sqlite");
+      assert.equal(response.headers.get("x-froozerp-canonical-device-id"), "FZDEV-DELL-1781852580596");
+      assert.equal(cloudRequests, 0, `${policyState} policy must not invoke the cloud router`);
+      const auditPath = path.join(appData, "com.srtcompany.froozerp", "logs", "cloud-request-audit.jsonl");
+      const audit = fs.readFileSync(auditPath, "utf8").trim().split(/\r?\n/).map(JSON.parse);
+      assert.deepEqual(audit.map(({ blocked, reachedCloud }) => ({ blocked, reachedCloud })), [
+        { blocked: true, reachedCloud: false },
+      ]);
+      assert.equal(audit[0].route, "/settings?device_id=FZDEV-DELL-1781852580596");
+    } finally {
+      await stopChild(runtime.child);
+      await new Promise((resolve) => cloudServer.close(resolve));
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("desktop settings use cloud only in Auto and malformed local settings fail without fallback", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "froozerp-settings-modes-"));
   const appData = path.join(root, "AppData", "Roaming");
@@ -378,8 +421,12 @@ test("desktop settings use cloud only in Auto and malformed local settings fail 
 
 test("desktop gateway converts upstream 502 into a clean cloud unavailable response", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "froozerp-cloud-unavailable-"));
+  const appData = path.join(root, "AppData", "Roaming");
   const databasePath = path.join(root, "profile", "froozerp-local.sqlite3");
   writeSQLiteFixture(databasePath);
+  const policyPath = path.join(appData, "com.srtcompany.froozerp", "cloud-network-policy.json");
+  fs.mkdirSync(path.dirname(policyPath), { recursive: true });
+  fs.writeFileSync(policyPath, JSON.stringify({ allowInternetAccess: true }));
   const cloudPort = await reservePort();
   const cloudServer = require("node:http").createServer((_req, res) => {
     const body = Buffer.from("upstream infrastructure detail");
@@ -392,7 +439,7 @@ test("desktop gateway converts upstream 502 into a clean cloud unavailable respo
     databasePath,
     port,
     extraEnv: {
-      APPDATA: path.join(root, "AppData", "Roaming"),
+      APPDATA: appData,
       LOCALAPPDATA: path.join(root, "AppData", "Local"),
       CLOUD_API_URL: `http://127.0.0.1:${cloudPort}`,
     },
