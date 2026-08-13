@@ -21,6 +21,42 @@ const writeSQLiteFixture = (databasePath) => {
   fs.writeFileSync(databasePath, page);
 };
 
+const writePopulatedSQLiteFixture = (databasePath, { malformedSettings = false } = {}) => {
+  fs.mkdirSync(path.dirname(databasePath), { recursive: true });
+  const { DatabaseSync } = require("node:sqlite");
+  const database = new DatabaseSync(databasePath);
+  database.exec(`
+    CREATE TABLE local_device_identity (
+      device_id TEXT PRIMARY KEY,
+      branch_id TEXT NOT NULL,
+      company_id TEXT,
+      registration_status TEXT NOT NULL
+    );
+    CREATE TABLE local_settings (
+      id TEXT PRIMARY KEY,
+      branch_id TEXT,
+      setting_key TEXT NOT NULL,
+      setting_value TEXT NOT NULL,
+      deleted_at TEXT
+    );
+    CREATE TABLE local_products (id TEXT PRIMARY KEY);
+    CREATE TABLE local_inventory_lots (id TEXT PRIMARY KEY);
+    CREATE TABLE sync_outbox (id TEXT PRIMARY KEY, device_id TEXT, status TEXT);
+    INSERT INTO local_device_identity VALUES ('FZDEV-DELL-1781852580596', '1', '1', 'approved');
+    INSERT INTO local_settings VALUES ('global-business', NULL, 'businessSettings', '{"business_name":"Global fallback"}', NULL);
+    INSERT INTO local_settings VALUES ('branch-business', '1', 'businessSettings', '${malformedSettings ? "{broken" : '{"business_name":"Feel the Freakin Frooz"}'}', NULL);
+    INSERT INTO local_settings VALUES ('branch-pos', '1', 'posSettings', '{"allow_negative_stock":false}', NULL);
+    INSERT INTO local_settings VALUES ('other-branch', '2', 'paymentSettings', '{"upi_id":"must-not-leak"}', NULL);
+  `);
+  const insertProduct = database.prepare("INSERT INTO local_products VALUES (?)");
+  const insertLot = database.prepare("INSERT INTO local_inventory_lots VALUES (?)");
+  const insertOutbox = database.prepare("INSERT INTO sync_outbox VALUES (?, 'FZDEV-DELL-1781852580596', 'synced')");
+  for (let id = 1; id <= 25; id += 1) insertProduct.run(String(id));
+  for (let id = 1; id <= 70; id += 1) insertLot.run(String(id));
+  for (let id = 1; id <= 17; id += 1) insertOutbox.run(String(id));
+  database.close();
+};
+
 const reservePort = async () => {
   const net = require("node:net");
   const server = net.createServer();
@@ -234,6 +270,106 @@ test("desktop Auto and Local Only policy confirms twenty transitions without clo
       }
     }
     assert.equal((await (await fetch(`http://127.0.0.1:${port}/api/cloud/internet-access`)).json()).status, "AUTO");
+  } finally {
+    await stopChild(runtime.child);
+    await new Promise((resolve) => cloudServer.close(resolve));
+  }
+});
+
+test("packaged desktop Local Only settings stay in SQLite without invoking cloud routing", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "froozerp-local-settings-policy-"));
+  const appData = path.join(root, "AppData", "Roaming");
+  const databasePath = path.join(root, "profile", "froozerp-local.sqlite3");
+  writePopulatedSQLiteFixture(databasePath);
+  const cloudPort = await reservePort();
+  let cloudRequests = 0;
+  const cloudServer = require("node:http").createServer((_req, res) => {
+    cloudRequests += 1;
+    res.writeHead(500).end();
+  });
+  await new Promise((resolve, reject) => cloudServer.listen(cloudPort, "127.0.0.1", resolve).once("error", reject));
+  const port = await reservePort();
+  const runtime = await startDesktopBackend({
+    databasePath,
+    port,
+    extraEnv: { APPDATA: appData, CLOUD_API_URL: `http://127.0.0.1:${cloudPort}` },
+  });
+  try {
+    const policyPath = path.join(appData, "com.srtcompany.froozerp", "cloud-network-policy.json");
+    fs.mkdirSync(path.dirname(policyPath), { recursive: true });
+    fs.writeFileSync(policyPath, JSON.stringify({ allowInternetAccess: false }));
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const response = await fetch(`http://127.0.0.1:${port}/settings?device_id=substituted-device`);
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get("x-froozerp-settings-source"), "local-sqlite");
+      assert.equal(response.headers.get("x-froozerp-canonical-device-id"), "FZDEV-DELL-1781852580596");
+      const settings = await response.json();
+      assert.equal(settings.businessSettings.business_name, "Feel the Freakin Frooz");
+      assert.equal(settings.posSettings.allow_negative_stock, false);
+      assert.equal(settings.paymentSettings, undefined, "another branch's settings must not leak");
+    }
+    assert.equal(cloudRequests, 0);
+    const { DatabaseSync } = require("node:sqlite");
+    const beforeTransition = new DatabaseSync(databasePath, { readOnly: true });
+    const settingsBefore = beforeTransition.prepare("SELECT id, branch_id, setting_key, setting_value, deleted_at FROM local_settings ORDER BY id").all();
+    beforeTransition.close();
+    fs.writeFileSync(policyPath, JSON.stringify({ allowInternetAccess: true }));
+    fs.writeFileSync(policyPath, JSON.stringify({ allowInternetAccess: false }));
+    const afterTransition = new DatabaseSync(databasePath, { readOnly: true });
+    assert.deepEqual(
+      afterTransition.prepare("SELECT id, branch_id, setting_key, setting_value, deleted_at FROM local_settings ORDER BY id").all(),
+      settingsBefore,
+      "Local Only transitions must not replace or erase saved settings"
+    );
+    const auditPath = path.join(appData, "com.srtcompany.froozerp", "logs", "cloud-request-audit.jsonl");
+    const audit = fs.readFileSync(auditPath, "utf8").trim().split(/\r?\n/).map(JSON.parse);
+    assert.equal(audit.length, 3);
+    assert.ok(audit.every((entry) => entry.blocked === true && entry.reachedCloud === false && entry.source === "local-sqlite"));
+    assert.equal(afterTransition.prepare("SELECT COUNT(*) AS count FROM local_products").get().count, 25);
+    assert.equal(afterTransition.prepare("SELECT COUNT(*) AS count FROM local_inventory_lots").get().count, 70);
+    assert.deepEqual({ ...afterTransition.prepare("SELECT COUNT(*) AS count, COUNT(DISTINCT device_id) AS devices, MIN(device_id) AS device_id FROM sync_outbox").get() }, {
+      count: 17,
+      devices: 1,
+      device_id: "FZDEV-DELL-1781852580596",
+    });
+    afterTransition.close();
+  } finally {
+    await stopChild(runtime.child);
+    await new Promise((resolve) => cloudServer.close(resolve));
+  }
+});
+
+test("desktop settings use cloud only in Auto and malformed local settings fail without fallback", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "froozerp-settings-modes-"));
+  const appData = path.join(root, "AppData", "Roaming");
+  const databasePath = path.join(root, "profile", "froozerp-local.sqlite3");
+  writePopulatedSQLiteFixture(databasePath, { malformedSettings: true });
+  const cloudPort = await reservePort();
+  let cloudRequests = 0;
+  const cloudServer = require("node:http").createServer((_req, res) => {
+    cloudRequests += 1;
+    const body = Buffer.from(JSON.stringify({ businessSettings: { business_name: "Authorized cloud" } }));
+    res.writeHead(200, { "content-type": "application/json", "content-length": body.length });
+    res.end(body);
+  });
+  await new Promise((resolve, reject) => cloudServer.listen(cloudPort, "127.0.0.1", resolve).once("error", reject));
+  const port = await reservePort();
+  const runtime = await startDesktopBackend({ databasePath, port, extraEnv: { APPDATA: appData, CLOUD_API_URL: `http://127.0.0.1:${cloudPort}` } });
+  try {
+    const policyPath = path.join(appData, "com.srtcompany.froozerp", "cloud-network-policy.json");
+    fs.mkdirSync(path.dirname(policyPath), { recursive: true });
+    fs.writeFileSync(policyPath, JSON.stringify({ allowInternetAccess: false }));
+    const malformed = await fetch(`http://127.0.0.1:${port}/settings`);
+    assert.equal(malformed.status, 503);
+    const failure = await malformed.json();
+    assert.equal(failure.code, "LOCAL_SETTINGS_MALFORMED");
+    assert.match(failure.message, /preserved/i);
+    assert.equal(cloudRequests, 0);
+    fs.writeFileSync(policyPath, JSON.stringify({ allowInternetAccess: true }));
+    const online = await fetch(`http://127.0.0.1:${port}/settings`);
+    assert.equal(online.status, 200);
+    assert.equal((await online.json()).businessSettings.business_name, "Authorized cloud");
+    assert.equal(cloudRequests, 1);
   } finally {
     await stopChild(runtime.child);
     await new Promise((resolve) => cloudServer.close(resolve));

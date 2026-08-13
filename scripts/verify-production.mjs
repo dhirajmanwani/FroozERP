@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 const root = path.resolve(new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
 const reportPath = path.join(root, ".cache", "production-verification-report.json");
 const commands = [
-  ["Backend syntax", "node --check backend/server.js && node --check backend/desktopGateway.js && node --check backend/storageAdapters.js"],
+  ["Backend syntax", "node --check backend/server.js && node --check backend/desktopGateway.js && node --check backend/localSettingsStore.js && node --check backend/storageAdapters.js"],
   ["Backend tests", "npm --prefix backend test"],
   ["Frontend local runtime tests", "npm --prefix frontend run test:local-runtime"],
   ["Frontend lint", "npm --prefix frontend run lint"],

@@ -3,6 +3,7 @@ const http = require("http");
 const os = require("os");
 const path = require("path");
 const { CLOUD_UNAVAILABLE_MESSAGE, normalizeCloudProxyError } = require("./cloudProxyError");
+const { readLocalSettingsBundle } = require("./localSettingsStore");
 
 const PORT = Number(process.env.PORT || 5000);
 const APP_VERSION = String(process.env.APP_VERSION || "0.0.0");
@@ -207,6 +208,14 @@ const localRoute = async (req, res, url, body) => {
       return sendJson(res, 200, { status: "ok", localBackendStatus: "ok", configuredCloudBaseUrl: CLOUD_API_URL, cloudApiConfigured: true, appInternetAllowed: true, cloudReachable: false, syncReady: false, errorCode: "CLOUD_UNREACHABLE", safeErrorMessage: "Cloud backend is not reachable." });
     }
   }
+  if (url.pathname === "/settings" && req.method === "GET" && !readPolicy().allowInternetAccess) {
+    auditCloudRequest({ method: req.method, route: req.url, blocked: true, reachedCloud: false, reason: "APP_LOCAL_ONLY", source: "local-sqlite" });
+    const local = readLocalSettingsBundle(SQLITE_PATH);
+    return sendJson(res, 200, local.settings, {
+      "x-froozerp-settings-source": "local-sqlite",
+      "x-froozerp-canonical-device-id": local.canonicalDeviceId,
+    });
+  }
   return false;
 };
 
@@ -221,6 +230,14 @@ const server = http.createServer(async (req, res) => {
     if (await localRoute(req, res, url, body) !== false) return;
     return proxy(res, await cloudRequest(req, body));
   } catch (error) {
+    if (String(error?.code || "").startsWith("LOCAL_") || error?.code === "DEVICE_IDENTITY_CONFLICT") {
+      return sendJson(res, 503, {
+        code: error.code,
+        failure_kind: "LOCAL_SETTINGS_UNAVAILABLE",
+        cloud_connected: false,
+        message: error.message,
+      });
+    }
     const normalized = normalizeCloudProxyError(error);
     return sendJson(res, normalized.status, normalized.payload);
   }

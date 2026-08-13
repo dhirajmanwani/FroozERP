@@ -7,6 +7,7 @@ const read = (...parts) => fs.readFileSync(path.join(root, ...parts), "utf8");
 const app = read("frontend", "src", "App.jsx");
 const css = read("frontend", "src", "App.css");
 const gateway = read("backend", "desktopGateway.js");
+const localSettingsStore = read("backend", "localSettingsStore.js");
 const adapters = read("backend", "storageAdapters.js");
 const backend = read("backend", "server.js");
 const operationalV3 = read("backend", "operationalV3.js");
@@ -39,6 +40,11 @@ assert.ok(gateway.includes('"access-control-allow-private-network": "true"'), "W
 assert.ok(gateway.includes("writePolicy(input.allowInternetAccess !== false"), "Owner must be able to request either confirmed connectivity mode");
 assert.ok(gateway.includes("readAuthoritativeTime"), "Connectivity mode audit must use server-confirmed time when Railway is available");
 assert.ok(gateway.includes('role !== "OWNER"'), "App Internet mode changes must remain Owner-only");
+assert.ok(gateway.includes('url.pathname === "/settings"') && gateway.includes('source: "local-sqlite"'), "Local Only settings must be served by the local SQLite route");
+assert.ok(gateway.includes("blocked: true") && gateway.includes("reachedCloud: false"), "Local Only settings requests must be audited as blocked before cloud routing");
+assert.ok(localSettingsStore.includes("PRAGMA query_only = ON"), "Local settings access must remain read-only");
+assert.ok(localSettingsStore.includes("LOCAL_SETTINGS_MALFORMED"), "Malformed local settings must fail explicitly without replacement defaults");
+assert.ok(localSettingsStore.includes("registration_status") && localSettingsStore.includes("branch_id = ?"), "Local settings must use canonical approved-device branch scope");
 assert.equal(/127\.0\.0\.1:5432/.test(gateway), false, "Desktop gateway must never target local PostgreSQL");
 
 assert.ok(backend.includes("ON CONFLICT (operation_id) DO NOTHING"), "Cloud operation acknowledgements must be idempotent");
