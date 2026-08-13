@@ -30,7 +30,8 @@ import {
 } from "./local/offlineSession";
 import { buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
-import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode, writeConnectivityMode } from "./local/connectivityMode";
+import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode } from "./local/connectivityMode";
+import { createStartupConnectivityAuthority } from "./local/startupConnectivityPolicy";
 import { filterSellableProducts, isSellableLot, lotAvailableQuantity, selectLocalPosInventory } from "./local/posInventory";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, resolveReportDateRange } from "./local/reportRefresh";
@@ -195,7 +196,12 @@ const mergeCloudIdentityIntoSavedConfig = (identity = {}) => {
 };
 const SAVED_API_CONFIG = sanitizeSavedApiConfigForRuntime(readSavedApiConfig());
 const normalizeCloudConnectionMode = normalizeConnectivityMode;
-const isLocalOnlyConnectivitySelected = () => readConnectivityMode() === CONNECTIVITY_MODES.LOCAL_ONLY;
+const startupConnectivityAuthority = createStartupConnectivityAuthority({
+  desktopRuntime: isDesktopShell(),
+  storage: globalThis.localStorage,
+  initialMode: readConnectivityMode(),
+});
+const isLocalOnlyConnectivitySelected = () => startupConnectivityAuthority.isLocalOnly();
 const savedModeForRuntime = normalizeApiMode(SAVED_API_CONFIG.mode);
 const legacyDesktopLocalMode = isDesktopShell() && [
   API_MODES.LOCAL_SINGLE_DEVICE,
@@ -586,7 +592,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.69";
+const APP_VERSION = "1.0.70";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -1499,7 +1505,8 @@ function App() {
   const [cloudDiagnostics, setCloudDiagnostics] = useState(null);
   const [loginBusy, setLoginBusy] = useState(false);
   const [offlineMode, setOfflineMode] = useState(false);
-  const [connectivityMode, setConnectivityMode] = useState(readConnectivityMode);
+  const [connectivityMode, setConnectivityMode] = useState(() => startupConnectivityAuthority.getMode());
+  const [connectivityPolicyReady, setConnectivityPolicyReady] = useState(() => startupConnectivityAuthority.isResolved());
   const [connectivityModeSwitching, setConnectivityModeSwitching] = useState(false);
   const [headerClock, setHeaderClock] = useState(() => authoritativeUtcNowIso());
   const [offlineReady, setOfflineReady] = useState(false);
@@ -1844,7 +1851,7 @@ function App() {
   }, [settingsData.deviceControlSettings?.fullscreen_lock_enabled]);
 
   useEffect(() => {
-    if (user) return undefined;
+    if (user || !connectivityPolicyReady) return undefined;
     let cancelled = false;
     const loadLoginDeviceControl = async () => {
       try {
@@ -1861,7 +1868,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [user, deviceInfo.device_id]);
+  }, [user, deviceInfo.device_id, connectivityPolicyReady]);
 
   useEffect(() => {
     let unlisten = () => {};
@@ -1960,6 +1967,21 @@ function App() {
   };
 
   const checkCloudBackendHealth = async (reason = "manual", timeoutMs = 5000) => {
+    if (isLocalOnlyConnectivitySelected()) {
+      const next = {
+        ...cloudHealthRef.current,
+        online: false,
+        checking: false,
+        reachabilityStatus: "paused",
+        status: "paused",
+        reason,
+        reasonCode: "APP_LOCAL_ONLY",
+        message: "Local Only mode selected - cloud sync paused.",
+        lastCheckedAt: new Date().toISOString(),
+      };
+      setCloudHealth(next);
+      return next;
+    }
     const latestDevice = await resolveLocalDeviceInfo(deviceInfo);
     const url = `${LOCAL_API_URL}/api/cloud/health`;
     const requestStartedAt = Date.now();
@@ -2357,8 +2379,8 @@ function App() {
         serverConfirmedAt: response.data?.confirmedAt || response.data?.updatedAt,
         timeSource: response.data?.timeSource || "device",
       }).catch((error) => writeDiagnosticLog("WARN", "connectivity-mode-local-audit-failed", { message: getErrorMessage(error, "Unable to write local connectivity audit") }));
-      writeConnectivityMode(nextMode);
-      setConnectivityMode(nextMode);
+      const confirmedRuntimeMode = startupConnectivityAuthority.confirm(nextMode);
+      setConnectivityMode(confirmedRuntimeMode);
       setSyncMessage(connectivityModeMessage(nextMode));
       await refreshPosInventoryFromSQLite("connectivity-mode-change");
       if (nextMode === CONNECTIVITY_MODES.LOCAL_ONLY) {
@@ -2509,8 +2531,9 @@ function App() {
       localServiceStartupStateRef.current = "checking";
       setLocalServiceStartupState("checking");
     }
+    const localOnly = isLocalOnlyConnectivitySelected();
     const browserOnline = typeof navigator === "undefined" ? true : navigator.onLine !== false;
-    const realInternet = browserOnline ? await probeRealInternet(options.timeoutMs || 4000) : false;
+    const realInternet = localOnly ? browserOnline : browserOnline ? await probeRealInternet(options.timeoutMs || 4000) : false;
     setInternetAvailable(realInternet);
     const health = localRuntime
       ? await waitForLocalBackendReady(reason, options.timeoutMs || 3500)
@@ -2540,13 +2563,13 @@ function App() {
         setStartupError((current) => (/local backend|froozERP service|backend/i.test(current) ? "" : current));
       }
     }
-    const nextCloudHealth = usesCloudBackend()
+    const nextCloudHealth = usesCloudBackend() && !localOnly
       ? await checkCloudBackendHealth(reason, options.timeoutMs || 5000)
       : cloudHealth;
     if (generation !== connectivityGenerationRef.current) return backendHealthRef.current;
     applyConnectivityState(health, realInternet, syncStatusRef.current);
     const cloudReadyForSync = !usesCloudBackend() || nextCloudHealth?.online === true;
-    if (health.online && cloudReadyForSync && userRef.current && !reconnectSyncRef.current && shouldStartBackgroundSync()) {
+    if (!localOnly && health.online && cloudReadyForSync && userRef.current && !reconnectSyncRef.current && shouldStartBackgroundSync()) {
       reconnectSyncRef.current = true;
       syncNow({
         apiUrl: SYNC_API_URL,
@@ -2581,9 +2604,48 @@ function App() {
     connectivityCheckRef.current = performConnectivityCheck;
   }, [performConnectivityCheck]);
 
+  useEffect(() => {
+    if (!isTauriRuntime() || connectivityPolicyReady || mandatoryRuntimeState !== "ready") return undefined;
+    let cancelled = false;
+    let retryTimer = 0;
+    const reconcilePolicy = async () => {
+      await ensureLocalBackendService({ reason: "startup-policy" });
+      const health = await waitForLocalBackendReady("startup-policy", 3000);
+      if (health?.online !== true) throw new Error("Local backend is not ready to provide the connectivity policy.");
+      const response = await axios.get(`${LOCAL_API_URL}/api/cloud/internet-access`, {
+        timeout: 5000,
+        headers: { "Cache-Control": "no-store" },
+      });
+      if (cancelled) return;
+      const authoritativeMode = startupConnectivityAuthority.reconcile(response.data);
+      setConnectivityMode(authoritativeMode);
+      setConnectivityPolicyReady(true);
+      writeDiagnosticLog("INFO", "startup-connectivity-policy-reconciled", {
+        mode: authoritativeMode,
+        source: "local-backend",
+      });
+    };
+    const reconcileWithRetry = () => reconcilePolicy().catch((error) => {
+      if (!cancelled) {
+        setConnectivityMode(CONNECTIVITY_MODES.LOCAL_ONLY);
+        setSyncMessage("Starting local service. Cloud access remains locked until the local connectivity policy is confirmed.");
+        writeDiagnosticLog("WARN", "startup-connectivity-policy-pending", {
+          message: getErrorMessage(error, "Unable to read the local connectivity policy"),
+        });
+        retryTimer = window.setTimeout(reconcileWithRetry, 1000);
+      }
+    });
+    reconcileWithRetry();
+    return () => {
+      cancelled = true;
+      if (retryTimer) window.clearTimeout(retryTimer);
+    };
+  }, [connectivityPolicyReady, ensureLocalBackendService, mandatoryRuntimeState, waitForLocalBackendReady]);
+
   useEffect(() => subscribeConnectivity(applyConnectivityState), [applyConnectivityState]);
 
   useEffect(() => {
+    if (!connectivityPolicyReady) return undefined;
     const runConnectivityCheck = (reason, options = {}) => Promise.resolve(connectivityCheckRef.current?.(reason, options)).catch((error) => {
       writeDiagnosticLog("WARN", "startup-connectivity-check-failed", describeRequestFailure(error, { url: `${API_URL}/api/health` }));
     });
@@ -2606,7 +2668,7 @@ function App() {
         target.removeEventListener(eventName, handleConnectivityEvent);
       }
     };
-  }, []);
+  }, [connectivityPolicyReady]);
 
   const startupDiagnostics = useMemo(() => ({
     desktopVersion: APP_VERSION,
@@ -2712,9 +2774,9 @@ function App() {
       setSyncMessage("Cloud sync is temporarily unavailable. Local changes remain queued safely.");
     });
     const timer = window.setInterval(() => {
-      if (backendHealth.online) runBackgroundSync();
+      if (backendHealth.online && !isLocalOnlyConnectivitySelected()) runBackgroundSync();
     }, 60_000);
-    if (backendHealth.online) runBackgroundSync();
+    if (backendHealth.online && !isLocalOnlyConnectivitySelected()) runBackgroundSync();
     return () => {
       cancelled = true;
       window.clearInterval(timer);
