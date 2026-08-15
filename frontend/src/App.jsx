@@ -33,6 +33,26 @@ import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode } from "./local/connectivityMode";
 import { createStartupConnectivityAuthority } from "./local/startupConnectivityPolicy";
 import { filterSellableProducts, isSellableLot, lotAvailableQuantity, selectLocalPosInventory } from "./local/posInventory";
+import {
+  activeStockFilterLabels,
+  canonicalInventoryId,
+  createLatestRequestGate,
+  createStockFilters,
+  findInventoryProduct,
+  groupInventoryLotsByProduct,
+  inventoryIdsEqual,
+  normalizeInventoryAuditResponse,
+  normalizeInventoryLotsResponse,
+  normalizeInventoryProductsResponse,
+  normalizeInventoryStatus,
+  normalizeLocalInventorySnapshot,
+  normalizeStockViewMode,
+  resolveInventoryPresentation,
+  resolveInventoryAuditEndpoint,
+  resolveInventoryHydrationPolicy,
+  sanitizedInventoryLoadError,
+  validateStockDateRange,
+} from "./local/stockInventory";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, resolveReportDateRange } from "./local/reportRefresh";
 import { approvedDeviceCredentialMessage, normalizeDeviceBootstrapStatus } from "./local/freshDeviceOnboarding";
@@ -1563,6 +1583,7 @@ function App() {
   const [purchaseSaveBusy, setPurchaseSaveBusy] = useState(false);
   const purchaseSaveInFlightRef = useRef(false);
   const purchaseSubmissionRef = useRef(createPurchaseSubmissionTracker());
+  const reportRequestGateRef = useRef(createLatestRequestGate());
   const [accounts, setAccounts] = useState([]);
   const [accountLedger, setAccountLedger] = useState({ account: null, ledger: [] });
   const [accountPayments, setAccountPayments] = useState([]);
@@ -1589,7 +1610,10 @@ function App() {
     pendingPurchaseBillsReport: [],
     stockWithoutBillReport: [],
     provisionalProfitSalesReport: [],
+    stockReport: [],
     stockLotReport: [],
+    inventoryLoadState: "idle",
+    inventoryLoadError: "",
     balanceSheet: {},
     profitLoss: {},
   });
@@ -3951,47 +3975,95 @@ function App() {
   };
 
   const loadReports = async (params = {}) => {
+    const requestGeneration = reportRequestGateRef.current.begin();
     const normalizedParams = { ...params, ...resolveReportDateRange(params) };
-    if (isTauriRuntime() && (offlineMode || readConnectivityMode() === CONNECTIVITY_MODES.LOCAL_ONLY)) {
-      const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id }).catch(() => null);
-      const localRows = await listLocalPosSales().catch(() => []);
-      const salesRows = filterRowsForReportRange(localRows.map(localSnapshotToInvoice), normalizedParams);
-      setReportsData((current) => ({
-        ...current,
-        salesHistoryReport: salesRows,
-        stockLotReport: snapshot?.inventory_lots || inventory,
-        cashBookReport: salesRows.flatMap((sale) => (sale.payments || []).map((payment) => ({
-          transaction_date: sale.sale_date,
-          source: "LOCAL_POS",
-          party_name: sale.customer_name || "Walk-in Customer",
-          payment_mode: payment.mode || payment.payment_mode || sale.payment_mode,
-          total_amount: Number(payment.amount || sale.total_amount || 0),
-          transaction_count: 1,
-        }))),
-        dateFrom: normalizedParams.date_from,
-        dateTo: normalizedParams.date_to,
-      }));
-      return { params: normalizedParams, source: "LOCAL_SQLITE", failures: [] };
+    setReportsData((current) => ({ ...current, inventoryLoadState: "loading", inventoryLoadError: "" }));
+    const tauriRuntime = isTauriRuntime();
+    const inventoryHydrationPolicy = resolveInventoryHydrationPolicy({ tauriRuntime });
+    let localInventorySnapshot = null;
+    let localInventoryFailure = null;
+    if (tauriRuntime) {
+      try {
+        const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id });
+        localInventorySnapshot = normalizeLocalInventorySnapshot(snapshot);
+      } catch (error) {
+        localInventoryFailure = { key: "inventory", message: sanitizedInventoryLoadError(error) };
+      }
     }
-    const { values, failures } = await settleNamedRequests([
-      { key: "summary", method: "GET", url: `${API_URL}/reports/summary`, fallback: reportsData, run: () => axios.get(`${API_URL}/reports/summary`, { params: normalizedParams }).then((response) => response.data) },
-      { key: "inventory", method: "GET", url: `${API_URL}/inventory`, fallback: reportsData.stockLotReport || inventory, run: () => axios.get(`${API_URL}/inventory`, { params: { include_cancelled: true } }).then((response) => response.data) },
-      { key: "cashBook", method: "GET", url: `${API_URL}/reports/cash-book`, fallback: reportsData.cashBookReport || [], run: () => axios.get(`${API_URL}/reports/cash-book`, { params: normalizedParams }).then((response) => response.data) },
-    ]);
+    if (tauriRuntime && (offlineMode || readConnectivityMode() === CONNECTIVITY_MODES.LOCAL_ONLY)) {
+      try {
+        if (localInventoryFailure) throw Object.assign(new Error(localInventoryFailure.message), { code: "INVENTORY_RESPONSE_CONTRACT" });
+        const localRows = await listLocalPosSales().catch(() => []);
+        const salesRows = filterRowsForReportRange(localRows.map(localSnapshotToInvoice), normalizedParams);
+        if (!reportRequestGateRef.current.isCurrent(requestGeneration)) {
+          return { params: normalizedParams, source: "LOCAL_SQLITE", failures: [], stale: true };
+        }
+        setReportsData((current) => ({
+          ...current,
+          salesHistoryReport: salesRows,
+          stockReport: localInventorySnapshot.products,
+          stockLotReport: localInventorySnapshot.lots,
+          inventoryLoadState: "ready",
+          inventoryLoadError: "",
+          cashBookReport: salesRows.flatMap((sale) => (sale.payments || []).map((payment) => ({
+            transaction_date: sale.sale_date,
+            source: "LOCAL_POS",
+            party_name: sale.customer_name || "Walk-in Customer",
+            payment_mode: payment.mode || payment.payment_mode || sale.payment_mode,
+            total_amount: Number(payment.amount || sale.total_amount || 0),
+            transaction_count: 1,
+          }))),
+          dateFrom: normalizedParams.date_from,
+          dateTo: normalizedParams.date_to,
+        }));
+        return { params: normalizedParams, source: "LOCAL_SQLITE", failures: [] };
+      } catch (error) {
+        const message = sanitizedInventoryLoadError(error);
+        writeDiagnosticLog("ERROR", "local-inventory-report-load-failed", { code: error?.code || "INVENTORY_LOAD_FAILED", message });
+        if (reportRequestGateRef.current.isCurrent(requestGeneration)) {
+          setReportsData((current) => ({ ...current, inventoryLoadState: "error", inventoryLoadError: message }));
+        }
+        return { params: normalizedParams, source: "LOCAL_SQLITE", failures: [{ key: "inventory", message }] };
+      }
+    }
+    const reportRequests = [
+      { key: "summary", method: "GET", url: `${API_URL}/reports/summary`, fallback: null, run: () => axios.get(`${API_URL}/reports/summary`, { params: normalizedParams }).then((response) => response.data) },
+      { key: "cashBook", method: "GET", url: `${API_URL}/reports/cash-book`, fallback: null, run: () => axios.get(`${API_URL}/reports/cash-book`, { params: normalizedParams }).then((response) => response.data) },
+    ];
+    if (inventoryHydrationPolicy.requestLegacyInventory) {
+      reportRequests.push({ key: "inventory", method: "GET", url: `${API_URL}/inventory`, fallback: null, run: () => axios.get(`${API_URL}/inventory`, { params: { include_cancelled: true } }).then((response) => normalizeInventoryLotsResponse(response.data)) });
+    }
+    const { values, failures } = await settleNamedRequests(reportRequests);
+    if (!reportRequestGateRef.current.isCurrent(requestGeneration)) {
+      return { params: normalizedParams, source: "HYBRID_LOCAL", failures, stale: true };
+    }
     failures.forEach((failure) => writeDiagnosticLog("WARN", "report-request-fallback", failure));
-    if (failures.length) {
-      setSyncMessage(`${failures.length} report request(s) failed. Showing the last preserved local values.`);
-      return { params: normalizedParams, source: "HYBRID_LOCAL", failures };
+    let inventoryFailure = localInventoryFailure || failures.find((failure) => (
+      tauriRuntime ? failure.key === "inventory" : ["summary", "inventory"].includes(failure.key)
+    ));
+    let nextStockReport = localInventorySnapshot?.products || null;
+    let nextStockLots = localInventorySnapshot?.lots || values.inventory;
+    if (!tauriRuntime && !inventoryFailure) {
+      try {
+        nextStockReport = normalizeInventoryProductsResponse(values.summary?.stockReport);
+      } catch (error) {
+        inventoryFailure = { key: "summary", message: sanitizedInventoryLoadError(error) };
+      }
     }
+    const effectiveFailures = inventoryFailure && !failures.includes(inventoryFailure) ? [...failures, inventoryFailure] : failures;
+    if (effectiveFailures.length) setSyncMessage(`${effectiveFailures.length} report request(s) failed. Showing the last preserved local values.`);
     setReportsData((current) => ({
       ...current,
-      ...(values.summary || {}),
-      stockLotReport: values.inventory || current.stockLotReport || [],
-      cashBookReport: values.cashBook || current.cashBookReport || [],
+      ...(failures.some((failure) => failure.key === "summary") ? {} : (values.summary || {})),
+      stockReport: inventoryFailure ? current.stockReport : nextStockReport,
+      stockLotReport: inventoryFailure ? current.stockLotReport : nextStockLots,
+      inventoryLoadState: inventoryFailure ? "error" : "ready",
+      inventoryLoadError: inventoryFailure ? sanitizedInventoryLoadError(inventoryFailure) : "",
+      cashBookReport: failures.some((failure) => failure.key === "cashBook") ? current.cashBookReport : values.cashBook,
       dateFrom: normalizedParams.date_from,
       dateTo: normalizedParams.date_to,
     }));
-    return { params: normalizedParams, source: "HYBRID_LOCAL", failures };
+    return { params: normalizedParams, source: "HYBRID_LOCAL", failures: effectiveFailures };
   };
 
   const loadExpenses = async () => {
@@ -6633,6 +6705,7 @@ function App() {
               canCancelSales={canCancelSales}
               canEditSales={canEditSales}
               canManageStock={canManageStock}
+              connectivityMode={connectivityMode}
               customers={customers}
               data={reportsData}
               onCancelPurchase={cancelPurchase}
@@ -9035,7 +9108,7 @@ function DiscountManagementModule({ discounts = [], inventory = [], onReload, pr
   );
 }
 
-function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageStock, customers = [], data = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, suppliers = [], user }) {
+function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageStock, connectivityMode = CONNECTIVITY_MODES.LOCAL_ONLY, customers = [], data = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, suppliers = [], user }) {
   const [range, setRange] = useState("today");
   const [search, setSearch] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
@@ -10332,7 +10405,12 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       </div>
     );
   };
-  const renderFilters = () => (
+  const renderFilters = () => selectedReport === "stockInventory" ? (
+    <div className="ledger-toolbar">
+      <button className="secondary-button" disabled={refreshBusy} onClick={refreshReports}>{refreshBusy ? "Refreshing..." : "Refresh Inventory"}</button>
+      {refreshError && <div className="field-error" role="alert">{refreshError}</div>}
+    </div>
+  ) : (
     <div className={selectedReport === "purchaseHistory" ? "ledger-toolbar purchase-history-toolbar" : "ledger-toolbar"}>
       <Field label="Report Range">
         <select value={range} onChange={(event) => setRange(event.target.value)}>
@@ -10936,10 +11014,10 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     })();
     const reportFilterSummary = (() => {
       const parts = [];
-      if (appliedQuery.date_from || appliedQuery.date_to) {
+      if (selectedReport !== "stockInventory" && (appliedQuery.date_from || appliedQuery.date_to)) {
         parts.push(`Range: ${formatIndianReportDate(appliedQuery.date_from)} to ${formatIndianReportDate(appliedQuery.date_to)}`);
       }
-      if (appliedSearch) parts.push(`Search: ${appliedSearch}`);
+      if (selectedReport !== "stockInventory" && appliedSearch) parts.push(`Search: ${appliedSearch}`);
       if (selectedReport === "salesHistory") {
         parts.push(`View: ${salesFilters.viewMode === "CUSTOMER" ? "Customer-wise" : salesFilters.viewMode === "INVOICE" ? "Invoice-wise" : salesFilters.viewMode === "LOT" ? "Lot-wise" : "Item-wise"}`);
         parts.push(`Status: ${salesFilters.status}`);
@@ -10962,7 +11040,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
             </div>
             {renderFilters()}
           </ModuleCard>
-          <ModuleCard eyebrow={currentCategory?.title || "Reports"} title={currentReport.title} subtitle={`${rows.length} row${rows.length === 1 ? "" : "s"} found.`}>
+          <ModuleCard eyebrow={currentCategory?.title || "Reports"} title={currentReport.title} subtitle={selectedReport === "stockInventory" ? "Inventory results use the filters shown below." : `${rows.length} row${rows.length === 1 ? "" : "s"} found.`}>
             <PrintableReport
               beforePdfExport={handleReportPrintOption}
               beforePrint={handleReportPrintOption}
@@ -10972,7 +11050,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
               user={user}
               whatsappRecipients={whatsappRecipients}
             >
-              {reportFilterSummary.length > 0 && (
+              {selectedReport === "stockInventory" ? null : reportFilterSummary.length > 0 && (
                 <div className="report-filter-summary">
                   {reportFilterSummary.map((item) => <span key={item}>{item}</span>)}
                 </div>
@@ -10982,11 +11060,14 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
               </div>
               {selectedReport === "stockInventory" ? (
                 <StockInventoryReport
-                  auditEndpoint={`${API_URL}/stock-inventory/audit`}
+                  auditEndpoint={resolveInventoryAuditEndpoint({ apiUrl: API_URL, connectivityMode })}
+                  auditUnavailableMessage={connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY ? "Inventory adjustment audit requires Auto mode. No audit request was sent." : ""}
                   canManageStock={canManageStock}
-                  lots={Array.isArray(data.stockLotReport) ? data.stockLotReport : []}
+                  loadError={data.inventoryLoadError}
+                  loadState={data.inventoryLoadState}
+                  lots={data.stockLotReport}
                   onLotAction={onOpenLotAction}
-                  products={Array.isArray(data.stockReport) ? data.stockReport : []}
+                  products={data.stockReport}
                 />
               ) : selectedReport === "profitLoss" ? renderProfitLossStatement() : selectedReport === "cashBook" ? renderCashBookStatement() : (
                 <>
@@ -11051,24 +11132,9 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
   );
 }
 
-function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotAction, products = [] }) {
-  const [viewMode, setViewMode] = useState(() => localStorage.getItem("froozerp-stock-view-mode") || "PRODUCT");
-  const [filters, setFilters] = useState({
-    productSearch: "",
-    lotSearch: "",
-    category: "",
-    product: "",
-    lot: "",
-    supplier: "",
-    status: "IN_STOCK",
-    unit: "",
-    origin: "ALL",
-    dateType: "ARRIVAL",
-    date_from: "",
-    date_to: "",
-    showEmpty: false,
-    showInactive: false,
-  });
+export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = "", canManageStock, loadError = "", loadState = "idle", lots = [], onLotAction, products = [] }) {
+  const [viewMode, setViewMode] = useState(() => normalizeStockViewMode(localStorage.getItem("froozerp-stock-view-mode")));
+  const [filters, setFilters] = useState(createStockFilters);
   const [sortBy, setSortBy] = useState("PRODUCT_ASC");
   const [pageSize, setPageSize] = useState(50);
   const [expandedProductId, setExpandedProductId] = useState("");
@@ -11085,17 +11151,17 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
   const lotCost = (lot) => Number(lot.effective_cost_per_unit || lot.purchase_rate || 0);
   const lotSaleRate = (lot) => Number(lot.temporary_sale_rate || lot.sale_rate || lot.selling_rate || 0);
   const normalizeUnit = (unit) => String(unit || "UNIT").trim().toUpperCase() || "UNIT";
-  const productMinimumStock = (lot) => Number(products.find((product) => Number(product.product_id || product.id) === Number(lot.product_id))?.minimum_stock || 0);
+  const productMinimumStock = (lot) => Number(findInventoryProduct(products, lot.product_id)?.minimum_stock || 0);
   const lotDateValue = (lot) => {
     if (filters.dateType === "BILL") return lot.purchase_bill_date || lot.bill_date || lot.purchase_date || lot.created_at || "";
     if (filters.dateType === "MOVEMENT") return lot.last_movement_at || lot.last_edited_at || lot.updated_at || lot.created_at || lot.purchase_date || "";
     return lot.purchase_date || lot.arrival_date || lot.created_at || "";
   };
   const lotStatus = (lot) => {
-    const status = String(lot.batch_status || "ACTIVE").toUpperCase();
+    const status = normalizeInventoryStatus(lot.batch_status);
     if (status === "CANCELLED") return "Cancelled";
     if (status === "INACTIVE") return "Inactive";
-    if (lot.sync_status === "CONFLICT") return "Sync Conflict";
+    if (normalizeInventoryStatus(lot.sync_status, "") === "CONFLICT") return "Sync Conflict";
     if (lotBalance(lot) < 0) return "Negative Stock";
     if (lotBalance(lot) <= 0 && lotUsed(lot) > 0) return "Sold Out";
     if (lotBalance(lot) <= productMinimumStock(lot) && lotBalance(lot) > 0) return "Low Stock";
@@ -11116,9 +11182,13 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
   }, [viewMode]);
   const activeLots = lots.filter((lot) => lotStatus(lot) === "Active");
   const productGroups = [...lots.reduce((groups, lot) => {
-    const key = String(lot.product_id);
+    // Must use the same canonical key derivation as groupInventoryLotsByProduct,
+    // otherwise a lot can count toward the summary tiles while its product row
+    // silently vanishes from the table (Products: 0 with non-zero Active Lots).
+    const key = canonicalInventoryId(lot.product_id);
+    if (!key) return groups;
     const current = groups.get(key) || {
-      product_id: lot.product_id,
+      product_id: key,
       product_name: lot.product_name,
       category: lot.category || "Fruit",
       unit: lot.unit || "",
@@ -11207,6 +11277,7 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
     if (!needle) return true;
     return values.some((value) => String(value ?? "").toLowerCase().includes(needle));
   };
+  const stockDateRangeError = validateStockDateRange(filters);
   const filteredLots = sortLots(lots.filter((lot) => {
     const status = lotStatus(lot);
     if (!filters.showEmpty && status === "Sold Out") return false;
@@ -11218,8 +11289,8 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
     if (filters.supplier && lot.supplier_name !== filters.supplier) return false;
     if (filters.origin !== "ALL" && String(lot.origin_type || lot.origin || "LOCAL").toUpperCase() !== filters.origin) return false;
     const dateKey = toDateKey(lotDateValue(lot));
-    if (filters.date_from && dateKey < filters.date_from) return false;
-    if (filters.date_to && dateKey > filters.date_to) return false;
+    if (!stockDateRangeError && filters.date_from && dateKey < filters.date_from) return false;
+    if (!stockDateRangeError && filters.date_to && dateKey > filters.date_to) return false;
     const productMatch = matchesNeedle(filters.productSearch, [lot.product_name, lot.barcode, lot.category]);
     const lotMatch = matchesNeedle(filters.lotSearch, [
       lot.lot_name,
@@ -11252,9 +11323,10 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
     ]);
   }));
   const pagedLots = filteredLots.slice(0, Number(pageSize || 50));
+  const filteredLotsByProduct = groupInventoryLotsByProduct(filteredLots);
   const filteredProductRows = productGroups
     .map((product) => {
-      const visibleLots = filteredLots.filter((lot) => Number(lot.product_id) === Number(product.product_id));
+      const visibleLots = filteredLotsByProduct.get(canonicalInventoryId(product.product_id)) || [];
       const unitGroups = visibleLots.reduce((groups, lot) => {
         addUnitValue(groups, lot.unit, lotBalance(lot));
         return groups;
@@ -11287,7 +11359,8 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
       setAuditError("");
       try {
         const response = await axios.get(auditEndpoint);
-        if (mounted) setAuditRows(response.data || []);
+        const normalizedAudit = normalizeInventoryAuditResponse(response.data);
+        if (mounted) setAuditRows(normalizedAudit);
       } catch (error) {
         if (mounted) setAuditError(getErrorMessage(error, "Unable to load stock audit trail"));
       } finally {
@@ -11313,7 +11386,33 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
     const afterRate = newValue.purchase_rate ?? newValue.effective_cost_per_unit ?? "-";
     return `Qty ${beforeQty} -> ${afterQty} | Cost ${beforeRate} -> ${afterRate}`;
   };
-  const clearFilters = () => setFilters({ productSearch: "", lotSearch: "", category: "", product: "", lot: "", supplier: "", status: "IN_STOCK", unit: "", origin: "ALL", dateType: "ARRIVAL", date_from: "", date_to: "", showEmpty: false, showInactive: false });
+  const clearFilters = () => {
+    setFilters(createStockFilters());
+    setSortBy("PRODUCT_ASC");
+    setPageSize(50);
+    setExpandedProductId("");
+  };
+  const activeFilterChips = activeStockFilterLabels(filters, { sortBy }).map(([key, label]) => {
+    if (key === "product") return [key, `${productOptions.find(([id]) => id === filters.product)?.[1] || "Product"}`];
+    if (key === "lot") return [key, `${lotOptions.find(([id]) => id === filters.lot)?.[1] || "Lot"}`];
+    if (key === "date_from") return [key, `From: ${formatDisplayDate(filters.date_from)}`];
+    if (key === "date_to") return [key, `To: ${formatDisplayDate(filters.date_to)}`];
+    return [key, label];
+  });
+  const clearActiveFilter = (key) => {
+    if (key === "sortBy") {
+      setSortBy("PRODUCT_ASC");
+      return;
+    }
+    if (key === "product") {
+      updateProductFilter("");
+      return;
+    }
+    setFilters((current) => ({ ...current, [key]: createStockFilters()[key] }));
+  };
+  const inventoryPresentation = resolveInventoryPresentation({ loadState, loadError, rowCount: filteredProductRows.length, filteredLotCount: filteredLots.length });
+  const inventoryLoading = inventoryPresentation.kind === "loading";
+  const inventoryUnavailable = inventoryPresentation.kind === "error";
   const renderLotActions = (lot) => {
     const status = lotStatus(lot);
     return (
@@ -11334,7 +11433,7 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
   const renderLotRows = (rows) => rows.map((lot) => {
     const status = lotStatus(lot);
     return (
-      <tr className="report-row-clickable" key={lot.id} onClick={() => openLotDetail(lot)}>
+      <tr className="report-row-clickable" data-inventory-lot-row={String(lot.id)} key={lot.id} onClick={() => openLotDetail(lot)}>
         <td className="primary-cell">{lot.product_name}<small className="cell-note">{lot.unit}</small></td>
         <td>{lot.category || "Fruit"}</td>
         <td>{lot.supplier_name || "-"}</td>
@@ -11359,7 +11458,7 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
   const renderCompactLotRows = (rows) => rows.map((lot) => {
     const status = lotStatus(lot);
     return (
-      <tr className="report-row-clickable" key={lot.id} onClick={() => openLotDetail(lot)}>
+      <tr className="report-row-clickable" data-inventory-lot-row={String(lot.id)} key={lot.id} onClick={() => openLotDetail(lot)}>
         <td className="primary-cell">{lot.product_name}<small className="cell-note">{lot.category || ""}</small></td>
         <td className="primary-cell">{lot.lot_name || lot.batch_no || "No Lot Number"}<small className="cell-note">{lot.lot_size || ""}</small></td>
         <td>{lot.supplier_name || "-"}</td>
@@ -11378,13 +11477,17 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
     <section className="stock-inventory-report">
       <div className="purchase-summary-grid supplier-payment-preview">
         <SummaryMetric featured label="Total Stock Value" value={canManageStock ? money(totalStockValue) : "Restricted"} />
-        <SummaryMetric label="Products" value={filteredProductRows.length} />
+        <SummaryMetric label="Products" value={inventoryPresentation.countLabel} />
         <SummaryMetric label="Active Lots" value={filteredLots.filter((lot) => ["Active", "Low Stock"].includes(lotStatus(lot))).length} />
         <SummaryMetric label="Stock" value={formatUnitGroups(filteredUnitGroups)} />
         <SummaryMetric label="Out-of-Stock Lots" value={filteredLots.filter((lot) => lotStatus(lot) === "Sold Out").length} />
         <SummaryMetric label="Low Stock Items" value={lowStockItems} />
-        <SummaryMetric label="Inventory Adjustments" value={auditLoading ? "Loading" : adjustmentCount} />
+        <SummaryMetric label="Inventory Adjustments" value={auditUnavailableMessage ? "Local only" : auditLoading ? "Loading" : adjustmentCount} />
       </div>
+      {inventoryLoading && <div className="cart-empty">{inventoryPresentation.message}</div>}
+      {inventoryUnavailable && <div className="error-banner" role="alert">{inventoryPresentation.message}</div>}
+      {stockDateRangeError && <div className="error-banner" role="alert">{stockDateRangeError}</div>}
+      {auditUnavailableMessage && <div className="cart-empty" role="status">{auditUnavailableMessage}</div>}
       {auditError && <div className="error-banner">{auditError}</div>}
       <div className="stock-inventory-toolbar sticky-report-filters no-print">
         <div className="stock-filter-row stock-filter-row-primary">
@@ -11510,14 +11613,7 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
         <button className="filter-chip" onClick={() => { setSortBy("UPDATED_NEW"); setFilters({ ...filters, dateType: "MOVEMENT" }); }}>Recently Updated</button>
       </div>
       <div className="active-filter-chip-row no-print">
-        {filters.productSearch && <button className="filter-chip" onClick={() => setFilters({ ...filters, productSearch: "" })}>{filters.productSearch} x</button>}
-        {filters.lotSearch && <button className="filter-chip" onClick={() => setFilters({ ...filters, lotSearch: "" })}>{filters.lotSearch} x</button>}
-        {filters.product && <button className="filter-chip" onClick={() => updateProductFilter("")}>{productOptions.find(([id]) => id === filters.product)?.[1] || "Product"} x</button>}
-        {filters.lot && <button className="filter-chip" onClick={() => setFilters({ ...filters, lot: "" })}>{lotOptions.find(([id]) => id === filters.lot)?.[1] || "Lot"} x</button>}
-        {filters.date_from && <button className="filter-chip" onClick={() => setFilters({ ...filters, date_from: "" })}>From {formatDisplayDate(filters.date_from)} x</button>}
-        {filters.date_to && <button className="filter-chip" onClick={() => setFilters({ ...filters, date_to: "" })}>To {formatDisplayDate(filters.date_to)} x</button>}
-        {filters.status !== "IN_STOCK" && <button className="filter-chip" onClick={() => setFilters({ ...filters, status: "IN_STOCK" })}>{filters.status.replaceAll("_", " ")} x</button>}
-        {filters.origin !== "ALL" && <button className="filter-chip" onClick={() => setFilters({ ...filters, origin: "ALL" })}>{filters.origin} x</button>}
+        {activeFilterChips.map(([key, label]) => <button className="filter-chip" key={key} onClick={() => clearActiveFilter(key)}>{label} x</button>)}
       </div>
       {viewMode === "PRODUCT" && (
         <DataTable headers={["Product", "Category", "Total Stock", "Available Lots", "Average Cost", "Sale Rate", "Stock Value", "Minimum Stock", "Status"]}>
@@ -11529,7 +11625,7 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
             const toggleProduct = () => setExpandedProductId(expandedProductId === String(product.product_id) ? "" : String(product.product_id));
             return (
               <React.Fragment key={product.product_id}>
-                <tr className="report-row-clickable" onClick={toggleProduct}>
+                <tr className="report-row-clickable" data-inventory-product-row={String(product.product_id)} onClick={toggleProduct}>
                   <td className="primary-cell">{product.product_name}<small className="cell-note">Click to view lots</small></td>
                   <td>{product.category}</td>
                   <td>{product.total_stock_summary}</td>
@@ -11552,13 +11648,13 @@ function StockInventoryReport({ auditEndpoint, canManageStock, lots = [], onLotA
               </React.Fragment>
             );
           })}
-          {filteredProductRows.length === 0 && <tr><td colSpan="9" className="empty-cell">No matching stock products found.</td></tr>}
+          {!inventoryLoading && !inventoryUnavailable && filteredProductRows.length === 0 && <tr><td colSpan="9" className="empty-cell">No matching stock products found.</td></tr>}
         </DataTable>
       )}
       {viewMode === "LOT" && (
         <DataTable headers={compactLotHeaders}>
           {renderCompactLotRows(pagedLots)}
-          {filteredLots.length === 0 && <tr><td colSpan={compactLotHeaders.length} className="empty-cell">No matching stock lots found.</td></tr>}
+          {!inventoryLoading && !inventoryUnavailable && filteredLots.length === 0 && <tr><td colSpan={compactLotHeaders.length} className="empty-cell">No matching stock lots found.</td></tr>}
         </DataTable>
       )}
       {viewMode === "CATEGORY" && (
@@ -16508,7 +16604,7 @@ function SaleEditModal({ canSaleDateEdit = false, customers = [], deviceInfo, in
     ["BANK_TRANSFER", "Bank Transfer Amount"],
   ];
   const activeLotsForProduct = (productId) => inventory.filter((lot) =>
-    Number(lot.product_id) === Number(productId) &&
+    inventoryIdsEqual(lot.product_id, productId) &&
     Number(lot.remaining_qty ?? lot.balance_qty ?? 0) > 0 &&
     !["CANCELLED", "INACTIVE"].includes(String(lot.batch_status || "ACTIVE").toUpperCase())
   );

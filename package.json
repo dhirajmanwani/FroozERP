@@ -12,6 +12,7 @@
     "release:manifest": "node scripts\\generate-tauri-update-manifest.mjs",
     "release:set-version": "node scripts\\set-release-version.mjs",
     "verify:update-safety": "node scripts\\verify-update-safety.mjs",
+    "verify:disposable-matrix": "node --test --test-concurrency=1 scripts/acceptance/disposable-module-matrix.test.mjs scripts/acceptance/stock-inventory-ssr.test.mjs",
     "build": "npm --prefix frontend run build",
     "backend:check": "node --check backend/server.js",
     "cloud:verify": "node scripts/cloud/verify-hosted-cloud.mjs",
