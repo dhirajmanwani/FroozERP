@@ -331,5 +331,33 @@ like a permanent lockout. Clearing localStorage restored access with no data cha
 
 ### Note
 
-No rows were inserted to work around this. Provisioning was unnecessary — the device was
-already authorised locally, and the blocker was the shadowing described above.
+At the time this item was logged (2026-08-15), no rows had been inserted to work around this —
+provisioning was unnecessary, the device was already authorised locally, and the blocker was the
+shadowing described above.
+
+**Re-measured 2026-08-16.** A hand-inserted `local_device_assignment` row was believed to have
+been added to a disposable profile to get past the login gate while testing the shelved
+`CanonicalSnapshotScope` patch. **No such row exists.** `local_device_assignment` was measured
+empty in every database reachable on this machine:
+
+| Database | `local_device_assignment` |
+| --- | --- |
+| Live app-data profile (`%APPDATA%/com.srtcompany.froozerp/froozerp-local.sqlite3`) | **0 rows** |
+| 2026-08-15 session scratchpad `dbcopy/froozerp-local.sqlite3` | 0 rows |
+| 2026-08-15 session scratchpad `fixture/fixture.sqlite3` | 0 rows |
+| 2026-08-15 session scratchpad `repro/pre.sqlite3` | 0 rows |
+| 2026-08-15 session scratchpad `repro/failed.sqlite3` | 0 rows |
+
+All read from copies; the live profile's mtime was unchanged by the inspection. The live
+profile's `local_device_identity` is 3 rows with 1 approved (`FZDEV-DELL-1781852580596`), which
+matches this document's item 2 baseline exactly. So the original note stands as written: **no
+rows were inserted**, and the empty-`local_device_assignment` precondition that items 2 and 5
+both depend on is intact. Whatever was done to pass the login gate did not leave an assignment
+row behind.
+
+**Related, and separately verified:** there is no isolated disposable SQLite profile on this
+machine. `npm run app` runs `tauri dev`, which sets neither `NODE_ENV=test` nor
+`FROOZERP_ISOLATED_SQLITE_DIR`; `resolve_app_data_dir` (`src-tauri/src/local_db.rs:2056`)
+requires **both** before it will redirect, so dev runs against the real app-data profile. Any
+future test that needs a disposable profile must set both variables explicitly — it does not
+happen by default, and assuming otherwise risks mutating live data.

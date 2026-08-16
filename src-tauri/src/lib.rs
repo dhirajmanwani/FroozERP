@@ -1,3 +1,6 @@
+// Offline activation entitlement core (Stage 1). Pure logic, no call sites yet — the module is
+// declared so it compiles and its tests run; nothing in the app invokes it.
+pub mod entitlement;
 mod local_db;
 
 use local_db::{
