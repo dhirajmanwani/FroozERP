@@ -17,3 +17,13 @@ node_modules/
 */.cache/
 backend/node_modules/
 frontend/node_modules/
+
+# Preserved failure evidence and local build/runtime artifacts.
+# Untracked already; listed here so git status stays readable.
+_recovery_backups/
+_up_/
+binaries/
+release-candidates/
+scratchpad/
+froozerp.exe
+uninstall.exe

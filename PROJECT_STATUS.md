@@ -301,6 +301,7 @@ The following areas are prepared but not fully production-complete:
 - Cloud sync status is local/future-ready only; no remote service exists yet.
 - Update Center buttons are UI/database readiness only; no online release channel exists.
 - There is no automated test suite yet.
+- Desktop SQLite lots do not carry `purchase_bill_status`, so provisional (pending-bill) costs are indistinguishable from final ones and understate stock valuation silently. Deferred to 1.0.72 — see `docs/backlog-1.0.72.md`.
 
 ## Database Tables
 
