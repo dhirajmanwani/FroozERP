@@ -1530,6 +1530,58 @@ tbody tr:last-child td {
   background: #ffffff !important;
 }
 
+/* Sits above the deliberate white-out so the user sees progress, not a blank screen. */
+.pdf-export-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(9, 12, 20, 0.86);
+  backdrop-filter: blur(2px);
+}
+
+.pdf-export-overlay-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 26px 34px;
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  border-radius: 14px;
+  background: #111827;
+  color: #f9fafb;
+  text-align: center;
+}
+
+.pdf-export-overlay-card strong {
+  font-size: 15px;
+  font-weight: 800;
+}
+
+.pdf-export-overlay-card span {
+  font-size: 12px;
+  color: #9ca3af;
+}
+
+.pdf-export-overlay-spinner {
+  width: 26px;
+  height: 26px;
+  border: 3px solid rgba(245, 158, 11, 0.25);
+  border-top-color: #fbbf24;
+  border-radius: 50%;
+  animation: pdf-export-spin 0.8s linear infinite;
+}
+
+@keyframes pdf-export-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pdf-export-overlay-spinner { animation-duration: 2.4s; }
+}
+
 .pdf-export-mode,
 .pdf-export-mode * {
   color: #000000 !important;
@@ -2882,11 +2934,13 @@ tbody tr:last-child td {
 }
 
 .stock-filter-row-primary {
-  grid-template-columns: minmax(120px, 0.8fr) minmax(220px, 1.6fr) minmax(150px, 1fr) minmax(128px, 0.85fr) minmax(128px, 0.85fr) minmax(140px, 0.9fr);
+  /* search, view mode, disclosure actions */
+  grid-template-columns: minmax(240px, 2fr) minmax(140px, 0.8fr) auto;
 }
 
 .stock-filter-row-secondary {
-  grid-template-columns: minmax(240px, 1.6fr) minmax(135px, 0.8fr) minmax(150px, 1fr) minmax(105px, 0.7fr) minmax(155px, 1fr) minmax(82px, 0.5fr) minmax(126px, 0.75fr);
+  /* auto-fit so the collapsed panel reflows without a hardcoded column count */
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
 }
 
 .stacked-control {
@@ -2904,6 +2958,22 @@ tbody tr:last-child td {
 
 .stock-clear-button {
   align-self: end;
+}
+
+.stock-filter-actions {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.stock-disclosure-button {
+  align-self: end;
+}
+
+.stock-disclosure-button.is-open {
+  border-color: rgba(245, 158, 11, 0.55);
+  color: #fbbf24;
 }
 
 .stock-inventory-report .quick-filter-row,

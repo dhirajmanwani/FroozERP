@@ -53,6 +53,7 @@ import {
   sanitizedInventoryLoadError,
   validateStockDateRange,
 } from "./local/stockInventory";
+import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, resolveReportDateRange } from "./local/reportRefresh";
 import { approvedDeviceCredentialMessage, normalizeDeviceBootstrapStatus } from "./local/freshDeviceOnboarding";
@@ -1022,10 +1023,32 @@ const openPdfInSystemViewer = async ({ blob, fileName }) => {
   setTimeout(() => URL.revokeObjectURL(url), 60000);
   return url;
 };
+// The export deliberately whitens the page for capture (.pdf-export-active in App.css).
+// Cover it before that happens so the user sees a progress state, never a blank screen.
+const showPdfExportOverlay = (message) => {
+  if (typeof document === "undefined" || !document.body) return () => {};
+  const overlay = document.createElement("div");
+  overlay.className = "pdf-export-overlay no-print";
+  overlay.setAttribute("role", "status");
+  overlay.setAttribute("aria-live", "polite");
+  const card = document.createElement("div");
+  card.className = "pdf-export-overlay-card";
+  const spinner = document.createElement("div");
+  spinner.className = "pdf-export-overlay-spinner";
+  const title = document.createElement("strong");
+  title.textContent = message;
+  const note = document.createElement("span");
+  note.textContent = "Large reports can take a few seconds.";
+  card.append(spinner, title, note);
+  overlay.append(card);
+  document.body.appendChild(overlay);
+  return () => overlay.remove();
+};
 const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth = "80MM", printProfile = "", save = true }) => {
   if (!element) throw new Error("Nothing to export");
   const isThermal = mode === "THERMAL";
   const resolvedProfile = isThermal ? (receiptWidth === "58MM" ? "THERMAL_58" : "THERMAL_80") : (printProfile || "A4_PORTRAIT");
+  const hidePdfExportOverlay = showPdfExportOverlay(isThermal ? "Preparing receipt..." : "Preparing PDF...");
   element.dataset.printProfile = resolvedProfile;
   element.classList.add("pdf-export-mode", isThermal ? "pdf-export-thermal" : "pdf-export-a4");
   if (!isThermal) {
@@ -1071,9 +1094,32 @@ const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth
     delete element.dataset.printProfile;
     element.classList.remove("pdf-export-mode", "pdf-export-thermal", "pdf-export-a4", "pdf-export-a4-landscape", "pdf-export-a4-portrait");
     document.body.classList.remove("pdf-export-active");
+    hidePdfExportOverlay();
   }
 };
 
+// Reports export as real text rather than a screenshot: selectable, searchable, and small
+// enough to survive the backend 25mb JSON body limit when base64-encoded for WhatsApp.
+// Returns null when the report has no extractable tables/metrics (e.g. chart-only), so the
+// caller can fall back to the raster path.
+const exportReportTextPdf = async ({ element, fileName, title, printProfile = "", save = true }) => {
+  if (!element) return null;
+  const meta = Array.from(element.querySelectorAll?.(".report-filter-summary") || [])
+    .map((node) => String(node.textContent || "").replace(/s+/g, " ").trim())
+    .filter(Boolean);
+  const model = buildReportPdfModel(element, { title, meta });
+  if (!reportPdfHasContent(model)) return null;
+  const pdf = renderReportPdf({
+    model,
+    jsPDF,
+    orientation: printProfile === "A4_LANDSCAPE" ? "landscape" : "portrait",
+    generatedAt: new Date().toLocaleString("en-IN"),
+  });
+  const finalFileName = safeFileName(fileName).replace(/.pdf$/i, "") + ".pdf";
+  const blob = ensurePdfBlob(pdf.output("blob"));
+  const saveResult = save ? await savePdfResult({ blob, fileName: finalFileName, pdf }) : null;
+  return { blob, fileName: finalFileName, pdf, saveResult };
+};
 const normalizeWhatsappNumber = (value, defaultCountryCode = "91") => {
   let digits = String(value || "").trim().replace(/[^\d+]/g, "");
   if (!digits) return "";
@@ -8538,12 +8584,15 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
     setExporting(true);
     try {
       await new Promise((resolve) => setTimeout(resolve, 80));
-      await exportElementToPdf({
-        element: reportRef.current,
-        fileName: fileName || `${title}.pdf`,
-        mode: "A4",
-        printProfile,
-      });
+      const textResult = await exportReportTextPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile });
+      if (!textResult) {
+        await exportElementToPdf({
+          element: reportRef.current,
+          fileName: fileName || `${title}.pdf`,
+          mode: "A4",
+          printProfile,
+        });
+      }
     } catch (error) {
       alert(`Unable to export PDF: ${error.message}`);
     } finally {
@@ -8558,13 +8607,14 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
     setExporting(true);
     try {
       await new Promise((resolve) => setTimeout(resolve, 80));
-      const result = await exportElementToPdf({
-        element: reportRef.current,
-        fileName: fileName || `${title}.pdf`,
-        mode: "A4",
-        printProfile,
-        save: false,
-      });
+      const result = await exportReportTextPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile, save: false })
+        || await exportElementToPdf({
+          element: reportRef.current,
+          fileName: fileName || `${title}.pdf`,
+          mode: "A4",
+          printProfile,
+          save: false,
+        });
       setPdfPreview({ ...result });
     } catch (error) {
       alert(`Unable to view PDF: ${error.message}`);
@@ -8580,13 +8630,14 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
     setExporting(true);
     try {
       await new Promise((resolve) => setTimeout(resolve, 80));
-      return await exportElementToPdf({
-        element: reportRef.current,
-        fileName: fileName || `${title}.pdf`,
-        mode: "A4",
-        printProfile,
-        save: false,
-      });
+      return await exportReportTextPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile, save: false })
+        || await exportElementToPdf({
+          element: reportRef.current,
+          fileName: fileName || `${title}.pdf`,
+          mode: "A4",
+          printProfile,
+          save: false,
+        });
     } finally {
       setExporting(false);
       setPrintTarget(false);
@@ -11137,6 +11188,8 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
   const [filters, setFilters] = useState(createStockFilters);
   const [sortBy, setSortBy] = useState("PRODUCT_ASC");
   const [pageSize, setPageSize] = useState(50);
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
   const [expandedProductId, setExpandedProductId] = useState("");
   const [auditRows, setAuditRows] = useState([]);
   const [auditLoading, setAuditLoading] = useState(false);
@@ -11491,12 +11544,6 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
       {auditError && <div className="error-banner">{auditError}</div>}
       <div className="stock-inventory-toolbar sticky-report-filters no-print">
         <div className="stock-filter-row stock-filter-row-primary">
-          <Field label="View Mode">
-            <select value={viewMode} onChange={(event) => setViewMode(event.target.value)}>
-              <option value="PRODUCT">Product View</option>
-              <option value="LOT">Lot View</option>
-            </select>
-          </Field>
           <Field label="Product Search / Selector">
             <div className="stacked-control">
               <input placeholder="Search or select product..." value={filters.productSearch} onChange={(event) => setFilters({ ...filters, productSearch: event.target.value })} />
@@ -11506,114 +11553,141 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
               </select>
             </div>
           </Field>
-          <Field label="Date Type">
-            <select value={filters.dateType} onChange={(event) => setFilters({ ...filters, dateType: event.target.value })}>
-              <option value="ARRIVAL">Arrival Date</option>
-              <option value="BILL">Purchase Bill Date</option>
-              <option value="MOVEMENT">Last Stock Movement Date</option>
+          <Field label="View Mode">
+            <select value={viewMode} onChange={(event) => setViewMode(event.target.value)}>
+              <option value="PRODUCT">Product View</option>
+              <option value="LOT">Lot View</option>
             </select>
           </Field>
-          <Field label="Date From"><input type="date" value={filters.date_from} onChange={(event) => setFilters({ ...filters, date_from: event.target.value })} /></Field>
-          <Field label="Date To"><input type="date" value={filters.date_to} onChange={(event) => setFilters({ ...filters, date_to: event.target.value })} /></Field>
-          <Field label="Status">
-            <select value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })}>
-              <option value="ALL">All</option>
-              <option value="IN_STOCK">In Stock</option>
-              <option value="LOW_STOCK">Low Stock</option>
-              <option value="OUT_OF_STOCK">Out of Stock</option>
-              <option value="NEGATIVE">Negative Stock</option>
-              <option value="CONFLICT">Conflict</option>
-            </select>
-          </Field>
+          <div className="stock-filter-actions">
+            <button
+              aria-expanded={filtersOpen}
+              className={filtersOpen ? "secondary-button stock-disclosure-button is-open" : "secondary-button stock-disclosure-button"}
+              onClick={() => setFiltersOpen((open) => !open)}
+            >
+              {activeFilterChips.length > 0 ? "Filters (" + activeFilterChips.length + ")" : "Filters"}
+            </button>
+            <button
+              aria-expanded={moreOpen}
+              className={moreOpen ? "secondary-button stock-disclosure-button is-open" : "secondary-button stock-disclosure-button"}
+              onClick={() => setMoreOpen((open) => !open)}
+            >
+              More
+            </button>
+            {activeFilterChips.length > 0 && <button className="secondary-button stock-clear-button" onClick={clearFilters}>Clear All Filters</button>}
+          </div>
         </div>
-        <div className="stock-filter-row stock-filter-row-secondary">
-          <Field label="Lot Filter">
-            <div className="stacked-control">
-              <input
-                disabled={!filters.product}
-                placeholder={filters.product ? "Search lot number, supplier lot, date, stock or rate..." : "Select product first"}
-                value={filters.lotSearch}
-                onChange={(event) => setFilters({ ...filters, lotSearch: event.target.value })}
-              />
-              <select
-                disabled={!filters.product}
-                value={filters.lot}
-                onChange={(event) => setFilters({ ...filters, lot: event.target.value })}
-              >
-                <option value="">{filters.product ? "All lots for selected product" : "Select product first"}</option>
-                {filters.product && lotOptions.length === 0 && <option value="" disabled>No lots found for this product</option>}
-                {lotOptions.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+        <div className="quick-filter-row no-print">
+          <button className="filter-chip" onClick={() => setFilters({ ...filters, dateType: "ARRIVAL", date_from: toDateKey(new Date()), date_to: toDateKey(new Date()) })}>Today&apos;s Arrivals</button>
+          <button className="filter-chip" onClick={() => {
+            const date = new Date();
+            date.setDate(date.getDate() - 6);
+            setFilters({ ...filters, dateType: "ARRIVAL", date_from: toDateKey(date), date_to: toDateKey(new Date()) });
+          }}>Last 7 Days</button>
+          <button className="filter-chip" onClick={() => {
+            const date = new Date();
+            date.setDate(date.getDate() - 29);
+            setFilters({ ...filters, dateType: "ARRIVAL", date_from: toDateKey(date), date_to: toDateKey(new Date()) });
+          }}>Last 30 Days</button>
+          <button className="filter-chip" onClick={() => setFilters({ ...filters, status: "LOW_STOCK" })}>Low Stock</button>
+          <button className="filter-chip" onClick={() => setFilters({ ...filters, status: "OUT_OF_STOCK", showEmpty: true })}>Out of Stock</button>
+          <button className="filter-chip" onClick={() => setFilters({ ...filters, origin: "IMPORTED" })}>Imported</button>
+          <button className="filter-chip" onClick={() => setFilters({ ...filters, origin: "LOCAL" })}>Local</button>
+          <button className="filter-chip" onClick={() => { setSortBy("UPDATED_NEW"); setFilters({ ...filters, dateType: "MOVEMENT" }); }}>Recently Updated</button>
+        </div>
+        {/* Every effective filter stays named here even while the panel below is collapsed. */}
+        <div className="active-filter-chip-row no-print">
+          {activeFilterChips.map(([key, label]) => <button className="filter-chip" key={key} onClick={() => clearActiveFilter(key)}>{label} x</button>)}
+        </div>
+        {filtersOpen && (
+          <div className="stock-filter-row stock-filter-row-secondary">
+            <Field label="Category">
+              <select value={filters.category} onChange={(event) => setFilters({ ...filters, category: event.target.value })}>
+                <option value="">All categories</option>
+                {categories.map((category) => <option key={category} value={category}>{category}</option>)}
               </select>
-            </div>
-          </Field>
-          <Field label="Category">
-            <select value={filters.category} onChange={(event) => setFilters({ ...filters, category: event.target.value })}>
-              <option value="">All categories</option>
-              {categories.map((category) => <option key={category} value={category}>{category}</option>)}
-            </select>
-          </Field>
-          <Field label="Supplier">
-            <select value={filters.supplier} onChange={(event) => setFilters({ ...filters, supplier: event.target.value })}>
-              <option value="">All suppliers</option>
-              {suppliers.map((supplier) => <option key={supplier} value={supplier}>{supplier}</option>)}
-            </select>
-          </Field>
-          <Field label="Origin">
-            <select value={filters.origin} onChange={(event) => setFilters({ ...filters, origin: event.target.value })}>
-              <option value="ALL">All</option>
-              <option value="LOCAL">Local</option>
-              <option value="IMPORTED">Imported</option>
-            </select>
-          </Field>
-          <Field label="Sort By">
-            <select value={sortBy} onChange={(event) => setSortBy(event.target.value)}>
-              <option value="PRODUCT_ASC">Product Name</option>
-              <option value="LOT_ASC">Lot Number</option>
-              <option value="ARRIVAL_OLD">Arrival Date - Oldest</option>
-              <option value="ARRIVAL_NEW">Arrival Date - Newest</option>
-              <option value="STOCK_HIGH">Available Stock - High</option>
-              <option value="STOCK_LOW">Available Stock - Low</option>
-              <option value="RATE_HIGH">Sale Rate - High</option>
-              <option value="RATE_LOW">Sale Rate - Low</option>
-              <option value="SUPPLIER_ASC">Supplier</option>
-              <option value="UPDATED_NEW">Last Updated</option>
-            </select>
-          </Field>
-          <Field label="Rows">
-            <select value={pageSize} onChange={(event) => setPageSize(Number(event.target.value))}>
-              <option value="25">25</option>
-              <option value="50">50</option>
-              <option value="100">100</option>
-            </select>
-          </Field>
-          <button className="secondary-button stock-clear-button" onClick={clearFilters}>Clear All Filters</button>
-        </div>
-        <div className="stock-toggle-row">
-          <label className="check-field report-check-field"><input checked={filters.showEmpty} type="checkbox" onChange={(event) => setFilters({ ...filters, showEmpty: event.target.checked })} /><span>Show Empty Lots</span></label>
-          <label className="check-field report-check-field"><input checked={filters.showInactive} type="checkbox" onChange={(event) => setFilters({ ...filters, showInactive: event.target.checked })} /><span>Show Inactive / Cancelled Lots</span></label>
-          <button className="secondary-button compact-button" onClick={() => openAudit()}>View Audit Trail</button>
-        </div>
-      </div>
-      <div className="quick-filter-row no-print">
-        <button className="filter-chip" onClick={() => setFilters({ ...filters, dateType: "ARRIVAL", date_from: toDateKey(new Date()), date_to: toDateKey(new Date()) })}>Today's Arrivals</button>
-        <button className="filter-chip" onClick={() => {
-          const date = new Date();
-          date.setDate(date.getDate() - 6);
-          setFilters({ ...filters, dateType: "ARRIVAL", date_from: toDateKey(date), date_to: toDateKey(new Date()) });
-        }}>Last 7 Days</button>
-        <button className="filter-chip" onClick={() => {
-          const date = new Date();
-          date.setDate(date.getDate() - 29);
-          setFilters({ ...filters, dateType: "ARRIVAL", date_from: toDateKey(date), date_to: toDateKey(new Date()) });
-        }}>Last 30 Days</button>
-        <button className="filter-chip" onClick={() => setFilters({ ...filters, status: "LOW_STOCK" })}>Low Stock</button>
-        <button className="filter-chip" onClick={() => setFilters({ ...filters, status: "OUT_OF_STOCK", showEmpty: true })}>Out of Stock</button>
-        <button className="filter-chip" onClick={() => setFilters({ ...filters, origin: "IMPORTED" })}>Imported</button>
-        <button className="filter-chip" onClick={() => setFilters({ ...filters, origin: "LOCAL" })}>Local</button>
-        <button className="filter-chip" onClick={() => { setSortBy("UPDATED_NEW"); setFilters({ ...filters, dateType: "MOVEMENT" }); }}>Recently Updated</button>
-      </div>
-      <div className="active-filter-chip-row no-print">
-        {activeFilterChips.map(([key, label]) => <button className="filter-chip" key={key} onClick={() => clearActiveFilter(key)}>{label} x</button>)}
+            </Field>
+            <Field label="Supplier">
+              <select value={filters.supplier} onChange={(event) => setFilters({ ...filters, supplier: event.target.value })}>
+                <option value="">All suppliers</option>
+                {suppliers.map((supplier) => <option key={supplier} value={supplier}>{supplier}</option>)}
+              </select>
+            </Field>
+            <Field label="Origin">
+              <select value={filters.origin} onChange={(event) => setFilters({ ...filters, origin: event.target.value })}>
+                <option value="ALL">All</option>
+                <option value="LOCAL">Local</option>
+                <option value="IMPORTED">Imported</option>
+              </select>
+            </Field>
+            <Field label="Status">
+              <select value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })}>
+                <option value="ALL">All</option>
+                <option value="IN_STOCK">In Stock</option>
+                <option value="LOW_STOCK">Low Stock</option>
+                <option value="OUT_OF_STOCK">Out of Stock</option>
+                <option value="NEGATIVE">Negative Stock</option>
+                <option value="CONFLICT">Conflict</option>
+              </select>
+            </Field>
+            <Field label="Date Type">
+              <select value={filters.dateType} onChange={(event) => setFilters({ ...filters, dateType: event.target.value })}>
+                <option value="ARRIVAL">Arrival Date</option>
+                <option value="BILL">Purchase Bill Date</option>
+                <option value="MOVEMENT">Last Stock Movement Date</option>
+              </select>
+            </Field>
+            <Field label="Date From"><input type="date" value={filters.date_from} onChange={(event) => setFilters({ ...filters, date_from: event.target.value })} /></Field>
+            <Field label="Date To"><input type="date" value={filters.date_to} onChange={(event) => setFilters({ ...filters, date_to: event.target.value })} /></Field>
+            <Field label="Lot Filter">
+              <div className="stacked-control">
+                <input
+                  disabled={!filters.product}
+                  placeholder={filters.product ? "Search lot number, supplier lot, date, stock or rate..." : "Select product first"}
+                  value={filters.lotSearch}
+                  onChange={(event) => setFilters({ ...filters, lotSearch: event.target.value })}
+                />
+                <select
+                  disabled={!filters.product}
+                  value={filters.lot}
+                  onChange={(event) => setFilters({ ...filters, lot: event.target.value })}
+                >
+                  <option value="">{filters.product ? "All lots for selected product" : "Select product first"}</option>
+                  {filters.product && lotOptions.length === 0 && <option value="" disabled>No lots found for this product</option>}
+                  {lotOptions.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+                </select>
+              </div>
+            </Field>
+            <Field label="Sort By">
+              <select value={sortBy} onChange={(event) => setSortBy(event.target.value)}>
+                <option value="PRODUCT_ASC">Product Name</option>
+                <option value="LOT_ASC">Lot Number</option>
+                <option value="ARRIVAL_OLD">Arrival Date - Oldest</option>
+                <option value="ARRIVAL_NEW">Arrival Date - Newest</option>
+                <option value="STOCK_HIGH">Available Stock - High</option>
+                <option value="STOCK_LOW">Available Stock - Low</option>
+                <option value="RATE_HIGH">Sale Rate - High</option>
+                <option value="RATE_LOW">Sale Rate - Low</option>
+                <option value="SUPPLIER_ASC">Supplier</option>
+                <option value="UPDATED_NEW">Last Updated</option>
+              </select>
+            </Field>
+            <Field label="Rows">
+              <select value={pageSize} onChange={(event) => setPageSize(Number(event.target.value))}>
+                <option value="25">25</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+              </select>
+            </Field>
+          </div>
+        )}
+        {moreOpen && (
+          <div className="stock-toggle-row">
+            <label className="check-field report-check-field"><input checked={filters.showEmpty} type="checkbox" onChange={(event) => setFilters({ ...filters, showEmpty: event.target.checked })} /><span>Show Empty Lots</span></label>
+            <label className="check-field report-check-field"><input checked={filters.showInactive} type="checkbox" onChange={(event) => setFilters({ ...filters, showInactive: event.target.checked })} /><span>Show Inactive / Cancelled Lots</span></label>
+            <button className="secondary-button compact-button" onClick={() => openAudit()}>View Audit Trail</button>
+          </div>
+        )}
       </div>
       {viewMode === "PRODUCT" && (
         <DataTable headers={["Product", "Category", "Total Stock", "Available Lots", "Average Cost", "Sale Rate", "Stock Value", "Minimum Stock", "Status"]}>
