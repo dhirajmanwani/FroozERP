@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
-const CURRENT_SCHEMA_VERSION: &str = "016_purchase_aggregate_reconciliation";
+const CURRENT_SCHEMA_VERSION: &str = "017_offline_entitlement_foundation";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -23,6 +23,7 @@ const MIGRATION_013: &str = include_str!("../migrations/sqlite/013_operational_l
 const MIGRATION_014: &str = include_str!("../migrations/sqlite/014_offline_purchase_grn.sql");
 const MIGRATION_015: &str = include_str!("../migrations/sqlite/015_supplier_reference_cache.sql");
 const MIGRATION_016: &str = include_str!("../migrations/sqlite/016_purchase_aggregate_reconciliation.sql");
+const MIGRATION_017: &str = include_str!("../migrations/sqlite/017_offline_entitlement_foundation.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -2102,6 +2103,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "014_offline_purchase_grn", MIGRATION_014)?;
     apply_migration(&mut conn, "015_supplier_reference_cache", MIGRATION_015)?;
     apply_migration(&mut conn, "016_purchase_aggregate_reconciliation", MIGRATION_016)?;
+    apply_migration(&mut conn, "017_offline_entitlement_foundation", MIGRATION_017)?;
     Ok(())
 }
 
@@ -4913,7 +4915,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("migration count");
-            assert_eq!(migration_count, 15);
+            assert_eq!(migration_count, 16);
             drop(conn);
             initialize_at(path).expect("restart with existing SQLite profile");
             let restored = ensure_device_identity_at(path).expect("restore device identity");
@@ -4975,7 +4977,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("preserved marker");
-        assert_eq!(migration_count, 15);
+        assert_eq!(migration_count, 16);
         assert_eq!(marker, "keep-me");
         drop(conn);
         let _ = fs::remove_file(&path);
@@ -5092,7 +5094,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("read upgraded migration count");
-            assert_eq!(migrations, 15);
+            assert_eq!(migrations, 16);
             drop(conn);
             let _ = fs::remove_file(&path);
         }

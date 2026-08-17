@@ -11,7 +11,8 @@
 > | --- | --- |
 > | 0 — test-environment hygiene | **Closed 2026-08-16.** No action was needed: `local_device_assignment` measured empty (0 rows) across the live app-data profile and all four 2026-08-15 scratchpad copies. Nothing was deleted. See the re-measurement note in `docs/backlog-1.0.72.md` item 5. |
 > | 1 — `entitlement.rs` pure core | **Complete 2026-08-16.** `src-tauri/src/entitlement.rs`, declared as `pub mod entitlement;` in `lib.rs` with no call sites. |
-> | 2–10 | Not started. |
+> | 2 — migration `017` | **Complete 2026-08-17.** Draft reviewed against design §5 and accepted unchanged; registered in `local_db.rs`. See the Stage 2 record at the end of this file. |
+> | 3–10 | Not started. |
 >
 > **Two amendments made after this plan was approved — both supersede the text below:**
 >
@@ -311,3 +312,157 @@ unit and fixture suites.
 Stages 1–4 are worth completing regardless of how any remaining implementation detail shakes out
 during the work — they are pure additions or direct fixes to defects already recorded in
 `docs/backlog-1.0.72.md`, and stage 4 is the one the maintainer is actually blocked on.
+
+---
+
+## Stage 2 record — completed 2026-08-17
+
+### Outcome
+
+`017_offline_entitlement_foundation.sql` **reviewed against design §5 and accepted with no
+changes**, then registered in `local_db.rs`. Storage shape only: nothing reads these tables yet,
+and `entitlement.rs` still has no call sites.
+
+### Files changed
+
+| File | Change |
+| --- | --- |
+| `src-tauri/src/local_db.rs` | `MIGRATION_017` const via `include_str!`; `apply_migration(..., "017_offline_entitlement_foundation", MIGRATION_017)` after 016; `CURRENT_SCHEMA_VERSION` → `017_offline_entitlement_foundation`; three migration-count assertions 15 → 16 |
+| `docs/backlog-1.0.72.md` | New item 6 — unregistered migrations (`008` here, `006`/`007`/`008` on `main`) and the release-branch finding |
+| `docs/offline-activation-plan.md` | Stage table row for Stage 2, and this record |
+
+`017_offline_entitlement_foundation.sql` itself is **unmodified** — it was reviewed, not edited.
+
+> **Scope note.** Stage 2 was briefed as "const + `apply_migration` call are the only changes to
+> `local_db.rs`". Two further edits in that file proved mechanically necessary for `cargo test`
+> to pass, and both are bookkeeping that tracks the migration count rather than design decisions:
+>
+> - `CURRENT_SCHEMA_VERSION` (`local_db.rs:9`). `status_at` reads the newest applied version from
+>   `local_schema_migrations ORDER BY rowid DESC`, which becomes `017…` the moment 017 is
+>   registered, and the test at `:4907` asserts that value equals `CURRENT_SCHEMA_VERSION`.
+>   Leaving it at `016…` fails the test and makes the reported schema version wrong in
+>   `LocalDbStatus`.
+> - Three `assert_eq!(…, 15)` migration-count assertions (`:4916`, `:4978`, `:5097`) → `16`.
+>
+> Flagged rather than assumed: if the intent was that these stay untouched, Stage 2 cannot pass
+> `cargo test`, and the two requirements need reconciling.
+
+### Review of the draft against §5 — three points checked deliberately
+
+All three choices are **correct and should stand**. Each was verified by execution, not by
+reading alone.
+
+1. **`local_entitlement_audit.entitlement_serial` nullable, no FK.** Agreed, and it is load-bearing.
+   A `REJECTED` event for an artefact that was never accepted has no ledger row to reference, and
+   an artefact rejected as truncated or unknown-version may have no readable serial at all. Either
+   `NOT NULL` or an FK would make the failure path unloggable — and §5.2 exists precisely so a
+   maintainer debugging a branch by phone gets a reason code. Verified: insert with
+   `entitlement_serial = NULL` succeeds; insert naming a serial with no ledger row succeeds.
+
+2. **`event` and `outcome` carry no CHECK.** Agreed. §8.2 already adds
+   `BOOTSTRAP_CREDENTIAL_CONSUMED` beyond the §5.2 list, and SQLite cannot alter a CHECK without
+   rebuilding the table, which forward-only migration policy makes expensive. A log that refuses a
+   write because it does not recognise an event name is worse than one storing an unexpected
+   string. Verified: an unknown future event name and an unknown outcome both insert cleanly.
+
+3. **`verification_state` ↔ `signature_blob` CHECK, and Stage 4 grandfathering. Confirmed
+   satisfiable.** §11.1 specifies grandfathered rows as `verification_state =
+   'LEGACY_GRANDFATHER'`, `source = 'LEGACY_UPGRADE'`, **empty `signature_blob`** — exactly the
+   branch the constraint permits. Verified by inserting the Stage 4 shape directly:
+
+   | Insert | Result |
+   | --- | --- |
+   | `VERIFIED` + 64-byte signature + non-empty payload | accepted |
+   | `VERIFIED` + 63-byte signature | rejected |
+   | `VERIFIED` + empty signature | rejected |
+   | `VERIFIED` + empty payload | rejected |
+   | `LEGACY_GRANDFATHER` + empty signature + **empty** payload | **accepted** |
+   | `LEGACY_GRANDFATHER` + empty signature + non-empty payload | accepted |
+   | `LEGACY_GRANDFATHER` + 64-byte signature | rejected |
+   | unknown `verification_state` | rejected |
+
+   The one implementation constraint Stage 4 must respect: `payload_blob` is `BLOB NOT NULL`, and
+   the `LEGACY_GRANDFATHER` branch does not exempt it. A grandfathered row has no signed payload,
+   so Stage 4 must bind an **empty** blob (`X''`), never `NULL`. Both empty and non-empty payloads
+   are accepted on that branch, so the constraint does not over-specify the shim.
+
+### Verification — disposable profile only
+
+**No live app-data profile was opened, and none exists in this environment.** The maintainer's
+`froozerp-local.sqlite3` lives under `%APPDATA%/com.srtcompany.froozerp/` on the Windows laptop;
+`*.sqlite3` is gitignored and no such file is present anywhere on this container. The plan's own
+Stage 4 amendment is the reason this is stated explicitly: `npm run app` runs against live app
+data, so "which file was opened" is never left to inference.
+
+The disposable profile was therefore **constructed, not copied** — built by replaying migrations
+`001`–`016` in the exact order and with the exact version strings `local_db.rs` uses, through a
+faithful re-implementation of `apply_migration` (skip-if-`APPLIED`, `execute_batch`, record
+version + checksum + status). `008` was deliberately excluded, matching real devices (backlog
+item 6).
+
+- Disposable database: `<session scratchpad>/disposable-froozerp-local.sqlite3`
+- Harness: `<session scratchpad>/verify_017.mjs`
+
+Both are session-scratchpad artefacts, outside the repo and outside app data. Nothing under
+`release/` or `F:\FroozERP_recovery_backups\` was touched; no production or Railway contact; no
+signing password; the packaged app was never installed or launched.
+
+**Results — all checks passed:**
+
+| Check | Result |
+| --- | --- |
+| Three tables exist with §5 columns | `local_entitlement` 19/19, `local_entitlement_audit` 7/7, `local_activation_code_seen` 3/3 — no missing, no extra |
+| Three indexes exist | `idx_local_entitlement_active`, `idx_local_entitlement_audit_serial`, `idx_local_entitlement_audit_occurred` — exactly three |
+| Second run is a no-op | version already `APPLIED` → skipped, no error |
+| No duplicate rows | exactly one `local_schema_migrations` row for `017` after two runs |
+| SQL body independently re-runnable | raw re-execute outside the version gate succeeds (`CREATE … IF NOT EXISTS`) |
+| Pre-existing `local_*` row counts unchanged | 23 data tables compared, all identical before/after |
+| Migration ledger | `local_schema_migrations` 15 → 16; newest row `017_offline_entitlement_foundation` / `APPLIED` |
+| Only expected tables added | exactly the three §5 tables |
+| New tables start empty | yes |
+| `local_kv` high-water row | **absent** — 0 rows for `entitlement_clock_high_water`, the correct initial state per the §5.3 amendment |
+
+### Gate results
+
+| Gate | Result |
+| --- | --- |
+| `cargo check --manifest-path src-tauri/Cargo.toml` | **Pass** (3 pre-existing `dead_code` warnings) |
+| `cargo test` | **58 passed, 3 failed — identical to the clean-tree baseline.** No new failure. |
+| `npm --prefix frontend run lint` | **Pass** — 0 errors, 37 pre-existing warnings in `App.jsx` (untouched) |
+| `npm run backend:check` | **Pass** |
+| `node --test frontend/src/local/*.test.mjs` | **123/123 pass** under `TZ=Asia/Kolkata` |
+
+Two environment caveats, both confirmed pre-existing and unrelated to this stage:
+
+- The 3 `cargo test` failures (`isolated_sqlite_override_is_absolute_and_test_only`, and two
+  `local_backend_lifecycle_tests`) hard-code Windows paths (`C:\…`, `F:\…`), which are not
+  absolute on Linux. They can only pass on Windows, the only shipped target. Verified by running
+  the suite on a stashed (clean) tree: the same 3 fail, and registering `017` adds none.
+- The local suite shows 5 failures under the container's UTC clock, all timezone-dependent
+  (`reportRefresh.test.mjs`, India calendar boundary). Under `TZ=Asia/Kolkata` the full suite is
+  123/123 green.
+
+`cargo check` additionally required installing Linux GTK/WebKit dev packages
+(`libgtk-3-dev`, `libwebkit2gtk-4.1-dev`, `libsoup-3.0-dev`) into the container, absent from the
+base image. Container-local only; no repository or dependency-manifest change.
+
+### Decisions the documents did not already rule
+
+One, and it is for Stage 5 rather than Stage 2 — recorded here so it is not rediscovered late:
+
+- **`bootstrap_consumed_at` is required by §8.2 but absent from the §5.1 table listing, and so
+  absent from `017`.** §8.2 states plainly that "`local_entitlement` gains a
+  `bootstrap_consumed_at` column", and the Stage 5 bootstrap-credential flow depends on it to make
+  the credential single-use. §5.1's column list — which Stage 2 was scoped to implement verbatim —
+  does not include it. The draft follows §5.1, which is the right call for this stage.
+
+  Not a defect and not a blocker: under forward-only policy the column arrives as an
+  `ALTER TABLE … ADD COLUMN` in a later migration, which is cheap in SQLite and needs no table
+  rebuild. It needs an explicit owner, though — either §5.1 is amended and `017` is revised
+  *before it is applied anywhere*, or Stage 5 carries an `018`. Recommend the latter: `017` is now
+  registered and must be treated as immutable.
+
+No ruled decision (D-1 … D-17) was reopened, and both 2026-08-16 amendments were honoured — the
+§5.3 clock rule is why the migration seeds no `entitlement_clock_high_water` value, and the §3.1
+crypto ruling is why the CHECK pins a signature at exactly 64 raw bytes rather than a minisign
+envelope.

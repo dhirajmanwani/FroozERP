@@ -361,3 +361,81 @@ machine. `npm run app` runs `tauri dev`, which sets neither `NODE_ENV=test` nor
 requires **both** before it will redirect, so dev runs against the real app-data profile. Any
 future test that needs a disposable profile must set both variables explicitly — it does not
 happen by default, and assuming otherwise risks mutating live data.
+
+---
+
+## 6. Migrations exist on disk but are never registered in `local_db.rs`, so they have never been applied on any device
+
+**Status:** open, not started. Logged 2026-08-17 during Stage 2 of
+`docs/offline-activation-plan.md`. **Recorded only — deliberately not fixed in Stage 2**, whose
+scope is the additive `017` migration and its registration.
+**Severity:** latent schema drift. Nothing is currently broken by it, which is exactly why it has
+gone unnoticed.
+
+### 6a. `008_cloud_sync_entity_metadata.sql` is orphaned on this branch
+
+`src-tauri/migrations/sqlite/008_cloud_sync_entity_metadata.sql` exists on disk. The const list in
+`src-tauri/src/local_db.rs` runs `MIGRATION_007` straight to `MIGRATION_009`, and the
+`apply_migration` call sequence does the same. There is no `MIGRATION_008` const and no call for
+it.
+
+`apply_migration` only ever runs SQL that is passed to it explicitly, so an unregistered file is
+inert: it is compiled into nothing, executed nowhere, and recorded nowhere in
+`local_schema_migrations`. **008 has therefore never been applied on any device** — not in dev,
+not in any release, not on the maintainer's laptop.
+
+Confirmed present on `codex/second-laptop-bootstrap-1.0.64` as well (12 migration files on disk,
+registered `001`–`007` + `009`–`012`), which is a branch real releases were dispatched from. So
+the gap shipped.
+
+### 6b. On `main` the gap is wider — three migrations, and `main` did ship
+
+On `main` @ `977caac` the const list stops at `MIGRATION_005`, while `006`, `007` and `008` all
+exist on disk. Three unregistered migrations rather than one.
+
+This is not hypothetical. `main` @ `977caac` is tagged `v1.0.51`, and `v1.0.51` is a published,
+non-draft GitHub release. Any device that installed a build cut from that tree ran a schema with
+`006_multibranch_identity_foundation`, `007_cloud_runtime_and_inbox_foundation` and
+`008_cloud_sync_entity_metadata` all missing.
+
+> **Correction to the framing this was logged under.** The gap does not "start earlier on `main`
+> than on the working branch". At the time of logging, `claude/offline-entitlement-migration-0nc0wl`
+> *was* `main` @ `977caac` — same SHA, empty `git diff` — because it had been cut from `main`
+> rather than from the active development branch. There was no divergence to compare. The real
+> comparison is `main` (stops at 005) versus `codex/final-cloud-sync-stabilization` (registers
+> `001`–`007`, `009`–`016`; only 008 missing).
+
+### Which branch are releases actually cut from? — verified
+
+**There is no single release branch, and that is the root cause.** Neither release workflow pins a
+ref: `.github/workflows/windows-updater-release.yml` uses a bare `actions/checkout@v4`, so it
+builds whatever ref triggered it. Both trigger paths are in active use.
+
+| Release range | Trigger | Ref actually built |
+| --- | --- | --- |
+| `v1.0.38` – `v1.0.51` | `push` on tag `v*` | the tag. `v1.0.51` → `977caac` → **`main`'s HEAD** |
+| `1.0.6x` (4 runs, 2026-07-22/23) | `workflow_dispatch` | **`codex/second-laptop-bootstrap-1.0.64`** |
+
+So the tag-push releases were built from `main`'s tree (registering only `001`–`005`), and the
+later dispatched releases from a `codex/*` branch (registering `001`–`007`, `009`–`012`). Devices
+in the field can be carrying either schema depending on which build they installed.
+
+### Why this is worth fixing deliberately rather than quickly
+
+Registering a skipped migration is **not** a safe one-line addition. `apply_migration` is
+version-gated on `local_schema_migrations`, so adding `MIGRATION_008` would cause `008` to run for
+the first time on profiles that have already had `009`–`017` applied — i.e. out of order, against
+a schema those later migrations already reshaped. Whether that is safe depends entirely on
+`008`'s contents versus what `009`+ did to the same tables.
+
+Fixing it needs, at minimum:
+
+1. A read of `008_cloud_sync_entity_metadata.sql` against `009`–`017` to establish whether it is
+   still meaningful, already superseded, or actively conflicting.
+2. A decision recorded in writing: register it (and prove out-of-order application is safe), fold
+   its still-needed parts into a new forward-only `018`, or retire the file with a comment
+   explaining why it stays unapplied.
+3. A ref-pinning guard on the release workflows, so "which branch shipped" stops being a question
+   answerable only by reading Actions history.
+
+Item 3 is arguably the more urgent half: without it, this class of divergence recurs silently.
