@@ -439,3 +439,98 @@ Fixing it needs, at minimum:
    answerable only by reading Actions history.
 
 Item 3 is arguably the more urgent half: without it, this class of divergence recurs silently.
+
+---
+
+## 7. Corrections to items 3 and 4, from a static audit (2026-08-17)
+
+Recorded during Stage 2/4 of `docs/offline-activation-plan.md`. **Both corrections were verified
+against source before being written here.** Items 3 and 4 remain open; this section fixes what
+they point at, because implementing them as originally written would not fix the defect.
+
+### 7a. Line numbers in items 3, 4 and design §12 have drifted
+
+| Cited | Actual |
+| --- | --- |
+| `App.jsx:148` (`DEFAULT_PRODUCTION_CLOUD_API_URL`) | `App.jsx:149` |
+| `App.jsx:249-256` | `App.jsx:250-257` |
+| `App.jsx:226-232` (`API_MODE`) | `App.jsx:226-237` |
+| `App.jsx:4249` (`canonical-cloud-login` probe) | `App.jsx:4239-4251` |
+| `device-bootstrap-status` | `App.jsx:4263` **and** `:4351` |
+
+### 7b. Item 3 names the wrong site — `:256` is not what poisons the config
+
+Item 3 names `App.jsx:256` (`isDesktopShell() ? DEFAULT_PRODUCTION_CLOUD_API_URL : ""`). That
+rung is effectively unreachable, and **editing it alone fixes nothing.** Verified:
+
+- **`App.jsx:171` is the real injector.** `sanitizeSavedApiConfigForRuntime` computes
+  `canonicalizeCloudApiUrl(config.cloudApiUrl || DEFAULT_PRODUCTION_CLOUD_API_URL)`, and
+  **`:173` writes that value straight back into `localStorage`**. On a profile with
+  `froozerp.apiConfig` cleared and `VITE_CLOUD_API_URL` blank, module evaluation re-poisons
+  localStorage with the Railway URL before `CLOUD_API_URL` is computed at all. Rung 3 then
+  resolves to production and rung 6 never runs.
+  **This explains the 2026-08-15 observation that *removing* all cloud configuration escalated
+  rather than stopped cloud contact.**
+- **`App.jsx:208` re-injects it after every login.** `mergeCloudIdentityIntoSavedConfig` uses
+  `identity.cloud_api_url || current.cloudApiUrl || DEFAULT_PRODUCTION_CLOUD_API_URL`, and `||`
+  treats `""` as falsy — so once `CLOUD_API_URL` is legitimately empty, the chain walks back to
+  production and persists it.
+- Two twins outside `App.jsx`: `syncService.js:79` (same `||` default) and
+  **`desktopGateway.js:16`, which defaults to production unconditionally** because
+  `src-tauri/src/lib.rs:994-1003` passes the gateway neither `CLOUD_API_URL` nor
+  `FROOZERP_PUBLIC_API_URL` — verified by reading the `.env(...)` list.
+
+Consequence worth stating plainly: **no `.env` exists in the repo and neither release workflow
+sets any `VITE_*`, so packaged releases have no cloud configuration and depend entirely on this
+fallback.** Removing it is not a no-op for shipped builds.
+
+### 7c. LOCAL_ONLY invariant: an existing, unaudited external connection
+
+**Called out loudly, as `CLAUDE.md` requires.** This is a pre-existing defect, not one introduced
+by the activation work.
+
+`backend/desktopGateway.js:207` — the `PUT /api/cloud/internet-access` handler calls
+`await readAuthoritativeTime()` **unconditionally, before `writePolicy`**. That function
+(`:79-86`) does `fetch(\`${CLOUD_API_URL}/api/health\`)` with **no `readPolicy()` check and no
+entry written to `cloud-request-audit.jsonl`**.
+
+So the gateway makes an outbound request to production **at the exact moment the Owner switches
+the app into LOCAL_ONLY**, and that request is neither policy-gated nor audited. Contrast
+`:212`, the very next handler, which correctly checks `readPolicy().allowInternetAccess` first.
+
+Against the `CLAUDE.md` invariant — `blocked=true`, `reachedCloud=false`, cloud-router
+invocations 0, external connections 0 — this is a genuine breach of the last clause. Any
+LOCAL_ONLY acceptance run that reported 0 external connections did not observe this path.
+
+Fix direction: gate the *call*, not the function. `connectivityMode.test.mjs:35` asserts the
+literal `timeSource: "railway"` is present in the gateway source, so deleting it breaks a test;
+gate the invocation and fall back to `timeSource: "device"`.
+
+### 7d. Item 4: `VITE_API_MODE=LOCAL_ONLY` is unreachable on desktop
+
+`normalizeApiMode` (`:127-133`) returns `LOCAL_SINGLE_DEVICE` for any unrecognised input
+**including `undefined`**, so a device with no saved mode is indistinguishable from one
+explicitly set to `LOCAL_SINGLE_DEVICE`. `legacyDesktopLocalMode` (`:227-230`) is therefore
+`true` on every desktop, and `:233` short-circuits to `HYBRID` — **`import.meta.env.VITE_API_MODE`
+at `:234` is never consulted.** The "silent `LOCAL_SINGLE_DEVICE` → `HYBRID` upgrade" the item
+names is, in practice, an unconditional desktop→HYBRID override, and it is why the
+`canonical-cloud-login` probe pointed at Railway.
+
+### 7e. Open product decision — not a bug fix, needs the maintainer
+
+Removing `legacyDesktopLocalMode` (the plan's stated preference) changes **default desktop
+behaviour on shipped devices**: no saved mode moves `HYBRID → LOCAL_SINGLE_DEVICE`,
+`usesCloudBackend()` becomes false, and the desktop stops performing cloud login and background
+sync by default. Under the activation design that is the intended destination, but it is a
+product decision rather than a defect repair and must be ruled explicitly before it lands.
+
+### 7f. Sequencing
+
+Items 3 and 4 are one change (D-16 already rules this) because they are the same defect — a `||`
+chain treating "not configured" as "use the most capable default". Fixing 3 alone reroutes the
+`SYNC_API_URL` writes onto the gateway, which is what makes 4's guards meaningful; fixing 4 alone
+leaves `CLOUD_API_URL` pointed at Railway.
+
+The regression guard that actually matters is a source-text assertion that no
+`|| DEFAULT_PRODUCTION_CLOUD_API_URL` chain exists, because the defect is a `||` chain rather
+than a value.
