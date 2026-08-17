@@ -23,11 +23,11 @@ import {
   recordConnectivityModeChange,
 } from "./local/localDatabase";
 import {
-  authenticateOfflineSession,
   cacheOfflineSession,
   readOfflineSession,
   verifyOfflineSessionRecord,
 } from "./local/offlineSession";
+import { resolveOfflineCredentialSource } from "./local/offlineCredentialSource";
 import { buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode } from "./local/connectivityMode";
@@ -3529,22 +3529,27 @@ function App() {
       setStartupError(error?.message || "Saved offline data could not be loaded. Retry local service readiness.");
       return false;
     }
-    const cachedOfflineRecord = hasObjectContent(snapshot?.offline_auth)
-      ? snapshot.offline_auth
-      : readOfflineSession();
-    const offlineAuth = cachedOfflineRecord
-      ? await verifyOfflineSessionRecord(cachedOfflineRecord, {
-        username,
-        password,
-        deviceId: latestDevice.device_id,
-      })
-      : await authenticateOfflineSession({
-        username,
-        password,
-        deviceId: latestDevice.device_id,
+    const credentialSource = resolveOfflineCredentialSource({
+      snapshotOfflineAuth: snapshot?.offline_auth,
+      localStorageSession: readOfflineSession(),
+      knownDeviceIds: [latestDevice?.device_id, snapshot?.device_identity?.device_id],
+      activeDeviceId: latestDevice?.device_id,
+    });
+    credentialSource.discarded.forEach((entry) => {
+      writeDiagnosticLog("WARN", "offline-credential-source-discarded", {
+        source: entry.source,
+        reason: entry.reason,
+        deviceId: entry.deviceId,
+        selectedSource: credentialSource.source,
       });
+    });
+    const offlineAuth = await verifyOfflineSessionRecord(credentialSource.record, {
+      username,
+      password,
+      deviceId: latestDevice.device_id,
+    });
     if (!offlineAuth.ok) {
-      setStartupError(offlineAuth.message);
+      setStartupError([offlineAuth.message, credentialSource.notice].filter(Boolean).join(" "));
       return false;
     }
     if (!snapshot?.reference_ready) {

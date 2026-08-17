@@ -76,7 +76,15 @@ export const buildOfflineSessionRecord = async ({
 
 export const verifyOfflineSessionRecord = async (session, { username, password, deviceId }) => {
   if (!session) {
-    return { ok: false, code: "NO_SESSION", message: "This device must connect to the internet once before offline use." };
+    // Interim wording (backlog item 5.3). The previous text told the user to "connect to the
+    // internet once before offline use", which is unsatisfiable when the backend is gone. The
+    // local recovery/activation route lands in stage 5 of docs/offline-activation-plan.md; until
+    // then this message states the situation without prescribing an impossible action.
+    return {
+      ok: false,
+      code: "NO_SESSION",
+      message: "No offline credential is stored on this device for this user, so offline sign-in is not available. On-device activation is not part of this build yet — contact the FroozERP owner before retrying.",
+    };
   }
   if (session.deviceId && deviceId && session.deviceId !== deviceId) {
     return { ok: false, code: "DEVICE_MISMATCH", message: "Offline login is only available on the previously authorised device." };
@@ -98,6 +106,12 @@ export const cacheOfflineSession = async (payload) => {
   return session;
 };
 
+/**
+ * localStorage-only authentication. Do NOT use this on the desktop offline-login path: it ignores
+ * the SQLite `offline_auth` credential and will happily authenticate against a stale browser
+ * record naming a device that no longer exists (backlog item 5). Desktop callers must resolve the
+ * credential through `resolveOfflineCredentialSource` in `offlineCredentialSource.js` first.
+ */
 export const authenticateOfflineSession = async ({ username, password, deviceId }) => {
   const session = readOfflineSession();
   return verifyOfflineSessionRecord(session, { username, password, deviceId });
