@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
-const CURRENT_SCHEMA_VERSION: &str = "017_offline_entitlement_foundation";
+const CURRENT_SCHEMA_VERSION: &str = "018_bootstrap_credential_consumption";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -24,6 +24,7 @@ const MIGRATION_014: &str = include_str!("../migrations/sqlite/014_offline_purch
 const MIGRATION_015: &str = include_str!("../migrations/sqlite/015_supplier_reference_cache.sql");
 const MIGRATION_016: &str = include_str!("../migrations/sqlite/016_purchase_aggregate_reconciliation.sql");
 const MIGRATION_017: &str = include_str!("../migrations/sqlite/017_offline_entitlement_foundation.sql");
+const MIGRATION_018: &str = include_str!("../migrations/sqlite/018_bootstrap_credential_consumption.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -2104,6 +2105,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "015_supplier_reference_cache", MIGRATION_015)?;
     apply_migration(&mut conn, "016_purchase_aggregate_reconciliation", MIGRATION_016)?;
     apply_migration(&mut conn, "017_offline_entitlement_foundation", MIGRATION_017)?;
+    apply_migration(&mut conn, "018_bootstrap_credential_consumption", MIGRATION_018)?;
     Ok(())
 }
 
@@ -3066,6 +3068,142 @@ pub fn ensure_device_identity_at(path: &Path) -> Result<serde_json::Value, Strin
     ensure_device_identity_with_preference_at(path, None)
 }
 
+/// Grandfathered validity, ruled in D-15. Generous on purpose: a device must not silently
+/// expire before anyone notices the rollout stalled.
+const GRANDFATHER_VALID_DAYS: i64 = 400;
+
+/// Write the §11.1 compatibility shim for a device that predates offline activation.
+///
+/// Every installation that exists today has an approved `local_device_identity`, a cached
+/// snapshot and `offline_auth::*` rows, but **no entitlement and no way to obtain one online**,
+/// because the cloud it would have asked is gone. Requiring a signed code before the app runs
+/// would brick every existing device on upgrade, so those devices get a shim instead.
+///
+/// The rule keys off `local_device_identity` plus a real cached `user_profile` **deliberately
+/// not off `local_device_assignment`**, which measured empty across every real profile
+/// (backlog item 2) and would therefore never fire.
+///
+/// This is a compatibility shim, not a credential:
+/// - `verification_state = 'LEGACY_GRANDFATHER'` with an **empty** `signature_blob`, which is
+///   the only shape migration 017's CHECK admits for that state. `payload_blob` is
+///   `BLOB NOT NULL` and the grandfather branch does not exempt it, so it is bound as an empty
+///   blob — never NULL, which would fail the NOT NULL constraint.
+/// - It cannot authorise provisioning another device; that needs a `VERIFIED` entitlement.
+/// - It is superseded on first redemption of a real code.
+///
+/// Returns `Ok(false)` when the device does not qualify — that is an ordinary outcome, not an
+/// error. Errors are reserved for a database that would not answer.
+fn grandfather_existing_device(
+    conn: &Connection,
+    identity: &serde_json::Value,
+) -> Result<bool, String> {
+    let device_id = match optional_text(identity, "device_id")
+        .filter(|value| !value.eq_ignore_ascii_case("default"))
+    {
+        Some(value) => value,
+        None => return Ok(false),
+    };
+
+    // Any entitlement at all means this device is already provisioned, or already shimmed.
+    // Checking for *any* row rather than an active one keeps this idempotent across restarts
+    // and stops a superseded shim being recreated behind a real entitlement.
+    let existing: i64 = conn
+        .query_row("SELECT COUNT(*) FROM local_entitlement", [], |row| row.get(0))
+        .map_err(to_error)?;
+    if existing > 0 {
+        return Ok(false);
+    }
+
+    // A real cached snapshot is the second half of the rule. The snapshot's user profile lives
+    // in local_kv under `offline_user_profile::<device>::<username>`; an empty object is what
+    // gets written when nothing matched, so it does not count as real.
+    let profile_prefix = format!("offline_user_profile::{}::", device_id);
+    let profile: Option<String> = conn
+        .query_row(
+            "SELECT value FROM local_kv WHERE key LIKE ?1 || '%' ORDER BY key LIMIT 1",
+            params![profile_prefix],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(to_error)?;
+    let has_real_profile = profile
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+        .and_then(|value| value.as_object().map(|map| !map.is_empty()))
+        .unwrap_or(false);
+    if !has_real_profile {
+        return Ok(false);
+    }
+
+    let company_id: Option<String> = conn
+        .query_row(
+            "SELECT company_id FROM local_device_identity WHERE device_id = ?1",
+            params![device_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(to_error)?
+        .flatten();
+    let company_id = company_id.unwrap_or_else(|| "1".to_string());
+    let branch_id = optional_text(identity, "branch_id")
+        .filter(|value| !value.eq_ignore_ascii_case("unassigned"))
+        .unwrap_or_else(|| "1".to_string());
+
+    let binding = crate::entitlement::device_binding_hash(&device_id);
+    let device_binding_hex = binding
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    // Deterministic serial: the PRIMARY KEY itself refuses a duplicate shim, so idempotency
+    // does not rest solely on the COUNT check above.
+    let serial = format!("LEGACY-{device_id}");
+    let expires_offset = format!("+{GRANDFATHER_VALID_DAYS} days");
+    let grace_offset = format!(
+        "+{} days",
+        GRANDFATHER_VALID_DAYS + crate::entitlement::GRACE_DAYS
+    );
+
+    conn.execute(
+        "INSERT OR IGNORE INTO local_entitlement (
+            entitlement_serial, key_id, format_version, company_id, branch_id, device_id,
+            device_binding_hex, issued_at, expires_at, grace_until, capabilities_json,
+            payload_blob, signature_blob, verification_state, source
+         ) VALUES (
+            ?1, 0, ?2, ?3, ?4, ?5,
+            ?6,
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?7),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?8),
+            '{}',
+            X'', X'', 'LEGACY_GRANDFATHER', 'LEGACY_UPGRADE'
+         )",
+        params![
+            serial,
+            crate::entitlement::FORMAT_VERSION as i64,
+            company_id,
+            branch_id,
+            device_id,
+            device_binding_hex,
+            expires_offset,
+            grace_offset
+        ],
+    )
+    .map_err(to_error)?;
+
+    conn.execute(
+        "INSERT INTO local_entitlement_audit (entitlement_serial, event, reason_code, detail_json, device_id)
+         VALUES (?1, 'ACCEPTED', 'LEGACY_GRANDFATHER', ?2, ?3)",
+        params![
+            serial,
+            format!("{{\"valid_days\":{GRANDFATHER_VALID_DAYS},\"source\":\"LEGACY_UPGRADE\"}}"),
+            device_id
+        ],
+    )
+    .map_err(to_error)?;
+
+    Ok(true)
+}
+
 fn ensure_device_identity_with_preference_at(
     path: &Path,
     preferred_device_id: Option<&str>,
@@ -3099,6 +3237,13 @@ fn ensure_device_identity_with_preference_at(
         return Err("DEVICE_IDENTITY_CONFLICT: Multiple approved local device identities exist. Restore the canonical device backup or reconcile the identities before continuing.".to_string());
     }
     if let Some(identity) = approved.first() {
+        // §11.1 grandfathering. Deliberately non-fatal: a device that cannot be grandfathered
+        // must still return its identity and keep working. Failing here would brick exactly the
+        // population this shim exists to protect, which is the opposite of §2.5's "fail into the
+        // running state, not out of it".
+        if let Err(error) = grandfather_existing_device(&conn, identity) {
+            eprintln!("entitlement grandfathering skipped: {error}");
+        }
         return Ok((*identity).clone());
     }
     if identities.len() > 1 {
@@ -4915,7 +5060,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("migration count");
-            assert_eq!(migration_count, 16);
+            assert_eq!(migration_count, 17);
             drop(conn);
             initialize_at(path).expect("restart with existing SQLite profile");
             let restored = ensure_device_identity_at(path).expect("restore device identity");
@@ -4977,9 +5122,184 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("preserved marker");
-        assert_eq!(migration_count, 16);
+        assert_eq!(migration_count, 17);
         assert_eq!(marker, "keep-me");
         drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Build a profile shaped like every real installation that predates offline activation:
+    /// one approved identity, a cached user profile, and no entitlement.
+    fn seed_legacy_profile(path: &Path, device_id: &str, with_profile: bool) {
+        initialize_at(path).expect("initialize legacy profile");
+        let conn = Connection::open(path).expect("open legacy profile");
+        conn.execute(
+            "INSERT INTO local_device_identity
+               (device_id,device_name,platform,app_version,branch_id,registration_status,company_id)
+             VALUES (?1,'Legacy Device','tauri-windows','1.0.71','7','approved','3')",
+            params![device_id],
+        )
+        .expect("insert approved identity");
+        if with_profile {
+            conn.execute(
+                "INSERT INTO local_kv (key, value) VALUES (?1, ?2)",
+                params![
+                    format!("offline_user_profile::{device_id}::owner"),
+                    "{\"id\":\"1\",\"company_id\":\"3\",\"role\":\"OWNER\"}"
+                ],
+            )
+            .expect("insert cached user profile");
+        }
+    }
+
+    fn entitlement_rows(path: &Path) -> i64 {
+        let conn = Connection::open(path).expect("open profile");
+        conn.query_row("SELECT COUNT(*) FROM local_entitlement", [], |row| row.get(0))
+            .expect("count entitlements")
+    }
+
+    #[test]
+    fn legacy_device_with_cached_profile_is_grandfathered_once() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-grandfather-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        let device_id = "FZDEV-LEGACY-GRANDFATHER";
+        seed_legacy_profile(&path, device_id, true);
+
+        ensure_device_identity_at(&path).expect("resolve identity");
+        assert_eq!(entitlement_rows(&path), 1, "a qualifying device must be shimmed");
+
+        let conn = Connection::open(&path).expect("open profile");
+        let (serial, state, source, company, branch, sig_len, payload_len, binding): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT entitlement_serial, verification_state, source, company_id, branch_id,
+                        length(signature_blob), length(payload_blob), device_binding_hex
+                 FROM local_entitlement",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .expect("read shim row");
+
+        assert_eq!(serial, format!("LEGACY-{device_id}"));
+        assert_eq!(state, "LEGACY_GRANDFATHER");
+        assert_eq!(source, "LEGACY_UPGRADE");
+        assert_eq!(company, "3", "company_id comes from the existing identity");
+        assert_eq!(branch, "7", "branch_id comes from the existing identity");
+        // §11.1: the shim is not a credential. 017's CHECK only admits LEGACY_GRANDFATHER with
+        // an empty signature, and payload_blob is NOT NULL, so it must be an empty blob.
+        assert_eq!(sig_len, 0, "a shim must carry no signature");
+        assert_eq!(payload_len, 0, "a shim has no signed payload");
+        let expected_binding = crate::entitlement::device_binding_hash(device_id)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(binding, expected_binding);
+
+        // D-15: 400 days validity, plus grace, and ordered so 017's CHECKs hold.
+        let (issued, expires, grace): (String, String, String) = conn
+            .query_row(
+                "SELECT issued_at, expires_at, grace_until FROM local_entitlement",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read window");
+        assert!(issued <= expires && expires <= grace, "signed window must be ordered");
+        assert!(expires > issued, "400-day validity must be in the future");
+
+        let audit: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_entitlement_audit WHERE reason_code = 'LEGACY_GRANDFATHER'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count audit");
+        assert_eq!(audit, 1, "grandfathering must be recorded in the audit log");
+        drop(conn);
+
+        // Idempotent across restarts: a second resolve must not add a second shim.
+        ensure_device_identity_at(&path).expect("resolve identity again");
+        assert_eq!(entitlement_rows(&path), 1, "restart must not duplicate the shim");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_device_without_cached_profile_is_not_grandfathered() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-grandfather-noprofile-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        seed_legacy_profile(&path, "FZDEV-LEGACY-NOPROFILE", false);
+
+        ensure_device_identity_at(&path).expect("resolve identity");
+        assert_eq!(
+            entitlement_rows(&path),
+            0,
+            "an approved identity alone is not evidence of a provisioned device"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn grandfathering_never_displaces_an_existing_entitlement() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-grandfather-existing-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        let device_id = "FZDEV-LEGACY-EXISTING";
+        seed_legacy_profile(&path, device_id, true);
+
+        let conn = Connection::open(&path).expect("open profile");
+        conn.execute(
+            "INSERT INTO local_entitlement (
+                entitlement_serial, key_id, format_version, company_id, branch_id, device_id,
+                device_binding_hex, issued_at, expires_at, grace_until,
+                payload_blob, signature_blob, verification_state, source
+             ) VALUES ('REAL-1', 1, 1, '3', '7', ?1, 'aabbccdd',
+                '2026-01-01T00:00:00.000Z','2027-01-01T00:00:00.000Z','2027-03-02T00:00:00.000Z',
+                X'0102', ?2, 'VERIFIED', 'OFFLINE_FILE')",
+            params![device_id, vec![7u8; 64]],
+        )
+        .expect("insert a real verified entitlement");
+        drop(conn);
+
+        ensure_device_identity_at(&path).expect("resolve identity");
+        assert_eq!(
+            entitlement_rows(&path),
+            1,
+            "a device holding a real entitlement must never gain a shim"
+        );
+        let conn = Connection::open(&path).expect("open profile");
+        let state: String = conn
+            .query_row("SELECT verification_state FROM local_entitlement", [], |row| row.get(0))
+            .expect("read state");
+        assert_eq!(state, "VERIFIED", "the real entitlement must be untouched");
         let _ = fs::remove_file(&path);
     }
 
@@ -5094,7 +5414,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("read upgraded migration count");
-            assert_eq!(migrations, 16);
+            assert_eq!(migrations, 17);
             drop(conn);
             let _ = fs::remove_file(&path);
         }
