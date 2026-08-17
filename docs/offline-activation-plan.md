@@ -559,7 +559,8 @@ already landed in Stage 4's commit `b923a65`, so this stage did not have to carr
 
 ### Decisions this stage owned
 
-- **Bootstrap credential KDF (§8.1/§8.2 left it to Stage 5).** Chosen to reuse the existing offline-session PBKDF2 exactly: `verifier = PBKDF2-SHA256( UTF8(username_lower::password), salt = UTF8(base64(saltBytes)), 150000, 32 bytes )`. The maintainer's signing recipe therefore is: pick random 16 `saltBytes`; `verifierBytes = base64decode( PBKDF2(username, tempPassword, base64(saltBytes)) )`; pass `--bootstrap-salt-hex hex(saltBytes)` and `--bootstrap-verifier-hex hex(verifierBytes)` to `sign_activation`. No new crypto primitive was invented; the signed bytes stay verifier-only (never a password), as §8.2 requires.
+- **Bootstrap credential KDF (§8.1/§8.2 left it to Stage 5).** Chosen to reuse the existing offline-session PBKDF2 exactly: `verifier = PBKDF2-SHA256( UTF8(username_lower::password), salt = UTF8(base64(saltBytes)), 150000, 32 bytes )`. No new crypto primitive was invented; the signed bytes stay verifier-only (never a password), as §8.2 requires. **Do not pass the raw salt bytes to PBKDF2** — the salt fed to the KDF is the UTF-8 bytes of the base64 *string*, an `offlineSession.js` convention. Getting that wrong yields a well-formed verifier that simply never matches, and the symptom appears on a branch machine as "the temporary password is wrong" with nothing to debug.
+- **`scripts/make-bootstrap-credential.mjs` (new) closes the §8.2 recommendation** that the tooling auto-generate a high-entropy temporary password rather than defaulting to something memorable. It prints the password, `salt-hex`, `verifier-hex` and a ready-to-paste `sign_activation` command line (`npm run bootstrap:credential -- --username owner`). It reads no private key and signs nothing. The password is 100 bits drawn from Crockford base32 (no I/L/O/U) in dash-separated groups of four, because §8.2 expects it to be dictated on a phone call. Its PBKDF2 is a **deliberately independent** implementation (`node:crypto`) from the app's (`WebCrypto`), following the reasoning `sign_activation.rs` gives for not sharing its encoder with `entitlement.rs`; `frontend/src/local/bootstrapCredentialTooling.test.mjs` asserts the two agree and runs in the ordinary local suite, so the tool is not the one link in this chain without a gate.
 - **Trusted keys are a parameter, not a constant, inside `accept_entitlement_at`/`entitlement_state_at`** — mirroring `entitlement::verify`, so tests sign with a throwaway key and never touch production key material.
 - **`consume_bootstrap` is set-once** — it never overwrites an existing `bootstrap_consumed_at`, because clearing it would re-open a single-use credential.
 
@@ -578,7 +579,16 @@ already landed in Stage 4's commit `b923a65`, so this stage did not have to carr
 | `npm run build` | Pass. |
 | `npm run backend:check` | Pass. |
 | `npm --prefix backend test` | 114 / 115 (pre-existing test-102 path assertion). |
-| `TZ=Asia/Kolkata node --test frontend/src/local/*.test.mjs` | **184 / 184** (+22 over the 162 baseline). |
+| `TZ=Asia/Kolkata node --test frontend/src/local/*.test.mjs` | **192 / 192** (+30 over the 162 baseline). |
+
+### End-to-end check actually performed here
+
+The whole credential chain was exercised on this container with the **TEST-ONLY fixture key**, never
+a real seed: `make-bootstrap-credential` generated a password/salt/verifier → `sign_activation`
+signed a real `.lic` carrying them → the §4 bootstrap tail was decoded back out of the signed
+payload bytes → the app's own `verifyBootstrapCredential` accepted the generated password and
+refused a wrong one. The salt and verifier recovered from the signed payload matched the generator's
+output byte for byte. That covers every hop except the Tauri/Windows UI itself.
 
 ### Not verified here
 
