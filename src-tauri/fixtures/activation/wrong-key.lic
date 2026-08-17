@@ -1,0 +1,12 @@
+# FroozERP activation file. '#' lines are UNSIGNED support metadata.
+# company: 1
+# branch: 1
+# device: FZDEV-TEST-0000000000001
+# serial: 1004
+# key-id: 1
+# issued: 2026-07-28
+# expires: 2027-07-28
+# grace-until: 2027-09-26
+format: FRZ-LIC/1
+payload: AQEAAQFZLx0qrMB2h+wDAABgCW0B
+signature: MYzHidI1sLdB0FqiDKt7YtDUevLww5Y6sPZIbYjIP55uaEPxWazBYIQSE/dTBiw+8H6OxJ4sY4+zwZ6MdVPZCA==

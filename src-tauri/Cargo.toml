@@ -8,6 +8,39 @@ default-run = "froozerp"
 [lib]
 name = "froozerp_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# The desktop shell. `default-run` above names it, so it is the *main* bundle binary.
+[[bin]]
+name = "froozerp"
+path = "src/main.rs"
+
+# Maintainer-local activation signing CLI (Stage 3). NOT part of the shipped bundle.
+#
+# Two things keep it out of the NSIS installer, and both are load-bearing:
+#
+#   1. `required-features`. tauri-cli's `get_binaries`
+#      (tauri-cli-2.11.2/src/interface/rust.rs:944-952) skips a declared `[[bin]]` whose required
+#      features are not present in the feature list passed on the build command line. Cargo's
+#      *default* features are not in that list, so this bin is invisible to the bundler while
+#      still being built by `cargo build` / `cargo test`.
+#   2. The source lives in `tools/`, not `src/bin/`. `get_binaries` also scans `src/bin`
+#      (rust.rs:963-1001) and re-adds anything found there that is not already in the binary list
+#      — which is exactly what a `required-features` skip leaves behind. tauri-bundler then
+#      packages every non-main binary into the installer
+#      (tauri-bundler-2.9.2/src/bundle/windows/nsis/mod.rs:828-839).
+#
+# `default-run` alone does NOT exclude a binary: it only chooses which one is main.
+[[bin]]
+name = "sign_activation"
+path = "tools/sign_activation.rs"
+required-features = ["signing-cli"]
+
+[features]
+default = ["signing-cli"]
+# Builds the maintainer-local signing CLI and its round-trip test suite. On by default so the
+# plain `cargo test --manifest-path src-tauri/Cargo.toml` gate exercises the real signing path.
+signing-cli = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 [dependencies]
