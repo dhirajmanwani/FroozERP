@@ -107,3 +107,26 @@ plaintext fallback. Flag it rather than working around it.
 - Keep migrations idempotent and forward-only. Never edit an applied migration.
 - Prefer editing `frontend/src/local/` over growing `App.jsx` or `server.js`.
 - Currency is INR; quantities carry 3 decimals; money rounds to 2.
+
+## Delegation (standing instruction)
+
+Multi-part work is delegated to subagents by default rather than done serially in one
+thread. This applies to all future jobs in this repo unless the maintainer says otherwise.
+
+How to split:
+
+- **Parallelise by disjoint file area**, never by "half a feature". A Rust/`src-tauri`
+  task and a `frontend/src/local` task can run at once; two agents editing `App.jsx`
+  cannot.
+- **Agents must not run `git` commands.** Concurrent agents race on `.git/index.lock`.
+  The lead reviews every diff and makes all commits.
+- **Read-only audit agents are cheap and worth it** — use one to produce a line-numbered
+  change plan before an agent edits a 17k-line file.
+- **The lead re-runs every gate after integration.** An agent reporting "tests pass" is
+  evidence, not proof; the gates are only green when the lead has seen them green on the
+  integrated tree.
+- Trivial single-file edits stay in the lead thread. Delegation is for breadth, not for
+  avoiding work.
+
+Every agent brief must carry the hard boundaries above verbatim — a cold agent does not
+know them, and the boundaries are release-safety rules, not preferences.
