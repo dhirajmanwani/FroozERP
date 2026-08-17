@@ -13,7 +13,19 @@ const normalizeCloudApiUrl = (value) => {
   const normalized = String(value || "").trim().replace(/\/$/, "");
   return LEGACY_CLOUD_API_URLS.has(normalized) ? DEFAULT_CLOUD_API_URL : normalized;
 };
-const CLOUD_API_URL = normalizeCloudApiUrl(process.env.CLOUD_API_URL || process.env.FROOZERP_PUBLIC_API_URL || DEFAULT_CLOUD_API_URL);
+// The desktop shell launches this gateway without CLOUD_API_URL or FROOZERP_PUBLIC_API_URL
+// (src-tauri/src/lib.rs), so an unconditional production default meant every packaged
+// installation proxied to production whether or not anyone had configured a cloud. An
+// unconfigured gateway now has no cloud target and refuses cloud routing by name.
+const CLOUD_API_URL = normalizeCloudApiUrl(process.env.CLOUD_API_URL || process.env.FROOZERP_PUBLIC_API_URL || "");
+const CLOUD_TARGET_CONFIGURED = CLOUD_API_URL !== "";
+const CLOUD_NOT_CONFIGURED_MESSAGE = "No cloud backend is configured for this installation. The request was refused instead of being sent to a default target.";
+const cloudNotConfiguredError = (route) => {
+  const error = new Error(CLOUD_NOT_CONFIGURED_MESSAGE);
+  error.code = "CLOUD_NOT_CONFIGURED";
+  error.route = route;
+  return error;
+};
 const APP_DATA = process.env.APPDATA
   ? path.join(process.env.APPDATA, "com.srtcompany.froozerp")
   : path.join(os.homedir(), "AppData", "Roaming", "com.srtcompany.froozerp");
@@ -77,6 +89,13 @@ const auditCloudRequest = (entry) => {
 };
 
 const readAuthoritativeTime = async () => {
+  if (!CLOUD_TARGET_CONFIGURED) {
+    // Without this the empty base turned the probe into fetch("/api/health"), which throws
+    // on a relative URL and was swallowed by the catch below -- a silent no-op that made
+    // "no cloud configured" look identical to "cloud is down". Name it and audit it.
+    auditCloudRequest({ method: "GET", route: "/api/health", blocked: true, reachedCloud: false, reason: "CLOUD_NOT_CONFIGURED", source: "authoritative-time" });
+    return { confirmedAt: new Date().toISOString(), timeSource: "device" };
+  }
   try {
     const response = await fetch(`${CLOUD_API_URL}/api/health`, { signal: AbortSignal.timeout(5000) });
     const value = await response.json().catch(() => ({}));
@@ -134,6 +153,10 @@ const cloudRequest = async (req, body, route = req.url, options = {}) => {
     const error = new Error("Local Only mode selected - cloud sync paused.");
     error.code = "APP_LOCAL_ONLY";
     throw error;
+  }
+  if (!CLOUD_TARGET_CONFIGURED) {
+    auditCloudRequest({ method: options.method || req.method, route, blocked: true, reachedCloud: false, reason: "CLOUD_NOT_CONFIGURED" });
+    throw cloudNotConfiguredError(route);
   }
   const headers = {};
   for (const [name, value] of Object.entries(req.headers || {})) {
@@ -227,6 +250,10 @@ const localRoute = async (req, res, url, body) => {
   }
   if (url.pathname === "/api/cloud/health") {
     if (!readPolicy().allowInternetAccess) return sendJson(res, 200, { status: "ok", localBackendStatus: "ok", appInternetAllowed: false, cloudReachable: false, syncReady: false, errorCode: "APP_LOCAL_ONLY", safeErrorMessage: "Local Only mode selected - cloud sync paused." });
+    if (!CLOUD_TARGET_CONFIGURED) {
+      auditCloudRequest({ method: req.method, route: url.pathname, blocked: true, reachedCloud: false, reason: "CLOUD_NOT_CONFIGURED", source: "cloud-health" });
+      return sendJson(res, 200, { status: "ok", localBackendStatus: "ok", configuredCloudBaseUrl: "", cloudApiConfigured: false, appInternetAllowed: true, cloudReachable: false, syncReady: false, errorCode: "CLOUD_NOT_CONFIGURED", safeErrorMessage: CLOUD_NOT_CONFIGURED_MESSAGE });
+    }
     try {
       const response = await fetch(`${CLOUD_API_URL}/api/health`, { signal: AbortSignal.timeout(8000) });
       const value = await response.json().catch(() => ({}));

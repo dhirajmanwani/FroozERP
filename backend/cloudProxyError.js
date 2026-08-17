@@ -10,7 +10,23 @@ const CLOUD_NETWORK_CODES = new Set([
 
 const CLOUD_UNAVAILABLE_MESSAGE = "FroozERP cloud is temporarily unavailable. Local modules remain available.";
 
+// "No cloud is configured" is a different fact from "the cloud is down", and collapsing the
+// two is what let an unconfigured installation look like a transient outage instead of a
+// deliberate local-only build.
+const CLOUD_NOT_CONFIGURED_MESSAGE = "No cloud backend is configured for this installation. Local modules remain available.";
+
 const normalizeCloudProxyError = (error = {}) => {
+  if (error.code === "CLOUD_NOT_CONFIGURED") {
+    return {
+      status: 503,
+      payload: {
+        code: "CLOUD_NOT_CONFIGURED",
+        failure_kind: "CLOUD_NOT_CONFIGURED",
+        cloud_connected: false,
+        message: CLOUD_NOT_CONFIGURED_MESSAGE,
+      },
+    };
+  }
   if (["APP_INTERNET_DISABLED", "APP_LOCAL_ONLY"].includes(error.code)) {
     return {
       status: 503,
@@ -46,4 +62,4 @@ const normalizeCloudProxyError = (error = {}) => {
   };
 };
 
-module.exports = { CLOUD_UNAVAILABLE_MESSAGE, normalizeCloudProxyError };
+module.exports = { CLOUD_NOT_CONFIGURED_MESSAGE, CLOUD_UNAVAILABLE_MESSAGE, normalizeCloudProxyError };

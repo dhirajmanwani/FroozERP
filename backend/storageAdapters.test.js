@@ -277,6 +277,64 @@ test("desktop Auto and Local Only policy confirms twenty transitions without clo
   }
 });
 
+test("an unconfigured gateway refuses cloud routing by name instead of defaulting to production", async () => {
+  // Disposable profile only: never the real APPDATA directory. No CLOUD_API_URL is supplied,
+  // which is exactly how src-tauri/src/lib.rs launches the packaged gateway.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "froozerp-unconfigured-cloud-"));
+  const appData = path.join(root, "AppData", "Roaming");
+  const databasePath = path.join(root, "profile", "froozerp-local.sqlite3");
+  writeSQLiteFixture(databasePath);
+  const policyPath = path.join(appData, "com.srtcompany.froozerp", "cloud-network-policy.json");
+  fs.mkdirSync(path.dirname(policyPath), { recursive: true });
+  // Internet access is *allowed*: the refusal must come from having no target, not from policy.
+  fs.writeFileSync(policyPath, JSON.stringify({ allowInternetAccess: true }));
+
+  const port = await reservePort();
+  const runtime = await startDesktopBackend({ databasePath, port, extraEnv: { APPDATA: appData } });
+  const auditPath = path.join(appData, "com.srtcompany.froozerp", "logs", "cloud-request-audit.jsonl");
+  const readAudit = () => (fs.existsSync(auditPath)
+    ? fs.readFileSync(auditPath, "utf8").trim().split(/\r?\n/).filter(Boolean).map(JSON.parse)
+    : []);
+  try {
+    assert.equal(runtime.health.cloud_api_configured, false, "an unconfigured gateway must not report a cloud target");
+
+    const cloudHealth = await (await fetch(`http://127.0.0.1:${port}/api/cloud/health`)).json();
+    assert.equal(cloudHealth.cloudApiConfigured, false);
+    assert.equal(cloudHealth.cloudReachable, false);
+    assert.equal(cloudHealth.errorCode, "CLOUD_NOT_CONFIGURED");
+    assert.equal(cloudHealth.configuredCloudBaseUrl, "");
+
+    // A route with no local handler falls through to the cloud proxy.
+    const proxied = await fetch(`http://127.0.0.1:${port}/api/sync/pull`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ cursor: "0" }),
+    });
+    assert.equal(proxied.status, 503);
+    const payload = await proxied.json();
+    assert.equal(payload.code, "CLOUD_NOT_CONFIGURED");
+    assert.equal(payload.failure_kind, "CLOUD_NOT_CONFIGURED");
+    assert.equal(payload.cloud_connected, false);
+
+    // Switching connectivity must not silently fall through the missing-target probe either.
+    const switched = await fetch(`http://127.0.0.1:${port}/api/cloud/internet-access`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", "x-user-id": "1", "x-user-role": "OWNER", "x-device-id": "device-test" },
+      body: JSON.stringify({ allowInternetAccess: true, user_id: 1, role: "OWNER", device_id: "device-test" }),
+    });
+    assert.equal((await switched.json()).timeSource, "device");
+
+    const audit = readAudit();
+    assert.equal(audit.length > 0, true, "every refusal must be audited, not silently dropped");
+    assert.equal(audit.some((entry) => entry.reachedCloud === true), false);
+    assert.equal(audit.every((entry) => entry.blocked === true), true);
+    assert.equal(audit.some((entry) => entry.reason === "CLOUD_NOT_CONFIGURED"), true);
+    assert.equal(/railway|froozerp-production/i.test(JSON.stringify(audit)), false, "no audit entry may name the production host");
+  } finally {
+    await stopChild(runtime.child);
+  }
+});
+
 test("switching into Local Only makes no external connection and is audited as blocked", async () => {
   // Disposable profile only: never the real APPDATA directory.
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "froozerp-local-only-switch-"));

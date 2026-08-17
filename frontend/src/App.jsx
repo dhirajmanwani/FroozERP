@@ -32,6 +32,9 @@ import { buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./loc
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode } from "./local/connectivityMode";
 import { createStartupConnectivityAuthority } from "./local/startupConnectivityPolicy";
+import { isCloudTargetConfigured, resolveCloudTarget } from "./local/cloudTarget";
+import { resolveApiMode } from "./local/apiModeResolution";
+import { CLOUD_CALL_REFUSAL_CODES, createCloudCallGuard, createCloudCallRefusalError, evaluateCloudCall } from "./local/cloudCallGuard";
 import { filterSellableProducts, isSellableLot, lotAvailableQuantity, selectLocalPosInventory } from "./local/posInventory";
 import {
   activeStockFilterLabels,
@@ -165,12 +168,16 @@ const canonicalizeCloudApiUrl = (value) => {
   return LEGACY_PRODUCTION_CLOUD_API_URLS.has(normalized) ? DEFAULT_PRODUCTION_CLOUD_API_URL : normalized;
 };
 const sanitizeSavedApiConfigForRuntime = (config) => {
+  // This function persists what it computes, so a default here is not a read-time convenience:
+  // it re-poisons localStorage on every module load. Clearing all cloud configuration used to
+  // *escalate* cloud contact for exactly this reason. An unconfigured profile stays unconfigured.
+  const savedCloudApiUrl = normalizeApiBase(config.cloudApiUrl);
   const migratedConfig = {
     ...config,
     cloudApiUrl: ISOLATED_LOOPBACK_CLOUD_API_URL
-      || canonicalizeCloudApiUrl(config.cloudApiUrl || DEFAULT_PRODUCTION_CLOUD_API_URL),
+      || canonicalizeCloudApiUrl(config.cloudApiUrl),
   };
-  if (migratedConfig.cloudApiUrl !== config.cloudApiUrl) writeSavedApiConfig(migratedConfig);
+  if (migratedConfig.cloudApiUrl !== savedCloudApiUrl) writeSavedApiConfig(migratedConfig);
   if (!isRailwayProductionHost()) return migratedConfig;
   const railwayOrigin = getCurrentOrigin();
   const savedMode = normalizeApiMode(migratedConfig.mode);
@@ -205,7 +212,10 @@ const mergeCloudIdentityIntoSavedConfig = (identity = {}) => {
   const current = readSavedApiConfig();
   const next = {
     ...current,
-    cloudApiUrl: canonicalizeCloudApiUrl(identity.cloud_api_url || current.cloudApiUrl || DEFAULT_PRODUCTION_CLOUD_API_URL),
+    // `||` treats "" as falsy, so a legitimately empty cloud URL used to walk back to a
+    // production default and persist it after every login. resolveCloudTarget stops at
+    // "not configured" instead of continuing down the chain.
+    cloudApiUrl: canonicalizeCloudApiUrl(resolveCloudTarget([identity.cloud_api_url, current.cloudApiUrl]).url),
     companyId: String(identity.company_id || current.companyId || "").trim(),
     branchId: String(identity.branch_id || current.branchId || "").trim(),
     subBranchId: String(identity.sub_branch_id || current.subBranchId || "").trim(),
@@ -217,24 +227,30 @@ const mergeCloudIdentityIntoSavedConfig = (identity = {}) => {
 };
 const SAVED_API_CONFIG = sanitizeSavedApiConfigForRuntime(readSavedApiConfig());
 const normalizeCloudConnectionMode = normalizeConnectivityMode;
+// The API mode is resolved *before* the connectivity authority is created, because
+// API_MODE=LOCAL_ONLY is authoritative over the connectivity policy (D-16 / backlog item 4,
+// option 1) and the authority needs to know it at construction.
+//
+// The former desktop legacy-local override is gone. It read a saved mode through a
+// normalizer that returned LOCAL_SINGLE_DEVICE for `undefined`, so it was true on every
+// desktop and short-circuited the whole chain to HYBRID -- `VITE_API_MODE` was never
+// consulted. Ruled: an unconfigured desktop is LOCAL_SINGLE_DEVICE, and therefore performs
+// no cloud login and no background sync until a mode is configured.
+const API_MODE_RESOLUTION = resolveApiMode({
+  savedMode: SAVED_API_CONFIG.mode,
+  envMode: import.meta.env.VITE_API_MODE,
+  globalMode: window.__FROOZERP_API_MODE__,
+  railwayProductionHost: RAILWAY_PRODUCTION_HOST,
+  desktopRuntime: isDesktopShell(),
+});
+const API_MODE = normalizeApiMode(API_MODE_RESOLUTION.mode);
 const startupConnectivityAuthority = createStartupConnectivityAuthority({
   desktopRuntime: isDesktopShell(),
   storage: globalThis.localStorage,
   initialMode: readConnectivityMode(),
+  apiMode: API_MODE,
 });
 const isLocalOnlyConnectivitySelected = () => startupConnectivityAuthority.isLocalOnly();
-const savedModeForRuntime = normalizeApiMode(SAVED_API_CONFIG.mode);
-const legacyDesktopLocalMode = isDesktopShell() && [
-  API_MODES.LOCAL_SINGLE_DEVICE,
-  API_MODES.BRANCH_LAN_SERVER,
-].includes(savedModeForRuntime);
-const API_MODE = normalizeApiMode(
-  RAILWAY_PRODUCTION_HOST ? API_MODES.CLOUD_PRODUCTION :
-  (legacyDesktopLocalMode ? API_MODES.HYBRID : SAVED_API_CONFIG.mode) ||
-  import.meta.env.VITE_API_MODE ||
-  window.__FROOZERP_API_MODE__ ||
-  (isDesktopShell() ? API_MODES.HYBRID : API_MODES.LOCAL_ONLY)
-);
 const LOCAL_API_URL = normalizeApiBase(
   SAVED_API_CONFIG.localApiUrl ||
   import.meta.env.VITE_LOCAL_API_URL ||
@@ -253,7 +269,7 @@ const CLOUD_API_URL = normalizeApiBase(
   canonicalizeCloudApiUrl(SAVED_API_CONFIG.cloudApiUrl) ||
   import.meta.env.VITE_CLOUD_API_URL ||
   window.__FROOZERP_CLOUD_API_URL__ ||
-  (isDesktopShell() ? DEFAULT_PRODUCTION_CLOUD_API_URL : "")
+  ""
 );
 const CUSTOM_API_URL = normalizeApiBase(
   SAVED_API_CONFIG.customApiUrl ||
@@ -297,6 +313,40 @@ const CLOUD_OPERATIONAL_API_URL = CLOUD_API_URL;
 const SYNC_API_URL = CLOUD_OPERATIONAL_API_URL || API_URL;
 const AUTH_API_URL = [API_MODES.HYBRID, API_MODES.CLOUD_ONLY, API_MODES.CLOUD_PRODUCTION, API_MODES.FIELD_REMOTE_DEVICE].includes(API_MODE)
   && CLOUD_OPERATIONAL_API_URL ? CLOUD_OPERATIONAL_API_URL : API_URL;
+const CLOUD_TARGET_CONFIGURED = isCloudTargetConfigured(CLOUD_OPERATIONAL_API_URL);
+const cloudCallGuard = createCloudCallGuard({
+  apiMode: API_MODE,
+  isLocalOnly: () => isLocalOnlyConnectivitySelected(),
+});
+/**
+ * Is a request to `targetUrl` actually bound for the cloud?
+ *
+ * This has to be asked separately from "may a cloud call be made", because the two answers
+ * live on different axes and conflating them would break local development. On desktop the
+ * local gateway owns only health, version, compatibility, connectivity policy and the Local
+ * Only settings route -- every auth, sync and /api/v3 route falls through to its cloud
+ * proxy, so on desktop those calls are cloud-bound wherever they are addressed. A browser
+ * build talks to a real Express backend at API_URL, which serves them itself; refusing those
+ * under API_MODE=LOCAL_ONLY would block local sign-in for no safety gain.
+ */
+const isCloudBoundCall = (targetUrl) => {
+  const target = normalizeApiBase(targetUrl);
+  if (!target) return true;
+  if (CLOUD_TARGET_CONFIGURED && target === CLOUD_OPERATIONAL_API_URL) return true;
+  if (BRANCH_LAN_API_URL && target === BRANCH_LAN_API_URL) return false;
+  return isDesktopShell();
+};
+/**
+ * The single decision point for "may this leave the device". Cloud-bound calls are judged
+ * against the configured cloud target, so an unconfigured build refuses by name instead of
+ * silently proxying to a default. Local-backend calls are still subject to the Owner's
+ * connectivity policy, which applies in every runtime.
+ */
+const guardCloudCall = (operation, targetUrl) => (
+  isCloudBoundCall(targetUrl)
+    ? cloudCallGuard.evaluate(operation, CLOUD_OPERATIONAL_API_URL)
+    : evaluateCloudCall({ operation, target: targetUrl, localOnly: isLocalOnlyConnectivitySelected() })
+);
 const createOperationalWrite = (user, payload = {}, operationId = "") => {
   const idempotencyKey = operationId || globalThis.crypto?.randomUUID?.() ||
     `op-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -2037,16 +2087,23 @@ function App() {
   };
 
   const checkCloudBackendHealth = async (reason = "manual", timeoutMs = 5000) => {
-    if (isLocalOnlyConnectivitySelected()) {
+    // "Not configured" and "paused by the Owner" are different facts and must not both
+    // render as a failed check. An unconfigured build reports not_configured and makes no
+    // request at all -- not even to the local gateway's cloud-health route.
+    const cloudHealthGate = cloudCallGuard.evaluate("cloud-backend-health", CLOUD_OPERATIONAL_API_URL);
+    if (!cloudHealthGate.allowed) {
+      const notConfigured = cloudHealthGate.code === CLOUD_CALL_REFUSAL_CODES.CLOUD_NOT_CONFIGURED;
       const next = {
         ...cloudHealthRef.current,
         online: false,
         checking: false,
-        reachabilityStatus: "paused",
-        status: "paused",
+        reachabilityStatus: notConfigured ? "not_configured" : "paused",
+        status: notConfigured ? "not_configured" : "paused",
         reason,
-        reasonCode: "APP_LOCAL_ONLY",
-        message: "Local Only mode selected - cloud sync paused.",
+        reasonCode: cloudHealthGate.code,
+        message: cloudHealthGate.code === CLOUD_CALL_REFUSAL_CODES.APP_LOCAL_ONLY
+          ? "Local Only mode selected - cloud sync paused."
+          : cloudHealthGate.message,
         lastCheckedAt: new Date().toISOString(),
       };
       setCloudHealth(next);
@@ -2390,17 +2447,20 @@ function App() {
     if (!user) return null;
     const force = Boolean(options.force);
     if (!force && !shouldStartBackgroundSync()) return syncStatus;
-    if (isLocalOnlyConnectivitySelected()) {
+    const manualSyncGate = guardCloudCall("sync-now", SYNC_API_URL);
+    if (isLocalOnlyConnectivitySelected() || !manualSyncGate.allowed) {
+      const paused = manualSyncGate.code !== CLOUD_CALL_REFUSAL_CODES.CLOUD_NOT_CONFIGURED;
+      const message = paused ? "Local Only mode selected - cloud sync paused." : manualSyncGate.message;
       const status = {
         ...(await getSyncStatus()),
         online: false,
         syncing: false,
-        lastFailureKind: "APP_LOCAL_ONLY",
-        lastError: "Local Only mode selected - cloud sync paused.",
+        lastFailureKind: paused ? "APP_LOCAL_ONLY" : manualSyncGate.code,
+        lastError: message,
         apiUrl: SYNC_API_URL,
       };
       setSyncStatus(status);
-      setSyncMessage("Local Only mode selected - cloud sync paused.");
+      setSyncMessage(message);
       return status;
     }
     if (force) lastAutoSyncStartedAtRef.current = Date.now();
@@ -2638,7 +2698,12 @@ function App() {
       : cloudHealth;
     if (generation !== connectivityGenerationRef.current) return backendHealthRef.current;
     applyConnectivityState(health, realInternet, syncStatusRef.current);
-    const cloudReadyForSync = !usesCloudBackend() || nextCloudHealth?.online === true;
+    // `!usesCloudBackend() || ...` alone is vacuously true in every non-cloud mode, which
+    // left `!localOnly` as the only thing standing between LOCAL_SINGLE_DEVICE and a
+    // background push. The guard supplies the missing teeth: API_MODE=LOCAL_ONLY and an
+    // unconfigured cloud target both refuse before any health result is consulted.
+    const backgroundSyncGate = guardCloudCall("background-sync", SYNC_API_URL);
+    const cloudReadyForSync = backgroundSyncGate.allowed && (!usesCloudBackend() || nextCloudHealth?.online === true);
     if (!localOnly && health.online && cloudReadyForSync && userRef.current && !reconnectSyncRef.current && shouldStartBackgroundSync()) {
       reconnectSyncRef.current = true;
       syncNow({
@@ -3589,7 +3654,8 @@ function App() {
 
   const loadPurchaseRules = async () => {
     const useCloudRules = readConnectivityMode() !== CONNECTIVITY_MODES.LOCAL_ONLY
-      && Boolean(CLOUD_OPERATIONAL_API_URL);
+      && Boolean(CLOUD_OPERATIONAL_API_URL)
+      && guardCloudCall("purchase-rules", SYNC_API_URL).allowed;
     const rulesApiUrl = useCloudRules ? SYNC_API_URL : API_URL;
     const response = await axios.get(
       `${rulesApiUrl}/purchase-rules`,
@@ -4241,11 +4307,18 @@ function App() {
         snapshot: cachedIdentitySnapshot,
       });
       await performConnectivityCheck("login", { force: true, timeoutMs: 4000 });
-      const authHealth = isLocalOnlyConnectivitySelected()
+      // The canonical-cloud-login probe is the call that was firing at a dead production
+      // host on an unconfigured device. It is refused here, before the request is built,
+      // rather than being allowed to fail at the network layer.
+      const cloudLoginGate = guardCloudCall("canonical-cloud-login", AUTH_API_URL);
+      const authHealth = !cloudLoginGate.allowed
         ? {
             online: false,
             url: `${AUTH_API_URL}/api/health`,
-            message: "FroozERP cloud access is disabled by the Owner.",
+            reasonCode: cloudLoginGate.code,
+            message: cloudLoginGate.code === CLOUD_CALL_REFUSAL_CODES.APP_LOCAL_ONLY
+              ? "FroozERP cloud access is disabled by the Owner."
+              : cloudLoginGate.message,
           }
         : await checkBackendHealth(AUTH_API_URL, {
             details: true,
@@ -4260,11 +4333,19 @@ function App() {
         setOfflineMode(true);
         const opened = await continueOffline(latestDevice);
         if (!opened) {
-          setStartupError((current) => current || `Authentication backend health check failed at ${authHealth.url}: ${authHealth.message}.`);
+          // A refusal is not a failed check, and must not be reported as one.
+          setStartupError((current) => current || (cloudLoginGate.allowed
+            ? `Authentication backend health check failed at ${authHealth.url}: ${authHealth.message}.`
+            : authHealth.message));
         }
         return;
       }
 
+      // Kept, not removed: dropping the cloud precondition from login is later-stage work.
+      // Guarded so it can only run when a cloud target is configured and permitted; the
+      // refusal is thrown so the existing catch falls through to the offline session.
+      const bootstrapGate = guardCloudCall("device-bootstrap-status", AUTH_API_URL);
+      if (!bootstrapGate.allowed) throw createCloudCallRefusalError(bootstrapGate);
       const bootstrapResponse = await axios.post(`${AUTH_API_URL}/api/auth/device-bootstrap-status`, latestDevice, {
         timeout: 8000,
       });
@@ -4352,6 +4433,12 @@ function App() {
       const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
       setDeviceInfo(latestDevice);
       const health = await performConnectivityCheck("retry-online", { force: true, timeoutMs: 4000 });
+      const retryGate = guardCloudCall("device-bootstrap-status", AUTH_API_URL);
+      if (!retryGate.allowed) {
+        setStartupError(retryGate.message);
+        setStartupNotice("");
+        return health;
+      }
       if (health.online) {
         const response = await axios.post(`${AUTH_API_URL}/api/auth/device-bootstrap-status`, latestDevice, {
           timeout: 8000,

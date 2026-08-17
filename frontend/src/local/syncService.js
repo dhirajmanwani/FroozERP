@@ -76,7 +76,8 @@ const readSavedApiConfig = () => {
     subBranchId: String(import.meta.env.VITE_SUB_BRANCH_ID || "").trim(),
     deviceId: String(import.meta.env.VITE_DEVICE_ID || "").trim(),
     deviceName: String(import.meta.env.VITE_DEVICE_NAME || "").trim(),
-    cloudApiUrl: canonicalizeCloudApiUrl(import.meta.env.VITE_CLOUD_API_URL || DEFAULT_PRODUCTION_CLOUD_API_URL),
+    // No configured cloud URL means no cloud target. It must never mean "use production".
+    cloudApiUrl: canonicalizeCloudApiUrl(import.meta.env.VITE_CLOUD_API_URL || ""),
     branchLanApiUrl: normalizeApiUrl(import.meta.env.VITE_BRANCH_LAN_API_URL || ""),
     customApiUrl: normalizeApiUrl(import.meta.env.VITE_CUSTOM_API_URL || ""),
   };
