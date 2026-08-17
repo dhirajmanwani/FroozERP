@@ -69,19 +69,38 @@ pub const CLOCK_AHEAD_ANOMALY_DAYS: i64 = 730;
 /// rotation — the wrong order for a rotation meant to be uneventful.
 ///
 /// ---
-/// **PLACEHOLDER KEY MATERIAL — NOT REAL KEYS.**
-/// These are structurally valid 32-byte arrays so the module compiles and its shape is fixed,
-/// but they are not the public halves of any keypair that exists. Real keys arrive with the
-/// signing CLI in Stage 3. Until then nothing verifies against these, and that is intended:
-/// `verify` returns `RejectReason::MalformedTrustedKey` rather than silently accepting if the
-/// bytes are not a valid Ed25519 point. Tests pass their own `trusted_keys`, which is exactly
-/// why `verify` takes them as a parameter instead of reading this constant.
+/// **REAL PRODUCTION KEY MATERIAL — public halves only (2026-08-17).**
+/// These replaced Stage 1's placeholders once the maintainer generated the root keypairs on
+/// their own machine. Only the public halves are here, and only the public halves ever will be:
+/// per §3.3 the private seeds live solely on that machine, encrypted with a separate paper
+/// backup, and never enter this repository, CI, or any cloud host.
+///
+/// Verified before being written here: each is 64 lowercase hex characters decoding to exactly
+/// 32 bytes, each SHA-256s to the checksum the generator printed (which is what rules out a
+/// transcription slip — one wrong digit changes the whole digest), and each is a valid Ed25519
+/// curve point, so `verify` accepts them instead of returning `MalformedTrustedKey`.
+///
+/// `key_id 0x01` signs today. `key_id 0x02` signs nothing yet and exists so a future rotation
+/// never requires devices to update before they can verify newly signed codes (D-2, §3.2).
+///
+/// Tests still pass their own `trusted_keys`, which is why `verify` takes them as a parameter
+/// rather than reading this constant — so the suite never depends on production key material.
 /// ---
 pub const TRUSTED_ACTIVATION_KEYS: &[(u8, [u8; 32])] = &[
-    // key_id 0x01 — "current" slot, placeholder.
-    (0x01, [0xAA; 32]),
-    // key_id 0x02 — "next" slot, pre-provisioned for rotation, placeholder.
-    (0x02, [0xBB; 32]),
+    // key_id 0x01 — "current" slot. Public half only.
+    (0x01, [
+        0x91, 0x4F, 0x23, 0xF3, 0x4E, 0x21, 0x3E, 0xCE,
+        0x06, 0x1D, 0x9A, 0x97, 0x95, 0xC9, 0x26, 0xC7,
+        0x05, 0xEB, 0x30, 0x97, 0x27, 0x35, 0x0B, 0x9D,
+        0x7A, 0x28, 0x7F, 0xBB, 0xD3, 0xF8, 0xE7, 0xA4,
+    ]),
+    // key_id 0x02 — "next" slot, pre-provisioned for rotation. Public half only.
+    (0x02, [
+        0x15, 0x34, 0xCA, 0x85, 0x8D, 0x9F, 0xF5, 0x23,
+        0x93, 0x2B, 0x12, 0xF4, 0x54, 0x8F, 0x2C, 0x26,
+        0xFA, 0x9B, 0xCA, 0xD2, 0x37, 0x33, 0x7D, 0x37,
+        0x09, 0xC7, 0xE9, 0x2D, 0x98, 0xA3, 0xF8, 0xEE,
+    ]),
 ];
 
 /// Why an activation artefact was refused.
@@ -813,9 +832,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_placeholder_trusted_key_material_rather_than_accepting_it() {
-        // The shipped TRUSTED_ACTIVATION_KEYS are placeholders until Stage 3. They must fail
-        // loudly, never silently accept.
+    fn rejects_foreign_signatures_against_the_shipped_trusted_keys() {
+        // The shipped TRUSTED_ACTIVATION_KEYS now hold real production public halves, so bytes
+        // signed by any other key must be rejected — `BadSignature`, never a silent accept.
+        // Before the real keys landed this same assertion caught the placeholder case via
+        // `MalformedTrustedKey`; both arms are kept so the test states "these bytes do not
+        // verify" without depending on which key material is currently shipped.
         let build = Build {
             key_id: 0x01,
             ..Default::default()
