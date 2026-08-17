@@ -204,7 +204,24 @@ const localRoute = async (req, res, url, body) => {
     if (!userId || !deviceId || role !== "OWNER") {
       return sendJson(res, 403, { code: "OWNER_REQUIRED", message: "Authenticated Owner permission is required." });
     }
-    const time = await readAuthoritativeTime();
+    // Gate the authoritative-time probe on the mode being *requested*, not the mode currently in
+    // force. This handler is the one place where those two disagree, because it is the moment the
+    // Owner switches. Consulting the policy in force would be wrong in both directions:
+    //   - switching *into* LOCAL_ONLY, the old policy still says Auto, so the outbound
+    //     /api/health probe would still fire — the exact breach of the CLAUDE.md invariant
+    //     "LOCAL_ONLY ... external connections at 0";
+    //   - switching back *to* Auto, the old policy still says LOCAL_ONLY, so the probe would be
+    //     refused and a legitimate switch-on would lose server-confirmed time for no reason.
+    // The requested value is the policy that takes effect the instant writePolicy returns, and it
+    // is the Owner's authorisation for this request, so it is what the gate consults.
+    const requestedInternetAccess = input.allowInternetAccess !== false;
+    let time;
+    if (requestedInternetAccess) {
+      time = await readAuthoritativeTime();
+    } else {
+      auditCloudRequest({ method: req.method, route: url.pathname, blocked: true, reachedCloud: false, reason: "APP_LOCAL_ONLY", source: "authoritative-time" });
+      time = { confirmedAt: new Date().toISOString(), timeSource: "device" };
+    }
     const policy = writePolicy(input.allowInternetAccess !== false, { ...time, changedBy: userId, deviceId });
     return sendJson(res, 200, { ...policy, status: policy.allowInternetAccess ? "AUTO" : "LOCAL_ONLY" });
   }

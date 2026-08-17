@@ -260,7 +260,8 @@ test("desktop Auto and Local Only policy confirms twenty transitions without clo
       assert.equal(response.status, 200);
       const policy = await response.json();
       assert.equal(policy.status, allowInternetAccess ? "AUTO" : "LOCAL_ONLY");
-      assert.equal(policy.timeSource, "railway");
+      // Server-confirmed time is only fetched when the requested mode permits the network.
+      assert.equal(policy.timeSource, allowInternetAccess ? "railway" : "device");
       if (!allowInternetAccess) {
         const requestsBeforeBlockedProbe = cloudMethods.length;
         const blocked = await fetch(`http://127.0.0.1:${port}/api/auth/me?user_id=1`);
@@ -270,6 +271,84 @@ test("desktop Auto and Local Only policy confirms twenty transitions without clo
       }
     }
     assert.equal((await (await fetch(`http://127.0.0.1:${port}/api/cloud/internet-access`)).json()).status, "AUTO");
+  } finally {
+    await stopChild(runtime.child);
+    await new Promise((resolve) => cloudServer.close(resolve));
+  }
+});
+
+test("switching into Local Only makes no external connection and is audited as blocked", async () => {
+  // Disposable profile only: never the real APPDATA directory.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "froozerp-local-only-switch-"));
+  const appData = path.join(root, "AppData", "Roaming");
+  const databasePath = path.join(root, "profile", "froozerp-local.sqlite3");
+  writeSQLiteFixture(databasePath);
+  const policyPath = path.join(appData, "com.srtcompany.froozerp", "cloud-network-policy.json");
+  fs.mkdirSync(path.dirname(policyPath), { recursive: true });
+  fs.writeFileSync(policyPath, JSON.stringify({ allowInternetAccess: false }));
+
+  // Stand-in for the cloud host. Any hit here is an outbound request the policy should have
+  // suppressed; the real production host is never contacted by this suite.
+  const cloudPort = await reservePort();
+  const cloudRequests = [];
+  const cloudServer = require("node:http").createServer((req, res) => {
+    cloudRequests.push(`${req.method} ${req.url}`);
+    const body = Buffer.from(JSON.stringify({ status: "ok", server_time: new Date().toISOString(), version: "test" }));
+    res.writeHead(200, { "content-type": "application/json", "content-length": body.length });
+    res.end(body);
+  });
+  await new Promise((resolve, reject) => cloudServer.listen(cloudPort, "127.0.0.1", resolve).once("error", reject));
+  const port = await reservePort();
+  const runtime = await startDesktopBackend({
+    databasePath,
+    port,
+    extraEnv: { APPDATA: appData, CLOUD_API_URL: `http://127.0.0.1:${cloudPort}` },
+  });
+  const auditPath = path.join(appData, "com.srtcompany.froozerp", "logs", "cloud-request-audit.jsonl");
+  const readAudit = () => (fs.existsSync(auditPath)
+    ? fs.readFileSync(auditPath, "utf8").trim().split(/\r?\n/).filter(Boolean).map(JSON.parse)
+    : []);
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/api/cloud/internet-access`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", "x-user-id": "1", "x-user-role": "OWNER", "x-device-id": "device-test" },
+      body: JSON.stringify({ allowInternetAccess: false, user_id: 1, role: "OWNER", device_id: "device-test" }),
+    });
+    assert.equal(response.status, 200);
+    const policy = await response.json();
+    assert.equal(policy.status, "LOCAL_ONLY");
+    assert.equal(policy.allowInternetAccess, false);
+    assert.equal(policy.timeSource, "device", "Local Only must fall back to the device clock, not a network probe");
+    assert.equal(policy.changedBy, "1");
+    assert.equal(policy.deviceId, "device-test");
+    assert.ok(Number.isFinite(Date.parse(policy.confirmedAt)));
+    assert.equal(JSON.parse(fs.readFileSync(policyPath, "utf8")).allowInternetAccess, false);
+
+    // The invariant itself: external connections at 0 while switching into Local Only.
+    assert.deepEqual(cloudRequests, [], "switching into Local Only must attempt no outbound request");
+
+    const audit = readAudit();
+    const auditText = JSON.stringify(audit);
+    assert.equal(/railway|froozerp-production/i.test(auditText), false, "no audit entry may name the production host");
+    assert.equal(audit.some((entry) => entry.reachedCloud === true), false, "no cloud-reaching entry may be recorded");
+    const suppressed = audit.filter((entry) => entry.route === "/api/cloud/internet-access");
+    assert.deepEqual(
+      suppressed.map(({ method, blocked, reachedCloud, reason }) => ({ method, blocked, reachedCloud, reason })),
+      [{ method: "PUT", blocked: true, reachedCloud: false, reason: "APP_LOCAL_ONLY" }],
+      "the suppressed authoritative-time probe must be audited as blocked"
+    );
+
+    // Contrast case: switching back to Auto is authorised by the request itself, so the probe runs.
+    const restored = await fetch(`http://127.0.0.1:${port}/api/cloud/internet-access`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", "x-user-id": "1", "x-user-role": "OWNER", "x-device-id": "device-test" },
+      body: JSON.stringify({ allowInternetAccess: true, user_id: 1, role: "OWNER", device_id: "device-test" }),
+    });
+    assert.equal(restored.status, 200);
+    const restoredPolicy = await restored.json();
+    assert.equal(restoredPolicy.status, "AUTO");
+    assert.equal(restoredPolicy.timeSource, "railway", "returning to Auto must still confirm time against the server");
+    assert.deepEqual(cloudRequests, ["GET /api/health"]);
   } finally {
     await stopChild(runtime.child);
     await new Promise((resolve) => cloudServer.close(resolve));
