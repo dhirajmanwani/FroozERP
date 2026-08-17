@@ -27,3 +27,9 @@ release-candidates/
 scratchpad/
 froozerp.exe
 uninstall.exe
+
+# Tauri generates a per-platform ACL schema. Windows is the only shipped target, so the
+# desktop/windows schemas are tracked and the Linux one is a build byproduct of working on
+# this repo from a Linux or cloud session. Ignored so it stays out of commits and out of
+# git status.
+src-tauri/gen/schemas/linux-schema.json
