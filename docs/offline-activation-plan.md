@@ -13,8 +13,9 @@
 > | 1 — `entitlement.rs` pure core | **Complete 2026-08-16.** `src-tauri/src/entitlement.rs`, declared as `pub mod entitlement;` in `lib.rs` with no call sites. |
 > | 2 — migration `017` | **Complete 2026-08-17.** Draft reviewed against design §5 and accepted unchanged; registered in `local_db.rs`. See the Stage 2 record at the end of this file. |
 > | 3 — signing CLI + fixtures | **Complete 2026-08-17.** `src-tauri/tools/sign_activation.rs`, `.lic` format, fixture set, 23/23 round-trip tests against real signed bytes. Real root public keys baked into `TRUSTED_ACTIVATION_KEYS`. |
-> | 4 — grandfathering, localStorage fix, backlog 3/4/5 | **Partially complete 2026-08-17.** The localStorage-shadowing fix and backlog items 3, 4 and 5 are done and verified on a disposable profile. **Grandfathering (`LEGACY_GRANDFATHER` insert) is NOT built** — see the Stage 4 record. |
-> | 5–10 | Not started. |
+> | 4 — grandfathering, localStorage fix, backlog 3/4/5 | **Complete 2026-08-17.** The localStorage-shadowing fix and backlog items 3, 4 and 5 landed first; grandfathering (`grandfather_existing_device`, the `LEGACY_GRANDFATHER` shim) and migration `018` (`bootstrap_consumed_at`) landed in commit `b923a65`, closing the gap the original Stage 4 record described. |
+> | 5 — `.lic` redemption, activation screen, bootstrap Owner | **Complete 2026-08-17.** Rust acceptance/state layer + four Tauri commands + `.lic` parser; frontend `entitlementState.js` (§9 mirror, pulled forward from Stage 7) + `bootstrapCredential.js`; App.jsx activation gate and forced-password-change flow. See the Stage 5 record at the end of this file. `registration_status` promotion and the two hardcoded "approved" removals stay in Stage 6. |
+> | 6–10 | Not started. |
 >
 > **Parallel track:** `docs/auth-hardening-plan.md` (stages A-1 … A-6) scopes the auth debt. It
 > is the gate on remote access and is independent of the stages below.
@@ -536,3 +537,49 @@ Two observations from the walkthrough, both expected and neither a regression:
 
 Stage 5 (`.lic` redemption, activation screen, Tauri commands) — **carrying the grandfathering
 work with it**, and the first stage to exercise the real keys end to end.
+
+---
+
+## Stage 5 record — completed 2026-08-17
+
+The `.lic` redemption path, the activation screen and the bootstrap Owner flow. Grandfathering had
+already landed in Stage 4's commit `b923a65`, so this stage did not have to carry it.
+
+### Files changed
+
+| File | Change |
+| --- | --- |
+| `src-tauri/src/activation.rs` | **New.** `parse_lic(text) -> Result<(payload, signature), String>` for the §7.2 container (ignores `#`/blank lines, reads `format`/`payload`/`signature`, rejects wrong format, missing fields, bad base64) plus a standard padded `base64_decode`. Declared `pub mod activation;` in `lib.rs`. 7 unit tests. |
+| `src-tauri/src/local_db.rs` | The four §6.2 functions — `accept_entitlement`, `active_entitlement`, `entitlement_state`, `record_entitlement_audit` — plus `consume_bootstrap` and `_at` helpers. Acceptance verifies the exact bytes against `TRUSTED_ACTIVATION_KEYS`, checks device binding, dedupes on the payload SHA-256 fingerprint, supersedes any prior live row (including a grandfather shim), and logs `ACCEPTED`/`REJECTED`/`SUPERSEDED`. State derivation re-verifies a `VERIFIED` row through `entitlement::evaluate_state`, evaluates a `LEGACY_GRANDFATHER` shim from its stored day-numbers under the same clock rule, and reports `Revoked` from `revoked_at`. Day arithmetic uses SQLite `julianday`/`strftime` anchored at 2020-01-01 to stay consistent with `entitlement::DAY_EPOCH`. 5 unit tests. |
+| `src-tauri/src/lib.rs` | Four commands — `entitlement_status`, `entitlement_redeem`, `entitlement_import_file`, `entitlement_consume_bootstrap` — registered in `generate_handler!`. |
+| `frontend/src/local/entitlementState.js` (+ test) | Pure mirror of the design §9 state table (pulled forward from Stage 7 at the maintainer's request): `capabilitiesForState`, `billingAllowed`, `holdsPreviousState`, `bannerForState`. The test iterates **every** state asserting `billingAllowed(state) === (state !== "Unprovisioned")` — the §2.2 invariant, defined directly rather than derived from capabilities so `ClockAnomaly`/`Malformed` still bill. |
+| `frontend/src/local/bootstrapCredential.js` (+ test) | `verifyBootstrapCredential` / `deriveBootstrapVerifier` (§8.2). PBKDF2 is byte-identical to `offlineSession.deriveVerifier`, with the salt string fed to PBKDF2 being `base64(saltBytes)`. |
+| `frontend/src/local/localDatabase.js` | Wrappers: `getEntitlementStatus`, `redeemEntitlement`, `importEntitlementFile`, `consumeBootstrapCredential`. |
+| `frontend/src/App.jsx` | Fetches entitlement status once the device identity resolves; renders an **ActivationGate** (device-ID display + `.lic` file import) when the shell reports `Unprovisioned`, and a **BootstrapOwnerSetup** forced-password-change flow that writes a normal `offline_auth` record via `cacheOfflineSession` and then consumes the bootstrap credential (§8.2). The frontend never evaluates policy — it renders what Rust reports (§2.3). |
+
+### Decisions this stage owned
+
+- **Bootstrap credential KDF (§8.1/§8.2 left it to Stage 5).** Chosen to reuse the existing offline-session PBKDF2 exactly: `verifier = PBKDF2-SHA256( UTF8(username_lower::password), salt = UTF8(base64(saltBytes)), 150000, 32 bytes )`. The maintainer's signing recipe therefore is: pick random 16 `saltBytes`; `verifierBytes = base64decode( PBKDF2(username, tempPassword, base64(saltBytes)) )`; pass `--bootstrap-salt-hex hex(saltBytes)` and `--bootstrap-verifier-hex hex(verifierBytes)` to `sign_activation`. No new crypto primitive was invented; the signed bytes stay verifier-only (never a password), as §8.2 requires.
+- **Trusted keys are a parameter, not a constant, inside `accept_entitlement_at`/`entitlement_state_at`** — mirroring `entitlement::verify`, so tests sign with a throwaway key and never touch production key material.
+- **`consume_bootstrap` is set-once** — it never overwrites an existing `bootstrap_consumed_at`, because clearing it would re-open a single-use credential.
+
+### Deliberately left for Stage 6 (not done here)
+
+- `local_device_identity.registration_status` is **not** promoted on acceptance, and the two hardcoded `"approved"` defaults (`App.jsx` self-built snapshot, `cache_reference_snapshot_at`) are **not** removed. The activation screen clears off entitlement state, not `registration_status`, so redemption is already functional without it. Promotion + the removals are Stage 6 per the plan.
+
+### Gate results (lead, on the integrated tree)
+
+| Gate | Result |
+| --- | --- |
+| `cargo test --lib` | **73 passed / 3 failed** — the 3 are the pre-existing Windows-path tests (`isolated_sqlite_override_is_absolute_and_test_only`, two `local_backend_lifecycle_tests`); +12 new over the 61 baseline. |
+| `cargo test --test activation_roundtrip --features signing-cli` | **23 / 23.** |
+| `cargo check` | Clean (pre-existing-style `dead_code` warnings only). |
+| `npm --prefix frontend run lint` | 0 errors, 37 pre-existing warnings. |
+| `npm run build` | Pass. |
+| `npm run backend:check` | Pass. |
+| `npm --prefix backend test` | 114 / 115 (pre-existing test-102 path assertion). |
+| `TZ=Asia/Kolkata node --test frontend/src/local/*.test.mjs` | **184 / 184** (+22 over the 162 baseline). |
+
+### Not verified here
+
+The App.jsx activation gate and bootstrap login were **not** exercised in the real desktop app — this Linux container has no Windows Tauri runtime, and per `CLAUDE.md` the packaged app is never launched on the real laptop. The pure pieces (state mirror, bootstrap KDF, `.lic` parser, acceptance/state SQL) are covered by unit tests; the App.jsx wiring is lint- and build-clean but wants a disposable-profile walkthrough on Windows before release.

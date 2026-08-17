@@ -1,6 +1,7 @@
 // Offline activation entitlement core (Stage 1). Pure logic, no call sites yet — the module is
 // declared so it compiles and its tests run; nothing in the app invokes it.
 pub mod entitlement;
+pub mod activation;
 mod local_db;
 
 use local_db::{
@@ -2059,6 +2060,50 @@ fn local_db_status(app: AppHandle) -> Result<LocalDbStatus, String> {
 fn local_db_audit(app: AppHandle) -> Result<serde_json::Value, String> {
     local_db::database_audit(&app)
 }
+
+#[tauri::command]
+fn entitlement_status(app: AppHandle, device_id: String) -> Result<serde_json::Value, String> {
+    local_db::entitlement_state(&app, &device_id)
+}
+
+#[tauri::command]
+fn entitlement_redeem(
+    app: AppHandle,
+    device_id: String,
+    payload_base64: String,
+    signature_base64: String,
+    source: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let payload = activation::base64_decode(&payload_base64)
+        .map_err(|error| format!("invalid payload base64: {error}"))?;
+    let signature = activation::base64_decode(&signature_base64)
+        .map_err(|error| format!("invalid signature base64: {error}"))?;
+    let source = source.unwrap_or_else(|| "OFFLINE_FILE".to_string());
+    local_db::accept_entitlement(&app, &device_id, &payload, &signature, &source)?;
+    local_db::entitlement_state(&app, &device_id)
+}
+
+#[tauri::command]
+fn entitlement_import_file(
+    app: AppHandle,
+    device_id: String,
+    contents: String,
+    source: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let (payload, signature) = activation::parse_lic(&contents)?;
+    let source = source.unwrap_or_else(|| "OFFLINE_FILE".to_string());
+    local_db::accept_entitlement(&app, &device_id, &payload, &signature, &source)?;
+    local_db::entitlement_state(&app, &device_id)
+}
+
+#[tauri::command]
+fn entitlement_consume_bootstrap(
+    app: AppHandle,
+    device_id: String,
+    entitlement_serial: String,
+) -> Result<(), String> {
+    local_db::consume_bootstrap(&app, &device_id, &entitlement_serial)
+}
 #[tauri::command]
 fn local_record_connectivity_mode_change(
     app: AppHandle,
@@ -2478,6 +2523,10 @@ pub fn run() {
             local_db_initialize,
             local_db_status,
             local_db_audit,
+            entitlement_status,
+            entitlement_redeem,
+            entitlement_import_file,
+            entitlement_consume_bootstrap,
             local_record_connectivity_mode_change,
             local_db_set_smoke_value,
             local_db_get_smoke_value,

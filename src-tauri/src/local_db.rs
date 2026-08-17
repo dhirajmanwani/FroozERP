@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
+use crate::entitlement::{self, EntitlementState};
+
 const CURRENT_SCHEMA_VERSION: &str = "018_bootstrap_credential_consumption";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
@@ -3204,6 +3206,606 @@ fn grandfather_existing_device(
     Ok(true)
 }
 
+// =======================================================================================
+// Offline activation redemption and state (design §6.2, Stage 5).
+//
+// These are the first call sites of `entitlement.rs`. The pure core decides the *meaning* of a
+// signature, a clock and a capability; everything here is the SQLite side: it stores what was
+// accepted, replays the ledger to answer "what state is this device in?", and records every
+// decision in the append-only audit log. No state except Unprovisioned ever denies billing —
+// that invariant lives in `EntitlementState::billing_allowed` and is surfaced verbatim below.
+// =======================================================================================
+
+/// Lowercase hex of a byte slice — the on-disk shape for `device_binding_hex`, salts, verifiers
+/// and payload fingerprints throughout this feature.
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Replay-guard fingerprint: lowercase-hex SHA-256 of the *exact* payload blob (§5.3).
+fn payload_fingerprint(payload: &[u8]) -> String {
+    use sha2::Digest;
+    hex_lower(&sha2::Sha256::digest(payload))
+}
+
+/// Render a day-stamp (days since 2020-01-01) as the migration-009 ISO shape via SQLite, so the
+/// stored `issued_at`/`expires_at`/`grace_until` match every other timestamp in the schema.
+fn day_to_iso_at(conn: &Connection, day: i64) -> Result<String, String> {
+    conn.query_row(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', '2020-01-01', ?1)",
+        params![format!("+{day} days")],
+        |row| row.get(0),
+    )
+    .map_err(to_error)
+}
+
+/// The `source` values migration 017's CHECK admits.
+const ALLOWED_ENTITLEMENT_SOURCES: &[&str] = &[
+    "ONLINE_REGISTRATION",
+    "OFFLINE_FILE",
+    "OFFLINE_TYPED",
+    "OFFLINE_QR",
+    "LEGACY_UPGRADE",
+];
+
+/// Append one row to the entitlement audit log (§5.2).
+fn record_entitlement_audit_at(
+    conn: &Connection,
+    serial: Option<&str>,
+    event: &str,
+    reason_code: Option<&str>,
+    detail_json: &str,
+    device_id: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO local_entitlement_audit
+           (entitlement_serial, event, reason_code, detail_json, device_id)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![serial, event, reason_code, detail_json, device_id],
+    )
+    .map_err(to_error)?;
+    Ok(())
+}
+
+pub fn record_entitlement_audit(
+    app: &AppHandle,
+    serial: Option<String>,
+    event: String,
+    reason_code: Option<String>,
+    detail_json: String,
+    device_id: String,
+) -> Result<(), String> {
+    let path = database_path(app)?;
+    initialize_at(&path)?;
+    let conn = Connection::open(&path).map_err(to_error)?;
+    record_entitlement_audit_at(
+        &conn,
+        serial.as_deref(),
+        &event,
+        reason_code.as_deref(),
+        &detail_json,
+        &device_id,
+    )
+}
+
+/// Verify and accept an activation artefact, writing the VERIFIED ledger row (§6.2).
+///
+/// `trusted_keys` is a parameter rather than a hard reference to `TRUSTED_ACTIVATION_KEYS` for the
+/// same reason `entitlement::verify` takes it: the tests sign with their own throwaway key and
+/// must be able to supply the matching trusted table without depending on production key material.
+/// The public wrapper passes `entitlement::TRUSTED_ACTIVATION_KEYS`.
+fn accept_entitlement_at(
+    path: &Path,
+    device_id: &str,
+    payload: &[u8],
+    signature: &[u8],
+    source: &str,
+    trusted_keys: &[(u8, [u8; 32])],
+) -> Result<serde_json::Value, String> {
+    if !ALLOWED_ENTITLEMENT_SOURCES.contains(&source) {
+        return Err(format!(
+            "INVALID_SOURCE: {source:?} is not an accepted activation source"
+        ));
+    }
+
+    initialize_at(path)?;
+    let mut conn = Connection::open(path).map_err(to_error)?;
+
+    let fingerprint = payload_fingerprint(payload);
+
+    // 1. Cryptographic verification over the exact bytes (§3.4). A rejection is logged and the
+    //    fingerprint remembered so the same bad artefact is recognised offline next time.
+    let verified = match entitlement::verify(payload, signature, trusted_keys) {
+        Ok(verified) => verified,
+        Err(reason) => {
+            let reason_code = format!("{reason:?}");
+            record_entitlement_audit_at(&conn, None, "REJECTED", Some(&reason_code), "{}", device_id)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO local_activation_code_seen (fingerprint, outcome)
+                 VALUES (?1, 'REJECTED')",
+                params![fingerprint],
+            )
+            .map_err(to_error)?;
+            return Err(reason_code);
+        }
+    };
+
+    // 2. Device binding (D-9). Verification says "did we sign this?"; binding says "was it meant
+    //    for this machine?". They fail for different reasons and report differently.
+    if entitlement::check_device_binding(verified.payload(), device_id).is_err() {
+        record_entitlement_audit_at(
+            &conn,
+            None,
+            "REJECTED",
+            Some("DeviceBindingMismatch"),
+            "{}",
+            device_id,
+        )?;
+        return Err(
+            "DEVICE_BINDING_MISMATCH: this activation file is for a different device".to_string(),
+        );
+    }
+
+    let payload_parsed = verified.payload();
+    let serial = payload_parsed.entitlement_serial.to_string();
+
+    // 3. Idempotency: a fingerprint already seen AND a ledger row already present for this serial
+    //    means this exact artefact was accepted before. Re-report the acceptance, do not double
+    //    insert or re-supersede.
+    let already_seen = conn
+        .query_row(
+            "SELECT 1 FROM local_activation_code_seen WHERE fingerprint = ?1",
+            params![fingerprint],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(to_error)?
+        .is_some();
+    let serial_present = conn
+        .query_row(
+            "SELECT 1 FROM local_entitlement WHERE entitlement_serial = ?1",
+            params![serial],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(to_error)?
+        .is_some();
+    if already_seen && serial_present {
+        return Ok(serde_json::json!({
+            "accepted": true,
+            "idempotent": true,
+            "entitlement_serial": serial,
+            "verification_state": "VERIFIED",
+            "source": source,
+            "bootstrap_present": payload_parsed.carries_credential(),
+        }));
+    }
+
+    // 4. Derive the stored columns from the signed payload.
+    let company_id = payload_parsed.company_id.to_string();
+    let branch_id = payload_parsed.branch_id.to_string();
+    let device_binding_hex = hex_lower(&payload_parsed.device_binding);
+    let issued_at_iso = day_to_iso_at(&conn, i64::from(payload_parsed.issued_at))?;
+    let expires_at_iso = day_to_iso_at(&conn, payload_parsed.expires_at_day())?;
+    let grace_until_iso = day_to_iso_at(&conn, payload_parsed.grace_until_day())?;
+
+    let tx = conn.transaction().map_err(to_error)?;
+
+    // 5. Supersede any prior live entitlement for this device — including a §11.1 grandfather
+    //    shim on the first real redemption. Superseded serials are logged individually.
+    let mut superseded: Vec<String> = Vec::new();
+    {
+        let mut stmt = tx
+            .prepare(
+                "SELECT entitlement_serial FROM local_entitlement
+                 WHERE device_id = ?1 AND superseded_at IS NULL AND revoked_at IS NULL
+                   AND entitlement_serial <> ?2",
+            )
+            .map_err(to_error)?;
+        let rows = stmt
+            .query_map(params![device_id, serial], |row| row.get::<_, String>(0))
+            .map_err(to_error)?;
+        for row in rows {
+            superseded.push(row.map_err(to_error)?);
+        }
+    }
+    tx.execute(
+        "UPDATE local_entitlement
+            SET superseded_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+          WHERE device_id = ?1 AND superseded_at IS NULL AND revoked_at IS NULL
+            AND entitlement_serial <> ?2",
+        params![device_id, serial],
+    )
+    .map_err(to_error)?;
+    for prior in &superseded {
+        record_entitlement_audit_at(
+            &tx,
+            Some(prior),
+            "SUPERSEDED",
+            Some("SUPERSEDED_BY_REDEMPTION"),
+            &format!("{{\"superseded_by\":\"{serial}\"}}"),
+            device_id,
+        )?;
+    }
+
+    // 6. Insert the VERIFIED row. Migration 017's CHECK enforces a 64-byte signature over a
+    //    non-empty payload; `verify` already guaranteed both.
+    tx.execute(
+        "INSERT OR IGNORE INTO local_entitlement (
+            entitlement_serial, key_id, format_version, company_id, branch_id, device_id,
+            device_binding_hex, issued_at, expires_at, grace_until, capabilities_json,
+            payload_blob, signature_blob, verification_state, source
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, '{}', ?11, ?12, 'VERIFIED', ?13)",
+        params![
+            serial,
+            i64::from(payload_parsed.key_id),
+            i64::from(payload_parsed.format_version),
+            company_id,
+            branch_id,
+            device_id,
+            device_binding_hex,
+            issued_at_iso,
+            expires_at_iso,
+            grace_until_iso,
+            payload,
+            signature,
+            source,
+        ],
+    )
+    .map_err(to_error)?;
+
+    // 7. Remember the fingerprint and log the acceptance.
+    tx.execute(
+        "INSERT OR IGNORE INTO local_activation_code_seen (fingerprint, outcome)
+         VALUES (?1, 'ACCEPTED')",
+        params![fingerprint],
+    )
+    .map_err(to_error)?;
+    record_entitlement_audit_at(
+        &tx,
+        Some(&serial),
+        "ACCEPTED",
+        None,
+        &format!("{{\"source\":\"{source}\",\"verification_state\":\"VERIFIED\"}}"),
+        device_id,
+    )?;
+
+    tx.commit().map_err(to_error)?;
+
+    Ok(serde_json::json!({
+        "accepted": true,
+        "entitlement_serial": serial,
+        "verification_state": "VERIFIED",
+        "source": source,
+        "superseded": superseded,
+        "bootstrap_present": payload_parsed.carries_credential(),
+    }))
+}
+
+pub fn accept_entitlement(
+    app: &AppHandle,
+    device_id: &str,
+    payload: &[u8],
+    signature: &[u8],
+    source: &str,
+) -> Result<serde_json::Value, String> {
+    let path = database_path(app)?;
+    accept_entitlement_at(
+        &path,
+        device_id,
+        payload,
+        signature,
+        source,
+        entitlement::TRUSTED_ACTIVATION_KEYS,
+    )
+}
+
+/// The current live entitlement row for a device, as a JSON object (blobs omitted; the signature
+/// is reported as a length). `None` when the device has no live entitlement.
+fn active_entitlement_at(path: &Path, device_id: &str) -> Result<Option<serde_json::Value>, String> {
+    initialize_at(path)?;
+    let conn = Connection::open(path).map_err(to_error)?;
+    conn.query_row(
+        "SELECT entitlement_serial, key_id, format_version, company_id, branch_id, device_id,
+                device_binding_hex, issued_at, expires_at, grace_until, capabilities_json,
+                verification_state, source, accepted_at, superseded_at, revoked_at,
+                revocation_reason, bootstrap_consumed_at, length(signature_blob)
+           FROM local_entitlement
+          WHERE device_id = ?1 AND superseded_at IS NULL AND revoked_at IS NULL
+          ORDER BY issued_at DESC
+          LIMIT 1",
+        params![device_id],
+        |row| {
+            Ok(serde_json::json!({
+                "entitlement_serial": row.get::<_, String>(0)?,
+                "key_id": row.get::<_, i64>(1)?,
+                "format_version": row.get::<_, i64>(2)?,
+                "company_id": row.get::<_, String>(3)?,
+                "branch_id": row.get::<_, String>(4)?,
+                "device_id": row.get::<_, String>(5)?,
+                "device_binding_hex": row.get::<_, String>(6)?,
+                "issued_at": row.get::<_, String>(7)?,
+                "expires_at": row.get::<_, String>(8)?,
+                "grace_until": row.get::<_, String>(9)?,
+                "capabilities_json": row.get::<_, String>(10)?,
+                "verification_state": row.get::<_, String>(11)?,
+                "source": row.get::<_, String>(12)?,
+                "accepted_at": row.get::<_, Option<String>>(13)?,
+                "superseded_at": row.get::<_, Option<String>>(14)?,
+                "revoked_at": row.get::<_, Option<String>>(15)?,
+                "revocation_reason": row.get::<_, Option<String>>(16)?,
+                "bootstrap_consumed_at": row.get::<_, Option<String>>(17)?,
+                "signature_len": row.get::<_, i64>(18)?,
+            }))
+        },
+    )
+    .optional()
+    .map_err(to_error)
+}
+
+pub fn active_entitlement(
+    app: &AppHandle,
+    device_id: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let path = database_path(app)?;
+    active_entitlement_at(&path, device_id)
+}
+
+/// Map an `EntitlementState` to its JSON pieces: PascalCase name, capability object (or null when
+/// the state holds the previous set), and a reason string for `Malformed`.
+fn state_json_parts(
+    state: &EntitlementState,
+) -> (&'static str, Option<serde_json::Value>, Option<String>) {
+    let name = match state {
+        EntitlementState::Unprovisioned => "Unprovisioned",
+        EntitlementState::Active => "Active",
+        EntitlementState::Grace => "Grace",
+        EntitlementState::Expired => "Expired",
+        EntitlementState::Revoked => "Revoked",
+        EntitlementState::ClockAnomaly => "ClockAnomaly",
+        EntitlementState::Malformed { .. } => "Malformed",
+    };
+    let capabilities = state.capabilities().map(|caps| {
+        serde_json::json!({
+            "billing": caps.billing,
+            "local_reports": caps.local_reports,
+            "sync": caps.sync,
+            "admin": caps.admin,
+            "provisioning": caps.provisioning,
+        })
+    });
+    let reason = match state {
+        EntitlementState::Malformed { reason } => Some(format!("{reason:?}")),
+        _ => None,
+    };
+    (name, capabilities, reason)
+}
+
+/// The full entitlement state a device is in, for the UI and the authorisation layer (§6.2, §9).
+///
+/// `trusted_keys` is parameterised for the same testing reason as `accept_entitlement_at`.
+fn entitlement_state_at(
+    path: &Path,
+    device_id: &str,
+    trusted_keys: &[(u8, [u8; 32])],
+) -> Result<serde_json::Value, String> {
+    initialize_at(path)?;
+    let conn = Connection::open(path).map_err(to_error)?;
+
+    // The "current" row includes a revoked one (revocation is a state to report, not a reason to
+    // fall back to an older entitlement), but never a superseded one.
+    let row = conn
+        .query_row(
+            "SELECT entitlement_serial, verification_state, source, company_id, branch_id,
+                    issued_at, expires_at, grace_until, revoked_at, bootstrap_consumed_at,
+                    payload_blob, signature_blob,
+                    CAST(julianday(expires_at) - julianday('2020-01-01') AS INTEGER),
+                    CAST(julianday(grace_until) - julianday('2020-01-01') AS INTEGER)
+               FROM local_entitlement
+              WHERE device_id = ?1 AND superseded_at IS NULL
+              ORDER BY issued_at DESC
+              LIMIT 1",
+            params![device_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Vec<u8>>(10)?,
+                    row.get::<_, Vec<u8>>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, i64>(13)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(to_error)?;
+
+    let Some((
+        serial,
+        verification_state,
+        source,
+        company_id,
+        branch_id,
+        issued_iso,
+        expires_iso,
+        grace_iso,
+        revoked_at,
+        bootstrap_consumed_at,
+        payload_blob,
+        signature_blob,
+        expires_day,
+        grace_day,
+    )) = row
+    else {
+        let (name, capabilities, reason) = state_json_parts(&EntitlementState::Unprovisioned);
+        return Ok(serde_json::json!({
+            "state": name,
+            "billing_allowed": false,
+            "capabilities": capabilities,
+            "reason": reason,
+            "verification_state": serde_json::Value::Null,
+            "source": serde_json::Value::Null,
+            "company_id": serde_json::Value::Null,
+            "branch_id": serde_json::Value::Null,
+            "entitlement_serial": serde_json::Value::Null,
+            "issued_at": serde_json::Value::Null,
+            "expires_at": serde_json::Value::Null,
+            "grace_until": serde_json::Value::Null,
+            "days_remaining": serde_json::Value::Null,
+            "bootstrap": serde_json::Value::Null,
+        }));
+    };
+
+    // Clock (§5.3). now is the untrusted device clock; the high-water mark is a corroborated
+    // floor, and the greatest accepted `issued_at` is itself a floor on a never-synced device.
+    let now_day: i64 = conn
+        .query_row(
+            "SELECT CAST(julianday('now') - julianday('2020-01-01') AS INTEGER)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(to_error)?;
+    let issued_day: i64 = conn
+        .query_row(
+            "SELECT CAST(julianday(?1) - julianday('2020-01-01') AS INTEGER)",
+            params![issued_iso],
+            |row| row.get(0),
+        )
+        .map_err(to_error)?;
+    let high_water_kv = single_optional_string(
+        &conn,
+        "SELECT value FROM local_kv WHERE key = 'entitlement_clock_high_water'",
+        &[],
+    )?;
+    let high_water_kv_day: Option<i64> = match &high_water_kv {
+        Some(value) => conn
+            .query_row(
+                "SELECT CAST(julianday(?1) - julianday('2020-01-01') AS INTEGER)",
+                params![value],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(to_error)?,
+        None => None,
+    };
+    let high_water_day = high_water_kv_day
+        .map(|day| day.max(issued_day))
+        .unwrap_or(issued_day);
+    let effective_now = now_day.max(high_water_day);
+
+    // Bootstrap fields come only from a VERIFIED row whose signed payload carries a credential.
+    let parsed_payload = if verification_state == "VERIFIED" {
+        entitlement::parse_payload(&payload_blob).ok()
+    } else {
+        None
+    };
+
+    let state = if revoked_at.is_some() {
+        EntitlementState::Revoked
+    } else if verification_state == "VERIFIED" {
+        match entitlement::verify(&payload_blob, &signature_blob, trusted_keys) {
+            Ok(verified) => entitlement::evaluate_state(&verified, now_day, high_water_day),
+            Err(reason) => EntitlementState::Malformed { reason },
+        }
+    } else {
+        // LEGACY_GRANDFATHER (empty blobs): same rule as evaluate_state, on the stored day-numbers.
+        if now_day < high_water_day - entitlement::CLOCK_BEHIND_ANOMALY_DAYS
+            || now_day > high_water_day + entitlement::CLOCK_AHEAD_ANOMALY_DAYS
+        {
+            EntitlementState::ClockAnomaly
+        } else if effective_now < expires_day {
+            EntitlementState::Active
+        } else if effective_now < grace_day {
+            EntitlementState::Grace
+        } else {
+            EntitlementState::Expired
+        }
+    };
+
+    let bootstrap = match parsed_payload.as_ref() {
+        Some(payload) if payload.carries_credential() => match payload.bootstrap.as_ref() {
+            Some(credential) => {
+                let window_open = payload
+                    .bootstrap_expires_at_day()
+                    .map(|expiry| now_day <= expiry)
+                    .unwrap_or(false);
+                let consumed = bootstrap_consumed_at.is_some();
+                serde_json::json!({
+                    "pending": !consumed && window_open,
+                    "owner_username": credential.owner_username,
+                    "owner_salt_hex": hex_lower(&credential.owner_salt),
+                    "owner_verifier_hex": hex_lower(&credential.owner_verifier),
+                    "window_open": window_open,
+                    "consumed": consumed,
+                })
+            }
+            None => serde_json::Value::Null,
+        },
+        _ => serde_json::Value::Null,
+    };
+
+    let (name, capabilities, reason) = state_json_parts(&state);
+    Ok(serde_json::json!({
+        "state": name,
+        "billing_allowed": state.billing_allowed(),
+        "capabilities": capabilities,
+        "reason": reason,
+        "verification_state": verification_state,
+        "source": source,
+        "company_id": company_id,
+        "branch_id": branch_id,
+        "entitlement_serial": serial,
+        "issued_at": issued_iso,
+        "expires_at": expires_iso,
+        "grace_until": grace_iso,
+        "days_remaining": expires_day - effective_now,
+        "bootstrap": bootstrap,
+    }))
+}
+
+pub fn entitlement_state(app: &AppHandle, device_id: &str) -> Result<serde_json::Value, String> {
+    let path = database_path(app)?;
+    entitlement_state_at(&path, device_id, entitlement::TRUSTED_ACTIVATION_KEYS)
+}
+
+/// Mark a bootstrap credential consumed (§8.2). Set-once: never overwrites an existing timestamp,
+/// because clearing or re-stamping it would re-open a credential the design describes as single-use.
+fn consume_bootstrap_at(path: &Path, device_id: &str, serial: &str) -> Result<(), String> {
+    initialize_at(path)?;
+    let conn = Connection::open(path).map_err(to_error)?;
+    let updated = conn
+        .execute(
+            "UPDATE local_entitlement
+                SET bootstrap_consumed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+              WHERE entitlement_serial = ?1 AND device_id = ?2 AND bootstrap_consumed_at IS NULL",
+            params![serial, device_id],
+        )
+        .map_err(to_error)?;
+    if updated > 0 {
+        record_entitlement_audit_at(
+            &conn,
+            Some(serial),
+            "BOOTSTRAP_CREDENTIAL_CONSUMED",
+            None,
+            "{}",
+            device_id,
+        )?;
+    }
+    Ok(())
+}
+
+pub fn consume_bootstrap(app: &AppHandle, device_id: &str, serial: &str) -> Result<(), String> {
+    let path = database_path(app)?;
+    consume_bootstrap_at(&path, device_id, serial)
+}
+
 fn ensure_device_identity_with_preference_at(
     path: &Path,
     preferred_device_id: Option<&str>,
@@ -5300,6 +5902,298 @@ mod tests {
             .query_row("SELECT verification_state FROM local_entitlement", [], |row| row.get(0))
             .expect("read state");
         assert_eq!(state, "VERIFIED", "the real entitlement must be untouched");
+        let _ = fs::remove_file(&path);
+    }
+
+    // ---- Stage 5: offline activation redemption and state ------------------------------
+
+    fn activation_temp_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "froozerp-{label}-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ))
+    }
+
+    fn test_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    /// A trusted-key table matching the throwaway signing key. Never `TRUSTED_ACTIVATION_KEYS`:
+    /// `accept_entitlement_at`/`entitlement_state_at` take the table as a parameter for exactly
+    /// this reason, so the suite never depends on production key material.
+    fn test_trusted_keys() -> Vec<(u8, [u8; 32])> {
+        vec![(0x01, test_signing_key().verifying_key().to_bytes())]
+    }
+
+    fn put_varint_test(out: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let mut byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Build a §4 payload bound to `device_id`. Independent of `sign_activation` so this test
+    /// controls issued_at directly (the state tests need it relative to the run clock).
+    fn build_payload(
+        device_id: &str,
+        serial: u32,
+        issued_at: u16,
+        valid_days: u16,
+        bootstrap: Option<(&str, u16)>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(crate::entitlement::FORMAT_VERSION);
+        out.push(0x01); // key_id
+        out.push(if bootstrap.is_some() { 0b0000_0001 } else { 0 });
+        put_varint_test(&mut out, 1); // company_id
+        put_varint_test(&mut out, 1); // branch_id
+        out.extend_from_slice(&crate::entitlement::device_binding_hash(device_id));
+        out.extend_from_slice(&serial.to_le_bytes());
+        out.extend_from_slice(&issued_at.to_le_bytes());
+        out.extend_from_slice(&valid_days.to_le_bytes());
+        if let Some((name, days)) = bootstrap {
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&[0x11u8; 16]);
+            out.extend_from_slice(&[0x22u8; 32]);
+            out.extend_from_slice(&days.to_le_bytes());
+        }
+        out
+    }
+
+    fn sign_payload(payload: &[u8]) -> Vec<u8> {
+        use ed25519_dalek::Signer;
+        test_signing_key().sign(payload).to_bytes().to_vec()
+    }
+
+    /// Days since 2020-01-01 for the run clock, matching the SQL `julianday` floor used inside
+    /// `entitlement_state_at`.
+    fn today_day() -> u16 {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs() as i64;
+        (secs / 86_400 - 18_262) as u16
+    }
+
+    #[test]
+    fn accepting_a_genuine_code_inserts_verified_row_and_reports_active() {
+        let path = activation_temp_path("accept-genuine");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-ACCEPT-1";
+        let issued = today_day().saturating_sub(10);
+        let payload = build_payload(device, 4242, issued, 365, None);
+        let sig = sign_payload(&payload);
+
+        let result =
+            accept_entitlement_at(&path, device, &payload, &sig, "OFFLINE_FILE", &test_trusted_keys())
+                .expect("genuine code must be accepted");
+        assert_eq!(result["accepted"], serde_json::json!(true));
+        assert_eq!(result["entitlement_serial"], serde_json::json!("4242"));
+        assert_eq!(result["verification_state"], serde_json::json!("VERIFIED"));
+
+        let conn = Connection::open(&path).expect("open db");
+        let (vstate, sig_len): (String, i64) = conn
+            .query_row(
+                "SELECT verification_state, length(signature_blob) FROM local_entitlement WHERE entitlement_serial = '4242'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read verified row");
+        assert_eq!(vstate, "VERIFIED");
+        assert_eq!(sig_len, 64, "a VERIFIED row must carry a 64-byte signature");
+        let accepted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_entitlement_audit WHERE event = 'ACCEPTED' AND entitlement_serial = '4242'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count accepted audit");
+        assert_eq!(accepted, 1, "acceptance must be recorded once");
+        drop(conn);
+
+        let state = entitlement_state_at(&path, device, &test_trusted_keys()).expect("state");
+        assert_eq!(state["state"], serde_json::json!("Active"));
+        assert_eq!(state["billing_allowed"], serde_json::json!(true));
+        assert_eq!(state["capabilities"]["billing"], serde_json::json!(true));
+
+        // A second accept of the exact same artefact is idempotent, not a duplicate.
+        let again =
+            accept_entitlement_at(&path, device, &payload, &sig, "OFFLINE_FILE", &test_trusted_keys())
+                .expect("second accept must succeed idempotently");
+        assert_eq!(again["idempotent"], serde_json::json!(true));
+        assert_eq!(entitlement_rows(&path), 1, "idempotent accept must not duplicate");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wrong_device_payload_is_rejected_with_binding_mismatch() {
+        let path = activation_temp_path("accept-wrongdevice");
+        let _ = fs::remove_file(&path);
+        let issued = today_day().saturating_sub(10);
+        let payload = build_payload("FZDEV-OWNER", 55, issued, 365, None);
+        let sig = sign_payload(&payload);
+
+        let err = accept_entitlement_at(
+            &path,
+            "FZDEV-SOMEONE-ELSE",
+            &payload,
+            &sig,
+            "OFFLINE_FILE",
+            &test_trusted_keys(),
+        )
+        .expect_err("a payload for another device must be rejected");
+        assert!(err.contains("DEVICE_BINDING_MISMATCH"), "got: {err}");
+
+        let conn = Connection::open(&path).expect("open db");
+        let rejected: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_entitlement_audit WHERE event = 'REJECTED' AND reason_code = 'DeviceBindingMismatch'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rejected audit");
+        assert_eq!(rejected, 1, "the rejection must be logged");
+        drop(conn);
+        assert_eq!(entitlement_rows(&path), 0, "a rejected code writes no ledger row");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn grandfather_row_is_active_then_superseded_by_a_real_code() {
+        let path = activation_temp_path("accept-supersede");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-LEGACY-THEN-REAL";
+        seed_legacy_profile(&path, device, true);
+        ensure_device_identity_at(&path).expect("grandfather the device");
+        assert_eq!(entitlement_rows(&path), 1, "the device must be shimmed");
+
+        // The shim alone keeps the shop running.
+        let state = entitlement_state_at(&path, device, &test_trusted_keys()).expect("state");
+        assert_eq!(state["state"], serde_json::json!("Active"));
+        assert_eq!(state["billing_allowed"], serde_json::json!(true));
+        assert_eq!(state["verification_state"], serde_json::json!("LEGACY_GRANDFATHER"));
+
+        // First real redemption supersedes the shim.
+        let issued = today_day().saturating_sub(10);
+        let payload = build_payload(device, 9001, issued, 365, None);
+        let sig = sign_payload(&payload);
+        let result =
+            accept_entitlement_at(&path, device, &payload, &sig, "OFFLINE_FILE", &test_trusted_keys())
+                .expect("real code accepted");
+        let superseded = result["superseded"].as_array().expect("superseded array");
+        assert_eq!(superseded.len(), 1, "the shim must be superseded");
+        assert_eq!(superseded[0], serde_json::json!(format!("LEGACY-{device}")));
+
+        let conn = Connection::open(&path).expect("open db");
+        let shim_superseded: Option<String> = conn
+            .query_row(
+                "SELECT superseded_at FROM local_entitlement WHERE verification_state = 'LEGACY_GRANDFATHER'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read shim");
+        assert!(shim_superseded.is_some(), "the shim must carry a superseded_at");
+        drop(conn);
+
+        let state = entitlement_state_at(&path, device, &test_trusted_keys()).expect("state");
+        assert_eq!(state["state"], serde_json::json!("Active"));
+        assert_eq!(state["verification_state"], serde_json::json!("VERIFIED"));
+        assert_eq!(state["entitlement_serial"], serde_json::json!("9001"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bootstrap_credential_is_pending_then_consumed_once() {
+        let path = activation_temp_path("accept-bootstrap");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-BOOTSTRAP-1";
+        let issued = today_day().saturating_sub(10);
+        // bootstrap_valid_days comfortably beyond the 10-day backdate so the window is open now.
+        let payload = build_payload(device, 77, issued, 365, Some(("owner", 30)));
+        let sig = sign_payload(&payload);
+        let accept =
+            accept_entitlement_at(&path, device, &payload, &sig, "OFFLINE_FILE", &test_trusted_keys())
+                .expect("bootstrap code accepted");
+        assert_eq!(accept["bootstrap_present"], serde_json::json!(true));
+
+        let state = entitlement_state_at(&path, device, &test_trusted_keys()).expect("state");
+        let boot = &state["bootstrap"];
+        assert_eq!(boot["pending"], serde_json::json!(true));
+        assert_eq!(boot["consumed"], serde_json::json!(false));
+        assert_eq!(boot["window_open"], serde_json::json!(true));
+        assert_eq!(boot["owner_username"], serde_json::json!("owner"));
+        assert_eq!(
+            boot["owner_salt_hex"],
+            serde_json::json!("11111111111111111111111111111111")
+        );
+        assert_eq!(
+            boot["owner_verifier_hex"],
+            serde_json::json!("2222222222222222222222222222222222222222222222222222222222222222")
+        );
+
+        consume_bootstrap_at(&path, device, "77").expect("consume");
+        let state = entitlement_state_at(&path, device, &test_trusted_keys()).expect("state");
+        assert_eq!(state["bootstrap"]["pending"], serde_json::json!(false));
+        assert_eq!(state["bootstrap"]["consumed"], serde_json::json!(true));
+
+        let conn = Connection::open(&path).expect("open db");
+        let consumed_audit: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_entitlement_audit WHERE event = 'BOOTSTRAP_CREDENTIAL_CONSUMED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count consumption audit");
+        assert_eq!(consumed_audit, 1, "consumption must be logged once");
+        let first_ts: String = conn
+            .query_row(
+                "SELECT bootstrap_consumed_at FROM local_entitlement WHERE entitlement_serial = '77'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read consumed timestamp");
+        drop(conn);
+
+        // A second consume is a no-op: it must not overwrite the timestamp or re-log.
+        consume_bootstrap_at(&path, device, "77").expect("second consume");
+        let conn = Connection::open(&path).expect("open db");
+        let second_ts: String = conn
+            .query_row(
+                "SELECT bootstrap_consumed_at FROM local_entitlement WHERE entitlement_serial = '77'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read consumed timestamp again");
+        assert_eq!(first_ts, second_ts, "single-use: timestamp must never be overwritten");
+        let consumed_audit_again: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_entitlement_audit WHERE event = 'BOOTSTRAP_CREDENTIAL_CONSUMED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count consumption audit again");
+        assert_eq!(consumed_audit_again, 1, "a no-op consume must not re-log");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn empty_db_reports_unprovisioned() {
+        let path = activation_temp_path("state-empty");
+        let _ = fs::remove_file(&path);
+        let state =
+            entitlement_state_at(&path, "FZDEV-NONE", &test_trusted_keys()).expect("state");
+        assert_eq!(state["state"], serde_json::json!("Unprovisioned"));
+        assert_eq!(state["billing_allowed"], serde_json::json!(false));
+        assert_eq!(state["bootstrap"], serde_json::Value::Null);
         let _ = fs::remove_file(&path);
     }
 

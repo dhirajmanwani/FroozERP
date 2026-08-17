@@ -275,3 +275,57 @@ export async function listLocalPurchases() {
   if (!isTauriRuntime()) return [];
   return invokeLocal("purchase_list_local");
 }
+
+// ---------------------------------------------------------------------------
+// Offline activation entitlements (docs/offline-activation-plan.md Stage 5).
+// The frontend never evaluates entitlement policy itself (design §2.3) — it
+// asks the Rust shell for the state and renders it.
+// ---------------------------------------------------------------------------
+
+/**
+ * Current entitlement state for a device. Off-desktop this returns Unprovisioned
+ * so browser/dev builds never mistake "no shell" for "no licence".
+ */
+export async function getEntitlementStatus(deviceId) {
+  if (!isTauriRuntime()) {
+    return { state: "Unprovisioned", billing_allowed: false, capabilities: null };
+  }
+  return invokeLocal("entitlement_status", { deviceId: String(deviceId || "") });
+}
+
+/** Redeem raw signed activation bytes (base64 payload + signature). */
+export async function redeemEntitlement({ deviceId, payloadBase64, signatureBase64, source } = {}) {
+  if (!isTauriRuntime()) {
+    throw new Error("Activation is only available inside the FroozERP desktop app.");
+  }
+  return invokeLocal("entitlement_redeem", {
+    deviceId: String(deviceId || ""),
+    payloadBase64: String(payloadBase64 || ""),
+    signatureBase64: String(signatureBase64 || ""),
+    source: source || null,
+  });
+}
+
+/** Import a .lic activation file (whole file text) and redeem it. */
+export async function importEntitlementFile({ deviceId, contents, source } = {}) {
+  if (!isTauriRuntime()) {
+    throw new Error("Activation is only available inside the FroozERP desktop app.");
+  }
+  return invokeLocal("entitlement_import_file", {
+    deviceId: String(deviceId || ""),
+    contents: String(contents || ""),
+    source: source || null,
+  });
+}
+
+/**
+ * Mark the bootstrap Owner credential consumed after the forced password change
+ * completes (design §8.2). Single-use is local policy — never reversible.
+ */
+export async function consumeBootstrapCredential({ deviceId, entitlementSerial } = {}) {
+  if (!isTauriRuntime()) return null;
+  return invokeLocal("entitlement_consume_bootstrap", {
+    deviceId: String(deviceId || ""),
+    entitlementSerial: String(entitlementSerial || ""),
+  });
+}

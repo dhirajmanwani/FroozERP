@@ -11,8 +11,11 @@ import {
   cacheLocalReferenceSnapshot,
   cancelLocalPosSale,
   completeLocalPosSale,
+  consumeBootstrapCredential,
   editLocalPosSale,
+  getEntitlementStatus,
   getOrCreateLocalDeviceIdentity,
+  importEntitlementFile,
   initializeLocalDatabase,
   isTauriRuntime,
   listLocalPurchases,
@@ -28,6 +31,7 @@ import {
   verifyOfflineSessionRecord,
 } from "./local/offlineSession";
 import { resolveOfflineCredentialSource } from "./local/offlineCredentialSource";
+import { verifyBootstrapCredential } from "./local/bootstrapCredential";
 import { buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode } from "./local/connectivityMode";
@@ -1572,6 +1576,7 @@ function App() {
   const [user, setUser] = useState(null);
   const [deviceInfo, setDeviceInfo] = useState(() => getClientDeviceInfo());
   const [localDbStatus, setLocalDbStatus] = useState(null);
+  const [entitlement, setEntitlement] = useState(null);
   const [localDbAudit, setLocalDbAudit] = useState(null);
   const [mandatoryRuntimeState, setMandatoryRuntimeState] = useState(() => (isTauriRuntime() ? "checking" : "ready"));
   const startupRenderStateRef = useRef("");
@@ -2054,6 +2059,28 @@ function App() {
       cancelled = true;
     };
   }, []);
+
+  // Offline-activation entitlement (design §9). Resolved once the device identity is known and
+  // refreshed after a redemption. A read that fails is logged and left null — never a reason to
+  // block the login screen (design §2.5).
+  useEffect(() => {
+    if (!isTauriRuntime()) return undefined;
+    const deviceId = deviceInfo?.device_id;
+    if (!deviceId) return undefined;
+    let cancelled = false;
+    getEntitlementStatus(deviceId)
+      .then((status) => {
+        if (!cancelled) setEntitlement(status);
+      })
+      .catch((error) => {
+        writeDiagnosticLog("WARN", "entitlement-status-failed", {
+          message: error?.message || String(error),
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [deviceInfo?.device_id]);
 
   const renderedStartupState = mandatoryRuntimeState === "checking"
     ? "mandatory-runtime-checking"
@@ -3576,6 +3603,23 @@ function App() {
       localServiceState: localServiceStartupStateRef.current,
     }).banner);
     return snapshot;
+  };
+
+  const refreshEntitlement = async (deviceId = deviceInfo?.device_id) => {
+    if (!isTauriRuntime()) return null;
+    try {
+      const status = await getEntitlementStatus(deviceId);
+      setEntitlement(status);
+      return status;
+    } catch (error) {
+      // Fail into the running state, not out of it (design §2.5): a status read that
+      // will not answer must not brick the login screen. Surface it, keep going.
+      writeDiagnosticLog("WARN", "entitlement-status-failed", {
+        code: error?.code || "ENTITLEMENT_STATUS_FAILED",
+        message: error?.message || String(error),
+      });
+      return null;
+    }
   };
 
   const continueOffline = async (latestDevice = deviceInfo) => {
@@ -5820,6 +5864,23 @@ function App() {
   if (mandatoryRuntimeState === "fatal") {
     return <ConfirmedLocalRuntimeFailure message={localDbStatus?.error || startupError} />;
   }
+  if (!user && isTauriRuntime() && entitlement
+      && (entitlement.state === "Unprovisioned" || entitlement.bootstrap?.pending)) {
+    return (
+      <ActivationGate
+        deviceInfo={deviceInfo}
+        entitlement={entitlement}
+        onRefresh={refreshEntitlement}
+        onActivated={(owner) => {
+          setOfflineMode(true);
+          setDeviceGate(null);
+          setStartupError("");
+          setUser(owner);
+        }}
+        onExit={requestControlledExit}
+      />
+    );
+  }
   if (!user) {
     return (
       <main className="login-page">
@@ -7817,6 +7878,234 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
         <button className="primary-button" disabled={!canManage} onClick={save}><Icon name="settings" /> Save FROST Settings</button>
       </div>
     </ModuleCard>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Offline activation (docs/offline-activation-plan.md Stage 5).
+//
+// Shown before the login form whenever the shell reports the device is
+// Unprovisioned (design §8.1, §8.2). The screen never evaluates entitlement
+// policy itself — it imports a signed .lic, asks Rust to redeem it, and renders
+// whatever state Rust reports back. Verification happens in Rust, not here
+// (design §2.3).
+// ---------------------------------------------------------------------------
+
+function BootstrapOwnerSetup({ deviceInfo, entitlement, onActivated }) {
+  const bootstrap = entitlement?.bootstrap || {};
+  const ownerUsername = bootstrap.owner_username || "";
+  const [step, setStep] = useState("verify");
+  const [tempPassword, setTempPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const verifyTemporary = async () => {
+    setError("");
+    if (!tempPassword) {
+      setError("Enter the temporary password provided with this activation.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const result = await verifyBootstrapCredential({
+        username: ownerUsername,
+        password: tempPassword,
+        saltHex: bootstrap.owner_salt_hex,
+        verifierHex: bootstrap.owner_verifier_hex,
+      });
+      if (!result.ok) {
+        setError(result.code === "MALFORMED_BOOTSTRAP"
+          ? "This activation's Owner credential could not be read. Ask for a fresh activation file."
+          : "The temporary password does not match this activation.");
+        return;
+      }
+      setStep("change");
+    } catch (caught) {
+      setError(String(caught?.message || caught || "Could not verify the temporary password."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const completePasswordChange = async () => {
+    setError("");
+    if (newPassword.length < 6) {
+      setError("Choose a new password of at least 6 characters.");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setError("The new password and its confirmation do not match.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const owner = {
+        id: ownerUsername,
+        username: ownerUsername,
+        name: ownerUsername,
+        role: "Owner",
+        branch_id: entitlement?.branch_id || "1",
+        offline_session: true,
+        authentication_source: "bootstrap_activation",
+        canonical_user_id: ownerUsername,
+      };
+      // Write a normal offline_auth record under the NEW password (design §8.2 step 2),
+      // through the same path a regular offline session uses.
+      await cacheOfflineSession({
+        username: ownerUsername,
+        password: newPassword,
+        user: owner,
+        deviceId: deviceInfo?.device_id || "",
+        branchId: owner.branch_id,
+      });
+      // Single-use is local policy: the payload verifier is never consulted again (§8.2).
+      await consumeBootstrapCredential({
+        deviceId: deviceInfo?.device_id || "",
+        entitlementSerial: entitlement?.entitlement_serial || "",
+      });
+      onActivated(owner);
+    } catch (caught) {
+      setError(String(caught?.message || caught || "Could not complete the password change."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="device-activation-panel">
+      <span className="eyebrow">Set Up Owner Account</span>
+      {step === "verify" ? (
+        <>
+          <strong>Confirm the temporary password for {ownerUsername || "the Owner"}.</strong>
+          <p>This device was activated with a one-time Owner credential. Enter the temporary password you were given to continue.</p>
+          <input
+            type="password"
+            placeholder="Temporary password"
+            value={tempPassword}
+            onChange={(event) => setTempPassword(event.target.value)}
+            onKeyDown={(event) => event.key === "Enter" && !busy && verifyTemporary()}
+          />
+          {error && <small className="startup-status-error">{error}</small>}
+          <button className="primary-button" disabled={busy} onClick={verifyTemporary}>
+            {busy ? "Checking..." : "Continue"}
+          </button>
+        </>
+      ) : (
+        <>
+          <strong>Choose a new password for {ownerUsername || "the Owner"}.</strong>
+          <p>The temporary password cannot be used again. Set a permanent Owner password to finish setting up this device.</p>
+          <input
+            type="password"
+            placeholder="New password"
+            value={newPassword}
+            onChange={(event) => setNewPassword(event.target.value)}
+          />
+          <input
+            type="password"
+            placeholder="Confirm new password"
+            value={confirmPassword}
+            onChange={(event) => setConfirmPassword(event.target.value)}
+            onKeyDown={(event) => event.key === "Enter" && !busy && completePasswordChange()}
+          />
+          {error && <small className="startup-status-error">{error}</small>}
+          <button className="primary-button" disabled={busy} onClick={completePasswordChange}>
+            {busy ? "Saving..." : "Set Password & Continue"}
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExit }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const fileInputRef = useRef(null);
+
+  if (entitlement?.bootstrap?.pending) {
+    return (
+      <main className="login-page">
+        <section className="login-panel">
+          <div className="login-brand">
+            <BrandLogo />
+          </div>
+          <BootstrapOwnerSetup
+            deviceInfo={deviceInfo}
+            entitlement={entitlement}
+            onActivated={onActivated}
+          />
+        </section>
+      </main>
+    );
+  }
+
+  const importFile = async (file) => {
+    setError("");
+    setNotice("");
+    if (!file) return;
+    setBusy(true);
+    try {
+      const contents = await file.text();
+      await importEntitlementFile({ deviceId: deviceInfo?.device_id || "", contents });
+      setNotice("Activation accepted.");
+      await onRefresh(deviceInfo?.device_id);
+    } catch (caught) {
+      const message = String(caught?.message || caught || "This activation file could not be redeemed.");
+      setError(message.startsWith("DEVICE_BINDING_MISMATCH")
+        ? "This activation file was issued for a different device."
+        : message);
+    } finally {
+      setBusy(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  return (
+    <main className="login-page">
+      <section className="login-panel">
+        <div className="login-brand">
+          <BrandLogo />
+        </div>
+        <div className="login-copy">
+          <span className="eyebrow">Device Activation Required</span>
+          <h1>{APP_DISPLAY_NAME}</h1>
+          <p>This device is not yet activated. Import the activation file (.lic) supplied by the FroozERP owner to enable this installation.</p>
+        </div>
+        <div className="device-activation-panel">
+          <span className="eyebrow">This device</span>
+          <small>Device ID: {deviceInfo?.device_id || "(resolving...)"}</small>
+          <p>Read this Device ID to the owner so a matching activation file can be issued for it.</p>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".lic,.txt,text/plain"
+            disabled={busy}
+            onChange={(event) => importFile(event.target.files?.[0])}
+          />
+          <button
+            className="primary-button"
+            type="button"
+            disabled={busy}
+            onClick={() => fileInputRef.current?.click()}
+          >
+            {busy ? "Activating..." : "Choose Activation File"}
+          </button>
+          {notice && <small>{notice}</small>}
+          {error && <small className="startup-status-error">{error}</small>}
+        </div>
+        <div className="startup-actions">
+          <button className="secondary-button" type="button" disabled={busy} onClick={() => onRefresh(deviceInfo?.device_id)}>
+            Refresh Status
+          </button>
+          <button className="secondary-button login-close-exit-button" type="button" disabled={busy} onClick={onExit}>
+            Close &amp; Exit
+          </button>
+        </div>
+      </section>
+    </main>
   );
 }
 
