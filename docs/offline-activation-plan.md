@@ -12,7 +12,12 @@
 > | 0 — test-environment hygiene | **Closed 2026-08-16.** No action was needed: `local_device_assignment` measured empty (0 rows) across the live app-data profile and all four 2026-08-15 scratchpad copies. Nothing was deleted. See the re-measurement note in `docs/backlog-1.0.72.md` item 5. |
 > | 1 — `entitlement.rs` pure core | **Complete 2026-08-16.** `src-tauri/src/entitlement.rs`, declared as `pub mod entitlement;` in `lib.rs` with no call sites. |
 > | 2 — migration `017` | **Complete 2026-08-17.** Draft reviewed against design §5 and accepted unchanged; registered in `local_db.rs`. See the Stage 2 record at the end of this file. |
-> | 3–10 | Not started. |
+> | 3 — signing CLI + fixtures | **Complete 2026-08-17.** `src-tauri/tools/sign_activation.rs`, `.lic` format, fixture set, 23/23 round-trip tests against real signed bytes. Real root public keys baked into `TRUSTED_ACTIVATION_KEYS`. |
+> | 4 — grandfathering, localStorage fix, backlog 3/4/5 | **Partially complete 2026-08-17.** The localStorage-shadowing fix and backlog items 3, 4 and 5 are done and verified on a disposable profile. **Grandfathering (`LEGACY_GRANDFATHER` insert) is NOT built** — see the Stage 4 record. |
+> | 5–10 | Not started. |
+>
+> **Parallel track:** `docs/auth-hardening-plan.md` (stages A-1 … A-6) scopes the auth debt. It
+> is the gate on remote access and is independent of the stages below.
 >
 > **Two amendments made after this plan was approved — both supersede the text below:**
 >
@@ -466,3 +471,68 @@ No ruled decision (D-1 … D-17) was reopened, and both 2026-08-16 amendments we
 §5.3 clock rule is why the migration seeds no `entitlement_clock_high_water` value, and the §3.1
 crypto ruling is why the CHECK pins a signature at exactly 64 raw bytes rather than a minisign
 envelope.
+
+---
+
+## Stages 3 and 4 record — 2026-08-17
+
+### Stage 3 — complete
+
+`src-tauri/tools/sign_activation.rs` (signing CLI, `sign` and `pubkey` subcommands), the `.lic`
+container, a fixture set covering every rejection path, and `tests/activation_roundtrip.rs`.
+
+`cargo test --test activation_roundtrip`: **23 passed, 0 failed.** This is the first point at
+which the signature format met bytes the signer actually produces — Stage 1's 33 tests used
+synthetic buffers. Includes the §2.2 invariant (no fixture outcome denies billing) and that
+winding the clock back does not extend an entitlement.
+
+Bundle exclusion verified against tauri-cli 2.11.2 source in three independent layers:
+`required-features` makes `get_binaries` skip the bin because it tests `options.features` (the
+`--features` command line, not Cargo defaults); the source lives in `tools/` so the `src/bin`
+rescan cannot re-add it; and `build:windows` passes no `--features`.
+
+**Root keypairs generated (D-3).** On the maintainer's machine, never here. Public halves are in
+`TRUSTED_ACTIVATION_KEYS`; private seeds are encrypted with a paper backup and never entered the
+repo, CI or any cloud host. Each public key was verified three ways before being committed:
+SHA-256 against the generator's printed checksum, validity as an Ed25519 curve point, and — the
+decisive one — the Rust CLI's `pubkey` subcommand deriving the identical bytes from the seed.
+
+### Stage 4 — partially complete, and the gap matters
+
+**Done:** the localStorage-shadowing fix (new `frontend/src/local/offlineCredentialSource.js`,
+wired into `continueOffline`), the `NO_SESSION` wording, and backlog items 3 and 4 (cloud-target
+fallback and LOCAL_ONLY gating), plus the pre-existing gateway breach in backlog item 7c.
+
+**Verified in the real application on a disposable profile:** the maintainer's laptop signs in
+offline with the stale `localStorage` record still present. Isolation was proven by file
+timestamp, not assumed — `F:\froozerp-disposable\froozerp-local.sqlite3` written minutes before,
+the live `%APPDATA%` profile untouched four days earlier. A full profile backup was taken first.
+Connection status showed `Cloud Backend Paused` / `Sync Paused` with no cloud contact. The
+maintainer reported the `cloud-request-audit.jsonl` check clean; that output was not observed
+directly by the agent and is recorded on their word.
+
+Two observations from the walkthrough, both expected and neither a regression:
+- **`App Mode: Hybrid`** despite `legacyDesktopLocalMode` being removed — the profile has an
+  explicitly saved mode, and saved config outranks defaults. The removal only changes the
+  *unconfigured* case.
+- **"Unable to load branch and device assignments"** — that panel calls the cloud
+  `/api/v3/admin/scope-management`. It was already failing with Railway down; it now fails as a
+  named refusal with no outbound request. Branch and device management is cloud-side by design.
+
+> **NOT BUILT — grandfathering.** Stage 4's first bullet specifies inserting a
+> `LEGACY_GRANDFATHER` / `LEGACY_UPGRADE` row with 400-day validity (D-15) when a device has one
+> approved identity, a cached snapshot, and no entitlement. **No such code exists.** Migration 017
+> created the table and the CHECK constraint was confirmed to admit the shim's shape, but nothing
+> writes it.
+>
+> This did not block the laptop repair — that was the localStorage fix, which is independent — so
+> the stage's headline goal is met. But every existing device still has **zero** rows in
+> `local_entitlement`, so `entitlement_status` will report `Unprovisioned` for all of them the
+> moment Stage 5 wires it up. Grandfathering must land with or before Stage 5, or upgrading
+> devices will meet an activation screen instead of their app, which §11.1 exists specifically to
+> prevent.
+
+### Next
+
+Stage 5 (`.lic` redemption, activation screen, Tauri commands) — **carrying the grandfathering
+work with it**, and the first stage to exercise the real keys end to end.
