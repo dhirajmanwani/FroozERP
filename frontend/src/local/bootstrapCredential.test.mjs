@@ -5,6 +5,9 @@ import {
   bytesToBase64,
   deriveBootstrapVerifier,
   verifyBootstrapCredential,
+  isConsumedBootstrapReplay,
+  BOOTSTRAP_CONSUMED_CODE,
+  BOOTSTRAP_CONSUMED_MESSAGE,
 } from "./bootstrapCredential.js";
 
 const encoder = new TextEncoder();
@@ -126,4 +129,85 @@ test("malformed inputs (missing verifierHex) yield MALFORMED_BOOTSTRAP", async (
   assert.equal((await verifyBootstrapCredential()).code, "MALFORMED_BOOTSTRAP");
   // Unparseable hex is malformed, not "invalid password".
   assert.equal((await verifyBootstrapCredential({ ...base, verifierHex: "zz" })).code, "MALFORMED_BOOTSTRAP");
+});
+
+// -----------------------------------------------------------------------------------------------
+// Replay of a consumed bootstrap credential (§8.2)
+//
+// The gap these close was found by asking, after the Windows walkthrough, whether a replayed
+// temporary password actually produced its own code. It did not: it fell through to the generic
+// INVALID_CREDENTIALS, which §8.2 names explicitly as the thing not to do.
+// -----------------------------------------------------------------------------------------------
+
+const bootstrapFixture = async ({ consumed, username = "dhirajmanwani", password = "TEMP-PASS-1234" }) => {
+  const saltBytes = new Uint8Array(16).fill(0x5a);
+  const verifierBase64 = await referenceVerifierBase64({ username, password, saltBytes });
+  const verifierBytes = Uint8Array.from(atob(verifierBase64), (c) => c.charCodeAt(0));
+  return {
+    bootstrap: {
+      consumed,
+      pending: !consumed,
+      owner_username: username,
+      owner_salt_hex: bytesToHex(saltBytes),
+      owner_verifier_hex: bytesToHex(verifierBytes),
+    },
+    username,
+    password,
+  };
+};
+
+test("reusing a consumed temporary password is recognised as a replay, not a typo", async () => {
+  const { bootstrap, username, password } = await bootstrapFixture({ consumed: true });
+  assert.equal(await isConsumedBootstrapReplay({ username, password, bootstrap }), true);
+});
+
+test("a genuinely wrong password is not reported as a replay", async () => {
+  const { bootstrap, username } = await bootstrapFixture({ consumed: true });
+  assert.equal(
+    await isConsumedBootstrapReplay({ username, password: "SOMETHING-ELSE", bootstrap }),
+    false,
+    "only the real temporary password may produce the consumed code",
+  );
+});
+
+test("an unconsumed credential is never a replay, however correct the password", async () => {
+  // While pending, the setup screen owns this password; classifying it as a replay here would
+  // mislabel the ordinary activation flow.
+  const { bootstrap, username, password } = await bootstrapFixture({ consumed: false });
+  assert.equal(await isConsumedBootstrapReplay({ username, password, bootstrap }), false);
+});
+
+test("a different user's sign-in is never attributed to the Owner's consumed credential", async () => {
+  const { bootstrap, password } = await bootstrapFixture({ consumed: true });
+  assert.equal(await isConsumedBootstrapReplay({ username: "cashier", password, bootstrap }), false);
+});
+
+test("username comparison is case- and whitespace-insensitive, matching the KDF", async () => {
+  const { bootstrap, password } = await bootstrapFixture({ consumed: true });
+  assert.equal(await isConsumedBootstrapReplay({ username: "  DHIRAJMANWANI ", password, bootstrap }), true);
+});
+
+test("a missing or malformed bootstrap block is never a replay", async () => {
+  const password = "TEMP-PASS-1234";
+  assert.equal(await isConsumedBootstrapReplay({ username: "x", password, bootstrap: null }), false);
+  assert.equal(await isConsumedBootstrapReplay({ username: "x", password, bootstrap: {} }), false);
+  assert.equal(await isConsumedBootstrapReplay({}), false);
+  assert.equal(
+    await isConsumedBootstrapReplay({
+      username: "x",
+      password,
+      bootstrap: { consumed: true, owner_username: "x", owner_salt_hex: "zz", owner_verifier_hex: "zz" },
+    }),
+    false,
+    "unparseable hex must not throw or be treated as a match",
+  );
+});
+
+test("the consumed code is distinct from the generic credential failure", () => {
+  // §8.2: "not folded into INVALID_CREDENTIALS -- a maintainer debugging a branch by phone needs
+  // to know which of the two happened."
+  assert.equal(BOOTSTRAP_CONSUMED_CODE, "BOOTSTRAP_CREDENTIAL_CONSUMED");
+  assert.notEqual(BOOTSTRAP_CONSUMED_CODE, "INVALID_CREDENTIALS");
+  assert.ok(BOOTSTRAP_CONSUMED_MESSAGE.trim().length > 0);
+  assert.match(BOOTSTRAP_CONSUMED_MESSAGE, /already been used/);
 });

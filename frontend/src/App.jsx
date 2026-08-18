@@ -31,7 +31,11 @@ import {
   verifyOfflineSessionRecord,
 } from "./local/offlineSession";
 import { resolveOfflineCredentialSource } from "./local/offlineCredentialSource";
-import { verifyBootstrapCredential } from "./local/bootstrapCredential";
+import {
+  BOOTSTRAP_CONSUMED_MESSAGE,
+  isConsumedBootstrapReplay,
+  verifyBootstrapCredential,
+} from "./local/bootstrapCredential";
 import { resolveOfflineOpenDecision } from "./local/offlineDataReadiness";
 import { buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
@@ -3659,7 +3663,19 @@ function App() {
       deviceId: latestDevice.device_id,
     });
     if (!offlineAuth.ok) {
-      setStartupError([offlineAuth.message, credentialSource.notice].filter(Boolean).join(" "));
+      // §8.2: a reused temporary activation password must be named, not folded into
+      // INVALID_CREDENTIALS. This runs only after authentication has already failed, so it
+      // classifies the failure and never grants access.
+      let failureMessage = offlineAuth.message;
+      if (offlineAuth.code === "INVALID_CREDENTIALS"
+        && await isConsumedBootstrapReplay({ username, password, bootstrap: entitlement?.bootstrap })) {
+        failureMessage = BOOTSTRAP_CONSUMED_MESSAGE;
+        writeDiagnosticLog("WARN", "bootstrap-credential-replay-refused", {
+          code: "BOOTSTRAP_CREDENTIAL_CONSUMED",
+          deviceId: latestDevice?.device_id,
+        });
+      }
+      setStartupError([failureMessage, credentialSource.notice].filter(Boolean).join(" "));
       return false;
     }
     // Entitlement decides access; data presence decides what is shown. An activated device with

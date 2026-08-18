@@ -110,3 +110,50 @@ export const verifyBootstrapCredential = async ({ username, password, saltHex, v
   }
   return { ok: false, code: "INVALID_BOOTSTRAP_PASSWORD" };
 };
+
+// ---------------------------------------------------------------------------------------------
+// Replay of an already-consumed bootstrap credential (§8.2)
+// ---------------------------------------------------------------------------------------------
+
+/** Distinct rejection code §8.2 requires: never folded into INVALID_CREDENTIALS. */
+export const BOOTSTRAP_CONSUMED_CODE = "BOOTSTRAP_CREDENTIAL_CONSUMED";
+
+export const BOOTSTRAP_CONSUMED_MESSAGE =
+  "That temporary activation password has already been used to set up this device. Sign in with the permanent password chosen during setup.";
+
+/**
+ * Was this failed sign-in an attempt to reuse the temporary activation password?
+ *
+ * §8.2 asks for two things that look contradictory until you separate *granting* from
+ * *classifying*: "from that point the app never compares against the payload's original verifier
+ * again", and "a later attempt is rejected with a distinct BOOTSTRAP_CREDENTIAL_CONSUMED code, not
+ * folded into INVALID_CREDENTIALS". Telling the two failures apart is only possible by comparing,
+ * so the rule is that the comparison here **never authenticates anyone** — it runs only after
+ * authentication has already failed, and its sole output is which error to show. A consumed
+ * credential cannot become a way in through this path; `pending` is what gates the setup screen,
+ * and consumption clears it permanently.
+ *
+ * Why it matters: the design describes a maintainer debugging a branch over the phone. "Wrong
+ * password" sends them hunting for a typo; "that one was already used, use the new one" ends the
+ * call. Same reasoning as every named `RejectReason` in `entitlement.rs`.
+ *
+ * @param {object} input
+ * @param {string} input.username  the username that was attempted.
+ * @param {string} input.password  the password that was attempted.
+ * @param {object|null} input.bootstrap  `entitlement.bootstrap` as reported by the shell.
+ * @returns {Promise<boolean>} true only for a genuine reuse of a consumed credential.
+ */
+export const isConsumedBootstrapReplay = async ({ username, password, bootstrap } = {}) => {
+  if (!bootstrap || bootstrap.consumed !== true) return false;
+  const owner = typeof bootstrap.owner_username === "string" ? bootstrap.owner_username.trim() : "";
+  const attempted = typeof username === "string" ? username.trim() : "";
+  if (!owner || !attempted) return false;
+  if (owner.toLowerCase() !== attempted.toLowerCase()) return false;
+  const result = await verifyBootstrapCredential({
+    username: attempted,
+    password,
+    saltHex: bootstrap.owner_salt_hex,
+    verifierHex: bootstrap.owner_verifier_hex,
+  });
+  return result.ok === true;
+};

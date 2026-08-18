@@ -372,6 +372,32 @@ scope is the additive `017` migration and its registration.
 **Severity:** latent schema drift. Nothing is currently broken by it, which is exactly why it has
 gone unnoticed.
 
+> **CORRECTION 2026-08-18 — 6a is not a defect, and must not be "fixed".** Re-read
+> `008_cloud_sync_entity_metadata.sql`. Its own first three lines say:
+>
+> ```
+> -- Migration plan only. It is intentionally not included by local_db.rs.
+> -- Apply only through the controlled SQLite migration runner after a verified local backup.
+> ```
+>
+> 008 is therefore **deliberately** unregistered, and says so in the file. Neither `006` nor `007`
+> carries that line — and both *are* registered on this branch — so the three files were never
+> equivalent cases, which is what made "the const list skips 008" look like drift.
+>
+> Two further facts settle it. `cloud_sync_entity_metadata` is referenced by **zero lines** of Rust,
+> backend or frontend code, and no later migration (`009`–`018`) touches it. Registering 008 would
+> add an unused table and two unused indexes to every device in the field: a schema change with real
+> risk, no consumer, and no benefit. It stays unregistered until something actually needs the table,
+> at which point it lands as a normal forward-only migration.
+>
+> **6b stands as written** — `006` and `007` genuinely were missing from builds cut off `main`, and
+> that did ship. Those two are registered here, and because `apply_migration` is version-gated they
+> apply on upgrade, so a device moving to a build from this branch heals itself. Nothing to do
+> beyond shipping.
+>
+> The original text is kept below, unedited, because the reasoning it records is still the right
+> reasoning — it was applied to a file whose header had not been read.
+
 ### 6a. `008_cloud_sync_entity_metadata.sql` is orphaned on this branch
 
 `src-tauri/migrations/sqlite/008_cloud_sync_entity_metadata.sql` exists on disk. The const list in
