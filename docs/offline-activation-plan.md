@@ -590,6 +590,32 @@ payload bytes → the app's own `verifyBootstrapCredential` accepted the generat
 refused a wrong one. The salt and verifier recovered from the signed payload matched the generator's
 output byte for byte. That covers every hop except the Tauri/Windows UI itself.
 
-### Not verified here
+### Verified end to end on Windows — 2026-08-18
 
-The App.jsx activation gate and bootstrap login were **not** exercised in the real desktop app — this Linux container has no Windows Tauri runtime, and per `CLAUDE.md` the packaged app is never launched on the real laptop. The pure pieces (state mirror, bootstrap KDF, `.lic` parser, acceptance/state SQL) are covered by unit tests; the App.jsx wiring is lint- and build-clean but wants a disposable-profile walkthrough on Windows before release.
+The gap above was closed the same day: the maintainer ran the full path on a fresh disposable
+profile (`F:\froozerp-disposable\stage5-20260818-100316`, `NODE_ENV=test` +
+`FROOZERP_ISOLATED_SQLITE_DIR`, isolation confirmed by file timestamp) using the **real**
+`key_id 0x01` production signing key from `F:\froozerp.keys\` — not a test fixture. Confirmed
+directly in the running app:
+
+- A device with no `local_device_identity` lands on **Device Activation Required**, showing its
+  own device id (`FZDEV-3C66EBC3-AC79-44B3-B26F-C3FE6FDECCEA`).
+- `npm run bootstrap:credential` (added this session, see below) plus `sign_activation` produced a
+  real `.lic`; the app's own `pubkey` output was checked byte-for-byte against
+  `TRUSTED_ACTIVATION_KEYS` before signing anything for real.
+- Redeeming the file promotes the device and surfaces the bootstrap Owner screen; a wrong temporary
+  password is refused, the correct one (independently verified via `deriveBootstrapVerifier` in
+  DevTools before use) is accepted.
+- The forced password-change screen cannot be bypassed; completing it lands in the app as Owner.
+- The dashboard confirms `Local Only mode selected`, `API mode: Local Only`, no cloud contact, and
+  POS/Products/Reports/Settings all reachable — LOCAL_ONLY billing works on a same-day activated
+  device with zero prior cloud contact, which is the whole point of the design.
+
+Not yet exercised: replay of a consumed bootstrap credential returning
+`BOOTSTRAP_CREDENTIAL_CONSUMED` specifically (rather than a generic rejection), and the
+`local_entitlement_audit` trail was not inspected row-by-row. Both are quick follow-ups, not
+re-opens of anything above.
+
+The pure pieces (state mirror, bootstrap KDF, `.lic` parser, acceptance/state SQL) were already
+covered by unit tests; this closes the one gap those couldn't reach — the actual Tauri/WebView2 UI
+on Windows.
