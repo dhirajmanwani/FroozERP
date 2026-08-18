@@ -32,6 +32,7 @@ import {
 } from "./local/offlineSession";
 import { resolveOfflineCredentialSource } from "./local/offlineCredentialSource";
 import { verifyBootstrapCredential } from "./local/bootstrapCredential";
+import { resolveOfflineOpenDecision } from "./local/offlineDataReadiness";
 import { buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode } from "./local/connectivityMode";
@@ -3661,11 +3662,24 @@ function App() {
       setStartupError([offlineAuth.message, credentialSource.notice].filter(Boolean).join(" "));
       return false;
     }
-    if (!snapshot?.reference_ready) {
+    // Entitlement decides access; data presence decides what is shown. An activated device with
+    // no products yet must still be able to sign in — refusing it here is what locked a freshly
+    // activated device out of its own app entirely.
+    const openDecision = resolveOfflineOpenDecision({
+      snapshot,
+      entitlementState: entitlement?.state ?? null,
+    });
+    if (!openDecision.allowed) {
       setOfflineReady(false);
       setLastReferenceSyncAt(snapshot?.last_successful_sync_at || offlineAuth.session?.lastSuccessfulSyncAt || "");
-      setStartupError("This device must connect to the internet once before offline use.");
+      setStartupError(openDecision.message);
       return false;
+    }
+    if (openDecision.empty) {
+      writeDiagnosticLog(openDecision.suspicious ? "WARN" : "INFO", "offline-open-with-empty-reference-data", {
+        code: openDecision.code,
+        suspicious: openDecision.suspicious,
+      });
     }
     const offlineUser = hasObjectContent(snapshot?.user_profile)
       ? snapshot.user_profile
@@ -5770,14 +5784,22 @@ function App() {
     const localDataMode = offlineMode || connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY;
     if (localDataMode) {
       const snapshot = await loadLocalReferenceSnapshot({ username: user?.username, deviceId: deviceInfo.device_id });
-      if (!snapshot?.reference_ready) {
-        setStartupError("This device must connect to the internet once before offline use.");
+      const openDecision = resolveOfflineOpenDecision({
+        snapshot,
+        entitlementState: entitlement?.state ?? null,
+      });
+      if (!openDecision.allowed) {
+        setStartupError(openDecision.message);
         return;
       }
       setSidebarOpen(false);
       const localOnly = connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY;
       await applyReferenceSnapshot(snapshot, { offline: offlineMode, localOnly, nextView: view });
-      if (localOnly) {
+      if (openDecision.empty) {
+        // An empty module must say why it is empty. Rendering ₹0.00 with no explanation is the
+        // failure CLAUDE.md names; the suspicious case says so louder than the new-device case.
+        setSyncMessage(openDecision.message);
+      } else if (localOnly) {
         setSyncMessage("Local Only mode selected - cloud sync paused.");
       } else if (offlineBackendRequiredViews.has(view)) {
         setSyncMessage("Offline - this module opens with local cached data where available. Some actions require the FroozERP backend.");
