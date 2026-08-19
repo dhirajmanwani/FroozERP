@@ -137,7 +137,32 @@ WhatsApp.
 **Depends on.** Cloud restored (scheduling needs a server that is awake); approved templates.
 
 **[P-3]** Customer consent: is opt-in recorded per customer, and where? Sending transactional bills
-to a customer who never asked is both a policy risk and a business one.
+to a customer who never asked is both a policy risk and a business one. Proposed shape: a
+`whatsapp_opt_in` flag on the customer record with the timestamp and how consent was obtained, so a
+bulk run can skip anyone who declined. It must exist *before* bulk sending, not after.
+
+**Official API vs "WhatsApp Bot Master" — settled 2026-08-18, recorded so it is not reopened.**
+
+The maintainer noted another application using a tool called "WhatsApp Bot Master". That name is
+generic, but such tools almost always fall into one of two categories:
+
+| | Unofficial automation panel | Official Meta Cloud API |
+| --- | --- | --- |
+| How it connects | QR-scan into WhatsApp Web, or a reverse-engineered library (Baileys, whatsapp-web.js) | Meta's sanctioned business API |
+| Templates | None needed | Pre-approved templates for business-initiated messages |
+| Cost | Cheap or one-off | Per conversation, category-based |
+| Risk | **Violates WhatsApp Terms of Service. Meta detects and bans numbers doing automated bulk sending.** | None when used correctly |
+
+**FroozERP already uses the official API** (`phone_number_id` + `access_token`, `App.jsx:1431`), and
+should stay on it. The decisive argument is not compliance in the abstract — it is that the ban
+lands on the business's own WhatsApp number, the one printed on its bills and known to every
+customer it has, with no reliable appeal.
+
+The trade would also buy capability that is not needed here. Unofficial panels exist mainly to do
+what the official API deliberately restricts: cold marketing to purchased contact lists. Sending a
+bill to a customer who has just transacted is *utility* messaging, which the official API supports
+directly — and if the customer messaged first, the 24-hour service window covers it with no template
+at all. The right tool for this use case is the one already wired in.
 
 ---
 
@@ -162,9 +187,15 @@ requirement: an OTP failure must never lock an already-authenticated cashier out
 
 **Depends on.** Auth hardening; an SMS provider account.
 
-**[P-4]** SMS provider: MSG91 (India-focused, cheaper, DLT-registered sender IDs required in India)
-versus Twilio (global, simpler API, costlier). India DLT registration is a lead-time item like the
-WhatsApp templates.
+**[P-4] RULED 2026-08-18 — MSG91.**
+
+> **Start the DLT registration now, before any code.** India's TRAI regulations require every entity
+> sending transactional SMS to register on a telecom operator's DLT platform: the business entity,
+> the sender ID (header), and **each message template**, all approved before a single OTP can be
+> delivered. This applies to any provider, MSG91 included — it is regulatory, not vendor-specific.
+> Approval takes days to weeks and needs business documents. It is the longest lead-time item on
+> this entire goal list and it blocks nothing else, so it should be started immediately and in
+> parallel with everything.
 
 ---
 
@@ -211,7 +242,16 @@ mandi purchases without carrying a laptop.
 **Current state.** Nothing generated. Tauri 2 supports mobile targets, so the shell is available —
 but see §2.1: the Node sidecar cannot come along.
 
-**[P-1] — the decision that must precede any mobile work.**
+**[P-1] RULED 2026-08-18 — (a) cloud client.**
+
+> **The known cost of this ruling, recorded so it is not rediscovered later.** A cloud client does
+> **not** serve the stated use case when there is no signal. A purchase manager standing in a mandi
+> with no data connection cannot enter a purchase on a thin client — he will fall back to paper, and
+> the entry will be keyed in later from memory or a photo. That is an acceptable first step for
+> learning the workflow cheaply; it is not the finished answer to "my purchase manager should not
+> carry a laptop". Expect (b) to follow once real usage shows how much of the work genuinely happens
+> offline. Scope (a) narrowly — purchase entry and viewing — so that little is thrown away when it
+> does.
 
 - **(a) Cloud client.** Thin app, talks to the cloud API, requires connectivity. Ships fastest.
   Fails exactly where the stated use case lives: a mandi with no signal.
@@ -265,16 +305,24 @@ answered with real usage evidence rather than in the abstract.
 
 ## 5. Open decisions
 
-| # | Decision | Owner | Blocking |
+| # | Decision | Status | Blocking |
 | --- | --- | --- | --- |
-| **P-1** | Mobile architecture: cloud client (a) or offline-capable (b) | Maintainer | All of G5 |
-| **P-2** | Does "simplify multibranch" mean the data model or only the screens | Maintainer | G1 scope |
-| **P-3** | Where customer WhatsApp consent/opt-in is recorded | Maintainer | G2 |
-| **P-4** | SMS provider: MSG91 vs Twilio (note India DLT lead time) | Maintainer | G3 |
-| **P-5** | FROST monthly spend cap, and behaviour when it is reached | Maintainer | G4 switch-on |
-| **P-6** | Authoritative voice provider for FROST realtime | Maintainer | G4 voice |
+| **P-1** | Mobile architecture | **RULED 2026-08-18: (a) cloud client**, scoped to purchase entry + viewing. Known cost recorded in G5: does not serve the no-signal mandi case; expect (b) later. | — |
+| **P-2** | Does "simplify multibranch" mean the data model or only the screens | Open | G1 scope |
+| **P-3** | Where customer WhatsApp consent/opt-in is recorded | Open. Tool choice settled (official API, stay as-is); the consent-storage question remains. | G2 |
+| **P-4** | SMS provider | **RULED 2026-08-18: MSG91.** DLT registration to start immediately — longest lead time on the list. | — |
+| **P-5** | FROST monthly spend cap, and behaviour when it is reached | Open | G4 switch-on |
+| **P-6** | Authoritative voice provider for FROST realtime | Open | G4 voice |
 
 None of these are blocked on engineering investigation; each is a business or product judgement.
+
+### Actions that should start now, independent of any code
+
+Both have external approval lead times measured in days-to-weeks, and neither blocks or is blocked
+by development:
+
+1. **India DLT registration** (entity, sender header, SMS templates) — gates G3 delivery entirely.
+2. **Meta WhatsApp template approval** for the bill-delivery message — gates G2 broadcast.
 
 ---
 
