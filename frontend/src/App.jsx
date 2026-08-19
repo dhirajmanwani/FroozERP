@@ -37,6 +37,18 @@ import {
   verifyBootstrapCredential,
 } from "./local/bootstrapCredential";
 import { resolveOfflineOpenDecision } from "./local/offlineDataReadiness";
+import { bannerForState } from "./local/entitlementState";
+import {
+  addNotification,
+  clearNotifications,
+  createNotification,
+  dismissNotification,
+  highestUnreadSeverity,
+  markAllRead,
+  NOTIFICATION_SEVERITY,
+  resolveNotification,
+  unreadCount,
+} from "./local/notificationCenter";
 import { buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode } from "./local/connectivityMode";
@@ -1479,6 +1491,7 @@ function Icon({ name, size = 18 }) {
     trend: <><path d="m3 17 6-6 4 4 8-8" /><path d="M15 7h6v6" /></>,
     rupee: <><path d="M6 4h12M6 8h12M7 4c5 0 6 8 0 8h-1l8 8" /></>,
     alert: <><path d="m12 3 10 18H2Z" /><path d="M12 9v4M12 17h.01" /></>,
+    bell: <><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.7 21a2 2 0 0 1-3.4 0" /></>,
     menu: <><path d="M4 6h16M4 12h16M4 18h16" /></>,
     logout: <><path d="M10 17l5-5-5-5M15 12H3M21 19V5a2 2 0 0 0-2-2h-6" /></>,
     search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></>,
@@ -1587,6 +1600,11 @@ function App() {
   const startupRenderStateRef = useRef("");
   const [syncStatus, setSyncStatus] = useState(null);
   const [syncMessage, setSyncMessage] = useState("");
+  // The notification centre. Messages used to live in a dozen separate useState boxes and 186
+  // blocking alert() popups: anything not read in the instant it appeared was gone, and a genuine
+  // warning looked identical to a routine status line. This is the one list that persists.
+  const [notifications, setNotifications] = useState([]);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [startupError, setStartupError] = useState("");
   const [startupNotice, setStartupNotice] = useState(() => (
     isTauriRuntime() ? "Starting local FroozERP service and checking the local database..." : ""
@@ -2048,6 +2066,30 @@ function App() {
         device_name: identity.device_name || current.device_name,
         device_type: identity.platform || current.device_type,
       }));
+      // Two ID cards on one machine used to stop the app dead. It now picks one and reports it
+      // here instead: a shop must never be halted by a metadata problem (design §2.5), but the
+      // operator still has to be told, or the condition is invisible until it causes something
+      // stranger later.
+      if (identity.identity_conflict) {
+        const competing = Array.isArray(identity.identity_conflict_device_ids)
+          ? identity.identity_conflict_device_ids
+          : [];
+        writeDiagnosticLog("WARN", "canonical-device-identity-conflict", {
+          kind: identity.identity_conflict_kind,
+          selected: identity.identity_conflict_selected,
+          deviceIds: competing,
+        });
+        setNotifications((current) => addNotification(current, createNotification({
+          severity: NOTIFICATION_SEVERITY.WARNING,
+          title: "This computer has more than one device record",
+          message: `FroozERP is using "${identity.identity_conflict_selected || identity.device_id}" and has kept working normally. `
+            + `${competing.length} records were found${competing.length ? `: ${competing.join(", ")}` : ""}. `
+            + "Nothing was deleted. Ask for the extra records to be tidied up when convenient.",
+          source: "Device identity",
+          dedupeKey: "device-identity-conflict",
+          sticky: true,
+        })));
+      }
     }).catch((error) => {
       if (cancelled) return;
       if (String(error?.message || error).includes("DEVICE_IDENTITY_CONFLICT")) {
@@ -3614,11 +3656,61 @@ function App() {
     return snapshot;
   };
 
+  /**
+   * Raise a notification. Safe to call repeatedly with the same `dedupeKey` — repeats collapse into
+   * one entry with a count rather than flooding the list.
+   */
+  const notify = useCallback((options) => {
+    try {
+      setNotifications((current) => addNotification(current, createNotification(options)));
+    } catch (error) {
+      // createNotification refuses a blank title. Never let a malformed notification take down the
+      // caller — the whole point of this centre is that reporting a problem cannot itself become one.
+      console.warn("notification rejected", error?.message || error);
+    }
+  }, []);
+
+  /** Retract a notification whose condition has cleared, so it stops implying a live problem. */
+  const clearNotice = useCallback((dedupeKey) => {
+    setNotifications((current) => resolveNotification(current, dedupeKey));
+  }, []);
+
+  /**
+   * Surface the activation state in the notification centre.
+   *
+   * `Active` deliberately produces nothing — a licence that is simply working is not news, and a
+   * centre that reports non-events trains people to ignore it. Everything else persists (sticky)
+   * because the condition is still true: clearing the list must not be a way to make an expired
+   * licence look fine.
+   */
+  const announceEntitlementState = useCallback((status) => {
+    const state = status?.state;
+    if (!state || state === "Active" || state === "Unprovisioned") {
+      clearNotice("entitlement-state");
+      return;
+    }
+    const banner = bannerForState(state, {
+      expiresAt: status?.expires_at,
+      graceUntil: status?.grace_until,
+      daysRemaining: status?.days_remaining,
+    });
+    if (!banner) return;
+    notify({
+      severity: banner.severity === "error" ? NOTIFICATION_SEVERITY.ERROR : NOTIFICATION_SEVERITY.WARNING,
+      title: banner.title,
+      message: banner.message,
+      source: "Activation",
+      dedupeKey: "entitlement-state",
+      sticky: !banner.dismissible,
+    });
+  }, [clearNotice, notify]);
+
   const refreshEntitlement = async (deviceId = deviceInfo?.device_id) => {
     if (!isTauriRuntime()) return null;
     try {
       const status = await getEntitlementStatus(deviceId);
       setEntitlement(status);
+      announceEntitlementState(status);
       return status;
     } catch (error) {
       // Fail into the running state, not out of it (design §2.5): a status read that
@@ -3700,6 +3792,20 @@ function App() {
         code: openDecision.code,
         suspicious: openDecision.suspicious,
       });
+      // "Empty because nothing has been entered yet" and "empty although this device has synced
+      // before" look identical on screen but mean opposite things, so they get different severities
+      // and the second one persists until someone deals with it.
+      notify({
+        severity: openDecision.suspicious ? NOTIFICATION_SEVERITY.WARNING : NOTIFICATION_SEVERITY.INFO,
+        title: openDecision.suspicious ? "Products are missing from this device" : "No products on this device yet",
+        message: openDecision.message,
+        source: "Local data",
+        dedupeKey: `offline-empty-${openDecision.code}`,
+        sticky: openDecision.suspicious,
+      });
+    } else {
+      clearNotice("offline-empty-EMPTY_NEW_DEVICE");
+      clearNotice("offline-empty-EMPTY_AFTER_SYNC");
     }
     const offlineUser = hasObjectContent(snapshot?.user_profile)
       ? snapshot.user_profile
@@ -6051,6 +6157,10 @@ function App() {
     );
   }
 
+  const notificationUnread = unreadCount(notifications);
+  // The badge wears the WORST unread severity, not the newest — an error must not be masked by a
+  // routine message arriving after it.
+  const notificationSeverity = highestUnreadSeverity(notifications) || NOTIFICATION_SEVERITY.INFO;
   const activeLabel = navigationItems.find(([view]) => view === activeView)?.[1];
   const canManageRates = ["Owner", "Admin"].includes(user.role);
   const userDisplayName = getUserDisplayName(user);
@@ -6206,6 +6316,33 @@ function App() {
                 {user.branch}
               </div>
               <div className="offline-pill">{connectionStatus.syncSummary}</div>
+              <div className="notification-bell-wrap">
+                <button
+                  type="button"
+                  className={`notification-bell${notificationUnread > 0 ? ` has-unread severity-${notificationSeverity}` : ""}`}
+                  aria-label={notificationUnread > 0
+                    ? `Notifications, ${notificationUnread} unread`
+                    : "Notifications"}
+                  aria-expanded={notificationsOpen}
+                  onClick={() => setNotificationsOpen((open) => !open)}
+                >
+                  <Icon name="bell" />
+                  {notificationUnread > 0 && (
+                    <span className="notification-badge">
+                      {notificationUnread > 99 ? "99+" : notificationUnread}
+                    </span>
+                  )}
+                </button>
+                {notificationsOpen && (
+                  <NotificationPanel
+                    notifications={notifications}
+                    onClose={() => setNotificationsOpen(false)}
+                    onDismiss={(id) => setNotifications((current) => dismissNotification(current, id))}
+                    onClearAll={() => setNotifications((current) => clearNotifications(current))}
+                    onMarkAllRead={() => setNotifications((current) => markAllRead(current))}
+                  />
+                )}
+              </div>
               {settingsData.deviceControlSettings?.fullscreen_lock_enabled && (
                 <button className="secondary-button kiosk-exit-button" onClick={requestControlledExit}>
                   Owner Exit
@@ -8148,6 +8285,88 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
         </div>
       </section>
     </main>
+  );
+}
+
+/**
+ * The notification list itself.
+ *
+ * Deliberately not a toast: a toast that disappears after four seconds is the same failure as the
+ * `alert()` popups this replaces, only quieter. Entries stay until the operator deals with them.
+ */
+function NotificationPanel({ notifications, onClose, onDismiss, onClearAll, onMarkAllRead }) {
+  const severityLabel = {
+    [NOTIFICATION_SEVERITY.ERROR]: "Error",
+    [NOTIFICATION_SEVERITY.WARNING]: "Warning",
+    [NOTIFICATION_SEVERITY.INFO]: "Info",
+    [NOTIFICATION_SEVERITY.SUCCESS]: "Done",
+  };
+  const formatWhen = (value) => {
+    if (!value) return "";
+    try {
+      return formatKolkataDateTime(value);
+    } catch {
+      return value;
+    }
+  };
+
+  return (
+    <div className="notification-panel" role="dialog" aria-label="Notifications">
+      <div className="notification-panel-head">
+        <strong>Notifications</strong>
+        <div className="notification-panel-actions">
+          {notifications.length > 0 && (
+            <>
+              <button type="button" className="table-action" onClick={onMarkAllRead}>Mark all read</button>
+              <button type="button" className="table-action" onClick={onClearAll}>Clear</button>
+            </>
+          )}
+          <button type="button" className="table-action" aria-label="Close notifications" onClick={onClose}>
+            <Icon name="close" size={14} />
+          </button>
+        </div>
+      </div>
+
+      {notifications.length === 0 ? (
+        <p className="notification-empty">Nothing to report. Warnings and alerts will appear here.</p>
+      ) : (
+        <ul className="notification-list">
+          {notifications.map((entry) => (
+            <li
+              key={entry.id}
+              className={`notification-item severity-${entry.severity}${entry.read ? "" : " unread"}`}
+            >
+              <div className="notification-item-head">
+                <span className={`notification-tag severity-${entry.severity}`}>
+                  {severityLabel[entry.severity] || "Info"}
+                </span>
+                <strong>{entry.title}</strong>
+                {entry.count > 1 && (
+                  <span className="notification-count" title={`Happened ${entry.count} times`}>
+                    ×{entry.count}
+                  </span>
+                )}
+                {!entry.sticky && (
+                  <button
+                    type="button"
+                    className="notification-dismiss"
+                    aria-label={`Dismiss ${entry.title}`}
+                    onClick={() => onDismiss(entry.id)}
+                  >
+                    <Icon name="close" size={12} />
+                  </button>
+                )}
+              </div>
+              {entry.message && <p className="notification-message">{entry.message}</p>}
+              <small className="notification-when">
+                {formatWhen(entry.lastAt || entry.at)}
+                {entry.source ? ` · ${entry.source}` : ""}
+              </small>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 

@@ -3878,6 +3878,43 @@ pub fn consume_bootstrap(app: &AppHandle, device_id: &str, serial: &str) -> Resu
     consume_bootstrap_at(&path, device_id, serial)
 }
 
+fn is_approved_identity(identity: &serde_json::Value) -> bool {
+    optional_text(identity, "registration_status")
+        .map(|status| status.eq_ignore_ascii_case("approved"))
+        .unwrap_or(false)
+}
+
+/// Deterministic pick among competing `local_device_identity` rows.
+///
+/// §2.5 rules "fail into the running state, not out of it", so a profile carrying more than
+/// one identity must not stop the app; it must choose one and say so. The order is fixed and
+/// documented because the same profile has to resolve to the same device on every restart and
+/// on every machine:
+///
+/// 1. an approved identity beats a non-approved one;
+/// 2. then the most recently seen wins — `last_seen_at` DESC, with a NULL/absent
+///    `last_seen_at` treated as the oldest possible value so it never outranks a real one;
+/// 3. then `device_id` ascending, which breaks every remaining tie (timestamps are ISO-8601
+///    UTC, so lexical order is chronological order).
+///
+/// This is read-only: it selects among existing rows and never creates, deletes or rewrites
+/// one.
+fn select_identity_under_conflict<'a>(
+    candidates: &[&'a serde_json::Value],
+) -> Option<&'a serde_json::Value> {
+    candidates.iter().copied().min_by_key(|identity| {
+        let approved_rank: u8 = if is_approved_identity(identity) { 0 } else { 1 };
+        let last_seen = optional_text(identity, "last_seen_at");
+        // Reverse() turns the ascending min_by_key into "newest first", and puts None
+        // (no last_seen_at) last, i.e. oldest.
+        (
+            approved_rank,
+            std::cmp::Reverse(last_seen),
+            optional_text(identity, "device_id").unwrap_or_default(),
+        )
+    })
+}
+
 fn ensure_device_identity_with_preference_at(
     path: &Path,
     preferred_device_id: Option<&str>,
@@ -3901,14 +3938,62 @@ fn ensure_device_identity_with_preference_at(
         .map_err(to_error)?;
     let approved = identities
         .iter()
-        .filter(|identity| {
-            optional_text(identity, "registration_status")
-                .map(|status| status.eq_ignore_ascii_case("approved"))
-                .unwrap_or(false)
-        })
+        .filter(|identity| is_approved_identity(identity))
         .collect::<Vec<_>>();
-    if approved.len() > 1 {
-        return Err("DEVICE_IDENTITY_CONFLICT: Multiple approved local device identities exist. Restore the canonical device backup or reconcile the identities before continuing.".to_string());
+
+    // A profile with more than one identity row is a metadata problem, and §2.5 forbids a
+    // metadata problem from stopping a shop: real field profiles carry two or three rows
+    // (backlog item 5). Both conflict shapes therefore resolve to a deterministic pick and
+    // report the conflict as data on the returned identity instead of returning Err, which
+    // used to surface as a 503 and a blocked startup. Nothing is written here.
+    let conflict = if approved.len() > 1 {
+        Some(("MULTIPLE_APPROVED", approved.clone()))
+    } else if approved.is_empty() && identities.len() > 1 {
+        Some(("MULTIPLE_PROVISIONAL", identities.iter().collect::<Vec<_>>()))
+    } else {
+        None
+    };
+    if let Some((kind, candidates)) = conflict {
+        if let Some(selected) = select_identity_under_conflict(&candidates) {
+            let mut conflicting_device_ids = candidates
+                .iter()
+                .filter_map(|identity| optional_text(identity, "device_id"))
+                .collect::<Vec<_>>();
+            conflicting_device_ids.sort();
+            let selected_device_id = optional_text(selected, "device_id").unwrap_or_default();
+            eprintln!(
+                "device identity conflict ({kind}): {} competing identities {:?}, continuing with {selected_device_id}",
+                conflicting_device_ids.len(),
+                conflicting_device_ids
+            );
+            if is_approved_identity(selected) {
+                // Grandfathering runs for the selected approved identity exactly as it does on
+                // the single-approved path below, and stays non-fatal for the same reason.
+                if let Err(error) = grandfather_existing_device(&conn, selected) {
+                    eprintln!("entitlement grandfathering skipped: {error}");
+                }
+            }
+            let mut identity = selected.clone();
+            if let Some(fields) = identity.as_object_mut() {
+                fields.insert(
+                    "identity_conflict".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+                fields.insert(
+                    "identity_conflict_kind".to_string(),
+                    serde_json::Value::String(kind.to_string()),
+                );
+                fields.insert(
+                    "identity_conflict_device_ids".to_string(),
+                    serde_json::json!(conflicting_device_ids),
+                );
+                fields.insert(
+                    "identity_conflict_selected".to_string(),
+                    serde_json::Value::String(selected_device_id),
+                );
+            }
+            return Ok(identity);
+        }
     }
     if let Some(identity) = approved.first() {
         // §11.1 grandfathering. Deliberately non-fatal: a device that cannot be grandfathered
@@ -3919,9 +4004,6 @@ fn ensure_device_identity_with_preference_at(
             eprintln!("entitlement grandfathering skipped: {error}");
         }
         return Ok((*identity).clone());
-    }
-    if identities.len() > 1 {
-        return Err("DEVICE_IDENTITY_CONFLICT: Multiple provisional local device identities exist and no approved canonical identity is available.".to_string());
     }
     if let Some(identity) = identities.first() {
         return Ok(identity.clone());
@@ -5574,8 +5656,25 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    /// Snapshot of every identity row, used to prove conflict resolution writes nothing.
+    fn identity_rows(path: &Path) -> Vec<(String, String, Option<String>)> {
+        let conn = Connection::open(path).expect("inspect identities");
+        let mut statement = conn
+            .prepare(
+                "SELECT device_id, registration_status, last_seen_at
+                 FROM local_device_identity ORDER BY device_id",
+            )
+            .expect("prepare identity inspection");
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query identities")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect identities");
+        rows
+    }
+
     #[test]
-    fn conflicting_approved_identities_fail_without_creating_or_overwriting() {
+    fn conflicting_approved_identities_resolve_without_creating_or_overwriting() {
         let path = std::env::temp_dir().join(format!(
             "froozerp-device-conflict-{}-{}.sqlite3",
             std::process::id(),
@@ -5592,13 +5691,180 @@ mod tests {
         )
         .expect("insert conflicts");
         drop(conn);
-        let error = ensure_device_identity_with_preference_at(&path, Some("approved-a"))
-            .expect_err("ambiguous approved identities must fail");
-        assert!(error.contains("DEVICE_IDENTITY_CONFLICT"));
+        let before = identity_rows(&path);
+
+        // §2.5: ambiguous identities must not stop the app. Neither row carries a
+        // last_seen_at, so the device_id tie-break decides and 'approved-a' wins.
+        let identity = ensure_device_identity_with_preference_at(&path, Some("approved-a"))
+            .expect("ambiguous approved identities must keep the app running");
+        assert_eq!(identity["device_id"], "approved-a");
+        assert_eq!(identity["identity_conflict"], true);
+        assert_eq!(identity["identity_conflict_kind"], "MULTIPLE_APPROVED");
+        assert_eq!(
+            identity["identity_conflict_device_ids"],
+            serde_json::json!(["approved-a", "approved-b"])
+        );
+        assert_eq!(identity["identity_conflict_selected"], "approved-a");
+
+        // Still the guarantee that mattered: the conflict path creates and overwrites nothing.
         let conn = Connection::open(&path).expect("inspect conflicts");
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM local_device_identity", [], |row| row.get(0)).unwrap();
         assert_eq!(count, 2);
         drop(conn);
+        assert_eq!(identity_rows(&path), before, "conflict resolution must be read-only");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn multiple_approved_identities_select_the_most_recently_seen() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-device-conflict-recent-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize conflict profile");
+        let conn = Connection::open(&path).expect("seed conflicts");
+        conn.execute(
+            "INSERT INTO local_device_identity
+               (device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at)
+             VALUES ('approved-a', 'A', 'tauri-windows', '1.0.65', '1', 'approved', '2026-08-01T10:00:00.000Z'),
+                    ('approved-z', 'Z', 'tauri-windows', '1.0.65', '1', 'approved', '2026-08-09T10:00:00.000Z')",
+            [],
+        )
+        .expect("insert conflicts");
+        drop(conn);
+        let before = identity_rows(&path);
+
+        let identity = ensure_device_identity_at(&path).expect("resolve conflicting identities");
+        assert_eq!(
+            identity["device_id"], "approved-z",
+            "last_seen_at DESC must outrank the device_id tie-break"
+        );
+        assert_eq!(identity["identity_conflict"], true);
+        assert_eq!(identity["identity_conflict_kind"], "MULTIPLE_APPROVED");
+        assert_eq!(
+            identity["identity_conflict_device_ids"],
+            serde_json::json!(["approved-a", "approved-z"])
+        );
+        assert_eq!(identity["identity_conflict_selected"], "approved-z");
+        assert_eq!(identity_rows(&path), before, "no row may be created or modified");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn multiple_provisional_identities_keep_the_app_running() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-device-provisional-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize provisional profile");
+        let conn = Connection::open(&path).expect("seed provisional identities");
+        conn.execute(
+            "INSERT INTO local_device_identity
+               (device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at)
+             VALUES ('pending-a', 'A', 'tauri-windows', '1.0.65', '1', 'pending', '2026-08-02T10:00:00.000Z'),
+                    ('pending-b', 'B', 'tauri-windows', '1.0.65', '1', 'pending', NULL)",
+            [],
+        )
+        .expect("insert provisional identities");
+        drop(conn);
+        let before = identity_rows(&path);
+
+        // This shape used to block startup outright, which §2.5 forbids.
+        let identity = ensure_device_identity_at(&path)
+            .expect("multiple provisional identities must never block startup");
+        assert_eq!(
+            identity["device_id"], "pending-a",
+            "a NULL last_seen_at is the oldest, so the seen device wins"
+        );
+        assert_eq!(identity["identity_conflict"], true);
+        assert_eq!(identity["identity_conflict_kind"], "MULTIPLE_PROVISIONAL");
+        assert_eq!(
+            identity["identity_conflict_device_ids"],
+            serde_json::json!(["pending-a", "pending-b"])
+        );
+        assert_eq!(identity["identity_conflict_selected"], "pending-a");
+        assert_eq!(identity_rows(&path), before, "no row may be created or modified");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn conflicting_identity_selection_is_stable_across_calls() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-device-conflict-stable-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize conflict profile");
+        let conn = Connection::open(&path).expect("seed conflicts");
+        conn.execute(
+            "INSERT INTO local_device_identity
+               (device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at)
+             VALUES ('pending-b', 'B', 'tauri-windows', '1.0.65', '1', 'pending', '2026-08-05T10:00:00.000Z'),
+                    ('pending-a', 'A', 'tauri-windows', '1.0.65', '1', 'pending', '2026-08-05T10:00:00.000Z')",
+            [],
+        )
+        .expect("insert conflicts");
+        drop(conn);
+
+        let first = ensure_device_identity_at(&path).expect("first resolve");
+        let second = ensure_device_identity_at(&path).expect("second resolve");
+        assert_eq!(first["device_id"], second["device_id"], "selection must be deterministic");
+        assert_eq!(first["device_id"], "pending-a", "equal timestamps fall back to device_id ASC");
+        let count: i64 = Connection::open(&path)
+            .expect("inspect conflicts")
+            .query_row("SELECT COUNT(*) FROM local_device_identity", [], |row| row.get(0))
+            .expect("count identities");
+        assert_eq!(count, 2, "repeated resolves must not add rows");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_single_identity_reports_no_conflict_fields() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-device-single-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize single-identity profile");
+        let conn = Connection::open(&path).expect("seed single identity");
+        conn.execute(
+            "INSERT INTO local_device_identity (device_id, device_name, platform, app_version, branch_id, registration_status)
+             VALUES ('only-device', 'Only', 'tauri-windows', '1.0.65', '1', 'approved')",
+            [],
+        )
+        .expect("insert single identity");
+        drop(conn);
+
+        let identity = ensure_device_identity_at(&path).expect("resolve single identity");
+        assert_eq!(identity["device_id"], "only-device");
+        for field in [
+            "identity_conflict",
+            "identity_conflict_kind",
+            "identity_conflict_device_ids",
+            "identity_conflict_selected",
+        ] {
+            assert!(
+                identity.get(field).is_none(),
+                "the normal path must stay clean: {field} must not be emitted"
+            );
+        }
+        // A newly created identity is equally clean.
+        let fresh = std::env::temp_dir().join(format!(
+            "froozerp-device-fresh-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&fresh);
+        initialize_at(&fresh).expect("initialize fresh profile");
+        let created = ensure_device_identity_at(&fresh).expect("create identity");
+        assert!(created.get("identity_conflict").is_none());
+        let _ = fs::remove_file(&fresh);
         let _ = fs::remove_file(&path);
     }
 
@@ -5974,6 +6240,52 @@ mod tests {
             .query_row("SELECT verification_state FROM local_entitlement", [], |row| row.get(0))
             .expect("read state");
         assert_eq!(state, "VERIFIED", "the real entitlement must be untouched");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn grandfathering_still_fires_for_the_selected_identity_under_conflict() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-grandfather-conflict-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        let device_id = "FZDEV-LEGACY-SELECTED";
+        seed_legacy_profile(&path, device_id, true);
+        let conn = Connection::open(&path).expect("open legacy profile");
+        conn.execute(
+            "UPDATE local_device_identity SET last_seen_at = '2026-08-10T10:00:00.000Z' WHERE device_id = ?1",
+            params![device_id],
+        )
+        .expect("mark the legacy device as most recently seen");
+        conn.execute(
+            "INSERT INTO local_device_identity
+               (device_id,device_name,platform,app_version,branch_id,registration_status,company_id,last_seen_at)
+             VALUES ('FZDEV-LEGACY-RIVAL','Rival','tauri-windows','1.0.71','7','approved','3','2026-07-01T10:00:00.000Z')",
+            [],
+        )
+        .expect("insert a competing approved identity");
+        drop(conn);
+
+        let identity = ensure_device_identity_at(&path).expect("resolve conflicting identities");
+        assert_eq!(identity["device_id"], device_id);
+        assert_eq!(identity["identity_conflict_kind"], "MULTIPLE_APPROVED");
+        assert_eq!(
+            entitlement_rows(&path),
+            1,
+            "the selected approved identity must still be grandfathered"
+        );
+        let conn = Connection::open(&path).expect("open profile");
+        let serial: String = conn
+            .query_row("SELECT entitlement_serial FROM local_entitlement", [], |row| row.get(0))
+            .expect("read shim serial");
+        assert_eq!(serial, format!("LEGACY-{device_id}"), "the shim binds the selected device");
+        drop(conn);
+
+        // Non-fatal and idempotent, exactly as on the single-approved path.
+        ensure_device_identity_at(&path).expect("resolve again");
+        assert_eq!(entitlement_rows(&path), 1);
         let _ = fs::remove_file(&path);
     }
 

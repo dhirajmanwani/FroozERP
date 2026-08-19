@@ -6,34 +6,59 @@ const localSettingsError = (code, message) => {
   return error;
 };
 
+/**
+ * Choose the canonical device when more than one identity row exists.
+ *
+ * This used to throw `DEVICE_IDENTITY_CONFLICT`, which `desktopGateway` turns into an HTTP 503 —
+ * so a machine carrying two device records (a restored backup, a copied profile) could not load
+ * its settings at all, in LOCAL_ONLY mode, with no cloud to appeal to. That is a metadata problem
+ * stopping a shop, which design §2.5 forbids: "fail into the running state, not out of it".
+ *
+ * It now mirrors `select_identity_under_conflict` in `src-tauri/src/local_db.rs` exactly, so the
+ * Rust and Node paths cannot disagree about which device this machine is: approved rows beat
+ * unapproved ones, then most recently seen wins (NULL treated as oldest), then `device_id`
+ * ascending as a stable final tie-break. Selection is read-only — no row is created or rewritten.
+ *
+ * The conflict is reported on the returned object rather than thrown, so callers can surface it.
+ */
 const selectCanonicalDevice = (database) => {
   const identities = database.prepare(`
-    SELECT device_id, branch_id, company_id, registration_status
+    SELECT device_id, branch_id, company_id, registration_status, last_seen_at
     FROM local_device_identity
     WHERE LOWER(device_id) <> 'default'
     ORDER BY device_id
   `).all();
+
+  if (identities.length === 0) {
+    throw localSettingsError(
+      "LOCAL_DEVICE_IDENTITY_MISSING",
+      "No established local device identity is available for offline settings."
+    );
+  }
+
   const approved = identities.filter((identity) =>
     String(identity.registration_status || "").toLowerCase() === "approved"
   );
-  if (approved.length > 1) {
-    throw localSettingsError(
-      "DEVICE_IDENTITY_CONFLICT",
-      "Multiple approved local device identities exist. Reconcile the canonical identity before loading settings."
-    );
-  }
-  if (approved.length === 1) return approved[0];
-  if (identities.length > 1) {
-    throw localSettingsError(
-      "DEVICE_IDENTITY_CONFLICT",
-      "Multiple provisional local device identities exist. Reconcile the canonical identity before loading settings."
-    );
-  }
-  if (identities.length === 1) return identities[0];
-  throw localSettingsError(
-    "LOCAL_DEVICE_IDENTITY_MISSING",
-    "No established local device identity is available for offline settings."
-  );
+  const group = approved.length > 0 ? approved : identities;
+
+  if (group.length === 1 && identities.length === 1) return group[0];
+  if (group.length === 1) return group[0];
+
+  const selected = [...group].sort((a, b) => {
+    // Most recently seen first; a missing timestamp sorts last, i.e. treated as oldest.
+    const seenA = a.last_seen_at || "";
+    const seenB = b.last_seen_at || "";
+    if (seenA !== seenB) return seenA < seenB ? 1 : -1;
+    return String(a.device_id).localeCompare(String(b.device_id));
+  })[0];
+
+  return {
+    ...selected,
+    identity_conflict: true,
+    identity_conflict_kind: approved.length > 1 ? "MULTIPLE_APPROVED" : "MULTIPLE_PROVISIONAL",
+    identity_conflict_device_ids: group.map((identity) => identity.device_id).sort(),
+    identity_conflict_selected: selected.device_id,
+  };
 };
 
 const parseSettingValue = (row) => {
@@ -81,6 +106,17 @@ const readLocalSettingsBundle = (databasePath) => {
       canonicalDeviceId: identity.device_id,
       companyId: identity.company_id || null,
       branchId,
+      // Present only when this machine carries more than one device record. Settings still load —
+      // the conflict is reported, not thrown — so callers can surface it without the shop stopping.
+      ...(identity.identity_conflict
+        ? {
+          identityConflict: {
+            kind: identity.identity_conflict_kind,
+            deviceIds: identity.identity_conflict_device_ids,
+            selected: identity.identity_conflict_selected,
+          },
+        }
+        : {}),
     };
   } catch (error) {
     if (error?.code) throw error;

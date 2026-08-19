@@ -30,7 +30,11 @@ const writePopulatedSQLiteFixture = (databasePath, { malformedSettings = false }
       device_id TEXT PRIMARY KEY,
       branch_id TEXT NOT NULL,
       company_id TEXT,
-      registration_status TEXT NOT NULL
+      registration_status TEXT NOT NULL,
+      -- Present in the real schema (migration 002) and used by selectCanonicalDevice to pick the
+      -- most recently seen device when a machine carries more than one identity row. The fixture
+      -- omitted it, so it was not a faithful stand-in for production.
+      last_seen_at TEXT
     );
     CREATE TABLE local_settings (
       id TEXT PRIMARY KEY,
@@ -42,7 +46,7 @@ const writePopulatedSQLiteFixture = (databasePath, { malformedSettings = false }
     CREATE TABLE local_products (id TEXT PRIMARY KEY);
     CREATE TABLE local_inventory_lots (id TEXT PRIMARY KEY);
     CREATE TABLE sync_outbox (id TEXT PRIMARY KEY, device_id TEXT, status TEXT);
-    INSERT INTO local_device_identity VALUES ('FZDEV-DELL-1781852580596', '1', '1', 'approved');
+    INSERT INTO local_device_identity VALUES ('FZDEV-DELL-1781852580596', '1', '1', 'approved', '2026-08-18T10:00:00.000Z');
     INSERT INTO local_settings VALUES ('global-business', NULL, 'businessSettings', '{"business_name":"Global fallback"}', NULL);
     INSERT INTO local_settings VALUES ('branch-business', '1', 'businessSettings', '${malformedSettings ? "{broken" : '{"business_name":"Feel the Freakin Frooz"}'}', NULL);
     INSERT INTO local_settings VALUES ('branch-pos', '1', 'posSettings', '{"allow_negative_stock":false}', NULL);
