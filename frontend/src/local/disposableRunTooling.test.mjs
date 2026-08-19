@@ -22,6 +22,7 @@ import {
   disposableStamp,
   isLiveAppDataPath,
   resolveDisposableDir,
+  tauriCliEntry,
 } from "../../../scripts/run-disposable-app.mjs";
 
 test("a path inside the live application data directory is refused", () => {
@@ -88,4 +89,16 @@ test("an empty or whitespace root is treated as unset rather than as the current
       `empty root must fall back to temp, got ${resolved}`,
     );
   }
+});
+
+test("the launcher targets the CLI's .js entry, never the .cmd shim", () => {
+  // Windows-only failure, found by running it there: Node refuses to spawn a .cmd directly and
+  // fails with EINVAL (the CVE-2024-27980 hardening). `shell: true` would re-open that hole and
+  // break on paths containing spaces, which C:\Users\... routinely does. Running the CLI's own
+  // .js through process.execPath avoids the shell entirely and behaves the same on every platform.
+  const entry = tauriCliEntry("/repo");
+  assert.ok(entry.endsWith("tauri.js"), `expected a .js entry, got ${entry}`);
+  assert.doesNotMatch(entry, /\.cmd$/, "a .cmd shim cannot be spawned on Windows");
+  assert.doesNotMatch(entry, /node_modules[\\/]\.bin/, "the .bin shim is the platform-specific trap");
+  assert.ok(entry.includes("@tauri-apps"), "it must come from the installed CLI package");
 });

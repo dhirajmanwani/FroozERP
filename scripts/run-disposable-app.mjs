@@ -93,10 +93,20 @@ export const resolveDisposableDir = ({ root, now = new Date() } = {}) => {
   return resolved;
 };
 
-const tauriBinary = (repoRoot) => {
-  const bin = process.platform === "win32" ? "tauri.cmd" : "tauri";
-  return path.join(repoRoot, "frontend", "node_modules", ".bin", bin);
-};
+/**
+ * Path to the Tauri CLI's JavaScript entry point.
+ *
+ * Deliberately NOT `node_modules/.bin/tauri(.cmd)`. On Windows that shim is a `.cmd` batch file,
+ * and Node refuses to `spawn()` a `.cmd` directly — it fails with `EINVAL`. (The restriction came
+ * in with the fix for CVE-2024-27980, where argument escaping for batch files was exploitable.)
+ * The usual workaround, `shell: true`, re-opens exactly that hole and additionally breaks on any
+ * path containing a space, which `C:\Users\...` frequently does.
+ *
+ * Running the CLI's own `.js` through `process.execPath` sidesteps both problems and behaves
+ * identically on Windows, macOS and Linux — there is no shell in the picture to disagree about.
+ */
+export const tauriCliEntry = (repoRoot) =>
+  path.join(repoRoot, "frontend", "node_modules", "@tauri-apps", "cli", "tauri.js");
 
 const main = () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -119,7 +129,14 @@ const main = () => {
     ].join("\n"),
   );
 
-  const child = spawn(tauriBinary(repoRoot), ["dev"], {
+  const cliEntry = tauriCliEntry(repoRoot);
+  if (!fs.existsSync(cliEntry)) {
+    throw new Error(
+      `Tauri CLI not found at ${cliEntry}. Run \`npm --prefix frontend install\` first.`,
+    );
+  }
+
+  const child = spawn(process.execPath, [cliEntry, "dev"], {
     cwd: repoRoot,
     stdio: "inherit",
     env: {
