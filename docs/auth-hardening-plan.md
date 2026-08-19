@@ -1,7 +1,16 @@
 # Auth Hardening — Scoping and Plan
 
-**Status:** scoped, not started. Written 2026-08-17 at the maintainer's request, to run **in
-parallel** with the offline-activation stages.
+**Status:** **A-1 complete 2026-08-19.** A-2 … A-6 open. Written 2026-08-17 at the maintainer's
+request, to run **in parallel** with the offline-activation stages.
+
+| Stage | Status |
+| --- | --- |
+| A-1 password hashing | **Complete 2026-08-19** — see the record at the end of this file |
+| A-2 remove plaintext fallback | Open. Unblocked: A-1's dispatcher is in place and tags the branch `PLAINTEXT`. |
+| A-3 real sessions | Open |
+| A-4 middleware on all routes | Open |
+| A-5 lockout + delete legacy verify | Open |
+| A-6 exposure checklist | Open |
 **Related:** `CLAUDE.md` "Known security debt"; `docs/offline-activation-design.md` §12 (which
 rules `deviceSession.js` is *kept*); `docs/backlog-1.0.72.md`.
 
@@ -161,3 +170,90 @@ the rebuild itself).
 
 No production or Railway contact; no signing password; nothing under `release/` or the recovery
 backups. Auth changes are developed against a local Postgres, per `CLAUDE.md`.
+
+---
+
+## A-1 record — completed 2026-08-19
+
+### What landed
+
+`backend/passwordHash.js` — salted, memory-hard password hashing with a self-describing stored
+format, plus a verifier that dispatches on that format so every existing row keeps working.
+
+    scrypt$v=1$n=65536,r=8,p=1$<salt-base64>$<derived-base64>
+
+`verifyPassword` returns `{ ok, format, needsRehash }`. `format` is one of `SCRYPT`,
+`LEGACY_SHA256`, `PLAINTEXT`, `UNKNOWN`, `EMPTY`. Legacy SHA-256 rows and plaintext rows still
+authenticate — no forced reset, nobody locked out — and are transparently upgraded on the next
+successful login by `upgradeStoredPassword` in `server.js`.
+
+### Deviation from the plan: scrypt, not argon2id
+
+The plan names "argon2id (preferred) or bcrypt". Both are **native modules** requiring node-gyp and
+a C++ toolchain, or a prebuilt binary matching the exact platform and Node ABI. `npm --prefix
+backend test` runs on the maintainer's **Windows** machine; a native dependency would need Visual
+Studio Build Tools there. Breaking the maintainer's own test command to improve password storage is
+a bad trade at this scale.
+
+Node's built-in `crypto.scrypt` is memory-hard, purpose-built for password storage, has zero
+dependencies, and behaves identically on Windows and Linux.
+
+**This is not a one-way door.** Because the algorithm and parameters are stored *in the hash*,
+adding argon2id later means teaching the dispatcher one more prefix and changing what
+`hashPassword` emits. Existing hashes keep verifying and migrate themselves on login. The same
+mechanism raises the scrypt cost later — a test covers exactly that path.
+
+Cost was measured on the development container, not guessed: N=16384 → 53 ms, N=32768 → 88 ms,
+N=65536 → 347 ms. **N=65536 (64 MiB) shipped.** Login frequency in a shop ERP is a few times per
+user per day, so ~350 ms is imperceptible, and hashing cost is the primary defence if the user
+table ever leaks. `crypto.scrypt`'s async form runs on the threadpool, so concurrent logins do not
+block the event loop; `hashPasswordSync` exists only for the schema bootstrap, which interpolates a
+hash into a SQL template literal and cannot await.
+
+### Verified before changing anything
+
+- **All 7 `hashPassword` and 3 `passwordMatches` call sites** were located and individually
+  inspected. Every one except the schema seed sits inside an `async` function, so `await` was safe.
+- **No SQL anywhere compares `password_hash` in a `WHERE` clause.** A query doing so would bypass
+  the dispatcher entirely and break silently the moment hashes became salted. Checked explicitly;
+  every reference is `SET password_hash`.
+- **`server.js` is not shipped to the desktop.** `tauri.conf.json` ships only `desktopGateway.js`,
+  `cloudProxyError.js` and `localSettingsStore.js`; the sidecar is a Node runtime that runs the
+  gateway. So this change touches the cloud backend only, and carries no desktop packaging risk.
+
+### Two existing tests changed, and why that was legitimate
+
+`identityPolicy.test.js` asserts `server.js` **source text** contains
+`passwordMatches(password, user.password_hash)`. Renaming the call broke the string match while the
+test's behavioural half still passed.
+
+Both assertions were updated to the new call (`checkPassword(...)`) rather than deleted — the
+intent ("approval state cannot bypass canonical password verification") is exactly right and is
+preserved verbatim. But the failure exposed a weakness in the mechanism: **a source-text assertion
+silently becomes a no-op when the thing it names is renamed**, and it keeps passing. Four
+behavioural regression tests were added in `passwordHash.test.js` to pin the same properties where
+a rename cannot hide a regression: a new hash is never the legacy SHA-256 shape; two users sharing
+a password get different hashes; a hash cannot be verified by supplying the hash as the password;
+near-miss passwords are rejected.
+
+### Gate results
+
+| Gate | Result |
+| --- | --- |
+| `npm --prefix backend test` | **139 / 140** — the 1 failure is the pre-existing Linux-vs-Windows path assertion. +19 new tests. |
+| `npm run backend:check` | Pass |
+| `npm --prefix frontend run lint` | 0 errors, 37 pre-existing warnings |
+| `npm run build` | Pass |
+| `TZ=Asia/Kolkata node --test frontend/src/local/*.test.mjs` | 231 / 231 (untouched by this stage) |
+
+### Not done here
+
+No route behaviour changed, by design — A-1's contract is "no behaviour change". Identity is still
+client-asserted via `x-user-id` on 212 unauthenticated routes; that is A-3 and A-4 and remains the
+actual gate on exposing the API. **A-1 improves what happens if the user table leaks. It does not
+yet stop anyone claiming to be Owner.** That distinction should not be blurred when judging whether
+the backend is safe to expose.
+
+`upgradeStoredPassword` was not exercised against a live Postgres — no database is running in this
+environment. Its failure path is deliberately swallowed so a re-hash can never break a valid
+sign-in, and the verify/`needsRehash` logic it depends on is covered by unit tests.

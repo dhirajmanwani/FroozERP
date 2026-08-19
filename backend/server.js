@@ -10,6 +10,11 @@ const { execFile } = require("child_process");
 const nodemailer = require("nodemailer");
 const { RUNTIME_MODES, createStorageAdapter } = require("./storageAdapters");
 const {
+  hashPassword,
+  hashPasswordSync,
+  verifyPassword,
+} = require("./passwordHash");
+const {
   approvedAliasCredentialFailure,
   canonicalAliasClaim,
   isOwnerBootstrapEligible,
@@ -604,8 +609,10 @@ const parseNonNegativeNumber = (value) => {
 
 const roundCurrency = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 const roundUnitCost = (value) => Math.round((Number(value) + Number.EPSILON) * 10000) / 10000;
-const hashPassword = (password) =>
-  crypto.createHash("sha256").update(String(password || ""), "utf8").digest("hex");
+// Password hashing moved to ./passwordHash (auth-hardening A-1). `hashPassword` is now async and
+// salted; `hashPasswordSync` exists only for the schema bootstrap below, which interpolates a hash
+// into a SQL template literal and cannot await. The old unsalted SHA-256 lives on inside that
+// module as `legacySha256`, used for verifying existing rows only — never for writing new ones.
 const hashActivationCode = (code) =>
   crypto.createHash("sha256").update(String(code || "").trim().toUpperCase(), "utf8").digest("hex");
 const hashExitCode = (code) =>
@@ -702,10 +709,31 @@ const execFileAsync = (file, args, options = {}) => new Promise((resolve, reject
   });
 });
 const escapePowerShellSingleQuoted = (value) => String(value).replace(/'/g, "''");
-const passwordMatches = (password, storedHash) => {
-  const stored = cleanText(storedHash);
-  if (!stored) return false;
-  return stored === hashPassword(password) || stored === String(password || "");
+/**
+ * Verify a password and report whether the stored hash should be upgraded (auth-hardening A-1).
+ *
+ * Replaces the old synchronous `passwordMatches`, which compared against an unsalted SHA-256 and
+ * additionally accepted a plaintext-valued column. Both legacy shapes still verify here so no
+ * existing user is locked out; `needsRehash` is how they get migrated, on successful login only.
+ *
+ * The plaintext branch is deleted in A-2 — it survives this stage solely to keep A-1's
+ * "no behaviour change" contract.
+ */
+const checkPassword = async (password, storedHash) => verifyPassword(password, storedHash);
+
+/**
+ * Upgrade a stored password hash after a successful login. Best-effort by design: a failure to
+ * re-hash must never fail the sign-in that just legitimately succeeded, so it is logged and
+ * swallowed rather than propagated.
+ */
+const upgradeStoredPassword = async (userId, password, verification) => {
+  if (!verification?.ok || !verification.needsRehash || !userId) return;
+  try {
+    const upgraded = await hashPassword(password);
+    await pool.query("UPDATE users SET password_hash = $1 WHERE id = $2", [upgraded, userId]);
+  } catch (error) {
+    console.error("password rehash skipped", error?.message || error);
+  }
 };
 const applySaleRateRounding = (value, rule) => {
   const amount = Number(value || 0);
@@ -2757,7 +2785,7 @@ const initializeDatabase = async () => {
     ON CONFLICT (role_name) DO NOTHING;
 
     INSERT INTO users (full_name, username, password_hash, role_id, branch_id, active)
-    SELECT 'Owner', 'owner', '${hashPassword("owner123")}', r.id, 1, TRUE
+    SELECT 'Owner', 'owner', '${hashPasswordSync("owner123")}', r.id, 1, TRUE
     FROM roles r
     WHERE r.role_name = 'Owner'
       AND NOT EXISTS (SELECT 1 FROM users);
@@ -5546,7 +5574,7 @@ app.put("/settings/device-control", async (req, res) => {
       if (!/^\d{4,}$/.test(newExitCode)) return res.status(400).json({ message: "Exit code must be at least 4 digits" });
       if (newExitCode !== confirmExitCode) return res.status(400).json({ message: "Exit code confirmation does not match" });
       const userResult = await pool.query("SELECT password_hash FROM users WHERE id = $1", [manager.id]);
-      if (!passwordMatches(currentPassword, userResult.rows[0]?.password_hash)) {
+      if (!(await checkPassword(currentPassword, userResult.rows[0]?.password_hash)).ok) {
         return res.status(403).json({ message: "Current password is incorrect" });
       }
       exitCodeHash = hashExitCode(newExitCode);
@@ -6292,7 +6320,7 @@ app.post("/users", async (req, res) => {
       RETURNING id, full_name, username, mobile_number, email, verified_email, verified_mobile, recovery_email, recovery_email_verified, recovery_mobile, recovery_mobile_verified, recovery_enabled, staff_self_recovery_enabled, active, joining_date, notes, created_at, updated_at
       `,
       [
-        payload.full_name, payload.username, hashPassword(password), roleId,
+        payload.full_name, payload.username, await hashPassword(password), roleId,
         parsePositiveInteger(req.body.branch_id) || manager.branch_id || 1,
         payload.active, payload.mobile_number, payload.email,
         payload.recovery_enabled, payload.staff_self_recovery_enabled,
@@ -6363,7 +6391,7 @@ app.put("/users/:id/password", async (req, res) => {
       WHERE id = $2
       RETURNING id, username
       `,
-      [hashPassword(password), userId]
+      [await hashPassword(password), userId]
     );
     if (result.rows[0]) {
       await writeAuthAudit({
@@ -7168,7 +7196,7 @@ app.post("/auth/recovery/reset-password", async (req, res) => {
           updated_at = CURRENT_TIMESTAMP
       WHERE id = $2
       `,
-      [hashPassword(password), request.user_id]
+      [await hashPassword(password), request.user_id]
     );
     await client.query(
       "UPDATE account_recovery_requests SET used_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE request_id = $1",
@@ -7249,7 +7277,7 @@ app.post("/users/:id/recovery-action", async (req, res) => {
             updated_at = CURRENT_TIMESTAMP
         WHERE id = $2
         `,
-        [hashPassword(temporaryPassword), userId]
+        [await hashPassword(temporaryPassword), userId]
       );
       await writeAuthAudit({
         userId,
@@ -9920,7 +9948,7 @@ app.post("/bootstrap/first-owner-device", async (req, res) => {
       [username]
     );
     const user = userResult.rows[0];
-    if (!user || user.active === false || !passwordMatches(password, user.password_hash) || !isOwnerBootstrapEligible(user)) {
+    if (!user || user.active === false || !(await checkPassword(password, user.password_hash)).ok || !isOwnerBootstrapEligible(user)) {
       return res.status(403).json({ message: "First owner device bootstrap requires valid owner credentials." });
     }
 
@@ -10350,7 +10378,8 @@ app.post("/login", async (req, res) => {
         details: { stage: "user_locked" },
       });
     }
-    if (!passwordMatches(password, user.password_hash)) {
+    const passwordCheck = await checkPassword(password, user.password_hash);
+    if (!passwordCheck.ok) {
       const approvedDeviceResult = canonicalAliasUsed
         ? await pool.query(
             "SELECT status, approved_by FROM authorized_devices WHERE device_id = $1 LIMIT 1",
@@ -10372,6 +10401,12 @@ app.post("/login", async (req, res) => {
         details: { stage: "password_verification", canonical_alias_used: canonicalAliasUsed },
       });
     }
+    // The password is now proven, so a legacy hash can be upgraded (auth-hardening A-1). Done here
+    // rather than after the device checks below: the user has demonstrated the password whatever
+    // the device turns out to be, and this is the only moment the plaintext is in hand. Failures
+    // are swallowed inside `upgradeStoredPassword` — a re-hash must never break a valid sign-in.
+    await upgradeStoredPassword(user.id, password, passwordCheck);
+
     if (!devicePayload.device_id) {
       return authFailure(res, {
         status: 403,
@@ -10522,7 +10557,7 @@ app.post("/login", async (req, res) => {
       "UPDATE authorized_devices SET last_active_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE device_id = $1",
       [device.device_id]
     );
-    const hashed = hashPassword(password);
+    const hashed = await hashPassword(password);
     await pool.query(
       "UPDATE users SET password_hash = $1, last_login_at = CURRENT_TIMESTAMP WHERE id = $2",
       [hashed, user.id]

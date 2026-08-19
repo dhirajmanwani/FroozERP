@@ -57,7 +57,10 @@ test("canonical alias SQL uses the explicit claim and server-authorized location
   assert.match(loginRoute, /u\.company_id = da\.company_id/);
   assert.doesNotMatch(loginRoute, /d\.approved_by = u\.id/);
   assert.doesNotMatch(loginRoute, /d\.assigned_branch_id = COALESCE\(u\.branch_id, 1\)/);
-  assert.match(loginRoute, /passwordMatches\(password, user\.password_hash\)/);
+  // Renamed to checkPassword in auth-hardening A-1 (salted scrypt + legacy dispatch). The
+  // assertion's intent is unchanged: the login route must verify the supplied password
+  // against this user's stored hash, and must not be reachable around.
+  assert.match(loginRoute, /checkPassword\(password, user\.password_hash\)/);
   assert.doesNotMatch(source, /INSERT INTO users[\s\S]{0,300}canonical.*alias/i);
 });
 
@@ -84,7 +87,7 @@ test("approval state cannot bypass canonical password verification", () => {
   const source = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
   assert.match(source, /d\.device_id = \$3/);
   assert.match(source, /\$2::INTEGER IS NOT NULL/);
-  assert.match(source, /passwordMatches\(password, user\.password_hash\)/);
+  assert.match(source, /checkPassword\(password, user\.password_hash\)/);
   assert.match(source, /canonical_alias_used: canonicalAliasUsed/);
 });
 
