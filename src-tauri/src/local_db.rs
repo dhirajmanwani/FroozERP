@@ -2197,10 +2197,49 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
     let device_name = optional_text(&device_identity, "device_name").unwrap_or_else(|| "FroozERP Device".to_string());
     let platform = optional_text(&device_identity, "platform").unwrap_or_else(|| "tauri-windows".to_string());
     let app_version = optional_text(&device_identity, "app_version").unwrap_or_else(|| "1.0.0".to_string());
-    let registration_status = optional_text(&device_identity, "registration_status").unwrap_or_else(|| "approved".to_string());
+    // §6.3 / §12: a snapshot that OMITS `registration_status` must yield the device's EXISTING
+    // status, never an upgrade to approved. The old default asserted approval on the strength of a
+    // field being absent, which is the weakest possible evidence — and because the desktop builds
+    // its own snapshot, it was effectively a device approving itself. A device with no row yet is
+    // `pending`; only a verified entitlement (or the cloud) may promote it.
+    let existing_registration_status: Option<String> = tx
+        .query_row(
+            "SELECT registration_status FROM local_device_identity WHERE device_id = ?1",
+            params![device_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(to_error)?
+        .flatten();
+    let registration_status = optional_text(&device_identity, "registration_status")
+        .or(existing_registration_status)
+        .unwrap_or_else(|| "pending".to_string());
+
     let user_profile = snapshot.get("user_profile").cloned().unwrap_or_else(|| serde_json::json!({}));
     let company_id = optional_text(&user_profile, "company_id")
         .or_else(|| optional_text(&device_identity, "company_id"));
+
+    // A live VERIFIED entitlement outranks the snapshot for scope (§6.4 rung 1). Without this the
+    // promotion in `accept_entitlement_at` would be cosmetic: `branch_id` is overwritten
+    // unconditionally below (`branch_id = excluded.branch_id`, no COALESCE) and the snapshot's
+    // value is client-supplied — `App.jsx` falls back to "1" when it knows nothing. A device could
+    // otherwise redeem a code scoped to branch 7 and have the very next cache quietly move it to
+    // branch 1. Scope that arrived under a signature is not up for revision by an unsigned snapshot.
+    let signed_scope: Option<(String, String)> = tx
+        .query_row(
+            "SELECT company_id, branch_id FROM local_entitlement
+              WHERE device_id = ?1 AND verification_state = 'VERIFIED'
+                AND superseded_at IS NULL AND revoked_at IS NULL
+              ORDER BY issued_at DESC LIMIT 1",
+            params![device_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(to_error)?;
+    let (company_id, branch_id) = match signed_scope {
+        Some((signed_company, signed_branch)) => (Some(signed_company), signed_branch),
+        None => (company_id, branch_id),
+    };
     let canonical_user_id = optional_text(&user_profile, "id");
     let canonical_role = optional_text(&user_profile, "role_name")
         .or_else(|| optional_text(&user_profile, "role"));
@@ -3470,6 +3509,38 @@ fn accept_entitlement_at(
         device_id,
     )?;
 
+    // 8. Promote the identity locally (§6.3). This is the change that removes the cloud from the
+    //    authorisation path: until now `registration_status` could only move to 'approved' by a
+    //    cloud lookup, or by one of the two hardcoded defaults that asserted approval without
+    //    evidence. A verified entitlement IS the evidence — it is a signature over this device's
+    //    own binding, checked locally against a baked-in trusted key.
+    //
+    //    `company_id` and `branch_id` come from the signed payload rather than from the caller, so
+    //    a device cannot talk itself into another company's scope. The row is only touched when it
+    //    already exists; `ensure_device_identity_*` owns creation, and inventing an identity here
+    //    would let an activation file conjure a device that never registered.
+    let promoted = tx
+        .execute(
+            "UPDATE local_device_identity
+                SET registration_status = 'approved',
+                    company_id = ?2,
+                    branch_id = ?3,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+              WHERE device_id = ?1",
+            params![device_id, company_id, branch_id],
+        )
+        .map_err(to_error)?;
+    if promoted > 0 {
+        record_entitlement_audit_at(
+            &tx,
+            Some(&serial),
+            "DEVICE_PROMOTED",
+            Some("VERIFIED_ENTITLEMENT"),
+            &format!("{{\"company_id\":\"{company_id}\",\"branch_id\":\"{branch_id}\"}}"),
+            device_id,
+        )?;
+    }
+
     tx.commit().map_err(to_error)?;
 
     Ok(serde_json::json!({
@@ -3479,6 +3550,7 @@ fn accept_entitlement_at(
         "source": source,
         "superseded": superseded,
         "bootstrap_present": payload_parsed.carries_credential(),
+        "identity_promoted": promoted > 0,
     }))
 }
 
@@ -5982,6 +6054,220 @@ mod tests {
             .expect("clock after epoch")
             .as_secs() as i64;
         (secs / 86_400 - 18_262) as u16
+    }
+
+    // ---- Stage 6: local promotion of registration_status (§6.3, §12) ----------------------
+
+    /// Insert a pending identity the way `ensure_device_identity_*` does for a new device.
+    fn seed_pending_identity(path: &Path, device_id: &str) {
+        initialize_at(path).expect("init");
+        let conn = Connection::open(path).expect("open");
+        conn.execute(
+            "INSERT INTO local_device_identity (device_id, device_name, platform, app_version,
+                 branch_id, registration_status, last_seen_at, updated_at)
+             VALUES (?1, 'Test Device', 'tauri-windows', '1.0.0', 'unassigned', 'pending',
+                 strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            params![device_id],
+        )
+        .expect("seed identity");
+    }
+
+    fn identity_status(path: &Path, device_id: &str) -> Option<(String, String, Option<String>)> {
+        let conn = Connection::open(path).expect("open");
+        conn.query_row(
+            "SELECT registration_status, branch_id, company_id FROM local_device_identity WHERE device_id = ?1",
+            params![device_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .expect("query identity")
+    }
+
+    #[test]
+    fn a_verified_entitlement_promotes_the_device_locally_with_payload_scope() {
+        // The point of Stage 6: approval stops requiring a cloud lookup. The signature over this
+        // device's own binding is the evidence, and the scope comes from the signed payload.
+        let path = activation_temp_path("promote-verified");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-PROMOTE-1";
+        seed_pending_identity(&path, device);
+        assert_eq!(identity_status(&path, device).unwrap().0, "pending");
+
+        let payload = build_payload(device, 7001, today_day().saturating_sub(5), 365, None);
+        let sig = sign_payload(&payload);
+        let result =
+            accept_entitlement_at(&path, device, &payload, &sig, "OFFLINE_FILE", &test_trusted_keys())
+                .expect("genuine code must be accepted");
+
+        assert_eq!(result["identity_promoted"], serde_json::json!(true));
+        let (status, branch, company) = identity_status(&path, device).expect("identity row");
+        assert_eq!(status, "approved");
+        assert_eq!(branch, "1", "branch must come from the signed payload");
+        assert_eq!(company.as_deref(), Some("1"), "company must come from the signed payload");
+
+        let conn = Connection::open(&path).expect("open");
+        let promoted_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_entitlement_audit WHERE event = 'DEVICE_PROMOTED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(promoted_events, 1, "promotion must be auditable");
+    }
+
+    #[test]
+    fn a_rejected_code_never_promotes_the_device() {
+        // A code for another device must leave the identity exactly as it was.
+        let path = activation_temp_path("promote-rejected");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-PROMOTE-2";
+        seed_pending_identity(&path, device);
+
+        let payload = build_payload("FZDEV-SOMEONE-ELSE", 7002, today_day(), 365, None);
+        let sig = sign_payload(&payload);
+        let err = accept_entitlement_at(
+            &path,
+            device,
+            &payload,
+            &sig,
+            "OFFLINE_FILE",
+            &test_trusted_keys(),
+        )
+        .expect_err("a code bound elsewhere must be refused");
+        assert!(err.starts_with("DEVICE_BINDING_MISMATCH"), "got {err}");
+        assert_eq!(identity_status(&path, device).unwrap().0, "pending");
+    }
+
+    #[test]
+    fn acceptance_never_invents_an_identity_row() {
+        // Creation belongs to ensure_device_identity_*. If an activation file could conjure an
+        // identity, it could register a device that never existed.
+        let path = activation_temp_path("promote-no-identity");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-PROMOTE-3";
+        initialize_at(&path).expect("init");
+
+        let payload = build_payload(device, 7003, today_day().saturating_sub(2), 365, None);
+        let sig = sign_payload(&payload);
+        let result =
+            accept_entitlement_at(&path, device, &payload, &sig, "OFFLINE_FILE", &test_trusted_keys())
+                .expect("acceptance still succeeds");
+        assert_eq!(result["identity_promoted"], serde_json::json!(false));
+        assert!(identity_status(&path, device).is_none(), "no identity may be created here");
+    }
+
+    #[test]
+    fn a_snapshot_cannot_move_a_signed_device_to_another_branch() {
+        // Found by audit: `branch_id = excluded.branch_id` is an unconditional overwrite, and the
+        // snapshot's branch is client-supplied (App.jsx falls back to "1"). Without the signed-scope
+        // override, redeeming a code for branch 7 then caching any snapshot would silently relocate
+        // the device to branch 1 — making the promotion cosmetic.
+        let path = activation_temp_path("signed-scope-wins");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-SCOPE-1";
+        seed_pending_identity(&path, device);
+
+        // A payload carrying company 1 / branch 1, accepted and promoted.
+        let payload = build_payload(device, 7100, today_day().saturating_sub(3), 365, None);
+        let sig = sign_payload(&payload);
+        accept_entitlement_at(&path, device, &payload, &sig, "OFFLINE_FILE", &test_trusted_keys())
+            .expect("accepted");
+        assert_eq!(identity_status(&path, device).unwrap().1, "1");
+
+        // A snapshot now claims a different branch entirely.
+        let snapshot = serde_json::json!({
+            "device_identity": { "device_id": device, "branch_id": "99" },
+            "branch_context": { "branch_id": "99" },
+            "user_profile": { "id": "user-1", "company_id": "99" },
+            "products": [],
+            "inventory_lots": [],
+        });
+        cache_reference_snapshot_at(&path, &snapshot).expect("snapshot caches");
+
+        let (status, branch, company) = identity_status(&path, device).expect("identity row");
+        assert_eq!(status, "approved");
+        assert_eq!(branch, "1", "the signed branch must survive an unsigned snapshot");
+        assert_eq!(
+            company.as_deref(),
+            Some("1"),
+            "the signed company must survive an unsigned snapshot"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_still_sets_scope_when_no_signed_entitlement_exists() {
+        // The override must not freeze scope for devices that have no entitlement yet — the
+        // ordinary cloud-provisioned path still needs the snapshot to be authoritative.
+        let path = activation_temp_path("unsigned-scope-applies");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-SCOPE-2";
+        seed_pending_identity(&path, device);
+
+        let snapshot = serde_json::json!({
+            "device_identity": { "device_id": device, "branch_id": "42" },
+            "branch_context": { "branch_id": "42" },
+            "user_profile": { "id": "user-1", "company_id": "42" },
+            "products": [],
+            "inventory_lots": [],
+        });
+        cache_reference_snapshot_at(&path, &snapshot).expect("snapshot caches");
+
+        let (_, branch, company) = identity_status(&path, device).expect("identity row");
+        assert_eq!(branch, "42");
+        assert_eq!(company.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn a_snapshot_omitting_registration_status_never_upgrades_the_device() {
+        // The defect being removed: an absent field used to mean "approved", so the desktop
+        // building its own snapshot approved itself.
+        let path = activation_temp_path("snapshot-no-upgrade");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-SNAPSHOT-1";
+        seed_pending_identity(&path, device);
+
+        let snapshot = serde_json::json!({
+            "device_identity": { "device_id": device, "branch_id": "1" },
+            "user_profile": { "id": "user-1", "company_id": "1" },
+            "products": [],
+            "inventory_lots": [],
+        });
+        cache_reference_snapshot_at(&path, &snapshot).expect("snapshot caches");
+
+        assert_eq!(
+            identity_status(&path, device).unwrap().0,
+            "pending",
+            "an omitted status must preserve the existing one, never upgrade it"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_omitting_registration_status_leaves_an_approved_device_approved() {
+        // The other direction: preserving the existing status must not DEMOTE a legitimately
+        // approved device either. Absent means "unchanged", not "pending".
+        let path = activation_temp_path("snapshot-no-demote");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-SNAPSHOT-2";
+        seed_pending_identity(&path, device);
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute(
+                "UPDATE local_device_identity SET registration_status = 'approved' WHERE device_id = ?1",
+                params![device],
+            )
+            .expect("approve");
+        }
+
+        let snapshot = serde_json::json!({
+            "device_identity": { "device_id": device, "branch_id": "1" },
+            "user_profile": { "id": "user-1", "company_id": "1" },
+            "products": [],
+            "inventory_lots": [],
+        });
+        cache_reference_snapshot_at(&path, &snapshot).expect("snapshot caches");
+
+        assert_eq!(identity_status(&path, device).unwrap().0, "approved");
     }
 
     #[test]

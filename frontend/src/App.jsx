@@ -3498,11 +3498,15 @@ function App() {
       },
       user_profile: currentUser,
       device_identity: {
+        // `registration_status` is deliberately NOT set here (design §12). The desktop builds this
+        // snapshot for itself, so hardcoding "approved" was the device granting itself the approval
+        // it was supposed to prove. Whatever `latestDevice` carries from local_device_identity is
+        // the truth; when it carries nothing, the Rust side keeps the device's existing status
+        // rather than upgrading it.
         ...latestDevice,
         platform: "tauri-windows",
         app_version: APP_VERSION,
         branch_id: branchId,
-        registration_status: "approved",
       },
       products: values.products || [],
       categories: values.categories || [],

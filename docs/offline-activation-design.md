@@ -31,7 +31,7 @@ reached the cloud has no record, and `offlineSession.js:79` tells the user to "c
 internet once before offline use" — unsatisfiable when the backend is gone.
 
 **Device approval is asserted, not proved.** Two places grant approval with no evidence:
-`App.jsx:3408` hardcodes `registration_status: "approved"` into the snapshot the desktop builds
+`App.jsx` (`fetchOnlineReferenceSnapshot`) hardcodes `registration_status: "approved"` into the snapshot the desktop builds
 for itself, and `cache_reference_snapshot_at` (`local_db.rs:2194`) defaults the same field to
 `"approved"` when the snapshot omits it. So authorisation today is simultaneously cloud-gated
 (you cannot get in without it) and unverifiable (once in, it is self-granted). That is the worst
@@ -384,7 +384,7 @@ change removes the cloud from the authorisation path.
 
 Two removals go with it:
 
-- `App.jsx:3408`'s hardcoded `registration_status: "approved"`.
+- `App.jsx`'s hardcoded `registration_status: "approved"` in `fetchOnlineReferenceSnapshot`.
 - The `"approved"` default in `cache_reference_snapshot_at` (`local_db.rs:2194`). A snapshot that
   omits the field should yield the device's existing status, never an upgrade to approved.
 
@@ -730,7 +730,7 @@ this"). Worth correcting there so the record is accurate; I have not edited that
 | `activation_codes` as an auth mechanism | `server.js:2189` | **[D-17]** keep the table for audit/seat history, or drop it |
 | `POST /api/auth/device-bootstrap-status` as a login precondition | `App.jsx:4263` | Cloud round-trip on the critical path |
 | `canonical-cloud-login` health probe as a gate | `App.jsx:4249` | Same, and it is what fires at dead Railway today |
-| Hardcoded `registration_status: "approved"` | `App.jsx:3408` | Self-granted approval |
+| Hardcoded `registration_status: "approved"` | `App.jsx` `fetchOnlineReferenceSnapshot` | Self-granted approval |
 | `"approved"` default when the snapshot omits it | `local_db.rs:2194` | Same |
 | `DEFAULT_PRODUCTION_CLOUD_API_URL` desktop fallback | `App.jsx:148` | Unconfigured must mean no target — **[D-16]** |
 | `NO_SESSION` message text | `offlineSession.js:79` | Instructs the user to do something impossible; must name the local route |

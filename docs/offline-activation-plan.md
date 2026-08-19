@@ -15,7 +15,8 @@
 > | 3 — signing CLI + fixtures | **Complete 2026-08-17.** `src-tauri/tools/sign_activation.rs`, `.lic` format, fixture set, 23/23 round-trip tests against real signed bytes. Real root public keys baked into `TRUSTED_ACTIVATION_KEYS`. |
 > | 4 — grandfathering, localStorage fix, backlog 3/4/5 | **Complete 2026-08-17.** The localStorage-shadowing fix and backlog items 3, 4 and 5 landed first; grandfathering (`grandfather_existing_device`, the `LEGACY_GRANDFATHER` shim) and migration `018` (`bootstrap_consumed_at`) landed in commit `b923a65`, closing the gap the original Stage 4 record described. |
 > | 5 — `.lic` redemption, activation screen, bootstrap Owner | **Complete 2026-08-17.** Rust acceptance/state layer + four Tauri commands + `.lic` parser; frontend `entitlementState.js` (§9 mirror, pulled forward from Stage 7) + `bootstrapCredential.js`; App.jsx activation gate and forced-password-change flow. See the Stage 5 record at the end of this file. `registration_status` promotion and the two hardcoded "approved" removals stay in Stage 6. |
-> | 6–10 | Not started. |
+> | 6 — local promotion of `registration_status` | **Complete 2026-08-18.** Verified acceptance promotes the identity locally; both hardcoded "approved" defaults removed; signed scope now outranks an unsigned snapshot. See the Stage 6 record at the end of this file. |
+> | 7–10 | Not started (7 partly done — `entitlementState.js` landed in Stage 5). |
 >
 > **Parallel track:** `docs/auth-hardening-plan.md` (stages A-1 … A-6) scopes the auth debt. It
 > is the gate on remote access and is independent of the stages below.
@@ -217,7 +218,8 @@ correct reason recorded in `local_entitlement_audit`.
   `local_device_identity.registration_status` locally. Remove the `"approved"` default in
   `cache_reference_snapshot_at` (`local_db.rs:2194`) — a snapshot omitting the field yields the
   device's existing status, never an upgrade.
-- `App.jsx:3408` — remove the hardcoded `registration_status: "approved"` in the snapshot the
+- `App.jsx` (`fetchOnlineReferenceSnapshot`, was cited as `:3408`, actually `:3505` by the time it
+  was removed) — remove the hardcoded `registration_status: "approved"` in the snapshot the
   desktop builds for itself.
 - Cloud-side note carried into stage 9, not built here: `device-bootstrap-status` stops being a
   hard gate on a device whose local entitlement already says approved — it becomes advisory/
@@ -619,3 +621,84 @@ re-opens of anything above.
 The pure pieces (state mirror, bootstrap KDF, `.lic` parser, acceptance/state SQL) were already
 covered by unit tests; this closes the one gap those couldn't reach — the actual Tauri/WebView2 UI
 on Windows.
+
+---
+
+## Stage 6 record — completed 2026-08-18
+
+Authorisation stops being asserted and starts being proved. Until now `registration_status` could
+only reach `approved` through a cloud lookup or one of two hardcoded defaults that granted approval
+on no evidence at all — and because the desktop builds its own snapshot, one of those defaults was
+literally a device approving itself (design §1: "authorisation today is simultaneously cloud-gated
+and unverifiable").
+
+### Changes
+
+| File | Change |
+| --- | --- |
+| `src-tauri/src/local_db.rs` | `accept_entitlement_at` promotes `local_device_identity` to `approved` with `company_id`/`branch_id` **from the signed payload**, and writes a `DEVICE_PROMOTED` audit row. Update-only: it never creates an identity, because an activation file must not be able to conjure a device that never registered. |
+| `src-tauri/src/local_db.rs` | `cache_reference_snapshot_at` no longer defaults a missing `registration_status` to `"approved"`. An omitted field now yields the device's **existing** status, falling back to `pending` only for a device with no row. |
+| `src-tauri/src/local_db.rs` | **New, found by audit:** a live `VERIFIED` entitlement now outranks the snapshot for `company_id`/`branch_id`. See "the defect the audit caught" below. |
+| `frontend/src/App.jsx` | Removed the hardcoded `registration_status: "approved"` from the snapshot the desktop builds for itself (`fetchOnlineReferenceSnapshot`). |
+
+### The defect the audit caught
+
+A read-only audit agent was run over every read and write of `registration_status` before the change
+landed. It found that the promotion, as first written, was **cosmetic for scope**:
+`cache_reference_snapshot_at` updates `branch_id = excluded.branch_id` unconditionally — no
+`COALESCE` — and the snapshot's branch is client-supplied, defaulting to `"1"` when `App.jsx` knows
+nothing. So a device could redeem a code scoped to branch 7 and have the very next snapshot cache
+quietly move it to branch 1, while the code comment claimed a device "cannot talk itself into
+another company's scope".
+
+Fixed by having a live `VERIFIED` entitlement supply scope in preference to the snapshot — §6.4's
+rung 1, made true now rather than deferred to Stage 8. Two regression tests cover both directions:
+the signed scope survives a hostile snapshot, and a device with **no** entitlement still takes scope
+from the snapshot (so the ordinary cloud-provisioned path is unchanged).
+
+### Risks the audit surfaced, recorded rather than fixed
+
+1. **Grandfathering keys off `approved`, which this change makes rarer.**
+   `grandfather_existing_device` has exactly one call site — inside the `approved.first()` branch —
+   so a `pending` device never reaches the §11.1 shim. Existing field devices are unaffected: their
+   rows already hold `approved` from before the upgrade, and the new code preserves an existing
+   status rather than recomputing it. The exposure is a device whose `approved` would only have been
+   granted by the removed default, which is now precisely the population the design says should not
+   be self-approving.
+
+2. **`DEVICE_IDENTITY_CONFLICT` becomes reachable where it was masked.** Two `pending` identities
+   with none approved is a hard error (`local_db.rs`, mirrored in `backend/localSettingsStore.js`,
+   surfacing as HTTP 503 through `desktopGateway.js`). The old permissive default resolved such
+   profiles by promoting whichever device cached a snapshot. Backlog item 5 records a real profile
+   with three identity rows, so multi-row profiles do exist in the field. **This is a fail-closed
+   path and contradicts §2.5's "fail into the running state" — it needs a decision, not a silent
+   change.** Raised with the maintainer; not altered here.
+
+3. **The column has no canonical case.** The local schema defaults to lowercase `pending`, the cloud
+   schema to uppercase `PENDING`; the Rust and Node selectors are case-insensitive, but
+   `scripts/cloud/verify-hosted-cloud.mjs` compares `=== "APPROVED"` strictly and one Rust fixture
+   asserts `registration_status='APPROVED'` in case-sensitive SQL. Nothing breaks today because no
+   path rewrites that fixture's row. Worth normalising before anything else depends on it.
+
+4. **`resolveLocalDeviceInfo` drops `registration_status` deliberately** (`App.jsx`), which is what
+   makes the removed line yield an *absent* field rather than a stale one. That behaviour is
+   load-bearing and undocumented: anyone later "helpfully" propagating the field through that
+   function re-creates the self-approval loop by another route, and no test would catch it.
+
+### Gate results
+
+| Gate | Result |
+| --- | --- |
+| `cargo test --lib` | **80 passed / 3 failed** — the 3 are the pre-existing Windows-path tests; +7 new over Stage 5's 73. |
+| `cargo test --test activation_roundtrip --features signing-cli` | 23 / 23 |
+| `cargo check` | Clean |
+| `npm --prefix frontend run lint` | 0 errors, 37 pre-existing warnings |
+| `npm run build` | Pass |
+| `npm --prefix backend test` | 114 / 115 (pre-existing test 102 path assertion) |
+| `TZ=Asia/Kolkata node --test frontend/src/local/*.test.mjs` | 217 / 217 |
+
+### Not verified here
+
+No Windows walkthrough. The behaviour most worth confirming on real hardware is that an existing
+grandfathered device still opens normally after this change — its status is preserved, but that is
+reasoning plus tests, not observation.
