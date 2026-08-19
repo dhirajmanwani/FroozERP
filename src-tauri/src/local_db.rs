@@ -2687,6 +2687,144 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
     tx.commit().map_err(to_error)
 }
 
+/// Resolve a device's company/branch/operational-location scope from local data alone, in
+/// decreasing order of authority, and NEVER fail the snapshot build over it (§6.4, D-6).
+///
+/// - **Rung 1 — an active `VERIFIED` entitlement.** Supplies `company_id`/`branch_id`. A verified
+///   entitlement is a signature over this device's own binding, checked once at acceptance time;
+///   the stored columns are trusted from that point on without re-verifying on every read — the
+///   same trust boundary `active_entitlement_at` already uses.
+/// - **Rung 2 — an active `local_device_assignment` row.** Adds `operational_location_id`. If
+///   rung 1 did not fire, this rung's own `company_id`/`branch_id` are used as a weaker fallback,
+///   since a real sync-delivered assignment is still meaningful evidence — just not as strong as a
+///   signature.
+/// - **Rung 3 — an approved `local_device_identity`.** `branch_id` only, exactly as §6.4 states;
+///   company scope is deliberately never read from here.
+/// - **Rung 4 — unscoped.** `branch_id`/`company_id` come back `null` and the caller's existing
+///   `branch_context` default stands unnarrowed. Not a failure path: a device with a corrupt or
+///   absent entitlement row must still load its own stock and bill (§2.5).
+///
+/// **`DEVICE_SCOPE_CONFLICT` / `DEVICE_SCOPE_MISMATCH`.** Design §6.4 names these as the two
+/// warnings that must fall through rather than abort, but does not define what distinguishes
+/// them. Resolved here, and flagged as a decision this stage owns rather than one already ruled:
+/// `CONFLICT` is rung 1 and rung 2 both resolving and disagreeing on `company_id`/`branch_id` —
+/// two comparably authoritative sources contradicting each other. `MISMATCH` is rung 3's
+/// `branch_id` disagreeing with a `branch_id` already resolved by rung 1 or 2 — a weaker,
+/// possibly-stale source disagreeing with something already trusted more. Neither ever changes
+/// which value wins; the higher rung always wins. Both are returned as data for a caller to
+/// surface, never thrown.
+fn canonical_snapshot_scope_at(conn: &Connection, device_id: &str) -> serde_json::Value {
+    match canonical_snapshot_scope_try(conn, device_id) {
+        Ok(scope) => scope,
+        Err(error) => {
+            // A lookup failure is metadata trouble, not a reason to refuse the snapshot — the same
+            // "fail into the running state" reasoning `grandfather_existing_device`'s call site
+            // already uses. Logged so it is not silently invisible, never propagated.
+            eprintln!("canonical snapshot scope resolution skipped: {error}");
+            serde_json::json!({
+                "company_id": null,
+                "branch_id": null,
+                "operational_location_id": null,
+                "source": "unscoped",
+                "warnings": [{"code": "DEVICE_SCOPE_LOOKUP_FAILED", "detail": error}],
+            })
+        }
+    }
+}
+
+fn canonical_snapshot_scope_try(conn: &Connection, device_id: &str) -> Result<serde_json::Value, String> {
+    let entitlement_scope: Option<(String, String)> = conn
+        .query_row(
+            "SELECT company_id, branch_id FROM local_entitlement
+              WHERE device_id = ?1 AND superseded_at IS NULL AND revoked_at IS NULL
+                AND verification_state = 'VERIFIED'
+              ORDER BY issued_at DESC LIMIT 1",
+            params![device_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(to_error)?;
+
+    let assignment_scope: Option<(String, String, String)> = conn
+        .query_row(
+            "SELECT company_id, branch_id, operational_location_id FROM local_device_assignment
+              WHERE device_id = ?1 AND active = 1",
+            params![device_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+        )
+        .optional()
+        .map_err(to_error)?;
+
+    let identity_branch: Option<String> = conn
+        .query_row(
+            "SELECT branch_id FROM local_device_identity
+              WHERE device_id = ?1 AND LOWER(registration_status) = 'approved'",
+            params![device_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(to_error)?
+        .filter(|value| !value.eq_ignore_ascii_case("unassigned"));
+
+    let mut warnings: Vec<serde_json::Value> = Vec::new();
+    let mut company_id: Option<String> = None;
+    let mut branch_id: Option<String> = None;
+    let mut operational_location_id: Option<String> = None;
+    let mut source = "unscoped";
+
+    if let Some((company, branch)) = &entitlement_scope {
+        company_id = Some(company.clone());
+        branch_id = Some(branch.clone());
+        source = "entitlement";
+    }
+
+    if let Some((assign_company, assign_branch, location)) = &assignment_scope {
+        if company_id.is_some() {
+            if company_id.as_deref() != Some(assign_company.as_str())
+                || branch_id.as_deref() != Some(assign_branch.as_str())
+            {
+                warnings.push(serde_json::json!({
+                    "code": "DEVICE_SCOPE_CONFLICT",
+                    "detail": "local_device_assignment disagrees with the active entitlement; the entitlement's scope was kept.",
+                }));
+            }
+        } else {
+            company_id = Some(assign_company.clone());
+            branch_id = Some(assign_branch.clone());
+            source = "device_assignment";
+        }
+        operational_location_id = Some(location.clone());
+    }
+
+    if let Some(identity_branch_value) = &identity_branch {
+        match &branch_id {
+            Some(existing) if existing != identity_branch_value => {
+                warnings.push(serde_json::json!({
+                    "code": "DEVICE_SCOPE_MISMATCH",
+                    "detail": "local_device_identity's branch differs from the resolved scope; the more authoritative source was kept.",
+                }));
+            }
+            Some(_) => {}
+            None => {
+                branch_id = Some(identity_branch_value.clone());
+                source = "device_identity";
+            }
+        }
+    }
+
+    if branch_id.is_none() {
+        source = "unscoped";
+    }
+
+    Ok(serde_json::json!({
+        "company_id": company_id,
+        "branch_id": branch_id,
+        "operational_location_id": operational_location_id,
+        "source": source,
+        "warnings": warnings,
+    }))
+}
+
 fn load_reference_snapshot_at(
     path: &Path,
     username: Option<&str>,
@@ -2996,6 +3134,10 @@ fn load_reference_snapshot_at(
     )?;
     let pending_operations = count_outbox_status(&conn, &["pending", "syncing", "failed"])?;
     let reference_ready = !products.is_empty() && !inventory_lots.is_empty();
+    // §6.4 / Stage 8: additive only. `branch_context` above is untouched — whatever was last
+    // cached stands exactly as it did before this field existed. `canonical_scope` is a second,
+    // independently-computed opinion a caller may prefer once it starts reading it.
+    let canonical_scope = canonical_snapshot_scope_at(&conn, requested_device);
 
     Ok(serde_json::json!({
         "reference_ready": reference_ready,
@@ -3004,6 +3146,7 @@ fn load_reference_snapshot_at(
         "last_successful_sync_at": last_successful_sync_at,
         "device_identity": device_identity,
         "branch_context": branch_context,
+        "canonical_scope": canonical_scope,
         "user_profile": user_profile,
         "offline_auth": offline_auth,
         "products": products,
@@ -6528,6 +6671,240 @@ mod tests {
         let (_, branch, company) = identity_status(&path, device).expect("identity row");
         assert_eq!(branch, "42");
         assert_eq!(company.as_deref(), Some("42"));
+    }
+
+    // ---- Stage 8: canonical_snapshot_scope (design §6.4) -----------------------------------
+
+    fn seed_operational_location(conn: &Connection, id: &str, company: &str, branch: &str) {
+        conn.execute(
+            "INSERT INTO local_operational_locations
+                (id, company_id, branch_id, location_code, location_name, updated_at)
+             VALUES (?1, ?2, ?3, 'LOC', 'Location', strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            params![id, company, branch],
+        )
+        .expect("seed location");
+    }
+
+    fn seed_device_assignment(path: &Path, device_id: &str, company: &str, branch: &str, location: &str) {
+        initialize_at(path).expect("init");
+        let conn = Connection::open(path).expect("open");
+        conn.pragma_update(None, "foreign_keys", "ON").expect("fk on");
+        seed_operational_location(&conn, location, company, branch);
+        conn.execute(
+            "INSERT INTO local_device_assignment
+                (device_id, company_id, branch_id, operational_location_id, intended_usage,
+                 assignment_generation, server_confirmed_at)
+             VALUES (?1, ?2, ?3, ?4, 'GENERAL', 1, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            params![device_id, company, branch, location],
+        )
+        .expect("seed assignment");
+    }
+
+    fn accept_scoped_entitlement(path: &Path, device_id: &str, company: u64, branch: u64, serial: u32) {
+        seed_pending_identity(path, device_id);
+        let mut payload = Vec::new();
+        payload.push(crate::entitlement::FORMAT_VERSION);
+        payload.push(0x01);
+        payload.push(0);
+        put_varint_test(&mut payload, company);
+        put_varint_test(&mut payload, branch);
+        payload.extend_from_slice(&crate::entitlement::device_binding_hash(device_id));
+        payload.extend_from_slice(&serial.to_le_bytes());
+        payload.extend_from_slice(&today_day().saturating_sub(5).to_le_bytes());
+        payload.extend_from_slice(&365u16.to_le_bytes());
+        let sig = sign_payload(&payload);
+        accept_entitlement_at(path, device_id, &payload, &sig, "OFFLINE_FILE", &test_trusted_keys())
+            .expect("scoped entitlement accepted");
+    }
+
+    fn scope_of(path: &Path, device_id: &str) -> serde_json::Value {
+        let conn = Connection::open(path).expect("open");
+        canonical_snapshot_scope_at(&conn, device_id)
+    }
+
+    #[test]
+    fn rung1_a_verified_entitlement_alone_supplies_company_and_branch() {
+        let path = activation_temp_path("scope-rung1");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-SCOPE-R1";
+        accept_scoped_entitlement(&path, device, 7, 3, 8001);
+
+        let scope = scope_of(&path, device);
+        assert_eq!(scope["company_id"], serde_json::json!("7"));
+        assert_eq!(scope["branch_id"], serde_json::json!("3"));
+        assert_eq!(scope["operational_location_id"], serde_json::Value::Null);
+        assert_eq!(scope["source"], serde_json::json!("entitlement"));
+        assert_eq!(scope["warnings"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn rung2_an_assignment_alone_supplies_full_scope() {
+        let path = activation_temp_path("scope-rung2-alone");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-SCOPE-R2A";
+        seed_device_assignment(&path, device, "9", "4", "loc-9-4");
+
+        let scope = scope_of(&path, device);
+        assert_eq!(scope["company_id"], serde_json::json!("9"));
+        assert_eq!(scope["branch_id"], serde_json::json!("4"));
+        assert_eq!(scope["operational_location_id"], serde_json::json!("loc-9-4"));
+        assert_eq!(scope["source"], serde_json::json!("device_assignment"));
+        assert_eq!(scope["warnings"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn rung2_only_adds_the_location_when_rung1_already_resolved_scope() {
+        let path = activation_temp_path("scope-rung1-plus-2");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-SCOPE-R12";
+        accept_scoped_entitlement(&path, device, 5, 2, 8002);
+        seed_device_assignment(&path, device, "5", "2", "loc-5-2");
+
+        let scope = scope_of(&path, device);
+        // company/branch still say the entitlement supplied them, not the assignment.
+        assert_eq!(scope["source"], serde_json::json!("entitlement"));
+        assert_eq!(scope["company_id"], serde_json::json!("5"));
+        assert_eq!(scope["branch_id"], serde_json::json!("2"));
+        assert_eq!(scope["operational_location_id"], serde_json::json!("loc-5-2"));
+        assert_eq!(scope["warnings"], serde_json::json!([]), "agreement raises no warning");
+    }
+
+    #[test]
+    fn a_disagreeing_assignment_is_flagged_but_the_entitlement_still_wins() {
+        let path = activation_temp_path("scope-conflict");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-SCOPE-CONFLICT";
+        accept_scoped_entitlement(&path, device, 5, 2, 8003);
+        // A stale or wrong assignment naming a different branch entirely.
+        seed_device_assignment(&path, device, "5", "9", "loc-5-9");
+
+        let scope = scope_of(&path, device);
+        assert_eq!(scope["branch_id"], serde_json::json!("2"), "the signed scope must still win");
+        assert_eq!(
+            scope["operational_location_id"],
+            serde_json::json!("loc-5-9"),
+            "the location is still useful even when branch disagrees"
+        );
+        let warnings = scope["warnings"].as_array().expect("warnings array");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0]["code"], serde_json::json!("DEVICE_SCOPE_CONFLICT"));
+    }
+
+    #[test]
+    fn rung3_an_approved_identity_supplies_branch_only_never_company() {
+        let path = activation_temp_path("scope-rung3");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-SCOPE-R3";
+        seed_pending_identity(&path, device);
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute(
+                "UPDATE local_device_identity SET registration_status='approved', branch_id='6' WHERE device_id=?1",
+                params![device],
+            )
+            .expect("approve");
+        }
+
+        let scope = scope_of(&path, device);
+        assert_eq!(scope["branch_id"], serde_json::json!("6"));
+        assert_eq!(scope["company_id"], serde_json::Value::Null, "rung 3 must never supply company");
+        assert_eq!(scope["source"], serde_json::json!("device_identity"));
+    }
+
+    #[test]
+    fn rung3_unassigned_branch_does_not_count_as_a_real_scope() {
+        let path = activation_temp_path("scope-rung3-unassigned");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-SCOPE-R3-UNASSIGNED";
+        seed_pending_identity(&path, device);
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute(
+                "UPDATE local_device_identity SET registration_status='approved', branch_id='unassigned' WHERE device_id=?1",
+                params![device],
+            )
+            .expect("approve");
+        }
+
+        let scope = scope_of(&path, device);
+        assert_eq!(scope["branch_id"], serde_json::Value::Null);
+        assert_eq!(scope["source"], serde_json::json!("unscoped"));
+    }
+
+    #[test]
+    fn a_stale_identity_branch_is_flagged_but_the_resolved_scope_still_wins() {
+        let path = activation_temp_path("scope-mismatch");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-SCOPE-MISMATCH";
+        accept_scoped_entitlement(&path, device, 5, 2, 8004);
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute(
+                "UPDATE local_device_identity SET branch_id='99' WHERE device_id=?1",
+                params![device],
+            )
+            .expect("stale identity branch");
+        }
+
+        let scope = scope_of(&path, device);
+        assert_eq!(scope["branch_id"], serde_json::json!("2"), "the entitlement's branch must still win");
+        let warnings = scope["warnings"].as_array().expect("warnings array");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0]["code"], serde_json::json!("DEVICE_SCOPE_MISMATCH"));
+    }
+
+    #[test]
+    fn rung4_a_device_with_nothing_at_all_is_unscoped_not_an_error() {
+        let path = activation_temp_path("scope-rung4");
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("init");
+
+        let scope = scope_of(&path, "FZDEV-SCOPE-NOTHING");
+        assert_eq!(scope["company_id"], serde_json::Value::Null);
+        assert_eq!(scope["branch_id"], serde_json::Value::Null);
+        assert_eq!(scope["operational_location_id"], serde_json::Value::Null);
+        assert_eq!(scope["source"], serde_json::json!("unscoped"));
+        assert_eq!(scope["warnings"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn an_unscoped_device_still_loads_a_full_snapshot_without_erroring() {
+        // The point of D-6: scope resolution must never abort the snapshot build.
+        let path = activation_temp_path("scope-rung4-snapshot");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-SCOPE-SNAPSHOT-UNSCOPED";
+        initialize_at(&path).expect("init");
+
+        let snapshot = load_reference_snapshot_at(&path, None, Some(device))
+            .expect("a snapshot must still load with nothing to scope from");
+        assert_eq!(snapshot["canonical_scope"]["source"], serde_json::json!("unscoped"));
+    }
+
+    #[test]
+    fn a_scoped_snapshot_carries_canonical_scope_without_touching_branch_context() {
+        // Additive only: branch_context is untouched by this stage, exactly as it was before.
+        let path = activation_temp_path("scope-additive");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-SCOPE-ADDITIVE";
+        accept_scoped_entitlement(&path, device, 11, 4, 8005);
+
+        let snapshot_before = serde_json::json!({
+            "device_identity": { "device_id": device },
+            "branch_context": { "branch_id": "1", "branch_name": "Main Branch" },
+            "user_profile": {},
+            "products": [],
+            "inventory_lots": [],
+        });
+        cache_reference_snapshot_at(&path, &snapshot_before).expect("caches");
+
+        let snapshot = load_reference_snapshot_at(&path, None, Some(device)).expect("loads");
+        assert_eq!(
+            snapshot["branch_context"]["branch_id"],
+            serde_json::json!("1"),
+            "the existing cached branch_context must be completely unaffected"
+        );
+        assert_eq!(snapshot["canonical_scope"]["branch_id"], serde_json::json!("4"));
+        assert_eq!(snapshot["canonical_scope"]["source"], serde_json::json!("entitlement"));
     }
 
     #[test]

@@ -16,7 +16,10 @@
 > | 4 — grandfathering, localStorage fix, backlog 3/4/5 | **Complete 2026-08-17.** The localStorage-shadowing fix and backlog items 3, 4 and 5 landed first; grandfathering (`grandfather_existing_device`, the `LEGACY_GRANDFATHER` shim) and migration `018` (`bootstrap_consumed_at`) landed in commit `b923a65`, closing the gap the original Stage 4 record described. |
 > | 5 — `.lic` redemption, activation screen, bootstrap Owner | **Complete 2026-08-17.** Rust acceptance/state layer + four Tauri commands + `.lic` parser; frontend `entitlementState.js` (§9 mirror, pulled forward from Stage 7) + `bootstrapCredential.js`; App.jsx activation gate and forced-password-change flow. See the Stage 5 record at the end of this file. `registration_status` promotion and the two hardcoded "approved" removals stay in Stage 6. |
 > | 6 — local promotion of `registration_status` | **Complete 2026-08-18.** Verified acceptance promotes the identity locally; both hardcoded "approved" defaults removed; signed scope now outranks an unsigned snapshot. See the Stage 6 record at the end of this file. |
-> | 7–10 | Not started (7 partly done — `entitlementState.js` landed in Stage 5). |
+> | 7 — banners | Partly done. `entitlementState.js` landed in Stage 5; a notification centre wiring most of the state banners landed as a follow-up fix on 2026-08-19. |
+> | 8 — `canonical_snapshot_scope` | **Complete 2026-08-19.** `canonical_snapshot_scope_at`, additive to the existing snapshot. See the Stage 8 record at the end of this file. |
+> | 9 — cloud registration/renewal/revocation | Not started. Needs a running cloud backend, which is currently down (Railway lapsed) — parked, not blocked on engineering. |
+> | 10 — typed code input | Not started. |
 >
 > **Parallel track:** `docs/auth-hardening-plan.md` (stages A-1 … A-6) scopes the auth debt. It
 > is the gate on remote access and is independent of the stages below.
@@ -702,3 +705,83 @@ from the snapshot (so the ordinary cloud-provisioned path is unchanged).
 No Windows walkthrough. The behaviour most worth confirming on real hardware is that an existing
 grandfathered device still opens normally after this change — its status is preserved, but that is
 reasoning plus tests, not observation.
+
+---
+
+## Stage 8 record — completed 2026-08-19
+
+### What landed
+
+`canonical_snapshot_scope_at` in `src-tauri/src/local_db.rs`, resolving a device's
+`company_id`/`branch_id`/`operational_location_id` from local data alone, in the four-rung order
+design §6.4 specifies. Wired into `load_reference_snapshot_at` as a new `canonical_scope` field on
+the snapshot, alongside the existing `branch_context` — **additive only**. `branch_context` and its
+own default (unscoped → branch `"1"`, current behaviour) are completely untouched; nothing that
+reads the snapshot today changes behaviour until it starts reading the new field.
+
+The shelved patch design §6.4 refers to (`scratchpad/local_db-canonical-snapshot-scope.patch`) does
+not exist anywhere in this repository or environment — this is new work built from §6.4's rules,
+not a rework of prior code.
+
+### Two decisions this stage owned, not already ruled
+
+Design §6.4 names `DEVICE_SCOPE_CONFLICT` and `DEVICE_SCOPE_MISMATCH` as warnings that must fall
+through rather than abort, but does not define what distinguishes them — the shelved patch that
+would have shown the original intent is not recoverable. Resolved and documented in the function's
+own doc comment rather than silently decided:
+
+- **`DEVICE_SCOPE_CONFLICT`** — rung 1 (entitlement) and rung 2 (device assignment) both resolve
+  and disagree on `company_id`/`branch_id`. Two comparably authoritative sources contradicting each
+  other. The entitlement wins; the assignment's `operational_location_id` is still used regardless,
+  since a location assignment stays useful information even when the branch it names is wrong.
+- **`DEVICE_SCOPE_MISMATCH`** — rung 3 (device identity) disagrees with a `branch_id` already
+  resolved by rung 1 or 2. A weaker, possibly-stale source disagreeing with something already
+  trusted more.
+
+Neither warning ever changes which value wins — the higher rung always wins, per §6.4's own
+ordering. Both are returned as data on the snapshot for a caller to surface, never thrown.
+
+One more read not explicit in the source text: rung 1 requires `verification_state = 'VERIFIED'`
+strictly, which excludes `LEGACY_GRANDFATHER` rows. This was checked rather than assumed safe:
+`grandfather_existing_device` only ever runs for a device whose `local_device_identity` is already
+`approved`, so a grandfathered device always has a real `branch_id` sitting at rung 3. Excluding
+grandfather rows from rung 1 does not leave those devices unscoped.
+
+### Testable
+
+Ten `cargo test` cases: each rung firing alone, rung 2 adding only the location on top of rung 1,
+a rung 1/2 conflict (entitlement wins, location still applied), rung 3 supplying branch only and
+never company, the `unassigned` placeholder branch correctly not counting as a real rung-3 value, a
+rung 2/3 mismatch (resolved scope still wins), full unscoped with no error, and two integration
+checks confirming `load_reference_snapshot_at` still succeeds with nothing to scope from and that
+`branch_context` is untouched when `canonical_scope` is populated.
+
+### Gate results
+
+| Gate | Result |
+| --- | --- |
+| `cargo test --lib` | **95 passed / 3 failed** — the 3 are the pre-existing Windows-path tests; +10 new over the notification-centre fix's 85. |
+| `cargo test --test activation_roundtrip --features signing-cli` | 23 / 23 |
+| `cargo check` | Clean |
+| `npm --prefix frontend run lint` | 0 errors, 37 pre-existing warnings |
+| `npm run build` | Pass |
+| `npm run backend:check` | Pass |
+| `npm --prefix backend test` | 120 / 121 (pre-existing test 102 path assertion) |
+| `TZ=Asia/Kolkata node --test frontend/src/local/*.test.mjs` | 231 / 231 |
+
+### Not verified here, and not required by the plan's own testable bar
+
+No frontend or backend code was changed to *read* `canonical_scope` — nothing consumes it yet, by
+design, to keep this stage's blast radius to one function in one file. The plan's own testable
+criteria for Stage 8 (`cargo test` covering all four rungs, plus a disposable-profile walkthrough
+confirming offline login still works) does not require consumption, and a manual Windows walkthrough
+was not performed this session. Wiring a real caller — most likely the multibranch module in
+`docs/product-goals.md` G1, which explicitly wants an offline read of the device's own scope — is
+left for when that goal is picked up, rather than speculative additions here.
+
+### Stage 9 — status note, not a start
+
+Recorded here so it is not mistaken for begun: Stage 9 requires a running cloud Postgres backend to
+develop and test against (per its own testable criteria, "entirely against a local Postgres
+instance"). No cloud backend is currently running in this environment or the maintainer's. Parked,
+not blocked on any engineering decision.
