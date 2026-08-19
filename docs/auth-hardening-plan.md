@@ -1,12 +1,12 @@
 # Auth Hardening — Scoping and Plan
 
-**Status:** **A-1 complete 2026-08-19.** A-2 … A-6 open. Written 2026-08-17 at the maintainer's
+**Status:** **A-1 and A-2 complete 2026-08-19.** A-3 … A-6 open. Written 2026-08-17 at the maintainer's
 request, to run **in parallel** with the offline-activation stages.
 
 | Stage | Status |
 | --- | --- |
 | A-1 password hashing | **Complete 2026-08-19** — see the record at the end of this file |
-| A-2 remove plaintext fallback | Open. Unblocked: A-1's dispatcher is in place and tags the branch `PLAINTEXT`. |
+| A-2 remove plaintext fallback | **Complete 2026-08-19** — see the record at the end of this file. **Carries an operational action: see "Before this reaches a live database".** |
 | A-3 real sessions | Open |
 | A-4 middleware on all routes | Open |
 | A-5 lockout + delete legacy verify | Open |
@@ -257,3 +257,88 @@ the backend is safe to expose.
 `upgradeStoredPassword` was not exercised against a live Postgres — no database is running in this
 environment. Its failure path is deliberately swallowed so a re-hash can never break a valid
 sign-in, and the verify/`needsRehash` logic it depends on is covered by unit tests.
+
+---
+
+## A-2 record — completed 2026-08-19
+
+### What changed
+
+One branch deleted from `verifyPassword` in `backend/passwordHash.js`. The original
+`passwordMatches` ended with:
+
+```js
+return stored === hashPassword(password) || stored === String(password || "");
+```
+
+That second clause meant **any user row whose password column held a plaintext value
+authenticated on that plaintext**. It was there for migration compatibility and was a permanent
+bypass while it stayed.
+
+A stored value that is neither a scrypt hash nor a legacy SHA-256 digest now reports
+`UNRECOGNIZED` and never authenticates.
+
+### The rejection deliberately reveals nothing
+
+An earlier draft reported the plaintext case precisely — comparing the stored value against the
+supplied password so an operator could see "this row is plaintext" in the logs. That was wrong and
+was removed before it shipped: the comparison would tell whoever made the request "your guess
+matched, but you may not come in", which leaks the exact fact the rejection exists to protect.
+
+The stored value's **shape** is enough to diagnose "this row was never migrated" without touching
+the supplied password at all. A test asserts a correct and an incorrect guess against a plaintext
+row are reported identically.
+
+### Before this reaches a live database
+
+**Any account whose password is still stored as plaintext can no longer sign in.** It needs an
+administrative password reset. This is the intended effect — that bypass was the vulnerability —
+but it is a lockout, so it should be checked for rather than discovered by a user.
+
+The A-1 upgrade path would normally absorb this: a plaintext row that logged in once between A-1
+and A-2 shipping would have been re-hashed to scrypt automatically. **That window never opened.**
+The cloud backend is not running (Railway lapsed), so nobody has logged in against `server.js`
+since A-1 landed, and A-1 and A-2 will reach a live database in the same deployment.
+
+Run this against the users table **before** deploying, to find any account that would be locked
+out:
+
+```sql
+SELECT id, username
+  FROM users
+ WHERE password_hash IS NOT NULL
+   AND password_hash <> ''
+   AND password_hash !~ '^scrypt\$'
+   AND password_hash !~ '^[0-9a-f]{64}$';
+```
+
+An empty result means nobody is affected and A-2 is invisible. Any row returned needs its password
+reset through the normal admin flow after deployment, which will write a proper scrypt hash.
+
+Expectation, not a measurement: the schema seed writes a hash, and every create/reset path in
+`server.js` writes a hash, so plaintext rows should only exist if one was inserted by hand. That
+has not been verified against a real database, because none is reachable from here.
+
+### Tests
+
+The A-1 test asserting plaintext *works* was replaced by its inverse, which is the security
+regression test worth keeping permanently: a plaintext-valued column no longer authenticates. Two
+more were added alongside it — a legacy SHA-256 row still authenticates (removing the bypass must
+not take the migration path with it, or everyone who has not logged in since A-1 is locked out),
+and the rejection does not reveal whether the guess was correct.
+
+### Gate results
+
+| Gate | Result |
+| --- | --- |
+| `npm --prefix backend test` | **141 / 142** — the 1 failure is the pre-existing Linux-vs-Windows path assertion. +2 over A-1. |
+| `npm run backend:check` | Pass |
+
+Frontend gates were not re-run: A-2 touches one branch of one backend module and no frontend file.
+
+### Still not fixed by this
+
+Identity remains client-asserted. `x-user-id` is still trusted across 212 unauthenticated routes,
+so anyone who can reach the API can still claim to be Owner **without any password at all** —
+which makes the plaintext bypass moot in the one scenario that matters most. A-2 closes a real hole
+in the password path; it does not make the API safe to expose. That is A-3 and A-4.

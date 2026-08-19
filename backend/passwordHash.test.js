@@ -69,8 +69,8 @@ test("needsRehash is never true for a failed attempt", async () => {
   assert.equal(failedLegacy.ok, false);
   assert.equal(failedLegacy.needsRehash, false);
 
-  const plaintext = "still-plaintext";
-  const failedPlain = await verifyPassword("guess", plaintext);
+  const unrecognised = "still-plaintext";
+  const failedPlain = await verifyPassword("guess", unrecognised);
   assert.equal(failedPlain.ok, false);
   assert.equal(failedPlain.needsRehash, false);
 });
@@ -134,12 +134,34 @@ test("a stored hash is compared after trimming, matching the previous behaviour"
   assert.equal(result.ok, true);
 });
 
-test("PLAINTEXT is reported distinctly, so A-2 has an exact target", async () => {
-  // A-1 keeps this branch working; A-2 deletes it. The format tag is what makes that safe to do.
+test("a plaintext-valued password column no longer authenticates (A-2)", async () => {
+  // THE A-2 regression test. The original passwordMatches ended with
+  //   || stored === String(password || "")
+  // so any row holding a plaintext password authenticated on that plaintext — a permanent bypass.
+  // This must never come back, which is why the assertion is on the exact scenario rather than on
+  // the shape of the code.
   const result = await verifyPassword("hunter2", "hunter2");
+  assert.equal(result.ok, false, "a plaintext password column must never authenticate");
+  assert.equal(result.format, PASSWORD_FORMATS.UNRECOGNIZED);
+  assert.equal(result.needsRehash, false);
+});
+
+test("a legacy SHA-256 row still authenticates after A-2", async () => {
+  // The other half of A-2's contract: removing the plaintext bypass must not take the legacy
+  // migration path with it, or every user who has not logged in since A-1 is locked out.
+  const stored = legacySha256("still-works");
+  const result = await verifyPassword("still-works", stored);
   assert.equal(result.ok, true);
-  assert.equal(result.format, PASSWORD_FORMATS.PLAINTEXT);
-  assert.equal(result.needsRehash, true, "a plaintext row must be upgraded the moment it is used");
+  assert.equal(result.format, PASSWORD_FORMATS.LEGACY_SHA256);
+  assert.equal(result.needsRehash, true);
+});
+
+test("the rejection does not reveal whether the plaintext guess was correct", async () => {
+  // Reporting "your guess matched the stored plaintext, but you may not come in" would leak the
+  // exact fact the rejection exists to protect. A right guess and a wrong one are indistinguishable.
+  const right = await verifyPassword("hunter2", "hunter2");
+  const wrong = await verifyPassword("not-hunter2", "hunter2");
+  assert.deepEqual(right, wrong, "correct and incorrect guesses must be reported identically");
 });
 
 test("a legacy-looking value is treated as a hash, not as a plaintext password", async () => {

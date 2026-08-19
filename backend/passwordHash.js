@@ -35,12 +35,17 @@
  * verifiable after the cost is raised, and that is impossible if the verifier can only assume
  * today's constants.
  *
- * ## What is deliberately NOT here
+ * ## The plaintext fallback is gone (A-2)
  *
- * The plaintext fallback (`stored === password`) is kept in `verifyPassword` for now because
- * A-1's contract is "no behaviour change" — removing it is A-2, immediately after. It is marked
- * `PLAINTEXT` in the returned format so A-2 has an exact target and so any caller can already
- * tell the difference.
+ * The original `passwordMatches` ended with `|| stored === String(password || "")`, so any row
+ * whose password column held a plaintext value authenticated on that plaintext. It existed for
+ * migration compatibility and was a permanent bypass while it stayed. It is removed: a stored
+ * value that is neither a scrypt hash nor a legacy SHA-256 digest now reports `UNRECOGNIZED` and
+ * never authenticates.
+ *
+ * **Operational consequence, stated plainly:** any account whose password is still stored as
+ * plaintext can no longer sign in and needs an administrative password reset. See the A-2 record
+ * in `docs/auth-hardening-plan.md` for the query that finds such rows.
  */
 
 const crypto = require("crypto");
@@ -60,7 +65,16 @@ const FORMAT_VERSION = 1;
 const PASSWORD_FORMATS = Object.freeze({
   SCRYPT: "SCRYPT",
   LEGACY_SHA256: "LEGACY_SHA256",
-  PLAINTEXT: "PLAINTEXT",
+  /**
+   * The stored value is neither a scrypt hash nor a legacy SHA-256 digest — so it is not a
+   * credential this system can verify, and never authenticates (A-2).
+   *
+   * In practice this is a row whose password column still holds a plaintext value from before the
+   * migration. It is reported by *shape* rather than by comparing against the supplied password,
+   * so an operator can diagnose "this row was never migrated" without the check itself confirming
+   * a guess to whoever made it.
+   */
+  UNRECOGNIZED: "UNRECOGNIZED",
   UNKNOWN: "UNKNOWN",
   EMPTY: "EMPTY",
 });
@@ -213,10 +227,19 @@ const verifyPassword = async (password, storedHash) => {
     return { ok, format: PASSWORD_FORMATS.LEGACY_SHA256, needsRehash: ok };
   }
 
-  // A-2 deletes this branch. Until then it preserves A-1's "no behaviour change" contract for any
-  // row whose password column still holds a plaintext value.
-  const ok = timingSafeEqualString(stored, String(password ?? ""));
-  return { ok, format: PASSWORD_FORMATS.PLAINTEXT, needsRehash: ok };
+  // A-2: a stored value that is neither a scrypt hash nor a legacy SHA-256 digest is not a
+  // credential, and never authenticates.
+  //
+  // This branch previously compared the stored value directly against the supplied password, so
+  // any row whose password column held a plaintext value authenticated on that plaintext. It
+  // existed for migration compatibility and was a permanent bypass while it stayed.
+  //
+  // It deliberately does NOT compare against the supplied password, even to report a more precise
+  // error. That comparison would tell a caller "your guess matched, but you may not come in",
+  // which leaks the exact fact the rejection exists to protect. The stored value's *shape* is
+  // enough for an operator to diagnose "this row was never migrated" without revealing anything
+  // about the password itself.
+  return { ok: false, format: PASSWORD_FORMATS.UNRECOGNIZED, needsRehash: false };
 };
 
 module.exports = {
