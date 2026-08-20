@@ -1,5 +1,6 @@
 import axios from "axios";
 import { optionalSessionAuthHeaders } from "./authHeaders";
+import { SESSION_FAILURE_KINDS, classifySessionFailure } from "./sessionExpiry";
 import { checkFroozBackendHealth, getConnectivitySnapshot } from "./connectivityService";
 import { isTauriRuntime } from "./localDatabase";
 import { repositories } from "./repositories";
@@ -229,6 +230,16 @@ export async function initialiseSync({ apiUrl, user, deviceInfo, branchId }) {
   return lastStatus;
 }
 
+/**
+ * Answered failures that are not a verdict on the purchase, so they must be retried rather than
+ * recorded as a rejection. Authentication failures are handled separately by the same rule.
+ */
+const NON_BUSINESS_REPLAY_KINDS = new Set([
+  SESSION_FAILURE_KINDS.PERMISSION_DENIED,
+  SESSION_FAILURE_KINDS.IDENTITY_CONFLICT,
+  SESSION_FAILURE_KINDS.SERVER_FAULT,
+]);
+
 const replayOfflinePurchase = async ({ apiUrl, operation, context }) => {
   const requestStartedAt = Date.now();
   try {
@@ -269,6 +280,20 @@ const replayOfflinePurchase = async ({ apiUrl, operation, context }) => {
     };
   } catch (error) {
     if (!error?.response) throw error;
+    // An acknowledgement is a verdict *on the purchase* — it marks the operation `failed` in
+    // `sync_outbox` and the purchase `failed` in `local_purchases`, out of the automatic queue and
+    // waiting on a manual retry. Only a server that actually judged the purchase may cause that.
+    //
+    // A refused session, a permission wall, or a broken server judged nothing: the purchase is
+    // still perfectly good and will go through once the session, the role or the server is fixed.
+    // Rethrowing hands these to the caller's `catch`, which releases the operations back to
+    // pending so the next sync retries them.
+    //
+    // This mattered little while nothing returned 401. After A-4 puts `requireAuth` on every route,
+    // an expired session would otherwise mark a shop's whole queue of offline purchases as business
+    // failures — the shop's morning of sales, flagged as rejected because a token aged out.
+    const classified = classifySessionFailure(error);
+    if (classified.authentication || NON_BUSINESS_REPLAY_KINDS.has(classified.kind)) throw error;
     const status = Number(error.response.status || 0);
     const data = error.response.data || {};
     return {

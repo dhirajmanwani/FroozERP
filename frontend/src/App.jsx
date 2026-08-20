@@ -39,6 +39,7 @@ import {
 import { resolveOfflineOpenDecision } from "./local/offlineDataReadiness";
 import { bannerForState } from "./local/entitlementState";
 import { sessionAuthHeaders } from "./local/authHeaders";
+import { resolveSessionAction } from "./local/sessionExpiry";
 import {
   addNotification,
   clearNotifications,
@@ -1895,6 +1896,35 @@ function App() {
   const [exitAttemptCount, setExitAttemptCount] = useState(0);
   const [loginDeviceControlSettings, setLoginDeviceControlSettings] = useState(defaultDeviceControlSettings);
   const [accountLedgerFocusKey, setAccountLedgerFocusKey] = useState("");
+
+  // A-4 will put `requireAuth` in front of ~219 routes, so an ended sign-in stops being a quiet
+  // oddity and starts failing most of the app at once. One interceptor decides what that means, so
+  // the user gets a single clear sentence instead of a screen of broken panels.
+  //
+  // Deliberately inert until someone is signed in: `/login` answers a wrong password with 401 and a
+  // device-approval refusal with 403, and neither is an ended session. Those screens already say
+  // the right thing.
+  useEffect(() => {
+    if (!user) return undefined;
+    const interceptorId = axios.interceptors.response.use(undefined, (error) => {
+      const verdict = resolveSessionAction({
+        token: user?.device_session_token,
+        failure: error,
+        // Without this a network outage on a local-first app would read as "you have been signed
+        // out" — wrong, and alarming at a busy counter.
+        online: !offlineMode,
+      });
+      if (verdict.requiresSignIn) {
+        setStartupNotice(verdict.message);
+        setUser(null);
+      }
+      // Always rethrow. Every call site owns its own error handling, and swallowing the rejection
+      // here would leave panels rendering empty instead of erroring — the failure CLAUDE.md calls
+      // out as "errors must never render as zero".
+      return Promise.reject(error);
+    });
+    return () => axios.interceptors.response.eject(interceptorId);
+  }, [user, offlineMode]);
 
   useEffect(() => {
     const normalized = normalizeApplicationFontSize(applicationFontSize);
