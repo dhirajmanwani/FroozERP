@@ -1,6 +1,6 @@
 # Auth Hardening — Scoping and Plan
 
-**Status:** **A-1 … A-4 complete (A-1/A-2 2026-08-19, A-3/A-4 2026-08-20).** A-5 and A-6 open, plus **A-4b**, which is the stage that actually finishes authorisation — see the A-4 record. Written 2026-08-17 at the maintainer's
+**Status:** **A-1 … A-4b complete (A-1/A-2 2026-08-19, A-3/A-4/A-4b 2026-08-20).** A-5, A-6 and **A-4c** open. Written 2026-08-17 at the maintainer's
 request, to run **in parallel** with the offline-activation stages.
 
 | Stage | Status |
@@ -9,7 +9,8 @@ request, to run **in parallel** with the offline-activation stages.
 | A-2 remove plaintext fallback | **Complete 2026-08-19** — see the record at the end of this file. **Carries an operational action: see "Before this reaches a live database".** |
 | A-3 real sessions | **Complete 2026-08-20** — see the record at the end of this file. **`requireAuth` is built and tested but mounted on nothing; A-4 is what closes the hole.** |
 | A-4 middleware on all routes | **Complete 2026-08-20** — 268/285 routes authenticated, 16 deliberately public. **Not the end of the story: see A-4b.** |
-| A-4b `updated_by` authorisation | **Open — this is now the top of the track.** After A-4 a signed-in Cashier can still act as Owner on ~63 routes. |
+| A-4b `updated_by` authorisation | **Complete 2026-08-20** — 92 routes across four guard families now read the verified session. See the record. |
+| A-4c money-route audit stamps | **Open** — 14 money-moving routes have a caller-chosen actor stamp **and no permission check at all**. |
 | A-5 lockout + delete legacy verify | Open |
 | A-6 exposure checklist | Open |
 **Related:** `CLAUDE.md` "Known security debt"; `docs/offline-activation-design.md` §12 (which
@@ -672,3 +673,125 @@ Unchanged. The gate is inside `server.js`, after the desktop-local forwarder; un
 `blocked=true` / `reachedCloud=false` / 0 cloud-router invocations / 0 external connections all
 hold. The only outbound change is an `Authorization` header on an existing `cloudFetchJson` call
 already gated on `appInternetAllowed`.
+
+---
+
+## A-4b record — the actor comes from the session (2026-08-20)
+
+### The inventory was four families, not one
+
+The plan and the audit both framed this as "~63 `requireRateManager` sites reading `updated_by`".
+Measured on the tree, that framing would have left most of the hole open:
+
+| Actor source | Sites |
+| --- | --- |
+| `req.body.updated_by` | 33 |
+| `created_by` / `edited_by` / `changed_by` / `deactivated_by` / `reactivated_by`, alone or in `\|\|` chains | 13 |
+| `req.query.user_id` / `req.query.updated_by` variants | 5 |
+| locals assigned from `req.body.*` | 10 |
+| helper-internal (fed by callers) | 2 |
+
+**A grep for `req.body.updated_by` would have found 33 of 61 live escalation sites.** Three further
+guard families had the same defect and were not separated out by the audit: `getPermissionUser`
+(12 sites), `getSalePermissionUser` (4), and `getSettingsBundle` (1 — the guard behind VULN-2,
+deciding whether the response carries the users table, every device and every activation code).
+
+**92 routes** now read `req.auth.userId`.
+
+### Two `|| 1` defaults were escalations in their own right
+
+`readPurchaseEntryPayload` used `body.created_by || body.edited_by || 1`, and `createSaleHandler`
+used `parsePositiveInteger(created_by) || 1`. A request that simply **omitted** the field was
+attributed to user 1 — the Owner in a single-owner shop. In both cases the same value was *also*
+the guard's actor and the `created_by` stamped on the row, so one change fixes the authorisation
+and the false record together.
+
+`createSaleHandler`'s version gated `pos_date_override` and `manual_pos_rate_override`.
+
+### Where substitution was not the fix
+
+- **`PUT /users/:id/password`** — actor and target are genuinely different people. The target stays
+  `req.params.id`; only the actor moves to the session. Self-service change and manager reset both
+  still work.
+- **`readPurchaseEntryPayload` / `createSaleHandler`** — the field served two jobs, so the verified
+  actor had to be threaded into the payload reader rather than substituted at the guard.
+
+### Second copy of the FROST precedence bug, fixed
+
+`resolveV3OperationalContext` still built its substitution comparison with first-match `||`
+precedence — the exact narrow form `submittedIdentityFrom` was widened away from after FROST proved
+handlers read a different location than the check. No escalation is known through this resolver
+(it uses the token's own claims), but a second copy of a check that was deliberately fixed elsewhere
+is how the fix gets quietly undone. It now collects every location.
+
+### Not fixed — A-4c, and it moves money
+
+**14 routes stamp a caller-chosen actor with a `|| 1` fallback *and have no authorisation check at
+all*.** They are authenticated after A-4, so any employee reaches them:
+
+`POST /accounts/payments`, `PUT /accounts/payments/:paymentKey`,
+`POST /accounts/payments/:paymentKey/cancel`, `POST /customer-payments`, `POST /contra-entries`,
+`POST /expenses`, `PUT /expenses/:id`, `POST /expenses/:id/cancel`, `POST /supplier-payments`,
+`PUT /supplier-payments/:id`, `POST /supplier-payments/:id/cancel`, `createSaleReturnHandler`,
+`createWasteEntryHandler`.
+
+The audit trail on every payment, expense and cancellation currently records whoever the client
+said, and defaults to user 1 when the client says nothing. A-4c should switch all 14 to
+`req.auth.userId` **and add a real permission check** — the missing check is the larger half.
+
+*(An earlier commit message on this branch put this at "~11 sites … audit data rather than
+authorisation". Both halves were wrong: it is 14, and the routes have no authorisation at all.)*
+
+### Also left, with reasons
+
+- **Sync-path actors** (`context.user.id` at the offline sale edit/cancel replay,
+  `requireSyncContext` on `/api/device/identity` and `/api/branch/status`) are safe **indirectly**:
+  `/api/sync/push` sits behind `requireAuth` and the substitution check pins the body's `user_id`.
+  That is authentication by a check in a different file rather than by construction — precisely the
+  arrangement that stopped being true for FROST. It belongs to the sync-enforcement item.
+- `getPermissionUser(editor.id, …)` — `editor` is already the row returned for the verified actor.
+
+### What a legitimate caller sees change
+
+All 15 `created_by`, 39 `updated_by`, 5 `cancelled_by`, 4 `edited_by` and 1 `changed_by` that
+`App.jsx` sends are `user.id` — the signed-in user — so this is a no-op for the shipped client on
+all 92 routes. Exceptions to watch on hardware:
+
+1. **Purchases and POS sales now record the real operator.** Rows previously created without
+   `created_by` were filed under user 1; reports grouped by user will show different, correct names
+   going forward. Existing rows are untouched.
+2. **`PUT /products/:id` audit rows** carry the session user and can no longer be `NULL`.
+3. **`GET /settings`, `GET /users`, `GET /sale-rates`, the five dashboard routes** and others now
+   ignore `?user_id=` entirely. A caller relying on querying as another user gets their own
+   permissions.
+4. **`PUT /users/:id/password`** — a manager resetting someone else's password must now hold the
+   manager's session. That is the fix, and it is user-visible.
+
+### Tests
+
+`backend/authorizationActor.test.js` — 7 tests. Comments are stripped before pattern matching (the
+new guard comment quotes the vulnerable call deliberately). Includes a **count** assertion with each
+exception pinned by source line and reason, so a site added later in the old style fails; a
+behavioural test that `rejectDeviceSessionSubstitution` accepts a valid session carrying
+`updated_by: 1` — pinning that the auth layer never covered this and only the call sites could; and
+a probe of all 92 routes on the loaded app asserting each is unreachable without a session.
+
+The suite was verified to bite: reverting one site to the old form fails two tests.
+
+### Gate results
+
+| Gate | Result |
+| --- | --- |
+| `npm --prefix backend test` | **204 / 205** — the 1 failure is the pre-existing Linux-vs-Windows path assertion |
+| `TZ=Asia/Kolkata node --test frontend/src/local/*.test.mjs` | **274 / 274** |
+| `npm --prefix frontend run lint` | 0 errors, 37 warnings (unchanged) |
+| `npm run build` | Pass |
+
+### Could not determine
+
+- Whether any client outside this repo posts an actor field different from the logged-in user. Only
+  `App.jsx` and `frontend/src/local/` were verified; anything else now gets its own permissions
+  instead of the id it names.
+- Whether `product_audit_trail.edited_by`, `purchases.created_by` and the stock-movement actor
+  columns carry NOT NULL or FK constraints. The new values are strictly better-formed than the old
+  `|| 1` / `|| null` paths, but the Postgres bootstrap was not read to confirm.

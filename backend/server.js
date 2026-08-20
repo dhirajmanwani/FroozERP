@@ -9437,10 +9437,16 @@ const resolveV3OperationalContext = async (req, { requireWrite = false } = {}) =
     );
     if (deviceSession.error) return { error: deviceSession.error };
     const substitution = rejectDeviceSessionSubstitution(deviceSession.claims, {
-      user_id: req.body?.user_id || req.query?.user_id || req.headers["x-user-id"],
-      device_id: req.body?.device_id || req.query?.device_id || req.headers["x-device-id"],
-      company_id: req.body?.company_id || req.query?.company_id,
-      branch_id: req.body?.branch_id || req.query?.branch_id,
+      // Every location a field can arrive from, not the first one found — the same widening
+      // `submittedIdentityFrom` received. A first-match check only holds if every downstream reader
+      // picks the same location, and FROST proved they do not: it read the query while the check
+      // took the header, so an agreeing header excused a contradicting query. No escalation is
+      // known through this particular resolver, but leaving a second copy of a check that was
+      // deliberately fixed elsewhere is how the fix gets undone.
+      user_id: [req.body?.user_id, req.query?.user_id, req.headers["x-user-id"]],
+      device_id: [req.body?.device_id, req.query?.device_id, req.headers["x-device-id"]],
+      company_id: [req.body?.company_id, req.query?.company_id],
+      branch_id: [req.body?.branch_id, req.query?.branch_id],
     });
     if (substitution) return { error: substitution };
     const resolved = await operationalScopeService.resolve({
