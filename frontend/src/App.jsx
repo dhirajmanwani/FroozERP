@@ -40,6 +40,7 @@ import { resolveOfflineOpenDecision } from "./local/offlineDataReadiness";
 import { bannerForState } from "./local/entitlementState";
 import { sessionAuthHeaders, shouldAttachSessionAuth } from "./local/authHeaders";
 import { consumeStashedSessionForReload, stashSessionForReload } from "./local/reloadSessionBridge";
+import { describeLocalServiceFailure } from "./local/localServiceFailure";
 import { resolveSessionAction } from "./local/sessionExpiry";
 import {
   addNotification,
@@ -14945,7 +14946,11 @@ function SyncSettingsSection({
       setConfigDraft((current) => ({ ...current, cloudConnectionMode: savedMode }));
       setConfigMessage(connectivityModeMessage(savedMode));
     } catch (error) {
-      setConfigMessage(getErrorMessage(error, "Unable to change Connectivity Mode"));
+      // Not `getErrorMessage`: when nothing answered, that shows this fallback as though the local
+      // service had considered the request and declined it. It had not — the request never arrived,
+      // and the remedy (restart the app so its separate local process picks up new code) is
+      // completely different from anything a refusal would call for.
+      setConfigMessage(describeLocalServiceFailure(error, "Unable to change Connectivity Mode"));
     } finally {
       setConnectivityModeBusy(false);
     }
