@@ -940,6 +940,8 @@ const PERMISSION_KEYS = [
   "reports",
   "purchases",
   "supplier_accounts",
+  "expenses",
+  "contra_entries",
   "inventory",
   "waste_management",
   "billing",
@@ -2962,6 +2964,36 @@ const initializeDatabase = async () => {
     SET permissions = permissions || '{"dashboard":false}'::jsonb
     WHERE role_name IN ('Cashier', 'Purchase Manager', 'Inventory Manager')
       AND NOT (permissions ? 'dashboard');
+
+    -- auth-hardening A-4c. Owner and Admin first, and unconditionally: the client treats both as
+    -- all-modules roles regardless of what the row stores, so an Admin whose Reports box had been
+    -- unticked would otherwise see the Expenses screen and be refused by the server.
+    UPDATE role_permission_settings
+    SET permissions = permissions || '{"expenses":true}'::jsonb
+    WHERE role_name IN ('Owner', 'Admin')
+      AND NOT (permissions ? 'expenses');
+
+    -- For every other role the expenses key is copied from that role's own reports value instead of
+    -- being seeded flat, because reports is what the shipped client gates the Expenses screen on
+    -- (modulePermissionMap in App.jsx). Copying it means every role that records expenses this week
+    -- still records them next week, while the authority becomes separately revocable from now on.
+    -- Seeding it Owner/Admin-only would have taken expense entry away from Purchase and Inventory
+    -- Managers on the first restart after the upgrade.
+    UPDATE role_permission_settings
+    SET permissions = permissions || jsonb_build_object('expenses', COALESCE(permissions -> 'reports', 'false'::jsonb))
+    WHERE NOT (permissions ? 'expenses');
+
+    -- Contra entries have no screen in the shipped client, so there is no established population to
+    -- preserve and cash-to-bank movement starts with the owners.
+    UPDATE role_permission_settings
+    SET permissions = permissions || '{"contra_entries":true}'::jsonb
+    WHERE role_name IN ('Owner', 'Admin')
+      AND NOT (permissions ? 'contra_entries');
+
+    UPDATE role_permission_settings
+    SET permissions = permissions || '{"contra_entries":false}'::jsonb
+    WHERE role_name IN ('Cashier', 'Purchase Manager', 'Inventory Manager')
+      AND NOT (permissions ? 'contra_entries');
 
     INSERT INTO branches (id, branch_name, location)
     VALUES (1, 'Main Branch', 'Primary Store')
@@ -13340,6 +13372,24 @@ app.post("/accounts/payments", async (req, res) => {
     if (!sourceId || amount === null || !SUPPLIER_PAYMENT_MODES.has(paymentMode)) {
       return res.status(400).json({ message: "Enter valid account payment details" });
     }
+    // One route, two different money movements, and two different authorities: a Cashier is granted
+    // `customer_payments` and denied `supplier_payments`, so the key has to follow the branch this
+    // request will actually take rather than the route it arrived on. An unrecognised combination
+    // gets no key and falls through to the existing 400 below — no branch writes before that.
+    const permissionKey = action === "RECEIVE_CUSTOMER" && source === "CUSTOMER"
+      ? "customer_payments"
+      : ["PAY_SUPPLIER", "SUPPLIER_REBATE"].includes(action) && source === "SUPPLIER"
+        ? "supplier_payments"
+        : null;
+    if (permissionKey) {
+      const manager = await getPermissionUser(req.auth.userId, permissionKey, ["Owner", "Admin"]);
+      if (!manager) {
+        return res.status(403).json({
+          code: "ACCOUNT_PAYMENT_PERMISSION_REQUIRED",
+          message: "You do not have permission to record this payment.",
+        });
+      }
+    }
     if (action === "RECEIVE_CUSTOMER" && source === "CUSTOMER") {
       if (amount <= 0) {
         return res.status(400).json({ message: "Customer payment amount must be greater than zero" });
@@ -13356,7 +13406,7 @@ app.post("/accounts/payments", async (req, res) => {
         [
           sourceId, req.body.payment_date || toDateKey(new Date()), amount, paymentMode,
           nullableText(req.body.reference_number), nullableText(req.body.remarks),
-          parsePositiveInteger(req.body.branch_id), parsePositiveInteger(req.body.created_by) || 1,
+          parsePositiveInteger(req.body.branch_id), req.auth.userId,
         ]
       );
       return res.status(201).json(result.rows[0]);
@@ -13381,7 +13431,7 @@ app.post("/accounts/payments", async (req, res) => {
           supplierPaymentAmount,
           supplierRebateAmount,
           paymentMode, nullableText(req.body.reference_number), nullableText(req.body.remarks),
-          parsePositiveInteger(req.body.branch_id), parsePositiveInteger(req.body.created_by) || 1,
+          parsePositiveInteger(req.body.branch_id), req.auth.userId,
         ]
       );
       return res.status(201).json(result.rows[0]);
@@ -13404,11 +13454,23 @@ app.put("/accounts/payments/:paymentKey", async (req, res) => {
     const paymentAmount = parseNonNegativeNumber(req.body.payment_amount ?? req.body.amount);
     const rebateAmount = parseNonNegativeNumber(req.body.rebate_amount);
     const paymentMode = normalizePaymentMode(req.body.payment_mode || "CASH");
-    const editedBy = parsePositiveInteger(req.body.edited_by) || parsePositiveInteger(req.body.created_by) || 1;
+    const editedBy = req.auth.userId;
     const reason = cleanText(req.body.reason);
     const paymentDate = req.body.payment_date || toDateKey(new Date());
     if (!paymentId || !accountId || !reason || paymentAmount === null || !SUPPLIER_PAYMENT_MODES.has(paymentMode)) {
       return res.status(400).json({ message: "Enter valid payment edit details and reason" });
+    }
+    // Editing restates the amount of a payment that is already in the ledger, so it carries the same
+    // authority as recording one — and the same split between the customer and supplier sides.
+    const permissionKey = source === "CUSTOMER" ? "customer_payments" : source === "SUPPLIER" ? "supplier_payments" : null;
+    if (permissionKey) {
+      const manager = await getPermissionUser(req.auth.userId, permissionKey, ["Owner", "Admin"], client);
+      if (!manager) {
+        return res.status(403).json({
+          code: "ACCOUNT_PAYMENT_PERMISSION_REQUIRED",
+          message: "You do not have permission to edit this payment.",
+        });
+      }
     }
     await client.query("BEGIN");
     if (source === "CUSTOMER" && accountSource === "CUSTOMER") {
@@ -13505,9 +13567,25 @@ app.post("/accounts/payments/:paymentKey/cancel", async (req, res) => {
   try {
     const [source, idValue] = String(req.params.paymentKey || "").split("-");
     const paymentId = parsePositiveInteger(Number(idValue));
-    const cancelledBy = parsePositiveInteger(req.body.cancelled_by) || 1;
+    const cancelledBy = req.auth.userId;
     const reason = cleanText(req.body.reason);
     if (!paymentId || !reason) return res.status(400).json({ message: "Cancellation reason is required" });
+    // Voiding a recorded payment is the fraud path this whole stage exists for — take the cash,
+    // record it, then quietly cancel the record — so it needs strictly more than recording one:
+    // authority over this kind of payment *and* `invoice_cancellation`, the key that already decides
+    // who may void a completed money document (it is what `sale_permission_settings.can_cancel_sales`
+    // is kept in sync with). A Cashier can record a customer payment and can no longer erase it.
+    const permissionKey = source === "CUSTOMER" ? "customer_payments" : source === "SUPPLIER" ? "supplier_payments" : null;
+    if (permissionKey) {
+      const payer = await getPermissionUser(req.auth.userId, permissionKey, ["Owner", "Admin"], client);
+      const canceller = payer ? await getPermissionUser(req.auth.userId, "invoice_cancellation", ["Owner", "Admin"], client) : null;
+      if (!canceller) {
+        return res.status(403).json({
+          code: "PAYMENT_CANCELLATION_PERMISSION_REQUIRED",
+          message: "You do not have permission to cancel this payment.",
+        });
+      }
+    }
     await client.query("BEGIN");
     if (source === "CUSTOMER") {
       const oldResult = await client.query("SELECT * FROM customer_payments WHERE id = $1 FOR UPDATE", [paymentId]);
@@ -13889,6 +13967,13 @@ app.post("/customer-payments", async (req, res) => {
     if (!customerId || !paymentAmount || !["CASH", "UPI", "CARD", "BANK_TRANSFER"].includes(paymentMode)) {
       return res.status(400).json({ message: "Enter valid customer payment details" });
     }
+    const manager = await getPermissionUser(req.auth.userId, "customer_payments", ["Owner", "Admin"]);
+    if (!manager) {
+      return res.status(403).json({
+        code: "CUSTOMER_PAYMENT_PERMISSION_REQUIRED",
+        message: "You do not have permission to receive customer payments.",
+      });
+    }
     const customerResult = await pool.query("SELECT id FROM customers WHERE id = $1 AND active = TRUE", [customerId]);
     if (customerResult.rows.length === 0) return res.status(400).json({ message: "Select an active customer" });
     const result = await pool.query(
@@ -13902,7 +13987,7 @@ app.post("/customer-payments", async (req, res) => {
       `,
       [
         customerId, paymentDate, paymentAmount, paymentMode, nullableText(req.body.reference_number),
-        nullableText(req.body.remarks), parsePositiveInteger(req.body.branch_id), parsePositiveInteger(req.body.created_by) || 1,
+        nullableText(req.body.remarks), parsePositiveInteger(req.body.branch_id), req.auth.userId,
       ]
     );
     return res.status(201).json(result.rows[0]);
@@ -14318,6 +14403,17 @@ app.post("/contra-entries", async (req, res) => {
     if (!amount) {
       return res.status(400).json({ message: "Enter valid contra amount" });
     }
+    // `contra_entries` is a key added by A-4c. Nothing existing fits: this moves money between cash
+    // in hand and the bank account, which is neither a customer nor a supplier settlement, and
+    // reusing `supplier_payments` or `reports` would grant treasury movement to anyone holding a key
+    // whose name says nothing about it.
+    const manager = await getPermissionUser(req.auth.userId, "contra_entries", ["Owner", "Admin"]);
+    if (!manager) {
+      return res.status(403).json({
+        code: "CONTRA_ENTRY_PERMISSION_REQUIRED",
+        message: "You do not have permission to record cash and bank transfers.",
+      });
+    }
     const contraDate = isDateInput(req.body.contra_date) ? req.body.contra_date : toDateKey(new Date());
     const result = await pool.query(
       `
@@ -14337,7 +14433,7 @@ app.post("/contra-entries", async (req, res) => {
         nullableText(req.body.reference_number),
         nullableText(req.body.remarks),
         parsePositiveInteger(req.body.branch_id),
-        parsePositiveInteger(req.body.created_by),
+        req.auth.userId,
       ]
     );
     return res.json(result.rows[0]);
@@ -15960,6 +16056,18 @@ app.post("/expenses", async (req, res) => {
     if (!category || !amount || !SUPPLIER_PAYMENT_MODES.has(paymentMode)) {
       return res.status(400).json({ message: "Enter valid expense details" });
     }
+    // `expenses` is a key added by A-4c. The closest existing key was `reports`, which is what the
+    // shipped client gates the Expenses screen on — but "can read reports" silently granting "can
+    // spend the shop's money" is exactly the sort of key reuse that is invisible in the role table.
+    // The startup migration copies each role's `reports` value into `expenses`, so the population is
+    // unchanged today and separable from now on.
+    const manager = await getPermissionUser(req.auth.userId, "expenses", ["Owner", "Admin"]);
+    if (!manager) {
+      return res.status(403).json({
+        code: "EXPENSE_PERMISSION_REQUIRED",
+        message: "You do not have permission to record expenses.",
+      });
+    }
     const result = await pool.query(
       `
       INSERT INTO expenses (
@@ -15974,7 +16082,7 @@ app.post("/expenses", async (req, res) => {
         nullableText(req.body.reference_number), nullableText(req.body.vendor_name || req.body.paid_to),
         nullableText(req.body.paid_to || req.body.vendor_name),
         nullableText(req.body.remarks), parsePositiveInteger(req.body.branch_id),
-        parsePositiveInteger(req.body.created_by) || 1, req.body.active !== false,
+        req.auth.userId, req.body.active !== false,
       ]
     );
     return res.status(201).json(result.rows[0]);
@@ -15994,6 +16102,13 @@ app.put("/expenses/:id", async (req, res) => {
     if (!expenseId || !category || !amount || !SUPPLIER_PAYMENT_MODES.has(paymentMode)) {
       return res.status(400).json({ message: "Enter valid expense details" });
     }
+    const manager = await getPermissionUser(req.auth.userId, "expenses", ["Owner", "Admin"], client);
+    if (!manager) {
+      return res.status(403).json({
+        code: "EXPENSE_PERMISSION_REQUIRED",
+        message: "You do not have permission to edit expenses.",
+      });
+    }
     await client.query("BEGIN");
     const oldResult = await client.query("SELECT * FROM expenses WHERE id = $1 FOR UPDATE", [expenseId]);
     const oldExpense = oldResult.rows[0];
@@ -16005,7 +16120,7 @@ app.put("/expenses/:id", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Cancelled expenses cannot be edited" });
     }
-    const editorId = parsePositiveInteger(req.body.edited_by) || parsePositiveInteger(req.body.created_by) || 1;
+    const editorId = req.auth.userId;
     const reason = cleanText(req.body.reason || req.body.edit_reason || "Expense updated");
     const result = await client.query(
       `
@@ -16049,8 +16164,18 @@ app.post("/expenses/:id/cancel", async (req, res) => {
   try {
     const expenseId = parsePositiveInteger(req.params.id);
     const reason = cleanText(req.body.reason);
-    const cancelledBy = parsePositiveInteger(req.body.cancelled_by) || 1;
+    const cancelledBy = req.auth.userId;
     if (!expenseId || !reason) return res.status(400).json({ message: "Cancellation reason is required" });
+    // Stricter than recording one, for the same reason as a payment cancellation: an expense that
+    // can be entered and then voided by the same person is an untraceable withdrawal.
+    const spender = await getPermissionUser(req.auth.userId, "expenses", ["Owner", "Admin"], client);
+    const canceller = spender ? await getPermissionUser(req.auth.userId, "invoice_cancellation", ["Owner", "Admin"], client) : null;
+    if (!canceller) {
+      return res.status(403).json({
+        code: "EXPENSE_CANCELLATION_PERMISSION_REQUIRED",
+        message: "You do not have permission to cancel expenses.",
+      });
+    }
     await client.query("BEGIN");
     const oldResult = await client.query("SELECT * FROM expenses WHERE id = $1 FOR UPDATE", [expenseId]);
     const oldExpense = oldResult.rows[0];
@@ -16120,7 +16245,7 @@ app.post("/supplier-payments", async (req, res) => {
     const rebateAmount = parseNonNegativeNumber(req.body.rebate_received ?? req.body.rebate_amount);
     const paymentMode = normalizePaymentMode(req.body.payment_mode);
     const branchId = parsePositiveInteger(req.body.branch_id);
-    const createdBy = parsePositiveInteger(req.body.created_by) || 1;
+    const createdBy = req.auth.userId;
     const paymentDate = req.body.payment_date || toDateKey(new Date());
 
     if (
@@ -16133,6 +16258,13 @@ app.post("/supplier-payments", async (req, res) => {
       return res.status(400).json({ message: "Enter valid supplier payment details" });
     }
 
+    const manager = await getPermissionUser(req.auth.userId, "supplier_payments", ["Owner", "Admin"]);
+    if (!manager) {
+      return res.status(403).json({
+        code: "SUPPLIER_PAYMENT_PERMISSION_REQUIRED",
+        message: "You do not have permission to record supplier payments.",
+      });
+    }
     const supplierResult = await pool.query("SELECT id FROM suppliers WHERE id = $1 AND active = TRUE", [supplierId]);
     if (supplierResult.rows.length === 0) {
       return res.status(400).json({ message: "Select an active supplier account" });
@@ -16167,11 +16299,18 @@ app.put("/supplier-payments/:id", async (req, res) => {
     const paymentAmount = parseNonNegativeNumber(req.body.payment_amount);
     const rebateAmount = parseNonNegativeNumber(req.body.rebate_received ?? req.body.rebate_amount);
     const paymentMode = normalizePaymentMode(req.body.payment_mode);
-    const editedBy = parsePositiveInteger(req.body.edited_by) || parsePositiveInteger(req.body.created_by) || 1;
+    const editedBy = req.auth.userId;
     const reason = cleanText(req.body.reason);
     const paymentDate = req.body.payment_date || toDateKey(new Date());
     if (!paymentId || !supplierId || paymentAmount === null || rebateAmount === null || paymentAmount + rebateAmount <= 0 || !SUPPLIER_PAYMENT_MODES.has(paymentMode) || !reason) {
       return res.status(400).json({ message: "Enter valid supplier payment edit details and reason" });
+    }
+    const manager = await getPermissionUser(req.auth.userId, "supplier_payments", ["Owner", "Admin"], client);
+    if (!manager) {
+      return res.status(403).json({
+        code: "SUPPLIER_PAYMENT_PERMISSION_REQUIRED",
+        message: "You do not have permission to edit supplier payments.",
+      });
     }
     await client.query("BEGIN");
     const oldResult = await client.query("SELECT * FROM supplier_payments WHERE id = $1 FOR UPDATE", [paymentId]);
@@ -16226,9 +16365,17 @@ app.post("/supplier-payments/:id/cancel", async (req, res) => {
   const client = await pool.connect();
   try {
     const paymentId = parsePositiveInteger(req.params.id);
-    const cancelledBy = parsePositiveInteger(req.body.cancelled_by) || 1;
+    const cancelledBy = req.auth.userId;
     const reason = cleanText(req.body.reason);
     if (!paymentId || !reason) return res.status(400).json({ message: "Cancellation reason is required" });
+    const payer = await getPermissionUser(req.auth.userId, "supplier_payments", ["Owner", "Admin"], client);
+    const canceller = payer ? await getPermissionUser(req.auth.userId, "invoice_cancellation", ["Owner", "Admin"], client) : null;
+    if (!canceller) {
+      return res.status(403).json({
+        code: "SUPPLIER_PAYMENT_CANCELLATION_PERMISSION_REQUIRED",
+        message: "You do not have permission to cancel supplier payments.",
+      });
+    }
     await client.query("BEGIN");
     const oldResult = await client.query("SELECT * FROM supplier_payments WHERE id = $1 FOR UPDATE", [paymentId]);
     const oldPayment = oldResult.rows[0];
@@ -19004,11 +19151,23 @@ const createSaleReturnHandler = async (req, res) => {
     const saleId = parsePositiveInteger(req.body.sale_id);
     const refundType = normalizeRefundType(req.body.refund_type);
     const returnReason = cleanText(req.body.return_reason);
-    const createdBy = parsePositiveInteger(req.body.created_by) || 1;
+    const createdBy = req.auth.userId;
     const branchId = parsePositiveInteger(req.body.branch_id);
     const items = Array.isArray(req.body.items) ? req.body.items : [];
     if (!saleId || !REFUND_TYPES.has(refundType) || !returnReason || items.length === 0) {
       return res.status(400).json({ message: "Select invoice, products, refund type and return reason" });
+    }
+    // `billing`, not `invoice_cancellation`, and the choice is deliberate. A return refunds money and
+    // is a partial void of a sale, so the stricter key is arguable — but returns are counter work a
+    // Cashier does all day, and `billing` is exactly what the shipped client gates the Returns screen
+    // on. Requiring `invoice_cancellation` here would stop the counter working on the first restart
+    // after upgrade, which is a worse outcome than the authority being coarse.
+    const manager = await getPermissionUser(req.auth.userId, "billing", ["Owner", "Admin"], client);
+    if (!manager) {
+      return res.status(403).json({
+        code: "SALE_RETURN_PERMISSION_REQUIRED",
+        message: "You do not have permission to record sale returns.",
+      });
     }
     await client.query("BEGIN");
     const replay = await beginV3BusinessOperation(client, req, "sale_return");
@@ -19215,9 +19374,16 @@ const createWasteEntryHandler = async (req, res) => {
     const quantity = parsePositiveNumber(req.body.quantity);
     const wasteType = normalizeWasteType(req.body.waste_type);
     const branchId = parsePositiveInteger(req.body.branch_id);
-    const createdBy = parsePositiveInteger(req.body.created_by) || 1;
+    const createdBy = req.auth.userId;
     if (!productId || !quantity || !branchId || !WASTE_TYPES.has(wasteType)) {
       return res.status(400).json({ message: "Enter valid waste details" });
+    }
+    const manager = await getPermissionUser(req.auth.userId, "waste_management", ["Owner", "Admin"], client);
+    if (!manager) {
+      return res.status(403).json({
+        code: "WASTE_ENTRY_PERMISSION_REQUIRED",
+        message: "You do not have permission to record waste entries.",
+      });
     }
     await client.query("BEGIN");
     const replay = await beginV3BusinessOperation(client, req, "waste_entry");

@@ -1,6 +1,6 @@
 # Auth Hardening — Scoping and Plan
 
-**Status:** **A-1 … A-4b complete (A-1/A-2 2026-08-19, A-3/A-4/A-4b 2026-08-20).** A-5, A-6 and **A-4c** open. Written 2026-08-17 at the maintainer's
+**Status:** **A-1 … A-4c complete; A-6 written (all 2026-08-19/20).** A-5 and **A-4d** open. Written 2026-08-17 at the maintainer's
 request, to run **in parallel** with the offline-activation stages.
 
 | Stage | Status |
@@ -10,7 +10,8 @@ request, to run **in parallel** with the offline-activation stages.
 | A-3 real sessions | **Complete 2026-08-20** — see the record at the end of this file. **`requireAuth` is built and tested but mounted on nothing; A-4 is what closes the hole.** |
 | A-4 middleware on all routes | **Complete 2026-08-20** — 268/285 routes authenticated, 16 deliberately public. **Not the end of the story: see A-4b.** |
 | A-4b `updated_by` authorisation | **Complete 2026-08-20** — 92 routes across four guard families now read the verified session. See the record. |
-| A-4c money-route audit stamps | **Open** — 14 money-moving routes have a caller-chosen actor stamp **and no permission check at all**. |
+| A-4c money-route permissions | **Complete 2026-08-20** — 13 handlers / 15 registrations. See the record. **Found a further unguarded class: see A-4d.** |
+| A-4d unguarded master-data writes | **Open** — `POST/PUT /accounts`, `/suppliers`, `/customers` write `opening_balance` with no permission check and no actor. |
 | A-5 lockout + delete legacy verify | Open |
 | A-6 exposure checklist | **Written 2026-08-20** — see the record. It is a **gate**, not a summary: every unticked line is a reason not to expose the backend. |
 **Related:** `CLAUDE.md` "Known security debt"; `docs/offline-activation-design.md` §12 (which
@@ -893,3 +894,124 @@ Work top to bottom and tick in the table itself. When every line is met, the ver
 changes and the reason is auditable. If a line is going to be waived, write *why* next to it —
 a waiver with a reason is a decision, and an untracked exception is how the checklist stops meaning
 anything.
+
+---
+
+## A-4c record — permissions on the money routes (2026-08-20)
+
+### The count was wrong in both directions
+
+The A-4b record said 14. Measured: **13 handlers, 15 HTTP registrations** —
+`createSaleReturnHandler` and `createWasteEntryHandler` are each mounted twice, at the bare path and
+under `/api/v3/`. All 13 confirmed to have had no authorisation call of any kind.
+
+One further correction: `POST /contra-entries` had **no** `|| 1`. It wrote
+`parsePositiveInteger(req.body.created_by)` — caller-chosen or NULL. The other 12 defaulted to
+user 1.
+
+### Two new permission keys, and why not to reuse
+
+`customer_payments`, `supplier_payments`, `invoice_cancellation`, `billing` and `waste_management`
+already fit their routes exactly. Two did not:
+
+- **`expenses`** — the closest existing key is `reports`, which is literally what `App.jsx`'s
+  `modulePermissionMap` gates the Expenses screen on. Reusing it was rejected: *"can read reports"*
+  silently granting *"can spend the shop's money"* is invisible in the role table the maintainer
+  actually edits. The distinction has to exist in the name.
+- **`contra_entries`** — cash↔bank treasury movement is neither a customer nor a supplier
+  settlement. No shipped screen posts to this route at all.
+
+### `POST /accounts/payments` needs two keys, not one
+
+One route, two money movements. A Cashier is seeded `customer_payments: true` and
+`supplier_payments: false`, so a single key would have been wrong in one direction. The key follows
+the `(payment_action, account source)` pair the request will actually take. An unrecognised pair
+gets no key and falls through to the pre-existing 400 — no branch writes before that point.
+
+### Cancellation is stricter than creation
+
+Cancelling a payment or an expense requires the domain key **and** `invoice_cancellation`. Recording
+a real payment and then quietly voiding it is the classic fraud path, and an expense one person can
+both enter and void is an untraceable withdrawal.
+
+`createSaleReturnHandler` was **deliberately left on `billing` alone.** A return refunds money and
+is arguably a partial void, but returns are counter work a Cashier does all day, and requiring the
+void key would have stopped the counter working on the first restart after upgrade. A judgement
+call, recorded as one rather than left to look like an oversight.
+
+### What happens to an existing installation
+
+Three idempotent startup statements, each guarded on the key being absent so a restart never
+overwrites a later decision:
+
+1. Owner/Admin get `expenses: true` outright — the client treats both as all-modules roles, so an
+   Admin with Reports unticked would otherwise see the screen and be refused by the server.
+2. **Every other role inherits its own stored `reports` value into `expenses`.** On the seeded roles
+   that is Purchase Manager `true`, Inventory Manager `true`, Cashier `false` — *identical to who
+   can reach the Expenses screen today*, including any per-shop customisation. **Nobody who records
+   expenses this week is locked out next week**, which was the explicit bar: a migration that stops
+   a shop recording expenses on Monday morning is worse than the hole it closes.
+3. `contra_entries`: `true` for Owner/Admin, `false` for staff roles. No population to preserve.
+
+### The frontend half, without which this is unusable
+
+Enforcement alone would have been worse than nothing in two specific ways, both fixed here:
+
+- **The keys had no labels**, so they were enforced on the server and invisible in
+  Settings → Role Permissions. A key that cannot be seen cannot be granted.
+- **The Cancel buttons were not role-gated**, so a Cashier would have kept a clickable button that
+  now always 403s. Both are disabled with a reason, gated on the same `canCancelSales` the invoice
+  Cancel button already uses — the same rule as `autoConnectivityAvailability.js`: an action that
+  cannot succeed must not render as available. `canCancel` defaults to `false`, so a future call
+  site that forgets the prop denies rather than permits.
+
+### What changes for a legitimate caller
+
+No change for: Owner, Admin, Cashier recording customer payments and sale returns, Inventory Manager
+recording waste, Purchase Manager recording supplier payments, all four manager roles on expenses.
+
+**Changes, each surfacing as a permission-denied message:**
+
+1. A **Cashier paying a supplier** from the Accounts screen → 403. The Accounts module is visible to
+   a Cashier by a hardcoded frontend default, but `supplier_payments` is seeded `false`. If a shop's
+   cashier genuinely pays suppliers, tick Supplier Payments for Cashier.
+2. A **Purchase Manager receiving a customer payment** → 403, same shape, same remedy.
+3. **Cancel buttons** are now disabled for anyone without Invoice Cancellation.
+4. **Audit values change going forward.** Rows previously filed under user 1 because the client
+   omitted the field now carry the real operator. Existing rows are untouched.
+
+### Gate results
+
+| Gate | Result |
+| --- | --- |
+| `npm --prefix backend test` | **213 / 214** — the 1 failure is the pre-existing Linux-vs-Windows path assertion |
+| `TZ=Asia/Kolkata node --test frontend/src/local/*.test.mjs` | **313 / 313** |
+| `npm --prefix frontend run lint` | 0 errors, 37 warnings (unchanged) |
+| `npm run build` | Pass |
+
+---
+
+## A-4d — unguarded master-data writes (open, found during A-4c)
+
+A sweep for *every* write route with no guard found the same defect outside the money list:
+
+- **`POST /accounts`, `PUT /accounts/:accountKey`** — no permission check, no actor at all, and they
+  write `opening_balance`, which the ledger renders directly as `outstanding_balance` /
+  `payable_balance`. Any signed-in employee can restate what a customer or supplier owes.
+  **Arguably worse than several routes A-4c just fixed**, because it rewrites history rather than
+  adding to it.
+- **`POST /suppliers`, `PUT /suppliers/:id`, `DELETE /suppliers/:id`, `POST /customers`,
+  `PUT /customers/:id`** — same class, same `opening_balance` field.
+- **`POST /api/whatsapp/send-document`** — no check, despite a `whatsapp_send` key existing for
+  exactly this.
+- `sale_rate_history.changed_by` still has an `actorId || 1` in the opening-stock helper. Dead today
+  (A-4b made `actorId` the session), but the same latent user-1 attribution.
+
+### Not determined
+
+- Whether a queued offline entry can be replayed by a *different* signed-in user than the one who
+  created it. If it can, the stamp becomes the replaying user. `/api/sync/push` handles only
+  `sync_test` and `pos_sale`, so expenses/returns/waste replay over the same HTTP routes and are
+  covered — but the general question was not traced to the end.
+- Whether `contra_entries.created_by`, `expenses.created_by` and the payment actor columns carry
+  NOT NULL/FK constraints. The new values are strictly better-formed than the `|| 1` path.

@@ -7001,6 +7001,7 @@ function App() {
 
           {activeView === "accounts" && (
             <AccountsModule
+              canCancel={canCancelSales}
               accounts={accounts}
               accountLedger={accountLedger}
               accountPayments={accountPayments}
@@ -7169,6 +7170,7 @@ function App() {
 
           {activeView === "expenses" && (
             <ExpensesModule
+              canCancel={canCancelSales}
               expenses={expenses}
               onReload={loadExpenses}
               user={user}
@@ -12726,7 +12728,7 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
   );
 }
 
-function ExpensesModule({ expenses, onReload, user }) {
+function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
   const expenseCategories = ["Rent", "Staff Salary", "Electricity", "Transport", "Loading / Hamali", "Packing Material", "Repair & Maintenance", "Food / Tea / Misc", "Other"];
   const emptyExpense = {
     expense_date: toDateKey(new Date()),
@@ -12881,7 +12883,7 @@ function ExpensesModule({ expenses, onReload, user }) {
               <td>
                 <div className="button-row table-actions-row">
                   <button className="table-action" disabled={status === "CANCELLED"} onClick={() => editExpense(expense)}>Edit</button>
-                  <button className="remove-button" disabled={status === "CANCELLED"} onClick={() => cancelExpense(expense)}>Cancel</button>
+                  <button className="remove-button" disabled={status === "CANCELLED" || !canCancel} title={canCancel ? undefined : "Cancelling an expense needs Invoice Cancellation permission."} onClick={() => cancelExpense(expense)}>Cancel</button>
                 </div>
               </td>
             </tr>
@@ -12893,7 +12895,7 @@ function ExpensesModule({ expenses, onReload, user }) {
   );
 }
 
-function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPayments, ledgerFocusKey, onLedgerLoad, onPaymentsLoad, onReload, user }) {
+function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPayments, canCancel = false, ledgerFocusKey, onLedgerLoad, onPaymentsLoad, onReload, user }) {
   const emptyAccount = {
     account_name: "",
     account_type: "CUSTOMER",
@@ -13399,7 +13401,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
                 <td>{row.cancellation_reason || row.edit_reason || row.remarks || "-"}</td>
                 <td className="table-actions-row">
                   <button className="table-action" disabled={row.cancelled} onClick={() => editPayment(row)}>Edit</button>
-                  <button className="remove-button" disabled={row.cancelled} onClick={() => cancelPayment(row)}>Cancel</button>
+                  <button className="remove-button" disabled={row.cancelled || !canCancel} title={canCancel ? undefined : "Cancelling a payment needs Invoice Cancellation permission."} onClick={() => cancelPayment(row)}>Cancel</button>
                   <button className="table-action" onClick={() => viewPaymentHistory(row)}>History</button>
                   <button className="table-action" onClick={() => setReceiptPayment(row)}>Print</button>
                 </td>
@@ -14042,6 +14044,10 @@ const permissionLabels = [
   ["rebate_rules", "Rebate Rules"],
   ["supplier_payments", "Supplier Payments"],
   ["customer_payments", "Customer Payments"],
+  // A-4c added both. Without a label here the key exists on the server and is invisible in
+  // Settings -> Role Permissions, so it can be enforced but never changed — the worst of both.
+  ["contra_entries", "Cash / Bank Transfer"],
+  ["expenses", "Expenses"],
   ["sale_edit", "Sale Edit"],
   ["invoice_cancellation", "Invoice Cancellation"],
   ["reports", "Reports"],
