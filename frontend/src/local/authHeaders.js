@@ -58,3 +58,51 @@ export const optionalSessionAuthHeaders = (token) => {
   if (!value) return undefined;
   return sessionAuthHeaders(value);
 };
+
+/**
+ * Normalise a URL to its origin (`scheme://host:port`), or `""` when it has none.
+ *
+ * A request URL in this codebase is sometimes absolute (built from a configured API base) and
+ * sometimes relative. `URL` throws on the relative ones, which is the signal that they are
+ * same-origin rather than an error.
+ */
+const originOf = (value) => {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) return "";
+  try {
+    return new URL(text).origin;
+  } catch {
+    return "";
+  }
+};
+
+/**
+ * Whether the session token may be attached to a request for `url`.
+ *
+ * ## Why this is not just "always attach"
+ *
+ * A global request interceptor attaches headers to *every* axios call in the process, including any
+ * made to a host this app does not own. Sending a bearer token to a third party hands that party a
+ * working credential for this business's data — the classic way an interceptor turns into a
+ * credential leak. So the token travels only to origins the app was configured to talk to.
+ *
+ * A relative URL is same-origin by definition and is allowed: that is how the desktop shell calls
+ * its own local backend.
+ *
+ * Unparseable or empty allowed origins are ignored rather than treated as wildcards. If nothing is
+ * configured, only relative URLs qualify — the safe direction to fail.
+ *
+ * @param {string} url the request URL, absolute or relative
+ * @param {Iterable<string>} allowedOrigins configured API bases, absolute or otherwise
+ * @returns {boolean}
+ */
+export const shouldAttachSessionAuth = (url, allowedOrigins = []) => {
+  const target = originOf(url);
+  if (!target) return true; // relative — the app's own origin
+  const permitted = new Set();
+  for (const candidate of allowedOrigins || []) {
+    const origin = originOf(candidate);
+    if (origin) permitted.add(origin);
+  }
+  return permitted.has(target);
+};

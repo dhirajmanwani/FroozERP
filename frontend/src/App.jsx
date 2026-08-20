@@ -38,7 +38,7 @@ import {
 } from "./local/bootstrapCredential";
 import { resolveOfflineOpenDecision } from "./local/offlineDataReadiness";
 import { bannerForState } from "./local/entitlementState";
-import { sessionAuthHeaders } from "./local/authHeaders";
+import { sessionAuthHeaders, shouldAttachSessionAuth } from "./local/authHeaders";
 import { resolveSessionAction } from "./local/sessionExpiry";
 import {
   addNotification,
@@ -1896,6 +1896,29 @@ function App() {
   const [exitAttemptCount, setExitAttemptCount] = useState(0);
   const [loginDeviceControlSettings, setLoginDeviceControlSettings] = useState(defaultDeviceControlSettings);
   const [accountLedgerFocusKey, setAccountLedgerFocusKey] = useState("");
+
+  // Every request carries the signed session, not just the handful of call sites that were wired by
+  // hand. Before this, 129 of App.jsx's 157 axios calls sent no token at all — which was survivable
+  // only because almost no route checked. A-4 makes every one of them check, so attaching the token
+  // per call site would mean 157 chances to forget one, and each omission is a broken screen.
+  //
+  // Scoped by origin on purpose: an interceptor attaches headers to *every* axios call in the
+  // process, and a bearer token sent to a host we do not own is a working credential handed to a
+  // stranger. `shouldAttachSessionAuth` allows same-origin and the configured API bases, nothing
+  // else.
+  useEffect(() => {
+    const token = user?.device_session_token;
+    if (!token) return undefined;
+    const allowedOrigins = [API_URL, SYNC_API_URL, LOCAL_OPERATIONAL_API_URL, CLOUD_OPERATIONAL_API_URL];
+    const interceptorId = axios.interceptors.request.use((config) => {
+      const target = config.baseURL ? `${config.baseURL}${config.url || ""}` : config.url;
+      if (!shouldAttachSessionAuth(target, allowedOrigins)) return config;
+      // Never overwrite a header a call site set deliberately.
+      config.headers = { ...sessionAuthHeaders(token), ...(config.headers || {}) };
+      return config;
+    });
+    return () => axios.interceptors.request.eject(interceptorId);
+  }, [user]);
 
   // A-4 will put `requireAuth` in front of ~219 routes, so an ended sign-in stops being a quiet
   // oddity and starts failing most of the app at once. One interceptor decides what that means, so

@@ -9,6 +9,7 @@ import {
   SESSION_HEADER,
   optionalSessionAuthHeaders,
   sessionAuthHeaders,
+  shouldAttachSessionAuth,
 } from "./authHeaders.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -71,4 +72,44 @@ test("every request layer builds its auth headers here, not inline", () => {
     );
     assert.match(source, /[sS]essionAuthHeaders/, `${file} must use the shared helper`);
   }
+});
+
+// -----------------------------------------------------------------------------------------------
+// Where the token is allowed to travel.
+//
+// A global request interceptor attaches headers to every axios call in the process. Without a
+// scope check that includes calls to hosts this app does not own, and a bearer token handed to a
+// third party is a working credential for the whole business.
+// -----------------------------------------------------------------------------------------------
+
+test("the token goes to configured API origins and to same-origin requests", () => {
+  const allowed = ["https://api.example.com", "http://192.168.1.9:5000/"];
+  assert.equal(shouldAttachSessionAuth("https://api.example.com/login", allowed), true);
+  assert.equal(shouldAttachSessionAuth("http://192.168.1.9:5000/sales", allowed), true);
+  assert.equal(shouldAttachSessionAuth("/api/sync/pull", allowed), true, "relative is same-origin");
+  assert.equal(shouldAttachSessionAuth("reports/summary", allowed), true);
+});
+
+test("the token never goes to a host the app was not configured to talk to", () => {
+  const allowed = ["https://api.example.com"];
+  for (const url of [
+    "https://evil.example.net/collect",
+    "http://api.example.com/login",          // different scheme is a different origin
+    "https://api.example.com.evil.net/x",    // suffix trick
+    "https://api.example.com:8443/login",    // different port is a different origin
+  ]) {
+    assert.equal(shouldAttachSessionAuth(url, allowed), false, `must not send the token to ${url}`);
+  }
+});
+
+test("with nothing configured, only same-origin requests carry the token", () => {
+  // Failing towards "send nothing" is the safe direction; the alternative leaks on misconfiguration.
+  assert.equal(shouldAttachSessionAuth("https://api.example.com/x", []), false);
+  assert.equal(shouldAttachSessionAuth("https://api.example.com/x", [""]), false);
+  assert.equal(shouldAttachSessionAuth("https://api.example.com/x", [null, undefined]), false);
+  assert.equal(shouldAttachSessionAuth("/local", []), true);
+});
+
+test("an unparseable allowed origin is ignored, not treated as a wildcard", () => {
+  assert.equal(shouldAttachSessionAuth("https://api.example.com/x", ["not a url"]), false);
 });

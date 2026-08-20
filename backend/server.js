@@ -46,7 +46,7 @@ const {
 // A-3: `extractSessionToken` accepts the session token from `Authorization: Bearer` as well as the
 // long-standing `x-froozerp-device-session` header, so a client that sends only the standard header
 // authenticates on the routes that already verify sessions. Same token, same verification.
-const { extractSessionToken } = require("./authMiddleware");
+const { createRequireAuth, extractSessionToken } = require("./authMiddleware");
 const { resolveSessionSecret } = require("./sessionSecret");
 const {
   REFERENCE_BOOTSTRAP_PROTOCOL,
@@ -661,6 +661,7 @@ if (sessionSecretResolution.fatal) {
   process.exit(1);
 }
 const deviceSessionSecret = sessionSecretResolution.secret;
+const requireAuth = createRequireAuth({ secret: deviceSessionSecret });
 const recoveryGenericMessage = "If the provided information matches an eligible account, a verification code will be sent.";
 const recoveryDevOtpEnabled = /^true$/i.test(process.env.RECOVERY_DEV_OTP_ENABLED || "") && process.env.NODE_ENV !== "production";
 const generateOtpCode = () => String(crypto.randomInt(0, 1000000)).padStart(6, "0");
@@ -1129,6 +1130,22 @@ const getSupportContacts = async ({ staffOnly = false } = {}) => {
   return result.rows;
 };
 
+/**
+ * Allow an action on `targetUserId` when the actor is that same user, or a manager of them.
+ *
+ * **`actorUserId` must come from a verified session (`req.auth.userId`) and nothing else.** This
+ * function authorises; it cannot authenticate. It was previously called as
+ * `requireSelfOrRateManager(userId, req.query.updated_by || req.query.user_id)`, where both
+ * arguments derived from the same client-supplied value — so target and actor were always equal,
+ * the self branch always matched, and the check passed for anyone. `GET /auth/recovery/profile?
+ * user_id=1` returned the Owner's recovery email and mobile in the clear, and
+ * `POST /auth/recovery/contact/request` then repointed them at the caller: account takeover in a
+ * few requests, with no credentials at all.
+ *
+ * Removing the `||` fallback would not have fixed it — an attacker simply sends `updated_by` too.
+ * The only fix is that the actor is a *proven* identity, which is why every caller now sits behind
+ * `requireAuth`.
+ */
 const requireSelfOrRateManager = async (targetUserId, actorUserId, client = pool) => {
   const parsedTarget = parsePositiveInteger(targetUserId);
   const parsedActor = parsePositiveInteger(actorUserId);
@@ -6487,10 +6504,10 @@ app.get("/auth/recovery/config", async (req, res) => {
   }
 });
 
-app.get("/auth/recovery/profile", async (req, res) => {
+app.get("/auth/recovery/profile", requireAuth, async (req, res) => {
   try {
     const userId = parsePositiveInteger(req.query.user_id);
-    const actor = await requireSelfOrRateManager(userId, req.query.updated_by || req.query.user_id);
+    const actor = await requireSelfOrRateManager(userId, req.auth.userId);
     if (!actor) return res.status(403).json({ code: "BRANCH_ACCESS_DENIED", message: "Not allowed to view recovery profile" });
     const result = await pool.query(
       `
@@ -6516,11 +6533,11 @@ app.get("/auth/recovery/profile", async (req, res) => {
   }
 });
 
-app.post("/auth/recovery/contact/request", async (req, res) => {
+app.post("/auth/recovery/contact/request", requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     const userId = parsePositiveInteger(req.body.user_id);
-    const actor = await requireSelfOrRateManager(userId, req.body.updated_by || req.body.user_id, client);
+    const actor = await requireSelfOrRateManager(userId, req.auth.userId, client);
     const contactType = cleanText(req.body.contact_type).toLowerCase();
     if (!actor) return res.status(403).json({ code: "BRANCH_ACCESS_DENIED", message: "Not allowed to update recovery contact" });
     if (!["email", "mobile"].includes(contactType)) return res.status(400).json({ code: "INVALID_CONTACT_TYPE", message: "Select email or mobile recovery contact." });
@@ -6608,11 +6625,11 @@ app.post("/auth/recovery/contact/request", async (req, res) => {
   }
 });
 
-app.post("/auth/recovery/contact/verify", async (req, res) => {
+app.post("/auth/recovery/contact/verify", requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     const userId = parsePositiveInteger(req.body.user_id);
-    const actor = await requireSelfOrRateManager(userId, req.body.updated_by || req.body.user_id, client);
+    const actor = await requireSelfOrRateManager(userId, req.auth.userId, client);
     const contactType = cleanText(req.body.contact_type).toLowerCase();
     if (!actor) return res.status(403).json({ code: "BRANCH_ACCESS_DENIED", message: "Not allowed to verify recovery contact" });
     if (!["email", "mobile"].includes(contactType)) return res.status(400).json({ code: "INVALID_CONTACT_TYPE", message: "Select email or mobile recovery contact." });
@@ -6691,11 +6708,11 @@ app.post("/auth/recovery/contact/verify", async (req, res) => {
   }
 });
 
-app.post("/api/auth/email/send-verification", async (req, res) => {
+app.post("/api/auth/email/send-verification", requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     const userId = parsePositiveInteger(req.body.user_id);
-    const actor = await requireSelfOrRateManager(userId, req.body.updated_by || req.body.user_id, client);
+    const actor = await requireSelfOrRateManager(userId, req.auth.userId, client);
     if (!actor) return res.status(403).json({ code: "OWNER_OR_SELF_REQUIRED", message: "Not allowed to update this email verification." });
     const email = normalizeRecoveryEmail(req.body.email || req.body.contact_value);
     if (!email) return res.status(400).json({ code: "INVALID_EMAIL", message: "Enter a valid email address." });
@@ -6743,11 +6760,11 @@ app.post("/api/auth/email/send-verification", async (req, res) => {
   }
 });
 
-app.post("/api/auth/email/verify", async (req, res) => {
+app.post("/api/auth/email/verify", requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     const userId = parsePositiveInteger(req.body.user_id);
-    const actor = await requireSelfOrRateManager(userId, req.body.updated_by || req.body.user_id, client);
+    const actor = await requireSelfOrRateManager(userId, req.auth.userId, client);
     if (!actor) return res.status(403).json({ code: "OWNER_OR_SELF_REQUIRED", message: "Not allowed to verify this email." });
     await client.query("BEGIN");
     const verification = await verifyOtpRequest({ requestId: cleanText(req.body.request_id), otp: cleanText(req.body.otp), purpose: "contact_email", client });
@@ -6788,11 +6805,11 @@ app.post("/api/auth/email/verify", async (req, res) => {
   }
 });
 
-app.post("/api/auth/phone/send-otp", async (req, res) => {
+app.post("/api/auth/phone/send-otp", requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     const userId = parsePositiveInteger(req.body.user_id);
-    const actor = await requireSelfOrRateManager(userId, req.body.updated_by || req.body.user_id, client);
+    const actor = await requireSelfOrRateManager(userId, req.auth.userId, client);
     if (!actor) return res.status(403).json({ code: "OWNER_OR_SELF_REQUIRED", message: "Not allowed to update this phone verification." });
     const mobile = normalizeRecoveryMobile(req.body.phone || req.body.mobile || req.body.contact_value);
     if (!mobile) return res.status(400).json({ code: "INVALID_PHONE", message: "Enter a valid Indian mobile number." });
@@ -6840,11 +6857,11 @@ app.post("/api/auth/phone/send-otp", async (req, res) => {
   }
 });
 
-app.post("/api/auth/phone/verify-otp", async (req, res) => {
+app.post("/api/auth/phone/verify-otp", requireAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     const userId = parsePositiveInteger(req.body.user_id);
-    const actor = await requireSelfOrRateManager(userId, req.body.updated_by || req.body.user_id, client);
+    const actor = await requireSelfOrRateManager(userId, req.auth.userId, client);
     if (!actor) return res.status(403).json({ code: "OWNER_OR_SELF_REQUIRED", message: "Not allowed to verify this phone." });
     await client.query("BEGIN");
     const verification = await verifyOtpRequest({ requestId: cleanText(req.body.request_id), otp: cleanText(req.body.otp), purpose: "contact_mobile", client });
