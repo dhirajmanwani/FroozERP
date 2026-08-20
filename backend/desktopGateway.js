@@ -522,7 +522,7 @@ const localRoute = async (req, res, url, body) => {
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
-    res.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-private-network": "true", "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS", "access-control-allow-headers": "cache-control,content-type,authorization,x-user-id,x-user-role,x-session-id,x-device-id,x-froozerp-frontend-version" });
+    res.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-private-network": "true", "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS", "access-control-allow-headers": "cache-control,content-type,authorization,x-froozerp-device-session,x-user-id,x-user-role,x-session-id,x-device-id,x-froozerp-frontend-version" });
     return res.end();
   }
   try {

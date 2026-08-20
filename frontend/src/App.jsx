@@ -39,6 +39,7 @@ import {
 import { resolveOfflineOpenDecision } from "./local/offlineDataReadiness";
 import { bannerForState } from "./local/entitlementState";
 import { sessionAuthHeaders, shouldAttachSessionAuth } from "./local/authHeaders";
+import { consumeStashedSessionForReload, stashSessionForReload } from "./local/reloadSessionBridge";
 import { resolveSessionAction } from "./local/sessionExpiry";
 import {
   addNotification,
@@ -1591,7 +1592,11 @@ function App() {
   })();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [user, setUser] = useState(null);
+  // A page reload is how a saved API-mode change actually takes effect (see saveApiConfig) — the
+  // URL constants below are consts computed once at script load, not reactive state. Restoring a
+  // session stashed for exactly that reload is the difference between "apply the setting" and
+  // "apply the setting, then also sign out", which is not what the maintainer asked this to do.
+  const [user, setUser] = useState(() => consumeStashedSessionForReload());
   const [deviceInfo, setDeviceInfo] = useState(() => getClientDeviceInfo());
   const [localDbStatus, setLocalDbStatus] = useState(null);
   const [entitlement, setEntitlement] = useState(null);
@@ -15114,6 +15119,9 @@ function SyncSettingsSection({
       return;
     }
     writeSavedApiConfig(nextConfig);
+    // The reload is what makes the new API URLs take effect; stashing the session first is what
+    // stops that reload from also acting as a sign-out. See reloadSessionBridge.js.
+    stashSessionForReload(user);
     setConfigMessage("API mode saved. FroozERP will reload to apply it.");
     window.setTimeout(() => window.location.reload(), 500);
   };
