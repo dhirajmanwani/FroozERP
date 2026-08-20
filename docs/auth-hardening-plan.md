@@ -12,7 +12,7 @@ request, to run **in parallel** with the offline-activation stages.
 | A-4b `updated_by` authorisation | **Complete 2026-08-20** — 92 routes across four guard families now read the verified session. See the record. |
 | A-4c money-route audit stamps | **Open** — 14 money-moving routes have a caller-chosen actor stamp **and no permission check at all**. |
 | A-5 lockout + delete legacy verify | Open |
-| A-6 exposure checklist | Open |
+| A-6 exposure checklist | **Written 2026-08-20** — see the record. It is a **gate**, not a summary: every unticked line is a reason not to expose the backend. |
 **Related:** `CLAUDE.md` "Known security debt"; `docs/offline-activation-design.md` §12 (which
 rules `deviceSession.js` is *kept*); `docs/backlog-1.0.72.md`.
 
@@ -795,3 +795,101 @@ The suite was verified to bite: reverting one site to the old form fails two tes
 - Whether `product_audit_trail.edited_by`, `purchases.created_by` and the stock-movement actor
   columns carry NOT NULL or FK constraints. The new values are strictly better-formed than the old
   `|| 1` / `|| null` paths, but the Postgres bootstrap was not read to confirm.
+
+---
+
+## A-6 record — the exposure gate (2026-08-20)
+
+### What this is
+
+Every other stage in this document makes the backend safer. This one decides **whether it may be
+reached from the internet at all**, and it is deliberately written as a gate rather than a summary:
+an unticked line is a reason not to expose, not a note to revisit later.
+
+It is written now, while the cloud is *not* running, precisely because that is the honest moment.
+Written the week of a launch, a checklist becomes a list of things to argue around.
+
+**Current verdict: DO NOT EXPOSE.** A-5 is open, A-4c was open when this was written, and six
+items below are unmet.
+
+### Why the timing is not urgent, and why the list still matters
+
+There is currently **no hosted backend** — the Railway subscription is inactive, App Mode on the
+maintainer's device is Local Only, and `CLOUD_TARGET_CONFIGURED` is false in the desktop gateway.
+Nothing is reachable, so nothing here is presently at risk.
+
+That is a reprieve, not a fix. The moment a cloud instance is stood up (offline-activation Stage 9),
+every item below applies at once, and several take real work. The list exists so that day is a
+morning of ticking boxes rather than a decision made under pressure.
+
+---
+
+### Gate 1 — Authentication and authorisation
+
+| # | Requirement | State |
+| --- | --- | --- |
+| 1.1 | Every route requires a verified session, or is on an explicit public allow-list | **Met (A-4)** — 268/285, 16 deliberately public, proved by `routeAuthCoverage.test.js` on every run |
+| 1.2 | No route derives *identity* from a request field | **Met (A-3, A-4b)** — 92 routes moved to `req.auth.userId` |
+| 1.3 | Money-moving routes carry a permission check, not just authentication | **A-4c** |
+| 1.4 | Failed logins are rate-limited and lock the account | **A-5 — open.** `locked_until` exists as a column and is not enforced. `/login` is on the public allow-list, so this is an unlimited online password-guessing oracle the moment the port is reachable |
+| 1.5 | Sessions can be revoked on sign-out | **Open.** `session_revocation_version` is carried in the token and checked by the sync path; nothing increments it. Today the only revocation is rotating the signing key, which signs everybody out |
+| 1.6 | The legacy SHA-256 verify path is removed | **A-5 — open.** Requires evidence every active user has signed in since A-1 |
+
+### Gate 2 — Secrets and transport
+
+| # | Requirement | State |
+| --- | --- | --- |
+| 2.1 | `DEVICE_SESSION_SECRET` set explicitly to a fresh random value ≥32 chars | **Enforced by the server** — an exposed instance refuses to start on a borrowed credential. Generate with `node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"` |
+| 2.2 | No secret is committed to the repository | **Believed met, unverified.** Run a secret scan before the first deploy rather than trusting recall |
+| 2.3 | TLS terminates in front of the app; no plaintext HTTP listener is reachable | **Not configured.** Sessions are bearer tokens: over plaintext, one interception is a full account takeover |
+| 2.4 | `trust proxy` set correctly if behind a load balancer | **Not set.** Without it `req.ip` is the proxy's address, so every per-IP control and every audit row records the wrong origin |
+| 2.5 | CORS allow-list contains real origins and never `*` | **Partly met.** `cloudConfigurationChecks` already asserts this for the cloud backend. The **desktop gateway still sends `access-control-allow-origin: *`** — acceptable while it is loopback-only, and it must never be exposed |
+
+### Gate 3 — What an unauthenticated caller can still learn
+
+| # | Requirement | State |
+| --- | --- | --- |
+| 3.1 | Public routes disclose nothing about the business | **Unmet.** `GET /api/health` and `GET /api/version` return `company_id`, `company_name` and `branch_id` with no credentials. Trim these before exposure — the liveness answer does not need the tenant's name |
+| 3.2 | Device-status and activation routes are rate-limited | **Unmet.** `POST /api/auth/device-bootstrap-status` is a device-ID oracle; `POST /devices/activate` allows unlimited attempts at a 48-bit code |
+| 3.3 | `POST /bootstrap/first-owner-device` is not reachable from the internet | **Unmet, and this is the sharpest edge on the allow-list.** It self-authenticates with a username and password and auto-approves the caller's device on success. It should become a documented CLI/ops action rather than an HTTP route |
+| 3.4 | Recovery routes are rate-limited and OTP attempts are capped | **Unmet / undetermined.** Whether `/auth/recovery/verify-otp` caps attempts was not confirmed by either the audit or the A-4 work. A 6-digit code with unlimited attempts is not a control |
+
+### Gate 4 — Isolation between tenants
+
+| # | Requirement | State |
+| --- | --- | --- |
+| 4.1 | Every query is scoped by `company_id` / `branch_id` | **Never audited.** §5 of this plan flagged it; nothing has been done |
+
+**This is the largest unknown in the document.** A-4 answers "is the caller who they say they
+are". It does not answer "may this authenticated user of branch A read branch B's data". With one
+company that is invisible; the maintainer intends multi-branch operation, which is exactly when it
+starts to matter. It deserves its own audit stage and must not be assumed solved by A-4.
+
+### Gate 5 — Operational
+
+| # | Requirement | State |
+| --- | --- | --- |
+| 5.1 | The plaintext-password query has been run against the live database | **Outstanding** — see the A-2 record. Any row it returns cannot sign in after A-2 and needs an admin reset |
+| 5.2 | A restore has been tested from a real backup, not just taken | Untested |
+| 5.3 | Logs do not contain tokens, passwords or OTPs | Unverified |
+| 5.4 | LOCAL_ONLY invariants re-read and re-tested after exposure work | `desktopGatewayOwnerControl.test.js` asserts them on the gateway paths; re-run after any cloud change |
+
+---
+
+### The three that would hurt most
+
+Not a ranking of severity so much as of regret:
+
+1. **1.4 — no lockout.** The moment the port is reachable, `/login` is an unlimited password-guessing
+   oracle. Everything else in this document assumes an attacker cannot simply become a real user.
+2. **4.1 — unaudited tenant isolation.** The one item where nobody has looked. Unknown risk is worse
+   than known risk, and it grows the day a second branch exists.
+3. **3.3 — `first-owner-device` on the public list.** A route that hands out an approved device on a
+   correct password guess, published to the internet.
+
+### How to use this
+
+Work top to bottom and tick in the table itself. When every line is met, the verdict at the top
+changes and the reason is auditable. If a line is going to be waived, write *why* next to it —
+a waiver with a reason is a decision, and an untracked exception is how the checklist stops meaning
+anything.
