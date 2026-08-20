@@ -65,12 +65,28 @@ test("operation processing is serialized and committed with business mutations",
 });
 
 test("protocol-v3 context comes from a verified signed device session", () => {
+  // A-3 moved the token read behind `extractSessionToken`, which accepts `Authorization: Bearer`
+  // as well as the legacy header. The property being pinned is unchanged: the v3 context is derived
+  // from a *verified signature*, never from an unverified header.
   assert.match(
     backendSource,
-    /verifyDeviceSession\(\s*req\.headers\["x-froozerp-device-session"\],\s*deviceSessionSecret\s*\)/
+    /verifyDeviceSession\(\s*extractSessionToken\(req\),\s*deviceSessionSecret\s*\)/
   );
   assert.match(backendSource, /rejectDeviceSessionSubstitution\(/);
   assert.match(backendSource, /DEVICE_NOT_APPROVED/);
+});
+
+test("no request path reads the session header for identity without verifying it", () => {
+  // The failure this guards is a future call site pulling the raw header and trusting it, which
+  // looks like authentication and is not. Every read must go through extractSessionToken and then
+  // through verifyDeviceSession.
+  assert.doesNotMatch(
+    backendSource,
+    /verifyDeviceSession\(\s*req\.headers\[/,
+    "session tokens must be extracted, not read straight off the request",
+  );
+  const rawHeaderReads = backendSource.match(/req\.headers\["x-froozerp-device-session"\]/g) || [];
+  assert.equal(rawHeaderReads.length, 0, "the session header is read only inside authMiddleware");
 });
 
 test("frontend confirmed workflows call protocol-v3 routes with operational writes", () => {

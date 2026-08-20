@@ -1,4 +1,5 @@
 import axios from "axios";
+import { optionalSessionAuthHeaders } from "./authHeaders";
 import { checkFroozBackendHealth, getConnectivitySnapshot } from "./connectivityService";
 import { isTauriRuntime } from "./localDatabase";
 import { repositories } from "./repositories";
@@ -241,7 +242,9 @@ const replayOfflinePurchase = async ({ apiUrl, operation, context }) => {
       {
         ...withTimeout(20000),
         headers: {
-          "x-froozerp-device-session": context.deviceSessionToken,
+          // Optional form: this path previously passed the raw token through, so an absent token
+          // sent no header at all rather than an empty one. Preserve that exactly.
+          ...(optionalSessionAuthHeaders(context.deviceSessionToken) || {}),
           "x-idempotency-key": operation.operation_id,
         },
       },
@@ -333,9 +336,7 @@ export async function pushPendingOperations({ apiUrl, user, deviceInfo, branchId
         })),
       }, {
         ...withTimeout(15000),
-        headers: context.deviceSessionToken
-          ? { "x-froozerp-device-session": context.deviceSessionToken }
-          : undefined,
+        headers: optionalSessionAuthHeaders(context.deviceSessionToken),
       });
       serverTime = response.data?.server_time || serverTime;
       observeServerTime({
@@ -394,9 +395,7 @@ export async function pullServerChanges({ apiUrl, user, deviceInfo, branchId }) 
   const pullStartedAt = Date.now();
   const response = await axios.get(endpointUrl(apiUrl, "/api/sync/pull"), {
     ...withTimeout(15000),
-    headers: context.deviceSessionToken
-      ? { "x-froozerp-device-session": context.deviceSessionToken }
-      : undefined,
+    headers: optionalSessionAuthHeaders(context.deviceSessionToken),
     params: {
       user_id: context.userId,
       device_id: context.deviceId,

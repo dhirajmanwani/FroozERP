@@ -34,7 +34,9 @@ test("new offline purchases use a durable protocol-v3 purchase intent", () => {
 });
 
 test("offline replay is signed, idempotent, and recovers after interruption", () => {
-  assert.match(syncSource, /x-froozerp-device-session/);
+  // A-3: the session header is now built by `authHeaders.js`, which sends the same token as both
+  // `Authorization: Bearer` and the legacy header. The property is unchanged — replay is signed.
+  assert.match(syncSource, /optionalSessionAuthHeaders\(context\.deviceSessionToken\)/);
   assert.match(syncSource, /x-idempotency-key/);
   assert.match(syncSource, /operation\.entity_type !== "purchase_grn"/);
   assert.match(syncSource, /replayOfflinePurchase/);

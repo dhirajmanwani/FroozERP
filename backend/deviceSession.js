@@ -14,6 +14,7 @@ const issueDeviceSession = ({
   deviceId,
   companyId,
   branchId,
+  role = "",
   sessionRevocationVersion = 0,
   nowMs = Date.now(),
   ttlSeconds = DEFAULT_TTL_SECONDS,
@@ -27,6 +28,11 @@ const issueDeviceSession = ({
     device_id: String(deviceId),
     company_id: Number(companyId),
     branch_id: Number(branchId),
+    // Added in auth-hardening A-3 so `requireRole` can authorise without a database round trip.
+    // Deliberately NOT part of the completeness check above: a token minted before A-3 carries no
+    // role and must still verify, and `requireRole` fails closed when the claim is absent rather
+    // than treating "no role" as permission.
+    role: String(role || ""),
     session_revocation_version: Number(sessionRevocationVersion || 0),
     issued_at: Math.floor(nowMs / 1000),
     expires_at: Math.floor(nowMs / 1000) + Number(ttlSeconds),

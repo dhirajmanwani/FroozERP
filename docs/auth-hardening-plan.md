@@ -1,13 +1,13 @@
 # Auth Hardening — Scoping and Plan
 
-**Status:** **A-1 and A-2 complete 2026-08-19.** A-3 … A-6 open. Written 2026-08-17 at the maintainer's
+**Status:** **A-1 and A-2 complete 2026-08-19; A-3 complete 2026-08-20.** A-4 … A-6 open. Written 2026-08-17 at the maintainer's
 request, to run **in parallel** with the offline-activation stages.
 
 | Stage | Status |
 | --- | --- |
 | A-1 password hashing | **Complete 2026-08-19** — see the record at the end of this file |
 | A-2 remove plaintext fallback | **Complete 2026-08-19** — see the record at the end of this file. **Carries an operational action: see "Before this reaches a live database".** |
-| A-3 real sessions | Open |
+| A-3 real sessions | **Complete 2026-08-20** — see the record at the end of this file. **`requireAuth` is built and tested but mounted on nothing; A-4 is what closes the hole.** |
 | A-4 middleware on all routes | Open |
 | A-5 lockout + delete legacy verify | Open |
 | A-6 exposure checklist | Open |
@@ -342,3 +342,142 @@ Identity remains client-asserted. `x-user-id` is still trusted across 212 unauth
 so anyone who can reach the API can still claim to be Owner **without any password at all** —
 which makes the plaintext bypass moot in the one scenario that matters most. A-2 closes a real hole
 in the password path; it does not make the API safe to expose. That is A-3 and A-4.
+
+---
+
+## A-3 record — real sessions, issued at `/login` (2026-08-20)
+
+### What was already there, and what actually had to be built
+
+The plan describes A-3 as if there were no sessions at all. Measured in the source first, most of
+the machinery already existed and was already load-bearing for sync:
+
+| Piece | State before A-3 |
+| --- | --- |
+| HMAC token module (`deviceSession.js`) | Present, v1, 12h TTL, substitution check |
+| `/login` issues a token | **Yes** — `device_session_token` in the response |
+| Frontend stores and sends it | **Yes** — as `x-froozerp-device-session` |
+| Sync + protocol-v3 routes verify it | **Yes** |
+| Token carries a `role` claim | **No** |
+| `Authorization: Bearer` accepted | **No** |
+| Reusable `requireAuth` / `requireRole` | **No** |
+
+So A-3 was narrower than written, and it is worth recording *why the hole stayed open anyway*: the
+signed session existed but only about a dozen routes consulted it. The other two hundred read
+`x-user-id`. A token nobody checks is not authentication.
+
+This stage builds the checker and the missing claim. Mounting it everywhere is A-4, and until that
+lands the hole is still open — see "Still not fixed by this".
+
+### `backend/authMiddleware.js` (new)
+
+`createRequireAuth({ secret })` returns middleware that extracts the token, verifies it via
+`deviceSession.js`, runs the substitution check, and sets `req.auth`. It **never reads `x-user-id`
+as identity.** The only way to influence who the server thinks you are is to present a token this
+server signed.
+
+Every path that cannot positively establish identity refuses:
+
+| Situation | Response |
+| --- | --- |
+| No token | 401 `AUTH_SESSION_REQUIRED` |
+| Expired / tampered / wrong-version / forged | 401, each with its own existing `DEVICE_SESSION_*` code |
+| Token valid but a submitted id contradicts it | 403 `DEVICE_SESSION_SUBSTITUTION_REJECTED` |
+| Server has no signing secret configured | 500 `AUTH_NOT_CONFIGURED` |
+
+There is no anonymous fallback and no development bypass. A bypass switch is the thing that
+survives into production.
+
+`requireRole(...roles)` denies when `requireAuth` has not run, when the session carries no role, and
+when the allow-list is empty. "Unknown role" must never read as "any role", and an empty allow-list
+is a bug at the call site that should be visible immediately rather than silently granting everyone.
+
+### The `role` claim
+
+`issueDeviceSession` gained a `role` parameter, emitted as a claim, and `/login` passes
+`user.role_name` — the role resolved server-side, never anything the client sent. `requireRole` can
+then authorise without a database round trip.
+
+It is **deliberately excluded from the token's completeness check**: a token minted before A-3
+carries no role and must still prove identity, otherwise deploying A-3 signs everyone out
+mid-shift. Such a token authenticates and is refused by any role-gated route until the next sign-in.
+There is a test for exactly that.
+
+### Transport: `Authorization: Bearer`
+
+`extractSessionToken` prefers `Authorization: Bearer <token>` and falls back to
+`x-froozerp-device-session`. Same token, same signature, same verification — only the envelope
+differs.
+
+Both server-side verification sites (`resolveSyncRequestContext`, `resolveV3OperationalContext`) now
+extract rather than reading the header directly, so a client sending only the standard header
+authenticates on the routes that already verified sessions.
+
+The legacy header is still sent by the frontend and still accepted. Dropping it would break sync
+against any backend built before A-3 for no security gain. It goes in A-4, when the old header has
+no remaining reader.
+
+### `frontend/src/local/authHeaders.js` (new)
+
+The session headers were written inline at five call sites across `App.jsx` and `syncService.js`.
+Five copies of an authentication decision is how one of them ends up subtly different and wrong, so
+they now all call `sessionAuthHeaders` / `optionalSessionAuthHeaders`. A test asserts no inline copy
+comes back.
+
+Two forms, because the existing behaviour differed and the difference is load-bearing: the
+operational paths always sent the header (empty when signed out), while the sync push/pull paths
+omitted it entirely. Preserved exactly. `Authorization` is never sent empty — `Bearer ` is a
+malformed credential, not an absent one.
+
+### Tests
+
+`backend/authMiddleware.test.js` — 20 tests, registered in `backend/package.json`. The first is the
+one the whole stage exists for: **a bare `x-user-id` never authenticates anyone.** If that ever
+fails, the API is wide open again.
+
+The rest pin the failures that are silent rather than loud: expired, tampered, wrong-secret,
+wrong-version and garbage tokens each rejected; an `x-user-id` that *contradicts* the token refused
+while one that *agrees* passes; a missing secret refusing rather than allowing; and a pre-A-3 token
+still proving identity but not role.
+
+`frontend/src/local/authHeaders.test.mjs` — 7 tests, including that both headers always carry the
+same token, and that no request layer builds them inline.
+
+Three existing source-text assertions matched the old inline header literals. They were updated to
+the new form with their intent preserved, and `operationalWriteRoutes.test.js` gained a companion
+assertion that no request path reads the session header for identity without verifying it — the
+failure being guarded is a future call site pulling the raw header and trusting it, which looks like
+authentication and is not.
+
+### Gate results
+
+| Gate | Result |
+| --- | --- |
+| `npm --prefix backend test` | **162 / 163** — the 1 failure is the pre-existing Linux-vs-Windows path assertion |
+| `npm run backend:check` | Pass |
+| `TZ=Asia/Kolkata node --test frontend/src/local/*.test.mjs` | **238 / 238** |
+| `npm --prefix frontend run lint` | 0 errors, 37 warnings (unchanged) |
+| `npm run build` | Pass |
+| `cargo check` | Pass (no Rust changes this stage) |
+
+### Still not fixed by this
+
+**The API is not yet safe to expose, and A-3 does not make it so.** `requireAuth` exists, is tested,
+and is mounted on nothing. Of 219 route registrations in `server.js`, the sync and protocol-v3
+paths verify sessions; the rest still trust `x-user-id`. Anyone who can reach the API can still
+claim to be Owner on those routes without a password.
+
+That is A-4, and A-4 is the stage that actually closes the hole — which is why its completeness test
+(enumerate every registered route, assert each either requires auth or is on an explicit allow-list)
+matters more than its diff.
+
+Also unaddressed, and worth recording because it is easy to miss:
+
+- **The signing secret falls back to a database credential.** `deviceSessionSecret` resolves to
+  `DEVICE_SESSION_SECRET`, then `DB_PASSWORD`, then the database URL. A leaked database credential
+  therefore also forges sessions, which couples two failure domains that should be independent.
+  `DEVICE_SESSION_SECRET` should be set explicitly before exposure — a checklist item for A-6.
+- **No revocation on sign-out.** The token is valid for its full 12 hours regardless.
+  `session_revocation_version` is carried in the claim and checked by the sync path, so the
+  mechanism exists; nothing increments it.
+- **Multi-tenant isolation is still unaudited** (§5).

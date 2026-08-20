@@ -14,7 +14,7 @@ const supplierMigration = fs.readFileSync(
 
 test("cursor zero opts into reference bootstrap and applies it atomically", () => {
   assert.match(syncService, /bootstrap_protocol: cursor === "0" \? "reference-v1" : undefined/);
-  assert.match(syncService, /"x-froozerp-device-session": context\.deviceSessionToken/);
+  assert.match(syncService, /headers: optionalSessionAuthHeaders\(context\.deviceSessionToken\)/);
   assert.match(syncService, /response\.data\?\.reference_bootstrap/);
   assert.match(syncService, /repositories\.pull\.bootstrap/);
   assert.match(localDatabase, /sync_apply_reference_bootstrap/);
@@ -27,7 +27,9 @@ test("all sync requests carry the canonical signed scope after bootstrap", () =>
   assert.match(syncService, /company_id: context\.companyId/);
   assert.match(syncService, /operational_location_id: context\.operationalLocationId/);
   assert.doesNotMatch(syncService, /headers: cursor === "0" && context\.deviceSessionToken/);
-  assert.match(syncService, /headers: context\.deviceSessionToken/);
+  // A-3 replaced the inline conditional header with the shared helper; the point of the assertion
+  // is that the token is attached unconditionally to every sync request, bootstrap or not.
+  assert.match(syncService, /headers: optionalSessionAuthHeaders\(context\.deviceSessionToken\)/);
 });
 
 test("ordinary incremental pulls retain the existing apply path", () => {

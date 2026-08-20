@@ -43,6 +43,10 @@ const {
   rejectDeviceSessionSubstitution,
   verifyDeviceSession,
 } = require("./deviceSession");
+// A-3: `extractSessionToken` accepts the session token from `Authorization: Bearer` as well as the
+// long-standing `x-froozerp-device-session` header, so a client that sends only the standard header
+// authenticates on the routes that already verify sessions. Same token, same verification.
+const { extractSessionToken } = require("./authMiddleware");
 const {
   REFERENCE_BOOTSTRAP_PROTOCOL,
   captureReferenceBootstrap,
@@ -9128,7 +9132,7 @@ const resolveSyncRequestContext = async (req, client = pool) => {
   }
 
   const deviceSession = verifyDeviceSession(
-    req.headers["x-froozerp-device-session"],
+    extractSessionToken(req),
     deviceSessionSecret
   );
   if (deviceSession.error) return { error: deviceSession.error };
@@ -9181,7 +9185,7 @@ const resolveSyncRequestContext = async (req, client = pool) => {
 const resolveV3OperationalContext = async (req, { requireWrite = false } = {}) => {
   try {
     const deviceSession = verifyDeviceSession(
-      req.headers["x-froozerp-device-session"],
+      extractSessionToken(req),
       deviceSessionSecret
     );
     if (deviceSession.error) return { error: deviceSession.error };
@@ -10596,6 +10600,9 @@ app.post("/login", async (req, res) => {
       deviceId: device.device_id,
       companyId: canonicalCompanyId,
       branchId: canonicalBranchId,
+      // A-3: the role travels in the signed token so `requireRole` can authorise without a database
+      // round trip. It is the role resolved here, server-side — never anything the client sent.
+      role: user.role_name,
       sessionRevocationVersion: user.session_revocation_version || 0,
       secret: deviceSessionSecret,
     });

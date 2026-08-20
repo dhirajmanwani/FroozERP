@@ -38,6 +38,7 @@ import {
 } from "./local/bootstrapCredential";
 import { resolveOfflineOpenDecision } from "./local/offlineDataReadiness";
 import { bannerForState } from "./local/entitlementState";
+import { sessionAuthHeaders } from "./local/authHeaders";
 import {
   addNotification,
   clearNotifications,
@@ -379,7 +380,7 @@ const createOperationalWrite = (user, payload = {}, operationId = "") => {
     },
     config: {
       headers: {
-        "x-froozerp-device-session": user?.device_session_token || "",
+        ...sessionAuthHeaders(user?.device_session_token),
         "x-idempotency-key": idempotencyKey,
       },
     },
@@ -387,9 +388,7 @@ const createOperationalWrite = (user, payload = {}, operationId = "") => {
   };
 };
 const createOperationalReadConfig = (user) => ({
-  headers: {
-    "x-froozerp-device-session": user?.device_session_token || "",
-  },
+  headers: sessionAuthHeaders(user?.device_session_token),
 });
 const API_CONFIG = {
   mode: API_MODE,
