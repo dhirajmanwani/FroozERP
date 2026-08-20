@@ -32,9 +32,35 @@ export const LOCAL_SERVICE_OUTCOMES = Object.freeze({
   REFUSED: "REFUSED",
   /** A server answered but said nothing useful. */
   REFUSED_WITHOUT_REASON: "REFUSED_WITHOUT_REASON",
+  /**
+   * The app refused before, or independently of, any request — a rule enforced in the frontend
+   * itself, which threw a plain `Error` carrying the actual reason.
+   *
+   * `startupConnectivityAuthority.confirm()` is the case that motivated this: with App Mode pinned
+   * to LOCAL_ONLY it throws "API_MODE=LOCAL_ONLY is authoritative; connectivity cannot be enabled
+   * at runtime." That is a correct, deliberate refusal with a precise explanation — and it has no
+   * HTTP response, so a classifier that only asks "did a server answer?" would call it a network
+   * failure and tell the user to restart the app. Wrong advice for a rule that is working exactly
+   * as designed.
+   */
+  REFUSED_LOCALLY: "REFUSED_LOCALLY",
   /** Nothing answered. The request did not arrive. */
   UNREACHABLE: "UNREACHABLE",
 });
+
+/**
+ * Codes axios attaches when a request failed at the transport layer rather than being answered.
+ * Their presence is what separates "the network ate it" from "our own code threw".
+ */
+const TRANSPORT_ERROR_CODES = new Set([
+  "ERR_NETWORK",
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "ERR_CANCELED",
+  "ERR_BAD_REQUEST",
+  "ERR_BAD_RESPONSE",
+]);
 
 const text = (value) => (typeof value === "string" ? value.trim() : "");
 
@@ -53,6 +79,36 @@ const REFUSED_WITHOUT_REASON_MESSAGE =
   + "again, then try once more.";
 
 /**
+ * Plain-language replacements for refusals whose own wording is written for a developer.
+ *
+ * The rule is right and the refusal is correct; only the sentence is wrong for the audience. These
+ * are matched on the thrown text rather than on an error code because these throws carry no code —
+ * adding one would be the better fix, and is a change to `startupConnectivityPolicy.js` that this
+ * module deliberately does not reach into.
+ */
+const PLAIN_LANGUAGE_REFUSALS = [
+  {
+    match: /API_MODE=LOCAL_ONLY is authoritative/i,
+    message:
+      "This installation is fixed to Local Only in App Mode, so Connectivity Mode cannot be "
+      + "switched to Auto. Change Select App Mode first, then set Connectivity Mode.",
+  },
+  {
+    match: /must be reconciled before it can be changed/i,
+    message:
+      "FroozERP is still checking this device's connection settings. Wait a moment for the "
+      + "Connection Status panel to finish loading, then try again.",
+  },
+];
+
+const plainLanguageFor = (message) => {
+  for (const { match, message: replacement } of PLAIN_LANGUAGE_REFUSALS) {
+    if (match.test(message)) return replacement;
+  }
+  return message;
+};
+
+/**
  * Classify a failed request to the local service.
  *
  * @param {*} failure an axios error, a `{ status, response }`-shaped object, or anything else
@@ -66,6 +122,22 @@ export const classifyLocalServiceFailure = (failure) => {
   const status = Number.isFinite(Number(rawStatus)) && Number(rawStatus) > 0 ? Number(rawStatus) : null;
 
   if (status === null) {
+    // No response. Two very different things land here, and telling them apart is the point:
+    // a request that died in transit, and our own code refusing with a reason worth reading.
+    const isTransportFailure = Boolean(
+      failure
+      && typeof failure === "object"
+      && (failure.isAxiosError === true || TRANSPORT_ERROR_CODES.has(String(failure.code || ""))),
+    );
+    const thrownMessage = failure instanceof Error ? text(failure.message) : "";
+    if (!isTransportFailure && thrownMessage) {
+      return {
+        outcome: LOCAL_SERVICE_OUTCOMES.REFUSED_LOCALLY,
+        answered: false,
+        status: null,
+        serverMessage: thrownMessage,
+      };
+    }
     return { outcome: LOCAL_SERVICE_OUTCOMES.UNREACHABLE, answered: false, status: null, serverMessage: "" };
   }
 
@@ -93,6 +165,8 @@ export const classifyLocalServiceFailure = (failure) => {
 export const describeLocalServiceFailure = (failure, fallback = "") => {
   const classified = classifyLocalServiceFailure(failure);
   if (classified.outcome === LOCAL_SERVICE_OUTCOMES.UNREACHABLE) return UNREACHABLE_MESSAGE;
-  if (classified.serverMessage) return classified.serverMessage;
+  // Covers both a server's own explanation and a local rule's — in either case something decided
+  // this deliberately and said why, and that beats anything invented here.
+  if (classified.serverMessage) return plainLanguageFor(classified.serverMessage);
   return text(fallback) || REFUSED_WITHOUT_REASON_MESSAGE;
 };
