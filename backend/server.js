@@ -986,6 +986,26 @@ const roleMatches = (value, allowed = []) => {
   return allowed.map(normalizeRoleName).includes(role);
 };
 
+/**
+ * Return the user when they hold a rate-managing role (Owner/Admin), otherwise `null`.
+ *
+ * **`userId` must come from a verified session (`req.auth.userId`) and nothing else.** This
+ * function authorises; it cannot authenticate. It looks up whatever id it is handed and reports
+ * that id's role, so handing it a number the caller wrote is not a permission check — it is asking
+ * the caller which permissions they would like.
+ *
+ * Until A-4b this was the dominant identity mechanism in this file: 61 call sites read the actor
+ * from `req.body.updated_by` / `req.body.created_by` / `req.query.user_id`. A-4 put a session
+ * behind every route, so a Cashier could no longer be a stranger — but a signed-in Cashier who
+ * sent the Owner's id in `updated_by` still passed all 61, including `POST /users`,
+ * `DELETE /users/:id`, `PUT /users/:id/password` and `POST /settings/activation-codes`. The
+ * session proved they were the Cashier; nothing compared that to the id in the body.
+ *
+ * `rejectDeviceSessionSubstitution` does not close this: it pins `user_id`, `device_id`,
+ * `company_id` and `branch_id` to the token, and `updated_by` is none of those.
+ *
+ * The same rule binds `requireSelfOrRateManager`, `getPermissionUser` and `getSalePermissionUser`.
+ */
 const requireRateManager = async (userId, client = pool) => {
   const parsedUserId = parsePositiveInteger(userId);
   if (!parsedUserId) return null;
@@ -4569,6 +4589,12 @@ const getSystemInfo = async (deviceId = "") => {
   };
 };
 
+/**
+ * `userId` decides how much of this bundle is returned: with a rate manager it also carries the
+ * entire users table, every authorized device, every activation code and the backup log. It must
+ * therefore be a verified session id — `GET /settings?user_id=1` was a full staff and device dump
+ * to anyone who guessed the Owner's id.
+ */
 const getSettingsBundle = async (userId, deviceId = "") => {
   const [businessResult, saleRateResult, mandiResult, rebateResult, discountResult, roleResult, updateResult, syncResult, syncQueueResult, posResult, paymentResult, whatsappResult, deviceControlResult, manager] = await Promise.all([
     pool.query("SELECT * FROM business_settings WHERE id = 1"),
@@ -5696,7 +5722,7 @@ app.get("/settings/purchase-rules", async (req, res) => {
 
 app.get("/settings", async (req, res) => {
   try {
-    return res.json(await getSettingsBundle(req.query.user_id, req.query.device_id));
+    return res.json(await getSettingsBundle(req.auth.userId, req.query.device_id));
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Settings" });
@@ -5750,7 +5776,7 @@ app.get("/settings/role-permissions", async (req, res) => {
 
 app.put("/settings/role-permissions/:roleName", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage role permissions" });
     const roleName = cleanText(req.params.roleName);
     const permissions = req.body.permissions && typeof req.body.permissions === "object" ? req.body.permissions : {};
@@ -5783,7 +5809,7 @@ app.put("/settings/role-permissions/:roleName", async (req, res) => {
 
 app.put("/settings/device-control", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage device control settings" });
     const currentPassword = cleanText(req.body.current_password);
     const newExitCode = cleanText(req.body.exit_code);
@@ -5926,7 +5952,7 @@ app.get("/api/update/manifest", async (req, res) => {
 
 app.put("/settings/update-center", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage update settings" });
     const result = await pool.query(
       `
@@ -5969,7 +5995,7 @@ app.get("/settings/sync-status", async (req, res) => {
 
 app.put("/settings/sync-status", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage sync settings" });
     const result = await pool.query(
       `
@@ -5989,7 +6015,7 @@ app.put("/settings/sync-status", async (req, res) => {
 
 app.put("/settings/pos", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage POS settings" });
     const connectionType = cleanText(req.body.scale_connection_type).toUpperCase();
     const allowedConnections = new Set(["USB", "SERIAL", "BLUETOOTH", "MANUAL_FALLBACK"]);
@@ -6025,7 +6051,7 @@ app.put("/settings/pos", async (req, res) => {
 
 app.put("/settings/payment", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage payment settings" });
     const salesMandiTaxPercent = parseNonNegativeNumber(req.body.sales_mandi_tax_percent);
     const salesMandiTaxBasis = cleanText(req.body.sales_mandi_tax_basis).toUpperCase() || "NET_AFTER_ALL_DISCOUNTS";
@@ -6083,7 +6109,7 @@ app.put("/settings/payment", async (req, res) => {
 
 app.put("/settings/whatsapp", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage WhatsApp settings" });
     const existing = await pool.query("SELECT * FROM whatsapp_settings WHERE id = 1");
     const existingToken = existing.rows[0]?.access_token || "";
@@ -6127,7 +6153,7 @@ app.put("/settings/whatsapp", async (req, res) => {
 
 app.post("/settings/whatsapp/test", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can test WhatsApp settings" });
     const settingsResult = await pool.query("SELECT * FROM whatsapp_settings WHERE id = 1");
     const settings = settingsResult.rows[0] || {};
@@ -6339,7 +6365,7 @@ app.post("/api/whatsapp/send-document", async (req, res) => {
 
 app.put("/settings/business", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage business settings" });
     const result = await pool.query(
       `
@@ -6401,7 +6427,7 @@ app.put("/settings/business", async (req, res) => {
 
 app.put("/settings/sale-rate", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     const desiredMargin = parseNonNegativeNumber(req.body.desired_margin_percent);
     const roundingRule = String(req.body.rounding_rule || "NEAREST_RUPEE").toUpperCase();
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage sale rate settings" });
@@ -6490,7 +6516,7 @@ const getUserTransactionCount = async (userId) => {
 
 app.get("/users", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.query.updated_by || req.query.user_id);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can view users" });
     const result = await pool.query(
       `
@@ -6519,7 +6545,7 @@ app.get("/users", async (req, res) => {
 
 app.post("/users", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can add users" });
     const payload = readUserPayload(req.body);
     const password = String(req.body.password || "");
@@ -6557,7 +6583,7 @@ app.post("/users", async (req, res) => {
 
 app.put("/users/:id", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     const userId = parsePositiveInteger(req.params.id);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can edit users" });
     if (!userId) return res.status(400).json({ message: "Invalid user" });
@@ -6594,8 +6620,12 @@ app.put("/users/:id", async (req, res) => {
 
 app.put("/users/:id/password", async (req, res) => {
   try {
+    // Target and actor are deliberately different things here: whose password is being changed
+    // comes from the URL, who is changing it comes from the session. Collapsing them would either
+    // remove the manager-resets-a-staff-password case or restore the old bug, where `updated_by`
+    // supplied both sides and a Cashier could name themselves the actor on the Owner's account.
     const userId = parsePositiveInteger(req.params.id);
-    const actorId = parsePositiveInteger(req.body.updated_by);
+    const actorId = req.auth.userId;
     const manager = await requireRateManager(actorId);
     const password = String(req.body.password || "");
     const confirmPassword = String(req.body.confirm_password || "");
@@ -6633,7 +6663,7 @@ app.put("/users/:id/password", async (req, res) => {
 
 app.post("/users/:id/deactivate", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     const userId = parsePositiveInteger(req.params.id);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can deactivate users" });
     if (!userId || userId === manager.id) return res.status(400).json({ message: "Invalid user deactivation request" });
@@ -6647,7 +6677,7 @@ app.post("/users/:id/deactivate", async (req, res) => {
 
 app.post("/users/:id/reactivate", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     const userId = parsePositiveInteger(req.params.id);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can reactivate users" });
     const result = await pool.query("UPDATE users SET active = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING id", [userId]);
@@ -6660,7 +6690,7 @@ app.post("/users/:id/reactivate", async (req, res) => {
 
 app.delete("/users/:id", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     const userId = parsePositiveInteger(req.params.id);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can delete users" });
     if (!userId || userId === manager.id) return res.status(400).json({ message: "Invalid user delete request" });
@@ -7091,7 +7121,7 @@ app.post("/api/auth/phone/verify-otp", requireAuth, async (req, res) => {
 
 app.get("/auth/recovery/readiness-report", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.query.user_id || req.query.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ code: "BRANCH_ACCESS_DENIED", message: "Only Owner or Admin can view recovery readiness" });
     const result = await pool.query(
       `
@@ -7466,7 +7496,7 @@ app.post("/auth/recovery/reset-password", async (req, res) => {
 
 app.post("/users/:id/recovery-action", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     const userId = parsePositiveInteger(req.params.id);
     const action = cleanText(req.body.action).toUpperCase();
     if (!manager) return res.status(403).json({ code: "BRANCH_ACCESS_DENIED", message: "Only Owner or Admin can manage recovery actions" });
@@ -7570,7 +7600,7 @@ app.get("/settings/discount-rules", async (req, res) => {
 
 app.post("/settings/discount-rules", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     const rule = readDiscountRulePayload(req.body);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage discount rules" });
     if (
@@ -7608,7 +7638,7 @@ app.post("/settings/discount-rules", async (req, res) => {
 app.put("/settings/discount-rules/:id", async (req, res) => {
   try {
     const ruleId = parsePositiveInteger(req.params.id);
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     const rule = readDiscountRulePayload(req.body);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage discount rules" });
     if (
@@ -7654,7 +7684,7 @@ app.put("/settings/discount-rules/:id", async (req, res) => {
 app.delete("/settings/discount-rules/:id", async (req, res) => {
   try {
     const ruleId = parsePositiveInteger(req.params.id);
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage discount rules" });
     if (!ruleId) return res.status(400).json({ message: "Invalid discount rule" });
     const result = await pool.query("DELETE FROM sale_discount_rules WHERE id = $1 RETURNING id", [ruleId]);
@@ -7710,7 +7740,7 @@ app.get("/lot-discounts", async (req, res) => {
 app.post("/lot-discounts", async (req, res) => {
   const client = await pool.connect();
   try {
-    const manager = await requireRateManager(req.body.created_by || req.body.updated_by, client);
+    const manager = await requireRateManager(req.auth.userId, client);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage discounts" });
     const productId = parsePositiveInteger(req.body.product_id);
     const lotIds = Array.isArray(req.body.inventory_batch_ids)
@@ -7785,7 +7815,7 @@ app.put("/lot-discounts/:id", async (req, res) => {
   const client = await pool.connect();
   try {
     const discountId = parsePositiveInteger(req.params.id);
-    const manager = await requireRateManager(req.body.updated_by, client);
+    const manager = await requireRateManager(req.auth.userId, client);
     const discountType = String(req.body.discount_type || "").trim().toUpperCase();
     const discountValue = parseNonNegativeNumber(req.body.discount_value);
     const startDate = toBusinessDateKey(req.body.start_date || new Date());
@@ -7837,7 +7867,7 @@ app.post("/lot-discounts/:id/deactivate", async (req, res) => {
   const client = await pool.connect();
   try {
     const discountId = parsePositiveInteger(req.params.id);
-    const manager = await requireRateManager(req.body.updated_by, client);
+    const manager = await requireRateManager(req.auth.userId, client);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage discounts" });
     if (!discountId) return res.status(400).json({ message: "Invalid discount" });
     await client.query("BEGIN");
@@ -7880,7 +7910,7 @@ app.post("/settings/mandi-tax-rules", async (req, res) => {
   try {
     const taxPercent = parseNonNegativeNumber(req.body.tax_percent);
     const originType = String(req.body.origin_type || "").toUpperCase();
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
     if (!originType || taxPercent === null) return res.status(400).json({ message: "Enter valid mandi tax rule details" });
     const result = await pool.query(
@@ -7903,7 +7933,7 @@ app.put("/settings/mandi-tax-rules/:id", async (req, res) => {
   try {
     const ruleId = parsePositiveInteger(req.params.id);
     const taxPercent = parseNonNegativeNumber(req.body.tax_percent);
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!ruleId || taxPercent === null || !manager) {
       return res.status(manager ? 400 : 403).json({ message: manager ? "Enter a valid mandi tax rate" : "Only Owner or Admin can manage settings" });
     }
@@ -7926,7 +7956,7 @@ app.put("/settings/mandi-tax-rules/:id", async (req, res) => {
 app.delete("/settings/mandi-tax-rules/:id", async (req, res) => {
   try {
     const ruleId = parsePositiveInteger(req.params.id);
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
     if (!ruleId) return res.status(400).json({ message: "Invalid mandi tax rule" });
     const result = await pool.query("DELETE FROM mandi_tax_rules WHERE id = $1 RETURNING id", [ruleId]);
@@ -7939,10 +7969,10 @@ app.delete("/settings/mandi-tax-rules/:id", async (req, res) => {
 
 app.post("/settings/rebate-rules", async (req, res) => {
   try {
-    const { rule_name, pay_within_days, rebate_percent, active, updated_by } = req.body;
+    const { rule_name, pay_within_days, rebate_percent, active } = req.body;
     const parsedDays = parseNonNegativeNumber(pay_within_days);
     const parsedPercent = parseNonNegativeNumber(rebate_percent);
-    const manager = await requireRateManager(updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
     if (!rule_name?.trim() || !Number.isInteger(parsedDays) || parsedPercent === null) {
       return res.status(400).json({ message: "Enter valid rebate rule details" });
@@ -7965,10 +7995,10 @@ app.post("/settings/rebate-rules", async (req, res) => {
 app.put("/settings/rebate-rules/:id", async (req, res) => {
   try {
     const ruleId = parsePositiveInteger(req.params.id);
-    const { rule_name, pay_within_days, rebate_percent, active, updated_by } = req.body;
+    const { rule_name, pay_within_days, rebate_percent, active } = req.body;
     const parsedDays = parseNonNegativeNumber(pay_within_days);
     const parsedPercent = parseNonNegativeNumber(rebate_percent);
-    const manager = await requireRateManager(updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
     if (!ruleId || !rule_name?.trim() || !Number.isInteger(parsedDays) || parsedPercent === null) {
       return res.status(400).json({ message: "Enter valid rebate rule details" });
@@ -7992,7 +8022,7 @@ app.put("/settings/rebate-rules/:id", async (req, res) => {
 app.delete("/settings/rebate-rules/:id", async (req, res) => {
   try {
     const ruleId = parsePositiveInteger(req.params.id);
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
     if (!ruleId) return res.status(400).json({ message: "Invalid rebate rule" });
     const result = await pool.query("DELETE FROM rebate_rules WHERE id = $1 RETURNING id", [ruleId]);
@@ -10207,7 +10237,7 @@ app.post("/bootstrap/first-owner-device", async (req, res) => {
 
 app.put("/settings/devices/:deviceId", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage authorized devices" });
     const deviceId = cleanText(req.params.deviceId);
     const action = cleanText(req.body.action).toUpperCase();
@@ -10264,7 +10294,7 @@ app.put("/settings/devices/:deviceId", async (req, res) => {
 
 app.post("/settings/activation-codes", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.created_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can generate activation codes" });
     const expiresHours = Math.max(Number(req.body.expires_in_hours || 24), 1);
     const code = generateActivationCode();
@@ -10294,7 +10324,7 @@ app.post("/settings/activation-codes", async (req, res) => {
 
 app.put("/settings/activation-codes/:id/revoke", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can revoke activation codes" });
     const codeId = parsePositiveInteger(req.params.id);
     const result = await pool.query("UPDATE activation_codes SET status = 'REVOKED' WHERE id = $1 RETURNING id", [codeId]);
@@ -10307,7 +10337,7 @@ app.put("/settings/activation-codes/:id/revoke", async (req, res) => {
 
 app.post("/settings/branches", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage branches" });
     const result = await pool.query(
       `
@@ -10326,7 +10356,7 @@ app.post("/settings/branches", async (req, res) => {
 
 app.post("/settings/counters", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage counters" });
     const result = await pool.query(
       `
@@ -10345,7 +10375,7 @@ app.post("/settings/counters", async (req, res) => {
 
 app.put("/settings/backup", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.updated_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage backups" });
     const result = await pool.query(
       `
@@ -10378,7 +10408,7 @@ app.put("/settings/backup", async (req, res) => {
 
 app.post("/settings/backup-now", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.created_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can run backups" });
     const backup = await createDatabaseBackup({ backupType: req.body.backup_type || "Manual", createdBy: manager.id });
     return res.json(backup);
@@ -10390,7 +10420,7 @@ app.post("/settings/backup-now", async (req, res) => {
 
 app.post("/settings/safe-shutdown", async (req, res) => {
   try {
-    const manager = await requireRateManager(req.body.created_by);
+    const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can safely close software" });
     const backup = await createDatabaseBackup({ backupType: "Shutdown", createdBy: manager.id });
     return res.json({
@@ -10894,7 +10924,7 @@ app.get("/api/v3/product-categories", rateLimitSyncRequest, v3ReadAdapter(listPr
 const createProductCategoryHandler = async (req, res) => {
   const client = await pool.connect();
   try {
-    const manager = await requireRateManager(req.body.created_by || req.body.updated_by, client);
+    const manager = await requireRateManager(req.auth.userId, client);
     const categoryName = cleanText(req.body.category_name);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage categories" });
     if (!categoryName) return res.status(400).json({ message: "Please enter category name." });
@@ -10972,7 +11002,7 @@ const updateProductCategoryHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const categoryId = parsePositiveInteger(req.params.id);
-    const manager = await requireRateManager(req.body.updated_by, client);
+    const manager = await requireRateManager(req.auth.userId, client);
     const categoryName = cleanText(req.body.category_name);
     const reason = cleanText(req.body.reason) || "Category updated";
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage categories" });
@@ -11059,7 +11089,7 @@ const deactivateProductCategoryHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const categoryId = parsePositiveInteger(req.params.id);
-    const manager = await requireRateManager(req.body?.updated_by || req.query.updated_by, client);
+    const manager = await requireRateManager(req.auth.userId, client);
     const reason = cleanText(req.body?.reason || req.query.reason) || "Category removed";
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage categories" });
     if (!categoryId) return res.status(400).json({ message: "Invalid category" });
@@ -11336,13 +11366,13 @@ const createProductHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     await ensureProductEntrySchema(client);
-    const { product_name, selling_rate, unit, barcode, origin_type, category, category_id, minimum_stock, active, created_by, remarks, branch_id } = req.body;
+    const { product_name, selling_rate, unit, barcode, origin_type, category, category_id, minimum_stock, active, remarks, branch_id } = req.body;
     const parsedSellingRate = parsePositiveNumber(selling_rate);
     const parsedMinimumStock = parseNonNegativeNumber(minimum_stock);
     const parsedOriginType = String(origin_type || "LOCAL").toUpperCase();
     const parsedUnit = normalizeProductUnit(unit);
     const normalizedCategory = cleanText(category) || "Fruit";
-    const rateManager = await requireRateManager(created_by, client);
+    const rateManager = await requireRateManager(req.auth.userId, client);
 
     if (!rateManager) return res.status(403).json({ success: false, message: "Only Owner or Admin can create owner-approved selling rates" });
     if (!product_name?.trim() || !parsedUnit || !parsedSellingRate || parsedMinimumStock === null || !["LOCAL", "IMPORTED"].includes(parsedOriginType)) {
@@ -11487,7 +11517,7 @@ const updateProductHandler = async (req, res) => {
   try {
     await ensureProductEntrySchema(client);
     const productId = parsePositiveInteger(req.params.id);
-    const { product_name, selling_rate, unit, barcode, origin_type, category, category_id, minimum_stock, active, updated_by, rate_change_reason, remarks } = req.body;
+    const { product_name, selling_rate, unit, barcode, origin_type, category, category_id, minimum_stock, active, rate_change_reason, remarks } = req.body;
     const parsedSellingRate = parsePositiveNumber(selling_rate);
     const parsedMinimumStock = parseNonNegativeNumber(minimum_stock);
     const parsedOriginType = String(origin_type || "").toUpperCase();
@@ -11542,7 +11572,7 @@ const updateProductHandler = async (req, res) => {
       return res.status(409).json({ message: "This product already exists." });
     }
     const sellingRateChanged = Number(current.selling_rate) !== parsedSellingRate;
-    const rateManager = sellingRateChanged ? await requireRateManager(updated_by, client) : null;
+    const rateManager = sellingRateChanged ? await requireRateManager(req.auth.userId, client) : null;
     if (sellingRateChanged && !rateManager) {
       await client.query("ROLLBACK");
       return res.status(403).json({ message: "Only Owner or Admin can change selling rates" });
@@ -11582,7 +11612,7 @@ const updateProductHandler = async (req, res) => {
       INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by)
       VALUES ($1, 'EDIT', $2::jsonb, $3::jsonb, $4, $5)
       `,
-      [productId, JSON.stringify(current), JSON.stringify(result.rows[0]), rate_change_reason?.trim() || "Product master update", parsePositiveInteger(updated_by) || rateManager?.id || null]
+      [productId, JSON.stringify(current), JSON.stringify(result.rows[0]), rate_change_reason?.trim() || "Product master update", req.auth.userId]
     );
     await logSyncChange(client, {
       branchId: req.v3OperationalContext?.branch_id || 1,
@@ -11614,7 +11644,7 @@ const addOpeningStockLotsForProduct = async (req, res, productIdParam = "id") =>
   try {
     await ensureProductEntrySchema(client);
     const productId = parsePositiveInteger(req.params[productIdParam]);
-    const manager = await requireRateManager(req.body.created_by || req.body.updated_by, client);
+    const manager = await requireRateManager(req.auth.userId, client);
     const lots = Array.isArray(req.body.opening_stock_lots) ? req.body.opening_stock_lots : [req.body];
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can add opening stock" });
     if (!productId || lots.length === 0) return res.status(400).json({ message: "Please add opening stock lots." });
@@ -11793,7 +11823,7 @@ const updateInventoryLotHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const lotId = parsePositiveInteger(req.params.lotId);
-    const manager = await requireRateManager(req.body.updated_by || req.body.edited_by, client);
+    const manager = await requireRateManager(req.auth.userId, client);
     const purchaseRate = parsePositiveNumber(req.body.purchase_rate || req.body.opening_cost);
     const saleRate = parsePositiveNumber(req.body.sale_rate);
     const reason = cleanText(req.body.reason || "Opening stock lot edited");
@@ -11934,7 +11964,7 @@ const addInventoryLotQuantityHandler = async (req, res) => {
   try {
     const lotId = parsePositiveInteger(req.params.lotId);
     const quantity = parsePositiveNumber(req.body.quantity);
-    const manager = await requireRateManager(req.body.updated_by || req.body.created_by, client);
+    const manager = await requireRateManager(req.auth.userId, client);
     const reason = cleanText(req.body.reason || "Quantity added to lot");
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can add lot quantity" });
     if (!lotId || !quantity) return res.status(400).json({ message: "Enter quantity to add" });
@@ -12006,7 +12036,7 @@ const adjustInventoryLotHandler = async (req, res) => {
   try {
     const lotId = parsePositiveInteger(req.params.lotId);
     const physicalQuantity = parseNonNegativeNumber(req.body.physical_quantity ?? req.body.balance_qty ?? req.body.new_balance_qty ?? req.body.new_quantity ?? req.body.quantity);
-    const manager = await requireRateManager(req.body.updated_by || req.body.created_by, client);
+    const manager = await requireRateManager(req.auth.userId, client);
     const reason = cleanText(req.body.reason);
     const adjustmentType = cleanText(req.body.adjustment_type || "Physical Count Correction");
     const adjustmentDate = isDateInput(req.body.adjustment_date) ? req.body.adjustment_date : toDateKey(new Date());
@@ -12123,7 +12153,7 @@ const deactivateInventoryLotHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const lotId = parsePositiveInteger(req.params.lotId);
-    const manager = await requireRateManager(req.body.updated_by || req.body.deactivated_by, client);
+    const manager = await requireRateManager(req.auth.userId, client);
     const reason = cleanText(req.body.reason);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can deactivate lots" });
     if (!lotId || !reason) return res.status(400).json({ message: "Reason is required" });
@@ -12201,7 +12231,7 @@ const reactivateInventoryLotHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const lotId = parsePositiveInteger(req.params.lotId);
-    const manager = await requireRateManager(req.body.updated_by || req.body.reactivated_by, client);
+    const manager = await requireRateManager(req.auth.userId, client);
     const reason = cleanText(req.body.reason);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can reactivate lots" });
     if (!lotId || !reason) return res.status(400).json({ message: "Reason is required" });
@@ -12281,7 +12311,7 @@ app.post("/lots/transfer-stock", async (req, res) => {
     const fromLotId = parsePositiveInteger(req.body.from_lot_id || req.body.from_inventory_batch_id);
     const toLotId = parsePositiveInteger(req.body.to_lot_id || req.body.to_inventory_batch_id);
     const quantity = parsePositiveNumber(req.body.quantity);
-    const manager = await requireRateManager(req.body.updated_by || req.body.created_by, client);
+    const manager = await requireRateManager(req.auth.userId, client);
     const reason = cleanText(req.body.reason);
     const remarks = nullableText(req.body.remarks);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can transfer stock between lots" });
@@ -12471,7 +12501,7 @@ const cancelProductHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const productId = parsePositiveInteger(req.params.id);
-    const userId = parsePositiveInteger(req.body.cancelled_by) || parsePositiveInteger(req.body.updated_by);
+    const userId = req.auth.userId;
     const reason = cleanText(req.body.reason);
     const manager = await requireRateManager(userId, client);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can deactivate products" });
@@ -12582,7 +12612,7 @@ app.get("/stock", async (req, res) => {
 
 app.get("/sale-rates", async (req, res) => {
   try {
-    if (!await requireRateManager(req.query.user_id)) {
+    if (!await requireRateManager(req.auth.userId)) {
       return res.status(403).json({ message: "Only Owner or Admin can manage selling rates" });
     }
     const settingsResult = await pool.query("SELECT * FROM sale_rate_settings WHERE id = 1");
@@ -12655,7 +12685,7 @@ app.get("/sale-rates", async (req, res) => {
 app.post("/sale-rates/bulk", async (req, res) => {
   const client = await pool.connect();
   try {
-    const manager = await requireRateManager(req.body.changed_by, client);
+    const manager = await requireRateManager(req.auth.userId, client);
     const updates = Array.isArray(req.body.updates) ? req.body.updates : [];
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage selling rates" });
     if (updates.length === 0) return res.status(400).json({ message: "Add at least one selling rate update" });
@@ -12731,7 +12761,7 @@ app.post("/sale-rates/bulk", async (req, res) => {
 
 app.get("/sale-rate-history", async (req, res) => {
   try {
-    if (!await requireRateManager(req.query.user_id)) {
+    if (!await requireRateManager(req.auth.userId)) {
       return res.status(403).json({ message: "Only Owner or Admin can view selling rate history" });
     }
     const result = await pool.query(
@@ -14146,7 +14176,7 @@ app.get("/customer-ledger", async (req, res) => {
 
 app.get("/dashboard-metrics", async (req, res) => {
   try {
-    if (!(await getPermissionUser(req.query.user_id, "dashboard", []))) {
+    if (!(await getPermissionUser(req.auth.userId, "dashboard", []))) {
       return res.status(403).json({ message: "You do not have permission to view Dashboard." });
     }
     return res.json(await getDashboardSummary());
@@ -14158,7 +14188,7 @@ app.get("/dashboard-metrics", async (req, res) => {
 
 app.get("/dashboard-analytics", async (req, res) => {
   try {
-    if (!(await getPermissionUser(req.query.user_id, "dashboard", []))) {
+    if (!(await getPermissionUser(req.auth.userId, "dashboard", []))) {
       return res.status(403).json({ message: "You do not have permission to view Dashboard." });
     }
     return res.json(await getDashboardAnalyticsPayload(req.query));
@@ -14170,7 +14200,7 @@ app.get("/dashboard-analytics", async (req, res) => {
 
 app.get("/dashboard-sales-trend", async (req, res) => {
   try {
-    if (!(await getPermissionUser(req.query.user_id, "dashboard", []))) {
+    if (!(await getPermissionUser(req.auth.userId, "dashboard", []))) {
       return res.status(403).json({ message: "You do not have permission to view Dashboard." });
     }
     const { dateFrom, dateTo, days } = parseDashboardRange(req.query);
@@ -14183,7 +14213,7 @@ app.get("/dashboard-sales-trend", async (req, res) => {
 
 app.get("/dashboard-profit-trend", async (req, res) => {
   try {
-    if (!(await getPermissionUser(req.query.user_id, "dashboard", []))) {
+    if (!(await getPermissionUser(req.auth.userId, "dashboard", []))) {
       return res.status(403).json({ message: "You do not have permission to view Dashboard." });
     }
     const { dateFrom, dateTo, days } = parseDashboardRange(req.query);
@@ -14196,7 +14226,7 @@ app.get("/dashboard-profit-trend", async (req, res) => {
 
 app.get("/dashboard-expense-trend", async (req, res) => {
   try {
-    if (!(await getPermissionUser(req.query.user_id, "dashboard", []))) {
+    if (!(await getPermissionUser(req.auth.userId, "dashboard", []))) {
       return res.status(403).json({ message: "You do not have permission to view Dashboard." });
     }
     const { dateFrom, dateTo, days } = parseDashboardRange(req.query);
@@ -16402,7 +16432,15 @@ app.get("/supplier-ledger", async (req, res) => {
   }
 });
 
-const readPurchaseEntryPayload = (body) => {
+/**
+ * `actorUserId` is a separate argument, and not read out of `body`, because `actorId` is used two
+ * ways: as the actor for `requireRateManager` on the pending-bill paths, and as the `created_by`
+ * written on the purchase, its stock movements and its audit trail. It was
+ * `body.created_by || body.edited_by || 1` — so a caller both chose which permissions they were
+ * checked against and signed someone else's name on the row, and a request that omitted the field
+ * entirely was attributed to user 1, who in a single-owner shop is the Owner.
+ */
+const readPurchaseEntryPayload = (body, actorUserId) => {
   const purchaseType = String(body.purchase_type || "CREDIT").trim().toUpperCase();
   const purchaseBillStatus = String(body.purchase_bill_status || "BILL_COMPLETED").trim().toUpperCase();
   return {
@@ -16434,7 +16472,7 @@ const readPurchaseEntryPayload = (body) => {
     unit: nullableText(body.unit),
     originType: nullableText(body.origin_type) ? String(body.origin_type).trim().toUpperCase() : null,
     branchId: parsePositiveInteger(body.branch_id),
-    actorId: parsePositiveInteger(body.created_by || body.edited_by) || 1,
+    actorId: parsePositiveInteger(actorUserId),
     remarks: nullableText(body.remarks),
   };
 };
@@ -16791,13 +16829,13 @@ app.post("/purchase", async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const entry = readPurchaseEntryPayload(req.body);
+    const entry = readPurchaseEntryPayload(req.body, req.auth.userId);
     const validationMessage = validatePurchaseEntry(entry);
     if (validationMessage) return res.status(400).json({ message: validationMessage });
 
     await client.query("BEGIN");
     if (entry.purchaseBillStatus === "BILL_PENDING") {
-      const manager = await requireRateManager(entry.actorId, client);
+      const manager = await requireRateManager(req.auth.userId, client);
       if (!manager) {
         await client.query("ROLLBACK");
         return res.status(403).json({ message: "Only Owner or Admin can set temporary sale rates for pending stock" });
@@ -16999,7 +17037,7 @@ const createPurchaseBillHandler = async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const baseEntry = readPurchaseEntryPayload(req.body);
+    const baseEntry = readPurchaseEntryPayload(req.body, req.auth.userId);
     const rawItems = Array.isArray(req.body.items) ? req.body.items : [];
     if (!baseEntry.supplierId) return res.status(400).json({ message: "Add New Supplier" });
     if (!baseEntry.branchId) return res.status(400).json({ message: "Select branch before saving purchase" });
@@ -17089,7 +17127,7 @@ const createPurchaseBillHandler = async (req, res) => {
           remarks: cleanText(item.remarks) || baseEntry.remarks,
           paid_amount: 0,
           purchase_type: baseEntry.purchaseBillStatus === "BILL_COMPLETED" ? "CREDIT" : "PENDING_BILL",
-        }),
+        }, req.auth.userId),
         lineGlobalId: suppliedLineGlobalId || expectedLineGlobalId,
         purchaseGlobalId,
         lotGlobalId: suppliedLotGlobalId || expectedLotGlobalId,
@@ -17141,7 +17179,7 @@ const createPurchaseBillHandler = async (req, res) => {
     let purchase;
 
     if (baseEntry.purchaseBillStatus === "BILL_PENDING") {
-      const manager = await requireRateManager(baseEntry.actorId, client);
+      const manager = await requireRateManager(req.auth.userId, client);
       if (!manager) {
         await client.query("ROLLBACK");
         return res.status(403).json({ message: "Only Owner or Admin can set temporary sale rates for pending stock" });
@@ -17462,7 +17500,7 @@ const updatePurchaseHandler = async (req, res) => {
   try {
     const purchaseId = parsePositiveInteger(Number(req.params.id));
     const reason = cleanText(req.body.reason);
-    const entry = readPurchaseEntryPayload(req.body);
+    const entry = readPurchaseEntryPayload(req.body, req.auth.userId);
     const validationMessage = validatePurchaseEntry(entry);
     if (!purchaseId) return res.status(400).json({ message: "Invalid purchase" });
     if (!reason) return res.status(400).json({ message: "Edit reason is required" });
@@ -17471,7 +17509,7 @@ const updatePurchaseHandler = async (req, res) => {
     await client.query("BEGIN");
     const replay = await beginV3BusinessOperation(client, req, "purchase");
     if (replay) return sendV3Replay(client, res, replay);
-    const manager = await requireRateManager(req.body.edited_by || entry.actorId, client);
+    const manager = await requireRateManager(req.auth.userId, client);
     if (!manager) {
       await client.query("ROLLBACK");
       return res.status(403).json({ message: "Only Owner or Admin can edit purchases" });
@@ -17535,7 +17573,7 @@ const updatePurchaseHandler = async (req, res) => {
         await client.query("ROLLBACK");
         return res.status(400).json({ message: "Only pending bill arrivals can be edited as pending entries" });
       }
-      const managerForRate = await requireRateManager(entry.actorId, client);
+      const managerForRate = await requireRateManager(req.auth.userId, client);
       if (!managerForRate) {
         await client.query("ROLLBACK");
         return res.status(403).json({ message: "Only Owner or Admin can update temporary sale rates" });
@@ -17768,7 +17806,7 @@ const completePurchaseBillHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     const purchaseId = parsePositiveInteger(Number(req.params.id));
-    const entry = readPurchaseEntryPayload({ ...req.body, purchase_bill_status: "BILL_COMPLETED" });
+    const entry = readPurchaseEntryPayload({ ...req.body, purchase_bill_status: "BILL_COMPLETED" }, req.auth.userId);
     const validationMessage = validatePurchaseEntry(entry);
     if (!purchaseId) return res.status(400).json({ message: "Invalid purchase" });
     if (validationMessage) return res.status(400).json({ message: validationMessage });
@@ -17776,7 +17814,7 @@ const completePurchaseBillHandler = async (req, res) => {
     await client.query("BEGIN");
     const replay = await beginV3BusinessOperation(client, req, "purchase");
     if (replay) return sendV3Replay(client, res, replay);
-    const manager = await requireRateManager(req.body.edited_by || entry.actorId, client);
+    const manager = await requireRateManager(req.auth.userId, client);
     if (!manager) {
       await client.query("ROLLBACK");
       return res.status(403).json({ message: "Only Owner or Admin can complete pending purchase bills" });
@@ -17957,13 +17995,12 @@ const cancelPurchaseHandler = async (req, res) => {
   try {
     const purchaseId = parsePositiveInteger(Number(req.params.id));
     const reason = cleanText(req.body.reason);
-    const cancelledBy = parsePositiveInteger(req.body.cancelled_by);
     if (!purchaseId || !reason) return res.status(400).json({ message: "Cancellation reason is required" });
 
     await client.query("BEGIN");
     const replay = await beginV3BusinessOperation(client, req, "purchase");
     if (replay) return sendV3Replay(client, res, replay);
-    const manager = await requireRateManager(cancelledBy, client);
+    const manager = await requireRateManager(req.auth.userId, client);
     if (!manager) {
       await client.query("ROLLBACK");
       return res.status(403).json({ message: "Only Owner or Admin can cancel purchases" });
@@ -18078,7 +18115,6 @@ const createSaleHandler = async (req, res) => {
       product_id,
       quantity,
       branch_id,
-      created_by,
       customer,
       invoice_discount,
       payments,
@@ -18088,7 +18124,7 @@ const createSaleHandler = async (req, res) => {
       backdate_reason,
     } = req.body;
     const parsedBranchId = parsePositiveInteger(branch_id);
-    const parsedCreatedBy = parsePositiveInteger(created_by) || 1;
+    const parsedCreatedBy = req.auth.userId;
     const parsedInvoiceDiscount = parseNonNegativeNumber(invoice_discount);
     const rawBillDateTime = cleanText(bill_datetime || "");
     const rawBillDate = cleanText(bill_date || rawBillDateTime || "");
@@ -19312,7 +19348,7 @@ const updateSaleHandler = async (req, res) => {
   try {
     const saleId = parsePositiveInteger(req.params.id);
     const reason = cleanText(req.body.reason);
-    const editor = await getSalePermissionUser(req.body.edited_by, "edit", client);
+    const editor = await getSalePermissionUser(req.auth.userId, "edit", client);
     if (!saleId) return res.status(400).json({ message: "Invalid invoice" });
     if (!reason) return res.status(400).json({ message: "Edit reason is required" });
     if (!editor) return res.status(403).json({ message: "You do not have permission to edit completed sales" });
@@ -19584,7 +19620,7 @@ const cancelSaleHandler = async (req, res) => {
   try {
     const saleId = parsePositiveInteger(req.params.id);
     const reason = cleanText(req.body.reason);
-    const canceller = await getSalePermissionUser(req.body.cancelled_by, "cancel", client);
+    const canceller = await getSalePermissionUser(req.auth.userId, "cancel", client);
     if (!saleId) return res.status(400).json({ message: "Invalid invoice" });
     if (!reason) return res.status(400).json({ message: "Cancellation reason is required" });
     if (!canceller) return res.status(403).json({ message: "You do not have permission to cancel completed sales" });
