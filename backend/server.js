@@ -47,6 +47,7 @@ const {
 // long-standing `x-froozerp-device-session` header, so a client that sends only the standard header
 // authenticates on the routes that already verify sessions. Same token, same verification.
 const { extractSessionToken } = require("./authMiddleware");
+const { resolveSessionSecret } = require("./sessionSecret");
 const {
   REFERENCE_BOOTSTRAP_PROTOCOL,
   captureReferenceBootstrap,
@@ -643,11 +644,23 @@ const maskAccessToken = (value) => {
 const hashSensitiveValue = (value) =>
   crypto.createHash("sha256").update(String(value || "").trim().toLowerCase(), "utf8").digest("hex");
 const recoveryOtpSecret = process.env.RECOVERY_OTP_HASH_SECRET || process.env.OTP_HASH_SECRET || process.env.DB_PASSWORD || "froozerp-local-dev-otp-secret";
-const deviceSessionSecret =
-  process.env.DEVICE_SESSION_SECRET ||
-  process.env.DB_PASSWORD ||
-  primaryDatabaseUrl ||
-  recoveryOtpSecret;
+// The session signing key, and a judgement on where it came from. Falling back to DB_PASSWORD or
+// the database URL means one leaked credential both opens the database and forges Owner sessions —
+// tolerable on a machine nobody else can reach, never on an exposed one. See sessionSecret.js.
+const sessionSecretResolution = resolveSessionSecret({
+  env: process.env,
+  primaryDatabaseUrl,
+  recoveryOtpSecret,
+  exposed: deploymentType === "cloud" || process.env.NODE_ENV === "production",
+});
+for (const warning of sessionSecretResolution.warnings) {
+  console.warn(`[auth] ${warning}`);
+}
+if (sessionSecretResolution.fatal) {
+  console.error(`[auth] ${sessionSecretResolution.fatal.code}: ${sessionSecretResolution.fatal.message}`);
+  process.exit(1);
+}
+const deviceSessionSecret = sessionSecretResolution.secret;
 const recoveryGenericMessage = "If the provided information matches an eligible account, a verification code will be sent.";
 const recoveryDevOtpEnabled = /^true$/i.test(process.env.RECOVERY_DEV_OTP_ENABLED || "") && process.env.NODE_ENV !== "production";
 const generateOtpCode = () => String(crypto.randomInt(0, 1000000)).padStart(6, "0");

@@ -473,11 +473,54 @@ matters more than its diff.
 
 Also unaddressed, and worth recording because it is easy to miss:
 
-- **The signing secret falls back to a database credential.** `deviceSessionSecret` resolves to
-  `DEVICE_SESSION_SECRET`, then `DB_PASSWORD`, then the database URL. A leaked database credential
-  therefore also forges sessions, which couples two failure domains that should be independent.
-  `DEVICE_SESSION_SECRET` should be set explicitly before exposure — a checklist item for A-6.
+- ~~**The signing secret falls back to a database credential.**~~ **Fixed 2026-08-20**, see the
+  record below. It is no longer possible to *start* an exposed server on a borrowed credential.
 - **No revocation on sign-out.** The token is valid for its full 12 hours regardless.
   `session_revocation_version` is carried in the claim and checked by the sync path, so the
   mechanism exists; nothing increments it.
 - **Multi-tenant isolation is still unaudited** (§5).
+
+---
+
+## Session signing key — provenance enforced (2026-08-20)
+
+Recorded separately from A-3 because it was found while writing that stage's record, not planned.
+
+`deviceSessionSecret` resolved as `DEVICE_SESSION_SECRET || DB_PASSWORD || <database URL> ||
+<OTP secret>`. Every entry after the first is, directly or transitively, a database credential. That
+means one leaked credential did two unrelated things: opened the database, **and** forged a valid
+session for any user including Owner. A forged session is indistinguishable from a real login, so
+the second half is silent.
+
+`backend/sessionSecret.js` now judges the source and graduates the response by consequence:
+
+| Where | Dedicated key | Borrowed credential | Key under 32 chars | No key at all |
+| --- | --- | --- | --- | --- |
+| Exposed (`NODE_ENV=production` or a cloud deployment) | starts | **refuses to start** | **refuses to start** | **refuses to start** |
+| Local | starts | starts, warns every boot | starts, warns | refuses to start |
+
+Refusing to start is the right outcome where it applies: a server that boots with a forgeable
+signing key is worse than one that does not boot, because nobody finds out.
+
+Requiring the variable unconditionally was rejected — it would stop the maintainer's local backend
+from starting on a single-maintainer project where local development *is* the normal case, and a
+check that gets in the way daily is a check that gets removed. In practice the local fallback lands
+on the OTP secret's hardcoded development default, so nothing breaks today.
+
+The 32-character floor exists because a short HMAC key is recoverable offline from a single issued
+token, with no rate limit in the way.
+
+10 tests in `backend/sessionSecret.test.js`, including one asserting **no diagnostic ever contains
+the key itself** — startup output lands in logs and screenshots, and a message that printed the
+signing key would leak, through the very channel meant to report the problem, the thing being
+protected.
+
+### Operational note
+
+Rotating this key invalidates every outstanding token, so everyone signs in again. That is
+deliberate: it is currently the *only* revocation mechanism this system has, since nothing
+increments `session_revocation_version` on sign-out.
+
+**Before exposure:** set `DEVICE_SESSION_SECRET` to a fresh random value of at least 32 characters
+(`openssl rand -base64 48`, or `node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"`).
+An A-6 checklist item, now enforced by the server rather than by remembering.
