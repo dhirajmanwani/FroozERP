@@ -15096,10 +15096,19 @@ function SyncSettingsSection({
       return;
     }
     try {
+      // The gateway's kill-switch guard (desktopGateway.js) only unlocks cloud access for a request
+      // that proves Owner role and names the device — role and device_id were missing here, so this
+      // call refused every save with OWNER_REQUIRED regardless of who was signed in. Mirrors the
+      // working call in changeConnectivityMode.
       await axios.put(`${LOCAL_API_URL}/api/cloud/internet-access`, {
         user_id: user.id,
+        role: user.role,
+        device_id: deviceInfo.device_id,
         allowInternetAccess: nextConfig.cloudConnectionMode !== CONNECTIVITY_MODES.LOCAL_ONLY,
-      }, { timeout: 5000, headers: { "x-user-id": user.id } });
+      }, {
+        timeout: 5000,
+        headers: { "x-user-id": user.id, "x-user-role": user.role, "x-device-id": deviceInfo.device_id },
+      });
     } catch (error) {
       setConfigMessage(getErrorMessage(error, "Unable to save FroozERP internet access policy."));
       return;
