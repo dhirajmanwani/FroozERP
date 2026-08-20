@@ -30,6 +30,9 @@
  * Usage:
  *   npm run app:disposable
  *   FROOZERP_DISPOSABLE_ROOT=F:\froozerp-disposable npm run app:disposable
+ *
+ *   # A named profile survives between runs, so the device stays activated:
+ *   FROOZERP_DISPOSABLE_PROFILE=test npm run app:disposable
  */
 
 import { spawn } from "node:child_process";
@@ -65,12 +68,32 @@ export const disposableStamp = (now = new Date()) => {
   ].join("");
 };
 
+/** Characters allowed in a named profile. Keeps the name a single, quoting-free path segment. */
+const PROFILE_NAME_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+
 /**
  * Resolve the directory this run will use.
  *
+ * ## Fresh by default, named on request
+ *
+ * The default is a new timestamped directory every run, because the thing this script exists to
+ * prevent is a run that quietly inherits state from somewhere it should not.
+ *
+ * But **entitlements are bound to a device id** (`device_binding` in `src-tauri/src/entitlement.rs`
+ * is a hash of it), and a brand-new profile means a brand-new device. So a fresh profile always
+ * opens on the activation screen, and testing anything past it would mean signing a new `.lic`
+ * against a new device id on every single run — which is not a test loop anybody sustains.
+ *
+ * A **named** profile is the answer: still isolated by exactly the same guards, still never live
+ * app data, but stable across runs so a device stays activated once. That is what makes it possible
+ * to test the app rather than the activation screen.
+ *
+ * Names are restricted to one plain path segment. A name containing `..` or a separator could climb
+ * out of the disposable root, and the whole value of this script is that it cannot.
+ *
  * @throws when the result is relative (the Rust side rejects it) or points at live app data.
  */
-export const resolveDisposableDir = ({ root, now = new Date() } = {}) => {
+export const resolveDisposableDir = ({ root, profile = "", now = new Date() } = {}) => {
   const base = root && String(root).trim().length > 0
     ? String(root).trim()
     : path.join(os.tmpdir(), "froozerp-disposable");
@@ -81,7 +104,23 @@ export const resolveDisposableDir = ({ root, now = new Date() } = {}) => {
     );
   }
 
-  const resolved = path.resolve(base, `run-${disposableStamp(now)}`);
+  const name = String(profile || "").trim();
+  if (name && !PROFILE_NAME_PATTERN.test(name)) {
+    throw new Error(
+      `refusing to use profile name ${JSON.stringify(name)}: use letters, digits, dot, dash or ` +
+      "underscore only — a name with a separator or '..' could escape the disposable root.",
+    );
+  }
+
+  const resolved = path.resolve(base, name ? `profile-${name}` : `run-${disposableStamp(now)}`);
+  // Containment, asserted rather than reasoned about. The `profile-` prefix happens to make a name
+  // like `..` a literal directory instead of a climb, but that is a property of the prefix, and a
+  // later edit to the naming could remove it without anyone noticing. Comparing the resolved path
+  // against the resolved base is the property that actually matters, checked directly.
+  const resolvedBase = path.resolve(base);
+  if (resolved !== resolvedBase && !resolved.startsWith(resolvedBase + path.sep)) {
+    throw new Error(`refusing to use ${resolved}: it resolves outside the disposable root ${resolvedBase}.`);
+  }
   if (!path.isAbsolute(resolved)) {
     // Belt and braces: path.resolve always returns absolute, but the Rust guard depends on it and
     // a silent relative path would fall back to live data rather than failing.
@@ -110,7 +149,9 @@ export const tauriCliEntry = (repoRoot) =>
 
 const main = () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-  const dir = resolveDisposableDir({ root: process.env.FROOZERP_DISPOSABLE_ROOT });
+  const profile = process.env.FROOZERP_DISPOSABLE_PROFILE || "";
+  const dir = resolveDisposableDir({ root: process.env.FROOZERP_DISPOSABLE_ROOT, profile });
+  const reused = profile && fs.existsSync(dir);
   fs.mkdirSync(dir, { recursive: true });
 
   process.stdout.write(
@@ -119,6 +160,7 @@ const main = () => {
       "  DISPOSABLE PROFILE RUN",
       "  ======================",
       `  SQLite profile : ${dir}`,
+      `  Profile mode   : ${profile ? `named "${profile}" — ${reused ? "REUSED, stays activated" : "new, needs activation once"}` : "fresh every run — will open on the activation screen"}`,
       "  Live app data  : untouched",
       "",
       "  This run cannot reach the real profile: NODE_ENV=test and an absolute",

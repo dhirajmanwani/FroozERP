@@ -102,3 +102,56 @@ test("the launcher targets the CLI's .js entry, never the .cmd shim", () => {
   assert.doesNotMatch(entry, /node_modules[\\/]\.bin/, "the .bin shim is the platform-specific trap");
   assert.ok(entry.includes("@tauri-apps"), "it must come from the installed CLI package");
 });
+
+// -----------------------------------------------------------------------------------------------
+// Named profiles.
+//
+// Entitlements are bound to a device id, and a fresh profile is a fresh device — so a fresh run
+// always lands on the activation screen. Testing anything past it would mean signing a new .lic on
+// every run. A named profile stays activated between runs, which is what makes the app testable at
+// all; it must not cost any of the isolation the fresh path provides.
+// -----------------------------------------------------------------------------------------------
+
+test("a named profile resolves to the same directory every run", () => {
+  const first = resolveDisposableDir({ root: "/tmp/froozerp-x", profile: "test" });
+  const second = resolveDisposableDir({ root: "/tmp/froozerp-x", profile: "test", now: new Date(0) });
+  assert.equal(first, second, "the whole point is that it survives between runs");
+});
+
+test("the default is still a fresh directory every run", () => {
+  // Reuse must be opt-in. The failure this script exists to prevent is a run quietly inheriting
+  // state, so the unnamed path has to keep being unpredictable.
+  const a = resolveDisposableDir({ root: "/tmp/froozerp-x", now: new Date("2026-08-20T10:00:00Z") });
+  const b = resolveDisposableDir({ root: "/tmp/froozerp-x", now: new Date("2026-08-20T10:00:01Z") });
+  assert.notEqual(a, b);
+});
+
+test("a named profile cannot escape the disposable root", () => {
+  // A name is a single path segment. Anything that could climb out defeats the only guarantee this
+  // script makes, so it is refused rather than sanitised.
+  for (const name of ["../escape", "a/b", "a\\b", "/etc", "x".repeat(65), "na me", "a;b"]) {
+    assert.throws(
+      () => resolveDisposableDir({ root: "/tmp/froozerp-x", profile: name }),
+      `must refuse profile name ${JSON.stringify(name)}`,
+    );
+  }
+});
+
+test("a dot-only name stays inside the root instead of climbing", () => {
+  // `..` passes the character check; containment is what stops it, and containment is asserted in
+  // the resolver rather than left to the naming prefix.
+  for (const name of ["..", "...", "."]) {
+    const resolved = resolveDisposableDir({ root: "/tmp/froozerp-x", profile: name });
+    assert.ok(
+      resolved.startsWith("/tmp/froozerp-x/"),
+      `${JSON.stringify(name)} escaped to ${resolved}`,
+    );
+  }
+});
+
+test("a named profile is refused inside live app data, exactly like a fresh one", () => {
+  assert.throws(() => resolveDisposableDir({
+    root: "/home/user/AppData/Roaming/com.srtcompany.froozerp",
+    profile: "test",
+  }));
+});
