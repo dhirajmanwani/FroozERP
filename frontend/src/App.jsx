@@ -41,6 +41,7 @@ import { bannerForState } from "./local/entitlementState";
 import { sessionAuthHeaders, shouldAttachSessionAuth } from "./local/authHeaders";
 import { consumeStashedSessionForReload, stashSessionForReload } from "./local/reloadSessionBridge";
 import { describeLocalServiceFailure } from "./local/localServiceFailure";
+import { autoConnectivityBlockedReason as resolveAutoConnectivityBlockedReason } from "./local/autoConnectivityAvailability";
 import { resolveSessionAction } from "./local/sessionExpiry";
 import {
   addNotification,
@@ -14934,6 +14935,12 @@ function SyncSettingsSection({
     branchServerPort: API_CONFIG.branchServerPort,
   });
   const [configMessage, setConfigMessage] = useState("");
+  // Recomputed from the draft, not the saved config, so the explanation tracks what the Owner is
+  // currently choosing rather than what was last saved.
+  const autoConnectivityBlockedReason = resolveAutoConnectivityBlockedReason({
+    apiMode: configDraft.mode,
+    cloudApiUrl: configDraft.cloudApiUrl,
+  });
   useEffect(() => {
     setConfigDraft((current) => ({ ...current, cloudConnectionMode: normalizeConnectivityMode(connectivityMode) }));
   }, [connectivityMode]);
@@ -15254,11 +15261,18 @@ function SyncSettingsSection({
             </Field>
             <Field label="Connectivity Mode">
               <div className="connectivity-segmented" role="group" aria-label="Connectivity Mode">
-                <button className={connectivityMode === CONNECTIVITY_MODES.AUTO ? "selected" : ""} disabled={connectivityModeBusy || String(user?.role || "").toUpperCase() !== "OWNER"} type="button" onClick={() => applyConnectivityMode(CONNECTIVITY_MODES.AUTO)}>{connectivityModeBusy ? "Switching..." : "AUTO"}</button>
+                {/* AUTO is disabled, not merely refused on click, when this installation cannot
+                    reach a cloud. An App Mode of LOCAL_ONLY is authoritative over Connectivity Mode
+                    (design D-16), and a mode that needs a cloud backend still cannot sync without a
+                    cloud URL configured. Offering a button that can only ever produce an error is
+                    the same failure as rendering an error as an empty result: the screen says the
+                    action is available when it is not. */}
+                <button className={connectivityMode === CONNECTIVITY_MODES.AUTO ? "selected" : ""} disabled={connectivityModeBusy || String(user?.role || "").toUpperCase() !== "OWNER" || autoConnectivityBlockedReason !== ""} title={autoConnectivityBlockedReason || undefined} type="button" onClick={() => applyConnectivityMode(CONNECTIVITY_MODES.AUTO)}>{connectivityModeBusy ? "Switching..." : "AUTO"}</button>
                 <button className={connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY ? "selected" : ""} disabled={connectivityModeBusy || String(user?.role || "").toUpperCase() !== "OWNER"} type="button" onClick={() => applyConnectivityMode(CONNECTIVITY_MODES.LOCAL_ONLY)}>{connectivityModeBusy ? "Switching..." : "LOCAL ONLY"}</button>
               </div>
             </Field>
           </div>
+          {autoConnectivityBlockedReason && <p className="form-note stock-low">{autoConnectivityBlockedReason}</p>}
           {connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY && <p className="form-note stock-low">Local Only mode selected - cloud sync paused. Windows networking remains unchanged.</p>}
           {configDraft.mode === API_MODES.LOCAL_SINGLE_DEVICE && <p className="form-note">Local Single Device uses this computer's local backend.</p>}
           {configDraft.mode === API_MODES.BRANCH_LAN_SERVER && <p className="form-note">Branch LAN Server is for the main shop computer serving same-branch devices over Wi-Fi/LAN.</p>}
