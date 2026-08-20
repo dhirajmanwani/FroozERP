@@ -1,6 +1,6 @@
 # Auth Hardening — Scoping and Plan
 
-**Status:** **A-1 and A-2 complete 2026-08-19; A-3 complete 2026-08-20.** A-4 … A-6 open. Written 2026-08-17 at the maintainer's
+**Status:** **A-1 … A-4 complete (A-1/A-2 2026-08-19, A-3/A-4 2026-08-20).** A-5 and A-6 open, plus **A-4b**, which is the stage that actually finishes authorisation — see the A-4 record. Written 2026-08-17 at the maintainer's
 request, to run **in parallel** with the offline-activation stages.
 
 | Stage | Status |
@@ -8,7 +8,8 @@ request, to run **in parallel** with the offline-activation stages.
 | A-1 password hashing | **Complete 2026-08-19** — see the record at the end of this file |
 | A-2 remove plaintext fallback | **Complete 2026-08-19** — see the record at the end of this file. **Carries an operational action: see "Before this reaches a live database".** |
 | A-3 real sessions | **Complete 2026-08-20** — see the record at the end of this file. **`requireAuth` is built and tested but mounted on nothing; A-4 is what closes the hole.** |
-| A-4 middleware on all routes | Open |
+| A-4 middleware on all routes | **Complete 2026-08-20** — 268/285 routes authenticated, 16 deliberately public. **Not the end of the story: see A-4b.** |
+| A-4b `updated_by` authorisation | **Open — this is now the top of the track.** After A-4 a signed-in Cashier can still act as Owner on ~63 routes. |
 | A-5 lockout + delete legacy verify | Open |
 | A-6 exposure checklist | Open |
 **Related:** `CLAUDE.md` "Known security debt"; `docs/offline-activation-design.md` §12 (which
@@ -524,3 +525,150 @@ increments `session_revocation_version` on sign-out.
 **Before exposure:** set `DEVICE_SESSION_SECRET` to a fresh random value of at least 32 characters
 (`openssl rand -base64 48`, or `node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"`).
 An A-6 checklist item, now enforced by the server rather than by remembering.
+
+---
+
+## A-4 record — default-deny on every route (2026-08-20)
+
+### The one line
+
+```js
+app.use((req, res, next) => {
+  if (PUBLIC_ROUTES.has(publicRouteKey(req))) return next();
+  return requireAuth(req, res, next);
+});
+```
+
+**60 of 285 routes authenticated before. 268 after**, with 16 deliberately public and one
+unprobeable SPA fallback. Measured by probing every registered route on the loaded app, twice —
+anonymously, and with a forged `x-user-id` — not by reading the diff.
+
+The default is the point. A route added in 2027 is authenticated because nobody did anything, and
+opening one takes a deliberate edit to a list where every entry has to say what a stranger gets
+from it. The inverse arrangement is what produced the 98 completely unguarded routes.
+
+### Where it sits, and why nowhere else
+
+The mount window is bounded on both sides, and both bounds are load-bearing:
+
+| Must be after | Because |
+| --- | --- |
+| `express.json` | else `submittedIdentityFrom` reads an undefined body and the substitution check passes everything |
+| `cors` | else a 401 arrives without CORS headers and the browser reports a network error, not an auth error |
+| the 426 protocol gate | so an out-of-date client is told to upgrade rather than handed a 401 it cannot act on |
+| the desktop-local cloud forwarder | a desktop backend *relays* most requests; refusing what it only forwards breaks the desktop app and protects nothing — the users table lives in the cloud |
+
+| Must be before | Because |
+| --- | --- |
+| `registerAiBusinessAssistantRoutes` (42 routes) | mounted after, a fifth of the app is silently open |
+| `registerOperationalV3Routes` (20 routes) | same |
+
+That last pair is why **the plan's "212 routes" was wrong**: it was a `server.js` grep, and 62
+routes are registered from other modules. Any completeness check that reads source text misses
+them. The coverage test enumerates from the live router instead.
+
+### Static assets: the trap in this stage
+
+`express.static` moved *above* the gate — a 401 on the JavaScript bundle means there is no login
+screen to log in from. It answers only for files that exist and calls `next()` otherwise, so it
+cannot expose a route.
+
+The SPA history fallback deliberately stayed *below* the gate. Registered early it would shadow
+`/products`, `/settings`, `/sales` and every other route served off the bare root. Two tempting
+alternatives were rejected as bypasses: "public = any GET not under `/api/`" makes `/products`
+public, and an extension-based rule lets `GET /sales-history/1.0` through. The cost is that an
+anonymous GET of an unknown non-`/api` path now 401s instead of returning the shell, which costs
+nothing today — the frontend navigates with `?view=` and loads the shell only from `/`.
+
+### The allow-list — 16 entries
+
+`/login`, `/health`, `/api/health`, `/api/version`, `/api/system/compatibility`, `/api/time`, `/`,
+`/settings/device-control`, `/api/auth/device-bootstrap-status`, `/devices/activate`,
+`/bootstrap/first-owner-device`, and the five `/auth/recovery/*` pre-login routes.
+
+The bar is **not** "authentication is awkward here" — it is "the caller provably cannot hold a token
+yet". Each entry in the source states what an unauthenticated attacker gets from it.
+
+`GET /settings/device-control` is new. The login screen needed four kiosk flags from `GET /settings`
+— a route that also returns the entire users table, every authorized device, every activation code
+and the backup log to anyone naming a manager's `user_id`. Splitting out the four fields is what
+lets `/settings` stay authenticated instead of being allow-listed.
+
+**`POST /bootstrap/first-owner-device` is the sharpest edge on the list.** On a fresh database
+nobody can log in, so it cannot require a session; it authenticates itself and refuses once an
+approved owner device exists. It should become a documented CLI action rather than an HTTP route.
+
+Matching is exact `METHOD path` — never by prefix (which would turn `/api/health` into a pass for
+`/api/health/../admin`) and never by regex. `req.path` is compared raw, so `/api/%68ealth` misses
+the list and is denied: the fail-closed direction.
+
+### Two escalations found while integrating, both fixed here
+
+**FROST, 42 routes.** `requireAiPermission` read `req.query.user_id || req.body?.user_id ||
+req.headers["x-user-id"]` — the *opposite* precedence to `submittedIdentityFrom`, which took the
+header. A signed-in Cashier sending `x-user-id: <own id>` (satisfying the substitution check)
+alongside `?user_id=<owner id>` got Owner authority on every FROST route. Now reads
+`req.auth.userId`, and refuses rather than falling back if the claim is absent.
+
+**The general form of it.** `rejectDeviceSessionSubstitution` compared only the *first* place a
+field was supplied. That is safe only if every downstream handler reads the same one — and FROST
+proved they do not. `submittedIdentityFrom` now collects **every** location a field can arrive from
+and the check requires all of them to agree, so it no longer matters which one a handler happens to
+read. Three regression tests cover it.
+
+The lesson is worth keeping: *"the substitution check covers it"* was true only where a route read
+the field the check had picked.
+
+### What a legitimate caller sees change
+
+1. The login screen now reads kiosk settings from `/settings/device-control` (wired in `App.jsx`).
+   Without that change fullscreen lock would silently read as **off** on the login screen — a
+   failed load rendering as a disabled feature, exactly the pattern `CLAUDE.md` forbids.
+2. `/api/sync/register-device`, `/api/device/register` and `/api/device/identity` now require a
+   session. The global request interceptor covers them. **Watch on hardware:** the substitution
+   check now applies to their bodies, so `company_id` and `branch_id` must equal the token claims
+   or the answer is 403, not 401.
+3. `GET /api/cloud/health` 401s before login, so the cloud tile reads not-ready on the login
+   screen. It does not block sign-in — login gates on `/api/health`, which is public.
+4. Owner/Admin checks on the `/api/cloud/*` and `/api/integrations/*` routes now run against the
+   session user. A client that sent `user_id=<owner>` while signed in as someone else now gets 403
+   where it used to succeed. That is the fix, and it is user-visible.
+5. Existing tokens keep working — same secret, same scheme, no forced re-login.
+
+### Gate results
+
+| Gate | Result |
+| --- | --- |
+| `npm --prefix backend test` | **184 / 185** — the 1 failure is the pre-existing Linux-vs-Windows path assertion |
+| `backend/routeAuthCoverage.test.js` | **Passes**, and is now registered in the test script |
+| `TZ=Asia/Kolkata node --test frontend/src/local/*.test.mjs` | **269 / 269** |
+| `npm --prefix frontend run lint` | 0 errors, 37 warnings (unchanged) |
+| `npm run build` | Pass |
+| `cargo check` | Pass |
+
+### Still not fixed by this — and A-4 must not be recorded as "auth is done"
+
+**A-4b, the `updated_by` surface.** Roughly 63 sites decide permission from a `updated_by` /
+`created_by` field in the request body. After A-4 a signed-in **Cashier can still act as Owner** on
+those routes by supplying the Owner's id. A-4 converts *"anyone is Owner"* into *"any employee is
+Owner"* — real progress, and not the finish line. This is now the top of the track.
+
+Also open:
+
+- **Sync verifies signatures only when `FROOZERP_OPERATIONAL_SCOPE_MODE=enforce`**, and the default
+  is `off`. `/api/sync/push|pull|status` take identity from the request body by default.
+- **The LOCAL_ONLY kill switch** (`desktopGateway.js`) is gated on `x-user-id` / `x-user-role`,
+  both caller-supplied. Different process, no signing key, unreachable by `requireAuth`.
+- **`/api/health` and `/api/version` disclose** `company_id`, `company_name`, `branch_id`
+  unauthenticated. A-6.
+- **`rateLimitSyncRequest` is keyed on a client-chosen `device_id`** and is not a control.
+- **Not determined:** whether `/auth/recovery/verify-otp` enforces an attempt cap. It is
+  allow-listed, so this matters, and neither the audit nor the implementation confirmed it. A-5.
+
+### LOCAL_ONLY
+
+Unchanged. The gate is inside `server.js`, after the desktop-local forwarder; under LOCAL_ONLY
+`desktopGateway.cloudRequest` refuses before opening a socket, so `server.js` is never reached and
+`blocked=true` / `reachedCloud=false` / 0 cloud-router invocations / 0 external connections all
+hold. The only outbound change is an `Authorization` header on an existing `cloudFetchJson` call
+already gated on `appInternetAllowed`.

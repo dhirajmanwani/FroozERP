@@ -2055,7 +2055,11 @@ function App() {
     let cancelled = false;
     const loadLoginDeviceControl = async () => {
       try {
-        const response = await axios.get(`${API_URL}/settings`, { params: { device_id: deviceInfo.device_id } });
+        // The narrow public endpoint, not `/settings`. This runs on the login screen with no
+        // session, and after A-4 `/settings` requires one — but the deeper reason is that
+        // `/settings` answers with the whole bundle, including the users table and every activation
+        // code. The login screen needs four kiosk flags, so it asks for four kiosk flags.
+        const response = await axios.get(`${API_URL}/settings/device-control`);
         if (cancelled) return;
         const nextSettings = { ...defaultDeviceControlSettings, ...(response.data?.deviceControlSettings || {}) };
         setLoginDeviceControlSettings(nextSettings);

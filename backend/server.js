@@ -662,6 +662,141 @@ if (sessionSecretResolution.fatal) {
 }
 const deviceSessionSecret = sessionSecretResolution.secret;
 const requireAuth = createRequireAuth({ secret: deviceSessionSecret });
+
+/**
+ * Auth-hardening A-4 — default-deny.
+ *
+ * Every path below answers without a session; everything else in this process requires one. The
+ * default matters more than the list: a route added in 2027 is authenticated because nobody did
+ * anything, and opening it takes a deliberate edit here. The inverse — allow by default, remember
+ * to guard — is the arrangement that produced the 98 completely unguarded routes A-4 exists to
+ * close.
+ *
+ * A route on this list is permanent unauthenticated attack surface, so each entry records what a
+ * stranger who can reach the port gets from it. The bar for an entry is not "authentication is
+ * awkward here" — it is "the caller provably cannot hold a token yet". Everything that fails that
+ * bar goes behind `requireAuth` even when it looks harmless: `GET /settings` looks like
+ * configuration and returns the entire users table; `POST /api/sync/register-device` looks like
+ * bootstrap and is called only after login.
+ *
+ * Keys are `METHOD path`, matched exactly. Not by prefix: a prefix rule turns `/api/health` into a
+ * pass for `/api/health/../admin`, and not by regular expression, because the one thing this list
+ * must never do is match more than it reads as matching.
+ */
+const PUBLIC_ROUTES = new Set([
+  // Mints the token. Requiring one to get one is a deadlock. Attacker gets: password guessing —
+  // `locked_until` exists as a column but `/login` does not yet enforce it (auth-hardening A-5).
+  "POST /login",
+  // The Tauri shell probes this over raw TCP before any user has typed anything
+  // (`src-tauri/src/lib.rs`), and the login screen refuses to proceed until it answers. Attacker
+  // gets: version, deployment type, and — noted as an A-6 exposure item, not fixed here —
+  // `company_id` / `company_name` / `branch_id`.
+  "GET /health",
+  // The same handler under the /api prefix, which is the path the desktop client probes.
+  "GET /api/health",
+  // Client/server contract negotiation, which happens before sign-in: a client too old to log in
+  // has to be told "update required" rather than 401. Attacker gets: the same identity fields as
+  // /api/health.
+  "GET /api/version",
+  // The startup preflight marks this `required: true`, and it runs before anyone has typed a
+  // password. Attacker gets: backend/frontend version skew and whether the database is reachable.
+  "GET /api/system/compatibility",
+  // Session tokens are time-bound, so a device whose clock has drifted cannot hold a valid one and
+  // must be able to discover the drift first. Attacker gets: the server clock.
+  "GET /api/time",
+  // The API banner, and the built index.html when a frontend bundle is present. The login screen
+  // has to load before anyone can authenticate. Attacker gets: the public bundle.
+  "GET /",
+  // Only the kiosk/exit-code flags, deliberately split out of `GET /settings` so the login screen
+  // never needs the full bundle. Attacker gets: whether this deployment locks its terminals and
+  // whether an exit code is configured — never the exit-code hash, and no account data.
+  "GET /settings/device-control",
+  // Called immediately before /login to decide whether this device may sign in at all; there is no
+  // token at that point by construction. Attacker gets: a device-ID oracle — whether a given id is
+  // registered and approved. Low value, and it wants a rate limit before internet exposure.
+  "POST /api/auth/device-bootstrap-status",
+  // Pre-login device enrolment by one-time activation code. An unapproved device cannot log in, so
+  // it cannot hold a token, so this cannot require one. Attacker gets: brute force against a
+  // 48-bit hashed activation code. Acceptable, and it also wants a lockout.
+  "POST /devices/activate",
+  // The first-install escape hatch: on a fresh database no device is approved, so nobody can log in
+  // and no token can exist. Self-authenticating — it verifies the owner's username and password
+  // itself and refuses once any approved owner device exists. Attacker gets: password guessing
+  // against the owner account, and on success an approved device. The sharpest edge on this list;
+  // it is here because behind `requireAuth` it could never run.
+  "POST /bootstrap/first-owner-device",
+  // Account recovery is by definition the flow for someone who cannot authenticate. Exactly these
+  // five, and no other `/auth/recovery/*` path: `/auth/recovery/profile` and the
+  // `/auth/recovery/contact/*` pair are in-app screens for a signed-in user, and public they are an
+  // account-takeover chain.
+  "GET /auth/recovery/config",
+  // Attacker gets: account existence, blunted by the generic response message.
+  "POST /auth/recovery/options",
+  // Attacker gets: the ability to send an OTP to the account's own registered address. A nuisance
+  // and a cost, not a takeover. Wants a rate limit.
+  "POST /auth/recovery/send-otp",
+  // Attacker gets: OTP guessing against a 6-digit code. A-5 owns the attempt cap.
+  "POST /auth/recovery/verify-otp",
+  // Attacker gets: nothing without the token minted by verify-otp.
+  "POST /auth/recovery/reset-password",
+]);
+
+/**
+ * The allow-list key for a request.
+ *
+ * A trailing slash is dropped because Express's own non-strict routing treats `/api/health/` as
+ * `/api/health`; without this the platform health probe would 401 on a URL the router considers
+ * identical. HEAD is folded into GET for the same reason — Express answers HEAD from the GET
+ * handler, so a HEAD of a public route is exactly as public as the GET.
+ *
+ * `req.path` is the raw, still-percent-encoded pathname, and it is compared literally. A request
+ * spelled `/api/%68ealth` therefore misses the list and is denied even though the router would
+ * later match it. That is the fail-closed direction, and it is the point: this comparison never
+ * needs to guess what a path means.
+ */
+const publicRouteKey = (req) => {
+  const method = req.method === "HEAD" ? "GET" : req.method;
+  const routePath = req.path.length > 1 && req.path.endsWith("/") ? req.path.slice(0, -1) : req.path;
+  return `${method} ${routePath}`;
+};
+
+// The built SPA is served ahead of the gate because a 401 on the JavaScript bundle means there is
+// no login screen to log in from. `express.static` only answers for files that exist under
+// `frontendDistPath` and calls `next()` for everything else, so this cannot expose a route — the
+// bundle is public by definition. The SPA history fallback stays at the bottom of this file, behind
+// the gate, because a catch-all registered here would shadow every non-/api route in the app.
+if (frontendDistAvailable()) {
+  app.use(express.static(frontendDistPath));
+}
+
+/**
+ * The default-deny gate. This is the load-bearing line of the backend, and where it sits is the
+ * whole of its correctness.
+ *
+ * It is here, and not anywhere else, because it must run:
+ *   - after `express.json`, or `submittedIdentityFrom` reads an undefined body and the
+ *     substitution check silently passes everything;
+ *   - after `cors`, or a 401 arrives without CORS headers and the browser reports a network error
+ *     instead of an authentication error;
+ *   - after the 426 protocol-upgrade gate, so an out-of-date client is still told to upgrade rather
+ *     than being handed a 401 it cannot act on;
+ *   - after the desktop-local cloud forwarder, because a desktop backend *relays* most requests
+ *     rather than serving them, and refusing what it is only forwarding would break the desktop app
+ *     while protecting nothing — the cloud is where the data and the users table live;
+ *   - before `registerAiBusinessAssistantRoutes` and `registerOperationalV3Routes`, which add 42
+ *     and 20 routes from other modules. Mounted after either call, a fifth of the app is silently
+ *     unprotected and nothing in this file would show it.
+ *
+ * Mounted app-wide rather than per route on purpose. There are 285 registered handlers: per-route
+ * would be 285 chances to miss one, and a missed registration here is a full bypass rather than a
+ * bug. It is also what `operationalWriteRoutes.test.js` pins — four registrations are asserted by
+ * exact source text and would break under a per-route edit.
+ */
+app.use((req, res, next) => {
+  if (PUBLIC_ROUTES.has(publicRouteKey(req))) return next();
+  return requireAuth(req, res, next);
+});
+
 const recoveryGenericMessage = "If the provided information matches an eligible account, a verification code will be sent.";
 const recoveryDevOtpEnabled = /^true$/i.test(process.env.RECOVERY_DEV_OTP_ENABLED || "") && process.env.NODE_ENV !== "production";
 const generateOtpCode = () => String(crypto.randomInt(0, 1000000)).padStart(6, "0");
@@ -1293,15 +1428,22 @@ const buildCanonicalIdentity = (user, { authenticated = true, sessionId = "" } =
   };
 };
 
-const getCanonicalIdentity = async ({ userId, sessionId = "" } = {}, client = pool) => {
+const getCanonicalIdentity = async ({ userId, sessionId = "", sessionToken = "" } = {}, client = pool) => {
   const parsedUserId = parsePositiveInteger(userId);
   if (!parsedUserId) return buildCanonicalIdentity(null);
   if (desktopLocalRuntime) {
     try {
+      // A-4: the cloud now requires a session on `/api/auth/me`, so the caller's own token has to
+      // make the hop. Without it this call answers 401, the `catch` below turns that into
+      // `buildCanonicalIdentity(null)`, and a failed identity lookup renders as "not signed in"
+      // instead of as an error — the failure mode CLAUDE.md names, occurring inside the auth layer.
+      // `x-user-id` is still sent because the cloud compares it against the token and rejects a
+      // mismatch; it is a value to be checked, not a source of identity.
       const result = await cloudFetchJson(
         `/api/auth/me?user_id=${encodeURIComponent(parsedUserId)}&session_id=${encodeURIComponent(sessionId || "")}`,
         {
           headers: {
+            ...(sessionToken ? { authorization: `Bearer ${sessionToken}` } : {}),
             "x-user-id": String(parsedUserId),
             "x-session-id": String(sessionId || ""),
           },
@@ -5221,9 +5363,13 @@ registerAiBusinessAssistantRoutes({
 
 app.get("/api/auth/me", async (req, res) => {
   try {
+    // A-4: who the caller is comes from the verified session. `x-user-id` and `user_id` were
+    // fields the caller wrote, on the one route whose entire job is to report identity — it
+    // reported whoever you claimed to be.
     const identity = await getCanonicalIdentity({
-      userId: req.query.user_id || req.headers["x-user-id"],
+      userId: req.auth.userId,
       sessionId: req.query.session_id || req.headers["x-session-id"],
+      sessionToken: extractSessionToken(req),
     });
     if (!identity.authenticated) {
       return res.status(401).json({
@@ -5253,9 +5399,12 @@ app.get("/api/cloud/internet-access", (_req, res) => {
 
 app.put("/api/cloud/internet-access", async (req, res) => {
   try {
+    // The Owner check below is only worth as much as the id it is run against. Taken from the body
+    // it was self-certified: "I am the Owner, therefore I may turn cloud access back on."
     const identity = await getCanonicalIdentity({
-      userId: req.body.user_id || req.headers["x-user-id"],
+      userId: req.auth.userId,
       sessionId: req.body.session_id || req.headers["x-session-id"],
+      sessionToken: extractSessionToken(req),
     });
     if (!identity.authenticated || !identity.is_owner) {
       return res.status(403).json({
@@ -5281,7 +5430,7 @@ app.put("/api/cloud/internet-access", async (req, res) => {
 app.get("/api/cloud/health", async (req, res) => {
   try {
     const payload = await buildCloudHealthPayload({
-      userId: req.query.user_id || req.headers["x-user-id"],
+      userId: req.auth.userId,
       deviceId: req.query.device_id || req.headers["x-device-id"] || configuredDeviceId || "",
       branchId: req.query.branch_id || configuredBranchId || 1,
     });
@@ -5339,7 +5488,7 @@ app.post("/api/cloud/device/register", async (req, res) => {
 
 app.get("/api/cloud/device/status", async (req, res) => {
   const deviceId = cleanText(req.query.device_id || req.headers["x-device-id"] || configuredDeviceId);
-  const userId = req.query.user_id || req.headers["x-user-id"];
+  const userId = req.auth.userId;
   const branchId = req.query.branch_id || configuredBranchId;
   if (!deviceId || !userId || !branchId) return res.status(400).json({ code: "DEVICE_CONTEXT_REQUIRED", message: "user_id, device_id and branch_id are required." });
   try {
@@ -5367,9 +5516,12 @@ app.get("/api/cloud/device/status", async (req, res) => {
 
 app.post("/api/cloud/device/approve", async (req, res) => {
   try {
+    // Device approval is the control that decides which machines may hold a session at all, so the
+    // Owner assertion behind it can never be a request field.
     const identity = await getCanonicalIdentity({
-      userId: req.body.user_id || req.headers["x-user-id"],
+      userId: req.auth.userId,
       sessionId: req.body.session_id || req.headers["x-session-id"],
+      sessionToken: extractSessionToken(req),
     });
     if (!identity.authenticated || !identity.is_owner) {
       return res.status(403).json({
@@ -5413,7 +5565,7 @@ app.post("/api/cloud/device/approve", async (req, res) => {
 
 app.get("/api/integrations/email/status", async (req, res) => {
   try {
-    const manager = await getPermissionUser(req.query.user_id || req.headers["x-user-id"], "settings", ["Owner", "Admin"]);
+    const manager = await getPermissionUser(req.auth.userId, "settings", ["Owner", "Admin"]);
     if (!manager) return res.status(403).json({ code: "OWNER_REQUIRED", message: "Owner/Admin permission is required to view email provider status." });
     return res.json({
       ...getEmailProviderDiagnostics(),
@@ -5431,7 +5583,7 @@ app.get("/api/integrations/email/status", async (req, res) => {
 
 app.post("/api/integrations/email/test", async (req, res) => {
   try {
-    const manager = await getPermissionUser(req.body.user_id || req.headers["x-user-id"], "settings", ["Owner", "Admin"]);
+    const manager = await getPermissionUser(req.auth.userId, "settings", ["Owner", "Admin"]);
     if (!manager) return res.status(403).json({ code: "OWNER_REQUIRED", message: "Owner/Admin permission is required to test email provider." });
     const status = getEmailProviderDiagnostics();
     if (!status.configured) {
@@ -5466,7 +5618,7 @@ app.post("/api/integrations/email/test", async (req, res) => {
 
 app.get("/api/integrations/sms/status", async (req, res) => {
   try {
-    const manager = await getPermissionUser(req.query.user_id || req.headers["x-user-id"], "settings", ["Owner", "Admin"]);
+    const manager = await getPermissionUser(req.auth.userId, "settings", ["Owner", "Admin"]);
     if (!manager) return res.status(403).json({ code: "OWNER_REQUIRED", message: "Owner/Admin permission is required to view SMS provider status." });
     const status = getSmsProviderDiagnostics();
     return res.json({
@@ -5485,7 +5637,7 @@ app.get("/api/integrations/sms/status", async (req, res) => {
 
 app.post("/api/integrations/sms/test", async (req, res) => {
   try {
-    const manager = await getPermissionUser(req.body.user_id || req.headers["x-user-id"], "settings", ["Owner", "Admin"]);
+    const manager = await getPermissionUser(req.auth.userId, "settings", ["Owner", "Admin"]);
     if (!manager) return res.status(403).json({ code: "OWNER_REQUIRED", message: "Owner/Admin permission is required to test SMS provider." });
     const status = getSmsProviderDiagnostics();
     if (!status.configured) {
@@ -5548,6 +5700,41 @@ app.get("/settings", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Settings" });
+  }
+});
+
+/**
+ * The kiosk configuration the login screen needs, and nothing else.
+ *
+ * This exists so `GET /settings` never has to be public. That route answers with the whole
+ * settings bundle — and, for a caller who names a manager's `user_id`, the entire users table,
+ * every authorized device, every activation code and the backup log. The login screen wanted four
+ * boolean-ish fields out of it, so the four fields get their own endpoint and the bundle stays
+ * behind the session gate.
+ *
+ * The response shape is deliberately identical to the `deviceControlSettings` slice of
+ * `getSettingsBundle`, so the caller reads the same object from either route. `exit_code_hash` is
+ * reported only as the boolean `exit_code_configured`; the hash itself never leaves the server, on
+ * this route least of all.
+ */
+app.get("/settings/device-control", async (_req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM device_control_settings WHERE id = 1");
+    const settings = result.rows[0] || {};
+    return res.json({
+      deviceControlSettings: {
+        fullscreen_lock_enabled: settings.fullscreen_lock_enabled === true,
+        require_exit_code_to_close: settings.require_exit_code_to_close !== false,
+        exit_code_configured: Boolean(settings.exit_code_hash),
+        updated_at: settings.updated_at || "",
+      },
+    });
+  } catch (error) {
+    console.error("Device control settings load failed", error);
+    return res.status(500).json({
+      code: "DEVICE_CONTROL_SETTINGS_UNAVAILABLE",
+      message: "Device control settings are temporarily unavailable.",
+    });
   }
 });
 
@@ -19653,7 +19840,13 @@ console.log(`frontendDistPath exists: ${frontendDistExists}`);
 console.log(`frontend index.html exists: ${frontendIndexExists}`);
 if (frontendDistAvailable()) {
   console.log(`Serving React frontend from ${frontendDistPath}`);
-  app.use(express.static(frontendDistPath));
+  // `express.static` for this directory is mounted far earlier, ahead of the A-4 default-deny gate,
+  // so the bundle and the login screen load without a session. Only the history fallback is left
+  // here: it must stay last, because a catch-all for every non-/api path registered any earlier
+  // would shadow `/products`, `/settings`, `/sales` and every other route this app serves off the
+  // bare root. Being registered after the gate means an anonymous request for an unknown non-/api
+  // path is answered 401 rather than with the shell — which costs nothing today, because the
+  // frontend navigates with `?view=` and only ever loads the shell from `/`, which is public.
   app.get(/^\/(?!api\/).*/, (req, res, next) => {
     if (req.path.includes(".")) return next();
     return res.sendFile(frontendIndexPath);

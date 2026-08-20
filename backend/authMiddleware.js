@@ -116,11 +116,18 @@ const submittedIdentityFrom = (req) => {
   const headers = req?.headers || {};
   const body = req?.body && typeof req.body === "object" ? req.body : {};
   const query = req?.query && typeof req.query === "object" ? req.query : {};
+  // Every place a field was supplied, not the first one found.
+  //
+  // `??` picked one and ignored the rest, which only holds if every downstream reader picks the
+  // same one. They do not: `aiBusinessAssistantService.js` read the query first while this took the
+  // header, so a caller could satisfy the check with an agreeing header and still hand the handler
+  // a different id in the query. Collecting all of them makes the check independent of what any
+  // handler happens to read.
   return {
-    user_id: headers["x-user-id"] ?? body.user_id ?? query.user_id,
-    device_id: headers["x-device-id"] ?? body.device_id ?? query.device_id,
-    company_id: body.company_id ?? query.company_id,
-    branch_id: body.branch_id ?? query.branch_id,
+    user_id: [headers["x-user-id"], body.user_id, query.user_id],
+    device_id: [headers["x-device-id"], body.device_id, query.device_id],
+    company_id: [body.company_id, query.company_id],
+    branch_id: [body.branch_id, query.branch_id],
   };
 };
 

@@ -144,7 +144,25 @@ const buildFrostPolicy = (identity = {}, actionClass = "READ_ONLY") => {
 };
 
 const requireAiPermission = async ({ req, res, getPermissionUser, getCanonicalIdentity, permission, fallbackRoles = ["Owner", "Admin"], actionClass = "READ_ONLY" }) => {
-  const userId = req.query.user_id || req.body?.user_id || req.headers["x-user-id"];
+  // A-4: the caller is whoever the signed session says, and nothing else.
+  //
+  // This read used to be `req.query.user_id || req.body?.user_id || req.headers["x-user-id"]`,
+  // which is the *opposite* precedence to the one `submittedIdentityFrom` uses when it checks a
+  // request against its token (header first). A signed-in Cashier could therefore send
+  // `x-user-id: <own id>` — satisfying the substitution check — alongside `?user_id: <owner id>`,
+  // and every one of these 42 routes would run with Owner authority. The substitution check is not
+  // a substitute for reading the verified claim.
+  const userId = req?.auth?.userId;
+  if (!userId) {
+    // Unreachable behind the default-deny gate, and deliberately not a fallback to a request field:
+    // if this ever runs unauthenticated it must refuse rather than resurrect the hole above.
+    res.status(401).json({
+      code: "FROST_SESSION_REQUIRED",
+      message: "An authenticated session is required for FROST features",
+      action_class: actionClass,
+    });
+    return null;
+  }
   const user = await getPermissionUser(userId, permission, fallbackRoles);
   if (!user) {
     res.status(403).json({

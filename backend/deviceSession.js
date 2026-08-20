@@ -76,6 +76,16 @@ const verifyDeviceSession = (token, secret, nowMs = Date.now()) => {
   return { claims };
 };
 
+/**
+ * Refuse a request whose own fields contradict its token.
+ *
+ * A submitted field may be a single value or an **array of every place that field was supplied**.
+ * Checking only one of them is how an escalation hides: a caller who sends an agreeing value in the
+ * header and a different one in the query passes a first-match check, and then a downstream handler
+ * that happens to read the query gets the value the check never looked at. FROST had exactly this
+ * shape — `submittedIdentityFrom` took the header, the service read the query first, and the two
+ * disagreed by design. Every supplied value must agree, so it cannot matter which one is read later.
+ */
 const rejectDeviceSessionSubstitution = (claims, submitted = {}) => {
   const comparisons = [
     ["user_id", Number],
@@ -84,13 +94,16 @@ const rejectDeviceSessionSubstitution = (claims, submitted = {}) => {
     ["branch_id", Number],
   ];
   for (const [field, convert] of comparisons) {
-    if (submitted[field] == null || String(submitted[field]).trim() === "") continue;
-    if (convert(submitted[field]) !== convert(claims[field])) {
-      return {
-        status: 403,
-        code: "DEVICE_SESSION_SUBSTITUTION_REJECTED",
-        message: `${field} does not match the authenticated device session`,
-      };
+    const supplied = Array.isArray(submitted[field]) ? submitted[field] : [submitted[field]];
+    for (const value of supplied) {
+      if (value == null || String(value).trim() === "") continue;
+      if (convert(value) !== convert(claims[field])) {
+        return {
+          status: 403,
+          code: "DEVICE_SESSION_SUBSTITUTION_REJECTED",
+          message: `${field} does not match the authenticated device session`,
+        };
+      }
     }
   }
   return null;

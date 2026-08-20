@@ -286,3 +286,59 @@ test("a token minted without a role still authenticates", () => {
     "so a role-gated route refuses it until the user signs in again",
   );
 });
+
+// ---------------------------------------------------------------------------------------------
+// Every supplied identity is checked, not just the first one found
+// ---------------------------------------------------------------------------------------------
+
+test("a contradiction anywhere in the request is rejected, not just in the header", () => {
+  // The escalation this closes: `submittedIdentityFrom` took the header first, while
+  // `aiBusinessAssistantService.js` read the query first. A caller who put their own id in the
+  // header (satisfying the check) and someone else's in the query got the handler to run as that
+  // other person. Whichever field a handler happens to read, it must already agree with the token.
+  const auth = createRequireAuth({ secret: SECRET });
+
+  const viaQuery = runMiddleware(auth, requestWith(
+    { authorization: `Bearer ${token({ userId: 7 })}`, "x-user-id": "7" },
+    { query: { user_id: "99" } },
+  ));
+  assert.equal(viaQuery.nexted, false, "an agreeing header must not excuse a contradicting query");
+  assert.equal(viaQuery.body.code, "DEVICE_SESSION_SUBSTITUTION_REJECTED");
+
+  const viaBody = runMiddleware(auth, requestWith(
+    { authorization: `Bearer ${token({ userId: 7 })}`, "x-user-id": "7" },
+    { body: { user_id: 99 } },
+  ));
+  assert.equal(viaBody.nexted, false, "nor a contradicting body");
+});
+
+test("agreement in every place a field appears is still allowed", () => {
+  // Existing clients legitimately restate their identity in more than one place; only disagreement
+  // is refused.
+  const auth = createRequireAuth({ secret: SECRET });
+  const req = requestWith(
+    { authorization: `Bearer ${token({ userId: 7 })}`, "x-user-id": "7" },
+    { query: { user_id: "7" }, body: { user_id: 7, company_id: 1, branch_id: 2 } },
+  );
+  assert.equal(runMiddleware(auth, req).nexted, true);
+  assert.equal(req.auth.userId, 7);
+});
+
+test("every identity field is checked in every location it can arrive", () => {
+  const auth = createRequireAuth({ secret: SECRET });
+  const good = { authorization: `Bearer ${token()}` };
+  const contradictions = [
+    [{ ...good, "x-device-id": "SOMEONE-ELSE" }, {}],
+    [good, { body: { device_id: "SOMEONE-ELSE" } }],
+    [good, { query: { device_id: "SOMEONE-ELSE" } }],
+    [good, { body: { company_id: 999 } }],
+    [good, { query: { company_id: "999" } }],
+    [good, { body: { branch_id: 999 } }],
+    [good, { query: { branch_id: "999" } }],
+  ];
+  for (const [headers, extra] of contradictions) {
+    const state = runMiddleware(auth, requestWith(headers, extra));
+    assert.equal(state.nexted, false, `must reject ${JSON.stringify(extra)}`);
+    assert.equal(state.status, 403);
+  }
+});
