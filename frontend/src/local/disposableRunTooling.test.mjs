@@ -23,6 +23,9 @@ import {
   isLiveAppDataPath,
   resolveDisposableDir,
   tauriCliEntry,
+  PROFILE_DATABASE,
+  liveProfileDir,
+  seedDisposableProfile,
 } from "../../../scripts/run-disposable-app.mjs";
 
 test("a path inside the live application data directory is refused", () => {
@@ -154,4 +157,105 @@ test("a named profile is refused inside live app data, exactly like a fresh one"
     root: "/home/user/AppData/Roaming/com.srtcompany.froozerp",
     profile: "test",
   }));
+});
+
+// -----------------------------------------------------------------------------------------------
+// Seeding from a copy of the live database.
+//
+// The point is that a disposable profile opens already activated, so testing never requires signing
+// a licence. The risk is that a script which touches live business data gets one direction wrong,
+// so the direction is what these tests pin.
+// -----------------------------------------------------------------------------------------------
+
+/** An in-memory stand-in, so no test ever touches a real profile directory. */
+const fakeFs = (files) => {
+  const store = new Map(Object.entries(files));
+  return {
+    store,
+    writes: [],
+    existsSync: (target) => store.has(target),
+    copyFileSync(from, to) {
+      if (!store.has(from)) throw new Error(`missing source ${from}`);
+      this.writes.push({ from, to });
+      store.set(to, store.get(from));
+    },
+  };
+};
+
+const LIVE = "/live/com.srtcompany.froozerp";
+const DEST = "/tmp/froozerp-x/profile-test";
+
+test("seeding copies the database so the profile is already activated", () => {
+  // The device id and the entitlement bound to it both live in this file. Copying it is what makes
+  // activation a one-time event rather than a per-run ritual.
+  const fileSystem = fakeFs({ [`${LIVE}/${PROFILE_DATABASE}`]: "db" });
+  const result = seedDisposableProfile({ sourceDir: LIVE, destinationDir: DEST, fileSystem });
+
+  assert.equal(result.seeded, true);
+  assert.deepEqual(result.files, [PROFILE_DATABASE]);
+  assert.equal(fileSystem.store.get(`${DEST}/${PROFILE_DATABASE}`), "db");
+});
+
+test("the write-ahead log travels with the database", () => {
+  // A copy that leaves a populated -wal behind is the database as of some earlier moment: a subtly
+  // wrong starting state rather than an obviously broken one, which is worse to debug.
+  const fileSystem = fakeFs({
+    [`${LIVE}/${PROFILE_DATABASE}`]: "db",
+    [`${LIVE}/${PROFILE_DATABASE}-wal`]: "wal",
+    [`${LIVE}/${PROFILE_DATABASE}-shm`]: "shm",
+  });
+  const result = seedDisposableProfile({ sourceDir: LIVE, destinationDir: DEST, fileSystem });
+  assert.deepEqual(result.files, [PROFILE_DATABASE, `${PROFILE_DATABASE}-wal`, `${PROFILE_DATABASE}-shm`]);
+});
+
+test("nothing is ever written back into the live profile", () => {
+  // The one direction that must never reverse. A seeding script that wrote to the source would
+  // corrupt the maintainer's real business data, which is the exact outcome this whole file exists
+  // to make impossible.
+  const fileSystem = fakeFs({ [`${LIVE}/${PROFILE_DATABASE}`]: "db" });
+  seedDisposableProfile({ sourceDir: LIVE, destinationDir: DEST, fileSystem });
+  for (const { to } of fileSystem.writes) {
+    assert.ok(!to.startsWith(LIVE), `wrote into the live profile: ${to}`);
+    assert.ok(to.startsWith(DEST), `wrote outside the disposable profile: ${to}`);
+  }
+});
+
+test("seeding into live application data is refused outright", () => {
+  const fileSystem = fakeFs({ [`${LIVE}/${PROFILE_DATABASE}`]: "db" });
+  assert.throws(() => seedDisposableProfile({
+    sourceDir: LIVE,
+    destinationDir: "/home/user/AppData/Roaming/com.srtcompany.froozerp",
+    fileSystem,
+  }));
+  assert.equal(fileSystem.writes.length, 0, "nothing may be copied before the refusal");
+});
+
+test("an existing disposable database is never overwritten", () => {
+  // A second run must not silently replace a state the maintainer is mid-way through testing —
+  // including one where they have just reproduced a bug.
+  const fileSystem = fakeFs({
+    [`${LIVE}/${PROFILE_DATABASE}`]: "live",
+    [`${DEST}/${PROFILE_DATABASE}`]: "work in progress",
+  });
+  const result = seedDisposableProfile({ sourceDir: LIVE, destinationDir: DEST, fileSystem });
+
+  assert.equal(result.seeded, false);
+  assert.equal(fileSystem.store.get(`${DEST}/${PROFILE_DATABASE}`), "work in progress");
+  assert.equal(fileSystem.writes.length, 0);
+});
+
+test("a missing live database reports why instead of throwing", () => {
+  // Seeding is a convenience. Failing the whole run because there is nothing to copy would turn it
+  // into a requirement.
+  const result = seedDisposableProfile({ sourceDir: LIVE, destinationDir: DEST, fileSystem: fakeFs({}) });
+  assert.equal(result.seeded, false);
+  assert.match(result.reason, /no live database/);
+});
+
+test("the live profile path matches where the app actually stores its database", () => {
+  // Pinned against src-tauri/src/lib.rs and backend/desktopGateway.js. A drift here means seeding
+  // silently copies nothing and the maintainer is back to signing a licence every run.
+  assert.match(liveProfileDir({ APPDATA: "C:\\Users\\x\\AppData\\Roaming" }, "win32"), /com\.srtcompany\.froozerp$/);
+  assert.match(liveProfileDir({}, "linux"), /com\.srtcompany\.froozerp$/);
+  assert.equal(PROFILE_DATABASE, "froozerp-local.sqlite3");
 });

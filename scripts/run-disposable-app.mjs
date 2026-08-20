@@ -33,6 +33,10 @@
  *
  *   # A named profile survives between runs, so the device stays activated:
  *   FROOZERP_DISPOSABLE_PROFILE=test npm run app:disposable
+ *
+ *   # ...and seeding it from a copy of the live database means it never needs activating at all.
+ *   # Close the real app first: copying a live SQLite file mid-write can capture a torn state.
+ *   FROOZERP_DISPOSABLE_PROFILE=test FROOZERP_DISPOSABLE_SEED=live npm run app:disposable
  */
 
 import { spawn } from "node:child_process";
@@ -132,6 +136,74 @@ export const resolveDisposableDir = ({ root, profile = "", now = new Date() } = 
   return resolved;
 };
 
+/** The database file inside a profile directory. Everything that matters lives in it. */
+export const PROFILE_DATABASE = "froozerp-local.sqlite3";
+
+/**
+ * SQLite's sidecar files. A copy that takes only the `.sqlite3` and leaves a populated `-wal`
+ * behind is not a copy of the database — it is a copy of the database as it stood before the most
+ * recent transactions, which is a subtly wrong starting state rather than an obviously broken one.
+ */
+const PROFILE_DATABASE_PARTS = [PROFILE_DATABASE, `${PROFILE_DATABASE}-wal`, `${PROFILE_DATABASE}-shm`];
+
+/**
+ * Where the real profile lives, per `src-tauri/src/lib.rs` and `backend/desktopGateway.js`.
+ *
+ * Read only, ever. Nothing in this script writes to it, and the copy direction is enforced by
+ * `seedDisposableProfile` refusing any destination that `isLiveAppDataPath` recognises.
+ */
+export const liveProfileDir = (env = process.env, platform = process.platform) => {
+  if (platform === "win32" && env.APPDATA) return path.join(env.APPDATA, APP_IDENTIFIER);
+  return path.join(os.homedir(), "AppData", "Roaming", APP_IDENTIFIER);
+};
+
+/**
+ * Copy the live database into a disposable profile, once.
+ *
+ * ## Why this exists
+ *
+ * Entitlements are bound to a device id, so a profile created from nothing is a new device and
+ * lands on the activation screen. Getting past it means signing a `.lic` against the new device id
+ * — which is fine once and intolerable as a routine, and a safe path that is tedious is a safe path
+ * people stop taking.
+ *
+ * Seeding from a copy of the live database sidesteps it entirely: the copy carries the device id
+ * and the entitlement that was already issued for it, so the disposable profile opens *already
+ * activated*, with real data, and never needs signing at all. `CLAUDE.md` prescribes exactly this
+ * — "use disposable copies of databases, profiles and app state" — and this makes the copy a
+ * command rather than a manual step performed correctly under time pressure.
+ *
+ * ## Safety
+ *
+ * One direction only. The source is opened for reading; the destination is refused outright if it
+ * looks like live app data. It seeds only when the destination database does **not** exist, so a
+ * second run never overwrites work done in the disposable profile — and never silently re-copies
+ * live data over a state the maintainer was mid-way through testing.
+ *
+ * @returns {{seeded: boolean, reason: string, from?: string, files?: string[]}}
+ */
+export const seedDisposableProfile = ({ sourceDir, destinationDir, fileSystem = fs } = {}) => {
+  if (isLiveAppDataPath(destinationDir)) {
+    throw new Error(`refusing to seed into ${destinationDir}: it is live application data.`);
+  }
+  const sourceDatabase = path.join(sourceDir, PROFILE_DATABASE);
+  if (!fileSystem.existsSync(sourceDatabase)) {
+    return { seeded: false, reason: `no live database found at ${sourceDatabase}` };
+  }
+  if (fileSystem.existsSync(path.join(destinationDir, PROFILE_DATABASE))) {
+    return { seeded: false, reason: "this profile already has a database; leaving it alone" };
+  }
+
+  const copied = [];
+  for (const name of PROFILE_DATABASE_PARTS) {
+    const from = path.join(sourceDir, name);
+    if (!fileSystem.existsSync(from)) continue;
+    fileSystem.copyFileSync(from, path.join(destinationDir, name));
+    copied.push(name);
+  }
+  return { seeded: true, reason: "copied from the live profile", from: sourceDir, files: copied };
+};
+
 /**
  * Path to the Tauri CLI's JavaScript entry point.
  *
@@ -151,8 +223,15 @@ const main = () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
   const profile = process.env.FROOZERP_DISPOSABLE_PROFILE || "";
   const dir = resolveDisposableDir({ root: process.env.FROOZERP_DISPOSABLE_ROOT, profile });
-  const reused = profile && fs.existsSync(dir);
+  const reused = profile && fs.existsSync(path.join(dir, PROFILE_DATABASE));
   fs.mkdirSync(dir, { recursive: true });
+
+  // Opt-in, never automatic: copying real business data anywhere should be something the maintainer
+  // asked for by name, not something a script decided was convenient.
+  let seed = { seeded: false, reason: "not requested" };
+  if (String(process.env.FROOZERP_DISPOSABLE_SEED || "").trim().toLowerCase() === "live") {
+    seed = seedDisposableProfile({ sourceDir: liveProfileDir(), destinationDir: dir });
+  }
 
   process.stdout.write(
     [
@@ -160,8 +239,9 @@ const main = () => {
       "  DISPOSABLE PROFILE RUN",
       "  ======================",
       `  SQLite profile : ${dir}`,
-      `  Profile mode   : ${profile ? `named "${profile}" — ${reused ? "REUSED, stays activated" : "new, needs activation once"}` : "fresh every run — will open on the activation screen"}`,
-      "  Live app data  : untouched",
+      `  Profile mode   : ${profile ? `named "${profile}" — ${reused ? "REUSED, already activated" : "new"}` : "fresh every run — will open on the activation screen"}`,
+      `  Seeded         : ${seed.seeded ? `yes, ${seed.files.join(", ")} — opens already activated` : seed.reason}`,
+      "  Live app data  : untouched (read only, never written)",
       "",
       "  This run cannot reach the real profile: NODE_ENV=test and an absolute",
       "  FROOZERP_ISOLATED_SQLITE_DIR are both set for the child process only.",
