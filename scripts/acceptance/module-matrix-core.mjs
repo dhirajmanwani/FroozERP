@@ -15,6 +15,7 @@ export const PRIMARY_MODULES = [
   ["sale-rates", "Sale Rate Update", ["/sale-rates", "/sale-rate-history"]],
   ["expenses", "Expenses", ["/expenses"]],
   ["reports", "Report Center", ["/reports/summary", "/inventory"]],
+  ["all-shops", "All Shops", ["/api/owner/all-branches-summary"]],
   ["settings", "Settings", ["/settings"]],
 ].map(([id, title, endpoints]) => ({ id, title, endpoints, primary: true }));
 

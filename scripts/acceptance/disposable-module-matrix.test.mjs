@@ -161,7 +161,10 @@ test("runner uses a disposable copy, records all surfaces, and proves rollback",
     assert.equal(output.result.releaseAcceptanceClaim, "PRECHECK_ONLY");
     assert.equal(output.fixture.rollbackExact, true);
     assert.equal(output.safety.inputUnchanged, true);
-    assert.equal(output.moduleMatrix.length, 21);
+    // Derived, not written out: this was a bare 21, and adding one surface failed here with
+    // "22 !== 21" and no hint that the list is the thing that moved. What matters is that the
+    // runner reports every surface it was given, which is what this now says.
+    assert.equal(output.moduleMatrix.length, ALL_SURFACES.length);
     assert.deepEqual(output.profiles.map(({ name }) => name), ["fresh", "restored"]);
     assert.equal(output.moduleMatrix.every((entry) => entry.evidence.staticPreflight.endpoints.length > 0), true);
     assert.equal(output.moduleMatrix.every((entry) => Array.isArray(entry.errors)), true);
