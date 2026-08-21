@@ -24,6 +24,9 @@ import {
   loadLocalPosSale,
   queueLocalPurchase,
   recordConnectivityModeChange,
+  listLocalCustomerOrders,
+  saveLocalCustomerOrder,
+  setLocalCustomerOrderStatus,
 } from "./local/localDatabase";
 import {
   cacheOfflineSession,
@@ -39,6 +42,8 @@ import {
 import { resolveOfflineOpenDecision } from "./local/offlineDataReadiness";
 import { allShopsHasFigures, resolveAllShopsPresentation } from "./local/allShopsSummary";
 import { resolveShopViewPresentation, shopPickerVisible } from "./local/shopView";
+import { ORDER_STATUS } from "./local/orderLifecycle";
+import { buildOrdersBoard, validateOrderAction } from "./local/ordersBoard";
 import { bannerForState } from "./local/entitlementState";
 import { sessionAuthHeaders, shouldAttachSessionAuth } from "./local/authHeaders";
 import { consumeStashedSessionForReload, stashSessionForReload } from "./local/reloadSessionBridge";
@@ -804,6 +809,7 @@ const icons = {
   reports: "chart",
   settings: "settings",
   "sale-rates": "trend",
+  orders: "parcel",
   "all-shops": "layers",
   frost: "message",
 };
@@ -820,12 +826,13 @@ const navigationItems = [
   ["discounts", "Discounts"],
   ["sale-rates", "Sale Rate Update"],
   ["expenses", "Expenses"],
+  ["orders", "Orders"],
   ["reports", "Reports"],
   ["all-shops", "All Shops"],
   ["settings", "Settings"],
 ];
 
-const offlineLocalDataViews = new Set(["dashboard", "products", "sales", "reports", "settings"]);
+const offlineLocalDataViews = new Set(["dashboard", "products", "sales", "reports", "settings", "orders"]);
 const offlineBackendRequiredViews = new Set(["purchase", "pending-bills", "accounts", "returns", "waste", "discounts", "sale-rates", "expenses", "all-shops"]);
 
 const getErrorMessage = (error, fallback) =>
@@ -1327,6 +1334,7 @@ const modulePermissionMap = {
   discounts: "discounts",
   "sale-rates": "discounts",
   expenses: "reports",
+  orders: "billing",
   reports: "reports",
   settings: "settings",
 };
@@ -1508,6 +1516,7 @@ function Icon({ name, size = 18 }) {
     print: <><path d="M6 9V3h12v6M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2M6 14h12v7H6Z" /></>,
     message: <><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.8 8.8 0 0 1-3.8-1L3 20l1.3-4A8.3 8.3 0 1 1 21 11.5Z" /></>,
     close: <><path d="M18 6 6 18M6 6l12 12" /></>,
+    parcel: <><path d="M3 8h18v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" /><path d="M3 8l2-4h14l2 4" /><path d="M12 4v17" /></>,
   };
 
   return (
@@ -1759,6 +1768,8 @@ function App() {
   const [allShopsState, setAllShopsState] = useState({ loadState: "idle", loadError: "", payload: null, dateTo: "" });
   const [shopViewState, setShopViewState] = useState({ loadState: "idle", loadError: "", branches: [], ownBranchId: null, viewingBranchId: null, viewOnly: false });
   const [shopSwitchBusy, setShopSwitchBusy] = useState(false);
+  const [ordersState, setOrdersState] = useState({ loadState: "idle", loadError: "", orders: [] });
+  const [orderActionBusy, setOrderActionBusy] = useState(false);
   const [dashboardRange, setDashboardRange] = useState("7");
   const [dashboardCustomRange, setDashboardCustomRange] = useState({
     date_from: toDateKey(new Date()),
@@ -4508,6 +4519,91 @@ function App() {
   };
 
   /**
+   * Customer orders, read straight from this device's SQLite.
+   *
+   * No backend call at all. G7's order half is the part that needs no cloud, no website and no
+   * approvals, and reading it through the API would quietly re-introduce every one of those.
+   */
+  const loadOrders = async () => {
+    setOrdersState((current) => ({ ...current, loadState: "loading", loadError: "" }));
+    try {
+      const result = await listLocalCustomerOrders();
+      if (result === null) {
+        // Outside the desktop shell there is no local database. Saying so is the point: treating
+        // it as an empty list would show a working, permanently empty board.
+        setOrdersState({
+          loadState: "error",
+          loadError: "Orders are stored on this device and need the desktop app. This looks like a browser.",
+          orders: [],
+        });
+        return;
+      }
+      setOrdersState({ loadState: "loaded", loadError: "", orders: result?.orders || [] });
+    } catch (error) {
+      setOrdersState({
+        loadState: "error",
+        loadError: describeLocalServiceFailure(error, "Orders could not be read from this device"),
+        orders: [],
+      });
+    }
+  };
+
+  /**
+   * Write a new order down, which sets its stock aside immediately.
+   */
+  const takeOrder = async (order) => {
+    setOrderActionBusy(true);
+    try {
+      const saved = await saveLocalCustomerOrder({
+        ...order,
+        // Human-readable and sortable. Generated here rather than in the store so the operator can
+        // read it back to the customer on the phone before the save has even finished.
+        order_no: `ORD-${Date.now().toString().slice(-6)}`,
+        created_by: user?.full_name || "",
+        branch_id: user?.branch_id ?? null,
+      });
+      if (saved === null) {
+        setSyncMessage("Orders need the desktop app — this looks like a browser.");
+        return;
+      }
+      await loadOrders();
+      setSyncMessage(`Order ${saved.order_no} saved. Stock is set aside.`);
+    } catch (error) {
+      setSyncMessage(describeLocalServiceFailure(error, "That order could not be saved"));
+    } finally {
+      setOrderActionBusy(false);
+    }
+  };
+
+  /**
+   * Move an order along.
+   *
+   * Checked here before it is attempted, using the same rules the board used to decide which
+   * buttons to show. Both call `validateOrderAction`, so a button can never appear for a move that
+   * would then be refused — and the storage layer refuses a billed order independently, so a bug
+   * in either of these cannot bill twice.
+   */
+  const advanceOrder = async (order, to, extras = {}) => {
+    const check = validateOrderAction({ order, to, carrier: extras.carrier, reason: extras.cancellation_reason });
+    if (!check.ok) {
+      setSyncMessage(check.message);
+      return;
+    }
+    setOrderActionBusy(true);
+    try {
+      await setLocalCustomerOrderStatus({ orderId: order.id, nextStatus: to, patch: extras });
+      await loadOrders();
+      setSyncMessage(to === ORDER_STATUS.SENT
+        ? "Order marked sent. Bill it on POS and the invoice will be linked."
+        : "");
+    } catch (error) {
+      setSyncMessage(describeLocalServiceFailure(error, "That order could not be updated"));
+    } finally {
+      setOrderActionBusy(false);
+    }
+  };
+
+  /**
    * The shops this Owner may look at.
    *
    * Errors land in state rather than throwing, for the same reason as `loadAllShops`: a thrown
@@ -6196,6 +6292,7 @@ function App() {
       if (view === "reports") await loadReports();
       if (view === "expenses") await loadExpenses();
       if (view === "all-shops") await loadAllShops();
+      if (view === "orders") await loadOrders();
       if (view === "returns") await loadSaleReturns();
       if (view === "waste") await loadWasteEntries();
       if (view === "dashboard") await loadDashboardData();
@@ -7403,6 +7500,18 @@ function App() {
               onOpenSupplierLedger={openSupplierLedgerFromReport}
               onReload={loadReports}
               suppliers={suppliers}
+              user={user}
+            />
+          )}
+
+          {activeView === "orders" && (
+            <OrdersModule
+              busy={orderActionBusy}
+              onAdvance={advanceOrder}
+              onReload={loadOrders}
+              onTakeOrder={takeOrder}
+              products={products}
+              state={ordersState}
               user={user}
             />
           )}
@@ -12986,6 +13095,255 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
  * the page. There is no `|| 0` anywhere below, because a zero written into a failed load is
  * indistinguishable from a shop that did no business.
  */
+/**
+ * The Orders board.
+ *
+ * Every judgement lives in `local/ordersBoard.js` and `local/orderLifecycle.js`, where it is
+ * tested without a browser. This renders what they decide — most importantly, it renders only the
+ * actions they offer, so a button can never appear for a move that would then be refused.
+ *
+ * Orders come from this device's SQLite and never from the API. That is the whole reason G7's order
+ * half is available now while its website half waits behind the exposure gate.
+ */
+function OrdersModule({ busy = false, onAdvance, onReload, onTakeOrder, products = [], state, user }) {
+  const money = (value) => currency.format(Number(value || 0));
+  const [carrierDraft, setCarrierDraft] = useState({});
+  const [reasonDraft, setReasonDraft] = useState({});
+  const emptyLine = { product_id: "", quantity: "", agreed_rate: "" };
+  const [draft, setDraft] = useState({ customer_name: "", customer_mobile: "", delivery_address: "", source: "PHONE", items: [{ ...emptyLine }] });
+  const [draftError, setDraftError] = useState("");
+
+  const setLine = (index, patch) => setDraft((current) => ({
+    ...current,
+    items: current.items.map((line, position) => (position === index ? { ...line, ...patch } : line)),
+  }));
+
+  const submitOrder = async () => {
+    // Validated here rather than only in the store, so the operator is told which field is missing
+    // instead of being handed the storage layer's message about the first one it happened to reach.
+    if (!draft.customer_name.trim()) return setDraftError("Enter the customer's name, even for a first-time caller.");
+    const lines = draft.items
+      .map((line) => {
+        const product = products.find((candidate) => canonicalInventoryId(candidate.id) === canonicalInventoryId(line.product_id));
+        return product ? {
+          product_id: String(product.id),
+          product_name: product.product_name,
+          unit: product.unit || "",
+          quantity: Number(line.quantity),
+          agreed_rate: Number(line.agreed_rate),
+        } : null;
+      })
+      .filter((line) => line && Number.isFinite(line.quantity) && line.quantity > 0);
+    if (lines.length === 0) return setDraftError("Add at least one item with a quantity.");
+    setDraftError("");
+    await onTakeOrder({ ...draft, items: lines });
+    setDraft({ customer_name: "", customer_mobile: "", delivery_address: "", source: "PHONE", items: [{ ...emptyLine }] });
+  };
+
+  if (state.loadState === "idle" || state.loadState === "loading") {
+    return (
+      <ModuleCard eyebrow="Customer Orders" title="Orders" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
+        <p className="form-note">Reading orders from this device...</p>
+      </ModuleCard>
+    );
+  }
+  if (state.loadState === "error" || state.loadError) {
+    // A distinct error state, never an empty board. "No orders" and "orders could not be read" look
+    // identical to a reader and mean opposite things.
+    return (
+      <ModuleCard eyebrow="Customer Orders" title="Orders" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
+        <div className="cart-empty">{state.loadError}</div>
+        <p><button className="table-action" type="button" onClick={onReload}>Try again</button></p>
+      </ModuleCard>
+    );
+  }
+
+  const board = buildOrdersBoard(state.orders);
+
+  return (
+    <section className="settings-layout">
+      <ModuleCard
+        eyebrow="Customer Orders"
+        title="Orders"
+        subtitle="Phone, WhatsApp and counter orders, from taken to delivered. Stored on this device — no internet needed."
+      >
+        <p><button className="table-action" type="button" onClick={onReload}>Refresh</button></p>
+
+        {board.needsAttention.length > 0 && (
+          // Above the board, not a badge on a card. A lapsed order looks exactly like a healthy one
+          // and the difference is that its fruit may already have been sold to somebody else.
+          <div className="cart-empty" role="alert">
+            <strong>{board.needsAttention.length} order{board.needsAttention.length === 1 ? "" : "s"} need checking.</strong>{" "}
+            {board.needsAttention.map((order) => `${order.orderNo || "Order"} (${order.customerName})`).join(", ")}
+            {" — "}the stock held for these went back on the shelf after six hours. Check it is still in the shop before packing.
+          </div>
+        )}
+
+        <div className="purchase-summary-grid supplier-payment-preview">
+          <SummaryMetric featured label="Open Orders" value={board.openCount} />
+          <SummaryMetric label="Value Held" value={money(board.reservedValue)} />
+          <SummaryMetric label="Needs Checking" value={board.needsAttention.length} />
+          <SummaryMetric label="Finished" value={board.finished.length} />
+        </div>
+      </ModuleCard>
+
+      <ModuleCard eyebrow="New" title="Take an order" subtitle="Rings the phone? Write it here. Stock is set aside the moment you save.">
+        {draftError && <div className="cart-empty" role="alert">{draftError}</div>}
+        <div className="purchase-summary-grid supplier-payment-preview">
+          <Field label="Customer name">
+            <input onChange={(event) => setDraft({ ...draft, customer_name: event.target.value })} placeholder="Who is ordering" value={draft.customer_name} />
+          </Field>
+          <Field label="Mobile">
+            <input onChange={(event) => setDraft({ ...draft, customer_mobile: event.target.value })} placeholder="For the delivery" value={draft.customer_mobile} />
+          </Field>
+          <Field label="How did it come in">
+            <select onChange={(event) => setDraft({ ...draft, source: event.target.value })} value={draft.source}>
+              <option value="PHONE">Phone</option>
+              <option value="WHATSAPP">WhatsApp</option>
+              <option value="COUNTER">Counter</option>
+              <option value="WEBSITE">Website</option>
+              <option value="OTHER">Other</option>
+            </select>
+          </Field>
+        </div>
+        <Field label="Delivery address">
+          <input onChange={(event) => setDraft({ ...draft, delivery_address: event.target.value })} placeholder="Where it is going" value={draft.delivery_address} />
+        </Field>
+
+        <DataTable headers={["Item", "Quantity", "Rate agreed", ""]}>
+          {draft.items.map((line, index) => (
+            <tr key={index}>
+              <td>
+                <select onChange={(event) => setLine(index, { product_id: event.target.value })} value={line.product_id}>
+                  <option value="">Choose an item</option>
+                  {products.map((product) => (
+                    <option key={product.id} value={product.id}>{product.product_name}</option>
+                  ))}
+                </select>
+              </td>
+              <td><input onChange={(event) => setLine(index, { quantity: event.target.value })} placeholder="0.000" step="0.001" type="number" value={line.quantity} /></td>
+              {/* The rate the customer is quoted today, kept for when the order ships. Produce
+                  rates move daily and a customer quoted 80 on Monday is owed 80 on Thursday. */}
+              <td><input onChange={(event) => setLine(index, { agreed_rate: event.target.value })} placeholder="0.00" step="0.01" type="number" value={line.agreed_rate} /></td>
+              <td>
+                <button
+                  className="table-action"
+                  disabled={draft.items.length === 1}
+                  type="button"
+                  onClick={() => setDraft({ ...draft, items: draft.items.filter((_, position) => position !== index) })}
+                >
+                  Remove
+                </button>
+              </td>
+            </tr>
+          ))}
+        </DataTable>
+        <p>
+          <button className="table-action" type="button" onClick={() => setDraft({ ...draft, items: [...draft.items, { ...emptyLine }] })}>Add item</button>
+          <button className="primary-button" disabled={busy} type="button" onClick={submitOrder}>Save order</button>
+        </p>
+      </ModuleCard>
+
+      {board.columns.map((column) => (
+        <ModuleCard eyebrow={column.hint} key={column.key} title={`${column.label} (${column.orders.length})`}>
+          {column.orders.length === 0 && <p className="form-note">Nothing here right now.</p>}
+          {column.orders.map((order) => (
+            <div className="content-card" key={order.id}>
+              <div className="carrier-top">
+                <strong>{order.orderNo} · {order.customerName}</strong>
+                <span>{money(order.value)}</span>
+              </div>
+              <p className="form-note">
+                {order.customerMobile || "No number"} · {order.source}
+                {order.deliveryAddress ? ` · ${order.deliveryAddress}` : ""}
+                {order.invoiceNo ? ` · billed ${order.invoiceNo}` : ""}
+              </p>
+
+              {order.warning && <div className="cart-empty" role="alert">{order.warning}</div>}
+
+              <DataTable headers={["Item", "Quantity", "Rate agreed", "Amount"]}>
+                {order.items.map((line) => (
+                  <tr key={line.id || `${order.id}-${line.line_index}`}>
+                    <td>{line.product_name}</td>
+                    {/* Quantities carry three decimals and rates always carry their unit: a produce
+                        price with no unit beside it is the commonest confusion in this trade. */}
+                    <td>{Number(line.quantity || 0).toFixed(3)} {line.unit || ""}</td>
+                    <td>{money(line.agreed_rate)} / {line.unit || "unit"}</td>
+                    <td>{money(Number(line.quantity || 0) * Number(line.agreed_rate || 0))}</td>
+                  </tr>
+                ))}
+              </DataTable>
+
+              {order.carrier && (
+                <p className="form-note">
+                  Carried by <strong>{order.carrier}</strong>
+                  {order.carrierReference ? ` · ${order.carrierReference}` : ""}
+                  {order.trackingUrl ? (
+                    <> · <a href={order.trackingUrl} rel="noreferrer" target="_blank">tracking link</a></>
+                  ) : ""}
+                </p>
+              )}
+
+              {order.actions.some((action) => action.needsCarrier) && (
+                <Field label="Who is carrying it">
+                  <input
+                    onChange={(event) => setCarrierDraft({ ...carrierDraft, [order.id]: event.target.value })}
+                    placeholder="Rapido, Porter, our own delivery..."
+                    value={carrierDraft[order.id] || ""}
+                  />
+                </Field>
+              )}
+              {order.actions.some((action) => action.needsReason) && (
+                <Field label="Reason (if cancelling)">
+                  <input
+                    onChange={(event) => setReasonDraft({ ...reasonDraft, [order.id]: event.target.value })}
+                    placeholder="Customer changed their mind, stock finished..."
+                    value={reasonDraft[order.id] || ""}
+                  />
+                </Field>
+              )}
+
+              <p>
+                {order.actions.map((action) => (
+                  <button
+                    className={action.tone === "primary" ? "primary-button" : "table-action"}
+                    disabled={busy}
+                    key={action.to}
+                    type="button"
+                    onClick={() => onAdvance(order, action.to, {
+                      carrier: carrierDraft[order.id] || "",
+                      cancellation_reason: reasonDraft[order.id] || "",
+                      created_by: user?.full_name || "",
+                    })}
+                  >
+                    {action.label}
+                  </button>
+                ))}
+              </p>
+            </div>
+          ))}
+        </ModuleCard>
+      ))}
+
+      {board.finished.length > 0 && (
+        <ModuleCard eyebrow="History" title={`Finished (${board.finished.length})`} subtitle="Kept on purpose — 'did that go out yesterday?' has to stay answerable.">
+          <DataTable headers={["Order", "Customer", "Status", "Carrier", "Value"]}>
+            {board.finished.map((order) => (
+              <tr key={order.id}>
+                <td>{order.orderNo}</td>
+                <td>{order.customerName}</td>
+                <td>{order.status}</td>
+                <td>{order.carrier || "-"}</td>
+                <td>{money(order.value)}</td>
+              </tr>
+            ))}
+          </DataTable>
+        </ModuleCard>
+      )}
+    </section>
+  );
+}
+
 function AllShopsModule({ connectivityMode, onReload, state }) {
   const money = (value) => currency.format(Number(value || 0));
   const presentation = resolveAllShopsPresentation({

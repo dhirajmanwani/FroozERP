@@ -95,3 +95,39 @@ test("All Shops asks the server for its as-at date rather than computing one", (
   // An empty value means "today", decided server-side.
   assert.match(app, /normalizeReportDate\(dateTo\) \? \{ date_to: dateTo \} : \{\}/);
 });
+
+test("Orders is registered, has an icon of its own, and renders", () => {
+  assert.match(app, /\["orders", "Orders"\]/);
+  // Its own glyph rather than a borrowed one: orders are neither purchases nor sales, and a
+  // duplicated icon in a sidebar is a nav item people click by mistake.
+  assert.match(app, /orders: "parcel"/);
+  assert.match(app, /activeView === "orders"/);
+  assert.match(app, /if \(view === "orders"\) await loadOrders\(\);/);
+});
+
+test("Orders is classified as working offline, because it does", () => {
+  // The whole reason G7's order half is available now while its website half waits behind the
+  // exposure gate. Listing it as backend-required would gate it on a cloud it never calls.
+  const offlineLocal = app.match(/const offlineLocalDataViews = new Set\(\[([^\]]*)\]\)/);
+  const backendRequired = app.match(/const offlineBackendRequiredViews = new Set\(\[([^\]]*)\]\)/);
+  assert.match(offlineLocal[1], /orders/);
+  assert.doesNotMatch(backendRequired[1], /"orders"/);
+});
+
+test("Orders reads the device, never the API", () => {
+  // An API call here would quietly re-gate the one module that needs no cloud.
+  const start = app.indexOf("const loadOrders = async");
+  const end = app.indexOf("const takeOrder = async", start);
+  assert.ok(start > 0 && end > start, "loadOrders must exist");
+  const body = app.slice(start, end);
+  assert.match(body, /listLocalCustomerOrders\(\)/);
+  assert.doesNotMatch(body, /axios\./);
+});
+
+test("an order action is validated before it is attempted", () => {
+  // The same check the board used to decide which buttons to show, so a visible button can never
+  // be a move that is then refused.
+  const start = app.indexOf("const advanceOrder = async");
+  const body = app.slice(start, start + 700);
+  assert.match(body, /validateOrderAction\(/);
+});

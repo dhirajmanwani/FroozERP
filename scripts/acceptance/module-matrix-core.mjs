@@ -14,6 +14,7 @@ export const PRIMARY_MODULES = [
   ["discounts", "Discounts", ["/lot-discounts"]],
   ["sale-rates", "Sale Rate Update", ["/sale-rates", "/sale-rate-history"]],
   ["expenses", "Expenses", ["/expenses"]],
+  ["orders", "Orders", ["local_list_customer_orders", "local_save_customer_order"]],
   ["reports", "Report Center", ["/reports/summary", "/inventory"]],
   ["all-shops", "All Shops", ["/api/owner/all-branches-summary"]],
   ["settings", "Settings", ["/settings"]],
