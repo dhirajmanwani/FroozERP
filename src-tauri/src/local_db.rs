@@ -1452,6 +1452,317 @@ fn unique_local_id(prefix: &str) -> String {
     format!("{prefix}-{millis}-{}", checksum(&format!("{prefix}-{millis}"))[..8].to_string())
 }
 
+/// A trimmed string field from a JSON object, or None when absent or blank.
+///
+/// Blank-as-None is the point: a form posts `""` for every field the operator left alone, and
+/// storing those would overwrite a carrier reference with nothing on the next status change. The
+/// UPDATE below leans on that by using COALESCE, so "not supplied" and "cleared" stay distinct.
+fn order_text(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|field| field.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+/// Customer orders held on this device.
+///
+/// The workflow rules — which status may follow which, and when a reservation lapses — live in
+/// `frontend/src/local/orderLifecycle.js`, where they are tested. This layer is deliberately a
+/// faithful store rather than a second copy of them: two implementations of a state machine drift,
+/// and the one nobody is looking at wins.
+///
+/// It enforces exactly one rule of its own, and only because money is involved: **an order that has
+/// been billed cannot walk backwards.** `sale_id` is set when the order is sent and an invoice is
+/// raised; after that, returning it to RECEIVED or PACKED or CANCELLED would leave a bill attached
+/// to an order the shop believes it still has in stock. Undoing a sent order is a sale return, and
+/// that is a separate recorded event with its own money.
+pub fn save_customer_order(app: &AppHandle, order: &serde_json::Value) -> Result<serde_json::Value, String> {
+    save_customer_order_at(&database_path(app)?, order)
+}
+
+/// The path-taking core. Split out for the same reason as `initialize_at`: a test cannot build an
+/// `AppHandle`, and a storage rule that is only exercised through the running app is a rule nobody
+/// checks until it has already gone wrong in front of a customer.
+pub fn save_customer_order_at(
+    path: &Path,
+    order: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    initialize_at(path)?;
+    let mut conn = Connection::open(path).map_err(to_error)?;
+
+    let order_id = order_text(order, "id").unwrap_or_else(|| unique_local_id("order"));
+    let order_no = order_text(order, "order_no")
+        .ok_or_else(|| "An order number is required.".to_string())?;
+    let customer_name = order_text(order, "customer_name")
+        .ok_or_else(|| "A customer name is required, even for a first-time caller.".to_string())?;
+
+    let items = order
+        .get("items")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "An order needs at least one line.".to_string())?;
+    if items.is_empty() {
+        return Err("An order needs at least one line.".to_string());
+    }
+
+    // One transaction for the order and every line. A half-written order is worse than none: it
+    // would hold a reservation against lines that were never recorded, so the stock would be
+    // missing from the counter with nothing on screen explaining where it went.
+    let tx = conn.transaction().map_err(to_error)?;
+    tx.execute(
+        "INSERT INTO local_customer_orders (
+           id, order_no, source, customer_id, customer_name, customer_mobile, delivery_address,
+           status, reserved_at, notes, branch_id, created_by
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'RECEIVED',
+                   -- COALESCE, not the column DEFAULT: `reserved_at` has none. An earlier draft
+                   -- assumed it did and passed NULL, which produced accepted orders carrying no
+                   -- reservation time at all. Those never lapse — `reservationState` fails towards
+                   -- holding stock when it has no timestamp to measure from — so a forgotten order
+                   -- would have held its fruit for ever, which is the exact failure the lapse exists
+                   -- to prevent. Caught by a test, not by reading.
+                   COALESCE(?8, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                   ?9, ?10, ?11)",
+        rusqlite::params![
+            order_id,
+            order_no,
+            order_text(order, "source").unwrap_or_else(|| "PHONE".to_string()),
+            order_text(order, "customer_id"),
+            customer_name,
+            order_text(order, "customer_mobile"),
+            order_text(order, "delivery_address"),
+            // Reserved from the moment it is accepted; the lapse is measured from here. When the
+            // caller does not supply one, SQLite's own strftime fills it in above, so every clock
+            // in this file is SQLite's and there is no second date format to keep in step.
+            order_text(order, "reserved_at"),
+            order_text(order, "notes"),
+            order.get("branch_id").and_then(|value| value.as_i64()),
+            order_text(order, "created_by"),
+        ],
+    )
+    .map_err(to_error)?;
+
+    for (index, item) in items.iter().enumerate() {
+        let product_id = order_text(item, "product_id")
+            .ok_or_else(|| "Every order line needs a product.".to_string())?;
+        let quantity = item
+            .get("quantity")
+            .and_then(|value| value.as_f64())
+            .ok_or_else(|| "Every order line needs a quantity.".to_string())?;
+        if !(quantity > 0.0) {
+            return Err("An order line must have a quantity greater than zero.".to_string());
+        }
+        tx.execute(
+            "INSERT INTO local_customer_order_items (
+               id, order_id, line_index, product_id, product_name, unit, quantity, agreed_rate
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                order_text(item, "id").unwrap_or_else(|| unique_local_id("order-line")),
+                order_id,
+                index as i64,
+                product_id,
+                order_text(item, "product_name").unwrap_or_else(|| "Unnamed product".to_string()),
+                order_text(item, "unit"),
+                quantity,
+                item.get("agreed_rate").and_then(|value| value.as_f64()),
+            ],
+        )
+        .map_err(to_error)?;
+    }
+    tx.commit().map_err(to_error)?;
+    read_customer_order(&conn, &order_id)
+}
+
+/// Move an order along, and record whatever that step produced.
+///
+/// `patch` carries the fields the step generates — the carrier and tracking link on SENT, the sale
+/// and invoice raised with it, a reason on CANCELLED. They are written in the same statement as the
+/// status so an order can never be SENT with no record of who is carrying it.
+pub fn set_customer_order_status(
+    app: &AppHandle,
+    order_id: &str,
+    next_status: &str,
+    patch: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    set_customer_order_status_at(&database_path(app)?, order_id, next_status, patch)
+}
+
+pub fn set_customer_order_status_at(
+    path: &Path,
+    order_id: &str,
+    next_status: &str,
+    patch: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    initialize_at(path)?;
+    let conn = Connection::open(path).map_err(to_error)?;
+
+    let current: (String, Option<String>) = conn
+        .query_row(
+            "SELECT status, sale_id FROM local_customer_orders WHERE id = ?1 AND deleted_at IS NULL",
+            rusqlite::params![order_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| "That order could not be found.".to_string())?;
+
+    // The one rule this layer owns. Everything else about which move follows which is decided in
+    // orderLifecycle.js; this is here because it is the one whose failure leaves a bill attached to
+    // stock the shop thinks it still has.
+    let already_billed = current.1.as_deref().map(|id| !id.trim().is_empty()).unwrap_or(false);
+    let walking_back = matches!(next_status, "RECEIVED" | "PACKED" | "CANCELLED");
+    if already_billed && walking_back {
+        return Err(
+            "This order has already been billed. To undo it, record a sale return.".to_string(),
+        );
+    }
+
+    let stamp_column = match next_status {
+        "PACKED" => Some("packed_at"),
+        "SENT" => Some("sent_at"),
+        "DELIVERED" => Some("delivered_at"),
+        "CANCELLED" => Some("cancelled_at"),
+        _ => None,
+    };
+    // Every timestamp below is written by SQLite's own strftime, in the same shape as the column
+    // DEFAULTs in migration 020. Formatting dates in Rust as well would mean two clocks and two
+    // formats to keep in step, and the one nobody looks at drifts.
+    let restart_reservation = next_status == "RECEIVED";
+
+    conn.execute(
+        "UPDATE local_customer_orders SET
+           status = ?2,
+           -- Returning an order to RECEIVED restarts its reservation clock. Without this, a lapsed
+           -- order put back in the queue would still read as expired and would be flagged for
+           -- attention for ever, however recently someone looked at it.
+           reserved_at = CASE WHEN ?3 THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE reserved_at END,
+           packed_at = CASE WHEN ?4 = 'packed_at' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE packed_at END,
+           sent_at = CASE WHEN ?4 = 'sent_at' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE sent_at END,
+           delivered_at = CASE WHEN ?4 = 'delivered_at' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE delivered_at END,
+           cancelled_at = CASE WHEN ?4 = 'cancelled_at' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE cancelled_at END,
+           cancellation_reason = COALESCE(?5, cancellation_reason),
+           carrier = COALESCE(?6, carrier),
+           carrier_reference = COALESCE(?7, carrier_reference),
+           tracking_url = COALESCE(?8, tracking_url),
+           carrier_contact = COALESCE(?9, carrier_contact),
+           sale_id = COALESCE(?10, sale_id),
+           invoice_no = COALESCE(?11, invoice_no),
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE id = ?1 AND deleted_at IS NULL",
+        rusqlite::params![
+            order_id,
+            next_status,
+            restart_reservation,
+            stamp_column.unwrap_or(""),
+            order_text(patch, "cancellation_reason"),
+            order_text(patch, "carrier"),
+            order_text(patch, "carrier_reference"),
+            order_text(patch, "tracking_url"),
+            order_text(patch, "carrier_contact"),
+            order_text(patch, "sale_id"),
+            order_text(patch, "invoice_no"),
+        ],
+    )
+    .map_err(to_error)?;
+    read_customer_order(&conn, order_id)
+}
+
+/// Every order this device knows about, newest first, with its lines attached.
+///
+/// Deleted orders are excluded; finished ones are not. A board that hid delivered orders would make
+/// "did that go out?" unanswerable the day after it went out.
+pub fn list_customer_orders(app: &AppHandle) -> Result<serde_json::Value, String> {
+    list_customer_orders_at(&database_path(app)?)
+}
+
+pub fn list_customer_orders_at(path: &Path) -> Result<serde_json::Value, String> {
+    initialize_at(path)?;
+    let conn = Connection::open(path).map_err(to_error)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT id FROM local_customer_orders
+             WHERE deleted_at IS NULL
+             ORDER BY created_at DESC, id DESC",
+        )
+        .map_err(to_error)?;
+    let ids: Vec<String> = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(to_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_error)?;
+    let mut orders = Vec::with_capacity(ids.len());
+    for id in ids {
+        orders.push(read_customer_order(&conn, &id)?);
+    }
+    Ok(serde_json::json!({ "orders": orders }))
+}
+
+fn read_customer_order(conn: &Connection, order_id: &str) -> Result<serde_json::Value, String> {
+    let mut order: serde_json::Value = conn
+        .query_row(
+            "SELECT id, order_no, source, customer_id, customer_name, customer_mobile,
+                    delivery_address, status, reserved_at, packed_at, sent_at, delivered_at,
+                    cancelled_at, cancellation_reason, carrier, carrier_reference, tracking_url,
+                    carrier_contact, sale_id, invoice_no, notes, branch_id, created_by, created_at
+             FROM local_customer_orders WHERE id = ?1",
+            rusqlite::params![order_id],
+            |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "order_no": row.get::<_, String>(1)?,
+                    "source": row.get::<_, String>(2)?,
+                    "customer_id": row.get::<_, Option<String>>(3)?,
+                    "customer_name": row.get::<_, String>(4)?,
+                    "customer_mobile": row.get::<_, Option<String>>(5)?,
+                    "delivery_address": row.get::<_, Option<String>>(6)?,
+                    "status": row.get::<_, String>(7)?,
+                    "reserved_at": row.get::<_, Option<String>>(8)?,
+                    "packed_at": row.get::<_, Option<String>>(9)?,
+                    "sent_at": row.get::<_, Option<String>>(10)?,
+                    "delivered_at": row.get::<_, Option<String>>(11)?,
+                    "cancelled_at": row.get::<_, Option<String>>(12)?,
+                    "cancellation_reason": row.get::<_, Option<String>>(13)?,
+                    "carrier": row.get::<_, Option<String>>(14)?,
+                    "carrier_reference": row.get::<_, Option<String>>(15)?,
+                    "tracking_url": row.get::<_, Option<String>>(16)?,
+                    "carrier_contact": row.get::<_, Option<String>>(17)?,
+                    "sale_id": row.get::<_, Option<String>>(18)?,
+                    "invoice_no": row.get::<_, Option<String>>(19)?,
+                    "notes": row.get::<_, Option<String>>(20)?,
+                    "branch_id": row.get::<_, Option<i64>>(21)?,
+                    "created_by": row.get::<_, Option<String>>(22)?,
+                    "created_at": row.get::<_, String>(23)?,
+                }))
+            },
+        )
+        .map_err(|_| "That order could not be found.".to_string())?;
+
+    let mut statement = conn
+        .prepare(
+            "SELECT id, line_index, product_id, product_name, unit, quantity, agreed_rate,
+                    inventory_lot_id
+             FROM local_customer_order_items WHERE order_id = ?1 ORDER BY line_index",
+        )
+        .map_err(to_error)?;
+    let items: Vec<serde_json::Value> = statement
+        .query_map(rusqlite::params![order_id], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "line_index": row.get::<_, i64>(1)?,
+                // Read back as text and never parsed. "004" is not 4.
+                "product_id": row.get::<_, String>(2)?,
+                "product_name": row.get::<_, String>(3)?,
+                "unit": row.get::<_, Option<String>>(4)?,
+                "quantity": row.get::<_, f64>(5)?,
+                "agreed_rate": row.get::<_, Option<f64>>(6)?,
+                "inventory_lot_id": row.get::<_, Option<String>>(7)?,
+            }))
+        })
+        .map_err(to_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_error)?;
+    order["items"] = serde_json::Value::Array(items);
+    Ok(order)
+}
+
 fn load_invoice_snapshot(conn: &Connection, invoice_id: &str) -> Result<serde_json::Value, String> {
     let invoice = conn
         .query_row(
@@ -5387,6 +5698,98 @@ mod tests {
             .expect("read reconciled aggregate state");
         assert_eq!(result, ("completed".to_string(), 1, 2, 2, 2));
         drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A billed order cannot be walked backwards, whatever the caller asks for.
+    ///
+    /// This is the single rule the storage layer owns. Everything else about which status may
+    /// follow which is decided in `frontend/src/local/orderLifecycle.js`, because two copies of a
+    /// state machine drift and the one nobody is looking at wins. This one is here because its
+    /// failure leaves an invoice attached to stock the shop believes it still has on the shelf.
+    #[test]
+    fn a_billed_order_cannot_walk_backwards() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-order-billing-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize order database");
+        let conn = Connection::open(&path).expect("open order database");
+        conn.execute(
+            "INSERT INTO local_customer_orders (id, order_no, customer_name, status, sale_id, invoice_no) \
+             VALUES ('order-billed', 'ORD-9', 'Ram', 'SENT', 'sale-77', 'INV-77')",
+            [],
+        )
+        .expect("seed a sent, billed order");
+        drop(conn);
+
+        for refused in ["RECEIVED", "PACKED", "CANCELLED"] {
+            let outcome = set_customer_order_status_at(&path, "order-billed", refused, &serde_json::json!({}));
+            let message = outcome.expect_err("a billed order must not walk backwards");
+            assert!(
+                message.contains("sale return"),
+                "the refusal must name the alternative, got: {message}"
+            );
+        }
+
+        // Forwards is still allowed: a sent parcel can be delivered, or come back.
+        set_customer_order_status_at(&path, "order-billed", "DELIVERED", &serde_json::json!({}))
+            .expect("a billed order may still be marked delivered");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// An order and its lines survive a round trip, and a rejected line takes the whole order with it.
+    #[test]
+    fn an_order_is_written_whole_or_not_at_all() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-order-roundtrip-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize order database");
+
+        let bad = serde_json::json!({
+            "order_no": "ORD-BAD",
+            "customer_name": "Sita",
+            "items": [
+                { "product_id": "004", "product_name": "Apple", "quantity": 5 },
+                { "product_id": "005", "product_name": "Banana", "quantity": 0 }
+            ]
+        });
+        assert!(
+            save_customer_order_at(&path, &bad).is_err(),
+            "a zero-quantity line must refuse the whole order"
+        );
+
+        // The point of the transaction: a half-written order would hold a reservation against
+        // lines that were never recorded, so stock would be missing from the counter with nothing
+        // on screen explaining where it went.
+        let conn = Connection::open(&path).expect("reopen");
+        let orphans: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_customer_orders", [], |row| row.get(0))
+            .expect("count orders");
+        assert_eq!(orphans, 0, "the rejected order must leave nothing behind");
+        drop(conn);
+
+        let good = serde_json::json!({
+            "order_no": "ORD-GOOD",
+            "customer_name": "Sita",
+            "customer_mobile": "9876543210",
+            "items": [{ "product_id": "004", "product_name": "Apple", "unit": "kg", "quantity": 10.5, "agreed_rate": 80 }]
+        });
+        let saved = save_customer_order_at(&path, &good).expect("a well-formed order is saved");
+        assert_eq!(saved["status"], "RECEIVED");
+        assert_eq!(saved["items"][0]["product_id"], "004", "ids stay text");
+        assert_eq!(saved["items"][0]["quantity"], 10.5);
+        assert!(
+            saved["reserved_at"].as_str().is_some_and(|value| !value.is_empty()),
+            "an accepted order reserves stock immediately, so it must carry a reservation time"
+        );
+
         let _ = fs::remove_file(&path);
     }
 

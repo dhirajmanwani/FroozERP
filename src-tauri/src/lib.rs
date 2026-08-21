@@ -2129,6 +2129,31 @@ fn local_record_connectivity_mode_change(
     )
 }
 #[tauri::command]
+fn local_save_customer_order(app: AppHandle, order: serde_json::Value) -> Result<serde_json::Value, String> {
+    local_db::save_customer_order(&app, &order)
+}
+
+#[tauri::command]
+fn local_list_customer_orders(app: AppHandle) -> Result<serde_json::Value, String> {
+    local_db::list_customer_orders(&app)
+}
+
+#[tauri::command]
+fn local_set_customer_order_status(
+    app: AppHandle,
+    order_id: String,
+    next_status: String,
+    patch: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    local_db::set_customer_order_status(
+        &app,
+        &order_id,
+        &next_status,
+        &patch.unwrap_or_else(|| serde_json::json!({})),
+    )
+}
+
+#[tauri::command]
 fn local_db_set_smoke_value(app: AppHandle, value: String) -> Result<(), String> {
     local_db::set_smoke_value(&app, &value)
 }
@@ -2528,6 +2553,9 @@ pub fn run() {
             entitlement_import_file,
             entitlement_consume_bootstrap,
             local_record_connectivity_mode_change,
+            local_save_customer_order,
+            local_list_customer_orders,
+            local_set_customer_order_status,
             local_db_set_smoke_value,
             local_db_get_smoke_value,
             sync_outbox_enqueue,
