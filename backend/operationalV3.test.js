@@ -136,6 +136,11 @@ test("location product route queries only canonical company, branch, and locatio
     sendScopeError: () => {
       throw new Error("unexpected");
     },
+    // A-4d: the supplier master routes declare a permission, and an unwired authorizer refuses with
+    // 500 by design so a wiring mistake cannot become a silent bypass. This harness stands in for
+    // the real wiring in server.js; the authorization rules themselves are covered by
+    // masterDataAuthorization.test.js.
+    authorizePermission: async () => ({ id: 1, role_name: "Owner" }),
   });
   const route = routes.find((entry) => entry.method === "get" && entry.path === "/api/v3/location-products");
   const res = fakeResponse();
@@ -160,6 +165,11 @@ test("consolidated report rejects an unauthorized selected location", async () =
     sendScopeError: () => {
       throw new Error("unexpected");
     },
+    // A-4d: the supplier master routes declare a permission, and an unwired authorizer refuses with
+    // 500 by design so a wiring mistake cannot become a silent bypass. This harness stands in for
+    // the real wiring in server.js; the authorization rules themselves are covered by
+    // masterDataAuthorization.test.js.
+    authorizePermission: async () => ({ id: 1, role_name: "Owner" }),
   });
   const route = routes.find((entry) => entry.path === "/api/v3/reports/consolidated");
   const res = fakeResponse();
@@ -304,6 +314,11 @@ test("protocol-v3 stock transactions set canonical publication attribution", asy
     sendScopeError: () => {
       throw new Error("unexpected");
     },
+    // A-4d: the supplier master routes declare a permission, and an unwired authorizer refuses with
+    // 500 by design so a wiring mistake cannot become a silent bypass. This harness stands in for
+    // the real wiring in server.js; the authorization rules themselves are covered by
+    // masterDataAuthorization.test.js.
+    authorizePermission: async () => ({ id: 1, role_name: "Owner" }),
   });
   const route = routes.find(
     (entry) => entry.method === "post" && entry.path === "/api/v3/purchase-orders"
@@ -400,6 +415,11 @@ test("supplier create uses canonical company attribution and one transactional p
     sendScopeError: () => {
       throw new Error("unexpected");
     },
+    // A-4d: the supplier master routes declare a permission, and an unwired authorizer refuses with
+    // 500 by design so a wiring mistake cannot become a silent bypass. This harness stands in for
+    // the real wiring in server.js; the authorization rules themselves are covered by
+    // masterDataAuthorization.test.js.
+    authorizePermission: async () => ({ id: 1, role_name: "Owner" }),
   });
   const route = routes.find(
     (entry) => entry.method === "post" && entry.path === "/api/v3/suppliers"

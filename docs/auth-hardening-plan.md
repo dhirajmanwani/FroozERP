@@ -1,6 +1,6 @@
 # Auth Hardening — Scoping and Plan
 
-**Status:** **A-1 … A-4c complete; A-6 written (all 2026-08-19/20).** A-5 and **A-4d** open. Written 2026-08-17 at the maintainer's
+**Status:** **A-1 … A-4d complete; A-6 written (all 2026-08-19/20).** A-5 open. Written 2026-08-17 at the maintainer's
 request, to run **in parallel** with the offline-activation stages.
 
 | Stage | Status |
@@ -11,7 +11,7 @@ request, to run **in parallel** with the offline-activation stages.
 | A-4 middleware on all routes | **Complete 2026-08-20** — 268/285 routes authenticated, 16 deliberately public. **Not the end of the story: see A-4b.** |
 | A-4b `updated_by` authorisation | **Complete 2026-08-20** — 92 routes across four guard families now read the verified session. See the record. |
 | A-4c money-route permissions | **Complete 2026-08-20** — 13 handlers / 15 registrations. See the record. **Found a further unguarded class: see A-4d.** |
-| A-4d unguarded master-data writes | **Open** — `POST/PUT /accounts`, `/suppliers`, `/customers` write `opening_balance` with no permission check and no actor. |
+| A-4d unguarded master-data writes | **Complete 2026-08-20** — including the live `/api/v3/suppliers` path the sweep nearly missed. See the record. |
 | A-5 lockout + delete legacy verify | Open |
 | A-6 exposure checklist | **Written 2026-08-20** — see the record. It is a **gate**, not a summary: every unticked line is a reason not to expose the backend. |
 **Related:** `CLAUDE.md` "Known security debt"; `docs/offline-activation-design.md` §12 (which
@@ -1015,3 +1015,113 @@ A sweep for *every* write route with no guard found the same defect outside the 
   covered — but the general question was not traced to the end.
 - Whether `contra_entries.created_by`, `expenses.created_by` and the payment actor columns carry
   NOT NULL/FK constraints. The new values are strictly better-formed than the `|| 1` path.
+
+---
+
+## A-4d record — master-data writes (2026-08-20)
+
+### The routes that rewrite what people owe
+
+`POST/PUT /accounts`, `POST/PUT/DELETE /suppliers`, `POST/PUT /customers` and
+`POST /api/whatsapp/send-document` had **no authorisation call of any kind**. They write
+`opening_balance`, which the ledger renders directly as `outstanding_balance` / `payable_balance` —
+so any signed-in employee could restate what a customer or supplier owed. That rewrites history
+rather than adding to it, which is why this was ranked above several routes A-4c fixed.
+
+Two corrections to the A-4d note written at the end of the A-4c record: `POST /accounts` has
+**three** destination tables (customers, suppliers, and the generic `accounts` ledger for
+`STAFF`/`OTHER`), not two; and `DELETE /suppliers/:id` is a **deactivation** (`active = FALSE`), not
+a hard delete.
+
+### The route the sweep nearly missed, and the lesson in it
+
+The shipped Accounts screen posts **all** supplier saves to `/api/v3/suppliers` in
+`operationalV3.js`, not to `/accounts`. So the supplier branch of `POST /accounts` is **dead from
+the client**, and guarding only the routes the sweep named would have closed an API hole while
+leaving the path a Cashier actually uses to rewrite a supplier's `opening_balance` completely open.
+
+`operationalV3.js` contained **zero** permission calls across all 20 of its routes. The three
+supplier master writes now declare `permission: "supplier_accounts"` through a new option on the
+module's own route guard, with the authorizer injected from `server.js` so the module stays free of
+it. **A declared permission with no authorizer wired in refuses with 500** rather than falling
+through — a wiring mistake must not become a silent bypass on the routes that most need a check.
+
+That guard immediately bit: `operationalV3.test.js` registered routes without an authorizer and
+started failing. The harness was corrected to wire one; the guard was not weakened.
+
+*The lesson worth keeping: "this route is unguarded" and "this route is reachable from the app" are
+different questions, and fixing only the first can produce a stage that reports success while the
+live exposure stands.*
+
+### Keys
+
+| Route | Key |
+| --- | --- |
+| `POST /accounts` | `customer_accounts` (CUSTOMER) / `supplier_accounts` (all others) |
+| `PUT /accounts/:accountKey` | keyed on the `CUSTOMER-` / `SUPPLIER-` / `ACCOUNT-` prefix |
+| `POST/PUT/DELETE /suppliers`, `POST/PUT/DELETE /api/v3/suppliers` | `supplier_accounts` |
+| `POST/PUT /customers` | **`customer_accounts`** (new) |
+| `POST /api/whatsapp/send-document` | `whatsapp_send`, actor moved to `req.auth.userId` |
+
+**`customer_accounts` is new rather than reusing `supplier_accounts`**, which fails both A-4c
+criteria at once: "Supplier Accounts" silently granting authority over *customer* ledgers is
+invisible in the role table the maintainer edits, and `supplier_accounts` is seeded **false for
+Cashier**, so reuse would have stopped a shop's cashier adding a customer on the first restart.
+
+**`DELETE /suppliers/:id` deliberately takes the same key as create/edit**, not a stricter one.
+A-4c made cancellation stricter because a void destroys a recorded movement; this sets
+`active = FALSE`, is reversed by the edit route, and loses no balance or history. A second authority
+would only block housekeeping.
+
+### The migration keeps everyone who has access today
+
+Two idempotent statements: Owner/Admin/Cashier/Purchase Manager get `customer_accounts: true` (the
+four roles the client hardcodes the Accounts module open for), then every other role — including
+custom ones — inherits the same OR-expression the frontend gate uses rather than a flat value. On
+the seeded rows Inventory Manager lands `false`, which is already what it sees. **Nobody loses
+customer master access.**
+
+### The one place access is genuinely removed — and it is not migrated
+
+**`whatsapp_send` is seeded `false` for Cashier, Purchase Manager and Inventory Manager.** Nothing
+has ever read that key, so enforcing it removes WhatsApp sending from those three roles on POS
+invoices, payment receipts, account ledgers and reports.
+
+No migration was added to re-grant it. This is the one deliberate departure from A-4c's
+"nobody loses access" bar, and the distinction is real: for `expenses` there was **no existing key
+expressing intent**, so a seed had to be chosen and copying `reports` preserved behaviour. Here the
+maintainer's key already exists with an explicit `false`. Overwriting it under cover of a security
+fix would be the tool deciding shop policy.
+
+**Consequence, stated plainly: a Cashier sending a bill on WhatsApp after billing is core counter
+work, and it stops.** Remedy is one tick — Settings → Role Permissions → WhatsApp Send. All four
+WhatsApp buttons are disabled with a title explaining why, so it is a visibly unavailable action
+rather than a failed request; Print and Save/Export PDF beside them are untouched, so the manual
+share path survives for every role.
+
+**This needs the maintainer's decision, not a default.**
+
+### Also changed
+
+`sale_rate_history.changed_by` had `actorId || 1` in `insertOpeningStockLot`. Removed: both callers
+resolve the actor from a permission check first, and `changed_by` is NOT NULL, so an unattributable
+rate change now fails the insert rather than being filed under user 1.
+
+### Still open
+
+- **`customers`, `suppliers` and `accounts` carry no actor column at all** — no `created_by` /
+  `updated_by`. Even after this stage, *who* restated an opening balance is unrecorded. Adding the
+  columns means editing the startup bootstrap path.
+- The frontend still sends `sentByUserId` in the WhatsApp body. The server ignores it.
+- **Not verified against a real Postgres.** No database exists in the development environment, so
+  the migration SQL is verified by construction and source assertion only. Worth one manual check on
+  a disposable database before release.
+
+### Gate results
+
+| Gate | Result |
+| --- | --- |
+| `npm --prefix backend test` | **228 / 229** — the 1 failure is the pre-existing Linux-vs-Windows path assertion |
+| `TZ=Asia/Kolkata node --test frontend/src/local/*.test.mjs` | **313 / 313** |
+| `npm --prefix frontend run lint` | 0 errors, 37 warnings (unchanged) |
+| `npm run build` | Pass |

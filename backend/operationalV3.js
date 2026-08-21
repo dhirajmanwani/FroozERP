@@ -505,11 +505,39 @@ const registerOperationalV3Routes = ({
   middleware = [],
   sendScopeError,
   serverTimePayload = () => ({}),
+  /**
+   * Resolve the caller's authority for a permission key, or a falsy value if they lack it.
+   *
+   * Injected rather than imported so this module stays free of `server.js`. Auth-hardening A-4d
+   * added it: these routes carried **no permission check of any kind**, and the supplier master
+   * routes here are the ones the shipped Accounts screen actually posts to — the `/accounts`
+   * equivalents in `server.js` are dead from the client. Guarding only those would have closed an
+   * API hole while leaving the live path to a supplier's `opening_balance` wide open.
+   */
+  authorizePermission = null,
 }) => {
-  const guard = (handler, { write = false } = {}) => async (req, res) => {
+  const guard = (handler, { write = false, permission = "" } = {}) => async (req, res) => {
     try {
       const resolved = await resolveContext(req, { requireWrite: write });
       if (resolved.error) return sendScopeError(res, resolved.error);
+      if (permission) {
+        // A declared permission with no authorizer wired in is a misconfiguration, and the only
+        // safe reading of it is "cannot establish authority". Falling through to the handler would
+        // turn a wiring mistake into a silent bypass on exactly the routes that most need one.
+        if (typeof authorizePermission !== "function") {
+          return res.status(500).json({
+            code: "OPERATIONAL_AUTHORIZATION_NOT_CONFIGURED",
+            message: "Server authorization is not configured.",
+          });
+        }
+        const authorized = await authorizePermission(req, permission);
+        if (!authorized) {
+          return res.status(403).json({
+            code: "OPERATIONAL_PERMISSION_REQUIRED",
+            message: "You do not have permission to perform this action.",
+          });
+        }
+      }
       return await handler(req, res, resolved.context);
     } catch (error) {
       console.error(`Protocol v3 ${req.method} ${req.path} failed`, error.code || error.message);
@@ -710,24 +738,27 @@ const registerOperationalV3Routes = ({
     }, context, key);
   };
 
+  // These three write `opening_balance`, which the account ledger renders directly as a supplier's
+  // payable balance — so an unguarded write here restates what the shop owes. `supplier_accounts`
+  // is the key the client already gates the Accounts module on.
   use("post", "/api/v3/suppliers", async (req, res, context) => {
     const supplier = await persistSupplierMaster(req, context);
     return res.status(201).json({ supplier, scope: { company_id: context.company_id }, ...serverTimePayload() });
-  }, { write: true });
+  }, { write: true, permission: "supplier_accounts" });
 
   use("put", "/api/v3/suppliers/:supplierId", async (req, res, context) => {
     const supplierId = positiveId(req.params.supplierId);
     if (!supplierId) throw routeError(400, "SUPPLIER_REQUIRED", "A supplier is required");
     const supplier = await persistSupplierMaster(req, context, supplierId);
     return res.json({ supplier, scope: { company_id: context.company_id }, ...serverTimePayload() });
-  }, { write: true });
+  }, { write: true, permission: "supplier_accounts" });
 
   use("delete", "/api/v3/suppliers/:supplierId", async (req, res, context) => {
     const supplierId = positiveId(req.params.supplierId);
     if (!supplierId) throw routeError(400, "SUPPLIER_REQUIRED", "A supplier is required");
     const supplier = await persistSupplierMaster(req, context, supplierId, true);
     return res.json({ supplier, scope: { company_id: context.company_id }, ...serverTimePayload() });
-  }, { write: true });
+  }, { write: true, permission: "supplier_accounts" });
 
   use("put", "/api/v3/location-products/:productId", async (req, res, context) => {
     const productId = positiveId(req.params.productId);

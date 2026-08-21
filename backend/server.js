@@ -940,6 +940,7 @@ const PERMISSION_KEYS = [
   "reports",
   "purchases",
   "supplier_accounts",
+  "customer_accounts",
   "expenses",
   "contra_entries",
   "inventory",
@@ -2994,6 +2995,32 @@ const initializeDatabase = async () => {
     SET permissions = permissions || '{"contra_entries":false}'::jsonb
     WHERE role_name IN ('Cashier', 'Purchase Manager', 'Inventory Manager')
       AND NOT (permissions ? 'contra_entries');
+
+    -- auth-hardening A-4d. customer_accounts is new because no existing key names the authority to
+    -- restate what a customer owes: supplier_accounts is the only master-data key, and reusing it
+    -- would have meant "Supplier Accounts" silently granting customer-ledger authority, which is
+    -- invisible in the role table the maintainer edits, and would also have locked a Cashier out of
+    -- adding a customer on the first restart after the upgrade.
+    --
+    -- The four roles below are the ones defaultRolePermissions in App.jsx hardcodes the Accounts
+    -- module open for (Owner/Admin via all, Cashier and Purchase Manager via accounts: true), so
+    -- they reach the customer master form today whatever their stored row says.
+    UPDATE role_permission_settings
+    SET permissions = permissions || '{"customer_accounts":true}'::jsonb
+    WHERE role_name IN ('Owner', 'Admin', 'Cashier', 'Purchase Manager')
+      AND NOT (permissions ? 'customer_accounts');
+
+    -- Every other role, including any the shop has added, inherits the condition hasModuleAccess
+    -- actually applies to the Accounts module rather than a flat value, so the set of people who can
+    -- add a customer is unchanged by the upgrade and only becomes separately revocable from now on.
+    -- On the seeded rows this leaves Inventory Manager false, which is already what it sees today.
+    UPDATE role_permission_settings
+    SET permissions = permissions || jsonb_build_object('customer_accounts', to_jsonb(
+      COALESCE(permissions -> 'customer_payments', 'false'::jsonb) = 'true'::jsonb
+      OR COALESCE(permissions -> 'supplier_payments', 'false'::jsonb) = 'true'::jsonb
+      OR COALESCE(permissions -> 'supplier_accounts', 'false'::jsonb) = 'true'::jsonb
+    ))
+    WHERE NOT (permissions ? 'customer_accounts');
 
     INSERT INTO branches (id, branch_name, location)
     VALUES (1, 'Main Branch', 'Primary Store')
@@ -6238,9 +6265,23 @@ app.post("/api/whatsapp/send-document", async (req, res) => {
     documentName = "FroozERP_Document.pdf",
     sourceType = "report",
     sourceId = "",
-    sentByUserId,
   } = req.body || {};
   try {
+    // This route spends the business's WhatsApp Cloud credentials and mails ledgers, invoices and
+    // reports to arbitrary numbers supplied in the request. `whatsapp_send` was added for exactly
+    // this and seeded false for the staff roles, but nothing ever read it.
+    const sender = await getPermissionUser(req.auth.userId, "whatsapp_send", ["Owner", "Admin"]);
+    if (!sender) {
+      return res.status(403).json({
+        code: "WHATSAPP_SEND_PERMISSION_REQUIRED",
+        message: "You do not have permission to send documents on WhatsApp.",
+      });
+    }
+    // `sentByUserId` used to arrive in the body, so `whatsapp_send_logs.sent_by_user_id` recorded
+    // whoever the client named — the one column that says who sent a customer's ledger out of the
+    // shop. Read inside the try so a request that somehow arrives without a session answers 500
+    // rather than rejecting into Express with nothing sent.
+    const sentByUserId = req.auth.userId;
     const settingsResult = await pool.query("SELECT * FROM whatsapp_settings WHERE id = 1");
     const settings = settingsResult.rows[0] || {};
     const recipients = (Array.isArray(phoneNumbers) ? phoneNumbers : [])
@@ -9745,6 +9786,10 @@ registerOperationalV3Routes({
   middleware: [rateLimitSyncRequest],
   sendScopeError: sendOperationalScopeError,
   serverTimePayload,
+  // A-4d: the actor is the verified session, never a request field. Owner/Admin remain the fallback
+  // roles, matching every other getPermissionUser call site.
+  authorizePermission: (req, permissionKey) =>
+    getPermissionUser(req?.auth?.userId, permissionKey, ["Owner", "Admin"]),
 });
 
 app.get("/api/device/identity", rateLimitSyncRequest, async (req, res) => {
@@ -12991,6 +13036,19 @@ app.post("/accounts", async (req, res) => {
     if (!account.account_name || !ACCOUNT_TYPES.has(account.account_type) || account.opening_balance === null) {
       return res.status(400).json({ message: "Enter valid account details" });
     }
+    // One route, three destination tables and two authorities. `opening_balance` is what the ledger
+    // renders as outstanding/payable, so an unguarded write here restates what a party owes rather
+    // than adding a transaction to it. The key follows the branch the request will actually take:
+    // customers to `customer_accounts`, and every other account type to `supplier_accounts`, which is
+    // the key `modulePermissionMap` already names for the Accounts module as a whole.
+    const permissionKey = account.account_type === "CUSTOMER" ? "customer_accounts" : "supplier_accounts";
+    const master = await getPermissionUser(req.auth.userId, permissionKey, ["Owner", "Admin"]);
+    if (!master) {
+      return res.status(403).json({
+        code: "ACCOUNT_MASTER_PERMISSION_REQUIRED",
+        message: "You do not have permission to save this account.",
+      });
+    }
     if (account.account_type === "CUSTOMER") {
       const duplicate = await pool.query(
         "SELECT id FROM customers WHERE LOWER(customer_name) = LOWER($1) AND COALESCE(mobile_number, '') = COALESCE($2, '') LIMIT 1",
@@ -13083,6 +13141,21 @@ app.put("/accounts/:accountKey", async (req, res) => {
     const account = readAccountPayload(req.body);
     if (!sourceId || !account.account_name || !ACCOUNT_TYPES.has(account.account_type) || account.opening_balance === null) {
       return res.status(400).json({ message: "Enter valid account details" });
+    }
+    // The key follows the table the account key addresses, not the type in the body, because that is
+    // the row whose `opening_balance` this request rewrites. An unrecognised prefix gets no key and
+    // falls through to the existing "Invalid account" 400 at the end — nothing writes before then.
+    const permissionKey = source === "CUSTOMER"
+      ? "customer_accounts"
+      : ["SUPPLIER", "ACCOUNT"].includes(source) ? "supplier_accounts" : null;
+    if (permissionKey) {
+      const master = await getPermissionUser(req.auth.userId, permissionKey, ["Owner", "Admin"]);
+      if (!master) {
+        return res.status(403).json({
+          code: "ACCOUNT_MASTER_PERMISSION_REQUIRED",
+          message: "You do not have permission to edit this account.",
+        });
+      }
     }
     if (source === "CUSTOMER") {
       const existingCustomer = await pool.query("SELECT id, system_account FROM customers WHERE id = $1", [sourceId]);
@@ -13716,6 +13789,15 @@ app.post("/suppliers", async (req, res) => {
     if (!supplier.supplier_name || supplier.opening_balance === null || !SUPPLIER_TYPES.has(supplier.supplier_type)) {
       return res.status(400).json({ message: "Enter valid supplier account details" });
     }
+    // `opening_balance` is the supplier's payable balance as the ledger reports it, so writing this
+    // row is the same authority as maintaining the supplier account, not a lesser one.
+    const master = await getPermissionUser(req.auth.userId, "supplier_accounts", ["Owner", "Admin"]);
+    if (!master) {
+      return res.status(403).json({
+        code: "SUPPLIER_MASTER_PERMISSION_REQUIRED",
+        message: "You do not have permission to save supplier accounts.",
+      });
+    }
     const duplicate = await pool.query(
       `
       SELECT id
@@ -13771,6 +13853,13 @@ app.put("/suppliers/:id", async (req, res) => {
     const supplier = readSupplierPayload(req.body);
     if (!supplierId || !supplier.supplier_name || supplier.opening_balance === null || !SUPPLIER_TYPES.has(supplier.supplier_type)) {
       return res.status(400).json({ message: "Enter valid supplier account details" });
+    }
+    const master = await getPermissionUser(req.auth.userId, "supplier_accounts", ["Owner", "Admin"]);
+    if (!master) {
+      return res.status(403).json({
+        code: "SUPPLIER_MASTER_PERMISSION_REQUIRED",
+        message: "You do not have permission to edit supplier accounts.",
+      });
     }
     const duplicate = await pool.query(
       `
@@ -13831,6 +13920,17 @@ app.delete("/suppliers/:id", async (req, res) => {
   try {
     const supplierId = parsePositiveInteger(req.params.id);
     if (!supplierId) return res.status(400).json({ message: "Invalid supplier" });
+    // Deliberately the same key as create and edit rather than a stricter one. A-4c made cancellation
+    // stricter than creation because a void destroys a recorded movement; this is a deactivation —
+    // `active = FALSE`, reversed by the edit route with `active` back on, and no balance or history is
+    // lost — so demanding a second authority would only stop legitimate housekeeping.
+    const master = await getPermissionUser(req.auth.userId, "supplier_accounts", ["Owner", "Admin"]);
+    if (!master) {
+      return res.status(403).json({
+        code: "SUPPLIER_MASTER_PERMISSION_REQUIRED",
+        message: "You do not have permission to deactivate supplier accounts.",
+      });
+    }
     const result = await pool.query(
       "UPDATE suppliers SET active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *",
       [supplierId]
@@ -13873,6 +13973,15 @@ app.post("/customers", async (req, res) => {
     if (!customer.customer_name || !CUSTOMER_TYPES.has(customer.customer_type) || customer.opening_balance === null) {
       return res.status(400).json({ message: "Enter valid customer details" });
     }
+    // `opening_balance` is what the ledger reports as the customer's outstanding, so this route can
+    // restate a debt rather than record against it.
+    const master = await getPermissionUser(req.auth.userId, "customer_accounts", ["Owner", "Admin"]);
+    if (!master) {
+      return res.status(403).json({
+        code: "CUSTOMER_MASTER_PERMISSION_REQUIRED",
+        message: "You do not have permission to save customer accounts.",
+      });
+    }
     const duplicate = await pool.query(
       "SELECT id FROM customers WHERE LOWER(customer_name) = LOWER($1) AND COALESCE(mobile_number, '') = COALESCE($2, '') LIMIT 1",
       [customer.customer_name, customer.mobile_number]
@@ -13909,6 +14018,13 @@ app.put("/customers/:id", async (req, res) => {
     const customer = readCustomerPayload(req.body);
     if (!customerId || !customer.customer_name || !CUSTOMER_TYPES.has(customer.customer_type) || customer.opening_balance === null) {
       return res.status(400).json({ message: "Enter valid customer details" });
+    }
+    const master = await getPermissionUser(req.auth.userId, "customer_accounts", ["Owner", "Admin"]);
+    if (!master) {
+      return res.status(403).json({
+        code: "CUSTOMER_MASTER_PERMISSION_REQUIRED",
+        message: "You do not have permission to edit customer accounts.",
+      });
     }
     const existingCustomer = await pool.query("SELECT id, system_account FROM customers WHERE id = $1", [customerId]);
     if (existingCustomer.rows[0]?.system_account === true && (customer.customer_name !== "Walk-in Customer" || customer.active !== true)) {
@@ -16827,7 +16943,10 @@ const insertOpeningStockLot = async (client, { product, lot, actorId, branchId, 
     );
     await client.query(
       "INSERT INTO sale_rate_history (product_id, old_selling_rate, new_selling_rate, changed_by, reason) VALUES ($1, $2, $3, $4, $5)",
-      [product.id, product.selling_rate || 0, saleRate, actorId || 1, `Opening stock sale rate for ${lotName}`]
+      // No `|| 1`: `changed_by` is NOT NULL, so an unattributable rate change must fail the insert
+      // rather than be filed under user 1, which in a single-owner shop reads as the Owner. Both
+      // callers resolve the actor from a permission check first, so this is not reachable today.
+      [product.id, product.selling_rate || 0, saleRate, actorId, `Opening stock sale rate for ${lotName}`]
     );
   }
   await client.query(

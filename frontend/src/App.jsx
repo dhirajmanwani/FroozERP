@@ -6230,6 +6230,12 @@ function App() {
   const userRoleLabel = getUserRoleLabel(user);
   const canEditSales = ["Owner", "Admin"].includes(user.role) || hasRolePermission("sale_edit");
   const canCancelSales = ["Owner", "Admin"].includes(user.role) || hasRolePermission("invoice_cancellation");
+  // A-4d put the pre-existing `whatsapp_send` key in front of /api/whatsapp/send-document, which
+  // until now enforced nothing. The staff roles are seeded false, so without this the WhatsApp
+  // buttons would stay clickable and always fail — an action that cannot succeed must not render as
+  // available. The Print and PDF Export buttons beside them are untouched, so the manual share path
+  // that WhatsApp Web fallback relies on is still there for everyone.
+  const canWhatsappSend = ["Owner", "Admin"].includes(user.role) || hasRolePermission("whatsapp_send");
   const canManageStock = ["Owner", "Admin", "Inventory Manager"].includes(user.role);
   const lotBalanceQuantity = (lot) => Number(lot.balance_qty ?? lot.remaining_qty ?? 0);
   const lotUsedQuantity = (lot) => Number(lot.sold_qty ?? Math.max(Number(lot.purchase_qty || 0) - Number(lot.remaining_qty || 0), 0));
@@ -7002,6 +7008,7 @@ function App() {
           {activeView === "accounts" && (
             <AccountsModule
               canCancel={canCancelSales}
+              canWhatsappSend={canWhatsappSend}
               accounts={accounts}
               accountLedger={accountLedger}
               accountPayments={accountPayments}
@@ -7147,6 +7154,7 @@ function App() {
               canCancelSales={canCancelSales}
               canEditSales={canEditSales}
               canManageStock={canManageStock}
+              canWhatsappSend={canWhatsappSend}
               connectivityMode={connectivityMode}
               customers={customers}
               data={reportsData}
@@ -7184,6 +7192,7 @@ function App() {
           autoPrintMode={selectedInvoicePrintMode}
           canCancel={canCancelSales && selectedInvoice.sale_status !== "CANCELLED"}
           canEdit={canEditSales && selectedInvoice.sale_status !== "CANCELLED"}
+          canWhatsappSend={canWhatsappSend}
           invoice={selectedInvoice}
           onCancel={async () => {
             const invoice = selectedInvoice;
@@ -9080,7 +9089,7 @@ function PdfPreviewModal({ blob, fileName, onClose, onSave }) {
   );
 }
 
-function ReportToolbar({ exporting = false, onPdfExport, onPdfView, onPrint, onWhatsApp, title }) {
+function ReportToolbar({ canWhatsappSend = false, exporting = false, onPdfExport, onPdfView, onPrint, onWhatsApp, title }) {
   return (
     <div className="report-toolbar no-print">
       <strong>{title}</strong>
@@ -9088,7 +9097,7 @@ function ReportToolbar({ exporting = false, onPdfExport, onPdfView, onPrint, onW
         <button className="secondary-button" onClick={onPrint}><Icon name="print" /> Print</button>
         {onPdfView && <button className="secondary-button" disabled={exporting} onClick={onPdfView}>{exporting ? "Preparing..." : "View PDF"}</button>}
         <button className="secondary-button" disabled={exporting} onClick={onPdfExport || onPrint}>{exporting ? "Exporting..." : "PDF Export"}</button>
-        <button className="whatsapp-button" disabled={exporting} onClick={onWhatsApp || onPdfExport || onPrint}><Icon name="message" /> WhatsApp</button>
+        <button className="whatsapp-button" disabled={exporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} onClick={onWhatsApp || onPdfExport || onPrint}><Icon name="message" /> WhatsApp</button>
       </div>
     </div>
   );
@@ -9261,7 +9270,7 @@ function UserProfilePanel({ onClose, onLogout, user }) {
   );
 }
 
-function PrintableReport({ beforePdfExport, beforePrint, children, fileName, reportClassName = "", title, user, whatsappRecipients = [] }) {
+function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false, children, fileName, reportClassName = "", title, user, whatsappRecipients = [] }) {
   const [printTarget, setPrintTarget] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [whatsappOpen, setWhatsappOpen] = useState(false);
@@ -9352,7 +9361,7 @@ function PrintableReport({ beforePdfExport, beforePrint, children, fileName, rep
   };
   return (
     <section className={`print-section ${reportClassName} print-profile-${printProfile.toLowerCase().replace("_", "-")} ${printTarget ? "print-target" : ""}`}>
-      <ReportToolbar exporting={exporting} onPdfExport={exportReport} onPdfView={viewReportPdf} onPrint={printReport} onWhatsApp={() => setWhatsappOpen(true)} title={title} />
+      <ReportToolbar canWhatsappSend={canWhatsappSend} exporting={exporting} onPdfExport={exportReport} onPdfView={viewReportPdf} onPrint={printReport} onWhatsApp={() => setWhatsappOpen(true)} title={title} />
       <div ref={reportRef} className="print-area report-paper">
         <header className="report-print-header">
           <BrandLogo invoice />
@@ -9866,7 +9875,7 @@ function DiscountManagementModule({ discounts = [], inventory = [], onReload, pr
   );
 }
 
-function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageStock, connectivityMode = CONNECTIVITY_MODES.LOCAL_ONLY, customers = [], data = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, suppliers = [], user }) {
+function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageStock, canWhatsappSend = false, connectivityMode = CONNECTIVITY_MODES.LOCAL_ONLY, customers = [], data = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, suppliers = [], user }) {
   const [range, setRange] = useState("today");
   const [search, setSearch] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
@@ -11802,6 +11811,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
             <PrintableReport
               beforePdfExport={handleReportPrintOption}
               beforePrint={handleReportPrintOption}
+              canWhatsappSend={canWhatsappSend}
               fileName={reportFileName}
               reportClassName={selectedReport === "salesHistory" ? "sales-history-print-report" : selectedReport === "purchaseHistory" ? "purchase-history-print-report" : selectedReport === "profitLoss" ? "profit-loss-print-report" : selectedReport === "cashBook" ? "cash-book-print-report" : ""}
               title={currentReport.title}
@@ -12895,7 +12905,7 @@ function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
   );
 }
 
-function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPayments, canCancel = false, ledgerFocusKey, onLedgerLoad, onPaymentsLoad, onReload, user }) {
+function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPayments, canCancel = false, canWhatsappSend = false, ledgerFocusKey, onLedgerLoad, onPaymentsLoad, onReload, user }) {
   const emptyAccount = {
     account_name: "",
     account_type: "CUSTOMER",
@@ -13278,7 +13288,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
             <Field label="Statement To"><input type="date" value={ledgerDateRange.date_to} onChange={(event) => setLedgerDateRange({ ...ledgerDateRange, date_to: event.target.value })} /></Field>
             <button className="secondary-button" onClick={() => window.print()}><Icon name="print" /> Print Statement</button>
             <button className="secondary-button" disabled={ledgerExporting} onClick={exportLedgerPdf}>{ledgerExporting ? "Exporting..." : "PDF Export"}</button>
-            <button className="whatsapp-button" disabled={!accountLedger.account || ledgerExporting} onClick={() => setLedgerWhatsappOpen(true)}><Icon name="message" /> WhatsApp</button>
+            <button className="whatsapp-button" disabled={!accountLedger.account || ledgerExporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} onClick={() => setLedgerWhatsappOpen(true)}><Icon name="message" /> WhatsApp</button>
           </div>
           <div ref={ledgerPrintRef} className="print-area report-paper">
             <header className="report-print-header">
@@ -13432,7 +13442,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
           </DataTable>
         </ModuleCard>
       )}
-      {receiptPayment && <PaymentReceiptModal payment={receiptPayment} onClose={() => setReceiptPayment(null)} user={user} />}
+      {receiptPayment && <PaymentReceiptModal canWhatsappSend={canWhatsappSend} payment={receiptPayment} onClose={() => setReceiptPayment(null)} user={user} />}
       {paymentAudit && <PaymentAuditModal audit={paymentAudit} onClose={() => setPaymentAudit(null)} />}
     </section>
   );
@@ -14053,6 +14063,9 @@ const permissionLabels = [
   ["reports", "Reports"],
   ["purchases", "Purchases"],
   ["supplier_accounts", "Supplier Accounts"],
+  // A-4d. Kept adjacent to Supplier Accounts because the pair is the whole point: the two sides of
+  // the account master are now separately grantable, so revoking one does not revoke the other.
+  ["customer_accounts", "Customer Accounts"],
   ["inventory", "Inventory"],
   ["waste_management", "Waste Management"],
   ["billing", "Billing"],
@@ -17918,7 +17931,7 @@ function PaymentAuditModal({ audit, onClose }) {
   );
 }
 
-function PaymentReceiptModal({ payment, onClose, user }) {
+function PaymentReceiptModal({ canWhatsappSend = false, payment, onClose, user }) {
   const paymentAmount = Number(payment.payment_amount || 0);
   const rebateAmount = Number(payment.rebate_amount || 0);
   const totalImpact = paymentAmount + rebateAmount;
@@ -17963,7 +17976,7 @@ function PaymentReceiptModal({ payment, onClose, user }) {
           <div className="invoice-actions">
             <button className="secondary-button" onClick={() => window.print()}><Icon name="print" /> Print Receipt</button>
             <button className="secondary-button" disabled={exporting} onClick={exportReceiptPdf}>{exporting ? "Exporting..." : "Save PDF"}</button>
-            <button className="whatsapp-button" disabled={exporting} onClick={() => setWhatsappOpen(true)}><Icon name="message" /> WhatsApp</button>
+            <button className="whatsapp-button" disabled={exporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} onClick={() => setWhatsappOpen(true)}><Icon name="message" /> WhatsApp</button>
             <button aria-label="Close receipt" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
@@ -18007,7 +18020,7 @@ function PaymentReceiptModal({ payment, onClose, user }) {
   );
 }
 
-function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false, invoice, onCancel, onClose, onEdit, paymentSettings = {}, printSettings = {}, user }) {
+function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false, canWhatsappSend = false, invoice, onCancel, onClose, onEdit, paymentSettings = {}, printSettings = {}, user }) {
   const storedInvoiceProfile = readStoredPrintProfile("invoice");
   const [printMode, setPrintMode] = useState(storedInvoiceProfile === "A4_INVOICE" ? "A4" : storedInvoiceProfile === "THERMAL_RECEIPT" ? "THERMAL" : printSettings.default_invoice_print === "A4_INVOICE" || printSettings.default_printer_type === "A4" ? "A4" : "THERMAL");
   const [upiQrDataUrl, setUpiQrDataUrl] = useState("");
@@ -18129,7 +18142,7 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
             <button className="secondary-button" onClick={() => printWithMode("A4")}><Icon name="print" /> A4 Invoice Print</button>
             <button className="secondary-button" disabled={exporting} onClick={() => viewInvoicePdf(activePrintMode)}>{exporting ? "Preparing..." : "View PDF"}</button>
             <button className="secondary-button" disabled={exporting} onClick={() => exportInvoicePdf(activePrintMode, true)}>{exporting ? "Exporting..." : "Save PDF"}</button>
-            <button className="whatsapp-button" disabled={exporting} onClick={() => setWhatsappOpen(true)}><Icon name="message" /> Send on WhatsApp</button>
+            <button className="whatsapp-button" disabled={exporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} onClick={() => setWhatsappOpen(true)}><Icon name="message" /> Send on WhatsApp</button>
             {canCancel && <button className="remove-button" onClick={onCancel}>Cancel Bill</button>}
             <button aria-label="Close invoice" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
