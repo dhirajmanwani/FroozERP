@@ -184,16 +184,36 @@ keeps them on the baseline is one statement — `SELECT * FROM accounts` — and
 the list in Phase 2, not before.** They were deliberately not fixed by removing `accounts` from
 `TENANT_TABLES` in the harness: that would make the number fall without changing anything real.
 
-### Business decisions this took, which the maintainer should confirm
+### Business decisions, as confirmed by the maintainer on 2026-08-21
 
-Phase 1 could not be finished without answering two questions. Both were answered the
-isolation-correct way and both are reversible, but neither should stay unexamined.
+Phase 1 could not be finished without answering two questions. I answered both the
+isolation-correct way and asked. **The first answer was wrong and has been reversed.**
 
-1. **A supplier's or customer's outstanding balance is treated as per branch, not per company.**
-   The directory is shared — every branch buys from the same suppliers, and neither table carries a
-   branch — but the money beside each name is this branch's money. If the business thinks of a
-   supplier debt as one company-level number, the doc comments on `getSupplierSummaryRows` and
-   `getCustomerSummaryRows` in `backend/server.js` are the two places to change.
+1. ~~A supplier's or customer's outstanding balance is per branch.~~ **Corrected: these are
+   *company* figures.** Stock is purchased from a supplier once, in bulk, into a warehouse branch,
+   and is then transferred out to the shops beneath it. A per-shop supplier balance therefore parks
+   the whole debt on the warehouse and reports zero at every shop that sells the goods. Customer
+   balances follow the same rule, because a customer may settle at any counter.
+
+   Implemented by `resolveMoneyScope` in `backend/server.js`, which makes every caller state which
+   question it is asking. Company scope is expressed as
+   `branch_id IN (SELECT id FROM branches WHERE company_id = $1)` — **not** as a `company_id`
+   column on the money tables, because those are the empty shadow columns Phase 2 exists to fill.
+   Going through `branches` needs no backfill at all.
+
+   One guard matters here: `branches.company_id` is nullable and was never backfilled, and a NULL
+   makes that subquery match nothing, turning every balance into a silent zero.
+   `assertCompanyBranchLink` refuses the question loudly instead. **If Phase 2 ever runs, it must
+   not break this link.**
+
+   Summary and detail were moved together — `/supplier-ledger`, `/customer-ledger`,
+   `/accounts/ledger`, `/accounts/payments`, `/supplier-payments` and `/pending-bills/customer` are
+   all company-scoped. A balance whose backing list is filtered differently never reconciles.
+
+   **The balance sheet and dashboard stay per shop**, by explicit decision: a shop's payables must
+   sit against that shop's own cash or the sheet will not balance. The Supplier screen and the
+   balance sheet will therefore disagree about "we owe suppliers". That is intended.
+   `backend/moneyScope.test.js` pins the split.
 
 2. **`/api/owner/dashboard-foundation` no longer accepts a branch from the caller.** It read
    `req.query.branch_id || 1`, so any authenticated user could name any branch — and an omitted
@@ -209,3 +229,12 @@ session from scoping by a value the caller supplied. **That verification needs a
 database and is still open.** A second guard was added in `backend/queryArity.test.js` after batch 5
 added a `$3` predicate to a query with no parameter array — a runtime failure that every existing
 gate passed.
+
+---
+
+## Open, agreed with the maintainer on 2026-08-21
+
+**An owner-only all-shops view.** Per-shop figures are the day-to-day view, so a whole-company
+summary needs its own screen rather than a switch on the existing one. Not built yet. When it is,
+it needs its own Owner check — not a branch parameter on an existing route, which is exactly the
+hole that `/api/owner/dashboard-foundation` had.
