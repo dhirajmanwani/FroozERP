@@ -58,6 +58,115 @@ const requiresOperationalProtocolUpgrade = (requestPath) => {
   return LEGACY_OPERATIONAL_ROUTE.test(normalized);
 };
 
+
+/**
+ * Legacy write routes that are duplicates of a correctly-scoped protocol-v3 route.
+ *
+ * ## Why these are dangerous rather than merely old
+ *
+ * Each of these handlers is registered twice: once behind `v3WriteAdapter`, which resolves an
+ * operational context, and once on a bare legacy path with no adapter at all. The handlers then
+ * filter by scope like this:
+ *
+ *     WHERE id = $1 AND ($2::INTEGER IS NULL OR company_id = $2)
+ *
+ * bound from `req.v3OperationalContext?.company_id || null`. On the legacy path that context is
+ * `undefined`, `$2` is NULL, the conjunct is **true**, and the row is selected **by primary key
+ * alone**. It fails *open*: `PUT /lots/<any id>` rewrites another branch's lot, and the change then
+ * publishes to that branch attributed to a foreign actor.
+ *
+ * The v3 twin of every path below already does the right thing, and the shipped client already
+ * calls the v3 twin — verified by `operationalWriteRoutes.test.js`, which asserts the frontend
+ * makes no legacy write calls. So refusing these costs nothing today and closes the entire
+ * cross-branch *write* class at once.
+ *
+ * ## Why an explicit list and not the pattern above
+ *
+ * `LEGACY_OPERATIONAL_ROUTE` ends each alternative with `(?:\/|$)`, so a hyphenated sibling escapes
+ * it — `/sales-history` does not match because `-` is neither `/` nor end-of-string. A branch-isolation
+ * audit measured the consequence: with `FROOZERP_OPERATIONAL_SCOPE_MODE=enforce`, only 64 of 216
+ * routes were actually blocked. A list that must never match less than it appears to had to stop
+ * being a regex over route *families* and become the routes themselves.
+ *
+ * Patterns are built mechanically from the registered paths, so `:param` becomes exactly one path
+ * segment and nothing else. Adding a route here is a deliberate line, not a family that silently
+ * grows or shrinks.
+ */
+const LEGACY_WRITE_ROUTES = Object.freeze([
+  ["POST", "/product-categories", "/api/v3/product-categories"],
+  ["PUT", "/product-categories/:id", "/api/v3/product-categories/:id"],
+  ["DELETE", "/product-categories/:id", "/api/v3/product-categories/:id"],
+  ["POST", "/products", "/api/v3/products"],
+  ["PUT", "/products/:id", "/api/v3/products/:id"],
+  ["POST", "/products/:id/opening-stock", "/api/v3/products/:id/opening-stock"],
+  ["POST", "/products/:productId/opening-stock-lots", "/api/v3/products/:productId/opening-stock-lots"],
+  // Renamed, not merely re-prefixed: "cancel" became "deactivate".
+  ["POST", "/products/:id/cancel", "/api/v3/products/:id/deactivate"],
+  ["PUT", "/inventory-lots/:lotId", "/api/v3/inventory-lots/:lotId"],
+  // `/lots/...` and `/inventory-lots/...` are two names for one handler, registered as an array.
+  // Both legacy spellings retire to the single v3 name.
+  ["PUT", "/lots/:lotId", "/api/v3/inventory-lots/:lotId"],
+  ["POST", "/inventory-lots/:lotId/add-quantity", "/api/v3/inventory-lots/:lotId/add-quantity"],
+  ["POST", "/inventory-lots/:lotId/adjust", "/api/v3/inventory-lots/:lotId/adjust"],
+  ["POST", "/lots/:lotId/adjust-stock", "/api/v3/inventory-lots/:lotId/adjust"],
+  ["POST", "/inventory-lots/:lotId/deactivate", "/api/v3/inventory-lots/:lotId/deactivate"],
+  ["POST", "/inventory-lots/:lotId/reactivate", "/api/v3/inventory-lots/:lotId/reactivate"],
+  // Singular became plural across the purchase family.
+  ["POST", "/purchase-bill", "/api/v3/purchase-bills"],
+  ["PUT", "/purchase/:id", "/api/v3/purchases/:id"],
+  ["POST", "/purchase/:id/complete-bill", "/api/v3/purchases/:id/complete-bill"],
+  ["POST", "/purchase/:id/cancel", "/api/v3/purchases/:id/cancel"],
+  ["POST", "/sales", "/api/v3/sales"],
+  ["PUT", "/sales/:id", "/api/v3/sales/:id"],
+  ["POST", "/sales/:id/cancel", "/api/v3/sales/:id/cancel"],
+  ["POST", "/sale-returns", "/api/v3/sale-returns"],
+  ["POST", "/waste-entries", "/api/v3/waste-entries"],
+]);
+
+/** `/products/:id/cancel` -> `^\/products\/[^/]+\/cancel$`. One segment per parameter, nothing more. */
+const legacyWritePattern = (routePath) => new RegExp(
+  `^${routePath
+    .split("/")
+    .map((segment) => (segment.startsWith(":")
+      ? "[^/]+"
+      : segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
+    .join("\\/")}$`,
+);
+
+const LEGACY_WRITE_MATCHERS = LEGACY_WRITE_ROUTES.map(([method, routePath, replacement]) => ({
+  method,
+  replacement,
+  pattern: legacyWritePattern(routePath),
+}));
+
+/**
+ * Is this request a legacy write that has a correctly-scoped v3 replacement?
+ *
+ * Unconditional — not gated on `FROOZERP_OPERATIONAL_SCOPE_MODE`, which defaults to `off` and which
+ * nothing in the repository sets. A cross-branch write hole that closes only when an environment
+ * variable happens to be set is not closed.
+ */
+const isRetiredLegacyWrite = (method, requestPath) =>
+  Boolean(retiredLegacyWriteReplacement(method, requestPath));
+
+/**
+ * The protocol-v3 route that replaces a retired legacy write, or `""` if this is not one.
+ *
+ * The replacement is recorded per route rather than derived by prefixing `/api/v3`, because seven
+ * of them were renamed and not merely re-prefixed — `/purchase-bill` became `/api/v3/purchase-bills`
+ * and `/products/:id/cancel` became `.../deactivate`. A derived mapping looked right and was wrong
+ * for a third of the list; a test comparing it against the real registrations is what caught that.
+ *
+ * Naming it in the refusal turns "this no longer works" into "use this instead", which is the
+ * difference between an upgrade hint and a dead end.
+ */
+const retiredLegacyWriteReplacement = (method, requestPath) => {
+  const verb = String(method || "").toUpperCase();
+  const normalized = String(requestPath || "").split("?")[0];
+  const match = LEGACY_WRITE_MATCHERS.find((entry) => entry.method === verb && entry.pattern.test(normalized));
+  return match ? match.replacement : "";
+};
+
 const createOperationalScopeService = (database) => {
   if (!database || typeof database.query !== "function") {
     throw new TypeError("Operational scope service requires a database query adapter");
@@ -160,7 +269,10 @@ module.exports = {
   createOperationalScopeService,
   normalizeId,
   normalizeScopeMode,
+  LEGACY_WRITE_ROUTES,
+  isRetiredLegacyWrite,
   requiresOperationalProtocolUpgrade,
+  retiredLegacyWriteReplacement,
   validateSubmittedScope,
   validateSyncBatchScope,
 };

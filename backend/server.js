@@ -35,6 +35,7 @@ const {
   createOperationalScopeService,
   normalizeScopeMode,
   requiresOperationalProtocolUpgrade,
+  retiredLegacyWriteReplacement,
   validateSyncBatchScope,
 } = require("./operationalScope");
 const { registerOperationalV3Routes } = require("./operationalV3");
@@ -796,6 +797,35 @@ if (frontendDistAvailable()) {
 app.use((req, res, next) => {
   if (PUBLIC_ROUTES.has(publicRouteKey(req))) return next();
   return requireAuth(req, res, next);
+});
+
+// A-7 step 1. Legacy write routes that duplicate a correctly-scoped protocol-v3 route are refused
+// outright, whatever the scope mode. Their handlers filter with
+// `($2::INTEGER IS NULL OR company_id = $2)` bound from an operational context that does not exist
+// on the legacy path, so the row is selected by primary key alone and a write lands in whichever
+// branch owns that id. It fails open, which is why this cannot wait for
+// FROOZERP_OPERATIONAL_SCOPE_MODE — that defaults to `off` and nothing in the repository sets it.
+//
+// Placed *after* the authentication gate on purpose. Ahead of it, a stranger probing a retired path
+// would learn it exists and get an upgrade hint instead of a refusal — and the route-coverage test
+// would rightly stop counting these routes as authenticated. Behind it, an anonymous caller gets
+// 401 and only a real client learns to upgrade.
+//
+// The registrations stay in place deliberately: an old client gets a 426 telling it what to do
+// rather than a 404 telling it nothing. `operationalWriteRoutes.test.js` pins that arrangement.
+app.use((req, res, next) => {
+  const replacement = retiredLegacyWriteReplacement(req.method, req.path);
+  if (replacement) {
+    return res.status(426).json({
+      code: "CLIENT_UPGRADE_REQUIRED",
+      // Naming the replacement turns "this no longer works" into "use this instead". Seven of these
+      // were renamed rather than re-prefixed, so a client cannot derive it.
+      message: `This write route has been replaced. Use ${req.method} ${replacement} instead.`,
+      replacement_route: replacement,
+      minimum_protocol_version: 3,
+    });
+  }
+  return next();
 });
 
 const recoveryGenericMessage = "If the provided information matches an eligible account, a verification code will be sent.";
