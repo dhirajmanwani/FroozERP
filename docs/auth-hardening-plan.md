@@ -1469,9 +1469,32 @@ The 37 and the audit's 119 are both honest and measure different things: the aud
 registration touching business data by reading, this counts GET routes that actually reached SQL
 against a listed table by running them.
 
-### What remains
+### What remains, and a correction to the estimate
 
-The read exposure — those 37, plus whatever the inconclusive 87 hide. Dormant while one branch
+**See `docs/tenancy-backfill-plan.md`.** Starting the read scoping turned up something that changes
+the size of the job in both directions.
+
+`backend/migrations/cloud/009` adds `company_id` as a **nullable shadow column** and says in its own
+comments that it "performs no ownership backfill" and that enforcement follows "an owner-approved
+backfill". So the columns are empty: adding `WHERE company_id = $1` to a route today returns nothing
+— an empty screen on every module at once, which is the "errors must never render as zero" failure.
+
+But `branch_id` is **not** a shadow column. It is part of the original schema on `sales`,
+`purchases`, `inventory_batches`, `expenses`, both payment tables, `waste_entries` and
+`sale_returns`, and has been written on every insert since. **Branch-level scoping therefore needs no
+backfill at all**, and branch-level is what multibranch requires — `company_id` matters when there is
+a second *company*, which is a later problem.
+
+So the audit's 3–4 weeks assumed a blocking backfill that is not blocking. The read scoping can
+proceed on the populated column, with the backfill deferred to whenever a second company is real.
+
+One thing to check per batch rather than assume: `branch_id = $1` does not match NULL, so any row
+with a NULL branch becomes invisible the moment a predicate is added. The plan carries the query
+that counts them.
+
+### The read exposure itself
+
+Those 37, plus whatever the inconclusive 87 hide. Dormant while one branch
 exists, live the day there are two. It is now a number in a test rather than a sentence in a
 document, which is the difference between work that can be finished and work that can only be
 worried about.
