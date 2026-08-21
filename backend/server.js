@@ -12850,8 +12850,9 @@ app.get("/inventory", async (req, res) => {
     const result = await pool.query(`
       ${stockInventorySelectSql}
       WHERE ($1::boolean = TRUE OR COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED')
+        AND ib.branch_id = $2
       ORDER BY ib.purchase_date, ib.created_at, ib.id
-    `, [includeCancelled]);
+    `, [includeCancelled, req.auth.branchId]);
 
     return res.json(result.rows);
   } catch (error) {
@@ -12872,11 +12873,16 @@ app.get("/stock", async (req, res) => {
         p.unit,
         COALESCE(SUM(ib.remaining_qty), 0) AS current_stock
       FROM products p
+      -- The branch predicate belongs in the JOIN, not the WHERE. In a WHERE it would filter rows
+      -- after the join and turn this LEFT JOIN into an inner one, hiding every product that has no
+      -- stock in this branch — a catalogue that shrinks as stock runs out. Here it means "count only
+      -- this branch's batches", and a product with none still appears with zero.
       LEFT JOIN inventory_batches ib ON ib.product_id = p.id
         AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+        AND ib.branch_id = $1
       GROUP BY p.id, p.product_name, p.unit
       ORDER BY p.product_name
-    `);
+    `, [req.auth.branchId]);
 
     return res.json(result.rows);
   } catch (error) {
@@ -13099,11 +13105,21 @@ const loadUnifiedAccounts = async () => {
   ].sort((left, right) => Number(right.active === true) - Number(left.active === true) || left.account_name.localeCompare(right.account_name));
 };
 
-const getUnifiedPaymentRows = async ({ accountKey } = {}) => {
-  const filters = [];
-  const supplierFilters = [];
-  const customerValues = [];
-  const supplierValues = [];
+/**
+ * Customer and supplier payments as one list.
+ *
+ * `branchId` is required and seeded as the first filter on both halves, so neither query can be
+ * built without it. The previous shape omitted `WHERE` entirely when no account was named — the
+ * default case, and the one that returned every branch's payments.
+ */
+const getUnifiedPaymentRows = async ({ accountKey, branchId } = {}) => {
+  if (!parsePositiveInteger(branchId)) {
+    throw new Error("getUnifiedPaymentRows requires a branchId");
+  }
+  const customerValues = [branchId];
+  const supplierValues = [branchId];
+  const filters = ["cp.branch_id = $1"];
+  const supplierFilters = ["sp.branch_id = $1"];
   if (accountKey) {
     const [source, idValue] = String(accountKey).split("-");
     const sourceId = parsePositiveInteger(Number(idValue));
@@ -13120,8 +13136,8 @@ const getUnifiedPaymentRows = async ({ accountKey } = {}) => {
       supplierFilters.push("FALSE");
     }
   }
-  const customerWhere = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
-  const supplierWhere = supplierFilters.length ? `WHERE ${supplierFilters.join(" AND ")}` : "";
+  const customerWhere = `WHERE ${filters.join(" AND ")}`;
+  const supplierWhere = `WHERE ${supplierFilters.join(" AND ")}`;
   const [customerResult, supplierResult] = await Promise.all([
     pool.query(
       `
@@ -13618,7 +13634,10 @@ app.get("/accounts/ledger", async (req, res) => {
 
 app.get("/accounts/payments", async (req, res) => {
   try {
-    return res.json(await getUnifiedPaymentRows({ accountKey: req.query.account_key }));
+    return res.json(await getUnifiedPaymentRows({
+      accountKey: req.query.account_key,
+      branchId: req.auth.branchId,
+    }));
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Account Payments" });
@@ -14312,8 +14331,9 @@ app.get("/stock-inventory", async (req, res) => {
       pool.query(`
         ${stockInventorySelectSql}
         WHERE ($1::boolean = TRUE OR COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED')
+          AND ib.branch_id = $2
         ORDER BY ib.purchase_date, ib.created_at, ib.id
-      `, [includeCancelled]),
+      `, [includeCancelled, req.auth.branchId]),
       pool.query(
         `
         SELECT pat.*, p.product_name, p.category, u.full_name AS edited_by_name
@@ -16534,13 +16554,16 @@ app.get("/supplier-payments", async (req, res) => {
   try {
     const supplierId = req.query.supplier_id ? parsePositiveInteger(req.query.supplier_id) : null;
     if (req.query.supplier_id && !supplierId) return res.status(400).json({ message: "Invalid supplier" });
-    const values = supplierId ? [supplierId] : [];
+    // Branch first, so the optional supplier filter becomes $2 and the WHERE is unconditional. The
+    // previous shape omitted WHERE entirely when no supplier was named, which is exactly the case
+    // that returned every branch's payments.
+    const values = supplierId ? [req.auth.branchId, supplierId] : [req.auth.branchId];
     const result = await pool.query(
       `
       SELECT sp.*, s.supplier_name, s.firm_name
       FROM supplier_payments sp
       JOIN suppliers s ON s.id = sp.supplier_id
-      ${supplierId ? "WHERE sp.supplier_id = $1" : ""}
+      WHERE sp.branch_id = $1${supplierId ? " AND sp.supplier_id = $2" : ""}
       ORDER BY sp.payment_date DESC, sp.created_at DESC, sp.id DESC
       `,
       values

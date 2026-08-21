@@ -40,17 +40,17 @@ const { TENANT_TABLE_PATTERN, SCOPE_PREDICATE_PATTERN, collectTenancyCoverage } 
 /*
  * Scoped and removed from this list on 2026-08-21 (A-7 Phase 1, first batch):
  *   GET /sales, /purchases, /expenses, /waste-entries, /sale-returns, /contra-entries
- * Each now filters on `branch_id` from the verified session. 37 -> 31.
+ * Second batch, same day:
+ *   GET /inventory, /stock, /stock-inventory, /supplier-payments, /accounts/payments
+ * Each now filters on `branch_id` from the verified session. 37 -> 26.
  */
 const KNOWN_UNSCOPED_READS = [
   "GET /accounts",
   "GET /accounts/outstanding",
-  "GET /accounts/payments",
   "GET /api/owner/dashboard-foundation",
   "GET /customer-ledger",
   "GET /customer-summary",
   "GET /customers",
-  "GET /inventory",
   "GET /lot-discounts",
   "GET /pending-bills/customer",
   "GET /products",
@@ -66,11 +66,8 @@ const KNOWN_UNSCOPED_READS = [
   "GET /sales-history/items",
   "GET /sales-history/lots",
   "GET /sales-report/changes",
-  "GET /stock",
   "GET /stock-adjustments",
-  "GET /stock-inventory",
   "GET /supplier-ledger",
-  "GET /supplier-payments",
   "GET /supplier-summary",
   "GET /suppliers",
   "GET /suppliers/:id",
