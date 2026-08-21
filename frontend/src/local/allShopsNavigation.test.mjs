@@ -102,7 +102,7 @@ test("Orders is registered, has an icon of its own, and renders", () => {
   // duplicated icon in a sidebar is a nav item people click by mistake.
   assert.match(app, /orders: "parcel"/);
   assert.match(app, /activeView === "orders"/);
-  assert.match(app, /if \(view === "orders"\) await loadOrders\(\);/);
+  assert.match(app, /if \(view === "orders"\) await Promise\.all\(/);
 });
 
 test("Orders is classified as working offline, because it does", () => {
@@ -130,4 +130,15 @@ test("an order action is validated before it is attempted", () => {
   const start = app.indexOf("const advanceOrder = async");
   const body = app.slice(start, start + 700);
   assert.match(body, /validateOrderAction\(/);
+});
+
+test("opening Orders loads the product list the order form needs", () => {
+  // The order form picks items from `products`. Without them the "Choose an item" dropdown is
+  // empty and the screen looks broken — and nothing else on the view needs products, which is
+  // exactly why it was missed the first time.
+  assert.match(app, /if \(view === "orders"\) await Promise\.all\(\[loadOrders\(\), loadProducts\(\)\]\)/);
+});
+
+test("an empty item list explains itself instead of showing a bare dropdown", () => {
+  assert.match(app, /No items are available to order/);
 });

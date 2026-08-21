@@ -6292,7 +6292,10 @@ function App() {
       if (view === "reports") await loadReports();
       if (view === "expenses") await loadExpenses();
       if (view === "all-shops") await loadAllShops();
-      if (view === "orders") await loadOrders();
+      // Products too: the order form picks items from that list, and without it the "Choose an
+      // item" dropdown is empty and the screen simply looks broken. Nothing else on this view
+      // needed them, which is exactly why it was missed.
+      if (view === "orders") await Promise.all([loadOrders(), loadProducts()]);
       if (view === "returns") await loadSaleReturns();
       if (view === "waste") await loadWasteEntries();
       if (view === "dashboard") await loadDashboardData();
@@ -13189,6 +13192,14 @@ function OrdersModule({ busy = false, onAdvance, onReload, onTakeOrder, products
 
       <ModuleCard eyebrow="New" title="Take an order" subtitle="Rings the phone? Write it here. Stock is set aside the moment you save.">
         {draftError && <div className="cart-empty" role="alert">{draftError}</div>}
+        {products.length === 0 && (
+          // An empty dropdown with no explanation reads as a broken screen. This says which of the
+          // two it is: nothing to sell yet, or a list that did not arrive.
+          <div className="cart-empty">
+            No items are available to order. Add products first, or reopen this screen if the item
+            list did not load.
+          </div>
+        )}
         <div className="purchase-summary-grid supplier-payment-preview">
           <Field label="Customer name">
             <input onChange={(event) => setDraft({ ...draft, customer_name: event.target.value })} placeholder="Who is ordering" value={draft.customer_name} />
