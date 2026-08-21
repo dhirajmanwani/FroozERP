@@ -62,16 +62,22 @@ This matters most for the stated use case: a purchase manager entering purchases
 has no signal, a thin cloud client is useless to him — which is precisely the failure mode this
 whole product philosophy exists to prevent. See **[P-1]**.
 
-### 2.2 Four goals share one prerequisite
+### 2.2 Five goals share one prerequisite
 
-Multibranch, WhatsApp-to-customers, OTP, FROST and mobile all require the cloud. The cloud cannot
+Multibranch, WhatsApp-to-customers, OTP, FROST, mobile **and now the G7 website** all require the
+cloud. The cloud cannot
 safely be exposed to the public internet in its current state: `/login` issues no session token, the
 frontend sends `x-user-id` and the backend believes it, most routes have no auth middleware, and
 passwords are unsalted SHA-256 with a plaintext-equality fallback (`CLAUDE.md`, "Known security
 debt").
 
-**Auth hardening is therefore not a seventh goal competing with these six. It is the tollgate in
-front of four of them.** `docs/auth-hardening-plan.md` already scopes it.
+**Auth hardening is therefore not another goal competing with these. It is the tollgate in front of
+most of them.** `docs/auth-hardening-plan.md` scopes it, and as of 2026-08-21 stages A-1 to A-6 are
+complete with A-7 (branch isolation) part-done. The verdict at the top of that document is still
+**DO NOT EXPOSE**, which is what G7's website waits on.
+
+G7 is the goal that most raises the cost of getting this wrong: an internal user seeing the wrong
+branch is a mistake; an unauthenticated stranger reaching an order endpoint is an open door.
 
 ### 2.3 FROST's hard problem is truthfulness, not capability
 
@@ -286,13 +292,88 @@ a genuine quick win available at any time.
 
 ---
 
+
+### G7 — Online orders, and getting the parcel out the door
+
+**Added 2026-08-21 at the maintainer's request.**
+
+> "I want to create a website and link it to the app. I receive an order online, and then after
+> sending the parcel I can say sent. Right now I don't have any parcel delivery, so I have to send
+> it through Rapido or another app, and can link that as well — until I start my own delivery."
+
+**What it is.** Two things wearing one name, and separating them is the whole of the analysis:
+
+1. **Order management** — an order arrives, it is picked, packed, sent, and someone can see where it
+   got to. A workflow inside the ERP.
+2. **A public website** that is one *source* of those orders.
+
+**They have very different dependencies, and only one of them is blocked.**
+
+#### Order management is available now, and probably undersold
+
+Orders already arrive today, by phone and WhatsApp. They are handled from memory and paper. A module
+that records *received → packed → sent → delivered*, with a delivery reference and a customer to
+bill, works **offline, on the counter machine, with no cloud, no website and no approvals**.
+
+That is most of the value the maintainer described, and none of the blockers. It also has to exist
+before a website is useful: a website that takes orders no one can track is a way to disappoint
+customers faster.
+
+#### The website is gated, and by the strictest gate in the project
+
+A public site taking real orders means the backend is **reachable from the internet** — the single
+thing `docs/auth-hardening-plan.md` §A-6 exists to gate, and whose current verdict is
+**DO NOT EXPOSE**. It also means the cloud is running, which today it is not.
+
+So G7 sits behind the same tollgate as G1–G5, and further back than most of them: an internal user
+seeing the wrong branch's data is a mistake, while an unauthenticated stranger reaching an
+order-taking endpoint is an open door.
+
+#### Delivery: link first, integrate later — maybe never
+
+Rapido, Porter and Dunzo all have partner APIs with onboarding, approval and minimums. **Do not
+start there.** The first version stores a **delivery reference and a link** — pasted from whichever
+app was used — against the order. That works with every provider at once, needs no approval, costs
+nothing, and is exactly as useful to the customer asking "where is my parcel".
+
+Integration earns its place only when the volume makes copying a link the bottleneck. Designing for
+"own delivery later" means the same rule: the order records *who is carrying it and how to follow
+it*, and a courier is one kind of carrier, an employee on a scooter is another.
+
+#### Stock accuracy stops being a reporting concern
+
+This is the part worth flagging loudest. Today a wrong stock figure produces a wrong report, which
+an owner can sanity-check. **Selling online what is not in the shop produces a refund, an apology
+and a customer who does not come back.** G7 raises the cost of every existing inventory inaccuracy —
+including the provisional-cost class fixed on 2026-08-21, which was 18.2% of stock value invisible.
+
+An order module that reserves stock, rather than merely recording an intention, is the difference.
+That is a real design decision and it belongs in the module, not bolted on afterwards. See **[P-7]**.
+
+#### Payments are a separate goal wearing this one's clothes
+
+"Receive an order online" says nothing about whether money moves online. Taking payment on a website
+brings a payment gateway, refunds, reconciliation and PCI-adjacent obligations — a project of its
+own. **Cash or UPI on delivery is a complete first version** and keeps G7 to one problem.
+
+**Classification.** Order management: available now, no gate. Website: gated on A-6 and on the cloud.
+Delivery integration: not recommended in the first version.
+
+---
+
 ## 4. Suggested sequence
 
 ```
-Auth hardening ──▶ Cloud restored ──▶ G1 ──▶ G3 ──▶ G2 ──▶ G4 ──▶ G5
+Auth hardening ──▶ Cloud restored ──▶ G1 ──▶ G3 ──▶ G2 ──▶ G4 ──▶ G7 website ──▶ G5
       (gate)          (gate)
-G6 ── available at any point, depends on nothing
+G6 ────────────── available at any point, depends on nothing
+G7 order module ─ available at any point, depends on nothing; SHOULD precede the website
 ```
+
+**G7 is deliberately split across the diagram.** Its order-management half needs nothing and is
+worth doing early — orders already arrive by phone and WhatsApp and are handled on paper. Its
+website half sits at the far end, behind the exposure gate, because it is the only goal that invites
+strangers to the door.
 
 Rationale: the first two are not goals anyone wants; they are the tollgate standing in front of four
 that are. G1 first among the real goals because it is the most defensive (it repairs a screen that
@@ -307,6 +388,7 @@ answered with real usage evidence rather than in the abstract.
 
 | # | Decision | Status | Blocking |
 | --- | --- | --- | --- |
+| **P-7** | Does the order module **reserve** stock on order, or merely record it? Reserving prevents overselling and is the reason the module is worth building rather than a spreadsheet; it also means an abandoned order must release the reservation, which is a lifecycle with edges. Recording is simpler and oversells. | Open — decide before the module is built, not after |
 | **P-1** | Mobile architecture | **RULED 2026-08-18: (a) cloud client**, scoped to purchase entry + viewing. Known cost recorded in G5: does not serve the no-signal mandi case; expect (b) later. | — |
 | **P-2** | Does "simplify multibranch" mean the data model or only the screens | Open | G1 scope |
 | **P-3** | Where customer WhatsApp consent/opt-in is recorded | Open. Tool choice settled (official API, stay as-is); the consent-storage question remains. | G2 |
