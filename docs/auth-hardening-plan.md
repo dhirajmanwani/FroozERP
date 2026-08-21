@@ -1,6 +1,6 @@
 # Auth Hardening — Scoping and Plan
 
-**Status:** **A-1 … A-4d complete; A-6 written (all 2026-08-19/20).** A-5 open. Written 2026-08-17 at the maintainer's
+**Status:** **A-1 … A-4d complete; A-6 written (all 2026-08-19/20).** A-5 open, and **A-7 — branch isolation — is now the largest open item on this track.** §5's "Not audited" is now **audited and failing**: see `docs/branch-isolation-audit.md`. Written 2026-08-17 at the maintainer's
 request, to run **in parallel** with the offline-activation stages.
 
 | Stage | Status |
@@ -13,6 +13,7 @@ request, to run **in parallel** with the offline-activation stages.
 | A-4c money-route permissions | **Complete 2026-08-20** — 13 handlers / 15 registrations. See the record. **Found a further unguarded class: see A-4d.** |
 | A-4d unguarded master-data writes | **Complete 2026-08-20** — including the live `/api/v3/suppliers` path the sweep nearly missed. See the record. |
 | A-5 lockout + delete legacy verify | Open |
+| **A-7 branch isolation** | **Open — audited 2026-08-20 and failing.** A signed-in Branch A user can read essentially all of Branch B's data. Gates multibranch. |
 | A-6 exposure checklist | **Written 2026-08-20** — see the record. It is a **gate**, not a summary: every unticked line is a reason not to expose the backend. |
 **Related:** `CLAUDE.md` "Known security debt"; `docs/offline-activation-design.md` §12 (which
 rules `deviceSession.js` is *kept*); `docs/backlog-1.0.72.md`.
@@ -163,9 +164,10 @@ the rebuild itself).
 
 - The offline/device side. Design §12 keeps `deviceSession.js` for API authorisation; entitlement
   verification is a separate trust domain and stays that way.
-- Multi-tenant isolation. With auth fixed, the next question is whether every query is scoped by
-  `company_id`/`branch_id`, or whether an authenticated user of one branch can read another's
-  data. **Not audited.** It deserves its own pass and should not be assumed solved by A-4.
+- ~~Multi-tenant isolation ... **Not audited.**~~ **Audited 2026-08-20. It fails.** A signed-in
+  Branch A user can read essentially all of Branch B's business data, and write into Branch B on a
+  smaller set of routes. Full report: `docs/branch-isolation-audit.md`. Tracked as **A-7**, which is
+  now the largest open item on this track and the gate on multibranch operation.
 
 ---
 
@@ -1125,3 +1127,104 @@ rate change now fails the insert rather than being filed under user 1.
 | `TZ=Asia/Kolkata node --test frontend/src/local/*.test.mjs` | **313 / 313** |
 | `npm --prefix frontend run lint` | 0 errors, 37 warnings (unchanged) |
 | `npm run build` | Pass |
+
+---
+
+## A-7 — branch isolation (audited 2026-08-20, failing)
+
+Full report: **`docs/branch-isolation-audit.md`** (896 lines, line-numbered). Summary and the four
+claims I verified myself before accepting it:
+
+### The finding in one line
+
+**`req.auth.branchId` and `req.auth.companyId` have zero read sites in the entire backend.**
+Verified: `grep -c "req.auth.branchId\|req.auth.companyId"` returns **0** in `server.js`,
+`operationalV3.js` and `aiBusinessAssistantService.js`. A-3 put verified `company_id` / `branch_id`
+into every token; nothing has ever consumed them. There is no row-level security in the schema
+either.
+
+So A-4 established *who you are* and A-4b/c/d established *what you may do* — and neither asks
+*whose data this is*.
+
+### Measured surface
+
+285 registrations. **119 return or write business data with no tenancy predicate at all**: 69
+branch-level in `server.js` (42 reads, 27 writes), 8 against untenanted tables, 42 FROST. 53 are
+correctly scoped — all of them in `operationalV3.js` / `scopeManagement.js`, which are a genuinely
+sound multi-tenant design and should not be disturbed.
+
+### The two I verified in the source
+
+**Reads.** `GET /reports/summary` spans lines 15012–16113 — **1,101 lines containing zero
+occurrences of `branch_id` or `company_id`.** Counted directly. The same holds for `/reports/day-book`,
+`/reports/balance-sheet`, `/reports/cash-book`, the dashboard, `/sales`, `/sales-history`, the
+customer and supplier ledgers, `/accounts/ledger`, `/inventory` and `GET /users`. **No crafted
+request is needed — the shipped frontend already calls these**, so the first symptom of adding a
+second branch is that every report silently includes it.
+
+**Writes.** 22 handlers are registered twice: once behind `v3WriteAdapter`, once on a legacy path
+with no adapter. Inside, the scope filter reads:
+
+```sql
+WHERE id = $1 AND ($2::INTEGER IS NULL OR company_id = $2)
+```
+
+bound from `req.v3OperationalContext?.company_id || null`. On the legacy path that context is
+`undefined`, `$2` is NULL, the conjunct is **true**, and the row is selected **by primary key
+alone**. Verified at `server.js:11616-11620` and 30 sibling sites. It fails *open*: `PUT /lots/<id>`
+rewrites another branch's lot, and the change then publishes to that branch attributed to a foreign
+actor.
+
+### `enforce` does not fix it, and `shadow` does nothing
+
+`FROOZERP_OPERATIONAL_SCOPE_MODE` defaults to `off` and nothing in the repo sets it. Even set to
+`enforce`, its 426 gate is a token-boundary regex, so hyphenated siblings escape: **64 of 216 routes
+blocked, 152 still reachable** — including `/stock-inventory`, `/customer-ledger`, `/supplier-ledger`,
+every `/dashboard-*`, `/sales-history*` and all 42 `/api/ai/*`. `shadow` is accepted by the
+normaliser and never branched on, so it behaves exactly as `off`.
+
+**Anyone tempted to "just turn on enforce" should read that paragraph twice.**
+
+### Severity, stated honestly
+
+This is **latent, not live**, while the business runs a single branch: with one branch there is no
+other branch's data to leak. It becomes real the moment a second branch exists — and the failure
+mode is quiet. Cross-branch totals look like an accounting mistake, not a breach, and leave no
+artefact.
+
+**It is the gate on multibranch, which is the maintainer's first stated product goal.**
+
+### Direction
+
+Not a middleware problem and not a query-helper problem: `server.js` builds SQL by interpolation
+with dynamic `$n` arithmetic, so a wrapping helper would be silently wrong somewhere. Recommended
+sequence: fix the device routes → delete the fail-open defaults → build a two-branch coverage suite
+→ thread scope through the remaining handlers → Postgres RLS as the backstop. **3–4 weeks**, and it
+deserves its own stage rather than a bullet under A-6.
+
+**The cheapest structural win: 22 of these handlers already have a correct v3 twin.** Deleting the
+legacy registration is smaller and far more verifiable than scoping them by hand.
+
+### Also found
+
+- `PUT /settings/devices/:deviceId` can re-point *any* device into *any* branch (role check only, no
+  scoping on the target), and `assigned_branch_id` is not one of the four fields the substitution
+  check covers. `/login` then mints a **legitimately signed** token for that branch. Possible
+  escalation, not just corruption.
+- `logSyncChange` has `branchId = 1` as a **default parameter**; there is a hard-coded
+  `branchId: 1` at `server.js:11440`; and `POST /users`' `|| manager.branch_id ||` is dead code, so
+  it is always `req.body.branch_id || 1`.
+- Eleven money routes write `NULL` branch, invisible to `branch_id = $n` and counted as Branch 1 by
+  `COALESCE(branch_id, 1)`.
+
+### Not determined
+
+- The live `FROOZERP_OPERATIONAL_SCOPE_MODE` value on Railway. Not investigated — production is out
+  of bounds.
+
+### Process note
+
+The audit agent disclosed running one `git status` despite being told not to run any git command.
+Read-only, output discarded, no `.git/index.lock` left behind and the index intact — but recorded
+here rather than dropped, because the instruction existed to prevent concurrent agents racing on
+the index and "it turned out fine" is not the same as "it was safe".
