@@ -178,12 +178,42 @@ const stubExpress = () => {
 
 let databasePhase = "startup";
 
+/**
+ * Statements handlers issued while serving, when recording is switched on.
+ *
+ * Exists for the tenancy-coverage harness, which asks a different question from this file's: not
+ * "did this route demand a session" but "did the SQL it then ran mention the caller's branch". That
+ * question can only be answered by looking at the statement, and the statement only exists at all
+ * because the adapter is stubbed — so recording belongs here rather than in a second loader that
+ * would need its own copy of every safety measure above.
+ */
+const recordedQueries = [];
+let recordingQueries = false;
+
+/** Start recording, and answer queries with empty rows so a handler runs on past its first read. */
+const startQueryRecording = () => {
+  recordedQueries.length = 0;
+  recordingQueries = true;
+};
+
+const stopQueryRecording = () => {
+  recordingQueries = false;
+  return [...recordedQueries];
+};
+
 const stubStorageAdapter = () => {
   const storagePath = require.resolve("./storageAdapters");
   const realStorage = require(storagePath);
-  const respond = () => (databasePhase === "startup"
-    ? new Promise(() => {})
-    : Promise.reject(new Error("routeAuthCoverage: the database is stubbed out")));
+  const respond = (text, values) => {
+    if (databasePhase === "startup") return new Promise(() => {});
+    if (recordingQueries) {
+      recordedQueries.push(String(typeof text === "object" && text ? text.text : text || ""));
+      // Empty rows rather than a rejection: a handler that throws on its first read never issues
+      // the second statement, and the second is often the one that carries the scope.
+      return Promise.resolve({ rows: [], rowCount: 0 });
+    }
+    return Promise.reject(new Error("routeAuthCoverage: the database is stubbed out"));
+  };
   const adapter = {
     kind: "route-auth-coverage-stub",
     databaseType: "none",
@@ -383,6 +413,9 @@ const collectRouteAuthCoverage = async () => {
 
 module.exports = {
   AUTH_DENIAL_CODES,
+  probe,
+  startQueryRecording,
+  stopQueryRecording,
   MINIMUM_EXPECTED_ROUTES,
   collectRouteAuthCoverage,
   listRegisteredRoutes,

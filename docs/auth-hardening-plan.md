@@ -13,7 +13,7 @@ request, to run **in parallel** with the offline-activation stages.
 | A-4c money-route permissions | **Complete 2026-08-20** — 13 handlers / 15 registrations. See the record. **Found a further unguarded class: see A-4d.** |
 | A-4d unguarded master-data writes | **Complete 2026-08-20** — including the live `/api/v3/suppliers` path the sweep nearly missed. See the record. |
 | A-5 lockout + delete legacy verify | **Lockout complete 2026-08-20. The legacy SHA-256 removal is deliberately NOT done** — its precondition is not met. See the record. |
-| **A-7 branch isolation** | **Open — audited 2026-08-20 and failing.** A signed-in Branch A user can read essentially all of Branch B's data. Gates multibranch. |
+| **A-7 branch isolation** | **Write half closed 2026-08-21 (steps 1-4).** The read exposure remains, now measured and baselined by `tenancyCoverage.test.js` rather than estimated. Still gates multibranch. |
 | A-6 exposure checklist | **Written 2026-08-20** — see the record. It is a **gate**, not a summary: every unticked line is a reason not to expose the backend. |
 **Related:** `CLAUDE.md` "Known security debt"; `docs/offline-activation-design.md` §12 (which
 rules `deviceSession.js` is *kept*); `docs/backlog-1.0.72.md`.
@@ -1381,3 +1381,105 @@ mechanism entirely.
 Not exercised against a real Postgres; there is no database in the development environment. The two
 new columns and both UPDATE statements are verified by construction and source assertion only.
 Worth one check on a disposable database before release.
+
+---
+
+## A-7 steps 1–4 record — the write half, and a measurement for the rest (2026-08-21)
+
+The audit split branch isolation into two risks with different profiles: **write corruption**,
+which can damage data, and **read exposure**, which is dormant until a second branch exists. These
+four steps close the first and make the second countable.
+
+### Step 1 — the duplicate write routes
+
+22 handlers were registered twice, once behind `v3WriteAdapter` and once on a bare legacy path. The
+scope filter reads `($2::INTEGER IS NULL OR company_id = $2)` bound from
+`req.v3OperationalContext?.company_id || null`; on the legacy path that context is `undefined`, so
+`$2` is NULL, the conjunct is true, and **the row is selected by primary key alone.** It fails open.
+
+All 24 legacy write paths now refuse with 426 and name their replacement.
+
+- **Unconditional**, not gated on `FROOZERP_OPERATIONAL_SCOPE_MODE`. That defaults to `off`,
+  nothing in the repository sets it, and a hole that closes only when an environment variable
+  happens to be set is not closed.
+- **An explicit list, not a pattern.** `LEGACY_OPERATIONAL_ROUTE` ends each alternative with
+  `(?:\/|$)`, so hyphenated siblings escape — the audit measured 64 of 216 routes actually blocked
+  under `enforce`. Parameters now compile to exactly one segment.
+- **Placed after the auth gate.** Ahead of it, a stranger probing a retired path would learn it
+  exists and get an upgrade hint rather than a refusal; three route-coverage tests failed when it
+  was first put there.
+- **The replacement is recorded per route**, not derived. Seven were renamed rather than
+  re-prefixed — `/purchase-bill` → `/api/v3/purchase-bills`, `/products/:id/cancel` →
+  `.../deactivate`. The derived mapping was wrong for a third of the list, and the test comparing it
+  against real registrations is what caught that.
+
+### Step 2 — device re-pointing
+
+`PUT /settings/devices/:deviceId` had a role check and nothing else: any Owner or Admin could
+rename, disable or re-point **any device in the database** into **any branch**. `/login` mints the
+branch claim as `operationalAssignment?.branch_id || device.assigned_branch_id || ...`, so this
+produced a *legitimately signed* token for another branch — escalation, not merely corruption.
+
+Now scoped to the actor's company, with the target branch required to exist, be active, and belong
+to that company. Validated before the update. A device outside the company gets the same 404 an
+unknown id gets, because a distinct "not yours" confirms it exists.
+
+**This is the first consumer of `req.auth.companyId` in the entire backend.** The audit's headline
+finding was that it and `req.auth.branchId` had zero read sites; a test now asserts that count stays
+above zero.
+
+*Correction recorded:* mid-task I concluded the schema had no company-to-branch relationship and was
+ready to report that scoping was impossible. It exists — `branches.company_id` and
+`authorized_devices.company_id`, added by cloud migrations 005 and 006 in
+`backend/migrations/cloud/`, a directory I had not searched. The relationship was there; the search
+was not.
+
+### Step 3 — the Branch 1 defaults
+
+27 `|| 1` fallbacks exist; most are harmless in a single-branch business and stay. Two were not:
+
+- **`POST /users`** used `parsePositiveInteger(req.body.branch_id) || manager.branch_id || 1`, whose
+  middle term is dead code — `requireRateManager` selects only id, full_name and role_name. What ran
+  was `req.body.branch_id || 1`: any branch of any company, unvalidated, or Branch 1 by omission.
+  Now validated against the actor's company, falling back to the actor's own verified branch.
+- **`logSyncChange`** defaulted `branchId` to 1. All 21 callers override it, so it was never
+  exercised and was waiting for caller 22. Now required, and throws. A change-log row is what every
+  other device replays; one attributed to the wrong branch does not fail, **it propagates**.
+
+### Step 4 — the measurement
+
+`backend/tenancyCoverage.js` drives every GET route with a real signed session, records the SQL the
+handler issues, and checks whether statements touching a tenant-owned table carry a `branch_id` /
+`company_id` predicate.
+
+**Measured 2026-08-21: 125 GET routes — 1 scoped, 37 unscoped, 87 inconclusive** (no tenant table
+reached, or the handler threw before its first query).
+
+`tenancyCoverage.test.js` baselines those 37. The list may shrink freely — that is the work — and
+cannot grow: a new entry fails the test **with the route's own name attached**. A third test fails
+when a route is fixed and left on the list, because a stale baseline hides finished work and makes
+the number meaningless.
+
+**What a pass does not mean.** There is no database here, so this proves what the query *said*, not
+what it returned. A route counted SCOPED could still scope by a caller-supplied value rather than by
+the session; that needs a live two-branch database and remains open. What it catches reliably is
+*no predicate at all*, which cannot be right under any reading.
+
+The 37 and the audit's 119 are both honest and measure different things: the audit counted every
+registration touching business data by reading, this counts GET routes that actually reached SQL
+against a listed table by running them.
+
+### What remains
+
+The read exposure — those 37, plus whatever the inconclusive 87 hide. Dormant while one branch
+exists, live the day there are two. It is now a number in a test rather than a sentence in a
+document, which is the difference between work that can be finished and work that can only be
+worried about.
+
+### Gate results
+
+| Gate | Result |
+| --- | --- |
+| `npm --prefix backend test` | **280 / 281** — the 1 failure is the pre-existing Linux-vs-Windows path assertion |
+| `TZ=Asia/Kolkata node --test frontend/src/local/*.test.mjs` | **343 / 343** |
+| `npm run build` | Pass |
