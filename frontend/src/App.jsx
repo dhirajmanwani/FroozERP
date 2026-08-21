@@ -42,7 +42,7 @@ import { sessionAuthHeaders, shouldAttachSessionAuth } from "./local/authHeaders
 import { consumeStashedSessionForReload, stashSessionForReload } from "./local/reloadSessionBridge";
 import { describeLocalServiceFailure } from "./local/localServiceFailure";
 import { autoConnectivityBlockedReason as resolveAutoConnectivityBlockedReason } from "./local/autoConnectivityAvailability";
-import { clearOfflineFailures, offlineLockMessage, readOfflineLockState, registerOfflineFailure } from "./local/offlineLoginLockout";
+import { clearOfflineFailures, offlineLockCountdownMessage, readOfflineLockState, registerOfflineFailure } from "./local/offlineLoginLockout";
 import { resolveSessionAction } from "./local/sessionExpiry";
 import {
   addNotification,
@@ -1903,6 +1903,9 @@ function App() {
   const [exitCodeError, setExitCodeError] = useState("");
   const [exitAttemptCount, setExitAttemptCount] = useState(0);
   const [loginDeviceControlSettings, setLoginDeviceControlSettings] = useState(defaultDeviceControlSettings);
+  // When offline sign-in is locked, the moment it lifts. Held separately from `startupError` so the
+  // countdown can own its own message without clobbering an unrelated startup problem.
+  const [offlineLockUntilMs, setOfflineLockUntilMs] = useState(0);
   const [accountLedgerFocusKey, setAccountLedgerFocusKey] = useState("");
 
   // Every request carries the signed session, not just the handful of call sites that were wired by
@@ -1927,6 +1930,32 @@ function App() {
     });
     return () => axios.interceptors.request.eject(interceptorId);
   }, [user]);
+
+  // Tick the offline-lockout countdown, and clear it the moment it lapses.
+  //
+  // A frozen "try again in about a minute" is worse than useless: it does not change while the user
+  // waits, so there is no way to tell the app from a hung one, and it is still on screen after the
+  // lock has lifted — which reads as "still locked" and earns another pointless attempt. The
+  // message counts down, then disappears on its own. It reappears only if another attempt fails.
+  const [offlineLockRemainingMs, setOfflineLockRemainingMs] = useState(0);
+  useEffect(() => {
+    if (!offlineLockUntilMs) {
+      setOfflineLockRemainingMs(0);
+      return undefined;
+    }
+    const tick = () => {
+      const remaining = offlineLockUntilMs - Date.now();
+      if (remaining <= 0) {
+        setOfflineLockUntilMs(0);
+        setOfflineLockRemainingMs(0);
+        return;
+      }
+      setOfflineLockRemainingMs(remaining);
+    };
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [offlineLockUntilMs]);
 
   // A-4 will put `requireAuth` in front of ~219 routes, so an ended sign-in stops being a quiet
   // oddity and starts failing most of the app at once. One interceptor decides what that means, so
@@ -3823,7 +3852,7 @@ function App() {
     // password, so a locked device refuses whatever is typed.
     const offlineLock = readOfflineLockState({ username });
     if (offlineLock.locked) {
-      setStartupError(offlineLockMessage(offlineLock.remainingMs));
+      setOfflineLockUntilMs(Date.now() + offlineLock.remainingMs);
       return false;
     }
     const offlineAuth = await verifyOfflineSessionRecord(credentialSource.record, {
@@ -3834,7 +3863,7 @@ function App() {
     if (!offlineAuth.ok) {
       const offlineFailure = registerOfflineFailure({ username });
       if (offlineFailure.locked) {
-        setStartupError(offlineLockMessage(offlineFailure.remainingMs));
+        setOfflineLockUntilMs(Date.now() + offlineFailure.remainingMs);
         return false;
       }
       // §8.2: a reused temporary activation password must be named, not folded into
@@ -3853,6 +3882,7 @@ function App() {
       return false;
     }
     clearOfflineFailures({ username });
+    setOfflineLockUntilMs(0);
     // Entitlement decides access; data presence decides what is shown. An activated device with
     // no products yet must still be able to sign in — refusing it here is what locked a freshly
     // activated device out of its own app entirely.
@@ -6057,9 +6087,24 @@ function App() {
     }
   };
 
+  // The banner's "Return to Auto" is a second door to the same action as the Settings toggle, so it
+  // needs the same answer. Computed from the saved App Mode rather than a settings draft, because
+  // this button lives outside that screen.
+  const bannerAutoBlockedReason = resolveAutoConnectivityBlockedReason({
+    apiMode: API_MODE,
+    cloudApiUrl: CLOUD_API_URL,
+  });
   const localServiceStarting = isTauriRuntime() && !isCloudMode() && localServiceStartupState === "checking";
   const localServiceUnavailable = isTauriRuntime() && !isCloudMode() && localServiceStartupState === "fatal";
-  const startupMainMessage = localServiceStarting
+  // The lockout countdown outranks the rest: while it is running it is the only thing the person at
+  // the keyboard can act on, and it must vanish the instant the wait ends rather than lingering as
+  // a stale "still locked" that earns another pointless attempt.
+  const offlineLockCountdown = offlineLockRemainingMs > 0
+    ? offlineLockCountdownMessage(offlineLockRemainingMs)
+    : "";
+  const startupMainMessage = offlineLockCountdown
+    ? offlineLockCountdown
+    : localServiceStarting
     ? "Starting local service..."
     : localServiceUnavailable
     ? "Local service could not start."
@@ -6442,9 +6487,18 @@ function App() {
             <div className="local-only-banner" data-connectivity-mode="LOCAL_ONLY">
               <div>
                 <strong>Local Only mode selected - cloud sync paused</strong>
-                <span>Business modules use local SQLite. Windows internet remains connected.</span>
+                <span>{bannerAutoBlockedReason || "Business modules use local SQLite. Windows internet remains connected."}</span>
               </div>
-              <button className="primary-button" disabled={connectivityModeSwitching} onClick={() => changeConnectivityMode(CONNECTIVITY_MODES.AUTO).catch((error) => setSyncMessage(getErrorMessage(error, "Unable to return to Auto mode")))}>
+              <button
+                className="primary-button"
+                disabled={connectivityModeSwitching || bannerAutoBlockedReason !== ""}
+                title={bannerAutoBlockedReason || undefined}
+                onClick={() => changeConnectivityMode(CONNECTIVITY_MODES.AUTO)
+                  // Not `getErrorMessage`: this refusal is thrown by the app's own rules and
+                  // carries the reason in the Error itself, which that helper discards because it
+                  // only reads a server response body.
+                  .catch((error) => setSyncMessage(describeLocalServiceFailure(error, "Unable to return to Auto mode")))}
+              >
                 {connectivityModeSwitching ? "Switching..." : "Return to Auto"}
               </button>
             </div>

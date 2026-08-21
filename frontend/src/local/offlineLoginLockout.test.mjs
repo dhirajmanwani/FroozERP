@@ -9,6 +9,7 @@ import {
   STREAK_WINDOW_MS,
   clearOfflineFailures,
   describeOfflineLockRemaining,
+  formatLockCountdown,
   offlineLockMessage,
   readOfflineLockState,
   registerOfflineFailure,
@@ -155,4 +156,56 @@ test("the offline sign-in path consults the lock before checking the password", 
   assert.ok(lockIndex < verifyIndex, "and must consult it before verifying the password");
   assert.match(app, /registerOfflineFailure\(\{ username \}\)/, "a failed offline attempt must count");
   assert.match(app, /clearOfflineFailures\(\{ username \}\)/, "success must clear the streak");
+});
+
+// -----------------------------------------------------------------------------------------------
+// The countdown
+//
+// A frozen "try again in about a minute" does not change while the user waits, so there is no way
+// to tell the app from a hung one — and it is still on screen after the lock lifts, which reads as
+// "still locked" and earns another pointless attempt.
+// -----------------------------------------------------------------------------------------------
+
+test("the countdown is exact, and counts in units a waiting person can read", () => {
+  assert.equal(formatLockCountdown(59_000), "59 seconds");
+  assert.equal(formatLockCountdown(1_000), "1 second", "singular, not '1 seconds'");
+  assert.equal(formatLockCountdown(60_000), "1:00");
+  assert.equal(formatLockCountdown(90_000), "1:30");
+  assert.equal(formatLockCountdown(3_600_000), "60:00");
+});
+
+test("the countdown never shows a negative or nonsense wait", () => {
+  for (const value of [0, -1, -60_000, NaN, null, undefined, "x"]) {
+    assert.equal(formatLockCountdown(value), "0 seconds", `failed for ${JSON.stringify(value)}`);
+  }
+});
+
+test("the countdown rounds up, so it never says 0 while the lock still holds", () => {
+  // Showing "0 seconds" a moment before the lock lifts invites an attempt that will still fail.
+  assert.equal(formatLockCountdown(1), "1 second");
+  assert.equal(formatLockCountdown(999), "1 second");
+});
+
+test("the login screen shows the countdown and drops it when the wait ends", () => {
+  // Pins the wiring: a ticking message that clears itself, rather than a frozen string left in the
+  // startup error.
+  const app = fs.readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(app, /offlineLockCountdownMessage\(offlineLockRemainingMs\)/, "the message must be live");
+  assert.match(app, /const timer = window\.setInterval\(tick, 1000\)/, "it must tick");
+  assert.match(app, /window\.clearInterval\(timer\)/, "and stop ticking when unmounted");
+  assert.match(
+    app,
+    /if \(remaining <= 0\) \{\s*\n\s*setOfflineLockUntilMs\(0\);/,
+    "an expired lock must clear itself rather than linger",
+  );
+  assert.match(app, /setOfflineLockUntilMs\(0\);\s*\n\s*\/\/ Entitlement decides access/, "success must clear it too");
+});
+
+test("the banner's Return to Auto is treated as the same action as the Settings toggle", () => {
+  // Two doors to one action. The Settings toggle was disabled with an explanation and this one was
+  // left enabled, so it still produced a meaningless error.
+  const app = fs.readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(app, /disabled=\{connectivityModeSwitching \|\| bannerAutoBlockedReason !== ""\}/);
+  assert.match(app, /describeLocalServiceFailure\(error, "Unable to return to Auto mode"\)/,
+    "it must not discard a locally-thrown reason via getErrorMessage");
 });

@@ -153,3 +153,27 @@ export const describeOfflineLockRemaining = (remainingMs) => {
 /** States the wait, never the policy — naming the threshold hands an attacker the tuning. */
 export const offlineLockMessage = (remainingMs) =>
   `Too many failed sign-in attempts on this device. Try again in ${describeOfflineLockRemaining(remainingMs)}.`;
+
+/**
+ * A live countdown, for a message that updates while the user waits.
+ *
+ * `describeOfflineLockRemaining` deliberately rounds up and stays vague — right for a one-shot
+ * sentence, wrong for a ticking display, where "about a minute" frozen on screen for sixty seconds
+ * reads as though the app has hung. This is exact and counts down.
+ *
+ * Seconds below a minute, then m:ss, because "try again in 90 seconds" is harder to act on than
+ * "1:30" when you are watching it change.
+ */
+export const formatLockCountdown = (remainingMs) => {
+  const remaining = Number(remainingMs);
+  if (!Number.isFinite(remaining) || remaining <= 0) return "0 seconds";
+  const totalSeconds = Math.ceil(remaining / 1000);
+  if (totalSeconds < 60) return `${totalSeconds} second${totalSeconds === 1 ? "" : "s"}`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+};
+
+/** The counting-down message shown while a lock is in force. */
+export const offlineLockCountdownMessage = (remainingMs) =>
+  `Too many failed sign-in attempts on this device. Try again in ${formatLockCountdown(remainingMs)}.`;
