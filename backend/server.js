@@ -3435,23 +3435,27 @@ const previousDateKey = (dateValue) => {
 /**
  * Supplier list with purchase and payment totals.
  *
- * `branchId` is required and scopes the **totals**, not the list. The supplier master is
- * company-wide — `suppliers` has no `branch_id` and is not meant to — so every supplier still
- * appears; what changes is that the money beside each one is this branch's money.
+ * The scope argument covers the **totals**, not the list. The supplier master is company-wide —
+ * `suppliers` has no `branch_id` and is not meant to — so every supplier always appears; what
+ * changes is whose money sits beside the name.
  *
- * **This encodes a business decision** (recorded as an open question in
- * `docs/tenancy-backfill-plan.md`): a supplier's outstanding balance is treated as *per branch*
- * rather than per company. That is the isolation-correct default — Jodhpur cannot see what Jaipur
- * bought — and consolidated figures have their own route. If the business considers a supplier debt
- * to be one company-level number, this is the line to revisit, and it should be revisited
- * deliberately rather than discovered.
+ * **The business decision here was made by the maintainer on 2026-08-21, and reversed an earlier
+ * guess.** A supplier balance is a *company* number, not a per-shop one. Stock is bought from the
+ * supplier once, in bulk, into a warehouse branch, and is then transferred out to the shops under
+ * it. Scoping this per shop would therefore park the entire debt on the warehouse and report zero
+ * at every shop that actually sells the goods — technically isolated, and useless. Callers on the
+ * supplier screens pass `{ companyId }`.
+ *
+ * The balance sheet and dashboard still pass `{ branchId }`, and that difference is intentional:
+ * a per-shop balance sheet has to set a shop's payables against that shop's cash or it will not
+ * balance. The two figures are answers to two different questions, which is why the caller has to
+ * name the question. See `resolveMoneyScope`.
  */
-const getSupplierSummaryRows = async ({ active, search, supplierId, dateTo, branchId } = {}) => {
-  if (!parsePositiveInteger(branchId)) {
-    throw new Error("getSupplierSummaryRows requires a branchId");
-  }
+const getSupplierSummaryRows = async ({ active, search, supplierId, dateTo, branchId, companyId } = {}) => {
+  const scope = resolveMoneyScope({ branchId, companyId });
+  if (scope.isCompany) await assertCompanyBranchLink();
   const filters = [];
-  const values = [branchId];
+  const values = [scope.value];
   const purchaseDateFilter = isDateInput(dateTo) ? `AND purchase_date <= $${values.push(dateTo)}` : "";
   const paymentDateFilter = isDateInput(dateTo) ? `AND payment_date <= $${values.length}` : "";
   if (supplierId) {
@@ -3484,7 +3488,7 @@ const getSupplierSummaryRows = async ({ active, search, supplierId, dateTo, bran
         SUM(COALESCE(paid_amount, 0)) AS purchase_paid
       FROM purchases
       WHERE supplier_id IS NOT NULL
-        AND branch_id = $1
+        AND ${scope.predicate()}
         AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
         AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
         ${purchaseDateFilter}
@@ -3497,7 +3501,7 @@ const getSupplierSummaryRows = async ({ active, search, supplierId, dateTo, bran
         SUM(rebate_amount) AS payment_rebate
       FROM supplier_payments
       WHERE cancelled = FALSE
-        AND branch_id = $1
+        AND ${scope.predicate()}
         ${paymentDateFilter}
       GROUP BY supplier_id
     )
@@ -3634,19 +3638,82 @@ const readAccountPayload = (body) => {
 };
 
 /**
- * Customers with their money attached, scoped to one branch.
+ * Which branches' money a figure covers.
  *
- * Same shape and same business decision as `getSupplierSummaryRows` above: the customer *directory*
- * is company-wide — `customers` has no `branch_id`, and every branch sells to the same people — but
- * the balance beside each name is this branch's balance. `branchId` is required and seeded as `$1`
- * so neither CTE can be built without it.
+ * There are two different questions in this app and they have different right answers, so the
+ * caller has to say which one it is asking rather than inherit a default:
+ *
+ * - **`{ companyId }` — the whole business.** Used for supplier and customer balances. Stock is
+ *   bought once, centrally, into a warehouse branch and then transferred out to the shops, so
+ *   "what do we owe Ramesh" is a company-level fact; asking it per shop would show the entire debt
+ *   at the warehouse and zero everywhere else. Same for what a customer owes: they may pay at any
+ *   counter.
+ * - **`{ branchId }` — one shop.** Used for the balance sheet and the dashboard tiles. A shop's
+ *   cash, stock and takings are its own, and mixing a company-level payable into a per-shop balance
+ *   sheet would stop it balancing.
+ *
+ * The company form filters on `branch_id IN (SELECT ... FROM branches WHERE company_id = $1)`
+ * rather than on a `company_id` column of its own. That is deliberate: `branch_id` is populated on
+ * every money row today, while the `company_id` shadow columns on those tables are not (see
+ * docs/tenancy-backfill-plan.md, Phase 2). Going through `branches` gets company-level scoping with
+ * no backfill and no migration. Both forms bind exactly one value at `$1`, so the rest of a query's
+ * parameter numbering is identical either way.
  */
-const getCustomerSummaryRows = async ({ active, search, customerId, dateTo, branchId } = {}) => {
-  if (!parsePositiveInteger(branchId)) {
-    throw new Error("getCustomerSummaryRows requires a branchId");
+const resolveMoneyScope = ({ branchId, companyId } = {}) => {
+  const branch = parsePositiveInteger(branchId);
+  const company = parsePositiveInteger(companyId);
+  if ((branch ? 1 : 0) + (company ? 1 : 0) !== 1) {
+    throw new Error("resolveMoneyScope needs exactly one of branchId or companyId");
   }
+  return {
+    value: branch || company,
+    isCompany: Boolean(company),
+    /** `qualifier` is a table alias with its dot, e.g. "sp." — or "" for an unqualified column. */
+    predicate: (qualifier = "") => (branch
+      ? `${qualifier}branch_id = $1`
+      : `${qualifier}branch_id IN (SELECT id FROM branches WHERE company_id = $1)`),
+  };
+};
+
+/**
+ * Refuse to answer a company-level money question while the company/branch link is missing.
+ *
+ * `branches.company_id` is nullable and was never backfilled by a migration. If it is NULL, the
+ * subquery above matches nothing and every company-scoped balance quietly reads zero — a supplier
+ * ledger showing "you owe nothing" is far worse than one showing an error. This turns that into a
+ * loud failure. It runs at most once per process: the link is structural, so once it is sound it
+ * does not come apart while the server is up.
+ */
+let companyBranchLinkVerified = false;
+const assertCompanyBranchLink = async () => {
+  if (companyBranchLinkVerified) return;
+  const result = await pool.query(
+    "SELECT COUNT(*)::INTEGER AS orphans FROM branches WHERE company_id IS NULL AND active IS DISTINCT FROM FALSE"
+  );
+  const orphans = Number(result.rows[0]?.orphans || 0);
+  if (orphans > 0) {
+    throw new Error(
+      `${orphans} active branch(es) have no company_id, so company-level balances would read as zero. `
+      + "Link every branch to its company before using company-scoped figures."
+    );
+  }
+  companyBranchLinkVerified = true;
+};
+
+/**
+ * Customers with their money attached.
+ *
+ * Pass `{ companyId }` for the customer-facing screens — what a customer owes is one number for the
+ * whole business, because they may pay at any counter — or `{ branchId }` for the balance sheet and
+ * dashboard, where the receivable has to belong to the same shop as the cash beside it. See
+ * `resolveMoneyScope`. The customer *directory* is company-wide either way: `customers` has no
+ * `branch_id`, and every shop serves the same people.
+ */
+const getCustomerSummaryRows = async ({ active, search, customerId, dateTo, branchId, companyId } = {}) => {
+  const scope = resolveMoneyScope({ branchId, companyId });
+  if (scope.isCompany) await assertCompanyBranchLink();
   const filters = [];
-  const values = [branchId];
+  const values = [scope.value];
   const saleDateFilter = isDateInput(dateTo) ? `AND s.sale_date <= $${values.push(dateTo)}` : "";
   const customerPaymentDateFilter = isDateInput(dateTo) ? `AND payment_date <= $${values.length}` : "";
   if (customerId) {
@@ -3704,7 +3771,7 @@ const getCustomerSummaryRows = async ({ active, search, customerId, dateTo, bran
         FROM sale_payments
         GROUP BY sale_id
       ) pay ON pay.sale_id = s.id
-      WHERE s.branch_id = $1
+      WHERE ${scope.predicate("s.")}
         ${saleDateFilter}
       GROUP BY matched.customer_id
     ),
@@ -3712,7 +3779,7 @@ const getCustomerSummaryRows = async ({ active, search, customerId, dateTo, bran
       SELECT customer_id, SUM(payment_amount) AS total_customer_paid
       FROM customer_payments
       WHERE cancelled = FALSE
-        AND branch_id = $1
+        AND ${scope.predicate()}
         ${customerPaymentDateFilter}
       GROUP BY customer_id
     )
@@ -13203,20 +13270,20 @@ app.get("/sale-rate-history", async (req, res) => {
 });
 
 /**
- * Customers, suppliers and standalone accounts as one directory.
+ * Customers, suppliers and standalone accounts as one directory, with company-level balances.
  *
  * `accounts` has no `branch_id` — like `customers` and `suppliers` it is company-wide master data —
- * so only the two money-carrying halves are scoped. `branchId` is required rather than optional
- * because every caller is a request handler with `req.auth.branchId` in hand, and an optional one
- * would silently rebuild the cross-branch view the moment someone forgot it.
+ * so only the two money-carrying halves are scoped, and both are scoped by company: this is the
+ * "who owes whom" directory, and those balances are company facts. `companyId` is required rather
+ * than optional so a caller cannot silently fall back to an unscoped read by omitting it.
  */
-const loadUnifiedAccounts = async ({ branchId } = {}) => {
-  if (!parsePositiveInteger(branchId)) {
-    throw new Error("loadUnifiedAccounts requires a branchId");
+const loadUnifiedAccounts = async ({ companyId } = {}) => {
+  if (!parsePositiveInteger(companyId)) {
+    throw new Error("loadUnifiedAccounts requires a companyId");
   }
   const [customerRows, supplierRows, genericRows] = await Promise.all([
-    getCustomerSummaryRows({ branchId }),
-    getSupplierSummaryRows({ branchId }),
+    getCustomerSummaryRows({ companyId }),
+    getSupplierSummaryRows({ companyId }),
     pool.query("SELECT * FROM accounts ORDER BY active DESC, account_name"),
   ]);
   return [
@@ -13259,18 +13326,22 @@ const loadUnifiedAccounts = async ({ branchId } = {}) => {
 /**
  * Customer and supplier payments as one list.
  *
- * `branchId` is required and seeded as the first filter on both halves, so neither query can be
- * built without it. The previous shape omitted `WHERE` entirely when no account was named — the
- * default case, and the one that returned every branch's payments.
+ * `companyId` is required and seeded as the first filter on both halves, so neither query can be
+ * built without it. The original shape omitted `WHERE` entirely when no account was named — the
+ * default case, and the one that returned every company's payments.
+ *
+ * Company rather than branch: this list sits behind the account balances on the Accounts screen,
+ * and a balance whose backing payment list is filtered more narrowly than the balance itself will
+ * never reconcile. That is the summary/detail rule in CLAUDE.md, applied to the scope axis.
  */
-const getUnifiedPaymentRows = async ({ accountKey, branchId } = {}) => {
-  if (!parsePositiveInteger(branchId)) {
-    throw new Error("getUnifiedPaymentRows requires a branchId");
+const getUnifiedPaymentRows = async ({ accountKey, companyId } = {}) => {
+  if (!parsePositiveInteger(companyId)) {
+    throw new Error("getUnifiedPaymentRows requires a companyId");
   }
-  const customerValues = [branchId];
-  const supplierValues = [branchId];
-  const filters = ["cp.branch_id = $1"];
-  const supplierFilters = ["sp.branch_id = $1"];
+  const customerValues = [companyId];
+  const supplierValues = [companyId];
+  const filters = ["cp.branch_id IN (SELECT id FROM branches WHERE company_id = $1)"];
+  const supplierFilters = ["sp.branch_id IN (SELECT id FROM branches WHERE company_id = $1)"];
   if (accountKey) {
     const [source, idValue] = String(accountKey).split("-");
     const sourceId = parsePositiveInteger(Number(idValue));
@@ -13378,7 +13449,7 @@ app.get("/accounts", async (req, res) => {
   try {
     const search = cleanText(req.query.search).toLowerCase();
     const accountType = req.query.account_type ? normalizeAccountType(req.query.account_type) : "";
-    const rows = await loadUnifiedAccounts({ branchId: req.auth.branchId });
+    const rows = await loadUnifiedAccounts({ companyId: req.auth.companyId });
     return res.json(rows.filter((account) =>
       (!accountType || account.account_type === accountType) &&
       (!search || account.account_name.toLowerCase().includes(search) || String(account.mobile_number || "").includes(search))
@@ -13614,7 +13685,7 @@ app.put("/accounts/:accountKey", async (req, res) => {
 
 app.get("/accounts/outstanding", async (req, res) => {
   try {
-    const accounts = await loadUnifiedAccounts({ branchId: req.auth.branchId });
+    const accounts = await loadUnifiedAccounts({ companyId: req.auth.companyId });
     const customerOutstanding = accounts.filter((account) => account.account_type === "CUSTOMER");
     const supplierOutstanding = accounts.filter((account) => ["SUPPLIER", "TRANSPORT_VENDOR", "COMMISSION_AGENT"].includes(account.account_type));
     return res.json({
@@ -13638,7 +13709,7 @@ app.get("/accounts/ledger", async (req, res) => {
       return res.json({ account: null, ledger: [] });
     }
     if (source === "CUSTOMER") {
-      const customers = await getCustomerSummaryRows({ customerId: sourceId, branchId: req.auth.branchId });
+      const customers = await getCustomerSummaryRows({ customerId: sourceId, companyId: req.auth.companyId });
       if (customers.length === 0) return res.json({ account: null, ledger: [] });
       const ledgerResult = await pool.query(
         `
@@ -13661,6 +13732,7 @@ app.get("/accounts/ledger", async (req, res) => {
             GROUP BY sale_id
           ) pay ON pay.sale_id = s.id
           WHERE s.sale_status <> 'CANCELLED'
+            AND s.branch_id IN (SELECT id FROM branches WHERE company_id = $4)
             AND (
               s.customer_id = $1
               OR (s.customer_id IS NULL AND s.customer_mobile IS NOT NULL AND s.customer_mobile = $2)
@@ -13679,10 +13751,11 @@ app.get("/accounts/ledger", async (req, res) => {
             cp.created_at
           FROM customer_payments cp
           WHERE cp.customer_id = $1 AND cp.cancelled = FALSE
+            AND cp.branch_id IN (SELECT id FROM branches WHERE company_id = $4)
         ) entries
         ORDER BY date, created_at
         `,
-        [sourceId, customers[0].mobile_number || "", customers[0].customer_name]
+        [sourceId, customers[0].mobile_number || "", customers[0].customer_name, req.auth.companyId]
       );
       let balance = Number(customers[0].opening_balance || 0);
       const ledger = [];
@@ -13709,7 +13782,7 @@ app.get("/accounts/ledger", async (req, res) => {
       const supplierPayload = await pool.query("SELECT * FROM suppliers WHERE id = $1", [sourceId]);
       if (supplierPayload.rows.length === 0) return res.json({ account: null, ledger: [] });
       const ledgerPayload = await (async () => {
-        const suppliers = await getSupplierSummaryRows({ supplierId: sourceId, branchId: req.auth.branchId });
+        const suppliers = await getSupplierSummaryRows({ supplierId: sourceId, companyId: req.auth.companyId });
         const ledgerResult = await pool.query(
           `
           SELECT *
@@ -13723,6 +13796,7 @@ app.get("/accounts/ledger", async (req, res) => {
               p.created_at
             FROM purchases p
             WHERE p.supplier_id = $1
+              AND p.branch_id IN (SELECT id FROM branches WHERE company_id = $2)
               AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
               AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
             UNION ALL
@@ -13737,10 +13811,11 @@ app.get("/accounts/ledger", async (req, res) => {
             FROM supplier_payments sp
             JOIN suppliers s ON s.id = sp.supplier_id
             WHERE sp.supplier_id = $1 AND sp.cancelled = FALSE
+              AND sp.branch_id IN (SELECT id FROM branches WHERE company_id = $2)
           ) entries
           ORDER BY date, created_at
           `,
-          [sourceId]
+          [sourceId, req.auth.companyId]
         );
         let balance = Number(suppliers[0]?.opening_balance || 0);
         const ledger = [];
@@ -13787,7 +13862,7 @@ app.get("/accounts/payments", async (req, res) => {
   try {
     return res.json(await getUnifiedPaymentRows({
       accountKey: req.query.account_key,
-      branchId: req.auth.branchId,
+      companyId: req.auth.companyId,
     }));
   } catch (error) {
     console.error(error);
@@ -14137,7 +14212,7 @@ app.get("/suppliers", async (req, res) => {
     const rows = await getSupplierSummaryRows({
       active,
       search: cleanText(req.query.search),
-      branchId: req.auth.branchId,
+      companyId: req.auth.companyId,
     });
     return res.json(rows);
   } catch (error) {
@@ -14202,7 +14277,7 @@ app.get("/suppliers/:id", async (req, res) => {
   try {
     const supplierId = parsePositiveInteger(req.params.id);
     if (!supplierId) return res.status(400).json({ message: "Invalid supplier" });
-    const rows = await getSupplierSummaryRows({ supplierId, branchId: req.auth.branchId });
+    const rows = await getSupplierSummaryRows({ supplierId, companyId: req.auth.companyId });
     return rows[0] ? res.json(rows[0]) : res.status(404).json({ message: "Supplier not found" });
   } catch (error) {
     console.error(error);
@@ -14311,7 +14386,7 @@ app.get("/supplier-summary", async (req, res) => {
   try {
     const supplierId = req.query.supplier_id ? parsePositiveInteger(req.query.supplier_id) : null;
     if (req.query.supplier_id && !supplierId) return res.status(400).json({ message: "Invalid supplier" });
-    const rows = await getSupplierSummaryRows({ supplierId, branchId: req.auth.branchId });
+    const rows = await getSupplierSummaryRows({ supplierId, companyId: req.auth.companyId });
     return res.json(buildSupplierSummaryPayload(rows));
   } catch (error) {
     console.error(error);
@@ -14322,7 +14397,7 @@ app.get("/supplier-summary", async (req, res) => {
 app.get("/customers", async (req, res) => {
   try {
     const active = req.query.active === undefined ? undefined : String(req.query.active) === "true";
-    const rows = await getCustomerSummaryRows({ active, search: cleanText(req.query.search), branchId: req.auth.branchId });
+    const rows = await getCustomerSummaryRows({ active, search: cleanText(req.query.search), companyId: req.auth.companyId });
     return res.json(rows);
   } catch (error) {
     console.error(error);
@@ -14429,7 +14504,7 @@ app.get("/customer-summary", async (req, res) => {
   try {
     const customerId = req.query.customer_id ? parsePositiveInteger(req.query.customer_id) : null;
     if (req.query.customer_id && !customerId) return res.status(400).json({ message: "Invalid customer" });
-    const rows = await getCustomerSummaryRows({ customerId, branchId: req.auth.branchId });
+    const rows = await getCustomerSummaryRows({ customerId, companyId: req.auth.companyId });
     return res.json(buildCustomerSummaryPayload(rows));
   } catch (error) {
     console.error(error);
@@ -14544,7 +14619,7 @@ app.get("/pending-bills/customer", async (req, res) => {
         FROM sale_payments
         GROUP BY sale_id
       ) pay ON pay.sale_id = s.id
-      WHERE s.branch_id = $1
+      WHERE s.branch_id IN (SELECT id FROM branches WHERE company_id = $1)
         AND s.payment_mode = 'CREDIT'
         AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
       GROUP BY s.id, c.customer_name, pay.sale_paid
@@ -14558,7 +14633,7 @@ app.get("/pending-bills/customer", async (req, res) => {
         cp.customer_id,
         SUM(cp.payment_amount) AS total_received
       FROM customer_payments cp
-      WHERE cp.branch_id = $1
+      WHERE cp.branch_id IN (SELECT id FROM branches WHERE company_id = $1)
         AND COALESCE(cp.cancelled, FALSE) = FALSE
       GROUP BY cp.customer_id
       `,
@@ -14626,7 +14701,7 @@ app.get("/customer-ledger", async (req, res) => {
   try {
     const customerId = req.query.customer_id ? parsePositiveInteger(req.query.customer_id) : null;
     if (req.query.customer_id && !customerId) return res.status(400).json({ message: "Invalid customer" });
-    const customers = await getCustomerSummaryRows({ customerId, branchId: req.auth.branchId });
+    const customers = await getCustomerSummaryRows({ customerId, companyId: req.auth.companyId });
     if (customerId && customers.length === 0) return res.status(404).json({ message: "Customer not found" });
     if (customers.length === 0) return res.json({ customers: [], ledger: [] });
     const ids = customers.map((customer) => customer.id);
@@ -14645,9 +14720,10 @@ app.get("/customer-ledger", async (req, res) => {
           SELECT sale_id, SUM(amount) AS total_paid FROM sale_payments GROUP BY sale_id
         ) pay ON pay.sale_id = s.id
         WHERE c.id = ANY($1::INT[])
+          AND s.branch_id IN (SELECT id FROM branches WHERE company_id = $2)
         ORDER BY s.sale_date, s.created_at, s.id
         `,
-        [ids]
+        [ids, req.auth.companyId]
       ),
       pool.query(
         `
@@ -14655,10 +14731,11 @@ app.get("/customer-ledger", async (req, res) => {
         FROM customer_payments cp
         JOIN customers c ON c.id = cp.customer_id
         WHERE cp.customer_id = ANY($1::INT[])
+          AND cp.branch_id IN (SELECT id FROM branches WHERE company_id = $2)
           AND cp.cancelled = FALSE
         ORDER BY cp.payment_date, cp.created_at, cp.id
         `,
-        [ids]
+        [ids, req.auth.companyId]
       ),
     ]);
     const ledgersByCustomer = new Map(ids.map((id) => [id, []]));
@@ -16715,16 +16792,18 @@ app.get("/supplier-payments", async (req, res) => {
   try {
     const supplierId = req.query.supplier_id ? parsePositiveInteger(req.query.supplier_id) : null;
     if (req.query.supplier_id && !supplierId) return res.status(400).json({ message: "Invalid supplier" });
-    // Branch first, so the optional supplier filter becomes $2 and the WHERE is unconditional. The
-    // previous shape omitted WHERE entirely when no supplier was named, which is exactly the case
-    // that returned every branch's payments.
-    const values = supplierId ? [req.auth.branchId, supplierId] : [req.auth.branchId];
+    // Company first, so the optional supplier filter becomes $2 and the WHERE is unconditional. The
+    // original shape omitted WHERE entirely when no supplier was named, which is exactly the case
+    // that returned every company's payments. Company rather than branch because this register is
+    // what a supplier balance is made of, and a balance whose backing list is filtered differently
+    // will not reconcile.
+    const values = supplierId ? [req.auth.companyId, supplierId] : [req.auth.companyId];
     const result = await pool.query(
       `
       SELECT sp.*, s.supplier_name, s.firm_name
       FROM supplier_payments sp
       JOIN suppliers s ON s.id = sp.supplier_id
-      WHERE sp.branch_id = $1${supplierId ? " AND sp.supplier_id = $2" : ""}
+      WHERE sp.branch_id IN (SELECT id FROM branches WHERE company_id = $1)${supplierId ? " AND sp.supplier_id = $2" : ""}
       ORDER BY sp.payment_date DESC, sp.created_at DESC, sp.id DESC
       `,
       values
@@ -16917,7 +16996,7 @@ app.get("/supplier-ledger", async (req, res) => {
     const supplierId = req.query.supplier_id ? parsePositiveInteger(req.query.supplier_id) : null;
     if (req.query.supplier_id && !supplierId) return res.status(400).json({ message: "Invalid supplier" });
 
-    const suppliers = await getSupplierSummaryRows({ supplierId, branchId: req.auth.branchId });
+    const suppliers = await getSupplierSummaryRows({ supplierId, companyId: req.auth.companyId });
     if (supplierId && suppliers.length === 0) return res.status(404).json({ message: "Supplier not found" });
     if (suppliers.length === 0) return res.json({ suppliers: [], ledger: [] });
 
@@ -16943,12 +17022,13 @@ app.get("/supplier-ledger", async (req, res) => {
         LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
         LEFT JOIN products pr ON pr.id = pi.product_id
         WHERE p.supplier_id = ANY($1::INT[])
+          AND p.branch_id IN (SELECT id FROM branches WHERE company_id = $2)
           AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
           AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
         GROUP BY p.id
         ORDER BY p.purchase_date, p.created_at, p.id
         `,
-        [supplierIds]
+        [supplierIds, req.auth.companyId]
       ),
       pool.query(
         `
@@ -16956,10 +17036,11 @@ app.get("/supplier-ledger", async (req, res) => {
         FROM supplier_payments sp
         JOIN suppliers s ON s.id = sp.supplier_id
         WHERE sp.supplier_id = ANY($1::INT[])
+          AND sp.branch_id IN (SELECT id FROM branches WHERE company_id = $2)
           AND sp.cancelled = FALSE
         ORDER BY sp.payment_date, sp.created_at, sp.id
         `,
-        [supplierIds]
+        [supplierIds, req.auth.companyId]
       ),
     ]);
 
