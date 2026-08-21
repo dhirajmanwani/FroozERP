@@ -160,3 +160,52 @@ in front of the business today, and both of which get easier once Phase 1 has pr
 
 The 3–4 week estimate in the audit assumed all three phases and a blocking backfill. **Phase 1
 alone is materially smaller**, and it is the part that matters.
+
+---
+
+## Phase 1: done (2026-08-21)
+
+Closed in five batches on branch `claude/offline-entitlement-migration-0nc0wl`. The number the
+harness reports for unscoped GET routes went **37 → 26 → 16 → 3 → 2**.
+
+| Batch | Area |
+|---|---|
+| 1 | transaction lists: `/sales`, `/purchases`, `/expenses`, `/waste-entries`, `/sale-returns`, `/contra-entries` |
+| 2 | inventory and payments: `/inventory`, `/stock`, `/stock-inventory`, `/supplier-payments`, `/accounts/payments` |
+| 3 | account balances, the balance sheet, the dashboards |
+| 4 | products and lots, sales history, cash book, day book |
+| 5 | the Report Center (`/reports/summary`, 27 queries) |
+
+### The two routes still on the list, and why they cannot come off yet
+
+`GET /accounts` and `GET /accounts/outstanding` scope both of their money halves already. What
+keeps them on the baseline is one statement — `SELECT * FROM accounts` — and `accounts` has no
+`branch_id`. It is company-wide master data, like `customers` and `suppliers`. **These two come off
+the list in Phase 2, not before.** They were deliberately not fixed by removing `accounts` from
+`TENANT_TABLES` in the harness: that would make the number fall without changing anything real.
+
+### Business decisions this took, which the maintainer should confirm
+
+Phase 1 could not be finished without answering two questions. Both were answered the
+isolation-correct way and both are reversible, but neither should stay unexamined.
+
+1. **A supplier's or customer's outstanding balance is treated as per branch, not per company.**
+   The directory is shared — every branch buys from the same suppliers, and neither table carries a
+   branch — but the money beside each name is this branch's money. If the business thinks of a
+   supplier debt as one company-level number, the doc comments on `getSupplierSummaryRows` and
+   `getCustomerSummaryRows` in `backend/server.js` are the two places to change.
+
+2. **`/api/owner/dashboard-foundation` no longer accepts a branch from the caller.** It read
+   `req.query.branch_id || 1`, so any authenticated user could name any branch — and an omitted
+   parameter silently reported branch 1's takings. It now uses the session's branch and requires the
+   `dashboard` permission. **If a genuine all-branches view is wanted, it needs its own route with
+   an Owner check**, not a query parameter.
+
+### What Phase 1 still does not prove
+
+The harness records the SQL a route runs; there is no database here. It proves a query *mentions*
+the branch. It does not prove the rows come back scoped, and it cannot distinguish scoping by the
+session from scoping by a value the caller supplied. **That verification needs a live two-branch
+database and is still open.** A second guard was added in `backend/queryArity.test.js` after batch 5
+added a `$3` predicate to a query with no parameter array — a runtime failure that every existing
+gate passed.
