@@ -443,6 +443,21 @@
   color: #ffffff;
 }
 
+/* A disabled option has to *look* disabled. Without this the button refuses the click and looks
+   identical to a working one, so the only feedback is the cursor — which is why AUTO read as
+   "restricted" rather than "unavailable" when App Mode pins the device to Local Only. */
+.connectivity-segmented button:disabled {
+  background: #0b1220;
+  color: #64748b;
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.connectivity-segmented button:disabled.selected {
+  background: #134e4a;
+  color: #94a3b8;
+}
+
 .login-close-exit-button {
   width: 100%;
   margin-top: 2px;

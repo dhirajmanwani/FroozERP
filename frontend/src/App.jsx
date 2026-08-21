@@ -42,6 +42,7 @@ import { sessionAuthHeaders, shouldAttachSessionAuth } from "./local/authHeaders
 import { consumeStashedSessionForReload, stashSessionForReload } from "./local/reloadSessionBridge";
 import { describeLocalServiceFailure } from "./local/localServiceFailure";
 import { autoConnectivityBlockedReason as resolveAutoConnectivityBlockedReason } from "./local/autoConnectivityAvailability";
+import { clearOfflineFailures, offlineLockMessage, readOfflineLockState, registerOfflineFailure } from "./local/offlineLoginLockout";
 import { resolveSessionAction } from "./local/sessionExpiry";
 import {
   addNotification,
@@ -3816,12 +3817,26 @@ function App() {
         selectedSource: credentialSource.source,
       });
     });
+    // A-5 locked /login and the bootstrap route, but both live in the cloud backend — an offline
+    // sign-in never reaches either, so offline guessing was unlimited. That is the case that
+    // matters most: the cloud is behind a network, the till is on a counter. Checked before the
+    // password, so a locked device refuses whatever is typed.
+    const offlineLock = readOfflineLockState({ username });
+    if (offlineLock.locked) {
+      setStartupError(offlineLockMessage(offlineLock.remainingMs));
+      return false;
+    }
     const offlineAuth = await verifyOfflineSessionRecord(credentialSource.record, {
       username,
       password,
       deviceId: latestDevice.device_id,
     });
     if (!offlineAuth.ok) {
+      const offlineFailure = registerOfflineFailure({ username });
+      if (offlineFailure.locked) {
+        setStartupError(offlineLockMessage(offlineFailure.remainingMs));
+        return false;
+      }
       // §8.2: a reused temporary activation password must be named, not folded into
       // INVALID_CREDENTIALS. This runs only after authentication has already failed, so it
       // classifies the failure and never grants access.
@@ -3837,6 +3852,7 @@ function App() {
       setStartupError([failureMessage, credentialSource.notice].filter(Boolean).join(" "));
       return false;
     }
+    clearOfflineFailures({ username });
     // Entitlement decides access; data presence decides what is shown. An activated device with
     // no products yet must still be able to sign in — refusing it here is what locked a freshly
     // activated device out of its own app entirely.
