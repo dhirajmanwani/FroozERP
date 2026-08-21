@@ -305,6 +305,50 @@ const validatePaymentAllocation = async (database, context, body) => {
   return { sourceType, targetType, sourceId, targetId, amount };
 };
 
+/**
+ * The permission key each side of an allocation demands, keyed by the entity type that names it.
+ *
+ * An allocation does not move money on its own — it decides which invoice an already-recorded
+ * payment settles — but it is what makes a supplier's bill read as paid and a customer's sale read
+ * as cleared, so it needs the same authority as recording the payment did.
+ */
+const PAYMENT_ALLOCATION_PERMISSIONS = Object.freeze({
+  CUSTOMER_PAYMENT: "customer_payments",
+  SALE_PAYMENT: "customer_payments",
+  SUPPLIER_PAYMENT: "supplier_payments",
+  SALE: "customer_payments",
+  SUPPLIER_BILL: "supplier_payments",
+});
+
+/**
+ * Which authorities one allocation request needs, read from the payment and target it names.
+ *
+ * A fixed key would be wrong in one direction or the other: `supplier_payments` alone stops a
+ * Cashier settling a customer's sale, and `customer_payments` alone hands the counter the supplier
+ * ledger. An unrecognised type demands both rather than none, because "no key" here means the
+ * request walks past the check entirely — it still fails validation a moment later, but from behind
+ * the guard rather than in front of it.
+ */
+const paymentAllocationPermissions = (req) => {
+  const named = [req?.body?.payment_entity_type, req?.body?.target_entity_type]
+    .map((value) => PAYMENT_ALLOCATION_PERMISSIONS[cleanText(value, 40).toUpperCase()]);
+  return named.every(Boolean)
+    ? [...new Set(named)]
+    : ["customer_payments", "supplier_payments"];
+};
+
+/**
+ * The keys a request must satisfy — all of them, not any one.
+ *
+ * `permission` is allowed to be a function of the request because a route whose authority depends
+ * on what the body names cannot be described by a literal. Anything falsy drops out, so a route
+ * declaring no permission is unchanged.
+ */
+const requiredPermissions = (permission, req) => {
+  const declared = typeof permission === "function" ? permission(req) : permission;
+  return (Array.isArray(declared) ? declared : [declared]).filter(Boolean);
+};
+
 const transferActionItems = (body) => new Map(
   (Array.isArray(body?.items) ? body.items : [])
     .map((item) => [positiveId(item.item_id), item])
@@ -520,7 +564,8 @@ const registerOperationalV3Routes = ({
     try {
       const resolved = await resolveContext(req, { requireWrite: write });
       if (resolved.error) return sendScopeError(res, resolved.error);
-      if (permission) {
+      const required = requiredPermissions(permission, req);
+      if (required.length) {
         // A declared permission with no authorizer wired in is a misconfiguration, and the only
         // safe reading of it is "cannot establish authority". Falling through to the handler would
         // turn a wiring mistake into a silent bypass on exactly the routes that most need one.
@@ -530,12 +575,14 @@ const registerOperationalV3Routes = ({
             message: "Server authorization is not configured.",
           });
         }
-        const authorized = await authorizePermission(req, permission);
-        if (!authorized) {
-          return res.status(403).json({
-            code: "OPERATIONAL_PERMISSION_REQUIRED",
-            message: "You do not have permission to perform this action.",
-          });
+        for (const key of required) {
+          const authorized = await authorizePermission(req, key);
+          if (!authorized) {
+            return res.status(403).json({
+              code: "OPERATIONAL_PERMISSION_REQUIRED",
+              message: "You do not have permission to perform this action.",
+            });
+          }
         }
       }
       return await handler(req, res, resolved.context);
@@ -760,6 +807,12 @@ const registerOperationalV3Routes = ({
     return res.json({ supplier, scope: { company_id: context.company_id }, ...serverTimePayload() });
   }, { write: true, permission: "supplier_accounts" });
 
+  // Decides what a terminal may sell and at what rate. `inventory` is the key the shipped client
+  // gates the Products module on, and this row is the per-location half of that master. It is
+  // looser than `server.js` on one field: changing `products.selling_rate` there needs the
+  // Owner/Admin rate-manager role, so an Inventory Manager holding `inventory` can set a POS rate
+  // here that they could not set on the product. Narrowing that needs a second authority on the
+  // rate field, not a broader key on the whole route.
   use("put", "/api/v3/location-products/:productId", async (req, res, context) => {
     const productId = positiveId(req.params.productId);
     if (!productId) throw routeError(400, "PRODUCT_REQUIRED", "A product is required");
@@ -832,7 +885,7 @@ const registerOperationalV3Routes = ({
       return current.rows[0];
     }, context, key);
     return res.json({ product: saved, scope: context, ...serverTimePayload() });
-  }, { write: true });
+  }, { write: true, permission: "inventory" });
 
   use("get", "/api/v3/purchase-orders", async (_req, res, context) => {
     const result = await database.query(
@@ -846,6 +899,11 @@ const registerOperationalV3Routes = ({
     return res.json({ scope: context, purchase_orders: result.rows, ...serverTimePayload() });
   });
 
+  // The three purchase-pipeline writes below all take `purchases`, the key the client gates the
+  // Purchases module on and the one the seeded roles deny a Cashier outright. There is no non-v3
+  // equivalent to copy from — `purchase_orders`, `goods_receipts` and `supplier_bills` exist only
+  // in this protocol — so the key is chosen by what the row commits the shop to: an order placed
+  // with a supplier, the stock received against it, and the invoice that becomes payable.
   use("post", "/api/v3/purchase-orders", async (req, res, context) => {
     const key = requiredIdempotencyKey(req.body);
     const supplierId = positiveId(req.body.supplier_id);
@@ -890,7 +948,7 @@ const registerOperationalV3Routes = ({
       return header.rows[0];
     }, context, key);
     return res.status(201).json({ purchase_order: saved, scope: context, ...serverTimePayload() });
-  }, { write: true });
+  }, { write: true, permission: "purchases" });
 
   use("get", "/api/v3/goods-receipts", async (_req, res, context) => {
     const result = await database.query(
@@ -976,7 +1034,7 @@ const registerOperationalV3Routes = ({
       return header.rows[0];
     }, context, key);
     return res.status(201).json({ goods_receipt: saved, scope: context, ...serverTimePayload() });
-  }, { write: true });
+  }, { write: true, permission: "purchases" });
 
   use("get", "/api/v3/supplier-bills", async (_req, res, context) => {
     const result = await database.query(
@@ -1016,7 +1074,7 @@ const registerOperationalV3Routes = ({
       ]
     );
     return res.status(201).json({ supplier_bill: result.rows[0], scope: context, ...serverTimePayload() });
-  }, { write: true });
+  }, { write: true, permission: "purchases" });
 
   use("get", "/api/v3/payment-allocations", async (_req, res, context) => {
     const result = await database.query(
@@ -1069,7 +1127,7 @@ const registerOperationalV3Routes = ({
       ]
     );
     return res.status(201).json({ payment_allocation: result.rows[0], scope: context, ...serverTimePayload() });
-  }, { write: true });
+  }, { write: true, permission: paymentAllocationPermissions });
 
   use("post", "/api/v3/transfers", async (req, res, context) => {
     const key = requiredIdempotencyKey(req.body);
@@ -1128,7 +1186,7 @@ const registerOperationalV3Routes = ({
       return transfer.rows[0];
     }, context, key);
     return res.status(201).json({ transfer: saved, scope: context, ...serverTimePayload() });
-  }, { write: true });
+  }, { write: true, permission: "inventory" });
 
   use("post", "/api/v3/transfers/:transferId/actions/:action", async (req, res, context) => {
     const transferId = positiveId(req.params.transferId);
@@ -1189,7 +1247,7 @@ const registerOperationalV3Routes = ({
       return updated.rows[0];
     }, context, key);
     return res.json({ transfer: saved, scope: context, ...serverTimePayload() });
-  }, { write: true });
+  }, { write: true, permission: "inventory" });
 
   use("get", "/api/v3/transfers", async (req, res, context) => {
     const consolidated = String(req.query.scope || "").toUpperCase() === "ALL_LOCATIONS";

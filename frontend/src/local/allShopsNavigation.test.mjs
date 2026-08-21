@@ -184,3 +184,46 @@ test("promised stock is shown on the cart line, not only on refusal", () => {
   // A refusal at the till happens with a customer standing there.
   assert.match(app, /reservedNote\(reservedIndex, item\.product_id, item\.unit\)/);
 });
+
+test("sending an order builds a POS cart instead of writing a sale directly", () => {
+  // POS owns lot allocation, discounts, mandi tax, payment mode and printing. A second writer
+  // that skipped those would be a second set of rules about money, and the one nobody exercises
+  // daily is the one that quietly gets it wrong.
+  const start = app.indexOf("const seed = buildOrderCartSeed(order,");
+  assert.ok(start > 0, "sending must build a cart seed");
+  const body = app.slice(start, start + 900);
+  assert.match(body, /setPosSeedCart\(seed\.lines\)/);
+  assert.match(body, /await navigate\("sales"\)/);
+});
+
+test("an order that cannot be billed at all says so instead of opening an empty till", () => {
+  assert.match(app, /Order sent, but nothing could be billed/);
+});
+
+test("a partly billable order is not silently billed short", () => {
+  // Billing part of an order and reporting success under-charges the customer and leaves the
+  // order looking complete.
+  assert.match(app, /Order sent, and part of it is on the POS screen/);
+});
+
+test("the saved bill is linked back to its order", () => {
+  // The storage layer treats a written sale_id as what makes an order irreversible. An order
+  // billed but not linked would still offer "cancel" and could be billed a second time.
+  const start = app.indexOf("if (pendingOrderBill) {");
+  assert.ok(start > 0, "the sale handler must link the order");
+  const body = app.slice(start, start + 1200);
+  assert.match(body, /nextStatus: ORDER_STATUS\.SENT/);
+  assert.match(body, /patch: \{ sale_id: saleId, invoice_no: invoiceNo \}/);
+  // A failed link must never be silent: the sale is saved and cannot be undone.
+  assert.match(body, /Do not bill it again/);
+});
+
+test("a seeded cart replaces the cart rather than merging into it", () => {
+  // The operator arrived here by sending an order. Merging a half-typed walk-in sale into that
+  // customer's bill would put somebody else's fruit on their invoice.
+  const start = app.indexOf("if (!Array.isArray(seedCart) || seedCart.length === 0) return;");
+  assert.ok(start > 0, "POS must accept a seeded cart");
+  const body = app.slice(start, start + 700);
+  assert.match(body, /setCart\(seedCart\.map/);
+  assert.match(body, /onSeedConsumed\?\.\(\)/);
+});

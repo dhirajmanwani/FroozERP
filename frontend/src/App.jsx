@@ -45,6 +45,7 @@ import { resolveShopViewPresentation, shopPickerVisible } from "./local/shopView
 import { ORDER_STATUS } from "./local/orderLifecycle";
 import { buildOrdersBoard, validateOrderAction } from "./local/ordersBoard";
 import { COUNTER_STOCK, buildReservedIndex, describeCounterStock, reservedForProduct, reservedNote } from "./local/reservedStock";
+import { buildOrderCartSeed, describeOrderBillingProblems } from "./local/orderBilling";
 import { bannerForState } from "./local/entitlementState";
 import { sessionAuthHeaders, shouldAttachSessionAuth } from "./local/authHeaders";
 import { consumeStashedSessionForReload, stashSessionForReload } from "./local/reloadSessionBridge";
@@ -1771,6 +1772,10 @@ function App() {
   const [shopSwitchBusy, setShopSwitchBusy] = useState(false);
   const [ordersState, setOrdersState] = useState({ loadState: "idle", loadError: "", orders: [] });
   const [orderActionBusy, setOrderActionBusy] = useState(false);
+  // The order whose bill is being rung up, and the cart POS should open with. Held here rather than
+  // inside PosBilling so the link back to the order survives POS remounting.
+  const [pendingOrderBill, setPendingOrderBill] = useState(null);
+  const [posSeedCart, setPosSeedCart] = useState(null);
   const [dashboardRange, setDashboardRange] = useState("7");
   const [dashboardCustomRange, setDashboardCustomRange] = useState({
     date_from: toDateKey(new Date()),
@@ -4607,9 +4612,23 @@ function App() {
     try {
       await setLocalCustomerOrderStatus({ orderId: order.id, nextStatus: to, patch: extras });
       await loadOrders();
-      setSyncMessage(to === ORDER_STATUS.SENT
-        ? "Order marked sent. Bill it on POS and the invoice will be linked."
-        : "");
+      if (to !== ORDER_STATUS.SENT) {
+        setSyncMessage("");
+        return;
+      }
+      // Sending raises the bill. The cart is built from the order and handed to POS rather than
+      // written directly, so the one tested billing path stays the only one — see local/orderBilling.js.
+      const seed = buildOrderCartSeed(order, { products, lots: inventory });
+      if (seed.lines.length === 0) {
+        setSyncMessage(`Order sent, but nothing could be billed. ${describeOrderBillingProblems(seed)}`);
+        return;
+      }
+      setPendingOrderBill({ orderId: order.id, orderNo: order.orderNo || "" });
+      setPosSeedCart(seed.lines);
+      setSyncMessage(seed.complete
+        ? `Order sent. Its items are on the POS screen at the rates you quoted — confirm payment to bill it.`
+        : `Order sent, and part of it is on the POS screen. ${describeOrderBillingProblems(seed)}`);
+      await navigate("sales");
     } catch (error) {
       setSyncMessage(describeLocalServiceFailure(error, "That order could not be updated"));
     } finally {
@@ -7410,12 +7429,38 @@ function App() {
             <PosBilling
               customers={customers.filter((customer) => customer.active !== false)}
               orders={ordersState.orders}
+              seedCart={posSeedCart}
+              onSeedConsumed={() => setPosSeedCart(null)}
               deviceInfo={deviceInfo}
               discountRules={discountRules}
               lotDiscounts={lotDiscounts}
               inventory={inventory}
               onInvoice={setSelectedInvoice}
               onSaved={async (result) => {
+                // Link the bill back to the order that produced it. Done before anything else can
+                // fail: the storage layer treats a written sale_id as the thing that makes an order
+                // irreversible, so an order that was billed and not linked would still offer
+                // "cancel" and could be billed a second time.
+                if (pendingOrderBill) {
+                  const saleId = String(result?.localSale?.id || result?.sale?.id || result?.id || "");
+                  const invoiceNo = String(result?.localSale?.invoice_no || result?.sale?.invoice_no || result?.invoice_no || "");
+                  if (saleId || invoiceNo) {
+                    try {
+                      await setLocalCustomerOrderStatus({
+                        orderId: pendingOrderBill.orderId,
+                        nextStatus: ORDER_STATUS.SENT,
+                        patch: { sale_id: saleId, invoice_no: invoiceNo },
+                      });
+                      setSyncMessage(`Bill ${invoiceNo || saleId} linked to order ${pendingOrderBill.orderNo}.`);
+                    } catch (error) {
+                      // The sale is already saved and must not be undone. Say so loudly instead:
+                      // an unlinked order is a recoverable nuisance, a re-billed one is not.
+                      setSyncMessage(`The bill was saved but could not be linked to order ${pendingOrderBill.orderNo}. Do not bill it again — link it by hand. (${describeLocalServiceFailure(error, "link failed")})`);
+                    }
+                  }
+                  setPendingOrderBill(null);
+                  await loadOrders();
+                }
                 if (result?.localSale) {
                   setSalesHistory((rows) => [result.localSale, ...rows]);
                   setInventory((rows) => rows.map((lot) => {
@@ -16887,7 +16932,7 @@ const currentDateTimeLocal = () => {
   return `${year}-${month}-${day}T${hours}:${minutes}`;
 };
 
-function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, syncInBackground, user }) {
+function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, onSeedConsumed, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
   const [search, setSearch] = useState("");
   const [barcode, setBarcode] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
@@ -16922,6 +16967,35 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     setLotFilter("AVAILABLE");
     searchRef.current?.focus();
   }, [refreshToken]);
+
+  /**
+   * Load a cart prepared from a sent order.
+   *
+   * Replaces whatever is in the cart rather than appending: the operator was moved here by sending
+   * an order, and merging a half-typed walk-in sale into that customer's bill would put somebody
+   * else's fruit on their invoice. Consumed immediately so a re-render cannot load it twice.
+   */
+  useEffect(() => {
+    if (!Array.isArray(seedCart) || seedCart.length === 0) return;
+    setCart(seedCart.map((line) => {
+      const lineId = newCartLineId();
+      return {
+        ...line,
+        line_id: lineId,
+        cart_key: lineId,
+        cart_identity: `${line.product_id}-${line.inventory_batch_id}`,
+        available_qty: Number(line.quantity || 0),
+        default_selling_rate: Number(line.selling_rate || 0),
+        discount_amount: 0,
+        lot_discount_id: null,
+        lot_discount_type: null,
+        lot_discount_value: 0,
+        lot_discount_per_unit: 0,
+      };
+    }));
+    onSeedConsumed?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seedCart]);
 
   const effectiveQuantityMode = posSettings.enable_weighing_scale ? quantityMode : "MANUAL";
   const lotSelectionMode = String(saleRateSettings.pos_lot_selection_mode || "ASK_MULTIPLE").toUpperCase();
