@@ -803,6 +803,7 @@ const icons = {
   reports: "chart",
   settings: "settings",
   "sale-rates": "trend",
+  "all-shops": "layers",
   frost: "message",
 };
 
