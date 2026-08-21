@@ -1,6 +1,6 @@
 # Auth Hardening — Scoping and Plan
 
-**Status:** **A-1 … A-4d complete; A-6 written (all 2026-08-19/20).** A-5 open, and **A-7 — branch isolation — is now the largest open item on this track.** §5's "Not audited" is now **audited and failing**: see `docs/branch-isolation-audit.md`. Written 2026-08-17 at the maintainer's
+**Status:** **A-1 … A-5 (lockout) complete; A-6 written (all 2026-08-19/20).** The A-5 legacy-hash removal is blocked on a precondition, and **A-7 — branch isolation — is now the largest open item on this track.** §5's "Not audited" is now **audited and failing**: see `docs/branch-isolation-audit.md`. Written 2026-08-17 at the maintainer's
 request, to run **in parallel** with the offline-activation stages.
 
 | Stage | Status |
@@ -12,7 +12,7 @@ request, to run **in parallel** with the offline-activation stages.
 | A-4b `updated_by` authorisation | **Complete 2026-08-20** — 92 routes across four guard families now read the verified session. See the record. |
 | A-4c money-route permissions | **Complete 2026-08-20** — 13 handlers / 15 registrations. See the record. **Found a further unguarded class: see A-4d.** |
 | A-4d unguarded master-data writes | **Complete 2026-08-20** — including the live `/api/v3/suppliers` path the sweep nearly missed. See the record. |
-| A-5 lockout + delete legacy verify | Open |
+| A-5 lockout + delete legacy verify | **Lockout complete 2026-08-20. The legacy SHA-256 removal is deliberately NOT done** — its precondition is not met. See the record. |
 | **A-7 branch isolation** | **Open — audited 2026-08-20 and failing.** A signed-in Branch A user can read essentially all of Branch B's data. Gates multibranch. |
 | A-6 exposure checklist | **Written 2026-08-20** — see the record. It is a **gate**, not a summary: every unticked line is a reason not to expose the backend. |
 **Related:** `CLAUDE.md` "Known security debt"; `docs/offline-activation-design.md` §12 (which
@@ -1228,3 +1228,124 @@ The audit agent disclosed running one `git status` despite being told not to run
 Read-only, output discarded, no `.git/index.lock` left behind and the index intact — but recorded
 here rather than dropped, because the instruction existed to prevent concurrent agents racing on
 the index and "it turned out fine" is not the same as "it was safe".
+
+---
+
+## A-5 record — failed-login lockout (2026-08-20)
+
+### A column, a check, and nothing in between
+
+`users.locked_until` has existed for a long time, and `/login` already refused a sign-in while it
+was in the future. **Nothing ever set it.** The only statement touching the column *cleared* it, so
+the guard was unreachable — password guessing against `/login` was unlimited, which is exactly why
+the API cannot be exposed even after A-1 fixed the hashing.
+
+This stage is the missing half: `backend/loginLockout.js`, pure and free of clock or database, so
+every branch could be tested. Each branch is a decision about locking a real shopkeeper out of
+their own till, which is the reason it is a separate module rather than inline SQL.
+
+### The policy, and the reasoning behind the shape
+
+| Consecutive failures | Result |
+| --- | --- |
+| 1–4 | nothing |
+| 5th | 1 minute |
+| 6th | 2 minutes |
+| 7th | 5 minutes |
+| 8th | 15 minutes |
+| 9th | 30 minutes |
+| 10th and beyond | 1 hour (capped) |
+
+**A short streak is a typo; a long one is an attack.** People mistype passwords at a counter, in a
+hurry, on a keyboard they are not looking at. The first few failures cost nothing and the curve then
+climbs steeply — barely noticeable to a human, an hour per ten guesses for a script.
+
+**The streak decays after 15 minutes.** Without it, four typos spread across a year would meet a
+fifth and lock an account that has never been attacked. A failure that is not part of a burst is not
+evidence of anything.
+
+**A locked account refuses the correct password too.** If the right password lifted the lock early,
+an attacker who guessed it would never learn the lock existed, and the lock would fail at the only
+moment it mattered.
+
+**The lock expires by itself, and the escalation stops at an hour.** A permanent lock needing an
+administrator turns a nuisance attack into a denial of service against a shop that may have nobody
+awake to unlock it. An unbounded lock is a denial of service dressed as security.
+
+**The message states the wait, never the policy** — naming the threshold hands an attacker the
+tuning for free and tells a legitimate user nothing they can act on. Remaining time is rounded
+*up*: "try again in 1 minute" when 61 seconds remain earns a second failed attempt and justified
+annoyance.
+
+### The route that would have made this theatre
+
+Locking `/login` alone would have been close to pointless. **`POST /bootstrap/first-owner-device` is
+on A-4's public allow-list, verifies the Owner's password, and had no limit of any kind.** An
+attacker would simply have guessed there instead — against the single most valuable account in the
+system, with no session required.
+
+It now shares the same lock and the *same counters*, so a streak accumulated on either route locks
+both. Two independent counters would have halved the cost of guessing: alternate routes, never trip
+either threshold. There is a test asserting exactly one shared counter.
+
+That route stays on the "no permission check by design" list in
+`masterDataAuthorization.test.js` — it authenticates itself, so there is no session to check a
+permission against — but the entry now records that "no permission check" no longer means
+"unlimited guessing".
+
+### Bookkeeping never breaks a sign-in
+
+Both counter updates are wrapped and swallowed. A failure there must never turn a wrong password
+into a 500: that would tell an attacker their guess was interesting, and would break sign-in for
+everyone the moment the column was missing.
+
+A successful sign-in clears the streak and the lock. Without that the counter only ever climbs, and
+a user who mistyped four times last week is locked by their next single slip.
+
+Locking is written to `auth_audit_log` as `ACCOUNT_LOCKED` with the streak length and the unlock
+time, so a lockout is explicable after the fact rather than mysterious.
+
+### The other half of A-5 is deliberately NOT done
+
+The plan pairs the lockout with **removing the legacy SHA-256 verify path**, gated on this
+condition, quoted from the plan itself:
+
+> remove the SHA-256 verify path once telemetry shows every active user has logged in since A-1.
+
+**A-1 landed on 2026-08-19 — yesterday.** Nobody except the maintainer has signed in since. Removing
+the legacy path today would lock out every user whose password has not yet been re-hashed, which is
+very likely all of them. That is not a judgement call; it is the precondition plainly not being met.
+
+**Precondition, to be checked before the removal:**
+
+```sql
+SELECT COUNT(*) AS still_legacy
+  FROM users
+ WHERE active = TRUE
+   AND password_hash ~ '^[0-9a-f]{64}$';
+```
+
+`0` means every active user has signed in since A-1 and the legacy branch in
+`backend/passwordHash.js` can be deleted along with its tests. Any other number is the list of
+people that removal would lock out.
+
+Until then the legacy path stays, and A-5 is **half complete by design** rather than by oversight.
+
+### Gate results
+
+| Gate | Result |
+| --- | --- |
+| `npm --prefix backend test` | **251 / 252** — the 1 failure is the pre-existing Linux-vs-Windows path assertion |
+| `TZ=Asia/Kolkata node --test frontend/src/local/*.test.mjs` | **313 / 313** |
+| `npm --prefix frontend run lint` | 0 errors, 37 warnings (unchanged) |
+| `npm run build` | Pass |
+
+23 tests on the policy and its wiring, including that the lock is consulted *before* the password
+on both routes — a lock checked afterwards would let a correct password through and defeat the
+mechanism entirely.
+
+### Not verified
+
+Not exercised against a real Postgres; there is no database in the development environment. The two
+new columns and both UPDATE statements are verified by construction and source assertion only.
+Worth one check on a disposable database before release.

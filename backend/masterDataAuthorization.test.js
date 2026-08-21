@@ -265,6 +265,11 @@ const collectWriteRegistrations = () => {
  */
 const UNGUARDED_BY_DESIGN = [
   "POST /login",
+  // Self-authenticating: it verifies the owner's username and password itself and refuses once any
+  // approved owner device exists. There is no permission to check because there is no session yet —
+  // that is why it sits on A-4's public allow-list. A-5 gave it the same failed-attempt lock as
+  // /login, so "no permission check" no longer means "unlimited guessing".
+  "POST /bootstrap/first-owner-device",
   "POST /devices/activate",
   "POST /api/device/register",
   "POST /api/sync/register-device",

@@ -48,6 +48,7 @@ const {
 // authenticates on the routes that already verify sessions. Same token, same verification.
 const { createRequireAuth, extractSessionToken } = require("./authMiddleware");
 const { resolveSessionSecret } = require("./sessionSecret");
+const { lockMessage, registerFailedAttempt, resolveLockState } = require("./loginLockout");
 const {
   REFERENCE_BOOTSTRAP_PROTOCOL,
   captureReferenceBootstrap,
@@ -1562,6 +1563,11 @@ const initializeDatabase = async () => {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS force_password_change BOOLEAN DEFAULT FALSE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS session_revocation_version INTEGER DEFAULT 0;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP;
+    -- A-5: locked_until has always existed and nothing ever set it, because there was nowhere to
+    -- count from. These two are that missing state. Defaulting the counter to 0 rather than NULL
+    -- keeps an existing row's first failed attempt from having to special-case a null streak.
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS last_failed_login_at TIMESTAMP;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP;
     CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_unique_idx
       ON users (LOWER(username));
@@ -10273,7 +10279,8 @@ app.post("/bootstrap/first-owner-device", async (req, res) => {
 
     const userResult = await pool.query(
       `
-      SELECT u.id, u.username, u.password_hash, u.branch_id, u.active, r.role_name
+      SELECT u.id, u.username, u.password_hash, u.branch_id, u.active, u.locked_until,
+             u.failed_login_attempts, u.last_failed_login_at, r.role_name
       FROM users u
       JOIN roles r ON r.id = u.role_id
       WHERE LOWER(u.username) = LOWER($1)
@@ -10282,7 +10289,41 @@ app.post("/bootstrap/first-owner-device", async (req, res) => {
       [username]
     );
     const user = userResult.rows[0];
-    if (!user || user.active === false || !(await checkPassword(password, user.password_hash)).ok || !isOwnerBootstrapEligible(user)) {
+    // A-5: this route is on the A-4 public allow-list and verifies the Owner's password, so a
+    // lockout that covered only `/login` would be theatre — an attacker would simply guess here
+    // instead, without limit. Same policy, same counters, so a streak accumulated on either route
+    // locks both.
+    const bootstrapLock = user ? resolveLockState({ lockedUntil: user.locked_until }) : { locked: false };
+    if (bootstrapLock.locked) {
+      return res.status(423).json({ code: "USER_LOCKED", message: lockMessage(bootstrapLock.remainingMs) });
+    }
+    const bootstrapCredentialsValid = Boolean(
+      user && user.active !== false
+      && (await checkPassword(password, user.password_hash)).ok
+      && isOwnerBootstrapEligible(user),
+    );
+    if (!bootstrapCredentialsValid) {
+      if (user) {
+        // Counted only for a real account, and swallowed on error: bookkeeping must never turn a
+        // rejected bootstrap into a 500, which would tell an attacker their guess was interesting.
+        const outcome = registerFailedAttempt({
+          failedAttempts: user.failed_login_attempts,
+          lastFailedAt: user.last_failed_login_at,
+        });
+        try {
+          await pool.query(
+            `UPDATE users
+                SET failed_login_attempts = $2,
+                    last_failed_login_at = CURRENT_TIMESTAMP,
+                    locked_until = $3,
+                    updated_at = CURRENT_TIMESTAMP
+              WHERE id = $1`,
+            [user.id, outcome.failedAttempts, outcome.lockedUntilMs ? new Date(outcome.lockedUntilMs) : null]
+          );
+        } catch (error) {
+          console.error("Bootstrap failed-login bookkeeping failed", error);
+        }
+      }
       return res.status(403).json({ message: "First owner device bootstrap requires valid owner credentials." });
     }
 
@@ -10596,6 +10637,8 @@ app.post("/login", async (req, res) => {
         u.force_password_change,
         u.session_revocation_version,
         u.locked_until,
+        u.failed_login_attempts,
+        u.last_failed_login_at,
         r.role_name,
         co.company_name,
         b.branch_name,
@@ -10700,16 +10743,21 @@ app.post("/login", async (req, res) => {
         details: { stage: "user_status" },
       });
     }
-    if (user.locked_until && new Date(user.locked_until).getTime() > Date.now()) {
+    // Checked before the password, so a locked account is refused whatever it types. If the correct
+    // password lifted the lock early, an attacker who guessed it would never learn a lock existed —
+    // and the lock would fail at the only moment it mattered.
+    const lockState = resolveLockState({ lockedUntil: user.locked_until });
+    if (lockState.locked) {
       return authFailure(res, {
         status: 423,
         code: "USER_LOCKED",
-        publicMessage: "This account is temporarily locked. Contact your Owner or Administrator.",
+        // States the wait, not the policy: naming the threshold hands an attacker the tuning.
+        publicMessage: lockMessage(lockState.remainingMs),
         userId: user.id,
         username: user.username,
         deviceId: devicePayload.device_id,
         ipAddress: req.ip,
-        details: { stage: "user_locked" },
+        details: { stage: "user_locked", unlocks_at: new Date(lockState.unlocksAtMs).toISOString() },
       });
     }
     const passwordCheck = await checkPassword(password, user.password_hash);
@@ -10724,6 +10772,42 @@ app.post("/login", async (req, res) => {
         canonicalAliasUsed,
         device: approvedDeviceResult.rows[0],
       });
+      // A-5: count the failure, and lock once the streak earns it. Recorded before the response so
+      // a caller cannot outrun the counter by abandoning the connection. Failures here are
+      // swallowed: a bookkeeping error must never turn a wrong password into a 500, which would
+      // tell an attacker their guess was interesting.
+      const lockOutcome = registerFailedAttempt({
+        failedAttempts: user.failed_login_attempts,
+        lastFailedAt: user.last_failed_login_at,
+      });
+      try {
+        await pool.query(
+          `UPDATE users
+              SET failed_login_attempts = $2,
+                  last_failed_login_at = CURRENT_TIMESTAMP,
+                  locked_until = $3,
+                  updated_at = CURRENT_TIMESTAMP
+            WHERE id = $1`,
+          [user.id, lockOutcome.failedAttempts, lockOutcome.lockedUntilMs ? new Date(lockOutcome.lockedUntilMs) : null]
+        );
+        if (lockOutcome.lockedUntilMs) {
+          await writeAuthAudit({
+            userId: user.id,
+            username: user.username,
+            action: "ACCOUNT_LOCKED",
+            safeCode: "USER_LOCKED",
+            deviceId: devicePayload.device_id,
+            ipAddress: req.ip,
+            details: {
+              failed_attempts: lockOutcome.failedAttempts,
+              lock_duration_ms: lockOutcome.lockDurationMs,
+              unlocks_at: new Date(lockOutcome.lockedUntilMs).toISOString(),
+            },
+          });
+        }
+      } catch (error) {
+        console.error("Failed-login bookkeeping failed", error);
+      }
       return authFailure(res, {
         status: aliasFailure?.status || 401,
         code: aliasFailure?.code || "INVALID_CREDENTIALS",
@@ -10892,8 +10976,17 @@ app.post("/login", async (req, res) => {
       [device.device_id]
     );
     const hashed = await hashPassword(password);
+    // A-5: a successful sign-in ends the streak. Without this the counter only ever climbs, and a
+    // user who mistyped four times last week would be locked by their next single slip — the
+    // streak is meant to measure a burst of guessing, not a lifetime of typos.
     await pool.query(
-      "UPDATE users SET password_hash = $1, last_login_at = CURRENT_TIMESTAMP WHERE id = $2",
+      `UPDATE users
+          SET password_hash = $1,
+              last_login_at = CURRENT_TIMESTAMP,
+              failed_login_attempts = 0,
+              last_failed_login_at = NULL,
+              locked_until = NULL
+        WHERE id = $2`,
       [hashed, user.id]
     );
     await writeAuthAudit({
