@@ -29,13 +29,30 @@
  *
  * Usage:
  *   npm run app:disposable
- *   FROOZERP_DISPOSABLE_ROOT=F:\froozerp-disposable npm run app:disposable
+ * The examples below are PowerShell, because Windows is the only shipped target and PowerShell is
+ * the shell in CLAUDE.md. They were written in `VAR=value command` form, which is bash: PowerShell
+ * reads that as a command name and answers "is not recognized as the name of a cmdlet". Usage
+ * examples that fail on the only supported platform are worse than none, because they cost someone
+ * a confusing error before they can start.
+ *
+ *   $env:FROOZERP_DISPOSABLE_ROOT = "F:\froozerp-disposable"
+ *   npm run app:disposable
  *
  *   # A named profile survives between runs, so the device stays activated:
- *   FROOZERP_DISPOSABLE_PROFILE=test npm run app:disposable
+ *   $env:FROOZERP_DISPOSABLE_PROFILE = "test"
+ *   npm run app:disposable
  *
  *   # ...and seeding it from a copy of the live database means it never needs activating at all.
  *   # Close the real app first: copying a live SQLite file mid-write can capture a torn state.
+ *   $env:FROOZERP_DISPOSABLE_PROFILE = "test"
+ *   $env:FROOZERP_DISPOSABLE_SEED = "live"
+ *   npm run app:disposable
+ *
+ *   # `$env:` values live as long as the window does. That is the same per-window statefulness that
+ *   # caused the 2026-08-18 incident above, so clear them or close the terminal when finished:
+ *   Remove-Item Env:FROOZERP_DISPOSABLE_PROFILE, Env:FROOZERP_DISPOSABLE_SEED
+ *
+ * On bash or zsh the inline form still works:
  *   FROOZERP_DISPOSABLE_PROFILE=test FROOZERP_DISPOSABLE_SEED=live npm run app:disposable
  */
 
