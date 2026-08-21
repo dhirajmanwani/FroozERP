@@ -1331,6 +1331,30 @@ people that removal would lock out.
 
 Until then the legacy path stays, and A-5 is **half complete by design** rather than by oversight.
 
+**The count is now printed at every cloud startup** (`reportLegacyPasswordHashes`) rather than left
+as a query in this document. The answer changes silently as people sign in, and a number nobody is
+watching is a number nobody knows. Only the count is reported — no usernames, no ids, because a
+startup log naming accounts with weak hashes is a list of targets. It is never fatal.
+
+### Why this is not unblocked by "the other accounts are only samples"
+
+The maintainer confirmed on 2026-08-20 that only their own account is real. That removes the
+*"other users would be locked out"* objection — but **not the one that matters**, which points at
+their own account:
+
+`passwordHash.js` is only ever reached by the **cloud** backend. `desktopGateway.js` never uses it.
+The cloud has been down (Railway lapsed) for the whole period since A-1, so nobody has signed in
+*against Postgres* since the re-hash-on-login path existed. The maintainer's own hash there is
+therefore almost certainly still the legacy format.
+
+**Removing the legacy path today would lock out the one account that matters, the moment the cloud
+comes back.** The precondition stands, and it is now self-reporting: sign in once after the cloud
+returns, watch the startup line say 0, then delete the path.
+
+Deleting sample user rows was offered and declined — it would not have helped (the risk is the
+maintainer's own row, not the samples), and deleting business data to satisfy a check is a
+`CLAUDE.md` boundary regardless of how little the data is worth.
+
 ### Gate results
 
 | Gate | Result |

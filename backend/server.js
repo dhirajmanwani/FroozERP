@@ -20221,6 +20221,46 @@ const readBusinessCounts = async () => {
   return Object.fromEntries(entries);
 };
 
+/**
+ * Report how many active users still carry a pre-A-1 password hash.
+ *
+ * This is the precondition for the second half of A-5 — deleting the legacy SHA-256 verify path
+ * from `passwordHash.js`. That path is a weaker, unsalted digest and should not live forever, but
+ * removing it locks out every user who has not signed in since A-1, so the removal is gated on this
+ * number reaching zero.
+ *
+ * It is printed at startup rather than left as a query in a document because the answer changes on
+ * its own, silently, as people sign in — a number nobody is watching is a number nobody knows. The
+ * count is deliberately the only thing reported: no usernames, no ids, nothing that turns a startup
+ * log into a list of accounts worth attacking.
+ *
+ * Never fatal. This is a readiness observation, not a health check, and a server that refused to
+ * start because it could not count something would be worse than the thing it is counting.
+ */
+const reportLegacyPasswordHashes = async () => {
+  if (desktopLocalRuntime) return;
+  try {
+    const result = await pool.query(
+      `SELECT COUNT(*)::INTEGER AS still_legacy
+         FROM users
+        WHERE active = TRUE
+          AND password_hash ~ '^[0-9a-f]{64}$'`
+    );
+    const stillLegacy = Number(result.rows[0]?.still_legacy || 0);
+    if (stillLegacy > 0) {
+      console.warn(
+        `[auth] ${stillLegacy} active user(s) still have a pre-A-1 password hash. `
+        + "They are upgraded automatically on their next sign-in. The legacy verify path in "
+        + "passwordHash.js cannot be removed until this reaches 0 (auth-hardening A-5)."
+      );
+    } else {
+      console.log("[auth] No legacy password hashes remain; the A-5 legacy verify path can be removed.");
+    }
+  } catch (error) {
+    console.warn(`[auth] Could not count legacy password hashes: ${error.message}`);
+  }
+};
+
 const prepareDatabaseForStartup = async () => {
   console.log("schema bootstrap started");
   if (desktopLocalRuntime) {
@@ -20245,6 +20285,7 @@ const prepareDatabaseForStartup = async () => {
   }
   await ensureProductEntrySchema();
   await verifyRequiredDatabaseSchema();
+  await reportLegacyPasswordHashes();
   if (!desktopLocalRuntime) {
     const aiSchema = await ensureAiBusinessAssistantSchema(pool);
     if (aiSchema.created) console.log(`FROST schema prepared: ${aiSchema.missingBefore.join(", ")}`);
