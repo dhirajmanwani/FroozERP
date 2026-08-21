@@ -8,7 +8,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::entitlement::{self, EntitlementState};
 
-const CURRENT_SCHEMA_VERSION: &str = "019_provisional_lot_cost_status";
+const CURRENT_SCHEMA_VERSION: &str = "020_customer_orders";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -28,6 +28,7 @@ const MIGRATION_016: &str = include_str!("../migrations/sqlite/016_purchase_aggr
 const MIGRATION_017: &str = include_str!("../migrations/sqlite/017_offline_entitlement_foundation.sql");
 const MIGRATION_018: &str = include_str!("../migrations/sqlite/018_bootstrap_credential_consumption.sql");
 const MIGRATION_019: &str = include_str!("../migrations/sqlite/019_provisional_lot_cost_status.sql");
+const MIGRATION_020: &str = include_str!("../migrations/sqlite/020_customer_orders.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -2118,6 +2119,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "017_offline_entitlement_foundation", MIGRATION_017)?;
     apply_migration(&mut conn, "018_bootstrap_credential_consumption", MIGRATION_018)?;
     apply_migration(&mut conn, "019_provisional_lot_cost_status", MIGRATION_019)?;
+    apply_migration(&mut conn, "020_customer_orders", MIGRATION_020)?;
     Ok(())
 }
 
@@ -5026,7 +5028,7 @@ mod tests {
     /// three at once with nothing but `left: 18, right: 17` to explain why, and the failures were
     /// mistaken for the environment for long enough to reach a merge check. One named constant is
     /// the whole fix: **bump this when you add a migration**, and the number says what it counts.
-    const EXPECTED_APPLIED_MIGRATIONS: i64 = 18;
+    const EXPECTED_APPLIED_MIGRATIONS: i64 = 19;
 
     #[test]
     fn snapshot_preflight_rejects_malformed_database_without_replacing_it() {
@@ -5384,6 +5386,86 @@ mod tests {
             )
             .expect("read reconciled aggregate state");
         assert_eq!(result, ("completed".to_string(), 1, 2, 2, 2));
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The order tables exist, and their CHECK constraints are load-bearing rather than decorative.
+    ///
+    /// `status` and `source` are constrained in SQL as well as in
+    /// `frontend/src/local/orderLifecycle.js` on purpose. The JS state machine decides which moves
+    /// the app offers; the constraint decides what can end up in the file. A row written by a
+    /// future sync arm, a repair script, or a hand-edited database still has to be a status this
+    /// app knows how to display — an unrecognised one would render as an order stuck in a state
+    /// with no buttons and no explanation.
+    #[test]
+    fn customer_order_tables_reject_states_the_app_cannot_display() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-customer-orders-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize order database");
+        let conn = Connection::open(&path).expect("open order database");
+
+        conn.execute(
+            "INSERT INTO local_customer_orders (id, order_no, customer_name, status, source) \
+             VALUES ('order-1', 'ORD-1', 'Ram', 'RECEIVED', 'PHONE')",
+            [],
+        )
+        .expect("a well-formed order is accepted");
+
+        assert!(
+            conn.execute(
+                "INSERT INTO local_customer_orders (id, order_no, customer_name, status) \
+                 VALUES ('order-2', 'ORD-2', 'Sita', 'HALF_PACKED')",
+                [],
+            )
+            .is_err(),
+            "an unknown status must be refused by the database, not only by the UI"
+        );
+
+        assert!(
+            conn.execute(
+                "INSERT INTO local_customer_orders (id, order_no, customer_name, source) \
+                 VALUES ('order-3', 'ORD-3', 'Mohan', 'CARRIER_PIGEON')",
+                [],
+            )
+            .is_err(),
+            "an unknown order source must be refused"
+        );
+
+        // Quantity is the one that silently corrupts stock rather than merely looking wrong: a
+        // zero- or negative-quantity line would reserve nothing, or worse, reserve backwards.
+        assert!(
+            conn.execute(
+                "INSERT INTO local_customer_order_items (id, order_id, line_index, product_id, product_name, quantity) \
+                 VALUES ('line-bad', 'order-1', 0, 'product-apple', 'Apple', 0)",
+                [],
+            )
+            .is_err(),
+            "a zero-quantity order line must be refused"
+        );
+
+        conn.execute(
+            "INSERT INTO local_customer_order_items (id, order_id, line_index, product_id, product_name, quantity) \
+             VALUES ('line-1', 'order-1', 0, '004', 'Apple', 10.5)",
+            [],
+        )
+        .expect("a well-formed line is accepted");
+
+        // Ids stay text. "004" must come back as "004": CLAUDE.md records numeric coercion of
+        // canonical ids silently emptying the Inventory table.
+        let product_id: String = conn
+            .query_row(
+                "SELECT product_id FROM local_customer_order_items WHERE id = 'line-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read the stored product id");
+        assert_eq!(product_id, "004");
+
         drop(conn);
         let _ = fs::remove_file(&path);
     }
