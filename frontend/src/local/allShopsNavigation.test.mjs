@@ -142,3 +142,22 @@ test("opening Orders loads the product list the order form needs", () => {
 test("an empty item list explains itself instead of showing a bare dropdown", () => {
   assert.match(app, /No items are available to order/);
 });
+
+test("Orders loads on the offline path as well as the online one", () => {
+  // `navigate` dispatches down two separate branches and the local-data one returns early. A
+  // loader placed only in the online branch never runs in LOCAL_ONLY — which stranded the one
+  // module built to work offline. Both branches are asserted so they cannot drift apart again.
+  const occurrences = app.match(/if \(view === "orders"\) await Promise\.all\(/g) || [];
+  assert.equal(occurrences.length, 2, "orders must be dispatched on both the local and online paths");
+});
+
+test("Orders has a safety net that does not depend on navigate", () => {
+  assert.match(app, /if \(activeView !== "orders"\) return;/);
+  assert.match(app, /if \(ordersState\.loadState !== "idle"\) return;/);
+});
+
+test("an unloaded Orders screen does not claim to be loading", () => {
+  // A permanent "Reading orders from this device..." that is reading nothing is a lie about what
+  // the app is doing, and it is exactly what a missed loader looked like.
+  assert.match(app, /Orders have not been loaded yet/);
+});

@@ -1951,6 +1951,19 @@ function App() {
     return () => axios.interceptors.request.eject(interceptorId);
   }, [user]);
 
+  // Load orders when the screen is opened and has nothing yet.
+  //
+  // `navigate` dispatches per-view loaders, but it does so down two separate paths — one for
+  // online, one for local data — and a loader added to only one of them silently never runs on the
+  // other. That happened here. This closes it at the screen instead of relying on both branches
+  // staying in step, and it cannot double-load: it fires only while the state is still untouched.
+  useEffect(() => {
+    if (activeView !== "orders") return;
+    if (ordersState.loadState !== "idle") return;
+    loadOrders();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeView, ordersState.loadState]);
+
   // Load the shop list once the Owner is signed in.
   //
   // Keyed on the user id and role rather than on `user`, which is replaced wholesale every time the
@@ -6262,6 +6275,11 @@ function App() {
         await refreshPosInventoryFromSQLite("navigate-local-pos");
         await Promise.all([loadSalesHistory(), loadReports()]).catch(() => null);
       }
+      // Orders belong here as much as anywhere: they live in this device's SQLite and need no
+      // backend at all. This branch returns before the online dispatch below, so a loader placed
+      // only there never runs in LOCAL_ONLY or offline — which is how the one module built to work
+      // offline ended up being the one the offline path skipped.
+      if (view === "orders") await Promise.all([loadOrders(), loadProducts()]).catch(() => null);
       return;
     }
     setSidebarOpen(false);
@@ -13143,10 +13161,22 @@ function OrdersModule({ busy = false, onAdvance, onReload, onTakeOrder, products
     setDraft({ customer_name: "", customer_mobile: "", delivery_address: "", source: "PHONE", items: [{ ...emptyLine }] });
   };
 
-  if (state.loadState === "idle" || state.loadState === "loading") {
+  if (state.loadState === "loading") {
     return (
       <ModuleCard eyebrow="Customer Orders" title="Orders" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
         <p className="form-note">Reading orders from this device...</p>
+      </ModuleCard>
+    );
+  }
+  if (state.loadState === "idle") {
+    // Not the same as loading, and it must not claim to be. "Idle" means nothing ever asked for
+    // the orders — which is what a missed loader looks like, and it showed a permanent "Reading
+    // orders from this device..." that was reading nothing. A stuck spinner is a lie about what
+    // the app is doing; this says what happened and offers the way out.
+    return (
+      <ModuleCard eyebrow="Customer Orders" title="Orders" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
+        <div className="cart-empty">Orders have not been loaded yet.</div>
+        <p><button className="table-action" type="button" onClick={onReload}>Load orders</button></p>
       </ModuleCard>
     );
   }
