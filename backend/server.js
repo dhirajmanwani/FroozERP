@@ -3944,7 +3944,15 @@ const cashBookModeGroup = (paymentMode) => {
   return "";
 };
 
+/**
+ * The cash book for one branch.
+ *
+ * Every arm of the union carries the branch, including all four contra-entry arms — a contra moves
+ * money between this branch's own cash and bank, so an unscoped arm would import another branch's
+ * transfers into this branch's running balance.
+ */
 const getCashBookReport = async ({
+  branchId,
   dateFrom = toDateKey(new Date()),
   dateTo = toDateKey(new Date()),
   paymentMode = "",
@@ -3954,6 +3962,9 @@ const getCashBookReport = async ({
   groupByDate = false,
   lineKey = "",
 } = {}) => {
+  if (!parsePositiveInteger(branchId)) {
+    throw new Error("getCashBookReport requires a branchId");
+  }
   const from = isDateInput(dateFrom) ? dateFrom : toDateKey(new Date());
   const to = isDateInput(dateTo) ? dateTo : from;
   const normalizedPaymentMode = normalizePaymentMode(paymentMode || "");
@@ -4012,7 +4023,8 @@ const getCashBookReport = async ({
       JOIN sales s ON s.id = sp.sale_id
       LEFT JOIN customers c ON c.id = s.customer_id
       LEFT JOIN sale_item_summary sis ON sis.sale_id = s.id
-      WHERE s.sale_status <> 'CANCELLED'
+      WHERE s.branch_id = $2
+        AND s.sale_status <> 'CANCELLED'
         AND s.sale_date <= $1
         AND sp.payment_mode <> 'CREDIT'
       UNION ALL
@@ -4031,7 +4043,8 @@ const getCashBookReport = async ({
         cp.id AS source_id
       FROM customer_payments cp
       JOIN customers c ON c.id = cp.customer_id
-      WHERE cp.cancelled = FALSE
+      WHERE cp.branch_id = $2
+        AND cp.cancelled = FALSE
         AND cp.payment_date <= $1
       UNION ALL
       SELECT
@@ -4050,7 +4063,8 @@ const getCashBookReport = async ({
       FROM purchases p
       LEFT JOIN suppliers s ON s.id = p.supplier_id
       LEFT JOIN purchase_item_summary pis ON pis.purchase_id = p.id
-      WHERE COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
+      WHERE p.branch_id = $2
+        AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
         AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
         AND COALESCE(p.paid_amount, 0) > 0
         AND p.purchase_date <= $1
@@ -4071,7 +4085,8 @@ const getCashBookReport = async ({
         sp.id AS source_id
       FROM supplier_payments sp
       JOIN suppliers s ON s.id = sp.supplier_id
-      WHERE sp.cancelled = FALSE
+      WHERE sp.branch_id = $2
+        AND sp.cancelled = FALSE
         AND sp.payment_date <= $1
       UNION ALL
       SELECT
@@ -4088,7 +4103,8 @@ const getCashBookReport = async ({
         'Expense' AS source_type,
         e.id AS source_id
       FROM expenses e
-      WHERE e.active IS DISTINCT FROM FALSE
+      WHERE e.branch_id = $2
+        AND e.active IS DISTINCT FROM FALSE
         AND COALESCE(e.status, 'ACTIVE') <> 'CANCELLED'
         AND e.expense_date <= $1
       UNION ALL
@@ -4106,7 +4122,8 @@ const getCashBookReport = async ({
         'Sale Return Refund' AS source_type,
         sr.id AS source_id
       FROM sale_returns sr
-      WHERE sr.return_date <= $1
+      WHERE sr.branch_id = $2
+        AND sr.return_date <= $1
         AND sr.refund_type IN ('CASH_REFUND', 'UPI_REFUND')
       UNION ALL
       SELECT
@@ -4123,7 +4140,8 @@ const getCashBookReport = async ({
         'Contra Payment' AS source_type,
         ce.id AS source_id
       FROM contra_entries ce
-      WHERE ce.cancelled = FALSE
+      WHERE ce.branch_id = $2
+        AND ce.cancelled = FALSE
         AND ce.contra_type = 'CASH_TO_BANK'
         AND ce.contra_date <= $1
       UNION ALL
@@ -4141,7 +4159,8 @@ const getCashBookReport = async ({
         'Contra Receipt' AS source_type,
         ce.id AS source_id
       FROM contra_entries ce
-      WHERE ce.cancelled = FALSE
+      WHERE ce.branch_id = $2
+        AND ce.cancelled = FALSE
         AND ce.contra_type = 'CASH_TO_BANK'
         AND ce.contra_date <= $1
       UNION ALL
@@ -4159,7 +4178,8 @@ const getCashBookReport = async ({
         'Contra Payment' AS source_type,
         ce.id AS source_id
       FROM contra_entries ce
-      WHERE ce.cancelled = FALSE
+      WHERE ce.branch_id = $2
+        AND ce.cancelled = FALSE
         AND ce.contra_type = 'BANK_TO_CASH'
         AND ce.contra_date <= $1
       UNION ALL
@@ -4177,13 +4197,14 @@ const getCashBookReport = async ({
         'Contra Receipt' AS source_type,
         ce.id AS source_id
       FROM contra_entries ce
-      WHERE ce.cancelled = FALSE
+      WHERE ce.branch_id = $2
+        AND ce.cancelled = FALSE
         AND ce.contra_type = 'BANK_TO_CASH'
         AND ce.contra_date <= $1
     ) cash_rows
     ORDER BY date, entry_time, reference_no
     `,
-    [to]
+    [to, branchId]
   );
 
   const filteredRows = result.rows
@@ -7933,8 +7954,10 @@ app.delete("/settings/discount-rules/:id", async (req, res) => {
 
 app.get("/lot-discounts", async (req, res) => {
   try {
-    const values = [];
-    const filters = [];
+    // Scoped through the lot rather than the discount row: a discount is only meaningful against
+    // stock, and `inventory_batches` is the table that actually carries the branch.
+    const values = [req.auth.branchId];
+    const filters = ["ib.branch_id = $1"];
     if (req.query.product_id) {
       values.push(parsePositiveInteger(req.query.product_id));
       filters.push(`ld.product_id = $${values.length}`);
@@ -7943,7 +7966,7 @@ app.get("/lot-discounts", async (req, res) => {
       values.push(String(req.query.active) === "true");
       filters.push(`ld.active = $${values.length}`);
     }
-    const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+    const whereClause = `WHERE ${filters.join(" AND ")}`;
     const result = await pool.query(
       `
       SELECT
@@ -11732,14 +11755,18 @@ app.get("/products", async (req, res) => {
         COALESCE(stock.lot_count, 0) AS lot_count
       FROM products p
       LEFT JOIN product_categories pc ON pc.id = p.category_id
+      -- The product catalogue is company-wide master data; the current_stock and lot_count beside
+      -- each row are not. Scoping the LATERAL and not the outer query is the difference between
+      -- "this branch holds none of it" and "this product does not exist".
       LEFT JOIN LATERAL (
         SELECT COUNT(*)::INTEGER AS lot_count, SUM(remaining_qty) AS current_stock
         FROM inventory_batches ib
         WHERE ib.product_id = p.id
+          AND ib.branch_id = $1
           AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
       ) stock ON TRUE
       ORDER BY COALESCE(pc.category_name, p.category, 'Fruit'), p.product_name
-    `);
+    `, [req.auth.branchId]);
     return res.json(result.rows);
   } catch (error) {
     console.error(error);
@@ -12180,9 +12207,10 @@ app.get("/products/:id/lots", async (req, res) => {
         `
         ${stockInventorySelectSql}
         WHERE ib.product_id = $1
+          AND ib.branch_id = $2
         ORDER BY COALESCE(ib.purchase_date, ib.created_at::date), ib.created_at, ib.id
         `,
-        [productId]
+        [productId, req.auth.branchId]
       ),
       pool.query(
         `
@@ -12844,9 +12872,11 @@ app.get("/stock-adjustments", async (req, res) => {
       JOIN products p ON p.id = sa.product_id
       JOIN inventory_batches ib ON ib.id = sa.inventory_batch_id
       LEFT JOIN users u ON u.id = sa.adjusted_by
+      WHERE ib.branch_id = $1
       ORDER BY sa.adjustment_date DESC, sa.created_at DESC, sa.id DESC
       LIMIT 500
-      `
+      `,
+      [req.auth.branchId]
     );
     return res.json(result.rows);
   } catch (error) {
@@ -14514,11 +14544,13 @@ app.get("/pending-bills/customer", async (req, res) => {
         FROM sale_payments
         GROUP BY sale_id
       ) pay ON pay.sale_id = s.id
-      WHERE s.payment_mode = 'CREDIT'
+      WHERE s.branch_id = $1
+        AND s.payment_mode = 'CREDIT'
         AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
       GROUP BY s.id, c.customer_name, pay.sale_paid
       ORDER BY s.customer_id NULLS LAST, s.sale_date, s.id
-      `
+      `,
+      [req.auth.branchId]
     );
     const paymentsResult = await pool.query(
       `
@@ -14526,9 +14558,11 @@ app.get("/pending-bills/customer", async (req, res) => {
         cp.customer_id,
         SUM(cp.payment_amount) AS total_received
       FROM customer_payments cp
-      WHERE COALESCE(cp.cancelled, FALSE) = FALSE
+      WHERE cp.branch_id = $1
+        AND COALESCE(cp.cancelled, FALSE) = FALSE
       GROUP BY cp.customer_id
-      `
+      `,
+      [req.auth.branchId]
     );
     const paymentByCustomer = new Map(paymentsResult.rows.map((row) => [Number(row.customer_id), Number(row.total_received || 0)]));
     const invoices = [];
@@ -14811,6 +14845,7 @@ app.get("/reports/cash-book", async (req, res) => {
     const dateFrom = req.query.date_from || reportRange.dateFrom;
     const dateTo = req.query.date_to || reportRange.dateTo;
     const report = await getCashBookReport({
+      branchId: req.auth.branchId,
       dateFrom,
       dateTo,
       paymentMode: req.query.payment_mode,
@@ -14918,7 +14953,7 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
     }
 
     if (lineKey === "cash_in_hand" || lineKey === "cash_at_bank") {
-      const cashBook = await getCashBookReport({ dateFrom, dateTo, lineKey });
+      const cashBook = await getCashBookReport({ dateFrom, dateTo, lineKey, branchId: req.auth.branchId });
       const isCash = lineKey === "cash_in_hand";
       const openingBalance = isCash ? cashBook.opening_cash : cashBook.opening_bank;
       const debitDuringRange = isCash ? cashBook.cash_receipts : cashBook.bank_receipts;
@@ -15185,7 +15220,7 @@ app.get("/reports/day-book", async (req, res) => {
           COALESCE(s.invoice_no, 'POS sale') AS narration
         FROM sales s
         LEFT JOIN sale_payments sp ON sp.sale_id = s.id
-        WHERE s.sale_status <> 'CANCELLED' AND s.sale_date BETWEEN $1 AND $2
+        WHERE s.branch_id = $3 AND s.sale_status <> 'CANCELLED' AND s.sale_date BETWEEN $1 AND $2
         UNION ALL
         SELECT p.purchase_date AS date, 'Purchase' AS transaction_type,
           COALESCE(s.supplier_name, p.supplier_name, 'Supplier') AS party_name,
@@ -15197,7 +15232,7 @@ app.get("/reports/day-book", async (req, res) => {
           COALESCE(p.remarks, 'Purchase') AS narration
         FROM purchases p
         LEFT JOIN suppliers s ON s.id = p.supplier_id
-        WHERE COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
+        WHERE p.branch_id = $3 AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
           AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
           AND p.purchase_date BETWEEN $1 AND $2
         UNION ALL
@@ -15211,7 +15246,7 @@ app.get("/reports/day-book", async (req, res) => {
           COALESCE(sp.remarks, 'Supplier payment') AS narration
         FROM supplier_payments sp
         JOIN suppliers s ON s.id = sp.supplier_id
-        WHERE sp.cancelled = FALSE AND sp.payment_date BETWEEN $1 AND $2
+        WHERE sp.branch_id = $3 AND sp.cancelled = FALSE AND sp.payment_date BETWEEN $1 AND $2
         UNION ALL
         SELECT cp.payment_date AS date, 'Customer Receipt' AS transaction_type,
           c.customer_name AS party_name,
@@ -15223,7 +15258,7 @@ app.get("/reports/day-book", async (req, res) => {
           COALESCE(cp.remarks, 'Customer receipt') AS narration
         FROM customer_payments cp
         JOIN customers c ON c.id = cp.customer_id
-        WHERE cp.cancelled = FALSE AND cp.payment_date BETWEEN $1 AND $2
+        WHERE cp.branch_id = $3 AND cp.cancelled = FALSE AND cp.payment_date BETWEEN $1 AND $2
         UNION ALL
         SELECT e.expense_date AS date, 'Expense' AS transaction_type,
           COALESCE(e.paid_to, e.vendor_name, e.category) AS party_name,
@@ -15234,7 +15269,7 @@ app.get("/reports/day-book", async (req, res) => {
           0::NUMERIC AS credit,
           COALESCE(e.remarks, e.category) AS narration
         FROM expenses e
-        WHERE e.active IS DISTINCT FROM FALSE
+        WHERE e.branch_id = $3 AND e.active IS DISTINCT FROM FALSE
           AND COALESCE(e.status, 'ACTIVE') <> 'CANCELLED'
           AND e.expense_date BETWEEN $1 AND $2
         UNION ALL
@@ -15247,7 +15282,7 @@ app.get("/reports/day-book", async (req, res) => {
           sr.total_return_amount AS credit,
           COALESCE(sr.return_reason, 'Sale return') AS narration
         FROM sale_returns sr
-        WHERE sr.return_date BETWEEN $1 AND $2
+        WHERE sr.branch_id = $3 AND sr.return_date BETWEEN $1 AND $2
         UNION ALL
         SELECT we.waste_date AS date, 'Waste' AS transaction_type,
           p.product_name AS party_name,
@@ -15259,7 +15294,7 @@ app.get("/reports/day-book", async (req, res) => {
           COALESCE(we.remarks, we.waste_type) AS narration
         FROM waste_entries we
         JOIN products p ON p.id = we.product_id
-        WHERE we.waste_date BETWEEN $1 AND $2
+        WHERE we.branch_id = $3 AND we.waste_date BETWEEN $1 AND $2
         UNION ALL
         SELECT ib.created_at::date AS date, 'Opening Stock' AS transaction_type,
           p.product_name AS party_name,
@@ -15271,13 +15306,13 @@ app.get("/reports/day-book", async (req, res) => {
           COALESCE(ib.remarks, 'Opening stock') AS narration
         FROM inventory_batches ib
         JOIN products p ON p.id = ib.product_id
-        WHERE ib.stock_source = 'OPENING_STOCK'
+        WHERE ib.branch_id = $3 AND ib.stock_source = 'OPENING_STOCK'
           AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
           AND ib.created_at::date BETWEEN $1 AND $2
       ) rows
       ORDER BY date DESC, transaction_type, party_name
       `,
-      [dateFrom, dateTo]
+      [dateFrom, dateTo, req.auth.branchId]
     );
     const matches = (row) => {
       const rowVoucherType = canonicalVoucher(row);
@@ -19350,9 +19385,18 @@ const salesHistoryDateParams = (query) => {
   };
 };
 
-const loadSalesHistoryStructured = async ({ dateFrom, dateTo, saleId = null, flat = false }) => {
-  const params = saleId ? [dateFrom, dateTo, saleId] : [dateFrom, dateTo];
-  const saleFilter = saleId ? "AND s.id = $3" : "";
+/**
+ * Sales history for one branch, in either the grouped or the flat shape.
+ *
+ * `branchId` is $3 whether or not a sale id is given, so the optional filter moves to $4 and the
+ * branch predicate never depends on which call shape was used. Both query bodies below carry it.
+ */
+const loadSalesHistoryStructured = async ({ dateFrom, dateTo, saleId = null, flat = false, branchId }) => {
+  if (!parsePositiveInteger(branchId)) {
+    throw new Error("loadSalesHistoryStructured requires a branchId");
+  }
+  const params = saleId ? [dateFrom, dateTo, branchId, saleId] : [dateFrom, dateTo, branchId];
+  const saleFilter = saleId ? "AND s.id = $4" : "";
   const query = flat ? `
     SELECT
       s.id AS sale_id,
@@ -19387,7 +19431,8 @@ const loadSalesHistoryStructured = async ({ dateFrom, dateTo, saleId = null, fla
     LEFT JOIN products p ON p.id = si.product_id
     LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
     LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
-    WHERE s.sale_date BETWEEN $1 AND $2
+    WHERE s.branch_id = $3
+      AND s.sale_date BETWEEN $1 AND $2
       ${saleFilter}
     ORDER BY s.sale_date DESC, s.created_at DESC, s.id DESC, si.id, sba.id
   ` : `
@@ -19440,7 +19485,8 @@ const loadSalesHistoryStructured = async ({ dateFrom, dateTo, saleId = null, fla
     LEFT JOIN products p ON p.id = si.product_id
     LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
     LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
-    WHERE s.sale_date BETWEEN $1 AND $2
+    WHERE s.branch_id = $3
+      AND s.sale_date BETWEEN $1 AND $2
       ${saleFilter}
     GROUP BY s.id, c.customer_name
     ORDER BY s.sale_date DESC, s.created_at DESC, s.id DESC
@@ -19452,7 +19498,7 @@ const loadSalesHistoryStructured = async ({ dateFrom, dateTo, saleId = null, fla
 app.get("/sales-history", async (req, res) => {
   try {
     const range = salesHistoryDateParams(req.query);
-    return res.json(await loadSalesHistoryStructured(range));
+    return res.json(await loadSalesHistoryStructured({ ...range, branchId: req.auth.branchId }));
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Sales History" });
@@ -19462,7 +19508,7 @@ app.get("/sales-history", async (req, res) => {
 app.get("/sales-history/items", async (req, res) => {
   try {
     const range = salesHistoryDateParams(req.query);
-    return res.json(await loadSalesHistoryStructured({ ...range, flat: true }));
+    return res.json(await loadSalesHistoryStructured({ ...range, flat: true, branchId: req.auth.branchId }));
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Sales History Items" });
@@ -19472,7 +19518,7 @@ app.get("/sales-history/items", async (req, res) => {
 app.get("/sales-history/lots", async (req, res) => {
   try {
     const range = salesHistoryDateParams(req.query);
-    return res.json(await loadSalesHistoryStructured({ ...range, flat: true }));
+    return res.json(await loadSalesHistoryStructured({ ...range, flat: true, branchId: req.auth.branchId }));
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Sales History Lots" });
@@ -19483,7 +19529,7 @@ app.get("/sales-history/:id", async (req, res) => {
   try {
     const saleId = parsePositiveInteger(req.params.id);
     if (!saleId) return res.status(400).json({ message: "Invalid invoice" });
-    const rows = await loadSalesHistoryStructured({ dateFrom: "1900-01-01", dateTo: "2999-12-31", saleId });
+    const rows = await loadSalesHistoryStructured({ dateFrom: "1900-01-01", dateTo: "2999-12-31", saleId, branchId: req.auth.branchId });
     if (!rows.length) return res.status(404).json({ message: "Invoice not found" });
     return res.json(rows[0]);
   } catch (error) {
@@ -19502,9 +19548,11 @@ app.get("/sales-report/changes", async (req, res) => {
           u.full_name AS edited_by_name, s.customer_name, s.customer_mobile
         FROM sales s
         LEFT JOIN users u ON u.id = s.edited_by
-        WHERE s.sale_status = 'EDITED'
+        WHERE s.branch_id = $1
+          AND s.sale_status = 'EDITED'
         ORDER BY s.edited_at DESC NULLS LAST, s.id DESC
-        `
+        `,
+        [req.auth.branchId]
       ),
       pool.query(
         `
@@ -19513,11 +19561,16 @@ app.get("/sales-report/changes", async (req, res) => {
           u.full_name AS cancelled_by_name, s.customer_name, s.customer_mobile
         FROM sales s
         LEFT JOIN users u ON u.id = s.cancelled_by
-        WHERE s.sale_status = 'CANCELLED'
+        WHERE s.branch_id = $1
+          AND s.sale_status = 'CANCELLED'
         ORDER BY s.cancelled_at DESC NULLS LAST, s.id DESC
-        `
+        `,
+        [req.auth.branchId]
       ),
-      pool.query("SELECT COALESCE(SUM(total_amount), 0) AS total_cancelled_amount FROM sales WHERE sale_status = 'CANCELLED'"),
+      pool.query(
+        "SELECT COALESCE(SUM(total_amount), 0) AS total_cancelled_amount FROM sales WHERE branch_id = $1 AND sale_status = 'CANCELLED'",
+        [req.auth.branchId],
+      ),
     ]);
     return res.json({
       editedBills: editedResult.rows,
@@ -19576,7 +19629,12 @@ app.get("/sale-returns/options/:saleId", async (req, res) => {
     const saleId = parsePositiveInteger(req.params.saleId);
     if (!saleId) return res.status(400).json({ message: "Invalid invoice" });
     const [saleResult, itemsResult] = await Promise.all([
-      pool.query("SELECT id, invoice_no, customer_name, customer_mobile, sale_date, total_amount, sale_status FROM sales WHERE id = $1", [saleId]),
+      // An invoice id is guessable. Without the branch predicate a cashier could type another
+      // branch's id and read its customer, total and line items.
+      pool.query(
+        "SELECT id, invoice_no, customer_name, customer_mobile, sale_date, total_amount, sale_status FROM sales WHERE id = $1 AND branch_id = $2",
+        [saleId, req.auth.branchId],
+      ),
       pool.query(
         `
         SELECT
@@ -19591,6 +19649,7 @@ app.get("/sale-returns/options/:saleId", async (req, res) => {
           COALESCE(si.net_amount, si.amount) AS net_amount,
           si.cost_amount
         FROM sale_items si
+        JOIN sales s ON s.id = si.sale_id AND s.branch_id = $2
         JOIN products p ON p.id = si.product_id
         LEFT JOIN (
           SELECT sale_item_id, SUM(return_quantity) AS returned_quantity
@@ -19600,7 +19659,7 @@ app.get("/sale-returns/options/:saleId", async (req, res) => {
         WHERE si.sale_id = $1
         ORDER BY si.id
         `,
-        [saleId]
+        [saleId, req.auth.branchId]
       ),
     ]);
     const sale = saleResult.rows[0];

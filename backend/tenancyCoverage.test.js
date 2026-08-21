@@ -46,7 +46,12 @@ const { TENANT_TABLE_PATTERN, SCOPE_PREDICATE_PATTERN, collectTenancyCoverage } 
  *   GET /suppliers, /suppliers/:id, /supplier-summary, /supplier-ledger, /customers,
  *   /customer-summary, /customer-ledger, /reports/balance-sheet,
  *   /reports/balance-sheet/details/:lineKey, /api/owner/dashboard-foundation
- * Each now filters on `branch_id` from the verified session. 37 -> 26 -> 16.
+ * Fourth batch, same day — product/lot reads, sales history and the two report books:
+ *   GET /products, /products/:id/lots, /lot-discounts, /stock-adjustments,
+ *   /pending-bills/customer, /sale-returns/options/:saleId, /sales-report/changes,
+ *   /sales-history, /sales-history/:id, /sales-history/items, /sales-history/lots,
+ *   /reports/cash-book, /reports/day-book
+ * Each now filters on `branch_id` from the verified session. 37 -> 26 -> 16 -> 3.
  */
 /*
  * Two entries below cannot be removed by any amount of work in Phase 1, and saying so here stops
@@ -61,20 +66,7 @@ const { TENANT_TABLE_PATTERN, SCOPE_PREDICATE_PATTERN, collectTenancyCoverage } 
 const KNOWN_UNSCOPED_READS = [
   "GET /accounts",
   "GET /accounts/outstanding",
-  "GET /lot-discounts",
-  "GET /pending-bills/customer",
-  "GET /products",
-  "GET /products/:id/lots",
-  "GET /reports/cash-book",
-  "GET /reports/day-book",
   "GET /reports/summary",
-  "GET /sale-returns/options/:saleId",
-  "GET /sales-history",
-  "GET /sales-history/:id",
-  "GET /sales-history/items",
-  "GET /sales-history/lots",
-  "GET /sales-report/changes",
-  "GET /stock-adjustments",
 ];
 
 let coverage;
