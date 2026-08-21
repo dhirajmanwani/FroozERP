@@ -40,6 +40,7 @@ const {
 } = require("./operationalScope");
 const { registerOperationalV3Routes } = require("./operationalV3");
 const {
+  VIEW_ONLY_TTL_SECONDS,
   issueDeviceSession,
   rejectDeviceSessionSubstitution,
   verifyDeviceSession,
@@ -10402,6 +10403,122 @@ app.get("/api/sync/status", rateLimitSyncRequest, async (req, res) => {
  * a shop whose figures errored would silently look like a shop with no business. Failed branches
  * are listed with their error, excluded from the totals, and the totals are marked incomplete.
  */
+/**
+ * Let the Owner look at another shop, by re-minting their session for it.
+ *
+ * ## Why a new token rather than a `branch_id` parameter
+ *
+ * The obvious design — pass the shop you want to see as a query parameter — cannot work here, and
+ * that is a feature. `requireAuth` refuses any request whose `branch_id` disagrees with its token
+ * (A-4b), because that disagreement is exactly what an escalation looks like. Adding a parameter
+ * would mean carving an exception into the check that stops account substitution.
+ *
+ * So the shop being viewed moves into the token instead. Every one of the thirty-odd reads scoped
+ * in A-7 then works untouched, because each still scopes to `req.auth.branchId` and the token is
+ * still the only place scope comes from. The authorisation happens once, here, where it can be
+ * tested properly — rather than thirty times, where one miss is a data leak.
+ *
+ * ## What makes it safe
+ *
+ * - **Owner only, checked against the database.** `getOwnerUser` re-reads the role rather than
+ *   trusting the token's claim, so a demotion closes this immediately.
+ * - **The shop must belong to the caller's company.** A branch id is guessable; without this the
+ *   route would hand any Owner any company's books.
+ * - **The new session cannot write.** `view_only` is enforced in `requireAuth` for every non-GET.
+ *   Without it an Owner who forgot which shop they were looking at would file a sale against the
+ *   wrong one, and nothing downstream would find that odd.
+ * - **Thirty minutes.** Long enough to read a report, short enough that nobody sits in this state.
+ *
+ * Returning to your own shop uses the same route with your own branch, and mints an ordinary
+ * writable session. The "own branch" is read from the database, not from the current token — which
+ * may itself already be pointed at somebody else's shop.
+ */
+app.post("/api/owner/view-branch", async (req, res) => {
+  try {
+    const owner = await getOwnerUser(req.auth.userId);
+    if (!owner) {
+      return res.status(403).json({
+        code: "OWNER_ONLY",
+        message: "Only the Owner can look at another shop.",
+      });
+    }
+    const companyId = parsePositiveInteger(req.auth.companyId);
+    const requestedBranchId = parsePositiveInteger(req.body?.view_branch_id);
+    if (!companyId || !requestedBranchId) {
+      return res.status(400).json({ message: "Choose a shop to view." });
+    }
+    // Verified, never trusted. The id arrives from the client and names whose money is about to be
+    // read, so it is checked against this company's own shops before it goes anywhere near a token.
+    const branchResult = await pool.query(
+      "SELECT id, branch_name FROM branches WHERE id = $1 AND company_id = $2 AND active IS DISTINCT FROM FALSE",
+      [requestedBranchId, companyId]
+    );
+    const branch = branchResult.rows[0];
+    if (!branch) {
+      return res.status(404).json({
+        code: "BRANCH_NOT_IN_COMPANY",
+        message: "That shop is not part of this company.",
+      });
+    }
+    const ownBranchId = parsePositiveInteger(owner.branch_id);
+    const returningHome = ownBranchId === requestedBranchId;
+    const token = issueDeviceSession({
+      userId: owner.id,
+      deviceId: req.auth.deviceId,
+      companyId,
+      branchId: requestedBranchId,
+      role: owner.role_name,
+      viewOnly: !returningHome,
+      ttlSeconds: returningHome ? undefined : VIEW_ONLY_TTL_SECONDS,
+      secret: deviceSessionSecret,
+    });
+    return res.json({
+      token,
+      branch_id: branch.id,
+      branch_name: branch.branch_name || `Shop ${branch.id}`,
+      view_only: !returningHome,
+      own_branch_id: ownBranchId || null,
+      message: returningHome
+        ? "Back on your own shop. You can make changes again."
+        : `Viewing ${branch.branch_name || `Shop ${branch.id}`}. Reports only — no changes can be saved while you are here.`,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Switching Shop View" });
+  }
+});
+
+/**
+ * The shops this Owner may look at.
+ *
+ * Separate from `/api/owner/all-branches-summary` because the picker needs to exist before any
+ * figures do — and because a list of shop names is a far smaller thing to hand out than a list of
+ * their balances.
+ */
+app.get("/api/owner/viewable-branches", async (req, res) => {
+  try {
+    const owner = await getOwnerUser(req.auth.userId);
+    if (!owner) {
+      return res.status(403).json({ code: "OWNER_ONLY", message: "Only the Owner can look at another shop." });
+    }
+    const companyId = parsePositiveInteger(req.auth.companyId);
+    if (!companyId) return res.status(400).json({ message: "This session has no company." });
+    const result = await pool.query(
+      "SELECT id, branch_name FROM branches WHERE company_id = $1 AND active IS DISTINCT FROM FALSE ORDER BY id",
+      [companyId]
+    );
+    return res.json({
+      branches: result.rows.map((row) => ({ id: row.id, branch_name: row.branch_name || `Shop ${row.id}` })),
+      own_branch_id: parsePositiveInteger(owner.branch_id) || null,
+      viewing_branch_id: parsePositiveInteger(req.auth.branchId) || null,
+      view_only: req.auth.viewOnly === true,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Shop List" });
+  }
+});
+
 app.get("/api/owner/all-branches-summary", async (req, res) => {
   try {
     const owner = await getOwnerUser(req.auth.userId);

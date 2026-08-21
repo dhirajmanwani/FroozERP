@@ -64,9 +64,17 @@ const AUTH_ERRORS = Object.freeze({
     code: "AUTH_NOT_CONFIGURED",
     message: "Server authentication is not configured.",
   },
+  VIEW_ONLY: {
+    status: 403,
+    code: "VIEW_ONLY_SESSION",
+    message: "You are viewing another shop. Switch back to your own shop to make any changes.",
+  },
 });
 
 const text = (value) => (typeof value === "string" ? value.trim() : "");
+
+/** Methods a view-only session may use. HEAD is a GET without a body, so it belongs here too. */
+const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 /**
  * Pull the session token out of a request.
@@ -98,6 +106,9 @@ const authContextFromClaims = (claims) => ({
   branchId: Number(claims.branch_id),
   role: text(claims.role),
   normalizedRole: text(claims.role).toUpperCase(),
+  // Truthiness, not `=== true`: a token minted before this claim existed has no field at all and
+  // must read as a normal session rather than as undefined-and-therefore-suspicious.
+  viewOnly: claims.view_only === true,
   sessionRevocationVersion: Number(claims.session_revocation_version || 0),
   issuedAt: Number(claims.issued_at) || null,
   expiresAt: Number(claims.expires_at) || null,
@@ -158,7 +169,26 @@ const createRequireAuth = ({ secret, verify = verifyDeviceSession, now = () => D
     const substitution = rejectDeviceSessionSubstitution(result.claims, submittedIdentityFrom(req));
     if (substitution) return sendAuthError(res, substitution);
 
-    req.auth = authContextFromClaims(result.claims);
+    const auth = authContextFromClaims(result.claims);
+
+    // A look-at-another-shop session may read and nothing else.
+    //
+    // The whole design of that feature is that `branch_id` in the token becomes the shop being
+    // viewed, so every existing route scopes to it untouched. The cost of that simplicity is that
+    // a write would also land in the viewed shop — an Owner glancing at another branch's report
+    // and then ringing up a sale would file it against the wrong shop, and nothing downstream
+    // would consider that unusual. One method check here is cheaper and far more reliable than
+    // auditing every write path for a condition it has no reason to know about.
+    //
+    // Blanket, with no allowlist. Some POSTs are morally reads — `/api/sync/pull` is one — but a
+    // sync running under a viewing session would sync the viewed shop's data onto this device,
+    // which is worse than a sync that waits. The token also expires in 30 minutes, so this is a
+    // state nobody can sit in for long.
+    if (auth.viewOnly && !SAFE_METHODS.has(req.method)) {
+      return sendAuthError(res, AUTH_ERRORS.VIEW_ONLY);
+    }
+
+    req.auth = auth;
     return next();
   };
 

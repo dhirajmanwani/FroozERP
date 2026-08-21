@@ -9,6 +9,9 @@ const encode = (value) => Buffer.from(value, "utf8").toString("base64url");
 const decode = (value) => Buffer.from(value, "base64url").toString("utf8");
 const sign = (value, secret) => crypto.createHmac("sha256", secret).update(value).digest("base64url");
 
+/** A look-at-another-shop session is deliberately short-lived. See `viewOnly` below. */
+const VIEW_ONLY_TTL_SECONDS = 30 * 60;
+
 const issueDeviceSession = ({
   userId,
   deviceId,
@@ -18,6 +21,7 @@ const issueDeviceSession = ({
   sessionRevocationVersion = 0,
   nowMs = Date.now(),
   ttlSeconds = DEFAULT_TTL_SECONDS,
+  viewOnly = false,
   secret,
 }) => {
   if (!secret || !userId || !deviceId || !companyId || !branchId) {
@@ -33,6 +37,15 @@ const issueDeviceSession = ({
     // role and must still verify, and `requireRole` fails closed when the claim is absent rather
     // than treating "no role" as permission.
     role: String(role || ""),
+    // Set when an Owner is looking at a shop that is not their own. The branch_id above is then the
+    // shop being *viewed*, so every existing route scopes to it with no change — the token stays
+    // the single source of truth for scope, which is the invariant the rest of the auth work rests
+    // on. What makes that safe is that this claim blocks every write: without it, an Owner who
+    // forgot which shop they were looking at would file a sale against the wrong one.
+    //
+    // Absent means false. A token minted before this existed carries no claim and must keep working
+    // as a normal session, so the check reads truthiness rather than requiring the field.
+    view_only: viewOnly === true,
     session_revocation_version: Number(sessionRevocationVersion || 0),
     issued_at: Math.floor(nowMs / 1000),
     expires_at: Math.floor(nowMs / 1000) + Number(ttlSeconds),
@@ -111,6 +124,7 @@ const rejectDeviceSessionSubstitution = (claims, submitted = {}) => {
 
 module.exports = {
   DEFAULT_TTL_SECONDS,
+  VIEW_ONLY_TTL_SECONDS,
   issueDeviceSession,
   rejectDeviceSessionSubstitution,
   verifyDeviceSession,

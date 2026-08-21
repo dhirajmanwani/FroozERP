@@ -349,9 +349,27 @@ const probe = (app, method, url, headers, body = undefined) => new Promise((reso
     if (chunk && typeof chunk !== "function") chunks.push(Buffer.from(chunk));
     return write(chunk, ...rest);
   };
+  // Settling is driven from `res.end` as well as the socket's "finish" event, and it has to be:
+  // once a request body has been pushed and ended, Node tears the fake socket down, so "finish"
+  // never fires for a handler that responds *after* an await. That combination — a body plus an
+  // async handler — silently timed out and read as "the route never answered", which is a very
+  // convincing wrong answer when the question is whether a route refused you. Reading the response
+  // object directly does not depend on the socket surviving.
+  const settleFromResponse = () => {
+    let code = null;
+    try {
+      code = JSON.parse(Buffer.concat(chunks).toString("utf8")).code ?? null;
+    } catch {
+      code = null;
+    }
+    finish({ status: res.statusCode, code, note: null });
+  };
+
   res.end = (chunk, ...rest) => {
     if (chunk && typeof chunk !== "function") chunks.push(Buffer.from(chunk));
-    return end(chunk, ...rest);
+    const outcome = end(chunk, ...rest);
+    settleFromResponse();
+    return outcome;
   };
 
   let settled = false;
@@ -363,15 +381,7 @@ const probe = (app, method, url, headers, body = undefined) => new Promise((reso
   };
   const timer = setTimeout(() => finish({ status: null, code: null, note: `no response in ${PROBE_TIMEOUT_MS}ms` }), PROBE_TIMEOUT_MS);
 
-  res.on("finish", () => {
-    let code = null;
-    try {
-      code = JSON.parse(Buffer.concat(chunks).toString("utf8")).code ?? null;
-    } catch {
-      code = null;
-    }
-    finish({ status: res.statusCode, code, note: null });
-  });
+  res.on("finish", settleFromResponse);
 
   try {
     app(req, res);
