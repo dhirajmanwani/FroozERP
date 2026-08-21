@@ -6656,6 +6656,30 @@ app.post("/users", async (req, res) => {
   try {
     const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can add users" });
+    // A-7 step 3. The branch this user lands in used to be
+    // `parsePositiveInteger(req.body.branch_id) || manager.branch_id || 1`, which had two faults.
+    // `manager.branch_id` is dead code — `requireRateManager` selects only id, full_name and
+    // role_name, so it is always undefined — leaving `req.body.branch_id || 1`: a client could
+    // place a new user in any branch of any company, and omitting the field filed them under
+    // Branch 1 rather than anywhere considered.
+    //
+    // Now a requested branch must belong to the actor's company, and the fallback is the actor's
+    // own verified branch. A user created without a stated branch belongs where their creator is,
+    // which is both a safer default and a truer one.
+    const requestedUserBranchId = parsePositiveInteger(req.body.branch_id);
+    if (requestedUserBranchId) {
+      const branch = await pool.query(
+        "SELECT id FROM branches WHERE id = $1 AND company_id = $2 AND active IS DISTINCT FROM FALSE LIMIT 1",
+        [requestedUserBranchId, req.auth.companyId]
+      );
+      if (!branch.rows[0]) {
+        return res.status(400).json({
+          code: "BRANCH_NOT_IN_COMPANY",
+          message: "That branch does not exist for this business, or is not active.",
+        });
+      }
+    }
+    const newUserBranchId = requestedUserBranchId || req.auth.branchId;
     const payload = readUserPayload(req.body);
     const password = String(req.body.password || "");
     const confirmPassword = String(req.body.confirm_password || "");
@@ -6677,7 +6701,7 @@ app.post("/users", async (req, res) => {
       `,
       [
         payload.full_name, payload.username, await hashPassword(password), roleId,
-        parsePositiveInteger(req.body.branch_id) || manager.branch_id || 1,
+        newUserBranchId,
         payload.active, payload.mobile_number, payload.email,
         payload.recovery_enabled, payload.staff_self_recovery_enabled,
         payload.joining_date, payload.notes,
@@ -8331,8 +8355,20 @@ const rateLimitSyncRequest = (req, res, next) => {
   return next();
 };
 
+/**
+ * Append to the sync change log.
+ *
+ * `branchId` is **required**, and deliberately has no default. It used to default to 1, which all
+ * 21 current callers happen to override — so the default was never exercised and was waiting for
+ * caller 22 to forget. A change-log row is what every other device replays; one attributed to the
+ * wrong branch does not fail, it propagates.
+ *
+ * Throwing is the right failure here. A missing branch is a programming error at the call site, and
+ * a loud error during development is cheaper than a quiet misattribution discovered in a report
+ * months later.
+ */
 const logSyncChange = async (client, {
-  branchId = 1,
+  branchId,
   operationalLocationId = null,
   assignmentGeneration = null,
   entityType,
@@ -8341,6 +8377,9 @@ const logSyncChange = async (client, {
   version = 1,
   payload = {},
 }) => {
+  if (!parsePositiveInteger(branchId)) {
+    throw new Error(`logSyncChange requires a branchId (entity ${entityType || "unknown"} ${entityId || ""})`);
+  }
   const result = await client.query(
     `
     INSERT INTO sync_change_log (
