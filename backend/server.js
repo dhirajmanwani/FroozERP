@@ -50,6 +50,7 @@ const {
 const { createRequireAuth, extractSessionToken } = require("./authMiddleware");
 const { resolveSessionSecret } = require("./sessionSecret");
 const { lockMessage, registerFailedAttempt, resolveLockState } = require("./loginLockout");
+const { reconcileCompanyTotals, summariseBranches } = require("./allBranchesSummary");
 const {
   REFERENCE_BOOTSTRAP_PROTOCOL,
   captureReferenceBootstrap,
@@ -1455,6 +1456,31 @@ const getPermissionUser = async (userId, permissionKey, defaultRoles = [], clien
     return user;
   }
   return null;
+};
+
+/**
+ * The caller, but only if they are actually the Owner right now.
+ *
+ * Distinct from `getPermissionUser`, which returns the user for any Owner *or* for anyone holding a
+ * named permission. Some things are not a permission that can be granted — reading every shop's
+ * money is one — so this asks a narrower question and asks it of the database. The role also
+ * travels in the signed session token, but that token was minted at login and keeps asserting
+ * "Owner" until it expires; demoting someone has to shut this door now, not in twelve hours.
+ */
+const getOwnerUser = async (userId, client = pool) => {
+  const parsedUserId = parsePositiveInteger(userId);
+  if (!parsedUserId) return null;
+  const result = await client.query(
+    `
+    SELECT u.id, u.full_name, u.username, u.branch_id, r.role_name
+    FROM users u
+    JOIN roles r ON r.id = u.role_id
+    WHERE u.id = $1 AND u.active = TRUE
+    `,
+    [parsedUserId]
+  );
+  const user = result.rows[0];
+  return user && isOwnerRole(user.role_name) ? user : null;
 };
 
 const buildCanonicalIdentity = (user, { authenticated = true, sessionId = "" } = {}) => {
@@ -10358,6 +10384,110 @@ app.get("/api/sync/status", rateLimitSyncRequest, async (req, res) => {
   } catch (error) {
     console.error("Sync status failed", error.message);
     return res.status(500).json({ message: "Sync status failed" });
+  }
+});
+
+/**
+ * Every shop's position side by side, for the Owner.
+ *
+ * This is the deliberate exception to A-7. Every other report in this app answers "how is *this*
+ * shop doing", scoped to the branch in the caller's session. This one answers "how is the business
+ * doing", and it is the only route allowed to cross that line — which is why it checks the role
+ * against the database rather than trusting the signed token's role claim. A token is issued at
+ * login and keeps saying "Owner" until it expires; demoting someone should close this door
+ * immediately, not in twelve hours.
+ *
+ * **A branch that fails to load reports an error, never a zero.** Summing whatever happened to come
+ * back and presenting the result as the company total is the exact failure CLAUDE.md warns about:
+ * a shop whose figures errored would silently look like a shop with no business. Failed branches
+ * are listed with their error, excluded from the totals, and the totals are marked incomplete.
+ */
+app.get("/api/owner/all-branches-summary", async (req, res) => {
+  try {
+    const owner = await getOwnerUser(req.auth.userId);
+    if (!owner) {
+      return res.status(403).json({
+        code: "OWNER_ONLY",
+        message: "Only the Owner can view figures across all shops.",
+      });
+    }
+    const companyId = parsePositiveInteger(req.auth.companyId);
+    if (!companyId) {
+      return res.status(400).json({ message: "This session has no company, so there is nothing to total." });
+    }
+    // Loud rather than empty: with no company/branch link every company figure below would read as
+    // zero, and a whole-business summary of zero is indistinguishable from a bad day.
+    await assertCompanyBranchLink();
+    const dateTo = isDateInput(req.query.date_to) ? req.query.date_to : toDateKey(new Date());
+
+    const branchResult = await pool.query(
+      `
+      SELECT id, branch_name
+      FROM branches
+      WHERE company_id = $1 AND active IS DISTINCT FROM FALSE
+      ORDER BY id
+      `,
+      [companyId]
+    );
+    if (branchResult.rows.length === 0) {
+      return res.status(409).json({
+        code: "NO_BRANCHES",
+        message: "No active shops are linked to this company.",
+      });
+    }
+
+    const branches = await Promise.all(branchResult.rows.map(async (branch) => {
+      const branchId = Number(branch.id);
+      try {
+        const snapshot = await getBalanceSheetSnapshot({ dateTo, branchId });
+        return {
+          branchId,
+          branchName: branch.branch_name || `Shop ${branchId}`,
+          ok: true,
+          cash: snapshot.cash,
+          bank: snapshot.bank,
+          inventory: snapshot.inventory,
+          customerReceivable: snapshot.customerReceivable,
+          supplierPayable: snapshot.supplierPayable,
+          netProfit: snapshot.netProfit,
+          netPosition: snapshot.netPosition,
+          salesRevenue: snapshot.profitLoss.salesRevenue,
+          expenses: snapshot.profitLoss.expenses,
+        };
+      } catch (error) {
+        console.error(`all-branches-summary: branch ${branchId} failed`, error);
+        return {
+          branchId,
+          branchName: branch.branch_name || `Shop ${branchId}`,
+          ok: false,
+          error: "This shop's figures could not be loaded.",
+        };
+      }
+    }));
+
+    const totals = summariseBranches(branches);
+
+    // The payable and receivable are computed twice on purpose: once as the sum of the shops above,
+    // and once by asking the company directly. See `reconcileCompanyTotals` for why a disagreement
+    // matters and why it is reported rather than smoothed away. Only worth asking when the branch
+    // totals are complete — otherwise the "gap" is just the shop that failed.
+    let reconciliation = null;
+    if (totals.complete) {
+      const [supplierRows, customerRows] = await Promise.all([
+        getSupplierSummaryRows({ dateTo, companyId }),
+        getCustomerSummaryRows({ dateTo, companyId }),
+      ]);
+      reconciliation = reconcileCompanyTotals({
+        totals,
+        companyPayable: supplierRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0),
+        companyReceivable: customerRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0),
+      });
+    }
+
+    return res.json({ companyId, asAtDate: dateTo, branches, totals, reconciliation });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading All Shops Summary" });
   }
 });
 
