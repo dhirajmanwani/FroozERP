@@ -1,3 +1,4 @@
+import { isProvisionalLot, provisionalStockNote, summariseLotCostStatus } from "./provisionalLotCost.js";
 const numberValue = (value) => Number(value || 0);
 
 const dateKey = (value) => {
@@ -32,11 +33,16 @@ export function buildLocalDashboardSnapshot({ inventoryLots = [], sales = [], ra
   const stockByProduct = new Map();
   const lotCosts = new Map();
   let stockValue = 0;
+  // Stock awaiting a supplier bill has no real cost yet, and multiplying its placeholder zero into
+  // the headline made the total quietly short — 18.2% of units on the measured snapshot. It is
+  // counted separately and reported beside the figure rather than silently folded into it.
+  const costStatusSummary = summariseLotCostStatus(inventoryLots);
   for (const lot of inventoryLots) {
     const quantity = numberValue(lot.remaining_qty ?? lot.balance_qty);
     const cost = numberValue(lot.effective_cost_per_unit ?? lot.purchase_rate ?? lot.cost_rate);
     const productKey = String(lot.product_id || lot.product_name || lot.id || "unknown");
-    stockValue += quantity * cost;
+    // The lot still counts as stock on hand — it is physically there — but not as value.
+    if (!isProvisionalLot(lot)) stockValue += quantity * cost;
     stockByProduct.set(productKey, {
       productId: lot.product_id,
       productName: lot.product_name || "Unnamed product",
@@ -85,6 +91,11 @@ export function buildLocalDashboardSnapshot({ inventoryLots = [], sales = [], ra
     todaySales: roundMoney(todaySales.reduce((sum, sale) => sum + numberValue(sale.total_amount ?? sale.net_total ?? sale.amount), 0)),
     todayProfit: roundMoney(todayProfit),
     stockValue: roundMoney(stockValue),
+    // Carried beside the figure so a caller cannot render the total without the caveat available.
+    // Empty string when nothing is awaiting a bill, so the common case shows no note at all.
+    stockValueNote: provisionalStockNote(costStatusSummary),
+    provisionalStockUnits: costStatusSummary.provisionalUnits,
+    provisionalStockLots: costStatusSummary.provisionalLotCount,
     lowStockItems: lowStockRows.length,
     transactions: todaySales.length,
     supplierOutstanding: 0,

@@ -8,7 +8,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::entitlement::{self, EntitlementState};
 
-const CURRENT_SCHEMA_VERSION: &str = "018_bootstrap_credential_consumption";
+const CURRENT_SCHEMA_VERSION: &str = "019_provisional_lot_cost_status";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -27,6 +27,7 @@ const MIGRATION_015: &str = include_str!("../migrations/sqlite/015_supplier_refe
 const MIGRATION_016: &str = include_str!("../migrations/sqlite/016_purchase_aggregate_reconciliation.sql");
 const MIGRATION_017: &str = include_str!("../migrations/sqlite/017_offline_entitlement_foundation.sql");
 const MIGRATION_018: &str = include_str!("../migrations/sqlite/018_bootstrap_credential_consumption.sql");
+const MIGRATION_019: &str = include_str!("../migrations/sqlite/019_provisional_lot_cost_status.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -2108,6 +2109,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "016_purchase_aggregate_reconciliation", MIGRATION_016)?;
     apply_migration(&mut conn, "017_offline_entitlement_foundation", MIGRATION_017)?;
     apply_migration(&mut conn, "018_bootstrap_credential_consumption", MIGRATION_018)?;
+    apply_migration(&mut conn, "019_provisional_lot_cost_status", MIGRATION_019)?;
     Ok(())
 }
 
@@ -2958,7 +2960,7 @@ fn load_reference_snapshot_at(
             .prepare(
                 "SELECT id, product_id, product_name, supplier_id, supplier_name, lot_no, size_grade,
                         opening_date, opening_qty, sold_qty, adjusted_qty, balance_qty, cost_rate, sale_rate,
-                        status, remarks, created_at, updated_at
+                        status, remarks, created_at, updated_at, purchase_bill_status
                  FROM local_inventory_lots
                  WHERE deleted_at IS NULL
                  ORDER BY product_name, opening_date, id",
@@ -2989,6 +2991,10 @@ fn load_reference_snapshot_at(
                     "temporary_sale_rate": row.get::<_, Option<f64>>(13)?,
                     "sale_rate": row.get::<_, Option<f64>>(13)?,
                     "batch_status": row.get::<_, String>(14)?,
+                    // Migration 019. Deliberately Option: NULL means this device was never told,
+                    // which is a different fact from BILL_COMPLETED and must stay distinguishable
+                    // all the way to the screen. Emitting a default here would put the guess back.
+                    "purchase_bill_status": row.get::<_, Option<String>>(18)?,
                     "remarks": row.get::<_, Option<String>>(15)?,
                     "created_at": row.get::<_, Option<String>>(16)?,
                     "updated_at": row.get::<_, Option<String>>(17)?,
@@ -4800,11 +4806,12 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                         id, cloud_id, branch_id, product_id, product_name, supplier_id, supplier_name,
                         lot_no, size_grade, opening_date, opening_qty, purchased_qty, sold_qty, returned_qty,
                         waste_qty, adjusted_qty, transfer_in_qty, transfer_out_qty, balance_qty, cost_rate,
-                        sale_rate, status, remarks, created_at, updated_at, version, sync_status, deleted_at
+                        sale_rate, status, purchase_bill_status, remarks, created_at, updated_at, version,
+                        sync_status, deleted_at
                      ) VALUES (
                         ?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15,
-                        ?16, ?17, ?18, ?19, ?20, ?21, COALESCE(?22, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-                        COALESCE(?23, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?24, 'synced', NULL
+                        ?16, ?17, ?18, ?19, ?20, ?21, ?22, COALESCE(?23, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                        COALESCE(?24, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?25, 'synced', NULL
                      ) ON CONFLICT(id) DO UPDATE SET
                         branch_id = excluded.branch_id,
                         product_id = excluded.product_id,
@@ -4826,6 +4833,7 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                         cost_rate = excluded.cost_rate,
                         sale_rate = excluded.sale_rate,
                         status = excluded.status,
+                        purchase_bill_status = excluded.purchase_bill_status,
                         remarks = excluded.remarks,
                         updated_at = excluded.updated_at,
                         version = excluded.version,
@@ -4854,6 +4862,11 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                         change.payload.get("effective_cost_per_unit").or_else(|| change.payload.get("purchase_rate")).and_then(json_number).unwrap_or(0.0),
                         change.payload.get("temporary_sale_rate").or_else(|| change.payload.get("sale_rate")).and_then(json_number),
                         optional_text(&change.payload, "batch_status").or_else(|| optional_text(&change.payload, "status")).unwrap_or_else(|| "ACTIVE".to_string()),
+                        // The whole point of migration 019: this used to be dropped, so a lot whose
+                        // bill had not arrived was indistinguishable from one that genuinely cost
+                        // nothing. Left NULL when the server does not say, because "not told" and
+                        // "told it is final" are different facts and only one of them is evidence.
+                        optional_text(&change.payload, "purchase_bill_status"),
                         optional_text(&change.payload, "remarks"),
                         optional_text(&change.payload, "created_at"),
                         change.updated_at.clone(),
