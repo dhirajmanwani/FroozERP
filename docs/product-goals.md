@@ -359,6 +359,25 @@ own. **Cash or UPI on delivery is a complete first version** and keeps G7 to one
 **Classification.** Order management: available now, no gate. Website: gated on A-6 and on the cloud.
 Delivery integration: not recommended in the first version.
 
+#### Status, 2026-08-21 — the order half is built
+
+| Piece | State |
+| --- | --- |
+| Lifecycle rules, reservation, six-hour lapse | `frontend/src/local/orderLifecycle.js`, 17 tests |
+| Board presentation, action gating | `frontend/src/local/ordersBoard.js`, 14 tests |
+| Local storage (migration 020, Rust CRUD) | `local_customer_orders`, `local_customer_order_items` |
+| Orders screen: take, pack, send, deliver, carrier + link | `OrdersModule` in `App.jsx` |
+| Counter refuses stock promised to orders | `frontend/src/local/reservedStock.js`, wired into POS |
+| Sending rings the order up | `frontend/src/local/orderBilling.js` — seeds the POS cart, links the bill back |
+
+P-7 was **ruled: reserve.** Sending **creates the bill**, via the existing POS path rather than a
+second writer. Both decisions are recorded at the head of `orderLifecycle.js` and `orderBilling.js`.
+
+**The gap that remains, and it is not small.** Orders live in this device's SQLite. A website order
+would arrive in the cloud. Nothing yet carries an order between the two, so the website half needs a
+sync arm for `customer_order` before it can feed this module at all — in addition to the exposure
+gate. That is unbuilt and is the first thing the website work will hit.
+
 ---
 
 ## 4. Suggested sequence
@@ -388,7 +407,7 @@ answered with real usage evidence rather than in the abstract.
 
 | # | Decision | Status | Blocking |
 | --- | --- | --- | --- |
-| **P-7** | Does the order module **reserve** stock on order, or merely record it? Reserving prevents overselling and is the reason the module is worth building rather than a spreadsheet; it also means an abandoned order must release the reservation, which is a lifecycle with edges. Recording is simpler and oversells. | Open — decide before the module is built, not after |
+| **P-7** | Does the order module **reserve** stock on order, or merely record it? | **RULED 2026-08-21: reserve.** An abandoned reservation *lapses* after six hours — the stock returns and the order is flagged, never silently cancelled, because the customer is still expecting their fruit. A packed order never lapses. Also ruled: sending creates the bill, through the existing POS path. | — |
 | **P-1** | Mobile architecture | **RULED 2026-08-18: (a) cloud client**, scoped to purchase entry + viewing. Known cost recorded in G5: does not serve the no-signal mandi case; expect (b) later. | — |
 | **P-2** | Does "simplify multibranch" mean the data model or only the screens | Open | G1 scope |
 | **P-3** | Where customer WhatsApp consent/opt-in is recorded | Open. Tool choice settled (official API, stay as-is); the consent-storage question remains. | G2 |

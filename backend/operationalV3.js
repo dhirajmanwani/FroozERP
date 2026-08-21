@@ -1087,6 +1087,7 @@ const registerOperationalV3Routes = ({
     return res.json({ scope: context, payment_allocations: result.rows, ...serverTimePayload() });
   });
 
+  // Two-sided, so the key is read from the body rather than fixed — see `paymentAllocationPermissions`.
   use("post", "/api/v3/payment-allocations", async (req, res, context) => {
     const key = requiredIdempotencyKey(req.body);
     const existing = await database.query(
@@ -1129,6 +1130,11 @@ const registerOperationalV3Routes = ({
     return res.status(201).json({ payment_allocation: result.rows[0], scope: context, ...serverTimePayload() });
   }, { write: true, permission: paymentAllocationPermissions });
 
+  // Both transfer writes take `inventory`. Creating a transfer reserves source stock and the action
+  // route moves `inventory_batches.remaining_qty` between locations, opening and closing lots as it
+  // goes; that is stock movement, which is what the seeded Inventory Manager role exists to hold.
+  // The in-handler scope check already refuses an action from the wrong end of a transfer, but it
+  // asks where the device is, never what the person may do.
   use("post", "/api/v3/transfers", async (req, res, context) => {
     const key = requiredIdempotencyKey(req.body);
     const transferScope = await validateTransferScope(database, context, req.body);
@@ -1358,6 +1364,7 @@ module.exports = {
   canUseConsolidatedReports,
   nextTransferStatus,
   applyTransferStockEffect,
+  paymentAllocationPermissions,
   readSupplierMasterPayload,
   registerOperationalV3Routes,
   supplierReferencePayload,
