@@ -128,7 +128,7 @@ test("an order action is validated before it is attempted", () => {
   // The same check the board used to decide which buttons to show, so a visible button can never
   // be a move that is then refused.
   const start = app.indexOf("const advanceOrder = async");
-  const body = app.slice(start, start + 700);
+  const body = app.slice(start, start + 1600);
   assert.match(body, /validateOrderAction\(/);
 });
 
@@ -147,8 +147,12 @@ test("Orders loads on the offline path as well as the online one", () => {
   // `navigate` dispatches down two separate branches and the local-data one returns early. A
   // loader placed only in the online branch never runs in LOCAL_ONLY — which stranded the one
   // module built to work offline. Both branches are asserted so they cannot drift apart again.
-  const occurrences = app.match(/if \(view === "orders"\) await Promise\.all\(/g) || [];
+  const occurrences = app.match(/if \(view === "orders"\) await/g) || [];
   assert.equal(occurrences.length, 2, "orders must be dispatched on both the local and online paths");
+  // The offline branch must not reach the API. Every other loader there is guarded, and
+  // applyReferenceSnapshot has already filled `products` from the local snapshot.
+  const localBranch = app.slice(app.indexOf("const localDataMode ="), app.indexOf("setSidebarOpen(false);\n    setActiveView(view);"));
+  assert.doesNotMatch(localBranch, /if \(view === "orders"\) await Promise\.all\(\[loadOrders\(\), loadProducts\(\)\]\)/);
 });
 
 test("Orders has a safety net that does not depend on navigate", () => {
@@ -167,8 +171,12 @@ test("POS refuses stock that orders have already promised", () => {
   // which is the whole failure reserve-on-order exists to prevent.
   const start = app.indexOf("const counterStock = describeCounterStock({");
   assert.ok(start > 0, "POS must consult the reservation before adding to the cart");
-  const body = app.slice(start, start + 600);
+  const body = app.slice(start, start + 1400);
   assert.match(body, /reservedForProduct\(reservedIndex, product\.id\)/);
+  // On-hand must be read with the same key form the reservation index uses. A raw lookup against
+  // a canonically-keyed map returns undefined, which reads as zero stock and refuses a product
+  // that is sitting on the shelf.
+  assert.match(body, /onHand: productOnHand\(product\.id\)/);
   assert.match(body, /if \(counterStock\.status !== COUNTER_STOCK\.FREE\)/);
 });
 
@@ -189,15 +197,25 @@ test("sending an order builds a POS cart instead of writing a sale directly", ()
   // POS owns lot allocation, discounts, mandi tax, payment mode and printing. A second writer
   // that skipped those would be a second set of rules about money, and the one nobody exercises
   // daily is the one that quietly gets it wrong.
-  const start = app.indexOf("const seed = buildOrderCartSeed(order,");
+  const start = app.indexOf("buildOrderCartSeed(order,");
   assert.ok(start > 0, "sending must build a cart seed");
-  const body = app.slice(start, start + 900);
-  assert.match(body, /setPosSeedCart\(seed\.lines\)/);
+  const body = app.slice(start, start + 1800);
+  assert.match(body, /setPosSeedCart\(\{/);
+  assert.match(body, /lines: seed\.lines/);
+  // The bill must reach the right ledger. Without the customer it is raised as a walk-in and a
+  // credit order leaves no record of who owes for it.
+  assert.match(body, /customer: \{/);
   assert.match(body, /await navigate\("sales"\)/);
 });
 
 test("an order that cannot be billed at all says so instead of opening an empty till", () => {
-  assert.match(app, /Order sent, but nothing could be billed/);
+  // And the order must not be marked sent in that case: SENT releases the reservation and reads
+  // as billed, so an order stranded there shows as done while its fruit is unaccounted for.
+  assert.match(app, /This order was not sent: nothing on it can be billed/);
+  const advance = app.slice(app.indexOf("const advanceOrder = async"), app.indexOf("const loadShopView = async"));
+  const seedAt = advance.indexOf("buildOrderCartSeed(order,");
+  const sendAt = advance.indexOf("await setLocalCustomerOrderStatus(");
+  assert.ok(seedAt > 0 && sendAt > 0 && seedAt < sendAt, "the cart must be built before the order is marked sent");
 });
 
 test("a partly billable order is not silently billed short", () => {
@@ -221,9 +239,9 @@ test("the saved bill is linked back to its order", () => {
 test("a seeded cart replaces the cart rather than merging into it", () => {
   // The operator arrived here by sending an order. Merging a half-typed walk-in sale into that
   // customer's bill would put somebody else's fruit on their invoice.
-  const start = app.indexOf("if (!Array.isArray(seedCart) || seedCart.length === 0) return;");
+  const start = app.indexOf("const seedLines = Array.isArray(seedCart?.lines)");
   assert.ok(start > 0, "POS must accept a seeded cart");
-  const body = app.slice(start, start + 700);
-  assert.match(body, /setCart\(seedCart\.map/);
+  const body = app.slice(start, start + 1600);
+  assert.match(body, /setCart\(seedLines\.map/);
   assert.match(body, /onSeedConsumed\?\.\(\)/);
 });

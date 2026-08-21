@@ -55,7 +55,10 @@ export const orderValue = (order) =>
  * shelf and may since have been sold to somebody else.
  */
 export const presentOrder = (order, nowMs = Date.now()) => {
-  const status = order?.status || ORDER_STATUS.RECEIVED;
+  // Whatever the row actually says, including nothing. Defaulting a missing status to RECEIVED
+  // invents a fact about a corrupt row and presents it as a live order holding stock — the row is
+  // then indistinguishable from a real one, which is the opposite of what a reader needs.
+  const status = order?.status || "";
   const reservation = reservationState(order, nowMs);
   const lapsed = reservation === RESERVATION_STATE.LAPSED;
   return {
@@ -63,6 +66,10 @@ export const presentOrder = (order, nowMs = Date.now()) => {
     orderNo: order?.order_no || "",
     customerName: order?.customer_name || "Walk-in customer",
     customerMobile: order?.customer_mobile || "",
+    // Carried through so a bill raised from this order reaches the right ledger. Nullable on the
+    // order by design — a first-time caller has no customer record — so it is passed as-is and the
+    // bill falls back to a walk-in only when there genuinely is nobody to bill.
+    customerId: order?.customer_id || "",
     deliveryAddress: order?.delivery_address || "",
     source: order?.source || "PHONE",
     status,
@@ -102,10 +109,23 @@ export const buildOrdersBoard = (orders = [], nowMs = Date.now()) => {
     ORDER_STATUS.CANCELLED,
     ORDER_STATUS.RETURNED,
   ].includes(order.status));
-  const needsAttention = presented.filter((order) => order.warning);
+  // Anything whose status this app does not know about. It belongs nowhere on the board and would
+  // otherwise be counted in no total and drawn in no column — an order that simply is not there,
+  // with nothing to say it was dropped. The database refuses such a status, so reaching here means
+  // something outside the app wrote it, which is precisely when silence is worst.
+  const known = [...Object.values(ORDER_STATUS)];
+  const unknown = presented.filter((order) => !known.includes(order.status));
+  const needsAttention = [
+    ...presented.filter((order) => order.warning),
+    ...unknown.map((order) => ({
+      ...order,
+      warning: `This order has an unrecognised status (${order.status || "blank"}) and cannot be worked on here.`,
+    })),
+  ];
   return {
     columns,
     finished,
+    unknown,
     needsAttention,
     openCount: columns.reduce((total, column) => total + column.orders.length, 0),
     reservedValue: columns

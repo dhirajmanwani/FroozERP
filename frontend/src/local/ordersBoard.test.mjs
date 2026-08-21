@@ -135,3 +135,22 @@ test("a malformed order list does not break the board", () => {
   assert.equal(board.openCount, 0);
   assert.deepEqual(board.needsAttention, []);
 });
+
+test("an order with an unrecognised status is surfaced, not silently dropped", () => {
+  // It belongs in no column and no total, so without this it simply is not on the board — with
+  // nothing to say it was dropped. The database refuses such a status, so reaching here means
+  // something outside the app wrote it, which is exactly when silence is worst.
+  const board = buildOrdersBoard([
+    order({ id: "a" }),
+    order({ id: "b", order_no: "ORD-X", status: "HALF_PACKED" }),
+  ], NOW);
+  assert.equal(board.unknown.length, 1);
+  assert.equal(board.unknown[0].orderNo, "ORD-X");
+  assert.ok(board.needsAttention.some((entry) => /unrecognised status/.test(entry.warning)));
+});
+
+test("a blank status is unrecognised too, and says so readably", () => {
+  const board = buildOrdersBoard([order({ id: "c", status: "" })], NOW);
+  assert.equal(board.unknown.length, 1);
+  assert.match(board.needsAttention[0].warning, /blank/);
+});

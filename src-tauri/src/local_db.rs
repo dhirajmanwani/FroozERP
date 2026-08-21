@@ -1557,7 +1557,12 @@ pub fn save_customer_order_at(
                id, order_id, line_index, product_id, product_name, unit, quantity, agreed_rate
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
-                order_text(item, "id").unwrap_or_else(|| unique_local_id("order-line")),
+                // Derived from the order and the line's position, not from the clock.
+                // `unique_local_id` is a pure function of the current millisecond, and these are
+                // inserted in a tight loop — every line of a multi-line order got the identical
+                // PRIMARY KEY, the second INSERT failed, and the transaction rejected the whole
+                // order. Order id plus index is unique by construction and stable across a retry.
+                order_text(item, "id").unwrap_or_else(|| format!("{order_id}-line-{index}")),
                 order_id,
                 index as i64,
                 product_id,
@@ -5698,6 +5703,44 @@ mod tests {
             .expect("read reconciled aggregate state");
         assert_eq!(result, ("completed".to_string(), 1, 2, 2, 2));
         drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// An order with more than one item saves.
+    ///
+    /// `unique_local_id` is a pure function of the current millisecond — same prefix, same
+    /// millisecond, same id. Order lines are inserted in a tight loop, so every line of a
+    /// multi-line order was handed the identical TEXT PRIMARY KEY, the second INSERT failed on the
+    /// uniqueness constraint, and the transaction took the whole order with it. Any order with two
+    /// or more items was rejected outright. The round-trip test above only ever saved one line,
+    /// which is exactly why it stayed green.
+    #[test]
+    fn a_multi_line_order_saves() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-order-multiline-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize order database");
+
+        let order = serde_json::json!({
+            "order_no": "ORD-MULTI",
+            "customer_name": "Ram",
+            "items": [
+                { "product_id": "004", "product_name": "Apple", "quantity": 2.5, "agreed_rate": 180 },
+                { "product_id": "005", "product_name": "Banana", "quantity": 1.5, "agreed_rate": 60 },
+                { "product_id": "006", "product_name": "Pomegranate", "quantity": 1.0, "agreed_rate": 240 }
+            ]
+        });
+        let saved = save_customer_order_at(&path, &order).expect("a three-line order must save");
+        let items = saved["items"].as_array().expect("items come back as an array");
+        assert_eq!(items.len(), 3, "every line must survive");
+
+        let ids: std::collections::HashSet<&str> =
+            items.iter().filter_map(|item| item["id"].as_str()).collect();
+        assert_eq!(ids.len(), 3, "each line needs an id of its own");
+
         let _ = fs::remove_file(&path);
     }
 

@@ -4571,24 +4571,39 @@ function App() {
    * Write a new order down, which sets its stock aside immediately.
    */
   const takeOrder = async (order) => {
+    // Match the typed name and number to an existing customer so the order joins their ledger.
+    // Left unset it is always NULL, and the customer index on the orders table indexes nothing.
+    // Matched, never created: making a customer record from a phone call is a decision for the
+    // person taking it, not a side effect of writing the order down.
+    const typedMobile = String(order.customer_mobile || "").trim();
+    const typedName = String(order.customer_name || "").trim().toLowerCase();
+    const matched = customers.find((candidate) => (
+      (typedMobile && String(candidate.mobile_number || "").trim() === typedMobile)
+      || (!typedMobile && String(candidate.customer_name || "").trim().toLowerCase() === typedName)
+    ));
     setOrderActionBusy(true);
     try {
       const saved = await saveLocalCustomerOrder({
         ...order,
-        // Human-readable and sortable. Generated here rather than in the store so the operator can
-        // read it back to the customer on the phone before the save has even finished.
-        order_no: `ORD-${Date.now().toString().slice(-6)}`,
+        // Date plus the last six digits of the millisecond clock. The first draft used only the
+        // last six digits, which is epoch-ms modulo a million and repeats every sixteen minutes —
+        // against a UNIQUE column that would have started rejecting orders with an opaque save
+        // failure. The date prefix also makes it sort, which the first version claimed and did not.
+        order_no: `ORD-${toDateKey(new Date()).replaceAll("-", "")}-${String(Date.now()).slice(-6)}`,
+        customer_id: matched ? String(matched.id) : null,
         created_by: user?.full_name || "",
         branch_id: user?.branch_id ?? null,
       });
       if (saved === null) {
         setSyncMessage("Orders need the desktop app — this looks like a browser.");
-        return;
+        return false;
       }
       await loadOrders();
       setSyncMessage(`Order ${saved.order_no} saved. Stock is set aside.`);
+      return true;
     } catch (error) {
       setSyncMessage(describeLocalServiceFailure(error, "That order could not be saved"));
+      return false;
     } finally {
       setOrderActionBusy(false);
     }
@@ -4610,21 +4625,39 @@ function App() {
     }
     setOrderActionBusy(true);
     try {
+      // The cart is built before the status moves, and an order that cannot be billed at all is
+      // not sent. SENT releases the reservation and the board reads it as billed, so an order
+      // stranded there with no bill shows as done while its fruit is unaccounted for — and the
+      // operator has no way back, because a sent order cannot be returned to packed.
+      let seed = null;
+      if (to === ORDER_STATUS.SENT) {
+        seed = buildOrderCartSeed(order, { products, lots: inventory });
+        if (seed.lines.length === 0) {
+          setSyncMessage(`This order was not sent: nothing on it can be billed. ${describeOrderBillingProblems(seed)}`);
+          return;
+        }
+      }
       await setLocalCustomerOrderStatus({ orderId: order.id, nextStatus: to, patch: extras });
       await loadOrders();
       if (to !== ORDER_STATUS.SENT) {
         setSyncMessage("");
         return;
       }
-      // Sending raises the bill. The cart is built from the order and handed to POS rather than
-      // written directly, so the one tested billing path stays the only one — see local/orderBilling.js.
-      const seed = buildOrderCartSeed(order, { products, lots: inventory });
-      if (seed.lines.length === 0) {
-        setSyncMessage(`Order sent, but nothing could be billed. ${describeOrderBillingProblems(seed)}`);
-        return;
-      }
+      // Replacing any previous pending link rather than queuing: only the cart now on screen can
+      // be this order's bill. Left to accumulate, a link would outlive its cart and attach itself
+      // to whatever walk-in sale happened to be saved next.
       setPendingOrderBill({ orderId: order.id, orderNo: order.orderNo || "" });
-      setPosSeedCart(seed.lines);
+      setPosSeedCart({
+        lines: seed.lines,
+        // The order knows who it is for. Without this the bill is raised as "Walk-in Customer" and
+        // nothing reaches that customer's ledger — so a credit order would leave no record of who
+        // owes for it.
+        customer: {
+          account_id: order.customerId || "",
+          name: order.customerName || "",
+          mobile: order.customerMobile || "",
+        },
+      });
       setSyncMessage(seed.complete
         ? `Order sent. Its items are on the POS screen at the rates you quoted — confirm payment to bill it.`
         : `Order sent, and part of it is on the POS screen. ${describeOrderBillingProblems(seed)}`);
@@ -6299,7 +6332,11 @@ function App() {
       // backend at all. This branch returns before the online dispatch below, so a loader placed
       // only there never runs in LOCAL_ONLY or offline — which is how the one module built to work
       // offline ended up being the one the offline path skipped.
-      if (view === "orders") await Promise.all([loadOrders(), loadProducts()]).catch(() => null);
+      // Orders only. `loadProducts` reaches the API, and every other loader on this branch is
+      // guarded against exactly that — `applyReferenceSnapshot` above has already filled `products`
+      // from the local snapshot, so calling it here would both contact the network in LOCAL_ONLY
+      // and overwrite good local data with the result.
+      if (view === "orders") await loadOrders().catch(() => null);
       // POS needs them too: it refuses to sell stock that orders have already promised, and with
       // an empty list it would refuse nothing and quietly sell the same fruit twice.
       if (view === "sales") await loadOrders().catch(() => null);
@@ -13213,7 +13250,14 @@ function OrdersModule({ busy = false, onAdvance, onReload, onTakeOrder, products
       return setDraftError("Every item needs the rate you quoted. It fills in from today's rate when you pick the item.");
     }
     setDraftError("");
-    await onTakeOrder({ ...draft, items: lines });
+    // Only clear the form once the order is actually saved. It used to reset unconditionally while
+    // `takeOrder` swallowed the failure into a toast, so a rejected order wiped the customer, the
+    // address and every line the operator had just taken down the phone.
+    const saved = await onTakeOrder({ ...draft, items: lines });
+    if (!saved) {
+      setDraftError("That order was not saved. Your details are still here — try again.");
+      return;
+    }
     setDraft({ customer_name: "", customer_mobile: "", delivery_address: "", source: "PHONE", items: [{ ...emptyLine }] });
   };
 
@@ -16976,8 +17020,12 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
    * else's fruit on their invoice. Consumed immediately so a re-render cannot load it twice.
    */
   useEffect(() => {
-    if (!Array.isArray(seedCart) || seedCart.length === 0) return;
-    setCart(seedCart.map((line) => {
+    const seedLines = Array.isArray(seedCart?.lines) ? seedCart.lines : [];
+    if (seedLines.length === 0) return;
+    if (seedCart?.customer?.name) {
+      setCustomer((current) => ({ ...current, ...seedCart.customer, system_account: false }));
+    }
+    setCart(seedLines.map((line) => {
       const lineId = newCartLineId();
       return {
         ...line,
@@ -17047,6 +17095,23 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
    * local/reservedStock.js.
    */
   const reservedIndex = useMemo(() => buildReservedIndex(orders), [orders]);
+
+  /**
+   * On-hand for a product, looked up the way the reserved index is keyed.
+   *
+   * `stockByProduct` is keyed by the raw `batch.product_id`, and the reservation index is keyed
+   * canonically. Reading one with the other's key form returns undefined, which reads as zero stock
+   * — and zero on hand against any reservation is OVERSOLD, so POS would refuse to sell a product
+   * that is sitting on the shelf. This is the CLAUDE.md canonical-id pitfall, in the direction that
+   * looks like a stock problem rather than a code one.
+   */
+  const productOnHand = (productId) => {
+    const wanted = canonicalInventoryId(productId);
+    for (const [key, quantity] of stockByProduct) {
+      if (canonicalInventoryId(key) === wanted) return quantity;
+    }
+    return 0;
+  };
 
   const getCartQuantityForProduct = (productId, excludeLineId = "") =>
     cart
@@ -17257,9 +17322,13 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     // the per-lot arithmetic below, which is left exactly as it was — it handles money, and this
     // is not the change to disturb it with.
     const counterStock = describeCounterStock({
-      onHand: stockByProduct.get(product.id) || 0,
+      onHand: productOnHand(product.id),
       reserved: reservedForProduct(reservedIndex, product.id),
-      requested: getCartQuantityForProduct(product.id) + 1,
+      // What is already in the cart, not that plus a whole unit. Asking for +1 made any fractional
+      // remainder unsellable: with 0.4 kg free the first add was refused, and there was then no line
+      // to type 0.4 into. Produce is sold by weight, so the operator sets the quantity next anyway,
+      // and the quantity handler re-checks with the real number.
+      requested: getCartQuantityForProduct(product.id),
       unit: lot.unit || product.unit || "",
     });
     if (counterStock.status !== COUNTER_STOCK.FREE) {
@@ -17323,6 +17392,21 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
       return;
     }
     const currentItem = cart.find((item) => item.line_id === lineId);
+    // Typing a weight is the normal way produce is sold, and this path checked only the lot
+    // balance. Adding one unit passed the reservation check, and then any quantity could be typed
+    // straight over stock that orders had already promised.
+    if (field === "quantity" && currentItem) {
+      const counterStock = describeCounterStock({
+        onHand: productOnHand(currentItem.product_id),
+        reserved: reservedForProduct(reservedIndex, currentItem.product_id),
+        requested: number + getCartQuantityForProduct(currentItem.product_id, currentItem.line_id),
+        unit: currentItem.unit || "",
+      });
+      if (counterStock.status !== COUNTER_STOCK.FREE) {
+        alert(counterStock.message);
+        return;
+      }
+    }
     if (field === "quantity" && currentItem && number + getCartQuantityForLot(currentItem.inventory_batch_id, currentItem.line_id) > Number(currentItem.available_qty || 0)) {
       const moreAvailable = Math.max(Number(currentItem.available_qty || 0) - getCartQuantityForLot(currentItem.inventory_batch_id, currentItem.line_id), 0);
       alert(currentItem.inventory_batch_id ? `Only ${moreAvailable.toLocaleString("en-IN", { maximumFractionDigits: 3 })} more units are available in Lot ${currentItem.lot_name || currentItem.inventory_batch_id}.` : `Only ${currentItem.available_qty || 0} units are available.`);
@@ -17658,7 +17742,10 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
       setCustomer({ account_id: "", name: "", mobile: "", notes: "", system_account: false });
       setCreditInfo({ due_date: "", remarks: "" });
       setBillDateTime(currentDateTimeLocal());
-      await onSaved();
+      // Hand the saved sale to `onSaved`. It was called bare, so a bill raised through this path
+      // linked nothing back to the order it came from — and `sale_id` is exactly what the storage
+      // layer uses to refuse a second billing, so the order stayed cancellable and re-billable.
+      await onSaved({ sale: response.data.sale });
       setLastInvoice(response.data.sale);
       onInvoice(response.data.sale);
       if (printAfterSave || printSettings.auto_print_after_billing === true) {
