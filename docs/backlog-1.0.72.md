@@ -6,7 +6,7 @@ Items deferred out of 1.0.71. Nothing here is implemented.
 
 ## 1. `purchase_bill_status` is dropped during sync, so provisional costs are indistinguishable from real ones
 
-**Status:** open, not started. Logged 2026-08-15.
+**Status:** **Fixed 2026-08-21.** Migration `019_provisional_lot_cost_status`, the `inventory_lot` sync arm, the reference snapshot, `frontend/src/local/provisionalLotCost.js` and the dashboard. Steps 1-3 of the proposed direction below were taken; step 4 was deliberately not (zero is legitimate for gifted or sample stock). The measured figures in this entry were used as the test fixture and the seven repro lots were **not** touched. Logged 2026-08-15.
 **Severity:** correctness / reporting. Understates stock valuation silently.
 
 ### The gap
