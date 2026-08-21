@@ -6303,3 +6303,26 @@ tbody tr:last-child td {
   color: #64748b;
   font-size: 10px;
 }
+
+/* The Owner's shop picker, under the sidebar navigation. Only rendered when there is more than one
+   shop to choose between, so it is absent for every single-shop install. */
+.sidebar-shop-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 16px 4px;
+}
+
+.sidebar-shop-picker select {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font: inherit;
+}
+
+/* Viewing another shop reuses the Local Only banner's layout: same shape, same place, and the
+   reader already knows what a bar across the top of the content area means. The attribute selector
+   only re-colours it, so the two are never mistaken for one another. */
+.local-only-banner[data-shop-view="OTHER_BRANCH"] {
+  border-color: #b45309;
+}

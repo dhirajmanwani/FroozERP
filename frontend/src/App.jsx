@@ -38,6 +38,7 @@ import {
 } from "./local/bootstrapCredential";
 import { resolveOfflineOpenDecision } from "./local/offlineDataReadiness";
 import { allShopsHasFigures, resolveAllShopsPresentation } from "./local/allShopsSummary";
+import { resolveShopViewPresentation, shopPickerVisible } from "./local/shopView";
 import { bannerForState } from "./local/entitlementState";
 import { sessionAuthHeaders, shouldAttachSessionAuth } from "./local/authHeaders";
 import { consumeStashedSessionForReload, stashSessionForReload } from "./local/reloadSessionBridge";
@@ -86,7 +87,7 @@ import {
 } from "./local/stockInventory";
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
-import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, resolveReportDateRange } from "./local/reportRefresh";
+import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, resolveReportDateRange } from "./local/reportRefresh";
 import { approvedDeviceCredentialMessage, normalizeDeviceBootstrapStatus } from "./local/freshDeviceOnboarding";
 import { getUserDisplayName, getUserInitial, getUserRoleLabel } from "./local/userPresentation";
 import { describeUpdateAvailability, normalizeUpdateMetadata } from "./local/updateMetadata";
@@ -1755,7 +1756,9 @@ function App() {
   const [expenses, setExpenses] = useState([]);
   // Kept as one object rather than three pieces of state so the view can never render a stale
   // payload beside a fresh error, which is how a failed refresh ends up looking like real figures.
-  const [allShopsState, setAllShopsState] = useState({ loadState: "idle", loadError: "", payload: null });
+  const [allShopsState, setAllShopsState] = useState({ loadState: "idle", loadError: "", payload: null, dateTo: "" });
+  const [shopViewState, setShopViewState] = useState({ loadState: "idle", loadError: "", branches: [], ownBranchId: null, viewingBranchId: null, viewOnly: false });
+  const [shopSwitchBusy, setShopSwitchBusy] = useState(false);
   const [dashboardRange, setDashboardRange] = useState("7");
   const [dashboardCustomRange, setDashboardCustomRange] = useState({
     date_from: toDateKey(new Date()),
@@ -1936,6 +1939,18 @@ function App() {
     });
     return () => axios.interceptors.request.eject(interceptorId);
   }, [user]);
+
+  // Load the shop list once the Owner is signed in.
+  //
+  // Keyed on the user id and role rather than on `user`, which is replaced wholesale every time the
+  // session token is swapped — including by `switchShopView` itself. Keying on the object would
+  // make picking a shop re-fetch the list, which would immediately overwrite the viewing state that
+  // the pick had just set.
+  useEffect(() => {
+    if (String(user?.role || "").toUpperCase() !== "OWNER") return;
+    loadShopView();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, user?.role]);
 
   // Tick the offline-lockout countdown, and clear it the moment it lapses.
   //
@@ -4493,6 +4508,72 @@ function App() {
   };
 
   /**
+   * The shops this Owner may look at.
+   *
+   * Errors land in state rather than throwing, for the same reason as `loadAllShops`: a thrown
+   * error becomes a banner over a screen still showing the previous contents, and here the previous
+   * contents include which shop the app thinks it is pointed at.
+   */
+  const loadShopView = async () => {
+    if (String(user?.role || "").toUpperCase() !== "OWNER") return;
+    setShopViewState((current) => ({ ...current, loadState: "loading", loadError: "" }));
+    try {
+      const response = await axios.get(`${API_URL}/api/owner/viewable-branches`);
+      setShopViewState({
+        loadState: "loaded",
+        loadError: "",
+        branches: response.data?.branches || [],
+        ownBranchId: response.data?.own_branch_id ?? null,
+        viewingBranchId: response.data?.viewing_branch_id ?? null,
+        viewOnly: response.data?.view_only === true,
+      });
+    } catch (error) {
+      // The list is lost, but what the session is pointed at is not: keeping the previous ids means
+      // the banner stays up. Losing the dropdown is an inconvenience; losing the banner would leave
+      // another shop's figures on screen with nothing saying so.
+      setShopViewState((current) => ({
+        ...current,
+        loadState: "error",
+        loadError: getErrorMessage(error, "The shop list could not be loaded."),
+        branches: [],
+      }));
+    }
+  };
+
+  /**
+   * Point the whole app at a different shop, or back at your own.
+   *
+   * The new token replaces the old one on `user`, which the axios interceptor is keyed on, so every
+   * subsequent request carries it. The current screen is then reloaded — without that the numbers
+   * on it would still be the previous shop's while the banner said otherwise, which is precisely
+   * the confusion this feature has to avoid.
+   */
+  const switchShopView = async (branchId) => {
+    if (!branchId || shopSwitchBusy) return;
+    setShopSwitchBusy(true);
+    try {
+      const response = await axios.post(`${API_URL}/api/owner/view-branch`, { view_branch_id: branchId });
+      const token = response.data?.token;
+      if (!token) throw new Error("No session was returned for that shop.");
+      setUser((current) => (current ? { ...current, device_session_token: token, branch_id: response.data.branch_id } : current));
+      setShopViewState((current) => ({
+        ...current,
+        viewingBranchId: response.data.branch_id ?? null,
+        viewOnly: response.data.view_only === true,
+      }));
+      setSyncMessage(response.data.message || "");
+      // `navigate` is the app's only per-view loader, and re-navigating to the view already open
+      // is what re-runs it. Without this the screen would keep the previous shop's figures while
+      // the banner said a different shop — exactly the confusion this feature exists to avoid.
+      await navigate(activeView);
+    } catch (error) {
+      setSyncMessage(getErrorMessage(error, "That shop could not be opened."));
+    } finally {
+      setShopSwitchBusy(false);
+    }
+  };
+
+  /**
    * The Owner's company-wide figures.
    *
    * Swallows its own error into state instead of throwing, because the shared per-view dispatch
@@ -4500,16 +4581,21 @@ function App() {
    * For this view that would mean the previous company totals sitting under a sync warning, read
    * as current. The presentation layer needs the failure in hand to blank the figures.
    */
-  const loadAllShops = async () => {
-    setAllShopsState((current) => ({ ...current, loadState: "loading", loadError: "" }));
+  const loadAllShops = async (dateTo = "") => {
+    setAllShopsState((current) => ({ ...current, loadState: "loading", loadError: "", dateTo }));
     try {
-      const response = await axios.get(`${API_URL}/api/owner/all-branches-summary`);
-      setAllShopsState({ loadState: "loaded", loadError: "", payload: response.data });
+      // A balance sheet is always "as at" a single day, never a range — a range would imply these
+      // are takings over a period, which they are not. An empty value means today, decided by the
+      // server so a device with a wrong clock cannot quietly shift the date.
+      const params = normalizeReportDate(dateTo) ? { date_to: dateTo } : {};
+      const response = await axios.get(`${API_URL}/api/owner/all-branches-summary`, { params });
+      setAllShopsState({ loadState: "loaded", loadError: "", payload: response.data, dateTo });
     } catch (error) {
       setAllShopsState({
         loadState: "error",
         loadError: getErrorMessage(error, "All Shops could not be loaded. Nothing was changed; try again."),
         payload: null,
+        dateTo,
       });
     }
   };
@@ -6419,6 +6505,16 @@ function App() {
     ["settings", "Open Update Center", () => navigate("settings")],
     ["settings", "Check Connection", () => { navigate("settings"); performConnectivityCheck("command-palette", { force: true }); }],
   ].filter(([view]) => hasModuleAccess(view) && (canManageRates || view !== "sale-rates"));
+  const shopView = resolveShopViewPresentation({
+    loadState: shopViewState.loadState,
+    loadError: shopViewState.loadError,
+    offline: offlineMode || connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY,
+    isOwner: String(user?.role || "").toUpperCase() === "OWNER",
+    branches: shopViewState.branches,
+    ownBranchId: shopViewState.ownBranchId,
+    viewingBranchId: shopViewState.viewingBranchId,
+    viewOnly: shopViewState.viewOnly,
+  });
   return (
     <main className="erp-shell">
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
@@ -6438,6 +6534,20 @@ function App() {
             </button>
           ))}
         </nav>
+        {shopPickerVisible(shopView) && (
+          <div className="sidebar-shop-picker">
+            <span className="sidebar-section">Viewing Shop</span>
+            <select
+              disabled={shopSwitchBusy}
+              value={shopView.viewingBranchId ?? ""}
+              onChange={(event) => switchShopView(Number(event.target.value))}
+            >
+              {shopView.shops.map((shop) => (
+                <option key={shop.id} value={shop.id}>{shop.name}</option>
+              ))}
+            </select>
+          </div>
+        )}
           <div className="sidebar-profile" onClick={() => setProfileOpen(true)} role="button" tabIndex={0} onKeyDown={(event) => event.key === "Enter" && setProfileOpen(true)}>
           <div className="user-avatar">{getUserInitial(user)}</div>
           <div>
@@ -6517,6 +6627,23 @@ function App() {
         </header>
 
         <div className="content-area">
+          {shopView.banner && (
+            // Above the connectivity notice on purpose. Local Only changes where the numbers come
+            // from; this changes whose they are, and that is the more surprising of the two.
+            <div className="local-only-banner" data-shop-view="OTHER_BRANCH" role="alert">
+              <div>
+                <strong>Viewing {shopView.banner.shopName}</strong>
+                <span>{shopView.banner.text}</span>
+              </div>
+              <button
+                className="primary-button"
+                disabled={shopSwitchBusy || !shopView.banner.returnBranchId}
+                onClick={() => switchShopView(shopView.banner.returnBranchId)}
+              >
+                {shopSwitchBusy ? "Switching..." : shopView.banner.returnLabel}
+              </button>
+            </div>
+          )}
           {connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY && (
             <div className="local-only-banner" data-connectivity-mode="LOCAL_ONLY">
               <div>
@@ -12876,7 +13003,21 @@ function AllShopsModule({ connectivityMode, onReload, state }) {
       title="All Shops"
       subtitle={asAt ? `Company position as at ${asAt}. Every other screen shows only the shop you are signed in to.` : "Company position across every shop. Every other screen shows only the shop you are signed in to."}
     >
-      <p><button className="table-action" type="button" onClick={onReload}>Refresh</button></p>
+      <p className="form-row">
+        <label>
+          As at{" "}
+          <input
+            max={toDateKey(new Date())}
+            type="date"
+            value={state.dateTo || ""}
+            onChange={(event) => onReload(event.target.value)}
+          />
+        </label>{" "}
+        <button className="table-action" type="button" onClick={() => onReload(state.dateTo || "")}>Refresh</button>
+        {state.dateTo && (
+          <button className="table-action" type="button" onClick={() => onReload("")}>Today</button>
+        )}
+      </p>
 
       {presentation.message && <p className="form-note">{presentation.message}</p>}
       {presentation.warnings.map((warning) => (

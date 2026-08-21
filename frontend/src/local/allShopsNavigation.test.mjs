@@ -67,3 +67,31 @@ test("All Shops is classified as needing the backend, not as offline-capable", (
   assert.doesNotMatch(offlineLocal[1], /all-shops/);
   assert.match(backendRequired[1], /all-shops/);
 });
+
+test("the shop picker is only rendered when the state module says so", () => {
+  // The picker must never be drawn from raw state. `shopPickerVisible` hides it for a single-shop
+  // business and for non-Owners, and a component that checked `branches.length` itself would
+  // quietly disagree with the tests that pin those rules.
+  assert.match(app, /shopPickerVisible\(shopView\)/);
+  assert.doesNotMatch(app, /shopViewState\.branches\.length/);
+});
+
+test("the viewing-another-shop banner is rendered from the resolved presentation", () => {
+  assert.match(app, /shopView\.banner && \(/);
+  assert.match(app, /switchShopView\(shopView\.banner\.returnBranchId\)/);
+});
+
+test("the banner sits above the connectivity notice", () => {
+  // Local Only changes where the numbers come from; viewing another shop changes whose they are.
+  // The more surprising message goes first, and ordering in JSX is ordering on screen.
+  const shopBanner = app.indexOf('data-shop-view="OTHER_BRANCH"');
+  const localOnlyBanner = app.indexOf('data-connectivity-mode="LOCAL_ONLY"');
+  assert.ok(shopBanner > 0 && localOnlyBanner > 0, "both banners must exist");
+  assert.ok(shopBanner < localOnlyBanner, "the shop banner must render before the connectivity one");
+});
+
+test("All Shops asks the server for its as-at date rather than computing one", () => {
+  // A device with a wrong clock would otherwise silently shift which day the balance sheet is for.
+  // An empty value means "today", decided server-side.
+  assert.match(app, /normalizeReportDate\(dateTo\) \? \{ date_to: dateTo \} : \{\}/);
+});
