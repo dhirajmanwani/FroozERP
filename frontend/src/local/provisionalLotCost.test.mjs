@@ -179,3 +179,18 @@ test("the sync arm and the snapshot both carry the field, or none of this works"
   );
   assert.match(migration, /ALTER TABLE local_inventory_lots ADD COLUMN purchase_bill_status TEXT/);
 });
+
+test("a lot booked offline against a pending bill is provisional from the moment it exists", () => {
+  // The gap that made the first version of this fix inert on a device with no cloud: the offline
+  // purchase path already knew purchase_bill_status — it used it to choose between the expected and
+  // the real rate — and then did not record it. Using a fact to pick a number and discarding the
+  // fact is exactly how the sync-path bug happened.
+  const rust = fs.readFileSync(new URL("../../../src-tauri/src/local_db.rs", import.meta.url), "utf8");
+  const offlineInsert = rust.slice(rust.indexOf("let cost_rate = if purchase_bill_status =="));
+  assert.match(
+    offlineInsert.slice(0, 6000),
+    /cost_rate, sale_rate, status, purchase_bill_status, remarks/,
+    "the offline purchase insert must record the status it already used",
+  );
+  assert.match(offlineInsert.slice(0, 7000), /purchase_bill_status\.clone\(\),/, "and bind it");
+});

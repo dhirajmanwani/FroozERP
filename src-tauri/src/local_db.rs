@@ -1008,12 +1008,19 @@ fn queue_local_purchase_at(path: &Path, mut purchase: serde_json::Value) -> Resu
         )
         .map_err(to_error)?;
         tx.execute(
+            // `purchase_bill_status` is recorded here even though `cost_rate` above already used it
+            // to choose between the expected and the real rate. Using a fact to pick a number and
+            // then discarding the fact is precisely how the valuation bug happened on the sync
+            // path: the resulting row says a cost with no way to tell whether it is a real one.
+            // A lot booked offline against a pending bill is provisional from the moment it exists,
+            // and waiting for a round trip to the cloud to learn that would leave every
+            // offline-created lot silently valued in the meantime.
             "INSERT INTO local_inventory_lots (
                 id, cloud_id, branch_id, device_id, product_id, product_name, supplier_id,
                 lot_no, size_grade, opening_date, opening_qty, purchased_qty, balance_qty,
-                cost_rate, sale_rate, status, remarks, created_by, version, sync_status,
-                company_id, operational_location_id
-             ) VALUES (?1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10,?10,?11,?12,'ACTIVE',?13,?14,1,'pending',?15,?16)
+                cost_rate, sale_rate, status, purchase_bill_status, remarks, created_by, version,
+                sync_status, company_id, operational_location_id
+             ) VALUES (?1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10,?10,?11,?12,'ACTIVE',?17,?13,?14,1,'pending',?15,?16)
              ON CONFLICT(id) DO NOTHING",
             params![
                 provisional_lot_id,
@@ -1032,6 +1039,7 @@ fn queue_local_purchase_at(path: &Path, mut purchase: serde_json::Value) -> Resu
                 user_id,
                 company_id,
                 operational_location_id,
+                purchase_bill_status.clone(),
             ],
         )
         .map_err(to_error)?;
