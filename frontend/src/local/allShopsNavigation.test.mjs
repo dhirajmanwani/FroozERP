@@ -161,3 +161,26 @@ test("an unloaded Orders screen does not claim to be loading", () => {
   // the app is doing, and it is exactly what a missed loader looked like.
   assert.match(app, /Orders have not been loaded yet/);
 });
+
+test("POS refuses stock that orders have already promised", () => {
+  // Without this the reservation is a note on another screen and the fruit gets sold anyway,
+  // which is the whole failure reserve-on-order exists to prevent.
+  const start = app.indexOf("const counterStock = describeCounterStock({");
+  assert.ok(start > 0, "POS must consult the reservation before adding to the cart");
+  const body = app.slice(start, start + 600);
+  assert.match(body, /reservedForProduct\(reservedIndex, product\.id\)/);
+  assert.match(body, /if \(counterStock\.status !== COUNTER_STOCK\.FREE\)/);
+});
+
+test("POS is given the orders it needs to check against", () => {
+  // An empty list would refuse nothing and sell the same fruit twice — a guard that silently
+  // passes is worse than no guard, because it reads as working.
+  assert.match(app, /orders=\{ordersState\.orders\}/);
+  const dispatches = app.match(/if \(view === "sales"\) await loadOrders\(\)/g) || [];
+  assert.equal(dispatches.length, 2, "POS must load orders on both the local and online paths");
+});
+
+test("promised stock is shown on the cart line, not only on refusal", () => {
+  // A refusal at the till happens with a customer standing there.
+  assert.match(app, /reservedNote\(reservedIndex, item\.product_id, item\.unit\)/);
+});

@@ -44,6 +44,7 @@ import { allShopsHasFigures, resolveAllShopsPresentation } from "./local/allShop
 import { resolveShopViewPresentation, shopPickerVisible } from "./local/shopView";
 import { ORDER_STATUS } from "./local/orderLifecycle";
 import { buildOrdersBoard, validateOrderAction } from "./local/ordersBoard";
+import { COUNTER_STOCK, buildReservedIndex, describeCounterStock, reservedForProduct, reservedNote } from "./local/reservedStock";
 import { bannerForState } from "./local/entitlementState";
 import { sessionAuthHeaders, shouldAttachSessionAuth } from "./local/authHeaders";
 import { consumeStashedSessionForReload, stashSessionForReload } from "./local/reloadSessionBridge";
@@ -6280,6 +6281,9 @@ function App() {
       // only there never runs in LOCAL_ONLY or offline — which is how the one module built to work
       // offline ended up being the one the offline path skipped.
       if (view === "orders") await Promise.all([loadOrders(), loadProducts()]).catch(() => null);
+      // POS needs them too: it refuses to sell stock that orders have already promised, and with
+      // an empty list it would refuse nothing and quietly sell the same fruit twice.
+      if (view === "sales") await loadOrders().catch(() => null);
       return;
     }
     setSidebarOpen(false);
@@ -6314,6 +6318,7 @@ function App() {
       // item" dropdown is empty and the screen simply looks broken. Nothing else on this view
       // needed them, which is exactly why it was missed.
       if (view === "orders") await Promise.all([loadOrders(), loadProducts()]);
+      if (view === "sales") await loadOrders().catch(() => null);
       if (view === "returns") await loadSaleReturns();
       if (view === "waste") await loadWasteEntries();
       if (view === "dashboard") await loadDashboardData();
@@ -7404,6 +7409,7 @@ function App() {
           {activeView === "sales" && (
             <PosBilling
               customers={customers.filter((customer) => customer.active !== false)}
+              orders={ordersState.orders}
               deviceInfo={deviceInfo}
               discountRules={discountRules}
               lotDiscounts={lotDiscounts}
@@ -16881,7 +16887,7 @@ const currentDateTimeLocal = () => {
   return `${year}-${month}-${day}T${hours}:${minutes}`;
 };
 
-function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, syncInBackground, user }) {
+function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, syncInBackground, user }) {
   const [search, setSearch] = useState("");
   const [barcode, setBarcode] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
@@ -16958,6 +16964,20 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     }, new Map()),
     [inventory]
   );
+
+  /**
+   * How much of each product is already promised to orders that have not gone out.
+   *
+   * Per product rather than per lot, deliberately: an order is taken against "10kg apples" long
+   * before anyone picks a crate, so subtracting it from a particular lot would invent a fact. See
+   * local/reservedStock.js.
+   */
+  const reservedIndex = useMemo(() => buildReservedIndex(orders), [orders]);
+
+  const getCartQuantityForProduct = (productId, excludeLineId = "") =>
+    cart
+      .filter((item) => canonicalInventoryId(item.product_id) === canonicalInventoryId(productId) && item.line_id !== excludeLineId)
+      .reduce((sum, item) => sum + Number(item.quantity || 0), 0);
 
   const lotsByProduct = useMemo(
     () => inventory.reduce((lots, batch) => {
@@ -17159,6 +17179,19 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
       return;
     }
     const availableStock = lotBalance(lot);
+    // Stock promised to orders is not the counter's to sell. Checked at product level and before
+    // the per-lot arithmetic below, which is left exactly as it was — it handles money, and this
+    // is not the change to disturb it with.
+    const counterStock = describeCounterStock({
+      onHand: stockByProduct.get(product.id) || 0,
+      reserved: reservedForProduct(reservedIndex, product.id),
+      requested: getCartQuantityForProduct(product.id) + 1,
+      unit: lot.unit || product.unit || "",
+    });
+    if (counterStock.status !== COUNTER_STOCK.FREE) {
+      alert(counterStock.message);
+      return;
+    }
     const lotSaleRate = Number(lot?.temporary_sale_rate || lot?.sale_rate || lot?.selling_rate || 0);
     const defaultRate = lotSaleRate > 0 ? lotSaleRate : Number(product.selling_rate);
     const lotDiscount = getActiveLotDiscount(lot?.id);
@@ -17788,6 +17821,11 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
                       <td className="primary-cell">
                         {item.product_name}
                         <small className="cell-note">{item.available_qty || stockByProduct.get(item.product_id) || 0} {item.unit} available</small>
+                        {/* Said before the operator tries, not only when they are refused. A
+                            refusal at the till happens with a customer standing there. */}
+                        {reservedNote(reservedIndex, item.product_id, item.unit) && (
+                          <small className="cell-note">{reservedNote(reservedIndex, item.product_id, item.unit)}</small>
+                        )}
                       </td>
                       <td><span className="batch-id">{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "Auto FIFO"}</span></td>
                       <td>
