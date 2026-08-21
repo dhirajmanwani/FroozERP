@@ -812,8 +812,10 @@ an unticked line is a reason not to expose, not a note to revisit later.
 It is written now, while the cloud is *not* running, precisely because that is the honest moment.
 Written the week of a launch, a checklist becomes a list of things to argue around.
 
-**Current verdict: DO NOT EXPOSE.** A-5 is open, A-4c was open when this was written, and six
-items below are unmet.
+**Current verdict: DO NOT EXPOSE.** Updated 2026-08-21 after A-4c, A-4d and A-5 landed and after
+branch isolation was audited. The blocking picture has changed shape rather than shrunk: the
+authentication gates are now largely met, and **Gate 4 turned from an unknown into a confirmed
+failure**, which is now the single reason this verdict cannot change.
 
 ### Why the timing is not urgent, and why the list still matters
 
@@ -833,8 +835,8 @@ morning of ticking boxes rather than a decision made under pressure.
 | --- | --- | --- |
 | 1.1 | Every route requires a verified session, or is on an explicit public allow-list | **Met (A-4)** — 268/285, 16 deliberately public, proved by `routeAuthCoverage.test.js` on every run |
 | 1.2 | No route derives *identity* from a request field | **Met (A-3, A-4b)** — 92 routes moved to `req.auth.userId` |
-| 1.3 | Money-moving routes carry a permission check, not just authentication | **A-4c** |
-| 1.4 | Failed logins are rate-limited and lock the account | **A-5 — open.** `locked_until` exists as a column and is not enforced. `/login` is on the public allow-list, so this is an unlimited online password-guessing oracle the moment the port is reachable |
+| 1.3 | Money-moving routes carry a permission check, not just authentication | **Met (A-4c, A-4d)** — 13 money handlers plus the master-data writes that rewrite balances |
+| 1.4 | Failed logins are rate-limited and lock the account | **Met (A-5).** Escalating lock on `/login` **and** `/bootstrap/first-owner-device`, sharing one counter. Offline sign-in got its own lock after hardware testing showed it bypassed both |
 | 1.5 | Sessions can be revoked on sign-out | **Open.** `session_revocation_version` is carried in the token and checked by the sync path; nothing increments it. Today the only revocation is rotating the signing key, which signs everybody out |
 | 1.6 | The legacy SHA-256 verify path is removed | **A-5 — open.** Requires evidence every active user has signed in since A-1 |
 
@@ -861,18 +863,21 @@ morning of ticking boxes rather than a decision made under pressure.
 
 | # | Requirement | State |
 | --- | --- | --- |
-| 4.1 | Every query is scoped by `company_id` / `branch_id` | **Never audited.** §5 of this plan flagged it; nothing has been done |
+| 4.1 | Every query is scoped by `company_id` / `branch_id` | **Audited 2026-08-20. FAILS.** `req.auth.branchId` and `req.auth.companyId` have **zero read sites** in the entire backend. 119 of 285 registrations return or write business data with no tenancy predicate. See `docs/branch-isolation-audit.md` |
 
-**This is the largest unknown in the document.** A-4 answers "is the caller who they say they
-are". It does not answer "may this authenticated user of branch A read branch B's data". With one
-company that is invisible; the maintainer intends multi-branch operation, which is exactly when it
-starts to matter. It deserves its own audit stage and must not be assumed solved by A-4.
+**This is now the single reason the verdict at the top cannot change.** It stopped being the
+document's largest *unknown* and became its largest *known failure*, which is progress only in the
+sense that it can now be planned. Tracked as **A-7**, roughly 3–4 weeks.
+
+Latent while one branch exists — there is no second branch's data to leak — and live the moment
+there is one. Because the maintainer's first product goal *is* multibranch, this gates the goal and
+the exposure together.
 
 ### Gate 5 — Operational
 
 | # | Requirement | State |
 | --- | --- | --- |
-| 5.1 | The plaintext-password query has been run against the live database | **Outstanding** — see the A-2 record. Any row it returns cannot sign in after A-2 and needs an admin reset |
+| 5.1 | The plaintext-password query has been run against the live database | **Outstanding, now self-reporting** — the server counts legacy hashes at every cloud startup (see the A-5 record). Any account it names cannot sign in after A-2 and needs an admin reset |
 | 5.2 | A restore has been tested from a real backup, not just taken | Untested |
 | 5.3 | Logs do not contain tokens, passwords or OTPs | Unverified |
 | 5.4 | LOCAL_ONLY invariants re-read and re-tested after exposure work | `desktopGatewayOwnerControl.test.js` asserts them on the gateway paths; re-run after any cloud change |
@@ -883,12 +888,15 @@ starts to matter. It deserves its own audit stage and must not be assumed solved
 
 Not a ranking of severity so much as of regret:
 
-1. **1.4 — no lockout.** The moment the port is reachable, `/login` is an unlimited password-guessing
-   oracle. Everything else in this document assumes an attacker cannot simply become a real user.
-2. **4.1 — unaudited tenant isolation.** The one item where nobody has looked. Unknown risk is worse
-   than known risk, and it grows the day a second branch exists.
+1. ~~**1.4 — no lockout.**~~ **Closed by A-5**, on both password-verifying routes and offline.
+2. **4.1 — tenant isolation. Now the top item, and no longer a guess.** Audited and failing.
+   Unknown risk became known risk, which is worse to look at and far better to have.
 3. **3.3 — `first-owner-device` on the public list.** A route that hands out an approved device on a
-   correct password guess, published to the internet.
+   correct password guess, published to the internet. A-5 rate-limits it now, which lowers the
+   severity without removing the reason it should be a CLI action instead.
+4. **2.3 — no TLS.** Sessions are bearer tokens. Over plaintext HTTP, one interception is a full
+   account takeover, and no amount of work in Gate 1 survives it. Cheap to fix and easy to forget,
+   which is a bad combination.
 
 ### How to use this
 
