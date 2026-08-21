@@ -101,7 +101,7 @@ A fix should be validated against these numbers rather than by mutating them.
 
 ## 2. Uncommitted `CanonicalSnapshotScope` work breaks offline login on every existing profile
 
-**Status:** open, **blocking — must be fixed before it lands**. Logged 2026-08-15.
+**Status:** **Resolved by Stage 8, 2026-08-19.** Verified 2026-08-21: `canonical_snapshot_scope_at` catches every failure from `canonical_snapshot_scope_try` and returns an `unscoped` result with a `DEVICE_SCOPE_LOOKUP_FAILED` warning — "fail into the running state", never propagated. A device with no assignment row can still sign in offline, which is the availability defect this entry was raised for. Logged 2026-08-15.
 **Severity:** availability. No device without an assignment row can sign in offline.
 
 ### The defect
@@ -169,7 +169,7 @@ share the same fail-closed path. Both need the same review.
 
 ## 3. Desktop shell falls back to a hardcoded production cloud URL when no cloud is configured
 
-**Status:** open, not started. Logged 2026-08-15.
+**Status:** **Fixed 2026-08-17** in commit `3363e59` "Stop treating 'no cloud configured' as 'use production'". Verified 2026-08-21: `CLOUD_TARGET_CONFIGURED` is `CLOUD_API_URL !== ""` with no production default, and an unconfigured gateway refuses cloud routing by name rather than silently reaching Railway. Logged 2026-08-15.
 **Severity:** safety. This is the mechanism by which accidental production contact happens.
 
 ### The defect
@@ -217,7 +217,7 @@ that any empty config chain lands on.
 
 ## 4. `API_MODE=LOCAL_ONLY` does not gate cloud calls, so the name promises a guarantee it does not give
 
-**Status:** open, not started. Logged 2026-08-15.
+**Status:** **Substantially fixed** across Stage 4 and the LOCAL_ONLY kill-switch work of 2026-08-20. Verified 2026-08-21: `syncService.js` refuses push and pull through `cloudAccessDisabledByOwner()` before a request is built, `desktopGateway.js` refuses before a socket opens, and `desktopGatewayOwnerControl.test.js` drives a real gateway against a stand-in cloud counter asserting `blocked=true`, `reachedCloud=false`, zero cloud-router invocations and zero external connections. **Not closed outright** — the claim is only as good as its coverage, and no exhaustive sweep has proved every outbound path is gated. Logged 2026-08-15.
 **Severity:** correctness of a safety control. The label misrepresents the behaviour.
 
 ### The defect
