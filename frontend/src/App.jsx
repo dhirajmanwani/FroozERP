@@ -13156,6 +13156,11 @@ function OrdersModule({ busy = false, onAdvance, onReload, onTakeOrder, products
       })
       .filter((line) => line && Number.isFinite(line.quantity) && line.quantity > 0);
     if (lines.length === 0) return setDraftError("Add at least one item with a quantity.");
+    // A rate of zero is not "no rate given" — it is a real number on a real order, and it would
+    // show the customer as owing nothing. Refused rather than stored.
+    if (lines.some((line) => !(line.agreed_rate > 0))) {
+      return setDraftError("Every item needs the rate you quoted. It fills in from today's rate when you pick the item.");
+    }
     setDraftError("");
     await onTakeOrder({ ...draft, items: lines });
     setDraft({ customer_name: "", customer_mobile: "", delivery_address: "", source: "PHONE", items: [{ ...emptyLine }] });
@@ -13255,7 +13260,19 @@ function OrdersModule({ busy = false, onAdvance, onReload, onTakeOrder, products
           {draft.items.map((line, index) => (
             <tr key={index}>
               <td>
-                <select onChange={(event) => setLine(index, { product_id: event.target.value })} value={line.product_id}>
+                <select
+                  onChange={(event) => {
+                    // Prefill today's rate. Most orders are quoted at the rate on the board, so
+                    // typing it again is work for nothing — and a blank left blank became an order
+                    // worth Rs 0, which is not "no rate", it is a wrong number on a real order.
+                    const picked = products.find((candidate) => canonicalInventoryId(candidate.id) === canonicalInventoryId(event.target.value));
+                    setLine(index, {
+                      product_id: event.target.value,
+                      agreed_rate: line.agreed_rate || (picked?.selling_rate ? String(picked.selling_rate) : ""),
+                    });
+                  }}
+                  value={line.product_id}
+                >
                   <option value="">Choose an item</option>
                   {products.map((product) => (
                     <option key={product.id} value={product.id}>{product.product_name}</option>
