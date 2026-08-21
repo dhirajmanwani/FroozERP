@@ -10404,10 +10404,40 @@ app.put("/settings/devices/:deviceId", async (req, res) => {
         message: "Use protocol-v3 device approval with an explicit operational location, usage, user and role.",
       });
     }
-    const beforeResult = await pool.query("SELECT * FROM authorized_devices WHERE device_id = $1", [deviceId]);
+    // A-7 step 2. Scoped to the actor's company, which is the tenant boundary — `branches.company_id`
+    // and `authorized_devices.company_id` both exist (cloud migrations 005/006) and neither was
+    // being consulted here. Unscoped, an Owner or Admin of one company could rename, disable or
+    // re-point ANY device in the database, including another tenant's.
+    //
+    // Read from `req.auth.companyId`, the verified session claim. Before this it had zero read
+    // sites in the entire backend: A-3 put it in every token and nothing had ever used it.
+    const beforeResult = await pool.query(
+      "SELECT * FROM authorized_devices WHERE device_id = $1 AND company_id = $2",
+      [deviceId, req.auth.companyId]
+    );
+    // Deliberately the same 404 an unknown device gets. A distinct "not yours" would confirm the
+    // device exists to someone who should not be able to learn that.
     if (!beforeResult.rows[0]) return res.status(404).json({ message: "Device not found" });
     let result;
     if (action === "RENAME") {
+      // Re-pointing a device is not a rename, whatever the action is called: /login mints the
+      // session's branch claim as `operationalAssignment?.branch_id || device.assigned_branch_id
+      // || ...`, so moving a device changes which branch its next token legitimately claims. The
+      // target branch must therefore exist, be active, and belong to the actor's company — an
+      // unchecked integer here is a signed token for a branch of someone else's business.
+      const requestedBranchId = parsePositiveInteger(req.body.assigned_branch_id);
+      if (requestedBranchId) {
+        const branch = await pool.query(
+          "SELECT id FROM branches WHERE id = $1 AND company_id = $2 AND active IS DISTINCT FROM FALSE LIMIT 1",
+          [requestedBranchId, req.auth.companyId]
+        );
+        if (!branch.rows[0]) {
+          return res.status(400).json({
+            code: "BRANCH_NOT_IN_COMPANY",
+            message: "That branch does not exist for this business, or is not active.",
+          });
+        }
+      }
       result = await pool.query(
         `
         UPDATE authorized_devices
