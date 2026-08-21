@@ -329,3 +329,30 @@ export async function consumeBootstrapCredential({ deviceId, entitlementSerial }
     entitlementSerial: String(entitlementSerial || ""),
   });
 }
+
+/**
+ * Customer orders, held on this device.
+ *
+ * G7's order half works with no cloud and no website, so these go straight to SQLite rather than
+ * through the backend. Each returns `null` outside the desktop shell — the browser dev server has
+ * no local database, and a caller that treats null as "no orders" would be wrong in a way that only
+ * shows up as an empty board.
+ */
+export async function saveLocalCustomerOrder(order) {
+  if (!isTauriRuntime()) return null;
+  return invokeLocal("local_save_customer_order", { order });
+}
+
+export async function listLocalCustomerOrders() {
+  if (!isTauriRuntime()) return null;
+  return invokeLocal("local_list_customer_orders");
+}
+
+export async function setLocalCustomerOrderStatus({ orderId, nextStatus, patch = {} }) {
+  if (!isTauriRuntime()) return null;
+  return invokeLocal("local_set_customer_order_status", {
+    orderId: String(orderId || ""),
+    nextStatus: String(nextStatus || ""),
+    patch,
+  });
+}
