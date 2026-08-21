@@ -12,7 +12,7 @@
     "release:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\copy-windows-release.ps1",
     "release:manifest": "node scripts\\generate-tauri-update-manifest.mjs",
     "release:set-version": "node scripts\\set-release-version.mjs",
-    "verify:update-safety": "node scripts\\verify-update-safety.mjs",
+    "verify:update-safety": "node scripts/verify-update-safety.mjs",
     "bootstrap:credential": "node scripts/make-bootstrap-credential.mjs",
     "verify:disposable-matrix": "node --test --test-concurrency=1 scripts/acceptance/disposable-module-matrix.test.mjs scripts/acceptance/stock-inventory-ssr.test.mjs",
     "build": "npm --prefix frontend run build",

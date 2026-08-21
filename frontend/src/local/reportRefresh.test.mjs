@@ -1,3 +1,15 @@
+// Two of the assertions below are about the *India* calendar boundary, and `filterRowsForReportRange`
+// classifies a timestamp by the host's local timezone. That made them pass on the maintainer's
+// machine and fail on every UTC one, including the container the production gate runs in — a test
+// whose result depends on where it is run tells you nothing about the code. Pinned so the tests
+// state the timezone they are actually about.
+//
+// Worth noting what this does NOT fix: the product still reads the device's timezone, so a terminal
+// set to the wrong zone files a 1am sale under the previous day. That is a real question about
+// whether report boundaries should be fixed to India or follow the device, and it is the
+// maintainer's to answer — not something to change quietly inside a test fix.
+process.env.TZ = "Asia/Kolkata";
+
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, resolveReportDateRange } from "./reportRefresh.js";

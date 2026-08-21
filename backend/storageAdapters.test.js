@@ -173,12 +173,24 @@ test("loopback PostgreSQL is allowed only for explicitly isolated staging tests"
 test("desktop SQLite path resolves from a clean profile without user configuration", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "froozerp-default-profile-"));
   const appData = path.join(root, "AppData", "Roaming");
+  // `resolveDesktopSqlitePath` picks its profile root from `process.platform`: APPDATA on Windows,
+  // Application Support on macOS, XDG_DATA_HOME elsewhere. Setting APPDATA and asserting the
+  // Windows answer therefore only ever passed on Windows, and this test sat red on every other
+  // machine — which is worse than no test, because a suite with a permanent failure in it stops
+  // being read. Windows is the shipped target, so that path is still the one that matters; the
+  // other two are pinned rather than skipped so a change to the branching fails somewhere.
   const env = {
     APPDATA: appData,
+    XDG_DATA_HOME: path.join(root, "xdg"),
     FROOZERP_RUNTIME_MODE: "desktop-local",
     DATABASE_URL: "postgresql://wrong@127.0.0.1:5432/wrong",
   };
-  const expected = path.join(appData, "com.srtcompany.froozerp", "froozerp-local.sqlite3");
+  const profileRoot = process.platform === "win32"
+    ? appData
+    : process.platform === "darwin"
+      ? path.join(os.homedir(), "Library", "Application Support")
+      : env.XDG_DATA_HOME;
+  const expected = path.join(profileRoot, "com.srtcompany.froozerp", "froozerp-local.sqlite3");
   assert.equal(resolveDesktopSqlitePath(env), expected);
   const { adapter } = createStorageAdapter(env);
   const health = await adapter.initialize();

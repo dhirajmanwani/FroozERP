@@ -5020,6 +5020,14 @@ fn require_server_time(server_time: Option<String>) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// How many migrations `initialize_at` applies to a fresh profile.
+    ///
+    /// Was written out as a bare `17` in three separate assertions. Adding migration 019 broke all
+    /// three at once with nothing but `left: 18, right: 17` to explain why, and the failures were
+    /// mistaken for the environment for long enough to reach a merge check. One named constant is
+    /// the whole fix: **bump this when you add a migration**, and the number says what it counts.
+    const EXPECTED_APPLIED_MIGRATIONS: i64 = 18;
+
     #[test]
     fn snapshot_preflight_rejects_malformed_database_without_replacing_it() {
         let path = std::env::temp_dir().join(format!(
@@ -6101,10 +6109,27 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    /// An absolute path on the host, not only on Windows.
+    ///
+    /// `Path::is_absolute` is platform-dependent: `F:\\anything` is absolute on Windows and
+    /// relative everywhere else. The test below turns on exactly that predicate, so hard-coded
+    /// Windows literals made it assert the opposite of its name off Windows. Windows is the shipped
+    /// target and stays the first argument; the second only exists so the test is meaningful when it
+    /// is run anywhere else.
+    fn absolute_here(windows: &str, unix: &str) -> PathBuf {
+        PathBuf::from(if cfg!(windows) { windows } else { unix })
+    }
+
     #[test]
     fn isolated_sqlite_override_is_absolute_and_test_only() {
-        let default_dir = PathBuf::from(r"C:\Users\Example\AppData\Roaming\com.srtcompany.froozerp");
-        let isolated_dir = PathBuf::from(r"F:\FroozERP\_recovery_backups\disposable-profile");
+        let default_dir = absolute_here(
+            r"C:\Users\Example\AppData\Roaming\com.srtcompany.froozerp",
+            "/home/example/.local/share/com.srtcompany.froozerp",
+        );
+        let isolated_dir = absolute_here(
+            r"F:\FroozERP\_recovery_backups\disposable-profile",
+            "/tmp/froozerp-disposable-profile",
+        );
 
         assert_eq!(
             resolve_app_data_dir(
@@ -6119,7 +6144,7 @@ mod tests {
             resolve_app_data_dir(
                 default_dir.clone(),
                 Some("production"),
-                Some(PathBuf::from(r"F:\ignored")),
+                Some(absolute_here(r"F:\ignored", "/tmp/ignored")),
             )
             .expect("ignore override outside tests"),
             default_dir
@@ -6164,7 +6189,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("migration count");
-            assert_eq!(migration_count, 17);
+            assert_eq!(migration_count, EXPECTED_APPLIED_MIGRATIONS);
             drop(conn);
             initialize_at(path).expect("restart with existing SQLite profile");
             let restored = ensure_device_identity_at(path).expect("restore device identity");
@@ -6226,7 +6251,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("preserved marker");
-        assert_eq!(migration_count, 17);
+        assert_eq!(migration_count, EXPECTED_APPLIED_MIGRATIONS);
         assert_eq!(marker, "keep-me");
         drop(conn);
         let _ = fs::remove_file(&path);
@@ -7304,7 +7329,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("read upgraded migration count");
-            assert_eq!(migrations, 17);
+            assert_eq!(migrations, EXPECTED_APPLIED_MIGRATIONS);
             drop(conn);
             let _ = fs::remove_file(&path);
         }
