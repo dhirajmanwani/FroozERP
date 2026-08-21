@@ -14690,9 +14690,10 @@ app.get("/contra-entries", async (req, res) => {
       `
       SELECT *
       FROM contra_entries
-      WHERE cancelled = FALSE
+      WHERE cancelled = FALSE AND branch_id = $1
       ORDER BY contra_date DESC, created_at DESC, id DESC
-      `
+      `,
+      [req.auth.branchId]
     );
     return res.json(result.rows);
   } catch (error) {
@@ -16304,8 +16305,13 @@ app.get("/reports/summary", async (req, res) => {
 
 app.get("/expenses", async (req, res) => {
   try {
-    const filters = [];
-    const values = [];
+    // A-7 Phase 1. Seeded first, deliberately, rather than appended with the optional filters
+    // below. The branch predicate is not one more thing a caller may ask for — it is the only
+    // one that is never optional, and putting it at the head means a later edit that reorders
+    // or forgets a filter cannot drop it. $1 is therefore always the branch, and whereClause
+    // can no longer be empty.
+    const filters = ["e.branch_id = $1"];
+    const values = [req.auth.branchId];
     if (req.query.date_from) {
       values.push(req.query.date_from);
       filters.push(`e.expense_date >= $${values.length}`);
@@ -16335,7 +16341,7 @@ app.get("/expenses", async (req, res) => {
         OR LOWER(COALESCE(e.remarks, '')) LIKE $${values.length}
       )`);
     }
-    const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+    const whereClause = `WHERE ${filters.join(" AND ")}`;
     const result = await pool.query(
       `
       SELECT e.*, COALESCE(e.paid_to, e.vendor_name) AS paid_to, u.full_name AS created_by_name,
@@ -17278,9 +17284,11 @@ app.get("/purchases", async (req, res) => {
       LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
       LEFT JOIN products pr ON pr.id = pi.product_id
       LEFT JOIN inventory_batches ib ON ib.purchase_id = p.id
+      WHERE p.branch_id = $1
       ORDER BY p.purchase_date DESC, p.created_at DESC, p.id DESC
       LIMIT 250
-      `
+      `,
+      [req.auth.branchId]
     );
     return res.json(result.rows);
   } catch (error) {
@@ -19177,9 +19185,10 @@ app.get("/sales", async (req, res) => {
       LEFT JOIN products p ON p.id = si.product_id
       LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
       LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
+      WHERE s.branch_id = $1
       GROUP BY s.id, c.customer_name
       ORDER BY s.created_at DESC, s.id DESC
-    `);
+    `, [req.auth.branchId]);
 
     return res.json(result.rows);
   } catch (error) {
@@ -19404,9 +19413,11 @@ app.get("/sale-returns", async (req, res) => {
       LEFT JOIN sale_return_items sri ON sri.sale_return_id = sr.id
       LEFT JOIN products p ON p.id = sri.product_id
       LEFT JOIN users u ON u.id = sr.created_by
+      WHERE sr.branch_id = $1
       GROUP BY sr.id, s.invoice_no, u.full_name
       ORDER BY sr.return_date DESC, sr.created_at DESC, sr.id DESC
-      `
+      `,
+      [req.auth.branchId]
     );
     return res.json(result.rows);
   } catch (error) {
@@ -19668,8 +19679,10 @@ app.get("/waste-entries", async (req, res) => {
       FROM waste_entries we
       JOIN products p ON p.id = we.product_id
       LEFT JOIN users u ON u.id = we.created_by
+      WHERE we.branch_id = $1
       ORDER BY we.waste_date DESC, we.created_at DESC, we.id DESC
-      `
+      `,
+      [req.auth.branchId]
     );
     return res.json(result.rows);
   } catch (error) {

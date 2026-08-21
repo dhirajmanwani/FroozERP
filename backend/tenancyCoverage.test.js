@@ -37,30 +37,30 @@ const { TENANT_TABLE_PATTERN, SCOPE_PREDICATE_PATTERN, collectTenancyCoverage } 
  * reached SQL against one of the tables named in `TENANT_TABLES`, by running them. A route that
  * throws before its first query, or reads a table not on that list, lands in neither number.
  */
+/*
+ * Scoped and removed from this list on 2026-08-21 (A-7 Phase 1, first batch):
+ *   GET /sales, /purchases, /expenses, /waste-entries, /sale-returns, /contra-entries
+ * Each now filters on `branch_id` from the verified session. 37 -> 31.
+ */
 const KNOWN_UNSCOPED_READS = [
   "GET /accounts",
   "GET /accounts/outstanding",
   "GET /accounts/payments",
   "GET /api/owner/dashboard-foundation",
-  "GET /contra-entries",
   "GET /customer-ledger",
   "GET /customer-summary",
   "GET /customers",
-  "GET /expenses",
   "GET /inventory",
   "GET /lot-discounts",
   "GET /pending-bills/customer",
   "GET /products",
   "GET /products/:id/lots",
-  "GET /purchases",
   "GET /reports/balance-sheet",
   "GET /reports/balance-sheet/details/:lineKey",
   "GET /reports/cash-book",
   "GET /reports/day-book",
   "GET /reports/summary",
-  "GET /sale-returns",
   "GET /sale-returns/options/:saleId",
-  "GET /sales",
   "GET /sales-history",
   "GET /sales-history/:id",
   "GET /sales-history/items",
@@ -74,7 +74,6 @@ const KNOWN_UNSCOPED_READS = [
   "GET /supplier-summary",
   "GET /suppliers",
   "GET /suppliers/:id",
-  "GET /waste-entries",
 ];
 
 let coverage;
