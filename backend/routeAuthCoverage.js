@@ -316,7 +316,7 @@ const listRegisteredRoutes = (app) => {
  * mock, so middleware that reaches for anything a normal response has still behaves normally.
  * Nothing is bound and nothing leaves the process.
  */
-const probe = (app, method, url, headers) => new Promise((resolve) => {
+const probe = (app, method, url, headers, body = undefined) => new Promise((resolve) => {
   const socket = new Duplex({ read() {}, write(chunk, encoding, done) { done(); } });
   const req = new http.IncomingMessage(socket);
   req.method = method;
@@ -325,7 +325,20 @@ const probe = (app, method, url, headers) => new Promise((resolve) => {
   req.httpVersion = "1.1";
   req.httpVersionMajor = 1;
   req.httpVersionMinor = 1;
-  req.push(null);
+  // A real request body, pushed through the stream so `express.json` parses it the way it parses a
+  // network request. Nothing set `req.body` directly: the substitution check runs inside
+  // `requireAuth`, which is mounted after the JSON parser, so a hand-assigned body would be
+  // overwritten and the test would pass while proving nothing. This parameter did not exist until
+  // an attempt to attack a live route with a hostile body silently sent no body at all.
+  if (body === undefined) {
+    req.push(null);
+  } else {
+    const payload = Buffer.from(typeof body === "string" ? body : JSON.stringify(body), "utf8");
+    req.headers["content-type"] = req.headers["content-type"] || "application/json";
+    req.headers["content-length"] = String(payload.length);
+    req.push(payload);
+    req.push(null);
+  }
 
   const res = new http.ServerResponse(req);
   res.assignSocket(socket);

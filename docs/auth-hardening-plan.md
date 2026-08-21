@@ -1506,3 +1506,46 @@ worried about.
 | `npm --prefix backend test` | **280 / 281** — the 1 failure is the pre-existing Linux-vs-Windows path assertion |
 | `TZ=Asia/Kolkata node --test frontend/src/local/*.test.mjs` | **343 / 343** |
 | `npm run build` | Pass |
+
+---
+
+## Task 12 revisited (2026-08-21): "sync routes verify signatures only when an env var is set"
+
+**Mostly stale, and the residue is narrower than the title.** Recorded here with the evidence rather
+than quietly ticked off.
+
+When it was written, `resolveSyncRequestContext` only called `verifyDeviceSession` under
+`FROOZERP_OPERATIONAL_SCOPE_MODE=enforce`, and that variable defaults to `off` and is set nowhere in
+the repository. The reading was that sync accepted unverified callers by default.
+
+What actually closed it was A-4, which mounted `requireAuth` app-wide ahead of every route including
+the sync surface, so the token is verified before any handler runs — the second verification inside
+the enforce branch is now belt and braces. A-4b then widened `submittedIdentityFrom` to collect
+`user_id`, `device_id`, `company_id` and `branch_id` from **every** location a caller can put them,
+so the off-path's use of `submitted.user_id` cannot differ from the token.
+
+Verified by attack, not by reading: `backend/liveBodySubstitution.test.js` drives live sync routes
+with a valid Cashier token and a body claiming another user, device, branch and company. All four are
+refused with `DEVICE_SESSION_SUBSTITUTION_REJECTED`, as is an identity smuggled through the query
+string, and as is a body that agrees while the query disagrees. An honest request passes the gate.
+Eleven of the twelve assertions were confirmed to fail with the substitution check removed.
+
+**A near miss worth recording.** The first attempt at that attack reported the same result for the
+honest request and every hostile one, which read as "the check never fires". The truth was that the
+harness's `probe` took no body parameter, so all five requests were byte-identical and empty. The
+tooling was wrong, not the product. `probe` now pushes a real body through the request stream so
+`express.json` parses it the way it parses a network request — assigning `req.body` directly would
+have been overwritten by that middleware and the test would have passed while proving nothing.
+
+### What genuinely remains, and why it is not actionable yet
+
+- `operational_location_id` is **not** in the substitution comparison list, so a caller may supply
+  any value for it. There is nothing to compare it against: it is not a session claim. It is also
+  not yet load-bearing — the column is one of the empty shadow columns Phase 3 exists to fill.
+- The v3 scope guards are written `($N::INTEGER IS NULL OR (company_id = $N AND ...))`, and the
+  context is null when scope mode is `off`, so those predicates pass unconditionally by default.
+  The branch scoping added in A-7 is separate and unconditional, so this is not currently a
+  cross-branch hole.
+
+Both are operational-location concerns and both wait on the Phase 3 business decision recorded in
+`docs/tenancy-backfill-plan.md`. Neither is a reason to keep task 12 open under its current title.
