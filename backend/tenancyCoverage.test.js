@@ -51,7 +51,9 @@ const { TENANT_TABLE_PATTERN, SCOPE_PREDICATE_PATTERN, collectTenancyCoverage } 
  *   /pending-bills/customer, /sale-returns/options/:saleId, /sales-report/changes,
  *   /sales-history, /sales-history/:id, /sales-history/items, /sales-history/lots,
  *   /reports/cash-book, /reports/day-book
- * Each now filters on `branch_id` from the verified session. 37 -> 26 -> 16 -> 3.
+ * Fifth batch, same day — the Report Center:
+ *   GET /reports/summary, all 27 of its queries.
+ * Each now filters on `branch_id` from the verified session. 37 -> 26 -> 16 -> 3 -> 2.
  */
 /*
  * Two entries below cannot be removed by any amount of work in Phase 1, and saying so here stops
@@ -66,7 +68,6 @@ const { TENANT_TABLE_PATTERN, SCOPE_PREDICATE_PATTERN, collectTenancyCoverage } 
 const KNOWN_UNSCOPED_READS = [
   "GET /accounts",
   "GET /accounts/outstanding",
-  "GET /reports/summary",
 ];
 
 let coverage;

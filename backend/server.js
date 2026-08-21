@@ -15427,7 +15427,7 @@ app.get("/reports/summary", async (req, res) => {
             SELECT SUM(sp.amount)
             FROM sale_payments sp
             JOIN sales sx ON sx.id = sp.sale_id
-            WHERE sx.sale_status <> 'CANCELLED'
+            WHERE sx.sale_status <> 'CANCELLED' AND sx.branch_id = $3
               AND sx.sale_date = s.sale_date
               AND sp.payment_mode = 'CASH'
           ), 0) AS cash_sales,
@@ -15435,7 +15435,7 @@ app.get("/reports/summary", async (req, res) => {
             SELECT SUM(sp.amount)
             FROM sale_payments sp
             JOIN sales sx ON sx.id = sp.sale_id
-            WHERE sx.sale_status <> 'CANCELLED'
+            WHERE sx.sale_status <> 'CANCELLED' AND sx.branch_id = $3
               AND sx.sale_date = s.sale_date
               AND sp.payment_mode = 'UPI'
           ), 0) AS upi_sales,
@@ -15443,17 +15443,17 @@ app.get("/reports/summary", async (req, res) => {
             SELECT SUM(sp.amount)
             FROM sale_payments sp
             JOIN sales sx ON sx.id = sp.sale_id
-            WHERE sx.sale_status <> 'CANCELLED'
+            WHERE sx.sale_status <> 'CANCELLED' AND sx.branch_id = $3
               AND sx.sale_date = s.sale_date
               AND sp.payment_mode IN ('CARD', 'BANK_TRANSFER')
           ), 0) AS bank_card_sales
         FROM sales s
-        WHERE s.sale_status <> 'CANCELLED'
+        WHERE s.sale_status <> 'CANCELLED' AND s.branch_id = $3
           AND s.sale_date BETWEEN $1 AND $2
         GROUP BY s.sale_date
         ORDER BY sale_date DESC
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -15478,12 +15478,12 @@ app.get("/reports/summary", async (req, res) => {
         LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
         LEFT JOIN products pr ON pr.id = pi.product_id
         LEFT JOIN inventory_batches ib ON ib.purchase_id = p.id
-        WHERE COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
+        WHERE COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED' AND p.branch_id = $3
           AND COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_PENDING'
           AND p.purchase_date BETWEEN $1 AND $2
         ORDER BY p.purchase_date DESC, p.id DESC
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -15505,12 +15505,12 @@ app.get("/reports/summary", async (req, res) => {
           ib.created_at::date AS arrival_date
         FROM inventory_batches ib
         JOIN products p ON p.id = ib.product_id
-        WHERE COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+        WHERE COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED' AND ib.branch_id = $3
           AND COALESCE(ib.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_PENDING'
           AND ib.created_at::date BETWEEN $1 AND $2
         ORDER BY ib.created_at DESC, ib.id DESC
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -15528,13 +15528,13 @@ app.get("/reports/summary", async (req, res) => {
         FROM sales s
         JOIN sale_items si ON si.sale_id = s.id
         JOIN products p ON p.id = si.product_id
-        WHERE s.sale_status <> 'CANCELLED'
+        WHERE s.sale_status <> 'CANCELLED' AND s.branch_id = $3
           AND COALESCE(s.profit_status, 'FINAL') = 'PROVISIONAL'
           AND s.sale_date BETWEEN $1 AND $2
         GROUP BY s.id
         ORDER BY s.sale_date DESC, s.id DESC
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -15547,13 +15547,13 @@ app.get("/reports/summary", async (req, res) => {
           SUM(COALESCE(paid_amount, 0)) AS paid_amount,
           SUM(COALESCE(balance_amount, 0)) AS balance_amount
         FROM purchases
-        WHERE purchase_date BETWEEN $1 AND $2
+        WHERE purchase_date BETWEEN $1 AND $2 AND branch_id = $3
           AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
           AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
         GROUP BY purchase_date
         ORDER BY purchase_date DESC
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -15607,14 +15607,14 @@ app.get("/reports/summary", async (req, res) => {
         LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
         LEFT JOIN products pr ON pr.id = pi.product_id
         LEFT JOIN inventory_batches ib ON ib.purchase_id = p.id
-        WHERE p.purchase_date BETWEEN $1 AND $2
+        WHERE p.purchase_date BETWEEN $1 AND $2 AND p.branch_id = $3
           AND (
             COALESCE(p.purchase_status, 'ACTIVE') = 'CANCELLED'
             OR COALESCE(p.purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
           )
         ORDER BY p.purchase_date DESC, p.supplier_name, p.id DESC
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       getSupplierSummaryRows({ branchId: req.auth.branchId }),
       getCustomerSummaryRows({ branchId: req.auth.branchId }),
@@ -15653,7 +15653,7 @@ app.get("/reports/summary", async (req, res) => {
         JOIN products p ON p.id = si.product_id
         LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
         LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
-        WHERE s.sale_status <> 'CANCELLED'
+        WHERE s.sale_status <> 'CANCELLED' AND s.branch_id = $3
           AND s.sale_date BETWEEN $1 AND $2
           AND (
             COALESCE(si.discount_amount, 0) > 0
@@ -15666,7 +15666,7 @@ app.get("/reports/summary", async (req, res) => {
           si.lot_discount_type, si.lot_discount_value
         ORDER BY s.sale_date DESC, p.product_name, lot_name
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -15693,10 +15693,10 @@ app.get("/reports/summary", async (req, res) => {
         LEFT JOIN users u ON u.id = e.created_by
         LEFT JOIN users eu ON eu.id = e.edited_by
         LEFT JOIN users cu ON cu.id = e.cancelled_by
-        WHERE e.expense_date BETWEEN $1 AND $2
+        WHERE e.expense_date BETWEEN $1 AND $2 AND e.branch_id = $3
         ORDER BY e.expense_date DESC, e.created_at DESC, e.id DESC
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -15714,7 +15714,7 @@ app.get("/reports/summary", async (req, res) => {
             cp.cancelled
           FROM customer_payments cp
           JOIN customers c ON c.id = cp.customer_id
-          WHERE cp.payment_date BETWEEN $1 AND $2
+          WHERE cp.payment_date BETWEEN $1 AND $2 AND cp.branch_id = $3
           UNION ALL
           SELECT
             sp.payment_date,
@@ -15728,11 +15728,11 @@ app.get("/reports/summary", async (req, res) => {
             sp.cancelled
           FROM supplier_payments sp
           JOIN suppliers s ON s.id = sp.supplier_id
-          WHERE sp.payment_date BETWEEN $1 AND $2
+          WHERE sp.payment_date BETWEEN $1 AND $2 AND sp.branch_id = $3
         ) payments
         ORDER BY payment_date DESC, party_name
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -15747,11 +15747,11 @@ app.get("/reports/summary", async (req, res) => {
           FROM sale_return_items
           GROUP BY sale_return_id
         ) item_summary ON item_summary.sale_return_id = sr.id
-        WHERE sr.return_date BETWEEN $1 AND $2
+        WHERE sr.return_date BETWEEN $1 AND $2 AND sr.branch_id = $3
         GROUP BY sr.return_date
         ORDER BY sr.return_date DESC
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -15760,11 +15760,11 @@ app.get("/reports/summary", async (req, res) => {
           COUNT(*)::INTEGER AS return_count,
           SUM(total_return_amount) AS return_value
         FROM sale_returns
-        WHERE return_date BETWEEN $1 AND $2
+        WHERE return_date BETWEEN $1 AND $2 AND branch_id = $3
         GROUP BY return_reason
         ORDER BY return_count DESC, return_value DESC
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -15775,11 +15775,11 @@ app.get("/reports/summary", async (req, res) => {
           SUM(quantity) AS waste_quantity,
           SUM(cost_amount) AS waste_cost
         FROM waste_entries
-        WHERE waste_date BETWEEN $1 AND $2
+        WHERE waste_date BETWEEN $1 AND $2 AND branch_id = $3
         GROUP BY waste_date, waste_type
         ORDER BY waste_date DESC, waste_type
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -15790,12 +15790,12 @@ app.get("/reports/summary", async (req, res) => {
           SUM(we.cost_amount) AS waste_cost
         FROM waste_entries we
         JOIN products p ON p.id = we.product_id
-        WHERE we.waste_date BETWEEN $1 AND $2
+        WHERE we.waste_date BETWEEN $1 AND $2 AND we.branch_id = $3
         GROUP BY p.product_name, p.unit
         ORDER BY waste_quantity DESC, waste_cost DESC
         LIMIT 20
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -15808,12 +15808,16 @@ app.get("/reports/summary", async (req, res) => {
           COALESCE(SUM(ib.remaining_qty), 0) AS current_stock,
           COALESCE(SUM(ib.remaining_qty * COALESCE(ib.effective_cost_per_unit, ib.purchase_rate)), 0) AS stock_value
         FROM products p
+        -- Branch in the JOIN, not the WHERE: a product this branch holds none of belongs in a stock
+        -- position at zero, not missing from it.
         LEFT JOIN inventory_batches ib ON ib.product_id = p.id
           AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+          AND ib.branch_id = $1
         WHERE p.active IS DISTINCT FROM FALSE
         GROUP BY p.id
         ORDER BY p.product_name
-        `
+        `,
+        [req.auth.branchId]
       ),
       pool.query(
         `
@@ -15837,7 +15841,7 @@ app.get("/reports/summary", async (req, res) => {
           FROM purchases p
           LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
           LEFT JOIN products pr ON pr.id = pi.product_id
-          WHERE p.purchase_date BETWEEN $1 AND $2
+          WHERE p.purchase_date BETWEEN $1 AND $2 AND p.branch_id = $3
             AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
           GROUP BY p.id
           UNION ALL
@@ -15854,7 +15858,7 @@ app.get("/reports/summary", async (req, res) => {
             COALESCE(p.remarks, 'Supplier rebate') AS remarks,
             'Rebate received against ' || COALESCE(p.bill_number, 'Purchase #' || p.id) AS narration
           FROM purchases p
-          WHERE p.purchase_date BETWEEN $1 AND $2
+          WHERE p.purchase_date BETWEEN $1 AND $2 AND p.branch_id = $3
             AND COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
             AND COALESCE(p.rebate_amount, 0) > 0
           UNION ALL
@@ -15871,7 +15875,7 @@ app.get("/reports/summary", async (req, res) => {
             COALESCE(p.cancellation_reason, 'Purchase cancelled') AS remarks,
             COALESCE(p.cancellation_reason, 'Purchase cancelled') AS narration
           FROM purchases p
-          WHERE p.cancelled_at::date BETWEEN $1 AND $2
+          WHERE p.cancelled_at::date BETWEEN $1 AND $2 AND p.branch_id = $3
             AND COALESCE(p.purchase_status, 'ACTIVE') = 'CANCELLED'
           UNION ALL
           SELECT sp.payment_date AS date, 'Supplier Payment' AS transaction_type,
@@ -15888,7 +15892,7 @@ app.get("/reports/summary", async (req, res) => {
             COALESCE(sp.remarks, 'Supplier payment') || CASE WHEN COALESCE(sp.rebate_amount, 0) > 0 THEN ' | Rebate ' || sp.rebate_amount ELSE '' END AS narration
           FROM supplier_payments sp
           JOIN suppliers s ON s.id = sp.supplier_id
-          WHERE sp.payment_date BETWEEN $1 AND $2
+          WHERE sp.payment_date BETWEEN $1 AND $2 AND sp.branch_id = $3
           UNION ALL
           SELECT s.sale_date AS date, 'Customer Sale' AS transaction_type,
             COALESCE(s.customer_name, c.customer_name, 'Walk-in Customer') AS party_name,
@@ -15910,7 +15914,7 @@ app.get("/reports/summary", async (req, res) => {
           LEFT JOIN (SELECT sale_id, SUM(amount) AS total_paid FROM sale_payments GROUP BY sale_id) pay ON pay.sale_id = s.id
           LEFT JOIN sale_items si ON si.sale_id = s.id
           LEFT JOIN products pr ON pr.id = si.product_id
-          WHERE s.sale_date BETWEEN $1 AND $2
+          WHERE s.sale_date BETWEEN $1 AND $2 AND s.branch_id = $3
             AND s.sale_status <> 'CANCELLED'
           GROUP BY s.id, c.id, c.customer_name, pay.total_paid
           UNION ALL
@@ -15928,7 +15932,7 @@ app.get("/reports/summary", async (req, res) => {
             COALESCE(s.cancellation_reason, 'Invoice cancelled') AS narration
           FROM sales s
           LEFT JOIN customers c ON c.id = s.customer_id
-          WHERE s.cancelled_at::date BETWEEN $1 AND $2
+          WHERE s.cancelled_at::date BETWEEN $1 AND $2 AND s.branch_id = $3
             AND s.sale_status = 'CANCELLED'
           UNION ALL
           SELECT cp.payment_date AS date, 'Customer Payment' AS transaction_type,
@@ -15945,7 +15949,7 @@ app.get("/reports/summary", async (req, res) => {
             COALESCE(cp.remarks, 'Customer payment received') AS narration
           FROM customer_payments cp
           JOIN customers c ON c.id = cp.customer_id
-          WHERE cp.payment_date BETWEEN $1 AND $2
+          WHERE cp.payment_date BETWEEN $1 AND $2 AND cp.branch_id = $3
           UNION ALL
           SELECT e.expense_date AS date, 'Expense' AS transaction_type,
             COALESCE(e.paid_to, e.vendor_name, e.category) AS party_name,
@@ -15960,7 +15964,7 @@ app.get("/reports/summary", async (req, res) => {
             COALESCE(e.remarks, e.category) AS remarks,
             e.category || CASE WHEN COALESCE(e.paid_to, e.vendor_name, '') <> '' THEN ' paid to ' || COALESCE(e.paid_to, e.vendor_name) ELSE '' END AS narration
           FROM expenses e
-          WHERE e.expense_date BETWEEN $1 AND $2
+          WHERE e.expense_date BETWEEN $1 AND $2 AND e.branch_id = $3
           UNION ALL
           SELECT sr.return_date AS date, 'Sale Return' AS transaction_type,
             COALESCE(sr.customer_name, 'Walk-in Customer') AS party_name,
@@ -15981,7 +15985,7 @@ app.get("/reports/summary", async (req, res) => {
           LEFT JOIN sales s ON s.id = sr.sale_id
           LEFT JOIN sale_return_items sri ON sri.sale_return_id = sr.id
           LEFT JOIN products pr ON pr.id = sri.product_id
-          WHERE sr.return_date BETWEEN $1 AND $2
+          WHERE sr.return_date BETWEEN $1 AND $2 AND sr.branch_id = $3
           GROUP BY sr.id, s.customer_id
           UNION ALL
           SELECT we.waste_date AS date, 'Waste' AS transaction_type,
@@ -15998,11 +16002,11 @@ app.get("/reports/summary", async (req, res) => {
             p.product_name || ' ' || TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM we.quantity::TEXT)) || COALESCE(p.unit, '') || ' wasted: ' || we.waste_type AS narration
           FROM waste_entries we
           JOIN products p ON p.id = we.product_id
-          WHERE we.waste_date BETWEEN $1 AND $2
+          WHERE we.waste_date BETWEEN $1 AND $2 AND we.branch_id = $3
         ) ledger
         ORDER BY date DESC, transaction_type, party_name
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -16012,19 +16016,19 @@ app.get("/reports/summary", async (req, res) => {
         sales_by_day AS (
           SELECT sale_date::date AS day, SUM(total_amount) AS sales, SUM(profit) AS profit, COUNT(*) AS transactions
           FROM sales
-          WHERE sale_status <> 'CANCELLED' AND sale_date BETWEEN $1 AND $2
+          WHERE sale_status <> 'CANCELLED' AND sale_date BETWEEN $1 AND $2 AND branch_id = $3
           GROUP BY sale_date
         ),
         purchases_by_day AS (
           SELECT purchase_date::date AS day, SUM(COALESCE(NULLIF(net_payable, 0), total_amount, 0)) AS purchases
           FROM purchases
-          WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date BETWEEN $1 AND $2
+          WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date BETWEEN $1 AND $2 AND branch_id = $3
           GROUP BY purchase_date
         ),
         expenses_by_day AS (
           SELECT expense_date::date AS day, SUM(amount) AS expenses
           FROM expenses
-          WHERE active IS DISTINCT FROM FALSE AND expense_date BETWEEN $1 AND $2
+          WHERE active IS DISTINCT FROM FALSE AND expense_date BETWEEN $1 AND $2 AND branch_id = $3
           GROUP BY expense_date
         ),
         sales_payments_by_day AS (
@@ -16034,7 +16038,7 @@ app.get("/reports/summary", async (req, res) => {
             SUM(CASE WHEN sp.payment_mode IN ('CARD', 'BANK_TRANSFER') THEN sp.amount ELSE 0 END) AS bank_card_sales
           FROM sale_payments sp
           JOIN sales s ON s.id = sp.sale_id
-          WHERE s.sale_status <> 'CANCELLED' AND s.sale_date BETWEEN $1 AND $2
+          WHERE s.sale_status <> 'CANCELLED' AND s.sale_date BETWEEN $1 AND $2 AND s.branch_id = $3
           GROUP BY s.sale_date
         ),
         customer_receipts_by_day AS (
@@ -16043,7 +16047,7 @@ app.get("/reports/summary", async (req, res) => {
             SUM(CASE WHEN payment_mode = 'UPI' THEN payment_amount ELSE 0 END) AS upi_receipts,
             SUM(CASE WHEN payment_mode IN ('CARD', 'BANK_TRANSFER') THEN payment_amount ELSE 0 END) AS bank_card_receipts
           FROM customer_payments
-          WHERE cancelled = FALSE AND payment_date BETWEEN $1 AND $2
+          WHERE cancelled = FALSE AND payment_date BETWEEN $1 AND $2 AND branch_id = $3
           GROUP BY payment_date
         ),
         supplier_payments_by_day AS (
@@ -16052,19 +16056,19 @@ app.get("/reports/summary", async (req, res) => {
             SUM(CASE WHEN payment_mode = 'UPI' THEN payment_amount ELSE 0 END) AS upi_supplier_payments,
             SUM(CASE WHEN payment_mode IN ('BANK_TRANSFER', 'CHEQUE') THEN payment_amount ELSE 0 END) AS bank_supplier_payments
           FROM supplier_payments
-          WHERE cancelled = FALSE AND payment_date BETWEEN $1 AND $2
+          WHERE cancelled = FALSE AND payment_date BETWEEN $1 AND $2 AND branch_id = $3
           GROUP BY payment_date
         ),
         returns_by_day AS (
           SELECT return_date::date AS day, SUM(total_return_amount) AS returns
           FROM sale_returns
-          WHERE return_date BETWEEN $1 AND $2
+          WHERE return_date BETWEEN $1 AND $2 AND branch_id = $3
           GROUP BY return_date
         ),
         waste_by_day AS (
           SELECT waste_date::date AS day, SUM(cost_amount) AS waste
           FROM waste_entries
-          WHERE waste_date BETWEEN $1 AND $2
+          WHERE waste_date BETWEEN $1 AND $2 AND branch_id = $3
           GROUP BY waste_date
         )
         SELECT
@@ -16097,7 +16101,7 @@ app.get("/reports/summary", async (req, res) => {
         LEFT JOIN waste_by_day ON waste_by_day.day = days.day
         ORDER BY days.day DESC
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -16115,12 +16119,12 @@ app.get("/reports/summary", async (req, res) => {
         JOIN products p ON p.id = si.product_id
         LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
         LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
-        WHERE s.sale_status <> 'CANCELLED'
+        WHERE s.sale_status <> 'CANCELLED' AND s.branch_id = $3
           AND s.sale_date BETWEEN $1 AND $2
         GROUP BY p.product_name, p.unit, ib.lot_name, ib.lot_size
         ORDER BY quantity_sold DESC, revenue DESC
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -16133,12 +16137,12 @@ app.get("/reports/summary", async (req, res) => {
           SUM(s.profit) AS total_profit
         FROM sales s
         LEFT JOIN customers c ON c.id = s.customer_id
-        WHERE s.sale_status <> 'CANCELLED'
+        WHERE s.sale_status <> 'CANCELLED' AND s.branch_id = $3
           AND s.sale_date BETWEEN $1 AND $2
         GROUP BY COALESCE(c.customer_name, NULLIF(s.customer_name, ''), 'Walk-in Customer'), COALESCE(c.mobile_number, s.customer_mobile, ''), COALESCE(s.customer_id, c.id)
         ORDER BY total_sales DESC, invoice_count DESC
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -16196,7 +16200,7 @@ app.get("/reports/summary", async (req, res) => {
         LEFT JOIN products p ON p.id = si.product_id
         LEFT JOIN sale_batch_allocations sba ON sba.sale_item_id = si.id
         LEFT JOIN inventory_batches ib ON ib.id = sba.inventory_batch_id
-        WHERE s.sale_date BETWEEN $1 AND $2
+        WHERE s.sale_date BETWEEN $1 AND $2 AND s.branch_id = $3
         GROUP BY
           s.id,
           s.invoice_no,
@@ -16216,7 +16220,7 @@ app.get("/reports/summary", async (req, res) => {
           s.profit
         ORDER BY s.sale_date DESC, s.created_at DESC, s.id DESC
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -16233,11 +16237,11 @@ app.get("/reports/summary", async (req, res) => {
           s.edited_at
         FROM sales s
         LEFT JOIN users u ON u.id = COALESCE(s.cancelled_by, s.edited_by)
-        WHERE (s.sale_status IN ('EDITED', 'CANCELLED') OR s.edited_at IS NOT NULL OR s.cancelled_at IS NOT NULL)
+        WHERE (s.sale_status IN ('EDITED', 'CANCELLED') OR s.edited_at IS NOT NULL OR s.cancelled_at IS NOT NULL) AND s.branch_id = $3
           AND s.sale_date BETWEEN $1 AND $2
         ORDER BY COALESCE(s.cancelled_at, s.edited_at, s.created_at) DESC
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -16252,12 +16256,12 @@ app.get("/reports/summary", async (req, res) => {
         FROM purchase_items pi
         JOIN purchases pur ON pur.id = pi.purchase_id
         JOIN products p ON p.id = pi.product_id
-        WHERE COALESCE(pur.purchase_status, 'ACTIVE') <> 'CANCELLED'
+        WHERE COALESCE(pur.purchase_status, 'ACTIVE') <> 'CANCELLED' AND pur.branch_id = $3
           AND pur.purchase_date BETWEEN $1 AND $2
         GROUP BY p.category, p.product_name, p.unit
         ORDER BY quantity_purchased DESC, net_purchase DESC
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -16270,12 +16274,12 @@ app.get("/reports/summary", async (req, res) => {
           SUM(COALESCE(paid_amount, 0)) AS paid_amount,
           SUM(COALESCE(balance_amount, 0)) AS balance_amount
         FROM purchases
-        WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
+        WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND branch_id = $3
           AND purchase_date BETWEEN $1 AND $2
         GROUP BY supplier_name
         ORDER BY net_purchase DESC
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -16292,11 +16296,11 @@ app.get("/reports/summary", async (req, res) => {
           u.full_name AS changed_by_name
         FROM purchases p
         LEFT JOIN users u ON u.id = COALESCE(p.cancelled_by, p.edited_by)
-        WHERE (p.purchase_status IN ('EDITED', 'CANCELLED') OR p.edited_at IS NOT NULL OR p.cancelled_at IS NOT NULL)
+        WHERE (p.purchase_status IN ('EDITED', 'CANCELLED') OR p.edited_at IS NOT NULL OR p.cancelled_at IS NOT NULL) AND p.branch_id = $3
           AND p.purchase_date BETWEEN $1 AND $2
         ORDER BY COALESCE(p.cancelled_at, p.edited_at, p.created_at) DESC
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -16314,11 +16318,11 @@ app.get("/reports/summary", async (req, res) => {
         LEFT JOIN sales s ON s.id = sr.sale_id
         LEFT JOIN sale_return_items sri ON sri.sale_return_id = sr.id
         LEFT JOIN products p ON p.id = sri.product_id
-        WHERE sr.return_date BETWEEN $1 AND $2
+        WHERE sr.return_date BETWEEN $1 AND $2 AND sr.branch_id = $3
         GROUP BY sr.id, s.invoice_no
         ORDER BY sr.return_date DESC, sr.id DESC
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -16332,11 +16336,11 @@ app.get("/reports/summary", async (req, res) => {
           STRING_AGG(DISTINCT COALESCE(st.remarks, ''), ', ') AS remarks
         FROM stock_transactions st
         JOIN products p ON p.id = st.product_id
-        WHERE st.created_at::date BETWEEN $1 AND $2
+        WHERE st.created_at::date BETWEEN $1 AND $2 AND st.branch_id = $3
         GROUP BY st.created_at::date, p.product_name, p.unit, st.transaction_type
         ORDER BY movement_date DESC, p.product_name, st.transaction_type
       `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -16355,14 +16359,14 @@ app.get("/reports/summary", async (req, res) => {
             FROM (
               SELECT category, SUM(amount) AS total_amount
               FROM expenses
-              WHERE active IS DISTINCT FROM FALSE
+              WHERE active IS DISTINCT FROM FALSE AND branch_id = $3
                 AND COALESCE(status, 'ACTIVE') <> 'CANCELLED'
                 AND expense_date BETWEEN $1 AND $2
               GROUP BY category
             ) expense_categories
           ), '[]'::json) AS expense_categories
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
       pool.query(
         `
@@ -16376,24 +16380,24 @@ app.get("/reports/summary", async (req, res) => {
           SELECT s.sale_date AS transaction_date, 'Sales' AS source, sp.payment_mode, sp.amount
           FROM sale_payments sp
           JOIN sales s ON s.id = sp.sale_id
-          WHERE s.sale_status <> 'CANCELLED' AND s.sale_date BETWEEN $1 AND $2
+          WHERE s.sale_status <> 'CANCELLED' AND s.sale_date BETWEEN $1 AND $2 AND s.branch_id = $3
           UNION ALL
           SELECT cp.payment_date AS transaction_date, 'Customer Receipt' AS source, cp.payment_mode, cp.payment_amount AS amount
           FROM customer_payments cp
-          WHERE cp.cancelled = FALSE AND cp.payment_date BETWEEN $1 AND $2
+          WHERE cp.cancelled = FALSE AND cp.payment_date BETWEEN $1 AND $2 AND cp.branch_id = $3
           UNION ALL
           SELECT sp.payment_date AS transaction_date, 'Supplier Payment' AS source, sp.payment_mode, sp.payment_amount AS amount
           FROM supplier_payments sp
-          WHERE sp.cancelled = FALSE AND sp.payment_date BETWEEN $1 AND $2
+          WHERE sp.cancelled = FALSE AND sp.payment_date BETWEEN $1 AND $2 AND sp.branch_id = $3
           UNION ALL
           SELECT e.expense_date AS transaction_date, 'Expense' AS source, e.payment_mode, e.amount
           FROM expenses e
-          WHERE e.active IS DISTINCT FROM FALSE AND e.expense_date BETWEEN $1 AND $2
+          WHERE e.active IS DISTINCT FROM FALSE AND e.expense_date BETWEEN $1 AND $2 AND e.branch_id = $3
         ) mode_rows
         GROUP BY transaction_date, source, payment_mode
         ORDER BY transaction_date DESC, source, payment_mode
         `,
-        [dateFrom, dateTo]
+        [dateFrom, dateTo, req.auth.branchId]
       ),
     ].map(resolveReportTask));
     const balanceSheetSnapshot = await getBalanceSheetSnapshot({ dateTo, branchId: req.auth.branchId }).catch((error) => {
