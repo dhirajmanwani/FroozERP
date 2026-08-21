@@ -37,6 +37,7 @@ import {
   verifyBootstrapCredential,
 } from "./local/bootstrapCredential";
 import { resolveOfflineOpenDecision } from "./local/offlineDataReadiness";
+import { allShopsHasFigures, resolveAllShopsPresentation } from "./local/allShopsSummary";
 import { bannerForState } from "./local/entitlementState";
 import { sessionAuthHeaders, shouldAttachSessionAuth } from "./local/authHeaders";
 import { consumeStashedSessionForReload, stashSessionForReload } from "./local/reloadSessionBridge";
@@ -818,11 +819,12 @@ const navigationItems = [
   ["sale-rates", "Sale Rate Update"],
   ["expenses", "Expenses"],
   ["reports", "Reports"],
+  ["all-shops", "All Shops"],
   ["settings", "Settings"],
 ];
 
 const offlineLocalDataViews = new Set(["dashboard", "products", "sales", "reports", "settings"]);
-const offlineBackendRequiredViews = new Set(["purchase", "pending-bills", "accounts", "returns", "waste", "discounts", "sale-rates", "expenses"]);
+const offlineBackendRequiredViews = new Set(["purchase", "pending-bills", "accounts", "returns", "waste", "discounts", "sale-rates", "expenses", "all-shops"]);
 
 const getErrorMessage = (error, fallback) =>
   error.response?.data?.message || fallback;
@@ -1750,6 +1752,9 @@ function App() {
     profitLoss: {},
   });
   const [expenses, setExpenses] = useState([]);
+  // Kept as one object rather than three pieces of state so the view can never render a stale
+  // payload beside a fresh error, which is how a failed refresh ends up looking like real figures.
+  const [allShopsState, setAllShopsState] = useState({ loadState: "idle", loadError: "", payload: null });
   const [dashboardRange, setDashboardRange] = useState("7");
   const [dashboardCustomRange, setDashboardCustomRange] = useState({
     date_from: toDateKey(new Date()),
@@ -3105,6 +3110,11 @@ function App() {
     if (!user) return false;
     const roleName = user.role;
     const permissions = rolePermissionMap.get(roleName);
+    // Owner only, and checked before anything else. Admin's default permissions are `{ all: true }`,
+    // so a view that falls through to the usual test is open to Admin as well — and this is the one
+    // screen that shows every shop's money. The backend refuses non-Owners regardless; this keeps
+    // the door from appearing in the first place.
+    if (view === "all-shops") return String(roleName || "").toUpperCase() === "OWNER";
     if (view === "dashboard") {
       if (roleName === "Owner") return true;
       if (permissions && Object.prototype.hasOwnProperty.call(permissions, "dashboard")) return Boolean(permissions.dashboard);
@@ -4479,6 +4489,28 @@ function App() {
   const loadExpenses = async () => {
     const response = await axios.get(`${API_URL}/expenses`);
     setExpenses(response.data);
+  };
+
+  /**
+   * The Owner's company-wide figures.
+   *
+   * Swallows its own error into state instead of throwing, because the shared per-view dispatch
+   * turns a thrown error into a banner and leaves the screen showing whatever was there before.
+   * For this view that would mean the previous company totals sitting under a sync warning, read
+   * as current. The presentation layer needs the failure in hand to blank the figures.
+   */
+  const loadAllShops = async () => {
+    setAllShopsState((current) => ({ ...current, loadState: "loading", loadError: "" }));
+    try {
+      const response = await axios.get(`${API_URL}/api/owner/all-branches-summary`);
+      setAllShopsState({ loadState: "loaded", loadError: "", payload: response.data });
+    } catch (error) {
+      setAllShopsState({
+        loadState: "error",
+        loadError: getErrorMessage(error, "All Shops could not be loaded. Nothing was changed; try again."),
+        payload: null,
+      });
+    }
   };
 
   const loadSalesHistory = async () => {
@@ -6076,6 +6108,7 @@ function App() {
       }
       if (view === "reports") await loadReports();
       if (view === "expenses") await loadExpenses();
+      if (view === "all-shops") await loadAllShops();
       if (view === "returns") await loadSaleReturns();
       if (view === "waste") await loadWasteEntries();
       if (view === "dashboard") await loadDashboardData();
@@ -7243,6 +7276,14 @@ function App() {
               onReload={loadReports}
               suppliers={suppliers}
               user={user}
+            />
+          )}
+
+          {activeView === "all-shops" && (
+            <AllShopsModule
+              connectivityMode={connectivityMode}
+              onReload={loadAllShops}
+              state={allShopsState}
             />
           )}
 
@@ -12805,6 +12846,85 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
         </DataTable>
       </ModuleCard>
     </section>
+  );
+}
+
+/**
+ * The Owner's whole-business view: every shop side by side, plus the company total.
+ *
+ * Every decision about *what* may be shown lives in `local/allShopsSummary.js`, where it is
+ * testable. This component only renders what it is handed, and the rule it exists to honour is
+ * that it never invents a number: when `presentation.totals` is null the figures are simply not on
+ * the page. There is no `|| 0` anywhere below, because a zero written into a failed load is
+ * indistinguishable from a shop that did no business.
+ */
+function AllShopsModule({ connectivityMode, onReload, state }) {
+  const money = (value) => currency.format(Number(value || 0));
+  const presentation = resolveAllShopsPresentation({
+    loadState: state.loadState,
+    loadError: state.loadError,
+    offline: connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY,
+    payload: state.payload,
+  });
+  const showFigures = allShopsHasFigures(presentation);
+  const asAt = state.payload?.asAtDate || "";
+
+  return (
+    <ModuleCard
+      eyebrow="Owner View"
+      title="All Shops"
+      subtitle={asAt ? `Company position as at ${asAt}. Every other screen shows only the shop you are signed in to.` : "Company position across every shop. Every other screen shows only the shop you are signed in to."}
+    >
+      <p><button className="table-action" type="button" onClick={onReload}>Refresh</button></p>
+
+      {presentation.message && <p className="form-note">{presentation.message}</p>}
+      {presentation.warnings.map((warning) => (
+        <p className="form-note" key={warning} role="alert"><strong>Check this:</strong> {warning}</p>
+      ))}
+
+      {showFigures && (
+        <div className="purchase-summary-grid supplier-payment-preview">
+          <SummaryMetric featured label="Cash + Bank" value={money(presentation.totals.cash + presentation.totals.bank)} />
+          <SummaryMetric label="Stock Value" value={money(presentation.totals.inventory)} />
+          <SummaryMetric label="Customers Owe Us" value={money(presentation.totals.customerReceivable)} />
+          <SummaryMetric label="We Owe Suppliers" value={money(presentation.totals.supplierPayable)} />
+          <SummaryMetric label="Net Profit" positive value={money(presentation.totals.netProfit)} />
+          <SummaryMetric label="Net Position" value={money(presentation.totals.netPosition)} />
+        </div>
+      )}
+
+      {presentation.shops.length > 0 && (
+        <DataTable headers={["Shop", "Cash", "Bank", "Stock Value", "Customers Owe", "We Owe", "Net Profit"]}>
+          {presentation.shops.map((shop) => (
+            <tr key={shop.branchId ?? shop.branchName}>
+              <td>{shop.branchName}</td>
+              {shop.ok ? (
+                <>
+                  <td>{money(shop.cash)}</td>
+                  <td>{money(shop.bank)}</td>
+                  <td>{money(shop.inventory)}</td>
+                  <td>{money(shop.customerReceivable)}</td>
+                  <td>{money(shop.supplierPayable)}</td>
+                  <td className="profit-cell">{money(shop.netProfit)}</td>
+                </>
+              ) : (
+                // Deliberately one spanning cell rather than six blanks or six zeros: a row of
+                // dashes still reads as a row of numbers at a glance.
+                <td colSpan={6}><strong>Not loaded.</strong> {shop.error}</td>
+              )}
+            </tr>
+          ))}
+        </DataTable>
+      )}
+
+      {showFigures && (
+        <p className="form-note">
+          Supplier and customer balances here match the Supplier and Customer screens, which are
+          company-wide. The per-shop Balance Sheet counts only the money each shop itself owes or is
+          owed, so the two will differ.
+        </p>
+      )}
+    </ModuleCard>
   );
 }
 
