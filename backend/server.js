@@ -3432,9 +3432,26 @@ const previousDateKey = (dateValue) => {
   return toDateKey(date);
 };
 
-const getSupplierSummaryRows = async ({ active, search, supplierId, dateTo } = {}) => {
+/**
+ * Supplier list with purchase and payment totals.
+ *
+ * `branchId` is required and scopes the **totals**, not the list. The supplier master is
+ * company-wide — `suppliers` has no `branch_id` and is not meant to — so every supplier still
+ * appears; what changes is that the money beside each one is this branch's money.
+ *
+ * **This encodes a business decision** (recorded as an open question in
+ * `docs/tenancy-backfill-plan.md`): a supplier's outstanding balance is treated as *per branch*
+ * rather than per company. That is the isolation-correct default — Jodhpur cannot see what Jaipur
+ * bought — and consolidated figures have their own route. If the business considers a supplier debt
+ * to be one company-level number, this is the line to revisit, and it should be revisited
+ * deliberately rather than discovered.
+ */
+const getSupplierSummaryRows = async ({ active, search, supplierId, dateTo, branchId } = {}) => {
+  if (!parsePositiveInteger(branchId)) {
+    throw new Error("getSupplierSummaryRows requires a branchId");
+  }
   const filters = [];
-  const values = [];
+  const values = [branchId];
   const purchaseDateFilter = isDateInput(dateTo) ? `AND purchase_date <= $${values.push(dateTo)}` : "";
   const paymentDateFilter = isDateInput(dateTo) ? `AND payment_date <= $${values.length}` : "";
   if (supplierId) {
@@ -3467,6 +3484,7 @@ const getSupplierSummaryRows = async ({ active, search, supplierId, dateTo } = {
         SUM(COALESCE(paid_amount, 0)) AS purchase_paid
       FROM purchases
       WHERE supplier_id IS NOT NULL
+        AND branch_id = $1
         AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
         AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
         ${purchaseDateFilter}
@@ -3479,6 +3497,7 @@ const getSupplierSummaryRows = async ({ active, search, supplierId, dateTo } = {
         SUM(rebate_amount) AS payment_rebate
       FROM supplier_payments
       WHERE cancelled = FALSE
+        AND branch_id = $1
         ${paymentDateFilter}
       GROUP BY supplier_id
     )
@@ -3614,9 +3633,20 @@ const readAccountPayload = (body) => {
   };
 };
 
-const getCustomerSummaryRows = async ({ active, search, customerId, dateTo } = {}) => {
+/**
+ * Customers with their money attached, scoped to one branch.
+ *
+ * Same shape and same business decision as `getSupplierSummaryRows` above: the customer *directory*
+ * is company-wide — `customers` has no `branch_id`, and every branch sells to the same people — but
+ * the balance beside each name is this branch's balance. `branchId` is required and seeded as `$1`
+ * so neither CTE can be built without it.
+ */
+const getCustomerSummaryRows = async ({ active, search, customerId, dateTo, branchId } = {}) => {
+  if (!parsePositiveInteger(branchId)) {
+    throw new Error("getCustomerSummaryRows requires a branchId");
+  }
   const filters = [];
-  const values = [];
+  const values = [branchId];
   const saleDateFilter = isDateInput(dateTo) ? `AND s.sale_date <= $${values.push(dateTo)}` : "";
   const customerPaymentDateFilter = isDateInput(dateTo) ? `AND payment_date <= $${values.length}` : "";
   if (customerId) {
@@ -3674,7 +3704,7 @@ const getCustomerSummaryRows = async ({ active, search, customerId, dateTo } = {
         FROM sale_payments
         GROUP BY sale_id
       ) pay ON pay.sale_id = s.id
-      WHERE 1 = 1
+      WHERE s.branch_id = $1
         ${saleDateFilter}
       GROUP BY matched.customer_id
     ),
@@ -3682,6 +3712,7 @@ const getCustomerSummaryRows = async ({ active, search, customerId, dateTo } = {
       SELECT customer_id, SUM(payment_amount) AS total_customer_paid
       FROM customer_payments
       WHERE cancelled = FALSE
+        AND branch_id = $1
         ${customerPaymentDateFilter}
       GROUP BY customer_id
     )
@@ -3721,7 +3752,23 @@ const buildCustomerSummaryPayload = (rows) => {
   };
 };
 
-const getBalanceSheetSnapshot = async ({ dateTo = toDateKey(new Date()) } = {}) => {
+/**
+ * The whole balance sheet for one branch, as at one date.
+ *
+ * Every one of the twenty-odd sub-selects below carries `AND ... branch_id = $2`, and that is not
+ * defensive repetition — a balance sheet whose cash is branch-scoped but whose inventory is not
+ * would simply fail to balance, and would do it quietly. Scoping is all-or-nothing here for the same
+ * reason the summary/detail rule in CLAUDE.md exists: the two halves have to share filter semantics
+ * or the difference reads as missing money.
+ *
+ * The cash CTEs scope on `s.branch_id` (the sale) rather than `sp.branch_id` (the payment line).
+ * Both columns exist and should agree, but the sale is the parent record and the one the rest of the
+ * report already filters on.
+ */
+const getBalanceSheetSnapshot = async ({ dateTo = toDateKey(new Date()), branchId } = {}) => {
+  if (!parsePositiveInteger(branchId)) {
+    throw new Error("getBalanceSheetSnapshot requires a branchId");
+  }
   const asAtDate = isDateInput(dateTo) ? dateTo : toDateKey(new Date());
   const bankModesSql = BANK_PAYMENT_MODES.map((mode) => `'${mode}'`).join(", ");
   const [cashResult, inventoryResult, profitLossResult, supplierRows, customerRows] = await Promise.all([
@@ -3732,28 +3779,32 @@ const getBalanceSheetSnapshot = async ({ dateTo = toDateKey(new Date()) } = {}) 
           SELECT SUM(sp.amount)
           FROM sale_payments sp
           JOIN sales s ON s.id = sp.sale_id
-          WHERE s.sale_status <> 'CANCELLED'
+          WHERE s.branch_id = $2
+            AND s.sale_status <> 'CANCELLED'
             AND sp.payment_mode = 'CASH'
             AND s.sale_date <= $1
         ), 0)
         + COALESCE((
           SELECT SUM(payment_amount)
           FROM customer_payments
-          WHERE cancelled = FALSE
+          WHERE branch_id = $2
+            AND cancelled = FALSE
             AND payment_mode = 'CASH'
             AND payment_date <= $1
         ), 0)
         - COALESCE((
           SELECT SUM(payment_amount)
           FROM supplier_payments
-          WHERE cancelled = FALSE
+          WHERE branch_id = $2
+            AND cancelled = FALSE
             AND payment_mode = 'CASH'
             AND payment_date <= $1
         ), 0)
         - COALESCE((
           SELECT SUM(COALESCE(paid_amount, 0))
           FROM purchases
-          WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
+          WHERE branch_id = $2
+            AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
             AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
             AND COALESCE(payment_mode, '') = 'CASH'
             AND purchase_date <= $1
@@ -3761,7 +3812,8 @@ const getBalanceSheetSnapshot = async ({ dateTo = toDateKey(new Date()) } = {}) 
         - COALESCE((
           SELECT SUM(amount)
           FROM expenses
-          WHERE active IS DISTINCT FROM FALSE
+          WHERE branch_id = $2
+            AND active IS DISTINCT FROM FALSE
             AND COALESCE(status, 'ACTIVE') <> 'CANCELLED'
             AND payment_mode = 'CASH'
             AND expense_date <= $1
@@ -3770,28 +3822,32 @@ const getBalanceSheetSnapshot = async ({ dateTo = toDateKey(new Date()) } = {}) 
           SELECT SUM(sp.amount)
           FROM sale_payments sp
           JOIN sales s ON s.id = sp.sale_id
-          WHERE s.sale_status <> 'CANCELLED'
+          WHERE s.branch_id = $2
+            AND s.sale_status <> 'CANCELLED'
             AND sp.payment_mode IN (${bankModesSql})
             AND s.sale_date <= $1
         ), 0)
         + COALESCE((
           SELECT SUM(payment_amount)
           FROM customer_payments
-          WHERE cancelled = FALSE
+          WHERE branch_id = $2
+            AND cancelled = FALSE
             AND payment_mode IN (${bankModesSql})
             AND payment_date <= $1
         ), 0)
         - COALESCE((
           SELECT SUM(payment_amount)
           FROM supplier_payments
-          WHERE cancelled = FALSE
+          WHERE branch_id = $2
+            AND cancelled = FALSE
             AND payment_mode IN (${bankModesSql})
             AND payment_date <= $1
         ), 0)
         - COALESCE((
           SELECT SUM(COALESCE(paid_amount, 0))
           FROM purchases
-          WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
+          WHERE branch_id = $2
+            AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
             AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
             AND COALESCE(payment_mode, '') IN (${bankModesSql})
             AND purchase_date <= $1
@@ -3799,40 +3855,42 @@ const getBalanceSheetSnapshot = async ({ dateTo = toDateKey(new Date()) } = {}) 
         - COALESCE((
           SELECT SUM(amount)
           FROM expenses
-          WHERE active IS DISTINCT FROM FALSE
+          WHERE branch_id = $2
+            AND active IS DISTINCT FROM FALSE
             AND COALESCE(status, 'ACTIVE') <> 'CANCELLED'
             AND payment_mode IN (${bankModesSql})
             AND expense_date <= $1
         ), 0) AS cash_at_bank
       `,
-      [asAtDate]
+      [asAtDate, branchId]
     ),
     pool.query(
       `
       SELECT COALESCE(SUM(remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate)), 0) AS inventory_value
       FROM inventory_batches
-      WHERE COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'
+      WHERE branch_id = $2
+        AND COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'
         AND created_at::date <= $1
       `,
-      [asAtDate]
+      [asAtDate, branchId]
     ),
     pool.query(
       `
       SELECT
-        COALESCE((SELECT SUM(total_amount) FROM sales WHERE sale_status <> 'CANCELLED' AND sale_date <= $1), 0) AS sales_revenue,
-        COALESCE((SELECT SUM(total_cost) FROM sales WHERE sale_status <> 'CANCELLED' AND sale_date <= $1), 0) AS purchase_cost,
-        COALESCE((SELECT SUM(mandi_tax_amount) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0) AS mandi_tax,
-        COALESCE((SELECT SUM(freight_charges) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0) AS freight_charges,
-        COALESCE((SELECT SUM(labour_charges) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0) AS labour_charges,
-        COALESCE((SELECT SUM(other_charges) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0) AS other_purchase_charges,
-        COALESCE((SELECT SUM(amount) FROM expenses WHERE active IS DISTINCT FROM FALSE AND COALESCE(status, 'ACTIVE') <> 'CANCELLED' AND expense_date <= $1), 0) AS expenses,
-        COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0)
-          + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE AND payment_date <= $1), 0) AS supplier_rebate_received
+        COALESCE((SELECT SUM(total_amount) FROM sales WHERE branch_id = $2 AND sale_status <> 'CANCELLED' AND sale_date <= $1), 0) AS sales_revenue,
+        COALESCE((SELECT SUM(total_cost) FROM sales WHERE branch_id = $2 AND sale_status <> 'CANCELLED' AND sale_date <= $1), 0) AS purchase_cost,
+        COALESCE((SELECT SUM(mandi_tax_amount) FROM purchases WHERE branch_id = $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0) AS mandi_tax,
+        COALESCE((SELECT SUM(freight_charges) FROM purchases WHERE branch_id = $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0) AS freight_charges,
+        COALESCE((SELECT SUM(labour_charges) FROM purchases WHERE branch_id = $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0) AS labour_charges,
+        COALESCE((SELECT SUM(other_charges) FROM purchases WHERE branch_id = $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0) AS other_purchase_charges,
+        COALESCE((SELECT SUM(amount) FROM expenses WHERE branch_id = $2 AND active IS DISTINCT FROM FALSE AND COALESCE(status, 'ACTIVE') <> 'CANCELLED' AND expense_date <= $1), 0) AS expenses,
+        COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE branch_id = $2 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND purchase_date <= $1), 0)
+          + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE branch_id = $2 AND cancelled = FALSE AND payment_date <= $1), 0) AS supplier_rebate_received
       `,
-      [asAtDate]
+      [asAtDate, branchId]
     ),
-    getSupplierSummaryRows({ dateTo: asAtDate }),
-    getCustomerSummaryRows({ dateTo: asAtDate }),
+    getSupplierSummaryRows({ dateTo: asAtDate, branchId }),
+    getCustomerSummaryRows({ dateTo: asAtDate, branchId }),
   ]);
 
   const cash = cashResult.rows[0] || {};
@@ -4284,9 +4342,27 @@ const DEFAULT_DASHBOARD_SUMMARY = Object.freeze({
   active_supplier_count: 0,
 });
 
-const readDashboardMetric = async (metricName, query) => {
+/**
+ * Runs one dashboard tile's query.
+ *
+ * The catch below turns a failure into a zero, which is the pattern CLAUDE.md warns about — a broken
+ * tile is indistinguishable from a quiet day. That is pre-existing and left alone here, but it makes
+ * branch scoping unusually easy to get wrong: a query whose placeholders and values disagree throws,
+ * gets swallowed, and shows ₹0 instead of an error. So the placeholder count is checked *before* the
+ * try, where a mistake fails loudly at startup of the request rather than dissolving into a zero.
+ */
+const readDashboardMetric = async (metricName, query, values = []) => {
+  // Highest placeholder number, not the count of distinct ones: pg numbers positionally, so a query
+  // using $1 and $3 needs three values even though it mentions two.
+  const highestPlaceholder = (String(query).match(/\$(\d+)/g) || [])
+    .reduce((highest, token) => Math.max(highest, Number(token.slice(1))), 0);
+  if (highestPlaceholder !== values.length) {
+    throw new Error(
+      `Dashboard metric ${metricName} binds ${values.length} value(s) but its highest placeholder is $${highestPlaceholder}`
+    );
+  }
   try {
-    const result = await pool.query(query);
+    const result = await pool.query(query, values);
     return Number(result.rows[0]?.value || 0);
   } catch (error) {
     console.warn(`Dashboard metric ${metricName} defaulted to zero: ${error.code || error.message}`);
@@ -4294,16 +4370,27 @@ const readDashboardMetric = async (metricName, query) => {
   }
 };
 
-const readDashboardOutstanding = async (label, loader, summaryBuilder) => {
+const readDashboardOutstanding = async (label, loader, summaryBuilder, branchId) => {
   try {
-    return Number(summaryBuilder(await loader()).outstandingBalance || 0);
+    return Number(summaryBuilder(await loader({ branchId })).outstandingBalance || 0);
   } catch (error) {
     console.warn(`Dashboard ${label} outstanding defaulted to zero: ${error.code || error.message}`);
     return 0;
   }
 };
 
-const getDashboardSummary = async () => {
+/**
+ * The home-screen tiles for one branch.
+ *
+ * Every money and movement tile is scoped to `$1`. The two supplier *count* tiles are not, and that
+ * is deliberate: `suppliers` has no `branch_id` — the supplier directory is company-wide master data
+ * that every branch shares — so "how many suppliers do we have" is a company answer while "what do we
+ * owe them" is a branch answer. Same split as `getSupplierSummaryRows`.
+ */
+const getDashboardSummary = async (branchId) => {
+  if (!parsePositiveInteger(branchId)) {
+    throw new Error("getDashboardSummary requires a branchId");
+  }
   const [
     todaySales,
     todayProfit,
@@ -4323,41 +4410,44 @@ const getDashboardSummary = async () => {
     supplierOutstanding,
     customerOutstanding,
   ] = await Promise.all([
-    readDashboardMetric("todaySales", "SELECT COALESCE(SUM(total_amount), 0) AS value FROM sales WHERE sale_date = CURRENT_DATE AND COALESCE(sale_status, 'COMPLETED') <> 'CANCELLED'"),
-    readDashboardMetric("todayProfit", "SELECT COALESCE(SUM(profit), 0) AS value FROM sales WHERE sale_date = CURRENT_DATE AND COALESCE(sale_status, 'COMPLETED') <> 'CANCELLED'"),
-    readDashboardMetric("stockValue", "SELECT COALESCE(SUM(remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate, 0)), 0) AS value FROM inventory_batches WHERE COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'"),
+    readDashboardMetric("todaySales", "SELECT COALESCE(SUM(total_amount), 0) AS value FROM sales WHERE branch_id = $1 AND sale_date = CURRENT_DATE AND COALESCE(sale_status, 'COMPLETED') <> 'CANCELLED'", [branchId]),
+    readDashboardMetric("todayProfit", "SELECT COALESCE(SUM(profit), 0) AS value FROM sales WHERE branch_id = $1 AND sale_date = CURRENT_DATE AND COALESCE(sale_status, 'COMPLETED') <> 'CANCELLED'", [branchId]),
+    readDashboardMetric("stockValue", "SELECT COALESCE(SUM(remaining_qty * COALESCE(effective_cost_per_unit, purchase_rate, 0)), 0) AS value FROM inventory_batches WHERE branch_id = $1 AND COALESCE(batch_status, 'ACTIVE') <> 'CANCELLED'", [branchId]),
     readDashboardMetric("lowStockItems", `
       SELECT COALESCE(COUNT(*), 0) AS value
       FROM (
         SELECT p.id, COALESCE(SUM(ib.remaining_qty), 0) AS current_stock, COALESCE(p.minimum_stock, 5) AS minimum_stock
         FROM products p
+        -- Branch goes in the JOIN, not the WHERE: in a WHERE it would drop every product this branch
+        -- holds no stock of, which is precisely the set that is low on stock.
         LEFT JOIN inventory_batches ib ON ib.product_id = p.id AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+          AND ib.branch_id = $1
         WHERE p.active IS DISTINCT FROM FALSE
         GROUP BY p.id, p.minimum_stock
       ) stock
       WHERE stock.current_stock <= stock.minimum_stock
-    `),
-    readDashboardMetric("transactions", "SELECT COALESCE(COUNT(*), 0) AS value FROM sales WHERE sale_date = CURRENT_DATE AND COALESCE(sale_status, 'COMPLETED') <> 'CANCELLED'"),
-    readDashboardMetric("todayExpenses", "SELECT COALESCE(SUM(amount), 0) AS value FROM expenses WHERE expense_date = CURRENT_DATE AND active IS DISTINCT FROM FALSE"),
-    readDashboardMetric("todayReturns", "SELECT COALESCE(SUM(total_return_amount), 0) AS value FROM sale_returns WHERE return_date = CURRENT_DATE"),
-    readDashboardMetric("monthlyReturns", "SELECT COALESCE(SUM(total_return_amount), 0) AS value FROM sale_returns WHERE return_date >= DATE_TRUNC('month', CURRENT_DATE)::date"),
-    readDashboardMetric("todayWaste", "SELECT COALESCE(SUM(cost_amount), 0) AS value FROM waste_entries WHERE waste_date = CURRENT_DATE"),
-    readDashboardMetric("monthlyWaste", "SELECT COALESCE(SUM(cost_amount), 0) AS value FROM waste_entries WHERE waste_date >= DATE_TRUNC('month', CURRENT_DATE)::date"),
-    readDashboardMetric("monthlyWasteQuantity", "SELECT COALESCE(SUM(quantity), 0) AS value FROM waste_entries WHERE waste_date >= DATE_TRUNC('month', CURRENT_DATE)::date"),
+    `, [branchId]),
+    readDashboardMetric("transactions", "SELECT COALESCE(COUNT(*), 0) AS value FROM sales WHERE branch_id = $1 AND sale_date = CURRENT_DATE AND COALESCE(sale_status, 'COMPLETED') <> 'CANCELLED'", [branchId]),
+    readDashboardMetric("todayExpenses", "SELECT COALESCE(SUM(amount), 0) AS value FROM expenses WHERE branch_id = $1 AND expense_date = CURRENT_DATE AND active IS DISTINCT FROM FALSE", [branchId]),
+    readDashboardMetric("todayReturns", "SELECT COALESCE(SUM(total_return_amount), 0) AS value FROM sale_returns WHERE branch_id = $1 AND return_date = CURRENT_DATE", [branchId]),
+    readDashboardMetric("monthlyReturns", "SELECT COALESCE(SUM(total_return_amount), 0) AS value FROM sale_returns WHERE branch_id = $1 AND return_date >= DATE_TRUNC('month', CURRENT_DATE)::date", [branchId]),
+    readDashboardMetric("todayWaste", "SELECT COALESCE(SUM(cost_amount), 0) AS value FROM waste_entries WHERE branch_id = $1 AND waste_date = CURRENT_DATE", [branchId]),
+    readDashboardMetric("monthlyWaste", "SELECT COALESCE(SUM(cost_amount), 0) AS value FROM waste_entries WHERE branch_id = $1 AND waste_date >= DATE_TRUNC('month', CURRENT_DATE)::date", [branchId]),
+    readDashboardMetric("monthlyWasteQuantity", "SELECT COALESCE(SUM(quantity), 0) AS value FROM waste_entries WHERE branch_id = $1 AND waste_date >= DATE_TRUNC('month', CURRENT_DATE)::date", [branchId]),
     readDashboardMetric("totalRebateReceived", `
       SELECT
-        COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'), 0)
-        + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE cancelled = FALSE), 0) AS value
-    `),
+        COALESCE((SELECT SUM(rebate_amount) FROM purchases WHERE branch_id = $1 AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'), 0)
+        + COALESCE((SELECT SUM(rebate_amount) FROM supplier_payments WHERE branch_id = $1 AND cancelled = FALSE), 0) AS value
+    `, [branchId]),
     readDashboardMetric("todaySupplierPayments", `
       SELECT
-        COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE payment_date = CURRENT_DATE AND cancelled = FALSE), 0)
-        + COALESCE((SELECT SUM(paid_amount) FROM purchases WHERE COALESCE(payment_date, purchase_date) = CURRENT_DATE AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'), 0) AS value
-    `),
+        COALESCE((SELECT SUM(payment_amount) FROM supplier_payments WHERE branch_id = $1 AND payment_date = CURRENT_DATE AND cancelled = FALSE), 0)
+        + COALESCE((SELECT SUM(paid_amount) FROM purchases WHERE branch_id = $1 AND COALESCE(payment_date, purchase_date) = CURRENT_DATE AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED' AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'), 0) AS value
+    `, [branchId]),
     readDashboardMetric("supplier_count", "SELECT COALESCE(COUNT(*), 0) AS value FROM suppliers"),
     readDashboardMetric("active_supplier_count", "SELECT COALESCE(COUNT(*), 0) AS value FROM suppliers WHERE active = TRUE"),
-    readDashboardOutstanding("supplier", getSupplierSummaryRows, buildSupplierSummaryPayload),
-    readDashboardOutstanding("customer", getCustomerSummaryRows, buildCustomerSummaryPayload),
+    readDashboardOutstanding("supplier", getSupplierSummaryRows, buildSupplierSummaryPayload, branchId),
+    readDashboardOutstanding("customer", getCustomerSummaryRows, buildCustomerSummaryPayload, branchId),
   ]);
   const metrics = {
     ...DEFAULT_DASHBOARD_SUMMARY,
@@ -4392,7 +4482,7 @@ const getDashboardSummary = async () => {
   };
 };
 
-const getDashboardSalesTrend = async (dateFrom, dateTo) => {
+const getDashboardSalesTrend = async (dateFrom, dateTo, branchId) => {
   const result = await pool.query(
     `
     WITH days AS (
@@ -4401,7 +4491,8 @@ const getDashboardSalesTrend = async (dateFrom, dateTo) => {
     sales_by_day AS (
       SELECT sale_date::date AS day, SUM(total_amount) AS sales
       FROM sales
-      WHERE sale_status <> 'CANCELLED'
+      WHERE branch_id = $3
+        AND sale_status <> 'CANCELLED'
         AND sale_date BETWEEN $1 AND $2
       GROUP BY sale_date
     )
@@ -4410,12 +4501,12 @@ const getDashboardSalesTrend = async (dateFrom, dateTo) => {
     LEFT JOIN sales_by_day ON sales_by_day.day = days.day
     ORDER BY days.day
     `,
-    [dateFrom, dateTo]
+    [dateFrom, dateTo, branchId]
   );
   return result.rows.map((row) => ({ date: row.date, sales: Number(row.sales || 0) }));
 };
 
-const getDashboardProfitTrend = async (dateFrom, dateTo) => {
+const getDashboardProfitTrend = async (dateFrom, dateTo, branchId) => {
   const result = await pool.query(
     `
     WITH days AS (
@@ -4424,7 +4515,8 @@ const getDashboardProfitTrend = async (dateFrom, dateTo) => {
     profit_by_day AS (
       SELECT sale_date::date AS day, SUM(profit) AS gross_profit
       FROM sales
-      WHERE sale_status <> 'CANCELLED'
+      WHERE branch_id = $3
+        AND sale_status <> 'CANCELLED'
         AND sale_date BETWEEN $1 AND $2
       GROUP BY sale_date
     )
@@ -4433,12 +4525,12 @@ const getDashboardProfitTrend = async (dateFrom, dateTo) => {
     LEFT JOIN profit_by_day ON profit_by_day.day = days.day
     ORDER BY days.day
     `,
-    [dateFrom, dateTo]
+    [dateFrom, dateTo, branchId]
   );
   return result.rows.map((row) => ({ date: row.date, grossProfit: Number(row.grossProfit || 0) }));
 };
 
-const getDashboardExpenseTrend = async (dateFrom, dateTo) => {
+const getDashboardExpenseTrend = async (dateFrom, dateTo, branchId) => {
   const result = await pool.query(
     `
     WITH days AS (
@@ -4447,7 +4539,8 @@ const getDashboardExpenseTrend = async (dateFrom, dateTo) => {
     expense_by_day AS (
       SELECT expense_date::date AS day, SUM(amount) AS expenses
       FROM expenses
-      WHERE active IS DISTINCT FROM FALSE
+      WHERE branch_id = $3
+        AND active IS DISTINCT FROM FALSE
         AND expense_date BETWEEN $1 AND $2
       GROUP BY expense_date
     )
@@ -4456,12 +4549,12 @@ const getDashboardExpenseTrend = async (dateFrom, dateTo) => {
     LEFT JOIN expense_by_day ON expense_by_day.day = days.day
     ORDER BY days.day
     `,
-    [dateFrom, dateTo]
+    [dateFrom, dateTo, branchId]
   );
   return result.rows.map((row) => ({ date: row.date, expenses: Number(row.expenses || 0) }));
 };
 
-const getDashboardPurchaseSalesComparison = async (dateFrom, dateTo) => {
+const getDashboardPurchaseSalesComparison = async (dateFrom, dateTo, branchId) => {
   const result = await pool.query(
     `
     WITH days AS (
@@ -4470,14 +4563,16 @@ const getDashboardPurchaseSalesComparison = async (dateFrom, dateTo) => {
     sales_by_day AS (
       SELECT sale_date::date AS day, SUM(total_amount) AS sales
       FROM sales
-      WHERE sale_status <> 'CANCELLED'
+      WHERE branch_id = $3
+        AND sale_status <> 'CANCELLED'
         AND sale_date BETWEEN $1 AND $2
       GROUP BY sale_date
     ),
     purchases_by_day AS (
       SELECT purchase_date::date AS day, SUM(COALESCE(NULLIF(net_payable, 0), total_amount, 0)) AS purchases
       FROM purchases
-      WHERE purchase_date BETWEEN $1 AND $2
+      WHERE branch_id = $3
+        AND purchase_date BETWEEN $1 AND $2
         AND COALESCE(purchase_status, 'ACTIVE') <> 'CANCELLED'
         AND COALESCE(purchase_bill_status, 'BILL_COMPLETED') = 'BILL_COMPLETED'
       GROUP BY purchase_date
@@ -4491,7 +4586,7 @@ const getDashboardPurchaseSalesComparison = async (dateFrom, dateTo) => {
     LEFT JOIN sales_by_day ON sales_by_day.day = days.day
     ORDER BY days.day
     `,
-    [dateFrom, dateTo]
+    [dateFrom, dateTo, branchId]
   );
   return result.rows.map((row) => ({
     date: row.date,
@@ -4500,7 +4595,7 @@ const getDashboardPurchaseSalesComparison = async (dateFrom, dateTo) => {
   }));
 };
 
-const getDashboardTopSellingProducts = async (dateFrom, dateTo) => {
+const getDashboardTopSellingProducts = async (dateFrom, dateTo, branchId) => {
   const result = await pool.query(
     `
     SELECT
@@ -4512,13 +4607,14 @@ const getDashboardTopSellingProducts = async (dateFrom, dateTo) => {
     FROM sale_items si
     JOIN sales s ON s.id = si.sale_id
     JOIN products p ON p.id = si.product_id
-    WHERE s.sale_status <> 'CANCELLED'
+    WHERE s.branch_id = $3
+      AND s.sale_status <> 'CANCELLED'
       AND s.sale_date BETWEEN $1 AND $2
     GROUP BY p.id, p.product_name, p.unit
     ORDER BY quantity_sold DESC, revenue DESC, p.product_name
     LIMIT 8
     `,
-    [dateFrom, dateTo]
+    [dateFrom, dateTo, branchId]
   );
   return result.rows.map((row) => ({
     product_id: row.product_id,
@@ -4529,7 +4625,7 @@ const getDashboardTopSellingProducts = async (dateFrom, dateTo) => {
   }));
 };
 
-const getDashboardLowStockItems = async () => {
+const getDashboardLowStockItems = async (branchId) => {
   const result = await pool.query(
     `
     SELECT *
@@ -4541,15 +4637,19 @@ const getDashboardLowStockItems = async () => {
         COALESCE(p.minimum_stock, 5) AS minimum_stock,
         COALESCE(SUM(ib.remaining_qty), 0) AS current_stock
       FROM products p
+      -- Branch belongs in the JOIN: a WHERE would hide every product this branch has no batch of,
+      -- and a product with no stock at all is the most low-stock thing there is.
       LEFT JOIN inventory_batches ib ON ib.product_id = p.id
         AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+        AND ib.branch_id = $1
       WHERE p.active IS DISTINCT FROM FALSE
       GROUP BY p.id, p.product_name, p.unit, p.minimum_stock
     ) stock
     WHERE stock.current_stock <= stock.minimum_stock
     ORDER BY (stock.current_stock - stock.minimum_stock), stock.product_name
     LIMIT 10
-    `
+    `,
+    [branchId]
   );
   return result.rows.map((row) => ({
     product_id: row.product_id,
@@ -4612,7 +4712,10 @@ const resolveDashboardAnalyticsTask = async (task, index) => {
   }
 };
 
-const getDashboardAnalyticsPayload = async (query = {}) => {
+const getDashboardAnalyticsPayload = async (query = {}, branchId) => {
+  if (!parsePositiveInteger(branchId)) {
+    throw new Error("getDashboardAnalyticsPayload requires a branchId");
+  }
   const range = parseDashboardRange(query);
   const [
     summary,
@@ -4623,13 +4726,13 @@ const getDashboardAnalyticsPayload = async (query = {}) => {
     topSellingProducts,
     lowStockItems,
   ] = await Promise.all([
-    getDashboardSummary(),
-    getDashboardSalesTrend(range.dateFrom, range.dateTo),
-    getDashboardProfitTrend(range.dateFrom, range.dateTo),
-    getDashboardExpenseTrend(range.dateFrom, range.dateTo),
-    getDashboardPurchaseSalesComparison(range.dateFrom, range.dateTo),
-    getDashboardTopSellingProducts(range.dateFrom, range.dateTo),
-    getDashboardLowStockItems(),
+    getDashboardSummary(branchId),
+    getDashboardSalesTrend(range.dateFrom, range.dateTo, branchId),
+    getDashboardProfitTrend(range.dateFrom, range.dateTo, branchId),
+    getDashboardExpenseTrend(range.dateFrom, range.dateTo, branchId),
+    getDashboardPurchaseSalesComparison(range.dateFrom, range.dateTo, branchId),
+    getDashboardTopSellingProducts(range.dateFrom, range.dateTo, branchId),
+    getDashboardLowStockItems(branchId),
   ].map(resolveDashboardAnalyticsTask));
   const expensesByDate = new Map(expenseTrend.map((row) => [row.date, row.expenses]));
   const netProfitTrend = profitTrend.map((row) => {
@@ -10170,7 +10273,14 @@ app.get("/api/sync/status", rateLimitSyncRequest, async (req, res) => {
 
 app.get("/api/owner/dashboard-foundation", async (req, res) => {
   try {
-    const branchId = parsePositiveInteger(req.query.branch_id) || 1;
+    // Was `req.query.branch_id || 1`: the caller named the branch it wanted, so any authenticated
+    // user could read any branch's takings, and an omitted parameter silently reported branch 1's.
+    // The session decides now. If a genuine cross-branch view is wanted later it needs its own route
+    // with an Owner check, not a query parameter anyone can type.
+    if (!(await getPermissionUser(req.auth.userId, "dashboard", []))) {
+      return res.status(403).json({ message: "You do not have permission to view Dashboard." });
+    }
+    const branchId = req.auth.branchId;
     const today = new Date().toISOString().slice(0, 10);
     const [
       metrics,
@@ -10180,7 +10290,7 @@ app.get("/api/owner/dashboard-foundation", async (req, res) => {
       devices,
       processedSync,
     ] = await Promise.all([
-      getDashboardSummary(),
+      getDashboardSummary(branchId),
       pool.query(
         `
         SELECT
@@ -13062,10 +13172,21 @@ app.get("/sale-rate-history", async (req, res) => {
   }
 });
 
-const loadUnifiedAccounts = async () => {
+/**
+ * Customers, suppliers and standalone accounts as one directory.
+ *
+ * `accounts` has no `branch_id` — like `customers` and `suppliers` it is company-wide master data —
+ * so only the two money-carrying halves are scoped. `branchId` is required rather than optional
+ * because every caller is a request handler with `req.auth.branchId` in hand, and an optional one
+ * would silently rebuild the cross-branch view the moment someone forgot it.
+ */
+const loadUnifiedAccounts = async ({ branchId } = {}) => {
+  if (!parsePositiveInteger(branchId)) {
+    throw new Error("loadUnifiedAccounts requires a branchId");
+  }
   const [customerRows, supplierRows, genericRows] = await Promise.all([
-    getCustomerSummaryRows(),
-    getSupplierSummaryRows(),
+    getCustomerSummaryRows({ branchId }),
+    getSupplierSummaryRows({ branchId }),
     pool.query("SELECT * FROM accounts ORDER BY active DESC, account_name"),
   ]);
   return [
@@ -13227,7 +13348,7 @@ app.get("/accounts", async (req, res) => {
   try {
     const search = cleanText(req.query.search).toLowerCase();
     const accountType = req.query.account_type ? normalizeAccountType(req.query.account_type) : "";
-    const rows = await loadUnifiedAccounts();
+    const rows = await loadUnifiedAccounts({ branchId: req.auth.branchId });
     return res.json(rows.filter((account) =>
       (!accountType || account.account_type === accountType) &&
       (!search || account.account_name.toLowerCase().includes(search) || String(account.mobile_number || "").includes(search))
@@ -13463,7 +13584,7 @@ app.put("/accounts/:accountKey", async (req, res) => {
 
 app.get("/accounts/outstanding", async (req, res) => {
   try {
-    const accounts = await loadUnifiedAccounts();
+    const accounts = await loadUnifiedAccounts({ branchId: req.auth.branchId });
     const customerOutstanding = accounts.filter((account) => account.account_type === "CUSTOMER");
     const supplierOutstanding = accounts.filter((account) => ["SUPPLIER", "TRANSPORT_VENDOR", "COMMISSION_AGENT"].includes(account.account_type));
     return res.json({
@@ -13487,7 +13608,7 @@ app.get("/accounts/ledger", async (req, res) => {
       return res.json({ account: null, ledger: [] });
     }
     if (source === "CUSTOMER") {
-      const customers = await getCustomerSummaryRows({ customerId: sourceId });
+      const customers = await getCustomerSummaryRows({ customerId: sourceId, branchId: req.auth.branchId });
       if (customers.length === 0) return res.json({ account: null, ledger: [] });
       const ledgerResult = await pool.query(
         `
@@ -13558,7 +13679,7 @@ app.get("/accounts/ledger", async (req, res) => {
       const supplierPayload = await pool.query("SELECT * FROM suppliers WHERE id = $1", [sourceId]);
       if (supplierPayload.rows.length === 0) return res.json({ account: null, ledger: [] });
       const ledgerPayload = await (async () => {
-        const suppliers = await getSupplierSummaryRows({ supplierId: sourceId });
+        const suppliers = await getSupplierSummaryRows({ supplierId: sourceId, branchId: req.auth.branchId });
         const ledgerResult = await pool.query(
           `
           SELECT *
@@ -13986,6 +14107,7 @@ app.get("/suppliers", async (req, res) => {
     const rows = await getSupplierSummaryRows({
       active,
       search: cleanText(req.query.search),
+      branchId: req.auth.branchId,
     });
     return res.json(rows);
   } catch (error) {
@@ -14050,7 +14172,7 @@ app.get("/suppliers/:id", async (req, res) => {
   try {
     const supplierId = parsePositiveInteger(req.params.id);
     if (!supplierId) return res.status(400).json({ message: "Invalid supplier" });
-    const rows = await getSupplierSummaryRows({ supplierId });
+    const rows = await getSupplierSummaryRows({ supplierId, branchId: req.auth.branchId });
     return rows[0] ? res.json(rows[0]) : res.status(404).json({ message: "Supplier not found" });
   } catch (error) {
     console.error(error);
@@ -14159,7 +14281,7 @@ app.get("/supplier-summary", async (req, res) => {
   try {
     const supplierId = req.query.supplier_id ? parsePositiveInteger(req.query.supplier_id) : null;
     if (req.query.supplier_id && !supplierId) return res.status(400).json({ message: "Invalid supplier" });
-    const rows = await getSupplierSummaryRows({ supplierId });
+    const rows = await getSupplierSummaryRows({ supplierId, branchId: req.auth.branchId });
     return res.json(buildSupplierSummaryPayload(rows));
   } catch (error) {
     console.error(error);
@@ -14170,7 +14292,7 @@ app.get("/supplier-summary", async (req, res) => {
 app.get("/customers", async (req, res) => {
   try {
     const active = req.query.active === undefined ? undefined : String(req.query.active) === "true";
-    const rows = await getCustomerSummaryRows({ active, search: cleanText(req.query.search) });
+    const rows = await getCustomerSummaryRows({ active, search: cleanText(req.query.search), branchId: req.auth.branchId });
     return res.json(rows);
   } catch (error) {
     console.error(error);
@@ -14277,7 +14399,7 @@ app.get("/customer-summary", async (req, res) => {
   try {
     const customerId = req.query.customer_id ? parsePositiveInteger(req.query.customer_id) : null;
     if (req.query.customer_id && !customerId) return res.status(400).json({ message: "Invalid customer" });
-    const rows = await getCustomerSummaryRows({ customerId });
+    const rows = await getCustomerSummaryRows({ customerId, branchId: req.auth.branchId });
     return res.json(buildCustomerSummaryPayload(rows));
   } catch (error) {
     console.error(error);
@@ -14470,7 +14592,7 @@ app.get("/customer-ledger", async (req, res) => {
   try {
     const customerId = req.query.customer_id ? parsePositiveInteger(req.query.customer_id) : null;
     if (req.query.customer_id && !customerId) return res.status(400).json({ message: "Invalid customer" });
-    const customers = await getCustomerSummaryRows({ customerId });
+    const customers = await getCustomerSummaryRows({ customerId, branchId: req.auth.branchId });
     if (customerId && customers.length === 0) return res.status(404).json({ message: "Customer not found" });
     if (customers.length === 0) return res.json({ customers: [], ledger: [] });
     const ids = customers.map((customer) => customer.id);
@@ -14598,7 +14720,7 @@ app.get("/dashboard-metrics", async (req, res) => {
     if (!(await getPermissionUser(req.auth.userId, "dashboard", []))) {
       return res.status(403).json({ message: "You do not have permission to view Dashboard." });
     }
-    return res.json(await getDashboardSummary());
+    return res.json(await getDashboardSummary(req.auth.branchId));
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Dashboard Metrics" });
@@ -14610,7 +14732,7 @@ app.get("/dashboard-analytics", async (req, res) => {
     if (!(await getPermissionUser(req.auth.userId, "dashboard", []))) {
       return res.status(403).json({ message: "You do not have permission to view Dashboard." });
     }
-    return res.json(await getDashboardAnalyticsPayload(req.query));
+    return res.json(await getDashboardAnalyticsPayload(req.query, req.auth.branchId));
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Dashboard Analytics" });
@@ -14623,7 +14745,7 @@ app.get("/dashboard-sales-trend", async (req, res) => {
       return res.status(403).json({ message: "You do not have permission to view Dashboard." });
     }
     const { dateFrom, dateTo, days } = parseDashboardRange(req.query);
-    return res.json({ dateFrom, dateTo, days, data: await getDashboardSalesTrend(dateFrom, dateTo) });
+    return res.json({ dateFrom, dateTo, days, data: await getDashboardSalesTrend(dateFrom, dateTo, req.auth.branchId) });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Sales Trend" });
@@ -14636,7 +14758,7 @@ app.get("/dashboard-profit-trend", async (req, res) => {
       return res.status(403).json({ message: "You do not have permission to view Dashboard." });
     }
     const { dateFrom, dateTo, days } = parseDashboardRange(req.query);
-    return res.json({ dateFrom, dateTo, days, data: await getDashboardProfitTrend(dateFrom, dateTo) });
+    return res.json({ dateFrom, dateTo, days, data: await getDashboardProfitTrend(dateFrom, dateTo, req.auth.branchId) });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Profit Trend" });
@@ -14649,7 +14771,7 @@ app.get("/dashboard-expense-trend", async (req, res) => {
       return res.status(403).json({ message: "You do not have permission to view Dashboard." });
     }
     const { dateFrom, dateTo, days } = parseDashboardRange(req.query);
-    return res.json({ dateFrom, dateTo, days, data: await getDashboardExpenseTrend(dateFrom, dateTo) });
+    return res.json({ dateFrom, dateTo, days, data: await getDashboardExpenseTrend(dateFrom, dateTo, req.auth.branchId) });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Expense Trend" });
@@ -14661,7 +14783,7 @@ app.get("/reports/balance-sheet", async (req, res) => {
     const reportRange = getReportDateRange(req.query);
     const dateFrom = req.query.date_from || reportRange.dateFrom;
     const dateTo = req.query.date_to || reportRange.dateTo;
-    const snapshot = await getBalanceSheetSnapshot({ dateTo });
+    const snapshot = await getBalanceSheetSnapshot({ dateTo, branchId: req.auth.branchId });
     return res.json({
       dateFrom,
       dateTo,
@@ -14778,7 +14900,7 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
     const reportRange = getReportDateRange(req.query);
     const dateFrom = req.query.date_from || reportRange.dateFrom;
     const dateTo = req.query.date_to || reportRange.dateTo;
-    const snapshot = await getBalanceSheetSnapshot({ dateTo });
+    const snapshot = await getBalanceSheetSnapshot({ dateTo, branchId: req.auth.branchId });
     const titles = {
       cash_in_hand: "Cash in Hand Detail",
       cash_at_bank: "Cash at Bank / Bank Balance Detail",
@@ -14874,7 +14996,7 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
     }
 
     if (lineKey === "supplier_payables") {
-      const openingRows = await getSupplierSummaryRows({ dateTo: previousDateKey(dateFrom) });
+      const openingRows = await getSupplierSummaryRows({ dateTo: previousDateKey(dateFrom), branchId: req.auth.branchId });
       const openingBalance = roundCurrency(openingRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0));
       const debitDuringRange = roundCurrency(Math.max(0, openingBalance - snapshot.supplierPayable));
       const creditDuringRange = roundCurrency(Math.max(0, snapshot.supplierPayable - openingBalance));
@@ -14906,7 +15028,7 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
     }
 
     if (lineKey === "customer_receivables") {
-      const openingRows = await getCustomerSummaryRows({ dateTo: previousDateKey(dateFrom) });
+      const openingRows = await getCustomerSummaryRows({ dateTo: previousDateKey(dateFrom), branchId: req.auth.branchId });
       const openingBalance = roundCurrency(openingRows.reduce((sum, row) => sum + Number(row.outstanding_balance || 0), 0));
       const debitDuringRange = roundCurrency(Math.max(0, snapshot.customerReceivable - openingBalance));
       const creditDuringRange = roundCurrency(Math.max(0, openingBalance - snapshot.customerReceivable));
@@ -14938,7 +15060,7 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
     }
 
     if (lineKey === "net_profit") {
-      const openingSnapshot = await getBalanceSheetSnapshot({ dateTo: previousDateKey(dateFrom) });
+      const openingSnapshot = await getBalanceSheetSnapshot({ dateTo: previousDateKey(dateFrom), branchId: req.auth.branchId });
       const openingBalance = openingSnapshot.netProfit;
       const debitDuringRange = roundCurrency(Math.max(0, openingBalance - snapshot.netProfit));
       const creditDuringRange = roundCurrency(Math.max(0, snapshot.netProfit - openingBalance));
@@ -14971,7 +15093,7 @@ app.get("/reports/balance-sheet/details/:lineKey", async (req, res) => {
     }
 
     if (lineKey === "owner_equity") {
-      const openingSnapshot = await getBalanceSheetSnapshot({ dateTo: previousDateKey(dateFrom) });
+      const openingSnapshot = await getBalanceSheetSnapshot({ dateTo: previousDateKey(dateFrom), branchId: req.auth.branchId });
       const openingBalance = openingSnapshot.ownerCapital;
       const debitDuringRange = roundCurrency(Math.max(0, openingBalance - snapshot.ownerCapital));
       const creditDuringRange = roundCurrency(Math.max(0, snapshot.ownerCapital - openingBalance));
@@ -15459,8 +15581,8 @@ app.get("/reports/summary", async (req, res) => {
         `,
         [dateFrom, dateTo]
       ),
-      getSupplierSummaryRows(),
-      getCustomerSummaryRows(),
+      getSupplierSummaryRows({ branchId: req.auth.branchId }),
+      getCustomerSummaryRows({ branchId: req.auth.branchId }),
       pool.query(
         `
         SELECT
@@ -16239,7 +16361,7 @@ app.get("/reports/summary", async (req, res) => {
         [dateFrom, dateTo]
       ),
     ].map(resolveReportTask));
-    const balanceSheetSnapshot = await getBalanceSheetSnapshot({ dateTo }).catch((error) => {
+    const balanceSheetSnapshot = await getBalanceSheetSnapshot({ dateTo, branchId: req.auth.branchId }).catch((error) => {
       console.warn(`Report balance sheet returned zero defaults: ${error.code || error.message}`);
       return EMPTY_BALANCE_SHEET;
     });
@@ -16756,7 +16878,7 @@ app.get("/supplier-ledger", async (req, res) => {
     const supplierId = req.query.supplier_id ? parsePositiveInteger(req.query.supplier_id) : null;
     if (req.query.supplier_id && !supplierId) return res.status(400).json({ message: "Invalid supplier" });
 
-    const suppliers = await getSupplierSummaryRows({ supplierId });
+    const suppliers = await getSupplierSummaryRows({ supplierId, branchId: req.auth.branchId });
     if (supplierId && suppliers.length === 0) return res.status(404).json({ message: "Supplier not found" });
     if (suppliers.length === 0) return res.json({ suppliers: [], ledger: [] });
 

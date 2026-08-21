@@ -42,21 +42,29 @@ const { TENANT_TABLE_PATTERN, SCOPE_PREDICATE_PATTERN, collectTenancyCoverage } 
  *   GET /sales, /purchases, /expenses, /waste-entries, /sale-returns, /contra-entries
  * Second batch, same day:
  *   GET /inventory, /stock, /stock-inventory, /supplier-payments, /accounts/payments
- * Each now filters on `branch_id` from the verified session. 37 -> 26.
+ * Third batch, same day — account balances, the balance sheet and the dashboards:
+ *   GET /suppliers, /suppliers/:id, /supplier-summary, /supplier-ledger, /customers,
+ *   /customer-summary, /customer-ledger, /reports/balance-sheet,
+ *   /reports/balance-sheet/details/:lineKey, /api/owner/dashboard-foundation
+ * Each now filters on `branch_id` from the verified session. 37 -> 26 -> 16.
+ */
+/*
+ * Two entries below cannot be removed by any amount of work in Phase 1, and saying so here stops
+ * the next person burning an afternoon on them. `GET /accounts` and `GET /accounts/outstanding`
+ * scope both of their money halves already; what keeps them on the list is the third statement,
+ * `SELECT * FROM accounts`, and the `accounts` table has no `branch_id` — it is company-wide master
+ * data, like `customers` and `suppliers`. They become measurable when Phase 2 backfills
+ * `company_id` (see docs/tenancy-backfill-plan.md). They are left on the list rather than
+ * reclassified, because moving a table out of TENANT_TABLES to make the number fall would be
+ * scoring the exam.
  */
 const KNOWN_UNSCOPED_READS = [
   "GET /accounts",
   "GET /accounts/outstanding",
-  "GET /api/owner/dashboard-foundation",
-  "GET /customer-ledger",
-  "GET /customer-summary",
-  "GET /customers",
   "GET /lot-discounts",
   "GET /pending-bills/customer",
   "GET /products",
   "GET /products/:id/lots",
-  "GET /reports/balance-sheet",
-  "GET /reports/balance-sheet/details/:lineKey",
   "GET /reports/cash-book",
   "GET /reports/day-book",
   "GET /reports/summary",
@@ -67,10 +75,6 @@ const KNOWN_UNSCOPED_READS = [
   "GET /sales-history/lots",
   "GET /sales-report/changes",
   "GET /stock-adjustments",
-  "GET /supplier-ledger",
-  "GET /supplier-summary",
-  "GET /suppliers",
-  "GET /suppliers/:id",
 ];
 
 let coverage;
