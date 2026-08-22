@@ -1,0 +1,66 @@
+/* The app's typefaces, shipped with it.
+ *
+ * index.css had asked for Inter since the beginning, but no font file, @font-face
+ * or import existed anywhere in the repo - so on any Windows machine without Inter
+ * installed, which is nearly all of them, the app was quietly rendering in Segoe UI.
+ * These files fix that and make the app look the same on every device.
+ *
+ * They are checked in rather than pulled from a package at build time, because this
+ * is an offline desktop app: the build has to be reproducible without a network and
+ * without a package's internal file layout shifting underneath it.
+ *
+ * Both faces are SIL Open Font License 1.1; the licences sit next to the files in
+ * src/assets/fonts/, which is what that licence requires when redistributing.
+ *
+ * To update: take the matching woff2 out of @fontsource-variable/inter or
+ * @fontsource-variable/bodoni-moda and replace the file. Keep the unicode-range
+ * lines as they are - they are copied from those packages and they are what makes
+ * the subsetting correct.
+ */
+
+/* latin-ext is not optional here. The rupee sign is U+20B9, which falls in
+ * U+20AD-20C0 - the latin-ext range, not the latin one. Ship latin alone and every
+ * price in the app renders its currency symbol in a different, system typeface. */
+
+@font-face {
+  font-family: "Inter Variable";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: block;
+  src: url("./assets/fonts/inter-latin.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "Inter Variable";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: block;
+  src: url("./assets/fonts/inter-latin-ext.woff2") format("woff2-variations");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+/* Bodoni Moda is the display face, and it is chosen rather than defaulted to: the
+ * FROOZ wordmark is a high-contrast didone, and this is that. It carries the opsz
+ * (optical size) axis, which thickens its hairlines as the type gets smaller. That
+ * axis is the whole reason it is usable here - pinned to a display optical size, its
+ * strokes visibly break up on the dark green ground at interface sizes. Every rule
+ * that uses it must therefore also set font-optical-sizing: auto. */
+
+@font-face {
+  font-family: "Bodoni Moda Variable";
+  font-style: normal;
+  font-weight: 400 900;
+  font-display: block;
+  src: url("./assets/fonts/bodoni-moda-latin.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+  font-family: "Bodoni Moda Variable";
+  font-style: normal;
+  font-weight: 400 900;
+  font-display: block;
+  src: url("./assets/fonts/bodoni-moda-latin-ext.woff2") format("woff2-variations");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}

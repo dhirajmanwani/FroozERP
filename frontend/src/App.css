@@ -144,6 +144,72 @@
   padding: 2px 4px 25px;
 }
 
+/* --- Display type ----------------------------------------------------------
+ *
+ * Bodoni Moda is the FROOZ wordmark's own kind of letter: a high-contrast didone.
+ * It carries the top two steps of the existing type scale and nothing else.
+ *
+ * The cut-off is a decision, not an oversight. Below roughly 20px this face's
+ * hairlines start breaking up on the dark green ground, so h3 and everything
+ * smaller stays on Inter. Serif for the two display sizes, sans for the interface,
+ * is the hierarchy - not an inconsistency to be tidied away later.
+ *
+ * font-optical-sizing: auto is mandatory wherever this face appears. It carries an
+ * optical-size axis that thickens its strokes as the type gets smaller; pinned to a
+ * display optical size, headings visibly lose strokes at interface sizes.
+ */
+
+:where(.erp-shell, .login-shell, .modal-backdrop) :where(h1, h2),
+.welcome-banner h2,
+.card-heading h2,
+.empty-state h2,
+.login-copy h1,
+.kpi-card strong {
+  font-family: "Bodoni Moda Variable", Georgia, "Times New Roman", serif;
+  font-optical-sizing: auto;
+  font-weight: 600;
+  letter-spacing: 0.004em;
+}
+
+/* A headline number is read as a quantity at a glance, not as prose, and Bodoni's
+   hairlines thin out at this size on a standard-density screen. Figures carry more
+   weight than the headings do; the headings are words and stay lighter.
+
+   A money value must never break across lines. "Rs 48,250." above "00" is not a
+   smaller version of the number, it is a different number to anyone scanning, and
+   the tile exists to be scanned. */
+.kpi-card strong {
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* An invoice is a document that gets printed and handed to a customer, so what the
+   preview shows has to be what comes out of the printer. Printing already switches
+   to a plain stack, because a 58mm thermal receipt drops a high-contrast serif's
+   hairlines entirely. So the display serif stops at the edge of the paper, on screen
+   as well as on paper, and the preview stays honest. */
+.invoice-paper :where(h1, h2, h3) {
+  font-family: inherit;
+  font-weight: 700;
+}
+
+/* --- Figures ----------------------------------------------------------------
+ *
+ * This is an ERP: a column of rupees is the most-read thing in it. Proportional
+ * digits are different widths, so the decimal points in a column do not line up and
+ * the eye cannot compare two rows without reading both. Tabular figures fix that,
+ * and cost nothing anywhere else.
+ */
+
+table,
+.kpi-card strong,
+.summary-metric,
+.global-clock,
+.invoice-paper,
+input[type="number"] {
+  font-variant-numeric: tabular-nums;
+}
+
 .brand-lockup {
   display: inline-flex;
   align-items: center;
@@ -768,9 +834,12 @@
   transform: translateY(-1px);
 }
 
+/* 180px was tight enough that four cards fitted on a 1366-wide laptop only by
+   squeezing the value, which then broke across two lines. Cards drop to three or two
+   across instead of shrinking below what a rupee value needs. */
 .kpi-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
   gap: 14px;
   margin: 17px 0;
 }
@@ -2244,11 +2313,20 @@ tbody tr:last-child td {
   transition: 160ms ease;
 }
 
+/* Gold means "this is the action", and .primary-button is already saying it in
+   solid gold. A row control - Print, View, Edit - sitting next to one in gold text
+   on a gold tint makes two things claim the same job, and the eye cannot tell which
+   is primary. These are neutral so the gold one stays the answer. */
 .table-action {
   padding: 6px 9px;
-  border: 1px solid rgba(217, 172, 82, 0.28);
-  color: #d9ac52;
-  background: rgba(217, 172, 82, 0.08);
+  border: 1px solid rgba(143, 171, 156, 0.2);
+  color: #c8d8ce;
+  background: #0f3222;
+}
+
+.table-action:hover {
+  border-color: rgba(143, 171, 156, 0.34);
+  color: #f6f3ea;
 }
 
 .pos-layout {
