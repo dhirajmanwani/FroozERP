@@ -1477,8 +1477,12 @@ const defaultDeviceControlSettings = {
 function BrandLogo({ compact = false, invoice = false, splash = false }) {
   const assetBase = import.meta.env.BASE_URL || "/";
   const assetPath = (path) => `${assetBase}${path}`.replace(/([^:]\/)\/+/g, "$1");
-  const imageSrc = compact ? assetPath("branding/frooz-symbol-192.png") : invoice ? assetPath("branding/frooz-logo-invoice-320.png") : assetPath("branding/frooz-logo-full-512.png");
-  const alt = compact ? "FroozERP" : "Feel the Freakin' Frooz official logo";
+  // The mark is a square crop of the official lockup, which is what fits the badge.
+  // Screen chrome is dark, so it takes the reversed (cream) cut; an invoice prints on
+  // white paper, so it takes the green cut. Both are generated from one vector source
+  // by tools/build-brand-assets.mjs - do not point this at a hand-made file.
+  const imageSrc = assetPath(invoice ? "branding/frooz-mark.svg" : "branding/frooz-mark-reversed.svg");
+  const alt = compact ? "Frooz" : "Feel the Freakin' Frooz";
   return (
     <div className={`${invoice ? "brand-lockup brand-lockup-invoice" : "brand-lockup"} ${compact ? "brand-lockup-compact" : ""} ${splash ? "brand-lockup-splash" : ""}`}>
       <span className="brand-monogram">
