@@ -13421,6 +13421,38 @@ function OrdersModule({ busy = false, onAdvance, onReload, onTakeOrder, products
 
               {order.warning && <div className="cart-empty" role="alert">{order.warning}</div>}
 
+              {/* Money before goods. Shown on the card and enforced in validateOrderAction, so the
+                  answer cannot be skipped by a path that did not draw this control. */}
+              {order.paymentWarning && (
+                <div className="cart-empty" role="alert">{order.paymentWarning}</div>
+              )}
+              <div className="purchase-summary-grid supplier-payment-preview">
+                <Field label="Has this been paid?">
+                  <select
+                    disabled={busy}
+                    value={order.paymentState || ""}
+                    onChange={(event) => onAdvance(order, order.status, {
+                      payment_state: event.target.value,
+                      amount_paid: event.target.value === "PAID" ? order.value : 0,
+                    })}
+                  >
+                    <option value="">Not decided yet</option>
+                    <option value="PAID">Paid</option>
+                    <option value="ON_DELIVERY">Pay on delivery</option>
+                    <option value="UNPAID">Not paid</option>
+                  </select>
+                </Field>
+                {order.paymentState === "PAID" && (
+                  <Field label="Payment reference">
+                    <input
+                      defaultValue={order.paymentReference}
+                      placeholder="UPI ref, cash to..., bank note"
+                      onBlur={(event) => onAdvance(order, order.status, { payment_reference: event.target.value })}
+                    />
+                  </Field>
+                )}
+              </div>
+
               <DataTable headers={["Item", "Quantity", "Rate agreed", "Amount"]}>
                 {order.items.map((line) => (
                   <tr key={line.id || `${order.id}-${line.line_index}`}>

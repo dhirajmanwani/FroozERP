@@ -16,6 +16,7 @@ import {
   RESERVATION_STATE,
   canTransition,
   nextStatuses,
+  paymentBlocksSending,
   reservationState,
 } from "./orderLifecycle.js";
 
@@ -76,6 +77,11 @@ export const presentOrder = (order, nowMs = Date.now()) => {
     reservation,
     items: Array.isArray(order?.items) ? order.items : [],
     value: orderValue(order),
+    paymentState: order?.payment_state || null,
+    amountPaid: Number(order?.amount_paid) || 0,
+    paymentReference: order?.payment_reference || "",
+    // Empty when the money question is settled. Drives whether Send is offered at all.
+    paymentWarning: paymentBlocksSending(order),
     carrier: order?.carrier || "",
     carrierReference: order?.carrier_reference || "",
     trackingUrl: order?.tracking_url || "",
@@ -84,10 +90,13 @@ export const presentOrder = (order, nowMs = Date.now()) => {
     warning: lapsed
       ? "The stock held for this order went back on the shelf after six hours. Check it is still in the shop before packing."
       : "",
-    actions: nextStatuses(status).map((next) => ({
-      to: next,
-      ...ACTION_LABELS[next],
-    })).filter((action) => Boolean(action.label)),
+    actions: nextStatuses(status)
+      .map((next) => ({ to: next, ...ACTION_LABELS[next] }))
+      .filter((action) => Boolean(action.label))
+      // Send disappears until the money question is answered rather than appearing and refusing.
+      // Every action this board offers is one the lifecycle accepts; a button that argues back is
+      // how an operator learns to stop reading the messages.
+      .filter((action) => !(action.to === ORDER_STATUS.SENT && paymentBlocksSending(order))),
   };
 };
 
@@ -145,8 +154,14 @@ export const validateOrderAction = ({ order, to, carrier = "", reason = "" } = {
   if (!canTransition(from, to)) {
     return { ok: false, message: `This order cannot go from ${from} to ${to}.` };
   }
-  if (to === ORDER_STATUS.SENT && !String(carrier || "").trim()) {
-    return { ok: false, message: "Enter who is carrying this order before marking it sent." };
+  if (to === ORDER_STATUS.SENT) {
+    // Money before goods. Asked here as well as shown on the card, so the answer cannot be skipped
+    // by a caller that did not draw the card.
+    const unpaid = paymentBlocksSending(order);
+    if (unpaid) return { ok: false, message: unpaid };
+    if (!String(carrier || "").trim()) {
+      return { ok: false, message: "Enter who is carrying this order before marking it sent." };
+    }
   }
   if (to === ORDER_STATUS.CANCELLED && !String(reason || "").trim()) {
     return { ok: false, message: "Give a reason for cancelling, so the customer can be told why." };

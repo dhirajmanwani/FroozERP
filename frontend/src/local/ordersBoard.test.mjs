@@ -12,6 +12,9 @@ const order = (overrides = {}) => ({
   order_no: "ORD-1",
   customer_name: "Ram",
   status: ORDER_STATUS.RECEIVED,
+  // Settled by default so tests about other things are not all about payment. The money gate has
+  // its own tests below.
+  payment_state: "ON_DELIVERY",
   reserved_at: agoMs(60 * 1000),
   items: [{ product_id: "004", product_name: "Apple", quantity: 10, agreed_rate: 80 }],
   ...overrides,
@@ -32,10 +35,14 @@ test("every offered action is one the lifecycle will accept", () => {
   // The rule this module exists for. A button that gets refused teaches an operator that the
   // app's buttons are suggestions.
   for (const status of Object.values(ORDER_STATUS)) {
-    const presented = presentOrder(order({ status }), NOW);
+    // The same order object on both sides. Presenting a settled order and then validating a bare
+    // `{ status }` compared two different orders and made the check meaningless the moment any
+    // rule started reading a second field.
+    const subject = order({ status });
+    const presented = presentOrder(subject, NOW);
     for (const action of presented.actions) {
       const check = validateOrderAction({
-        order: { status },
+        order: subject,
         to: action.to,
         carrier: "Rapido",
         reason: "customer changed their mind",
@@ -70,6 +77,50 @@ test("sending requires a carrier", () => {
   assert.match(refused.message, /who is carrying/i);
   const allowed = validateOrderAction({ order: order({ status: ORDER_STATUS.PACKED }), to: ORDER_STATUS.SENT, carrier: "Rapido" });
   assert.equal(allowed.ok, true);
+});
+
+test("the money question is asked before the carrier question", () => {
+  // Both are required, and the order matters: telling someone to type a carrier name and only
+  // then that the order is unpaid wastes the step and buries the important half.
+  const undecided = validateOrderAction({
+    order: order({ status: ORDER_STATUS.PACKED, payment_state: null }),
+    to: ORDER_STATUS.SENT,
+  });
+  assert.equal(undecided.ok, false);
+  assert.match(undecided.message, /has been paid/i);
+});
+
+test("an order explicitly marked unpaid cannot be sent", () => {
+  const refused = validateOrderAction({
+    order: order({ status: ORDER_STATUS.PACKED, payment_state: "UNPAID" }),
+    to: ORDER_STATUS.SENT,
+    carrier: "Rapido",
+  });
+  assert.equal(refused.ok, false);
+  assert.match(refused.message, /marked unpaid/i);
+});
+
+test("pay-on-delivery is a decision, not an unpaid order", () => {
+  // Calling it unpaid would put every cash-on-delivery order on a list of problems and make the
+  // list useless.
+  const allowed = validateOrderAction({
+    order: order({ status: ORDER_STATUS.PACKED, payment_state: "ON_DELIVERY" }),
+    to: ORDER_STATUS.SENT,
+    carrier: "Rapido",
+  });
+  assert.equal(allowed.ok, true);
+});
+
+test("Send is not offered at all while the money question is open", () => {
+  // Not offered rather than offered-and-refused. A button that argues back teaches an operator to
+  // stop reading the messages.
+  const open = presentOrder(order({ status: ORDER_STATUS.PACKED, payment_state: null }), NOW);
+  assert.ok(!open.actions.some((action) => action.to === ORDER_STATUS.SENT));
+  assert.match(open.paymentWarning, /has been paid/i);
+
+  const settled = presentOrder(order({ status: ORDER_STATUS.PACKED, payment_state: "PAID" }), NOW);
+  assert.ok(settled.actions.some((action) => action.to === ORDER_STATUS.SENT));
+  assert.equal(settled.paymentWarning, "");
 });
 
 test("cancelling requires a reason", () => {

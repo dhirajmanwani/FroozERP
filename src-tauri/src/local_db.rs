@@ -8,7 +8,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::entitlement::{self, EntitlementState};
 
-const CURRENT_SCHEMA_VERSION: &str = "020_customer_orders";
+const CURRENT_SCHEMA_VERSION: &str = "021_customer_order_payment";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -29,6 +29,7 @@ const MIGRATION_017: &str = include_str!("../migrations/sqlite/017_offline_entit
 const MIGRATION_018: &str = include_str!("../migrations/sqlite/018_bootstrap_credential_consumption.sql");
 const MIGRATION_019: &str = include_str!("../migrations/sqlite/019_provisional_lot_cost_status.sql");
 const MIGRATION_020: &str = include_str!("../migrations/sqlite/020_customer_orders.sql");
+const MIGRATION_021: &str = include_str!("../migrations/sqlite/021_customer_order_payment.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -1706,7 +1707,8 @@ fn read_customer_order(conn: &Connection, order_id: &str) -> Result<serde_json::
             "SELECT id, order_no, source, customer_id, customer_name, customer_mobile,
                     delivery_address, status, reserved_at, packed_at, sent_at, delivered_at,
                     cancelled_at, cancellation_reason, carrier, carrier_reference, tracking_url,
-                    carrier_contact, sale_id, invoice_no, notes, branch_id, created_by, created_at
+                    carrier_contact, sale_id, invoice_no, notes, branch_id, created_by, created_at,
+                    payment_state, amount_paid, payment_reference, payment_marked_at
              FROM local_customer_orders WHERE id = ?1",
             rusqlite::params![order_id],
             |row| {
@@ -1735,10 +1737,21 @@ fn read_customer_order(conn: &Connection, order_id: &str) -> Result<serde_json::
                     "branch_id": row.get::<_, Option<i64>>(21)?,
                     "created_by": row.get::<_, Option<String>>(22)?,
                     "created_at": row.get::<_, String>(23)?,
+                    "payment_state": row.get::<_, Option<String>>(24)?,
+                    "amount_paid": row.get::<_, Option<f64>>(25)?,
+                    "payment_reference": row.get::<_, Option<String>>(26)?,
+                    "payment_marked_at": row.get::<_, Option<String>>(27)?,
                 }))
             },
         )
-        .map_err(|_| "That order could not be found.".to_string())?;
+        // "Not found" only when there genuinely is no such row. Every other failure — a column
+        // added to the SELECT and not to the closure, a schema older than this build — used to be
+        // reported as a missing order, which sends the reader looking for a deleted record instead
+        // of at the query. Same rule as errors never rendering as zero.
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => "That order could not be found.".to_string(),
+            other => format!("That order could not be read: {other}"),
+        })?;
 
     let mut statement = conn
         .prepare(
@@ -2436,6 +2449,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "018_bootstrap_credential_consumption", MIGRATION_018)?;
     apply_migration(&mut conn, "019_provisional_lot_cost_status", MIGRATION_019)?;
     apply_migration(&mut conn, "020_customer_orders", MIGRATION_020)?;
+    apply_migration(&mut conn, "021_customer_order_payment", MIGRATION_021)?;
     Ok(())
 }
 
@@ -5344,7 +5358,7 @@ mod tests {
     /// three at once with nothing but `left: 18, right: 17` to explain why, and the failures were
     /// mistaken for the environment for long enough to reach a merge check. One named constant is
     /// the whole fix: **bump this when you add a migration**, and the number says what it counts.
-    const EXPECTED_APPLIED_MIGRATIONS: i64 = 19;
+    const EXPECTED_APPLIED_MIGRATIONS: i64 = 20;
 
     #[test]
     fn snapshot_preflight_rejects_malformed_database_without_replacing_it() {

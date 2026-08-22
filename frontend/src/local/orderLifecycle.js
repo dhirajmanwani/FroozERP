@@ -59,6 +59,43 @@ const TRANSITIONS = Object.freeze({
   [ORDER_STATUS.RETURNED]: [],
 });
 
+/**
+ * Whether the money is settled, asked before a parcel leaves.
+ *
+ * Three answers, not two. "Paid" and "unpaid" would force a lie for the ordinary case where the
+ * customer pays the carrier on the doorstep: that is neither, and calling it unpaid would put every
+ * cash-on-delivery order on a list of problems and make the list useless. `ON_DELIVERY` is a
+ * decision somebody took; `UNPAID` means nobody has decided yet, and that is the state that stops
+ * a parcel.
+ *
+ * `null` — an order taken before this question existed — reads the same as UNPAID for stopping a
+ * parcel, but stays distinguishable in a report, because "never asked" is not "asked and unpaid".
+ */
+export const PAYMENT_STATE = Object.freeze({
+  UNPAID: "UNPAID",
+  PAID: "PAID",
+  ON_DELIVERY: "ON_DELIVERY",
+});
+
+/** Payment answers that let a parcel go out. */
+const SETTLED_ENOUGH_TO_SEND = [PAYMENT_STATE.PAID, PAYMENT_STATE.ON_DELIVERY];
+
+/**
+ * May this order be sent, as far as money is concerned?
+ *
+ * The gate is on SENT and not on PACKED: packing is reversible and costs nothing, while sending
+ * puts goods in a stranger's hands and raises the bill. Refusing earlier would only make packing
+ * annoying without protecting anything.
+ */
+export const paymentBlocksSending = (order) => {
+  const state = order?.payment_state || null;
+  if (SETTLED_ENOUGH_TO_SEND.includes(state)) return "";
+  if (state === PAYMENT_STATE.UNPAID) {
+    return "This order is marked unpaid. Take the payment, or mark it as pay-on-delivery, before the parcel goes out.";
+  }
+  return "Say whether this order has been paid before sending it. Choose paid, or pay-on-delivery.";
+};
+
 export const RESERVATION_STATE = Object.freeze({
   ACTIVE: "ACTIVE",
   LAPSED: "LAPSED",
