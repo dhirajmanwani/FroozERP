@@ -1,0 +1,121 @@
+{
+  "_comment": "Sample data. Nothing here is real stock. It exists so the page can be built and reviewed before the site is wired to the shop's own catalogue, and it deliberately includes every awkward case: a low lot, a sold-out lot, and two products whose stock could not be read at all.",
+  "shop": {
+    "name": "Frooz",
+    "branch": "Jodhpur - Main",
+    "phone": "+91 90000 00000",
+    "address": "Sardarpura, Jodhpur, Rajasthan",
+    "openText": "Open 7am to 9pm, every day"
+  },
+  "ratesSetOn": "2026-08-22",
+  "lastOrder": {
+    "reference": "FRZ-2026-0412",
+    "placedOn": "2026-08-19",
+    "lines": [
+      { "productId": "004", "name": "Alphonso Mango", "quantityKg": 2 },
+      { "productId": "011", "name": "Nagpur Orange", "quantityKg": 1.5 },
+      { "productId": "007", "name": "Green Grapes", "quantityKg": 0.5 }
+    ]
+  },
+  "products": [
+    {
+      "id": "004",
+      "name": "Alphonso Mango",
+      "variety": "Ratnagiri, second flush",
+      "initial": "A",
+      "tint": "#c8862f",
+      "ratePerKg": 240,
+      "availableKg": 128.5,
+      "arrivedAt": "2026-08-22T04:10:00+05:30"
+    },
+    {
+      "id": "011",
+      "name": "Nagpur Orange",
+      "variety": "Loose, medium grade",
+      "initial": "N",
+      "tint": "#c2691f",
+      "ratePerKg": 96,
+      "availableKg": 4.25,
+      "arrivedAt": "2026-08-21T05:40:00+05:30"
+    },
+    {
+      "id": "007",
+      "name": "Green Grapes",
+      "variety": "Thompson seedless",
+      "initial": "G",
+      "tint": "#7c9a3c",
+      "ratePerKg": 130,
+      "availableKg": 22,
+      "arrivedAt": "2026-08-22T05:05:00+05:30"
+    },
+    {
+      "id": "015",
+      "name": "Kashmiri Apple",
+      "variety": "Delicious, tray packed",
+      "initial": "K",
+      "tint": "#a83a34",
+      "ratePerKg": 185,
+      "availableKg": 64.25,
+      "arrivedAt": "2026-08-20T06:00:00+05:30"
+    },
+    {
+      "id": "022",
+      "name": "Pomegranate",
+      "variety": "Bhagwa, export grade",
+      "initial": "P",
+      "tint": "#96233a",
+      "ratePerKg": 210,
+      "availableKg": 0,
+      "arrivedAt": "2026-08-18T05:20:00+05:30"
+    },
+    {
+      "id": "031",
+      "name": "Banganapalli Mango",
+      "variety": "Andhra, ripened",
+      "initial": "B",
+      "tint": "#d0a52c",
+      "ratePerKg": 155,
+      "availableKg": null,
+      "arrivedAt": "2026-08-22T04:25:00+05:30"
+    },
+    {
+      "id": "044",
+      "name": "Sweet Lime",
+      "variety": "Mosambi, juice grade",
+      "initial": "S",
+      "tint": "#8a9c2e",
+      "ratePerKg": 72,
+      "arrivedAt": "2026-08-21T05:55:00+05:30"
+    },
+    {
+      "id": "052",
+      "name": "Papaya",
+      "variety": "Red Lady, half ripe",
+      "initial": "P",
+      "tint": "#c26a2c",
+      "ratePerKg": 58,
+      "availableKg": 37,
+      "arrivedAt": "2026-08-22T04:50:00+05:30"
+    },
+    {
+      "id": "060",
+      "name": "Watermelon",
+      "variety": "Kiran, whole",
+      "initial": "W",
+      "tint": "#2f7a44",
+      "ratePerKg": 32,
+      "availableKg": 3.5,
+      "arrivedAt": "2026-08-21T06:15:00+05:30"
+    },
+    {
+      "id": "073",
+      "name": "Guava",
+      "variety": "Allahabad, firm",
+      "initial": "G",
+      "tint": "#6f8f4a",
+      "ratePerKg": 88,
+      "availableKg": 19.75,
+      "arrivedAt": "2026-08-20T05:30:00+05:30"
+    }
+  ]
+}

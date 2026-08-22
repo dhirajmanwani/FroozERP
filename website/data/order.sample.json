@@ -1,0 +1,19 @@
+{
+  "_comment": "Sample data for the tracking page. The delivery reference is pasted from the carrier's own app rather than fetched from an API - that is deliberate and is documented in docs/website-design-brief.md section 4.",
+  "reference": "FRZ-2026-0418",
+  "placedAt": "2026-08-22T09:12:00+05:30",
+  "status": "sent",
+  "stages": [
+    { "id": "received", "name": "Order received", "at": "2026-08-22T09:12:00+05:30" },
+    { "id": "packed", "name": "Packed at the shop", "at": "2026-08-22T10:04:00+05:30" },
+    { "id": "sent", "name": "Out for delivery", "at": "2026-08-22T10:41:00+05:30" },
+    { "id": "delivered", "name": "Delivered", "at": null }
+  ],
+  "carrier": { "name": "Rapido", "rider": "Mahesh", "trackingUrl": "https://example.invalid/track/placeholder" },
+  "payment": { "state": "paid", "method": "UPI" },
+  "lines": [
+    { "productId": "004", "name": "Alphonso Mango", "quantityKg": 2, "ratePerKg": 240 },
+    { "productId": "015", "name": "Kashmiri Apple", "quantityKg": 1.5, "ratePerKg": 185 },
+    { "productId": "007", "name": "Green Grapes", "quantityKg": 0.5, "ratePerKg": 130 }
+  ]
+}

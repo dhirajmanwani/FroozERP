@@ -18,14 +18,26 @@ import {
 } from "./brandPalette.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const frontendRoot = join(here, "..", "..");
+const repoRoot = join(here, "..", "..", "..");
 
 // index.html and public/favicon.svg are guarded too: the brand leaking into a
 // splash screen or a browser tab is exactly as visible as it leaking into the app.
-const GUARDED_FILES = ["src/App.css", "src/index.css", "index.html", "public/favicon.svg"];
+//
+// The website is guarded from here rather than from its own suite, so there is one
+// list of allowed colours and one place that enforces it. A customer who sees the
+// site and an invoice on the same day should not be able to tell they were built by
+// different hands.
+const GUARDED_FILES = [
+  "frontend/src/App.css",
+  "frontend/src/index.css",
+  "frontend/index.html",
+  "frontend/public/favicon.svg",
+  "website/src/tokens.css",
+  "website/src/site.css",
+];
 
 function read(relative) {
-  return readFileSync(join(frontendRoot, relative), "utf8");
+  return readFileSync(join(repoRoot, relative), "utf8");
 }
 
 /** Every `#rrggbb` / `#rgb` literal in a stylesheet, with the line it sits on. */
@@ -123,7 +135,7 @@ for (const relative of GUARDED_FILES) {
 test("the app stylesheet is actually being checked", () => {
   // A guard that silently reads an empty file passes forever. Prove there is
   // something there to guard.
-  const appCss = read("src/App.css");
+  const appCss = read("frontend/src/App.css");
   assert.ok(appCss.length > 50000, "App.css looks unexpectedly small - is the path right?");
   assert.ok(hexLiterals(appCss).length > 200, "expected App.css to be full of colour literals");
 });

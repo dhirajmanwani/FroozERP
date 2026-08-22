@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0a2d1c" />
+    <title>Track your Frooz order</title>
+    <meta name="description" content="Where your Frooz parcel is, what is in it, and who is carrying it." />
+    <link rel="icon" type="image/svg+xml" href="./public/branding/favicon.svg" />
+    <link rel="stylesheet" href="./src/site.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="wrap">
+        <a class="site-logo" href="./index.html" aria-label="Frooz, home">
+          <img src="./public/branding/frooz-wordmark-reversed.svg" alt="Frooz" width="120" height="26" />
+        </a>
+        <a class="header-link" href="./index.html">Order fruit</a>
+      </div>
+    </header>
+
+    <main class="wrap">
+      <section>
+        <div class="eyebrow" id="order-ref">Order</div>
+        <h1 id="order-headline">Finding your order</h1>
+        <p class="muted small" id="order-sub">Checking where this parcel has got to.</p>
+      </section>
+
+      <section id="order-body" hidden>
+        <ol class="stages" id="stages"></ol>
+
+        <div class="panel" style="margin-top: 18px">
+          <h3>Who is bringing it</h3>
+          <dl class="kv" id="carrier-rows"></dl>
+          <p style="margin-top: 14px"><a class="carrier-link" id="carrier-link" href="#" target="_blank" rel="noopener">Follow the rider</a></p>
+          <p class="small muted" style="margin-top: 10px">
+            This link comes from the delivery service's own app, so it shows exactly what
+            the rider sees.
+          </p>
+        </div>
+
+        <div class="panel" style="margin-top: 14px">
+          <h3>What is in it</h3>
+          <dl class="kv" id="order-lines"></dl>
+          <div class="basket-totals">
+            <span class="muted small">Total for <span id="order-weight" class="num"></span></span>
+            <strong id="order-total"></strong>
+          </div>
+          <p class="small muted" style="margin-top: 10px" id="payment-line"></p>
+        </div>
+      </section>
+
+      <div id="order-failure"></div>
+
+      <footer class="site-footer">
+        <span>Something not right? Message the shop and we will sort it out.</span>
+        <span><a href="./index.html">Order more fruit</a></span>
+      </footer>
+    </main>
+
+    <script type="module" src="./src/track.js"></script>
+  </body>
+</html>

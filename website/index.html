@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0a2d1c" />
+    <title>Frooz - fresh fruit, ordered today</title>
+    <meta name="description" content="Order fruit from Frooz in Jodhpur. Today's rates, today's stock, delivered." />
+    <link rel="icon" type="image/svg+xml" href="./public/branding/favicon.svg" />
+    <!-- Text before images: the stylesheet is the only blocking asset, and the
+         typefaces swap in rather than holding the first paint. -->
+    <link rel="stylesheet" href="./src/site.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="wrap">
+        <a class="site-logo" href="./index.html" aria-label="Frooz, home">
+          <img src="./public/branding/frooz-wordmark-reversed.svg" alt="Frooz" width="120" height="26" />
+        </a>
+        <a class="header-link" href="./track.html">Track an order</a>
+      </div>
+    </header>
+
+    <main class="wrap" id="main">
+      <p class="rate-line">
+        <strong id="rate-date">Today's rates</strong>
+        <span>All prices are per kilo and are set fresh each morning.</span>
+      </p>
+
+      <!-- The most valuable thing on the page in repeat-purchase retail, so it sits
+           above the catalogue. Hidden entirely when there is no previous order -
+           an empty version of this would be clutter, not information. -->
+      <section id="reorder-section" hidden>
+        <div class="section-head"><h2>Order again</h2></div>
+        <div class="reorder">
+          <div>
+            <div class="eyebrow" id="reorder-when">Last order</div>
+            <p class="reorder-lines" id="reorder-lines"></p>
+          </div>
+          <button class="add-button" id="reorder-button" type="button">Add all to basket</button>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <h2>Good today</h2>
+          <span class="small muted" id="produce-count"></span>
+        </div>
+        <div id="produce-region" aria-live="polite">
+          <div class="state" id="produce-loading">
+            <h3>Loading today's stock</h3>
+            <p>Checking what is on the shelf at Jodhpur - Main right now.</p>
+          </div>
+        </div>
+      </section>
+
+      <footer class="site-footer">
+        <span id="shop-open"></span>
+        <span id="shop-address"></span>
+        <span><a href="./track.html">Track an order</a></span>
+      </footer>
+    </main>
+
+    <div class="basket-bar" id="basket-bar" aria-hidden="true">
+      <div class="basket-bar-inner">
+        <div class="basket-summary">
+          <strong id="basket-total">&#8377;0.00</strong>
+          <span id="basket-count">Basket is empty</span>
+        </div>
+        <button class="basket-open" id="basket-open" type="button">View basket</button>
+      </div>
+    </div>
+
+    <div class="sheet-scrim" id="sheet-scrim"></div>
+    <section class="sheet" id="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title" aria-hidden="true">
+      <div class="sheet-head">
+        <h2 id="sheet-title">Your basket</h2>
+        <button class="sheet-close" id="sheet-close" type="button" aria-label="Close basket">&#215;</button>
+      </div>
+      <div id="sheet-lines"></div>
+      <div class="basket-totals">
+        <span class="muted small">Total for <span id="sheet-weight" class="num">0</span></span>
+        <strong id="sheet-total">&#8377;0.00</strong>
+      </div>
+      <button class="sheet-action" id="sheet-action" type="button">Send this order on WhatsApp</button>
+      <p class="sheet-note">
+        We confirm the weight and the final bill on WhatsApp before anything is packed.
+      </p>
+    </section>
+
+    <script type="module" src="./src/shop.js"></script>
+  </body>
+</html>
