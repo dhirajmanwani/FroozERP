@@ -1,21 +1,15 @@
 {
-  "_comment": "Sample data. Nothing here is real stock. It exists so the page can be built and reviewed before the site is wired to the shop's own catalogue, and it deliberately includes every awkward case: a low lot, a sold-out lot, and two products whose stock could not be read at all.",
+  "_comment": "Sample data, and the file the app's export replaces. Nothing here is real stock. Export from the app (Report Center > Website catalogue) and upload the result over this file.",
+  "formatVersion": 1,
+  "generatedAt": "2026-08-22T05:30:00.000Z",
+  "stockTrustedForHours": 12,
+  "ratesSetOn": "2026-08-22",
   "shop": {
     "name": "Frooz",
     "branch": "Jodhpur - Main",
     "phone": "+91 90000 00000",
     "address": "Sardarpura, Jodhpur, Rajasthan",
     "openText": "Open 7am to 9pm, every day"
-  },
-  "ratesSetOn": "2026-08-22",
-  "lastOrder": {
-    "reference": "FRZ-2026-0412",
-    "placedOn": "2026-08-19",
-    "lines": [
-      { "productId": "004", "name": "Alphonso Mango", "quantityKg": 2 },
-      { "productId": "011", "name": "Nagpur Orange", "quantityKg": 1.5 },
-      { "productId": "007", "name": "Green Grapes", "quantityKg": 0.5 }
-    ]
   },
   "products": [
     {

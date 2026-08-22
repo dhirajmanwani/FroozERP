@@ -27,7 +27,8 @@ import {
   setLineQuantity,
 } from "./basket.js";
 
-const CATALOGUE_URL = "./data/catalogue.sample.json";
+const CATALOGUE_URL = "./data/catalogue.json";
+const LAST_ORDER_KEY = "frooz.lastOrder.v1";
 const STEP_KG = 0.5;
 const DEFAULT_KG = 1;
 
@@ -35,6 +36,9 @@ const el = (id) => document.getElementById(id);
 
 const state = {
   catalogue: null,
+  // False once the file is older than the shop said to trust it for. Every product
+  // then resolves to "we could not check" instead of quoting yesterday's number.
+  stockTrusted: true,
   basket: createBasket(),
   quantities: new Map(), // productId -> kg the stepper is currently showing
 };
@@ -52,6 +56,23 @@ function shopDate(isoDate) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
+/**
+ * Whether this file's stock figures are still worth quoting.
+ *
+ * The catalogue is a snapshot a person uploads, not a live feed. Produce moves during
+ * a trading day, so past the window the shop set, the site stops asserting quantities
+ * and falls back to the state it already has for "we could not check". Rates are
+ * different - set once a day and printed on a board - so they stay shown, with the
+ * date they were set.
+ */
+function stockIsStillTrusted(catalogue, nowMs) {
+  const generatedAt = Date.parse(catalogue?.generatedAt ?? "");
+  if (!Number.isFinite(generatedAt)) return false;
+  const hours = Number(catalogue?.stockTrustedForHours);
+  const window = Number.isFinite(hours) && hours > 0 ? hours : 12;
+  return nowMs - generatedAt < window * 60 * 60 * 1000;
+}
+
 function renderRateLine(catalogue) {
   const date = shopDate(catalogue.ratesSetOn);
   el("rate-date").textContent = date
@@ -64,18 +85,59 @@ function renderRateLine(catalogue) {
 function renderShop(shop) {
   el("shop-open").textContent = shop.openText || "";
   el("shop-address").textContent = `${shop.name} - ${shop.branch}, ${shop.address}`;
+  el("shop-phone").textContent = shop.phone ? `Call or message ${shop.phone}` : "";
+  el("header-contact").addEventListener("click", (event) => {
+    event.preventDefault();
+    openWhatsApp("Hello, I have a question about an order.");
+  });
 }
 
-function renderReorder(catalogue) {
-  const last = catalogue.lastOrder;
-  if (!last || !Array.isArray(last.lines) || last.lines.length === 0) return;
+/**
+ * The last order is remembered by the customer's own browser, not by us.
+ *
+ * There are no accounts on this site and no server behind it, so there is nowhere
+ * else it could honestly live - and it should not live anywhere else: it is one
+ * person's shopping, on one person's phone, and it never leaves it.
+ *
+ * Every read and write is guarded. A private window, cleared site data or a browser
+ * set to block storage all throw here, and none of those should stop someone
+ * ordering fruit.
+ */
+function readLastOrder() {
+  try {
+    const raw = window.localStorage.getItem(LAST_ORDER_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed?.lines) && parsed.lines.length > 0 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
 
-  const placed = shopDate(last.placedOn);
-  el("reorder-when").textContent = placed
-    ? `Your last order, ${placed.toLocaleDateString("en-IN", {
+function rememberLastOrder(rows) {
+  try {
+    window.localStorage.setItem(
+      LAST_ORDER_KEY,
+      JSON.stringify({
+        placedAt: new Date().toISOString(),
+        lines: rows.map((row) => ({ productId: row.productId, name: row.name, quantityKg: row.quantityKg })),
+      }),
+    );
+  } catch {
+    // Remembering is a convenience. Losing it must never block an order.
+  }
+}
+
+function renderReorder() {
+  const last = readLastOrder();
+  if (!last) return;
+
+  const placed = new Date(last.placedAt);
+  el("reorder-when").textContent = Number.isNaN(placed.getTime())
+    ? "Your last order"
+    : `Your last order, ${placed.toLocaleDateString("en-IN", {
         timeZone: SHOP_TIME_ZONE, day: "numeric", month: "long",
-      })}`
-    : "Your last order";
+      })}`;
 
   el("reorder-lines").textContent = last.lines
     .map((line) => `${line.name} ${formatKg(line.quantityKg)}`)
@@ -86,7 +148,7 @@ function renderReorder(catalogue) {
     for (const line of last.lines) {
       const product = findProduct(line.productId);
       if (!product) continue;
-      const availability = resolveAvailability(product);
+      const availability = resolveAvailability(product, { stockKnown: state.stockTrusted });
       if (!canOrder(availability.state)) continue;
       const quantity = clampQuantity(line.quantityKg, availability);
       if (quantity <= 0) continue;
@@ -141,7 +203,7 @@ function actionButton(product, availability, orderable) {
 }
 
 function productCard(product, nowMs) {
-  const availability = resolveAvailability(product);
+  const availability = resolveAvailability(product, { stockKnown: state.stockTrusted });
   const orderable = canOrder(availability.state);
   const fresh = describeFreshness(product, nowMs);
   const quantity = state.quantities.get(product.id) ?? DEFAULT_KG;
@@ -259,7 +321,7 @@ function onProduceClick(event) {
   }
   if (!stepButton && !addButton) return;
 
-  const availability = resolveAvailability(product);
+  const availability = resolveAvailability(product, { stockKnown: state.stockTrusted });
   const current = state.quantities.get(product.id) ?? DEFAULT_KG;
 
   if (stepButton) {
@@ -335,7 +397,9 @@ function wireEvents() {
 
   el("sheet-action").addEventListener("click", () => {
     const totals = basketTotals(state.basket);
-    const lines = basketRows(state.basket)
+    const rows = basketRows(state.basket);
+    rememberLastOrder(rows);
+    const lines = rows
       .map((row) => `${row.name} - ${formatKg(row.quantityKg)} - ${formatRupees(row.total)}`)
       .join("\n");
     openWhatsApp(
@@ -367,10 +431,12 @@ async function boot() {
       throw new Error("The catalogue came back without a product list.");
     }
     state.catalogue = catalogue;
+    state.stockTrusted = stockIsStillTrusted(catalogue, Date.now());
+    el("stale-notice").hidden = state.stockTrusted;
     renderRateLine(catalogue);
     renderShop(catalogue.shop || {});
     renderProduce();
-    renderReorder(catalogue);
+    renderReorder();
     renderBasket();
   } catch (error) {
     renderLoadFailure(error?.message || String(error));

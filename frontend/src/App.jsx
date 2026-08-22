@@ -43,6 +43,7 @@ import { resolveOfflineOpenDecision } from "./local/offlineDataReadiness";
 import { allShopsHasFigures, resolveAllShopsPresentation } from "./local/allShopsSummary";
 import { resolveShopViewPresentation, shopPickerVisible } from "./local/shopView";
 import { ORDER_STATUS } from "./local/orderLifecycle";
+import { STOCK_TRUSTED_FOR_HOURS, buildCatalogue, catalogueFilename, describeExport } from "./local/catalogueExport";
 import { buildOrdersBoard, validateOrderAction } from "./local/ordersBoard";
 import { COUNTER_STOCK, buildReservedIndex, describeCounterStock, reservedForProduct, reservedNote } from "./local/reservedStock";
 import { buildOrderCartSeed, describeOrderBillingProblems } from "./local/orderBilling";
@@ -1495,6 +1496,88 @@ function BrandLogo({ compact = false, invoice = false, splash = false }) {
         </span>
       )}
     </div>
+  );
+}
+
+/**
+ * Writes the file the public website reads.
+ *
+ * The storefront is deliberately static - it has no backend and nothing of this
+ * system is on the internet, which is the only reason it can be live while the
+ * exposure gates are still open. The cost of that is that its prices and stock are a
+ * snapshot somebody uploads, and this is where that snapshot is made.
+ *
+ * All the judgement lives in `local/catalogueExport.js`, where it is tested. This is
+ * a button and a sentence.
+ */
+function WebsiteCatalogueExport({ products, lots, shop }) {
+  const [outcome, setOutcome] = useState(null);
+
+  // Built once per change rather than on every keystroke elsewhere in the screen;
+  // this walks every product and every lot.
+  const prepared = useMemo(() => buildCatalogue({ products, lots, shop }), [products, lots, shop]);
+  const prepare = () => prepared;
+
+  const save = () => {
+    try {
+      const { catalogue, summary } = prepare();
+      const blob = new Blob([`${JSON.stringify(catalogue, null, 2)}\n`], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = catalogueFilename();
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+      setOutcome({ tone: "ok", text: `Saved as ${catalogueFilename()}. ${describeExport(summary)}` });
+    } catch (error) {
+      // Never claim a save that did not happen. Copying still works, so say so.
+      setOutcome({
+        tone: "error",
+        text: `The file could not be saved (${error?.message || String(error)}). Use Copy instead and paste it into the file on your website.`,
+      });
+    }
+  };
+
+  const copy = async () => {
+    const { catalogue, summary } = prepare();
+    const text = `${JSON.stringify(catalogue, null, 2)}\n`;
+    try {
+      await navigator.clipboard.writeText(text);
+      setOutcome({ tone: "ok", text: `Copied. ${describeExport(summary)}` });
+    } catch (error) {
+      setOutcome({
+        tone: "error",
+        text: `Could not copy (${error?.message || String(error)}). Use Save the file instead.`,
+      });
+    }
+  };
+
+  const preview = describeExport(prepared.summary);
+
+  return (
+    <ModuleCard
+      eyebrow="Website"
+      title="Today's list for the website"
+      subtitle="Send today's rates and stock to the public site. The site does not read this system directly, so nothing here is exposed to the internet - you upload the file yourself."
+    >
+      <p className="form-note">{preview}</p>
+      <div className="button-row">
+        <button className="primary-button" onClick={save} type="button">Save the file</button>
+        <button className="secondary-button" onClick={copy} type="button">Copy the text</button>
+      </div>
+      {outcome && (
+        <p className={outcome.tone === "error" ? "form-note cell-note" : "form-note"} role="status">
+          {outcome.text}
+        </p>
+      )}
+      <p className="form-note">
+        Items with no sale rate set for today are left out rather than shown at zero. The site stops
+        quoting stock once this file is more than {STOCK_TRUSTED_FOR_HOURS} hours old, and asks
+        customers to check with you instead.
+      </p>
+    </ModuleCard>
   );
 }
 
@@ -6594,6 +6677,22 @@ function App() {
   const notificationUnread = unreadCount(notifications);
   // The badge wears the WORST unread severity, not the newest — an error must not be masked by a
   // routine message arriving after it.
+  // The public site's header, footer and order button are built from the branch's
+  // own contact details. Nothing here is invented: an unset field is exported empty
+  // and the export says so, rather than the site quietly pointing nowhere.
+  // A plain lookup rather than a hook: this sits after an early return, and a find
+  // over the branch list costs nothing.
+  const websiteShopBranch = (settingsData?.branches || []).find(
+    (row) => String(row?.id ?? "") === String(user?.branch_id ?? ""),
+  );
+  const websiteShopDetails = {
+    name: "Frooz",
+    branch: String(websiteShopBranch?.branch_name ?? user?.branch ?? ""),
+    phone: String(websiteShopBranch?.phone_number ?? ""),
+    address: String(websiteShopBranch?.address ?? websiteShopBranch?.location ?? ""),
+    openText: "",
+  };
+
   const notificationSeverity = highestUnreadSeverity(notifications) || NOTIFICATION_SEVERITY.INFO;
   const activeLabel = navigationItems.find(([view]) => view === activeView)?.[1];
   const canManageRates = ["Owner", "Admin"].includes(user.role);
@@ -7549,15 +7648,25 @@ function App() {
           )}
 
           {activeView === "sale-rates" && canManageRates && (
-            <SaleRateManager
-              history={saleRateHistory}
-              onReload={async () => { await Promise.all([loadProducts(), loadSaleRates()]); }}
-              onRefresh={loadSaleRates}
-              rates={saleRates}
-              desiredMargin={saleDesiredMargin}
-              setDesiredMargin={setSaleDesiredMargin}
-              user={user}
-            />
+            <>
+              <SaleRateManager
+                history={saleRateHistory}
+                onReload={async () => { await Promise.all([loadProducts(), loadSaleRates()]); }}
+                onRefresh={loadSaleRates}
+                rates={saleRates}
+                desiredMargin={saleDesiredMargin}
+                setDesiredMargin={setSaleDesiredMargin}
+                user={user}
+              />
+              {/* Right after the rates are set is when the website's copy of them is
+                  wrong, so the export lives here rather than somewhere it has to be
+                  remembered. */}
+              <WebsiteCatalogueExport
+                products={products}
+                lots={inventory}
+                shop={websiteShopDetails}
+              />
+            </>
           )}
 
           {activeView === "settings" && (

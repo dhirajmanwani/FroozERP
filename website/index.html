@@ -17,7 +17,7 @@
         <a class="site-logo" href="./index.html" aria-label="Frooz, home">
           <img src="./public/branding/frooz-wordmark-reversed.svg" alt="Frooz" width="120" height="26" />
         </a>
-        <a class="header-link" href="./track.html">Track an order</a>
+        <a class="header-link" id="header-contact" href="#" rel="noopener">Message us</a>
       </div>
     </header>
 
@@ -26,6 +26,13 @@
         <strong id="rate-date">Today's rates</strong>
         <span>All prices are per kilo and are set fresh each morning.</span>
       </p>
+
+      <!-- Shown only when the shop's stock snapshot is older than it said to trust.
+           Every item then reads "stock not confirmed", and this says why. -->
+      <div class="state" id="stale-notice" hidden style="margin-top:12px">
+        <h3>We are still confirming today's stock</h3>
+        <p>Prices below are right. Whether each item is on the shelf has not been checked yet this morning, so nothing is shown as available until it has been. Message us and we will confirm anything you need.</p>
+      </div>
 
       <!-- The most valuable thing on the page in repeat-purchase retail, so it sits
            above the catalogue. Hidden entirely when there is no previous order -
@@ -57,7 +64,7 @@
       <footer class="site-footer">
         <span id="shop-open"></span>
         <span id="shop-address"></span>
-        <span><a href="./track.html">Track an order</a></span>
+        <span id="shop-phone"></span>
       </footer>
     </main>
 
