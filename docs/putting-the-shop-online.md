@@ -49,11 +49,27 @@ customers reach the site from a WhatsApp link anyway - almost nobody types a sho
 address by hand. Buy a name when it is going on the shop sign, a board or a bill,
 not before.
 
-When you do: `frooz.in` and `frooz.com` are both already in use by someone else, so
-the name is not free. Things like `froozfruits.in` or `frooz.shop` showed nothing,
-which suggests they are available but does not prove it - a name can be owned and
-sitting unused. Check at a registrar; they will tell you for certain and it takes a
-minute.
+**The name to buy is `freakinfrooz.com`.** It is your own tagline, so the address,
+the shop sign and the app all say the same thing, and nobody else has it. `frooz.in`
+and `frooz.com` are both already taken - a single-word name almost always is.
+
+Checked 2026-08-22: `freakinfrooz.com` has no website and no address record, which
+means it is very probably free. That is not proof. A name can be owned by someone and
+left sitting unused. Type it into any registrar's search box and you will know for
+certain in half a minute.
+
+**You buy `freakinfrooz.com`, not `www.freakinfrooz.com`.** The `www.` part comes with
+it - it is just a label pointing at the same place, and the hosting service sets it up
+for you. One purchase, both addresses work.
+
+**Buy the obvious misspelling too.** "Freakin'" and "Frooz" are both spelled the way
+you say them rather than the way they look, so somebody told the name out loud will
+type `freakingfrooz.com`, with the g. Buy that one as well and have the host point it
+at the same site. It costs very little and takes a minute to set up. `freakinfrooz.in`
+is worth having for the same reason, and reads as local.
+
+This matters less than it sounds, because customers reach the site from a WhatsApp
+link rather than by typing it. It is for the shop sign and for word of mouth.
 
 A `.in` name costs roughly the price of a few kilos of mangoes per year. Buying it is
 yours to do - it needs your card and your identity, and the name should be registered
