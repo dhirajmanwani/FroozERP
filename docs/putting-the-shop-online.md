@@ -42,6 +42,24 @@ from the same place; the site does not change.
 **3. Send the address to a few regular customers first.** Not everyone. Watch what
 they do for a week before you put it on the shop sign.
 
+### About a domain name
+
+**You do not need one to start.** The free address the host gives you works, and
+customers reach the site from a WhatsApp link anyway - almost nobody types a shop's
+address by hand. Buy a name when it is going on the shop sign, a board or a bill,
+not before.
+
+When you do: `frooz.in` and `frooz.com` are both already in use by someone else, so
+the name is not free. Things like `froozfruits.in` or `frooz.shop` showed nothing,
+which suggests they are available but does not prove it - a name can be owned and
+sitting unused. Check at a registrar; they will tell you for certain and it takes a
+minute.
+
+A `.in` name costs roughly the price of a few kilos of mangoes per year. Buying it is
+yours to do - it needs your card and your identity, and the name should be registered
+to you and not to anyone helping you set it up. Once you own it, the hosting service
+has a "add a domain" step and the site itself does not change.
+
 ---
 
 ## Every morning, two minutes

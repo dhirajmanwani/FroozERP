@@ -1,0 +1,37 @@
+# Rules for the hosting service. Netlify and Cloudflare Pages both read this file
+# from the root of whatever folder you upload, so the same file works on either.
+#
+# The important one is the catalogue. Without it, a host will happily serve this
+# morning's upload from yesterday's cache for hours - and because the site refuses to
+# quote stock from a file older than twelve hours, the whole shop would read
+# "stock not confirmed" while the correct file sat on the server unused. That failure
+# looks exactly like a broken site and would be very hard to work out from the shop.
+
+/data/catalogue.json
+  Cache-Control: no-cache
+  X-Content-Type-Options: nosniff
+
+# The logo and the typefaces never change without changing their name, so they can be
+# held for a long time. This is most of the site's weight, and it means a returning
+# customer downloads almost nothing.
+/public/fonts/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/public/branding/*
+  Cache-Control: public, max-age=604800
+
+/*
+  # This site has no login, no cookies and no personal data on the server. These
+  # headers are cheap and rule out whole categories of mischief anyway.
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: geolocation=(), microphone=(), camera=(), payment=()
+  # Scripts may only come from this site: no CDN, no injected third party, nothing
+  # inline. That is the one that matters, and the site is built to live within it.
+  #
+  # Styles allow 'unsafe-inline' deliberately. Each product card carries its own
+  # produce colour as a style attribute, and the alternative - reaching into the page
+  # from JavaScript to set it - buys nothing here. Inline styles cannot execute code;
+  # the script rule above is what stops that.
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'

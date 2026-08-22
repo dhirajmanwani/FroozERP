@@ -75,6 +75,13 @@
 
 * { box-sizing: border-box; }
 
+/* The `hidden` attribute is only `display: none` from the browser's own stylesheet,
+   which any `display` rule of ours outranks. Without this, every element we hide by
+   setting `.hidden = true` stays on screen if it also happens to be a flex or grid
+   box - which is how the "still confirming stock" notice showed permanently, over a
+   list of items that were confidently in stock. */
+[hidden] { display: none !important; }
+
 html { -webkit-text-size-adjust: 100%; }
 
 body {
