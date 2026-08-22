@@ -4595,15 +4595,22 @@ function App() {
         branch_id: user?.branch_id ?? null,
       });
       if (saved === null) {
-        setSyncMessage("Orders need the desktop app — this looks like a browser.");
-        return false;
+        return { ok: false, message: "Orders are stored on this device and need the desktop app. This looks like a browser." };
       }
       await loadOrders();
       setSyncMessage(`Order ${saved.order_no} saved. Stock is set aside.`);
-      return true;
+      return { ok: true, message: "" };
     } catch (error) {
-      setSyncMessage(describeLocalServiceFailure(error, "That order could not be saved"));
-      return false;
+      // The reason travels back to the form. It used to go only to the sync banner while the form
+      // said "that order was not saved" — which names no cause, so the operator has nothing to try
+      // and anyone debugging it has nothing at all. The raw message is included because the useful
+      // part of a SQLite failure is its own words.
+      const reason = describeLocalServiceFailure(error, "That order could not be saved");
+      const raw = String(error?.message || error || "").trim();
+      // Also to the log file. A message on screen is gone the moment the operator navigates away,
+      // and this is the one failure where the exact wording is the whole diagnosis.
+      writeDiagnosticLog("ERROR", "customer-order-save-failed", { message: raw, lines: order?.items?.length ?? 0 });
+      return { ok: false, message: raw && !reason.includes(raw) ? `${reason} (${raw})` : reason };
     } finally {
       setOrderActionBusy(false);
     }
@@ -13254,8 +13261,8 @@ function OrdersModule({ busy = false, onAdvance, onReload, onTakeOrder, products
     // `takeOrder` swallowed the failure into a toast, so a rejected order wiped the customer, the
     // address and every line the operator had just taken down the phone.
     const saved = await onTakeOrder({ ...draft, items: lines });
-    if (!saved) {
-      setDraftError("That order was not saved. Your details are still here — try again.");
+    if (!saved?.ok) {
+      setDraftError(`${saved?.message || "That order was not saved."} Your details are still here.`);
       return;
     }
     setDraft({ customer_name: "", customer_mobile: "", delivery_address: "", source: "PHONE", items: [{ ...emptyLine }] });
