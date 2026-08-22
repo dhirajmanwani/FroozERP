@@ -1,0 +1,129 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+import {
+  ACCENT,
+  BRAND,
+  CREAM,
+  CREAM_DIM,
+  GROUND,
+  INK,
+  SIGNAL,
+  approvedColours,
+  brandRgb,
+  isBrandColour,
+} from "./brandPalette.js";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const frontendRoot = join(here, "..", "..");
+
+// index.html and public/favicon.svg are guarded too: the brand leaking into a
+// splash screen or a browser tab is exactly as visible as it leaking into the app.
+const GUARDED_FILES = ["src/App.css", "src/index.css", "index.html", "public/favicon.svg"];
+
+function read(relative) {
+  return readFileSync(join(frontendRoot, relative), "utf8");
+}
+
+/** Every `#rrggbb` / `#rgb` literal in a stylesheet, with the line it sits on. */
+function hexLiterals(source) {
+  const found = [];
+  source.split("\n").forEach((line, index) => {
+    for (const match of line.matchAll(/#[0-9a-fA-F]{3,8}\b/g)) {
+      found.push({ value: match[0].toLowerCase(), line: index + 1 });
+    }
+  });
+  return found;
+}
+
+/** Every `rgb()` / `rgba()` triple in a stylesheet, with the line it sits on. */
+function rgbLiterals(source) {
+  const found = [];
+  source.split("\n").forEach((line, index) => {
+    for (const match of line.matchAll(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/g)) {
+      found.push({
+        r: Number(match[1]),
+        g: Number(match[2]),
+        b: Number(match[3]),
+        text: match[0],
+        line: index + 1,
+      });
+    }
+  });
+  return found;
+}
+
+const approvedTriples = new Set(
+  approvedColours()
+    .map((colour) => brandRgb(colour))
+    .filter(Boolean)
+    .map(({ r, g, b }) => `${r},${g},${b}`),
+);
+
+test("the palette is built out of the logo's own three colours", () => {
+  assert.equal(BRAND.greenDeep, "#0a2d1c");
+  assert.equal(BRAND.greenMid, "#123623");
+  assert.equal(BRAND.gold, "#c29030");
+  // The card surface is the logo's mid green rather than something near it.
+  assert.equal(GROUND.card, BRAND.greenMid);
+  // The brightest text is the reversed logo's ink.
+  assert.equal(INK.brightest, CREAM);
+  assert.ok(isBrandColour(BRAND.gold));
+  assert.ok(isBrandColour(CREAM_DIM), "the reversed logo's second cream is part of the palette");
+  assert.ok(!isBrandColour("#0f172a"), "the old slate ground is not part of this brand");
+});
+
+test("error and success colours are not brand-coloured", () => {
+  // An error styled in the brand's own green is an error nobody sees.
+  for (const signal of [SIGNAL.danger, SIGNAL.dangerBright, SIGNAL.successBright]) {
+    assert.ok(
+      !Object.values(GROUND).includes(signal) && !Object.values(ACCENT).includes(signal),
+      `${signal} must stay distinct from the ground and accent ramps`,
+    );
+  }
+});
+
+for (const relative of GUARDED_FILES) {
+  test(`${relative} uses only approved brand colours`, () => {
+    const source = read(relative);
+    const offenders = hexLiterals(source).filter(({ value }) => !isBrandColour(value));
+    assert.deepEqual(
+      offenders,
+      [],
+      offenders.length
+        ? `off-palette colours in ${relative}:\n` +
+          offenders.map(({ value, line }) => `  line ${line}: ${value}`).join("\n") +
+          "\n\nEither use a colour from frontend/src/local/brandPalette.js, or add the new" +
+          " colour there with a comment saying what job it does."
+        : "",
+    );
+  });
+
+  test(`${relative} builds translucent layers out of approved colours`, () => {
+    const source = read(relative);
+    const offenders = rgbLiterals(source).filter(
+      ({ r, g, b }) => !approvedTriples.has(`${r},${g},${b}`),
+    );
+    assert.deepEqual(
+      offenders,
+      [],
+      offenders.length
+        ? `off-palette rgba() bases in ${relative}:\n` +
+          offenders.map(({ text, line }) => `  line ${line}: ${text}...)`).join("\n") +
+          "\n\nA translucent layer must be tinted with a palette colour too - otherwise the" +
+          " brand leaks at 12% opacity in a hundred places nobody thinks to check."
+        : "",
+    );
+  });
+}
+
+test("the app stylesheet is actually being checked", () => {
+  // A guard that silently reads an empty file passes forever. Prove there is
+  // something there to guard.
+  const appCss = read("src/App.css");
+  assert.ok(appCss.length > 50000, "App.css looks unexpectedly small - is the path right?");
+  assert.ok(hexLiterals(appCss).length > 200, "expected App.css to be full of colour literals");
+});
