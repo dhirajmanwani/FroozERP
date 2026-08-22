@@ -23,7 +23,7 @@ These values are taken from the vector artwork itself, `frontend/public/branding
 | Ground | `#0a2d1c` → `#123623` | The two greens in the logo: deep green, then a slightly lighter mid green for panels and cards |
 | Accent | `#c29030`, lifted to `#d9ac52` when it sits on the dark ground | The gold of the leaf, the vertical rule and the tagline |
 | Text | `#f6f3ea` / `#c8d8ce` / `#8fab9c` | Brightest is the cream used as ink in the reversed logo files; the two quieter weights are greens of the same lightness as the app's old greys, so nothing loses contrast. All three are in `frontend/src/local/brandPalette.js` |
-| Type | The `FROOZ` lettering from the logo for the one big display line; Inter for everything else | The wordmark is already drawn; Inter is already loaded and is the app's voice |
+| Type | Bodoni Moda for headings and headline numbers, Inter for everything else | Bodoni Moda is the same kind of letter as the `FROOZ` wordmark - a high-contrast didone. Both are now shipped with the app, in `frontend/src/assets/fonts/` |
 
 **Deep green and gold is the whole idea, and it should not be softened for the web.**
 
@@ -51,6 +51,22 @@ white. Nobody is running a near-black green page with gold on it.
 - Add a heading typeface beyond the lettering the wordmark already gives you.
 - Recolour the logo. There are exactly two palettes, the normal one and the reversed one, and both
   are generated. Nothing else is allowed.
+
+### Two rules about the type, learned the hard way in the app
+
+**Bodoni only goes big.** Below about 20px its hairlines break up on a dark ground.
+In the app it carries the top two heading sizes and the headline numbers, and nothing
+else. Serif for display, Inter for the interface - that split *is* the hierarchy, and
+the site should use the same rule rather than setting body copy in a didone.
+
+**Optical sizing is not optional.** Bodoni Moda carries an `opsz` axis that thickens
+its strokes as type gets smaller. Every rule that uses the face must also set
+`font-optical-sizing: auto`. Pinned to a display optical size, headings visibly lose
+strokes at real sizes - it looks like a rendering fault, not a style.
+
+**And bundle `latin-ext`, not just `latin`.** The rupee sign is U+20B9, which lives in
+the latin-ext range. Ship latin alone and every price on the site renders its currency
+symbol in whatever font the visitor's phone falls back to.
 
 **The app is being rethemed onto these same values at the same time.** Same greens, same gold, same
 cream. So a customer who sees an invoice, a WhatsApp message and the web page in one day sees one

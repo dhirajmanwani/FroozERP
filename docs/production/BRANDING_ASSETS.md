@@ -73,6 +73,40 @@ if it cannot. It draws on a canvas and reads the pixels back rather than taking 
 headless Chromium's `--window-size` sets the window rather than the viewport and clamps width to
 500px, which silently crops small tiles.
 
+## Typefaces
+
+```text
+frontend/src/assets/fonts/inter-latin.woff2
+frontend/src/assets/fonts/inter-latin-ext.woff2
+frontend/src/assets/fonts/bodoni-moda-latin.woff2
+frontend/src/assets/fonts/bodoni-moda-latin-ext.woff2
+```
+
+Declared in `frontend/src/fonts.css`. Both are SIL Open Font License 1.1 and the
+licences sit beside the files, which is what redistributing them requires.
+
+**Inter** is the interface face. It had been named in `index.css` from the start with
+nothing behind it, so the app was rendering in Segoe UI on any machine without Inter
+installed.
+
+**Bodoni Moda** is the display face, chosen because it is the same kind of letter as
+the `FROOZ` wordmark. It carries the top two steps of the type scale and the headline
+numbers, and nothing else — below about 20px its hairlines break up on the dark green
+ground. Every rule that uses it must also set `font-optical-sizing: auto`; pinned to a
+display optical size it visibly loses strokes at interface sizes.
+
+It also stops at the edge of an invoice. Printing runs on a plain sans stack because a
+58mm thermal receipt drops a serif's hairlines, and the on-screen preview matches, so
+what you see is what the printer produces.
+
+`latin-ext` is bundled alongside `latin` for both faces and is **not** optional: the
+rupee sign is U+20B9, which sits in the latin-ext range. With latin alone, every price
+in the app renders its currency symbol in a different, system typeface.
+
+To update a face, take the matching woff2 out of `@fontsource-variable/inter` or
+`@fontsource-variable/bodoni-moda` and replace the file. Leave the `unicode-range`
+lines alone — they are what makes the subsetting correct.
+
 ## Colour discipline
 
 The full approved colour list is `frontend/src/local/brandPalette.js`, and
