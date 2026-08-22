@@ -52,6 +52,7 @@ const { createRequireAuth, extractSessionToken } = require("./authMiddleware");
 const { resolveSessionSecret } = require("./sessionSecret");
 const { lockMessage, registerFailedAttempt, resolveLockState } = require("./loginLockout");
 const { reconcileCompanyTotals, summariseBranches } = require("./allBranchesSummary");
+const { callerKey, registerAttempt, throttleMessage } = require("./publicRouteThrottle");
 const {
   REFERENCE_BOOTSTRAP_PROTOCOL,
   captureReferenceBootstrap,
@@ -60,6 +61,7 @@ const {
 } = require("./syncReferenceBootstrap");
 
 const app = express();
+
 app.use(express.json({ limit: "25mb" }));
 
 const frontendDistCandidates = [
@@ -167,6 +169,25 @@ const APP_MODES = new Set([
   "CUSTOM_API_URL",
 ]);
 const deploymentType = cloudServerRuntime ? "cloud" : "local";
+
+/**
+ * A-6 Gate 2.4 — trust exactly one proxy hop when hosted, and none otherwise.
+ *
+ * Railway terminates TLS and forwards, so without this every request appears to come from the
+ * platform's own address: `req.ip` is the proxy, `X-Forwarded-For` is ignored, and every rate
+ * limit, lockout and audit row records the wrong origin. The failure is not that controls stop
+ * working — it is that they all key on one shared value, so one attacker looks like every user and
+ * every user looks like that attacker.
+ *
+ * `1`, not `true`. Trusting the whole chain lets a caller prepend any address they like to
+ * `X-Forwarded-For` and choose the origin the server records — turning a control into a decoration.
+ * One hop is the number of proxies actually in front of this app.
+ *
+ * Off entirely when not hosted: on the desktop the only client is loopback, and trusting a
+ * forwarded header there would let anything on the machine claim to be somewhere else.
+ */
+app.set("trust proxy", deploymentType === "cloud" ? 1 : false);
+
 const requestedAppMode = runtimeAppMode || "LOCAL_SINGLE_DEVICE";
 const configuredAppMode = APP_MODES.has(requestedAppMode) ? requestedAppMode : "LOCAL_SINGLE_DEVICE";
 const hostedCloudDeployment = deploymentType === "cloud" && configuredAppMode === "CLOUD_PRODUCTION";
@@ -758,6 +779,23 @@ const PUBLIC_ROUTES = new Set([
  * later match it. That is the fail-closed direction, and it is the point: this comparison never
  * needs to guess what a path means.
  */
+/**
+ * A-6 Gate 3.2. Refuse a public route that is being guessed at, or return null to proceed.
+ *
+ * Applied to the three routes that answer a stranger before anyone has signed in: a device-id
+ * oracle, a 48-bit activation code, and an OTP sender that costs money and rings a real person's
+ * phone. Each is defensible with a limit and indefensible without one.
+ */
+const refusePublicFlood = (req, res, scope) => {
+  const attempt = registerAttempt({ key: callerKey(req, scope) });
+  if (attempt.allowed) return null;
+  res.set("Retry-After", String(attempt.retryAfterSeconds));
+  return res.status(429).json({
+    code: "TOO_MANY_ATTEMPTS",
+    message: throttleMessage(attempt.retryAfterSeconds),
+  });
+};
+
 const publicRouteKey = (req) => {
   const method = req.method === "HEAD" ? "GET" : req.method;
   const routePath = req.path.length > 1 && req.path.endsWith("/") ? req.path.slice(0, -1) : req.path;
@@ -7530,6 +7568,7 @@ app.post("/auth/recovery/options", async (req, res) => {
 });
 
 app.post("/auth/recovery/send-otp", async (req, res) => {
+  if (refusePublicFlood(req, res, "recovery-send-otp")) return;
   try {
     const identifier = cleanText(req.body.identifier);
     const purpose = cleanText(req.body.purpose || "password").toLowerCase() === "username" ? "username" : "password";
@@ -9586,7 +9625,7 @@ app.get("/api/time", (_req, res) => {
   return res.json({ status: "ok", app: "FroozERP", ...serverTimePayload() });
 });
 
-app.get("/api/version", async (_req, res) => {
+app.get("/api/version", async (req, res) => {
   const cloudIdentity = await resolveCloudDeploymentIdentity();
   const cloudReady = Object.values(cloudConfigurationChecks(cloudIdentity)).every(Boolean);
   res.json({
@@ -9601,9 +9640,16 @@ app.get("/api/version", async (_req, res) => {
     cloud_api_configured: cloudApiConfigured,
     device_identity_configured: Boolean(configuredDeviceId && configuredDeviceName),
     cloud_ready: cloudReady,
-    company_id: cloudIdentity.companyId,
-    company_name: cloudIdentity.companyName,
-    branch_id: cloudIdentity.branchId,
+    // A-6 Gate 3.1. These used to be returned to anyone who asked, with no credentials: the
+    // company's name, its id and a branch id, from a route whose job is to answer "are you running
+    // and what version". A version check does not need the tenant's name, and handing it to an
+    // unauthenticated caller tells a stranger who they have found. Behind a session they are the
+    // caller's own identity and are answered in full.
+    ...(req.auth ? {
+      company_id: cloudIdentity.companyId,
+      company_name: cloudIdentity.companyName,
+      branch_id: cloudIdentity.branchId,
+    } : {}),
     api: "FroozERP Cloud Foundation",
   });
 });
@@ -10733,6 +10779,7 @@ app.get("/api/owner/dashboard-foundation", async (req, res) => {
 });
 
 app.post("/devices/activate", async (req, res) => {
+  if (refusePublicFlood(req, res, "device-activate")) return;
   const client = await pool.connect();
   try {
     const device = readDevicePayload(req.body, req);
@@ -11113,6 +11160,7 @@ app.get("/settings/system-info", async (req, res) => {
 });
 
 app.post("/api/auth/device-bootstrap-status", async (req, res) => {
+  if (refusePublicFlood(req, res, "device-bootstrap-status")) return;
   try {
     const devicePayload = readDevicePayload(req.body, req);
     if (!devicePayload.device_id) {
