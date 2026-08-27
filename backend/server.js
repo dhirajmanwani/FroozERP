@@ -7549,6 +7549,11 @@ app.get("/auth/recovery/readiness-report", async (req, res) => {
 });
 
 app.post("/auth/recovery/options", async (req, res) => {
+  // A-6 Gate 3.2. This route's answer differs for an account that exists and one that does not, so
+  // unlimited it is an account-existence oracle: feed it a list of names and it sorts them into
+  // staff and strangers. The generic message blunts a single reading of it; only a limit stops the
+  // enumeration.
+  if (refusePublicFlood(req, res, "recovery-options")) return;
   try {
     const identifier = cleanText(req.body.identifier);
     const purpose = cleanText(req.body.purpose || "password").toLowerCase();
