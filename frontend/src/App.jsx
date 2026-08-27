@@ -45,6 +45,7 @@ import { resolveShopViewPresentation, shopPickerVisible } from "./local/shopView
 import { ORDER_STATUS } from "./local/orderLifecycle";
 import { STOCK_TRUSTED_FOR_HOURS, buildCatalogue, catalogueFilename, describeExport } from "./local/catalogueExport";
 import { buildOrdersBoard, validateOrderAction } from "./local/ordersBoard";
+import { buildOrderNotifications } from "./local/orderNotifications";
 import { COUNTER_STOCK, buildReservedIndex, describeCounterStock, reservedForProduct, reservedNote } from "./local/reservedStock";
 import { buildOrderCartSeed, describeOrderBillingProblems } from "./local/orderBilling";
 import { bannerForState } from "./local/entitlementState";
@@ -3910,6 +3911,41 @@ function App() {
   const clearNotice = useCallback((dedupeKey) => {
     setNotifications((current) => resolveNotification(current, dedupeKey));
   }, []);
+
+  /**
+   * Ring the bell for orders that need somebody.
+   *
+   * The judgement all lives in `local/orderNotifications.js`, which is tested. This
+   * pushes what it returns and, just as importantly, retracts what it stops
+   * returning - an alert saying "packed but not paid for" that survives the payment
+   * being taken teaches the owner to ignore the bell.
+   *
+   * It re-runs on a timer because the alerts are about elapsed time, not just about
+   * what changed: an order nobody has touched becomes urgent while the screen sits
+   * still, and a held reservation runs out whether or not anything is clicked.
+   */
+  const raisedOrderAlerts = useRef(new Set());
+
+  useEffect(() => {
+    const publish = () => {
+      // A failed load is passed through as "unreadable" rather than as an empty list.
+      // No orders and could-not-read-the-orders look identical in a bell that shows
+      // nothing, and only one of them is safe to ignore.
+      const source = ordersState.loadState === "error" ? null : ordersState.orders;
+      const alerts = buildOrderNotifications(source, Date.now());
+      const live = new Set(alerts.map((alert) => alert.dedupeKey));
+
+      for (const alert of alerts) notify(alert);
+      for (const key of raisedOrderAlerts.current) {
+        if (!live.has(key)) clearNotice(key);
+      }
+      raisedOrderAlerts.current = live;
+    };
+
+    publish();
+    const timer = window.setInterval(publish, 60000);
+    return () => window.clearInterval(timer);
+  }, [ordersState.orders, ordersState.loadState, notify, clearNotice]);
 
   /**
    * Surface the activation state in the notification centre.

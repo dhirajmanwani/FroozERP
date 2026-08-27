@@ -78,6 +78,43 @@ has a "add a domain" step and the site itself does not change.
 
 ---
 
+## Before the name goes on anything printed
+
+**Checked 2026-08-22: there is already a food brand called FROOZ in India**, at
+`frooz.in`, selling packaged healthy snacks. They have the website and the social
+accounts. That is why `frooz.in` cannot be bought from them - it is a working
+business, not a parked name someone is holding to resell.
+
+This does not necessarily affect you. They sell packaged snacks; this shop sells
+fresh fruit, and trade marks are owned inside a category rather than across all of
+them. But it is worth an hour of checking **before** money is spent on signage, bill
+books or packaging, because finding out afterwards is expensive.
+
+The free public search is at `ipindiaonline.gov.in`, under Trade Marks, then Public
+Search. Search `FROOZ` in these classes:
+
+| Class | Covers | Why |
+| --- | --- | --- |
+| **31** | Fresh fruits and vegetables | **This shop's own class. Check first** |
+| 35 | Retail and shop services | This shop runs shops |
+| 29 | Preserved, dried and cooked fruit | Adjacent |
+| 30 | Snacks and confectionery | Probably the other FROOZ |
+| 32 | Fruit juices and drinks | If anything is ever bottled |
+
+Run each one twice: once on Wordmark, once on **Phonetic**. The legal question is
+whether a customer would confuse the two, not whether the spelling matches, so
+phonetic is the search that matters.
+
+Nothing live in class 31 or 35 is a good sign. Anything live in either is worth an
+hour with a trade mark lawyer before printing. Either way, keep a screenshot of what
+was found and the date.
+
+Using the longer name - `freakinfrooz.com`, out of the tagline already on the logo -
+sits further from an existing brand than the bare word does. That is a reason to
+prefer it beyond it simply being available.
+
+---
+
 ## Every morning, two minutes
 
 **1. Set today's rates** in the app, as you already do.
