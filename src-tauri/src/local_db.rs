@@ -8,7 +8,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::entitlement::{self, EntitlementState};
 
-const CURRENT_SCHEMA_VERSION: &str = "021_customer_order_payment";
+const CURRENT_SCHEMA_VERSION: &str = "022_customer_order_sync";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -30,6 +30,7 @@ const MIGRATION_018: &str = include_str!("../migrations/sqlite/018_bootstrap_cre
 const MIGRATION_019: &str = include_str!("../migrations/sqlite/019_provisional_lot_cost_status.sql");
 const MIGRATION_020: &str = include_str!("../migrations/sqlite/020_customer_orders.sql");
 const MIGRATION_021: &str = include_str!("../migrations/sqlite/021_customer_order_payment.sql");
+const MIGRATION_022: &str = include_str!("../migrations/sqlite/022_customer_order_sync.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -1467,6 +1468,176 @@ fn order_text(value: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A branch id read out of JSON as **text**, whatever shape it arrived in.
+///
+/// `local_customer_orders.branch_id` is INTEGER while every other local table stores branch ids as
+/// TEXT, and the wire needs text either way. The old reader was
+/// `order.get("branch_id").and_then(|value| value.as_i64())`, which silently dropped the branch
+/// whenever the caller sent a string — and `App.jsx` sends `user?.branch_id`, whose shape depends
+/// on what the login response happened to contain. A dropped branch is not a cosmetic loss: the
+/// server's `logSyncChange` throws on a change with no branch id, and because a push batch is one
+/// Postgres transaction that throw discards the acknowledgements for every other operation in it.
+///
+/// A string is trimmed and kept as a string. It is never parsed: ids in this codebase are opaque,
+/// and `"004"` is not `4`.
+fn order_branch_text(value: &serde_json::Value, key: &str) -> Option<String> {
+    match value.get(key) {
+        Some(serde_json::Value::String(raw)) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+        }
+        Some(serde_json::Value::Number(number)) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+/// Said on the order itself when it cannot be queued, so the state has a name instead of being an
+/// order that simply never syncs.
+const ORDER_BRANCH_UNRESOLVED: &str =
+    "This order has no branch, and this device has no approved branch of its own to give it.      It is saved here and is not queued for the cloud, because a branchless change would be      rejected by the server and would take the rest of the batch down with it. The next status      change tries again.";
+
+/// Which branch an order belongs to, decided before it is allowed onto the outbox.
+///
+/// Three rungs, strongest first, and no default constant at the bottom. Inventing `"1"` for a
+/// device that has never been told its branch would file real orders against a branch that is
+/// merely the first one — a wrong answer that reports itself as a right one. `None` here is
+/// answered by `sync_status = 'blocked'` and a reason the operator can read, not by a guess.
+fn resolve_order_branch_id(
+    conn: &Connection,
+    supplied: Option<String>,
+) -> Result<Option<String>, String> {
+    // Rung 1 — what the caller said. The order's own branch always wins.
+    if supplied.is_some() {
+        return Ok(supplied);
+    }
+
+    // Rung 2 — this device's approved registration. `ORDER BY device_id` rather than "whichever
+    // row comes first": a profile carrying two identities must resolve the same way on every call,
+    // or the same order would push under different branches on different days.
+    let identity: Option<String> = conn
+        .query_row(
+            "SELECT branch_id FROM local_device_identity
+              WHERE LOWER(registration_status) = 'approved'
+                AND branch_id IS NOT NULL
+                AND TRIM(branch_id) <> ''
+                AND LOWER(branch_id) <> 'unassigned'
+              ORDER BY device_id
+              LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(to_error)?;
+    if identity.is_some() {
+        return Ok(identity);
+    }
+
+    // Rung 3 — the cached branch context the reference snapshot already trusts for the same
+    // question elsewhere in this file.
+    let context = single_optional_string(
+        conn,
+        "SELECT value FROM local_kv WHERE key = 'offline_branch_context'",
+        &[],
+    )?
+    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    .and_then(|value| order_branch_text(&value, "branch_id"));
+    Ok(context)
+}
+
+/// The device this order is being written on, for the outbox row. Best effort: the outbox column is
+/// nullable and, unlike the branch, the server does not refuse a change without it.
+fn resolve_order_device_id(conn: &Connection) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT device_id FROM local_device_identity
+          WHERE LOWER(registration_status) = 'approved'
+          ORDER BY device_id
+          LIMIT 1",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(to_error)
+}
+
+/// Put this order on the sync road, inside the caller's transaction.
+///
+/// **Inside the transaction is the whole point.** `enqueue_sync_operation` opens a connection of
+/// its own and runs outside any transaction, so a frontend that called "save the order" and then
+/// "queue the order" would leave, on any failure between the two, an order with no outbox row —
+/// unsynced for ever, and looking exactly like a synced one. The POS sale has always enqueued
+/// inside its own transaction (`complete_local_pos_sale_at`); this is the same shape.
+///
+/// The payload is the **whole order**, header and every line, on creation and on every status
+/// change alike, always as `UPSERT`. A distinct operation type per status change would create an
+/// ordering dependency, and the server sorts a push batch by `operation_id` string rather than by
+/// causality and then permanently records any rejection — so a status change that arrived before
+/// its own creation would be rejected once and never retried. Whole-record UPSERT with
+/// last-writer-wins on `version` is order-independent and immune to that.
+///
+/// The operation id is derived from the order and its version, not from the clock. That makes the
+/// enqueue idempotent against `ON CONFLICT(operation_id) DO NOTHING`: re-running the same mutation
+/// queues the same row once, and a genuinely new mutation carries a new version and so a new id.
+fn enqueue_customer_order_with_tx(
+    tx: &rusqlite::Transaction,
+    order_id: &str,
+) -> Result<(), String> {
+    let mut payload = read_customer_order(tx, order_id)?;
+    let version = payload
+        .get("entity_version")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(1);
+
+    let Some(branch_id) = resolve_order_branch_id(tx, order_branch_text(&payload, "branch_id"))?
+    else {
+        // Not queued, and said so on the record. Never a NULL branch on the outbox: the server
+        // throws on one, and a push batch is a single Postgres transaction, so this one order
+        // would discard the acknowledgements for every other operation travelling with it.
+        tx.execute(
+            "UPDATE local_customer_orders
+                SET sync_status = 'blocked', sync_blocked_reason = ?2
+              WHERE id = ?1",
+            rusqlite::params![order_id, ORDER_BRANCH_UNRESOLVED],
+        )
+        .map_err(to_error)?;
+        return Ok(());
+    };
+
+    let device_id = resolve_order_device_id(tx)?;
+    // The conversion happens here, at the sync boundary, rather than by rebuilding the table: the
+    // column is INTEGER only on this one table, nothing joins it against another table's branch,
+    // and a SQLite column-type change means copying every row.
+    payload["branch_id"] = serde_json::Value::String(branch_id.clone());
+    payload["entity_version"] = serde_json::Value::from(version);
+    if let Some(device) = &device_id {
+        payload["device_id"] = serde_json::Value::String(device.clone());
+    }
+
+    let operation_id = format!("order-{order_id}-v{version}");
+    let operation = SyncOperation {
+        id: operation_id.clone(),
+        operation_id: Some(operation_id),
+        entity_type: "customer_order".to_string(),
+        entity_id: order_id.to_string(),
+        operation_type: "UPSERT".to_string(),
+        payload,
+        branch_id: Some(branch_id),
+        device_id,
+        user_id: None,
+        version: Some(version),
+        created_at: None,
+    };
+    enqueue_sync_operation_with_conn(tx, &operation)?;
+
+    tx.execute(
+        "UPDATE local_customer_orders
+            SET sync_status = 'pending', sync_blocked_reason = NULL
+          WHERE id = ?1",
+        rusqlite::params![order_id],
+    )
+    .map_err(to_error)?;
+    Ok(())
+}
+
 /// Customer orders held on this device.
 ///
 /// The workflow rules — which status may follow which, and when a reservation lapses — live in
@@ -2450,6 +2621,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "019_provisional_lot_cost_status", MIGRATION_019)?;
     apply_migration(&mut conn, "020_customer_orders", MIGRATION_020)?;
     apply_migration(&mut conn, "021_customer_order_payment", MIGRATION_021)?;
+    apply_migration(&mut conn, "022_customer_order_sync", MIGRATION_022)?;
     Ok(())
 }
 
