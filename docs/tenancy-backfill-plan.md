@@ -73,6 +73,20 @@ NULL-tolerant predicate is a permanent hole.
 
 ### Phase 2 — the `company_id` backfill (needs approval)
 
+> **RULED 2026-08-22 by the maintainer: not needed, and therefore not scheduled.**
+>
+> The installation is one company - Frooz - with multiple branches, each holding multiple
+> devices. Phase 2 exists to keep one company's data away from another's. With one company
+> there is no second party to isolate from, so the backfill would be schema churn with a real
+> risk (it has no natural undo) and no beneficiary.
+>
+> **What this does *not* excuse.** Multiple branches are real, so *branch* isolation is real,
+> and that is Phase 1 - already done. Nothing below reduces that obligation.
+>
+> **The trigger to reopen this:** a second company, or any requirement to show one branch's
+> staff a company-level figure that must exclude another company. Until one of those is true,
+> this section is a plan, not a task.
+
 Only once a second company is real, or company-level isolation is otherwise wanted.
 
 On a single-company installation this is mechanical:
@@ -183,6 +197,16 @@ keeps them on the baseline is one statement — `SELECT * FROM accounts` — and
 `branch_id`. It is company-wide master data, like `customers` and `suppliers`. **These two come off
 the list in Phase 2, not before.** They were deliberately not fixed by removing `accounts` from
 `TENANT_TABLES` in the harness: that would make the number fall without changing anything real.
+
+> **Reassessed 2026-08-22, after the ruling above.** With exactly one company, an unscoped read of
+> `accounts` returns that company's own accounts and nothing else. There is no second company's
+> data in the table for it to leak, so these two are **correct as they stand**, not merely
+> tolerated.
+>
+> They stay on the baseline anyway, and deliberately. The number is not a score to drive to zero;
+> it is a list of places whose correctness depends on an assumption. The assumption here is "there
+> is one company", and the day that stops being true these two must be the first things looked at.
+> Removing them from the list would delete exactly the reminder that makes that possible.
 
 ### Business decisions, as confirmed by the maintainer on 2026-08-21
 

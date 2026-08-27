@@ -76,14 +76,23 @@ export const buildOfflineSessionRecord = async ({
 
 export const verifyOfflineSessionRecord = async (session, { username, password, deviceId }) => {
   if (!session) {
-    // Interim wording (backlog item 5.3). The previous text told the user to "connect to the
-    // internet once before offline use", which is unsatisfiable when the backend is gone. The
-    // local recovery/activation route lands in stage 5 of docs/offline-activation-plan.md; until
-    // then this message states the situation without prescribing an impossible action.
+    // Backlog item 5.3, finalised now that Stage 5 has shipped (offline-activation-plan.md).
+    //
+    // Two different lockouts used to share this one sentence, and it was wrong about both.
+    //
+    //   A device that was never provisioned at all never reaches here - it is Unprovisioned, and
+    //   App.jsx shows the activation screen, where an owner redeems a .lic file with no internet
+    //   at all. So "on-device activation is not part of this build yet" is simply false now, and
+    //   telling an owner that while a working door stands open is the worst kind of wrong message.
+    //
+    //   What actually reaches here is the narrower case: the device IS provisioned, but this
+    //   particular user has never signed in on it. There is genuinely no offline route for that
+    //   one - a .lic provisions a device, not a person - so the message says what is true and
+    //   names what still works, rather than inventing a rescue.
     return {
       ok: false,
       code: "NO_SESSION",
-      message: "No offline credential is stored on this device for this user, so offline sign-in is not available. On-device activation is not part of this build yet — contact the FroozERP owner before retrying.",
+      message: "This device has no offline sign-in record for this user. Anyone who has already signed in on it can still sign in with no internet. Adding a new user to this device still needs it to reach FroozERP once.",
     };
   }
   if (session.deviceId && deviceId && session.deviceId !== deviceId) {

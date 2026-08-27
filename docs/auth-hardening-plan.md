@@ -863,11 +863,18 @@ morning of ticking boxes rather than a decision made under pressure.
 
 | # | Requirement | State |
 | --- | --- | --- |
-| 4.1 | Every query is scoped by `company_id` / `branch_id` | **Audited 2026-08-20. FAILS.** `req.auth.branchId` and `req.auth.companyId` have **zero read sites** in the entire backend. 119 of 285 registrations return or write business data with no tenancy predicate. See `docs/branch-isolation-audit.md` |
+| 4.1 | Every query is scoped by `company_id` / `branch_id` | **Reassessed 2026-08-22 after the maintainer ruled one company with multiple branches — see `docs/tenancy-backfill-plan.md`. Branch isolation is the requirement that applies, and Phase 1 delivered it: 37 unscoped GET routes to 2, both of which read company-wide master data that a single-company installation cannot leak. Company-level scoping is not applicable until a second company exists.** Original finding, kept because it is what the ruling reinterprets rather than erases — **audited 2026-08-20, FAILED:** `req.auth.branchId` and `req.auth.companyId` have **zero read sites** in the entire backend. 119 of 285 registrations return or write business data with no tenancy predicate. See `docs/branch-isolation-audit.md` |
 
-**This is now the single reason the verdict at the top cannot change.** It stopped being the
+~~**This is now the single reason the verdict at the top cannot change.**~~ It stopped being the
 document's largest *unknown* and became its largest *known failure*, which is progress only in the
-sense that it can now be planned. Tracked as **A-7**, roughly 3–4 weeks.
+sense that it could then be planned. Tracked as **A-7**, originally estimated 3–4 weeks.
+
+> **Superseded 2026-08-22.** Phase 1 landed the branch scoping, and the maintainer then ruled the
+> installation is one company with multiple branches. Branch isolation is therefore the real
+> requirement and it is met; the company-level work is not applicable. **Gate 4 is no longer what
+> holds the verdict.** What now holds it is Gate 3 in full, plus 1.5, 1.6, 2.2 and 2.3 — a list of
+> days, not weeks. The estimate above is left visible because a 3–4 week figure that quietly
+> vanished would look like it was delivered rather than ruled out of scope.
 
 Latent while one branch exists — there is no second branch's data to leak — and live the moment
 there is one. Because the maintainer's first product goal *is* multibranch, this gates the goal and
