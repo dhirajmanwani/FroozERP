@@ -96,7 +96,7 @@ const PUBLIC_ROUTES = new Map([
   [
     "POST /bootstrap/first-owner-device",
     {
-      reason: "The first-install escape hatch. On a fresh database no device is approved, so nobody can sign in and no token can exist; behind requireAuth this route could never run at all. It authenticates itself instead — it verifies the owner's username and password with checkPassword and refuses with 409 once any approved owner device exists. An unauthenticated attacker gets password guessing against the owner account and, on success, an approved device: the sharpest entry on this list, and the reason it is worth converting to a documented CLI/ops action rather than an HTTP route (recorded for A-6).",
+      reason: "The first-install escape hatch. On a fresh database no device is approved, so nobody can sign in and no token can exist; behind requireAuth this route could never run at all. It authenticates itself instead — it verifies the owner's username and password with checkPassword and refuses with 409 once any approved owner device exists. An unauthenticated attacker gets password guessing against the owner account and, on success, an approved device: the sharpest entry on this list. A-6 Gate 3.3 closed it on 2026-08-22 - the handler now refuses before it reads the body, never serves a hosted deployment at all, and is closed by default everywhere else, with `scripts/bootstrap-first-owner.mjs` as the ops path. It stays listed because the registration still exists; what an unauthenticated attacker now gets is a 404 with no password comparison behind it.",
     },
   ],
   [

@@ -49,6 +49,7 @@ const {
 // long-standing `x-froozerp-device-session` header, so a client that sends only the standard header
 // authenticates on the routes that already verify sessions. Same token, same verification.
 const { createRequireAuth, createAttachOptionalAuth, extractSessionToken } = require("./authMiddleware");
+const { resolveOwnerBootstrapTransport } = require("./ownerBootstrapPolicy");
 const { resolveSessionSecret } = require("./sessionSecret");
 const { lockMessage, registerFailedAttempt, resolveLockState } = require("./loginLockout");
 const { reconcileCompanyTotals, summariseBranches } = require("./allBranchesSummary");
@@ -751,9 +752,14 @@ const PUBLIC_ROUTES = new Set([
   "POST /devices/activate",
   // The first-install escape hatch: on a fresh database no device is approved, so nobody can log in
   // and no token can exist. Self-authenticating — it verifies the owner's username and password
-  // itself and refuses once any approved owner device exists. Attacker gets: password guessing
-  // against the owner account, and on success an approved device. The sharpest edge on this list;
-  // it is here because behind `requireAuth` it could never run.
+  // itself and refuses once any approved owner device exists.
+  //
+  // A-6 Gate 3.3, 2026-08-22: it stays on this list, and is now refused before it reads anything.
+  // Removing the registration would have made the allow-list read as though the surface were gone
+  // while a handler still sat behind it; keeping it here and closing it inside is the honest shape,
+  // and it is what `ownerBootstrapPolicy.js` decides. Never available on a hosted deployment, and
+  // closed by default everywhere else. Attacker now gets: a 404 with no password comparison behind
+  // it, so nothing to guess against and no counter to move.
   "POST /bootstrap/first-owner-device",
   // Account recovery is by definition the flow for someone who cannot authenticate. Exactly these
   // five, and no other `/auth/recovery/*` path: `/auth/recovery/profile` and the
@@ -10860,6 +10866,15 @@ app.post("/devices/activate", async (req, res) => {
 });
 
 app.post("/bootstrap/first-owner-device", async (req, res) => {
+  // A-6 Gate 3.3. Refused before a single field of the body is read, and long before any password
+  // is checked. That ordering is the point: a refusal that arrives after the password comparison
+  // still leaks whether the guess was right, through the failed-attempt counter and the lock it
+  // trips. Nothing below this line runs unless an operator has deliberately opened the route, and
+  // on a hosted deployment nothing opens it at all.
+  const transport = resolveOwnerBootstrapTransport({ env: process.env, deploymentType });
+  if (!transport.allowed) {
+    return res.status(404).json({ code: transport.code, message: transport.message });
+  }
   try {
     const username = cleanText(req.body.username);
     const password = String(req.body.password || "");
