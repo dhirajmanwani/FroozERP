@@ -16053,7 +16053,10 @@ function SyncSettingsSection({
         && Boolean(health.version)
         && health.deployment_type === "cloud"
         && health.cloud_ready === true
-        && Boolean(health.company_id)
+        // A-6 Gate 3.1: this asks whether the far end is a provisioned deployment, not who it
+        // belongs to. The identity fields it used to read are now behind a session, which this
+        // check cannot have - it runs while choosing which server to talk to.
+        && health.tenant_configured === true
       );
       const ok = healthOk && cloudIdentityOk;
       setConfigMessage(ok

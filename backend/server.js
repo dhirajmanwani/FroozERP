@@ -48,7 +48,7 @@ const {
 // A-3: `extractSessionToken` accepts the session token from `Authorization: Bearer` as well as the
 // long-standing `x-froozerp-device-session` header, so a client that sends only the standard header
 // authenticates on the routes that already verify sessions. Same token, same verification.
-const { createRequireAuth, extractSessionToken } = require("./authMiddleware");
+const { createRequireAuth, createAttachOptionalAuth, extractSessionToken } = require("./authMiddleware");
 const { resolveSessionSecret } = require("./sessionSecret");
 const { lockMessage, registerFailedAttempt, resolveLockState } = require("./loginLockout");
 const { reconcileCompanyTotals, summariseBranches } = require("./allBranchesSummary");
@@ -687,6 +687,11 @@ if (sessionSecretResolution.fatal) {
 }
 const deviceSessionSecret = sessionSecretResolution.secret;
 const requireAuth = createRequireAuth({ secret: deviceSessionSecret });
+// A-6 Gate 3.1. Public routes never run `requireAuth`, so `req.auth` is never set on one. A handler
+// that answers `req.auth ? more : {}` on a public route is therefore not gating those fields behind
+// a session - it is withholding them from everybody, operator included. This populates a session
+// when a valid one is presented and never denies, so the gate means what it reads as meaning.
+const attachOptionalAuth = createAttachOptionalAuth({ secret: deviceSessionSecret });
 
 /**
  * Auth-hardening A-4 — default-deny.
@@ -835,7 +840,7 @@ if (frontendDistAvailable()) {
  * exact source text and would break under a per-route edit.
  */
 app.use((req, res, next) => {
-  if (PUBLIC_ROUTES.has(publicRouteKey(req))) return next();
+  if (PUBLIC_ROUTES.has(publicRouteKey(req))) return attachOptionalAuth(req, res, next);
   return requireAuth(req, res, next);
 });
 
@@ -9584,7 +9589,21 @@ const processSyncOperation = async (client, operation, context) => {
   return ack;
 };
 
-const healthHandler = async (_req, res) => {
+/**
+ * A-6 Gate 3.1.
+ *
+ * A liveness check answers "are you running". It used to answer rather more than that to anybody
+ * who asked, with no credentials at all: the company's name and id, a branch id, and the database's
+ * path on disk. The identity tells a stranger who they have found; the path tells them how the
+ * server is laid out. Neither is any part of the question.
+ *
+ * The split below is deliberate rather than a blanket removal. One caller genuinely needs an
+ * unauthenticated answer - the Settings screen's "test connection", which is used while choosing
+ * *which* server to talk to and therefore before any session with it can exist. It needs to know
+ * that the far end is a provisioned FroozERP cloud, so it is told exactly that as a boolean, and
+ * not who the tenant is. A stranger learns the deployment is configured; only a session learns whose.
+ */
+const healthHandler = async (req, res) => {
   try {
     const storageHealth = await storageAdapter.health();
     const cloudIdentity = await resolveCloudDeploymentIdentity();
@@ -9597,19 +9616,23 @@ const healthHandler = async (_req, res) => {
       ...serverTimePayload(),
       version: appVersion,
       database: "reachable",
-      database_type: storageHealth.databaseType,
-      database_path: storageHealth.databasePath || null,
-      storage_adapter: storageAdapter.kind,
-      client_postgres_access: false,
-      mode: process.env.NODE_ENV || "development",
       deployment_type: deploymentType,
       app_mode: configuredAppMode,
-      cloud_api_configured: cloudApiConfigured,
-      device_identity_configured: Boolean(configuredDeviceId && configuredDeviceName),
       cloud_ready: cloudReady,
-      company_id: cloudIdentity.companyId,
-      company_name: cloudIdentity.companyName,
-      branch_id: cloudIdentity.branchId,
+      // Enough for a caller to confirm this is a provisioned deployment, without naming it.
+      tenant_configured: Boolean(cloudIdentity.companyId),
+      ...(req?.auth ? {
+        database_type: storageHealth.databaseType,
+        database_path: storageHealth.databasePath || null,
+        storage_adapter: storageAdapter.kind,
+        client_postgres_access: false,
+        mode: process.env.NODE_ENV || "development",
+        cloud_api_configured: cloudApiConfigured,
+        device_identity_configured: Boolean(configuredDeviceId && configuredDeviceName),
+        company_id: cloudIdentity.companyId,
+        company_name: cloudIdentity.companyName,
+        branch_id: cloudIdentity.branchId,
+      } : {}),
     });
   } catch (error) {
     console.error("Health check failed", error.message);
@@ -9634,18 +9657,21 @@ app.get("/api/version", async (req, res) => {
     api_version: apiContractVersion,
     version: appVersion,
     ...serverTimePayload(),
-    node_env: process.env.NODE_ENV || "development",
     deployment_type: deploymentType,
     app_mode: configuredAppMode,
-    cloud_api_configured: cloudApiConfigured,
-    device_identity_configured: Boolean(configuredDeviceId && configuredDeviceName),
     cloud_ready: cloudReady,
+    // Same reasoning as the identity fields below, applied to deployment posture. Which
+    // environment this is, and which halves of the cloud configuration are filled in, describe the
+    // inside of the deployment rather than its version. Nothing outside this file read them.
     // A-6 Gate 3.1. These used to be returned to anyone who asked, with no credentials: the
     // company's name, its id and a branch id, from a route whose job is to answer "are you running
     // and what version". A version check does not need the tenant's name, and handing it to an
     // unauthenticated caller tells a stranger who they have found. Behind a session they are the
     // caller's own identity and are answered in full.
     ...(req.auth ? {
+      node_env: process.env.NODE_ENV || "development",
+      cloud_api_configured: cloudApiConfigured,
+      device_identity_configured: Boolean(configuredDeviceId && configuredDeviceName),
       company_id: cloudIdentity.companyId,
       company_name: cloudIdentity.companyName,
       branch_id: cloudIdentity.branchId,

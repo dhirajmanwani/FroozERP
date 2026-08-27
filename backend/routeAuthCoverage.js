@@ -356,13 +356,21 @@ const probe = (app, method, url, headers, body = undefined) => new Promise((reso
   // convincing wrong answer when the question is whether a route refused you. Reading the response
   // object directly does not depend on the socket surviving.
   const settleFromResponse = () => {
+    // `body` is carried alongside `code` so a suite can ask what a route *said*, not only whether
+    // it refused. Gate 3.1 needs exactly that: the question there is which fields a public route
+    // puts in front of an anonymous caller, which no status code can answer. Purely additive -
+    // every existing caller reads `status` and `code` and is untouched.
+    const text = Buffer.concat(chunks).toString("utf8");
     let code = null;
+    let body = null;
     try {
-      code = JSON.parse(Buffer.concat(chunks).toString("utf8")).code ?? null;
+      body = JSON.parse(text);
+      code = body?.code ?? null;
     } catch {
       code = null;
+      body = null;
     }
-    finish({ status: res.statusCode, code, note: null });
+    finish({ status: res.statusCode, code, note: null, body, text });
   };
 
   res.end = (chunk, ...rest) => {
@@ -379,14 +387,14 @@ const probe = (app, method, url, headers, body = undefined) => new Promise((reso
     clearTimeout(timer);
     resolve(result);
   };
-  const timer = setTimeout(() => finish({ status: null, code: null, note: `no response in ${PROBE_TIMEOUT_MS}ms` }), PROBE_TIMEOUT_MS);
+  const timer = setTimeout(() => finish({ status: null, code: null, note: `no response in ${PROBE_TIMEOUT_MS}ms`, body: null, text: "" }), PROBE_TIMEOUT_MS);
 
   res.on("finish", settleFromResponse);
 
   try {
     app(req, res);
   } catch (error) {
-    finish({ status: null, code: null, note: `handler threw: ${error.message}` });
+    finish({ status: null, code: null, note: `handler threw: ${error.message}`, body: null, text: "" });
   }
 });
 

@@ -193,6 +193,39 @@ const createRequireAuth = ({ secret, verify = verifyDeviceSession, now = () => D
   };
 
 /**
+ * Build the optional counterpart to `requireAuth`, for the public allow-list.
+ *
+ * A public route never runs `requireAuth`, so `req.auth` is never populated on one — which means a
+ * handler that writes `req.auth ? extraFields : {}` is not gating those fields behind a session at
+ * all. It is deleting them for everybody, including the operator holding a valid token. That reads
+ * as a fix in review and is not one, which is exactly why this exists.
+ *
+ * The rules it applies are the same ones `requireAuth` applies, deliberately: a bad, expired,
+ * substituted or view-only token leaves `req.auth` unset rather than half-set. The single
+ * difference is the ending. It never denies, because the route is public and denying would break
+ * the thing the allow-list exists to keep working.
+ */
+const createAttachOptionalAuth = ({ secret, verify = verifyDeviceSession, now = () => Date.now() } = {}) =>
+  (req, _res, next) => {
+    if (!text(secret)) return next();
+    const token = extractSessionToken(req);
+    if (!token) return next();
+
+    const result = verify(token, secret, now());
+    if (result.error) return next();
+
+    if (rejectDeviceSessionSubstitution(result.claims, submittedIdentityFrom(req))) return next();
+
+    const auth = authContextFromClaims(result.claims);
+    // A viewing session is read-only, and these routes are reads, so it is honoured rather than
+    // ignored. Kept explicit so the two middlewares cannot drift apart on what a session means.
+    if (auth.viewOnly && !SAFE_METHODS.has(req.method)) return next();
+
+    req.auth = auth;
+    return next();
+  };
+
+/**
  * Restrict a route to given roles.
  *
  * Must be mounted after `requireAuth`; without `req.auth` it denies rather than assuming. A session
@@ -222,6 +255,7 @@ module.exports = {
   LEGACY_SESSION_HEADER,
   authContextFromClaims,
   createRequireAuth,
+  createAttachOptionalAuth,
   extractSessionToken,
   requireRole,
   submittedIdentityFrom,
