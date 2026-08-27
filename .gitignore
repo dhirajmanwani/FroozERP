@@ -1,3 +1,16 @@
+# Real credentials. A-6 Gate 2.2, added 2026-08-22 after a scan found that nothing here
+# covered them: DATABASE_URL, DEVICE_SESSION_SECRET, the WhatsApp access token and the
+# SMTP password all live in a .env that the deployment docs tell you to create. Nothing
+# has ever been committed - the whole history was scanned - but the only thing preventing
+# it was that the file did not exist yet, and one `git add -A` would have been enough.
+# Once pushed, a credential is leaked permanently; deleting it later does not unpublish it.
+.env
+.env.*
+*.env
+# The templates are the point of the templates.
+!.env.example
+!.env.*.example
+
 backups/
 node_modules/
 frontend/node_modules/

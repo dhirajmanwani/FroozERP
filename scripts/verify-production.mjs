@@ -5,6 +5,11 @@ import { spawnSync } from "node:child_process";
 const root = path.resolve(new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
 const reportPath = path.join(root, ".cache", "production-verification-report.json");
 const commands = [
+  // A-6 Gate 2.2, and deliberately first. This list breaks at the first failure, so anything
+  // below a broken check does not run at all; a leaked credential is the finding you least want
+  // hidden behind an unrelated one. It is also the cheapest check here, so it costs nothing to
+  // put in front.
+  ["Secret scan", "node scripts/scan-secrets.mjs"],
   ["Backend syntax", "node --check backend/server.js && node --check backend/desktopGateway.js && node --check backend/localSettingsStore.js && node --check backend/storageAdapters.js"],
   ["Backend tests", "npm --prefix backend test"],
   ["Frontend local runtime tests", "npm --prefix frontend run test:local-runtime"],
