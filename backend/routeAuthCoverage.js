@@ -204,8 +204,30 @@ const stopQueryRecording = () => {
 const stubStorageAdapter = () => {
   const storagePath = require.resolve("./storageAdapters");
   const realStorage = require(storagePath);
+  /**
+   * The one statement the stub answers for real.
+   *
+   * A-6 Gate 1.5 put a session-revocation check in front of every authenticated route, so
+   * authenticating at all now requires the database to answer. That query is authentication
+   * infrastructure, not a handler reading business data - and this harness exists to prove the
+   * latter is guarded, not to model a database that cannot sign anyone in. Left unanswered, every
+   * probe in every suite gets a 503 from the guard and never reaches the route it is testing.
+   *
+   * Matched narrowly on both columns and the users table, so it cannot stand in for a business
+   * query by accident. It answers the way a live session looks: version 0, matching the default a
+   * test-minted token carries, and active.
+   */
+  const isSessionRevocationLookup = (text) => {
+    const sql = String(typeof text === "object" && text ? text.text : text || "");
+    return /session_revocation_version/.test(sql) && /\bactive\b/.test(sql) && /FROM\s+users/i.test(sql);
+  };
+
   const respond = (text, values) => {
     if (databasePhase === "startup") return new Promise(() => {});
+    if (isSessionRevocationLookup(text)) {
+      if (recordingQueries) recordedQueries.push(String(typeof text === "object" && text ? text.text : text || ""));
+      return Promise.resolve({ rows: [{ session_revocation_version: 0, active: true }], rowCount: 1 });
+    }
     if (recordingQueries) {
       recordedQueries.push(String(typeof text === "object" && text ? text.text : text || ""));
       // Empty rows rather than a rejection: a handler that throws on its first read never issues

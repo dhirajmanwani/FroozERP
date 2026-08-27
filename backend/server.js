@@ -850,6 +850,54 @@ app.use((req, res, next) => {
   return requireAuth(req, res, next);
 });
 
+/**
+ * A-6 Gate 1.5 — a revoked session stops working everywhere, not only on sync.
+ *
+ * `session_revocation_version` was already carried in the token, already incremented when a
+ * password is reset or an account is disabled, and already compared against the database - but
+ * only inside `resolveSyncContext`. So a session revoked because somebody's password had been
+ * changed was refused by sync and accepted by the other 268 routes. The claim was read into
+ * `req.auth` by the middleware and then never compared to anything.
+ *
+ * This is a separate middleware rather than a change to `requireAuth` on purpose. `requireAuth` is
+ * synchronous and its verification is pure token maths with no I/O; making it async to fit a
+ * database read in would change the contract every one of its tests is written against, for a
+ * check that is not about the token's validity but about what has happened since it was minted.
+ * Mounted app-wide for the same reason `requireAuth` is: 285 handlers is 285 chances to miss one.
+ *
+ * It costs one primary-key lookup per authenticated request. That is affordable here and would not
+ * be everywhere: this file is the hosted backend and never runs on a shop's own machine, where the
+ * desktop gateway serves instead - so no counter's billing depends on this query answering.
+ */
+const revokedSessionGuard = async (req, res, next) => {
+  if (!req.auth) return next();
+  try {
+    const { rows } = await pool.query(
+      "SELECT session_revocation_version, active FROM users WHERE id = $1 LIMIT 1",
+      [req.auth.userId],
+    );
+    const user = rows[0];
+    if (!user) {
+      // The account is gone. A token for a deleted user is not a valid session.
+      return res.status(401).json({ code: "SESSION_REVOKED", message: "This sign-in is no longer valid. Sign in again." });
+    }
+    if (user.active === false) {
+      return res.status(401).json({ code: "SESSION_REVOKED", message: "This account is no longer active." });
+    }
+    if (Number(user.session_revocation_version || 0) !== Number(req.auth.sessionRevocationVersion || 0)) {
+      return res.status(401).json({ code: "SESSION_REVOKED", message: "This sign-in was ended. Sign in again." });
+    }
+    return next();
+  } catch (error) {
+    // Fail closed. A database that cannot answer "is this session still valid" has not said yes,
+    // and treating silence as approval is how a revoked session outlives its revocation.
+    console.error("session revocation check failed", error?.message || error);
+    return res.status(503).json({ code: "SESSION_CHECK_UNAVAILABLE", message: "Could not verify this sign-in. Try again shortly." });
+  }
+};
+
+app.use(revokedSessionGuard);
+
 // A-7 step 1. Legacy write routes that duplicate a correctly-scoped protocol-v3 route are refused
 // outright, whatever the scope mode. Their handlers filter with
 // `($2::INTEGER IS NULL OR company_id = $2)` bound from an operational context that does not exist
@@ -10867,6 +10915,38 @@ app.post("/devices/activate", async (req, res) => {
     return res.status(500).json({ message: "Device activation failed" });
   } finally {
     client.release();
+  }
+});
+
+/**
+ * A-6 Gate 1.5 — sign out, and mean it.
+ *
+ * Signing out used to be a client-side gesture: the app forgot the token and the token carried on
+ * working for the rest of its twelve hours. On a shared counter machine that is the whole problem -
+ * the next person to pick it up has a working session belonging to whoever used it last.
+ *
+ * Incrementing the caller's revocation version invalidates every session that user holds, on every
+ * device, which is the right blast radius for "sign me out": a staff member signing off a counter
+ * they share should not leave a session alive on the machine they walked away from either.
+ *
+ * You may only revoke your own. The user id comes from the verified token and is never read from
+ * the request, so this cannot be pointed at somebody else's account.
+ */
+app.post("/auth/sign-out", async (req, res) => {
+  try {
+    await pool.query(
+      `UPDATE users
+          SET session_revocation_version = COALESCE(session_revocation_version, 0) + 1,
+              updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1`,
+      [req.auth.userId],
+    );
+    return res.json({ success: true, message: "Signed out on every device." });
+  } catch (error) {
+    // Say so rather than reporting success. A sign-out that silently failed leaves the person
+    // believing they are signed out while the session is still live, which is worse than an error.
+    console.error("sign-out failed", error?.message || error);
+    return res.status(503).json({ code: "SIGN_OUT_FAILED", message: "Could not sign out. Try again." });
   }
 });
 

@@ -3907,6 +3907,31 @@ function App() {
     }
   }, []);
 
+  /**
+   * Sign out, and tell the server so the session actually ends.
+   *
+   * Forgetting the token locally is not signing out: it leaves a working session for the rest of
+   * its twelve hours, which on a shared counter machine belongs to whoever picks it up next.
+   *
+   * The local half happens regardless of what the server says. Someone pressing sign out on a
+   * counter with no internet must still end up signed out on that screen - refusing to clear it
+   * because a request failed would leave their session on display to the next person, which is the
+   * exact thing this is for. What is lost offline is the server-side revocation, not the sign-out.
+   */
+  const signOut = useCallback(async () => {
+    try {
+      // The session token is attached by the axios interceptor above; setting it here would
+      // duplicate that and, worse, drift from it.
+      await axios.post(`${API_URL}/auth/sign-out`, {}, { timeout: 4000 });
+    } catch {
+      // Offline, or the server refused. The local sign-out below still happens.
+    }
+    setUser(null);
+    setOfflineMode(false);
+    setStartupError("");
+    setStartupNotice("");
+  }, []);
+
   /** Retract a notification whose condition has cleared, so it stops implying a live problem. */
   const clearNotice = useCallback((dedupeKey) => {
     setNotifications((current) => resolveNotification(current, dedupeKey));
@@ -6879,7 +6904,7 @@ function App() {
             <strong>{userDisplayName}</strong>
             <small>{userRoleLabel}</small>
           </div>
-          <button aria-label="Log out" className="logout-button" onClick={(event) => { event.stopPropagation(); setUser(null); setOfflineMode(false); setStartupError(""); setStartupNotice(""); }}>
+          <button aria-label="Log out" className="logout-button" onClick={(event) => { event.stopPropagation(); signOut(); }}>
             <Icon name="logout" size={17} />
           </button>
         </div>
