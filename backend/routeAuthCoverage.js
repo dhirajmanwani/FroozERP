@@ -213,6 +213,28 @@ const setQueryResponder = (responder) => {
   queryResponder = typeof responder === "function" ? responder : null;
 };
 
+/**
+ * An optional stand-in for `pool.connect()`, for the routes that open a transaction.
+ *
+ * The default adapter answers `connect` the same way it answers a query, which is fine for the
+ * question this harness was built for - a route that reaches `await pool.connect()` has already
+ * proved it got past authentication - and useless for driving such a route on purpose:
+ * `/api/sync/push` runs its entire batch on the client it gets back, so without one there is
+ * nothing to script. A suite installs a factory returning an object with `query` and `release`.
+ *
+ * Unset by default, so every existing suite sees exactly what it saw before. Clear it in a
+ * `finally`: the stub is process-wide.
+ */
+let connectionResponder = null;
+
+const setConnectionResponder = (responder) => {
+  connectionResponder = typeof responder === "function" ? responder : null;
+};
+
+const clearConnectionResponder = () => {
+  connectionResponder = null;
+};
+
 const clearQueryResponder = () => {
   queryResponder = null;
 };
@@ -284,7 +306,7 @@ const stubStorageAdapter = () => {
     initialize: () => new Promise(() => {}),
     health: respond,
     query: respond,
-    connect: respond,
+    connect: (...args) => (connectionResponder ? Promise.resolve(connectionResponder(...args)) : respond(...args)),
     close: async () => {},
   };
   require.cache[storagePath].exports = {
@@ -511,6 +533,8 @@ module.exports = {
   stopQueryRecording,
   setQueryResponder,
   clearQueryResponder,
+  setConnectionResponder,
+  clearConnectionResponder,
   MINIMUM_EXPECTED_ROUTES,
   collectRouteAuthCoverage,
   listRegisteredRoutes,

@@ -40,6 +40,10 @@ pub struct LocalDbStatus {
     pub pending_operations: i64,
     pub failed_operations: i64,
     pub conflict_operations: i64,
+    /// Pulled changes this build could not apply and kept rather than dropped. Surfaced because
+    /// the alternative is the failure that reports itself as health: sync green, cursor advanced,
+    /// records gone.
+    pub unapplied_changes: i64,
     pub last_successful_sync_at: Option<String>,
     pub last_push_at: Option<String>,
     pub last_pull_at: Option<String>,
@@ -92,7 +96,7 @@ pub struct SyncAck {
     pub result_payload: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct PulledChange {
     pub change_id: serde_json::Value,
     pub branch_id: Option<i64>,
@@ -191,6 +195,7 @@ pub fn status(app: &AppHandle) -> Result<LocalDbStatus, String> {
             pending_operations: 0,
             failed_operations: 0,
             conflict_operations: 0,
+            unapplied_changes: 0,
             last_successful_sync_at: None,
             last_push_at: None,
             last_pull_at: None,
@@ -230,9 +235,22 @@ pub fn pending_outbox(app: &AppHandle, limit: i64) -> Result<Vec<PendingSyncOper
 }
 
 pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck], device_id: Option<String>, server_time: Option<String>) -> Result<LocalDbStatus, String> {
-    let path = database_path(app)?;
-    initialize_at(&path)?;
-    let mut conn = Connection::open(&path).map_err(to_error)?;
+    apply_push_acks_at(&database_path(app)?, acks, device_id, server_time)
+}
+
+/// The body of `apply_push_acks`, addressed by path.
+///
+/// Split out for the same reason every other `*_at` in this file is: the `AppHandle` form cannot be
+/// driven from a test, and what an acknowledgement does to the local database is exactly the part
+/// worth pinning. The seam between the outbox row and the record's own `sync_status` lives here.
+pub fn apply_push_acks_at(
+    path: &Path,
+    acks: &[SyncAck],
+    device_id: Option<String>,
+    server_time: Option<String>,
+) -> Result<LocalDbStatus, String> {
+    initialize_at(path)?;
+    let mut conn = Connection::open(path).map_err(to_error)?;
     let tx = conn.transaction().map_err(to_error)?;
     let confirmed_at = require_server_time(server_time)?;
     for ack in acks {
@@ -258,6 +276,29 @@ pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck], device_id: Option<Stri
                          entity_version = COALESCE(?3, entity_version)
                      WHERE id = (SELECT entity_id FROM sync_outbox WHERE operation_id = ?1 AND entity_type = 'pos_sale')",
                     params![ack.operation_id, server_ack, ack.server_entity_version, confirmed_at],
+                )
+                .map_err(to_error)?;
+                // The order's own row, not just its outbox row. Migration 022 gave
+                // `local_customer_orders` a `sync_status`, and without this arm it would sit at
+                // 'pending' forever after a perfectly successful push - every synced order
+                // reporting itself as still waiting, which is a status field lying about the one
+                // thing it exists to say.
+                //
+                // Version-gated on purpose. `entity_version` is bumped by every local status
+                // change, and a change made while this push was in flight has already queued its
+                // own operation. Marking the row 'synced' on the older acknowledgement would
+                // report the newer, genuinely unsent version as delivered. Only the version the
+                // server actually acknowledged clears the flag; anything newer stays 'pending'
+                // until its own acknowledgement arrives. A NULL `server_entity_version` matches
+                // nothing here rather than matching everything.
+                tx.execute(
+                    "UPDATE local_customer_orders
+                     SET sync_status = 'synced',
+                         sync_blocked_reason = NULL
+                     WHERE id = (SELECT entity_id FROM sync_outbox
+                                  WHERE operation_id = ?1 AND entity_type = 'customer_order')
+                       AND entity_version = ?2",
+                    params![ack.operation_id, ack.server_entity_version],
                 )
                 .map_err(to_error)?;
                 apply_purchase_ack_with_tx(&tx, ack, "completed", &server_ack, &confirmed_at)?;
@@ -322,7 +363,7 @@ pub fn apply_push_acks(app: &AppHandle, acks: &[SyncAck], device_id: Option<Stri
     )
     .map_err(to_error)?;
     tx.commit().map_err(to_error)?;
-    status_at(&path)
+    status_at(path)
 }
 
 pub fn database_audit(app: &AppHandle) -> Result<serde_json::Value, String> {
@@ -1682,6 +1723,11 @@ pub fn save_customer_order_at(
     // would hold a reservation against lines that were never recorded, so the stock would be
     // missing from the counter with nothing on screen explaining where it went.
     let tx = conn.transaction().map_err(to_error)?;
+
+    // Decided before the row is written, not at push time. An order has to belong to a branch for
+    // the cloud to accept it at all, and the honest place to record that is on the order.
+    let branch_id = resolve_order_branch_id(&tx, order_branch_text(order, "branch_id"))?;
+
     tx.execute(
         "INSERT INTO local_customer_orders (
            id, order_no, source, customer_id, customer_name, customer_mobile, delivery_address,
@@ -1708,7 +1754,12 @@ pub fn save_customer_order_at(
             // in this file is SQLite's and there is no second date format to keep in step.
             order_text(order, "reserved_at"),
             order_text(order, "notes"),
-            order.get("branch_id").and_then(|value| value.as_i64()),
+            // Text, not `as_i64()`. The old reader dropped any branch the caller sent as a string,
+            // and App.jsx sends `user?.branch_id` whose shape is whatever the login response held.
+            // SQLite's INTEGER affinity still stores a numeric branch as an integer, so nothing
+            // that reads this column sees a change; a non-numeric branch is now kept instead of
+            // silently becoming NULL.
+            branch_id,
             order_text(order, "created_by"),
         ],
     )
@@ -1746,6 +1797,12 @@ pub fn save_customer_order_at(
         )
         .map_err(to_error)?;
     }
+
+    // The outbox row goes in here, inside the same transaction as the order and its lines, before
+    // the commit. An order that exists with nothing queued behind it is an order that never leaves
+    // this device and never says so.
+    enqueue_customer_order_with_tx(&tx, &order_id)?;
+
     tx.commit().map_err(to_error)?;
     read_customer_order(&conn, &order_id)
 }
@@ -1771,7 +1828,7 @@ pub fn set_customer_order_status_at(
     patch: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     initialize_at(path)?;
-    let conn = Connection::open(path).map_err(to_error)?;
+    let mut conn = Connection::open(path).map_err(to_error)?;
 
     let current: (String, Option<String>) = conn
         .query_row(
@@ -1804,7 +1861,13 @@ pub fn set_customer_order_status_at(
     // formats to keep in step, and the one nobody looks at drifts.
     let restart_reservation = next_status == "RECEIVED";
 
-    conn.execute(
+    // A transaction, where there used to be a bare statement. The status change, the version bump
+    // and the outbox row have to land together or not at all: a status change that committed
+    // without its outbox row would be a move the rest of the business never hears about, and it
+    // would look identical to one that had synced.
+    let tx = conn.transaction().map_err(to_error)?;
+
+    let changed = tx.execute(
         "UPDATE local_customer_orders SET
            status = ?2,
            -- Returning an order to RECEIVED restarts its reservation clock. Without this, a lapsed
@@ -1822,6 +1885,11 @@ pub fn set_customer_order_status_at(
            carrier_contact = COALESCE(?9, carrier_contact),
            sale_id = COALESCE(?10, sale_id),
            invoice_no = COALESCE(?11, invoice_no),
+           -- Every local mutation moves the version on. This is the number the whole sync contract
+           -- rests on: the pull path refuses an incoming copy older than the one already here, so
+           -- a status change can never be undone by a stale copy of the same order arriving late
+           -- from another device.
+           entity_version = entity_version + 1,
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE id = ?1 AND deleted_at IS NULL",
         rusqlite::params![
@@ -1839,6 +1907,15 @@ pub fn set_customer_order_status_at(
         ],
     )
     .map_err(to_error)?;
+    if changed == 0 {
+        // The order was found a moment ago and is gone now. Named, not swallowed: a status change
+        // that quietly updates nothing and then reports the order back unchanged is the failure
+        // that reads as success.
+        return Err("That order changed underneath this update and was not moved.".to_string());
+    }
+
+    enqueue_customer_order_with_tx(&tx, order_id)?;
+    tx.commit().map_err(to_error)?;
     read_customer_order(&conn, order_id)
 }
 
@@ -1879,10 +1956,24 @@ fn read_customer_order(conn: &Connection, order_id: &str) -> Result<serde_json::
                     delivery_address, status, reserved_at, packed_at, sent_at, delivered_at,
                     cancelled_at, cancellation_reason, carrier, carrier_reference, tracking_url,
                     carrier_contact, sale_id, invoice_no, notes, branch_id, created_by, created_at,
-                    payment_state, amount_paid, payment_reference, payment_marked_at
+                    payment_state, amount_paid, payment_reference, payment_marked_at,
+                    entity_version, sync_status, sync_blocked_reason, updated_at
              FROM local_customer_orders WHERE id = ?1",
             rusqlite::params![order_id],
             |row| {
+                // Read as a raw value rather than as `Option<i64>`. The column is INTEGER, but a
+                // branch id is an opaque string everywhere else in this codebase and a copy pulled
+                // from the cloud can legitimately carry a non-numeric one. `Option<i64>` on such a
+                // row fails the whole read, and because `list_customer_orders_at` reads every order
+                // in a loop, one such row would empty the entire Orders board. A numeric branch
+                // still comes back as a number, exactly as before.
+                let branch_id = match row.get::<_, rusqlite::types::Value>(21)? {
+                    rusqlite::types::Value::Null => serde_json::Value::Null,
+                    rusqlite::types::Value::Integer(value) => serde_json::Value::from(value),
+                    rusqlite::types::Value::Real(value) => serde_json::Value::from(value),
+                    rusqlite::types::Value::Text(value) => serde_json::Value::String(value),
+                    rusqlite::types::Value::Blob(_) => serde_json::Value::Null,
+                };
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
                     "order_no": row.get::<_, String>(1)?,
@@ -1905,13 +1996,20 @@ fn read_customer_order(conn: &Connection, order_id: &str) -> Result<serde_json::
                     "sale_id": row.get::<_, Option<String>>(18)?,
                     "invoice_no": row.get::<_, Option<String>>(19)?,
                     "notes": row.get::<_, Option<String>>(20)?,
-                    "branch_id": row.get::<_, Option<i64>>(21)?,
+                    "branch_id": branch_id,
                     "created_by": row.get::<_, Option<String>>(22)?,
                     "created_at": row.get::<_, String>(23)?,
                     "payment_state": row.get::<_, Option<String>>(24)?,
                     "amount_paid": row.get::<_, Option<f64>>(25)?,
                     "payment_reference": row.get::<_, Option<String>>(26)?,
                     "payment_marked_at": row.get::<_, Option<String>>(27)?,
+                    // The sync half of the record. `sync_status` is deliberately part of what the
+                    // board reads: 'blocked' is an error state with a sentence attached, and an
+                    // order that is never going to reach the cloud must not look like one that has.
+                    "entity_version": row.get::<_, i64>(28)?,
+                    "sync_status": row.get::<_, String>(29)?,
+                    "sync_blocked_reason": row.get::<_, Option<String>>(30)?,
+                    "updated_at": row.get::<_, Option<String>>(31)?,
                 }))
             },
         )
@@ -2674,6 +2772,11 @@ fn status_at(path: &Path) -> Result<LocalDbStatus, String> {
         pending_operations: count_outbox_status(&conn, &["pending", "syncing"])?,
         failed_operations: count_outbox_status(&conn, &["failed"])?,
         conflict_operations: count_outbox_status(&conn, &["conflict"])?,
+        unapplied_changes: conn
+            .query_row("SELECT COUNT(*) FROM local_unapplied_changes", [], |row| row.get(0))
+            .optional()
+            .map_err(to_error)?
+            .unwrap_or(0),
         last_successful_sync_at: last_sync,
         last_push_at: single_optional_string(
             &conn,
@@ -5143,6 +5246,360 @@ fn apply_pulled_pos_sale_with_tx(
     Ok(())
 }
 
+/// Statuses this build can display. The same six the CHECK constraint in migration 020 allows.
+const CUSTOMER_ORDER_STATUSES: [&str; 6] =
+    ["RECEIVED", "PACKED", "SENT", "DELIVERED", "CANCELLED", "RETURNED"];
+const CUSTOMER_ORDER_SOURCES: [&str; 5] = ["PHONE", "WHATSAPP", "WEBSITE", "COUNTER", "OTHER"];
+const CUSTOMER_ORDER_PAYMENT_STATES: [&str; 3] = ["UNPAID", "PAID", "ON_DELIVERY"];
+
+/// Keep a pulled change this build could not apply, instead of dropping it.
+///
+/// `apply_pull_changes_at` advances the pull cursor in the same transaction that applies the
+/// changes, so a change this code declines is never offered again. Before migration 022 the
+/// decline was `_ => {}` — no error, no log, no trace — which meant that the day the server began
+/// emitting an entity type an older device did not know, every one of those rows was destroyed on
+/// that device while sync went on reporting itself healthy.
+///
+/// Two things are deliberately not done here. It is not an error: a device running older code has
+/// to be able to go on syncing everything it does understand, so one unknown type must not fail the
+/// page. And it is not a `sync_conflicts` row: that table feeds a conflict count a person is meant
+/// to act on, and "this build is older than the server" is not a conflict to resolve. It is written
+/// whole, so an upgraded build can read these back and apply them.
+fn record_unapplied_change(
+    tx: &rusqlite::Transaction,
+    change: &PulledChange,
+    reason: &str,
+    detail: Option<String>,
+) -> Result<(), String> {
+    let payload = serde_json::to_string(&change.payload).map_err(to_error)?;
+    // Derived from the change, not from the clock, so a replay updates the row it already wrote
+    // instead of piling up a copy per pull.
+    let record_id = format!(
+        "{}::{}::{}",
+        change.entity_type,
+        change.entity_id,
+        change.version.unwrap_or(0)
+    );
+    eprintln!(
+        "local sync: change not applied ({reason}) entity_type={} entity_id={} version={:?}",
+        change.entity_type, change.entity_id, change.version
+    );
+    tx.execute(
+        "INSERT INTO local_unapplied_changes (
+            id, entity_type, entity_id, operation_type, version, payload, updated_at, reason, detail
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(id) DO UPDATE SET
+           operation_type = excluded.operation_type,
+           payload = excluded.payload,
+           updated_at = excluded.updated_at,
+           reason = excluded.reason,
+           detail = excluded.detail,
+           last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+           seen_count = local_unapplied_changes.seen_count + 1",
+        params![
+            record_id,
+            change.entity_type,
+            change.entity_id,
+            change.operation_type,
+            change.version,
+            payload,
+            change.updated_at,
+            reason,
+            detail,
+        ],
+    )
+    .map_err(to_error)?;
+    Ok(())
+}
+
+/// Apply a customer order pulled from the cloud.
+///
+/// ## Stock reservation on the receiving device — the judgement this function makes
+///
+/// An order in RECEIVED or PACKED reserves stock on the device that took it. The reservation is
+/// **derived, not stored**: `reservedQuantityByProduct` in `frontend/src/local/orderLifecycle.js`
+/// walks the orders this device holds and adds up the lines of the ones still holding stock, and
+/// `reservedStock.js` subtracts that from what the counter may sell. Nothing is written to
+/// `local_inventory_lots` when an order is accepted.
+///
+/// That decides the question. Writing the pulled order faithfully into `local_customer_orders` and
+/// `local_customer_order_items` — with its real status and its real `reserved_at`, so the lapse
+/// clock reads the same on both devices — *is* what makes device B reserve the stock. It needs no
+/// stock mutation, and a stock mutation would be actively wrong: it would double-count against the
+/// POS arithmetic, which deducts from lots at the moment of sale and knows nothing about orders.
+/// So this function deliberately does not touch `local_inventory_lots`, for the same reason
+/// `apply_pulled_pos_sale_with_tx` does not.
+///
+/// **Residual risk, stated rather than hidden.** The reservation on device B is only as fresh as
+/// its last successful pull. Between one counter accepting an order and the other counter pulling
+/// it, both can still sell the same crate; sync closes that window, it does not remove it. When it
+/// happens, `availableQuantity` reports `oversold` with the shortfall rather than showing a plain
+/// "out of stock", so a person is told to ring the customer. A second, narrower risk: reservations
+/// are summed across every order this device holds, without regard to branch, so if the server ever
+/// sends a device orders from a branch other than its own, that device's counter would see stock
+/// reserved that is not its stock to reserve. `branch_id` is preserved on every row applied here so
+/// that a branch filter is possible; today no caller applies one, and that belongs to the frontend
+/// layer rather than here.
+fn apply_pulled_customer_order_with_tx(
+    tx: &rusqlite::Transaction,
+    change: &PulledChange,
+) -> Result<(), String> {
+    let payload = &change.payload;
+    let incoming_version = change.version.unwrap_or(1);
+
+    // The version guard, the same shape as the POS sale's. Last-writer-wins on version: an older
+    // copy arriving late — a re-delivery, a device that has been offline, a batch replayed after a
+    // failed ack — must never undo a newer local status change.
+    let existing_version: Option<i64> = tx
+        .query_row(
+            "SELECT entity_version FROM local_customer_orders WHERE id = ?1",
+            [change.entity_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(to_error)?;
+    if let Some(local_version) = existing_version {
+        if incoming_version < local_version {
+            return Ok(());
+        }
+    }
+
+    if change.operation_type.eq_ignore_ascii_case("DELETE") {
+        tx.execute(
+            "UPDATE local_customer_orders
+                SET deleted_at = COALESCE(?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    entity_version = ?3,
+                    sync_status = 'synced',
+                    sync_blocked_reason = NULL,
+                    updated_at = COALESCE(?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+              WHERE id = ?1",
+            params![change.entity_id, change.updated_at, incoming_version],
+        )
+        .map_err(to_error)?;
+        return Ok(());
+    }
+
+    // Status is the field that decides whether this order holds stock, so an unrecognised one is
+    // not guessed at. Coercing it to RECEIVED would reserve fruit for an order that might have been
+    // cancelled; letting the CHECK constraint reject it would abort the whole pull transaction and
+    // wedge the cursor for every other change in the page. It is kept instead, and skipped.
+    let status = optional_text(payload, "status")
+        .map(|value| value.trim().to_uppercase())
+        .unwrap_or_else(|| "RECEIVED".to_string());
+    if !CUSTOMER_ORDER_STATUSES.contains(&status.as_str()) {
+        return record_unapplied_change(
+            tx,
+            change,
+            "CUSTOMER_ORDER_STATUS_NOT_RECOGNISED",
+            Some(format!(
+                "status {status:?} is not one this build knows how to display or reserve against"
+            )),
+        );
+    }
+
+    // Source is not load-bearing in the same way — it records how the order arrived. An unknown one
+    // becomes OTHER, which is what OTHER means, rather than costing the order.
+    let source = optional_text(payload, "source")
+        .map(|value| value.trim().to_uppercase())
+        .filter(|value| CUSTOMER_ORDER_SOURCES.contains(&value.as_str()))
+        .unwrap_or_else(|| "OTHER".to_string());
+
+    let raw_payment_state = optional_text(payload, "payment_state")
+        .map(|value| value.trim().to_uppercase());
+    let payment_state = raw_payment_state
+        .clone()
+        .filter(|value| CUSTOMER_ORDER_PAYMENT_STATES.contains(&value.as_str()));
+    if raw_payment_state.is_some() && payment_state.is_none() {
+        // The order still applies — it is stock and a customer — but NULL means "nobody was ever
+        // asked whether this was paid", which is not what happened here. The difference is kept.
+        record_unapplied_change(
+            tx,
+            change,
+            "CUSTOMER_ORDER_PAYMENT_STATE_NOT_RECOGNISED",
+            Some(format!(
+                "payment_state {:?} is not one this build knows; the order was applied with no payment state",
+                raw_payment_state.unwrap_or_default()
+            )),
+        )?;
+    }
+
+    let order_no = optional_text(payload, "order_no")
+        .unwrap_or_else(|| format!("CLOUD-{}", change.entity_id));
+    // `order_no` is UNIQUE. A collision with a *different* order would abort the pull transaction
+    // and stall the cursor behind it for ever, so it is caught here and kept instead.
+    let clashing_id: Option<String> = tx
+        .query_row(
+            "SELECT id FROM local_customer_orders WHERE order_no = ?1 AND id <> ?2",
+            params![order_no, change.entity_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(to_error)?;
+    if let Some(other) = clashing_id {
+        return record_unapplied_change(
+            tx,
+            change,
+            "CUSTOMER_ORDER_NUMBER_ALREADY_USED",
+            Some(format!(
+                "order number {order_no:?} already belongs to order {other:?} on this device"
+            )),
+        );
+    }
+
+    let branch_id = order_branch_text(payload, "branch_id")
+        .or_else(|| change.branch_id.map(|value| value.to_string()));
+
+    tx.execute(
+        "INSERT INTO local_customer_orders (
+            id, order_no, source, customer_id, customer_name, customer_mobile, delivery_address,
+            status, reserved_at, packed_at, sent_at, delivered_at, cancelled_at,
+            cancellation_reason, carrier, carrier_reference, tracking_url, carrier_contact,
+            sale_id, invoice_no, notes, branch_id, created_by, created_at, updated_at, deleted_at,
+            payment_state, amount_paid, payment_reference, payment_marked_at,
+            entity_version, sync_status, sync_blocked_reason
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+            ?19, ?20, ?21, ?22, ?23,
+            COALESCE(?24, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            COALESCE(?25, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            ?26, ?27, ?28, ?29, ?30, ?31, 'synced', NULL
+         )
+         ON CONFLICT(id) DO UPDATE SET
+           order_no = excluded.order_no,
+           source = excluded.source,
+           customer_id = excluded.customer_id,
+           customer_name = excluded.customer_name,
+           customer_mobile = excluded.customer_mobile,
+           delivery_address = excluded.delivery_address,
+           status = excluded.status,
+           reserved_at = excluded.reserved_at,
+           packed_at = excluded.packed_at,
+           sent_at = excluded.sent_at,
+           delivered_at = excluded.delivered_at,
+           cancelled_at = excluded.cancelled_at,
+           cancellation_reason = excluded.cancellation_reason,
+           carrier = excluded.carrier,
+           carrier_reference = excluded.carrier_reference,
+           tracking_url = excluded.tracking_url,
+           carrier_contact = excluded.carrier_contact,
+           sale_id = excluded.sale_id,
+           invoice_no = excluded.invoice_no,
+           notes = excluded.notes,
+           branch_id = excluded.branch_id,
+           created_by = excluded.created_by,
+           updated_at = excluded.updated_at,
+           deleted_at = excluded.deleted_at,
+           payment_state = excluded.payment_state,
+           amount_paid = excluded.amount_paid,
+           payment_reference = excluded.payment_reference,
+           payment_marked_at = excluded.payment_marked_at,
+           entity_version = excluded.entity_version,
+           sync_status = 'synced',
+           sync_blocked_reason = NULL",
+        params![
+            change.entity_id,
+            order_no,
+            source,
+            optional_text(payload, "customer_id"),
+            optional_text(payload, "customer_name")
+                .unwrap_or_else(|| "Walk-in customer".to_string()),
+            optional_text(payload, "customer_mobile"),
+            optional_text(payload, "delivery_address"),
+            status,
+            // Carried across rather than restamped. The lapse is measured from this timestamp, so
+            // restamping it here would make every pull look like a fresh reservation and a
+            // forgotten order would hold its fruit for ever — the exact failure the lapse exists
+            // to prevent, reintroduced through the back door.
+            optional_text(payload, "reserved_at"),
+            optional_text(payload, "packed_at"),
+            optional_text(payload, "sent_at"),
+            optional_text(payload, "delivered_at"),
+            optional_text(payload, "cancelled_at"),
+            optional_text(payload, "cancellation_reason"),
+            optional_text(payload, "carrier"),
+            optional_text(payload, "carrier_reference"),
+            optional_text(payload, "tracking_url"),
+            optional_text(payload, "carrier_contact"),
+            optional_text(payload, "sale_id"),
+            optional_text(payload, "invoice_no"),
+            optional_text(payload, "notes"),
+            branch_id,
+            optional_text(payload, "created_by"),
+            optional_text(payload, "created_at"),
+            change.updated_at.clone(),
+            optional_text(payload, "deleted_at"),
+            payment_state,
+            payload.get("amount_paid").and_then(json_number),
+            optional_text(payload, "payment_reference"),
+            optional_text(payload, "payment_marked_at"),
+            incoming_version,
+        ],
+    )
+    .map_err(to_error)?;
+
+    // Whole-record UPSERT means the lines are replaced, not merged. Merging would leave a line that
+    // was removed from the order still reserving stock here after it had stopped reserving stock
+    // where it was edited. The push payload always carries every line, including the lot assigned
+    // at packing, so a round trip loses nothing.
+    tx.execute(
+        "DELETE FROM local_customer_order_items WHERE order_id = ?1",
+        params![change.entity_id],
+    )
+    .map_err(to_error)?;
+
+    if let Some(items) = payload.get("items").and_then(|value| value.as_array()) {
+        for (index, item) in items.iter().enumerate() {
+            // Never coerced. `"004"` and `4` are different products, and comparing one against the
+            // other is what silently emptied the Inventory table once.
+            let Some(product_id) = order_text(item, "product_id") else {
+                record_unapplied_change(
+                    tx,
+                    change,
+                    "CUSTOMER_ORDER_LINE_HAS_NO_PRODUCT",
+                    Some(format!("line {index} of this order carries no product id and was skipped")),
+                )?;
+                continue;
+            };
+            let quantity = item.get("quantity").and_then(json_number).unwrap_or(0.0);
+            if !(quantity > 0.0) {
+                // The CHECK would reject it and take the whole pull page down with it. A line that
+                // reserves nothing, or reserves backwards, is kept and skipped instead.
+                record_unapplied_change(
+                    tx,
+                    change,
+                    "CUSTOMER_ORDER_LINE_QUANTITY_NOT_POSITIVE",
+                    Some(format!("line {index} of this order has quantity {quantity} and was skipped")),
+                )?;
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO local_customer_order_items (
+                    id, order_id, line_index, product_id, product_name, unit, quantity,
+                    agreed_rate, inventory_lot_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    order_text(item, "id")
+                        .unwrap_or_else(|| format!("{}-line-{}", change.entity_id, index)),
+                    change.entity_id,
+                    index as i64,
+                    product_id,
+                    order_text(item, "product_name")
+                        .unwrap_or_else(|| "Unnamed product".to_string()),
+                    order_text(item, "unit"),
+                    quantity,
+                    item.get("agreed_rate").and_then(json_number),
+                    // Text, and left alone. The lot assigned at packing is an opaque id like every
+                    // other id here.
+                    order_text(item, "inventory_lot_id"),
+                ],
+            )
+            .map_err(to_error)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Result<(), String> {
     let _change_id = &change.change_id;
     let operation = change.operation_type.to_uppercase();
@@ -5421,7 +5878,21 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
             )
             .map_err(to_error)?;
         }
-        _ => {}
+        "customer_order" => apply_pulled_customer_order_with_tx(tx, change)?,
+        // Not `_ => {}`. An unrecognised entity type used to be dropped here with no error and no
+        // log, while the caller advanced the pull cursor in the same transaction — so the change
+        // was never offered again and the loss was invisible on both ends. It is kept instead:
+        // still not fatal, because a device running older code has to go on syncing everything it
+        // does understand, but no longer silent and no longer destroyed.
+        _ => record_unapplied_change(
+            tx,
+            change,
+            "ENTITY_TYPE_NOT_SUPPORTED",
+            Some(format!(
+                "this build has no arm for entity type {:?}",
+                change.entity_type
+            )),
+        )?,
     }
     Ok(())
 }
@@ -5530,7 +6001,7 @@ mod tests {
     /// three at once with nothing but `left: 18, right: 17` to explain why, and the failures were
     /// mistaken for the environment for long enough to reach a merge check. One named constant is
     /// the whole fix: **bump this when you add a migration**, and the number says what it counts.
-    const EXPECTED_APPLIED_MIGRATIONS: i64 = 20;
+    const EXPECTED_APPLIED_MIGRATIONS: i64 = 21;
 
     #[test]
     fn snapshot_preflight_rejects_malformed_database_without_replacing_it() {
@@ -6018,6 +6489,798 @@ mod tests {
             saved["reserved_at"].as_str().is_some_and(|value| !value.is_empty()),
             "an accepted order reserves stock immediately, so it must carry a reservation time"
         );
+
+        // Nothing was queued for either order. The rejected one left no outbox row because it left
+        // no order; the accepted one left none because this profile has no branch of its own to
+        // give it, and a branchless change would be refused by the server and would take the
+        // acknowledgements for the rest of its push batch down with it. That refusal is named on
+        // the record rather than being an order that silently never syncs.
+        let conn = Connection::open(&path).expect("reopen for outbox");
+        let queued: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .expect("count outbox");
+        assert_eq!(queued, 0, "a rejected order must leave no outbox row either");
+        drop(conn);
+        assert_eq!(saved["sync_status"], "blocked");
+        assert!(
+            saved["sync_blocked_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("no branch")),
+            "an order that cannot be queued must say so in words, not just fail to sync"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Build a throwaway order profile.
+    fn order_sync_test_path(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-order-sync-{label}-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        path
+    }
+
+    /// Give the profile an approved device so branch resolution has a rung 2 to land on.
+    fn seed_order_branch(path: &std::path::Path, branch: &str) {
+        let conn = Connection::open(path).expect("open profile to seed identity");
+        conn.execute(
+            "INSERT INTO local_device_identity
+               (device_id, device_name, platform, app_version, branch_id, registration_status)
+             VALUES ('FZDEV-ORDERS', 'Order Counter', 'windows', '1.0.0', ?1, 'approved')",
+            rusqlite::params![branch],
+        )
+        .expect("seed approved device identity");
+    }
+
+    /// One order read back by id, through the same list the board uses.
+    fn order_row(path: &std::path::Path, order_id: &str) -> serde_json::Value {
+        list_customer_orders_at(path)
+            .expect("orders list")["orders"]
+            .as_array()
+            .expect("orders array")
+            .iter()
+            .find(|order| order["id"] == order_id)
+            .cloned()
+            .unwrap_or_else(|| panic!("order {order_id} is missing from the board"))
+    }
+
+    fn outbox_rows(path: &std::path::Path) -> Vec<(String, String, String, String, i64, Option<String>, String, serde_json::Value)> {
+        let conn = Connection::open(path).expect("open profile to read outbox");
+        let mut statement = conn
+            .prepare(
+                "SELECT operation_id, entity_type, entity_id, operation_type, version, branch_id,
+                        status, payload_json
+                 FROM sync_outbox ORDER BY version, operation_id",
+            )
+            .expect("prepare outbox read");
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(7)?)
+                        .unwrap_or(serde_json::Value::Null),
+                ))
+            })
+            .expect("read outbox")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect outbox");
+        rows
+    }
+
+    /// Writing an order queues it, in the same transaction, exactly once.
+    ///
+    /// The order and its outbox row have to commit together. Enqueueing from JavaScript after the
+    /// save returned would mean that any failure between the two calls left an order with nothing
+    /// queued behind it — unsynced for ever, and indistinguishable on screen from one that had
+    /// synced. So this asserts on the shape of the queued row as well as on its existence.
+    #[test]
+    fn an_order_write_queues_exactly_one_upsert_carrying_the_whole_order() {
+        let path = order_sync_test_path("write");
+        initialize_at(&path).expect("initialize order sync database");
+
+        let saved = save_customer_order_at(
+            &path,
+            &serde_json::json!({
+                "order_no": "ORD-SYNC-1",
+                "customer_name": "Ram",
+                // A branch sent as a string. The old reader used `as_i64()` and dropped it, which
+                // is how an order reached the outbox with no branch at all.
+                "branch_id": "3",
+                "items": [
+                    { "product_id": "004", "product_name": "Apple", "quantity": 2.5, "agreed_rate": 180 },
+                    { "product_id": "005", "product_name": "Banana", "quantity": 1.5, "agreed_rate": 60 }
+                ]
+            }),
+        )
+        .expect("a well-formed order saves");
+        let order_id = saved["id"].as_str().expect("saved order has an id").to_string();
+
+        let rows = outbox_rows(&path);
+        assert_eq!(rows.len(), 1, "one order write means one outbox row, not zero and not two");
+        let (operation_id, entity_type, entity_id, operation_type, version, branch, status, payload) =
+            rows.into_iter().next().unwrap();
+        assert_eq!(entity_type, "customer_order");
+        assert_eq!(entity_id, order_id, "the entity id is the order id, uncoerced");
+        assert_eq!(operation_type, "UPSERT");
+        assert_eq!(version, 1);
+        assert_eq!(branch.as_deref(), Some("3"), "the branch travels as text");
+        assert_eq!(status, "pending");
+        assert_eq!(operation_id, format!("order-{order_id}-v1"));
+
+        // The whole record, every time: header plus every line.
+        assert_eq!(payload["branch_id"], "3", "the wire carries a text branch id");
+        assert_eq!(payload["customer_name"], "Ram");
+        assert_eq!(payload["status"], "RECEIVED");
+        assert_eq!(payload["entity_version"], 1);
+        let lines = payload["items"].as_array().expect("the payload carries its lines");
+        assert_eq!(lines.len(), 2, "a partial payload would sync a partial order");
+        assert_eq!(lines[0]["product_id"], "004", "product ids stay opaque text on the wire");
+        assert_eq!(saved["sync_status"], "pending");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A branch that is not a number survives the round trip instead of emptying the board.
+    ///
+    /// `local_customer_orders.branch_id` is INTEGER while every other local table stores branch ids
+    /// as TEXT. The column is not rebuilt — nothing joins it — so the read has to tolerate what
+    /// SQLite's affinity rules actually store. A read that insisted on `Option<i64>` would fail on
+    /// such a row, and because the board reads every order in a loop, one row would empty all of it.
+    #[test]
+    fn a_branch_id_that_is_not_a_number_survives_the_order_round_trip() {
+        let path = order_sync_test_path("textbranch");
+        initialize_at(&path).expect("initialize order sync database");
+
+        let saved = save_customer_order_at(
+            &path,
+            &serde_json::json!({
+                "order_no": "ORD-SYNC-TEXT",
+                "customer_name": "Sita",
+                "branch_id": "north-2",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 1 }]
+            }),
+        )
+        .expect("an order with a non-numeric branch saves");
+        assert_eq!(saved["branch_id"], "north-2");
+        assert_eq!(outbox_rows(&path)[0].5.as_deref(), Some("north-2"));
+
+        // And the board still loads.
+        let board = list_customer_orders_at(&path).expect("the orders board must still load");
+        assert_eq!(board["orders"].as_array().expect("orders array").len(), 1);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A rejected order leaves neither an order nor an outbox row.
+    #[test]
+    fn a_rejected_order_leaves_no_outbox_row_behind() {
+        let path = order_sync_test_path("rollback");
+        initialize_at(&path).expect("initialize order sync database");
+        seed_order_branch(&path, "3");
+
+        let outcome = save_customer_order_at(
+            &path,
+            &serde_json::json!({
+                "order_no": "ORD-SYNC-BAD",
+                "customer_name": "Mohan",
+                "items": [
+                    { "product_id": "004", "product_name": "Apple", "quantity": 5 },
+                    { "product_id": "005", "product_name": "Banana", "quantity": 0 }
+                ]
+            }),
+        );
+        assert!(outcome.is_err(), "a zero-quantity line must refuse the whole order");
+
+        let conn = Connection::open(&path).expect("reopen after rollback");
+        let orders: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_customer_orders", [], |row| row.get(0))
+            .expect("count orders");
+        let queued: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .expect("count outbox");
+        assert_eq!(orders, 0, "the rejected order must leave nothing behind");
+        assert_eq!(
+            queued, 0,
+            "an outbox row without its order would push an order that does not exist"
+        );
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Every status change queues its own whole-record UPSERT and moves the version on.
+    ///
+    /// Not a distinct operation type per status change: the server sorts a push batch by
+    /// `operation_id` string rather than by causality and permanently records any rejection, so a
+    /// status change that arrived before its own creation would be rejected once and never retried.
+    /// Whole-record UPSERT with last-writer-wins on version is order-independent.
+    #[test]
+    #[test]
+    fn an_acknowledged_order_stops_reporting_itself_as_pending() {
+        // The seam between the two halves of this feature, and the one place neither half could
+        // see on its own. The push acknowledgement marks the *outbox* row synced; the order's own
+        // `sync_status` is a different column, added by migration 022. Without an arm for it here
+        // a perfectly delivered order sits at 'pending' forever, and the board reports every
+        // synced order as still waiting - a status field lying about the single thing it exists
+        // to say.
+        let path = order_sync_test_path("ack");
+        initialize_at(&path).expect("initialize order sync database");
+        seed_order_branch(&path, "7");
+
+        let saved = save_customer_order_at(
+            &path,
+            &serde_json::json!({
+                "order_no": "ORD-ACK-1",
+                "customer_name": "Sita",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 2 }]
+            }),
+        )
+        .expect("order saves");
+        let order_id = saved["id"].as_str().unwrap().to_string();
+        assert_eq!(saved["sync_status"], "pending", "an order starts out unsent");
+
+        let ack = SyncAck {
+            operation_id: format!("order-{order_id}-v1"),
+            status: "accepted".to_string(),
+            server_entity_version: Some(1),
+            server_updated_at: Some("2026-08-27T10:00:00.000Z".to_string()),
+            error_code: None,
+            message: None,
+            result_payload: Some(serde_json::json!({
+                "entity_type": "customer_order",
+                "order_id": order_id,
+                "entity_version": 1,
+                "duplicate": false
+            })),
+        };
+        apply_push_acks_at(&path, &[ack], None, Some("2026-08-27T10:00:00.000Z".to_string()))
+            .expect("the acknowledgement applies");
+
+        let order = order_row(&path, &order_id);
+        assert_eq!(order["sync_status"], "synced", "a delivered order must stop claiming to be pending");
+        assert!(order["sync_blocked_reason"].is_null());
+    }
+
+    #[test]
+    fn an_order_changed_while_its_push_was_in_flight_stays_pending() {
+        // The reason the arm above is version-gated rather than a plain id match. A status change
+        // made between the push leaving and its acknowledgement arriving has already queued an
+        // operation of its own. Clearing the flag on the older acknowledgement would report that
+        // newer, genuinely unsent version as delivered - the shop would believe a change had
+        // reached the other counters when it had not left this one.
+        let path = order_sync_test_path("ack-inflight");
+        initialize_at(&path).expect("initialize order sync database");
+        seed_order_branch(&path, "7");
+
+        let saved = save_customer_order_at(
+            &path,
+            &serde_json::json!({
+                "order_no": "ORD-ACK-2",
+                "customer_name": "Gita",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 2 }]
+            }),
+        )
+        .expect("order saves");
+        let order_id = saved["id"].as_str().unwrap().to_string();
+
+        // v2 happens while v1 is still on the wire.
+        set_customer_order_status_at(&path, &order_id, "PACKED", &serde_json::json!({}))
+            .expect("an order can be packed");
+
+        let ack = SyncAck {
+            operation_id: format!("order-{order_id}-v1"),
+            status: "accepted".to_string(),
+            server_entity_version: Some(1),
+            server_updated_at: Some("2026-08-27T10:00:00.000Z".to_string()),
+            error_code: None,
+            message: None,
+            result_payload: Some(serde_json::json!({ "entity_version": 1 })),
+        };
+        apply_push_acks_at(&path, &[ack], None, Some("2026-08-27T10:00:00.000Z".to_string()))
+            .expect("the acknowledgement applies");
+
+        let order = order_row(&path, &order_id);
+        assert_eq!(order["entity_version"], 2);
+        assert_eq!(
+            order["sync_status"], "pending",
+            "v1's acknowledgement must not vouch for v2, which has not been sent"
+        );
+    }
+
+    fn a_status_change_queues_its_own_upsert_and_moves_the_version_on() {
+        let path = order_sync_test_path("status");
+        initialize_at(&path).expect("initialize order sync database");
+        // No branch on the order itself: this exercises rung 2, the device's own registration.
+        seed_order_branch(&path, "7");
+
+        let saved = save_customer_order_at(
+            &path,
+            &serde_json::json!({
+                "order_no": "ORD-SYNC-2",
+                "customer_name": "Ram",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 4 }]
+            }),
+        )
+        .expect("order saves");
+        let order_id = saved["id"].as_str().unwrap().to_string();
+        assert_eq!(saved["entity_version"], 1);
+        assert_eq!(outbox_rows(&path).len(), 1);
+        assert_eq!(outbox_rows(&path)[0].5.as_deref(), Some("7"), "the device's branch is used");
+
+        let packed = set_customer_order_status_at(&path, &order_id, "PACKED", &serde_json::json!({}))
+            .expect("an order can be packed");
+        assert_eq!(packed["status"], "PACKED");
+        assert_eq!(packed["entity_version"], 2, "every local mutation moves the version on");
+        assert_eq!(packed["sync_status"], "pending");
+
+        let rows = outbox_rows(&path);
+        assert_eq!(rows.len(), 2, "the status change queues a row of its own");
+        assert_eq!(rows[1].0, format!("order-{order_id}-v2"));
+        assert_eq!(rows[1].3, "UPSERT", "a status change is an UPSERT like any other mutation");
+        assert_eq!(rows[1].4, 2);
+        assert_eq!(rows[1].7["status"], "PACKED", "the queued payload is the order as it now stands");
+        assert_eq!(
+            rows[1].7["items"].as_array().map(Vec::len),
+            Some(1),
+            "a status change still carries the whole record, lines included"
+        );
+
+        let sent = set_customer_order_status_at(
+            &path,
+            &order_id,
+            "SENT",
+            &serde_json::json!({ "carrier": "Porter", "sale_id": "sale-1", "invoice_no": "INV-1" }),
+        )
+        .expect("a packed order can be sent");
+        assert_eq!(sent["entity_version"], 3);
+        let rows = outbox_rows(&path);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2].7["carrier"], "Porter");
+        assert_eq!(rows[2].7["sale_id"], "sale-1");
+
+        let operation_ids: std::collections::HashSet<&str> =
+            rows.iter().map(|row| row.0.as_str()).collect();
+        assert_eq!(operation_ids.len(), 3, "each mutation needs an operation id of its own");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A refused status change queues nothing.
+    #[test]
+    fn a_refused_status_change_queues_nothing() {
+        let path = order_sync_test_path("refused");
+        initialize_at(&path).expect("initialize order sync database");
+        seed_order_branch(&path, "7");
+        let conn = Connection::open(&path).expect("open to seed");
+        conn.execute(
+            "INSERT INTO local_customer_orders (id, order_no, customer_name, status, sale_id, invoice_no) \
+             VALUES ('order-billed', 'ORD-B', 'Ram', 'SENT', 'sale-9', 'INV-9')",
+            [],
+        )
+        .expect("seed a billed order");
+        drop(conn);
+
+        assert!(
+            set_customer_order_status_at(&path, "order-billed", "RECEIVED", &serde_json::json!({}))
+                .is_err(),
+            "a billed order must not walk backwards"
+        );
+        assert!(
+            outbox_rows(&path).is_empty(),
+            "a refused status change must not queue a move that never happened"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A pulled order lands whole, and a replay of the same change changes nothing.
+    ///
+    /// This is the arm that has to exist **before** the server ever emits a `customer_order` row.
+    /// Without it the change falls to the default arm, and `apply_pull_changes_at` advances the
+    /// pull cursor in the same transaction regardless — so the order would be gone from every
+    /// device with no error anywhere.
+    #[test]
+    fn a_pulled_order_is_applied_once_and_replays_without_duplicating() {
+        let path = order_sync_test_path("pull");
+        initialize_at(&path).expect("initialize order pull database");
+
+        let change = PulledChange {
+            change_id: serde_json::json!(9001),
+            branch_id: Some(3),
+            entity_type: "customer_order".to_string(),
+            entity_id: "remote-order-1".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(4),
+            updated_at: Some("2026-08-20T09:30:00.000Z".to_string()),
+            payload: serde_json::json!({
+                "id": "remote-order-1",
+                "order_no": "ORD-REMOTE-1",
+                "source": "WHATSAPP",
+                "customer_name": "Anita",
+                "customer_mobile": "9876500000",
+                "status": "PACKED",
+                "reserved_at": "2026-08-20T09:00:00.000Z",
+                "packed_at": "2026-08-20T09:25:00.000Z",
+                "branch_id": "3",
+                "payment_state": "ON_DELIVERY",
+                "amount_paid": 0,
+                "items": [
+                    { "id": "remote-order-1-line-0", "product_id": "004", "product_name": "Apple", "unit": "kg", "quantity": 6, "agreed_rate": 80, "inventory_lot_id": "lot-77" },
+                    { "id": "remote-order-1-line-1", "product_id": "005", "product_name": "Banana", "quantity": 2 }
+                ]
+            }),
+        };
+
+        for _ in 0..2 {
+            apply_pull_changes_at(
+                &path,
+                std::slice::from_ref(&change),
+                "cursor-1",
+                Some("FZDEV-B".to_string()),
+                Some("2026-08-20T09:31:00.000Z".to_string()),
+            )
+            .expect("a pulled order must apply");
+        }
+
+        let applied = read_customer_order(
+            &Connection::open(&path).expect("open after pull"),
+            "remote-order-1",
+        )
+        .expect("the pulled order must be readable");
+        assert_eq!(applied["order_no"], "ORD-REMOTE-1");
+        assert_eq!(applied["status"], "PACKED");
+        assert_eq!(applied["source"], "WHATSAPP");
+        assert_eq!(applied["entity_version"], 4);
+        assert_eq!(applied["sync_status"], "synced");
+        assert_eq!(applied["payment_state"], "ON_DELIVERY");
+        // Carried across, not restamped. The lapse is measured from this timestamp; restamping it
+        // on every pull would mean a forgotten order held its fruit for ever.
+        assert_eq!(applied["reserved_at"], "2026-08-20T09:00:00.000Z");
+
+        let lines = applied["items"].as_array().expect("lines");
+        assert_eq!(lines.len(), 2, "a replay must not duplicate the lines");
+        assert_eq!(lines[0]["product_id"], "004", "ids stay text through the sync path");
+        assert_eq!(lines[0]["quantity"], 6.0);
+        assert_eq!(lines[0]["inventory_lot_id"], "lot-77");
+
+        let conn = Connection::open(&path).expect("inspect after pull");
+        let orders: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_customer_orders", [], |row| row.get(0))
+            .expect("count orders");
+        assert_eq!(orders, 1, "a replayed change must not make a second order");
+
+        // The receiving device reserves this stock because the order is here in a reserving status
+        // and `reservedQuantityByProduct` derives the reservation from exactly these rows. Nothing
+        // is written to the lots: doing so would double-count against the POS arithmetic, which
+        // deducts from lots at the moment of sale and knows nothing about orders. Same reason
+        // `apply_pulled_pos_sale_with_tx` leaves the lots alone.
+        let lots: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_inventory_lots", [], |row| row.get(0))
+            .expect("count lots");
+        let movements: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_stock_movements", [], |row| row.get(0))
+            .expect("count movements");
+        assert_eq!(lots, 0, "a pulled order must not invent or mutate stock");
+        assert_eq!(movements, 0, "a pulled order is a reservation, not a stock movement");
+
+        // Applying a pulled order must not push it straight back out again.
+        let queued: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_outbox", [], |row| row.get(0))
+            .expect("count outbox");
+        assert_eq!(queued, 0, "an order that came from the cloud must not be echoed back to it");
+        drop(conn);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// An older copy arriving late must not undo a newer local change.
+    #[test]
+    fn an_older_pulled_order_does_not_overwrite_a_newer_local_one() {
+        let path = order_sync_test_path("stale");
+        initialize_at(&path).expect("initialize order pull database");
+        seed_order_branch(&path, "3");
+
+        save_customer_order_at(
+            &path,
+            &serde_json::json!({
+                "id": "order-local-1",
+                "order_no": "ORD-LOCAL-1",
+                "customer_name": "Ram",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 3 }]
+            }),
+        )
+        .expect("local order saves");
+        let packed =
+            set_customer_order_status_at(&path, "order-local-1", "PACKED", &serde_json::json!({}))
+                .expect("local order packs");
+        assert_eq!(packed["entity_version"], 2);
+
+        let stale = PulledChange {
+            change_id: serde_json::json!(1),
+            branch_id: Some(3),
+            entity_type: "customer_order".to_string(),
+            entity_id: "order-local-1".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            updated_at: Some("2026-08-20T08:00:00.000Z".to_string()),
+            payload: serde_json::json!({
+                "order_no": "ORD-LOCAL-1",
+                "customer_name": "Ram",
+                "status": "CANCELLED",
+                "branch_id": "3",
+                "items": []
+            }),
+        };
+        apply_pull_changes_at(
+            &path,
+            std::slice::from_ref(&stale),
+            "cursor-2",
+            Some("FZDEV-ORDERS".to_string()),
+            Some("2026-08-20T09:31:00.000Z".to_string()),
+        )
+        .expect("a stale change is skipped, not an error");
+
+        let conn = Connection::open(&path).expect("open after stale pull");
+        let after = read_customer_order(&conn, "order-local-1").expect("read order");
+        assert_eq!(after["status"], "PACKED", "a stale copy must not undo a newer local change");
+        assert_eq!(after["entity_version"], 2);
+        assert_eq!(
+            after["items"].as_array().map(Vec::len),
+            Some(1),
+            "and it must not take the lines with it"
+        );
+        drop(conn);
+
+        // A genuinely newer copy does win.
+        let newer = PulledChange { version: Some(5), ..stale };
+        apply_pull_changes_at(
+            &path,
+            std::slice::from_ref(&newer),
+            "cursor-3",
+            Some("FZDEV-ORDERS".to_string()),
+            Some("2026-08-20T09:32:00.000Z".to_string()),
+        )
+        .expect("a newer change applies");
+        let conn = Connection::open(&path).expect("open after newer pull");
+        let after = read_customer_order(&conn, "order-local-1").expect("read order");
+        assert_eq!(after["status"], "CANCELLED");
+        assert_eq!(after["entity_version"], 5);
+        drop(conn);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// An entity type this build does not know is kept, not destroyed, and does not stop the page.
+    ///
+    /// `apply_pull_changes_at` advances the pull cursor in the same transaction that applies the
+    /// changes, so anything declined here is never offered again. The old `_ => {}` therefore
+    /// destroyed it silently. It must still not be fatal — a device on older code has to go on
+    /// syncing what it does understand — so this asserts both halves at once.
+    #[test]
+    fn an_unknown_entity_type_is_kept_rather_than_destroying_the_page() {
+        let path = order_sync_test_path("unknown");
+        initialize_at(&path).expect("initialize pull database");
+
+        let unknown = PulledChange {
+            change_id: serde_json::json!(1),
+            branch_id: Some(1),
+            entity_type: "delivery_route".to_string(),
+            entity_id: "route-1".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(2),
+            updated_at: Some("2026-08-20T09:00:00.000Z".to_string()),
+            payload: serde_json::json!({ "name": "Ring Road", "stops": 4 }),
+        };
+        let known = PulledChange {
+            change_id: serde_json::json!(2),
+            branch_id: Some(1),
+            entity_type: "product".to_string(),
+            entity_id: "product-1".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            updated_at: Some("2026-08-20T09:00:00.000Z".to_string()),
+            payload: serde_json::json!({ "product_name": "Apple", "branch_id": 1 }),
+        };
+
+        for _ in 0..2 {
+            apply_pull_changes_at(
+                &path,
+                &[unknown.clone(), known.clone()],
+                "cursor-9",
+                Some("FZDEV-B".to_string()),
+                Some("2026-08-20T09:31:00.000Z".to_string()),
+            )
+            .expect("one unknown type must not fail the whole page");
+        }
+
+        let conn = Connection::open(&path).expect("inspect after pull");
+        let products: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_products WHERE id = 'product-1'", [], |row| {
+                row.get(0)
+            })
+            .expect("count products");
+        assert_eq!(products, 1, "the changes this build does understand must still apply");
+
+        let (reason, payload, seen): (String, String, i64) = conn
+            .query_row(
+                "SELECT reason, payload, seen_count FROM local_unapplied_changes WHERE entity_id = 'route-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("the unknown change must be kept, not dropped");
+        assert_eq!(reason, "ENTITY_TYPE_NOT_SUPPORTED");
+        assert!(
+            payload.contains("Ring Road"),
+            "the change is kept whole so an upgraded build can apply it: {payload}"
+        );
+        assert_eq!(seen, 2, "a replay updates the kept row rather than piling up copies");
+        drop(conn);
+
+        // And it is counted, because a loss that reports itself as health is the failure this
+        // whole table exists to prevent.
+        let status = status_at(&path).expect("status");
+        assert_eq!(status.unapplied_changes, 1);
+        assert_eq!(status.current_cursor.as_deref(), Some("cursor-9"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A pulled order in a status this build cannot display is kept, not guessed at.
+    ///
+    /// Coercing it to RECEIVED would reserve fruit for an order that might have been cancelled.
+    /// Letting the CHECK constraint reject it would abort the pull transaction and wedge the cursor
+    /// behind it for every other change in the page. Neither; it is kept and skipped.
+    #[test]
+    fn a_pulled_order_in_an_unknown_status_is_kept_not_guessed_at() {
+        let path = order_sync_test_path("badstatus");
+        initialize_at(&path).expect("initialize pull database");
+
+        let change = PulledChange {
+            change_id: serde_json::json!(1),
+            branch_id: Some(1),
+            entity_type: "customer_order".to_string(),
+            entity_id: "remote-order-2".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            updated_at: Some("2026-08-20T09:00:00.000Z".to_string()),
+            payload: serde_json::json!({
+                "order_no": "ORD-REMOTE-2",
+                "customer_name": "Anita",
+                "status": "HALF_PACKED",
+                "branch_id": "1",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 1 }]
+            }),
+        };
+        apply_pull_changes_at(
+            &path,
+            std::slice::from_ref(&change),
+            "cursor-4",
+            Some("FZDEV-B".to_string()),
+            Some("2026-08-20T09:31:00.000Z".to_string()),
+        )
+        .expect("an unreadable status must not fail the page");
+
+        let conn = Connection::open(&path).expect("inspect");
+        let orders: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_customer_orders", [], |row| row.get(0))
+            .expect("count orders");
+        assert_eq!(orders, 0, "an order in a status with no buttons must not be reserved against");
+        let reason: String = conn
+            .query_row(
+                "SELECT reason FROM local_unapplied_changes WHERE entity_id = 'remote-order-2'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the skipped order must be kept");
+        assert_eq!(reason, "CUSTOMER_ORDER_STATUS_NOT_RECOGNISED");
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A pulled order whose number is already used by a different local order is kept, not applied.
+    ///
+    /// `order_no` is UNIQUE. Letting the INSERT fail would abort the pull transaction and stall the
+    /// cursor behind it permanently, which turns one collision into a device that never syncs again.
+    #[test]
+    fn a_pulled_order_number_collision_does_not_stall_the_cursor() {
+        let path = order_sync_test_path("collision");
+        initialize_at(&path).expect("initialize pull database");
+        seed_order_branch(&path, "1");
+        save_customer_order_at(
+            &path,
+            &serde_json::json!({
+                "id": "order-local-2",
+                "order_no": "ORD-CLASH",
+                "customer_name": "Ram",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 1 }]
+            }),
+        )
+        .expect("local order saves");
+
+        let change = PulledChange {
+            change_id: serde_json::json!(1),
+            branch_id: Some(1),
+            entity_type: "customer_order".to_string(),
+            entity_id: "remote-order-3".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            updated_at: Some("2026-08-20T09:00:00.000Z".to_string()),
+            payload: serde_json::json!({
+                "order_no": "ORD-CLASH",
+                "customer_name": "Anita",
+                "status": "RECEIVED",
+                "branch_id": "1",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 1 }]
+            }),
+        };
+        apply_pull_changes_at(
+            &path,
+            std::slice::from_ref(&change),
+            "cursor-5",
+            Some("FZDEV-ORDERS".to_string()),
+            Some("2026-08-20T09:31:00.000Z".to_string()),
+        )
+        .expect("a collision must not stall the cursor");
+
+        let conn = Connection::open(&path).expect("inspect");
+        let reason: String = conn
+            .query_row(
+                "SELECT reason FROM local_unapplied_changes WHERE entity_id = 'remote-order-3'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the colliding order must be kept");
+        assert_eq!(reason, "CUSTOMER_ORDER_NUMBER_ALREADY_USED");
+        drop(conn);
+        let status = status_at(&path).expect("status");
+        assert_eq!(status.current_cursor.as_deref(), Some("cursor-5"), "the page still completed");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// An order that cannot resolve a branch is saved, refused the outbox, and says why.
+    ///
+    /// The server's `logSyncChange` throws on a change with no branch id, and a push batch is one
+    /// Postgres transaction — so one branchless order would discard the acknowledgements for every
+    /// other operation travelling with it. It must not be queued. It must also not become an order
+    /// that silently never syncs, so the refusal is a named state on the record, and the next
+    /// status change tries again.
+    #[test]
+    fn an_order_with_no_resolvable_branch_is_blocked_rather_than_queued_with_a_null() {
+        let path = order_sync_test_path("nobranch");
+        initialize_at(&path).expect("initialize order sync database");
+
+        let saved = save_customer_order_at(
+            &path,
+            &serde_json::json!({
+                "id": "order-nobranch",
+                "order_no": "ORD-NOBRANCH",
+                "customer_name": "Ram",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 1 }]
+            }),
+        )
+        .expect("the order is still written down");
+        assert_eq!(saved["sync_status"], "blocked");
+        assert!(saved["sync_blocked_reason"].as_str().is_some_and(|r| !r.is_empty()));
+        assert!(outbox_rows(&path).is_empty(), "a null branch must never reach the outbox");
+
+        // The device learns its branch, and the next status change queues the order.
+        seed_order_branch(&path, "5");
+        let packed =
+            set_customer_order_status_at(&path, "order-nobranch", "PACKED", &serde_json::json!({}))
+                .expect("the order packs");
+        assert_eq!(packed["sync_status"], "pending");
+        assert!(packed["sync_blocked_reason"].is_null());
+        let rows = outbox_rows(&path);
+        assert_eq!(rows.len(), 1, "the retry queues the order once it has a branch");
+        assert_eq!(rows[0].5.as_deref(), Some("5"));
+        assert_eq!(rows[0].7["status"], "PACKED");
 
         let _ = fs::remove_file(&path);
     }

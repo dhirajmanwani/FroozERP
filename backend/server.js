@@ -641,6 +641,8 @@ const parseNonNegativeNumber = (value) => {
 
 const roundCurrency = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 const roundUnitCost = (value) => Math.round((Number(value) + Number.EPSILON) * 10000) / 10000;
+// Quantities carry three decimals (CLAUDE.md "Conventions"); money rounds to two.
+const roundQuantity = (value) => Math.round((Number(value) + Number.EPSILON) * 1000) / 1000;
 // Password hashing moved to ./passwordHash (auth-hardening A-1). `hashPassword` is now async and
 // salted; `hashPasswordSync` exists only for the schema bootstrap below, which interpolates a hash
 // into a SQL template literal and cannot await. The old unsalted SHA-256 lives on inside that
@@ -2690,6 +2692,89 @@ const initializeDatabase = async () => {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+
+    -- Customer orders (G7): the cloud half of the device tables in
+    -- src-tauri/migrations/sqlite/020_customer_orders.sql. An order is written on one device and
+    -- has to be visible on the others, so it travels as a whole-record UPSERT and is stored here
+    -- exactly as the device holds it, with the sync columns the rest of this file uses.
+    --
+    -- Deliberate choices, each of which has a reason that is not obvious:
+    --
+    --   * global_id is the device's opaque order id and the only key the sync path ever matches
+    --     on. id exists because every other table here has a serial. Entity ids are opaque
+    --     strings in this codebase; nothing coerces one to a number.
+    --   * order_no carries NO unique constraint. It is unique per device, and two devices can
+    --     mint the same one. A collision must not be able to reject an order permanently, because
+    --     a rejection is stored under its operation id and is never retried.
+    --   * product_global_id, sale_global_id, inventory_lot_global_id and customer_id stay
+    --     text and are never resolved to a numeric row id here. The POS item path does resolve
+    --     product_id, with a global_id fallback for products and none at all for lots; that
+    --     asymmetry is not copied.
+    --   * No CHECK on status or source, though the device has both. The handler validates
+    --     against the same two enums; keeping the constraint out of the schema means a later
+    --     device release that adds a status needs a handler change, not a migration on a database
+    --     this bootstrap is the only schema for.
+    --   * line_amount is NULL, never 0, when a line has no agreed rate. Zero would read as
+    --     "free" in every total downstream, and an unknown price is not a price of nothing.
+    CREATE TABLE IF NOT EXISTS customer_orders (
+      id BIGSERIAL PRIMARY KEY,
+      global_id VARCHAR(180) NOT NULL UNIQUE,
+      order_no VARCHAR(120),
+      source VARCHAR(30) NOT NULL DEFAULT 'PHONE',
+      company_id INTEGER,
+      branch_id INTEGER NOT NULL DEFAULT 1 REFERENCES branches(id),
+      operational_location_id INTEGER,
+      assignment_generation INTEGER,
+      customer_id VARCHAR(180),
+      customer_name VARCHAR(220) NOT NULL,
+      customer_mobile VARCHAR(40),
+      delivery_address TEXT,
+      status VARCHAR(30) NOT NULL DEFAULT 'RECEIVED',
+      reserved_at TIMESTAMP,
+      packed_at TIMESTAMP,
+      sent_at TIMESTAMP,
+      delivered_at TIMESTAMP,
+      cancelled_at TIMESTAMP,
+      cancellation_reason TEXT,
+      carrier VARCHAR(160),
+      carrier_reference VARCHAR(180),
+      tracking_url TEXT,
+      carrier_contact VARCHAR(120),
+      sale_global_id VARCHAR(180),
+      invoice_no VARCHAR(120),
+      notes TEXT,
+      created_by INTEGER REFERENCES users(id),
+      source_device_id VARCHAR(160),
+      entity_version INTEGER NOT NULL DEFAULT 1,
+      device_created_at TIMESTAMP,
+      device_updated_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      deleted_at TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS customer_orders_scope_idx
+      ON customer_orders (company_id, branch_id, status);
+    CREATE INDEX IF NOT EXISTS customer_orders_open_idx
+      ON customer_orders (branch_id, reserved_at, created_at)
+      WHERE status IN ('RECEIVED', 'PACKED') AND deleted_at IS NULL;
+
+    CREATE TABLE IF NOT EXISTS customer_order_items (
+      id BIGSERIAL PRIMARY KEY,
+      order_global_id VARCHAR(180) NOT NULL REFERENCES customer_orders(global_id) ON DELETE CASCADE,
+      global_id VARCHAR(180),
+      line_index INTEGER NOT NULL,
+      product_global_id VARCHAR(180) NOT NULL,
+      product_name VARCHAR(220) NOT NULL,
+      unit VARCHAR(40),
+      quantity NUMERIC(14,3) NOT NULL CHECK (quantity > 0),
+      agreed_rate NUMERIC(14,2),
+      line_amount NUMERIC(14,2),
+      inventory_lot_global_id VARCHAR(180),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (order_global_id, line_index)
+    );
+    CREATE INDEX IF NOT EXISTS customer_order_items_product_idx
+      ON customer_order_items (product_global_id, order_global_id);
 
     ALTER TABLE product_categories ADD COLUMN IF NOT EXISTS global_id VARCHAR(180);
     ALTER TABLE product_categories ADD COLUMN IF NOT EXISTS entity_version INTEGER NOT NULL DEFAULT 1;
@@ -8607,7 +8692,11 @@ const hasApprovedOwnerDevice = async (client = pool) => {
 
 const normalizeSyncStatus = (value) => String(value || "").trim().toLowerCase();
 const SYNC_OPERATION_TYPES = new Set(["UPSERT", "DELETE", "CREATE", "UPDATE", "SALE_EDIT", "SALE_CANCEL"]);
-const SYNC_ENTITY_TYPES = new Set(["sync_test", "pos_sale"]);
+// Every entity type here must have an arm in the dispatch inside `processSyncOperation`. Adding a
+// name to this set and not to that switch is exactly the mistake the switch's default exists to
+// catch: an operation that reaches no handler of its own is rejected by name, not handed to
+// whichever handler happened to be last.
+const SYNC_ENTITY_TYPES = new Set(["sync_test", "pos_sale", "customer_order"]);
 const syncRateWindow = new Map();
 
 const requireSyncContext = async ({ userId, deviceId, branchId, operationalLocationId }, client = pool) => {
@@ -9638,6 +9727,398 @@ const processPosSaleCancelOperation = async (client, operation, context) => {
   };
 };
 
+/**
+ * Customer orders (G7) - the cloud half of `local_customer_orders` / `local_customer_order_items`.
+ *
+ * ## The wire contract
+ *
+ * One operation type, `UPSERT`, for creating an order and for every status change alike, carrying
+ * the whole record - header fields plus the full `items` array - every time, with a version that
+ * only ever goes up. Nothing about an order is sent as a delta.
+ *
+ * That is not laziness, it is the only shape that survives this transport. A push batch is sorted
+ * by `operation_id` *string* before it is processed, not by causality, so a status change can be
+ * handed to this function before the creation it follows. Rejections are stored under their
+ * operation id by `storeProcessedOperation` and replayed verbatim forever, so an operation rejected
+ * for arriving "too early" would never be retried - the order would be silently stuck at whatever
+ * state it happened to reach. A whole-record upsert has no ordering dependency to violate: whichever
+ * one arrives last and carries the highest version wins, and the others are duplicates.
+ *
+ * ## Last writer wins, and a loser is not an error
+ *
+ * A version lower than or equal to the stored one is answered `accepted` with `duplicate: true`,
+ * not rejected. Replays and echoes are the normal traffic of this system - the same device retrying
+ * an unacknowledged push, or a second device pushing an order it pulled - and answering "rejected"
+ * to one would both alarm the operator and, because the answer is stored, do it permanently.
+ *
+ * ## Scope comes from the session, never from the payload
+ *
+ * `company_id`, `branch_id`, `operational_location_id`, the creating user and the source device are
+ * all read from `context`, which was verified before the batch opened. A payload that names a
+ * different branch is stored under the session's branch anyway. (`processPosSaleEditOperation`
+ * reads `invoice.branch_id` from the payload; that is the counter-example, not the model.)
+ *
+ * ## Failure modes
+ *
+ * Every input-shaped failure returns `rejectOperation`, because `/api/sync/push` wraps the entire
+ * batch in one transaction and a throw here discards the acknowledgements of up to 49 innocent
+ * operations. Infrastructure failures - the table missing, the connection dropping - are deliberately
+ * *not* caught: a caught one could not be stored anyway (the transaction is already aborted), and
+ * turning a transient outage into a stored rejection would poison the order permanently. Letting it
+ * propagate rolls the batch back and leaves the device free to retry.
+ */
+const CUSTOMER_ORDER_STATUSES = new Set(["RECEIVED", "PACKED", "SENT", "DELIVERED", "CANCELLED", "RETURNED"]);
+const CUSTOMER_ORDER_SOURCES = new Set(["PHONE", "WHATSAPP", "WEBSITE", "COUNTER", "OTHER"]);
+
+/**
+ * An ISO timestamp from the device, or null, or a refusal.
+ *
+ * Absent is normal - most of these columns are null for most of an order's life - so absent is not
+ * an error. A value that is present but unparseable is: dropping it silently would put an order on
+ * the board with no `sent_at`, which reads as "not sent yet" rather than as "we do not know".
+ */
+const parseCustomerOrderTimestamp = (value) => {
+  const text = cleanText(value);
+  if (!text) return { value: null };
+  const parsed = Date.parse(text);
+  if (!Number.isFinite(parsed)) return { error: true, value: null };
+  return { value: new Date(parsed).toISOString() };
+};
+
+/**
+ * Validate and normalise the order lines, or name the first thing that is wrong with them.
+ *
+ * `product_id` and `inventory_lot_id` are carried through as the opaque strings they are. The POS
+ * item path resolves `product_id` to a numeric row id via `parsePositiveInteger` - which is
+ * `Number()` in a coat - with a `global_id` fallback for products and no fallback at all for lots.
+ * "004" and 4 are different products; that coercion, and that asymmetry, are not repeated here.
+ */
+const normalizeCustomerOrderItems = (rawItems) => {
+  if (!Array.isArray(rawItems) || rawItems.length === 0) {
+    return { error: "Customer order requires at least one item" };
+  }
+  const items = [];
+  const seenLineIndexes = new Set();
+  for (let position = 0; position < rawItems.length; position += 1) {
+    const raw = rawItems[position] && typeof rawItems[position] === "object" ? rawItems[position] : {};
+    const label = `item ${position + 1}`;
+    const productId = cleanText(raw.product_id) || cleanText(raw.product_global_id);
+    if (!productId) return { error: `${label} is missing product_id` };
+    const productName = cleanText(raw.product_name);
+    if (!productName) return { error: `${label} is missing product_name` };
+    const quantityValue = Number(raw.quantity);
+    if (!Number.isFinite(quantityValue) || quantityValue <= 0) {
+      return { error: `${label} has an invalid quantity` };
+    }
+    // Bounded before it reaches a NUMERIC column. An out-of-range value would raise a Postgres
+    // error, and a Postgres error inside a push is a 500 the device retries forever - whereas a
+    // named rejection tells somebody which line is wrong.
+    if (quantityValue >= 1e9) return { error: `${label} has an out-of-range quantity` };
+    const lineIndexValue = Number(raw.line_index);
+    const lineIndex = Number.isInteger(lineIndexValue) && lineIndexValue >= 0 ? lineIndexValue : position;
+    if (seenLineIndexes.has(lineIndex)) return { error: `${label} repeats line_index ${lineIndex}` };
+    seenLineIndexes.add(lineIndex);
+    // A rate of 0 is a legitimate agreed rate, and `??` falls through on 0 - so presence is decided
+    // explicitly rather than by a default. Absent means "no rate was agreed", which is not zero.
+    const hasRate = raw.agreed_rate !== null
+      && raw.agreed_rate !== undefined
+      && String(raw.agreed_rate).trim() !== "";
+    const rateValue = Number(raw.agreed_rate);
+    if (hasRate && (!Number.isFinite(rateValue) || rateValue < 0)) {
+      return { error: `${label} has an invalid agreed_rate` };
+    }
+    if (hasRate && rateValue >= 1e9) return { error: `${label} has an out-of-range agreed_rate` };
+    const quantity = roundQuantity(quantityValue);
+    // Three decimals is the stored precision, so a quantity that rounds away to nothing is not a
+    // quantity. Caught here rather than by the column's CHECK, which would be a 500.
+    if (quantity <= 0) return { error: `${label} has a quantity that rounds to zero` };
+    const agreedRate = hasRate ? roundCurrency(rateValue) : null;
+    items.push({
+      global_id: cleanText(raw.id) || null,
+      line_index: lineIndex,
+      product_global_id: productId,
+      product_name: productName,
+      unit: cleanText(raw.unit) || null,
+      quantity,
+      agreed_rate: agreedRate,
+      // Money rounds once per line and the lines are then summed by whoever needs a total. A line
+      // with no agreed rate has no amount at all - null, never 0.
+      line_amount: agreedRate === null ? null : roundCurrency(agreedRate * quantity),
+      inventory_lot_global_id: cleanText(raw.inventory_lot_id) || cleanText(raw.inventory_lot_global_id) || null,
+    });
+  }
+  return { items };
+};
+
+const processCustomerOrderOperation = async (client, operation, context) => {
+  const payload = operation.payload && typeof operation.payload === "object" ? operation.payload : {};
+  if (operation.operation_type !== "UPSERT") {
+    return rejectOperation(
+      operation,
+      "UNSUPPORTED_OPERATION",
+      `Customer orders sync as UPSERT only; received ${operation.operation_type}`
+    );
+  }
+
+  // Scope is the session's, and only the session's. `logSyncChange` throws without a branch, and
+  // `local_customer_orders.branch_id` is nullable on the device - so the absence is answered here,
+  // as a rejection, rather than left to become an exception that discards a whole batch.
+  const branchId = parsePositiveInteger(context.branchId);
+  if (!branchId) {
+    return rejectOperation(
+      operation,
+      "SCOPE_REQUIRED",
+      "Customer order sync requires an assigned branch"
+    );
+  }
+  const companyId = parsePositiveInteger(context.companyId);
+  const orderGlobalId = cleanText(operation.entity_id);
+  if (!orderGlobalId) {
+    return rejectOperation(operation, "VALIDATION_ERROR", "Customer order requires an entity_id");
+  }
+  const incomingVersion = Number(operation.version);
+  if (!Number.isInteger(incomingVersion) || incomingVersion < 1) {
+    return rejectOperation(operation, "VALIDATION_ERROR", "Customer order version must be a positive integer");
+  }
+
+  const customerName = cleanText(payload.customer_name);
+  if (!customerName) {
+    return rejectOperation(operation, "VALIDATION_ERROR", "Customer order requires customer_name");
+  }
+  const status = (cleanText(payload.status) || "RECEIVED").toUpperCase();
+  if (!CUSTOMER_ORDER_STATUSES.has(status)) {
+    return rejectOperation(operation, "VALIDATION_ERROR", `Unsupported customer order status: ${status}`);
+  }
+  const source = (cleanText(payload.source) || "PHONE").toUpperCase();
+  if (!CUSTOMER_ORDER_SOURCES.has(source)) {
+    return rejectOperation(operation, "VALIDATION_ERROR", `Unsupported customer order source: ${source}`);
+  }
+
+  const timestamps = {};
+  for (const field of [
+    "reserved_at",
+    "packed_at",
+    "sent_at",
+    "delivered_at",
+    "cancelled_at",
+    "deleted_at",
+    "created_at",
+    "updated_at",
+  ]) {
+    const parsed = parseCustomerOrderTimestamp(payload[field]);
+    if (parsed.error) {
+      return rejectOperation(operation, "VALIDATION_ERROR", `Customer order ${field} is not a valid timestamp`);
+    }
+    timestamps[field] = parsed.value;
+  }
+
+  const normalizedItems = normalizeCustomerOrderItems(payload.items);
+  if (normalizedItems.error) {
+    return rejectOperation(operation, "VALIDATION_ERROR", normalizedItems.error);
+  }
+  const items = normalizedItems.items;
+
+  const existingResult = await client.query(
+    `SELECT global_id, order_no, status, company_id, branch_id, entity_version, updated_at
+     FROM customer_orders
+     WHERE global_id = $1
+     FOR UPDATE`,
+    [orderGlobalId]
+  );
+  const current = existingResult.rows[0] || null;
+  if (current) {
+    // Company and branch ids are integers everywhere in this schema - unlike entity ids, they are
+    // genuinely numbers, so comparing them as numbers is correct here and nowhere near the ids.
+    const sameCompany = Number(current.company_id || 0) === Number(companyId || 0);
+    const sameBranch = Number(current.branch_id || 0) === branchId;
+    if (!sameCompany || !sameBranch) {
+      return rejectOperation(
+        operation,
+        "CONFLICT",
+        "Customer order id already exists in another company or branch"
+      );
+    }
+    if (Number(current.entity_version || 0) >= incomingVersion) {
+      return {
+        operation_id: operation.operation_id,
+        status: "accepted",
+        server_entity_version: Number(current.entity_version || incomingVersion),
+        server_updated_at: current.updated_at || new Date().toISOString(),
+        error_code: null,
+        message: "Customer order already stored at this version or newer",
+        result_payload: {
+          entity_type: "customer_order",
+          order_id: current.global_id,
+          order_no: current.order_no || null,
+          status: current.status || null,
+          entity_version: Number(current.entity_version || incomingVersion),
+          duplicate: true,
+        },
+      };
+    }
+  }
+
+  const upserted = await client.query(
+    `
+    INSERT INTO customer_orders (
+      global_id, order_no, source, company_id, branch_id, operational_location_id,
+      assignment_generation, customer_id, customer_name, customer_mobile, delivery_address,
+      status, reserved_at, packed_at, sent_at, delivered_at, cancelled_at, cancellation_reason,
+      carrier, carrier_reference, tracking_url, carrier_contact, sale_global_id, invoice_no,
+      notes, created_by, source_device_id, entity_version, device_created_at, device_updated_at,
+      deleted_at, updated_at
+    )
+    VALUES (
+      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
+      $25,$26,$27,$28,$29,$30,$31, CURRENT_TIMESTAMP
+    )
+    ON CONFLICT (global_id) DO UPDATE SET
+      order_no = EXCLUDED.order_no,
+      source = EXCLUDED.source,
+      company_id = EXCLUDED.company_id,
+      branch_id = EXCLUDED.branch_id,
+      operational_location_id = EXCLUDED.operational_location_id,
+      assignment_generation = EXCLUDED.assignment_generation,
+      customer_id = EXCLUDED.customer_id,
+      customer_name = EXCLUDED.customer_name,
+      customer_mobile = EXCLUDED.customer_mobile,
+      delivery_address = EXCLUDED.delivery_address,
+      status = EXCLUDED.status,
+      reserved_at = EXCLUDED.reserved_at,
+      packed_at = EXCLUDED.packed_at,
+      sent_at = EXCLUDED.sent_at,
+      delivered_at = EXCLUDED.delivered_at,
+      cancelled_at = EXCLUDED.cancelled_at,
+      cancellation_reason = EXCLUDED.cancellation_reason,
+      carrier = EXCLUDED.carrier,
+      carrier_reference = EXCLUDED.carrier_reference,
+      tracking_url = EXCLUDED.tracking_url,
+      carrier_contact = EXCLUDED.carrier_contact,
+      sale_global_id = EXCLUDED.sale_global_id,
+      invoice_no = EXCLUDED.invoice_no,
+      notes = EXCLUDED.notes,
+      source_device_id = EXCLUDED.source_device_id,
+      entity_version = EXCLUDED.entity_version,
+      device_created_at = EXCLUDED.device_created_at,
+      device_updated_at = EXCLUDED.device_updated_at,
+      deleted_at = EXCLUDED.deleted_at,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE customer_orders.entity_version < EXCLUDED.entity_version
+    RETURNING *
+    `,
+    [
+      orderGlobalId,
+      cleanText(payload.order_no) || null,
+      source,
+      companyId,
+      branchId,
+      context.operationalLocationId || null,
+      context.assignmentGeneration || null,
+      cleanText(payload.customer_id) || null,
+      customerName,
+      cleanText(payload.customer_mobile) || null,
+      cleanText(payload.delivery_address) || null,
+      status,
+      timestamps.reserved_at,
+      timestamps.packed_at,
+      timestamps.sent_at,
+      timestamps.delivered_at,
+      timestamps.cancelled_at,
+      cleanText(payload.cancellation_reason) || null,
+      cleanText(payload.carrier) || null,
+      cleanText(payload.carrier_reference) || null,
+      cleanText(payload.tracking_url) || null,
+      cleanText(payload.carrier_contact) || null,
+      cleanText(payload.sale_id) || cleanText(payload.sale_global_id) || null,
+      cleanText(payload.invoice_no) || null,
+      cleanText(payload.notes) || null,
+      context.user.id,
+      context.deviceId,
+      incomingVersion,
+      timestamps.created_at,
+      timestamps.updated_at,
+      timestamps.deleted_at,
+    ]
+  );
+  const row = upserted.rows[0];
+  if (!row) {
+    // The conflict target matched but the version guard refused the update: another operation in
+    // this same batch already stored a newer version of this order. A duplicate, not a failure.
+    return {
+      operation_id: operation.operation_id,
+      status: "accepted",
+      server_entity_version: Number(current?.entity_version || incomingVersion),
+      server_updated_at: current?.updated_at || new Date().toISOString(),
+      error_code: null,
+      message: "Customer order already stored at this version or newer",
+      result_payload: {
+        entity_type: "customer_order",
+        order_id: orderGlobalId,
+        order_no: current?.order_no || null,
+        status: current?.status || null,
+        entity_version: Number(current?.entity_version || incomingVersion),
+        duplicate: true,
+      },
+    };
+  }
+
+  // The lines are replaced wholesale, because the payload is the whole order. Editing them in place
+  // would leave a line the device deleted behind, and a stale line on an order is a box packed
+  // wrongly.
+  await client.query("DELETE FROM customer_order_items WHERE order_global_id = $1", [orderGlobalId]);
+  for (const item of items) {
+    await client.query(
+      `
+      INSERT INTO customer_order_items (
+        order_global_id, global_id, line_index, product_global_id, product_name, unit,
+        quantity, agreed_rate, line_amount, inventory_lot_global_id
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      `,
+      [
+        orderGlobalId,
+        item.global_id,
+        item.line_index,
+        item.product_global_id,
+        item.product_name,
+        item.unit,
+        item.quantity,
+        item.agreed_rate,
+        item.line_amount,
+        item.inventory_lot_global_id,
+      ]
+    );
+  }
+
+  const change = await logSyncChange(client, {
+    branchId,
+    operationalLocationId: context.operationalLocationId,
+    assignmentGeneration: context.assignmentGeneration,
+    entityType: "customer_order",
+    entityId: orderGlobalId,
+    operationType: "UPSERT",
+    version: Number(row.entity_version || incomingVersion),
+    payload: { ...row, items },
+  });
+
+  return {
+    operation_id: operation.operation_id,
+    status: "accepted",
+    server_entity_version: Number(row.entity_version || incomingVersion),
+    server_updated_at: change.created_at || row.updated_at,
+    error_code: null,
+    message: "Customer order synced",
+    result_payload: {
+      entity_type: "customer_order",
+      order_id: row.global_id,
+      order_no: row.order_no || null,
+      status: row.status,
+      entity_version: Number(row.entity_version || incomingVersion),
+      duplicate: false,
+    },
+  };
+};
+
 const processSyncOperation = async (client, operation, context) => {
   if (!operation || typeof operation !== "object") {
     return rejectOperation({ operation_id: "" }, "VALIDATION_ERROR", "Invalid operation");
@@ -9662,13 +10143,42 @@ const processSyncOperation = async (client, operation, context) => {
     [operation.operation_id, context.companyId, context.branchId]
   );
   if (processed.rows[0]) return processedAckFromRow(processed.rows[0]);
-  const ack = operation.entity_type === "sync_test"
-    ? await processSyncTestOperation(client, operation, context)
-    : operation.operation_type === "SALE_EDIT"
-      ? await processPosSaleEditOperation(client, operation, context)
-      : operation.operation_type === "SALE_CANCEL"
-        ? await processPosSaleCancelOperation(client, operation, context)
-        : await processPosSaleFoundationOperation(client, operation, context);
+  // Keyed on entity_type first, with a default that refuses by name.
+  //
+  // This used to test `entity_type === "sync_test"` and then fall through to the POS sale handlers
+  // on everything else, with `processPosSaleFoundationOperation` as the final else. That is fine
+  // while only two entity types exist and dangerous the moment a third does: an order handed to
+  // the sale handler is rejected as a malformed invoice, `storeProcessedOperation` below stores
+  // rejections as readily as successes, and the replay check above returns a stored acknowledgement
+  // without re-running anything. The order would be poisoned under its operation id forever, and
+  // retrying - which re-sends the same id - would keep getting the same refusal back.
+  //
+  // `SYNC_OPERATION_TYPES` already admits CREATE, UPDATE and DELETE, none of which any POS handler
+  // understands, so operations were reaching the sale handler by accident before customer orders
+  // existed at all.
+  let ack;
+  switch (operation.entity_type) {
+    case "sync_test":
+      ack = await processSyncTestOperation(client, operation, context);
+      break;
+    case "pos_sale":
+      ack = operation.operation_type === "SALE_EDIT"
+        ? await processPosSaleEditOperation(client, operation, context)
+        : operation.operation_type === "SALE_CANCEL"
+          ? await processPosSaleCancelOperation(client, operation, context)
+          : await processPosSaleFoundationOperation(client, operation, context);
+      break;
+    case "customer_order":
+      ack = await processCustomerOrderOperation(client, operation, context);
+      break;
+    default:
+      ack = rejectOperation(
+        operation,
+        "UNSUPPORTED_ENTITY",
+        `No sync handler for entity type: ${operation.entity_type}`
+      );
+      break;
+  }
   await storeProcessedOperation(client, operation, context, ack);
   return ack;
 };
@@ -21247,3 +21757,23 @@ prepareDatabaseForStartup()
     console.error("Database initialization failed", error);
     process.exit(1);
   });
+
+/**
+ * Exported for tests only.
+ *
+ * `server.js` is started as a script and never required in production, so nothing here is an
+ * interface - these are the seams the sync suites need. The alternative is asserting on the source
+ * text of a 21k-line file, which stops testing anything the day a name changes and is how the
+ * pos_sale apply path ended up with no behavioural test at all.
+ *
+ * Requiring this module boots a server. A test must load it through
+ * `routeAuthCoverage.loadServerApp()` first, which sandboxes the database, the network and
+ * `app.listen`; requiring it directly is a mistake that harness refuses to let pass silently.
+ */
+module.exports = {
+  SYNC_ENTITY_TYPES,
+  SYNC_OPERATION_TYPES,
+  processSyncOperation,
+  processCustomerOrderOperation,
+  normalizeCustomerOrderItems,
+};
