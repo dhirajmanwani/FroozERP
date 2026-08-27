@@ -31,7 +31,7 @@ import { createRequire } from "node:module";
 // command and the server agree on what a valid password and an eligible owner are, rather than
 // growing a second opinion.
 const require = createRequire(new URL("../backend/package.json", import.meta.url));
-const { verifyPassword } = require("./passwordHash.js");
+const { verifyPassword, PASSWORD_FORMATS } = require("./passwordHash.js");
 const { isOwnerBootstrapEligible } = require("./identityPolicy.js");
 
 const readFlag = (name) => {
@@ -97,12 +97,27 @@ const main = async () => {
     // One message for every way this can fail. On a trusted machine the distinction is not a
     // security matter, but the output gets pasted into places that are less trusted than the
     // terminal it was printed in.
+    const verification = user
+      ? await verifyPassword(password, user.password_hash)
+      : { ok: false, format: PASSWORD_FORMATS.EMPTY };
     const verified = Boolean(
       user
       && user.active !== false
       && isOwnerBootstrapEligible({ username: user.username, role_name: user.role_name, active: user.active })
-      && (await verifyPassword(password, user.password_hash)).ok,
+      && verification.ok,
     );
+    // A-5 named this failure separately, because it is the one that no amount of retyping fixes.
+    // The owner's stored password is in a format the verifier no longer accepts, so this command
+    // would otherwise report "credentials not accepted" forever to someone typing the right
+    // password. Saying so reveals nothing about the password - nothing was compared to produce it -
+    // and this runs on a machine that already holds the database.
+    if (user && verification.format && verification.format !== PASSWORD_FORMATS.SCRYPT) {
+      fail(
+        `${user.username}'s password is stored in a format FroozERP no longer accepts, so it cannot `
+        + "be verified here. Set a new one first:\n"
+        + `      node scripts/reset-password.mjs --username ${user.username}`,
+      );
+    }
     if (!verified) fail("Those owner credentials were not accepted.");
 
     const existing = await pool.query(

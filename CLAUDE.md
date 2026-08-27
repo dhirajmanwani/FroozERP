@@ -88,16 +88,33 @@ explicitly, in the current conversation, by the maintainer:
 
 ## Known security debt
 
-Authorization currently trusts a client-supplied identity: `/login` issues no session
-token, and the frontend sends `x-user-id` on subsequent requests which the backend accepts
-at face value. Most routes have no auth middleware. Anyone who can reach the API can assert
-any user ID, including Owner. Passwords are unsalted SHA-256 with a plaintext-equality
-fallback in `passwordMatches`, and `/login` has no failed-attempt lockout despite a
-`locked_until` column existing.
+This section described the state before the auth-hardening track. Most of it is now fixed;
+the fixes are recorded stage by stage in `docs/auth-hardening-plan.md`, which is the source
+of truth. Kept here so the original problems are still legible, because several conventions
+in this file exist because of them.
 
-Do not treat this as fixed. If you touch auth, the direction is: real signed sessions
-verified by middleware on every route, bcrypt/argon2id hashing, and removal of the
-plaintext fallback. Flag it rather than working around it.
+**Was:** authorization trusted a client-supplied identity — `/login` issued no session token,
+the frontend sent `x-user-id`, and the backend accepted it at face value. Most routes had no
+auth middleware, so anyone who could reach the API could assert any user ID including Owner.
+Passwords were unsalted SHA-256 with a plaintext-equality fallback in `passwordMatches`, and
+`/login` had no failed-attempt lockout despite a `locked_until` column existing.
+
+**Now:** HMAC-signed session tokens verified by `requireAuth`, mounted app-wide as a
+default-deny (A-4) with an explicit public allow-list; `revokedSessionGuard` checks
+`session_revocation_version` on every authenticated request, so signing out and password
+resets end sessions everywhere (A-6 Gate 1.5). Passwords are scrypt (A-1). The plaintext
+fallback is gone (A-2) and so is the legacy SHA-256 verify path (A-5) — the only format that
+authenticates is scrypt, and a row in any retired shape is refused as `PASSWORD_RESET_REQUIRED`
+with `scripts/reset-password.mjs` as the ops backstop. `/login` and the owner-bootstrap route
+share an escalating lockout (A-5).
+
+**Still open:** TLS is not configured (Gate 2.3) — sessions are bearer tokens, so over
+plaintext HTTP one interception is a full account takeover, and no amount of Gate 1 work
+survives it. That is a deployment setting, not a code change.
+
+If you touch auth, read the plan first and update it in the same change. Never reintroduce an
+identity taken from a request header or body: `req.auth` is the only identity, and it comes
+from the verified token.
 
 ## Conventions
 

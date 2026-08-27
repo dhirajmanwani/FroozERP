@@ -190,6 +190,33 @@ let databasePhase = "startup";
 const recordedQueries = [];
 let recordingQueries = false;
 
+/**
+ * An optional per-suite responder, consulted before the empty-rows default.
+ *
+ * The default stub answers every business query with zero rows, which is exactly right for asking
+ * "is this route guarded" and useless for asking "what does this route *do* once it has a row".
+ * Some behaviour is only reachable through the real handler with a real row underneath it — a login
+ * refused because the stored password is in a retired format, say, where the interesting part is
+ * which of several branches runs and what it does to the account on the way out.
+ *
+ * A suite installs a function of `(sql, values)`. Returning `undefined` falls through to the
+ * default, so a responder only has to know about the statements it cares about. It is consulted
+ * *after* the session-revocation answer above, so no suite can accidentally break authentication
+ * for every other probe in its file.
+ *
+ * Always clear it in a `finally`: the stub is process-wide, and a responder left installed would
+ * silently change what the next test in the file sees.
+ */
+let queryResponder = null;
+
+const setQueryResponder = (responder) => {
+  queryResponder = typeof responder === "function" ? responder : null;
+};
+
+const clearQueryResponder = () => {
+  queryResponder = null;
+};
+
 /** Start recording, and answer queries with empty rows so a handler runs on past its first read. */
 const startQueryRecording = () => {
   recordedQueries.length = 0;
@@ -213,13 +240,18 @@ const stubStorageAdapter = () => {
    * latter is guarded, not to model a database that cannot sign anyone in. Left unanswered, every
    * probe in every suite gets a 503 from the guard and never reaches the route it is testing.
    *
-   * Matched narrowly on both columns and the users table, so it cannot stand in for a business
-   * query by accident. It answers the way a live session looks: version 0, matching the default a
-   * test-minted token carries, and active.
+   * Matched on the guard's whole statement rather than on the columns it mentions. An earlier
+   * version tested for `session_revocation_version`, `active` and `FROM users` separately, and
+   * `/login`'s user lookup selects all three - so every probe of `/login` was silently handed the
+   * guard's two-column row instead of the user row the suite had scripted, and read a row with no
+   * `password_hash` as an account with no password. It answers the way a live session looks:
+   * version 0, matching the default a test-minted token carries, and active.
    */
+  const SESSION_REVOCATION_SQL =
+    /SELECT\s+session_revocation_version,\s*active\s+FROM\s+users\s+WHERE\s+id\s*=\s*\$1/i;
   const isSessionRevocationLookup = (text) => {
     const sql = String(typeof text === "object" && text ? text.text : text || "");
-    return /session_revocation_version/.test(sql) && /\bactive\b/.test(sql) && /FROM\s+users/i.test(sql);
+    return SESSION_REVOCATION_SQL.test(sql);
   };
 
   const respond = (text, values) => {
@@ -228,8 +260,16 @@ const stubStorageAdapter = () => {
       if (recordingQueries) recordedQueries.push(String(typeof text === "object" && text ? text.text : text || ""));
       return Promise.resolve({ rows: [{ session_revocation_version: 0, active: true }], rowCount: 1 });
     }
+    const sql = String(typeof text === "object" && text ? text.text : text || "");
+    if (queryResponder) {
+      const scripted = queryResponder(sql, values);
+      if (scripted !== undefined) {
+        if (recordingQueries) recordedQueries.push(sql);
+        return Promise.resolve(scripted);
+      }
+    }
     if (recordingQueries) {
-      recordedQueries.push(String(typeof text === "object" && text ? text.text : text || ""));
+      recordedQueries.push(sql);
       // Empty rows rather than a rejection: a handler that throws on its first read never issues
       // the second statement, and the second is often the one that carries the scope.
       return Promise.resolve({ rows: [], rowCount: 0 });
@@ -469,6 +509,8 @@ module.exports = {
   probe,
   startQueryRecording,
   stopQueryRecording,
+  setQueryResponder,
+  clearQueryResponder,
   MINIMUM_EXPECTED_ROUTES,
   collectRouteAuthCoverage,
   listRegisteredRoutes,

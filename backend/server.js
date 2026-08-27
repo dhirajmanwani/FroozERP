@@ -13,6 +13,7 @@ const {
   hashPassword,
   hashPasswordSync,
   verifyPassword,
+  PASSWORD_FORMATS,
 } = require("./passwordHash");
 const {
   approvedAliasCredentialFailure,
@@ -996,13 +997,37 @@ const escapePowerShellSingleQuoted = (value) => String(value).replace(/'/g, "''"
  * Verify a password and report whether the stored hash should be upgraded (auth-hardening A-1).
  *
  * Replaces the old synchronous `passwordMatches`, which compared against an unsalted SHA-256 and
- * additionally accepted a plaintext-valued column. Both legacy shapes still verify here so no
- * existing user is locked out; `needsRehash` is how they get migrated, on successful login only.
- *
- * The plaintext branch is deleted in A-2 — it survives this stage solely to keep A-1's
- * "no behaviour change" contract.
+ * additionally accepted a plaintext-valued column. A-2 deleted the plaintext branch and A-5 the
+ * legacy-digest one; scrypt is the only format that authenticates. `needsRehash` now only signals a
+ * scrypt hash written at a lower cost than today's, upgraded on successful login.
  */
 const checkPassword = async (password, storedHash) => verifyPassword(password, storedHash);
+
+/**
+ * True when the stored value is not a credential this system can verify at all — so no password
+ * could ever open this account, and the person in front of the screen needs a reset rather than
+ * another attempt.
+ *
+ * The four shapes are: a retired unsalted SHA-256 digest (A-5), a pre-migration plaintext column
+ * (A-2), a corrupt or unreadable scrypt hash, and an empty password column. `SCRYPT` is the only
+ * format where a `false` result means "wrong password"; every other one means "wrong stored value".
+ *
+ * The distinction matters because the two need opposite responses. A wrong password should be
+ * counted toward the lockout and answered vaguely. An unusable stored value carries no information
+ * about the password at all — nothing was compared — so counting it would only lock an account that
+ * getting the password right can never unlock, and answering vaguely would leave a real staff
+ * member retyping a password that was correct all along.
+ */
+const storedPasswordIsUnusable = (verification) =>
+  Boolean(verification) && verification.format !== PASSWORD_FORMATS.SCRYPT;
+
+/**
+ * What to tell someone whose account cannot verify any password. Names the fix, not the format:
+ * "your hash is an unsalted SHA-256 digest" is true and useless to the person reading it.
+ */
+const PASSWORD_RESET_REQUIRED_MESSAGE =
+  "This account's saved password is in an old format that FroozERP no longer accepts. "
+  + "Use \"Forgot password\" to set a new one, or ask your Owner or Administrator to reset it.";
 
 /**
  * Upgrade a stored password hash after a successful login. Best-effort by design: a failure to
@@ -11481,6 +11506,26 @@ app.post("/login", async (req, res) => {
       });
     }
     const passwordCheck = await checkPassword(password, user.password_hash);
+    // A-5: an account whose stored value is not a verifiable credential is refused *by name*, and
+    // without touching the lockout counters. Checked before the wrong-password path below because
+    // the two are different events: nothing here was compared against the supplied password, so
+    // there is no guess to count, and no amount of retrying can succeed. Telling this person to
+    // reset is the only response that leads anywhere.
+    if (storedPasswordIsUnusable(passwordCheck)) {
+      return authFailure(res, {
+        status: 401,
+        code: "PASSWORD_RESET_REQUIRED",
+        publicMessage: PASSWORD_RESET_REQUIRED_MESSAGE,
+        userId: user.id,
+        username: user.username,
+        deviceId: devicePayload.device_id,
+        ipAddress: req.ip,
+        // The format is recorded for the operator reading the audit trail, never returned to the
+        // caller: it says which migration this row missed, which is a maintenance fact, not
+        // something the person at the login screen can act on.
+        details: { stage: "password_format_retired", stored_format: passwordCheck.format },
+      });
+    }
     if (!passwordCheck.ok) {
       const approvedDeviceResult = canonicalAliasUsed
         ? await pool.query(
@@ -21044,15 +21089,21 @@ const readBusinessCounts = async () => {
 };
 
 /**
- * Report how many active users still carry a pre-A-1 password hash.
+ * Report how many active users cannot sign in because their stored password is in a retired format.
  *
- * This is the precondition for the second half of A-5 — deleting the legacy SHA-256 verify path
- * from `passwordHash.js`. That path is a weaker, unsalted digest and should not live forever, but
- * removing it locks out every user who has not signed in since A-1, so the removal is gated on this
- * number reaching zero.
+ * Before A-5 this counted a *precondition*: the legacy unsalted SHA-256 verify path was still live,
+ * and the count said how many accounts removing it would strand. A-5 removed the path, so the same
+ * number now means something more urgent — these accounts are locked out right now, and each one is
+ * a person who will be told to reset their password the next time they try to work.
+ *
+ * The condition is "not a scrypt hash" rather than "matches the legacy digest shape" because the
+ * retired formats are not only the legacy digest: a pre-migration plaintext column (A-2), a corrupt
+ * hash and an empty password column are all equally unusable, and all equally need a reset. The
+ * verifier already treats them alike; this count has to agree with the verifier or it is measuring
+ * something other than the problem.
  *
  * It is printed at startup rather than left as a query in a document because the answer changes on
- * its own, silently, as people sign in — a number nobody is watching is a number nobody knows. The
+ * its own, silently, as people reset — a number nobody is watching is a number nobody knows. The
  * count is deliberately the only thing reported: no usernames, no ids, nothing that turns a startup
  * log into a list of accounts worth attacking.
  *
@@ -21063,23 +21114,23 @@ const reportLegacyPasswordHashes = async () => {
   if (desktopLocalRuntime) return;
   try {
     const result = await pool.query(
-      `SELECT COUNT(*)::INTEGER AS still_legacy
+      `SELECT COUNT(*)::INTEGER AS needs_reset
          FROM users
         WHERE active = TRUE
-          AND password_hash ~ '^[0-9a-f]{64}$'`
+          AND COALESCE(password_hash, '') NOT LIKE 'scrypt$%'`
     );
-    const stillLegacy = Number(result.rows[0]?.still_legacy || 0);
-    if (stillLegacy > 0) {
+    const needsReset = Number(result.rows[0]?.needs_reset || 0);
+    if (needsReset > 0) {
       console.warn(
-        `[auth] ${stillLegacy} active user(s) still have a pre-A-1 password hash. `
-        + "They are upgraded automatically on their next sign-in. The legacy verify path in "
-        + "passwordHash.js cannot be removed until this reaches 0 (auth-hardening A-5)."
+        `[auth] ${needsReset} active user(s) have a password stored in a retired format and cannot `
+        + "sign in (auth-hardening A-5). Each one needs a password reset: self-service recovery, an "
+        + "Owner or Admin reset, or node scripts/reset-password.mjs --username <name>."
       );
     } else {
-      console.log("[auth] No legacy password hashes remain; the A-5 legacy verify path can be removed.");
+      console.log("[auth] Every active user's password is stored as scrypt.");
     }
   } catch (error) {
-    console.warn(`[auth] Could not count legacy password hashes: ${error.message}`);
+    console.warn(`[auth] Could not count retired password formats: ${error.message}`);
   }
 };
 

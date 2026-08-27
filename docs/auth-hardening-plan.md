@@ -1,6 +1,6 @@
 # Auth Hardening — Scoping and Plan
 
-**Status:** **A-1 … A-5 (lockout) complete; A-6 written (all 2026-08-19/20).** The A-5 legacy-hash removal is blocked on a precondition, and **A-7 — branch isolation — is now the largest open item on this track.** §5's "Not audited" is now **audited and failing**: see `docs/branch-isolation-audit.md`. Written 2026-08-17 at the maintainer's
+**Status:** **A-1 … A-5 complete, including the legacy-hash removal (2026-08-27); A-6 written.** and **A-7 — branch isolation — is now the largest open item on this track.** §5's "Not audited" is now **audited and failing**: see `docs/branch-isolation-audit.md`. Written 2026-08-17 at the maintainer's
 request, to run **in parallel** with the offline-activation stages.
 
 | Stage | Status |
@@ -12,7 +12,7 @@ request, to run **in parallel** with the offline-activation stages.
 | A-4b `updated_by` authorisation | **Complete 2026-08-20** — 92 routes across four guard families now read the verified session. See the record. |
 | A-4c money-route permissions | **Complete 2026-08-20** — 13 handlers / 15 registrations. See the record. **Found a further unguarded class: see A-4d.** |
 | A-4d unguarded master-data writes | **Complete 2026-08-20** — including the live `/api/v3/suppliers` path the sweep nearly missed. See the record. |
-| A-5 lockout + delete legacy verify | **Lockout complete 2026-08-20. The legacy SHA-256 removal is deliberately NOT done** — its precondition is not met. See the record. |
+| A-5 lockout + delete legacy verify | **Complete.** Lockout 2026-08-20; the legacy SHA-256 verify path removed 2026-08-27 — the precondition was replaced by making the refusal recoverable rather than waiting for it. See the record. |
 | **A-7 branch isolation** | **Write half closed 2026-08-21 (steps 1-4).** The read exposure remains, now measured and baselined by `tenancyCoverage.test.js` rather than estimated. Still gates multibranch. |
 | A-6 exposure checklist | **Written 2026-08-20** — see the record. It is a **gate**, not a summary: every unticked line is a reason not to expose the backend. |
 **Related:** `CLAUDE.md` "Known security debt"; `docs/offline-activation-design.md` §12 (which
@@ -331,6 +331,11 @@ regression test worth keeping permanently: a plaintext-valued column no longer a
 more were added alongside it — a legacy SHA-256 row still authenticates (removing the bypass must
 not take the migration path with it, or everyone who has not logged in since A-1 is locked out),
 and the rejection does not reveal whether the guess was correct.
+
+> **The first of those two was replaced by its own inverse on 2026-08-27**, when A-5 removed the
+> legacy verify path. What A-2 had to protect — the migration path surviving the bypass removal —
+> stopped being something to protect once the migration itself was retired. The second still
+> stands, and A-5 extended it to the legacy format as well.
 
 ### Gate results
 
@@ -838,7 +843,7 @@ morning of ticking boxes rather than a decision made under pressure.
 | 1.3 | Money-moving routes carry a permission check, not just authentication | **Met (A-4c, A-4d)** — 13 money handlers plus the master-data writes that rewrite balances |
 | 1.4 | Failed logins are rate-limited and lock the account | **Met (A-5).** Escalating lock on `/login` **and** `/bootstrap/first-owner-device`, sharing one counter. Offline sign-in got its own lock after hardware testing showed it bypassed both |
 | 1.5 | Sessions can be revoked on sign-out | **Met 2026-08-22.** The row above was half wrong and the half it got wrong was the dangerous one. Four paths already incremented the counter &mdash; a manager resetting a password, a temporary-password reset, disabling an account, an explicit revoke &mdash; but it was only ever *compared* inside `resolveSyncContext`. So a session revoked because somebody's password had been changed was refused by sync and accepted by the other 268 routes: the claim was read into `req.auth` and never used. `revokedSessionGuard` now runs app-wide after `requireAuth` and fails closed, so an unanswerable database refuses rather than falls through. `POST /auth/sign-out` increments the caller's own counter, taken from the verified token and never from the request. The app calls it and still clears locally when it cannot reach the server, because somebody signing out on a counter with no internet must still end up signed out on that screen. Costs one primary-key lookup per authenticated request; affordable because this file is the hosted backend and never runs on a shop's own machine |
-| 1.6 | The legacy SHA-256 verify path is removed | **A-5 — open.** Requires evidence every active user has signed in since A-1 |
+| 1.6 | The legacy SHA-256 verify path is removed | **Met (A-5, 2026-08-27).** The retired algorithm is not computed at all; a row holding one is refused as `PASSWORD_RESET_REQUIRED` without touching the lockout counters, and `scripts/reset-password.mjs` covers the case neither recovery route can. Gates: backend 391/391, frontend 508/508, website 45/45, lint 0 errors, build clean |
 
 ### Gate 2 — Secrets and transport
 
@@ -873,7 +878,9 @@ sense that it could then be planned. Tracked as **A-7**, originally estimated 3�
 > installation is one company with multiple branches. Branch isolation is therefore the real
 > requirement and it is met; the company-level work is not applicable. **Gate 4 is no longer what
 > holds the verdict.** What now holds it is Gate 3 in full, plus 1.5, 1.6, 2.2 and 2.3 — a list of
-> days, not weeks. The estimate above is left visible because a 3–4 week figure that quietly
+> days, not weeks. **Of those, only 2.3 is still open** as of 2026-08-27: Gate 3 closed in full,
+> 1.5 on 2026-08-26, 1.6 and 2.2 since. 2.3 is TLS, which is a Railway deployment setting rather
+> than a code change. The estimate above is left visible because a 3–4 week figure that quietly
 > vanished would look like it was delivered rather than ruled out of scope.
 
 Latent while one branch exists — there is no second branch's data to leak — and live the moment
@@ -884,7 +891,7 @@ the exposure together.
 
 | # | Requirement | State |
 | --- | --- | --- |
-| 5.1 | The plaintext-password query has been run against the live database | **Outstanding, now self-reporting** — the server counts legacy hashes at every cloud startup (see the A-5 record). Any account it names cannot sign in after A-2 and needs an admin reset |
+| 5.1 | The plaintext-password query has been run against the live database | **No longer a gate.** The count is reported at every cloud startup and now covers every format the verifier refuses, not only plaintext (see the A-5 record). Any account it counts is refused by name and told how to reset, so a stranded row is self-announcing rather than something to go looking for |
 | 5.2 | A restore has been tested from a real backup, not just taken | Untested |
 | 5.3 | Logs do not contain tokens, passwords or OTPs | Unverified |
 | 5.4 | LOCAL_ONLY invariants re-read and re-tested after exposure work | `desktopGatewayOwnerControl.test.js` asserts them on the gateway paths; re-run after any cloud change |
@@ -1320,55 +1327,119 @@ a user who mistyped four times last week is locked by their next single slip.
 Locking is written to `auth_audit_log` as `ACCOUNT_LOCKED` with the streak length and the unlock
 time, so a lockout is explicable after the fact rather than mysterious.
 
-### The other half of A-5 is deliberately NOT done
+### The other half of A-5 — completed 2026-08-27
 
-The plan pairs the lockout with **removing the legacy SHA-256 verify path**, gated on this
+The plan paired the lockout with **removing the legacy SHA-256 verify path**, gated on this
 condition, quoted from the plan itself:
 
 > remove the SHA-256 verify path once telemetry shows every active user has logged in since A-1.
 
-**A-1 landed on 2026-08-19 — yesterday.** Nobody except the maintainer has signed in since. Removing
-the legacy path today would lock out every user whose password has not yet been re-hashed, which is
-very likely all of them. That is not a judgement call; it is the precondition plainly not being met.
+That precondition was never met, and waiting for it had become the wrong plan. It is quoted here
+with the reasoning that replaced it, because the change of approach is the substance of this record.
 
-**Precondition, to be checked before the removal:**
+#### Why waiting stopped being the right answer
+
+The condition asks for evidence that no account would be stranded. Two things made it unreachable:
+
+- `passwordHash.js` is only ever reached by the **cloud** backend; `desktopGateway.js` never uses
+  it. So the maintainer's own Postgres hash is almost certainly still the legacy format, because
+  nobody had signed in against Postgres while the re-hash-on-login path existed.
+- Gathering the evidence means querying the live database, which is a `CLAUDE.md` boundary. The
+  startup count reports it, but only *after* a deploy, and only to whoever is reading the log.
+
+Meanwhile the cost of waiting was real and compounding. While the verifier accepted the legacy
+format, **the weakest hash in the table was still a working credential.** An unsalted single-round
+digest falls to a rainbow table in seconds, so anyone holding a copy of `users` — a leaked backup, a
+restored dump, a stolen laptop — could recover those passwords and sign in with them.
+Re-hash-on-login is no defence there: the attacker never needs the user to log in first.
+
+#### What made the removal safe instead
+
+The precondition existed to prevent one outcome: a real person locked out with no way back in and no
+idea why. That outcome is prevented directly now, which is a better guarantee than a count that
+might be stale by the time it is read.
+
+- **The refusal says what is wrong and what to do about it.** `/login` answers
+  `PASSWORD_RESET_REQUIRED` — *"This account's saved password is in an old format that FroozERP no
+  longer accepts. Use "Forgot password" to set a new one, or ask your Owner or Administrator to
+  reset it."* Not the generic "invalid username or password", which is true, useless, and would have
+  someone retyping a correct password until they gave up.
+- **The refusal never locks the account.** Nothing is compared against the supplied password, so
+  there is no failed guess to count. Counting it would lock an account that no correct password can
+  ever unlock — a denial of service dressed as a security control.
+- **Three ways back in, none of which depend on the old hash.** Self-service OTP recovery
+  (`/auth/recovery/*`), an Owner or Admin reset (`/users/:id/recovery-action`,
+  `/users/:id/password`), and `scripts/reset-password.mjs` for whoever holds database access.
+- **The last of those is new, and it is the one that closes the gap.** The unrecoverable case was
+  *the Owner* holding the retired hash with no verified recovery contact — self-service needs the
+  contact, and an admin reset needs an admin who can sign in. The ops command moves that trust
+  boundary to shell access on the machine holding `DATABASE_URL`, which the deployment already has
+  and already protects. It also increments `session_revocation_version` (a reset that left an
+  existing session alive would be a reset in name only), clears the lockout counters, and writes an
+  `OPS_PASSWORD_RESET` audit row.
+- **`scripts/bootstrap-first-owner.mjs` diagnoses the same condition**, so an operator running it
+  against an Owner with a retired hash is told to reset rather than being told, forever, that
+  correct credentials were not accepted.
+
+#### What the verifier does now
+
+The retired algorithm is **not computed at all**, on any input. `legacySha256` is deleted from
+`passwordHash.js` and is not exported; only `LEGACY_SHA256_PATTERN` remains, and only to *recognise*
+a stored row by shape so the account can be told to reset. Recognition by shape rather than by
+comparison is what keeps the specific refusal from becoming an oracle: it cannot tell an attacker
+their guess was right, because nothing checked.
+
+The same treatment covers the pre-A-2 plaintext column, a corrupt hash and an empty password column.
+All four are "the stored value is not a credential", all four need a reset, and `/login` answers them
+identically. `SCRYPT` is now the only format where a `false` result means "wrong password".
+
+#### The expected consequence, stated plainly
+
+**The first cloud sign-in after this deploys may be refused with `PASSWORD_RESET_REQUIRED`.** That is
+this change working, not a fault. The desktop app is unaffected — `desktopGateway.js` does not use
+this module — so day-to-day work continues while the cloud password is reset.
+
+The startup count changed meaning to match. It was a precondition ("how many accounts would removal
+strand"); it is now a live fault count ("how many accounts are stranded right now"), and its
+condition widened from the legacy digest shape to `NOT LIKE 'scrypt$%'` so it agrees with what the
+verifier actually refuses:
 
 ```sql
-SELECT COUNT(*) AS still_legacy
+SELECT COUNT(*) AS needs_reset
   FROM users
  WHERE active = TRUE
-   AND password_hash ~ '^[0-9a-f]{64}$';
+   AND COALESCE(password_hash, '') NOT LIKE 'scrypt$%';
 ```
 
-`0` means every active user has signed in since A-1 and the legacy branch in
-`backend/passwordHash.js` can be deleted along with its tests. Any other number is the list of
-people that removal would lock out.
+Still only a count — no usernames, no ids, because a startup log naming accounts with weak hashes is
+a list of targets — and still never fatal.
 
-Until then the legacy path stays, and A-5 is **half complete by design** rather than by oversight.
+#### Tests
 
-**The count is now printed at every cloud startup** (`reportLegacyPasswordHashes`) rather than left
-as a query in this document. The answer changes silently as people sign in, and a number nobody is
-watching is a number nobody knows. Only the count is reported — no usernames, no ids, because a
-startup log naming accounts with weak hashes is a list of targets. It is never fatal.
+`passwordHash.test.js` asserts the refusal behaviourally and with the **correct** password: a test
+using a wrong password would pass on a server that had never removed the legacy path, and would
+prove nothing. It also asserts that a right and a wrong password are reported identically, and that
+the module exports no way to compute a legacy digest.
 
-### Why this is not unblocked by "the other accounts are only samples"
+`retiredPasswordLogin.test.js` drives `/login` for real with a scripted row underneath it, because
+the branch order, the untouched lockout counters and the audit write are properties of the handler's
+control flow that no source-text assertion can pin. Its last test is the guard in the other
+direction: a wrong password against a current scrypt hash must still be answered generically and
+must still be counted, or this hardening step becomes an unlimited guessing window.
 
-The maintainer confirmed on 2026-08-20 that only their own account is real. That removes the
-*"other users would be locked out"* objection — but **not the one that matters**, which points at
-their own account:
+The removal was verified by reintroducing it: restoring the legacy comparison fails three tests.
 
-`passwordHash.js` is only ever reached by the **cloud** backend. `desktopGateway.js` never uses it.
-The cloud has been down (Railway lapsed) for the whole period since A-1, so nobody has signed in
-*against Postgres* since the re-hash-on-login path existed. The maintainer's own hash there is
-therefore almost certainly still the legacy format.
+#### Two things found on the way
 
-**Removing the legacy path today would lock out the one account that matters, the moment the cloud
-comes back.** The precondition stands, and it is now self-reporting: sign in once after the cloud
-returns, watch the startup line say 0, then delete the path.
-
-Deleting sample user rows was offered and declined — it would not have helped (the risk is the
-maintainer's own row, not the samples), and deleting business data to satisfy a check is a
-`CLAUDE.md` boundary regardless of how little the data is worth.
+- **The `routeAuthCoverage` session-revocation stub was over-matching.** It tested for
+  `session_revocation_version`, `active` and `FROM users` separately — and `/login`'s user lookup
+  selects all three. Every probe of `/login` was silently handed the guard's two-column row instead
+  of the row the suite had scripted, and read a row with no `password_hash` as an account with no
+  password. Narrowed to the guard's whole statement.
+- **Two suites were never running.** `backend/package.json` names its test files one by one, and
+  `isolatedCloudEndpoint.test.js` had been committed without being added — a file of green
+  assertions nobody executed. `suiteRegistration.test.js` now asserts the list and the directory
+  agree in both directions.
 
 ### Gate results
 
@@ -1382,6 +1453,8 @@ maintainer's own row, not the samples), and deleting business data to satisfy a 
 23 tests on the policy and its wiring, including that the lock is consulted *before* the password
 on both routes — a lock checked afterwards would let a correct password through and defeat the
 mechanism entirely.
+
+Gates for the 2026-08-27 removal are recorded with the A-6 Gate 1.6 row in §8.
 
 ### Not verified
 

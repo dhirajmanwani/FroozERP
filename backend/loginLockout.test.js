@@ -278,11 +278,17 @@ test("locking is audited, so a lockout is explicable afterwards", () => {
   assert.match(backendCode, /action: "ACCOUNT_LOCKED"/);
 });
 
-test("the A-5 legacy-hash precondition is measured at startup, not left in a document", () => {
-  // The removal is gated on a number that changes silently as people sign in. A number nobody is
-  // watching is a number nobody knows, so the server counts it every boot.
+test("accounts stranded by A-5 are counted at startup, not left in a document", () => {
+  // Before A-5 this number was a precondition: how many accounts removing the legacy verify path
+  // would strand. Now the path is gone it is a live fault count — each one is a person who will be
+  // told to reset the next time they try to work — so it still has to be measured every boot. A
+  // number nobody is watching is a number nobody knows.
   assert.match(backendCode, /const reportLegacyPasswordHashes = async \(\) => \{/);
-  assert.match(backendCode, /password_hash ~ '\^\[0-9a-f\]\{64\}\$'/);
+  assert.match(
+    backendCode,
+    /NOT LIKE 'scrypt\$%'/,
+    "the count must be everything the verifier refuses, not only the legacy digest shape",
+  );
   assert.match(backendCode, /await reportLegacyPasswordHashes\(\);/, "it must actually run at startup");
 });
 
@@ -298,9 +304,27 @@ test("the legacy-hash report names no accounts and never blocks startup", () => 
   assert.match(report, /catch \(error\)/, "a counting failure must not be fatal");
 });
 
-test("the legacy verify path is still present, because its precondition is unmet", () => {
-  // Pins the deliberate half-completion. When the startup count reaches 0 this test is what should
-  // be revisited — it is the record of *why* the path was kept, not an assertion that it is good.
+test("the legacy verify path is gone, and /login refuses it by name", () => {
+  // Replaces the test that pinned A-5's deliberate half-completion. The gate was "the legacy
+  // SHA-256 verify path is removed", and the two halves of that are: the verifier no longer runs
+  // the retired algorithm, and `/login` answers the resulting refusal with something the person
+  // reading it can act on. `passwordHash.test.js` proves the first behaviourally; this pins the
+  // second, which lives in server.js and has no unit of its own.
   const hashSource = fs.readFileSync(path.join(__dirname, "passwordHash.js"), "utf8");
-  assert.match(hashSource, /LEGACY_SHA256_PATTERN/, "A-1's legacy path must remain until A-5's precondition is met");
+  assert.doesNotMatch(
+    hashSource,
+    /createHash\(\s*["']sha256["']\s*\)/,
+    "the retired algorithm must not be computable in passwordHash.js",
+  );
+  assert.match(
+    backendCode,
+    /if \(storedPasswordIsUnusable\(passwordCheck\)\) \{/,
+    "/login must branch on an unusable stored value before the wrong-password path",
+  );
+  assert.match(backendCode, /code: "PASSWORD_RESET_REQUIRED"/);
+  assert.ok(
+    backendCode.indexOf("storedPasswordIsUnusable(passwordCheck)")
+      < backendCode.indexOf("if (!passwordCheck.ok) {"),
+    "it must be checked first, or a retired format is counted as a wrong guess and locks the account",
+  );
 });
