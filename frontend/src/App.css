@@ -6402,3 +6402,173 @@ tbody tr:last-child td {
 .local-only-banner[data-shop-view="OTHER_BRANCH"] {
   border-color: #8a6520;
 }
+
+/* ---------------------------------------------------------------------------------------------
+   Shell chrome: the collapsing rail, the top-bar controls, and the shortcut chips.
+
+   The rail is a collapse, never a hide. A counter machine wants the width for the bill, but a
+   cashier who has lost the menu entirely mid-sale is worse off than one with a narrow one -- so
+   the icons stay and only the words go.
+   --------------------------------------------------------------------------------------------- */
+
+.sidebar.sidebar-rail {
+  width: 64px;
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
+/* The content follows the rail. Both numbers are the sidebar's own width; if they ever disagree
+   the page gets a gap or an overlap, so they are written next to each other on purpose. */
+.erp-shell:has(.sidebar-rail) .content-shell {
+  width: calc(100% - 64px);
+  margin-left: 64px;
+}
+
+.sidebar-rail .nav-item span,
+.sidebar-rail .nav-shortcut,
+.sidebar-rail .sidebar-section,
+.sidebar-rail .sidebar-shop-picker,
+.sidebar-rail .sidebar-profile > div {
+  display: none;
+}
+
+.sidebar-rail .nav-item {
+  justify-content: center;
+  padding-left: 0;
+  padding-right: 0;
+}
+
+.sidebar-rail .sidebar-brand,
+.sidebar-rail .sidebar-profile {
+  justify-content: center;
+}
+
+/* The keyboard chip beside a module name. Deliberately quiet: it is a thing to notice once and
+   then stop seeing, not a second label competing with the first. */
+.nav-shortcut {
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 5px;
+  border: 1px solid rgba(143, 171, 156, 0.22);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+  color: rgba(143, 171, 156, 0.75);
+  background: rgba(143, 171, 156, 0.07);
+}
+
+.nav-item-active .nav-shortcut {
+  border-color: rgba(217, 172, 82, 0.35);
+  color: rgba(217, 172, 82, 0.9);
+  background: rgba(217, 172, 82, 0.12);
+}
+
+.chrome-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-right: 6px;
+}
+
+.chrome-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  color: #8fab9c;
+  background: transparent;
+  cursor: pointer;
+  transition: 140ms ease;
+}
+
+.chrome-button:hover:not(:disabled) {
+  color: #f6f3ea;
+  background: rgba(217, 172, 82, 0.12);
+}
+
+.chrome-button:focus-visible {
+  outline: 2px solid rgba(217, 172, 82, 0.7);
+  outline-offset: 1px;
+}
+
+/* Dimmed rather than removed. A control that disappears at the ends of the history moves the two
+   beside it, and a moving target is worse than a quiet one. */
+.chrome-button:disabled {
+  opacity: 0.28;
+  cursor: default;
+}
+
+.command-result {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  text-align: left;
+}
+
+.command-result-label {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+
+.command-result-label small {
+  font-size: 11px;
+  opacity: 0.6;
+}
+
+.command-result-label mark {
+  color: #d9ac52;
+  background: transparent;
+  font-weight: 750;
+}
+
+.command-result-key {
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 5px;
+  border: 1px solid rgba(143, 171, 156, 0.22);
+  font-family: inherit;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: rgba(143, 171, 156, 0.75);
+}
+
+.command-result-active {
+  background: rgba(217, 172, 82, 0.12);
+}
+
+.command-palette-notice {
+  margin: 0 0 6px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  font-size: 12px;
+  color: #d9ac52;
+  background: rgba(217, 172, 82, 0.1);
+}
+
+@media (max-width: 900px) {
+  /* The rail is a desktop affordance. On a narrow screen the sidebar is already an overlay, and a
+     64px strip permanently taking width would be worse than either state. */
+  .sidebar.sidebar-rail {
+    width: 252px;
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  .sidebar-rail .nav-item span,
+  .sidebar-rail .nav-shortcut {
+    display: initial;
+  }
+
+  .chrome-bar {
+    display: none;
+  }
+}

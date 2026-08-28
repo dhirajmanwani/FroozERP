@@ -46,6 +46,8 @@ import { ORDER_STATUS } from "./local/orderLifecycle";
 import { STOCK_TRUSTED_FOR_HOURS, buildCatalogue, catalogueFilename, describeExport } from "./local/catalogueExport";
 import { buildOrdersBoard, validateOrderAction } from "./local/ordersBoard";
 import { ORDER_REPORT, buildOrderReports, describeOrderReportError } from "./local/orderReporting";
+import { formatShortcut, navigationRegistry, resolveShortcutTarget } from "./local/appNavigation";
+import { buildCommandIndex, highlightSegments, searchCommands } from "./local/commandPalette";
 import { buildOrderNotifications } from "./local/orderNotifications";
 import { COUNTER_STOCK, buildReservedIndex, describeCounterStock, reservedForProduct, reservedNote } from "./local/reservedStock";
 import { buildOrderCartSeed, describeOrderBillingProblems } from "./local/orderBilling";
@@ -1602,6 +1604,8 @@ function Icon({ name, size = 18 }) {
     menu: <><path d="M4 6h16M4 12h16M4 18h16" /></>,
     logout: <><path d="M10 17l5-5-5-5M15 12H3M21 19V5a2 2 0 0 0-2-2h-6" /></>,
     search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></>,
+    "arrow-left": <><path d="M19 12H5" /><path d="m12 19-7-7 7-7" /></>,
+    "arrow-right": <><path d="M5 12h14" /><path d="m12 5 7 7-7 7" /></>,
     barcode: <><path d="M3 5v14M7 5v14M11 5v14M15 5v14M19 5v14M21 5v14" /></>,
     trash: <><path d="M4 7h16M10 11v6M14 11v6M9 7V4h6v3M6 7l1 14h10l1-14" /></>,
     print: <><path d="M6 9V3h12v6M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2M6 14h12v7H6Z" /></>,
@@ -1773,6 +1777,47 @@ function App() {
   const [activeView, setActiveView] = useState(initialView);
   const [applicationFontSize, setApplicationFontSize] = useState(getStoredApplicationFontSize);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  /**
+   * The sidebar collapsed to an icon rail.
+   *
+   * Collapsed, not hidden. A counter machine wants the width for the bill, but a cashier who has
+   * lost the menu entirely mid-sale is worse off than one with a narrow one, so the icons stay.
+   * Remembered per device because it is a property of the screen it runs on, not of the user.
+   */
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return window.localStorage.getItem("froozerp.sidebar.collapsed") === "1";
+    } catch {
+      // A browser with site data blocked must still render a sidebar, just not a remembered one.
+      return false;
+    }
+  });
+  /**
+   * Where we are in the browser's own history, so Back and Forward can be disabled at the ends.
+   *
+   * `navigate` already calls `pushState` and a `popstate` listener already restores the view, so
+   * the browser history is the real one and a second stack beside it could only disagree. The
+   * index rides along inside `pushState`'s own state object rather than in a parallel counter, for
+   * the same reason.
+   */
+  const [navPosition, setNavPosition] = useState({ index: 0, max: 0 });
+  /**
+   * The current `navigate`, for the keyboard listener.
+   *
+   * That listener registers once per user rather than once per render, so calling `navigate`
+   * directly would capture the first render's closure and navigate using whatever `offlineMode`
+   * and `connectivityMode` were true at sign-in. The ref is reassigned every render, so a shortcut
+   * pressed an hour later still routes on what is true now.
+   */
+  const navigateRef = useRef(null);
+  /**
+   * The last few screens visited, newest first, so the palette can float them to the top.
+   *
+   * Ranking alone cannot know that this shop lives on the POS screen. Typing "bill" scores
+   * "Bill-Level Discount Slabs" above "POS Billing" on the letters alone, which is correct as
+   * text and wrong as an answer. Where somebody has actually been is the missing evidence.
+   */
+  const [recentViews, setRecentViews] = useState([]);
   const [internetAvailable, setInternetAvailable] = useState(() => (
     typeof navigator === "undefined" ? true : navigator.onLine !== false
   ));
@@ -2169,11 +2214,23 @@ function App() {
         setCommandPaletteOpen(false);
       }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
-        const target = event.target;
-        const isEditing = ["INPUT", "TEXTAREA", "SELECT"].includes(target?.tagName) || target?.isContentEditable;
-        if (isEditing) return;
+        // Deliberately still works while typing, unlike the Alt shortcuts below. That is the whole
+        // reason to require a modifier: somebody halfway through a product search is exactly the
+        // person who wants to jump somewhere else, and refusing them made the palette unreachable
+        // from the screen they spend the day on.
         event.preventDefault();
         if (user) setCommandPaletteOpen((current) => !current);
+      }
+      // Alt + digit jumps straight to a module. `resolveShortcutTarget` returns null while any
+      // input, textarea, select or contenteditable has focus, and during IME composition - a
+      // cashier types into a search box all day, and a keystroke that changed screens mid-sale
+      // would be a defect, not a nuisance. The guard lives in the module because that is where it
+      // can be tested; removing it fails three tests.
+      const shortcutTarget = resolveShortcutTarget(event);
+      if (shortcutTarget && user) {
+        event.preventDefault();
+        setCommandPaletteOpen(false);
+        navigateRef.current?.(shortcutTarget.id);
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -2270,11 +2327,17 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const onPopState = () => {
+    const onPopState = (event) => {
       const requestedView = new URLSearchParams(window.location.search).get("view");
       if (requestedView && navigationItems.some(([view]) => view === requestedView)) {
         setActiveView(requestedView);
       }
+      // Only the index moves here. `max` is the high-water mark of this session and must survive
+      // going back, or Forward would switch itself off the moment it became useful.
+      setNavPosition((current) => ({
+        index: Number(event?.state?.navIndex || 0),
+        max: Math.max(current.max, Number(event?.state?.navIndex || 0)),
+      }));
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
@@ -6453,11 +6516,19 @@ function App() {
       alert("Your role does not have access to this module.");
       return;
     }
+    // Newest first, deduplicated, capped. Feeds the palette's ranking so that where somebody
+    // actually works outweighs how well a label happens to match their letters.
+    setRecentViews((current) => [view, ...current.filter((id) => id !== view)].slice(0, 8));
     const currentUrlView = new URLSearchParams(window.location.search).get("view");
     if (currentUrlView !== view) {
       const nextUrl = new URL(window.location.href);
       nextUrl.searchParams.set("view", view);
-      window.history.pushState({ view }, "", nextUrl);
+      // A forward push truncates the forward trail, which is the browser's own rule and the one
+      // people expect; `max` follows the new index rather than keeping a trail that Forward could
+      // no longer reach.
+      const nextIndex = Number(window.history.state?.navIndex || 0) + 1;
+      window.history.pushState({ view, navIndex: nextIndex }, "", nextUrl);
+      setNavPosition({ index: nextIndex, max: nextIndex });
     }
     const localDataMode = offlineMode || connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY;
     if (localDataMode) {
@@ -6547,6 +6618,9 @@ function App() {
       setSyncMessage(getErrorMessage(error, `${navigationItems.find(([itemView]) => itemView === view)?.[1] || "Module"} data could not be refreshed.`));
     }
   };
+  // Reassigned every render so the keyboard listener, which registers once, never calls a
+  // stale closure. See `navigateRef` above.
+  navigateRef.current = navigate;
 
   // The banner's "Return to Auto" is a second door to the same action as the Settings toggle, so it
   // needs the same answer. Computed from the saved App Mode rather than a settings draft, because
@@ -6849,19 +6923,27 @@ function App() {
     setFrostActiveTab(tab);
     setFrostDrawerOpen(true);
   };
-  const commandItems = [
-    ["sales", "Open POS Billing", () => navigate("sales")],
-    ["purchase", "New Purchase Entry", () => navigate("purchase")],
-    ["pending-bills", "Open Pending Bills", () => navigate("pending-bills")],
-    ["accounts", "Open Accounts", () => navigate("accounts")],
-    ["reports", "Open Reports", () => navigate("reports")],
-    ["sale-rates", "Open Sale Rate Update", () => navigate("sale-rates")],
-    ["products", "Search Product", () => navigate("products")],
-    ["accounts", "Search Customer", () => navigate("accounts")],
-    ["accounts", "Search Supplier", () => navigate("accounts")],
-    ["settings", "Open Update Center", () => navigate("settings")],
-    ["settings", "Check Connection", () => { navigate("settings"); performConnectivityCheck("command-palette", { force: true }); }],
-  ].filter(([view]) => hasModuleAccess(view) && (canManageRates || view !== "sale-rates"));
+  /**
+   * Everything a person can navigate to, searchable.
+   *
+   * This replaced eleven hand-written commands that could reach a module and nothing inside one:
+   * Settings' seventeen sections and Report Center's categories were unreachable by search, which
+   * is most of what there is to find. The index is built from the same registry the sidebar and
+   * the Alt shortcuts use, so a screen cannot exist in one and be missing from the other.
+   *
+   * Access is filtered before indexing rather than after searching, so a Cashier is never shown a
+   * result that would refuse them on arrival.
+   *
+   * Built only while the palette is open. A `useMemo` here sits after an early return in this
+   * component and breaks the rules-of-hooks ordering; the registry is forty entries, so building
+   * it on demand costs less than the memo would have.
+   */
+  const commandIndex = commandPaletteOpen
+    ? buildCommandIndex(navigationRegistry.filter(
+        (item) => hasModuleAccess(item.id) && (canManageRates || item.id !== "sale-rates"),
+      ))
+    : null;
+
   const shopView = resolveShopViewPresentation({
     loadState: shopViewState.loadState,
     loadError: shopViewState.loadError,
@@ -6874,22 +6956,31 @@ function App() {
   });
   return (
     <main className="erp-shell">
-      <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
+      <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""} ${sidebarCollapsed ? "sidebar-rail" : ""}`}>
         <div className="sidebar-brand">
           <BrandLogo />
         </div>
         <span className="sidebar-section">Main Menu</span>
         <nav className="sidebar-nav">
-          {navigationItems.filter(([view]) => hasModuleAccess(view) && (canManageRates || view !== "sale-rates")).map(([view, label]) => (
-            <button
-              className={activeView === view ? "nav-item nav-item-active" : "nav-item"}
-              key={view}
-              onClick={() => navigate(view)}
-            >
-              <Icon name={icons[view]} />
-              <span>{label}</span>
-            </button>
-          ))}
+          {navigationItems.filter(([view]) => hasModuleAccess(view) && (canManageRates || view !== "sale-rates")).map(([view, label]) => {
+            const shortcut = navigationRegistry.find((item) => item.id === view)?.shortcut || null;
+            return (
+              <button
+                className={activeView === view ? "nav-item nav-item-active" : "nav-item"}
+                key={view}
+                // The label becomes the tooltip on the collapsed rail, where it is the only way
+                // left to tell two similar icons apart.
+                title={sidebarCollapsed ? `${label}${shortcut ? ` (${formatShortcut(shortcut)})` : ""}` : undefined}
+                onClick={() => navigate(view)}
+              >
+                <Icon name={icons[view]} />
+                <span>{label}</span>
+                {/* The chip is how anybody discovers the shortcut exists. Rendered from the same
+                    registry the keystroke resolves against, so the two cannot disagree. */}
+                {shortcut && <kbd className="nav-shortcut">{formatShortcut(shortcut)}</kbd>}
+              </button>
+            );
+          })}
         </nav>
         {shopPickerVisible(shopView) && (
           <div className="sidebar-shop-picker">
@@ -6933,6 +7024,59 @@ function App() {
             >
               <Icon name="menu" />
             </button>
+            {/* The shell controls. Back and forward drive the browser's own history, which
+                `navigate` already pushes to and a `popstate` listener already restores from -- a
+                second stack beside it could only ever disagree with it. */}
+            <div className="chrome-bar">
+              <button
+                aria-label={sidebarCollapsed ? "Expand the menu" : "Collapse the menu to icons"}
+                aria-pressed={sidebarCollapsed}
+                className="chrome-button"
+                onClick={() => setSidebarCollapsed((collapsed) => {
+                  const next = !collapsed;
+                  try {
+                    window.localStorage.setItem("froozerp.sidebar.collapsed", next ? "1" : "0");
+                  } catch {
+                    // Remembering is a convenience; a browser refusing storage must not stop the
+                    // menu from collapsing right now.
+                  }
+                  return next;
+                })}
+                title={sidebarCollapsed ? "Expand the menu" : "Collapse the menu to icons"}
+                type="button"
+              >
+                <Icon name="menu" />
+              </button>
+              <button
+                aria-label="Search screens and settings"
+                className="chrome-button"
+                onClick={() => setCommandPaletteOpen(true)}
+                title="Search screens and settings (Ctrl K)"
+                type="button"
+              >
+                <Icon name="search" />
+              </button>
+              <button
+                aria-label="Back"
+                className="chrome-button"
+                disabled={navPosition.index <= 0}
+                onClick={() => window.history.back()}
+                title="Back"
+                type="button"
+              >
+                <Icon name="arrow-left" />
+              </button>
+              <button
+                aria-label="Forward"
+                className="chrome-button"
+                disabled={navPosition.index >= navPosition.max}
+                onClick={() => window.history.forward()}
+                title="Forward"
+                type="button"
+              >
+                <Icon name="arrow-right" />
+              </button>
+            </div>
             <BrandLogo compact />
             <div>
               <span className="eyebrow">Retail Operations Workspace</span>
@@ -8052,7 +8196,13 @@ function App() {
       />
       {commandPaletteOpen && (
         <CommandPalette
-          commands={commandItems}
+          index={commandIndex}
+          recentIds={recentViews}
+          // `sectionId` is deliberately ignored for now. Landing on the exact card needs every
+          // section to carry a DOM id, which arrives with the Settings drill-down; scrolling to an
+          // id that does not exist yet would work for some sections and silently not for others,
+          // which is worse than consistently landing at the top of the right screen.
+          onNavigate={(viewId) => navigate(viewId)}
           onClose={() => setCommandPaletteOpen(false)}
         />
       )}
@@ -8137,29 +8287,111 @@ function FrostFloatingCopilot({
   );
 }
 
-function CommandPalette({ commands = [], onClose }) {
+/**
+ * Search across every screen and every section inside one.
+ *
+ * Replaces a filter over eleven hand-written commands that matched with `includes()` and could not
+ * reach a single Settings section or report. What makes this usable is not the search box but the
+ * ranking behind it, which lives in `local/commandPalette.js` where it is tested; this component
+ * only presents what that returns.
+ *
+ * Two things it must never do, both instances of "errors must never render as zero": show an empty
+ * list when the map itself failed to build, and show a complete-looking list built from a map it
+ * knows is partial. `status` and `degraded` are why both are distinguishable here.
+ */
+function CommandPalette({ index, recentIds = [], onNavigate, onClose }) {
   const [query, setQuery] = useState("");
-  const filtered = commands.filter(([, label]) => label.toLowerCase().includes(query.trim().toLowerCase()));
-  const runCommand = (command) => {
-    command?.();
+  const [highlighted, setHighlighted] = useState(0);
+  const search = searchCommands(index, query, { recentIds });
+  const results = search.results || [];
+  // Clamped rather than reset: the list shrinks as somebody types, and an index left past the end
+  // would make Enter do nothing at the exact moment they have finished narrowing it down.
+  const activeIndex = Math.min(highlighted, Math.max(0, results.length - 1));
+
+  const run = (result) => {
+    if (!result) return;
+    onNavigate?.(result.viewId, result.sectionId);
     onClose?.();
   };
+
+  const onKeyDown = (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      // The arrows belong to the list even though focus is in the text box, or choosing a result
+      // would mean taking a hand off the keyboard - which is the whole point of a palette.
+      event.preventDefault();
+      const step = event.key === "ArrowDown" ? 1 : -1;
+      setHighlighted((current) => {
+        const next = Math.min(current, Math.max(0, results.length - 1)) + step;
+        if (next < 0) return Math.max(0, results.length - 1);
+        return next >= results.length ? 0 : next;
+      });
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      run(results[activeIndex]);
+    }
+  };
+
+  const renderLabel = (result) => {
+    const segments = highlightSegments(result.highlight?.text ?? result.label, result.highlight?.ranges);
+    // The matched letters are marked so a result explains why it is in the list. Where the match
+    // was on a keyword or an eyebrow rather than the label, the label is shown plain instead of
+    // pretending the highlight belongs to it.
+    if (result.highlight?.field !== "label") return result.label;
+    return segments.map((segment, position) => (
+      segment.matched
+        ? <mark key={`${result.id}-${position}`}>{segment.text}</mark>
+        : <span key={`${result.id}-${position}`}>{segment.text}</span>
+    ));
+  };
+
   return (
     <div className="command-palette-backdrop" onClick={onClose}>
       <section className="command-palette" onClick={(event) => event.stopPropagation()}>
         <div className="command-palette-header">
-          <span className="eyebrow">Command Palette</span>
+          <span className="eyebrow">Go to</span>
           <button aria-label="Close command palette" className="remove-button" onClick={onClose} type="button"><Icon name="close" /></button>
         </div>
-        <input autoFocus placeholder="Search commands" value={query} onChange={(event) => setQuery(event.target.value)} />
+        <input
+          autoFocus
+          onChange={(event) => { setQuery(event.target.value); setHighlighted(0); }}
+          onKeyDown={onKeyDown}
+          placeholder="Search screens and settings"
+          value={query}
+        />
+        {search.degraded && (
+          <div className="command-palette-notice">Some screens could not be listed, so this search is incomplete.</div>
+        )}
         <div className="command-list">
-          {filtered.map(([view, label, command]) => (
-            <button key={`${view}-${label}`} onClick={() => runCommand(command)} type="button">
-              <Icon name={icons[view] || "settings"} />
-              <span>{label}</span>
+          {results.map((result, position) => (
+            <button
+              className={position === activeIndex ? "command-result command-result-active" : "command-result"}
+              key={result.id}
+              onClick={() => run(result)}
+              onMouseEnter={() => setHighlighted(position)}
+              type="button"
+            >
+              <Icon name={result.icon || "settings"} />
+              <span className="command-result-label">
+                {renderLabel(result)}
+                {/* A section is meaningless without the screen it lives in: "Business Identity" is
+                    only findable if you are told it is inside Settings. */}
+                {result.parentLabel && <small>in {result.parentLabel}</small>}
+              </span>
+              {result.shortcut && <kbd className="command-result-key">{formatShortcut(result.shortcut)}</kbd>}
             </button>
           ))}
-          {filtered.length === 0 && <div className="cart-empty">No matching command.</div>}
+          {results.length === 0 && (
+            <div className="cart-empty">
+              {/* Three different answers that would all have been an empty list before. */}
+              {search.status === "INVALID_INDEX"
+                ? "The list of screens could not be read, so search is unavailable."
+                : query.trim()
+                  ? `Nothing matches "${query.trim()}".`
+                  : "Start typing to find a screen."}
+            </div>
+          )}
         </div>
       </section>
     </div>
