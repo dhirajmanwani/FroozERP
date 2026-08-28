@@ -39,7 +39,13 @@ explicitly, in the current conversation, by the maintainer:
 - **Never modify updater metadata** or anything under `release/`.
 - **Never touch `F:\FroozERP_recovery_backups\`.** It is preserved failure evidence.
 - **Never install or launch the packaged app on the real laptop** during source work.
-  Use disposable copies of databases, profiles and app state.
+  Use disposable copies of databases, profiles and app state. `npm run app:disposable`
+  is the safe launcher and sets the isolation variables itself; **`npm run app` opens the
+  real profile** and has already written migrations into live data once.
+- **Rehearse before every significant publish.** The updater installs in `quiet` mode
+  against `latest`, so a release reaches every counter silently with no easy undo. Run
+  `npm run app:disposable` seeded from a copy of live first — see
+  `docs/production/RELEASE_AND_UPDATE_PROCESS.md`, "Milestone Rehearsal".
 - **Never fabricate, delete or reassign business data to make a test pass.**
 - LOCAL_ONLY mode must keep `blocked=true`, `reachedCloud=false`, cloud-router
   invocations at 0, and external connections at 0. Any change that could weaken this

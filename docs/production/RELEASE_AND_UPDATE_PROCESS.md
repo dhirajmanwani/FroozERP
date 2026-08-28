@@ -81,6 +81,78 @@ Before installing updates:
 - run local migrations transactionally after update
 - record migration success/failure
 
+## Milestone Rehearsal — run before every publish
+
+**Ruled by the maintainer, 2026-08-27:** before any significant publish, the build is run once on a
+disposable copy. Not ceremony. The updater installs in `quiet` mode against the `latest` release, so
+a publish reaches every counter silently, with nobody clicking anything and no easy undo — the first
+person to exercise a new release must not be a cashier mid-sale.
+
+Automated gates prove the pieces. They run headless on Linux and never open a window, so the things
+they can least vouch for are exactly the things a release changes most often: a schema migration
+against a real database, sync between two machines, and whether a screen actually renders.
+
+### Run it
+
+```powershell
+# Close the real app first. Copying a live SQLite file mid-write can capture a torn state.
+$env:FROOZERP_DISPOSABLE_PROFILE = "rehearsal"
+$env:FROOZERP_DISPOSABLE_SEED = "live"
+npm run app:disposable
+```
+
+**Never `npm run app` for this.** That opens the real profile: `resolve_app_data_dir` redirects the
+database only when `NODE_ENV=test` *and* an absolute `FROOZERP_ISOLATED_SQLITE_DIR` are both set,
+and a plain dev run sets neither. On 2026-08-18 exactly that happened — the variables were set in
+one terminal window and the run came from another — and migrations plus a grandfather entitlement
+were written into live data. `app:disposable` sets them itself and refuses to start if the path
+resolves anywhere near the real app-data directory. That is why it exists.
+
+`FROOZERP_DISPOSABLE_SEED = "live"` copies the real database so the rehearsal meets real data, real
+volume and real migration state — a fresh empty profile proves the app starts, not that the upgrade
+survives what is actually on the machine.
+
+Afterwards, clear the variables or close the window. They live as long as the terminal does, which
+is the same per-window statefulness behind the 2026-08-18 incident:
+
+```powershell
+Remove-Item Env:FROOZERP_DISPOSABLE_PROFILE, Env:FROOZERP_DISPOSABLE_SEED
+```
+
+### What to check, every time
+
+- The app opens, and opens **into the seeded data** — the shop's real products and customers, not an
+  empty profile. If it looks empty, the seed did not take and the rehearsal is proving nothing.
+- Sign in works.
+- Billing: one sale, start to finish. This is the till; nothing ships if this is uncertain.
+- Every screen the release touched, opened at least once.
+- The terminal, read to the end for a migration failure or a panic. A migration that failed and was
+  swallowed looks identical to one that worked, from the UI.
+
+### What to check for *this* release specifically
+
+Each release adds its own rows here, because the generic list above cannot know what changed.
+
+**Orders across devices + orders in Report Center (2026-08-27):**
+
+- Migration `022_customer_order_sync` applies to a **seeded** profile without error. It is
+  forward-only and additive, but it has never met a real database.
+- Orders written before this release are marked `blocked` with a readable reason, not left claiming
+  to be queued. Making a status change on one should queue it and clear the block.
+- A new order queues exactly one outbox row.
+- Report Center → **Order Reports**: all four open. Reached without visiting the Orders screen
+  first, they must show real figures — not zeros, and not a permanent "Reading this device's
+  orders…".
+- With no internet, the order reports still answer. They read local SQLite by design; if they go
+  blank offline, that design has been broken.
+- Two devices, if two are available: an order taken on one appears on the other after a sync. This
+  is the release's whole point and the part with no automated coverage at all.
+
+### Only then
+
+A rehearsal that found nothing is the precondition for **Signing And Publishing** below. A rehearsal
+that found something is a bug report, and the version does not go out.
+
 ## Signing And Publishing
 
 Only an authorised release process should publish FroozERP binaries. Ordinary staff must not upload installers or update artifacts.
