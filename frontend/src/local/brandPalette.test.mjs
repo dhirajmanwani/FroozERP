@@ -28,6 +28,10 @@ const repoRoot = join(here, "..", "..", "..");
 // site and an invoice on the same day should not be able to tell they were built by
 // different hands.
 const GUARDED_FILES = [
+  // theme.css first: it is the token layer every other stylesheet is being converted onto,
+  // so a colour invented there would spread into all of them under a name that looks
+  // official. It is held to exactly the same standard as App.css, and for the same reason.
+  "frontend/src/theme.css",
   "frontend/src/App.css",
   "frontend/src/index.css",
   "frontend/index.html",
