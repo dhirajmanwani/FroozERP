@@ -45,6 +45,7 @@ import { resolveShopViewPresentation, shopPickerVisible } from "./local/shopView
 import { ORDER_STATUS } from "./local/orderLifecycle";
 import { STOCK_TRUSTED_FOR_HOURS, buildCatalogue, catalogueFilename, describeExport } from "./local/catalogueExport";
 import { buildOrdersBoard, validateOrderAction } from "./local/ordersBoard";
+import { ORDER_REPORT, buildOrderReports, describeOrderReportError } from "./local/orderReporting";
 import { buildOrderNotifications } from "./local/orderNotifications";
 import { COUNTER_STOCK, buildReservedIndex, describeCounterStock, reservedForProduct, reservedNote } from "./local/reservedStock";
 import { buildOrderCartSeed, describeOrderBillingProblems } from "./local/orderBilling";
@@ -2051,8 +2052,14 @@ function App() {
   // online, one for local data — and a loader added to only one of them silently never runs on the
   // other. That happened here. This closes it at the screen instead of relying on both branches
   // staying in step, and it cannot double-load: it fires only while the state is still untouched.
+  //
+  // Report Center needs them too, and for the same reason: an order report built from an
+  // unloaded list would render 0 orders, which is indistinguishable from a day nobody ordered
+  // anything. `CLAUDE.md` records that as the "errors must never render as zero" rule. The
+  // screen still tells the difference (see `orderReportsState`), but not loading at all would
+  // make the honest answer permanently "not loaded".
   useEffect(() => {
-    if (activeView !== "orders") return;
+    if (activeView !== "orders" && activeView !== "reports") return;
     if (ordersState.loadState !== "idle") return;
     loadOrders();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -7769,6 +7776,7 @@ function App() {
           {activeView === "reports" && (
             <ReportsModule
               accounts={accounts}
+              orders={ordersState}
               canCancelSales={canCancelSales}
               canEditSales={canEditSales}
               canManageStock={canManageStock}
@@ -10513,7 +10521,7 @@ function DiscountManagementModule({ discounts = [], inventory = [], onReload, pr
   );
 }
 
-function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageStock, canWhatsappSend = false, connectivityMode = CONNECTIVITY_MODES.LOCAL_ONLY, customers = [], data = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, suppliers = [], user }) {
+function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageStock, canWhatsappSend = false, connectivityMode = CONNECTIVITY_MODES.LOCAL_ONLY, customers = [], data = {}, orders: ordersState = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, suppliers = [], user }) {
   const [range, setRange] = useState("today");
   const [search, setSearch] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
@@ -10659,6 +10667,54 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     return safeRows.filter(matchesSearch);
   };
   const totalOf = (rows, key) => rows.reduce((sum, row) => sum + Number(row[key] || 0), 0);
+  /**
+   * The four order reports, built from this device's SQLite rather than from the API.
+   *
+   * Orders are local-first and need no cloud, so they are the one part of Report Center that
+   * still answers when the internet does not. The range is the one Report Center is already
+   * showing (`appliedQuery`), passed as an explicit `custom` range so the reports cannot quietly
+   * filter on a different period from the one printed at the top of the page.
+   *
+   * `loadState` is carried through rather than collapsed into the rows, because "we have not read
+   * your orders" and "nobody ordered anything" are different answers and only one of them is
+   * zero.
+   */
+  const orderReportsState = (() => {
+    const loadState = ordersState.loadState || "idle";
+    if (loadState === "error") {
+      return { ready: false, notice: ordersState.loadError || "Orders could not be read on this device.", reports: null };
+    }
+    if (loadState === "idle" || loadState === "loading") {
+      return { ready: false, notice: "Reading this device's orders…", reports: null };
+    }
+    const reports = buildOrderReports(ordersState.orders, {
+      range: "custom",
+      date_from: appliedQuery.date_from,
+      date_to: appliedQuery.date_to,
+    });
+    return { ready: reports.ok, notice: describeOrderReportError(reports), reports };
+  })();
+  /**
+   * Rows for one order report, or an empty list while the orders are unread.
+   *
+   * Empty-while-unread is safe only because `orderReportSummary` refuses to produce figures in the
+   * same state: a table with no rows next to tiles reading 0 would be the exact failure this pair
+   * exists to prevent.
+   */
+  const orderReportRows = (key) => (
+    orderReportsState.reports?.[key]?.ok ? filterRows(orderReportsState.reports[key].rows) : []
+  );
+  /**
+   * Summary tiles for one order report, or a single tile naming the reason there are none.
+   *
+   * Returning `[["Orders", "-"]]` rather than `[["Orders", 0]]` is the whole point. A zero here
+   * would be a confident, wrong statement about the shop's day.
+   */
+  const orderReportSummary = (key, build) => {
+    const report = orderReportsState.reports?.[key];
+    if (!report?.ok) return [["Orders", "-", true], ["Status", orderReportsState.notice || "Unavailable"]];
+    return build(report.summary);
+  };
   const money = (value) => currency.format(Number(value || 0));
   const number = (value) => Number(value || 0).toLocaleString("en-IN");
   const stockRows = filterRows(data.stockReport);
@@ -11245,6 +11301,117 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     salesPrintNarration || salesPrintNarrationRef.current ? row.item_narration : row.item_summary
   );
   const reports = {
+    // ---- Orders -------------------------------------------------------------------------------
+    // Built from this device's SQLite, not from the API, so they answer with no internet. Every
+    // summary here is derived from the same filtered source as its own rows: `buildOrderReports`
+    // builds one source and hands it to all four, so by-product and by-date cannot disagree about
+    // the same day's rupees.
+    [ORDER_REPORT.BY_DATE]: {
+      title: "Orders by Date",
+      rows: orderReportRows(ORDER_REPORT.BY_DATE),
+      summary: () => orderReportSummary(ORDER_REPORT.BY_DATE, (total) => [
+        ["Order Value", money(total.value), true],
+        ["Orders", number(total.orders)],
+        ["Delivered", number(total.delivered)],
+        ["Still Open", number(total.open)],
+        ["Cancelled", number(total.cancelled)],
+      ]),
+      headers: ["Date", "Orders", "Value", "Delivered", "Open", "Cancelled", "Returned"],
+      render: (row) => (
+        <tr key={row.date}>
+          <td>{row.dateLabel}</td>
+          <td>{number(row.orders)}</td>
+          <td>{money(row.value)}</td>
+          <td>{number(row.delivered)}</td>
+          <td>{number(row.open)}</td>
+          <td>{number(row.cancelled)}</td>
+          <td>{number(row.returned)}</td>
+        </tr>
+      ),
+    },
+    // The one that answers "what do I buy at the mandi tomorrow". Cancelled quantity is shown in
+    // its own column rather than folded into the total: buying fruit for an order the customer
+    // cancelled yesterday is the specific mistake this report exists to prevent.
+    [ORDER_REPORT.BY_PRODUCT]: {
+      title: "Orders by Product",
+      rows: orderReportRows(ORDER_REPORT.BY_PRODUCT),
+      summary: () => orderReportSummary(ORDER_REPORT.BY_PRODUCT, (total) => [
+        ["Order Value", money(total.value), true],
+        ["Products", number(total.products)],
+        ["Quantity Ordered", number(total.quantity)],
+        ["Orders", number(total.orders)],
+      ]),
+      headers: ["Product", "Quantity", "Value", "Orders", "Customers", "Cancelled Qty", "Last Ordered"],
+      render: (row) => (
+        <tr key={row.productKey}>
+          <td className="primary-cell">{row.productName}{row.unit ? <small className="cell-note">{row.unit}</small> : null}</td>
+          <td>{number(row.quantity)}</td>
+          <td>{money(row.value)}</td>
+          <td>{number(row.orders)}</td>
+          <td>{number(row.customers)}</td>
+          <td>{row.cancelledQuantity > 0 ? number(row.cancelledQuantity) : "-"}</td>
+          <td>{row.lastOrderedOn ? formatIndianReportDate(row.lastOrderedOn) : "-"}</td>
+        </tr>
+      ),
+    },
+    [ORDER_REPORT.BY_CUSTOMER]: {
+      title: "Orders by Customer",
+      rows: orderReportRows(ORDER_REPORT.BY_CUSTOMER),
+      summary: () => orderReportSummary(ORDER_REPORT.BY_CUSTOMER, (total) => [
+        ["Order Value", money(total.value), true],
+        ["Customers", number(total.customers)],
+        ["Orders", number(total.orders)],
+        ["Average Order", money(total.averageOrderValue)],
+      ]),
+      headers: ["Customer", "Mobile", "Orders", "Value", "Average Order", "Cancelled", "Last Ordered"],
+      render: (row) => (
+        <tr key={row.customerKey}>
+          <td className="primary-cell">
+            {row.customerName}
+            {/* A first-time caller has no customer record yet, and the order is deliberately
+                allowed without one. Saying so beats showing a name that looks like an account. */}
+            {row.identified ? null : <small className="cell-note">Not a saved customer</small>}
+          </td>
+          <td>{row.customerMobile || "-"}</td>
+          <td>{number(row.orders)}</td>
+          <td>{money(row.value)}</td>
+          <td>{money(row.averageOrderValue)}</td>
+          <td>{row.cancelled > 0 ? number(row.cancelled) : "-"}</td>
+          <td>{row.lastOrderedOn ? formatIndianReportDate(row.lastOrderedOn) : "-"}</td>
+        </tr>
+      ),
+    },
+    [ORDER_REPORT.FULFILMENT]: {
+      title: "Order Fulfilment",
+      rows: orderReportRows(ORDER_REPORT.FULFILMENT),
+      summary: () => orderReportSummary(ORDER_REPORT.FULFILMENT, (total) => [
+        ["Order Value", money(total.value), true],
+        ["Orders", number(total.orders)],
+        ["Still Open", number(total.open)],
+        ["Delivered", number(total.delivered)],
+      ]),
+      headers: ["Order", "Date", "Customer", "Status", "Age", "Carrier", "Invoice", "Value"],
+      render: (row) => (
+        <tr key={row.id}>
+          <td className="primary-cell">
+            {row.orderNo}
+            <small className="cell-note">{row.source}</small>
+          </td>
+          <td>{row.orderedOnLabel}</td>
+          <td>{row.customerName}{row.customerMobile ? <small className="cell-note">{row.customerMobile}</small> : null}</td>
+          <td>
+            {row.status}
+            {/* Carried from the board rather than recomputed, so a warning a person has already
+                seen on the Orders screen reads identically here. */}
+            {row.warning ? <small className="cell-note">{row.warning}</small> : null}
+          </td>
+          <td>{row.ageHours < 24 ? `${row.ageHours} h` : `${Math.floor(row.ageHours / 24)} d`}</td>
+          <td>{row.carrier || "-"}</td>
+          <td>{row.invoiceNo || (row.billed ? "Billed" : "-")}</td>
+          <td>{money(row.value)}</td>
+        </tr>
+      ),
+    },
     salesByDate: {
       title: "Sales by Date",
       rows: filterRows(data.salesReport),
@@ -11705,6 +11872,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     },
   };
   const categories = [
+    { id: "orders", title: "Order Reports", icon: "parcel", description: "Customer orders taken by phone, WhatsApp and the counter: what was ordered, by whom, and what is still open. Read from this device, so these answer with no internet.", reports: [ORDER_REPORT.BY_DATE, ORDER_REPORT.BY_PRODUCT, ORDER_REPORT.BY_CUSTOMER, ORDER_REPORT.FULFILMENT] },
     { id: "sales", title: "Sales Reports", icon: "receipt", description: "Unified sales history with item narration, discounts, payments and bill status.", reports: ["salesHistory", "discountReport"] },
     { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Unified purchase history with item narration, bill status, payments and amendment actions.", reports: ["purchaseHistory"] },
     { id: "accounts", title: "Accounts & Ledger", icon: "users", description: "Customer ledger, supplier ledger, statements, payments and balances.", reports: ["customerLedger", "supplierLedger", "accountStatement", "paymentReport", "paymentModeSummary", "receivableReport", "payableReport"] },
@@ -12406,6 +12574,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       });
       return renderedRows;
     };
+    const isOrderReport = Object.values(ORDER_REPORT).includes(selectedReport);
     const reportFileName = (() => {
       const from = formatFileDate(appliedQuery.date_from || data.dateFrom);
       const to = formatFileDate(appliedQuery.date_to || data.dateTo);
@@ -12423,6 +12592,9 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
         parts.push(`Range: ${formatIndianReportDate(appliedQuery.date_from)} to ${formatIndianReportDate(appliedQuery.date_to)}`);
       }
       if (selectedReport !== "stockInventory" && appliedSearch) parts.push(`Search: ${appliedSearch}`);
+      // A short total that does not say it is short is the failure `describeOrderReportError`
+      // exists to prevent, so it is surfaced beside the range rather than only in a tile.
+      if (isOrderReport && orderReportsState.notice) parts.push(orderReportsState.notice);
       if (selectedReport === "salesHistory") {
         parts.push(`View: ${salesFilters.viewMode === "CUSTOMER" ? "Customer-wise" : salesFilters.viewMode === "INVOICE" ? "Invoice-wise" : salesFilters.viewMode === "LOT" ? "Lot-wise" : "Item-wise"}`);
         parts.push(`Status: ${salesFilters.status}`);
@@ -12480,7 +12652,15 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
                   <DataTable headers={currentReport.headers}>
                     {selectedReport === "purchaseHistory" ? renderPurchaseHistoryRows() : rows.map((row, index) => currentReport.render(row, index))}
                   </DataTable>
-                  {rows.length === 0 && <div className="cart-empty">No records found for the selected range {formatIndianReportDate(appliedQuery.date_from)} to {formatIndianReportDate(appliedQuery.date_to)}.</div>}
+                  {rows.length === 0 && (
+                    <div className="cart-empty">
+                      {/* An order report with no rows has two very different causes, and saying
+                          "no records found" for both would report a failed read as a quiet day. */}
+                      {isOrderReport && !orderReportsState.ready
+                        ? orderReportsState.notice
+                        : `No records found for the selected range ${formatIndianReportDate(appliedQuery.date_from)} to ${formatIndianReportDate(appliedQuery.date_to)}.`}
+                    </div>
+                  )}
                 </>
               )}
             </PrintableReport>
