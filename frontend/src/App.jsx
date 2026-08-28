@@ -6967,7 +6967,10 @@ function App() {
     <main className="erp-shell">
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""} ${sidebarCollapsed ? "sidebar-rail" : ""}`}>
         <div className="sidebar-brand">
-          <BrandLogo />
+          {/* Collapsed, the mark stands alone. `compact` is the existing mode built for exactly
+              this - it drops the wordmark rather than letting CSS clip it, so the accessible name
+              becomes "Frooz" instead of a full title nobody can see. */}
+          <BrandLogo compact={sidebarCollapsed} />
         </div>
         <span className="sidebar-section">Main Menu</span>
         <nav className="sidebar-nav">
