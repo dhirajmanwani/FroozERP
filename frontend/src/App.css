@@ -6438,7 +6438,16 @@ tbody tr:last-child td {
   padding-right: 0;
 }
 
-.sidebar-rail .sidebar-brand,
+/* `.sidebar-brand` is a plain block, so centring needs a flex context here rather than a
+   `justify-content` that lands on nothing. Its own 4px side padding also left 40px inside the
+   48px rail for a 42px mark, which clipped the badge's border by a hair. */
+.sidebar-rail .sidebar-brand {
+  display: flex;
+  justify-content: center;
+  /* The 25px below the full lockup is spacing for a wordmark that is no longer rendered. */
+  padding: 2px 0 14px;
+}
+
 .sidebar-rail .sidebar-profile {
   justify-content: center;
 }
