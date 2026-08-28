@@ -179,6 +179,51 @@
   --paper-ink-muted: #2c5d43;
   --paper-line: #c8d8ce;
   --accent-deep: #8a6520;         /* accent text where it must survive a light surface */
+
+  /* Translucent panel veils. In dark these recede a surface toward the page; in light they lift it
+     toward white. That inversion is the reason they had to become tokens: as literals they were 83
+     hardcoded dark-green washes that would have smeared across a white page. */
+  --veil-faint: rgba(255, 255, 255, 0.35);
+  --veil-subtle: rgba(255, 255, 255, 0.55);
+  --veil: rgba(255, 255, 255, 0.7);
+  --veil-strong: rgba(255, 255, 255, 0.85);
+  --veil-heavy: rgba(255, 255, 255, 0.92);
+  --veil-solid: rgba(255, 255, 255, 0.97);
+  --card-veil-soft: rgba(255, 255, 255, 0.62);
+  --card-veil: rgba(255, 255, 255, 0.8);
+  --card-veil-solid: rgba(255, 255, 255, 0.97);
+  --shadow-faint: rgba(10, 45, 28, 0.04);
+  --shadow-deep: rgba(10, 45, 28, 0.26);
+  --scrim-soft: rgba(10, 45, 28, 0.28);
+  --scrim-strong: rgba(10, 45, 28, 0.5);
+
+    --veil-faint: rgba(8, 33, 22, 0.2);
+    --veil-subtle: rgba(8, 33, 22, 0.35);
+    --veil: rgba(8, 33, 22, 0.45);
+    --veil-strong: rgba(8, 33, 22, 0.62);
+    --veil-heavy: rgba(8, 33, 22, 0.78);
+    --veil-solid: rgba(8, 33, 22, 0.96);
+    --card-veil-soft: rgba(18, 54, 35, 0.62);
+    --card-veil-soft: rgba(18, 54, 35, 0.62);
+  --card-veil: rgba(18, 54, 35, 0.8);
+    --card-veil-solid: rgba(18, 54, 35, 0.97);
+    --shadow-faint: rgba(3, 17, 11, 0.16);
+    --shadow-deep: rgba(3, 17, 11, 0.78);
+    --scrim-soft: rgba(3, 17, 11, 0.42);
+    --scrim-strong: rgba(3, 17, 11, 0.78);
+
+  --veil-faint: rgba(8, 33, 22, 0.2);
+  --veil-subtle: rgba(8, 33, 22, 0.35);
+  --veil: rgba(8, 33, 22, 0.45);
+  --veil-strong: rgba(8, 33, 22, 0.62);
+  --veil-heavy: rgba(8, 33, 22, 0.78);
+  --veil-solid: rgba(8, 33, 22, 0.96);
+  --card-veil: rgba(18, 54, 35, 0.8);
+  --card-veil-solid: rgba(18, 54, 35, 0.97);
+  --shadow-faint: rgba(3, 17, 11, 0.16);
+  --shadow-deep: rgba(3, 17, 11, 0.78);
+  --scrim-soft: rgba(3, 17, 11, 0.42);
+  --scrim-strong: rgba(3, 17, 11, 0.78);
 }
 
 /* Block 2: the System state on a machine set to dark.
