@@ -6572,3 +6572,12 @@ tbody tr:last-child td {
     display: none;
   }
 }
+
+/* The "7 settings" line on a Settings group card. Quiet: it sets an expectation of how much is
+   behind the card, which is the one thing a chooser cannot show directly. */
+.settings-group-count {
+  margin-top: 2px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: rgba(143, 171, 156, 0.7);
+}

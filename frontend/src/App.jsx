@@ -46,7 +46,7 @@ import { ORDER_STATUS } from "./local/orderLifecycle";
 import { STOCK_TRUSTED_FOR_HOURS, buildCatalogue, catalogueFilename, describeExport } from "./local/catalogueExport";
 import { buildOrdersBoard, validateOrderAction } from "./local/ordersBoard";
 import { ORDER_REPORT, buildOrderReports, describeOrderReportError } from "./local/orderReporting";
-import { formatShortcut, navigationRegistry, resolveShortcutTarget } from "./local/appNavigation";
+import { SETTINGS_GROUPS, formatShortcut, navigationRegistry, resolveShortcutTarget } from "./local/appNavigation";
 import { buildCommandIndex, highlightSegments, searchCommands } from "./local/commandPalette";
 import { buildOrderNotifications } from "./local/orderNotifications";
 import { COUNTER_STOCK, buildReservedIndex, describeCounterStock, reservedForProduct, reservedNote } from "./local/reservedStock";
@@ -14971,32 +14971,55 @@ function SettingsModule({
   timeDiagnostics,
   user,
 }) {
-  return (
-    <section className="settings-layout">
-      <section className="settings-banner">
-        <div>
-          <span className="eyebrow">System Controls</span>
-          <h2>Settings</h2>
-          <p>{canManage ? "Owner/Admin controls are active." : "Read-only access. Owner/Admin approval is required for changes."}</p>
-        </div>
-        <span className={canManage ? "stock-ok" : "stock-low"}>{canManage ? "Manager Access" : "Read Only"}</span>
-      </section>
-      <AppearanceAccessibilitySettings applicationFontSize={applicationFontSize} setApplicationFontSize={setApplicationFontSize} />
-      <BusinessSettingsSection businessSettings={settingsData.businessSettings} canManage={canManage} key={settingsData.businessSettings?.updated_at || "business-settings"} onReload={onReload} user={user} />
-      <PosSettingsSection canManage={canManage} key={settingsData.posSettings?.updated_at || "pos-settings"} onReload={onReload} posSettings={settingsData.posSettings} user={user} />
-      <PaymentSettingsSection canManage={canManage} key={settingsData.paymentSettings?.updated_at || "payment-settings"} onReload={onReload} paymentSettings={settingsData.paymentSettings} user={user} />
-      <WhatsAppSettingsSection canManage={canManage} key={settingsData.whatsappSettings?.updated_at || "whatsapp-settings"} onReload={onReload} user={user} whatsappSettings={settingsData.whatsappSettings} />
-      <MandiTaxSettings canManage={canManage} onReload={onReload} rules={rules.mandiTaxRules} user={user} />
-      <RebateSettings canManage={canManage} onReload={onReload} rules={rules.rebateRules} user={user} />
-      <SaleRateSettingsSection canManage={canManage} key={settingsData.saleRateSettings?.updated_at || "sale-rate-settings"} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />
-      <DiscountSettings canManage={canManage} discountRules={settingsData.discountRules} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />
-      <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />
-      <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />
-      <DeviceControlSettingsSection canManage={canManage} deviceControlSettings={settingsData.deviceControlSettings} exitAttemptLogs={settingsData.exitAttemptLogs || []} onReload={onReload} user={user} />
-      <OperationalScopeManagement canManage={canManage} user={user} />
+  /**
+   * Which group of settings is open, or `null` for the group chooser.
+   *
+   * Deliberately not remembered between visits. Settings is where the damage lives, so arriving
+   * should always start from the overview rather than dropping somebody straight back into the
+   * screen they were last editing.
+   */
+  const [settingsGroup, setSettingsGroup] = useState(null);
+  /**
+   * Settings, grouped rather than stacked.
+   *
+   * This was one page carrying all seventeen sections, so finding the one you wanted meant
+   * scrolling past sixteen you did not. The grouping matches Report Center's existing pattern --
+   * one level, group then contents -- rather than introducing a second navigation idea into the
+   * same app.
+   *
+   * One level deep on purpose. A group opens straight onto its sections rather than onto a list of
+   * links: changing a WhatsApp token should be two clicks, not three.
+   */
+  const settingsSections = navigationRegistry.find((item) => item.id === "settings")?.sections || [];
+  const sectionsInGroup = (groupId) => settingsSections.filter((section) => section.group === groupId);
+  /**
+   * Each section keyed by its registry id.
+   *
+   * The registry decides which group a section belongs to and the group decides what renders, so
+   * the two cannot disagree about where a setting lives. A section present in one and missing from
+   * the other is reported on screen rather than silently skipped -- a setting that quietly stops
+   * being reachable is exactly the failure this drill-down could otherwise introduce.
+   */
+  const sectionContent = {
+    "settings/display-typography": <AppearanceAccessibilitySettings applicationFontSize={applicationFontSize} setApplicationFontSize={setApplicationFontSize} />,
+    "settings/business-identity": <BusinessSettingsSection businessSettings={settingsData.businessSettings} canManage={canManage} key={settingsData.businessSettings?.updated_at || "business-settings"} onReload={onReload} user={user} />,
+    "settings/weighing-scale": <PosSettingsSection canManage={canManage} key={settingsData.posSettings?.updated_at || "pos-settings"} onReload={onReload} posSettings={settingsData.posSettings} user={user} />,
+    "settings/payment-tax": <PaymentSettingsSection canManage={canManage} key={settingsData.paymentSettings?.updated_at || "payment-settings"} onReload={onReload} paymentSettings={settingsData.paymentSettings} user={user} />,
+    "settings/whatsapp": <WhatsAppSettingsSection canManage={canManage} key={settingsData.whatsappSettings?.updated_at || "whatsapp-settings"} onReload={onReload} user={user} whatsappSettings={settingsData.whatsappSettings} />,
+    "settings/mandi-tax": <MandiTaxSettings canManage={canManage} onReload={onReload} rules={rules.mandiTaxRules} user={user} />,
+    "settings/supplier-rebate": <RebateSettings canManage={canManage} onReload={onReload} rules={rules.rebateRules} user={user} />,
+    "settings/sale-rate-suggestions": <SaleRateSettingsSection canManage={canManage} key={settingsData.saleRateSettings?.updated_at || "sale-rate-settings"} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />,
+    "settings/bill-discount-slabs": <DiscountSettings canManage={canManage} discountRules={settingsData.discountRules} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />,
+    "settings/permission-matrix": <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />,
+    "settings/users": <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />,
+    "settings/device-control": <DeviceControlSettingsSection canManage={canManage} deviceControlSettings={settingsData.deviceControlSettings} exitAttemptLogs={settingsData.exitAttemptLogs || []} onReload={onReload} user={user} />,
+    "settings/operational-scope": <OperationalScopeManagement canManage={canManage} user={user} />,
+    "settings/updates": (
       <SettingsSectionErrorBoundary sectionName="Update Center">
         <UpdateCenterSection canManage={canManage} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
       </SettingsSectionErrorBoundary>
+    ),
+    "settings/sync": (
       <SyncSettingsSection
         backendHealth={backendHealth}
         canManage={canManage}
@@ -15027,8 +15050,66 @@ function SettingsModule({
         timeDiagnostics={timeDiagnostics}
         user={user}
       />
-      <BackupSettings backupLogs={settingsData.backupLogs || []} backupSettings={settingsData.backupSettings} canManage={canManage} onReload={onReload} user={user} />
-      <SystemInfoSection systemInfo={settingsData.systemInfo || {}} />
+    ),
+    "settings/backup": <BackupSettings backupLogs={settingsData.backupLogs || []} backupSettings={settingsData.backupSettings} canManage={canManage} onReload={onReload} user={user} />,
+    "settings/system-info": <SystemInfoSection systemInfo={settingsData.systemInfo || {}} />,
+  };
+
+  const banner = (
+    <section className="settings-banner">
+      <div>
+        <span className="eyebrow">System Controls</span>
+        <h2>Settings</h2>
+        <p>{canManage ? "Owner/Admin controls are active." : "Read-only access. Owner/Admin approval is required for changes."}</p>
+      </div>
+      <span className={canManage ? "stock-ok" : "stock-low"}>{canManage ? "Manager Access" : "Read Only"}</span>
+    </section>
+  );
+
+  const openGroup = SETTINGS_GROUPS.find((group) => group.id === settingsGroup) || null;
+  if (openGroup) {
+    return (
+      <section className="settings-layout">
+        {banner}
+        <ModuleCard eyebrow="Settings" title={openGroup.label} subtitle={openGroup.description}>
+          <div className="button-row">
+            <button className="secondary-button" onClick={() => setSettingsGroup(null)} type="button">Back to Settings</button>
+          </div>
+        </ModuleCard>
+        {sectionsInGroup(openGroup.id).map((section) => (
+          // The id is the section's address on the page: it is what will let a search result land
+          // on this card rather than at the top of the group. Derived from the registry id so the
+          // two cannot drift.
+          <div id={section.id.replace("/", "-")} key={section.id}>
+            {sectionContent[section.id] || (
+              <ModuleCard eyebrow="Settings" title={section.label} subtitle="This section is listed but has nothing to render.">
+                <p className="cart-empty">Reported rather than skipped, because a setting that disappears quietly is one nobody knows to look for.</p>
+              </ModuleCard>
+            )}
+          </div>
+        ))}
+      </section>
+    );
+  }
+
+  return (
+    <section className="settings-layout">
+      {banner}
+      <ModuleCard eyebrow="Settings" title="Choose what to change" subtitle="Grouped by what you are trying to do. Press Ctrl K and type to jump straight to a setting.">
+        <section className="report-center-grid">
+          {SETTINGS_GROUPS.map((group) => {
+            const count = sectionsInGroup(group.id).length;
+            return (
+              <button className="report-menu-card" key={group.id} onClick={() => setSettingsGroup(group.id)} type="button">
+                <Icon name={group.icon} size={22} />
+                <strong>{group.label}</strong>
+                <span>{group.description}</span>
+                <span className="settings-group-count">{count} setting{count === 1 ? "" : "s"}</span>
+              </button>
+            );
+          })}
+        </section>
+      </ModuleCard>
     </section>
   );
 }

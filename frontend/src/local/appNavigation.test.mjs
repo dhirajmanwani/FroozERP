@@ -21,6 +21,7 @@ import {
   pushNavigation,
   resolveNavigationTarget,
   resolveShortcutTarget,
+  SETTINGS_GROUPS,
 } from "./appNavigation.js";
 
 /**
@@ -458,4 +459,77 @@ test("an empty id is not recorded", () => {
   const state = pushNavigation(createNavigationHistory("dashboard"), "");
   assert.deepEqual([...state.entries], ["dashboard"]);
   assert.deepEqual([...pushNavigation(state, null).entries], ["dashboard"]);
+});
+
+
+// -------------------------------------------------------------------------------------------
+// Settings grouping. Settings was one page with seventeen sections stacked on it; the groups are
+// what makes it drillable, and a section that quietly loses its group would vanish from the
+// screen rather than fail loudly.
+// -------------------------------------------------------------------------------------------
+
+test("every Settings section belongs to a group that exists", () => {
+  const groupIds = new Set(SETTINGS_GROUPS.map((group) => group.id));
+  const sections = navigationRegistry.find((item) => item.id === "settings").sections;
+  const orphans = sections.filter((section) => !groupIds.has(section.group));
+  assert.deepEqual(
+    orphans.map((section) => section.id),
+    [],
+    "a section with no group is rendered by no group card, so it becomes unreachable on screen",
+  );
+});
+
+test("every group has at least one section", () => {
+  // An empty group card is a promise of something behind it. Opening it to nothing is worse than
+  // never offering it.
+  const sections = navigationRegistry.find((item) => item.id === "settings").sections;
+  const empty = SETTINGS_GROUPS.filter((group) => !sections.some((section) => section.group === group.id));
+  assert.deepEqual(empty.map((group) => group.id), []);
+});
+
+test("the groups account for every section exactly once", () => {
+  // Guards the arithmetic rather than the intent: if a section were counted twice the totals would
+  // still look plausible on screen, and only this would say so.
+  const sections = navigationRegistry.find((item) => item.id === "settings").sections;
+  const counted = SETTINGS_GROUPS.reduce(
+    (total, group) => total + sections.filter((section) => section.group === group.id).length,
+    0,
+  );
+  assert.equal(counted, sections.length);
+});
+
+test("every registered Settings section is actually rendered by the drill-down", () => {
+  // The drill-down moved seventeen sections from one stacked list into a keyed map. A section left
+  // out of that map would still appear in the registry, still be counted on its group card, and
+  // render nothing when opened - a setting that silently stopped existing, which is the specific
+  // way this refactor could have gone wrong.
+  const sections = navigationRegistry.find((item) => item.id === "settings").sections;
+  const map = app.slice(app.indexOf("const sectionContent = {"), app.indexOf("const banner = ("));
+  assert.ok(map.length > 0, "the sectionContent map must exist");
+  const missing = sections.filter((section) => !map.includes(`"${section.id}":`));
+  assert.deepEqual(missing.map((section) => section.id), [], "these sections would render nothing");
+});
+
+test("no Settings section component was dropped in the move", () => {
+  // The inverse, and the one that catches a lost *component* rather than a lost id. Each of these
+  // rendered on the old stacked page; if one is no longer referenced anywhere in App.jsx, its
+  // settings became unreachable without any id going missing.
+  const components = [
+    "AppearanceAccessibilitySettings", "BusinessSettingsSection", "PosSettingsSection",
+    "PaymentSettingsSection", "WhatsAppSettingsSection", "MandiTaxSettings", "RebateSettings",
+    "SaleRateSettingsSection", "DiscountSettings", "PermissionSettings", "UserManagementSection",
+    "DeviceControlSettingsSection", "OperationalScopeManagement", "UpdateCenterSection",
+    "SyncSettingsSection", "BackupSettings", "SystemInfoSection",
+  ];
+  const dropped = components.filter((name) => !app.includes(`<${name}`));
+  assert.deepEqual(dropped, [], "these components are defined but no longer rendered");
+});
+
+test("the Update Center keeps its error boundary", () => {
+  // It was the one section wrapped in `SettingsSectionErrorBoundary`, because it is the one that
+  // talks to the updater. Losing the wrapper in the move would let a failure there take the whole
+  // group down with it.
+  const start = app.indexOf('"settings/updates":');
+  assert.ok(start > 0);
+  assert.match(app.slice(start, start + 400), /SettingsSectionErrorBoundary/);
 });

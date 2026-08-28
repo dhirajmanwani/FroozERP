@@ -190,23 +190,23 @@ const modules = [
     // renders it — it is the grouping the maintainer already wrote, and repeating it here means
     // the drill-down and the page agree about what a group is called.
     sections: [
-      { id: "settings/display-typography", label: "Display Typography", eyebrow: "Appearance / Accessibility", keywords: ["font size", "text size", "readability", "zoom"] },
-      { id: "settings/business-identity", label: "Business Identity", eyebrow: "Business Settings", keywords: ["shop name", "address", "gst", "invoice header", "logo"] },
-      { id: "settings/weighing-scale", label: "Weighing Scale Integration", eyebrow: "POS Settings", keywords: ["scale", "usb", "serial", "bluetooth", "weight"] },
-      { id: "settings/payment-tax", label: "UPI, Payment QR and Sales Mandi Tax", eyebrow: "Payment & Tax Settings", keywords: ["upi", "qr code", "payment", "sales tax", "gst", "tax", "mandi tax"] },
-      { id: "settings/whatsapp", label: "WhatsApp Business Cloud API", eyebrow: "WhatsApp Settings", keywords: ["whatsapp", "send bill", "cloud api", "token"] },
-      { id: "settings/mandi-tax", label: "Origin-Based Mandi Tax", eyebrow: "Mandi Tax Settings", keywords: ["local", "imported", "purchase tax", "percentage", "gst", "tax", "mandi tax"] },
-      { id: "settings/supplier-rebate", label: "Payment-Speed Rebate Slabs", eyebrow: "Supplier Rebate Settings", keywords: ["rebate", "early payment", "discount days", "slab"] },
-      { id: "settings/sale-rate-suggestions", label: "Sale Rate Suggestions", eyebrow: "Sale Rate Settings", keywords: ["margin", "rounding", "suggested rate"] },
-      { id: "settings/bill-discount-slabs", label: "Bill-Level Discount Slabs", eyebrow: "Overall Sale Discount Settings", keywords: ["automatic discount", "bill total", "payment mode"] },
-      { id: "settings/permission-matrix", label: "Permission Matrix", eyebrow: "Role Management", keywords: ["roles", "access", "permissions", "cashier", "admin"] },
-      { id: "settings/users", label: "Owner User Administration", eyebrow: "User Management", keywords: ["staff", "add user", "reset password", "deactivate"] },
-      { id: "settings/device-control", label: "Fullscreen Lock & Owner Exit Code", eyebrow: "Security / Device Control", keywords: ["kiosk", "fullscreen", "exit code", "lock"] },
-      { id: "settings/operational-scope", label: "Branch, Location, Staff and Device Control", eyebrow: "Operational Scope", keywords: ["branch", "location", "counter", "assignment"] },
-      { id: "settings/updates", label: "FroozERP Windows Updates", eyebrow: "Software Updates", keywords: ["update", "version", "installer", "upgrade"] },
-      { id: "settings/sync", label: "Connection Status", eyebrow: "Sync & Connection", keywords: ["sync", "internet", "cloud", "offline", "local only", "server"] },
-      { id: "settings/backup", label: "Auto Backup and Safe Shutdown", eyebrow: "Backup & Restore", keywords: ["backup", "restore", "shutdown", "safety"] },
-      { id: "settings/system-info", label: "Server, Network and Device Status", eyebrow: "System Info", keywords: ["lan url", "ip address", "diagnostics", "device"] },
+      { group: "counter", id: "settings/display-typography", label: "Display Typography", eyebrow: "Appearance / Accessibility", keywords: ["font size", "text size", "readability", "zoom"] },
+      { group: "business", id: "settings/business-identity", label: "Business Identity", eyebrow: "Business Settings", keywords: ["shop name", "address", "gst", "invoice header", "logo"] },
+      { group: "counter", id: "settings/weighing-scale", label: "Weighing Scale Integration", eyebrow: "POS Settings", keywords: ["scale", "usb", "serial", "bluetooth", "weight"] },
+      { group: "business", id: "settings/payment-tax", label: "UPI, Payment QR and Sales Mandi Tax", eyebrow: "Payment & Tax Settings", keywords: ["upi", "qr code", "payment", "sales tax", "gst", "tax", "mandi tax"] },
+      { group: "business", id: "settings/whatsapp", label: "WhatsApp Business Cloud API", eyebrow: "WhatsApp Settings", keywords: ["whatsapp", "send bill", "cloud api", "token"] },
+      { group: "business", id: "settings/mandi-tax", label: "Origin-Based Mandi Tax", eyebrow: "Mandi Tax Settings", keywords: ["local", "imported", "purchase tax", "percentage", "gst", "tax", "mandi tax"] },
+      { group: "business", id: "settings/supplier-rebate", label: "Payment-Speed Rebate Slabs", eyebrow: "Supplier Rebate Settings", keywords: ["rebate", "early payment", "discount days", "slab"] },
+      { group: "business", id: "settings/sale-rate-suggestions", label: "Sale Rate Suggestions", eyebrow: "Sale Rate Settings", keywords: ["margin", "rounding", "suggested rate"] },
+      { group: "business", id: "settings/bill-discount-slabs", label: "Bill-Level Discount Slabs", eyebrow: "Overall Sale Discount Settings", keywords: ["automatic discount", "bill total", "payment mode"] },
+      { group: "people", id: "settings/permission-matrix", label: "Permission Matrix", eyebrow: "Role Management", keywords: ["roles", "access", "permissions", "cashier", "admin"] },
+      { group: "people", id: "settings/users", label: "Owner User Administration", eyebrow: "User Management", keywords: ["staff", "add user", "reset password", "deactivate"] },
+      { group: "counter", id: "settings/device-control", label: "Fullscreen Lock & Owner Exit Code", eyebrow: "Security / Device Control", keywords: ["kiosk", "fullscreen", "exit code", "lock"] },
+      { group: "people", id: "settings/operational-scope", label: "Branch, Location, Staff and Device Control", eyebrow: "Operational Scope", keywords: ["branch", "location", "counter", "assignment"] },
+      { group: "system", id: "settings/updates", label: "FroozERP Windows Updates", eyebrow: "Software Updates", keywords: ["update", "version", "installer", "upgrade"] },
+      { group: "system", id: "settings/sync", label: "Connection Status", eyebrow: "Sync & Connection", keywords: ["sync", "internet", "cloud", "offline", "local only", "server"] },
+      { group: "system", id: "settings/backup", label: "Auto Backup and Safe Shutdown", eyebrow: "Backup & Restore", keywords: ["backup", "restore", "shutdown", "safety"] },
+      { group: "system", id: "settings/system-info", label: "Server, Network and Device Status", eyebrow: "System Info", keywords: ["lan url", "ip address", "diagnostics", "device"] },
     ],
   },
 ];
@@ -221,6 +221,25 @@ const freezeModule = (item) =>
   });
 
 /** The registry. Frozen because two consumers read it and neither may edit it for the other. */
+/**
+ * How the seventeen Settings sections are grouped on screen.
+ *
+ * Settings was one page with all seventeen stacked vertically, which is why it needed drilling
+ * into. The grouping is by **what a shopkeeper is trying to do**, not by which part of the system
+ * a setting happens to live in: WhatsApp sits with the business rules because it is how a bill
+ * reaches a customer, and the fullscreen lock sits with the counter hardware because it is a
+ * property of the machine on the till rather than of the people using it.
+ *
+ * Kept here rather than in `App.jsx` so the screen, the search index and the sidebar all read one
+ * source. A section with no group, or a group with no sections, fails a test.
+ */
+export const SETTINGS_GROUPS = Object.freeze([
+  Object.freeze({ id: "business", label: "Business Rules", icon: "rupee", description: "Identity, tax, rates, discounts, rebates and how bills reach customers." }),
+  Object.freeze({ id: "counter", label: "Counter & Display", icon: "barcode", description: "The till machine itself: weighing scale, text size and screen lock." }),
+  Object.freeze({ id: "people", label: "People & Places", icon: "users", description: "Who can sign in, what they may do, and which branch or counter they work at." }),
+  Object.freeze({ id: "system", label: "System & Data", icon: "layers", description: "Updates, connection, backups and what this device reports about itself." }),
+]);
+
 export const navigationRegistry = Object.freeze(modules.map(freezeModule));
 
 /**
