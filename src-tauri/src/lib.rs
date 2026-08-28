@@ -530,6 +530,16 @@ fn resolve_backend_dir() -> Result<PathBuf, String> {
 fn node_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let install_dir = current_install_dir();
+    // An explicit override has to come first or it is not an override. `resolve_node_path` takes
+    // the first candidate that exists, and a dev checkout always has the bundled
+    // `froozerp-backend-node.exe` on disk, so an override placed after it could never be reached.
+    // It stays behind `debug_assertions`: a packaged release must never take the interpreter it
+    // executes from the environment.
+    if cfg!(debug_assertions) {
+        if let Some(path) = env::var_os("FROOZERP_NODE_PATH").map(PathBuf::from) {
+            candidates.push(path);
+        }
+    }
     candidates.push(
         install_dir
             .join("binaries")
@@ -561,9 +571,6 @@ fn node_candidates() -> Vec<PathBuf> {
                     .join("binaries")
                     .join("froozerp-backend-node.exe"),
             );
-            if let Some(path) = env::var_os("FROOZERP_NODE_PATH").map(PathBuf::from) {
-                candidates.push(path);
-            }
             candidates.push(PathBuf::from("node"));
         }
     } else if let Ok(current_dir) = env::current_dir() {
@@ -2263,6 +2270,15 @@ mod local_backend_lifecycle_tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    // These tests mutate process-wide environment variables, so they have to run one at a time.
+    // A panic while the lock is held poisons it, and every later test then fails with
+    // `PoisonError` instead of its own result — one real failure becomes several fake ones and
+    // the suite stops being readable. The lock guards no data, only exclusion, so a poisoned
+    // lock is still a valid lock.
+    fn lock_environment() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn spawned_backend_must_own_the_port_before_it_is_accepted() {
         assert!(spawned_backend_owns_port(42, Some(42)));
@@ -2272,7 +2288,7 @@ mod local_backend_lifecycle_tests {
 
     #[test]
     fn test_runtime_uses_the_isolated_sqlite_directory_for_backend_and_logs() {
-        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let _guard = lock_environment();
         let original_node_env = env::var_os("NODE_ENV");
         let original_isolated_dir = env::var_os("FROOZERP_ISOLATED_SQLITE_DIR");
         let isolated_dir = env::temp_dir().join(format!(
@@ -2300,9 +2316,17 @@ mod local_backend_lifecycle_tests {
         }
     }
 
+    // Windows-only, and not for want of a desktop: this test asserts that concurrent startups
+    // arbitrate to a single port owner, and `backend_port_owner_pid` decides that by parsing
+    // `netstat -ano -p tcp` — Windows syntax. Anywhere else it returns `None`,
+    // `spawned_backend_owns_port` reads that as "a competitor holds the port", and the launch
+    // kills its own healthy child and reports unhealthy. There is no other-platform answer to
+    // assert here, so the test is pinned to the platform whose behaviour it describes rather
+    // than left to fail everywhere else. Windows is the only shipped target.
+    #[cfg(windows)]
     #[test]
     fn forced_restart_replaces_only_the_owned_desktop_sqlite_service() {
-        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let _guard = lock_environment();
         let profile_root = env::temp_dir().join(format!(
             "froozerp-backend-restart-{}-{}",
             std::process::id(),
