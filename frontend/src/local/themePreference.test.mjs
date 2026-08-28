@@ -691,11 +691,38 @@ for (const [themeName, theme] of [["light", lightTokens], ["dark", mediaDarkToke
 test("the dark theme's surfaces are the palette's own ground ramp", () => {
   // Not "near enough". If these drift, the themed app and the parts of App.css that have
   // not been converted yet stop matching, and the seam is visible.
-  assert.equal(mediaDarkTokens.get("--ground"), "#082116");
+  //
+  // `--ground` was `#082116` until the contrast pass moved it one step deeper to `GROUND.abyss`.
+  // The seam this test guards against needs a literal painting the *same role*: a background of
+  // the old value sitting beside a background of the new one. Every remaining `#082116` in
+  // App.css is a `color:` -- text, and mostly invoice text that is deliberately never themed --
+  // so there is nothing left to disagree with. Checked before the value was changed, not assumed.
+  assert.equal(mediaDarkTokens.get("--ground"), "#03110b");
   assert.equal(mediaDarkTokens.get("--panel"), "#092318");
   assert.equal(mediaDarkTokens.get("--card"), "#123623");
   assert.equal(mediaDarkTokens.get("--ink"), "#f6f3ea");
   assert.equal(mediaDarkTokens.get("--accent"), "#d9ac52");
+});
+
+test("no remaining literal paints a surface that a moved token also paints", () => {
+  // The rule behind the test above, stated so it keeps working when the next token moves. A
+  // leftover literal is only a seam when it fills a *flat* background, border or shadow -- the
+  // same job a surface token does. As `color:` it is text and cannot disagree with anything.
+  //
+  // Gradient stops are excluded, and that is a rule rather than an exception for the one case that
+  // prompted it. A stop is a point in a blend, not a plane that meets the page along an edge; the
+  // Frost launcher's conic ring holds two of these values and cannot seam against anything,
+  // because nothing else is that colour anywhere near it.
+  const appCss = readFileSync(new URL("../App.css", import.meta.url), "utf8");
+  const surfacePainted = (appCss.match(
+    /(background|border|box-shadow|outline)[^;{}]*#(082116|1e4a34|2c5d43|4a7a61)\b/gi,
+  ) || []).filter((declaration) => !/gradient\(/i.test(declaration));
+  assert.deepEqual(
+    surfacePainted,
+    [],
+    "a surface still hardcodes a colour a token has moved away from, which shows as a patch of the "
+    + "old theme. Convert it to the token before moving the token.",
+  );
 });
 
 test("the light theme does not reuse the dark theme's gold", () => {

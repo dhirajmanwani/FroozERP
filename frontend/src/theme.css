@@ -49,7 +49,7 @@
  *   --ink-strong      10.7:1      13.2:1
  *   --ink-body         9.0:1      11.8:1
  *   --ink-muted        5.4:1       6.8:1
- *   --ink-faint        2.7:1       4.4:1   <- disabled/placeholder only, never reading text
+ *   --ink-faint        4.8:1       4.4:1   <- disabled/placeholder only, never reading text
  *   --accent           6.3:1       4.7:1
  *   --ink-on-accent    8.1:1       4.8:1   (against --accent, which fills the surface)
  *   signals (worst)    4.8:1       5.3:1
@@ -187,7 +187,7 @@
   :root:not([data-theme="light"]) {
     color-scheme: dark;
 
-    --ground: #082116;
+    --ground: #03110b;
     --panel: #092318;
     --card: #123623;
     --raised: #0d2e1f;
@@ -206,11 +206,11 @@
     --ink-body-warm: #cedbd3;
     --ink-muted: #8fab9c;
     --ink-muted-warm: #97ada1;
-    --ink-faint: #4a7a61;
+    --ink-faint: #7aa48f;
     --ink-on-accent: #082116;
 
-    --line: #1e4a34;
-    --line-strong: #2c5d43;
+    --line: #2c5d43;
+    --line-strong: #4a7a61;
     --line-soft: rgba(143, 171, 156, 0.12);
     --line-control: #8fab9c;
 
@@ -270,7 +270,7 @@
 :root[data-theme="dark"] {
   color-scheme: dark;
 
-  --ground: #082116;
+  --ground: #03110b;
   --panel: #092318;
   --card: #123623;
   --raised: #0d2e1f;
@@ -289,11 +289,11 @@
   --ink-body-warm: #cedbd3;
   --ink-muted: #8fab9c;
   --ink-muted-warm: #97ada1;
-  --ink-faint: #4a7a61;
+  --ink-faint: #7aa48f;
   --ink-on-accent: #082116;
 
-  --line: #1e4a34;
-  --line-strong: #2c5d43;
+  --line: #2c5d43;
+  --line-strong: #4a7a61;
   --line-soft: rgba(143, 171, 156, 0.12);
   --line-control: #8fab9c;
 

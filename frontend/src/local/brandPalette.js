@@ -47,7 +47,11 @@ export const GROUND = Object.freeze({
 // --- Text ramp ---------------------------------------------------------------
 
 export const INK = Object.freeze({
-  faint: "#4a7a61", // disabled, placeholder
+  faint: "#4a7a61", // a divider that has to carry weight on the dark ground
+  placeholder: "#7aa48f", // disabled and placeholder text. `faint` was 2.69:1 on a card - below the
+  // 4.5:1 a person needs to read it at all - so placeholders were decorative rather than legible.
+  // This clears 4.5:1 on every dark surface while staying dimmer than `muted`, which is the whole
+  // point of the step: quieter than a label, still readable.
   muted: "#8fab9c", // labels, secondary detail
   mutedWarm: "#97ada1", // the same weight where the surroundings are warmer
   body: "#c8d8ce", // ordinary reading text
