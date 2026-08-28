@@ -533,3 +533,42 @@ test("the Update Center keeps its error boundary", () => {
   assert.ok(start > 0);
   assert.match(app.slice(start, start + 400), /SettingsSectionErrorBoundary/);
 });
+
+// -------------------------------------------------------------------------------------------
+// Landing on the section, not just the screen. This is what the whole registry is for: searching
+// "whatsapp" is only useful if it arrives at that card rather than at the top of a screen holding
+// seventeen of them.
+// -------------------------------------------------------------------------------------------
+
+test("a searched section is carried to the screen that owns it", () => {
+  // The palette closes before the target has rendered - on a drill-down screen the group it lives
+  // in is not even open yet - so the id has to be held and handed on rather than acted on.
+  assert.match(app, /onNavigate=\{\(viewId, sectionId\) => \{ navigate\(viewId\); setPendingSection\(sectionId \|\| null\); \}\}/);
+  assert.match(app, /focusSection=\{pendingSection\}/);
+});
+
+test("every screen given a section target also reports it handled", () => {
+  // A target left set re-fires the effect on every later render, which on Settings would drag the
+  // page back to the same card every time anything else changed.
+  const handedTo = [...app.matchAll(/focusSection=\{pendingSection\}/g)].length;
+  const clears = [...app.matchAll(/onFocusSectionHandled=\{\(\) => setPendingSection\(null\)\}/g)].length;
+  assert.equal(clears, handedTo, "each screen receiving a target must also clear it");
+  assert.ok(handedTo >= 2, "Settings and Report Center both take section targets");
+});
+
+test("the Settings section id and its DOM id are derived from one another", () => {
+  // The element is addressed by the registry id with the slash swapped out. Two independent
+  // spellings would drift, and the failure would be a scroll that silently goes nowhere.
+  assert.match(app, /id=\{section\.id\.replace\("\/", "-"\)\}/, "the card is addressed by its registry id");
+  assert.match(app, /getElementById\(section\.id\.replace\("\/", "-"\)\)/, "and looked up the same way");
+});
+
+test("a section target that no screen recognises is still cleared", () => {
+  // Otherwise an id from an older build would wedge the effect on, re-running forever against an
+  // element that does not exist.
+  const settingsEffect = app.slice(
+    app.indexOf("Open the group that holds a searched-for section"),
+    app.indexOf("Settings, grouped rather than stacked"),
+  );
+  assert.match(settingsEffect, /if \(!section\) \{\s*\n\s*onFocusSectionHandled\?\.\(\);/);
+});

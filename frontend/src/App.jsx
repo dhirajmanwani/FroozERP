@@ -1818,6 +1818,15 @@ function App() {
    * text and wrong as an answer. Where somebody has actually been is the missing evidence.
    */
   const [recentViews, setRecentViews] = useState([]);
+  /**
+   * A section the person asked for by name, waiting for the screen that contains it.
+   *
+   * Searching "whatsapp" should land on that card, not at the top of a screen holding seventeen.
+   * Held rather than acted on immediately because the card does not exist yet at the moment the
+   * palette closes -- the module has not rendered, and on a drill-down screen the group it lives
+   * in is not even open.
+   */
+  const [pendingSection, setPendingSection] = useState(null);
   const [internetAvailable, setInternetAvailable] = useState(() => (
     typeof navigator === "undefined" ? true : navigator.onLine !== false
   ));
@@ -7884,6 +7893,8 @@ function App() {
           {activeView === "settings" && (
             <ModuleErrorBoundary onClose={() => setActiveView("dashboard")}>
               <SettingsModule
+                focusSection={pendingSection}
+                onFocusSectionHandled={() => setPendingSection(null)}
                 applicationFontSize={applicationFontSize}
                 backendHealth={backendHealth}
                 canManage={canManageRates}
@@ -7920,6 +7931,8 @@ function App() {
           {activeView === "reports" && (
             <ReportsModule
               accounts={accounts}
+              focusSection={pendingSection}
+              onFocusSectionHandled={() => setPendingSection(null)}
               orders={ordersState}
               canCancelSales={canCancelSales}
               canEditSales={canEditSales}
@@ -8198,11 +8211,7 @@ function App() {
         <CommandPalette
           index={commandIndex}
           recentIds={recentViews}
-          // `sectionId` is deliberately ignored for now. Landing on the exact card needs every
-          // section to carry a DOM id, which arrives with the Settings drill-down; scrolling to an
-          // id that does not exist yet would work for some sections and silently not for others,
-          // which is worse than consistently landing at the top of the right screen.
-          onNavigate={(viewId) => navigate(viewId)}
+          onNavigate={(viewId, sectionId) => { navigate(viewId); setPendingSection(sectionId || null); }}
           onClose={() => setCommandPaletteOpen(false)}
         />
       )}
@@ -10753,11 +10762,30 @@ function DiscountManagementModule({ discounts = [], inventory = [], onReload, pr
   );
 }
 
-function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageStock, canWhatsappSend = false, connectivityMode = CONNECTIVITY_MODES.LOCAL_ONLY, customers = [], data = {}, orders: ordersState = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, suppliers = [], user }) {
+function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageStock, canWhatsappSend = false, connectivityMode = CONNECTIVITY_MODES.LOCAL_ONLY, customers = [], data = {}, focusSection = null, onFocusSectionHandled, orders: ordersState = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, suppliers = [], user }) {
   const [range, setRange] = useState("today");
   const [search, setSearch] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
   const [selectedReport, setSelectedReport] = useState("");
+  /**
+   * Open the report category a search asked for.
+   *
+   * Simpler than Settings' equivalent because Report Center's categories are the drill-down: there
+   * is no card to scroll to, opening the category *is* arriving. The registry id is
+   * `reports/<category>`, and the part after the slash is the category id this screen already uses.
+   */
+  useEffect(() => {
+    if (!focusSection) return;
+    const categoryId = String(focusSection).startsWith("reports/") ? String(focusSection).slice("reports/".length) : "";
+    // Cleared either way. A target this screen does not recognise must not sit re-firing on every
+    // render, and leaving the person on the Report Center overview is a reasonable answer.
+    if (categoryId) {
+      setSelectedReport("");
+      setSelectedCategory(categoryId);
+    }
+    onFocusSectionHandled?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusSection]);
   const [clubSalesItems, setClubSalesItems] = useState(false);
   const [salesPrintNarration, setSalesPrintNarration] = useState(false);
   const salesPrintNarrationRef = useRef(false);
@@ -14969,6 +14997,8 @@ function SettingsModule({
   syncMessage,
   syncStatus,
   timeDiagnostics,
+  focusSection = null,
+  onFocusSectionHandled,
   user,
 }) {
   /**
@@ -14979,6 +15009,34 @@ function SettingsModule({
    * screen they were last editing.
    */
   const [settingsGroup, setSettingsGroup] = useState(null);
+  /**
+   * Open the group that holds a searched-for section, then scroll to it.
+   *
+   * Two steps because the card is behind a drill-down: opening the group is what makes the element
+   * exist, and only then is there anything to scroll to. The scroll is deferred to the next frame
+   * for exactly that reason - React has not painted the group at the moment this effect runs.
+   *
+   * Cleared through the callback whether or not the element is found, so a section that cannot be
+   * scrolled to does not sit there re-firing on every later render. A miss still leaves the person
+   * on the right group, which is the useful half of the answer.
+   */
+  useEffect(() => {
+    if (!focusSection) return undefined;
+    const section = (navigationRegistry.find((item) => item.id === "settings")?.sections || [])
+      .find((entry) => entry.id === focusSection);
+    if (!section) {
+      onFocusSectionHandled?.();
+      return undefined;
+    }
+    setSettingsGroup(section.group);
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById(section.id.replace("/", "-"))
+        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+      onFocusSectionHandled?.();
+    });
+    return () => window.cancelAnimationFrame(frame);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusSection]);
   /**
    * Settings, grouped rather than stacked.
    *
