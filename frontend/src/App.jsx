@@ -47,6 +47,7 @@ import { STOCK_TRUSTED_FOR_HOURS, buildCatalogue, catalogueFilename, describeExp
 import { buildOrdersBoard, validateOrderAction } from "./local/ordersBoard";
 import { ORDER_REPORT, buildOrderReports, describeOrderReportError } from "./local/orderReporting";
 import { SETTINGS_GROUPS, formatShortcut, navigationRegistry, resolveShortcutTarget } from "./local/appNavigation";
+import { DEFAULT_THEME_MODE, SYSTEM_DARK_QUERY, THEME_MODES, applyThemeMode, describeThemeMode, readThemeMode, resolveTheme, systemPrefersDarkFrom, watchSystemTheme, writeThemePreference } from "./local/themePreference";
 import { buildCommandIndex, highlightSegments, searchCommands } from "./local/commandPalette";
 import { buildOrderNotifications } from "./local/orderNotifications";
 import { COUNTER_STOCK, buildReservedIndex, describeCounterStock, reservedForProduct, reservedNote } from "./local/reservedStock";
@@ -1776,6 +1777,33 @@ function App() {
   const [recoveryOpen, setRecoveryOpen] = useState(false);
   const [activeView, setActiveView] = useState(initialView);
   const [applicationFontSize, setApplicationFontSize] = useState(getStoredApplicationFontSize);
+  /**
+   * Light, Dark, or follow Windows.
+   *
+   * Device-local, like the font size beside it: which screen this is says more about what suits it
+   * than which person is signed in. Read straight from storage on the first render rather than
+   * defaulted and corrected in an effect, because correcting it later is a visible flash of the
+   * wrong theme.
+   */
+  const [themeMode, setThemeMode] = useState(() => {
+    try {
+      return readThemeMode(window.localStorage);
+    } catch {
+      return DEFAULT_THEME_MODE;
+    }
+  });
+  /**
+   * What Windows is currently asking for. Only needed so the screen can *say* which way System is
+   * resolving -- the switch itself is CSS's job, and re-stamping the attribute here would override
+   * `prefers-color-scheme` and break the very mode it is describing.
+   */
+  const [systemPrefersDark, setSystemPrefersDark] = useState(() => {
+    try {
+      return systemPrefersDarkFrom(window.matchMedia(SYSTEM_DARK_QUERY));
+    } catch {
+      return true;
+    }
+  });
   const [sidebarOpen, setSidebarOpen] = useState(false);
   /**
    * The sidebar collapsed to an icon rail.
@@ -2185,6 +2213,27 @@ function App() {
     });
     return () => axios.interceptors.response.eject(interceptorId);
   }, [user, offlineMode]);
+
+  useEffect(() => {
+    applyThemeMode(document.documentElement, themeMode);
+    const result = writeThemePreference(window.localStorage, themeMode);
+    if (result.reason === "rejected") {
+      // A mode the module refuses is a bug here, not a user action. Say so in the log rather than
+      // silently leaving the screen and the stored value disagreeing.
+      writeDiagnosticLog("WARN", "theme-preference-rejected", { mode: themeMode });
+    }
+  }, [themeMode]);
+
+  useEffect(() => {
+    let stop = () => {};
+    try {
+      stop = watchSystemTheme(window.matchMedia(SYSTEM_DARK_QUERY), setSystemPrefersDark);
+    } catch {
+      // A webview without matchMedia still themes correctly from an explicit choice; only the
+      // "System - currently Dark" caption goes quiet.
+    }
+    return () => stop();
+  }, []);
 
   useEffect(() => {
     const normalized = normalizeApplicationFontSize(applicationFontSize);
@@ -7896,6 +7945,9 @@ function App() {
           {activeView === "settings" && (
             <ModuleErrorBoundary onClose={() => setActiveView("dashboard")}>
               <SettingsModule
+                themeMode={themeMode}
+                setThemeMode={setThemeMode}
+                systemPrefersDark={systemPrefersDark}
                 focusSection={pendingSection}
                 onFocusSectionHandled={() => setPendingSection(null)}
                 applicationFontSize={applicationFontSize}
@@ -14973,6 +15025,9 @@ class SettingsSectionErrorBoundary extends React.Component {
 
 function SettingsModule({
   applicationFontSize,
+  themeMode,
+  setThemeMode,
+  systemPrefersDark,
   backendHealth,
   canManage,
   cloudDeviceRegistration,
@@ -15062,7 +15117,7 @@ function SettingsModule({
    * being reachable is exactly the failure this drill-down could otherwise introduce.
    */
   const sectionContent = {
-    "settings/display-typography": <AppearanceAccessibilitySettings applicationFontSize={applicationFontSize} setApplicationFontSize={setApplicationFontSize} />,
+    "settings/display-typography": <AppearanceAccessibilitySettings applicationFontSize={applicationFontSize} setApplicationFontSize={setApplicationFontSize} setThemeMode={setThemeMode} systemPrefersDark={systemPrefersDark} themeMode={themeMode} />,
     "settings/business-identity": <BusinessSettingsSection businessSettings={settingsData.businessSettings} canManage={canManage} key={settingsData.businessSettings?.updated_at || "business-settings"} onReload={onReload} user={user} />,
     "settings/weighing-scale": <PosSettingsSection canManage={canManage} key={settingsData.posSettings?.updated_at || "pos-settings"} onReload={onReload} posSettings={settingsData.posSettings} user={user} />,
     "settings/payment-tax": <PaymentSettingsSection canManage={canManage} key={settingsData.paymentSettings?.updated_at || "payment-settings"} onReload={onReload} paymentSettings={settingsData.paymentSettings} user={user} />,
@@ -15175,11 +15230,39 @@ function SettingsModule({
   );
 }
 
-function AppearanceAccessibilitySettings({ applicationFontSize, setApplicationFontSize }) {
+function AppearanceAccessibilitySettings({
+  applicationFontSize,
+  setApplicationFontSize,
+  setThemeMode,
+  systemPrefersDark = true,
+  themeMode = DEFAULT_THEME_MODE,
+}) {
   const selected = applicationFontSizeOptions.find((option) => option.value === applicationFontSize) || applicationFontSizeOptions[1];
+  // What System is resolving to right now. Worth saying out loud: "System" alone tells somebody
+  // nothing about what they are about to get, and the answer changes without them touching it.
+  const resolved = resolveTheme(themeMode, systemPrefersDark);
   return (
     <ModuleCard eyebrow="Appearance / Accessibility" title="Display Typography" subtitle="Device-local display preference. This changes the app UI only; invoices and report print typography stay on their own print profiles.">
       <div className="form-grid supplier-form-grid">
+        <Field label="Display Mode">
+          <select onChange={(event) => setThemeMode?.(event.target.value)} value={themeMode}>
+            {THEME_MODES.map((mode) => (
+              <option key={mode} value={mode}>{describeThemeMode(mode).label}</option>
+            ))}
+          </select>
+        </Field>
+        <div className="accessibility-preview-card">
+          <span>Current Display</span>
+          <strong>{describeThemeMode(themeMode).label}</strong>
+          <small>
+            {describeThemeMode(themeMode).description}
+            {themeMode === "system" && ` Windows is asking for ${resolved === "dark" ? "dark" : "light"} right now.`}
+            {" Applied immediately on this device and remembered after restart."}
+            {/* Said here because it is the question this control raises and the answer is not
+                obvious: a bill is white paper whichever way the screen goes. */}
+            {" Printed bills and reports stay on white paper in every mode."}
+          </small>
+        </div>
         <Field label="Application Font Size">
           <select value={selected.value} onChange={(event) => setApplicationFontSize(normalizeApplicationFontSize(event.target.value))}>
             {applicationFontSizeOptions.map((option) => (
