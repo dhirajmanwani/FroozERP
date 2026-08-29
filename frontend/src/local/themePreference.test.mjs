@@ -804,3 +804,23 @@ test("every token App.css uses has a value in the light theme", () => {
   const undefinedInLight = colourTokens.filter((token) => !lightTokens.has(token)).sort();
   assert.deepEqual(undefinedInLight, [], "App.css uses these tokens but the light theme never defines them");
 });
+
+
+test("the mark sits on a solid tile that inverts with the theme", () => {
+  // Ruled by the maintainer after seeing light mode: white leaf on green when dark, green leaf on
+  // white when light. The artwork is the leaf alone -- there is no background shape in the file --
+  // so the tile is drawn in CSS, and if it goes back to a translucent wash the badge reads as empty
+  // on a light ground, which is exactly what it did.
+  assert.equal(lightTokens.get("--brand-tile"), "#ffffff");
+  assert.equal(mediaDarkTokens.get("--brand-tile"), "#123623");
+  assert.equal(attributeDarkTokens.get("--brand-tile"), "#123623");
+});
+
+test("the leaf reads against its own tile in both themes", () => {
+  // The point of inverting it. A cream leaf on a white tile, or a green one on green, is a badge
+  // with nothing in it -- and nothing else in this file would notice.
+  assert.ok(contrast("#f6f3ea", mediaDarkTokens.get("--brand-tile")) >= 7,
+    "the cream cut must read on the dark tile");
+  assert.ok(contrast("#0a2d1c", lightTokens.get("--brand-tile")) >= 7,
+    "the green cut must read on the light tile");
+});
