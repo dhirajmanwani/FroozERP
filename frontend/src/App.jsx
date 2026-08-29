@@ -1487,12 +1487,32 @@ function BrandLogo({ compact = false, invoice = false, splash = false }) {
   // Screen chrome is dark, so it takes the reversed (cream) cut; an invoice prints on
   // white paper, so it takes the green cut. Both are generated from one vector source
   // by tools/build-brand-assets.mjs - do not point this at a hand-made file.
-  const imageSrc = assetPath(invoice ? "branding/frooz-mark.svg" : "branding/frooz-mark-reversed.svg");
   const alt = compact ? "Frooz" : "Feel the Freakin' Frooz";
   return (
     <div className={`${invoice ? "brand-lockup brand-lockup-invoice" : "brand-lockup"} ${compact ? "brand-lockup-compact" : ""} ${splash ? "brand-lockup-splash" : ""}`}>
-      <span className="brand-monogram">
-        <img alt={alt} src={imageSrc} />
+      {/*
+        Both cuts of the mark are rendered and CSS shows the one that suits the ground. The
+        reversed cut inks in cream for a dark background; on the light theme it was a cream mark on
+        a pale badge, which is to say invisible.
+
+        The choice has to be CSS rather than a `src` picked here, because in System mode Windows
+        can flip from light to dark without React re-rendering anything -- a JavaScript choice
+        would stay on the cut that suited the theme at sign-in. An invoice is exempt: it is white
+        paper in both themes and always takes the green cut.
+
+        The accessible name sits on the wrapper, because `display: none` takes the hidden cut out
+        of the accessibility tree, and a name attached to whichever image happened to be hidden
+        would disappear in one theme.
+      */}
+      <span aria-label={alt} className="brand-monogram" role="img">
+        {invoice ? (
+          <img alt="" aria-hidden="true" src={assetPath("branding/frooz-mark.svg")} />
+        ) : (
+          <>
+            <img alt="" aria-hidden="true" className="brand-art-on-dark" src={assetPath("branding/frooz-mark-reversed.svg")} />
+            <img alt="" aria-hidden="true" className="brand-art-on-light" src={assetPath("branding/frooz-mark.svg")} />
+          </>
+        )}
       </span>
       {!compact && (
         <span className="brand-copy">
@@ -15247,16 +15267,21 @@ function AppearanceAccessibilitySettings({
         <Field label="Display Mode">
           <select onChange={(event) => setThemeMode?.(event.target.value)} value={themeMode}>
             {THEME_MODES.map((mode) => (
-              <option key={mode} value={mode}>{describeThemeMode(mode).label}</option>
+              <option key={mode} value={mode}>{describeThemeMode(mode)}</option>
             ))}
           </select>
         </Field>
         <div className="accessibility-preview-card">
           <span>Current Display</span>
-          <strong>{describeThemeMode(themeMode).label}</strong>
+          <strong>{describeThemeMode(themeMode)}</strong>
           <small>
-            {describeThemeMode(themeMode).description}
-            {themeMode === "system" && ` Windows is asking for ${resolved === "dark" ? "dark" : "light"} right now.`}
+            {/* `describeThemeMode` returns the label alone, not an object. Reading `.label` off it
+                gave `undefined`, which React renders as nothing -- so every option in the select
+                above was blank and this card showed only the sentences that were hardcoded. The
+                wording below lives here because the module has no description to give. */}
+            {themeMode === "system"
+              ? `Follows Windows. It is asking for ${resolved === "dark" ? "dark" : "light"} right now.`
+              : `Always ${describeThemeMode(themeMode).toLowerCase()}, whatever Windows is set to.`}
             {" Applied immediately on this device and remembered after restart."}
             {/* Said here because it is the question this control raises and the answer is not
                 obvious: a bill is white paper whichever way the screen goes. */}

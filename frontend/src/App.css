@@ -4574,7 +4574,7 @@ tbody tr:last-child td {
 }
 
 .ai-toolbar p {
-  color: var(--muted-text);
+  color: var(--ink-muted);
   margin: 0;
 }
 
@@ -4604,7 +4604,7 @@ tbody tr:last-child td {
   background: var(--veil-heavy);
   border: 1px solid rgba(143, 171, 156, 0.18);
   border-radius: 8px;
-  color: var(--muted-text);
+  color: var(--ink-muted);
   cursor: pointer;
   font-weight: 800;
   min-height: 38px;
@@ -4645,7 +4645,10 @@ tbody tr:last-child td {
   background: var(--card-veil);
   border: 1px solid rgba(143, 171, 156, 0.2);
   border-radius: 8px;
-  color: var(--text);
+  /* Was `var(--text)`, which is defined nowhere in this repository -- so the declaration was
+     invalid and this text simply inherited whatever the parent gave it. It happened to look right
+     on dark and would have had no theme at all in light. Ten rules in this panel were like it. */
+  color: var(--ink-body);
   cursor: pointer;
   min-height: 48px;
   padding: 11px 13px;
@@ -4663,14 +4666,14 @@ tbody tr:last-child td {
 
 .ai-answer-panel h3,
 .ai-history-item strong {
-  color: var(--text);
+  color: var(--ink-body);
   display: block;
   margin-bottom: 8px;
 }
 
 .ai-answer-panel p,
 .ai-history-item p {
-  color: var(--muted-text);
+  color: var(--ink-muted);
   margin: 0 0 8px;
 }
 
@@ -4683,7 +4686,7 @@ tbody tr:last-child td {
   background: var(--card-veil-soft);
   border-left: 3px solid var(--info);
   border-radius: 6px;
-  color: var(--text);
+  color: var(--ink-body);
   margin: 0;
   padding: 10px 12px;
 }
@@ -4699,7 +4702,7 @@ tbody tr:last-child td {
   background: var(--veil-heavy);
   border: 1px solid rgba(143, 171, 156, 0.16);
   border-radius: 8px;
-  color: var(--text);
+  color: var(--ink-body);
   padding: 10px;
 }
 
@@ -4767,7 +4770,7 @@ tbody tr:last-child td {
 }
 
 .frost-voice-panel p {
-  color: var(--muted-text);
+  color: var(--ink-muted);
   margin: 0;
 }
 
@@ -4841,7 +4844,7 @@ tbody tr:last-child td {
 }
 
 .frost-insight-card strong {
-  color: var(--text);
+  color: var(--ink-body);
   font-size: 1rem;
 }
 
@@ -4900,7 +4903,7 @@ tbody tr:last-child td {
   background: var(--veil-heavy);
   border: 1px solid rgba(143, 171, 156, 0.18);
   border-radius: 8px;
-  color: var(--muted-text);
+  color: var(--ink-muted);
   display: flex;
   justify-content: space-between;
   padding: 10px 12px;
@@ -6590,3 +6593,25 @@ tbody tr:last-child td {
   font-variant-numeric: tabular-nums;
   color: rgba(143, 171, 156, 0.7);
 }
+
+/* ---------------------------------------------------------------------------------------------
+   The mark, on whichever ground it lands on.
+
+   Two cuts exist: the reversed one inks in cream for a dark background, the standard one in green
+   and gold for a light one. Both are rendered and the theme picks -- in System mode Windows can
+   flip without React re-rendering, so a source chosen in JavaScript would stay on the wrong cut.
+
+   Follows theme.css's three-block shape for the same reason it does: the un-stamped document is
+   the System state, and only `prefers-color-scheme` separates it there.
+   --------------------------------------------------------------------------------------------- */
+
+.brand-art-on-dark { display: none; }
+.brand-art-on-light { display: block; }
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .brand-art-on-dark { display: block; }
+  :root:not([data-theme="light"]) .brand-art-on-light { display: none; }
+}
+
+:root[data-theme="dark"] .brand-art-on-dark { display: block; }
+:root[data-theme="dark"] .brand-art-on-light { display: none; }
