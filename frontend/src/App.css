@@ -462,6 +462,11 @@ input[type="number"] {
   white-space: nowrap;
 }
 
+/* Local Only is a mode the operator chose, not a fault, so this bar is a notice and not an alarm.
+   It used to be a dark slab with cream text baked in as literals -- which was the one thing on a
+   light page still painted for a dark one. Every colour here now comes from the accent family, so
+   the bar is a warm gold tint on the page in light and a deep gold tint in dark, and it stays
+   clearly distinct from the red the app spends on genuine failures. */
 .local-only-banner {
   display: flex;
   align-items: center;
@@ -470,8 +475,8 @@ input[type="number"] {
   margin-bottom: 16px;
   padding: 12px 16px;
   border: 1px solid var(--accent-deep);
-  background: #2b1f06;
-  color: #f6ecd3;
+  background: var(--accent-muted);
+  color: var(--ink-body);
 }
 
 .local-only-banner div {
@@ -479,8 +484,14 @@ input[type="number"] {
   gap: 3px;
 }
 
+.local-only-banner strong {
+  color: var(--ink-strong-warm);
+}
+
+/* `--ink-muted-warm`, not `--ink-muted`: on the gold fill the plainer muted ink measures 4.44:1 in
+   dark, just under the 4.5:1 this 12px line needs. The warm one clears it at 4.62:1. */
 .local-only-banner span {
-  color: #f2dfae;
+  color: var(--ink-muted-warm);
   font-size: 12px;
 }
 
@@ -6400,9 +6411,19 @@ tbody tr:last-child td {
 
 /* Viewing another shop reuses the Local Only banner's layout: same shape, same place, and the
    reader already knows what a bar across the top of the content area means. The attribute selector
-   only re-colours it, so the two are never mistaken for one another. */
+   re-colours it, so the two are never mistaken for one another -- and both can be on screen at
+   once, stacked, which is exactly when telling them apart matters.
+
+   This override used to set `border-color` to the same value the base rule already had, so it did
+   nothing and the two bars were identical. Now it moves the whole bar onto the info family: gold
+   means "this device is offline by choice", blue means "these are not this counter's numbers". */
 .local-only-banner[data-shop-view="OTHER_BRANCH"] {
-  border-color: var(--accent-deep);
+  border-color: var(--info-line);
+  background: var(--info-soft);
+}
+
+.local-only-banner[data-shop-view="OTHER_BRANCH"] strong {
+  color: var(--info-ink);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -6604,13 +6625,18 @@ tbody tr:last-child td {
    the System state, and only `prefers-color-scheme` separates it there.
    --------------------------------------------------------------------------------------------- */
 
-.brand-art-on-dark { display: none; }
-.brand-art-on-light { display: block; }
+/* Every rule here is scoped under `.brand-monogram`, and that is load-bearing rather than tidy.
+   `.brand-monogram img` sets `display: block` and scores 0,1,1; a bare `.brand-art-on-dark` scores
+   0,1,0 and loses to it whatever the order, so both cuts rendered and the login screen showed the
+   mark twice, overlapping. Dark mode hid its spare only by accident -- the themed rules below
+   carry an extra selector and were already winning. Keep these at 0,2,0 or higher. */
+.brand-monogram .brand-art-on-dark { display: none; }
+.brand-monogram .brand-art-on-light { display: block; }
 
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .brand-art-on-dark { display: block; }
-  :root:not([data-theme="light"]) .brand-art-on-light { display: none; }
+  :root:not([data-theme="light"]) .brand-monogram .brand-art-on-dark { display: block; }
+  :root:not([data-theme="light"]) .brand-monogram .brand-art-on-light { display: none; }
 }
 
-:root[data-theme="dark"] .brand-art-on-dark { display: block; }
-:root[data-theme="dark"] .brand-art-on-light { display: none; }
+:root[data-theme="dark"] .brand-monogram .brand-art-on-dark { display: block; }
+:root[data-theme="dark"] .brand-monogram .brand-art-on-light { display: none; }

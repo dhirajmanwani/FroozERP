@@ -166,13 +166,69 @@ test("App.css is mostly themed rather than hardcoded", () => {
   const appCss = read("frontend/src/App.css");
   const outsidePrint = appCss.replace(/@media print[\s\S]*?\n\}/g, "");
   const literals = hexLiterals(outsidePrint).length;
-  // A ratchet, not a target. 80 at the time of writing, down from 393 before the token conversion.
-  // The ceiling sits just above that so the number can only be driven down; raising it needs a
-  // deliberate edit here, which is the conversation this test exists to force.
+  // A ratchet, not a target. 77 at the time of writing, down from 393 before the token conversion
+  // and from 80 before the Local Only banner was themed. The ceiling sits just above that so the
+  // number can only be driven down; raising it needs a deliberate edit here, which is the
+  // conversation this test exists to force.
   assert.ok(
-    literals <= 95,
-    `${literals} hardcoded colours outside print styles, up from the 80 this ratchet was set at. `
+    literals <= 85,
+    `${literals} hardcoded colours outside print styles, up from the 77 this ratchet was set at. `
     + "Prefer a token from theme.css: a literal here is a colour that stays dark when the app goes "
     + "light. If the increase is deliberate, raise the ceiling in this test and say why.",
+  );
+});
+
+test("the Local Only banner follows the theme", () => {
+  // This bar was the last piece of the app still painted for a dark screen no matter which theme
+  // was on: a `#2b1f06` slab with `#f6ecd3` text, written before light mode existed and skipped by
+  // the token conversion because its cream had no matching token. On a light page it read as a
+  // black box dropped onto the layout.
+  //
+  // The rule is checked by name rather than by the file-wide count above, because the file-wide
+  // count has 8 spare slots -- these three literals could come back without moving it past the
+  // ceiling. A colour written directly into this rule is a colour that cannot follow the theme.
+  const appCss = read("frontend/src/App.css");
+  const rules = [...appCss.matchAll(/(^|\n)(\.local-only-banner[^{]*)\{([^}]*)\}/g)];
+  assert.ok(
+    rules.length >= 3,
+    `expected the Local Only banner rules in App.css, found ${rules.length} - has it been renamed?`,
+  );
+  for (const [, , selector, body] of rules) {
+    const literals = hexLiterals(body);
+    assert.equal(
+      literals.length,
+      0,
+      `${selector.trim()} declares ${literals.join(", ")} directly. Use a token from theme.css: a `
+      + "literal here is the dark-slab-on-a-light-page bug coming back.",
+    );
+  }
+});
+
+test("the two content-area banners do not look the same", () => {
+  // Local Only ("this device is offline by choice") and Viewing another shop ("these are not this
+  // counter's numbers") share a shape and a position, and both can be on screen at once, stacked.
+  // Colour is the only thing telling them apart.
+  //
+  // For a year it was not telling them apart at all: the shop-view override set `border-color` to
+  // the same value the base rule already had, so the override did nothing and the two bars were
+  // pixel-identical. A no-op override is invisible in review -- it looks like a difference.
+  const appCss = read("frontend/src/App.css");
+  const declaration = (selector, property) => {
+    const rule = appCss.match(
+      new RegExp(`(^|\\n)${selector.replace(/[.[\]"^$]/g, "\\$&")}\\s*\\{([^}]*)\\}`),
+    );
+    assert.ok(rule, `expected a \`${selector}\` rule in App.css`);
+    const found = rule[2].match(new RegExp(`(?:^|;)\\s*${property}\\s*:\\s*([^;]+)`));
+    return found ? found[1].trim() : "";
+  };
+
+  const base = declaration(".local-only-banner", "background");
+  const shopView = declaration('.local-only-banner[data-shop-view="OTHER_BRANCH"]', "background");
+  assert.ok(base, "the Local Only banner declares no background");
+  assert.ok(shopView, "the shop-view banner declares no background of its own");
+  assert.notEqual(
+    base,
+    shopView,
+    `both banners fill with ${base}, so they are the same bar wearing the same colour`,
   );
 });
