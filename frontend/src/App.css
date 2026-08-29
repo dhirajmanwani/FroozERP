@@ -222,22 +222,15 @@ input[type="number"] {
   display: grid;
   flex: 0 0 auto;
   place-items: center;
-  /* A solid tile, not a wash. The mark's artwork is the leaf alone -- there is no background in
-     the file -- so the block behind it is drawn here: green carrying the cream leaf on dark, white
-     carrying the green leaf on light. The old gold gradient was faint enough that on a light
-     ground the badge read as empty. */
-  border: 1px solid var(--brand-tile-line);
-  border-radius: 11px;
-  background: var(--brand-tile);
-  box-shadow: 0 8px 25px var(--accent-soft);
-  overflow: hidden;
+  /* No tile. The mark sits directly on whatever it is placed on and carries its own colour: the
+     green cut on a light ground, the cream cut on a dark one. It had a gold-washed badge, then a
+     solid one; both were a box the logo never asked for. A mark drawn this well does not need
+     something behind it to be legible, and the box was competing with it. */
 }
 
 .brand-monogram img {
-  /* Inset so the leaf breathes inside the tile instead of touching its corners. The artwork is a
-     tight crop of the lockup, so without this it runs to the rounded edge. */
-  width: 78%;
-  height: 78%;
+  width: 100%;
+  height: 100%;
   display: block;
   object-fit: contain;
 }

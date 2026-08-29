@@ -806,21 +806,33 @@ test("every token App.css uses has a value in the light theme", () => {
 });
 
 
-test("the mark sits on a solid tile that inverts with the theme", () => {
-  // Ruled by the maintainer after seeing light mode: white leaf on green when dark, green leaf on
-  // white when light. The artwork is the leaf alone -- there is no background shape in the file --
-  // so the tile is drawn in CSS, and if it goes back to a translucent wash the badge reads as empty
-  // on a light ground, which is exactly what it did.
-  assert.equal(lightTokens.get("--brand-tile"), "#ffffff");
-  assert.equal(mediaDarkTokens.get("--brand-tile"), "#123623");
-  assert.equal(attributeDarkTokens.get("--brand-tile"), "#123623");
+test("the mark has no tile of its own", () => {
+  // Ruled by the maintainer, after two attempts at a badge: no box behind the symbol. It sits
+  // directly on whatever it is placed on and carries its own colour. Both earlier versions -- a
+  // gold wash, then a solid tile -- were a container the logo never asked for, and the second was
+  // competing with it. Asserted on the rule rather than on a token, because the failure mode is
+  // somebody adding a background back to make it "stand out".
+  const appCss = readFileSync(new URL("../App.css", import.meta.url), "utf8");
+  const start = appCss.indexOf(".brand-monogram {");
+  assert.ok(start > 0, "the mark's wrapper must still exist");
+  const rule = appCss.slice(start, appCss.indexOf("}", start)).replace(/\/\*[\s\S]*?\*\//g, "");
+  for (const property of ["background", "border", "box-shadow"]) {
+    assert.doesNotMatch(
+      rule,
+      new RegExp(`\\b${property}\\s*:`),
+      `the mark must not paint a ${property}; it sits on the app, not in a box`,
+    );
+  }
 });
 
-test("the leaf reads against its own tile in both themes", () => {
-  // The point of inverting it. A cream leaf on a white tile, or a green one on green, is a badge
-  // with nothing in it -- and nothing else in this file would notice.
-  assert.ok(contrast("#f6f3ea", mediaDarkTokens.get("--brand-tile")) >= 7,
-    "the cream cut must read on the dark tile");
-  assert.ok(contrast("#0a2d1c", lightTokens.get("--brand-tile")) >= 7,
-    "the green cut must read on the light tile");
+test("each cut of the mark reads on the ground it is shown against", () => {
+  // With no tile, the surface behind the mark is the app itself -- so the cut has to suit the
+  // theme, and the theme switch is the only thing making it legible. The cream cut on a light page
+  // would be a mark nobody can see, which is what shipped before the switch existed.
+  const darkGround = mediaDarkTokens.get("--ground");
+  const lightSurfaces = [lightTokens.get("--ground"), lightTokens.get("--panel"), lightTokens.get("--card")];
+  assert.ok(contrast("#f6f3ea", darkGround) >= 7, "the cream cut must read on the dark page");
+  for (const surface of lightSurfaces) {
+    assert.ok(contrast("#0a2d1c", surface) >= 7, `the green cut must read on ${surface}`);
+  }
 });
