@@ -2758,6 +2758,31 @@ const initializeDatabase = async () => {
       ON customer_orders (branch_id, reserved_at, created_at)
       WHERE status IN ('RECEIVED', 'PACKED') AND deleted_at IS NULL;
 
+    -- One field was doing two jobs. See docs/order-routing-decision.md: an order has a branch that
+    -- *took* it and a branch that is *fulfilling* it, and conflating them is why an order could
+    -- never be moved. "branch_id" keeps its name and becomes the fulfilment branch -- because
+    -- "logSyncChange" and the pull predicate both scope by that column, so fulfilment living there
+    -- is what makes a transfer an ordinary field change instead of a new transport.
+    ALTER TABLE customer_orders ADD COLUMN IF NOT EXISTS taken_at_branch_id INTEGER REFERENCES branches(id);
+
+    -- Provenance for every row written before the split. Not a guess: an order could only be typed
+    -- in on a device at the branch that was handling it, so for existing rows the two genuinely
+    -- coincide.
+    UPDATE customer_orders SET taken_at_branch_id = branch_id
+     WHERE taken_at_branch_id IS NULL AND branch_id IS NOT NULL;
+
+    -- An unassigned order -- a website order, a WhatsApp to the company number -- has no fulfilment
+    -- branch yet. "NOT NULL DEFAULT 1" answered that question by inventing branch 1, which is
+    -- exactly the confusion the routing decision exists to prevent. A NULL that admits there is no
+    -- answer is safer than a default that fabricates one, and it is also what keeps unassigned
+    -- orders off the sync road for free: "logSyncChange" already throws without a branch id.
+    ALTER TABLE customer_orders ALTER COLUMN branch_id DROP NOT NULL;
+    ALTER TABLE customer_orders ALTER COLUMN branch_id DROP DEFAULT;
+
+    CREATE INDEX IF NOT EXISTS customer_orders_unassigned_idx
+      ON customer_orders (company_id, created_at)
+      WHERE branch_id IS NULL AND deleted_at IS NULL;
+
     CREATE TABLE IF NOT EXISTS customer_order_items (
       id BIGSERIAL PRIMARY KEY,
       order_global_id VARCHAR(180) NOT NULL REFERENCES customer_orders(global_id) ON DELETE CASCADE,
@@ -9930,12 +9955,35 @@ const processCustomerOrderOperation = async (client, operation, context) => {
     // Company and branch ids are integers everywhere in this schema - unlike entity ids, they are
     // genuinely numbers, so comparing them as numbers is correct here and nowhere near the ids.
     const sameCompany = Number(current.company_id || 0) === Number(companyId || 0);
-    const sameBranch = Number(current.branch_id || 0) === branchId;
-    if (!sameCompany || !sameBranch) {
+    if (!sameCompany) {
       return rejectOperation(
         operation,
         "CONFLICT",
-        "Customer order id already exists in another company or branch"
+        "Customer order id already exists in another company"
+      );
+    }
+    // Since orders became transferable, "this order is not yours" has three distinct causes, and
+    // they are worth telling apart because only one of them is a fault. A device is refused in all
+    // three cases either way - the check itself has not been loosened.
+    const currentBranchId = parsePositiveInteger(current.branch_id);
+    if (!currentBranchId) {
+      // Unassigned. It lives in the cloud and has never been sent to a counter, so a device holding
+      // a copy to push is not something that should be able to happen at all.
+      return rejectOperation(
+        operation,
+        "CONFLICT",
+        "Customer order is unassigned and is not held by any branch"
+      );
+    }
+    if (currentBranchId !== branchId) {
+      // The ordinary race: this branch edited the order at about the moment somebody moved it
+      // elsewhere. The device will be told the order has left on its next pull, by the TRANSFER_OUT
+      // row written for it, so this refusal is the correct end of the story and not a lost edit to
+      // chase.
+      return rejectOperation(
+        operation,
+        "CONFLICT",
+        "Customer order is now being fulfilled by another branch"
       );
     }
     if (Number(current.entity_version || 0) >= incomingVersion) {
@@ -9961,7 +10009,8 @@ const processCustomerOrderOperation = async (client, operation, context) => {
   const upserted = await client.query(
     `
     INSERT INTO customer_orders (
-      global_id, order_no, source, company_id, branch_id, operational_location_id,
+      global_id, order_no, source, company_id, branch_id, taken_at_branch_id,
+      operational_location_id,
       assignment_generation, customer_id, customer_name, customer_mobile, delivery_address,
       status, reserved_at, packed_at, sent_at, delivered_at, cancelled_at, cancellation_reason,
       carrier, carrier_reference, tracking_url, carrier_contact, sale_global_id, invoice_no,
@@ -9969,7 +10018,7 @@ const processCustomerOrderOperation = async (client, operation, context) => {
       deleted_at, updated_at
     )
     VALUES (
-      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
+      $1,$2,$3,$4,$5,$32,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
       $25,$26,$27,$28,$29,$30,$31, CURRENT_TIMESTAMP
     )
     ON CONFLICT (global_id) DO UPDATE SET
@@ -9977,6 +10026,10 @@ const processCustomerOrderOperation = async (client, operation, context) => {
       source = EXCLUDED.source,
       company_id = EXCLUDED.company_id,
       branch_id = EXCLUDED.branch_id,
+      -- Provenance is written once and never rewritten. A device pushing an order it has been
+      -- given by a transfer would otherwise overwrite "who took this" with "who is holding it
+      -- now", which is the one fact the split exists to keep.
+      taken_at_branch_id = COALESCE(customer_orders.taken_at_branch_id, EXCLUDED.taken_at_branch_id),
       operational_location_id = EXCLUDED.operational_location_id,
       assignment_generation = EXCLUDED.assignment_generation,
       customer_id = EXCLUDED.customer_id,
@@ -10038,6 +10091,10 @@ const processCustomerOrderOperation = async (client, operation, context) => {
       timestamps.created_at,
       timestamps.updated_at,
       timestamps.deleted_at,
+      // $32. A device that types an order in both took it and is fulfilling it, so the two agree on
+      // creation. The payload may still carry a value - an order the device received by transfer
+      // and later edited - and that one is the truthful provenance, so it wins over the session.
+      parsePositiveInteger(payload.taken_at_branch_id) || branchId,
     ]
   );
   const row = upserted.rows[0];
@@ -10116,6 +10173,247 @@ const processCustomerOrderOperation = async (client, operation, context) => {
       entity_version: Number(row.entity_version || incomingVersion),
       duplicate: false,
     },
+  };
+};
+
+/**
+ * The operational location a change for this branch must be scoped to.
+ *
+ * The pull predicate is `branch_id = $2 AND operational_location_id = $3` -- an exact match on
+ * both. A change row written with the wrong location, or with none, is invisible to every device
+ * at the branch it was meant for: it sits in the log forever and nothing reports it, which is the
+ * silent-loss shape this codebase keeps having to design against. So a transfer resolves the
+ * destination's location *before* it writes anything, and refuses if it cannot.
+ *
+ * Returns the branch's default operational location id, or null when the branch has none.
+ */
+const resolveBranchDefaultLocationId = async (client, { companyId, branchId }) => {
+  const result = await client.query(
+    `
+    SELECT id
+    FROM operational_locations
+    WHERE company_id = $1 AND branch_id = $2 AND active = TRUE
+    ORDER BY is_default DESC, id
+    LIMIT 1
+    `,
+    [companyId, branchId]
+  );
+  return parsePositiveInteger(result.rows[0]?.id) || null;
+};
+
+const ORDER_TRANSFER_CLOSED_STATUSES = new Set(["DELIVERED", "CANCELLED", "RETURNED"]);
+
+/**
+ * Move a customer order to another branch, or assign an unassigned one for the first time.
+ *
+ * See `docs/order-routing-decision.md`. The rule this function exists to satisfy, and the one thing
+ * that must not be simplified away:
+ *
+ *   **A transfer writes two change-log rows.** `TRANSFER_OUT` scoped to the branch losing the
+ *   order, `UPSERT` scoped to the branch gaining it, both carrying the same entity_version, both in
+ *   the same transaction as the UPDATE.
+ *
+ * One row is a bug with a specific and expensive shape: the losing branch's devices have already
+ * pulled the order, they only pull rows scoped to themselves, and so they would never be told it
+ * left. The order would sit on their board as open work for ever, and two branches would each
+ * believe they owed the same customer a delivery -- which is precisely the confusion the routing
+ * decision was written to prevent.
+ *
+ * An assignment is the same operation with nobody to tell: there is no old branch, so it writes one
+ * row rather than two.
+ *
+ * The caller supplies the transaction. Nothing here commits, so the two rows and the UPDATE stand
+ * or fall together; there is no instant at which one exists without the other.
+ *
+ * @returns {{ok: true, order: object, movedFrom: number|null, movedTo: number, changes: object[]}}
+ *          or {{ok: false, code: string, message: string}} -- a refusal, never a throw, so the
+ *          route can turn it into a status code and the caller can be told why in a sentence.
+ */
+const transferCustomerOrderBranch = async (client, {
+  orderGlobalId,
+  companyId,
+  toBranchId,
+  actorUserId = null,
+  note = "",
+} = {}) => {
+  const orderId = cleanText(orderGlobalId);
+  const company = parsePositiveInteger(companyId);
+  const destination = parsePositiveInteger(toBranchId);
+  if (!orderId) {
+    return { ok: false, code: "VALIDATION_ERROR", message: "An order id is required" };
+  }
+  if (!company) {
+    return { ok: false, code: "VALIDATION_ERROR", message: "A company is required" };
+  }
+  if (!destination) {
+    return { ok: false, code: "VALIDATION_ERROR", message: "Choose the branch that will handle this order" };
+  }
+
+  const existing = await client.query(
+    `
+    SELECT global_id, order_no, company_id, branch_id, taken_at_branch_id, operational_location_id,
+           status, entity_version, deleted_at
+    FROM customer_orders
+    WHERE global_id = $1
+    FOR UPDATE
+    `,
+    [orderId]
+  );
+  const order = existing.rows[0];
+  if (!order) {
+    return { ok: false, code: "NOT_FOUND", message: "That order no longer exists" };
+  }
+  if (Number(order.company_id || 0) !== company) {
+    // Deliberately the same answer as a missing order. Confirming that an id exists in someone
+    // else's company is itself a disclosure.
+    return { ok: false, code: "NOT_FOUND", message: "That order no longer exists" };
+  }
+  if (order.deleted_at) {
+    return { ok: false, code: "CONFLICT", message: "That order has been deleted and cannot be moved" };
+  }
+
+  const status = String(order.status || "").toUpperCase();
+  if (ORDER_TRANSFER_CLOSED_STATUSES.has(status)) {
+    // Moving a finished order would hand the new branch a delivery that has already happened, and
+    // the reservation arithmetic would reserve stock for it on arrival.
+    return {
+      ok: false,
+      code: "CONFLICT",
+      message: `This order is already ${status.toLowerCase()}, so there is nothing left to hand over`,
+    };
+  }
+
+  const origin = parsePositiveInteger(order.branch_id);
+  if (origin === destination) {
+    return {
+      ok: false,
+      code: "NO_CHANGE",
+      message: "That branch is already handling this order",
+    };
+  }
+
+  const destinationBranch = await client.query(
+    "SELECT id, branch_name, company_id, active FROM branches WHERE id = $1 LIMIT 1",
+    [destination]
+  );
+  const branch = destinationBranch.rows[0];
+  if (!branch || Number(branch.company_id || 0) !== company) {
+    return { ok: false, code: "NOT_FOUND", message: "That branch is not part of this business" };
+  }
+  if (branch.active === false) {
+    return { ok: false, code: "CONFLICT", message: `${branch.branch_name || "That branch"} is closed` };
+  }
+
+  const destinationLocationId = await resolveBranchDefaultLocationId(client, {
+    companyId: company,
+    branchId: destination,
+  });
+  if (!destinationLocationId) {
+    // Refused rather than written. A change row scoped to a location that does not exist is pulled
+    // by nobody: the order would leave the old branch's board and never appear on the new one, and
+    // no error would be raised anywhere. Better to say so now, while somebody is looking at it.
+    return {
+      ok: false,
+      code: "DESTINATION_UNREACHABLE",
+      message: `${branch.branch_name || "That branch"} has no active counter set up yet, so an order sent `
+        + "there would not reach any device. Set up its counter first.",
+    };
+  }
+
+  // The location the *losing* branch's devices pull on. The order's own is the truthful one; a row
+  // written before operational locations existed may not have one, and then the branch's default is
+  // the only answer available. If neither resolves, the removal cannot be delivered -- and that has
+  // to be a refusal too, because completing the move would leave the order open on the old board
+  // for ever, which is the exact failure this whole design is built around.
+  let originLocationId = null;
+  if (origin) {
+    originLocationId = parsePositiveInteger(order.operational_location_id)
+      || (await resolveBranchDefaultLocationId(client, { companyId: company, branchId: origin }));
+    if (!originLocationId) {
+      return {
+        ok: false,
+        code: "ORIGIN_UNREACHABLE",
+        message: "The branch currently holding this order has no active counter, so it cannot be "
+          + "told the order has moved. Sort that out first, or the order would stay open on both.",
+      };
+    }
+  }
+
+  const nextVersion = Number(order.entity_version || 1) + 1;
+  const updated = await client.query(
+    `
+    UPDATE customer_orders
+       SET branch_id = $2,
+           operational_location_id = $3,
+           -- The old branch's device assignment generation has no meaning at the new branch, and
+           -- leaving it would attach a stale scope to every future change for this order.
+           assignment_generation = NULL,
+           entity_version = $4,
+           updated_at = CURRENT_TIMESTAMP
+     WHERE global_id = $1
+    RETURNING *
+    `,
+    [orderId, destination, destinationLocationId, nextVersion]
+  );
+  const row = updated.rows[0];
+
+  const itemsResult = await client.query(
+    `
+    SELECT global_id, line_index, product_global_id, product_name, unit, quantity, agreed_rate,
+           line_amount, inventory_lot_global_id
+    FROM customer_order_items
+    WHERE order_global_id = $1
+    ORDER BY line_index
+    `,
+    [orderId]
+  );
+  const items = itemsResult.rows;
+
+  const changes = [];
+
+  if (origin) {
+    // Row one of two. Written first on purpose: if anything below were ever to fail, the failure
+    // that leaves an order on nobody's board is recoverable by a person, and the one that leaves it
+    // on two boards is the one that gets a customer two deliveries or none.
+    changes.push(
+      await logSyncChange(client, {
+        branchId: origin,
+        operationalLocationId: originLocationId,
+        entityType: "customer_order",
+        entityId: orderId,
+        operationType: "TRANSFER_OUT",
+        version: nextVersion,
+        payload: {
+          global_id: orderId,
+          order_no: row.order_no || null,
+          transferred_to_branch_id: destination,
+          transferred_to_branch_name: branch.branch_name || null,
+          transferred_by_user_id: actorUserId || null,
+          transfer_note: cleanText(note) || null,
+        },
+      })
+    );
+  }
+
+  // Row two of two.
+  changes.push(
+    await logSyncChange(client, {
+      branchId: destination,
+      operationalLocationId: destinationLocationId,
+      entityType: "customer_order",
+      entityId: orderId,
+      operationType: "UPSERT",
+      version: nextVersion,
+      payload: { ...row, items },
+    })
+  );
+
+  return {
+    ok: true,
+    order: row,
+    movedFrom: origin || null,
+    movedTo: destination,
+    changes,
   };
 };
 
@@ -21775,5 +22073,7 @@ module.exports = {
   SYNC_OPERATION_TYPES,
   processSyncOperation,
   processCustomerOrderOperation,
+  transferCustomerOrderBranch,
+  resolveBranchDefaultLocationId,
   normalizeCustomerOrderItems,
 };
