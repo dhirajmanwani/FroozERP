@@ -50,7 +50,16 @@ test("the picker offers exactly the three modes, from the module", () => {
   // Hardcoding the options here is how a fourth mode gets added to the module and never appears on
   // screen, or a removed one lingers as a dead choice.
   assert.match(app, /THEME_MODES\.map\(\(mode\) =>/);
-  assert.match(app, /describeThemeMode\(mode\)\.label/);
+  // `describeThemeMode` returns the label as a plain string. This asserted `.label` on it, which is
+  // `undefined` -- and React renders `undefined` as nothing, so the test passed while every option
+  // in the select was blank on screen. Pinned as a bare call now, and the empty-option bug is
+  // covered behaviourally by the test below.
+  assert.match(app, /describeThemeMode\(mode\)\}/);
+  assert.doesNotMatch(
+    app,
+    /describeThemeMode\([^)]*\)\.(label|description)/,
+    "describeThemeMode returns a string; reading a property off it renders nothing",
+  );
 });
 
 test("choosing a mode writes it, and a refused write is reported", () => {
@@ -65,7 +74,7 @@ test("the screen says which way System is currently resolving", () => {
   // "System" on its own tells nobody what they are about to get, and the answer changes without
   // them touching anything.
   assert.match(app, /resolveTheme\(themeMode, systemPrefersDark\)/);
-  assert.match(app, /Windows is asking for/);
+  assert.match(app, /It is asking for \$\{resolved === "dark"/);
 });
 
 test("the picker says printing is unaffected", () => {

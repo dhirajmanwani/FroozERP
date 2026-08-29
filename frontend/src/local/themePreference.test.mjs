@@ -730,6 +730,77 @@ test("the light theme does not reuse the dark theme's gold", () => {
   // has a gold that survives paper, and reaching for the dark one here is the single
   // easiest way to ship an unreadable light theme.
   assert.notEqual(lightTokens.get("--accent"), mediaDarkTokens.get("--accent"));
-  assert.equal(lightTokens.get("--accent"), "#8a6520");
+  // `ACCENT.deepStrong`, not `deep`. #8a6520 clears 4.5:1 on a white card and only 3.6:1 on the
+  // light theme's sidebar -- and gold labels sit on the sidebar. The working accent has to survive
+  // every light surface, not just the lightest one, so `deep` stays available as `--accent-deep`
+  // for the places that are always on white.
+  assert.equal(lightTokens.get("--accent"), "#6b4d18");
   assert.ok(contrast("#d9ac52", "#ffffff") < 4.5, "the premise of this test still holds");
+});
+
+
+// -------------------------------------------------------------------------------------------
+// The guard that was missing.
+//
+// Thirteen veil tokens were added with their DARK values inside the `:root` light block, and never
+// added to the dark blocks at all. Every existing structural test passed: "dark tokens are also in
+// :root" held vacuously because the tokens were not in the dark blocks, and "both dark blocks agree"
+// held because both were equally empty. Dark mode looked right, inheriting the values from :root by
+// accident, while light mode painted a 96%-opaque dark green over every card.
+//
+// A value can be in the correct block and still be the wrong value. So this asserts the property
+// nothing else did: the light theme has to actually be light.
+// -------------------------------------------------------------------------------------------
+
+/** A translucent layer as it lands on the surface below it - which is the only way to judge it. */
+const overSurface = (token, surface) => {
+  const value = String(token).trim();
+  if (!value.startsWith("rgba(")) return relativeLuminance(value);
+  const parts = value.replace(/rgba\(|\)/g, "").split(",").map((part) => Number(part.trim()));
+  const alpha = parts[3];
+  const base = [1, 3, 5].map((i) => parseInt(surface.slice(i, i + 2), 16));
+  const mixed = parts.slice(0, 3).map((c, i) => Math.round(c * alpha + base[i] * (1 - alpha)));
+  const toHex = (n) => n.toString(16).padStart(2, "0");
+  return relativeLuminance(`#${mixed.map(toHex).join("")}`);
+};
+
+test("every light surface is actually light", () => {
+  // Composited on white, because that is what a veil sits on in the light theme. A dark value here
+  // is not a subtle mismatch: it is a dark panel in a light app, which is what shipped.
+  const surfaces = ["--ground", "--panel", "--card", "--raised", "--raised-high",
+    "--veil-faint", "--veil-subtle", "--veil", "--veil-strong", "--veil-heavy", "--veil-solid",
+    "--card-veil-soft", "--card-veil", "--card-veil-solid"];
+  const tooDark = surfaces
+    .filter((token) => lightTokens.has(token))
+    .map((token) => [token, overSurface(lightTokens.get(token), "#ffffff")])
+    .filter(([, luminance]) => luminance < 0.5);
+  assert.deepEqual(tooDark, [], "these light-theme surfaces are dark; a dark value is in the light block");
+});
+
+test("every dark surface is actually dark", () => {
+  // The mirror, so the same mistake in the other direction is caught too.
+  const surfaces = ["--ground", "--panel", "--card", "--raised", "--raised-high",
+    "--veil-subtle", "--veil", "--veil-strong", "--veil-heavy", "--veil-solid",
+    "--card-veil", "--card-veil-solid"];
+  const tooLight = surfaces
+    .filter((token) => mediaDarkTokens.has(token))
+    .map((token) => [token, overSurface(mediaDarkTokens.get(token), "#03110b")])
+    .filter(([, luminance]) => luminance > 0.3);
+  assert.deepEqual(tooLight, [], "these dark-theme surfaces are light");
+});
+
+test("every token App.css uses has a value in the light theme", () => {
+  // The other half of the same bug: a token defined only in a dark block would fall back to
+  // nothing in light, and the declaration using it would be dropped silently.
+  // Comments stripped first. A comment explaining that `var(--text)` was broken counts as a use of
+  // `--text` otherwise, and the test fails on its own documentation -- which is exactly how the
+  // structure tests in this file first went wrong, finding a rule quoted in a header comment
+  // instead of the rule.
+  const appCss = readFileSync(new URL("../App.css", import.meta.url), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+  const used = new Set([...appCss.matchAll(/var\((--[\w-]+)/g)].map((match) => match[1]));
+  // Font sizing lives in index.css, not the colour theme.
+  const colourTokens = [...used].filter((token) => !/^--font/.test(token) && token !== "--font-scale");
+  const undefinedInLight = colourTokens.filter((token) => !lightTokens.has(token)).sort();
+  assert.deepEqual(undefinedInLight, [], "App.css uses these tokens but the light theme never defines them");
 });

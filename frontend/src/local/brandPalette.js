@@ -73,7 +73,11 @@ export const ACCENT = Object.freeze({
   // Hover/focus for `deep`. On a dark ground the accent brightens on hover; on a
   // light one it has to darken instead, because brightening a gold that is already
   // sitting on white is how you end up with an unreadable hover state. 7.8:1 on white.
-  deepHover: "#6b4d18",
+  deepStrong: "#6b4d18", // the light theme's working accent. `deep` clears 4.5:1 on a white card but
+  // only 3.6:1 on the tinted sidebar, and gold labels sit there - so the working value has to be the
+  // one that survives every light surface, not just the lightest. 7.8:1 on white, 5.3:1 on the sidebar.
+  deepHover: "#573c11", // hover/focus for `deepStrong`. On light, hover goes darker: brightening a
+  // gold that is already on a pale ground removes the only contrast it had. 10.2:1 on white.
   brandGold: BRAND.gold, // the logo's value - print, light surfaces
   accent: "#d9ac52", // the working accent on dark ground
   deepMuted: "#4a3a14", // an accent surface that is switched on but unavailable
@@ -115,7 +119,9 @@ export const SIGNAL = Object.freeze({
   infoDeep: "#0ea5e9",
   infoCyan: "#22d3ee",
   infoNavy: "#082f49",
-  infoInk: "#0369a1", // info text on a light surface - 5.9:1 on white
+  infoInk: "#075985", // info as text on a light surface. Was #0369a1, which cleared 4.5:1 on a white
+  // card but only 4.0:1 once the light theme's sidebar was deepened to give the page some structure
+  // -- and info labels sit there. Deepened with it. 5.1:1 at worst across every light surface. // info text on a light surface - 5.9:1 on white
   // The severity ramp on the assistant panel runs info -> attention -> high ->
   // critical. It stays blue/yellow/orange/red on purpose: recoloured into the
   // brand's own gold, "attention" and "high" would read as decoration.

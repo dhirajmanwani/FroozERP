@@ -67,8 +67,8 @@
      through --raised-high all land on white and are separated by --line and the shadow
      tokens instead of by hue. --ground is therefore the darkest light surface (1.13:1
      against a white card), not the lightest, or cards would have nothing to sit on. */
-  --ground: #eef2ef;              /* the page itself */
-  --panel: #f7f9f7;               /* sidebar and deep panels sitting on the page */
+  --ground: #e8e3d3;              /* the page itself */
+  --panel: #c8d8ce;               /* sidebar and deep panels sitting on the page */
   --card: #ffffff;                /* a content card */
   --raised: #ffffff;              /* a surface lifted off the page (dropdown, popover) */
   --raised-high: #ffffff;         /* a surface lifted off a raised surface (modal) */
@@ -101,8 +101,8 @@
      *seen*. A border that carries meaning on its own - a form control's outline, a
      selected row's edge - needs 3:1 against its surface, which neither of them reaches,
      so it uses --line-control. */
-  --line: #dfe9e2;                /* an ordinary divider */
-  --line-strong: #c8d8ce;         /* a divider that has to carry weight */
+  --line: #c8d8ce;                /* an ordinary divider */
+  --line-strong: #97ada1;         /* a divider that has to carry weight */
   --line-soft: rgba(10, 45, 28, 0.1);   /* a hairline that works over any surface */
   --line-control: #4a7a61;        /* a border that must be perceivable: 4.4:1 worst case */
 
@@ -120,8 +120,8 @@
      ground and measures 2.9:1 on white - it fails as text on paper, which is precisely
      why ACCENT.deep exists. On light, "hover" also means *darker*: brightening a gold
      that is already on white removes the only contrast it had. */
-  --accent: #8a6520;              /* the working accent */
-  --accent-bright: #6b4d18;       /* hover, focus - darker here, see above */
+  --accent: #6b4d18;              /* the working accent */
+  --accent-bright: #573c11;       /* hover, focus - darker here, see above */
   --accent-soft: rgba(138, 101, 32, 0.1);    /* a translucent accent wash */
   --accent-wash: rgba(138, 101, 32, 0.06);   /* the faintest accent tint */
   --accent-line: rgba(138, 101, 32, 0.28);
@@ -150,11 +150,11 @@
   --success-line: #86efac;
   --success-ink: #166534;
 
-  --info: #0369a1;
+  --info: #075985;
   --info-strong: #0ea5e9;
   --info-soft: #e0f2fe;
   --info-line: #bae6fd;
-  --info-ink: #0369a1;
+  --info-ink: #075985;
 
   /* Warning and attention have no pale wash in the palette the way danger, success and
      info do, so their surfaces are built translucently out of their own base. */
@@ -196,34 +196,6 @@
   --shadow-deep: rgba(10, 45, 28, 0.26);
   --scrim-soft: rgba(10, 45, 28, 0.28);
   --scrim-strong: rgba(10, 45, 28, 0.5);
-
-    --veil-faint: rgba(8, 33, 22, 0.2);
-    --veil-subtle: rgba(8, 33, 22, 0.35);
-    --veil: rgba(8, 33, 22, 0.45);
-    --veil-strong: rgba(8, 33, 22, 0.62);
-    --veil-heavy: rgba(8, 33, 22, 0.78);
-    --veil-solid: rgba(8, 33, 22, 0.96);
-    --card-veil-soft: rgba(18, 54, 35, 0.62);
-    --card-veil-soft: rgba(18, 54, 35, 0.62);
-  --card-veil: rgba(18, 54, 35, 0.8);
-    --card-veil-solid: rgba(18, 54, 35, 0.97);
-    --shadow-faint: rgba(3, 17, 11, 0.16);
-    --shadow-deep: rgba(3, 17, 11, 0.78);
-    --scrim-soft: rgba(3, 17, 11, 0.42);
-    --scrim-strong: rgba(3, 17, 11, 0.78);
-
-  --veil-faint: rgba(8, 33, 22, 0.2);
-  --veil-subtle: rgba(8, 33, 22, 0.35);
-  --veil: rgba(8, 33, 22, 0.45);
-  --veil-strong: rgba(8, 33, 22, 0.62);
-  --veil-heavy: rgba(8, 33, 22, 0.78);
-  --veil-solid: rgba(8, 33, 22, 0.96);
-  --card-veil: rgba(18, 54, 35, 0.8);
-  --card-veil-solid: rgba(18, 54, 35, 0.97);
-  --shadow-faint: rgba(3, 17, 11, 0.16);
-  --shadow-deep: rgba(3, 17, 11, 0.78);
-  --scrim-soft: rgba(3, 17, 11, 0.42);
-  --scrim-strong: rgba(3, 17, 11, 0.78);
 }
 
 /* Block 2: the System state on a machine set to dark.
@@ -304,6 +276,19 @@
     --attention-soft: rgba(253, 224, 71, 0.14);
     --attention-line: rgba(250, 204, 21, 0.4);
     --attention-ink: #fde047;
+    --veil-faint: rgba(8, 33, 22, 0.2);
+    --veil-subtle: rgba(8, 33, 22, 0.35);
+    --veil: rgba(8, 33, 22, 0.45);
+    --veil-strong: rgba(8, 33, 22, 0.62);
+    --veil-heavy: rgba(8, 33, 22, 0.78);
+    --veil-solid: rgba(8, 33, 22, 0.96);
+    --card-veil-soft: rgba(18, 54, 35, 0.62);
+    --card-veil: rgba(18, 54, 35, 0.8);
+    --card-veil-solid: rgba(18, 54, 35, 0.97);
+    --shadow-faint: rgba(3, 17, 11, 0.16);
+    --shadow-deep: rgba(3, 17, 11, 0.78);
+    --scrim-soft: rgba(3, 17, 11, 0.42);
+    --scrim-strong: rgba(3, 17, 11, 0.78);
   }
 }
 
@@ -387,4 +372,17 @@
   --attention-soft: rgba(253, 224, 71, 0.14);
   --attention-line: rgba(250, 204, 21, 0.4);
   --attention-ink: #fde047;
+  --veil-faint: rgba(8, 33, 22, 0.2);
+  --veil-subtle: rgba(8, 33, 22, 0.35);
+  --veil: rgba(8, 33, 22, 0.45);
+  --veil-strong: rgba(8, 33, 22, 0.62);
+  --veil-heavy: rgba(8, 33, 22, 0.78);
+  --veil-solid: rgba(8, 33, 22, 0.96);
+  --card-veil-soft: rgba(18, 54, 35, 0.62);
+  --card-veil: rgba(18, 54, 35, 0.8);
+  --card-veil-solid: rgba(18, 54, 35, 0.97);
+  --shadow-faint: rgba(3, 17, 11, 0.16);
+  --shadow-deep: rgba(3, 17, 11, 0.78);
+  --scrim-soft: rgba(3, 17, 11, 0.42);
+  --scrim-strong: rgba(3, 17, 11, 0.78);
 }
