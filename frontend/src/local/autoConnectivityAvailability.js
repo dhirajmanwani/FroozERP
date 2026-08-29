@@ -41,8 +41,8 @@ const text = (value) => (typeof value === "string" ? value.trim() : "");
  */
 export const autoConnectivityBlockedReason = ({ apiMode, cloudApiUrl } = {}) => {
   if (isLocalOnlyApiMode(apiMode)) {
-    return "App Mode is set to Local Only, which fixes this device offline. Connectivity Mode "
-      + "cannot be set to Auto while that is the App Mode.";
+    return "App Mode is set to Local Only, which keeps this device offline on purpose. Connectivity "
+      + "Mode cannot be set to Auto while that is the App Mode.";
   }
   if (apiModeUsesCloudBackend(apiMode) && !text(cloudApiUrl)) {
     return "No cloud backend is configured for this installation, so there is nothing for Auto to "
