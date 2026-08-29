@@ -6604,13 +6604,18 @@ tbody tr:last-child td {
    the System state, and only `prefers-color-scheme` separates it there.
    --------------------------------------------------------------------------------------------- */
 
-.brand-art-on-dark { display: none; }
-.brand-art-on-light { display: block; }
+/* Every rule here is scoped under `.brand-monogram`, and that is load-bearing rather than tidy.
+   `.brand-monogram img` sets `display: block` and scores 0,1,1; a bare `.brand-art-on-dark` scores
+   0,1,0 and loses to it whatever the order, so both cuts rendered and the login screen showed the
+   mark twice, overlapping. Dark mode hid its spare only by accident -- the themed rules below
+   carry an extra selector and were already winning. Keep these at 0,2,0 or higher. */
+.brand-monogram .brand-art-on-dark { display: none; }
+.brand-monogram .brand-art-on-light { display: block; }
 
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) .brand-art-on-dark { display: block; }
-  :root:not([data-theme="light"]) .brand-art-on-light { display: none; }
+  :root:not([data-theme="light"]) .brand-monogram .brand-art-on-dark { display: block; }
+  :root:not([data-theme="light"]) .brand-monogram .brand-art-on-light { display: none; }
 }
 
-:root[data-theme="dark"] .brand-art-on-dark { display: block; }
-:root[data-theme="dark"] .brand-art-on-light { display: none; }
+:root[data-theme="dark"] .brand-monogram .brand-art-on-dark { display: block; }
+:root[data-theme="dark"] .brand-monogram .brand-art-on-light { display: none; }

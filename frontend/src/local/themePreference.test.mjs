@@ -836,3 +836,27 @@ test("each cut of the mark reads on the ground it is shown against", () => {
     assert.ok(contrast("#0a2d1c", surface) >= 7, `the green cut must read on ${surface}`);
   }
 });
+
+
+test("only one cut of the mark can be visible at a time", () => {
+  // The login screen rendered the mark twice, overlapping, and nothing here noticed. Both cuts are
+  // in the DOM by design -- CSS picks, because in System mode Windows can flip without React
+  // re-rendering -- so the hiding rule is the only thing stopping a double logo.
+  //
+  // It lost on specificity, not on order. `.brand-monogram img` sets `display: block` and scores
+  // 0,1,1; a bare `.brand-art-on-dark` scores 0,1,0 and is beaten wherever it sits in the file.
+  // Dark mode looked right purely because its rules carry an extra selector and were already
+  // winning. So this asserts the shape that makes them win, rather than that they exist.
+  const appCss = readFileSync(new URL("../App.css", import.meta.url), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+  const rules = [...appCss.matchAll(/([^{}]*\.brand-art-on-(?:dark|light))\s*\{([^}]*)\}/g)];
+  assert.ok(rules.length >= 6, `expected the light/dark pair in all three theme blocks, found ${rules.length}`);
+  const tooWeak = rules
+    .map(([, selector]) => selector.trim())
+    .filter((selector) => !selector.includes(".brand-monogram"));
+  assert.deepEqual(
+    tooWeak,
+    [],
+    "these rules do not out-rank `.brand-monogram img { display: block }` and will not hide anything",
+  );
+});
