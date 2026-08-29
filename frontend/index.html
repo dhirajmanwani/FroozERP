@@ -7,20 +7,61 @@
     <link rel="apple-touch-icon" href="./branding/frooz-icon-192.png" />
     <link rel="manifest" href="./manifest.webmanifest" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="theme-color" content="#082116" />
+    <meta name="theme-color" content="#eef2ef" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#082116" media="(prefers-color-scheme: dark)" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="FroozERP" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <style>
+      /* The pre-React paint. theme.css has not loaded yet at this point, so the boot
+         splash carries its own copy of the three colour roles it needs, in the same
+         three-block shape (light :root, the guarded prefers-color-scheme block, then an
+         explicit data-theme="dark"). Values are the same palette entries the tokens use.
+         Without this the splash is a fixed dark screen that flashes white - or, on a
+         light theme, a dark screen that flashes light - which is the most visible
+         theming defect there is. */
+      :root {
+        color-scheme: light;
+        --boot-ground: #eef2ef;
+        --boot-ink: #0a2d1c;
+        --boot-ink-body: #123623;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root:not([data-theme="light"]) {
+          color-scheme: dark;
+          --boot-ground: #082116;
+          --boot-ink: #f6f3ea;
+          --boot-ink-body: #c8d8ce;
+        }
+      }
+      :root[data-theme="dark"] {
+        color-scheme: dark;
+        --boot-ground: #082116;
+        --boot-ink: #f6f3ea;
+        --boot-ink-body: #c8d8ce;
+      }
+      /* The reversed logo inks in cream and vanishes on paper; the plain one inks in
+         green and vanishes on the dark ground. Both ship, and the theme picks. */
+      .boot-logo-light { display: block; }
+      .boot-logo-dark { display: none; }
+      @media (prefers-color-scheme: dark) {
+        :root:not([data-theme="light"]) .boot-logo-light { display: none; }
+        :root:not([data-theme="light"]) .boot-logo-dark { display: block; }
+      }
+      :root[data-theme="dark"] .boot-logo-light { display: none; }
+      :root[data-theme="dark"] .boot-logo-dark { display: block; }
+    </style>
     <title>FroozERP - Feel the Freakin' Frooz | SRT Company</title>
   </head>
   <body>
     <div id="root">
-      <div style="min-height:100vh;display:grid;place-items:center;background:#082116;color:#f6f3ea;font-family:Inter,Segoe UI,Arial,sans-serif;padding:32px;text-align:center;">
+      <div style="min-height:100vh;display:grid;place-items:center;background:var(--boot-ground);color:var(--boot-ink);font-family:Inter,Segoe UI,Arial,sans-serif;padding:32px;text-align:center;">
         <div>
-          <img src="./branding/frooz-logo-reversed.svg" alt="Feel the Freakin' Frooz" style="width:min(360px,72vw);height:auto;display:block;margin:0 auto 22px;" />
+          <img class="boot-logo boot-logo-dark" src="./branding/frooz-logo-reversed.svg" alt="Feel the Freakin' Frooz" style="width:min(360px,72vw);height:auto;margin:0 auto 22px;" />
+          <img class="boot-logo boot-logo-light" src="./branding/frooz-logo.svg" alt="Feel the Freakin' Frooz" style="width:min(360px,72vw);height:auto;margin:0 auto 22px;" />
           <h1 style="font-size:24px;margin:0 0 8px;">Starting local services</h1>
-          <p style="font-size:14px;margin:0;color:#c8d8ce;">Preparing the local database and application shell.</p>
+          <p style="font-size:14px;margin:0;color:var(--boot-ink-body);">Preparing the local database and application shell.</p>
         </div>
       </div>
     </div>

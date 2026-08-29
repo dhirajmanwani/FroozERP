@@ -1,0 +1,390 @@
+/*
+ * The colour roles the app is painted with, in three states: Light, Dark, System.
+ *
+ * Why this file exists
+ * --------------------
+ * App.css carries ~390 hardcoded hex literals and almost no variables, which is why the
+ * app has only ever had one theme: a second theme would mean a second copy of every one
+ * of those literals. This file is the layer that makes a second theme possible at all -
+ * every colour role gets a name here once, a later stage converts App.css onto those
+ * names, and after that a theme is a change to this file rather than to 6,300 lines of
+ * stylesheet.
+ *
+ * The three-block shape, and why the order and the guard matter
+ * ------------------------------------------------------------
+ *   1. `:root`                                        - the complete light palette.
+ *   2. `@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) }`
+ *   3. `:root[data-theme="dark"]`
+ *
+ * "System" is not a third palette. It is the state where the document carries no
+ * `data-theme` attribute at all, so nothing but `prefers-color-scheme` decides - which is
+ * exactly how Windows' own Light/Dark/System setting behaves. That is why block 2 is
+ * needed and why `themePreference.js` stamps *nothing* for System.
+ *
+ * The `:not([data-theme="light"])` guard in block 2 is the half people forget: without it
+ * a person who explicitly picks Light on a machine set to dark gets the dark values back,
+ * because a media query outranks nothing and block 1 has already been overwritten. Block 3
+ * is the mirror of that: an explicit Dark choice on a light machine.
+ *
+ * The one rule this file must never break
+ * ---------------------------------------
+ * **Every token gets its value in `:root`.** A token defined only inside block 2 or 3 is
+ * undefined in the light state, so it falls back to nothing - and a colour that resolves to
+ * nothing is not a missing colour, it is the *other* theme's text on this theme's
+ * background: unreadable, and only on one of the three settings, so it survives review.
+ * Blocks 2 and 3 therefore only ever *redefine*; they never introduce.
+ * `themePreference.test.mjs` enforces all of that by parsing this file.
+ *
+ * Colours
+ * -------
+ * Every value here is from `frontend/src/local/brandPalette.js`, including the `rgba()`
+ * bases. `brandPalette.test.mjs` reads this file and fails on anything that is not, so a
+ * new colour goes in the palette with a comment saying what job it does, not in here.
+ *
+ * Contrast, measured (WCAG 2.1, worst case across --ground/--panel/--card/--raised/
+ * --raised-high in each theme):
+ *
+ *                     dark        light
+ *   --ink             12.0:1      13.2:1
+ *   --ink-strong      10.7:1      13.2:1
+ *   --ink-body         9.0:1      11.8:1
+ *   --ink-muted        5.4:1       6.8:1
+ *   --ink-faint        4.8:1       4.4:1   <- disabled/placeholder only, never reading text
+ *   --accent           6.3:1       4.7:1
+ *   --ink-on-accent    8.1:1       4.8:1   (against --accent, which fills the surface)
+ *   signals (worst)    4.8:1       5.3:1
+ */
+
+:root {
+  /* `color-scheme` is not decoration: it is what makes the webview paint native
+     scrollbars, form controls and the flash before first paint in the right theme. It is
+     stamped alongside the tokens in all three blocks for that reason. */
+  color-scheme: light;
+
+  /* --- surfaces -----------------------------------------------------------------
+     Light inverts the dark theme's elevation rule rather than mirroring it: on dark,
+     lifting a surface means going lighter; on light it means going *whiter*, so --card
+     through --raised-high all land on white and are separated by --line and the shadow
+     tokens instead of by hue. --ground is therefore the darkest light surface (1.13:1
+     against a white card), not the lightest, or cards would have nothing to sit on. */
+  --ground: #eef2ef;              /* the page itself */
+  --panel: #f7f9f7;               /* sidebar and deep panels sitting on the page */
+  --card: #ffffff;                /* a content card */
+  --raised: #ffffff;              /* a surface lifted off the page (dropdown, popover) */
+  --raised-high: #ffffff;         /* a surface lifted off a raised surface (modal) */
+  --track: #dfe9e2;               /* scrollbar troughs, inset wells */
+  --track-thumb: #8fab9c;         /* the scrollbar itself - must be visible in its trough */
+  --scrim: rgba(10, 45, 28, 0.45);   /* the dim behind a modal */
+
+  /* --- elevation ----------------------------------------------------------------
+     Colour only; the offsets and blur stay with the rule that uses them. Light shadows
+     are far weaker than dark ones because a shadow on paper is contact, not depth. */
+  --shadow-soft: rgba(10, 45, 28, 0.08);
+  --shadow-strong: rgba(10, 45, 28, 0.18);
+
+  /* --- text ---------------------------------------------------------------------
+     The dark theme has five steps between brightest and faint; paper has four, because
+     the top of a light ramp runs out of room long before the bottom does. --ink-strong
+     therefore lands on the heading colour here rather than one step below it. */
+  --ink: #0a2d1c;                 /* headings, primary values */
+  --ink-strong: #0a2d1c;          /* emphasised text */
+  --ink-strong-warm: #0a2d1c;     /* the same weight where the surroundings are warmer */
+  --ink-body: #123623;            /* ordinary reading text */
+  --ink-body-warm: #123623;
+  --ink-muted: #2c5d43;           /* labels, secondary detail */
+  --ink-muted-warm: #2c5d43;
+  --ink-faint: #4a7a61;           /* disabled, placeholder - not a reading colour */
+  --ink-on-accent: #f6f3ea;       /* text sitting on an accent-filled surface */
+
+  /* --- lines --------------------------------------------------------------------
+     --line and --line-strong are hairlines: they separate, they do not have to be
+     *seen*. A border that carries meaning on its own - a form control's outline, a
+     selected row's edge - needs 3:1 against its surface, which neither of them reaches,
+     so it uses --line-control. */
+  --line: #dfe9e2;                /* an ordinary divider */
+  --line-strong: #c8d8ce;         /* a divider that has to carry weight */
+  --line-soft: rgba(10, 45, 28, 0.1);   /* a hairline that works over any surface */
+  --line-control: #4a7a61;        /* a border that must be perceivable: 4.4:1 worst case */
+
+  /* --- neutral layers -----------------------------------------------------------
+     Translucent so that one value works on every surface underneath it - a solid hover
+     colour would need five variants, one per surface, and the fifth would be wrong. */
+  --fill-subtle: rgba(10, 45, 28, 0.03);
+  --fill: rgba(10, 45, 28, 0.06);
+  --fill-strong: rgba(10, 45, 28, 0.1);
+  --hover: rgba(10, 45, 28, 0.06);
+  --pressed: rgba(10, 45, 28, 0.12);
+
+  /* --- accent -------------------------------------------------------------------
+     The working accent is NOT the same gold in both themes. #d9ac52 is tuned for a dark
+     ground and measures 2.9:1 on white - it fails as text on paper, which is precisely
+     why ACCENT.deep exists. On light, "hover" also means *darker*: brightening a gold
+     that is already on white removes the only contrast it had. */
+  --accent: #8a6520;              /* the working accent */
+  --accent-bright: #6b4d18;       /* hover, focus - darker here, see above */
+  --accent-soft: rgba(138, 101, 32, 0.1);    /* a translucent accent wash */
+  --accent-wash: rgba(138, 101, 32, 0.06);   /* the faintest accent tint */
+  --accent-line: rgba(138, 101, 32, 0.28);
+  --accent-line-strong: rgba(138, 101, 32, 0.5);
+  --accent-muted: #eed08d;        /* an accent surface switched on but unavailable */
+  --accent-shadow: rgba(138, 101, 32, 0.18); /* the well under accent text */
+  --focus-ring: rgba(138, 101, 32, 0.45);
+
+  /* --- signals ------------------------------------------------------------------
+     Five roles each, because a signal is never just one colour: the base is text and
+     icons on the page, -strong is the loud fill or hover, -soft is the surface a message
+     sits on, -line is that surface's border and -ink is the text on it.
+
+     The light bases are deliberately not the dark ones. #ef4444 measures 3.76:1 on white
+     and #22c55e measures 2.28:1 - both fail as text, and a warning nobody can read is
+     worse than no warning. The dark bases stay bright for the same reason inverted. */
+  --danger: #7f1d1d;
+  --danger-strong: #ef4444;
+  --danger-soft: #fecaca;
+  --danger-line: #fca5a5;
+  --danger-ink: #7f1d1d;
+
+  --success: #166534;
+  --success-strong: #22c55e;
+  --success-soft: #bbf7d0;
+  --success-line: #86efac;
+  --success-ink: #166534;
+
+  --info: #0369a1;
+  --info-strong: #0ea5e9;
+  --info-soft: #e0f2fe;
+  --info-line: #bae6fd;
+  --info-ink: #0369a1;
+
+  /* Warning and attention have no pale wash in the palette the way danger, success and
+     info do, so their surfaces are built translucently out of their own base. */
+  --warning: #9a3412;
+  --warning-strong: #fb923c;
+  --warning-soft: rgba(154, 52, 18, 0.1);
+  --warning-line: rgba(154, 52, 18, 0.3);
+  --warning-ink: #9a3412;
+
+  --attention: #854d0e;
+  --attention-strong: #facc15;
+  --attention-soft: rgba(133, 77, 14, 0.1);
+  --attention-line: rgba(133, 77, 14, 0.3);
+  --attention-ink: #854d0e;
+
+  /* --- printed output -----------------------------------------------------------
+     Defined once and never redefined below, on purpose: an invoice is white paper in
+     both themes, and a dark-themed invoice is a wasted cartridge and an unreadable bill.
+     Anything inside a print surface uses these, not the tokens above. */
+  --paper: #ffffff;
+  --paper-ink: #111111;
+  --paper-ink-muted: #2c5d43;
+  --paper-line: #c8d8ce;
+  --accent-deep: #8a6520;         /* accent text where it must survive a light surface */
+
+  /* Translucent panel veils. In dark these recede a surface toward the page; in light they lift it
+     toward white. That inversion is the reason they had to become tokens: as literals they were 83
+     hardcoded dark-green washes that would have smeared across a white page. */
+  --veil-faint: rgba(255, 255, 255, 0.35);
+  --veil-subtle: rgba(255, 255, 255, 0.55);
+  --veil: rgba(255, 255, 255, 0.7);
+  --veil-strong: rgba(255, 255, 255, 0.85);
+  --veil-heavy: rgba(255, 255, 255, 0.92);
+  --veil-solid: rgba(255, 255, 255, 0.97);
+  --card-veil-soft: rgba(255, 255, 255, 0.62);
+  --card-veil: rgba(255, 255, 255, 0.8);
+  --card-veil-solid: rgba(255, 255, 255, 0.97);
+  --shadow-faint: rgba(10, 45, 28, 0.04);
+  --shadow-deep: rgba(10, 45, 28, 0.26);
+  --scrim-soft: rgba(10, 45, 28, 0.28);
+  --scrim-strong: rgba(10, 45, 28, 0.5);
+
+    --veil-faint: rgba(8, 33, 22, 0.2);
+    --veil-subtle: rgba(8, 33, 22, 0.35);
+    --veil: rgba(8, 33, 22, 0.45);
+    --veil-strong: rgba(8, 33, 22, 0.62);
+    --veil-heavy: rgba(8, 33, 22, 0.78);
+    --veil-solid: rgba(8, 33, 22, 0.96);
+    --card-veil-soft: rgba(18, 54, 35, 0.62);
+    --card-veil-soft: rgba(18, 54, 35, 0.62);
+  --card-veil: rgba(18, 54, 35, 0.8);
+    --card-veil-solid: rgba(18, 54, 35, 0.97);
+    --shadow-faint: rgba(3, 17, 11, 0.16);
+    --shadow-deep: rgba(3, 17, 11, 0.78);
+    --scrim-soft: rgba(3, 17, 11, 0.42);
+    --scrim-strong: rgba(3, 17, 11, 0.78);
+
+  --veil-faint: rgba(8, 33, 22, 0.2);
+  --veil-subtle: rgba(8, 33, 22, 0.35);
+  --veil: rgba(8, 33, 22, 0.45);
+  --veil-strong: rgba(8, 33, 22, 0.62);
+  --veil-heavy: rgba(8, 33, 22, 0.78);
+  --veil-solid: rgba(8, 33, 22, 0.96);
+  --card-veil: rgba(18, 54, 35, 0.8);
+  --card-veil-solid: rgba(18, 54, 35, 0.97);
+  --shadow-faint: rgba(3, 17, 11, 0.16);
+  --shadow-deep: rgba(3, 17, 11, 0.78);
+  --scrim-soft: rgba(3, 17, 11, 0.42);
+  --scrim-strong: rgba(3, 17, 11, 0.78);
+}
+
+/* Block 2: the System state on a machine set to dark.
+   The :not([data-theme="light"]) guard is what lets an explicit Light choice win here. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    --ground: #03110b;
+    --panel: #092318;
+    --card: #123623;
+    --raised: #0d2e1f;
+    --raised-high: #0f3222;
+    --track: #0c2b1d;
+    --track-thumb: #2c5d43;
+    --scrim: rgba(3, 17, 11, 0.72);
+
+    --shadow-soft: rgba(3, 17, 11, 0.42);
+    --shadow-strong: rgba(3, 17, 11, 0.55);
+
+    --ink: #f6f3ea;
+    --ink-strong: #dfe9e2;
+    --ink-strong-warm: #e2eae5;
+    --ink-body: #c8d8ce;
+    --ink-body-warm: #cedbd3;
+    --ink-muted: #8fab9c;
+    --ink-muted-warm: #97ada1;
+    --ink-faint: #7aa48f;
+    --ink-on-accent: #082116;
+
+    --line: #2c5d43;
+    --line-strong: #4a7a61;
+    --line-soft: rgba(143, 171, 156, 0.12);
+    --line-control: #8fab9c;
+
+    --fill-subtle: rgba(143, 171, 156, 0.07);
+    --fill: rgba(143, 171, 156, 0.12);
+    --fill-strong: rgba(143, 171, 156, 0.2);
+    --hover: rgba(143, 171, 156, 0.16);
+    --pressed: rgba(143, 171, 156, 0.22);
+
+    --accent: #d9ac52;
+    --accent-bright: #e6c274;
+    --accent-soft: rgba(217, 172, 82, 0.12);
+    --accent-wash: rgba(217, 172, 82, 0.07);
+    --accent-line: rgba(217, 172, 82, 0.28);
+    --accent-line-strong: rgba(217, 172, 82, 0.45);
+    --accent-muted: #4a3a14;
+    --accent-shadow: #2b1f06;
+    --focus-ring: rgba(217, 172, 82, 0.45);
+
+    --danger: #f87171;
+    --danger-strong: #fca5a5;
+    --danger-soft: rgba(239, 68, 68, 0.16);
+    --danger-line: rgba(248, 113, 113, 0.45);
+    --danger-ink: #fecaca;
+
+    --success: #4ade80;
+    --success-strong: #86efac;
+    --success-soft: rgba(34, 197, 94, 0.14);
+    --success-line: rgba(74, 222, 128, 0.4);
+    --success-ink: #bbf7d0;
+
+    --info: #38bdf8;
+    --info-strong: #7dd3fc;
+    --info-soft: rgba(56, 189, 248, 0.14);
+    --info-line: rgba(56, 189, 248, 0.4);
+    --info-ink: #bae6fd;
+
+    --warning: #fdba74;
+    --warning-strong: #fb923c;
+    --warning-soft: rgba(253, 186, 116, 0.14);
+    --warning-line: rgba(251, 146, 60, 0.4);
+    --warning-ink: #fdba74;
+
+    --attention: #fde047;
+    --attention-strong: #facc15;
+    --attention-soft: rgba(253, 224, 71, 0.14);
+    --attention-line: rgba(250, 204, 21, 0.4);
+    --attention-ink: #fde047;
+  }
+}
+
+/* Block 3: an explicit Dark choice, which has to win on a machine set to light.
+   Identical to block 2 by necessity - CSS has no way to share a declaration list across a
+   media-query boundary - and identical by *test*: themePreference.test.mjs compares the two
+   blocks token for token and value for value, because a toggle and an OS setting that
+   disagree is a bug nobody would find by looking. Edit one, edit the other. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --ground: #03110b;
+  --panel: #092318;
+  --card: #123623;
+  --raised: #0d2e1f;
+  --raised-high: #0f3222;
+  --track: #0c2b1d;
+  --track-thumb: #2c5d43;
+  --scrim: rgba(3, 17, 11, 0.72);
+
+  --shadow-soft: rgba(3, 17, 11, 0.42);
+  --shadow-strong: rgba(3, 17, 11, 0.55);
+
+  --ink: #f6f3ea;
+  --ink-strong: #dfe9e2;
+  --ink-strong-warm: #e2eae5;
+  --ink-body: #c8d8ce;
+  --ink-body-warm: #cedbd3;
+  --ink-muted: #8fab9c;
+  --ink-muted-warm: #97ada1;
+  --ink-faint: #7aa48f;
+  --ink-on-accent: #082116;
+
+  --line: #2c5d43;
+  --line-strong: #4a7a61;
+  --line-soft: rgba(143, 171, 156, 0.12);
+  --line-control: #8fab9c;
+
+  --fill-subtle: rgba(143, 171, 156, 0.07);
+  --fill: rgba(143, 171, 156, 0.12);
+  --fill-strong: rgba(143, 171, 156, 0.2);
+  --hover: rgba(143, 171, 156, 0.16);
+  --pressed: rgba(143, 171, 156, 0.22);
+
+  --accent: #d9ac52;
+  --accent-bright: #e6c274;
+  --accent-soft: rgba(217, 172, 82, 0.12);
+  --accent-wash: rgba(217, 172, 82, 0.07);
+  --accent-line: rgba(217, 172, 82, 0.28);
+  --accent-line-strong: rgba(217, 172, 82, 0.45);
+  --accent-muted: #4a3a14;
+  --accent-shadow: #2b1f06;
+  --focus-ring: rgba(217, 172, 82, 0.45);
+
+  --danger: #f87171;
+  --danger-strong: #fca5a5;
+  --danger-soft: rgba(239, 68, 68, 0.16);
+  --danger-line: rgba(248, 113, 113, 0.45);
+  --danger-ink: #fecaca;
+
+  --success: #4ade80;
+  --success-strong: #86efac;
+  --success-soft: rgba(34, 197, 94, 0.14);
+  --success-line: rgba(74, 222, 128, 0.4);
+  --success-ink: #bbf7d0;
+
+  --info: #38bdf8;
+  --info-strong: #7dd3fc;
+  --info-soft: rgba(56, 189, 248, 0.14);
+  --info-line: rgba(56, 189, 248, 0.4);
+  --info-ink: #bae6fd;
+
+  --warning: #fdba74;
+  --warning-strong: #fb923c;
+  --warning-soft: rgba(253, 186, 116, 0.14);
+  --warning-line: rgba(251, 146, 60, 0.4);
+  --warning-ink: #fdba74;
+
+  --attention: #fde047;
+  --attention-strong: #facc15;
+  --attention-soft: rgba(253, 224, 71, 0.14);
+  --attention-line: rgba(250, 204, 21, 0.4);
+  --attention-ink: #fde047;
+}

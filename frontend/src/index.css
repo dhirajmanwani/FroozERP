@@ -1,5 +1,8 @@
 /* Typefaces first: an @import has to precede every rule in the file. */
 @import "./fonts.css";
+/* The colour roles every stylesheet below is painted with. It has to load before
+   App.css, and index.css is imported before App.jsx, so this is that point. */
+@import "./theme.css";
 
 :root {
   --font-scale: 1;
@@ -9,8 +12,8 @@
   --font-size-lg: calc(16px * var(--font-scale));
   --font-size-xl: calc(22px * var(--font-scale));
   --font-size-2xl: calc(29px * var(--font-scale));
-  color: #f6f3ea;
-  background: #082116;
+  color: var(--ink);
+  background: var(--ground);
   font-family: "Inter Variable", Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -35,7 +38,7 @@
 }
 
 * {
-  scrollbar-color: #2c5d43 #0c2b1d;
+  scrollbar-color: var(--track-thumb) var(--track);
   scrollbar-width: thin;
 }
 
@@ -43,7 +46,7 @@ body {
   min-width: 320px;
   min-height: 100vh;
   margin: 0;
-  background: #082116;
+  background: var(--ground);
   font-size: var(--font-size-base);
 }
 

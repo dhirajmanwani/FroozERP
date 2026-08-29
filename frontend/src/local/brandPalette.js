@@ -47,7 +47,11 @@ export const GROUND = Object.freeze({
 // --- Text ramp ---------------------------------------------------------------
 
 export const INK = Object.freeze({
-  faint: "#4a7a61", // disabled, placeholder
+  faint: "#4a7a61", // a divider that has to carry weight on the dark ground
+  placeholder: "#7aa48f", // disabled and placeholder text. `faint` was 2.69:1 on a card - below the
+  // 4.5:1 a person needs to read it at all - so placeholders were decorative rather than legible.
+  // This clears 4.5:1 on every dark surface while staying dimmer than `muted`, which is the whole
+  // point of the step: quieter than a label, still readable.
   muted: "#8fab9c", // labels, secondary detail
   mutedWarm: "#97ada1", // the same weight where the surroundings are warmer
   body: "#c8d8ce", // ordinary reading text
@@ -66,6 +70,10 @@ export const INK = Object.freeze({
 export const ACCENT = Object.freeze({
   deepShadow: "#2b1f06", // gold text's shadow well
   deep: "#8a6520", // gold on a light surface, e.g. an invoice
+  // Hover/focus for `deep`. On a dark ground the accent brightens on hover; on a
+  // light one it has to darken instead, because brightening a gold that is already
+  // sitting on white is how you end up with an unreadable hover state. 7.8:1 on white.
+  deepHover: "#6b4d18",
   brandGold: BRAND.gold, // the logo's value - print, light surfaces
   accent: "#d9ac52", // the working accent on dark ground
   deepMuted: "#4a3a14", // an accent surface that is switched on but unavailable
@@ -91,6 +99,12 @@ export const SIGNAL = Object.freeze({
   dangerRoseSoft: "#fecdd3",
   dangerDeep: "#7f1d1d",
   success: "#22c55e",
+  // The four `*Ink`/`*Deep` entries below exist only because of the light theme. The
+  // bright signal colours above are tuned for a dark ground and every one of them
+  // fails as text on paper - #22c55e measures 2.28:1 on white, #38bdf8 2.14:1,
+  // #fb923c 2.26:1. These are the same signals darkened until they clear 4.5:1 there,
+  // so a warning stays readable in both themes. They are still not brand-coloured.
+  successDeep: "#166534", // success text on a light surface - 7.1:1 on white
   successBright: "#4ade80",
   successSoft: "#86efac",
   successWash: "#bbf7d0",
@@ -101,6 +115,7 @@ export const SIGNAL = Object.freeze({
   infoDeep: "#0ea5e9",
   infoCyan: "#22d3ee",
   infoNavy: "#082f49",
+  infoInk: "#0369a1", // info text on a light surface - 5.9:1 on white
   // The severity ramp on the assistant panel runs info -> attention -> high ->
   // critical. It stays blue/yellow/orange/red on purpose: recoloured into the
   // brand's own gold, "attention" and "high" would read as decoration.
@@ -108,6 +123,8 @@ export const SIGNAL = Object.freeze({
   attentionDeep: "#facc15",
   warning: "#fdba74",
   warningDeep: "#fb923c",
+  warningInk: "#9a3412", // warning text on a light surface - 7.3:1 on white
+  attentionInk: "#854d0e", // attention text on a light surface - 6.9:1 on white
 });
 
 // --- Absolutes ---------------------------------------------------------------

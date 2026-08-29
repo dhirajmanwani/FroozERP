@@ -28,6 +28,10 @@ const repoRoot = join(here, "..", "..", "..");
 // site and an invoice on the same day should not be able to tell they were built by
 // different hands.
 const GUARDED_FILES = [
+  // theme.css first: it is the token layer every other stylesheet is being converted onto,
+  // so a colour invented there would spread into all of them under a name that looks
+  // official. It is held to exactly the same standard as App.css, and for the same reason.
+  "frontend/src/theme.css",
   "frontend/src/App.css",
   "frontend/src/index.css",
   "frontend/index.html",
@@ -135,7 +139,40 @@ for (const relative of GUARDED_FILES) {
 test("the app stylesheet is actually being checked", () => {
   // A guard that silently reads an empty file passes forever. Prove there is
   // something there to guard.
+  //
+  // This used to demand more than 200 hex literals, which was true when every colour was written
+  // where it was used. Converting App.css to theme tokens took it to 154 and tripped the canary --
+  // a *successful* change failing the test that exists to prove the file is real. The count was
+  // never the point; "this file still carries the app's colour" was.
+  //
+  // So it now counts colour in either form. A token reference is as much a colour decision as a
+  // literal, and the total cannot be eroded by more conversion: every literal that becomes a token
+  // moves between the two terms rather than leaving the sum.
   const appCss = read("frontend/src/App.css");
   assert.ok(appCss.length > 50000, "App.css looks unexpectedly small - is the path right?");
-  assert.ok(hexLiterals(appCss).length > 200, "expected App.css to be full of colour literals");
+  const literals = hexLiterals(appCss).length;
+  const tokenUses = (appCss.match(/var\(--/g) || []).length;
+  assert.ok(
+    literals + tokenUses > 200,
+    `expected App.css to carry the app's colour, found ${literals} literals and ${tokenUses} token uses`,
+  );
+});
+
+test("App.css is mostly themed rather than hardcoded", () => {
+  // The direction of travel, pinned so it cannot quietly reverse. Every literal left in App.css is
+  // a colour that cannot follow the light theme, so a change that adds them back is a change that
+  // un-themes part of the app -- and it would do so silently, since a palette-approved literal
+  // passes every other guard in this file.
+  const appCss = read("frontend/src/App.css");
+  const outsidePrint = appCss.replace(/@media print[\s\S]*?\n\}/g, "");
+  const literals = hexLiterals(outsidePrint).length;
+  // A ratchet, not a target. 80 at the time of writing, down from 393 before the token conversion.
+  // The ceiling sits just above that so the number can only be driven down; raising it needs a
+  // deliberate edit here, which is the conversation this test exists to force.
+  assert.ok(
+    literals <= 95,
+    `${literals} hardcoded colours outside print styles, up from the 80 this ratchet was set at. `
+    + "Prefer a token from theme.css: a literal here is a colour that stays dark when the app goes "
+    + "light. If the increase is deliberate, raise the ceiling in this test and say why.",
+  );
 });
