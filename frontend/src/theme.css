@@ -196,6 +196,13 @@
   --shadow-deep: rgba(10, 45, 28, 0.26);
   --scrim-soft: rgba(10, 45, 28, 0.28);
   --scrim-strong: rgba(10, 45, 28, 0.5);
+
+  /* The mark's tile. The artwork is the leaf alone with no background of its own, so the block it
+     sits on is drawn here: green with the cream leaf on dark, white with the green leaf on light.
+     A token rather than a surface role, because it follows the *logo*, not the page -- it stays a
+     white tile on a white card, where only the leaf needs to read. */
+  --brand-tile: #ffffff;
+  --brand-tile-line: #c8d8ce;
 }
 
 /* Block 2: the System state on a machine set to dark.
@@ -289,6 +296,8 @@
     --shadow-deep: rgba(3, 17, 11, 0.78);
     --scrim-soft: rgba(3, 17, 11, 0.42);
     --scrim-strong: rgba(3, 17, 11, 0.78);
+    --brand-tile: #123623;
+    --brand-tile-line: rgba(217, 172, 82, 0.48);
   }
 }
 
@@ -385,4 +394,6 @@
   --shadow-deep: rgba(3, 17, 11, 0.78);
   --scrim-soft: rgba(3, 17, 11, 0.42);
   --scrim-strong: rgba(3, 17, 11, 0.78);
+  --brand-tile: #123623;
+  --brand-tile-line: rgba(217, 172, 82, 0.48);
 }
