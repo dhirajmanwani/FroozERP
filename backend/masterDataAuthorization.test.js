@@ -270,6 +270,11 @@ const UNGUARDED_BY_DESIGN = [
   // that is why it sits on A-4's public allow-list. A-5 gave it the same failed-attempt lock as
   // /login, so "no permission check" no longer means "unlimited guessing".
   "POST /bootstrap/first-owner-device",
+  // A-6 Gate 1.5. Writes one column on one row: the caller's own session revocation counter. The
+  // user id comes from the verified token and is never read from the request, so there is no other
+  // account it could be pointed at and no permission to check - "may I sign myself out" has one
+  // answer. Reading the id from the body instead is exactly the A-3 bug this list was built after.
+  "POST /auth/sign-out",
   "POST /devices/activate",
   "POST /api/device/register",
   "POST /api/sync/register-device",

@@ -87,7 +87,11 @@ test("the refusal runs behind authentication, not in front of it", () => {
   // Ahead of the auth gate a stranger probing a retired path learns it exists and receives an
   // upgrade hint rather than a refusal, and the route-coverage test rightly stops counting these
   // routes as authenticated.
-  const authIndex = backendCode.indexOf("if (PUBLIC_ROUTES.has(publicRouteKey(req))) return next();");
+  // Anchored on the gate's condition rather than on what it returns. What this test protects is the
+  // *ordering* - authentication before the retired-write refusal - and that is unchanged by how the
+  // public branch is handled. It previously matched `... return next();` and broke when public
+  // routes started attaching an optional session (A-6 Gate 3.1) despite the ordering being intact.
+  const authIndex = backendCode.indexOf("if (PUBLIC_ROUTES.has(publicRouteKey(req)))");
   const retireIndex = backendCode.indexOf("const replacement = retiredLegacyWriteReplacement(req.method, req.path);");
   assert.ok(authIndex > 0 && retireIndex > 0, "both gates must exist");
   assert.ok(authIndex < retireIndex, "authentication must come first");

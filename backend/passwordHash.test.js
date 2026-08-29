@@ -1,24 +1,41 @@
 /**
- * Stage A-1 — password hashing.
+ * Password hashing — stages A-1 (scrypt), A-2 (no plaintext fallback) and A-5 (no legacy digest).
  *
  * The properties that matter here are the ones whose absence is invisible until a breach: that a
- * hash is salted (so identical passwords do not look identical), that legacy rows still verify (so
- * nobody is locked out by the upgrade), and that `needsRehash` never fires on a failed attempt (so
- * an attacker's guess can never overwrite a stored hash).
+ * hash is salted (so identical passwords do not look identical), that `needsRehash` never fires on
+ * a failed attempt (so an attacker's guess can never overwrite a stored hash), and — since A-5 —
+ * that neither retired format authenticates anybody, whatever password is supplied with it.
+ *
+ * The A-5 tests are written as the inverse of the A-1 ones they replace. A-1's contract was "a
+ * legacy row still verifies"; A-5's is "a legacy row never verifies, and says so specifically
+ * enough that the account can be told to reset". Both halves are asserted, because a change that
+ * silently turned the specific refusal back into a generic wrong-password answer would leave a real
+ * shopkeeper retyping a correct password with no way to learn why it fails.
  */
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
 const {
   hashPassword,
   hashPasswordSync,
   verifyPassword,
-  legacySha256,
   PASSWORD_FORMATS,
   SCRYPT_PARAMS,
 } = require("./passwordHash");
+
+/**
+ * The retired pre-A-1 hash, reproduced here rather than imported.
+ *
+ * A-5 deleted `legacySha256` from the module, and that deletion is the point: production code has
+ * no way left to compute this digest. The tests still need to *build* such a row to prove it is
+ * refused, so the algorithm lives here, in the only place that should still know it.
+ */
+const legacySha256 = (password) =>
+  crypto.createHash("sha256").update(String(password || ""), "utf8").digest("hex");
 
 test("a hashed password verifies, and a wrong one does not", async () => {
   const stored = await hashPassword("correct horse battery staple");
@@ -48,18 +65,48 @@ test("the plaintext password never appears in the stored hash", async () => {
   assert.ok(!stored.includes(password));
 });
 
-test("a legacy SHA-256 row still verifies, and is flagged for upgrade", async () => {
-  // The whole point of A-1: no forced reset, nobody locked out.
+test("a legacy SHA-256 row no longer authenticates, even with the right password (A-5)", async () => {
+  // THE A-5 regression test. An unsalted single-round digest falls to a rainbow table in seconds,
+  // so anyone holding a copy of `users` could recover the password and sign in with it. While the
+  // verifier accepted this format, the weakest hash in the table was still a working credential.
+  //
+  // Asserted on the *correct* password on purpose: a test using a wrong password would still pass
+  // if the whole branch were restored, and would prove nothing.
   const stored = legacySha256("legacy-user-password");
   const result = await verifyPassword("legacy-user-password", stored);
-  assert.equal(result.ok, true);
-  assert.equal(result.format, PASSWORD_FORMATS.LEGACY_SHA256);
-  assert.equal(result.needsRehash, true, "a legacy hash must be upgraded on next login");
+  assert.equal(result.ok, false, "a retired unsalted digest must never authenticate");
+  assert.equal(result.needsRehash, false, "and must never be treated as an upgradable success");
 });
 
-test("a legacy row rejects the wrong password", async () => {
-  const stored = legacySha256("legacy-user-password");
-  assert.equal((await verifyPassword("not-it", stored)).ok, false);
+test("a legacy row is refused by name, so the account can be told to reset", async () => {
+  // The other half of A-5. Refusing is not enough on its own: if this reported UNRECOGNIZED or
+  // UNKNOWN, `/login` could not distinguish "old format, reset it" from "wrong password", and the
+  // person at the counter would retype a correct password forever.
+  const result = await verifyPassword("anything at all", legacySha256("legacy-user-password"));
+  assert.equal(result.format, PASSWORD_FORMATS.LEGACY_SHA256);
+});
+
+test("a legacy row cannot confirm a guess", async () => {
+  // The refusal is by shape, not by comparison — the retired algorithm is not run on the supplied
+  // password at all. If it were, the specific `PASSWORD_RESET_REQUIRED` answer would become an
+  // oracle: an attacker could learn a password was correct from an account they cannot enter.
+  const stored = legacySha256("the-real-one");
+  const right = await verifyPassword("the-real-one", stored);
+  const wrong = await verifyPassword("nowhere-near-it", stored);
+  assert.deepEqual(right, wrong, "correct and incorrect passwords must be reported identically");
+});
+
+test("the module offers no way to compute a legacy digest", () => {
+  // Deleting the branch but leaving the function exported would let the next caller reintroduce
+  // the comparison in a line of code, somewhere with no test watching.
+  const passwordHash = require("./passwordHash");
+  assert.equal(passwordHash.legacySha256, undefined, "the retired algorithm must not be exported");
+  const source = fs.readFileSync(path.join(__dirname, "passwordHash.js"), "utf8");
+  assert.doesNotMatch(
+    source,
+    /createHash\(\s*["']sha256["']\s*\)/,
+    "passwordHash.js must not hash anything with plain SHA-256",
+  );
 });
 
 test("needsRehash is never true for a failed attempt", async () => {
@@ -128,8 +175,9 @@ test("a corrupt scrypt hash fails closed instead of throwing", async () => {
 
 test("a stored hash is compared after trimming, matching the previous behaviour", async () => {
   // The old passwordMatches trimmed the stored column; rows with stray whitespace must not
-  // suddenly stop working.
-  const stored = legacySha256("padded");
+  // suddenly stop working. Written against a scrypt hash since A-5 — the legacy row this used to
+  // use no longer verifies whether it is trimmed or not, so it could no longer prove anything.
+  const stored = await hashPassword("padded");
   const result = await verifyPassword("padded", `  ${stored}  `);
   assert.equal(result.ok, true);
 });
@@ -146,16 +194,6 @@ test("a plaintext-valued password column no longer authenticates (A-2)", async (
   assert.equal(result.needsRehash, false);
 });
 
-test("a legacy SHA-256 row still authenticates after A-2", async () => {
-  // The other half of A-2's contract: removing the plaintext bypass must not take the legacy
-  // migration path with it, or every user who has not logged in since A-1 is locked out.
-  const stored = legacySha256("still-works");
-  const result = await verifyPassword("still-works", stored);
-  assert.equal(result.ok, true);
-  assert.equal(result.format, PASSWORD_FORMATS.LEGACY_SHA256);
-  assert.equal(result.needsRehash, true);
-});
-
 test("the rejection does not reveal whether the plaintext guess was correct", async () => {
   // Reporting "your guess matched the stored plaintext, but you may not come in" would leak the
   // exact fact the rejection exists to protect. A right guess and a wrong one are indistinguishable.
@@ -166,7 +204,9 @@ test("the rejection does not reveal whether the plaintext guess was correct", as
 
 test("a legacy-looking value is treated as a hash, not as a plaintext password", async () => {
   // 64 hex characters is the legacy hash shape. Someone whose literal password is 64 hex chars
-  // must not authenticate against a row storing that same string as plaintext.
+  // must not authenticate against a row storing that same string as plaintext. Since A-5 nothing
+  // with this shape authenticates at all, but the classification still has to be the hash one:
+  // falling through to UNRECOGNIZED would lose the specific "reset this account" answer.
   const sixtyFourHex = "a".repeat(64);
   const result = await verifyPassword(sixtyFourHex, sixtyFourHex);
   assert.equal(

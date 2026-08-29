@@ -13,6 +13,7 @@ const {
   hashPassword,
   hashPasswordSync,
   verifyPassword,
+  PASSWORD_FORMATS,
 } = require("./passwordHash");
 const {
   approvedAliasCredentialFailure,
@@ -48,10 +49,12 @@ const {
 // A-3: `extractSessionToken` accepts the session token from `Authorization: Bearer` as well as the
 // long-standing `x-froozerp-device-session` header, so a client that sends only the standard header
 // authenticates on the routes that already verify sessions. Same token, same verification.
-const { createRequireAuth, extractSessionToken } = require("./authMiddleware");
+const { createRequireAuth, createAttachOptionalAuth, extractSessionToken } = require("./authMiddleware");
+const { resolveOwnerBootstrapTransport } = require("./ownerBootstrapPolicy");
 const { resolveSessionSecret } = require("./sessionSecret");
 const { lockMessage, registerFailedAttempt, resolveLockState } = require("./loginLockout");
 const { reconcileCompanyTotals, summariseBranches } = require("./allBranchesSummary");
+const { callerKey, registerAttempt, throttleMessage } = require("./publicRouteThrottle");
 const {
   REFERENCE_BOOTSTRAP_PROTOCOL,
   captureReferenceBootstrap,
@@ -60,6 +63,7 @@ const {
 } = require("./syncReferenceBootstrap");
 
 const app = express();
+
 app.use(express.json({ limit: "25mb" }));
 
 const frontendDistCandidates = [
@@ -167,6 +171,25 @@ const APP_MODES = new Set([
   "CUSTOM_API_URL",
 ]);
 const deploymentType = cloudServerRuntime ? "cloud" : "local";
+
+/**
+ * A-6 Gate 2.4 — trust exactly one proxy hop when hosted, and none otherwise.
+ *
+ * Railway terminates TLS and forwards, so without this every request appears to come from the
+ * platform's own address: `req.ip` is the proxy, `X-Forwarded-For` is ignored, and every rate
+ * limit, lockout and audit row records the wrong origin. The failure is not that controls stop
+ * working — it is that they all key on one shared value, so one attacker looks like every user and
+ * every user looks like that attacker.
+ *
+ * `1`, not `true`. Trusting the whole chain lets a caller prepend any address they like to
+ * `X-Forwarded-For` and choose the origin the server records — turning a control into a decoration.
+ * One hop is the number of proxies actually in front of this app.
+ *
+ * Off entirely when not hosted: on the desktop the only client is loopback, and trusting a
+ * forwarded header there would let anything on the machine claim to be somewhere else.
+ */
+app.set("trust proxy", deploymentType === "cloud" ? 1 : false);
+
 const requestedAppMode = runtimeAppMode || "LOCAL_SINGLE_DEVICE";
 const configuredAppMode = APP_MODES.has(requestedAppMode) ? requestedAppMode : "LOCAL_SINGLE_DEVICE";
 const hostedCloudDeployment = deploymentType === "cloud" && configuredAppMode === "CLOUD_PRODUCTION";
@@ -618,6 +641,8 @@ const parseNonNegativeNumber = (value) => {
 
 const roundCurrency = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 const roundUnitCost = (value) => Math.round((Number(value) + Number.EPSILON) * 10000) / 10000;
+// Quantities carry three decimals (CLAUDE.md "Conventions"); money rounds to two.
+const roundQuantity = (value) => Math.round((Number(value) + Number.EPSILON) * 1000) / 1000;
 // Password hashing moved to ./passwordHash (auth-hardening A-1). `hashPassword` is now async and
 // salted; `hashPasswordSync` exists only for the schema bootstrap below, which interpolates a hash
 // into a SQL template literal and cannot await. The old unsalted SHA-256 lives on inside that
@@ -666,6 +691,11 @@ if (sessionSecretResolution.fatal) {
 }
 const deviceSessionSecret = sessionSecretResolution.secret;
 const requireAuth = createRequireAuth({ secret: deviceSessionSecret });
+// A-6 Gate 3.1. Public routes never run `requireAuth`, so `req.auth` is never set on one. A handler
+// that answers `req.auth ? more : {}` on a public route is therefore not gating those fields behind
+// a session - it is withholding them from everybody, operator included. This populates a session
+// when a valid one is presented and never denies, so the gate means what it reads as meaning.
+const attachOptionalAuth = createAttachOptionalAuth({ secret: deviceSessionSecret });
 
 /**
  * Auth-hardening A-4 — default-deny.
@@ -725,9 +755,14 @@ const PUBLIC_ROUTES = new Set([
   "POST /devices/activate",
   // The first-install escape hatch: on a fresh database no device is approved, so nobody can log in
   // and no token can exist. Self-authenticating — it verifies the owner's username and password
-  // itself and refuses once any approved owner device exists. Attacker gets: password guessing
-  // against the owner account, and on success an approved device. The sharpest edge on this list;
-  // it is here because behind `requireAuth` it could never run.
+  // itself and refuses once any approved owner device exists.
+  //
+  // A-6 Gate 3.3, 2026-08-22: it stays on this list, and is now refused before it reads anything.
+  // Removing the registration would have made the allow-list read as though the surface were gone
+  // while a handler still sat behind it; keeping it here and closing it inside is the honest shape,
+  // and it is what `ownerBootstrapPolicy.js` decides. Never available on a hosted deployment, and
+  // closed by default everywhere else. Attacker now gets: a 404 with no password comparison behind
+  // it, so nothing to guess against and no counter to move.
   "POST /bootstrap/first-owner-device",
   // Account recovery is by definition the flow for someone who cannot authenticate. Exactly these
   // five, and no other `/auth/recovery/*` path: `/auth/recovery/profile` and the
@@ -758,6 +793,23 @@ const PUBLIC_ROUTES = new Set([
  * later match it. That is the fail-closed direction, and it is the point: this comparison never
  * needs to guess what a path means.
  */
+/**
+ * A-6 Gate 3.2. Refuse a public route that is being guessed at, or return null to proceed.
+ *
+ * Applied to the three routes that answer a stranger before anyone has signed in: a device-id
+ * oracle, a 48-bit activation code, and an OTP sender that costs money and rings a real person's
+ * phone. Each is defensible with a limit and indefensible without one.
+ */
+const refusePublicFlood = (req, res, scope) => {
+  const attempt = registerAttempt({ key: callerKey(req, scope) });
+  if (attempt.allowed) return null;
+  res.set("Retry-After", String(attempt.retryAfterSeconds));
+  return res.status(429).json({
+    code: "TOO_MANY_ATTEMPTS",
+    message: throttleMessage(attempt.retryAfterSeconds),
+  });
+};
+
 const publicRouteKey = (req) => {
   const method = req.method === "HEAD" ? "GET" : req.method;
   const routePath = req.path.length > 1 && req.path.endsWith("/") ? req.path.slice(0, -1) : req.path;
@@ -797,9 +849,57 @@ if (frontendDistAvailable()) {
  * exact source text and would break under a per-route edit.
  */
 app.use((req, res, next) => {
-  if (PUBLIC_ROUTES.has(publicRouteKey(req))) return next();
+  if (PUBLIC_ROUTES.has(publicRouteKey(req))) return attachOptionalAuth(req, res, next);
   return requireAuth(req, res, next);
 });
+
+/**
+ * A-6 Gate 1.5 — a revoked session stops working everywhere, not only on sync.
+ *
+ * `session_revocation_version` was already carried in the token, already incremented when a
+ * password is reset or an account is disabled, and already compared against the database - but
+ * only inside `resolveSyncContext`. So a session revoked because somebody's password had been
+ * changed was refused by sync and accepted by the other 268 routes. The claim was read into
+ * `req.auth` by the middleware and then never compared to anything.
+ *
+ * This is a separate middleware rather than a change to `requireAuth` on purpose. `requireAuth` is
+ * synchronous and its verification is pure token maths with no I/O; making it async to fit a
+ * database read in would change the contract every one of its tests is written against, for a
+ * check that is not about the token's validity but about what has happened since it was minted.
+ * Mounted app-wide for the same reason `requireAuth` is: 285 handlers is 285 chances to miss one.
+ *
+ * It costs one primary-key lookup per authenticated request. That is affordable here and would not
+ * be everywhere: this file is the hosted backend and never runs on a shop's own machine, where the
+ * desktop gateway serves instead - so no counter's billing depends on this query answering.
+ */
+const revokedSessionGuard = async (req, res, next) => {
+  if (!req.auth) return next();
+  try {
+    const { rows } = await pool.query(
+      "SELECT session_revocation_version, active FROM users WHERE id = $1 LIMIT 1",
+      [req.auth.userId],
+    );
+    const user = rows[0];
+    if (!user) {
+      // The account is gone. A token for a deleted user is not a valid session.
+      return res.status(401).json({ code: "SESSION_REVOKED", message: "This sign-in is no longer valid. Sign in again." });
+    }
+    if (user.active === false) {
+      return res.status(401).json({ code: "SESSION_REVOKED", message: "This account is no longer active." });
+    }
+    if (Number(user.session_revocation_version || 0) !== Number(req.auth.sessionRevocationVersion || 0)) {
+      return res.status(401).json({ code: "SESSION_REVOKED", message: "This sign-in was ended. Sign in again." });
+    }
+    return next();
+  } catch (error) {
+    // Fail closed. A database that cannot answer "is this session still valid" has not said yes,
+    // and treating silence as approval is how a revoked session outlives its revocation.
+    console.error("session revocation check failed", error?.message || error);
+    return res.status(503).json({ code: "SESSION_CHECK_UNAVAILABLE", message: "Could not verify this sign-in. Try again shortly." });
+  }
+};
+
+app.use(revokedSessionGuard);
 
 // A-7 step 1. Legacy write routes that duplicate a correctly-scoped protocol-v3 route are refused
 // outright, whatever the scope mode. Their handlers filter with
@@ -899,13 +999,37 @@ const escapePowerShellSingleQuoted = (value) => String(value).replace(/'/g, "''"
  * Verify a password and report whether the stored hash should be upgraded (auth-hardening A-1).
  *
  * Replaces the old synchronous `passwordMatches`, which compared against an unsalted SHA-256 and
- * additionally accepted a plaintext-valued column. Both legacy shapes still verify here so no
- * existing user is locked out; `needsRehash` is how they get migrated, on successful login only.
- *
- * The plaintext branch is deleted in A-2 — it survives this stage solely to keep A-1's
- * "no behaviour change" contract.
+ * additionally accepted a plaintext-valued column. A-2 deleted the plaintext branch and A-5 the
+ * legacy-digest one; scrypt is the only format that authenticates. `needsRehash` now only signals a
+ * scrypt hash written at a lower cost than today's, upgraded on successful login.
  */
 const checkPassword = async (password, storedHash) => verifyPassword(password, storedHash);
+
+/**
+ * True when the stored value is not a credential this system can verify at all — so no password
+ * could ever open this account, and the person in front of the screen needs a reset rather than
+ * another attempt.
+ *
+ * The four shapes are: a retired unsalted SHA-256 digest (A-5), a pre-migration plaintext column
+ * (A-2), a corrupt or unreadable scrypt hash, and an empty password column. `SCRYPT` is the only
+ * format where a `false` result means "wrong password"; every other one means "wrong stored value".
+ *
+ * The distinction matters because the two need opposite responses. A wrong password should be
+ * counted toward the lockout and answered vaguely. An unusable stored value carries no information
+ * about the password at all — nothing was compared — so counting it would only lock an account that
+ * getting the password right can never unlock, and answering vaguely would leave a real staff
+ * member retyping a password that was correct all along.
+ */
+const storedPasswordIsUnusable = (verification) =>
+  Boolean(verification) && verification.format !== PASSWORD_FORMATS.SCRYPT;
+
+/**
+ * What to tell someone whose account cannot verify any password. Names the fix, not the format:
+ * "your hash is an unsalted SHA-256 digest" is true and useless to the person reading it.
+ */
+const PASSWORD_RESET_REQUIRED_MESSAGE =
+  "This account's saved password is in an old format that FroozERP no longer accepts. "
+  + "Use \"Forgot password\" to set a new one, or ask your Owner or Administrator to reset it.";
 
 /**
  * Upgrade a stored password hash after a successful login. Best-effort by design: a failure to
@@ -2568,6 +2692,89 @@ const initializeDatabase = async () => {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+
+    -- Customer orders (G7): the cloud half of the device tables in
+    -- src-tauri/migrations/sqlite/020_customer_orders.sql. An order is written on one device and
+    -- has to be visible on the others, so it travels as a whole-record UPSERT and is stored here
+    -- exactly as the device holds it, with the sync columns the rest of this file uses.
+    --
+    -- Deliberate choices, each of which has a reason that is not obvious:
+    --
+    --   * global_id is the device's opaque order id and the only key the sync path ever matches
+    --     on. id exists because every other table here has a serial. Entity ids are opaque
+    --     strings in this codebase; nothing coerces one to a number.
+    --   * order_no carries NO unique constraint. It is unique per device, and two devices can
+    --     mint the same one. A collision must not be able to reject an order permanently, because
+    --     a rejection is stored under its operation id and is never retried.
+    --   * product_global_id, sale_global_id, inventory_lot_global_id and customer_id stay
+    --     text and are never resolved to a numeric row id here. The POS item path does resolve
+    --     product_id, with a global_id fallback for products and none at all for lots; that
+    --     asymmetry is not copied.
+    --   * No CHECK on status or source, though the device has both. The handler validates
+    --     against the same two enums; keeping the constraint out of the schema means a later
+    --     device release that adds a status needs a handler change, not a migration on a database
+    --     this bootstrap is the only schema for.
+    --   * line_amount is NULL, never 0, when a line has no agreed rate. Zero would read as
+    --     "free" in every total downstream, and an unknown price is not a price of nothing.
+    CREATE TABLE IF NOT EXISTS customer_orders (
+      id BIGSERIAL PRIMARY KEY,
+      global_id VARCHAR(180) NOT NULL UNIQUE,
+      order_no VARCHAR(120),
+      source VARCHAR(30) NOT NULL DEFAULT 'PHONE',
+      company_id INTEGER,
+      branch_id INTEGER NOT NULL DEFAULT 1 REFERENCES branches(id),
+      operational_location_id INTEGER,
+      assignment_generation INTEGER,
+      customer_id VARCHAR(180),
+      customer_name VARCHAR(220) NOT NULL,
+      customer_mobile VARCHAR(40),
+      delivery_address TEXT,
+      status VARCHAR(30) NOT NULL DEFAULT 'RECEIVED',
+      reserved_at TIMESTAMP,
+      packed_at TIMESTAMP,
+      sent_at TIMESTAMP,
+      delivered_at TIMESTAMP,
+      cancelled_at TIMESTAMP,
+      cancellation_reason TEXT,
+      carrier VARCHAR(160),
+      carrier_reference VARCHAR(180),
+      tracking_url TEXT,
+      carrier_contact VARCHAR(120),
+      sale_global_id VARCHAR(180),
+      invoice_no VARCHAR(120),
+      notes TEXT,
+      created_by INTEGER REFERENCES users(id),
+      source_device_id VARCHAR(160),
+      entity_version INTEGER NOT NULL DEFAULT 1,
+      device_created_at TIMESTAMP,
+      device_updated_at TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      deleted_at TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS customer_orders_scope_idx
+      ON customer_orders (company_id, branch_id, status);
+    CREATE INDEX IF NOT EXISTS customer_orders_open_idx
+      ON customer_orders (branch_id, reserved_at, created_at)
+      WHERE status IN ('RECEIVED', 'PACKED') AND deleted_at IS NULL;
+
+    CREATE TABLE IF NOT EXISTS customer_order_items (
+      id BIGSERIAL PRIMARY KEY,
+      order_global_id VARCHAR(180) NOT NULL REFERENCES customer_orders(global_id) ON DELETE CASCADE,
+      global_id VARCHAR(180),
+      line_index INTEGER NOT NULL,
+      product_global_id VARCHAR(180) NOT NULL,
+      product_name VARCHAR(220) NOT NULL,
+      unit VARCHAR(40),
+      quantity NUMERIC(14,3) NOT NULL CHECK (quantity > 0),
+      agreed_rate NUMERIC(14,2),
+      line_amount NUMERIC(14,2),
+      inventory_lot_global_id VARCHAR(180),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (order_global_id, line_index)
+    );
+    CREATE INDEX IF NOT EXISTS customer_order_items_product_idx
+      ON customer_order_items (product_global_id, order_global_id);
 
     ALTER TABLE product_categories ADD COLUMN IF NOT EXISTS global_id VARCHAR(180);
     ALTER TABLE product_categories ADD COLUMN IF NOT EXISTS entity_version INTEGER NOT NULL DEFAULT 1;
@@ -7500,6 +7707,11 @@ app.get("/auth/recovery/readiness-report", async (req, res) => {
 });
 
 app.post("/auth/recovery/options", async (req, res) => {
+  // A-6 Gate 3.2. This route's answer differs for an account that exists and one that does not, so
+  // unlimited it is an account-existence oracle: feed it a list of names and it sorts them into
+  // staff and strangers. The generic message blunts a single reading of it; only a limit stops the
+  // enumeration.
+  if (refusePublicFlood(req, res, "recovery-options")) return;
   try {
     const identifier = cleanText(req.body.identifier);
     const purpose = cleanText(req.body.purpose || "password").toLowerCase();
@@ -7530,6 +7742,7 @@ app.post("/auth/recovery/options", async (req, res) => {
 });
 
 app.post("/auth/recovery/send-otp", async (req, res) => {
+  if (refusePublicFlood(req, res, "recovery-send-otp")) return;
   try {
     const identifier = cleanText(req.body.identifier);
     const purpose = cleanText(req.body.purpose || "password").toLowerCase() === "username" ? "username" : "password";
@@ -8479,7 +8692,11 @@ const hasApprovedOwnerDevice = async (client = pool) => {
 
 const normalizeSyncStatus = (value) => String(value || "").trim().toLowerCase();
 const SYNC_OPERATION_TYPES = new Set(["UPSERT", "DELETE", "CREATE", "UPDATE", "SALE_EDIT", "SALE_CANCEL"]);
-const SYNC_ENTITY_TYPES = new Set(["sync_test", "pos_sale"]);
+// Every entity type here must have an arm in the dispatch inside `processSyncOperation`. Adding a
+// name to this set and not to that switch is exactly the mistake the switch's default exists to
+// catch: an operation that reaches no handler of its own is rejected by name, not handed to
+// whichever handler happened to be last.
+const SYNC_ENTITY_TYPES = new Set(["sync_test", "pos_sale", "customer_order"]);
 const syncRateWindow = new Map();
 
 const requireSyncContext = async ({ userId, deviceId, branchId, operationalLocationId }, client = pool) => {
@@ -9510,6 +9727,398 @@ const processPosSaleCancelOperation = async (client, operation, context) => {
   };
 };
 
+/**
+ * Customer orders (G7) - the cloud half of `local_customer_orders` / `local_customer_order_items`.
+ *
+ * ## The wire contract
+ *
+ * One operation type, `UPSERT`, for creating an order and for every status change alike, carrying
+ * the whole record - header fields plus the full `items` array - every time, with a version that
+ * only ever goes up. Nothing about an order is sent as a delta.
+ *
+ * That is not laziness, it is the only shape that survives this transport. A push batch is sorted
+ * by `operation_id` *string* before it is processed, not by causality, so a status change can be
+ * handed to this function before the creation it follows. Rejections are stored under their
+ * operation id by `storeProcessedOperation` and replayed verbatim forever, so an operation rejected
+ * for arriving "too early" would never be retried - the order would be silently stuck at whatever
+ * state it happened to reach. A whole-record upsert has no ordering dependency to violate: whichever
+ * one arrives last and carries the highest version wins, and the others are duplicates.
+ *
+ * ## Last writer wins, and a loser is not an error
+ *
+ * A version lower than or equal to the stored one is answered `accepted` with `duplicate: true`,
+ * not rejected. Replays and echoes are the normal traffic of this system - the same device retrying
+ * an unacknowledged push, or a second device pushing an order it pulled - and answering "rejected"
+ * to one would both alarm the operator and, because the answer is stored, do it permanently.
+ *
+ * ## Scope comes from the session, never from the payload
+ *
+ * `company_id`, `branch_id`, `operational_location_id`, the creating user and the source device are
+ * all read from `context`, which was verified before the batch opened. A payload that names a
+ * different branch is stored under the session's branch anyway. (`processPosSaleEditOperation`
+ * reads `invoice.branch_id` from the payload; that is the counter-example, not the model.)
+ *
+ * ## Failure modes
+ *
+ * Every input-shaped failure returns `rejectOperation`, because `/api/sync/push` wraps the entire
+ * batch in one transaction and a throw here discards the acknowledgements of up to 49 innocent
+ * operations. Infrastructure failures - the table missing, the connection dropping - are deliberately
+ * *not* caught: a caught one could not be stored anyway (the transaction is already aborted), and
+ * turning a transient outage into a stored rejection would poison the order permanently. Letting it
+ * propagate rolls the batch back and leaves the device free to retry.
+ */
+const CUSTOMER_ORDER_STATUSES = new Set(["RECEIVED", "PACKED", "SENT", "DELIVERED", "CANCELLED", "RETURNED"]);
+const CUSTOMER_ORDER_SOURCES = new Set(["PHONE", "WHATSAPP", "WEBSITE", "COUNTER", "OTHER"]);
+
+/**
+ * An ISO timestamp from the device, or null, or a refusal.
+ *
+ * Absent is normal - most of these columns are null for most of an order's life - so absent is not
+ * an error. A value that is present but unparseable is: dropping it silently would put an order on
+ * the board with no `sent_at`, which reads as "not sent yet" rather than as "we do not know".
+ */
+const parseCustomerOrderTimestamp = (value) => {
+  const text = cleanText(value);
+  if (!text) return { value: null };
+  const parsed = Date.parse(text);
+  if (!Number.isFinite(parsed)) return { error: true, value: null };
+  return { value: new Date(parsed).toISOString() };
+};
+
+/**
+ * Validate and normalise the order lines, or name the first thing that is wrong with them.
+ *
+ * `product_id` and `inventory_lot_id` are carried through as the opaque strings they are. The POS
+ * item path resolves `product_id` to a numeric row id via `parsePositiveInteger` - which is
+ * `Number()` in a coat - with a `global_id` fallback for products and no fallback at all for lots.
+ * "004" and 4 are different products; that coercion, and that asymmetry, are not repeated here.
+ */
+const normalizeCustomerOrderItems = (rawItems) => {
+  if (!Array.isArray(rawItems) || rawItems.length === 0) {
+    return { error: "Customer order requires at least one item" };
+  }
+  const items = [];
+  const seenLineIndexes = new Set();
+  for (let position = 0; position < rawItems.length; position += 1) {
+    const raw = rawItems[position] && typeof rawItems[position] === "object" ? rawItems[position] : {};
+    const label = `item ${position + 1}`;
+    const productId = cleanText(raw.product_id) || cleanText(raw.product_global_id);
+    if (!productId) return { error: `${label} is missing product_id` };
+    const productName = cleanText(raw.product_name);
+    if (!productName) return { error: `${label} is missing product_name` };
+    const quantityValue = Number(raw.quantity);
+    if (!Number.isFinite(quantityValue) || quantityValue <= 0) {
+      return { error: `${label} has an invalid quantity` };
+    }
+    // Bounded before it reaches a NUMERIC column. An out-of-range value would raise a Postgres
+    // error, and a Postgres error inside a push is a 500 the device retries forever - whereas a
+    // named rejection tells somebody which line is wrong.
+    if (quantityValue >= 1e9) return { error: `${label} has an out-of-range quantity` };
+    const lineIndexValue = Number(raw.line_index);
+    const lineIndex = Number.isInteger(lineIndexValue) && lineIndexValue >= 0 ? lineIndexValue : position;
+    if (seenLineIndexes.has(lineIndex)) return { error: `${label} repeats line_index ${lineIndex}` };
+    seenLineIndexes.add(lineIndex);
+    // A rate of 0 is a legitimate agreed rate, and `??` falls through on 0 - so presence is decided
+    // explicitly rather than by a default. Absent means "no rate was agreed", which is not zero.
+    const hasRate = raw.agreed_rate !== null
+      && raw.agreed_rate !== undefined
+      && String(raw.agreed_rate).trim() !== "";
+    const rateValue = Number(raw.agreed_rate);
+    if (hasRate && (!Number.isFinite(rateValue) || rateValue < 0)) {
+      return { error: `${label} has an invalid agreed_rate` };
+    }
+    if (hasRate && rateValue >= 1e9) return { error: `${label} has an out-of-range agreed_rate` };
+    const quantity = roundQuantity(quantityValue);
+    // Three decimals is the stored precision, so a quantity that rounds away to nothing is not a
+    // quantity. Caught here rather than by the column's CHECK, which would be a 500.
+    if (quantity <= 0) return { error: `${label} has a quantity that rounds to zero` };
+    const agreedRate = hasRate ? roundCurrency(rateValue) : null;
+    items.push({
+      global_id: cleanText(raw.id) || null,
+      line_index: lineIndex,
+      product_global_id: productId,
+      product_name: productName,
+      unit: cleanText(raw.unit) || null,
+      quantity,
+      agreed_rate: agreedRate,
+      // Money rounds once per line and the lines are then summed by whoever needs a total. A line
+      // with no agreed rate has no amount at all - null, never 0.
+      line_amount: agreedRate === null ? null : roundCurrency(agreedRate * quantity),
+      inventory_lot_global_id: cleanText(raw.inventory_lot_id) || cleanText(raw.inventory_lot_global_id) || null,
+    });
+  }
+  return { items };
+};
+
+const processCustomerOrderOperation = async (client, operation, context) => {
+  const payload = operation.payload && typeof operation.payload === "object" ? operation.payload : {};
+  if (operation.operation_type !== "UPSERT") {
+    return rejectOperation(
+      operation,
+      "UNSUPPORTED_OPERATION",
+      `Customer orders sync as UPSERT only; received ${operation.operation_type}`
+    );
+  }
+
+  // Scope is the session's, and only the session's. `logSyncChange` throws without a branch, and
+  // `local_customer_orders.branch_id` is nullable on the device - so the absence is answered here,
+  // as a rejection, rather than left to become an exception that discards a whole batch.
+  const branchId = parsePositiveInteger(context.branchId);
+  if (!branchId) {
+    return rejectOperation(
+      operation,
+      "SCOPE_REQUIRED",
+      "Customer order sync requires an assigned branch"
+    );
+  }
+  const companyId = parsePositiveInteger(context.companyId);
+  const orderGlobalId = cleanText(operation.entity_id);
+  if (!orderGlobalId) {
+    return rejectOperation(operation, "VALIDATION_ERROR", "Customer order requires an entity_id");
+  }
+  const incomingVersion = Number(operation.version);
+  if (!Number.isInteger(incomingVersion) || incomingVersion < 1) {
+    return rejectOperation(operation, "VALIDATION_ERROR", "Customer order version must be a positive integer");
+  }
+
+  const customerName = cleanText(payload.customer_name);
+  if (!customerName) {
+    return rejectOperation(operation, "VALIDATION_ERROR", "Customer order requires customer_name");
+  }
+  const status = (cleanText(payload.status) || "RECEIVED").toUpperCase();
+  if (!CUSTOMER_ORDER_STATUSES.has(status)) {
+    return rejectOperation(operation, "VALIDATION_ERROR", `Unsupported customer order status: ${status}`);
+  }
+  const source = (cleanText(payload.source) || "PHONE").toUpperCase();
+  if (!CUSTOMER_ORDER_SOURCES.has(source)) {
+    return rejectOperation(operation, "VALIDATION_ERROR", `Unsupported customer order source: ${source}`);
+  }
+
+  const timestamps = {};
+  for (const field of [
+    "reserved_at",
+    "packed_at",
+    "sent_at",
+    "delivered_at",
+    "cancelled_at",
+    "deleted_at",
+    "created_at",
+    "updated_at",
+  ]) {
+    const parsed = parseCustomerOrderTimestamp(payload[field]);
+    if (parsed.error) {
+      return rejectOperation(operation, "VALIDATION_ERROR", `Customer order ${field} is not a valid timestamp`);
+    }
+    timestamps[field] = parsed.value;
+  }
+
+  const normalizedItems = normalizeCustomerOrderItems(payload.items);
+  if (normalizedItems.error) {
+    return rejectOperation(operation, "VALIDATION_ERROR", normalizedItems.error);
+  }
+  const items = normalizedItems.items;
+
+  const existingResult = await client.query(
+    `SELECT global_id, order_no, status, company_id, branch_id, entity_version, updated_at
+     FROM customer_orders
+     WHERE global_id = $1
+     FOR UPDATE`,
+    [orderGlobalId]
+  );
+  const current = existingResult.rows[0] || null;
+  if (current) {
+    // Company and branch ids are integers everywhere in this schema - unlike entity ids, they are
+    // genuinely numbers, so comparing them as numbers is correct here and nowhere near the ids.
+    const sameCompany = Number(current.company_id || 0) === Number(companyId || 0);
+    const sameBranch = Number(current.branch_id || 0) === branchId;
+    if (!sameCompany || !sameBranch) {
+      return rejectOperation(
+        operation,
+        "CONFLICT",
+        "Customer order id already exists in another company or branch"
+      );
+    }
+    if (Number(current.entity_version || 0) >= incomingVersion) {
+      return {
+        operation_id: operation.operation_id,
+        status: "accepted",
+        server_entity_version: Number(current.entity_version || incomingVersion),
+        server_updated_at: current.updated_at || new Date().toISOString(),
+        error_code: null,
+        message: "Customer order already stored at this version or newer",
+        result_payload: {
+          entity_type: "customer_order",
+          order_id: current.global_id,
+          order_no: current.order_no || null,
+          status: current.status || null,
+          entity_version: Number(current.entity_version || incomingVersion),
+          duplicate: true,
+        },
+      };
+    }
+  }
+
+  const upserted = await client.query(
+    `
+    INSERT INTO customer_orders (
+      global_id, order_no, source, company_id, branch_id, operational_location_id,
+      assignment_generation, customer_id, customer_name, customer_mobile, delivery_address,
+      status, reserved_at, packed_at, sent_at, delivered_at, cancelled_at, cancellation_reason,
+      carrier, carrier_reference, tracking_url, carrier_contact, sale_global_id, invoice_no,
+      notes, created_by, source_device_id, entity_version, device_created_at, device_updated_at,
+      deleted_at, updated_at
+    )
+    VALUES (
+      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
+      $25,$26,$27,$28,$29,$30,$31, CURRENT_TIMESTAMP
+    )
+    ON CONFLICT (global_id) DO UPDATE SET
+      order_no = EXCLUDED.order_no,
+      source = EXCLUDED.source,
+      company_id = EXCLUDED.company_id,
+      branch_id = EXCLUDED.branch_id,
+      operational_location_id = EXCLUDED.operational_location_id,
+      assignment_generation = EXCLUDED.assignment_generation,
+      customer_id = EXCLUDED.customer_id,
+      customer_name = EXCLUDED.customer_name,
+      customer_mobile = EXCLUDED.customer_mobile,
+      delivery_address = EXCLUDED.delivery_address,
+      status = EXCLUDED.status,
+      reserved_at = EXCLUDED.reserved_at,
+      packed_at = EXCLUDED.packed_at,
+      sent_at = EXCLUDED.sent_at,
+      delivered_at = EXCLUDED.delivered_at,
+      cancelled_at = EXCLUDED.cancelled_at,
+      cancellation_reason = EXCLUDED.cancellation_reason,
+      carrier = EXCLUDED.carrier,
+      carrier_reference = EXCLUDED.carrier_reference,
+      tracking_url = EXCLUDED.tracking_url,
+      carrier_contact = EXCLUDED.carrier_contact,
+      sale_global_id = EXCLUDED.sale_global_id,
+      invoice_no = EXCLUDED.invoice_no,
+      notes = EXCLUDED.notes,
+      source_device_id = EXCLUDED.source_device_id,
+      entity_version = EXCLUDED.entity_version,
+      device_created_at = EXCLUDED.device_created_at,
+      device_updated_at = EXCLUDED.device_updated_at,
+      deleted_at = EXCLUDED.deleted_at,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE customer_orders.entity_version < EXCLUDED.entity_version
+    RETURNING *
+    `,
+    [
+      orderGlobalId,
+      cleanText(payload.order_no) || null,
+      source,
+      companyId,
+      branchId,
+      context.operationalLocationId || null,
+      context.assignmentGeneration || null,
+      cleanText(payload.customer_id) || null,
+      customerName,
+      cleanText(payload.customer_mobile) || null,
+      cleanText(payload.delivery_address) || null,
+      status,
+      timestamps.reserved_at,
+      timestamps.packed_at,
+      timestamps.sent_at,
+      timestamps.delivered_at,
+      timestamps.cancelled_at,
+      cleanText(payload.cancellation_reason) || null,
+      cleanText(payload.carrier) || null,
+      cleanText(payload.carrier_reference) || null,
+      cleanText(payload.tracking_url) || null,
+      cleanText(payload.carrier_contact) || null,
+      cleanText(payload.sale_id) || cleanText(payload.sale_global_id) || null,
+      cleanText(payload.invoice_no) || null,
+      cleanText(payload.notes) || null,
+      context.user.id,
+      context.deviceId,
+      incomingVersion,
+      timestamps.created_at,
+      timestamps.updated_at,
+      timestamps.deleted_at,
+    ]
+  );
+  const row = upserted.rows[0];
+  if (!row) {
+    // The conflict target matched but the version guard refused the update: another operation in
+    // this same batch already stored a newer version of this order. A duplicate, not a failure.
+    return {
+      operation_id: operation.operation_id,
+      status: "accepted",
+      server_entity_version: Number(current?.entity_version || incomingVersion),
+      server_updated_at: current?.updated_at || new Date().toISOString(),
+      error_code: null,
+      message: "Customer order already stored at this version or newer",
+      result_payload: {
+        entity_type: "customer_order",
+        order_id: orderGlobalId,
+        order_no: current?.order_no || null,
+        status: current?.status || null,
+        entity_version: Number(current?.entity_version || incomingVersion),
+        duplicate: true,
+      },
+    };
+  }
+
+  // The lines are replaced wholesale, because the payload is the whole order. Editing them in place
+  // would leave a line the device deleted behind, and a stale line on an order is a box packed
+  // wrongly.
+  await client.query("DELETE FROM customer_order_items WHERE order_global_id = $1", [orderGlobalId]);
+  for (const item of items) {
+    await client.query(
+      `
+      INSERT INTO customer_order_items (
+        order_global_id, global_id, line_index, product_global_id, product_name, unit,
+        quantity, agreed_rate, line_amount, inventory_lot_global_id
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      `,
+      [
+        orderGlobalId,
+        item.global_id,
+        item.line_index,
+        item.product_global_id,
+        item.product_name,
+        item.unit,
+        item.quantity,
+        item.agreed_rate,
+        item.line_amount,
+        item.inventory_lot_global_id,
+      ]
+    );
+  }
+
+  const change = await logSyncChange(client, {
+    branchId,
+    operationalLocationId: context.operationalLocationId,
+    assignmentGeneration: context.assignmentGeneration,
+    entityType: "customer_order",
+    entityId: orderGlobalId,
+    operationType: "UPSERT",
+    version: Number(row.entity_version || incomingVersion),
+    payload: { ...row, items },
+  });
+
+  return {
+    operation_id: operation.operation_id,
+    status: "accepted",
+    server_entity_version: Number(row.entity_version || incomingVersion),
+    server_updated_at: change.created_at || row.updated_at,
+    error_code: null,
+    message: "Customer order synced",
+    result_payload: {
+      entity_type: "customer_order",
+      order_id: row.global_id,
+      order_no: row.order_no || null,
+      status: row.status,
+      entity_version: Number(row.entity_version || incomingVersion),
+      duplicate: false,
+    },
+  };
+};
+
 const processSyncOperation = async (client, operation, context) => {
   if (!operation || typeof operation !== "object") {
     return rejectOperation({ operation_id: "" }, "VALIDATION_ERROR", "Invalid operation");
@@ -9534,18 +10143,61 @@ const processSyncOperation = async (client, operation, context) => {
     [operation.operation_id, context.companyId, context.branchId]
   );
   if (processed.rows[0]) return processedAckFromRow(processed.rows[0]);
-  const ack = operation.entity_type === "sync_test"
-    ? await processSyncTestOperation(client, operation, context)
-    : operation.operation_type === "SALE_EDIT"
-      ? await processPosSaleEditOperation(client, operation, context)
-      : operation.operation_type === "SALE_CANCEL"
-        ? await processPosSaleCancelOperation(client, operation, context)
-        : await processPosSaleFoundationOperation(client, operation, context);
+  // Keyed on entity_type first, with a default that refuses by name.
+  //
+  // This used to test `entity_type === "sync_test"` and then fall through to the POS sale handlers
+  // on everything else, with `processPosSaleFoundationOperation` as the final else. That is fine
+  // while only two entity types exist and dangerous the moment a third does: an order handed to
+  // the sale handler is rejected as a malformed invoice, `storeProcessedOperation` below stores
+  // rejections as readily as successes, and the replay check above returns a stored acknowledgement
+  // without re-running anything. The order would be poisoned under its operation id forever, and
+  // retrying - which re-sends the same id - would keep getting the same refusal back.
+  //
+  // `SYNC_OPERATION_TYPES` already admits CREATE, UPDATE and DELETE, none of which any POS handler
+  // understands, so operations were reaching the sale handler by accident before customer orders
+  // existed at all.
+  let ack;
+  switch (operation.entity_type) {
+    case "sync_test":
+      ack = await processSyncTestOperation(client, operation, context);
+      break;
+    case "pos_sale":
+      ack = operation.operation_type === "SALE_EDIT"
+        ? await processPosSaleEditOperation(client, operation, context)
+        : operation.operation_type === "SALE_CANCEL"
+          ? await processPosSaleCancelOperation(client, operation, context)
+          : await processPosSaleFoundationOperation(client, operation, context);
+      break;
+    case "customer_order":
+      ack = await processCustomerOrderOperation(client, operation, context);
+      break;
+    default:
+      ack = rejectOperation(
+        operation,
+        "UNSUPPORTED_ENTITY",
+        `No sync handler for entity type: ${operation.entity_type}`
+      );
+      break;
+  }
   await storeProcessedOperation(client, operation, context, ack);
   return ack;
 };
 
-const healthHandler = async (_req, res) => {
+/**
+ * A-6 Gate 3.1.
+ *
+ * A liveness check answers "are you running". It used to answer rather more than that to anybody
+ * who asked, with no credentials at all: the company's name and id, a branch id, and the database's
+ * path on disk. The identity tells a stranger who they have found; the path tells them how the
+ * server is laid out. Neither is any part of the question.
+ *
+ * The split below is deliberate rather than a blanket removal. One caller genuinely needs an
+ * unauthenticated answer - the Settings screen's "test connection", which is used while choosing
+ * *which* server to talk to and therefore before any session with it can exist. It needs to know
+ * that the far end is a provisioned FroozERP cloud, so it is told exactly that as a boolean, and
+ * not who the tenant is. A stranger learns the deployment is configured; only a session learns whose.
+ */
+const healthHandler = async (req, res) => {
   try {
     const storageHealth = await storageAdapter.health();
     const cloudIdentity = await resolveCloudDeploymentIdentity();
@@ -9558,19 +10210,23 @@ const healthHandler = async (_req, res) => {
       ...serverTimePayload(),
       version: appVersion,
       database: "reachable",
-      database_type: storageHealth.databaseType,
-      database_path: storageHealth.databasePath || null,
-      storage_adapter: storageAdapter.kind,
-      client_postgres_access: false,
-      mode: process.env.NODE_ENV || "development",
       deployment_type: deploymentType,
       app_mode: configuredAppMode,
-      cloud_api_configured: cloudApiConfigured,
-      device_identity_configured: Boolean(configuredDeviceId && configuredDeviceName),
       cloud_ready: cloudReady,
-      company_id: cloudIdentity.companyId,
-      company_name: cloudIdentity.companyName,
-      branch_id: cloudIdentity.branchId,
+      // Enough for a caller to confirm this is a provisioned deployment, without naming it.
+      tenant_configured: Boolean(cloudIdentity.companyId),
+      ...(req?.auth ? {
+        database_type: storageHealth.databaseType,
+        database_path: storageHealth.databasePath || null,
+        storage_adapter: storageAdapter.kind,
+        client_postgres_access: false,
+        mode: process.env.NODE_ENV || "development",
+        cloud_api_configured: cloudApiConfigured,
+        device_identity_configured: Boolean(configuredDeviceId && configuredDeviceName),
+        company_id: cloudIdentity.companyId,
+        company_name: cloudIdentity.companyName,
+        branch_id: cloudIdentity.branchId,
+      } : {}),
     });
   } catch (error) {
     console.error("Health check failed", error.message);
@@ -9586,7 +10242,7 @@ app.get("/api/time", (_req, res) => {
   return res.json({ status: "ok", app: "FroozERP", ...serverTimePayload() });
 });
 
-app.get("/api/version", async (_req, res) => {
+app.get("/api/version", async (req, res) => {
   const cloudIdentity = await resolveCloudDeploymentIdentity();
   const cloudReady = Object.values(cloudConfigurationChecks(cloudIdentity)).every(Boolean);
   res.json({
@@ -9595,15 +10251,25 @@ app.get("/api/version", async (_req, res) => {
     api_version: apiContractVersion,
     version: appVersion,
     ...serverTimePayload(),
-    node_env: process.env.NODE_ENV || "development",
     deployment_type: deploymentType,
     app_mode: configuredAppMode,
-    cloud_api_configured: cloudApiConfigured,
-    device_identity_configured: Boolean(configuredDeviceId && configuredDeviceName),
     cloud_ready: cloudReady,
-    company_id: cloudIdentity.companyId,
-    company_name: cloudIdentity.companyName,
-    branch_id: cloudIdentity.branchId,
+    // Same reasoning as the identity fields below, applied to deployment posture. Which
+    // environment this is, and which halves of the cloud configuration are filled in, describe the
+    // inside of the deployment rather than its version. Nothing outside this file read them.
+    // A-6 Gate 3.1. These used to be returned to anyone who asked, with no credentials: the
+    // company's name, its id and a branch id, from a route whose job is to answer "are you running
+    // and what version". A version check does not need the tenant's name, and handing it to an
+    // unauthenticated caller tells a stranger who they have found. Behind a session they are the
+    // caller's own identity and are answered in full.
+    ...(req.auth ? {
+      node_env: process.env.NODE_ENV || "development",
+      cloud_api_configured: cloudApiConfigured,
+      device_identity_configured: Boolean(configuredDeviceId && configuredDeviceName),
+      company_id: cloudIdentity.companyId,
+      company_name: cloudIdentity.companyName,
+      branch_id: cloudIdentity.branchId,
+    } : {}),
     api: "FroozERP Cloud Foundation",
   });
 });
@@ -10733,6 +11399,7 @@ app.get("/api/owner/dashboard-foundation", async (req, res) => {
 });
 
 app.post("/devices/activate", async (req, res) => {
+  if (refusePublicFlood(req, res, "device-activate")) return;
   const client = await pool.connect();
   try {
     const device = readDevicePayload(req.body, req);
@@ -10786,7 +11453,48 @@ app.post("/devices/activate", async (req, res) => {
   }
 });
 
+/**
+ * A-6 Gate 1.5 — sign out, and mean it.
+ *
+ * Signing out used to be a client-side gesture: the app forgot the token and the token carried on
+ * working for the rest of its twelve hours. On a shared counter machine that is the whole problem -
+ * the next person to pick it up has a working session belonging to whoever used it last.
+ *
+ * Incrementing the caller's revocation version invalidates every session that user holds, on every
+ * device, which is the right blast radius for "sign me out": a staff member signing off a counter
+ * they share should not leave a session alive on the machine they walked away from either.
+ *
+ * You may only revoke your own. The user id comes from the verified token and is never read from
+ * the request, so this cannot be pointed at somebody else's account.
+ */
+app.post("/auth/sign-out", async (req, res) => {
+  try {
+    await pool.query(
+      `UPDATE users
+          SET session_revocation_version = COALESCE(session_revocation_version, 0) + 1,
+              updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1`,
+      [req.auth.userId],
+    );
+    return res.json({ success: true, message: "Signed out on every device." });
+  } catch (error) {
+    // Say so rather than reporting success. A sign-out that silently failed leaves the person
+    // believing they are signed out while the session is still live, which is worse than an error.
+    console.error("sign-out failed", error?.message || error);
+    return res.status(503).json({ code: "SIGN_OUT_FAILED", message: "Could not sign out. Try again." });
+  }
+});
+
 app.post("/bootstrap/first-owner-device", async (req, res) => {
+  // A-6 Gate 3.3. Refused before a single field of the body is read, and long before any password
+  // is checked. That ordering is the point: a refusal that arrives after the password comparison
+  // still leaks whether the guess was right, through the failed-attempt counter and the lock it
+  // trips. Nothing below this line runs unless an operator has deliberately opened the route, and
+  // on a hosted deployment nothing opens it at all.
+  const transport = resolveOwnerBootstrapTransport({ env: process.env, deploymentType });
+  if (!transport.allowed) {
+    return res.status(404).json({ code: transport.code, message: transport.message });
+  }
   try {
     const username = cleanText(req.body.username);
     const password = String(req.body.password || "");
@@ -11113,6 +11821,7 @@ app.get("/settings/system-info", async (req, res) => {
 });
 
 app.post("/api/auth/device-bootstrap-status", async (req, res) => {
+  if (refusePublicFlood(req, res, "device-bootstrap-status")) return;
   try {
     const devicePayload = readDevicePayload(req.body, req);
     if (!devicePayload.device_id) {
@@ -11307,6 +12016,26 @@ app.post("/login", async (req, res) => {
       });
     }
     const passwordCheck = await checkPassword(password, user.password_hash);
+    // A-5: an account whose stored value is not a verifiable credential is refused *by name*, and
+    // without touching the lockout counters. Checked before the wrong-password path below because
+    // the two are different events: nothing here was compared against the supplied password, so
+    // there is no guess to count, and no amount of retrying can succeed. Telling this person to
+    // reset is the only response that leads anywhere.
+    if (storedPasswordIsUnusable(passwordCheck)) {
+      return authFailure(res, {
+        status: 401,
+        code: "PASSWORD_RESET_REQUIRED",
+        publicMessage: PASSWORD_RESET_REQUIRED_MESSAGE,
+        userId: user.id,
+        username: user.username,
+        deviceId: devicePayload.device_id,
+        ipAddress: req.ip,
+        // The format is recorded for the operator reading the audit trail, never returned to the
+        // caller: it says which migration this row missed, which is a maintenance fact, not
+        // something the person at the login screen can act on.
+        details: { stage: "password_format_retired", stored_format: passwordCheck.format },
+      });
+    }
     if (!passwordCheck.ok) {
       const approvedDeviceResult = canonicalAliasUsed
         ? await pool.query(
@@ -20870,15 +21599,21 @@ const readBusinessCounts = async () => {
 };
 
 /**
- * Report how many active users still carry a pre-A-1 password hash.
+ * Report how many active users cannot sign in because their stored password is in a retired format.
  *
- * This is the precondition for the second half of A-5 — deleting the legacy SHA-256 verify path
- * from `passwordHash.js`. That path is a weaker, unsalted digest and should not live forever, but
- * removing it locks out every user who has not signed in since A-1, so the removal is gated on this
- * number reaching zero.
+ * Before A-5 this counted a *precondition*: the legacy unsalted SHA-256 verify path was still live,
+ * and the count said how many accounts removing it would strand. A-5 removed the path, so the same
+ * number now means something more urgent — these accounts are locked out right now, and each one is
+ * a person who will be told to reset their password the next time they try to work.
+ *
+ * The condition is "not a scrypt hash" rather than "matches the legacy digest shape" because the
+ * retired formats are not only the legacy digest: a pre-migration plaintext column (A-2), a corrupt
+ * hash and an empty password column are all equally unusable, and all equally need a reset. The
+ * verifier already treats them alike; this count has to agree with the verifier or it is measuring
+ * something other than the problem.
  *
  * It is printed at startup rather than left as a query in a document because the answer changes on
- * its own, silently, as people sign in — a number nobody is watching is a number nobody knows. The
+ * its own, silently, as people reset — a number nobody is watching is a number nobody knows. The
  * count is deliberately the only thing reported: no usernames, no ids, nothing that turns a startup
  * log into a list of accounts worth attacking.
  *
@@ -20889,23 +21624,23 @@ const reportLegacyPasswordHashes = async () => {
   if (desktopLocalRuntime) return;
   try {
     const result = await pool.query(
-      `SELECT COUNT(*)::INTEGER AS still_legacy
+      `SELECT COUNT(*)::INTEGER AS needs_reset
          FROM users
         WHERE active = TRUE
-          AND password_hash ~ '^[0-9a-f]{64}$'`
+          AND COALESCE(password_hash, '') NOT LIKE 'scrypt$%'`
     );
-    const stillLegacy = Number(result.rows[0]?.still_legacy || 0);
-    if (stillLegacy > 0) {
+    const needsReset = Number(result.rows[0]?.needs_reset || 0);
+    if (needsReset > 0) {
       console.warn(
-        `[auth] ${stillLegacy} active user(s) still have a pre-A-1 password hash. `
-        + "They are upgraded automatically on their next sign-in. The legacy verify path in "
-        + "passwordHash.js cannot be removed until this reaches 0 (auth-hardening A-5)."
+        `[auth] ${needsReset} active user(s) have a password stored in a retired format and cannot `
+        + "sign in (auth-hardening A-5). Each one needs a password reset: self-service recovery, an "
+        + "Owner or Admin reset, or node scripts/reset-password.mjs --username <name>."
       );
     } else {
-      console.log("[auth] No legacy password hashes remain; the A-5 legacy verify path can be removed.");
+      console.log("[auth] Every active user's password is stored as scrypt.");
     }
   } catch (error) {
-    console.warn(`[auth] Could not count legacy password hashes: ${error.message}`);
+    console.warn(`[auth] Could not count retired password formats: ${error.message}`);
   }
 };
 
@@ -21022,3 +21757,23 @@ prepareDatabaseForStartup()
     console.error("Database initialization failed", error);
     process.exit(1);
   });
+
+/**
+ * Exported for tests only.
+ *
+ * `server.js` is started as a script and never required in production, so nothing here is an
+ * interface - these are the seams the sync suites need. The alternative is asserting on the source
+ * text of a 21k-line file, which stops testing anything the day a name changes and is how the
+ * pos_sale apply path ended up with no behavioural test at all.
+ *
+ * Requiring this module boots a server. A test must load it through
+ * `routeAuthCoverage.loadServerApp()` first, which sandboxes the database, the network and
+ * `app.listen`; requiring it directly is a mistake that harness refuses to let pass silently.
+ */
+module.exports = {
+  SYNC_ENTITY_TYPES,
+  SYNC_OPERATION_TYPES,
+  processSyncOperation,
+  processCustomerOrderOperation,
+  normalizeCustomerOrderItems,
+};

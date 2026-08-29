@@ -43,7 +43,12 @@ import { resolveOfflineOpenDecision } from "./local/offlineDataReadiness";
 import { allShopsHasFigures, resolveAllShopsPresentation } from "./local/allShopsSummary";
 import { resolveShopViewPresentation, shopPickerVisible } from "./local/shopView";
 import { ORDER_STATUS } from "./local/orderLifecycle";
+import { STOCK_TRUSTED_FOR_HOURS, buildCatalogue, catalogueFilename, describeExport } from "./local/catalogueExport";
 import { buildOrdersBoard, validateOrderAction } from "./local/ordersBoard";
+import { ORDER_REPORT, buildOrderReports, describeOrderReportError } from "./local/orderReporting";
+import { SETTINGS_GROUPS, formatShortcut, navigationRegistry, resolveShortcutTarget } from "./local/appNavigation";
+import { buildCommandIndex, highlightSegments, searchCommands } from "./local/commandPalette";
+import { buildOrderNotifications } from "./local/orderNotifications";
 import { COUNTER_STOCK, buildReservedIndex, describeCounterStock, reservedForProduct, reservedNote } from "./local/reservedStock";
 import { buildOrderCartSeed, describeOrderBillingProblems } from "./local/orderBilling";
 import { bannerForState } from "./local/entitlementState";
@@ -1477,8 +1482,12 @@ const defaultDeviceControlSettings = {
 function BrandLogo({ compact = false, invoice = false, splash = false }) {
   const assetBase = import.meta.env.BASE_URL || "/";
   const assetPath = (path) => `${assetBase}${path}`.replace(/([^:]\/)\/+/g, "$1");
-  const imageSrc = compact ? assetPath("branding/frooz-symbol-192.png") : invoice ? assetPath("branding/frooz-logo-invoice-320.png") : assetPath("branding/frooz-logo-full-512.png");
-  const alt = compact ? "FroozERP" : "Feel the Freakin' Frooz official logo";
+  // The mark is a square crop of the official lockup, which is what fits the badge.
+  // Screen chrome is dark, so it takes the reversed (cream) cut; an invoice prints on
+  // white paper, so it takes the green cut. Both are generated from one vector source
+  // by tools/build-brand-assets.mjs - do not point this at a hand-made file.
+  const imageSrc = assetPath(invoice ? "branding/frooz-mark.svg" : "branding/frooz-mark-reversed.svg");
+  const alt = compact ? "Frooz" : "Feel the Freakin' Frooz";
   return (
     <div className={`${invoice ? "brand-lockup brand-lockup-invoice" : "brand-lockup"} ${compact ? "brand-lockup-compact" : ""} ${splash ? "brand-lockup-splash" : ""}`}>
       <span className="brand-monogram">
@@ -1491,6 +1500,88 @@ function BrandLogo({ compact = false, invoice = false, splash = false }) {
         </span>
       )}
     </div>
+  );
+}
+
+/**
+ * Writes the file the public website reads.
+ *
+ * The storefront is deliberately static - it has no backend and nothing of this
+ * system is on the internet, which is the only reason it can be live while the
+ * exposure gates are still open. The cost of that is that its prices and stock are a
+ * snapshot somebody uploads, and this is where that snapshot is made.
+ *
+ * All the judgement lives in `local/catalogueExport.js`, where it is tested. This is
+ * a button and a sentence.
+ */
+function WebsiteCatalogueExport({ products, lots, shop }) {
+  const [outcome, setOutcome] = useState(null);
+
+  // Built once per change rather than on every keystroke elsewhere in the screen;
+  // this walks every product and every lot.
+  const prepared = useMemo(() => buildCatalogue({ products, lots, shop }), [products, lots, shop]);
+  const prepare = () => prepared;
+
+  const save = () => {
+    try {
+      const { catalogue, summary } = prepare();
+      const blob = new Blob([`${JSON.stringify(catalogue, null, 2)}\n`], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = catalogueFilename();
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+      setOutcome({ tone: "ok", text: `Saved as ${catalogueFilename()}. ${describeExport(summary)}` });
+    } catch (error) {
+      // Never claim a save that did not happen. Copying still works, so say so.
+      setOutcome({
+        tone: "error",
+        text: `The file could not be saved (${error?.message || String(error)}). Use Copy instead and paste it into the file on your website.`,
+      });
+    }
+  };
+
+  const copy = async () => {
+    const { catalogue, summary } = prepare();
+    const text = `${JSON.stringify(catalogue, null, 2)}\n`;
+    try {
+      await navigator.clipboard.writeText(text);
+      setOutcome({ tone: "ok", text: `Copied. ${describeExport(summary)}` });
+    } catch (error) {
+      setOutcome({
+        tone: "error",
+        text: `Could not copy (${error?.message || String(error)}). Use Save the file instead.`,
+      });
+    }
+  };
+
+  const preview = describeExport(prepared.summary);
+
+  return (
+    <ModuleCard
+      eyebrow="Website"
+      title="Today's list for the website"
+      subtitle="Send today's rates and stock to the public site. The site does not read this system directly, so nothing here is exposed to the internet - you upload the file yourself."
+    >
+      <p className="form-note">{preview}</p>
+      <div className="button-row">
+        <button className="primary-button" onClick={save} type="button">Save the file</button>
+        <button className="secondary-button" onClick={copy} type="button">Copy the text</button>
+      </div>
+      {outcome && (
+        <p className={outcome.tone === "error" ? "form-note cell-note" : "form-note"} role="status">
+          {outcome.text}
+        </p>
+      )}
+      <p className="form-note">
+        Items with no sale rate set for today are left out rather than shown at zero. The site stops
+        quoting stock once this file is more than {STOCK_TRUSTED_FOR_HOURS} hours old, and asks
+        customers to check with you instead.
+      </p>
+    </ModuleCard>
   );
 }
 
@@ -1513,6 +1604,8 @@ function Icon({ name, size = 18 }) {
     menu: <><path d="M4 6h16M4 12h16M4 18h16" /></>,
     logout: <><path d="M10 17l5-5-5-5M15 12H3M21 19V5a2 2 0 0 0-2-2h-6" /></>,
     search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></>,
+    "arrow-left": <><path d="M19 12H5" /><path d="m12 19-7-7 7-7" /></>,
+    "arrow-right": <><path d="M5 12h14" /><path d="m12 5 7 7-7 7" /></>,
     barcode: <><path d="M3 5v14M7 5v14M11 5v14M15 5v14M19 5v14M21 5v14" /></>,
     trash: <><path d="M4 7h16M10 11v6M14 11v6M9 7V4h6v3M6 7l1 14h10l1-14" /></>,
     print: <><path d="M6 9V3h12v6M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2M6 14h12v7H6Z" /></>,
@@ -1684,6 +1777,56 @@ function App() {
   const [activeView, setActiveView] = useState(initialView);
   const [applicationFontSize, setApplicationFontSize] = useState(getStoredApplicationFontSize);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  /**
+   * The sidebar collapsed to an icon rail.
+   *
+   * Collapsed, not hidden. A counter machine wants the width for the bill, but a cashier who has
+   * lost the menu entirely mid-sale is worse off than one with a narrow one, so the icons stay.
+   * Remembered per device because it is a property of the screen it runs on, not of the user.
+   */
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return window.localStorage.getItem("froozerp.sidebar.collapsed") === "1";
+    } catch {
+      // A browser with site data blocked must still render a sidebar, just not a remembered one.
+      return false;
+    }
+  });
+  /**
+   * Where we are in the browser's own history, so Back and Forward can be disabled at the ends.
+   *
+   * `navigate` already calls `pushState` and a `popstate` listener already restores the view, so
+   * the browser history is the real one and a second stack beside it could only disagree. The
+   * index rides along inside `pushState`'s own state object rather than in a parallel counter, for
+   * the same reason.
+   */
+  const [navPosition, setNavPosition] = useState({ index: 0, max: 0 });
+  /**
+   * The current `navigate`, for the keyboard listener.
+   *
+   * That listener registers once per user rather than once per render, so calling `navigate`
+   * directly would capture the first render's closure and navigate using whatever `offlineMode`
+   * and `connectivityMode` were true at sign-in. The ref is reassigned every render, so a shortcut
+   * pressed an hour later still routes on what is true now.
+   */
+  const navigateRef = useRef(null);
+  /**
+   * The last few screens visited, newest first, so the palette can float them to the top.
+   *
+   * Ranking alone cannot know that this shop lives on the POS screen. Typing "bill" scores
+   * "Bill-Level Discount Slabs" above "POS Billing" on the letters alone, which is correct as
+   * text and wrong as an answer. Where somebody has actually been is the missing evidence.
+   */
+  const [recentViews, setRecentViews] = useState([]);
+  /**
+   * A section the person asked for by name, waiting for the screen that contains it.
+   *
+   * Searching "whatsapp" should land on that card, not at the top of a screen holding seventeen.
+   * Held rather than acted on immediately because the card does not exist yet at the moment the
+   * palette closes -- the module has not rendered, and on a drill-down screen the group it lives
+   * in is not even open.
+   */
+  const [pendingSection, setPendingSection] = useState(null);
   const [internetAvailable, setInternetAvailable] = useState(() => (
     typeof navigator === "undefined" ? true : navigator.onLine !== false
   ));
@@ -1963,8 +2106,14 @@ function App() {
   // online, one for local data — and a loader added to only one of them silently never runs on the
   // other. That happened here. This closes it at the screen instead of relying on both branches
   // staying in step, and it cannot double-load: it fires only while the state is still untouched.
+  //
+  // Report Center needs them too, and for the same reason: an order report built from an
+  // unloaded list would render 0 orders, which is indistinguishable from a day nobody ordered
+  // anything. `CLAUDE.md` records that as the "errors must never render as zero" rule. The
+  // screen still tells the difference (see `orderReportsState`), but not loading at all would
+  // make the honest answer permanently "not loaded".
   useEffect(() => {
-    if (activeView !== "orders") return;
+    if (activeView !== "orders" && activeView !== "reports") return;
     if (ordersState.loadState !== "idle") return;
     loadOrders();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2074,11 +2223,23 @@ function App() {
         setCommandPaletteOpen(false);
       }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
-        const target = event.target;
-        const isEditing = ["INPUT", "TEXTAREA", "SELECT"].includes(target?.tagName) || target?.isContentEditable;
-        if (isEditing) return;
+        // Deliberately still works while typing, unlike the Alt shortcuts below. That is the whole
+        // reason to require a modifier: somebody halfway through a product search is exactly the
+        // person who wants to jump somewhere else, and refusing them made the palette unreachable
+        // from the screen they spend the day on.
         event.preventDefault();
         if (user) setCommandPaletteOpen((current) => !current);
+      }
+      // Alt + digit jumps straight to a module. `resolveShortcutTarget` returns null while any
+      // input, textarea, select or contenteditable has focus, and during IME composition - a
+      // cashier types into a search box all day, and a keystroke that changed screens mid-sale
+      // would be a defect, not a nuisance. The guard lives in the module because that is where it
+      // can be tested; removing it fails three tests.
+      const shortcutTarget = resolveShortcutTarget(event);
+      if (shortcutTarget && user) {
+        event.preventDefault();
+        setCommandPaletteOpen(false);
+        navigateRef.current?.(shortcutTarget.id);
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -2175,11 +2336,17 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const onPopState = () => {
+    const onPopState = (event) => {
       const requestedView = new URLSearchParams(window.location.search).get("view");
       if (requestedView && navigationItems.some(([view]) => view === requestedView)) {
         setActiveView(requestedView);
       }
+      // Only the index moves here. `max` is the high-water mark of this session and must survive
+      // going back, or Forward would switch itself off the moment it became useful.
+      setNavPosition((current) => ({
+        index: Number(event?.state?.navIndex || 0),
+        max: Math.max(current.max, Number(event?.state?.navIndex || 0)),
+      }));
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
@@ -3819,10 +3986,70 @@ function App() {
     }
   }, []);
 
+  /**
+   * Sign out, and tell the server so the session actually ends.
+   *
+   * Forgetting the token locally is not signing out: it leaves a working session for the rest of
+   * its twelve hours, which on a shared counter machine belongs to whoever picks it up next.
+   *
+   * The local half happens regardless of what the server says. Someone pressing sign out on a
+   * counter with no internet must still end up signed out on that screen - refusing to clear it
+   * because a request failed would leave their session on display to the next person, which is the
+   * exact thing this is for. What is lost offline is the server-side revocation, not the sign-out.
+   */
+  const signOut = useCallback(async () => {
+    try {
+      // The session token is attached by the axios interceptor above; setting it here would
+      // duplicate that and, worse, drift from it.
+      await axios.post(`${API_URL}/auth/sign-out`, {}, { timeout: 4000 });
+    } catch {
+      // Offline, or the server refused. The local sign-out below still happens.
+    }
+    setUser(null);
+    setOfflineMode(false);
+    setStartupError("");
+    setStartupNotice("");
+  }, []);
+
   /** Retract a notification whose condition has cleared, so it stops implying a live problem. */
   const clearNotice = useCallback((dedupeKey) => {
     setNotifications((current) => resolveNotification(current, dedupeKey));
   }, []);
+
+  /**
+   * Ring the bell for orders that need somebody.
+   *
+   * The judgement all lives in `local/orderNotifications.js`, which is tested. This
+   * pushes what it returns and, just as importantly, retracts what it stops
+   * returning - an alert saying "packed but not paid for" that survives the payment
+   * being taken teaches the owner to ignore the bell.
+   *
+   * It re-runs on a timer because the alerts are about elapsed time, not just about
+   * what changed: an order nobody has touched becomes urgent while the screen sits
+   * still, and a held reservation runs out whether or not anything is clicked.
+   */
+  const raisedOrderAlerts = useRef(new Set());
+
+  useEffect(() => {
+    const publish = () => {
+      // A failed load is passed through as "unreadable" rather than as an empty list.
+      // No orders and could-not-read-the-orders look identical in a bell that shows
+      // nothing, and only one of them is safe to ignore.
+      const source = ordersState.loadState === "error" ? null : ordersState.orders;
+      const alerts = buildOrderNotifications(source, Date.now());
+      const live = new Set(alerts.map((alert) => alert.dedupeKey));
+
+      for (const alert of alerts) notify(alert);
+      for (const key of raisedOrderAlerts.current) {
+        if (!live.has(key)) clearNotice(key);
+      }
+      raisedOrderAlerts.current = live;
+    };
+
+    publish();
+    const timer = window.setInterval(publish, 60000);
+    return () => window.clearInterval(timer);
+  }, [ordersState.orders, ordersState.loadState, notify, clearNotice]);
 
   /**
    * Surface the activation state in the notification centre.
@@ -6298,11 +6525,19 @@ function App() {
       alert("Your role does not have access to this module.");
       return;
     }
+    // Newest first, deduplicated, capped. Feeds the palette's ranking so that where somebody
+    // actually works outweighs how well a label happens to match their letters.
+    setRecentViews((current) => [view, ...current.filter((id) => id !== view)].slice(0, 8));
     const currentUrlView = new URLSearchParams(window.location.search).get("view");
     if (currentUrlView !== view) {
       const nextUrl = new URL(window.location.href);
       nextUrl.searchParams.set("view", view);
-      window.history.pushState({ view }, "", nextUrl);
+      // A forward push truncates the forward trail, which is the browser's own rule and the one
+      // people expect; `max` follows the new index rather than keeping a trail that Forward could
+      // no longer reach.
+      const nextIndex = Number(window.history.state?.navIndex || 0) + 1;
+      window.history.pushState({ view, navIndex: nextIndex }, "", nextUrl);
+      setNavPosition({ index: nextIndex, max: nextIndex });
     }
     const localDataMode = offlineMode || connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY;
     if (localDataMode) {
@@ -6392,6 +6627,9 @@ function App() {
       setSyncMessage(getErrorMessage(error, `${navigationItems.find(([itemView]) => itemView === view)?.[1] || "Module"} data could not be refreshed.`));
     }
   };
+  // Reassigned every render so the keyboard listener, which registers once, never calls a
+  // stale closure. See `navigateRef` above.
+  navigateRef.current = navigate;
 
   // The banner's "Return to Auto" is a second door to the same action as the Settings toggle, so it
   // needs the same answer. Computed from the saved App Mode rather than a settings draft, because
@@ -6590,6 +6828,22 @@ function App() {
   const notificationUnread = unreadCount(notifications);
   // The badge wears the WORST unread severity, not the newest — an error must not be masked by a
   // routine message arriving after it.
+  // The public site's header, footer and order button are built from the branch's
+  // own contact details. Nothing here is invented: an unset field is exported empty
+  // and the export says so, rather than the site quietly pointing nowhere.
+  // A plain lookup rather than a hook: this sits after an early return, and a find
+  // over the branch list costs nothing.
+  const websiteShopBranch = (settingsData?.branches || []).find(
+    (row) => String(row?.id ?? "") === String(user?.branch_id ?? ""),
+  );
+  const websiteShopDetails = {
+    name: "Frooz",
+    branch: String(websiteShopBranch?.branch_name ?? user?.branch ?? ""),
+    phone: String(websiteShopBranch?.phone_number ?? ""),
+    address: String(websiteShopBranch?.address ?? websiteShopBranch?.location ?? ""),
+    openText: "",
+  };
+
   const notificationSeverity = highestUnreadSeverity(notifications) || NOTIFICATION_SEVERITY.INFO;
   const activeLabel = navigationItems.find(([view]) => view === activeView)?.[1];
   const canManageRates = ["Owner", "Admin"].includes(user.role);
@@ -6678,19 +6932,27 @@ function App() {
     setFrostActiveTab(tab);
     setFrostDrawerOpen(true);
   };
-  const commandItems = [
-    ["sales", "Open POS Billing", () => navigate("sales")],
-    ["purchase", "New Purchase Entry", () => navigate("purchase")],
-    ["pending-bills", "Open Pending Bills", () => navigate("pending-bills")],
-    ["accounts", "Open Accounts", () => navigate("accounts")],
-    ["reports", "Open Reports", () => navigate("reports")],
-    ["sale-rates", "Open Sale Rate Update", () => navigate("sale-rates")],
-    ["products", "Search Product", () => navigate("products")],
-    ["accounts", "Search Customer", () => navigate("accounts")],
-    ["accounts", "Search Supplier", () => navigate("accounts")],
-    ["settings", "Open Update Center", () => navigate("settings")],
-    ["settings", "Check Connection", () => { navigate("settings"); performConnectivityCheck("command-palette", { force: true }); }],
-  ].filter(([view]) => hasModuleAccess(view) && (canManageRates || view !== "sale-rates"));
+  /**
+   * Everything a person can navigate to, searchable.
+   *
+   * This replaced eleven hand-written commands that could reach a module and nothing inside one:
+   * Settings' seventeen sections and Report Center's categories were unreachable by search, which
+   * is most of what there is to find. The index is built from the same registry the sidebar and
+   * the Alt shortcuts use, so a screen cannot exist in one and be missing from the other.
+   *
+   * Access is filtered before indexing rather than after searching, so a Cashier is never shown a
+   * result that would refuse them on arrival.
+   *
+   * Built only while the palette is open. A `useMemo` here sits after an early return in this
+   * component and breaks the rules-of-hooks ordering; the registry is forty entries, so building
+   * it on demand costs less than the memo would have.
+   */
+  const commandIndex = commandPaletteOpen
+    ? buildCommandIndex(navigationRegistry.filter(
+        (item) => hasModuleAccess(item.id) && (canManageRates || item.id !== "sale-rates"),
+      ))
+    : null;
+
   const shopView = resolveShopViewPresentation({
     loadState: shopViewState.loadState,
     loadError: shopViewState.loadError,
@@ -6703,22 +6965,31 @@ function App() {
   });
   return (
     <main className="erp-shell">
-      <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
+      <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""} ${sidebarCollapsed ? "sidebar-rail" : ""}`}>
         <div className="sidebar-brand">
           <BrandLogo />
         </div>
         <span className="sidebar-section">Main Menu</span>
         <nav className="sidebar-nav">
-          {navigationItems.filter(([view]) => hasModuleAccess(view) && (canManageRates || view !== "sale-rates")).map(([view, label]) => (
-            <button
-              className={activeView === view ? "nav-item nav-item-active" : "nav-item"}
-              key={view}
-              onClick={() => navigate(view)}
-            >
-              <Icon name={icons[view]} />
-              <span>{label}</span>
-            </button>
-          ))}
+          {navigationItems.filter(([view]) => hasModuleAccess(view) && (canManageRates || view !== "sale-rates")).map(([view, label]) => {
+            const shortcut = navigationRegistry.find((item) => item.id === view)?.shortcut || null;
+            return (
+              <button
+                className={activeView === view ? "nav-item nav-item-active" : "nav-item"}
+                key={view}
+                // The label becomes the tooltip on the collapsed rail, where it is the only way
+                // left to tell two similar icons apart.
+                title={sidebarCollapsed ? `${label}${shortcut ? ` (${formatShortcut(shortcut)})` : ""}` : undefined}
+                onClick={() => navigate(view)}
+              >
+                <Icon name={icons[view]} />
+                <span>{label}</span>
+                {/* The chip is how anybody discovers the shortcut exists. Rendered from the same
+                    registry the keystroke resolves against, so the two cannot disagree. */}
+                {shortcut && <kbd className="nav-shortcut">{formatShortcut(shortcut)}</kbd>}
+              </button>
+            );
+          })}
         </nav>
         {shopPickerVisible(shopView) && (
           <div className="sidebar-shop-picker">
@@ -6740,7 +7011,7 @@ function App() {
             <strong>{userDisplayName}</strong>
             <small>{userRoleLabel}</small>
           </div>
-          <button aria-label="Log out" className="logout-button" onClick={(event) => { event.stopPropagation(); setUser(null); setOfflineMode(false); setStartupError(""); setStartupNotice(""); }}>
+          <button aria-label="Log out" className="logout-button" onClick={(event) => { event.stopPropagation(); signOut(); }}>
             <Icon name="logout" size={17} />
           </button>
         </div>
@@ -6762,6 +7033,59 @@ function App() {
             >
               <Icon name="menu" />
             </button>
+            {/* The shell controls. Back and forward drive the browser's own history, which
+                `navigate` already pushes to and a `popstate` listener already restores from -- a
+                second stack beside it could only ever disagree with it. */}
+            <div className="chrome-bar">
+              <button
+                aria-label={sidebarCollapsed ? "Expand the menu" : "Collapse the menu to icons"}
+                aria-pressed={sidebarCollapsed}
+                className="chrome-button"
+                onClick={() => setSidebarCollapsed((collapsed) => {
+                  const next = !collapsed;
+                  try {
+                    window.localStorage.setItem("froozerp.sidebar.collapsed", next ? "1" : "0");
+                  } catch {
+                    // Remembering is a convenience; a browser refusing storage must not stop the
+                    // menu from collapsing right now.
+                  }
+                  return next;
+                })}
+                title={sidebarCollapsed ? "Expand the menu" : "Collapse the menu to icons"}
+                type="button"
+              >
+                <Icon name="menu" />
+              </button>
+              <button
+                aria-label="Search screens and settings"
+                className="chrome-button"
+                onClick={() => setCommandPaletteOpen(true)}
+                title="Search screens and settings (Ctrl K)"
+                type="button"
+              >
+                <Icon name="search" />
+              </button>
+              <button
+                aria-label="Back"
+                className="chrome-button"
+                disabled={navPosition.index <= 0}
+                onClick={() => window.history.back()}
+                title="Back"
+                type="button"
+              >
+                <Icon name="arrow-left" />
+              </button>
+              <button
+                aria-label="Forward"
+                className="chrome-button"
+                disabled={navPosition.index >= navPosition.max}
+                onClick={() => window.history.forward()}
+                title="Forward"
+                type="button"
+              >
+                <Icon name="arrow-right" />
+              </button>
+            </div>
             <BrandLogo compact />
             <div>
               <span className="eyebrow">Retail Operations Workspace</span>
@@ -7545,20 +7869,32 @@ function App() {
           )}
 
           {activeView === "sale-rates" && canManageRates && (
-            <SaleRateManager
-              history={saleRateHistory}
-              onReload={async () => { await Promise.all([loadProducts(), loadSaleRates()]); }}
-              onRefresh={loadSaleRates}
-              rates={saleRates}
-              desiredMargin={saleDesiredMargin}
-              setDesiredMargin={setSaleDesiredMargin}
-              user={user}
-            />
+            <>
+              <SaleRateManager
+                history={saleRateHistory}
+                onReload={async () => { await Promise.all([loadProducts(), loadSaleRates()]); }}
+                onRefresh={loadSaleRates}
+                rates={saleRates}
+                desiredMargin={saleDesiredMargin}
+                setDesiredMargin={setSaleDesiredMargin}
+                user={user}
+              />
+              {/* Right after the rates are set is when the website's copy of them is
+                  wrong, so the export lives here rather than somewhere it has to be
+                  remembered. */}
+              <WebsiteCatalogueExport
+                products={products}
+                lots={inventory}
+                shop={websiteShopDetails}
+              />
+            </>
           )}
 
           {activeView === "settings" && (
             <ModuleErrorBoundary onClose={() => setActiveView("dashboard")}>
               <SettingsModule
+                focusSection={pendingSection}
+                onFocusSectionHandled={() => setPendingSection(null)}
                 applicationFontSize={applicationFontSize}
                 backendHealth={backendHealth}
                 canManage={canManageRates}
@@ -7595,6 +7931,9 @@ function App() {
           {activeView === "reports" && (
             <ReportsModule
               accounts={accounts}
+              focusSection={pendingSection}
+              onFocusSectionHandled={() => setPendingSection(null)}
+              orders={ordersState}
               canCancelSales={canCancelSales}
               canEditSales={canEditSales}
               canManageStock={canManageStock}
@@ -7870,7 +8209,9 @@ function App() {
       />
       {commandPaletteOpen && (
         <CommandPalette
-          commands={commandItems}
+          index={commandIndex}
+          recentIds={recentViews}
+          onNavigate={(viewId, sectionId) => { navigate(viewId); setPendingSection(sectionId || null); }}
           onClose={() => setCommandPaletteOpen(false)}
         />
       )}
@@ -7955,29 +8296,111 @@ function FrostFloatingCopilot({
   );
 }
 
-function CommandPalette({ commands = [], onClose }) {
+/**
+ * Search across every screen and every section inside one.
+ *
+ * Replaces a filter over eleven hand-written commands that matched with `includes()` and could not
+ * reach a single Settings section or report. What makes this usable is not the search box but the
+ * ranking behind it, which lives in `local/commandPalette.js` where it is tested; this component
+ * only presents what that returns.
+ *
+ * Two things it must never do, both instances of "errors must never render as zero": show an empty
+ * list when the map itself failed to build, and show a complete-looking list built from a map it
+ * knows is partial. `status` and `degraded` are why both are distinguishable here.
+ */
+function CommandPalette({ index, recentIds = [], onNavigate, onClose }) {
   const [query, setQuery] = useState("");
-  const filtered = commands.filter(([, label]) => label.toLowerCase().includes(query.trim().toLowerCase()));
-  const runCommand = (command) => {
-    command?.();
+  const [highlighted, setHighlighted] = useState(0);
+  const search = searchCommands(index, query, { recentIds });
+  const results = search.results || [];
+  // Clamped rather than reset: the list shrinks as somebody types, and an index left past the end
+  // would make Enter do nothing at the exact moment they have finished narrowing it down.
+  const activeIndex = Math.min(highlighted, Math.max(0, results.length - 1));
+
+  const run = (result) => {
+    if (!result) return;
+    onNavigate?.(result.viewId, result.sectionId);
     onClose?.();
   };
+
+  const onKeyDown = (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      // The arrows belong to the list even though focus is in the text box, or choosing a result
+      // would mean taking a hand off the keyboard - which is the whole point of a palette.
+      event.preventDefault();
+      const step = event.key === "ArrowDown" ? 1 : -1;
+      setHighlighted((current) => {
+        const next = Math.min(current, Math.max(0, results.length - 1)) + step;
+        if (next < 0) return Math.max(0, results.length - 1);
+        return next >= results.length ? 0 : next;
+      });
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      run(results[activeIndex]);
+    }
+  };
+
+  const renderLabel = (result) => {
+    const segments = highlightSegments(result.highlight?.text ?? result.label, result.highlight?.ranges);
+    // The matched letters are marked so a result explains why it is in the list. Where the match
+    // was on a keyword or an eyebrow rather than the label, the label is shown plain instead of
+    // pretending the highlight belongs to it.
+    if (result.highlight?.field !== "label") return result.label;
+    return segments.map((segment, position) => (
+      segment.matched
+        ? <mark key={`${result.id}-${position}`}>{segment.text}</mark>
+        : <span key={`${result.id}-${position}`}>{segment.text}</span>
+    ));
+  };
+
   return (
     <div className="command-palette-backdrop" onClick={onClose}>
       <section className="command-palette" onClick={(event) => event.stopPropagation()}>
         <div className="command-palette-header">
-          <span className="eyebrow">Command Palette</span>
+          <span className="eyebrow">Go to</span>
           <button aria-label="Close command palette" className="remove-button" onClick={onClose} type="button"><Icon name="close" /></button>
         </div>
-        <input autoFocus placeholder="Search commands" value={query} onChange={(event) => setQuery(event.target.value)} />
+        <input
+          autoFocus
+          onChange={(event) => { setQuery(event.target.value); setHighlighted(0); }}
+          onKeyDown={onKeyDown}
+          placeholder="Search screens and settings"
+          value={query}
+        />
+        {search.degraded && (
+          <div className="command-palette-notice">Some screens could not be listed, so this search is incomplete.</div>
+        )}
         <div className="command-list">
-          {filtered.map(([view, label, command]) => (
-            <button key={`${view}-${label}`} onClick={() => runCommand(command)} type="button">
-              <Icon name={icons[view] || "settings"} />
-              <span>{label}</span>
+          {results.map((result, position) => (
+            <button
+              className={position === activeIndex ? "command-result command-result-active" : "command-result"}
+              key={result.id}
+              onClick={() => run(result)}
+              onMouseEnter={() => setHighlighted(position)}
+              type="button"
+            >
+              <Icon name={result.icon || "settings"} />
+              <span className="command-result-label">
+                {renderLabel(result)}
+                {/* A section is meaningless without the screen it lives in: "Business Identity" is
+                    only findable if you are told it is inside Settings. */}
+                {result.parentLabel && <small>in {result.parentLabel}</small>}
+              </span>
+              {result.shortcut && <kbd className="command-result-key">{formatShortcut(result.shortcut)}</kbd>}
             </button>
           ))}
-          {filtered.length === 0 && <div className="cart-empty">No matching command.</div>}
+          {results.length === 0 && (
+            <div className="cart-empty">
+              {/* Three different answers that would all have been an empty list before. */}
+              {search.status === "INVALID_INDEX"
+                ? "The list of screens could not be read, so search is unavailable."
+                : query.trim()
+                  ? `Nothing matches "${query.trim()}".`
+                  : "Start typing to find a screen."}
+            </div>
+          )}
         </div>
       </section>
     </div>
@@ -10339,11 +10762,30 @@ function DiscountManagementModule({ discounts = [], inventory = [], onReload, pr
   );
 }
 
-function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageStock, canWhatsappSend = false, connectivityMode = CONNECTIVITY_MODES.LOCAL_ONLY, customers = [], data = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, suppliers = [], user }) {
+function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageStock, canWhatsappSend = false, connectivityMode = CONNECTIVITY_MODES.LOCAL_ONLY, customers = [], data = {}, focusSection = null, onFocusSectionHandled, orders: ordersState = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, suppliers = [], user }) {
   const [range, setRange] = useState("today");
   const [search, setSearch] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
   const [selectedReport, setSelectedReport] = useState("");
+  /**
+   * Open the report category a search asked for.
+   *
+   * Simpler than Settings' equivalent because Report Center's categories are the drill-down: there
+   * is no card to scroll to, opening the category *is* arriving. The registry id is
+   * `reports/<category>`, and the part after the slash is the category id this screen already uses.
+   */
+  useEffect(() => {
+    if (!focusSection) return;
+    const categoryId = String(focusSection).startsWith("reports/") ? String(focusSection).slice("reports/".length) : "";
+    // Cleared either way. A target this screen does not recognise must not sit re-firing on every
+    // render, and leaving the person on the Report Center overview is a reasonable answer.
+    if (categoryId) {
+      setSelectedReport("");
+      setSelectedCategory(categoryId);
+    }
+    onFocusSectionHandled?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusSection]);
   const [clubSalesItems, setClubSalesItems] = useState(false);
   const [salesPrintNarration, setSalesPrintNarration] = useState(false);
   const salesPrintNarrationRef = useRef(false);
@@ -10485,6 +10927,54 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     return safeRows.filter(matchesSearch);
   };
   const totalOf = (rows, key) => rows.reduce((sum, row) => sum + Number(row[key] || 0), 0);
+  /**
+   * The four order reports, built from this device's SQLite rather than from the API.
+   *
+   * Orders are local-first and need no cloud, so they are the one part of Report Center that
+   * still answers when the internet does not. The range is the one Report Center is already
+   * showing (`appliedQuery`), passed as an explicit `custom` range so the reports cannot quietly
+   * filter on a different period from the one printed at the top of the page.
+   *
+   * `loadState` is carried through rather than collapsed into the rows, because "we have not read
+   * your orders" and "nobody ordered anything" are different answers and only one of them is
+   * zero.
+   */
+  const orderReportsState = (() => {
+    const loadState = ordersState.loadState || "idle";
+    if (loadState === "error") {
+      return { ready: false, notice: ordersState.loadError || "Orders could not be read on this device.", reports: null };
+    }
+    if (loadState === "idle" || loadState === "loading") {
+      return { ready: false, notice: "Reading this device's orders…", reports: null };
+    }
+    const reports = buildOrderReports(ordersState.orders, {
+      range: "custom",
+      date_from: appliedQuery.date_from,
+      date_to: appliedQuery.date_to,
+    });
+    return { ready: reports.ok, notice: describeOrderReportError(reports), reports };
+  })();
+  /**
+   * Rows for one order report, or an empty list while the orders are unread.
+   *
+   * Empty-while-unread is safe only because `orderReportSummary` refuses to produce figures in the
+   * same state: a table with no rows next to tiles reading 0 would be the exact failure this pair
+   * exists to prevent.
+   */
+  const orderReportRows = (key) => (
+    orderReportsState.reports?.[key]?.ok ? filterRows(orderReportsState.reports[key].rows) : []
+  );
+  /**
+   * Summary tiles for one order report, or a single tile naming the reason there are none.
+   *
+   * Returning `[["Orders", "-"]]` rather than `[["Orders", 0]]` is the whole point. A zero here
+   * would be a confident, wrong statement about the shop's day.
+   */
+  const orderReportSummary = (key, build) => {
+    const report = orderReportsState.reports?.[key];
+    if (!report?.ok) return [["Orders", "-", true], ["Status", orderReportsState.notice || "Unavailable"]];
+    return build(report.summary);
+  };
   const money = (value) => currency.format(Number(value || 0));
   const number = (value) => Number(value || 0).toLocaleString("en-IN");
   const stockRows = filterRows(data.stockReport);
@@ -11071,6 +11561,117 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     salesPrintNarration || salesPrintNarrationRef.current ? row.item_narration : row.item_summary
   );
   const reports = {
+    // ---- Orders -------------------------------------------------------------------------------
+    // Built from this device's SQLite, not from the API, so they answer with no internet. Every
+    // summary here is derived from the same filtered source as its own rows: `buildOrderReports`
+    // builds one source and hands it to all four, so by-product and by-date cannot disagree about
+    // the same day's rupees.
+    [ORDER_REPORT.BY_DATE]: {
+      title: "Orders by Date",
+      rows: orderReportRows(ORDER_REPORT.BY_DATE),
+      summary: () => orderReportSummary(ORDER_REPORT.BY_DATE, (total) => [
+        ["Order Value", money(total.value), true],
+        ["Orders", number(total.orders)],
+        ["Delivered", number(total.delivered)],
+        ["Still Open", number(total.open)],
+        ["Cancelled", number(total.cancelled)],
+      ]),
+      headers: ["Date", "Orders", "Value", "Delivered", "Open", "Cancelled", "Returned"],
+      render: (row) => (
+        <tr key={row.date}>
+          <td>{row.dateLabel}</td>
+          <td>{number(row.orders)}</td>
+          <td>{money(row.value)}</td>
+          <td>{number(row.delivered)}</td>
+          <td>{number(row.open)}</td>
+          <td>{number(row.cancelled)}</td>
+          <td>{number(row.returned)}</td>
+        </tr>
+      ),
+    },
+    // The one that answers "what do I buy at the mandi tomorrow". Cancelled quantity is shown in
+    // its own column rather than folded into the total: buying fruit for an order the customer
+    // cancelled yesterday is the specific mistake this report exists to prevent.
+    [ORDER_REPORT.BY_PRODUCT]: {
+      title: "Orders by Product",
+      rows: orderReportRows(ORDER_REPORT.BY_PRODUCT),
+      summary: () => orderReportSummary(ORDER_REPORT.BY_PRODUCT, (total) => [
+        ["Order Value", money(total.value), true],
+        ["Products", number(total.products)],
+        ["Quantity Ordered", number(total.quantity)],
+        ["Orders", number(total.orders)],
+      ]),
+      headers: ["Product", "Quantity", "Value", "Orders", "Customers", "Cancelled Qty", "Last Ordered"],
+      render: (row) => (
+        <tr key={row.productKey}>
+          <td className="primary-cell">{row.productName}{row.unit ? <small className="cell-note">{row.unit}</small> : null}</td>
+          <td>{number(row.quantity)}</td>
+          <td>{money(row.value)}</td>
+          <td>{number(row.orders)}</td>
+          <td>{number(row.customers)}</td>
+          <td>{row.cancelledQuantity > 0 ? number(row.cancelledQuantity) : "-"}</td>
+          <td>{row.lastOrderedOn ? formatIndianReportDate(row.lastOrderedOn) : "-"}</td>
+        </tr>
+      ),
+    },
+    [ORDER_REPORT.BY_CUSTOMER]: {
+      title: "Orders by Customer",
+      rows: orderReportRows(ORDER_REPORT.BY_CUSTOMER),
+      summary: () => orderReportSummary(ORDER_REPORT.BY_CUSTOMER, (total) => [
+        ["Order Value", money(total.value), true],
+        ["Customers", number(total.customers)],
+        ["Orders", number(total.orders)],
+        ["Average Order", money(total.averageOrderValue)],
+      ]),
+      headers: ["Customer", "Mobile", "Orders", "Value", "Average Order", "Cancelled", "Last Ordered"],
+      render: (row) => (
+        <tr key={row.customerKey}>
+          <td className="primary-cell">
+            {row.customerName}
+            {/* A first-time caller has no customer record yet, and the order is deliberately
+                allowed without one. Saying so beats showing a name that looks like an account. */}
+            {row.identified ? null : <small className="cell-note">Not a saved customer</small>}
+          </td>
+          <td>{row.customerMobile || "-"}</td>
+          <td>{number(row.orders)}</td>
+          <td>{money(row.value)}</td>
+          <td>{money(row.averageOrderValue)}</td>
+          <td>{row.cancelled > 0 ? number(row.cancelled) : "-"}</td>
+          <td>{row.lastOrderedOn ? formatIndianReportDate(row.lastOrderedOn) : "-"}</td>
+        </tr>
+      ),
+    },
+    [ORDER_REPORT.FULFILMENT]: {
+      title: "Order Fulfilment",
+      rows: orderReportRows(ORDER_REPORT.FULFILMENT),
+      summary: () => orderReportSummary(ORDER_REPORT.FULFILMENT, (total) => [
+        ["Order Value", money(total.value), true],
+        ["Orders", number(total.orders)],
+        ["Still Open", number(total.open)],
+        ["Delivered", number(total.delivered)],
+      ]),
+      headers: ["Order", "Date", "Customer", "Status", "Age", "Carrier", "Invoice", "Value"],
+      render: (row) => (
+        <tr key={row.id}>
+          <td className="primary-cell">
+            {row.orderNo}
+            <small className="cell-note">{row.source}</small>
+          </td>
+          <td>{row.orderedOnLabel}</td>
+          <td>{row.customerName}{row.customerMobile ? <small className="cell-note">{row.customerMobile}</small> : null}</td>
+          <td>
+            {row.status}
+            {/* Carried from the board rather than recomputed, so a warning a person has already
+                seen on the Orders screen reads identically here. */}
+            {row.warning ? <small className="cell-note">{row.warning}</small> : null}
+          </td>
+          <td>{row.ageHours < 24 ? `${row.ageHours} h` : `${Math.floor(row.ageHours / 24)} d`}</td>
+          <td>{row.carrier || "-"}</td>
+          <td>{row.invoiceNo || (row.billed ? "Billed" : "-")}</td>
+          <td>{money(row.value)}</td>
+        </tr>
+      ),
+    },
     salesByDate: {
       title: "Sales by Date",
       rows: filterRows(data.salesReport),
@@ -11531,6 +12132,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     },
   };
   const categories = [
+    { id: "orders", title: "Order Reports", icon: "parcel", description: "Customer orders taken by phone, WhatsApp and the counter: what was ordered, by whom, and what is still open. Read from this device, so these answer with no internet.", reports: [ORDER_REPORT.BY_DATE, ORDER_REPORT.BY_PRODUCT, ORDER_REPORT.BY_CUSTOMER, ORDER_REPORT.FULFILMENT] },
     { id: "sales", title: "Sales Reports", icon: "receipt", description: "Unified sales history with item narration, discounts, payments and bill status.", reports: ["salesHistory", "discountReport"] },
     { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Unified purchase history with item narration, bill status, payments and amendment actions.", reports: ["purchaseHistory"] },
     { id: "accounts", title: "Accounts & Ledger", icon: "users", description: "Customer ledger, supplier ledger, statements, payments and balances.", reports: ["customerLedger", "supplierLedger", "accountStatement", "paymentReport", "paymentModeSummary", "receivableReport", "payableReport"] },
@@ -12232,6 +12834,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       });
       return renderedRows;
     };
+    const isOrderReport = Object.values(ORDER_REPORT).includes(selectedReport);
     const reportFileName = (() => {
       const from = formatFileDate(appliedQuery.date_from || data.dateFrom);
       const to = formatFileDate(appliedQuery.date_to || data.dateTo);
@@ -12249,6 +12852,9 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
         parts.push(`Range: ${formatIndianReportDate(appliedQuery.date_from)} to ${formatIndianReportDate(appliedQuery.date_to)}`);
       }
       if (selectedReport !== "stockInventory" && appliedSearch) parts.push(`Search: ${appliedSearch}`);
+      // A short total that does not say it is short is the failure `describeOrderReportError`
+      // exists to prevent, so it is surfaced beside the range rather than only in a tile.
+      if (isOrderReport && orderReportsState.notice) parts.push(orderReportsState.notice);
       if (selectedReport === "salesHistory") {
         parts.push(`View: ${salesFilters.viewMode === "CUSTOMER" ? "Customer-wise" : salesFilters.viewMode === "INVOICE" ? "Invoice-wise" : salesFilters.viewMode === "LOT" ? "Lot-wise" : "Item-wise"}`);
         parts.push(`Status: ${salesFilters.status}`);
@@ -12306,7 +12912,15 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
                   <DataTable headers={currentReport.headers}>
                     {selectedReport === "purchaseHistory" ? renderPurchaseHistoryRows() : rows.map((row, index) => currentReport.render(row, index))}
                   </DataTable>
-                  {rows.length === 0 && <div className="cart-empty">No records found for the selected range {formatIndianReportDate(appliedQuery.date_from)} to {formatIndianReportDate(appliedQuery.date_to)}.</div>}
+                  {rows.length === 0 && (
+                    <div className="cart-empty">
+                      {/* An order report with no rows has two very different causes, and saying
+                          "no records found" for both would report a failed read as a quiet day. */}
+                      {isOrderReport && !orderReportsState.ready
+                        ? orderReportsState.notice
+                        : `No records found for the selected range ${formatIndianReportDate(appliedQuery.date_from)} to ${formatIndianReportDate(appliedQuery.date_to)}.`}
+                    </div>
+                  )}
                 </>
               )}
             </PrintableReport>
@@ -14383,34 +14997,87 @@ function SettingsModule({
   syncMessage,
   syncStatus,
   timeDiagnostics,
+  focusSection = null,
+  onFocusSectionHandled,
   user,
 }) {
-  return (
-    <section className="settings-layout">
-      <section className="settings-banner">
-        <div>
-          <span className="eyebrow">System Controls</span>
-          <h2>Settings</h2>
-          <p>{canManage ? "Owner/Admin controls are active." : "Read-only access. Owner/Admin approval is required for changes."}</p>
-        </div>
-        <span className={canManage ? "stock-ok" : "stock-low"}>{canManage ? "Manager Access" : "Read Only"}</span>
-      </section>
-      <AppearanceAccessibilitySettings applicationFontSize={applicationFontSize} setApplicationFontSize={setApplicationFontSize} />
-      <BusinessSettingsSection businessSettings={settingsData.businessSettings} canManage={canManage} key={settingsData.businessSettings?.updated_at || "business-settings"} onReload={onReload} user={user} />
-      <PosSettingsSection canManage={canManage} key={settingsData.posSettings?.updated_at || "pos-settings"} onReload={onReload} posSettings={settingsData.posSettings} user={user} />
-      <PaymentSettingsSection canManage={canManage} key={settingsData.paymentSettings?.updated_at || "payment-settings"} onReload={onReload} paymentSettings={settingsData.paymentSettings} user={user} />
-      <WhatsAppSettingsSection canManage={canManage} key={settingsData.whatsappSettings?.updated_at || "whatsapp-settings"} onReload={onReload} user={user} whatsappSettings={settingsData.whatsappSettings} />
-      <MandiTaxSettings canManage={canManage} onReload={onReload} rules={rules.mandiTaxRules} user={user} />
-      <RebateSettings canManage={canManage} onReload={onReload} rules={rules.rebateRules} user={user} />
-      <SaleRateSettingsSection canManage={canManage} key={settingsData.saleRateSettings?.updated_at || "sale-rate-settings"} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />
-      <DiscountSettings canManage={canManage} discountRules={settingsData.discountRules} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />
-      <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />
-      <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />
-      <DeviceControlSettingsSection canManage={canManage} deviceControlSettings={settingsData.deviceControlSettings} exitAttemptLogs={settingsData.exitAttemptLogs || []} onReload={onReload} user={user} />
-      <OperationalScopeManagement canManage={canManage} user={user} />
+  /**
+   * Which group of settings is open, or `null` for the group chooser.
+   *
+   * Deliberately not remembered between visits. Settings is where the damage lives, so arriving
+   * should always start from the overview rather than dropping somebody straight back into the
+   * screen they were last editing.
+   */
+  const [settingsGroup, setSettingsGroup] = useState(null);
+  /**
+   * Open the group that holds a searched-for section, then scroll to it.
+   *
+   * Two steps because the card is behind a drill-down: opening the group is what makes the element
+   * exist, and only then is there anything to scroll to. The scroll is deferred to the next frame
+   * for exactly that reason - React has not painted the group at the moment this effect runs.
+   *
+   * Cleared through the callback whether or not the element is found, so a section that cannot be
+   * scrolled to does not sit there re-firing on every later render. A miss still leaves the person
+   * on the right group, which is the useful half of the answer.
+   */
+  useEffect(() => {
+    if (!focusSection) return undefined;
+    const section = (navigationRegistry.find((item) => item.id === "settings")?.sections || [])
+      .find((entry) => entry.id === focusSection);
+    if (!section) {
+      onFocusSectionHandled?.();
+      return undefined;
+    }
+    setSettingsGroup(section.group);
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById(section.id.replace("/", "-"))
+        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+      onFocusSectionHandled?.();
+    });
+    return () => window.cancelAnimationFrame(frame);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusSection]);
+  /**
+   * Settings, grouped rather than stacked.
+   *
+   * This was one page carrying all seventeen sections, so finding the one you wanted meant
+   * scrolling past sixteen you did not. The grouping matches Report Center's existing pattern --
+   * one level, group then contents -- rather than introducing a second navigation idea into the
+   * same app.
+   *
+   * One level deep on purpose. A group opens straight onto its sections rather than onto a list of
+   * links: changing a WhatsApp token should be two clicks, not three.
+   */
+  const settingsSections = navigationRegistry.find((item) => item.id === "settings")?.sections || [];
+  const sectionsInGroup = (groupId) => settingsSections.filter((section) => section.group === groupId);
+  /**
+   * Each section keyed by its registry id.
+   *
+   * The registry decides which group a section belongs to and the group decides what renders, so
+   * the two cannot disagree about where a setting lives. A section present in one and missing from
+   * the other is reported on screen rather than silently skipped -- a setting that quietly stops
+   * being reachable is exactly the failure this drill-down could otherwise introduce.
+   */
+  const sectionContent = {
+    "settings/display-typography": <AppearanceAccessibilitySettings applicationFontSize={applicationFontSize} setApplicationFontSize={setApplicationFontSize} />,
+    "settings/business-identity": <BusinessSettingsSection businessSettings={settingsData.businessSettings} canManage={canManage} key={settingsData.businessSettings?.updated_at || "business-settings"} onReload={onReload} user={user} />,
+    "settings/weighing-scale": <PosSettingsSection canManage={canManage} key={settingsData.posSettings?.updated_at || "pos-settings"} onReload={onReload} posSettings={settingsData.posSettings} user={user} />,
+    "settings/payment-tax": <PaymentSettingsSection canManage={canManage} key={settingsData.paymentSettings?.updated_at || "payment-settings"} onReload={onReload} paymentSettings={settingsData.paymentSettings} user={user} />,
+    "settings/whatsapp": <WhatsAppSettingsSection canManage={canManage} key={settingsData.whatsappSettings?.updated_at || "whatsapp-settings"} onReload={onReload} user={user} whatsappSettings={settingsData.whatsappSettings} />,
+    "settings/mandi-tax": <MandiTaxSettings canManage={canManage} onReload={onReload} rules={rules.mandiTaxRules} user={user} />,
+    "settings/supplier-rebate": <RebateSettings canManage={canManage} onReload={onReload} rules={rules.rebateRules} user={user} />,
+    "settings/sale-rate-suggestions": <SaleRateSettingsSection canManage={canManage} key={settingsData.saleRateSettings?.updated_at || "sale-rate-settings"} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />,
+    "settings/bill-discount-slabs": <DiscountSettings canManage={canManage} discountRules={settingsData.discountRules} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />,
+    "settings/permission-matrix": <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />,
+    "settings/users": <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />,
+    "settings/device-control": <DeviceControlSettingsSection canManage={canManage} deviceControlSettings={settingsData.deviceControlSettings} exitAttemptLogs={settingsData.exitAttemptLogs || []} onReload={onReload} user={user} />,
+    "settings/operational-scope": <OperationalScopeManagement canManage={canManage} user={user} />,
+    "settings/updates": (
       <SettingsSectionErrorBoundary sectionName="Update Center">
         <UpdateCenterSection canManage={canManage} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
       </SettingsSectionErrorBoundary>
+    ),
+    "settings/sync": (
       <SyncSettingsSection
         backendHealth={backendHealth}
         canManage={canManage}
@@ -14441,8 +15108,66 @@ function SettingsModule({
         timeDiagnostics={timeDiagnostics}
         user={user}
       />
-      <BackupSettings backupLogs={settingsData.backupLogs || []} backupSettings={settingsData.backupSettings} canManage={canManage} onReload={onReload} user={user} />
-      <SystemInfoSection systemInfo={settingsData.systemInfo || {}} />
+    ),
+    "settings/backup": <BackupSettings backupLogs={settingsData.backupLogs || []} backupSettings={settingsData.backupSettings} canManage={canManage} onReload={onReload} user={user} />,
+    "settings/system-info": <SystemInfoSection systemInfo={settingsData.systemInfo || {}} />,
+  };
+
+  const banner = (
+    <section className="settings-banner">
+      <div>
+        <span className="eyebrow">System Controls</span>
+        <h2>Settings</h2>
+        <p>{canManage ? "Owner/Admin controls are active." : "Read-only access. Owner/Admin approval is required for changes."}</p>
+      </div>
+      <span className={canManage ? "stock-ok" : "stock-low"}>{canManage ? "Manager Access" : "Read Only"}</span>
+    </section>
+  );
+
+  const openGroup = SETTINGS_GROUPS.find((group) => group.id === settingsGroup) || null;
+  if (openGroup) {
+    return (
+      <section className="settings-layout">
+        {banner}
+        <ModuleCard eyebrow="Settings" title={openGroup.label} subtitle={openGroup.description}>
+          <div className="button-row">
+            <button className="secondary-button" onClick={() => setSettingsGroup(null)} type="button">Back to Settings</button>
+          </div>
+        </ModuleCard>
+        {sectionsInGroup(openGroup.id).map((section) => (
+          // The id is the section's address on the page: it is what will let a search result land
+          // on this card rather than at the top of the group. Derived from the registry id so the
+          // two cannot drift.
+          <div id={section.id.replace("/", "-")} key={section.id}>
+            {sectionContent[section.id] || (
+              <ModuleCard eyebrow="Settings" title={section.label} subtitle="This section is listed but has nothing to render.">
+                <p className="cart-empty">Reported rather than skipped, because a setting that disappears quietly is one nobody knows to look for.</p>
+              </ModuleCard>
+            )}
+          </div>
+        ))}
+      </section>
+    );
+  }
+
+  return (
+    <section className="settings-layout">
+      {banner}
+      <ModuleCard eyebrow="Settings" title="Choose what to change" subtitle="Grouped by what you are trying to do. Press Ctrl K and type to jump straight to a setting.">
+        <section className="report-center-grid">
+          {SETTINGS_GROUPS.map((group) => {
+            const count = sectionsInGroup(group.id).length;
+            return (
+              <button className="report-menu-card" key={group.id} onClick={() => setSettingsGroup(group.id)} type="button">
+                <Icon name={group.icon} size={22} />
+                <strong>{group.label}</strong>
+                <span>{group.description}</span>
+                <span className="settings-group-count">{count} setting{count === 1 ? "" : "s"}</span>
+              </button>
+            );
+          })}
+        </section>
+      </ModuleCard>
     </section>
   );
 }
@@ -15904,7 +16629,10 @@ function SyncSettingsSection({
         && Boolean(health.version)
         && health.deployment_type === "cloud"
         && health.cloud_ready === true
-        && Boolean(health.company_id)
+        // A-6 Gate 3.1: this asks whether the far end is a provisioned deployment, not who it
+        // belongs to. The identity fields it used to read are now behind a session, which this
+        // check cannot have - it runs while choosing which server to talk to.
+        && health.tenant_configured === true
       );
       const ok = healthOk && cloudIdentityOk;
       setConfigMessage(ok

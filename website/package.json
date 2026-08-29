@@ -1,0 +1,11 @@
+{
+  "name": "frooz-website",
+  "private": true,
+  "version": "0.1.0",
+  "description": "The Frooz customer storefront. Static, framework-free, no build step.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test src/*.test.mjs",
+    "serve": "python3 -m http.server 8901"
+  }
+}

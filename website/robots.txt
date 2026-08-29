@@ -1,0 +1,6 @@
+# The shop wants to be found.
+User-agent: *
+Allow: /
+
+# The tracking page answers about one order and is not linked from anywhere yet.
+Disallow: /track.html

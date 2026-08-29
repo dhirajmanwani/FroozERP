@@ -156,8 +156,30 @@ test("Orders loads on the offline path as well as the online one", () => {
 });
 
 test("Orders has a safety net that does not depend on navigate", () => {
-  assert.match(app, /if \(activeView !== "orders"\) return;/);
-  assert.match(app, /if \(ordersState\.loadState !== "idle"\) return;/);
+  // Re-anchored on the property rather than the exact condition when Report Center started
+  // needing orders too. What matters is that the screen loads them itself, guarded so it cannot
+  // double-load - not the precise shape of the view test, which now covers two views.
+  const start = app.indexOf('if (activeView !== "orders"');
+  assert.ok(start > 0, "the orders safety net must still be keyed on the orders view");
+  const effect = app.slice(start, start + 260);
+  assert.match(effect, /if \(ordersState\.loadState !== "idle"\) return;/, "and must not double-load");
+  assert.match(effect, /loadOrders\(\);/, "and must actually load them");
+});
+
+test("Report Center loads orders itself rather than trusting another screen to have done it", () => {
+  // Order reports are built from this device's SQLite. Reached without visiting the Orders screen
+  // first, an unloaded list would render as zero orders - indistinguishable from a day nobody
+  // ordered anything, which is the "errors must never render as zero" rule in CLAUDE.md.
+  const start = app.indexOf('if (activeView !== "orders"');
+  assert.ok(start > 0);
+  assert.match(app.slice(start, start + 260), /activeView !== "reports"/);
+});
+
+test("an order report with unread orders says so instead of showing zeros", () => {
+  // The pair that keeps a failed read from reading as a quiet day: no summary figures at all, and
+  // an empty table that names the reason rather than claiming no records were found.
+  assert.match(app, /return \[\["Orders", "-", true\], \["Status", orderReportsState\.notice/);
+  assert.match(app, /isOrderReport && !orderReportsState\.ready\s*\n?\s*\? orderReportsState\.notice/);
 });
 
 test("an unloaded Orders screen does not claim to be loading", () => {

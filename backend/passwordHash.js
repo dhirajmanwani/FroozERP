@@ -1,10 +1,14 @@
 /**
  * Password hashing and verification.
  *
- * Stage A-1 of `docs/auth-hardening-plan.md`. Replaces the unsalted single-round SHA-256
- * (`hashPassword` in `server.js`) with a real password KDF, while still verifying every legacy
- * hash so nobody is locked out. No user-visible change: existing passwords keep working and are
- * upgraded silently on next successful login.
+ * Stage A-1 of `docs/auth-hardening-plan.md` replaced the unsalted single-round SHA-256
+ * (`hashPassword` in `server.js`) with a real password KDF. It kept verifying every legacy hash so
+ * that nobody was locked out by the upgrade, and re-hashed each one on its next successful login.
+ *
+ * A-5 finished the job: only scrypt authenticates now. The two retired shapes — the unsalted digest
+ * and the pre-migration plaintext column — are still recognised, but only so the account can be
+ * told to reset. See "The plaintext fallback is gone (A-2)" and "The legacy SHA-256 verify path is
+ * gone too (A-5)" below for what that costs and how an affected account gets back in.
  *
  * ## Why scrypt rather than argon2id
  *
@@ -46,6 +50,32 @@
  * **Operational consequence, stated plainly:** any account whose password is still stored as
  * plaintext can no longer sign in and needs an administrative password reset. See the A-2 record
  * in `docs/auth-hardening-plan.md` for the query that finds such rows.
+ *
+ * ## The legacy SHA-256 verify path is gone too (A-5)
+ *
+ * A-1 kept verifying unsalted single-round SHA-256 digests so that nobody was locked out by the
+ * upgrade, and re-hashed them to scrypt on the next successful login. That migration is one-way and
+ * self-completing — the population of legacy rows only ever shrinks — but while the verifier still
+ * accepted them, the weakest hash in the table was still a working credential. An unsalted
+ * single-round digest falls to a rainbow table in seconds, so anyone who obtained a copy of `users`
+ * (a leaked backup, a restored dump, a stolen laptop) could recover those passwords and sign in
+ * with them. Re-hash-on-login does not help there: the attacker never needs to log in as that user
+ * first.
+ *
+ * So a legacy digest no longer authenticates anyone. It is still *recognised*, by shape, so callers
+ * can say "this account's password is stored in a retired format, reset it" instead of the flat
+ * "invalid username or password" that would send a real shopkeeper round in circles. What the
+ * verifier no longer does is compute the legacy digest of the supplied password and compare it —
+ * the retired algorithm is not run at all, on any input, so there is no path by which it can grant
+ * access.
+ *
+ * **Operational consequence, stated plainly:** any account that has not signed in since A-1 shipped
+ * can no longer sign in and needs a password reset. Three routes exist and none of them depend on
+ * the old hash: self-service OTP recovery (`/auth/recovery/*`), an Owner or Admin resetting the
+ * account (`/users/:id/recovery-action`), and `scripts/reset-password.mjs` for whoever holds
+ * database access — the backstop that covers an Owner with no verified recovery contact.
+ *
+ * `reportLegacyPasswordHashes` in `server.js` counts the affected accounts at every startup.
  */
 
 const crypto = require("crypto");
@@ -64,6 +94,12 @@ const FORMAT_VERSION = 1;
 /** Hash formats `verifyPassword` can encounter, reported so callers can act on provenance. */
 const PASSWORD_FORMATS = Object.freeze({
   SCRYPT: "SCRYPT",
+  /**
+   * The stored value has the shape of the pre-A-1 unsalted SHA-256 digest. Retired in A-5: it is
+   * reported so the account can be told to reset, and it never authenticates (see the module
+   * docblock). Reported by *shape* only — the supplied password is not hashed and not compared,
+   * so this branch cannot confirm a guess to whoever made it.
+   */
   LEGACY_SHA256: "LEGACY_SHA256",
   /**
    * The stored value is neither a scrypt hash nor a legacy SHA-256 digest — so it is not a
@@ -81,25 +117,14 @@ const PASSWORD_FORMATS = Object.freeze({
 
 const cleanText = (value) => (typeof value === "string" ? value.trim() : "");
 
-/** The exact legacy hash: 64 lowercase hex characters, unsalted single-round SHA-256. */
-const LEGACY_SHA256_PATTERN = /^[0-9a-f]{64}$/;
-
-const legacySha256 = (password) =>
-  crypto.createHash("sha256").update(String(password || ""), "utf8").digest("hex");
-
 /**
- * Compare two strings without leaking their contents through timing.
+ * The exact shape of the retired hash: 64 lowercase hex characters, unsalted single-round SHA-256.
  *
- * `timingSafeEqual` throws when lengths differ, and the length check itself leaks length — which
- * is harmless here (hash lengths are fixed and public) but would not be for the secret itself, so
- * this is only ever used on digests, never on a raw password.
+ * A-5 deleted the function that produced it. This pattern is all that remains, and it is used only
+ * to *recognise* such a row so the account can be told to reset — never to verify one. There is
+ * deliberately no way left in this module to compute a legacy digest.
  */
-const timingSafeEqualString = (a, b) => {
-  const bufferA = Buffer.from(String(a), "utf8");
-  const bufferB = Buffer.from(String(b), "utf8");
-  if (bufferA.length !== bufferB.length) return false;
-  return crypto.timingSafeEqual(bufferA, bufferB);
-};
+const LEGACY_SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
 const encodeHash = (salt, derived, params = SCRYPT_PARAMS) =>
   [
@@ -223,8 +248,11 @@ const verifyPassword = async (password, storedHash) => {
   }
 
   if (LEGACY_SHA256_PATTERN.test(stored)) {
-    const ok = timingSafeEqualString(stored, legacySha256(password));
-    return { ok, format: PASSWORD_FORMATS.LEGACY_SHA256, needsRehash: ok };
+    // A-5: the retired unsalted digest is recognised but never verified. `password` is not hashed
+    // here and not compared to anything — the algorithm this branch used to run no longer exists in
+    // this module. Reporting the format lets `/login` say "reset this account" instead of "invalid
+    // password"; it cannot say "your guess was right", because nothing checked.
+    return { ok: false, format: PASSWORD_FORMATS.LEGACY_SHA256, needsRehash: false };
   }
 
   // A-2: a stored value that is neither a scrypt hash nor a legacy SHA-256 digest is not a
@@ -246,7 +274,6 @@ module.exports = {
   hashPassword,
   hashPasswordSync,
   verifyPassword,
-  legacySha256,
   PASSWORD_FORMATS,
   SCRYPT_PARAMS,
 };
