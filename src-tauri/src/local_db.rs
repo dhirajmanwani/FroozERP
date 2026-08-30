@@ -8,7 +8,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::entitlement::{self, EntitlementState};
 
-const CURRENT_SCHEMA_VERSION: &str = "022_customer_order_sync";
+const CURRENT_SCHEMA_VERSION: &str = "023_customer_order_transfer";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -31,6 +31,7 @@ const MIGRATION_019: &str = include_str!("../migrations/sqlite/019_provisional_l
 const MIGRATION_020: &str = include_str!("../migrations/sqlite/020_customer_orders.sql");
 const MIGRATION_021: &str = include_str!("../migrations/sqlite/021_customer_order_payment.sql");
 const MIGRATION_022: &str = include_str!("../migrations/sqlite/022_customer_order_sync.sql");
+const MIGRATION_023: &str = include_str!("../migrations/sqlite/023_customer_order_transfer.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -1731,7 +1732,7 @@ pub fn save_customer_order_at(
     tx.execute(
         "INSERT INTO local_customer_orders (
            id, order_no, source, customer_id, customer_name, customer_mobile, delivery_address,
-           status, reserved_at, notes, branch_id, created_by
+           status, reserved_at, notes, branch_id, created_by, taken_at_branch_id
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'RECEIVED',
                    -- COALESCE, not the column DEFAULT: `reserved_at` has none. An earlier draft
                    -- assumed it did and passed NULL, which produced accepted orders carrying no
@@ -1740,7 +1741,7 @@ pub fn save_customer_order_at(
                    -- would have held its fruit for ever, which is the exact failure the lapse exists
                    -- to prevent. Caught by a test, not by reading.
                    COALESCE(?8, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-                   ?9, ?10, ?11)",
+                   ?9, ?10, ?11, ?12)",
         rusqlite::params![
             order_id,
             order_no,
@@ -1761,6 +1762,13 @@ pub fn save_customer_order_at(
             // silently becoming NULL.
             branch_id,
             order_text(order, "created_by"),
+            // Provenance and fulfilment are the same branch here, and that is not an assumption:
+            // the device taking this order is the device that will pack it. They only diverge
+            // later, when somebody transfers the order, and a transfer changes `branch_id` alone.
+            // Written from the resolved value rather than from the raw payload so that a device
+            // that supplied no branch of its own records the same answer in both columns — or NULL
+            // in both, when the branch could not be resolved at all and the order is blocked.
+            branch_id,
         ],
     )
     .map_err(to_error)?;
@@ -1957,7 +1965,8 @@ fn read_customer_order(conn: &Connection, order_id: &str) -> Result<serde_json::
                     cancelled_at, cancellation_reason, carrier, carrier_reference, tracking_url,
                     carrier_contact, sale_id, invoice_no, notes, branch_id, created_by, created_at,
                     payment_state, amount_paid, payment_reference, payment_marked_at,
-                    entity_version, sync_status, sync_blocked_reason, updated_at
+                    entity_version, sync_status, sync_blocked_reason, updated_at,
+                    taken_at_branch_id, transferred_to_branch_id, transferred_away_at
              FROM local_customer_orders WHERE id = ?1",
             rusqlite::params![order_id],
             |row| {
@@ -2010,6 +2019,17 @@ fn read_customer_order(conn: &Connection, order_id: &str) -> Result<serde_json::
                     "sync_status": row.get::<_, String>(29)?,
                     "sync_blocked_reason": row.get::<_, Option<String>>(30)?,
                     "updated_at": row.get::<_, Option<String>>(31)?,
+                    // The routing half of the record. `branch_id` above is the branch *fulfilling*
+                    // the order; this is the branch that *took* it, and they differ from the moment
+                    // anybody moves an order. Read as Option<String> rather than as a raw value
+                    // because, unlike `branch_id`, this column is TEXT — there is no INTEGER
+                    // affinity to trip over.
+                    "taken_at_branch_id": row.get::<_, Option<String>>(32)?,
+                    // Both NULL on an ordinary order. Set together on the losing device when a
+                    // TRANSFER_OUT arrives, so an order that left is distinguishable from one that
+                    // was cancelled and from one that simply vanished.
+                    "transferred_to_branch_id": row.get::<_, Option<String>>(33)?,
+                    "transferred_away_at": row.get::<_, Option<String>>(34)?,
                 }))
             },
         )
@@ -2720,6 +2740,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "020_customer_orders", MIGRATION_020)?;
     apply_migration(&mut conn, "021_customer_order_payment", MIGRATION_021)?;
     apply_migration(&mut conn, "022_customer_order_sync", MIGRATION_022)?;
+    apply_migration(&mut conn, "023_customer_order_transfer", MIGRATION_023)?;
     Ok(())
 }
 
@@ -5379,6 +5400,55 @@ fn apply_pulled_customer_order_with_tx(
         return Ok(());
     }
 
+    // The order has moved to another branch, and this device is the one losing it.
+    //
+    // **This arm has to exist, and its absence is the single most likely way to build this wrong.**
+    // Everything below treats a change that is not DELETE as an upsert, so a TRANSFER_OUT falling
+    // through would re-insert the order onto the very device it is supposed to be leaving — and
+    // because the two branches' change rows carry the same entity_version, the version guard would
+    // not save us either. Both branches would then go on believing they owed the same customer a
+    // delivery, which is exactly the confusion this whole design exists to prevent.
+    //
+    // It is deliberately not folded into the DELETE arm. "This order was cancelled" and "this order
+    // is now the other branch's" are different facts, and a counter told the wrong one rings the
+    // wrong customer.
+    //
+    // `deleted_at` is what releases the reserved stock: reservations are summed by
+    // `reservedQuantityByProduct` over the orders the board loads, and the board loads
+    // `deleted_at IS NULL`. So the release is a consequence of the rule that already governs every
+    // other order, rather than a second mechanism that could disagree with it.
+    //
+    // `branch_id` is left exactly as it was. It still says which branch this row belonged to, which
+    // is the true statement here; overwriting it with the destination would leave the losing device
+    // holding a row claiming to belong to a branch it has never been.
+    //
+    // When no such row exists — a TRANSFER_OUT for an order this device never pulled — the UPDATE
+    // touches nothing and that is the right answer: there is no local copy to take away, and
+    // inserting a tombstone would only invent a record of an order this counter never saw.
+    if change.operation_type.eq_ignore_ascii_case("TRANSFER_OUT") {
+        // Where it went. The explicit field is preferred; `branch_id` on a transfer payload is the
+        // *new* fulfilment branch and so answers the same question, and is the fallback for a
+        // server that names it only that way. Read through `order_branch_text` for the same reason
+        // every other branch here is: `as_i64` silently drops a branch id sent as a string, and
+        // "004" is not 4.
+        let destination = order_branch_text(payload, "transferred_to_branch_id")
+            .or_else(|| order_branch_text(payload, "branch_id"));
+        tx.execute(
+            "UPDATE local_customer_orders
+                SET deleted_at = COALESCE(?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    transferred_to_branch_id = ?4,
+                    transferred_away_at = COALESCE(?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    entity_version = ?3,
+                    sync_status = 'synced',
+                    sync_blocked_reason = NULL,
+                    updated_at = COALESCE(?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+              WHERE id = ?1",
+            params![change.entity_id, change.updated_at, incoming_version, destination],
+        )
+        .map_err(to_error)?;
+        return Ok(());
+    }
+
     // Status is the field that decides whether this order holds stock, so an unrecognised one is
     // not guessed at. Coercing it to RECEIVED would reserve fruit for an order that might have been
     // cancelled; letting the CHECK constraint reject it would abort the whole pull transaction and
@@ -5446,8 +5516,17 @@ fn apply_pulled_customer_order_with_tx(
         );
     }
 
+    // The branch *fulfilling* this order. It is the column the whole transport scopes by, so it is
+    // also the column a transfer changes — an order arriving here with a different `branch_id` than
+    // it had is a transfer in, and needs no special handling on this side.
     let branch_id = order_branch_text(payload, "branch_id")
         .or_else(|| change.branch_id.map(|value| value.to_string()));
+    // The branch that *took* the order. Never derived from `branch_id`: on an order transferred in
+    // from somewhere else those two are different by definition, so falling back to the fulfilment
+    // branch would quietly rewrite history to say this branch answered a call it never took. When
+    // the payload does not carry it — an older server, or a record written before the split — the
+    // UPSERT below keeps whatever this device already had rather than replacing it with NULL.
+    let taken_at_branch_id = order_branch_text(payload, "taken_at_branch_id");
 
     tx.execute(
         "INSERT INTO local_customer_orders (
@@ -5456,13 +5535,13 @@ fn apply_pulled_customer_order_with_tx(
             cancellation_reason, carrier, carrier_reference, tracking_url, carrier_contact,
             sale_id, invoice_no, notes, branch_id, created_by, created_at, updated_at, deleted_at,
             payment_state, amount_paid, payment_reference, payment_marked_at,
-            entity_version, sync_status, sync_blocked_reason
+            entity_version, sync_status, sync_blocked_reason, taken_at_branch_id
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
             ?19, ?20, ?21, ?22, ?23,
             COALESCE(?24, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
             COALESCE(?25, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-            ?26, ?27, ?28, ?29, ?30, ?31, 'synced', NULL
+            ?26, ?27, ?28, ?29, ?30, ?31, 'synced', NULL, ?32
          )
          ON CONFLICT(id) DO UPDATE SET
            order_no = excluded.order_no,
@@ -5494,6 +5573,17 @@ fn apply_pulled_customer_order_with_tx(
            payment_reference = excluded.payment_reference,
            payment_marked_at = excluded.payment_marked_at,
            entity_version = excluded.entity_version,
+           -- COALESCE, not `excluded.`, and it is the one field here treated that way. Provenance
+           -- never changes, so an incoming copy that does not carry it is saying nothing about it
+           -- rather than saying it is unknown — and overwriting a real branch with NULL would lose
+           -- the only record of who took the order, permanently and silently.
+           taken_at_branch_id = COALESCE(excluded.taken_at_branch_id, local_customer_orders.taken_at_branch_id),
+           -- Cleared, because an UPSERT reaching this device means this branch is fulfilling the
+           -- order — the pull predicate sends it nowhere else. An order transferred away and later
+           -- transferred back would otherwise come back live while still carrying the note saying
+           -- it had left, which reads as two contradictory facts about the same row.
+           transferred_to_branch_id = NULL,
+           transferred_away_at = NULL,
            sync_status = 'synced',
            sync_blocked_reason = NULL",
         params![
@@ -5533,6 +5623,7 @@ fn apply_pulled_customer_order_with_tx(
             optional_text(payload, "payment_reference"),
             optional_text(payload, "payment_marked_at"),
             incoming_version,
+            taken_at_branch_id,
         ],
     )
     .map_err(to_error)?;
@@ -6001,7 +6092,7 @@ mod tests {
     /// three at once with nothing but `left: 18, right: 17` to explain why, and the failures were
     /// mistaken for the environment for long enough to reach a merge check. One named constant is
     /// the whole fix: **bump this when you add a migration**, and the number says what it counts.
-    const EXPECTED_APPLIED_MIGRATIONS: i64 = 21;
+    const EXPECTED_APPLIED_MIGRATIONS: i64 = 22;
 
     #[test]
     fn snapshot_preflight_rejects_malformed_database_without_replacing_it() {
@@ -7052,6 +7143,329 @@ mod tests {
         let after = read_customer_order(&conn, "order-local-1").expect("read order");
         assert_eq!(after["status"], "CANCELLED");
         assert_eq!(after["entity_version"], 5);
+        drop(conn);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A transfer takes the order off this branch's board and says where it went.
+    ///
+    /// A transfer from branch A to branch B writes **two** change-log rows carrying the same
+    /// entity_version: a TRANSFER_OUT scoped to A and an UPSERT scoped to B. A's devices only pull
+    /// rows matching A, so without the first row they would never be told the order had left, and
+    /// two branches would go on believing they owed the same customer a delivery.
+    ///
+    /// The soft delete is what releases the reserved stock: reservations are summed by
+    /// `reservedQuantityByProduct` over the orders the board loads, and the board loads
+    /// `deleted_at IS NULL`. The two transfer columns are what stop the order from looking as
+    /// though it had simply vanished — a counter told "cancelled" when the truth is "it is now
+    /// Ratanada's" rings the wrong customer.
+    #[test]
+    fn a_transferred_out_order_leaves_the_board_and_records_where_it_went() {
+        let path = order_sync_test_path("transfer-out");
+        initialize_at(&path).expect("initialize order transfer database");
+        seed_order_branch(&path, "3");
+
+        save_customer_order_at(
+            &path,
+            &serde_json::json!({
+                "id": "order-moving",
+                "order_no": "ORD-MOVING",
+                "customer_name": "Anita",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 6 }]
+            }),
+        )
+        .expect("the order is taken at this branch");
+
+        // Taken here and fulfilled here, which is every order until somebody moves one.
+        let before = order_row(&path, "order-moving");
+        assert_eq!(before["branch_id"], 3);
+        assert_eq!(before["taken_at_branch_id"], "3");
+        assert!(before["transferred_to_branch_id"].is_null());
+
+        let transfer = PulledChange {
+            change_id: serde_json::json!(9101),
+            branch_id: Some(3),
+            entity_type: "customer_order".to_string(),
+            entity_id: "order-moving".to_string(),
+            operation_type: "TRANSFER_OUT".to_string(),
+            version: Some(2),
+            updated_at: Some("2026-08-28T11:00:00.000Z".to_string()),
+            payload: serde_json::json!({
+                "id": "order-moving",
+                "order_no": "ORD-MOVING",
+                "customer_name": "Anita",
+                "status": "RECEIVED",
+                // The payload describes the order as it now is: fulfilled by branch 7, still taken
+                // at branch 3.
+                "branch_id": "7",
+                "transferred_to_branch_id": "7",
+                "taken_at_branch_id": "3",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 6 }]
+            }),
+        };
+        apply_pull_changes_at(
+            &path,
+            std::slice::from_ref(&transfer),
+            "cursor-transfer-1",
+            Some("FZDEV-ORDERS".to_string()),
+            Some("2026-08-28T11:01:00.000Z".to_string()),
+        )
+        .expect("a transfer out applies");
+
+        // Gone from the query the board actually runs, which is what releases the reservation.
+        let board = list_customer_orders_at(&path).expect("orders list");
+        assert!(
+            board["orders"]
+                .as_array()
+                .expect("orders array")
+                .iter()
+                .all(|order| order["id"] != "order-moving"),
+            "an order that has moved to another branch must not stay on this branch's board"
+        );
+
+        let conn = Connection::open(&path).expect("open after transfer");
+        let after = read_customer_order(&conn, "order-moving")
+            .expect("the row stays, so it can explain itself");
+        assert_eq!(
+            after["transferred_to_branch_id"], "7",
+            "the order did not vanish; it went somewhere, and the record says where"
+        );
+        assert_eq!(after["transferred_away_at"], "2026-08-28T11:00:00.000Z");
+        assert_eq!(
+            after["taken_at_branch_id"], "3",
+            "provenance is not rewritten by a transfer — this branch did answer the phone"
+        );
+        assert_eq!(
+            after["branch_id"], 3,
+            "and the row still says which branch lost it, rather than claiming to be branch 7's"
+        );
+        assert_eq!(after["entity_version"], 2);
+        assert_eq!(after["sync_status"], "synced");
+        assert!(after["sync_blocked_reason"].is_null());
+
+        let deleted_at: Option<String> = conn
+            .query_row(
+                "SELECT deleted_at FROM local_customer_orders WHERE id = 'order-moving'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read deleted_at");
+        assert!(
+            deleted_at.is_some(),
+            "the soft delete is what releases the reserved stock, so it has to be set"
+        );
+
+        // Nothing was invented or destroyed in the stock tables: the reservation was only ever
+        // derived from the orders this device holds.
+        let lots: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_inventory_lots", [], |row| row.get(0))
+            .expect("count lots");
+        let movements: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_stock_movements", [], |row| row.get(0))
+            .expect("count movements");
+        assert_eq!(lots, 0, "releasing a reservation is not a stock movement");
+        assert_eq!(movements, 0);
+        drop(conn);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A TRANSFER_OUT must never leave a live order behind.
+    ///
+    /// `apply_pulled_customer_order_with_tx` special-cases DELETE and treats **everything else** as
+    /// an upsert. Without an explicit TRANSFER_OUT arm the change falls through to that upsert and
+    /// re-inserts the order onto the very device it is supposed to be leaving — and since both
+    /// change rows of a transfer carry the same entity_version, the version guard does not catch it
+    /// either. This test is the one that fails if that arm is ever removed.
+    #[test]
+    fn a_transfer_out_is_not_an_upsert_and_leaves_no_live_order_behind() {
+        let path = order_sync_test_path("transfer-not-upsert");
+        initialize_at(&path).expect("initialize order transfer database");
+        seed_order_branch(&path, "3");
+
+        save_customer_order_at(
+            &path,
+            &serde_json::json!({
+                "id": "order-leaving",
+                "order_no": "ORD-LEAVING",
+                "customer_name": "Ram",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 2 }]
+            }),
+        )
+        .expect("the order is taken at this branch");
+
+        let transfer = PulledChange {
+            change_id: serde_json::json!(9102),
+            branch_id: Some(3),
+            entity_type: "customer_order".to_string(),
+            entity_id: "order-leaving".to_string(),
+            operation_type: "TRANSFER_OUT".to_string(),
+            version: Some(2),
+            updated_at: Some("2026-08-28T12:00:00.000Z".to_string()),
+            payload: serde_json::json!({
+                "id": "order-leaving",
+                "order_no": "ORD-LEAVING",
+                "customer_name": "Ram",
+                // Deliberately different from the local row on every field an upsert would copy, so
+                // that a fall-through is visible rather than merely suspected.
+                "status": "PACKED",
+                "branch_id": "7",
+                "transferred_to_branch_id": "7",
+                "taken_at_branch_id": "3",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 2 }]
+            }),
+        };
+        apply_pull_changes_at(
+            &path,
+            std::slice::from_ref(&transfer),
+            "cursor-transfer-2",
+            Some("FZDEV-ORDERS".to_string()),
+            Some("2026-08-28T12:01:00.000Z".to_string()),
+        )
+        .expect("a transfer out applies");
+
+        let conn = Connection::open(&path).expect("open after transfer");
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_customer_orders
+                  WHERE id = 'order-leaving' AND deleted_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count live rows");
+        assert_eq!(
+            live, 0,
+            "a TRANSFER_OUT treated as an upsert would re-insert the order it is meant to remove"
+        );
+        let (status, branch): (String, i64) = conn
+            .query_row(
+                "SELECT status, branch_id FROM local_customer_orders WHERE id = 'order-leaving'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read the row that stayed behind");
+        assert_eq!(status, "RECEIVED", "the payload's status is not applied by a transfer out");
+        assert_eq!(branch, 3, "nor is the destination branch written over the losing branch");
+        drop(conn);
+
+        // And a transfer out for an order this device never pulled creates nothing at all. There is
+        // no local copy to take away, and a tombstone would invent a record of an order this
+        // counter never saw.
+        let unknown = PulledChange {
+            change_id: serde_json::json!(9103),
+            entity_id: "order-never-here".to_string(),
+            version: Some(1),
+            ..transfer
+        };
+        apply_pull_changes_at(
+            &path,
+            std::slice::from_ref(&unknown),
+            "cursor-transfer-3",
+            Some("FZDEV-ORDERS".to_string()),
+            Some("2026-08-28T12:02:00.000Z".to_string()),
+        )
+        .expect("a transfer out for an unknown order is not an error");
+        let conn = Connection::open(&path).expect("open after unknown transfer");
+        let created: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_customer_orders WHERE id = 'order-never-here'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count invented rows");
+        assert_eq!(created, 0, "a transfer out must never create an order");
+        drop(conn);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// An older TRANSFER_OUT arriving late must not take away a newer local order.
+    ///
+    /// The version guard applies to a transfer exactly as it does to an upsert: a re-delivery, or a
+    /// device coming back from a long offline spell, must not remove an order from a board that has
+    /// since moved it on.
+    #[test]
+    fn an_older_transfer_out_does_not_undo_a_newer_local_change() {
+        let path = order_sync_test_path("transfer-stale");
+        initialize_at(&path).expect("initialize order transfer database");
+        seed_order_branch(&path, "3");
+
+        save_customer_order_at(
+            &path,
+            &serde_json::json!({
+                "id": "order-staying",
+                "order_no": "ORD-STAYING",
+                "customer_name": "Sita",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 4 }]
+            }),
+        )
+        .expect("local order saves");
+        let packed =
+            set_customer_order_status_at(&path, "order-staying", "PACKED", &serde_json::json!({}))
+                .expect("local order packs");
+        assert_eq!(packed["entity_version"], 2);
+
+        let stale = PulledChange {
+            change_id: serde_json::json!(9104),
+            branch_id: Some(3),
+            entity_type: "customer_order".to_string(),
+            entity_id: "order-staying".to_string(),
+            operation_type: "TRANSFER_OUT".to_string(),
+            version: Some(1),
+            updated_at: Some("2026-08-27T08:00:00.000Z".to_string()),
+            payload: serde_json::json!({
+                "id": "order-staying",
+                "order_no": "ORD-STAYING",
+                "customer_name": "Sita",
+                "status": "RECEIVED",
+                "branch_id": "7",
+                "transferred_to_branch_id": "7",
+                "taken_at_branch_id": "3",
+                "items": []
+            }),
+        };
+        apply_pull_changes_at(
+            &path,
+            std::slice::from_ref(&stale),
+            "cursor-transfer-4",
+            Some("FZDEV-ORDERS".to_string()),
+            Some("2026-08-28T13:00:00.000Z".to_string()),
+        )
+        .expect("a stale transfer is skipped, not an error");
+
+        let still_there = order_row(&path, "order-staying");
+        assert_eq!(
+            still_there["status"], "PACKED",
+            "a stale transfer must not remove an order the branch has since packed"
+        );
+        assert_eq!(still_there["entity_version"], 2);
+        assert!(still_there["transferred_to_branch_id"].is_null());
+        assert!(still_there["transferred_away_at"].is_null());
+
+        // A genuinely newer transfer does take it away.
+        let current = PulledChange { version: Some(3), ..stale };
+        apply_pull_changes_at(
+            &path,
+            std::slice::from_ref(&current),
+            "cursor-transfer-5",
+            Some("FZDEV-ORDERS".to_string()),
+            Some("2026-08-28T13:01:00.000Z".to_string()),
+        )
+        .expect("a newer transfer applies");
+        let board = list_customer_orders_at(&path).expect("orders list");
+        assert!(
+            board["orders"]
+                .as_array()
+                .expect("orders array")
+                .iter()
+                .all(|order| order["id"] != "order-staying"),
+            "the current transfer does move the order off this board"
+        );
+        let conn = Connection::open(&path).expect("open after newer transfer");
+        let after = read_customer_order(&conn, "order-staying").expect("read order");
+        assert_eq!(after["transferred_to_branch_id"], "7");
+        assert_eq!(after["entity_version"], 3);
         drop(conn);
 
         let _ = fs::remove_file(&path);
@@ -8231,6 +8645,129 @@ mod tests {
         assert_eq!(migration_count, EXPECTED_APPLIED_MIGRATIONS);
         assert_eq!(marker, "keep-me");
         drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Migration 023 backfills provenance from the branch that was already on the row.
+    ///
+    /// Every order written before the split was typed in on a device at the branch that is handling
+    /// it — there was no way to move one — so `taken_at_branch_id := branch_id` is the true value
+    /// and not a guess. Leaving it NULL would claim we do not know where those orders were taken.
+    /// A row that never had a branch at all stays NULL, because that is the honest answer for it.
+    #[test]
+    fn migration_023_backfills_provenance_onto_orders_written_before_the_split() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-order-transfer-backfill-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+
+        // A profile at the schema this migration upgrades from: everything up to and including 022,
+        // and nothing after it.
+        let mut conn = Connection::open(&path).expect("open pre-023 database");
+        conn.execute_batch(
+            "CREATE TABLE local_schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                checksum TEXT NOT NULL,
+                status TEXT NOT NULL
+            );",
+        )
+        .expect("create migration table");
+        for (version, sql) in [
+            ("001_local_foundation", MIGRATION_001),
+            ("002_sync_engine_foundation", MIGRATION_002),
+            ("003_local_first_pos", MIGRATION_003),
+            ("004_offline_sale_edit_cancel", MIGRATION_004),
+            ("005_mandi_tax_sale_details", MIGRATION_005),
+            ("006_multibranch_identity_foundation", MIGRATION_006),
+            ("007_cloud_runtime_and_inbox_foundation", MIGRATION_007),
+            ("009_canonical_utc_timestamps", MIGRATION_009),
+            ("010_sync_delivery_state", MIGRATION_010),
+            ("011_connectivity_mode_audit", MIGRATION_011),
+            ("012_connectivity_mode_server_time", MIGRATION_012),
+            ("013_operational_location_foundation", MIGRATION_013),
+            ("014_offline_purchase_grn", MIGRATION_014),
+            ("015_supplier_reference_cache", MIGRATION_015),
+            ("016_purchase_aggregate_reconciliation", MIGRATION_016),
+            ("017_offline_entitlement_foundation", MIGRATION_017),
+            ("018_bootstrap_credential_consumption", MIGRATION_018),
+            ("019_provisional_lot_cost_status", MIGRATION_019),
+            ("020_customer_orders", MIGRATION_020),
+            ("021_customer_order_payment", MIGRATION_021),
+            ("022_customer_order_sync", MIGRATION_022),
+        ] {
+            apply_migration(&mut conn, version, sql).expect("apply pre-023 migration");
+        }
+        conn.execute(
+            "INSERT INTO local_customer_orders (id, order_no, customer_name, status, branch_id)
+             VALUES ('order-pre-023', 'ORD-PRE-023', 'Ram', 'RECEIVED', 4)",
+            [],
+        )
+        .expect("insert a pre-split order");
+        conn.execute(
+            "INSERT INTO local_customer_orders (id, order_no, customer_name, status)
+             VALUES ('order-pre-023-branchless', 'ORD-PRE-023-NB', 'Sita', 'RECEIVED')",
+            [],
+        )
+        .expect("insert a pre-split order that never resolved a branch");
+        drop(conn);
+
+        initialize_at(&path).expect("upgrade the pre-023 profile");
+
+        let conn = Connection::open(&path).expect("inspect the upgraded profile");
+        let migrations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_schema_migrations WHERE status = 'APPLIED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration count");
+        assert_eq!(migrations, EXPECTED_APPLIED_MIGRATIONS);
+
+        let (taken, branch): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT taken_at_branch_id, branch_id FROM local_customer_orders
+                  WHERE id = 'order-pre-023'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read the backfilled order");
+        // Text, not 4. `taken_at_branch_id` is TEXT and SQLite applies the target column's affinity
+        // on UPDATE, which is the shape the rest of the codebase and the wire use for a branch id.
+        assert_eq!(taken.as_deref(), Some("4"), "provenance is backfilled from the branch that was there");
+        assert_eq!(branch, 4, "and the fulfilment branch is left exactly as it was");
+
+        let branchless: Option<String> = conn
+            .query_row(
+                "SELECT taken_at_branch_id FROM local_customer_orders
+                  WHERE id = 'order-pre-023-branchless'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read the branchless order");
+        assert!(
+            branchless.is_none(),
+            "an order that never had a branch must not be given one by the backfill"
+        );
+        drop(conn);
+
+        // Forward-only and version-gated: a restart re-runs nothing and changes nothing. SQLite has
+        // no ADD COLUMN IF NOT EXISTS, so a second run of this file would fail outright — the gate
+        // in apply_migration() is what makes it idempotent.
+        initialize_at(&path).expect("restart with the upgraded profile");
+        let conn = Connection::open(&path).expect("inspect after restart");
+        let taken_again: Option<String> = conn
+            .query_row(
+                "SELECT taken_at_branch_id FROM local_customer_orders WHERE id = 'order-pre-023'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read after restart");
+        assert_eq!(taken_again.as_deref(), Some("4"));
+        drop(conn);
+
         let _ = fs::remove_file(&path);
     }
 
