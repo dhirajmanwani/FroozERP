@@ -425,3 +425,95 @@ test("a lot fully dispatched elsewhere keeps its zero without falling through to
   assert.equal(summary.lots, 1, "an empty lot is still this counter's row, not a hidden one");
   assert.equal(summary.scopeUsable, true);
 });
+
+/**
+ * The wiring, pinned.
+ *
+ * Everything above proves the decision layer is right. None of it proves App.jsx actually *asks*
+ * it — and for the whole of this feature's first day, it did not: the module was complete, tested,
+ * and wired to nothing, so every gate was green while POS still sold from an unscoped list.
+ *
+ * A source-text assertion is the weaker kind of test and is used here deliberately, because the
+ * thing being protected is a call site inside a 20k-line component that cannot be imported in
+ * isolation. It cannot prove the scope is *correct*; it can prove the argument was not quietly
+ * dropped, which is the regression that actually happened.
+ */
+const appSource = () => fs.readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+
+test("POS asks for the counter's own shop, on both paths a sale can start from", () => {
+  const source = appSource();
+
+  // The typed search and the barcode scanner reach the same decision by different routes. The
+  // scanner is the more dangerous one to leave unscoped, because nobody reads a barcode before it
+  // beeps, so both are pinned rather than just the one a person looks at.
+  const scopedCalls = source.match(/filterSellableProducts\(products, inventory, new Date\(\), counterScope\)/g) || [];
+  assert.equal(
+    scopedCalls.length,
+    2,
+    `expected both POS sellable-product calls to pass counterScope, found ${scopedCalls.length}`,
+  );
+
+  const unscopedCalls = source.match(/filterSellableProducts\(products, inventory\)/g) || [];
+  assert.equal(
+    unscopedCalls.length,
+    0,
+    "a filterSellableProducts call with no scope argument is a counter that can sell another shop's fruit",
+  );
+});
+
+test("the counter's shop comes from the device, never from the login", () => {
+  const source = appSource();
+
+  assert.match(
+    source,
+    /const scope = resolveCounterScope\(snapshot\)/,
+    "POS must resolve its shop from the local snapshot",
+  );
+  // docs/stock-distribution-decision.md: selling binds to the machine. A scope built from the
+  // signed-in user would follow a cashier to whatever counter they stood at, and sell that shop's
+  // fruit out of their own shop's stock.
+  assert.doesNotMatch(
+    source,
+    /resolveCounterScope\(\s*\{[^}]*user\b/,
+    "the counter's shop must not be derived from the signed-in user",
+  );
+  assert.doesNotMatch(
+    source,
+    /createCounterScope\(\s*\{[^}]*user\?\./,
+    "the counter's shop must not be derived from the signed-in user",
+  );
+});
+
+test("an unknown shop clears the shelf instead of leaving the last one on screen", () => {
+  const source = appSource();
+
+  // The caller of refreshPosInventoryFromSQLite catches a throw and leaves the previous values up
+  // with "Existing values remain visible". For an unknown scope that means POS keeps selling from
+  // whatever list it last held -- possibly another shop's, fetched over HTTP while an Owner was
+  // viewing that shop. So the scope failure must return, not throw.
+  assert.match(
+    source,
+    /if \(!counterMaySell\(selected\)\)/,
+    "POS must handle an unusable scope before the snapshot-not-ready throw",
+  );
+  const guardAt = source.indexOf("if (!counterMaySell(selected))");
+  const throwAt = source.indexOf('throw new Error("Local SQLite POS inventory snapshot is not ready.")');
+  assert.ok(guardAt > 0 && throwAt > 0, "both branches must exist");
+  assert.ok(
+    guardAt < throwAt,
+    "the scope guard must come first, or an unknown shop is reported as a missing download",
+  );
+});
+
+test("the empty shelf and the unknown shop do not share one sentence", () => {
+  const source = appSource();
+
+  // "No matching products or lots found." is true when the search found nothing and false when the
+  // machine does not know which shop it is in. Saying it in the second case tells a cashier the
+  // fruit is finished while it sits in front of them.
+  assert.match(
+    source,
+    /shelf\.usable\s*\n?\s*\?\s*"No matching products or lots found\."/,
+    "the no-results message must be conditional on the shelf being answerable",
+  );
+});

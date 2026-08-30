@@ -77,7 +77,8 @@ import { createStartupConnectivityAuthority } from "./local/startupConnectivityP
 import { isCloudTargetConfigured, resolveCloudTarget } from "./local/cloudTarget";
 import { resolveApiMode } from "./local/apiModeResolution";
 import { CLOUD_CALL_REFUSAL_CODES, createCloudCallGuard, createCloudCallRefusalError, evaluateCloudCall } from "./local/cloudCallGuard";
-import { filterSellableProducts, isSellableLot, lotAvailableQuantity, selectLocalPosInventory } from "./local/posInventory";
+import { UNKNOWN_COUNTER_SCOPE, counterMaySell, resolveCounterScope } from "./local/locationScope";
+import { filterSellableProducts, isSellableLot, lotAvailableQuantity, resolveSellableProducts, selectLocalPosInventory } from "./local/posInventory";
 import {
   activeStockFilterLabels,
   canonicalInventoryId,
@@ -1882,6 +1883,17 @@ function App() {
   const [productCategories, setProductCategories] = useState([]);
   const [productDuplicateWarning, setProductDuplicateWarning] = useState("");
   const [inventory, setInventory] = useState([]);
+  // Which shop this machine is standing in, as the local snapshot reports it.
+  //
+  // Selling binds to the machine, not to the login -- see docs/stock-distribution-decision.md. So
+  // this is resolved from the device's own snapshot and never from `user.branch_id`: a cashier who
+  // signs in at another shop's counter is selling that shop's fruit off that shop's shelf, and no
+  // login may change whose stock leaves the building.
+  //
+  // Starts UNKNOWN, which is a real state and not a placeholder: until the snapshot has been read
+  // this device genuinely does not know its own shop, and every consumer of this value has an arm
+  // that says so rather than rendering an empty shelf.
+  const [counterScope, setCounterScope] = useState(UNKNOWN_COUNTER_SCOPE);
   const [salesHistory, setSalesHistory] = useState([]);
   const [saleReturns, setSaleReturns] = useState([]);
   const [wasteEntries, setWasteEntries] = useState([]);
@@ -3821,7 +3833,33 @@ function App() {
   const refreshPosInventoryFromSQLite = async (reason = "pos-open") => {
     if (!isTauriRuntime() || !user?.id) return null;
     const snapshot = await loadLocalReferenceSnapshot({ username: user.username, deviceId: deviceInfo.device_id });
-    const selected = selectLocalPosInventory(snapshot);
+    // The snapshot answers "which shop is this machine?" itself, from the same ladder the sync pull
+    // enforces, so the shelf on screen and the stock the server will send here cannot disagree.
+    const scope = resolveCounterScope(snapshot);
+    setCounterScope(scope);
+    const selected = selectLocalPosInventory(snapshot, {}, scope);
+
+    // Two different emptinesses, and collapsing them is the bug this whole path exists to prevent.
+    //
+    // "This device does not know its own shop" produces no lots, exactly as "the snapshot has not
+    // downloaded yet" does. But the caller of this function catches a throw and leaves the previous
+    // values on screen with "Existing values remain visible" -- which, for an unknown scope, means
+    // POS keeps selling from whatever list it happened to be holding, possibly another shop's,
+    // fetched over HTTP while an Owner was viewing that shop. So the scope failure clears the list
+    // and says why, rather than throwing.
+    if (!counterMaySell(selected)) {
+      setProducts(selected.products);
+      setInventory([]);
+      setSyncMessage(selected.scopeMessage || "This counter has not been told which shop it is in.");
+      writeDiagnosticLog("ERROR", "pos-local-inventory-scope-unusable", {
+        reason,
+        scopeStatus: selected.scopeStatus,
+        scopeSource: scope.source,
+        connectivityMode: readConnectivityMode(),
+      });
+      return selected;
+    }
+
     if (!selected.products.length || !selected.inventoryLots.length) {
       throw new Error("Local SQLite POS inventory snapshot is not ready.");
     }
@@ -3831,6 +3869,11 @@ function App() {
       reason,
       products: selected.products.length,
       inventoryLots: selected.inventoryLots.length,
+      // Another shop's crates reaching this device is a server-side scoping fault. The counter is
+      // right to hide them; somebody still has to be able to find out that it happened.
+      foreignLotsHidden: selected.scopeCounts?.foreign || 0,
+      untaggedLots: selected.scopeCounts?.untagged || 0,
+      scopeSource: scope.source,
       connectivityMode: readConnectivityMode(),
     });
     return selected;
@@ -7875,6 +7918,7 @@ function App() {
               discountRules={discountRules}
               lotDiscounts={lotDiscounts}
               inventory={inventory}
+              counterScope={counterScope}
               onInvoice={setSelectedInvoice}
               onSaved={async (result) => {
                 // Link the bill back to the order that produced it. Done before anything else can
@@ -13246,6 +13290,16 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
     ]);
   }));
   const pagedLots = filteredLots.slice(0, Number(pageSize || 50));
+  // Deliberately not narrowed to this machine's shop, and that is the ruling rather than an
+  // omission. docs/stock-distribution-decision.md separates the two questions: *selling* binds to
+  // the machine, because the fruit and the customer are standing there, but *looking* binds to the
+  // person -- a manager over two shops is entitled to see both, and forcing the counter's own shop
+  // here would take that away.
+  //
+  // It is safe to leave open because the narrowing already happened upstream: the pull refuses a lot
+  // belonging to another shop (`DevicePullScope::refusal_for_inventory_lot`), so a counter's device
+  // holds only its own lots to begin with. This screen shows what the device has; POS decides what
+  // may be sold, and POS is scoped.
   const filteredLotsByProduct = groupInventoryLotsByProduct(filteredLots);
   const filteredProductRows = productGroups
     .map((product) => {
@@ -17854,7 +17908,7 @@ const currentDateTimeLocal = () => {
   return `${year}-${month}-${day}T${hours}:${minutes}`;
 };
 
-function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, onSeedConsumed, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
+function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, onSeedConsumed, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
   const [search, setSearch] = useState("");
   const [barcode, setBarcode] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
@@ -18015,6 +18069,17 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     [inventory]
   );
 
+  // What this counter may sell, as a *named* state rather than just a list.
+  //
+  // An array has one way to say "nothing", and POS has two very different nothings: the shelf is
+  // genuinely empty, or this machine has not been told which shop it is in and therefore cannot
+  // answer. Rendering the second as the first tells a cashier the fruit is finished while it is
+  // sitting in front of them -- the failure CLAUDE.md names as "errors must never render as zero".
+  const shelf = useMemo(
+    () => resolveSellableProducts({ products, inventoryLots: inventory, scope: counterScope }),
+    [counterScope, inventory, products],
+  );
+
   const searchResults = useMemo(() => {
     const query = search.trim().toLowerCase();
     const matchesProduct = (product) => {
@@ -18039,11 +18104,15 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
         ]),
       ].some((value) => String(value ?? "").toLowerCase().includes(query));
     };
-    return filterSellableProducts(products, inventory)
+    // Scoped here as well as at the source. `inventory` is filled by two paths -- the local snapshot,
+    // which is already narrowed, and an HTTP fetch that is not -- so the shelf is re-checked at the
+    // point of sale rather than trusted to have been checked upstream. Filtering an already-filtered
+    // list changes nothing; failing to filter an unfiltered one sells another shop's fruit.
+    return filterSellableProducts(products, inventory, new Date(), counterScope)
       .filter((product) => matchesProduct(product))
       .map((product) => ({ key: `product-${product.id}`, product, lotCount: (lotsByProduct.get(product.id) || []).filter(isSelectableLot).length }))
       .slice(0, 12);
-  }, [inventory, lotsByProduct, products, search]);
+  }, [counterScope, inventory, lotsByProduct, products, search]);
 
   const salesMandiTaxBasisLabel = {
     GROSS_BEFORE_DISCOUNTS: "Gross item value before discounts",
@@ -18323,7 +18392,10 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
   const scanBarcode = () => {
     const code = barcode.trim();
     if (!code) return;
-    const product = filterSellableProducts(products, inventory).find((item) => item.barcode === code);
+    // The barcode path reaches the same decision by a different route, so it takes the same scope.
+    // A scanner that could sell what the search list refuses would be the more dangerous of the
+    // two, because nobody reads a barcode before it beeps.
+    const product = filterSellableProducts(products, inventory, new Date(), counterScope).find((item) => item.barcode === code);
     if (!product) {
       alert(`No sellable stock is available for barcode ${code}`);
       barcodeRef.current?.focus();
@@ -18836,7 +18908,14 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
                 </button>
               );
             })}
-            {searchResults.length === 0 && <div className="cart-empty">No matching products or lots found.</div>}
+            {searchResults.length === 0 && (
+              <div className="cart-empty">
+                {shelf.usable
+                  ? "No matching products or lots found."
+                  // Not "nothing found". The search worked; the shop is the unknown.
+                  : (shelf.message || "This counter has not been told which shop it is in, so it cannot show what is on the shelf.")}
+              </div>
+            )}
           </div>
         </section>
 
