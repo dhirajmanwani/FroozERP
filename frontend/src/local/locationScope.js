@@ -119,7 +119,10 @@ export const canonicalScopeId = (value) => {
   if (value === null || value === undefined) return "";
   if (typeof value === "number") {
     if (!Number.isFinite(value)) return "";
-    return Number.isInteger(value) ? String(value) : String(value);
+    // JS already renders an integer-valued float without its fraction — `String(4.0) === "4"` —
+    // which is the same normalisation the Rust twin does explicitly. No branch is needed here, and
+    // a branch whose arms are identical reads as if one of them were meant to differ.
+    return String(value);
   }
   if (typeof value === "boolean") return "";
   if (typeof value === "object") return "";
