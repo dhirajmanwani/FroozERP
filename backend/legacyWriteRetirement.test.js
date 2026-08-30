@@ -20,10 +20,26 @@ const path = require("node:path");
 
 const { LEGACY_WRITE_ROUTES, isRetiredLegacyWrite } = require("./operationalScope");
 
-const backendSource = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
-const backendCode = backendSource
+const stripComments = (source) => source
   .replace(/\/\*[\s\S]*?\*\//g, "")
   .replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+
+const backendSource = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
+const backendCode = stripComments(backendSource);
+
+/**
+ * Route registrations do not all live in `server.js`.
+ *
+ * `operationalV3.js` mounts its 20 routes through a local `use()` helper, so the replacement for a
+ * retired write can be a string `server.js` never contains — `/api/v3/transfers` is the first such
+ * case. Reading only `server.js` would have failed the twin check on a replacement that is in fact
+ * registered, which is the opposite of what that check is for.
+ */
+const registrationCode = [
+  backendCode,
+  stripComments(fs.readFileSync(path.join(__dirname, "operationalV3.js"), "utf8")),
+  stripComments(fs.readFileSync(path.join(__dirname, "scopeManagement.js"), "utf8")),
+].join("\n");
 
 test("every retired legacy write is refused, whatever its id looks like", () => {
   // Ids in this system are opaque strings (CLAUDE.md), so the matcher must not assume numeric.
@@ -113,7 +129,7 @@ test("every listed route still has a v3 twin registered, or retiring it removes 
   // merely upgraded — and nothing else in the suite would notice.
   for (const [method, routePath, replacement] of LEGACY_WRITE_ROUTES) {
     assert.ok(
-      backendCode.includes(`"${replacement}"`),
+      registrationCode.includes(`"${replacement}"`),
       `${method} ${replacement} must be registered before ${method} ${routePath} can be retired`,
     );
   }

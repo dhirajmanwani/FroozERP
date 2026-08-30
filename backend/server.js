@@ -2071,6 +2071,31 @@ const initializeDatabase = async () => {
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS transfer_out_qty NUMERIC(14, 3) DEFAULT 0;
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS returned_qty NUMERIC(14, 3) DEFAULT 0;
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS waste_qty NUMERIC(14, 3) DEFAULT 0;
+    -- Operational-location scope. Mirrors migrations/cloud/009_operational_location_foundation.sql,
+    -- which is the only other place these two columns are ever created.
+    --
+    -- syncReferenceBootstrap.js filters lots on company_id, branch_id AND operational_location_id.
+    -- A database bootstrapped by server startup alone had neither of the outer two columns, so the
+    -- protocol could not serve its own bootstrap: the pull failed with an undefined-column error
+    -- rather than returning an empty snapshot, which is at least loud, but it happened on the first
+    -- sync of a fresh deployment.
+    --
+    -- Both startup paths must carry these. ensureProductEntrySchema also runs
+    -- CREATE TABLE IF NOT EXISTS inventory_batches, so whichever of the two runs first defines the
+    -- table and the other one is a no-op on the table itself; only the ALTERs still apply. Adding
+    -- the columns to one path and not the other leaves the outcome depending on call order.
+    -- schemaLocationScope.test.js asserts both paths, for exactly that reason.
+    --
+    -- Deliberately without the REFERENCES clauses that migration 009 carries. companies and
+    -- operational_locations are created by migrations 006 and 009 and by nothing at startup, so a
+    -- foreign key here would abort the whole bootstrap transaction on the fresh database this is
+    -- meant to repair. Migration 009 stays the owner of the constraints; startup only guarantees
+    -- the columns exist. ai_settings.company_id above is bare for the same reason.
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS company_id INTEGER;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS operational_location_id INTEGER;
+    CREATE INDEX IF NOT EXISTS inventory_batches_location_fifo_idx
+      ON inventory_batches(company_id, branch_id, operational_location_id, product_id, purchase_date, created_at, id)
+      WHERE remaining_qty > 0;
     UPDATE inventory_batches SET batch_status = 'ACTIVE' WHERE batch_status IS NULL;
     UPDATE inventory_batches SET effective_cost_per_unit = purchase_rate WHERE effective_cost_per_unit IS NULL;
     UPDATE purchase_items pi
@@ -8770,6 +8795,40 @@ const requireSyncContext = async ({ userId, deviceId, branchId, operationalLocat
   if (!userCompanyId || !branchCompanyId || userCompanyId !== branchCompanyId || deviceCompanyId !== branchCompanyId) {
     return { error: { status: 403, message: "Company or branch scope does not match this device" } };
   }
+  /**
+   * The device's operational location, for read filtering outside ENFORCE.
+   *
+   * `operationalLocationId` below is `null` in every non-ENFORCE request and must stay that way:
+   * it is the canonical, write-authorising scope, and it is only canonical when
+   * `createOperationalScopeService` has proved the user and the device share an approved
+   * assignment. This is a weaker, separate thing — where the device says it sits — and it exists
+   * so a *read* can be narrowed without pretending to authority the legacy path never established.
+   *
+   * `device_assignments` is created by migration 009 and by nothing at startup, but `/login`
+   * already queries it unconditionally on this same path, so a database that cannot answer this
+   * cannot sign anyone in either. Same ordering as `/login`, so both agree on which assignment is
+   * current when a device has been reassigned.
+   *
+   * Not read under ENFORCE, where `operationalLocationId` below is the canonical answer and this
+   * would only be a second location value able to disagree with it. Left NULL there rather than
+   * carrying both.
+   */
+  const deviceLocationResult = operationalScopeMode === SCOPE_MODES.ENFORCE
+    ? { rows: [] }
+    : await client.query(
+      `
+      SELECT da.operational_location_id
+      FROM device_assignments da
+      WHERE da.device_id = $1
+        AND da.active = TRUE
+        AND da.company_id = $2
+        AND da.branch_id = $3
+        AND da.operational_location_id IS NOT NULL
+      ORDER BY da.assignment_generation DESC, da.id DESC
+      LIMIT 1
+      `,
+      [cleanDeviceId, branchCompanyId, parsedBranchId]
+    );
   const legacyContext = {
     user,
     device,
@@ -8778,6 +8837,7 @@ const requireSyncContext = async ({ userId, deviceId, branchId, operationalLocat
     branchId: parsedBranchId,
     deviceId: cleanDeviceId,
     operationalLocationId: null,
+    deviceLocationId: parsePositiveInteger(deviceLocationResult.rows[0]?.operational_location_id),
     assignmentGeneration: null,
   };
   if (operationalScopeMode !== SCOPE_MODES.ENFORCE) return legacyContext;
@@ -11276,6 +11336,34 @@ app.get("/api/sync/pull", rateLimitSyncRequest, async (req, res) => {
       rows = visible.rows;
       hasMore = visible.hasMore;
     } else {
+      /*
+       * The location predicate belongs here as much as in the ENFORCE path.
+       *
+       * `readVisibleIncrementalChanges` filters company, branch and location; the reference
+       * bootstrap this incremental pull continues filters all three too
+       * (`syncReferenceBootstrap.js`). Only this branch filtered two of the three - and
+       * `operationalScopeMode` defaults to `off` with nothing in the repository setting it, so this
+       * is the branch that actually runs. A warehouse and a shop counter under one branch would
+       * pull each other's stock, which is precisely the shape warehouse-to-shop distribution
+       * creates.
+       *
+       * Both NULLs are decided deliberately rather than left to `= NULL`, which matches nothing:
+       *
+       * - `$3` is NULL when the device has no active `device_assignments` row naming a location.
+       *   That is every device on a deployment that has not rolled out assignments, and it is not
+       *   an error - it is a device whose location nobody has stated. Narrowing it to nothing would
+       *   stop its sync dead, so it keeps exactly the branch-wide visibility it has today.
+       * - `operational_location_id IS NULL` on the row means the *change* is not location-stamped.
+       *   Everything `logSyncChange` writes on a non-ENFORCE path is like this, because
+       *   `requireSyncContext` returns `operationalLocationId: null` there, and so is every row
+       *   written before migration 009 added the column. Hiding those would empty every counter's
+       *   incremental feed of its entire history.
+       *
+       * What is left is the case that matters: both sides stamped, and they must agree. Migration
+       * 011's `froozerp_publish_inventory_lot_sync` returns early unless company, branch and
+       * location are all present, so every inventory-lot row it publishes is stamped and is now
+       * delivered only to the location that owns the stock.
+       */
       const result = await pool.query(
         `
         SELECT change_id, branch_id, entity_type, entity_id, operation_type,
@@ -11283,11 +11371,16 @@ app.get("/api/sync/pull", rateLimitSyncRequest, async (req, res) => {
         FROM sync_change_log
         WHERE company_id = $1
           AND branch_id = $2
-          AND change_id > $3
+          AND (
+            $3::INTEGER IS NULL
+            OR operational_location_id IS NULL
+            OR operational_location_id = $3
+          )
+          AND change_id > $4
         ORDER BY change_id
-        LIMIT $4
+        LIMIT $5
         `,
-        [context.companyId, context.branchId, cursor, limit + 1]
+        [context.companyId, context.branchId, context.deviceLocationId ?? null, cursor, limit + 1]
       );
       rows = result.rows.slice(0, limit);
       hasMore = result.rows.length > limit;
@@ -13027,6 +13120,14 @@ const ensureProductEntrySchema = async (client = pool) => {
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS entity_version INTEGER NOT NULL DEFAULT 1;
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP;
+    -- The second of the two startup paths that define inventory_batches. See the matching block in
+    -- initializeDatabase for why these are here, why they carry no REFERENCES clause, and why
+    -- adding them to only one path is the bug rather than the fix.
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS company_id INTEGER;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS operational_location_id INTEGER;
+    CREATE INDEX IF NOT EXISTS inventory_batches_location_fifo_idx
+      ON inventory_batches(company_id, branch_id, operational_location_id, product_id, purchase_date, created_at, id)
+      WHERE remaining_qty > 0;
 
     CREATE TABLE IF NOT EXISTS stock_transactions (
       id SERIAL PRIMARY KEY,

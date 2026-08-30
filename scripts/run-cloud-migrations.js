@@ -8,6 +8,11 @@ const migrationFiles = [
   "backend/migrations/cloud/008_canonical_utc_timestamps.sql",
   "backend/migrations/cloud/009_operational_location_foundation.sql",
   "backend/migrations/cloud/010_operational_protocol_v3.sql",
+  // 011 installs froozerp_publish_inventory_lot_sync, the only mechanism that publishes an
+  // inventory-lot change to a device. Without it no stock movement of any kind reaches a counter
+  // except through a full reference bootstrap. It was missing from this list, and the list is the
+  // only thing that decides what runs.
+  "backend/migrations/cloud/011_inventory_incremental_publication.sql",
   "backend/migrations/cloud/012_scope_management.sql",
 ];
 
