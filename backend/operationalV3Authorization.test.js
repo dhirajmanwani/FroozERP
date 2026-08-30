@@ -330,6 +330,13 @@ const NO_PERMISSION_BY_DESIGN = [
   "GET /api/v3/supplier-bills",
   "GET /api/v3/payment-allocations",
   "GET /api/v3/transfers",
+  // Reads the names of the other places in a company the caller is already authenticated into.
+  // No stock, no money, no customer. It is deliberately not behind the "inventory" permission that
+  // guards the transfer *writes*: the maintainer's staff hold more than one job, so the person who
+  // sends a consignment may be on the Purchase Manager role, which does not carry "inventory"
+  // by default. Gating the destination list would have made the screen unreachable for the role
+  // most likely to use it, while protecting nothing the writes do not already protect.
+  "GET /api/v3/transfers/destinations",
   "GET /api/v3/reports/consolidated",
   // Both previews write nothing (`would_write: false`) and both go through
   // `validateAssignmentPreview`, which refuses anyone who is not the Owner holding

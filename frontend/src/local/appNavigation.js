@@ -154,6 +154,20 @@ const modules = [
     sections: [],
   },
   {
+    id: "distribution",
+    label: "Stock Distribution",
+    icon: "truck",
+    // No shortcut: Alt+0 to Alt+9 are all taken by the modules a counter opens all day, and this is
+    // a warehouse screen opened a few times a day. Taking a digit off POS Billing or Products to
+    // give it one would be the wrong trade. Findable through the palette, like Settings.
+    shortcut: null,
+    keywords: [
+      "warehouse", "transfer", "consignment", "send stock", "dispatch", "receive",
+      "branch transfer", "godown", "distribute", "delivery to shop",
+    ],
+    sections: [],
+  },
+  {
     id: "reports",
     label: "Reports",
     icon: "chart",

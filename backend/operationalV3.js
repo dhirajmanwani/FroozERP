@@ -1255,6 +1255,35 @@ const registerOperationalV3Routes = ({
     return res.json({ transfer: saved, scope: context, ...serverTimePayload() });
   }, { write: true, permission: "inventory" });
 
+  // Where this counter may send stock.
+  //
+  // Composing a consignment needs the list of other places in the business, and the only endpoint
+  // that had one was `/api/v3/admin/scope-management`, which is Owner/Admin gated. A warehouse
+  // manager is not necessarily an admin -- the maintainer's own staff hold more than one job, and
+  // the person who buys the fruit may also be the person who sends it out -- so gating the
+  // destination list on admin would have made the feature unreachable for exactly the role that
+  // needs it.
+  //
+  // It carries no stock, no money and no customer: location names within a company the caller is
+  // already authenticated into. The device's own location is excluded because a transfer to itself
+  // is refused anyway (TRANSFER_LOCATIONS_IDENTICAL), and offering it would be a button that only
+  // ever produces an error.
+  use("get", "/api/v3/transfers/destinations", async (req, res, context) => {
+    const result = await database.query(
+      `SELECT ol.id AS operational_location_id, ol.branch_id, ol.location_name, ol.location_code,
+              ol.location_type, ol.is_default, b.branch_name
+       FROM operational_locations ol
+       JOIN branches b ON b.id = ol.branch_id AND b.company_id = ol.company_id
+       WHERE ol.company_id = $1
+         AND ol.active = TRUE
+         AND b.active IS DISTINCT FROM FALSE
+         AND ol.id <> $2
+       ORDER BY b.branch_name, ol.is_default DESC, ol.location_name`,
+      [context.company_id, context.operational_location_id]
+    );
+    return res.json({ destinations: result.rows, scope: context, ...serverTimePayload() });
+  });
+
   use("get", "/api/v3/transfers", async (req, res, context) => {
     const consolidated = String(req.query.scope || "").toUpperCase() === "ALL_LOCATIONS";
     if (consolidated && !canUseConsolidatedReports(context)) {
