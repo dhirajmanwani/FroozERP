@@ -451,6 +451,149 @@ pub fn record_sync_cycle_completed(app: &AppHandle, device_id: &str, server_time
     status_at(&path)
 }
 
+/// One scope value, read the way the local layer reads every other opaque id.
+///
+/// The Rust side of `canonicalInventoryId`. `local_inventory_lots.branch_id` is TEXT, the wire
+/// value arrives as a Postgres INTEGER, and the applier below stringifies it — so a branch
+/// comparison necessarily crosses that boundary, and the only safe way across is to bring both
+/// sides to text and compare as text. Never `Number()`, and never numeric equality: `"004"` and
+/// `4` are different entities, and treating them as one is what silently emptied the Inventory
+/// table while every summary tile went on looking correct.
+///
+/// An integer-valued float is rendered as an integer because a JSON `4.0` and a JSON `4` are the
+/// same branch said two ways, and `"4"` vs `"4.0"` would refuse a legitimate row. `"unassigned"`
+/// is the placeholder the applier stamps when the server said nothing, so it is treated as "no
+/// scope stated" rather than as the name of a shop.
+fn canonical_scope_id(value: Option<&serde_json::Value>) -> Option<String> {
+    let text = match value {
+        Some(serde_json::Value::String(raw)) => raw.trim().to_string(),
+        Some(serde_json::Value::Number(number)) => {
+            if let Some(integer) = number.as_i64() {
+                integer.to_string()
+            } else if let Some(unsigned) = number.as_u64() {
+                unsigned.to_string()
+            } else if let Some(float) = number.as_f64() {
+                if float.is_finite() && float.fract() == 0.0 {
+                    format!("{}", float as i64)
+                } else {
+                    number.to_string()
+                }
+            } else {
+                number.to_string()
+            }
+        }
+        _ => return None,
+    };
+    if text.is_empty() || text.eq_ignore_ascii_case("unassigned") {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// The shop this device is standing in, as far as the pull path is concerned.
+#[derive(Debug, Clone, Default)]
+struct DevicePullScope {
+    branch_id: Option<String>,
+    operational_location_id: Option<String>,
+}
+
+impl DevicePullScope {
+    /// Why an incoming `inventory_lot` must not be applied here, or `None` if it may be.
+    ///
+    /// Three rules, and each one is a decision:
+    ///
+    /// 1. **Only a stated scope can disagree.** A payload that carries no `branch_id` and no
+    ///    `operational_location_id` is applied. Absence is not evidence of foreignness — it is an
+    ///    older server, or a record written before migration 013 — and refusing it would stop a
+    ///    working device from syncing anything at all. The bootstrap path can afford to demand
+    ///    scope on every record because it runs once, against a payload built for it; the hot path
+    ///    cannot.
+    /// 2. **Only a known scope can judge.** A device with no resolved branch — never bootstrapped,
+    ///    entitlement missing — refuses nothing. It has no shelf to compare against, and a check
+    ///    that cannot be evaluated must not be resolved as "guilty".
+    /// 3. **DELETE is exempt.** A delete names a row to remove. If this device does not have it,
+    ///    the delete is a no-op; if it does, the row is one that should never have arrived and
+    ///    removing it corrects the device rather than damaging it. Refusing foreign deletes would
+    ///    strand exactly the rows a fix most needs to clear.
+    fn refusal_for_inventory_lot(&self, change: &PulledChange) -> Option<String> {
+        if change.operation_type.eq_ignore_ascii_case("DELETE") {
+            return None;
+        }
+        // The applier falls back to the change envelope's `branch_id` when the payload has none and
+        // stamps that on the row, so the check has to look at the same value the write would use.
+        // Checking only the payload would let an envelope-only foreign branch through the guard and
+        // straight onto the shelf.
+        let payload_branch = canonical_scope_id(change.payload.get("branch_id"))
+            .or_else(|| change.branch_id.map(|value| value.to_string()));
+        let payload_location = canonical_scope_id(change.payload.get("operational_location_id"));
+
+        let mut mismatches: Vec<String> = Vec::new();
+        if let (Some(device), Some(incoming)) = (self.branch_id.as_deref(), payload_branch.as_deref()) {
+            if device != incoming {
+                mismatches.push(format!("branch {incoming:?} is not this device's branch {device:?}"));
+            }
+        }
+        if let (Some(device), Some(incoming)) =
+            (self.operational_location_id.as_deref(), payload_location.as_deref())
+        {
+            if device != incoming {
+                mismatches.push(format!(
+                    "operational location {incoming:?} is not this device's location {device:?}"
+                ));
+            }
+        }
+        if mismatches.is_empty() {
+            None
+        } else {
+            Some(mismatches.join("; "))
+        }
+    }
+}
+
+/// What this device is, resolved once per pull.
+///
+/// Deliberately the *same* answer `canonical_scope` in the reference snapshot shows the operator,
+/// because the two must never be able to differ: if the screen says a device belongs to Ratanada
+/// then Ratanada is what the pull enforces, and there is no second ladder to keep in step.
+///
+/// A lookup failure resolves to unscoped rather than to an error. Scope trouble is metadata
+/// trouble; a device whose entitlement row is unreadable still has to be able to sync and bill,
+/// and `canonical_snapshot_scope_at` already logs the reason.
+fn resolve_device_pull_scope(conn: &Connection, device_id: Option<&str>) -> DevicePullScope {
+    let named = device_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"))
+        .map(|value| value.to_string());
+    // When the caller did not name a device, the assignment table may still say who this is — but
+    // only if it says so unambiguously. Picking the first of several active assignments would
+    // enforce one shop's scope on another shop's rows, which is the very failure this guards.
+    let device = match named {
+        Some(value) => Some(value),
+        None => {
+            let candidates: Result<Vec<String>, _> = conn
+                .prepare("SELECT device_id FROM local_device_assignment WHERE active = 1")
+                .and_then(|mut statement| {
+                    statement
+                        .query_map([], |row| row.get::<_, String>(0))
+                        .and_then(|rows| rows.collect())
+                });
+            match candidates {
+                Ok(mut rows) if rows.len() == 1 => Some(rows.remove(0)),
+                _ => None,
+            }
+        }
+    };
+    let Some(device) = device else {
+        return DevicePullScope::default();
+    };
+    let scope = canonical_snapshot_scope_at(conn, &device);
+    DevicePullScope {
+        branch_id: canonical_scope_id(scope.get("branch_id")),
+        operational_location_id: canonical_scope_id(scope.get("operational_location_id")),
+    }
+}
+
 pub fn apply_pull_changes(
     app: &AppHandle,
     changes: &[PulledChange],
@@ -474,7 +617,39 @@ fn apply_pull_changes_at(
     let mut conn = Connection::open(&path).map_err(to_error)?;
     let tx = conn.transaction().map_err(to_error)?;
     let confirmed_at = require_server_time(server_time)?;
+    // Stock belongs to the shop it is physically sitting in, and a counter may sell only what is on
+    // its own shelf (docs/stock-distribution-decision.md). The bootstrap path has always enforced
+    // that — it refuses any `inventory_lot` outside the canonical device scope — but this path, the
+    // one every subsequent pull takes, applied whatever arrived. So the rule held for exactly as
+    // long as a device never pulled again. The check is the same check; it now runs where it
+    // matters.
+    //
+    // **Refused and recorded, not thrown.** A hard `Err` here aborts the whole transaction, which
+    // means one foreign lot discards every other change in the page *and* leaves the cursor
+    // wedged — the page is offered again, fails again, and sync stops for good on a device whose
+    // own data is fine. A foreign lot is a server-side scoping bug, not a corrupt device, and the
+    // proportionate answer is to decline the row and say so in a form somebody can count and
+    // replay. That is exactly what `local_unapplied_changes` (migration 022) is for: the row is
+    // kept whole, the reason is named, the console says it out loud, and the rest of the pull
+    // lands. What must never happen — and is what happened before — is "applied silently", or a
+    // sync that reports itself healthy while the shelf and the screen disagree.
+    //
+    // Note that a genuine transfer *out* of this shop is not affected: per the distribution
+    // decision it arrives as a change scoped to this branch with a reduced quantity, not as a row
+    // wearing the receiving branch's id.
+    let device_scope = resolve_device_pull_scope(&tx, device_id.as_deref());
     for change in changes {
+        if change.entity_type == "inventory_lot" {
+            if let Some(detail) = device_scope.refusal_for_inventory_lot(change) {
+                record_unapplied_change(
+                    &tx,
+                    change,
+                    "INVENTORY_LOT_OUTSIDE_DEVICE_SCOPE",
+                    Some(detail),
+                )?;
+                continue;
+            }
+        }
         apply_change_with_tx(&tx, change)?;
     }
     let state_device = device_id.unwrap_or_else(|| "default".to_string());
@@ -3583,8 +3758,56 @@ fn load_reference_snapshot_at(
                     "remarks": row.get::<_, Option<String>>(9)?,
                     "updated_at": row.get::<_, Option<String>>(10)?,
                     "entity_version": row.get::<_, i64>(11)?,
+                    // Every location's stock added together, because the join below is on
+                    // `product_id` alone. That is correct for an owner looking at the company and
+                    // wrong for a cashier looking at a shelf, and nothing in the name says which.
+                    // A counter's own figure must come from `product_stock_by_scope` (or be summed
+                    // from `inventory_lots`, which now carries scope) — never from here.
                     "current_stock": row.get::<_, f64>(12)?,
                     "lot_count": row.get::<_, i64>(13)?,
+                }))
+            })
+            .map_err(to_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?
+    };
+
+    // The same aggregate as `products`, split by the place the fruit is sitting in.
+    //
+    // This exists because `products.current_stock` cannot be made scope-aware without either
+    // filtering the snapshot (which decides for a caller that never asked) or emitting several rows
+    // per product (which every existing reader of `products` would mis-count). So the scoped answer
+    // is a second projection of the *same rows* rather than a change to the first.
+    //
+    // The predicate is a character-for-character copy of the one in `products` — same
+    // `deleted_at IS NULL`, same CANCELLED exclusion — and that is load-bearing, not tidiness. A
+    // summary and a detail that filter differently disagree eventually, and the disagreement looks
+    // exactly like data loss. `product_aggregate_and_lot_list_agree_about_which_lots_exist` fails
+    // if these two predicates are ever edited apart.
+    //
+    // `inventory_lots` remains the detail of record; this is a convenience over it, so a caller
+    // must not mix a tile from here with a table filtered by some other rule.
+    let product_stock_by_scope = {
+        let mut statement = conn
+            .prepare(
+                "SELECT l.product_id, l.branch_id, l.company_id, l.operational_location_id,
+                        COALESCE(SUM(l.balance_qty), 0) AS current_stock,
+                        COUNT(*) AS lot_count
+                 FROM local_inventory_lots l
+                 WHERE l.deleted_at IS NULL
+                   AND UPPER(COALESCE(l.status, 'ACTIVE')) <> 'CANCELLED'
+                 GROUP BY l.product_id, l.branch_id, l.company_id, l.operational_location_id
+                 ORDER BY l.product_id, l.branch_id, l.operational_location_id",
+            )
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(serde_json::json!({
+                    "product_id": row.get::<_, String>(0)?,
+                    "branch_id": row.get::<_, Option<String>>(1)?,
+                    "company_id": row.get::<_, Option<String>>(2)?,
+                    "operational_location_id": row.get::<_, Option<String>>(3)?,
+                    "current_stock": row.get::<_, f64>(4)?,
+                    "lot_count": row.get::<_, i64>(5)?,
                 }))
             })
             .map_err(to_error)?;
@@ -3594,9 +3817,21 @@ fn load_reference_snapshot_at(
     let inventory_lots = {
         let mut statement = conn
             .prepare(
+                // Scope — `branch_id`, `company_id`, `operational_location_id` — is selected but
+                // deliberately NOT filtered on. A lot belongs to one shop
+                // (docs/stock-distribution-decision.md), and until this query emitted those three
+                // columns the frontend could not filter by shop even if it wanted to: the fields
+                // simply were not in the objects it received, so every counter saw every counter's
+                // fruit. Emitting them is what makes the choice possible. The choice itself stays
+                // in the frontend local layer, where it is testable and where a filter that is
+                // active can be made visible to the person looking at it. Filtering here would
+                // instead hide rows from a caller that never asked, and would leave the product
+                // aggregate below counting a different universe than this list — the exact
+                // summary-vs-detail split CLAUDE.md warns about.
                 "SELECT id, product_id, product_name, supplier_id, supplier_name, lot_no, size_grade,
                         opening_date, opening_qty, sold_qty, adjusted_qty, balance_qty, cost_rate, sale_rate,
-                        status, remarks, created_at, updated_at, purchase_bill_status
+                        status, remarks, created_at, updated_at, purchase_bill_status,
+                        branch_id, company_id, operational_location_id
                  FROM local_inventory_lots
                  WHERE deleted_at IS NULL
                  ORDER BY product_name, opening_date, id",
@@ -3634,6 +3869,18 @@ fn load_reference_snapshot_at(
                     "remarks": row.get::<_, Option<String>>(15)?,
                     "created_at": row.get::<_, Option<String>>(16)?,
                     "updated_at": row.get::<_, Option<String>>(17)?,
+                    // Where this fruit physically is. Every one of the three is a separate column
+                    // on the table and none is an alias of another, unlike the pairs above — do
+                    // not "tidy" one away. All three are Option because a lot written before
+                    // migration 013, or pulled from a server that does not send scope, genuinely
+                    // has none: NULL here means "this device was never told", which is a different
+                    // fact from "it belongs to nowhere" and must stay distinguishable on screen.
+                    // Emitted as opaque text and never coerced with a number — `"004"` and `4` are
+                    // different entities, and comparing them numerically is what silently emptied
+                    // the Inventory table once already.
+                    "branch_id": row.get::<_, Option<String>>(19)?,
+                    "company_id": row.get::<_, Option<String>>(20)?,
+                    "operational_location_id": row.get::<_, Option<String>>(21)?,
                 }))
             })
             .map_err(to_error)?;
@@ -3792,6 +4039,7 @@ fn load_reference_snapshot_at(
         "user_profile": user_profile,
         "offline_auth": offline_auth,
         "products": products,
+        "product_stock_by_scope": product_stock_by_scope,
         "categories": categories,
         "inventory_lots": inventory_lots,
         "customers": customers,
@@ -10373,6 +10621,429 @@ mod tests {
         }));
         assert!(duplicate.is_err());
 
+        let _ = fs::remove_file(&path);
+    }
+    // ---- Stock is scoped to the shop it is sitting in (docs/stock-distribution-decision.md) ----
+    //
+    // Ratanada holds 15 kg of apples and Main Branch holds 20. A cashier at Ratanada must bill
+    // against Ratanada's 15 and must never be able to reach Main Branch's crate: selling it makes
+    // both shops' counts wrong and prints the wrong shop on the bill, and the error is silent for
+    // days. These four tests cover the two places the device is responsible for — what the
+    // snapshot tells the frontend, and what the pull path lets onto the shelf.
+
+    fn seed_scoped_product(conn: &Connection, id: &str, name: &str) {
+        conn.execute(
+            "INSERT INTO local_products (id, product_name, unit, sale_rate, active)
+             VALUES (?1, ?2, 'KG', 100, 1)",
+            params![id, name],
+        )
+        .expect("seed product");
+    }
+
+    /// Written with SQL rather than through the pull path on purpose: the point of the snapshot
+    /// tests is a device that already holds several shops' lots, and the pull path now refuses to
+    /// create exactly that situation.
+    #[allow(clippy::too_many_arguments)]
+    fn seed_scoped_lot(
+        conn: &Connection,
+        id: &str,
+        product_id: &str,
+        branch: &str,
+        company: &str,
+        location: &str,
+        balance: f64,
+        status: &str,
+        deleted: bool,
+    ) {
+        conn.execute(
+            "INSERT INTO local_inventory_lots (
+                id, branch_id, company_id, operational_location_id, product_id, product_name,
+                lot_no, opening_date, opening_qty, balance_qty, cost_rate, status, deleted_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'Apples', ?1, '2026-08-01', ?6, ?6, 10, ?7, ?8)",
+            params![
+                id,
+                branch,
+                company,
+                location,
+                product_id,
+                balance,
+                status,
+                if deleted { Some("2026-08-02T00:00:00.000Z") } else { None },
+            ],
+        )
+        .expect("seed lot");
+    }
+
+    #[test]
+    fn snapshot_lots_carry_the_shop_they_are_sitting_in() {
+        // Before this, the SELECT behind `inventory_lots` listed eighteen columns and none of them
+        // was scope, so `branch_id`, `company_id` and `operational_location_id` never reached
+        // JavaScript at all. The frontend could not filter a cashier down to their own shop even
+        // if it wanted to — the fields were not in the objects it received. It only looked correct
+        // because there is one shop today.
+        let path = activation_temp_path("scoped-lot-snapshot");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-STOCK-SCOPE-1";
+        seed_device_assignment(&path, device, "1", "3", "loc-ratanada");
+
+        {
+            let conn = Connection::open(&path).expect("open scoped snapshot database");
+            seed_scoped_product(&conn, "product-apple", "Apples");
+            seed_scoped_lot(&conn, "lot-ratanada", "product-apple", "3", "1", "loc-ratanada", 15.0, "ACTIVE", false);
+            seed_scoped_lot(&conn, "lot-main", "product-apple", "4", "1", "loc-main", 20.0, "ACTIVE", false);
+        }
+
+        let snapshot = load_reference_snapshot_at(&path, None, Some(device)).expect("load snapshot");
+        let lots = snapshot["inventory_lots"].as_array().expect("lot list");
+
+        // Both shops' lots are still emitted. The snapshot's job is to make the filter possible,
+        // not to apply it: filtering here would decide for a caller that never asked, and would
+        // leave the product aggregate counting a universe the list does not show.
+        assert_eq!(lots.len(), 2);
+
+        for lot in lots {
+            for field in ["branch_id", "company_id", "operational_location_id"] {
+                assert!(
+                    lot.get(field).is_some_and(|value| !value.is_null()),
+                    "lot {:?} must carry {field}; a lot with no scope cannot be filtered to a shop \
+                     and would be billable from every counter",
+                    lot["id"],
+                );
+            }
+        }
+
+        let ratanada = lots.iter().find(|lot| lot["id"] == "lot-ratanada").expect("ratanada lot");
+        assert_eq!(ratanada["branch_id"], serde_json::json!("3"));
+        assert_eq!(ratanada["company_id"], serde_json::json!("1"));
+        assert_eq!(ratanada["operational_location_id"], serde_json::json!("loc-ratanada"));
+        assert_eq!(ratanada["remaining_qty"], serde_json::json!(15.0));
+
+        let main = lots.iter().find(|lot| lot["id"] == "lot-main").expect("main lot");
+        assert_eq!(main["branch_id"], serde_json::json!("4"));
+        assert_eq!(main["operational_location_id"], serde_json::json!("loc-main"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn product_aggregate_and_lot_list_agree_about_which_lots_exist() {
+        // The summary-vs-detail guard. `products.current_stock` and `product_stock_by_scope` are
+        // separate queries from the lot list, and CLAUDE.md's rule is that a panel's total and its
+        // table must be derived from the same filtered source or they will eventually disagree —
+        // and the disagreement will look like data loss rather than like a bug. This test is what
+        // catches the two predicates being edited apart.
+        let path = activation_temp_path("scoped-aggregate-agreement");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-STOCK-SCOPE-2";
+        seed_device_assignment(&path, device, "1", "3", "loc-ratanada");
+
+        {
+            let conn = Connection::open(&path).expect("open aggregate database");
+            seed_scoped_product(&conn, "product-apple", "Apples");
+            seed_scoped_lot(&conn, "lot-r1", "product-apple", "3", "1", "loc-ratanada", 15.0, "ACTIVE", false);
+            seed_scoped_lot(&conn, "lot-r2", "product-apple", "3", "1", "loc-ratanada", 5.0, "ACTIVE", false);
+            seed_scoped_lot(&conn, "lot-m1", "product-apple", "4", "1", "loc-main", 20.0, "ACTIVE", false);
+            // Cancelled: listed as a lot, excluded from both stock figures. Present so the two
+            // aggregates are checked against a rule the lot list does not itself apply.
+            seed_scoped_lot(&conn, "lot-cancelled", "product-apple", "3", "1", "loc-ratanada", 7.0, "CANCELLED", false);
+            // Deleted: must be invisible everywhere.
+            seed_scoped_lot(&conn, "lot-deleted", "product-apple", "3", "1", "loc-ratanada", 9.0, "ACTIVE", true);
+        }
+
+        let snapshot = load_reference_snapshot_at(&path, None, Some(device)).expect("load snapshot");
+        let lots = snapshot["inventory_lots"].as_array().expect("lot list");
+        let by_scope = snapshot["product_stock_by_scope"].as_array().expect("scoped aggregate");
+        let products = snapshot["products"].as_array().expect("product list");
+
+        let live_ids = lots.iter().map(|lot| lot["id"].as_str().unwrap().to_string()).collect::<std::collections::HashSet<_>>();
+        assert!(!live_ids.contains("lot-deleted"), "a deleted lot must not reach the list");
+        assert!(live_ids.contains("lot-cancelled"), "a cancelled lot is still a lot");
+        assert_eq!(live_ids.len(), 4);
+
+        // Rebuild the scoped aggregate from the detail rows, applying the one rule the aggregate
+        // adds, and require the two to be identical. If somebody changes what one of them counts,
+        // this is the assertion that fails instead of the Inventory tiles.
+        let mut expected: std::collections::BTreeMap<(String, String, String), (f64, i64)> =
+            std::collections::BTreeMap::new();
+        for lot in lots {
+            if lot["batch_status"].as_str().unwrap_or("ACTIVE").to_uppercase() == "CANCELLED" {
+                continue;
+            }
+            let key = (
+                lot["product_id"].as_str().unwrap().to_string(),
+                lot["branch_id"].as_str().unwrap().to_string(),
+                lot["operational_location_id"].as_str().unwrap().to_string(),
+            );
+            let entry = expected.entry(key).or_insert((0.0, 0));
+            entry.0 += lot["balance_qty"].as_f64().unwrap();
+            entry.1 += 1;
+        }
+
+        let mut emitted: std::collections::BTreeMap<(String, String, String), (f64, i64)> =
+            std::collections::BTreeMap::new();
+        for row in by_scope {
+            emitted.insert(
+                (
+                    row["product_id"].as_str().unwrap().to_string(),
+                    row["branch_id"].as_str().unwrap().to_string(),
+                    row["operational_location_id"].as_str().unwrap().to_string(),
+                ),
+                (row["current_stock"].as_f64().unwrap(), row["lot_count"].as_i64().unwrap()),
+            );
+        }
+        assert_eq!(emitted, expected);
+        assert_eq!(
+            emitted.get(&("product-apple".into(), "3".into(), "loc-ratanada".into())),
+            Some(&(20.0, 2)),
+            "Ratanada's own shelf, and nothing of Main Branch's"
+        );
+
+        // And the unscoped product total is the sum of the scoped ones — the same rows again, so a
+        // caller that reads either one is reading the same fruit.
+        let product = products.iter().find(|row| row["id"] == "product-apple").expect("product row");
+        let scoped_total: f64 = by_scope.iter().map(|row| row["current_stock"].as_f64().unwrap()).sum();
+        let scoped_lots: i64 = by_scope.iter().map(|row| row["lot_count"].as_i64().unwrap()).sum();
+        assert_eq!(product["current_stock"].as_f64().unwrap(), scoped_total);
+        assert_eq!(product["lot_count"].as_i64().unwrap(), scoped_lots);
+        assert_eq!(scoped_total, 40.0);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_pulled_lot_from_another_shop_is_refused_and_the_rest_of_the_pull_lands() {
+        // The bootstrap path has always refused an `inventory_lot` outside the device's canonical
+        // scope. The incremental path — the one every pull after the first one takes — applied
+        // whatever arrived, so the rule held only until the device pulled again. What is asserted
+        // here is both halves: the foreign lot is not live, and the honest changes travelling with
+        // it in the same page still applied and the cursor still advanced.
+        let path = activation_temp_path("scoped-pull-refusal");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-STOCK-SCOPE-3";
+        seed_device_assignment(&path, device, "1", "3", "loc-ratanada");
+        {
+            let conn = Connection::open(&path).expect("open refusal database");
+            seed_scoped_product(&conn, "product-apple", "Apples");
+        }
+
+        let foreign_payload = PulledChange {
+            change_id: serde_json::json!(101),
+            branch_id: Some(4),
+            entity_type: "inventory_lot".to_string(),
+            entity_id: "lot-main-branch".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            payload: serde_json::json!({
+                "branch_id": 4,
+                "company_id": 1,
+                "operational_location_id": "loc-main",
+                "product_global_id": "product-apple",
+                "product_name": "Apples",
+                "purchase_qty": 20,
+                "remaining_qty": 20,
+                "batch_status": "ACTIVE"
+            }),
+            updated_at: Some("2026-08-30T10:00:00.000Z".to_string()),
+        };
+        // Scope stated only on the envelope. The applier falls back to it and stamps it on the row,
+        // so a guard that read the payload alone would wave this one through onto the shelf.
+        let foreign_envelope = PulledChange {
+            change_id: serde_json::json!(102),
+            branch_id: Some(4),
+            entity_type: "inventory_lot".to_string(),
+            entity_id: "lot-envelope-only".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            payload: serde_json::json!({
+                "product_global_id": "product-apple",
+                "product_name": "Apples",
+                "purchase_qty": 6,
+                "remaining_qty": 6,
+                "batch_status": "ACTIVE"
+            }),
+            updated_at: Some("2026-08-30T10:00:01.000Z".to_string()),
+        };
+        // Same page, nothing wrong with it. A hard `Err` on the lots above would have discarded
+        // this and wedged the cursor behind them for ever.
+        let innocent = PulledChange {
+            change_id: serde_json::json!(103),
+            branch_id: Some(3),
+            entity_type: "product".to_string(),
+            entity_id: "product-banana".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            payload: serde_json::json!({
+                "branch_id": 3,
+                "product_name": "Bananas",
+                "unit": "KG",
+                "selling_rate": 40,
+                "active": true
+            }),
+            updated_at: Some("2026-08-30T10:00:02.000Z".to_string()),
+        };
+
+        apply_pull_changes_at(
+            &path,
+            &[foreign_payload, foreign_envelope, innocent],
+            "103",
+            Some(device.to_string()),
+            Some("2026-08-30T10:00:03.000Z".to_string()),
+        )
+        .expect("a foreign lot must not fail the page");
+
+        let conn = Connection::open(&path).expect("inspect refusal database");
+        // Not "soft-deleted", not "applied with a corrected branch" — not present at all. A row
+        // that reached the table would be sellable from this counter.
+        let foreign_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_inventory_lots WHERE id IN ('lot-main-branch', 'lot-envelope-only')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count foreign lots");
+        assert_eq!(foreign_rows, 0, "another shop's stock must never reach this device's lots");
+
+        // Refused loudly: countable, readable, and replayable rather than dropped.
+        let refusals: Vec<(String, String)> = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT entity_id, reason FROM local_unapplied_changes
+                      WHERE entity_type = 'inventory_lot' ORDER BY entity_id",
+                )
+                .expect("prepare refusals");
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query refusals")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect refusals")
+        };
+        assert_eq!(
+            refusals,
+            vec![
+                ("lot-envelope-only".to_string(), "INVENTORY_LOT_OUTSIDE_DEVICE_SCOPE".to_string()),
+                ("lot-main-branch".to_string(), "INVENTORY_LOT_OUTSIDE_DEVICE_SCOPE".to_string()),
+            ]
+        );
+        let detail: String = conn
+            .query_row(
+                "SELECT detail FROM local_unapplied_changes WHERE entity_id = 'lot-main-branch'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("refusal detail");
+        assert!(detail.contains("branch"), "the reason has to name what was wrong: {detail}");
+
+        // The rest of the page landed, and the cursor moved, so the next pull does not re-offer it.
+        let banana: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_products WHERE id = 'product-banana'", [], |row| row.get(0))
+            .expect("count innocent product");
+        assert_eq!(banana, 1);
+        let cursor: String = conn
+            .query_row(
+                "SELECT last_pull_cursor FROM sync_state WHERE device_id = ?1",
+                params![device],
+                |row| row.get(0),
+            )
+            .expect("read cursor");
+        assert_eq!(cursor, "103");
+
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_pulled_lot_for_this_shop_still_applies() {
+        // Without this, a suite passes by refusing everything, and a counter that can sell nothing
+        // is not a fix. Three shapes that must all still go through: the device's own branch and
+        // location stated in full; scope stated only on the envelope and matching; and a payload
+        // that states no scope at all, which is an older server rather than a foreign shop.
+        let path = activation_temp_path("scoped-pull-accepts-own");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-STOCK-SCOPE-4";
+        seed_device_assignment(&path, device, "1", "3", "loc-ratanada");
+        {
+            let conn = Connection::open(&path).expect("open accept database");
+            seed_scoped_product(&conn, "product-apple", "Apples");
+        }
+
+        let make_lot = |change_id: i64, id: &str, payload: serde_json::Value, envelope_branch: Option<i64>| PulledChange {
+            change_id: serde_json::json!(change_id),
+            branch_id: envelope_branch,
+            entity_type: "inventory_lot".to_string(),
+            entity_id: id.to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            payload,
+            updated_at: Some("2026-08-30T11:00:00.000Z".to_string()),
+        };
+
+        let changes = vec![
+            make_lot(
+                201,
+                "lot-own-full",
+                serde_json::json!({
+                    "branch_id": 3,
+                    "company_id": 1,
+                    "operational_location_id": "loc-ratanada",
+                    "product_global_id": "product-apple",
+                    "product_name": "Apples",
+                    "purchase_qty": 15,
+                    "remaining_qty": 15,
+                    "batch_status": "ACTIVE"
+                }),
+                Some(3),
+            ),
+            make_lot(
+                202,
+                "lot-own-envelope",
+                serde_json::json!({
+                    "product_global_id": "product-apple",
+                    "product_name": "Apples",
+                    "purchase_qty": 4,
+                    "remaining_qty": 4,
+                    "batch_status": "ACTIVE"
+                }),
+                Some(3),
+            ),
+            make_lot(
+                203,
+                "lot-no-scope-stated",
+                serde_json::json!({
+                    "product_global_id": "product-apple",
+                    "product_name": "Apples",
+                    "purchase_qty": 2,
+                    "remaining_qty": 2,
+                    "batch_status": "ACTIVE"
+                }),
+                None,
+            ),
+        ];
+
+        apply_pull_changes_at(
+            &path,
+            &changes,
+            "203",
+            Some(device.to_string()),
+            Some("2026-08-30T11:00:01.000Z".to_string()),
+        )
+        .expect("this device's own stock must apply");
+
+        let conn = Connection::open(&path).expect("inspect accept database");
+        let (live, balance): (i64, f64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(balance_qty), 0) FROM local_inventory_lots WHERE deleted_at IS NULL",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("count applied lots");
+        assert_eq!(live, 3);
+        assert_eq!(balance, 21.0);
+        let refused: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_unapplied_changes", [], |row| row.get(0))
+            .expect("count refusals");
+        assert_eq!(refused, 0, "nothing here is foreign, so nothing may be refused");
+
+        drop(conn);
         let _ = fs::remove_file(&path);
     }
 }
