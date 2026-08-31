@@ -14,6 +14,7 @@ const migrationFiles = [
   // only thing that decides what runs.
   "backend/migrations/cloud/011_inventory_incremental_publication.sql",
   "backend/migrations/cloud/012_scope_management.sql",
+  "backend/migrations/cloud/013_transfer_request_without_lot.sql",
 ];
 
 async function main() {

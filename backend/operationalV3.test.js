@@ -186,6 +186,13 @@ test("transfer approval reserves only available source stock", async () => {
   const database = {
     query: async (sql, params) => {
       queries.push({ sql, params });
+      // Both fixtures below describe an item that already names its lot, so the "which lines have
+      // no lot chosen yet" query must answer empty. Without modelling the predicate this stub
+      // answers every inventory_transfer_items query with the same allocated row, and approval then
+      // demands lots for a line that already has one.
+      if (sql.includes("source_lot_id IS NULL")) {
+        return { rows: sql.includes("COUNT(*)") ? [{ pending: 0 }] : [] };
+      }
       if (sql.includes("FROM inventory_transfer_items")) {
         return {
           rows: [{
@@ -222,6 +229,13 @@ test("transfer approval reserves only available source stock", async () => {
 test("transfer approval rejects stock already reserved elsewhere", async () => {
   const database = {
     query: async (sql) => {
+      // Both fixtures below describe an item that already names its lot, so the "which lines have
+      // no lot chosen yet" query must answer empty. Without modelling the predicate this stub
+      // answers every inventory_transfer_items query with the same allocated row, and approval then
+      // demands lots for a line that already has one.
+      if (sql.includes("source_lot_id IS NULL")) {
+        return { rows: sql.includes("COUNT(*)") ? [{ pending: 0 }] : [] };
+      }
       if (sql.includes("FROM inventory_transfer_items")) {
         return { rows: [{ id: 50, source_lot_id: 70, product_id: 276, requested_quantity: "10", remaining_qty: "12" }] };
       }

@@ -355,8 +355,121 @@ const transferActionItems = (body) => new Map(
     .filter(([itemId]) => itemId)
 );
 
+/**
+ * Give an unallocated request line its crates.
+ *
+ * A branch asking another branch for stock names a product and a quantity, not a lot -- it cannot
+ * see the other branch's lots. Approval is where the branch that holds the fruit says which crates
+ * it is sending, and it may split one request across several.
+ *
+ * Splitting is done by rewriting the request row to the first crate and inserting a row per further
+ * crate, rather than by letting one row carry several. Every step after this -- reserve, dispatch,
+ * receive, and the destination lot the receiving branch ends up with -- assumes one row means one
+ * crate, and each crate carries its own purchase cost into the receiving branch's margin. Teaching
+ * all of that to handle a list would be a far larger change than making the list into rows here.
+ *
+ * Each named lot is checked against the *source* location, so an approver cannot allocate a crate
+ * belonging to somewhere else, and against what is genuinely free after existing reservations.
+ */
+const allocateRequestedTransferItem = async (client, transfer, item, allocations) => {
+  const rows = (Array.isArray(allocations) ? allocations : [])
+    .map((entry) => ({
+      lotId: positiveId(entry?.source_lot_id),
+      quantity: positiveNumber(entry?.quantity),
+    }))
+    .filter((entry) => entry.lotId && entry.quantity);
+
+  if (rows.length === 0) {
+    throw routeError(
+      422,
+      "TRANSFER_ALLOCATION_REQUIRED",
+      "Choose which lots this stock is coming from before approving"
+    );
+  }
+
+  const total = rows.reduce((sum, entry) => sum + entry.quantity, 0);
+  const requested = Number(item.requested_quantity);
+  if (total > requested) {
+    throw routeError(
+      422,
+      "TRANSFER_ALLOCATION_EXCEEDS_REQUEST",
+      "The lots chosen add up to more than was asked for"
+    );
+  }
+
+  const prepared = [];
+  for (const entry of rows) {
+    const lot = await client.query(
+      `SELECT ib.id, ib.effective_cost_per_unit,
+              GREATEST(ib.remaining_qty - COALESCE(SUM(sr.quantity) FILTER (WHERE sr.status = 'ACTIVE'), 0), 0) AS available
+       FROM inventory_batches ib
+       LEFT JOIN stock_reservations sr ON sr.inventory_batch_id = ib.id
+       WHERE ib.id = $1 AND ib.product_id = $2 AND ib.company_id = $3
+         AND ib.branch_id = $4 AND ib.operational_location_id = $5
+         AND ib.deleted_at IS NULL
+       GROUP BY ib.id, ib.effective_cost_per_unit`,
+      [
+        entry.lotId,
+        item.product_id,
+        transfer.company_id,
+        transfer.source_branch_id,
+        transfer.source_operational_location_id,
+      ]
+    );
+    const found = lot.rows?.[0];
+    if (!found) {
+      // Deliberately one message for "no such lot", "not this product" and "not this location".
+      // Telling an approver which of the three it was would map out another location's stock.
+      throw routeError(422, "TRANSFER_ALLOCATION_INVALID", "That lot is not available at this location");
+    }
+    if (Number(found.available) < entry.quantity) {
+      throw routeError(409, "TRANSFER_STOCK_UNAVAILABLE", "That lot no longer holds the quantity being allocated");
+    }
+    prepared.push({ ...entry, costRate: found.effective_cost_per_unit });
+  }
+
+  const [first, ...rest] = prepared;
+  await client.query(
+    `UPDATE inventory_transfer_items
+     SET source_lot_id = $2, requested_quantity = $3, original_cost_rate = $4
+     WHERE id = $1`,
+    [item.id, first.lotId, first.quantity, first.costRate]
+  );
+  const created = [];
+  for (const entry of rest) {
+    const inserted = await client.query(
+      `INSERT INTO inventory_transfer_items
+        (transfer_id, product_id, source_lot_id, requested_quantity, original_cost_rate)
+       VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+      [transfer.id, item.product_id, entry.lotId, entry.quantity, entry.costRate]
+    );
+    created.push(inserted.rows[0].id);
+  }
+  return created;
+};
+
 const applyTransferStockEffect = async (client, transfer, action, body, context, idempotencyKey) => {
   if (!["approve", "dispatch", "receive", "partial_receive", "source_receive"].includes(action)) return;
+  const supplied = transferActionItems(body);
+
+  // Approval is the step that turns "10 kg of apples" into named crates, so it runs before the
+  // join below -- which is an inner join on the lot and would otherwise drop every unallocated row
+  // silently, advancing the transfer with no fruit behind it.
+  if (action === "approve") {
+    const unallocated = await client.query(
+      `SELECT id, product_id, requested_quantity
+       FROM inventory_transfer_items
+       WHERE transfer_id = $1 AND source_lot_id IS NULL
+       ORDER BY id
+       FOR UPDATE`,
+      [transfer.id]
+    );
+    for (const item of unallocated.rows) {
+      const instruction = supplied.get(Number(item.id));
+      await allocateRequestedTransferItem(client, transfer, item, instruction?.allocations);
+    }
+  }
+
   const itemsResult = await client.query(
     `SELECT ti.*, ib.remaining_qty, ib.purchase_rate, ib.effective_cost_per_unit,
             ib.supplier_id, ib.supplier_name, ib.batch_no
@@ -365,17 +478,34 @@ const applyTransferStockEffect = async (client, transfer, action, body, context,
      WHERE ti.transfer_id = $1 ORDER BY ti.id FOR UPDATE OF ti, ib`,
     [transfer.id]
   );
-  const supplied = transferActionItems(body);
   if (itemsResult.rows.length === 0) {
     throw routeError(409, "TRANSFER_ITEMS_MISSING", "Transfer has no stock items");
+  }
+
+  // The join above cannot see an item with no lot, so an unallocated row left behind by any path
+  // other than approve would mean "this quantity quietly moved nowhere". Counted separately and
+  // refused by name rather than left to be discovered as a shortage at the far end.
+  const stillUnallocated = await client.query(
+    "SELECT COUNT(*)::INT AS pending FROM inventory_transfer_items WHERE transfer_id = $1 AND source_lot_id IS NULL",
+    [transfer.id]
+  );
+  if (Number(stillUnallocated.rows[0]?.pending || 0) > 0) {
+    throw routeError(
+      409,
+      "TRANSFER_NOT_ALLOCATED",
+      "Some of this request has no lot chosen yet, so it cannot move"
+    );
   }
 
   for (const item of itemsResult.rows) {
     const requested = Number(item.requested_quantity);
     if (action === "approve") {
-      const approved = supplied.has(Number(item.id))
-        ? positiveNumber(supplied.get(Number(item.id)).approved_quantity)
-        : requested;
+      // Falls back to the requested quantity when the caller supplied an entry but no
+      // `approved_quantity`. An entry carrying only `allocations` is the normal shape for a request
+      // whose crates were just chosen: the amount is already settled by the allocation, and reading
+      // a missing field as zero would refuse the very approval that produced it.
+      const instruction = supplied.get(Number(item.id));
+      const approved = positiveNumber(instruction?.approved_quantity) || requested;
       if (!approved || approved > requested) {
         throw routeError(422, "INVALID_APPROVED_QUANTITY", "Approved quantity must be positive and cannot exceed requested quantity");
       }
@@ -1166,9 +1296,36 @@ const registerOperationalV3Routes = ({
         const quantity = positiveNumber(item.requested_quantity);
         const productId = positiveId(item.product_id);
         const lotId = positiveId(item.source_lot_id);
-        if (!quantity || !productId || !lotId) {
-          throw routeError(400, "INVALID_TRANSFER_ITEM", "Transfer items require product, source lot, and positive quantity");
+        if (!quantity || !productId) {
+          throw routeError(400, "INVALID_TRANSFER_ITEM", "Transfer items require a product and a positive quantity");
         }
+
+        // A branch asking another branch for stock names the product and the quantity, and not the
+        // crate -- because the crate belongs to the other branch and this device deliberately
+        // cannot see it. The branch that holds the fruit chooses which crates to send when it
+        // approves. See migration 013 and docs/stock-distribution-decision.md.
+        //
+        // Only a *request* may leave the crate open. When this location is the source it is sending
+        // its own stock, it can see its own lots, and naming one is both possible and required --
+        // otherwise a warehouse could dispatch "10 kg of apples" with nothing saying which apples,
+        // and the cost that travels with the fruit would be a guess.
+        if (!lotId) {
+          if (transferScope.mode !== "DESTINATION_REQUESTED") {
+            throw routeError(
+              400,
+              "SOURCE_LOT_REQUIRED",
+              "Stock being sent must name the lot it is coming from"
+            );
+          }
+          await client.query(
+            `INSERT INTO inventory_transfer_items
+              (transfer_id, product_id, source_lot_id, requested_quantity)
+             VALUES ($1,$2,NULL,$3)`,
+            [transfer.rows[0].id, productId, quantity]
+          );
+          continue;
+        }
+
         const available = await client.query(
           `SELECT ib.id, ib.product_id,
                   GREATEST(ib.remaining_qty - COALESCE(SUM(sr.quantity) FILTER (WHERE sr.status = 'ACTIVE'), 0), 0) AS available
