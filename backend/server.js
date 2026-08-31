@@ -18579,9 +18579,69 @@ const readPurchaseEntryPayload = (body, actorUserId) => {
     unit: nullableText(body.unit),
     originType: nullableText(body.origin_type) ? String(body.origin_type).trim().toUpperCase() : null,
     branchId: parsePositiveInteger(body.branch_id),
+    // Where the goods physically land, which is not always where the buying happened.
+    //
+    // The maintainer's fruit is bought in bulk and delivered to a warehouse, then distributed to
+    // the shops -- see docs/stock-distribution-decision.md. Until now a purchase always landed at
+    // the location of the machine that typed it in, so a purchase manager working from a shop
+    // counter silently put the whole consignment on that shop's shelf.
+    //
+    // Read under `destination_*` rather than `operational_location_id` **on purpose**:
+    // `v3WriteAdapter` unconditionally overwrites company_id, branch_id and
+    // operational_location_id in the request body with the submitting device's own scope. A
+    // destination sent under those names would be silently replaced and the field would look
+    // ignored, with no error anywhere. These names survive it.
+    destinationBranchId: parsePositiveInteger(body.destination_branch_id),
+    destinationLocationId: parsePositiveInteger(body.destination_operational_location_id),
     actorId: parsePositiveInteger(actorUserId),
     remarks: nullableText(body.remarks),
   };
+};
+
+/**
+ * Where a purchase's stock should be written, having checked the caller may put it there.
+ *
+ * Returns `{ branchId, locationId }`, or `{ error }` for the route to refuse with. It never falls
+ * back to the session's scope when a destination was named but is unusable: a silent fallback would
+ * put a whole consignment on the wrong shelf while telling the operator it went where they asked,
+ * which is the exact failure this feature exists to remove.
+ *
+ * With no destination named it returns the session's own scope, so every existing caller behaves
+ * byte-for-byte as it did before.
+ */
+const resolveGoodsReceivedAt = async (client, context, entry) => {
+  const sessionScope = {
+    branchId: entry.branchId,
+    locationId: parsePositiveInteger(context?.operational_location_id) || null,
+  };
+  if (!entry.destinationBranchId && !entry.destinationLocationId) return sessionScope;
+
+  const companyId = parsePositiveInteger(context?.company_id);
+  if (!companyId) {
+    return { error: "This device has no company scope, so it cannot direct goods to another location." };
+  }
+  if (!entry.destinationBranchId || !entry.destinationLocationId) {
+    // Half an answer is worse than none: a branch with no location would write a lot the pull
+    // predicate can never deliver, and it would sit in Postgres reaching no device, silently.
+    return { error: "Choose both the shop and the counter the goods were received at." };
+  }
+
+  const found = await client.query(
+    `SELECT ol.id, ol.branch_id
+     FROM operational_locations ol
+     JOIN branches b ON b.id = ol.branch_id AND b.company_id = ol.company_id
+     WHERE ol.id = $1
+       AND ol.branch_id = $2
+       AND ol.company_id = $3
+       AND ol.active = TRUE
+       AND b.active IS DISTINCT FROM FALSE
+     LIMIT 1`,
+    [entry.destinationLocationId, entry.destinationBranchId, companyId]
+  );
+  if (!found.rows[0]) {
+    return { error: "That location is not an active part of this business, so goods cannot be received there." };
+  }
+  return { branchId: found.rows[0].branch_id, locationId: found.rows[0].id };
 };
 
 const validatePurchaseEntry = (entry) => {
@@ -19175,6 +19235,18 @@ const createPurchaseBillHandler = async (req, res) => {
     const replay = await beginV3BusinessOperation(client, req, "purchase");
     if (replay) return sendV3Replay(client, res, replay);
     const context = req.v3OperationalContext;
+
+    // Where the fruit actually goes. Defaults to this machine's own location, so nothing changes
+    // for a purchase entered at the counter that will hold it. When a destination is named -- a
+    // purchase manager buying from a shop counter for the warehouse -- it is validated against this
+    // company before a single row is written, and an unusable one refuses the whole purchase rather
+    // than quietly landing the consignment on the wrong shelf.
+    const receivedAt = await resolveGoodsReceivedAt(client, context, baseEntry);
+    if (receivedAt.error) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: receivedAt.error });
+    }
+
     const operationId = v3OperationKey(req);
     const hasLegacyOfflineIdentity = rawItems.some((item, index) =>
       cleanText(item.purchase_global_id) === `offline-purchase-${operationId}-${index + 1}`
@@ -19377,9 +19449,9 @@ const createPurchaseBillHandler = async (req, res) => {
            ) RETURNING *`,
           [
             entry.productId, batchNo, entry.quantity, provisionalCost, supplier.id,
-            supplier.supplier_name, baseEntry.branchId, purchase.id, entry.temporarySaleRate,
+            supplier.supplier_name, receivedAt.branchId, purchase.id, entry.temporarySaleRate,
             entry.lotName, entry.lotSize, entry.remarks, baseEntry.purchaseDate, itemUnit,
-            itemOriginType, context?.company_id || null, context?.operational_location_id || null,
+            itemOriginType, context?.company_id || null, receivedAt.locationId,
             entry.lotGlobalId,
           ]
         );
@@ -19389,7 +19461,7 @@ const createPurchaseBillHandler = async (req, res) => {
              company_id, operational_location_id
            ) VALUES ($1,$2,'IN',$3,$4,$5,$6,$7)`,
           [entry.productId, entry.quantity, `Stock arrival pending bill #${purchase.id}`, baseEntry.actorId,
-            baseEntry.branchId, context?.company_id || null, context?.operational_location_id || null]
+            receivedAt.branchId, context?.company_id || null, receivedAt.locationId]
         );
         createdItems.push({
           ...itemResult.rows[0],
@@ -19533,12 +19605,12 @@ const createPurchaseBillHandler = async (req, res) => {
            ) RETURNING *`,
           [
             entry.productId, batchNo, entry.quantity, entry.purchaseRate, financials.effectiveCostPerUnit,
-            first.supplier.id, first.supplier.supplier_name, baseEntry.branchId,
+            first.supplier.id, first.supplier.supplier_name, receivedAt.branchId,
             financials.mandiTaxAmount, entry.freightCharges, entry.labourCharges, entry.otherCharges,
             financials.grossAmount, financials.rebateAmount, financials.netPayable, rebateRule.rule_name,
             financials.balanceAmount, purchase.id, entry.lotName, entry.lotSize, entry.remarks,
             baseEntry.purchaseDate, itemUnit, itemOriginType, context?.company_id || null,
-            context?.operational_location_id || null, entry.lotGlobalId,
+            receivedAt.locationId, entry.lotGlobalId,
           ]
         );
         await client.query(
@@ -19547,7 +19619,7 @@ const createPurchaseBillHandler = async (req, res) => {
              company_id, operational_location_id
            ) VALUES ($1,$2,'IN',$3,$4,$5,$6,$7)`,
           [entry.productId, entry.quantity, `Purchase #${purchase.id}`, baseEntry.actorId,
-            baseEntry.branchId, context?.company_id || null, context?.operational_location_id || null]
+            receivedAt.branchId, context?.company_id || null, receivedAt.locationId]
         );
         createdItems.push({
           ...itemResult.rows[0],
@@ -22175,6 +22247,7 @@ module.exports = {
   processSyncOperation,
   processCustomerOrderOperation,
   transferCustomerOrderBranch,
+  resolveGoodsReceivedAt,
   resolveBranchDefaultLocationId,
   normalizeCustomerOrderItems,
 };
