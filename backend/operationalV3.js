@@ -1453,10 +1453,35 @@ const registerOperationalV3Routes = ({
       ? "t.company_id = $1"
       : "t.company_id = $1 AND (t.source_operational_location_id = $2 OR t.destination_operational_location_id = $2)";
     const result = await database.query(
-      `SELECT t.*, sl.location_name AS source_location_name, dl.location_name AS destination_location_name
+      `SELECT t.*, sl.location_name AS source_location_name, dl.location_name AS destination_location_name,
+              COALESCE(items.lines, '[]'::jsonb) AS items,
+              COALESCE(items.unallocated, 0) AS unallocated_line_count
        FROM inventory_transfers t
        JOIN operational_locations sl ON sl.id = t.source_operational_location_id
        JOIN operational_locations dl ON dl.id = t.destination_operational_location_id
+       -- The lines travel with the board because a request names products rather than lots, and the
+       -- branch being asked cannot choose which crates to send without seeing what was asked for.
+       -- LEFT JOIN, and the aggregate is over a LEFT JOIN to products too: a line whose product row
+       -- is missing must still appear, or a consignment would silently show fewer lines than it has.
+       LEFT JOIN LATERAL (
+         SELECT JSONB_AGG(
+                  JSONB_BUILD_OBJECT(
+                    'id', ti.id,
+                    'product_id', ti.product_id,
+                    'product_name', p.product_name,
+                    'unit', p.unit,
+                    'source_lot_id', ti.source_lot_id,
+                    'requested_quantity', ti.requested_quantity,
+                    'approved_quantity', ti.approved_quantity,
+                    'dispatched_quantity', ti.dispatched_quantity,
+                    'received_quantity', ti.received_quantity
+                  ) ORDER BY ti.id
+                ) AS lines,
+                COUNT(*) FILTER (WHERE ti.source_lot_id IS NULL) AS unallocated
+         FROM inventory_transfer_items ti
+         LEFT JOIN products p ON p.id = ti.product_id
+         WHERE ti.transfer_id = t.id
+       ) items ON TRUE
        WHERE ${filter} ORDER BY t.created_at DESC, t.id DESC`,
       params
     );

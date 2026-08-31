@@ -1986,6 +1986,9 @@ function App() {
     loadState: "idle", loadError: "", transfers: [], destinations: [],
   });
   const [distributionBusy, setDistributionBusy] = useState(false);
+  // Where a purchase's goods were actually received. Empty means "this counter", which is what the
+  // backend assumes when no destination is sent -- so an untouched picker changes nothing.
+  const [purchaseDestinationId, setPurchaseDestinationId] = useState("");
   const [orderActionBusy, setOrderActionBusy] = useState(false);
   // The order whose bill is being rung up, and the cart POS should open with. Held here rather than
   // inside PosBilling so the link back to the order survives POS remounting.
@@ -4970,6 +4973,27 @@ function App() {
     }
   };
 
+  /**
+   * The other places in this business, for a screen that needs to name one.
+   *
+   * Shared by the consignment board and by Purchase Entry's "Goods received at" picker. Kept
+   * separate from `loadDistribution` so opening Purchase Entry does not also fetch every
+   * consignment, and so a failure here cannot empty a board.
+   */
+  const loadDistributionDestinations = async () => {
+    try {
+      const response = await axios.get(
+        `${SYNC_API_URL}/api/v3/transfers/destinations`,
+        createOperationalReadConfig(user),
+      );
+      setDistributionState((current) => ({ ...current, destinations: response?.data?.destinations || [] }));
+    } catch {
+      // Silent on purpose: without this list the picker simply offers "this counter", which is the
+      // behaviour every purchase had before the picker existed. Nothing is lost and nothing is wrong.
+      setDistributionState((current) => ({ ...current, destinations: [] }));
+    }
+  };
+
   /** Send stock from this counter to another shop. */
   const sendConsignment = async (draft) => {
     setDistributionBusy(true);
@@ -6212,6 +6236,9 @@ function App() {
       }
       const reason = editingPurchaseId ? window.prompt("Enter purchase edit reason") : "";
       if (editingPurchaseId && !reason?.trim()) return;
+      const purchaseDestination = distributionState.destinations.find(
+        (row) => String(row.operational_location_id) === String(purchaseDestinationId),
+      ) || null;
       const payload = {
         supplier_id: purchaseSupplierId,
         product_id: purchaseProductId,
@@ -6239,6 +6266,17 @@ function App() {
         edited_by: user.id,
         reason,
         remarks: purchaseRemarks,
+        // Where the goods physically landed, when that is not this counter -- a purchase manager
+        // buying for the warehouse from a shop machine. Sent under `destination_*` because
+        // `v3WriteAdapter` overwrites `branch_id` and `operational_location_id` with the submitting
+        // device's own scope; a destination under those names would vanish with no error. Omitted
+        // entirely when the picker is untouched, which is exactly the pre-picker behaviour.
+        ...(purchaseDestination
+          ? {
+            destination_branch_id: purchaseDestination.branch_id,
+            destination_operational_location_id: purchaseDestination.operational_location_id,
+          }
+          : {}),
       };
       const aggregatePayload = { ...payload, items: purchaseCart };
       const aggregateOperationId = purchaseSubmissionRef.current.resolve(aggregatePayload);
@@ -6831,6 +6869,10 @@ function App() {
       if (["purchase", "pending-bills"].includes(view)) {
         await Promise.all([loadPurchases(), loadPurchaseRules()]);
       }
+      // The "Goods received at" picker needs the other places in the business. Not awaited with the
+      // rest: a purchase must still be enterable when this list cannot be fetched, and without it
+      // the picker simply offers "this counter", which is what every purchase did before it existed.
+      if (view === "purchase") loadDistributionDestinations();
       if (view === "pending-bills") await Promise.all([loadCustomerPendingBills(), loadCustomerData()]);
       if (view === "accounts") {
         await Promise.all([loadAccounts(), loadCustomerData(), loadSupplierData(), loadAccountOutstanding()]);
@@ -7845,6 +7887,23 @@ function App() {
                     </select>
                   </Field>
                   <Field label={purchaseBillStatus === "BILL_PENDING" ? "Arrival Date" : "Purchase Date"}><input type="date" value={purchaseDate} onChange={(event) => setPurchaseDate(event.target.value)} /></Field>
+                  {/* Where the fruit physically landed, which is not always where it was typed in.
+                      Bought in bulk into a warehouse, then distributed -- see
+                      docs/stock-distribution-decision.md. Only offered when there is somewhere else
+                      to choose: a business with one location gets no field to get wrong, and the
+                      default is always this counter, exactly as before this existed. */}
+                  {distributionState.destinations.length > 0 && (
+                    <Field label="Goods received at">
+                      <select value={purchaseDestinationId} onChange={(event) => setPurchaseDestinationId(event.target.value)}>
+                        <option value="">This counter</option>
+                        {distributionState.destinations.map((row) => (
+                          <option key={row.operational_location_id} value={row.operational_location_id}>
+                            {row.branch_name} — {row.location_name}
+                          </option>
+                        ))}
+                      </select>
+                    </Field>
+                  )}
                   {purchaseBillStatus === "BILL_COMPLETED" && (
                     <>
                       <Field label="Bill Number"><input value={purchaseBillNumber} onChange={(event) => setPurchaseBillNumber(event.target.value)} /></Field>

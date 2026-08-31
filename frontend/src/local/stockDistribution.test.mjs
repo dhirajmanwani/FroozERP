@@ -222,3 +222,172 @@ test("a quantity of zero is kept and a missing quantity is not invented", () => 
   assert.equal(transferQuantity(""), null, "an empty box is nobody having answered yet");
   assert.equal(transferQuantity("4.5"), 4.5);
 });
+
+/**
+ * The wiring, pinned.
+ *
+ * Source-text assertions, and the weaker kind of test on purpose: these call sites live inside a
+ * 20k-line component that cannot be imported in isolation. They cannot prove the values are right;
+ * they prove the field was not quietly dropped, which is the regression that actually happens --
+ * the scope module shipped complete, tested and wired to nothing for a whole day.
+ */
+const appSource = () => fs.readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+
+test("a purchase sends its destination under names the write adapter cannot overwrite", () => {
+  const source = appSource();
+
+  // `v3WriteAdapter` on the server unconditionally replaces `branch_id` and
+  // `operational_location_id` in the body with the submitting device's own scope. A destination sent
+  // under those names is gone before the handler runs, and the symptom is a field that appears to be
+  // ignored with no error anywhere.
+  assert.match(source, /destination_branch_id: purchaseDestination\.branch_id/);
+  assert.match(source, /destination_operational_location_id: purchaseDestination\.operational_location_id/);
+});
+
+test("an untouched picker sends no destination at all", () => {
+  // Not "send this counter's own ids", which would look equivalent and is not: the server treats a
+  // named destination as a deliberate instruction and validates it, while absence means "here" and
+  // costs no round trip. Every purchase entered before this field existed must keep behaving
+  // exactly as it did.
+  const source = appSource();
+  assert.match(
+    source,
+    /\.\.\.\(purchaseDestination\s*\n?\s*\?\s*\{/,
+    "the destination fields must be spread in conditionally, not always present",
+  );
+  assert.match(source, /:\s*\{\}\),/, "and the else branch must contribute nothing");
+});
+
+test("the picker is offered only when there is somewhere else to choose", () => {
+  // A business with one location gets no field to get wrong.
+  const source = appSource();
+  assert.match(
+    source,
+    /\{distributionState\.destinations\.length > 0 && \(\s*\n?\s*<Field label="Goods received at">/,
+    "the Goods received at field must be conditional on there being other locations",
+  );
+});
+
+test("Purchase Entry loads the destinations it needs, without blocking on them", () => {
+  const source = appSource();
+  assert.match(
+    source,
+    /if \(view === "purchase"\) loadDistributionDestinations\(\);/,
+    "opening Purchase Entry must fetch the location list",
+  );
+  // Deliberately not awaited: a purchase must still be enterable when this list cannot be fetched,
+  // and without it the picker simply offers "this counter" -- the pre-picker behaviour.
+  assert.doesNotMatch(
+    source,
+    /await loadDistributionDestinations\(\)/,
+    "a failed location list must never stop somebody entering a purchase",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Asking another branch for stock
+// ---------------------------------------------------------------------------
+
+test("a request names products and quantities, and no lots at all", async () => {
+  const { validateStockRequest } = await import("./stockDistribution.js");
+  const good = validateStockRequest({
+    sourceLocationId: "10",
+    requesterLocationId: "90",
+    lines: [{ product_id: "p1", requested_quantity: 10 }],
+  });
+  assert.equal(good.ok, true, good.problems.join("; "));
+  assert.equal(good.lines.length, 1);
+  assert.equal(
+    Object.hasOwn(good.lines[0], "source_lot_id"),
+    false,
+    "a request must not carry a lot: the asking branch cannot see the other branch's crates",
+  );
+});
+
+test("a shop cannot ask itself, and cannot ask without knowing who it is", async () => {
+  const { validateStockRequest } = await import("./stockDistribution.js");
+  const itself = validateStockRequest({
+    sourceLocationId: "90",
+    requesterLocationId: "90",
+    lines: [{ product_id: "p1", requested_quantity: 5 }],
+  });
+  assert.equal(itself.ok, false);
+  assert.ok(itself.problems.some((problem) => /cannot ask itself/.test(problem)));
+
+  const nowhere = validateStockRequest({
+    sourceLocationId: "10",
+    requesterLocationId: "",
+    lines: [{ product_id: "p1", requested_quantity: 5 }],
+  });
+  assert.equal(nowhere.ok, false);
+  assert.ok(nowhere.problems.some((problem) => /does not know which shop/.test(problem)));
+});
+
+test("only the branch holding the fruit is asked to choose crates", async () => {
+  const { pendingAllocationLines } = await import("./stockDistribution.js");
+  const request = consignment({
+    status: "APPROVAL_PENDING",
+    items: [
+      { id: 1, product_id: "p1", product_name: "Alphonso", source_lot_id: null, requested_quantity: "10" },
+      { id: 2, product_id: "p2", product_name: "Banana", source_lot_id: 71, requested_quantity: "4" },
+    ],
+  });
+
+  const forSource = pendingAllocationLines(request, WAREHOUSE);
+  assert.equal(forSource.length, 1, "only the line with no crate needs choosing");
+  assert.equal(forSource[0].productName, "Alphonso");
+  assert.equal(forSource[0].requested, 10);
+
+  assert.deepEqual(
+    pendingAllocationLines(request, RATANADA),
+    [],
+    "the branch that asked cannot choose crates it cannot see",
+  );
+  assert.deepEqual(pendingAllocationLines(request, SOMEWHERE_ELSE), []);
+});
+
+test("crate choices are checked against the amount asked for and what each crate holds", async () => {
+  const { validateAllocation } = await import("./stockDistribution.js");
+
+  const over = validateAllocation({
+    requested: 10,
+    allocations: [{ source_lot_id: "71", quantity: 7 }, { source_lot_id: "72", quantity: 5 }],
+  });
+  assert.equal(over.ok, false);
+  assert.ok(over.problems.some((problem) => /more than the 10 asked for/.test(problem)));
+
+  // Zero available is a real answer, not an absent one -- a crate already promised elsewhere.
+  const empty = validateAllocation({
+    requested: 10,
+    allocations: [{ source_lot_id: "71", lot_label: "Crate A", quantity: 4, available_quantity: 0 }],
+  });
+  assert.equal(empty.ok, false);
+  assert.ok(
+    empty.problems.some((problem) => /Crate A: only 0 available/.test(problem)),
+    `expected the empty crate to be refused, got: ${empty.problems.join("; ")}`,
+  );
+
+  const split = validateAllocation({
+    requested: 10,
+    allocations: [
+      { source_lot_id: "71", quantity: 6, available_quantity: 20 },
+      { source_lot_id: "72", quantity: 4, available_quantity: 20 },
+    ],
+  });
+  assert.equal(split.ok, true, split.problems.join("; "));
+  assert.equal(split.total, 10);
+  assert.equal(split.allocations.length, 2, "one request may be answered from several crates");
+});
+
+test("a request is not held back by stock this counter cannot see", async () => {
+  // There is deliberately no availability check on a request. This counter cannot see the other
+  // branch's stock, so any limit it showed would be a guess -- and a guess presented as a limit is
+  // worse than no limit, because a person would believe it.
+  const { validateStockRequest } = await import("./stockDistribution.js");
+  const request = validateStockRequest({
+    sourceLocationId: "10",
+    requesterLocationId: "90",
+    lines: [{ product_id: "p1", requested_quantity: 99999 }],
+  });
+  assert.equal(request.ok, true, "asking for more than exists is the other branch's call, not ours");
+});

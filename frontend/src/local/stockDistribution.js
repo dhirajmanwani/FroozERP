@@ -298,3 +298,94 @@ export const validateDistributionDraft = ({ destinationLocationId, lines = [], s
 
   return { ok: problems.length === 0, problems, lines: usable };
 };
+
+/**
+ * Is this a request another branch will accept?
+ *
+ * A request names products and quantities and **no lots**, because the asking branch cannot see the
+ * other branch's crates -- that is the whole point of the scoping this app enforces everywhere
+ * else. The branch holding the fruit chooses the crates when it approves. See migration 013.
+ */
+export const validateStockRequest = ({ sourceLocationId, requesterLocationId, lines = [] } = {}) => {
+  const problems = [];
+  const source = canonicalInventoryId(sourceLocationId);
+  const requester = canonicalInventoryId(requesterLocationId);
+
+  if (requester === "") problems.push("This counter does not know which shop it is asking from.");
+  if (source === "") problems.push("Choose the shop you are asking.");
+  if (source !== "" && requester !== "" && source === requester) {
+    problems.push("A shop cannot ask itself for stock.");
+  }
+
+  const usable = rows(lines).filter((line) => {
+    const quantity = transferQuantity(line?.requested_quantity ?? line?.quantity);
+    return canonicalInventoryId(line?.product_id) !== "" && quantity !== null && quantity > 0;
+  });
+
+  if (rows(lines).length === 0) {
+    problems.push("Add at least one product to ask for.");
+  } else if (usable.length !== rows(lines).length) {
+    problems.push("Every line needs a product and a quantity above zero.");
+  }
+
+  // Deliberately no availability check. This counter cannot see the other branch's stock, so any
+  // number it produced would be a guess -- and a guess shown as a limit would be worse than no
+  // limit at all. The branch being asked refuses, or approves less, from what it can actually see.
+  return { ok: problems.length === 0, problems, lines: usable };
+};
+
+/**
+ * The lines on this consignment that still need crates choosing, if that is this counter's job.
+ *
+ * Only the source may allocate: it is the branch holding the fruit, and the only one that can see
+ * its own crates. A destination looking at its own request gets an empty list -- not because there
+ * is nothing pending, but because it is not theirs to do, and the board already says who is waited
+ * on.
+ */
+export const pendingAllocationLines = (transfer, scope) => {
+  if (transferSideFor(transfer, scope) !== TRANSFER_SIDE.SOURCE) return [];
+  return rows(transfer?.items)
+    .filter((line) => canonicalInventoryId(line?.source_lot_id) === "")
+    .map((line) => ({
+      id: line?.id,
+      productId: line?.product_id,
+      productName: text(line?.product_name) || "Unnamed product",
+      unit: text(line?.unit),
+      // `transferQuantity`, not `|| 0`: a line asking for nothing is a contract violation worth
+      // seeing, and a zero invented here would be indistinguishable from one genuinely stored.
+      requested: transferQuantity(line?.requested_quantity),
+    }));
+};
+
+/**
+ * Do these crate choices answer the line they are answering?
+ *
+ * The server checks all of this again against real stock. This exists so an approver is told what
+ * is wrong while the form is still in front of them, rather than after a round trip.
+ */
+export const validateAllocation = ({ requested, allocations = [] } = {}) => {
+  const problems = [];
+  const usable = rows(allocations).filter((entry) => {
+    const quantity = transferQuantity(entry?.quantity);
+    return canonicalInventoryId(entry?.source_lot_id) !== "" && quantity !== null && quantity > 0;
+  });
+
+  if (usable.length === 0) problems.push("Choose at least one lot to send this from.");
+
+  const total = usable.reduce((sum, entry) => sum + transferQuantity(entry.quantity), 0);
+  const asked = transferQuantity(requested);
+  if (asked !== null && total > asked) {
+    problems.push(`The lots chosen come to ${total}, which is more than the ${asked} asked for.`);
+  }
+
+  for (const entry of usable) {
+    const available = transferQuantity(entry?.available_quantity);
+    // Compared only when it is a real number. `available` of 0 is a genuine answer -- a crate
+    // already promised elsewhere -- and a falsy check would skip it and let the crate be sent twice.
+    if (available !== null && transferQuantity(entry.quantity) > available) {
+      problems.push(`${text(entry?.lot_label) || "A lot"}: only ${available} available.`);
+    }
+  }
+
+  return { ok: problems.length === 0, problems, allocations: usable, total };
+};
