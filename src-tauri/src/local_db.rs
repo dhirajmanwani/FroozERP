@@ -3629,10 +3629,36 @@ fn canonical_snapshot_scope_try(conn: &Connection, device_id: &str) -> Result<se
         source = "unscoped";
     }
 
+    // The name a person can read, beside the ids only the machine cares about.
+    //
+    // The maintainer runs more than one device in a branch -- a warehouse machine and a counter
+    // machine can sit under one roof, and two tills can stand side by side. Ids cannot tell those
+    // apart on screen, and a device quietly set up as the wrong counter is a mistake that surfaces
+    // days later as stock that does not add up. `local_operational_locations` already holds the
+    // name; it has simply never been carried up to where anybody could see it.
+    //
+    // A missing row is left as null rather than filled with the id: "Counter 40" reads like a name
+    // and is not one, and a person shown it would believe the device was configured when it was not.
+    let location_name: Option<String> = match &operational_location_id {
+        Some(id) => conn
+            .query_row(
+                "SELECT location_name FROM local_operational_locations WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(to_error)?
+            .flatten()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        None => None,
+    };
+
     Ok(serde_json::json!({
         "company_id": company_id,
         "branch_id": branch_id,
         "operational_location_id": operational_location_id,
+        "location_name": location_name,
         "source": source,
         "warnings": warnings,
     }))

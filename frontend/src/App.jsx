@@ -7274,6 +7274,19 @@ function App() {
               becomes "Frooz" instead of a full title nobody can see. */}
           <BrandLogo compact={sidebarCollapsed} />
         </div>
+        {/* Which machine is this?
+            More than one device runs in a branch -- a warehouse machine and a counter machine under
+            one roof, or two tills side by side -- and until now nothing on screen told them apart.
+            A device quietly set up as the wrong counter is a mistake that surfaces days later as
+            stock that does not add up, and this is the cheapest possible way to catch it on day one.
+            Shown only when the device actually knows: an unnamed counter says nothing rather than
+            inventing a label from an id. */}
+        {counterScope.known && counterScope.locationName && (
+          <div className="sidebar-counter-name" title="This device is set up for this counter">
+            <Icon name="layers" size={14} />
+            <span>{counterScope.locationName}</span>
+          </div>
+        )}
         <span className="sidebar-section">Main Menu</span>
         <nav className="sidebar-nav">
           {navigationItems.filter(([view]) => hasModuleAccess(view) && (canManageRates || view !== "sale-rates")).map(([view, label]) => {

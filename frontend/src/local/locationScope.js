@@ -139,7 +139,7 @@ const scopeIdsEqual = (left, right) => {
 };
 
 /** A counter scope, in the one shape everything downstream expects. */
-const buildScope = ({ companyId, branchId, operationalLocationId, source, warnings }) => {
+const buildScope = ({ companyId, branchId, locationName, operationalLocationId, source, warnings }) => {
   const company = canonicalScopeId(companyId);
   const branch = canonicalScopeId(branchId);
   const location = canonicalScopeId(operationalLocationId);
@@ -151,6 +151,9 @@ const buildScope = ({ companyId, branchId, operationalLocationId, source, warnin
     companyId: company,
     branchId: branch,
     operationalLocationId: location,
+    // The name a person reads. Never derived from the id: "Counter 40" looks like a name and is
+    // not one, and somebody shown it would believe the device was set up when it was not.
+    locationName: typeof locationName === "string" ? locationName.trim() : "",
     known,
     source: known ? String(source || "explicit") : "unscoped",
     warnings: Object.freeze([...(Array.isArray(warnings) ? warnings : [])]),
@@ -161,10 +164,11 @@ const buildScope = ({ companyId, branchId, operationalLocationId, source, warnin
 export const createCounterScope = ({
   companyId = "",
   branchId = "",
+  locationName = "",
   operationalLocationId = "",
   source = "explicit",
   warnings = [],
-} = {}) => buildScope({ companyId, branchId, operationalLocationId, source, warnings });
+} = {}) => buildScope({ companyId, branchId, locationName, operationalLocationId, source, warnings });
 
 /** The scope of a counter that has not been told which shop it is in. */
 export const UNKNOWN_COUNTER_SCOPE = buildScope({ source: "unscoped" });
@@ -199,6 +203,7 @@ export const resolveCounterScope = (input = {}) => {
       companyId: canonical.company_id ?? canonical.companyId,
       branchId: canonical.branch_id ?? canonical.branchId,
       operationalLocationId: canonical.operational_location_id ?? canonical.operationalLocationId,
+      locationName: canonical.location_name ?? canonical.locationName,
       source: canonical.source || "canonical_scope",
       warnings,
     });

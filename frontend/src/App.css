@@ -6640,3 +6640,35 @@ tbody tr:last-child td {
 
 :root[data-theme="dark"] .brand-monogram .brand-art-on-dark { display: block; }
 :root[data-theme="dark"] .brand-monogram .brand-art-on-light { display: none; }
+
+/* Which counter this machine is.
+   Sits under the logo, above the menu, and is deliberately quiet -- it is a fact to be checked at a
+   glance on the first day, not a thing to be read all day. Only rendered when the device genuinely
+   knows its counter, so an empty rail means "not set up", not "no name". */
+.sidebar-counter-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 12px 4px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  background: var(--accent-wash);
+  color: var(--ink-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* On the collapsed rail there is no room for words, and a truncated counter name is worse than
+   none -- half a name reads as a different counter. The icon and the tooltip remain. */
+.sidebar-rail .sidebar-counter-name span {
+  display: none;
+}
+
+.sidebar-rail .sidebar-counter-name {
+  justify-content: center;
+  margin: 0 8px 4px;
+}

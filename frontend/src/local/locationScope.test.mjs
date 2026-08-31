@@ -517,3 +517,49 @@ test("the empty shelf and the unknown shop do not share one sentence", () => {
     "the no-results message must be conditional on the shelf being answerable",
   );
 });
+
+test("a counter carries the name a person reads, never one invented from its id", () => {
+  // More than one device runs in a branch -- a warehouse machine and a counter machine under one
+  // roof, or two tills side by side. Ids cannot tell those apart on screen, and a device set up as
+  // the wrong counter is a mistake that surfaces days later as stock that does not add up.
+  const named = resolveCounterScope({
+    canonical_scope: {
+      company_id: "1",
+      branch_id: "4",
+      operational_location_id: "40",
+      location_name: "Front Counter",
+      source: "device_assignment",
+    },
+  });
+  assert.equal(named.locationName, "Front Counter");
+  assert.equal(named.known, true);
+
+  // A device whose location has no name must say nothing. "Counter 40" looks like a name and is
+  // not one, and a person shown it would believe the machine was configured when it was not.
+  const unnamed = resolveCounterScope({
+    canonical_scope: { company_id: "1", branch_id: "4", operational_location_id: "40", source: "device_assignment" },
+  });
+  assert.equal(unnamed.locationName, "", "an absent name must stay absent, not become the id");
+  assert.equal(unnamed.known, true, "and the scope is still usable for filtering stock");
+});
+
+test("the sidebar shows the counter name only when the device actually knows it", () => {
+  const source = appSource();
+  assert.match(
+    source,
+    /\{counterScope\.known && counterScope\.locationName && \(/,
+    "the counter label must require both a known scope and a real name",
+  );
+  // The Rust side must actually send it, or the label is permanently blank and nobody would know.
+  const rust = fs.readFileSync(new URL("../../../src-tauri/src/local_db.rs", import.meta.url), "utf8");
+  assert.match(
+    rust,
+    /"location_name": location_name/,
+    "canonical_scope must carry the location name the screen reads",
+  );
+  assert.match(
+    rust,
+    /SELECT location_name FROM local_operational_locations WHERE id = \?1/,
+    "and it must come from the locations table, not be derived",
+  );
+});
