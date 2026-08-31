@@ -391,3 +391,45 @@ test("a request is not held back by stock this counter cannot see", async () => 
   });
   assert.equal(request.ok, true, "asking for more than exists is the other branch's call, not ours");
 });
+
+test("a request is sent as a request, and carries no lots", () => {
+  const source = appSource();
+
+  assert.match(
+    source,
+    /initiation_mode: "DESTINATION_REQUESTED"/,
+    "asking must use the mode where the other branch approves",
+  );
+  // The request body names product and quantity only. A `source_lot_id` here would be a crate this
+  // counter cannot see, and the server would refuse it -- but the more useful point is that the
+  // form must not ask a person for something they cannot know.
+  const request = source.slice(
+    source.indexOf("const requestConsignment"),
+    source.indexOf("const requestConsignment") + 1400,
+  );
+  assert.match(request, /requested_quantity: line\.requested_quantity/);
+  assert.doesNotMatch(request, /source_lot_id/, "a request must not carry a lot");
+});
+
+test("the ask form offers products, and the send form offers lots", () => {
+  // Offering an empty lot dropdown to somebody asking another shop for stock would look like a
+  // fault rather than a rule. The two forms differ by exactly that column.
+  const source = appSource();
+  assert.match(
+    source,
+    /\{asking \? \(\s*\n(?:.*\n)*?.*Choose a product/,
+    "the ask form must pick a product",
+  );
+  assert.match(source, /const asking = direction === "ASK";/);
+});
+
+test("approving a request draws the crate form instead of a bare Approve button", () => {
+  // Two buttons that do different things under one word is the confusion this avoids.
+  const source = appSource();
+  assert.match(
+    source,
+    /\(option\.action === "approve" && toAllocate\.length > 0\) \? null : \(/,
+    "the plain Approve button must be withheld while crates are still unchosen",
+  );
+  assert.match(source, /onClick=\{\(\) => approveWithCrates\(entry, toAllocate\)\}/);
+});

@@ -80,8 +80,11 @@ import { CLOUD_CALL_REFUSAL_CODES, createCloudCallGuard, createCloudCallRefusalE
 import { UNKNOWN_COUNTER_SCOPE, counterMaySell, resolveCounterScope } from "./local/locationScope";
 import {
   DISTRIBUTION_BOARD_STATUS,
+  pendingAllocationLines,
   resolveDistributionBoard,
+  validateAllocation,
   validateDistributionDraft,
+  validateStockRequest,
 } from "./local/stockDistribution";
 import { filterSellableProducts, isSellableLot, lotAvailableQuantity, resolveSellableProducts, selectLocalPosInventory } from "./local/posInventory";
 import {
@@ -4907,6 +4910,37 @@ function App() {
    * approvals, and reading it through the API would quietly re-introduce every one of those.
    */
   /**
+   * Ask another shop to send stock here.
+   *
+   * The mirror of `sendConsignment`, and the difference is who decides. A request names products
+   * and quantities and no lots -- this counter cannot see the other shop's crates -- and the shop
+   * being asked chooses the crates when it approves, or refuses.
+   */
+  const requestConsignment = async (draft) => {
+    setDistributionBusy(true);
+    try {
+      const write = createOperationalWrite(user, {
+        initiation_mode: "DESTINATION_REQUESTED",
+        source_branch_id: draft.sourceBranchId,
+        source_operational_location_id: draft.sourceLocationId,
+        items: draft.lines.map((line) => ({
+          product_id: line.product_id,
+          requested_quantity: line.requested_quantity,
+        })),
+      });
+      await axios.post(`${SYNC_API_URL}/api/v3/transfers`, write.body, write.config);
+      await loadDistribution();
+      setSyncMessage("Request sent. The other shop decides what to send and when.");
+      return true;
+    } catch (error) {
+      setSyncMessage(getErrorMessage(error, "The request could not be sent"));
+      return false;
+    } finally {
+      setDistributionBusy(false);
+    }
+  };
+
+  /**
    * What is on its way in or out of this counter.
    *
    * Two reads, and the destination list is loaded with the board rather than when the compose form
@@ -8270,6 +8304,7 @@ function App() {
               inventory={inventory}
               onAction={runDistributionAction}
               onReload={loadDistribution}
+              onRequest={requestConsignment}
               onSend={sendConsignment}
               products={products}
               scope={counterScope}
@@ -14163,10 +14198,15 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
  * same screen and want opposite halves of it, and "what is waiting for me" is the only question
  * that answers both.
  */
-function DistributionModule({ busy = false, destinations = [], inventory = [], onAction, onReload, onSend, products = [], scope, state }) {
+function DistributionModule({ busy = false, destinations = [], inventory = [], onAction, onReload, onRequest, onSend, products = [], scope, state }) {
   const [composing, setComposing] = useState(false);
+  // "SEND" moves this counter's own stock out; "ASK" requests somebody else's. They are the same
+  // form with the crate column removed, because a request cannot name crates it cannot see.
+  const [direction, setDirection] = useState("SEND");
   const [destinationId, setDestinationId] = useState("");
   const [draftLines, setDraftLines] = useState([]);
+  // Crate choices, keyed by the request line they answer: { [lineId]: [{ source_lot_id, quantity }] }
+  const [allocations, setAllocations] = useState({});
 
   const board = resolveDistributionBoard({
     transfers: state.transfers,
@@ -14199,23 +14239,75 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
       available_quantity: lot ? lotAvailableQuantity(lot) : null,
     };
   });
-  const checkedDraft = validateDistributionDraft({
-    sourceLocationId: scope?.operationalLocationId,
-    destinationLocationId: destination?.operational_location_id,
-    lines: resolvedLines,
-  });
-
-  const send = async () => {
-    const sent = await onSend?.({
-      destinationBranchId: destination?.branch_id,
+  // Two different questions, so two different checks. Sending is limited by what is on this shelf;
+  // asking is not limited at all, because this counter cannot see the other shop's shelf and a
+  // guess presented as a limit is worse than no limit -- a person would believe it.
+  const asking = direction === "ASK";
+  const checkedDraft = asking
+    ? validateStockRequest({
+      sourceLocationId: destination?.operational_location_id,
+      requesterLocationId: scope?.operationalLocationId,
+      lines: draftLines,
+    })
+    : validateDistributionDraft({
+      sourceLocationId: scope?.operationalLocationId,
       destinationLocationId: destination?.operational_location_id,
-      lines: checkedDraft.lines,
+      lines: resolvedLines,
     });
-    if (sent) {
+
+  const submitDraft = async () => {
+    const done = asking
+      ? await onRequest?.({
+        sourceBranchId: destination?.branch_id,
+        sourceLocationId: destination?.operational_location_id,
+        lines: checkedDraft.lines,
+      })
+      : await onSend?.({
+        destinationBranchId: destination?.branch_id,
+        destinationLocationId: destination?.operational_location_id,
+        lines: checkedDraft.lines,
+      });
+    if (done) {
       setComposing(false);
       setDraftLines([]);
       setDestinationId("");
     }
+  };
+
+  /** Crate choices for one request line, and whether they answer it. */
+  const allocationFor = (line) => {
+    const chosen = (allocations[line.id] || []).map((entry) => {
+      const lot = sendableLots.find((row) => inventoryIdsEqual(row?.id, entry.source_lot_id)) || null;
+      return {
+        ...entry,
+        lot_label: lot ? `${productName(lot)} ${lot.lot_no || lot.id}` : "",
+        available_quantity: lot ? lotAvailableQuantity(lot) : null,
+      };
+    });
+    return { chosen, checked: validateAllocation({ requested: line.requested, allocations: chosen }) };
+  };
+
+  const setAllocation = (lineId, index, patch) => setAllocations((current) => {
+    const list = [...(current[lineId] || [])];
+    list[index] = { ...list[index], ...patch };
+    return { ...current, [lineId]: list };
+  });
+  const addAllocation = (lineId) => setAllocations((current) => ({
+    ...current,
+    [lineId]: [...(current[lineId] || []), { source_lot_id: "", quantity: "" }],
+  }));
+
+  /** Approve a request, naming the crates it will be sent from. */
+  const approveWithCrates = async (entry, lines) => {
+    const items = lines.map((line) => ({
+      item_id: line.id,
+      allocations: allocationFor(line).checked.allocations.map((choice) => ({
+        source_lot_id: choice.source_lot_id,
+        quantity: Number(choice.quantity),
+      })),
+    }));
+    await onAction?.(entry.id, "approve", { items });
+    setAllocations({});
   };
 
   return (
@@ -14251,8 +14343,28 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
 
       {composing && (
         <div className="content-card">
-          <h3>Send stock to another shop</h3>
-          <Field label="Send to">
+          <h3>{asking ? "Ask another shop for stock" : "Send stock to another shop"}</h3>
+          <div className="button-row">
+            <button
+              className={asking ? "secondary-button" : "primary-button"}
+              onClick={() => { setDirection("SEND"); setDraftLines([]); }}
+            >
+              Send my stock
+            </button>
+            <button
+              className={asking ? "primary-button" : "secondary-button"}
+              onClick={() => { setDirection("ASK"); setDraftLines([]); }}
+            >
+              Ask for stock
+            </button>
+          </div>
+          <p className="muted-note">
+            {asking
+              ? "Say what you need. The other shop chooses which lots to send, and can refuse."
+              : "You choose the lots. The receiving shop confirms what actually arrives."}
+          </p>
+
+          <Field label={asking ? "Ask" : "Send to"}>
             <select value={destinationId} onChange={(event) => setDestinationId(event.target.value)}>
               <option value="">Choose a shop</option>
               {destinations.map((row) => (
@@ -14263,16 +14375,28 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
             </select>
           </Field>
 
-          {resolvedLines.map((line) => (
+          {(asking ? draftLines : resolvedLines).map((line) => (
             <div className="button-row" key={line.key}>
-              <select value={line.source_lot_id} onChange={(event) => updateLine(line.key, { source_lot_id: event.target.value })}>
-                <option value="">Choose a lot</option>
-                {sendableLots.map((lot) => (
-                  <option key={lot.id} value={lot.id}>
-                    {productName(lot)} — {lot.lot_no || lot.id} ({lotAvailableQuantity(lot)} available)
-                  </option>
-                ))}
-              </select>
+              {asking ? (
+                // A request names the product only. There is no lot column, because the crates
+                // belong to the other shop and this counter cannot see them -- offering an empty
+                // dropdown would look like a fault rather than a rule.
+                <select value={line.product_id || ""} onChange={(event) => updateLine(line.key, { product_id: event.target.value })}>
+                  <option value="">Choose a product</option>
+                  {products.filter((product) => product.active !== false).map((product) => (
+                    <option key={product.id} value={product.id}>{product.product_name}</option>
+                  ))}
+                </select>
+              ) : (
+                <select value={line.source_lot_id} onChange={(event) => updateLine(line.key, { source_lot_id: event.target.value })}>
+                  <option value="">Choose a lot</option>
+                  {sendableLots.map((lot) => (
+                    <option key={lot.id} value={lot.id}>
+                      {productName(lot)} — {lot.lot_no || lot.id} ({lotAvailableQuantity(lot)} available)
+                    </option>
+                  ))}
+                </select>
+              )}
               <input
                 inputMode="decimal"
                 placeholder="Quantity"
@@ -14285,8 +14409,8 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
 
           <div className="button-row">
             <button className="secondary-button" onClick={addLine}>Add a product</button>
-            <button className="primary-button" disabled={busy || !checkedDraft.ok} onClick={send}>
-              {busy ? "Sending..." : "Create consignment"}
+            <button className="primary-button" disabled={busy || !checkedDraft.ok} onClick={submitDraft}>
+              {busy ? "Sending..." : (asking ? "Send request" : "Create consignment")}
             </button>
           </div>
 
@@ -14306,7 +14430,15 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
             <tr><th>Number</th><th>From</th><th>To</th><th>Status</th><th>What you can do</th></tr>
           </thead>
           <tbody>
-            {board.transfers.map((entry) => (
+            {board.transfers.map((entry) => {
+              // The board's entries are the *described* form; the crates need the raw lines. Looked
+              // up by the same canonical id `describeTransfer` derived, never by `Number()`.
+              const raw = state.transfers.find(
+                (row) => canonicalInventoryId(row?.global_id ?? row?.id) === entry.id,
+              ) || null;
+              const toAllocate = pendingAllocationLines(raw, scope);
+              const canApprove = entry.actions.some((option) => option.action === "approve");
+              return (
               <tr key={entry.id}>
                 <td className="primary-cell">
                   {entry.number}
@@ -14318,23 +14450,81 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
                 <td>
                   <div className="table-actions">
                     {entry.actions.map((option) => (
-                      <button
-                        className="table-action"
-                        disabled={busy}
-                        key={option.action}
-                        title={option.detail}
-                        onClick={() => onAction?.(entry.id, option.action)}
-                      >
-                        {option.label}
-                      </button>
+                      // Approving a request means choosing the crates, so that button is drawn by
+                      // the form below instead. Drawing it here as well would give two buttons that
+                      // do different things under one word.
+                      (option.action === "approve" && toAllocate.length > 0) ? null : (
+                        <button
+                          className="table-action"
+                          disabled={busy}
+                          key={option.action}
+                          title={option.detail}
+                          onClick={() => onAction?.(entry.id, option.action)}
+                        >
+                          {option.label}
+                        </button>
+                      )
                     ))}
                     {/* Not blank. "Nothing for you to do here" and "this screen forgot to draw the
                         buttons" look identical when the cell is empty. */}
                     {entry.actions.length === 0 && <small className="cell-note">Nothing for you to do</small>}
                   </div>
+
+                  {canApprove && toAllocate.length > 0 && (
+                    <div className="content-card">
+                      <strong>Choose what to send</strong>
+                      {toAllocate.map((line) => {
+                        const { chosen, checked } = allocationFor(line);
+                        return (
+                          <div key={line.id}>
+                            <p className="muted-note">
+                              {line.productName}: {line.requested === null ? "quantity not recorded" : `${line.requested} ${line.unit || ""}`.trim()} asked for
+                            </p>
+                            {chosen.map((choice, index) => (
+                              <div className="button-row" key={`${line.id}-${index}`}>
+                                <select
+                                  value={choice.source_lot_id}
+                                  onChange={(event) => setAllocation(line.id, index, { source_lot_id: event.target.value })}
+                                >
+                                  <option value="">Choose a lot</option>
+                                  {sendableLots
+                                    .filter((lot) => inventoryIdsEqual(lot?.product_id, line.productId))
+                                    .map((lot) => (
+                                      <option key={lot.id} value={lot.id}>
+                                        {lot.lot_no || lot.id} ({lotAvailableQuantity(lot)} available)
+                                      </option>
+                                    ))}
+                                </select>
+                                <input
+                                  inputMode="decimal"
+                                  placeholder="Quantity"
+                                  value={choice.quantity}
+                                  onChange={(event) => setAllocation(line.id, index, { quantity: event.target.value })}
+                                />
+                              </div>
+                            ))}
+                            <button className="secondary-button" onClick={() => addAllocation(line.id)}>Add a lot</button>
+                            {!checked.ok && chosen.length > 0 && (
+                              <ul className="form-note">
+                                {checked.problems.map((problem) => <li key={problem}>{problem}</li>)}
+                              </ul>
+                            )}
+                          </div>
+                        );
+                      })}
+                      <button
+                        className="primary-button"
+                        disabled={busy || !toAllocate.every((line) => allocationFor(line).checked.ok)}
+                        onClick={() => approveWithCrates(entry, toAllocate)}
+                      >
+                        Approve and hold this stock
+                      </button>
+                    </div>
+                  )}
                 </td>
               </tr>
-            ))}
+              );
+            })}
             {board.transfers.length === 0 && (
               <tr><td colSpan={5}>No consignments yet. Stock sent between shops will appear here.</td></tr>
             )}
