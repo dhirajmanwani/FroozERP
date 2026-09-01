@@ -828,6 +828,7 @@ const icons = {
   "sale-rates": "trend",
   orders: "parcel",
   distribution: "truck",
+  branches: "shopfront",
   "all-shops": "layers",
   frost: "message",
 };
@@ -848,6 +849,7 @@ const navigationItems = [
   ["distribution", "Stock Distribution"],
   ["reports", "Reports"],
   ["all-shops", "All Shops"],
+  ["branches", "Branches & Counters"],
   ["settings", "Settings"],
 ];
 
@@ -1639,6 +1641,7 @@ function Icon({ name, size = 18 }) {
     "arrow-left": <><path d="M19 12H5" /><path d="m12 19-7-7 7-7" /></>,
     "arrow-right": <><path d="M5 12h14" /><path d="m12 5 7 7-7 7" /></>,
     truck: <><path d="M3 7h11v9H3z" /><path d="M14 10h4l3 3v3h-7z" /><circle cx="7" cy="18" r="1.6" /><circle cx="17" cy="18" r="1.6" /></>,
+    shopfront: <><path d="M4 10v10h16V10" /><path d="M3 10 5 4h14l2 6Z" /><path d="M10 20v-6h4v6" /></>,
     barcode: <><path d="M3 5v14M7 5v14M11 5v14M15 5v14M19 5v14M21 5v14" /></>,
     trash: <><path d="M4 7h16M10 11v6M14 11v6M9 7V4h6v3M6 7l1 14h10l1-14" /></>,
     print: <><path d="M6 9V3h12v6M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2M6 14h12v7H6Z" /></>,
@@ -7274,19 +7277,6 @@ function App() {
               becomes "Frooz" instead of a full title nobody can see. */}
           <BrandLogo compact={sidebarCollapsed} />
         </div>
-        {/* Which machine is this?
-            More than one device runs in a branch -- a warehouse machine and a counter machine under
-            one roof, or two tills side by side -- and until now nothing on screen told them apart.
-            A device quietly set up as the wrong counter is a mistake that surfaces days later as
-            stock that does not add up, and this is the cheapest possible way to catch it on day one.
-            Shown only when the device actually knows: an unnamed counter says nothing rather than
-            inventing a label from an id. */}
-        {counterScope.known && counterScope.locationName && (
-          <div className="sidebar-counter-name" title="This device is set up for this counter">
-            <Icon name="layers" size={14} />
-            <span>{counterScope.locationName}</span>
-          </div>
-        )}
         <span className="sidebar-section">Main Menu</span>
         <nav className="sidebar-nav">
           {navigationItems.filter(([view]) => hasModuleAccess(view) && (canManageRates || view !== "sale-rates")).map(([view, label]) => {
@@ -7413,9 +7403,28 @@ function App() {
           <div className="topbar-status-group">
             <time className="global-clock" dateTime={headerClock}>{formatKolkataHeaderClock(headerClock)}</time>
             <div className="topbar-status-row">
-              <div className="branch-pill">
+              {/* Where this person is working, which is a property of the machine and not of the
+                  login. docs/stock-distribution-decision.md: selling binds to the machine, because
+                  the fruit and the customer are standing there.
+
+                  This pill used to show `user.branch` -- the branch on the staff record. That is
+                  the wrong fact: it is what the person is *assigned* to, while every sale, every
+                  stock figure and every bill on this screen comes from the counter the machine is
+                  set up as. They agree today because login refuses a user who is not authorised
+                  for the device's counter, but showing the one that does not govern would make a
+                  future mismatch invisible at exactly the moment it mattered.
+
+                  The counter name wins when the device knows it. `user.branch` remains the
+                  fallback, so a device that has never been assigned a counter reads as it always
+                  did rather than going blank. */}
+              <div
+                className="branch-pill"
+                title={counterScope.known && counterScope.locationName
+                  ? "The counter this machine is set up as. Stock and bills come from here."
+                  : undefined}
+              >
                 <span className="status-dot" />
-                {user.branch}
+                {(counterScope.known && counterScope.locationName) || user.branch}
               </div>
               <div className="offline-pill">{connectionStatus.syncSummary}</div>
               <div className="notification-bell-wrap">
@@ -8323,6 +8332,13 @@ function App() {
               scope={counterScope}
               state={distributionState}
             />
+          )}
+
+          {activeView === "branches" && (
+            // Promoted out of Settings. Adding a shop or a counter is not a preference to be
+            // adjusted once and forgotten -- it is the thing that decides which stock a machine
+            // sells from, so it belongs where a person can find it without hunting.
+            <OperationalScopeManagement canManage={settingsData.canManageSettings} user={user} />
           )}
 
           {activeView === "all-shops" && (
@@ -15787,7 +15803,6 @@ function SettingsModule({
     "settings/permission-matrix": <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />,
     "settings/users": <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />,
     "settings/device-control": <DeviceControlSettingsSection canManage={canManage} deviceControlSettings={settingsData.deviceControlSettings} exitAttemptLogs={settingsData.exitAttemptLogs || []} onReload={onReload} user={user} />,
-    "settings/operational-scope": <OperationalScopeManagement canManage={canManage} user={user} />,
     "settings/updates": (
       <SettingsSectionErrorBoundary sectionName="Update Center">
         <UpdateCenterSection canManage={canManage} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />

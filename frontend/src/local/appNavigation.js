@@ -195,6 +195,19 @@ const modules = [
     sections: [],
   },
   {
+    id: "branches",
+    label: "Branches & Counters",
+    icon: "shopfront",
+    // No shortcut. Alt+0 to Alt+9 belong to the screens a counter opens all day; this is a setup
+    // screen opened when a shop or a machine is added. Reachable from the sidebar and the palette.
+    shortcut: null,
+    keywords: [
+      "branch", "shop", "location", "counter", "warehouse", "godown",
+      "device", "machine", "till", "staff posting", "assignment", "add branch", "new shop",
+    ],
+    sections: [],
+  },
+  {
     id: "settings",
     label: "Settings",
     icon: "settings",
@@ -216,7 +229,6 @@ const modules = [
       { group: "people", id: "settings/permission-matrix", label: "Permission Matrix", eyebrow: "Role Management", keywords: ["roles", "access", "permissions", "cashier", "admin"] },
       { group: "people", id: "settings/users", label: "Owner User Administration", eyebrow: "User Management", keywords: ["staff", "add user", "reset password", "deactivate"] },
       { group: "counter", id: "settings/device-control", label: "Fullscreen Lock & Owner Exit Code", eyebrow: "Security / Device Control", keywords: ["kiosk", "fullscreen", "exit code", "lock"] },
-      { group: "people", id: "settings/operational-scope", label: "Branch, Location, Staff and Device Control", eyebrow: "Operational Scope", keywords: ["branch", "location", "counter", "assignment"] },
       { group: "system", id: "settings/updates", label: "FroozERP Windows Updates", eyebrow: "Software Updates", keywords: ["update", "version", "installer", "upgrade"] },
       { group: "system", id: "settings/sync", label: "Connection Status", eyebrow: "Sync & Connection", keywords: ["sync", "internet", "cloud", "offline", "local only", "server"] },
       { group: "system", id: "settings/backup", label: "Auto Backup and Safe Shutdown", eyebrow: "Backup & Restore", keywords: ["backup", "restore", "shutdown", "safety"] },

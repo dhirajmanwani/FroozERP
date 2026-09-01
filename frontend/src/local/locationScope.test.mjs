@@ -543,12 +543,16 @@ test("a counter carries the name a person reads, never one invented from its id"
   assert.equal(unnamed.known, true, "and the scope is still usable for filtering stock");
 });
 
-test("the sidebar shows the counter name only when the device actually knows it", () => {
+test("the topbar names the counter the machine is, not the branch on the staff record", () => {
   const source = appSource();
+  // Those are two different facts. The staff record says what a person is *assigned* to; every
+  // sale, stock figure and bill on the screen comes from the counter the machine is set up as.
+  // They agree today only because login refuses a user not authorised for the device's counter --
+  // showing the one that does not govern would hide a mismatch exactly when it mattered.
   assert.match(
     source,
-    /\{counterScope\.known && counterScope\.locationName && \(/,
-    "the counter label must require both a known scope and a real name",
+    /\{\(counterScope\.known && counterScope\.locationName\) \|\| user\.branch\}/,
+    "the workplace pill must prefer the device's counter, falling back to the staff branch",
   );
   // The Rust side must actually send it, or the label is permanently blank and nobody would know.
   const rust = fs.readFileSync(new URL("../../../src-tauri/src/local_db.rs", import.meta.url), "utf8");
