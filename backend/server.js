@@ -3199,6 +3199,18 @@ const initializeDatabase = async () => {
     VALUES (1, '${backupDirectory.replace(/'/g, "''")}')
     ON CONFLICT (id) DO NOTHING;
 
+    -- The default branch is seeded here, before anything references it.
+    --
+    -- It used to sit 143 lines below "ai_settings", which carries a foreign key to "branches(id)"
+    -- and inserts "branch_id = 1". On any database that already has a branch 1 -- which is every
+    -- database anybody has ever run this against -- the order does not matter and nothing fails.
+    -- On a genuinely fresh one the bootstrap aborts on a foreign key violation, so a new cloud
+    -- database could not be created at all. Found by running this path against an empty Postgres
+    -- rather than by reading it.
+    INSERT INTO branches (id, branch_name, location)
+    VALUES (1, 'Main Branch', 'Primary Store')
+    ON CONFLICT (id) DO NOTHING;
+
     INSERT INTO ai_settings (id, company_id, branch_id, thresholds, ai_provider_enabled)
     VALUES (
       1,
@@ -3341,10 +3353,6 @@ const initializeDatabase = async () => {
       OR COALESCE(permissions -> 'supplier_accounts', 'false'::jsonb) = 'true'::jsonb
     ))
     WHERE NOT (permissions ? 'customer_accounts');
-
-    INSERT INTO branches (id, branch_name, location)
-    VALUES (1, 'Main Branch', 'Primary Store')
-    ON CONFLICT (id) DO NOTHING;
 
     INSERT INTO counters (id, branch_id, counter_name, counter_type, active)
     VALUES
