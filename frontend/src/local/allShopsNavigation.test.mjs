@@ -136,7 +136,15 @@ test("opening Orders loads the product list the order form needs", () => {
   // The order form picks items from `products`. Without them the "Choose an item" dropdown is
   // empty and the screen looks broken — and nothing else on the view needs products, which is
   // exactly why it was missed the first time.
-  assert.match(app, /if \(view === "orders"\) await Promise\.all\(\[loadOrders\(\), loadProducts\(\)\]\)/);
+  // Each of these is a list the screen looks broken without, and each was added after being
+  // missed once. Products fill the order form's item picker; the waiting queue is the orders
+  // nobody has been given yet; branches fill the "Give it to" dropdown, without which an Owner
+  // can see a waiting order and have nowhere to send it.
+  const opening = app.match(/if \(view === "orders"\) await Promise\.all\(\[([^\]]*)\]\)/);
+  assert.ok(opening, "opening Orders must still load its lists in one place");
+  for (const loader of ["loadOrders()", "loadProducts()", "loadUnassignedOrders()", "loadSettingsData()"]) {
+    assert.ok(opening[1].includes(loader), `opening Orders must call ${loader}`);
+  }
 });
 
 test("an empty item list explains itself instead of showing a bare dropdown", () => {

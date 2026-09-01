@@ -44,7 +44,13 @@ import { allShopsHasFigures, resolveAllShopsPresentation } from "./local/allShop
 import { resolveShopViewPresentation, shopPickerVisible } from "./local/shopView";
 import { ORDER_STATUS } from "./local/orderLifecycle";
 import { STOCK_TRUSTED_FOR_HOURS, buildCatalogue, catalogueFilename, describeExport } from "./local/catalogueExport";
-import { buildOrdersBoard, validateOrderAction } from "./local/ordersBoard";
+import {
+  ORDER_QUEUE_STATUS,
+  buildOrdersBoard,
+  resolveUnassignedQueue,
+  validateOrderAction,
+  validateOrderAssignment,
+} from "./local/ordersBoard";
 import { ORDER_REPORT, buildOrderReports, describeOrderReportError } from "./local/orderReporting";
 import { SETTINGS_GROUPS, formatShortcut, navigationRegistry, resolveShortcutTarget } from "./local/appNavigation";
 import { DEFAULT_THEME_MODE, SYSTEM_DARK_QUERY, THEME_MODES, applyThemeMode, describeThemeMode, readThemeMode, resolveTheme, systemPrefersDarkFrom, watchSystemTheme, writeThemePreference } from "./local/themePreference";
@@ -1989,6 +1995,11 @@ function App() {
   const [shopViewState, setShopViewState] = useState({ loadState: "idle", loadError: "", branches: [], ownBranchId: null, viewingBranchId: null, viewOnly: false });
   const [shopSwitchBusy, setShopSwitchBusy] = useState(false);
   const [ordersState, setOrdersState] = useState({ loadState: "idle", loadError: "", orders: [] });
+  // Orders that arrived with no shop attached. A cloud read, never a sync entity: the pull road
+  // scopes by branch and has no notion of role, so an unassigned order on it would land on every
+  // till carrying a customer's name, mobile and home address.
+  const [orderQueueState, setOrderQueueState] = useState({ loadState: "idle", loadError: "", orders: [] });
+  const [orderRoutingBusy, setOrderRoutingBusy] = useState(false);
   const [distributionState, setDistributionState] = useState({
     loadState: "idle", loadError: "", transfers: [], destinations: [],
   });
@@ -5058,6 +5069,61 @@ function App() {
     }
   };
 
+  /**
+   * Orders waiting for somebody to decide which shop handles them.
+   *
+   * Only fetched for people who may act on it -- the route refuses anybody else, and asking anyway
+   * would put a refusal in the log on every Orders visit by every cashier.
+   */
+  const loadUnassignedOrders = async () => {
+    // Read from `user` here rather than from a flag computed further down the component: this runs
+    // from an effect that can fire before that flag's declaration is reached, and a temporal-dead-
+    // zone crash on the Orders screen is a worse outcome than one duplicated role test.
+    // The server checks this again and is the authority; this only avoids asking to be refused.
+    const canRouteOrders = ["Owner", "Admin"].includes(String(user?.role || ""));
+    if (!canRouteOrders) {
+      setOrderQueueState({ loadState: "loaded", loadError: "", orders: [] });
+      return;
+    }
+    setOrderQueueState((current) => ({ ...current, loadState: "loading", loadError: "" }));
+    try {
+      const response = await axios.get(`${API_URL}/api/orders/unassigned`, createOperationalReadConfig(user));
+      setOrderQueueState({ loadState: "loaded", loadError: "", orders: response?.data?.orders || [] });
+    } catch (error) {
+      setOrderQueueState({
+        loadState: "error",
+        loadError: getErrorMessage(error, "Unassigned orders could not be loaded"),
+        orders: [],
+      });
+    }
+  };
+
+  /**
+   * Hand an order to a shop, or move it to a different one.
+   *
+   * The same call for both, because they are the same act. The server writes one change row for a
+   * first assignment and two for a move -- and reports which -- so the message says what actually
+   * happened rather than what was intended.
+   */
+  const assignOrderToBranch = async (orderId, branchId, note = "") => {
+    setOrderRoutingBusy(true);
+    try {
+      const response = await axios.post(
+        `${API_URL}/api/orders/${encodeURIComponent(orderId)}/assign`,
+        { branch_id: branchId, note },
+        createOperationalReadConfig(user),
+      );
+      await Promise.all([loadUnassignedOrders(), loadOrders()]);
+      setSyncMessage(response?.data?.message || "Order handed over.");
+      return true;
+    } catch (error) {
+      setSyncMessage(getErrorMessage(error, "The order could not be handed over"));
+      return false;
+    } finally {
+      setOrderRoutingBusy(false);
+    }
+  };
+
   const loadOrders = async () => {
     setOrdersState((current) => ({ ...current, loadState: "loading", loadError: "" }));
     try {
@@ -6921,7 +6987,9 @@ function App() {
       // Products too: the order form picks items from that list, and without it the "Choose an
       // item" dropdown is empty and the screen simply looks broken. Nothing else on this view
       // needed them, which is exactly why it was missed.
-      if (view === "orders") await Promise.all([loadOrders(), loadProducts()]);
+      // The waiting queue and the shop list too: without branches the "Give it to" dropdown is
+      // empty and the screen looks broken, which is exactly how the order form was missed once.
+      if (view === "orders") await Promise.all([loadOrders(), loadProducts(), loadUnassignedOrders(), loadSettingsData()]);
       if (view === "sales") await loadOrders().catch(() => null);
       if (view === "returns") await loadSaleReturns();
       if (view === "waste") await loadWasteEntries();
@@ -8310,9 +8378,13 @@ function App() {
 
           {activeView === "orders" && (
             <OrdersModule
+              branches={settingsData.branches || []}
               busy={orderActionBusy}
               onAdvance={advanceOrder}
-              onReload={loadOrders}
+              onAssign={assignOrderToBranch}
+              queue={orderQueueState}
+              routingBusy={orderRoutingBusy}
+              onReload={() => { loadOrders(); loadUnassignedOrders(); }}
               onTakeOrder={takeOrder}
               products={products}
               state={ordersState}
@@ -14595,8 +14667,16 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
   );
 }
 
-function OrdersModule({ busy = false, onAdvance, onReload, onTakeOrder, products = [], state, user }) {
+function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onReload, onTakeOrder, products = [], queue, routingBusy = false, state, user }) {
   const money = (value) => currency.format(Number(value || 0));
+  const [assignDraft, setAssignDraft] = useState({});
+  const canRoute = ["Owner", "Admin"].includes(String(user?.role || ""));
+  const waiting = resolveUnassignedQueue({
+    orders: queue?.orders,
+    loadState: queue?.loadState,
+    loadError: queue?.loadError,
+    permitted: canRoute,
+  });
   const [carrierDraft, setCarrierDraft] = useState({});
   const [reasonDraft, setReasonDraft] = useState({});
   const emptyLine = { product_id: "", quantity: "", agreed_rate: "" };
@@ -14674,8 +14754,89 @@ function OrdersModule({ busy = false, onAdvance, onReload, onTakeOrder, products
 
   const board = buildOrdersBoard(state.orders);
 
+  /** Hand one waiting order to a shop. */
+  const handOver = async (orderId) => {
+    const branchId = assignDraft[orderId] || "";
+    const checked = validateOrderAssignment({ orderId, branchId });
+    if (!checked.ok) return;
+    const done = await onAssign?.(orderId, branchId);
+    if (done) setAssignDraft((current) => ({ ...current, [orderId]: "" }));
+  };
+
   return (
     <section className="settings-layout">
+      {/* Orders that arrived with nobody handling them -- a website order, or a WhatsApp to the
+          company number. They never reach a counter on their own: the sync road scopes by branch
+          and has no notion of role, so an unassigned order on it would land on every till carrying
+          a customer's name, mobile and home address. A person decides, here.
+
+          Drawn above the board because it is the only part of this screen with a customer waiting
+          on the other end of it, and hidden entirely from anybody who cannot act on it -- an
+          Owner-only queue shown to a cashier as an empty box would read as "nothing is waiting". */}
+      {waiting.status !== ORDER_QUEUE_STATUS.NOT_PERMITTED && (
+        <ModuleCard
+          eyebrow="Waiting for a shop"
+          title="Unassigned orders"
+          subtitle="These arrived without a shop. Until one is chosen, no counter can see them and no stock is set aside."
+        >
+          <p className="button-row">
+            <span className="pill">{waiting.countLabel}</span>
+            <button className="table-action" type="button" onClick={onReload}>Refresh</button>
+          </p>
+
+          {/* Never a bare empty list: "none waiting", "could not load" and "not allowed" look the
+              same as rows, and only one of them means a customer is not waiting. */}
+          {waiting.message && <p className="form-note">{waiting.message}</p>}
+
+          {waiting.orders.length > 0 && (
+            <DataTable headers={["Order", "Customer", "Going to", "What they want", "Give it to"]}>
+              {waiting.orders.map((order) => (
+                <tr key={order.id}>
+                  <td className="primary-cell">
+                    {order.orderNo}
+                    <small className="cell-note">{order.source.toLowerCase()}</small>
+                  </td>
+                  <td>
+                    {order.customerName}
+                    {order.customerMobile && <small className="cell-note">{order.customerMobile}</small>}
+                  </td>
+                  {/* The address is why a person decides this and not a rule: it is how somebody
+                      knows which shop is nearer. */}
+                  <td>{order.deliveryAddress || <span className="stock-low">No address given</span>}</td>
+                  <td>
+                    {order.items.length === 0
+                      ? <span className="stock-low">No items recorded</span>
+                      : order.items.map((line, index) => (
+                        <div key={index}>{line.product_name} — {line.quantity} {line.unit || ""}</div>
+                      ))}
+                  </td>
+                  <td>
+                    <div className="button-row">
+                      <select
+                        value={assignDraft[order.id] || ""}
+                        onChange={(event) => setAssignDraft((current) => ({ ...current, [order.id]: event.target.value }))}
+                      >
+                        <option value="">Choose a shop</option>
+                        {branches.filter((branch) => branch.active !== false).map((branch) => (
+                          <option key={branch.id} value={branch.id}>{branch.branch_name}</option>
+                        ))}
+                      </select>
+                      <button
+                        className="primary-button"
+                        disabled={routingBusy || !assignDraft[order.id]}
+                        onClick={() => handOver(order.id)}
+                      >
+                        {routingBusy ? "Sending..." : "Hand over"}
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </DataTable>
+          )}
+        </ModuleCard>
+      )}
+
       <ModuleCard
         eyebrow="Customer Orders"
         title="Orders"
