@@ -82,6 +82,7 @@ import {
   DISTRIBUTION_BOARD_STATUS,
   pendingAllocationLines,
   resolveDistributionBoard,
+  transferQuantity,
   validateAllocation,
   validateDistributionDraft,
   validateStockRequest,
@@ -8325,6 +8326,9 @@ function App() {
               destinations={distributionState.destinations}
               inventory={inventory}
               onAction={runDistributionAction}
+              onNothingToReceive={() => setSyncMessage(
+                "This consignment has no dispatched quantity to receive. Ask the sender to check it.",
+              )}
               onReload={loadDistribution}
               onRequest={requestConsignment}
               onSend={sendConsignment}
@@ -14227,7 +14231,7 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
  * same screen and want opposite halves of it, and "what is waiting for me" is the only question
  * that answers both.
  */
-function DistributionModule({ busy = false, destinations = [], inventory = [], onAction, onReload, onRequest, onSend, products = [], scope, state }) {
+function DistributionModule({ busy = false, destinations = [], inventory = [], onAction, onNothingToReceive, onReload, onRequest, onSend, products = [], scope, state }) {
   const [composing, setComposing] = useState(false);
   // "SEND" moves this counter's own stock out; "ASK" requests somebody else's. They are the same
   // form with the crate column removed, because a request cannot name crates it cannot see.
@@ -14325,6 +14329,31 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
     ...current,
     [lineId]: [...(current[lineId] || []), { source_lot_id: "", quantity: "" }],
   }));
+
+  /**
+   * Receiving needs quantities, not just a button press.
+   *
+   * The server refuses `receive` with RECEIVED_QUANTITY_REQUIRED unless every line carries a
+   * positive received quantity -- it will not assume that what was dispatched is what turned up,
+   * which is right: a short delivery recorded as a full one is stock the shop believes it has and
+   * does not.
+   *
+   * "Receive in full" therefore means "everything dispatched arrived", and says so explicitly by
+   * echoing each line's dispatched quantity back. Found by pushing a consignment through a real
+   * database: without this the button returned 422 and the delivery could not be accepted at all.
+   */
+  const receiveInFull = async (entry, raw) => {
+    const lines = (raw?.items || [])
+      .map((line) => ({ item_id: line.id, received_quantity: transferQuantity(line.dispatched_quantity) }))
+      // A line dispatched as zero has nothing to receive, and sending it would be refused for the
+      // whole consignment rather than just that line.
+      .filter((line) => line.received_quantity !== null && line.received_quantity > 0);
+    if (lines.length === 0) {
+      onNothingToReceive?.();
+      return;
+    }
+    await onAction?.(entry.id, "receive", { items: lines });
+  };
 
   /** Approve a request, naming the crates it will be sent from. */
   const approveWithCrates = async (entry, lines) => {
@@ -14488,7 +14517,9 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
                           disabled={busy}
                           key={option.action}
                           title={option.detail}
-                          onClick={() => onAction?.(entry.id, option.action)}
+                          onClick={() => (option.action === "receive"
+                            ? receiveInFull(entry, raw)
+                            : onAction?.(entry.id, option.action))}
                         >
                           {option.label}
                         </button>

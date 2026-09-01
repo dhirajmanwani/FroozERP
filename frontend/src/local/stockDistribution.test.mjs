@@ -433,3 +433,41 @@ test("approving a request draws the crate form instead of a bare Approve button"
   );
   assert.match(source, /onClick=\{\(\) => approveWithCrates\(entry, toAllocate\)\}/);
 });
+
+test("Receive in full sends the quantities the server demands", () => {
+  // Found by pushing a consignment through a real PostgreSQL: the server refuses `receive` with
+  // RECEIVED_QUANTITY_REQUIRED unless every line carries a positive received quantity. It will not
+  // assume that what was dispatched is what turned up, which is right -- a short delivery recorded
+  // as a full one is stock a shop believes it has and does not.
+  //
+  // The button used to send nothing at all, so a delivery could not be accepted. No unit test could
+  // have found that: they all run against fakes that never refuse.
+  const source = appSource();
+  assert.match(
+    source,
+    /const receiveInFull = async \(entry, raw\) => \{/,
+    "receiving must go through a step that supplies quantities",
+  );
+  assert.match(
+    source,
+    /received_quantity: transferQuantity\(line\.dispatched_quantity\)/,
+    "\"Receive in full\" means every dispatched quantity arrived, stated explicitly",
+  );
+  assert.match(
+    source,
+    /option\.action === "receive"\s*\n?\s*\? receiveInFull\(entry, raw\)/,
+    "the receive button must not fall through to the plain action call",
+  );
+});
+
+test("a line dispatched as nothing is not offered for receipt", () => {
+  // Sending a zero would be refused for the whole consignment rather than for that line, so a
+  // consignment with one empty line could never be received at all.
+  const source = appSource();
+  assert.match(
+    source,
+    /\.filter\(\(line\) => line\.received_quantity !== null && line\.received_quantity > 0\)/,
+  );
+  // And an empty result says so rather than firing a request that will be refused.
+  assert.match(source, /onNothingToReceive\?\.\(\)/);
+});
