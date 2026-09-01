@@ -227,7 +227,12 @@ const collectWriteRegistrations = () => {
     if (declaration) handlers.set(declaration[1], blockFrom(index).join("\n"));
   });
 
-  const GUARDS = /getPermissionUser\(|requireRateManager\(|getSalePermissionUser\(|requireSelfOrRateManager\(|requireSyncContext\(/;
+  // `requireOrderRouter` is listed because it is a stricter check than one already trusted here,
+  // not a looser one: it re-reads the role from the database like `requireRateManager` does, and
+  // then also requires the caller's company to match the session's. Role without company is the
+  // shape of the cross-tenant hole found in /lots/transfer-stock today -- a role check wearing
+  // authorisation's clothes.
+  const GUARDS = /getPermissionUser\(|requireRateManager\(|getSalePermissionUser\(|requireSelfOrRateManager\(|requireSyncContext\(|requireOrderRouter\(/;
   const registrations = [];
   codeLines.forEach((line, index) => {
     const match = /^app\.(post|put|patch|delete)\("([^"]+)"/.exec(line);

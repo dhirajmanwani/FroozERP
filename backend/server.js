@@ -11498,6 +11498,137 @@ app.get("/api/sync/status", rateLimitSyncRequest, async (req, res) => {
  * writable session. The "own branch" is read from the database, not from the current token — which
  * may itself already be pointed at somebody else's shop.
  */
+/**
+ * Who may decide which shop handles an order.
+ *
+ * Owner or Admin, re-read from the database rather than trusted from the token so a demotion takes
+ * effect immediately -- and checked against the caller's own company, which `requireRateManager`
+ * alone does not do. That omission is the hole closed in `/lots/transfer-stock` today: role without
+ * company is not authorisation, it is a role check wearing authorisation's clothes.
+ */
+const requireOrderRouter = async (req, client = pool) => {
+  const companyId = parsePositiveInteger(req.auth?.companyId);
+  if (!companyId) return null;
+  const result = await client.query(
+    `SELECT u.id, u.full_name, u.company_id, r.role_name
+     FROM users u
+     JOIN roles r ON r.id = u.role_id
+     WHERE u.id = $1 AND u.active = TRUE`,
+    [parsePositiveInteger(req.auth?.userId)]
+  );
+  const user = result.rows[0];
+  if (!user || !RATE_MANAGER_ROLES.has(user.role_name)) return null;
+  if (parsePositiveInteger(user.company_id) !== companyId) return null;
+  return { ...user, companyId };
+};
+
+/**
+ * Orders nobody is handling yet.
+ *
+ * A website order or a WhatsApp to the company number arrives with no branch. `docs/order-routing-
+ * decision.md` rules that such an order **must not reach any counter**: the pull predicate scopes
+ * by branch and location and has no notion of role, so a company-wide unassigned order would land
+ * on every till including cashier machines -- carrying a customer's name, mobile and address to
+ * shops with no business seeing them.
+ *
+ * So it lives in the cloud and is read here, by a person who may decide. It enters the sync road
+ * only when somebody assigns it, and only then does it reach that branch's devices.
+ */
+app.get("/api/orders/unassigned", async (req, res) => {
+  try {
+    const router = await requireOrderRouter(req);
+    if (!router) {
+      return res.status(403).json({
+        code: "ORDER_ROUTING_DENIED",
+        message: "Only the Owner or an Administrator can hand out unassigned orders.",
+      });
+    }
+    const result = await pool.query(
+      `SELECT co.global_id, co.order_no, co.customer_name, co.customer_mobile, co.delivery_address,
+              co.status, co.source, co.notes, co.created_at, co.taken_at_branch_id,
+              tb.branch_name AS taken_at_branch_name,
+              COALESCE(items.lines, '[]'::jsonb) AS items
+       FROM customer_orders co
+       LEFT JOIN branches tb ON tb.id = co.taken_at_branch_id
+       LEFT JOIN LATERAL (
+         SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                  'product_name', ci.product_name,
+                  'unit', ci.unit,
+                  'quantity', ci.quantity,
+                  'agreed_rate', ci.agreed_rate
+                ) ORDER BY ci.line_index) AS lines
+         FROM customer_order_items ci WHERE ci.order_global_id = co.global_id
+       ) items ON TRUE
+       WHERE co.company_id = $1
+         AND co.branch_id IS NULL
+         AND co.deleted_at IS NULL
+       ORDER BY co.created_at, co.id`,
+      [router.companyId]
+    );
+    return res.json({ orders: result.rows });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Unassigned Orders" });
+  }
+});
+
+/**
+ * Hand an order to a shop, or move it to a different one.
+ *
+ * Both are the same operation. Assigning is a transfer whose "from" is nobody, so it writes one
+ * change row rather than two -- there is no old branch to tell. `transferCustomerOrderBranch` owns
+ * that rule and everything it implies; this route is the door, the authorisation and the
+ * transaction boundary, and nothing else.
+ */
+app.post("/api/orders/:orderGlobalId/assign", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const router = await requireOrderRouter(req, client);
+    if (!router) {
+      return res.status(403).json({
+        code: "ORDER_ROUTING_DENIED",
+        message: "Only the Owner or an Administrator can decide which shop handles an order.",
+      });
+    }
+    await client.query("BEGIN");
+    const result = await transferCustomerOrderBranch(client, {
+      orderGlobalId: req.params.orderGlobalId,
+      companyId: router.companyId,
+      toBranchId: req.body?.branch_id,
+      actorUserId: router.id,
+      note: req.body?.note,
+    });
+    if (!result.ok) {
+      await client.query("ROLLBACK");
+      // The refusals are already written for a person to read, and each names what to do next.
+      const status = result.code === "NOT_FOUND" ? 404
+        : result.code === "VALIDATION_ERROR" ? 400
+        : result.code === "NO_CHANGE" ? 409
+        : 409;
+      return res.status(status).json({ code: result.code, message: result.message });
+    }
+    await client.query("COMMIT");
+    return res.json({
+      order_id: result.order.global_id,
+      order_no: result.order.order_no || null,
+      moved_from: result.movedFrom,
+      moved_to: result.movedTo,
+      // Two when it moved between shops, one when it was assigned for the first time. Reported so
+      // an operator -- or a test -- can see the rule held rather than trusting that it did.
+      change_rows: result.changes.length,
+      message: result.movedFrom
+        ? `Moved to ${result.order.branch_id}. Both shops have been told.`
+        : "Assigned. It will reach that shop's counters on their next sync.",
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => null);
+    console.error(error);
+    return res.status(500).json({ message: "Error Assigning Order" });
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/api/owner/view-branch", async (req, res) => {
   try {
     const owner = await getOwnerUser(req.auth.userId);
