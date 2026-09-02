@@ -11,7 +11,8 @@
  * deployment already has and already protects. There is nothing to guess at over the network,
  * because there is no longer anything listening.
  *
- * Usage, on the machine running the backend, with the same DATABASE_URL it uses:
+ * Usage, on the machine running the backend, with the same DATABASE_URL it uses -- or from
+ * anywhere, with DATABASE_PUBLIC_URL set to the host's public connection string:
  *
  *   node scripts/bootstrap-first-owner.mjs --username <owner> --device-id <id> [--device-name <name>]
  *
@@ -71,8 +72,14 @@ const main = async () => {
   if (!username || !deviceId) {
     fail("Usage: node scripts/bootstrap-first-owner.mjs --username <owner> --device-id <id> [--device-name <name>]");
   }
-  if (!env.DATABASE_URL) {
-    fail("DATABASE_URL is not set. Run this with the same database configuration the backend uses.");
+  // Both names, because these commands are run by hand from a laptop at least as often as from
+  // the server. A hosted database exposes its outside-reachable string as DATABASE_PUBLIC_URL,
+  // and accepting only DATABASE_URL sent the maintainer to "DATABASE_URL is not set" mid-setup
+  // with the right value already sitting in the shell under the other name.
+  const connectionString = env.DATABASE_PUBLIC_URL || env.DATABASE_URL;
+  if (!connectionString) {
+    fail("Neither DATABASE_PUBLIC_URL nor DATABASE_URL is set. Run this with the same database\n"
+      + "configuration the backend uses, or the public connection string from your host.");
   }
 
   const password = await askHidden(`Password for ${username}: `);
@@ -82,7 +89,7 @@ const main = async () => {
   // installed the backend's dependencies - which is exactly the machine somebody runs this on by
   // mistake, and the moment they most need a readable error.
   const { Pool } = require("pg");
-  const pool = new Pool({ connectionString: env.DATABASE_URL });
+  const pool = new Pool({ connectionString });
   try {
     const { rows } = await pool.query(
       `SELECT u.id, u.username, u.password_hash, u.branch_id, u.active, r.role_name

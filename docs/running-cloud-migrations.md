@@ -119,4 +119,6 @@ If someone adds a migration and forgets the list, `npm --prefix backend test` fa
 
 ## After the migrations
 
-The counters come next — see `docs/first-counter-setup.md`.
+The counters come next — see `docs/first-counter-setup.md`. Keep the same PowerShell window: every
+command in this repo that talks to the cloud reads `DATABASE_PUBLIC_URL` as well as `DATABASE_URL`,
+so what you set above carries straight over.

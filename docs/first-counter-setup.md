@@ -45,7 +45,12 @@ You need that machine's **device id**. It is on the login screen, under *Show te
 
 ## The command
 
-On the machine running the backend, with the same database settings it uses:
+The command needs to know where your database is. It reads either `DATABASE_URL` (what the backend
+itself uses) or `DATABASE_PUBLIC_URL` (the outside-reachable string your host gives you) — whichever
+is set. If you have just run the cloud migrations, the value is already in your window under the
+public name and there is nothing more to do.
+
+On the machine running the backend, or on your own laptop with the public string set:
 
 ```
 node scripts/bootstrap-first-counter.mjs \

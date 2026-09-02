@@ -17,7 +17,8 @@
  * of its own till with nobody able to help. With it, the trust boundary is shell access on the
  * machine holding DATABASE_URL — a boundary the deployment already has and already protects.
  *
- * Usage, on the machine running the backend, with the same DATABASE_URL it uses:
+ * Usage, on the machine running the backend, with the same DATABASE_URL it uses -- or from
+ * anywhere, with DATABASE_PUBLIC_URL set to the host's public connection string:
  *
  *   node scripts/reset-password.mjs --username <name>
  *
@@ -110,15 +111,21 @@ const main = async () => {
   if (!username) {
     fail("Usage: node scripts/reset-password.mjs --username <name>");
   }
-  if (!env.DATABASE_URL) {
-    fail("DATABASE_URL is not set. Run this with the same database configuration the backend uses.");
+  // Both names, because these commands are run by hand from a laptop at least as often as from
+  // the server. A hosted database exposes its outside-reachable string as DATABASE_PUBLIC_URL,
+  // and accepting only DATABASE_URL sent the maintainer to "DATABASE_URL is not set" mid-setup
+  // with the right value already sitting in the shell under the other name.
+  const connectionString = env.DATABASE_PUBLIC_URL || env.DATABASE_URL;
+  if (!connectionString) {
+    fail("Neither DATABASE_PUBLIC_URL nor DATABASE_URL is set. Run this with the same database\n"
+      + "configuration the backend uses, or the public connection string from your host.");
   }
 
   // Loaded here rather than at the top so the usage message above works on a machine that has not
   // installed the backend's dependencies - which is exactly the machine somebody runs this on by
   // mistake, and the moment they most need a readable error.
   const { Pool } = require("pg");
-  const pool = new Pool({ connectionString: env.DATABASE_URL });
+  const pool = new Pool({ connectionString });
   try {
     const { rows } = await pool.query(
       `SELECT u.id, u.username, u.full_name, u.password_hash, u.active, r.role_name
