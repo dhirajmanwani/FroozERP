@@ -690,11 +690,20 @@ const settingsResponder = (role) => (sql, values) => {
   }
   if (/FROM charge_types/i.test(sql)) return { rows: CHARGE_TYPE_ROWS, rowCount: CHARGE_TYPE_ROWS.length };
   if (/FROM charge_rate_slabs/i.test(sql)) {
-    const ids = (values?.[0] || []).map(Number);
+    // Two callers ask this two ways: the list loader passes an array for `= ANY($1::int[])`, and
+    // the publisher passes one id for `charge_type_id = $1`. A stub that models only the first
+    // answers the second with a crash, which is how this arrived -- as a 500 from a route whose
+    // own code was right. Model the predicate, not one call site.
+    const first = values?.[0];
+    const ids = (Array.isArray(first) ? first : [first]).map(Number).filter(Number.isFinite);
     return { rows: SLAB_ROWS.filter((row) => ids.includes(Number(row.charge_type_id))) };
   }
   if (/^\s*INSERT INTO charge_types/i.test(sql)) return { rows: [chargeTypeRow({ id: 41 })], rowCount: 1 };
   if (/^\s*UPDATE charge_types/i.test(sql)) return { rows: [chargeTypeRow()], rowCount: 1 };
+  // Every charge-type write now republishes the charge on the sync road, so the stub has to answer
+  // the change-log insert. Without it `logSyncChange` reads change_id off an empty result and the
+  // route answers 500 -- which is how this arrived, as two green tests turning red.
+  if (/^\s*INSERT INTO sync_change_log/i.test(sql)) return { rows: [{ change_id: "9001" }], rowCount: 1 };
   return undefined;
 };
 
@@ -791,6 +800,58 @@ test("a flat charge with no rate is refused at the form, not at the counter", as
     flat_rate: 0,
   });
   assert.equal(free.response.status, 201, free.response.text);
+});
+
+test("every charge-type write tells the counters, in the same transaction", async () => {
+  // Without this a re-priced delivery reaches a counter only through a full reference bootstrap, so
+  // the counter keeps billing the old rate -- not broken, just confidently wrong, which is worse.
+  //
+  // In the same transaction, because a price changed here but not there is the shape where the shop
+  // believes it re-priced and the tills disagree.
+  const writes = [
+    ["POST", "/settings/charge-types", { charge_name: "Cold storage", basis: "FLAT", flat_rate: 25 }],
+    ["PUT", `/settings/charge-types/${DELIVERY_ID}`, { charge_name: "Delivery charge", basis: "FLAT", flat_rate: 90 }],
+    ["POST", `/settings/charge-types/${DELIVERY_ID}/deactivate`, {}],
+    ["POST", `/settings/charge-types/${DELIVERY_ID}/slabs`, { upto_value: 25, rate: 250 }],
+    ["PUT", `/settings/charge-types/${DELIVERY_ID}/slabs/1`, { upto_value: 25, rate: 250 }],
+    ["POST", `/settings/charge-types/${DELIVERY_ID}/slabs/1/deactivate`, {}],
+  ];
+
+  for (const [method, url, body] of writes) {
+    const { response, client } = await settingsCall(method, url, body);
+    assert.ok(response.status < 400, `${method} ${url} -> ${response.status} ${response.text}`);
+
+    const published = client.statements.filter((entry) => /INSERT INTO sync_change_log/i.test(entry.sql));
+    assert.equal(published.length, 1, `${method} ${url} must publish the charge exactly once`);
+    assert.ok(
+      published[0].values.includes("charge_type"),
+      `${method} ${url} must publish it as a charge_type`,
+    );
+
+    const order = client.statements.map((entry) => entry.sql);
+    const begin = order.findIndex((sql) => sql === "BEGIN");
+    const commit = order.findIndex((sql) => sql === "COMMIT");
+    const publish = order.findIndex((sql) => /INSERT INTO sync_change_log/i.test(sql));
+    assert.ok(begin !== -1 && commit !== -1, `${method} ${url} must run in a transaction`);
+    assert.ok(publish > begin && publish < commit, `${method} ${url} must publish inside it`);
+  }
+});
+
+test("a charge type is published whole, slabs and all", async () => {
+  // A slab is not independently useful: pricing is "the first slab that covers this", an answer
+  // that depends on the whole ordered list. So a device replaces the set rather than merging one
+  // row into a list it cannot check.
+  const { client } = await settingsCall("POST", `/settings/charge-types/${DELIVERY_ID}/slabs`, {
+    upto_value: 25,
+    rate: 250,
+  });
+  const published = client.statements.find((entry) => /INSERT INTO sync_change_log/i.test(entry.sql));
+  // logSyncChange stringifies the payload before binding it, so this is JSON on the wire.
+  const raw = published.values.find((value) => typeof value === "string" && value.includes("slabs"));
+  assert.ok(raw, "the published payload must carry the slabs");
+  const payload = JSON.parse(raw);
+  assert.ok(Array.isArray(payload.slabs));
+  assert.ok("charge_name" in payload, "and the charge it belongs to");
 });
 
 test("two slabs cannot share a measurement", async () => {

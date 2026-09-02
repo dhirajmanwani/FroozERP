@@ -2152,6 +2152,8 @@ const initializeDatabase = async () => {
     -- and 15 km at 150 a 12 km delivery costs 150, because 12 km is past what 100 was meant to
     -- cover. A measurement past the largest slab has no rate at all and is refused by name at
     -- pricing time -- see resolveChargeRateFromType below.
+    ALTER TABLE charge_types ADD COLUMN IF NOT EXISTS entity_version INTEGER NOT NULL DEFAULT 1;
+
     CREATE TABLE IF NOT EXISTS charge_rate_slabs (
       id SERIAL PRIMARY KEY,
       charge_type_id INTEGER NOT NULL REFERENCES charge_types(id) ON DELETE CASCADE,
@@ -9106,6 +9108,62 @@ const parseChargeSlabPayload = (slabs) => {
   return { slabs: parsed.sort((first, second) => first.upto - second.upto) };
 };
 
+/**
+ * Republish a charge type, slabs and all, so every counter learns its new price.
+ *
+ * ## Why the whole charge type, on any change
+ *
+ * A slab is not independently useful. "Up to 15 km costs 150" means nothing without the charge it
+ * belongs to and the slabs either side of it, because pricing is "the first slab that covers this"
+ * -- an answer that depends on the whole ordered list. So a slab edit republishes its parent, and a
+ * device replaces the set rather than merging one row into a list it cannot verify.
+ *
+ * ## Why this has to exist at all
+ *
+ * `syncReferenceBootstrap.js` publishes product_category, product, sale_rate, supplier and
+ * inventory_lot, and nothing else. Without this, a charge type reached a device only through a full
+ * reference bootstrap -- so re-pricing delivery from 100 to 150 in Settings would leave every
+ * counter billing 100, indefinitely, with nothing anywhere reporting a problem. The counter would
+ * not be broken; it would be confidently wrong, which is worse.
+ *
+ * `charge_type` is in COMPANY_REFERENCE_ENTITY_TYPES, so these rows reach every device in the
+ * company regardless of branch or counter -- a price list is not a per-counter thing. The branchId
+ * below is the acting branch, recorded for the audit trail, not a visibility filter.
+ */
+const publishChargeType = async (client, chargeTypeId, { branchId, manager }) => {
+  const typeResult = await client.query(
+    `UPDATE charge_types
+     SET entity_version = COALESCE(entity_version, 1) + 1,
+         updated_by = $2,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = $1
+     RETURNING id, company_id, charge_name, charge_code, basis, measure_unit, flat_rate,
+               active, entity_version, updated_by, updated_at`,
+    [chargeTypeId, manager?.id || null]
+  );
+  const chargeType = typeResult.rows[0];
+  if (!chargeType) return null;
+
+  // Inactive slabs travel too. A device that only ever heard about live slabs could not tell
+  // "this slab was withdrawn" from "this slab never reached me", and would keep pricing from it.
+  const slabsResult = await client.query(
+    `SELECT id, charge_type_id, upto_value, rate, active, updated_by, updated_at
+     FROM charge_rate_slabs WHERE charge_type_id = $1 ORDER BY upto_value, id`,
+    [chargeTypeId]
+  );
+
+  const payload = { ...chargeType, slabs: slabsResult.rows };
+  await logSyncChange(client, {
+    branchId: parsePositiveInteger(branchId) || 1,
+    entityType: "charge_type",
+    entityId: `charge-type-${chargeType.id}`,
+    operationType: "UPSERT",
+    version: Number(chargeType.entity_version || 1),
+    payload,
+  });
+  return payload;
+};
+
 app.get("/settings/charge-types", async (req, res) => {
   try {
     const companyId = parsePositiveInteger(req.auth.companyId);
@@ -9183,6 +9241,7 @@ app.post("/settings/charge-types", async (req, res) => {
         [chargeType.id, slab.upto, slab.rate, slab.active, manager.id]
       );
     }
+    await publishChargeType(client, chargeType.id, { branchId: req.auth.branchId, manager });
     await client.query("COMMIT");
     const slabsByType = await loadChargeSlabsByType([chargeType.id], true);
     return res.status(201).json({ ...chargeType, slabs: slabsByType.get(Number(chargeType.id)) || [] });
@@ -9267,6 +9326,7 @@ app.put("/settings/charge-types/:id", async (req, res) => {
         );
       }
     }
+    await publishChargeType(client, chargeTypeId, { branchId: req.auth.branchId, manager });
     await client.query("COMMIT");
     const slabsByType = await loadChargeSlabsByType([chargeTypeId], true);
     return res.json({ ...updated.rows[0], slabs: slabsByType.get(Number(chargeTypeId)) || [] });
@@ -9288,12 +9348,17 @@ app.put("/settings/charge-types/:id", async (req, res) => {
  * rather than quietly dropped from the bill.
  */
 app.post("/settings/charge-types/:id/deactivate", async (req, res) => {
+  // Transactional so the withdrawal and the news of it commit together. A charge switched off here
+  // but still priced at every counter is the worst of both: the shop believes it retired the
+  // charge, and the counters keep billing it.
+  const client = await pool.connect();
   try {
-    const manager = await requireRateManager(req.auth.userId);
+    const manager = await requireRateManager(req.auth.userId, client);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
     const chargeTypeId = parsePositiveInteger(req.params.id);
     if (!chargeTypeId) return res.status(400).json({ message: "Invalid charge" });
-    const result = await pool.query(
+    await client.query("BEGIN");
+    const result = await client.query(
       `
       UPDATE charge_types
       SET active = FALSE, updated_by = $1, updated_at = CURRENT_TIMESTAMP
@@ -9302,30 +9367,39 @@ app.post("/settings/charge-types/:id/deactivate", async (req, res) => {
       `,
       [manager.id, chargeTypeId, parsePositiveInteger(req.auth.companyId)]
     );
-    return result.rows[0]
-      ? res.json({ success: true, charge_type: result.rows[0] })
-      : res.status(404).json({ message: "Charge not found" });
+    if (!result.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Charge not found" });
+    }
+    await publishChargeType(client, chargeTypeId, { branchId: req.auth.branchId, manager });
+    await client.query("COMMIT");
+    return res.json({ success: true, charge_type: result.rows[0] });
   } catch (error) {
+    await client.query("ROLLBACK").catch(() => null);
     console.error(error);
     return res.status(500).json({ message: "Error Deactivating Charge Type" });
+  } finally {
+    client.release();
   }
 });
 
 app.post("/settings/charge-types/:id/slabs", async (req, res) => {
+  const client = await pool.connect();
   try {
-    const manager = await requireRateManager(req.auth.userId);
+    const manager = await requireRateManager(req.auth.userId, client);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
     const chargeTypeId = parsePositiveInteger(req.params.id);
     const parsed = parseChargeSlabPayload([req.body]);
     if (!chargeTypeId) return res.status(400).json({ message: "Invalid charge" });
     if (parsed.error) return res.status(400).json({ message: parsed.error });
-    const owner = await pool.query(
+    const owner = await client.query(
       "SELECT id FROM charge_types WHERE id = $1 AND ($2::INTEGER IS NULL OR company_id IS NULL OR company_id = $2)",
       [chargeTypeId, parsePositiveInteger(req.auth.companyId)]
     );
     if (!owner.rows[0]) return res.status(404).json({ message: "Charge not found" });
     const [slab] = parsed.slabs;
-    const result = await pool.query(
+    await client.query("BEGIN");
+    const result = await client.query(
       `
       INSERT INTO charge_rate_slabs (charge_type_id, upto_value, rate, active, updated_by)
       VALUES ($1, $2, $3, $4, $5)
@@ -9333,16 +9407,22 @@ app.post("/settings/charge-types/:id/slabs", async (req, res) => {
       `,
       [chargeTypeId, slab.upto, slab.rate, slab.active, manager.id]
     );
+    await publishChargeType(client, chargeTypeId, { branchId: req.auth.branchId, manager });
+    await client.query("COMMIT");
     return res.status(201).json(result.rows[0]);
   } catch (error) {
+    await client.query("ROLLBACK").catch(() => null);
     console.error(error);
     return res.status(500).json({ message: "Error Adding Charge Slab" });
+  } finally {
+    client.release();
   }
 });
 
 app.put("/settings/charge-types/:id/slabs/:slabId", async (req, res) => {
+  const client = await pool.connect();
   try {
-    const manager = await requireRateManager(req.auth.userId);
+    const manager = await requireRateManager(req.auth.userId, client);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
     const chargeTypeId = parsePositiveInteger(req.params.id);
     const slabId = parsePositiveInteger(req.params.slabId);
@@ -9350,7 +9430,8 @@ app.put("/settings/charge-types/:id/slabs/:slabId", async (req, res) => {
     if (!chargeTypeId || !slabId) return res.status(400).json({ message: "Invalid charge slab" });
     if (parsed.error) return res.status(400).json({ message: parsed.error });
     const [slab] = parsed.slabs;
-    const result = await pool.query(
+    await client.query("BEGIN");
+    const result = await client.query(
       `
       UPDATE charge_rate_slabs
       SET upto_value = $1, rate = $2, active = $3, updated_by = $4, updated_at = CURRENT_TIMESTAMP
@@ -9364,21 +9445,32 @@ app.put("/settings/charge-types/:id/slabs/:slabId", async (req, res) => {
       `,
       [slab.upto, slab.rate, slab.active, manager.id, slabId, chargeTypeId, parsePositiveInteger(req.auth.companyId)]
     );
-    return result.rows[0] ? res.json(result.rows[0]) : res.status(404).json({ message: "Charge slab not found" });
+    if (!result.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Charge slab not found" });
+    }
+    await publishChargeType(client, chargeTypeId, { branchId: req.auth.branchId, manager });
+    await client.query("COMMIT");
+    return res.json(result.rows[0]);
   } catch (error) {
+    await client.query("ROLLBACK").catch(() => null);
     console.error(error);
     return res.status(500).json({ message: "Error Updating Charge Slab" });
+  } finally {
+    client.release();
   }
 });
 
 app.post("/settings/charge-types/:id/slabs/:slabId/deactivate", async (req, res) => {
+  const client = await pool.connect();
   try {
-    const manager = await requireRateManager(req.auth.userId);
+    const manager = await requireRateManager(req.auth.userId, client);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
     const chargeTypeId = parsePositiveInteger(req.params.id);
     const slabId = parsePositiveInteger(req.params.slabId);
     if (!chargeTypeId || !slabId) return res.status(400).json({ message: "Invalid charge slab" });
-    const result = await pool.query(
+    await client.query("BEGIN");
+    const result = await client.query(
       `
       UPDATE charge_rate_slabs
       SET active = FALSE, updated_by = $1, updated_at = CURRENT_TIMESTAMP
@@ -9392,12 +9484,19 @@ app.post("/settings/charge-types/:id/slabs/:slabId/deactivate", async (req, res)
       `,
       [manager.id, slabId, chargeTypeId, parsePositiveInteger(req.auth.companyId)]
     );
-    return result.rows[0]
-      ? res.json({ success: true, slab: result.rows[0] })
-      : res.status(404).json({ message: "Charge slab not found" });
+    if (!result.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Charge slab not found" });
+    }
+    await publishChargeType(client, chargeTypeId, { branchId: req.auth.branchId, manager });
+    await client.query("COMMIT");
+    return res.json({ success: true, slab: result.rows[0] });
   } catch (error) {
+    await client.query("ROLLBACK").catch(() => null);
     console.error(error);
     return res.status(500).json({ message: "Error Deactivating Charge Slab" });
+  } finally {
+    client.release();
   }
 });
 

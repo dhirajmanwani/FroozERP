@@ -1,7 +1,17 @@
 "use strict";
 
 const REFERENCE_BOOTSTRAP_PROTOCOL = "reference-v1";
-const COMPANY_REFERENCE_ENTITY_TYPES = Object.freeze(["product_category", "product", "sale_rate", "supplier"]);
+/**
+ * Entity types every device in the company sees, whatever branch or counter it stands at.
+ *
+ * `charge_type` belongs here for the same reason `sale_rate` does: a price list is not a
+ * per-counter thing. Without it a re-priced delivery charge would reach a counter only through a
+ * full reference bootstrap, so the counter would keep billing the old rate -- not broken, just
+ * confidently wrong, which is worse.
+ */
+const COMPANY_REFERENCE_ENTITY_TYPES = Object.freeze([
+  "product_category", "product", "sale_rate", "supplier", "charge_type",
+]);
 
 const visibleChangePredicate = (offset = 1) => `
   company_id = $${offset}
@@ -180,6 +190,37 @@ const captureReferenceBootstrap = async (client, context) => {
     [context.companyId, context.branchId, context.operationalLocationId]
   );
 
+  // Charge types travel whole, slabs nested, on the bootstrap as well as the incremental path.
+  // A slab is not independently useful: "up to 15 km costs 150" means nothing without the charge it
+  // belongs to and the slabs either side of it, because pricing is "the first slab that covers
+  // this" -- an answer that depends on the whole ordered list. So a device replaces the set rather
+  // than merging rows into a list it cannot verify.
+  //
+  // Inactive slabs are included deliberately. A device that only ever heard about live slabs could
+  // not tell "this slab was withdrawn" from "this slab never reached me", and would keep pricing
+  // from a rate the shop retired.
+  const chargeTypesResult = await client.query(
+    `
+    SELECT ct.id, ct.company_id, ct.charge_name, ct.charge_code, ct.basis, ct.measure_unit,
+           ct.flat_rate, ct.active, COALESCE(ct.entity_version, 1) AS entity_version,
+           ct.updated_by, ct.updated_at,
+           COALESCE(
+             (
+               SELECT JSONB_AGG(TO_JSONB(slab) ORDER BY slab.upto_value, slab.id)
+               FROM (
+                 SELECT id, charge_type_id, upto_value, rate, active, updated_by, updated_at
+                 FROM charge_rate_slabs WHERE charge_type_id = ct.id
+               ) AS slab
+             ),
+             '[]'::JSONB
+           ) AS slabs
+    FROM charge_types ct
+    WHERE ct.company_id IS NULL OR ct.company_id = $1
+    ORDER BY ct.id
+    `,
+    [context.companyId]
+  );
+
   const record = (entityType, row) => ({
     change_id: null,
     branch_id: context.branchId,
@@ -204,6 +245,7 @@ const captureReferenceBootstrap = async (client, context) => {
     operational_location: location,
     device_assignment: assignment,
     location_products: locationProductsResult.rows,
+    charge_types: chargeTypesResult.rows,
     records: [
       ...categoriesResult.rows.map((row) => record("product_category", row)),
       ...productsResult.rows.map((row) => record("product", row)),
