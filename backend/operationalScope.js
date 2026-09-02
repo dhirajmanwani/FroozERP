@@ -111,6 +111,30 @@ const LEGACY_WRITE_ROUTES = Object.freeze([
   ["POST", "/lots/:lotId/adjust-stock", "/api/v3/inventory-lots/:lotId/adjust"],
   ["POST", "/inventory-lots/:lotId/deactivate", "/api/v3/inventory-lots/:lotId/deactivate"],
   ["POST", "/inventory-lots/:lotId/reactivate", "/api/v3/inventory-lots/:lotId/reactivate"],
+  // Retired rather than scoped, and it is the worst of the list.
+  //
+  // The others fail open through a NULL-bound scope conjunct. This one has no scope conjunct at
+  // all: the handler locks its two lots with `WHERE id = ANY($1::int[]) ... FOR UPDATE`, by primary
+  // key only - no company, no branch, no location, not even `deleted_at` - and its only guard is
+  // `requireRateManager`, which reads a role and nothing else. Any authenticated Owner or Admin
+  // could move any quantity between any two lot ids in the database, across branches and across
+  // companies, and the two `stock_transactions` rows it writes take their `branch_id` from the
+  // lots it just moved, so the theft is booked to the victim's branch.
+  //
+  // Scoping it instead was considered and rejected. There is nothing on the legacy path to scope
+  // *to*: `req.v3OperationalContext` is undefined there, which is precisely how the rest of this
+  // list came to fail open. Deriving a scope from the session claims would mean inventing the
+  // codebase's first `req.auth.branchId` read site inside a route nothing calls.
+  //
+  // Nothing depends on it. The shipped client has no transfer UI - `operationalWriteRoutes.test.js`
+  // asserts the absence of both the call and the button - and `scripts/multibranch/
+  // isolated-operational-write-routes.js` already expects this route to answer 426, which it did
+  // only under `enforce`. Listing it here makes that true in the shipped default as well.
+  //
+  // `/api/v3/transfers` is the replacement: a real warehouse-to-shop movement between two
+  // operational locations, scoped from the canonical device context, not a quantity nudged between
+  // two lot ids by whoever knew the numbers.
+  ["POST", "/lots/transfer-stock", "/api/v3/transfers"],
   // Singular became plural across the purchase family.
   ["POST", "/purchase-bill", "/api/v3/purchase-bills"],
   ["PUT", "/purchase/:id", "/api/v3/purchases/:id"],

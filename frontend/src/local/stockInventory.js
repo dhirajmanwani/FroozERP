@@ -1,3 +1,10 @@
+import {
+  LOCATION_SCOPE_STATUS,
+  counterScopeMessage,
+  filterLotsForScope,
+  resolveScopedLots,
+} from "./locationScope.js";
+
 export const STOCK_VIEW_MODES = Object.freeze({
   PRODUCT: "PRODUCT",
   LOT: "LOT",
@@ -53,8 +60,20 @@ export const findInventoryProduct = (products, productId) => (
   ))
 );
 
-export const groupInventoryLotsByProduct = (lots) => (
-  (Array.isArray(lots) ? lots : []).reduce((groups, lot) => {
+/**
+ * Lots bucketed by product, optionally narrowed to one counter's shelf.
+ *
+ * `scope` is optional and defaults to "none supplied", which leaves the grouping byte-for-byte what
+ * it was before location scoping existed — the Stock Inventory screen is also a *manager's* view,
+ * and `docs/stock-distribution-decision.md` rules that looking binds to the person while selling
+ * binds to the machine. So the filter is something a caller turns on, not something imposed here.
+ *
+ * This feeds the table. `summarizeInventoryLots` feeds the tiles above it and filters through the
+ * same call, because a summary and a detail that filter differently eventually disagree and the
+ * disagreement looks exactly like data loss.
+ */
+export const groupInventoryLotsByProduct = (lots, scope = null) => (
+  filterLotsForScope(Array.isArray(lots) ? lots : [], scope).reduce((groups, lot) => {
     const key = canonicalInventoryId(lot?.product_id);
     if (!key) return groups;
     const current = groups.get(key) || [];
@@ -64,8 +83,22 @@ export const groupInventoryLotsByProduct = (lots) => (
   }, new Map())
 );
 
-export const summarizeInventoryLots = (lots) => {
-  const rows = Array.isArray(lots) ? lots : [];
+/**
+ * The tiles: lot count, product count, quantity and value — for the same rows the table shows.
+ *
+ * The filtered set is resolved **once** here and the grouping is done on that result rather than on
+ * the caller's raw list, so the tiles and `groupInventoryLotsByProduct` cannot be looking at two
+ * different universes. Passing the already-filtered rows on (rather than the scope) is what
+ * guarantees it: there is only one filtering step in the whole call.
+ *
+ * The four numbers are only answers when `scopeUsable` is true. Under an unknown counter scope they
+ * are all zero because nothing may be shown, and zero there is *not* a stock figure — it is the
+ * absence of one. Feed `scopeStatus`/`scopeMessage` into `resolveInventoryPresentation` and render
+ * what it returns; do not put these numbers on a screen without consulting it.
+ */
+export const summarizeInventoryLots = (lots, scope = null) => {
+  const resolution = resolveScopedLots(Array.isArray(lots) ? lots : [], scope);
+  const rows = resolution.lots;
   const groups = groupInventoryLotsByProduct(rows);
   return {
     lots: rows.length,
@@ -76,6 +109,10 @@ export const summarizeInventoryLots = (lots) => {
       const cost = Number(lot?.effective_cost_per_unit ?? lot?.purchase_rate ?? 0);
       return sum + quantity * cost;
     }, 0),
+    scopeStatus: resolution.status,
+    scopeUsable: resolution.usable !== false,
+    scopeMessage: resolution.message,
+    scopeCounts: resolution.counts,
   };
 };
 
@@ -201,15 +238,63 @@ export const sanitizedInventoryLoadError = (error) => {
   return "Inventory could not be loaded. Existing local data was preserved; retry when the local service is ready.";
 };
 
-export const resolveInventoryPresentation = ({ loadState = "idle", loadError = "", rowCount = 0, filteredLotCount = 0 } = {}) => {
+/**
+ * What the screen shows, and why — one decision so the tiles and the table cannot contradict.
+ *
+ * Every arm answers the same question: is this number an answer, or the absence of one? The rule
+ * from CLAUDE.md is that a failure, a contract violation or an internal inconsistency must produce
+ * a distinct state and never a `0`, because `Products: 0` is indistinguishable from "the shop is
+ * out of apples" and a shopkeeper acts on it as if it were.
+ *
+ * Scope adds two arms to that:
+ *
+ * - **The counter does not know which shop it is in** (`SCOPE_UNKNOWN`). `resolveScopedLots` fails
+ *   closed, so there are no rows — but the truth is "I cannot tell", not "there is none". This
+ *   returns `kind: "error"` deliberately: every existing consumer already renders an `error` as a
+ *   banner carrying `message`, so the operator is told what to do even before a screen learns the
+ *   new `reason`. `reason` and `scopeStatus` are what a screen keys on to offer "assign this
+ *   counter" instead of "retry". Ordered *after* the load-failure arm, because a snapshot that
+ *   never loaded is the more immediate fault and its message is the more specific one.
+ * - **Every row on the device belongs to another shop** (`FOREIGN_ROWS_EXCLUDED` with nothing
+ *   kept). Here `0` is honest — this shop really is holding none — so it stays an `empty`, but the
+ *   message says the fruit may have been distributed to the wrong branch rather than sold, which is
+ *   the difference between checking Stock Distribution and telling a customer the item is finished.
+ *
+ * A scope that merely excluded some rows, or admitted untagged ones, is not a state of its own: the
+ * figures shown are correct for this counter. That reaches the screen as `notice`, alongside a
+ * normal `ready` or `empty`, so it informs without blocking.
+ */
+export const resolveInventoryPresentation = ({
+  loadState = "idle",
+  loadError = "",
+  rowCount = 0,
+  filteredLotCount = 0,
+  scopeStatus = LOCATION_SCOPE_STATUS.UNFILTERED,
+  scopeCounts = null,
+  scopeMessage = "",
+} = {}) => {
+  const scopeNote = scopeMessage || counterScopeMessage(scopeStatus, { counts: scopeCounts || {} });
+  const base = { reason: "", scopeStatus, notice: "" };
   if (loadState === "idle" || loadState === "loading") {
-    return { kind: "loading", countLabel: rowCount > 0 ? String(rowCount) : "Loading", message: "Loading local inventory..." };
+    return { ...base, kind: "loading", countLabel: rowCount > 0 ? String(rowCount) : "Loading", message: "Loading local inventory..." };
   }
   if (loadState === "error" || loadError) {
     return {
+      ...base,
       kind: "error",
+      reason: "LOAD_FAILED",
       countLabel: rowCount > 0 ? String(rowCount) : "Unavailable",
       message: loadError || "Inventory could not be loaded. Existing local data was preserved; retry when the local service is ready.",
+    };
+  }
+  // The counter's own shop is unknown, so no figure here is this counter's figure. Never a "0".
+  if (scopeStatus === LOCATION_SCOPE_STATUS.SCOPE_UNKNOWN) {
+    return {
+      ...base,
+      kind: "error",
+      reason: LOCATION_SCOPE_STATUS.SCOPE_UNKNOWN,
+      countLabel: "Unavailable",
+      message: scopeNote,
     };
   }
   // Lots survived filtering but none could be matched to a product row. That is an
@@ -217,13 +302,24 @@ export const resolveInventoryPresentation = ({ loadState = "idle", loadError = "
   // "Products: 0" while the summary tiles still show stock.
   if (rowCount === 0 && Number(filteredLotCount) > 0) {
     return {
+      ...base,
       kind: "error",
+      reason: "PRODUCT_JOIN_INCONSISTENT",
       countLabel: "Unavailable",
       message: "Inventory lots could not be matched to their products. Local data was preserved; retry, and report this if it persists.",
     };
   }
-  if (rowCount === 0) return { kind: "empty", countLabel: "0", message: "No inventory records match the selected filters." };
-  return { kind: "ready", countLabel: String(rowCount), message: "" };
+  if (rowCount === 0 && scopeStatus === LOCATION_SCOPE_STATUS.FOREIGN_ROWS_EXCLUDED) {
+    return {
+      ...base,
+      kind: "empty",
+      reason: LOCATION_SCOPE_STATUS.FOREIGN_ROWS_EXCLUDED,
+      countLabel: "0",
+      message: scopeNote,
+    };
+  }
+  if (rowCount === 0) return { ...base, kind: "empty", notice: scopeNote, countLabel: "0", message: "No inventory records match the selected filters." };
+  return { ...base, kind: "ready", notice: scopeNote, countLabel: String(rowCount), message: "" };
 };
 
 export const activeStockFilterLabels = (filters, { sortBy = "PRODUCT_ASC" } = {}) => {

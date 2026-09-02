@@ -62,7 +62,7 @@ test("the registry lists exactly the modules the sidebar lists", () => {
   const block = app.match(/const navigationItems = \[([\s\S]*?)\n\];/);
   assert.ok(block, "navigationItems must still be a literal array in App.jsx");
   const sidebar = [...block[1].matchAll(/\["([^"]+)", "([^"]+)"\]/g)].map(([, id, label]) => ({ id, label }));
-  assert.equal(sidebar.length, 15, "guard against a silently truncated parse");
+  assert.equal(sidebar.length, 17, "guard against a silently truncated parse");
 
   assert.deepEqual(
     navigationRegistry.map((item) => item.id),

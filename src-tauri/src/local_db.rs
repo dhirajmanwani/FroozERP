@@ -8,7 +8,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::entitlement::{self, EntitlementState};
 
-const CURRENT_SCHEMA_VERSION: &str = "022_customer_order_sync";
+const CURRENT_SCHEMA_VERSION: &str = "023_customer_order_transfer";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -31,6 +31,7 @@ const MIGRATION_019: &str = include_str!("../migrations/sqlite/019_provisional_l
 const MIGRATION_020: &str = include_str!("../migrations/sqlite/020_customer_orders.sql");
 const MIGRATION_021: &str = include_str!("../migrations/sqlite/021_customer_order_payment.sql");
 const MIGRATION_022: &str = include_str!("../migrations/sqlite/022_customer_order_sync.sql");
+const MIGRATION_023: &str = include_str!("../migrations/sqlite/023_customer_order_transfer.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -450,6 +451,149 @@ pub fn record_sync_cycle_completed(app: &AppHandle, device_id: &str, server_time
     status_at(&path)
 }
 
+/// One scope value, read the way the local layer reads every other opaque id.
+///
+/// The Rust side of `canonicalInventoryId`. `local_inventory_lots.branch_id` is TEXT, the wire
+/// value arrives as a Postgres INTEGER, and the applier below stringifies it — so a branch
+/// comparison necessarily crosses that boundary, and the only safe way across is to bring both
+/// sides to text and compare as text. Never `Number()`, and never numeric equality: `"004"` and
+/// `4` are different entities, and treating them as one is what silently emptied the Inventory
+/// table while every summary tile went on looking correct.
+///
+/// An integer-valued float is rendered as an integer because a JSON `4.0` and a JSON `4` are the
+/// same branch said two ways, and `"4"` vs `"4.0"` would refuse a legitimate row. `"unassigned"`
+/// is the placeholder the applier stamps when the server said nothing, so it is treated as "no
+/// scope stated" rather than as the name of a shop.
+fn canonical_scope_id(value: Option<&serde_json::Value>) -> Option<String> {
+    let text = match value {
+        Some(serde_json::Value::String(raw)) => raw.trim().to_string(),
+        Some(serde_json::Value::Number(number)) => {
+            if let Some(integer) = number.as_i64() {
+                integer.to_string()
+            } else if let Some(unsigned) = number.as_u64() {
+                unsigned.to_string()
+            } else if let Some(float) = number.as_f64() {
+                if float.is_finite() && float.fract() == 0.0 {
+                    format!("{}", float as i64)
+                } else {
+                    number.to_string()
+                }
+            } else {
+                number.to_string()
+            }
+        }
+        _ => return None,
+    };
+    if text.is_empty() || text.eq_ignore_ascii_case("unassigned") {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// The shop this device is standing in, as far as the pull path is concerned.
+#[derive(Debug, Clone, Default)]
+struct DevicePullScope {
+    branch_id: Option<String>,
+    operational_location_id: Option<String>,
+}
+
+impl DevicePullScope {
+    /// Why an incoming `inventory_lot` must not be applied here, or `None` if it may be.
+    ///
+    /// Three rules, and each one is a decision:
+    ///
+    /// 1. **Only a stated scope can disagree.** A payload that carries no `branch_id` and no
+    ///    `operational_location_id` is applied. Absence is not evidence of foreignness — it is an
+    ///    older server, or a record written before migration 013 — and refusing it would stop a
+    ///    working device from syncing anything at all. The bootstrap path can afford to demand
+    ///    scope on every record because it runs once, against a payload built for it; the hot path
+    ///    cannot.
+    /// 2. **Only a known scope can judge.** A device with no resolved branch — never bootstrapped,
+    ///    entitlement missing — refuses nothing. It has no shelf to compare against, and a check
+    ///    that cannot be evaluated must not be resolved as "guilty".
+    /// 3. **DELETE is exempt.** A delete names a row to remove. If this device does not have it,
+    ///    the delete is a no-op; if it does, the row is one that should never have arrived and
+    ///    removing it corrects the device rather than damaging it. Refusing foreign deletes would
+    ///    strand exactly the rows a fix most needs to clear.
+    fn refusal_for_inventory_lot(&self, change: &PulledChange) -> Option<String> {
+        if change.operation_type.eq_ignore_ascii_case("DELETE") {
+            return None;
+        }
+        // The applier falls back to the change envelope's `branch_id` when the payload has none and
+        // stamps that on the row, so the check has to look at the same value the write would use.
+        // Checking only the payload would let an envelope-only foreign branch through the guard and
+        // straight onto the shelf.
+        let payload_branch = canonical_scope_id(change.payload.get("branch_id"))
+            .or_else(|| change.branch_id.map(|value| value.to_string()));
+        let payload_location = canonical_scope_id(change.payload.get("operational_location_id"));
+
+        let mut mismatches: Vec<String> = Vec::new();
+        if let (Some(device), Some(incoming)) = (self.branch_id.as_deref(), payload_branch.as_deref()) {
+            if device != incoming {
+                mismatches.push(format!("branch {incoming:?} is not this device's branch {device:?}"));
+            }
+        }
+        if let (Some(device), Some(incoming)) =
+            (self.operational_location_id.as_deref(), payload_location.as_deref())
+        {
+            if device != incoming {
+                mismatches.push(format!(
+                    "operational location {incoming:?} is not this device's location {device:?}"
+                ));
+            }
+        }
+        if mismatches.is_empty() {
+            None
+        } else {
+            Some(mismatches.join("; "))
+        }
+    }
+}
+
+/// What this device is, resolved once per pull.
+///
+/// Deliberately the *same* answer `canonical_scope` in the reference snapshot shows the operator,
+/// because the two must never be able to differ: if the screen says a device belongs to Ratanada
+/// then Ratanada is what the pull enforces, and there is no second ladder to keep in step.
+///
+/// A lookup failure resolves to unscoped rather than to an error. Scope trouble is metadata
+/// trouble; a device whose entitlement row is unreadable still has to be able to sync and bill,
+/// and `canonical_snapshot_scope_at` already logs the reason.
+fn resolve_device_pull_scope(conn: &Connection, device_id: Option<&str>) -> DevicePullScope {
+    let named = device_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"))
+        .map(|value| value.to_string());
+    // When the caller did not name a device, the assignment table may still say who this is — but
+    // only if it says so unambiguously. Picking the first of several active assignments would
+    // enforce one shop's scope on another shop's rows, which is the very failure this guards.
+    let device = match named {
+        Some(value) => Some(value),
+        None => {
+            let candidates: Result<Vec<String>, _> = conn
+                .prepare("SELECT device_id FROM local_device_assignment WHERE active = 1")
+                .and_then(|mut statement| {
+                    statement
+                        .query_map([], |row| row.get::<_, String>(0))
+                        .and_then(|rows| rows.collect())
+                });
+            match candidates {
+                Ok(mut rows) if rows.len() == 1 => Some(rows.remove(0)),
+                _ => None,
+            }
+        }
+    };
+    let Some(device) = device else {
+        return DevicePullScope::default();
+    };
+    let scope = canonical_snapshot_scope_at(conn, &device);
+    DevicePullScope {
+        branch_id: canonical_scope_id(scope.get("branch_id")),
+        operational_location_id: canonical_scope_id(scope.get("operational_location_id")),
+    }
+}
+
 pub fn apply_pull_changes(
     app: &AppHandle,
     changes: &[PulledChange],
@@ -473,7 +617,39 @@ fn apply_pull_changes_at(
     let mut conn = Connection::open(&path).map_err(to_error)?;
     let tx = conn.transaction().map_err(to_error)?;
     let confirmed_at = require_server_time(server_time)?;
+    // Stock belongs to the shop it is physically sitting in, and a counter may sell only what is on
+    // its own shelf (docs/stock-distribution-decision.md). The bootstrap path has always enforced
+    // that — it refuses any `inventory_lot` outside the canonical device scope — but this path, the
+    // one every subsequent pull takes, applied whatever arrived. So the rule held for exactly as
+    // long as a device never pulled again. The check is the same check; it now runs where it
+    // matters.
+    //
+    // **Refused and recorded, not thrown.** A hard `Err` here aborts the whole transaction, which
+    // means one foreign lot discards every other change in the page *and* leaves the cursor
+    // wedged — the page is offered again, fails again, and sync stops for good on a device whose
+    // own data is fine. A foreign lot is a server-side scoping bug, not a corrupt device, and the
+    // proportionate answer is to decline the row and say so in a form somebody can count and
+    // replay. That is exactly what `local_unapplied_changes` (migration 022) is for: the row is
+    // kept whole, the reason is named, the console says it out loud, and the rest of the pull
+    // lands. What must never happen — and is what happened before — is "applied silently", or a
+    // sync that reports itself healthy while the shelf and the screen disagree.
+    //
+    // Note that a genuine transfer *out* of this shop is not affected: per the distribution
+    // decision it arrives as a change scoped to this branch with a reduced quantity, not as a row
+    // wearing the receiving branch's id.
+    let device_scope = resolve_device_pull_scope(&tx, device_id.as_deref());
     for change in changes {
+        if change.entity_type == "inventory_lot" {
+            if let Some(detail) = device_scope.refusal_for_inventory_lot(change) {
+                record_unapplied_change(
+                    &tx,
+                    change,
+                    "INVENTORY_LOT_OUTSIDE_DEVICE_SCOPE",
+                    Some(detail),
+                )?;
+                continue;
+            }
+        }
         apply_change_with_tx(&tx, change)?;
     }
     let state_device = device_id.unwrap_or_else(|| "default".to_string());
@@ -1731,7 +1907,7 @@ pub fn save_customer_order_at(
     tx.execute(
         "INSERT INTO local_customer_orders (
            id, order_no, source, customer_id, customer_name, customer_mobile, delivery_address,
-           status, reserved_at, notes, branch_id, created_by
+           status, reserved_at, notes, branch_id, created_by, taken_at_branch_id
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'RECEIVED',
                    -- COALESCE, not the column DEFAULT: `reserved_at` has none. An earlier draft
                    -- assumed it did and passed NULL, which produced accepted orders carrying no
@@ -1740,7 +1916,7 @@ pub fn save_customer_order_at(
                    -- would have held its fruit for ever, which is the exact failure the lapse exists
                    -- to prevent. Caught by a test, not by reading.
                    COALESCE(?8, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-                   ?9, ?10, ?11)",
+                   ?9, ?10, ?11, ?12)",
         rusqlite::params![
             order_id,
             order_no,
@@ -1761,6 +1937,13 @@ pub fn save_customer_order_at(
             // silently becoming NULL.
             branch_id,
             order_text(order, "created_by"),
+            // Provenance and fulfilment are the same branch here, and that is not an assumption:
+            // the device taking this order is the device that will pack it. They only diverge
+            // later, when somebody transfers the order, and a transfer changes `branch_id` alone.
+            // Written from the resolved value rather than from the raw payload so that a device
+            // that supplied no branch of its own records the same answer in both columns — or NULL
+            // in both, when the branch could not be resolved at all and the order is blocked.
+            branch_id,
         ],
     )
     .map_err(to_error)?;
@@ -1957,7 +2140,8 @@ fn read_customer_order(conn: &Connection, order_id: &str) -> Result<serde_json::
                     cancelled_at, cancellation_reason, carrier, carrier_reference, tracking_url,
                     carrier_contact, sale_id, invoice_no, notes, branch_id, created_by, created_at,
                     payment_state, amount_paid, payment_reference, payment_marked_at,
-                    entity_version, sync_status, sync_blocked_reason, updated_at
+                    entity_version, sync_status, sync_blocked_reason, updated_at,
+                    taken_at_branch_id, transferred_to_branch_id, transferred_away_at
              FROM local_customer_orders WHERE id = ?1",
             rusqlite::params![order_id],
             |row| {
@@ -2010,6 +2194,17 @@ fn read_customer_order(conn: &Connection, order_id: &str) -> Result<serde_json::
                     "sync_status": row.get::<_, String>(29)?,
                     "sync_blocked_reason": row.get::<_, Option<String>>(30)?,
                     "updated_at": row.get::<_, Option<String>>(31)?,
+                    // The routing half of the record. `branch_id` above is the branch *fulfilling*
+                    // the order; this is the branch that *took* it, and they differ from the moment
+                    // anybody moves an order. Read as Option<String> rather than as a raw value
+                    // because, unlike `branch_id`, this column is TEXT — there is no INTEGER
+                    // affinity to trip over.
+                    "taken_at_branch_id": row.get::<_, Option<String>>(32)?,
+                    // Both NULL on an ordinary order. Set together on the losing device when a
+                    // TRANSFER_OUT arrives, so an order that left is distinguishable from one that
+                    // was cancelled and from one that simply vanished.
+                    "transferred_to_branch_id": row.get::<_, Option<String>>(33)?,
+                    "transferred_away_at": row.get::<_, Option<String>>(34)?,
                 }))
             },
         )
@@ -2720,6 +2915,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "020_customer_orders", MIGRATION_020)?;
     apply_migration(&mut conn, "021_customer_order_payment", MIGRATION_021)?;
     apply_migration(&mut conn, "022_customer_order_sync", MIGRATION_022)?;
+    apply_migration(&mut conn, "023_customer_order_transfer", MIGRATION_023)?;
     Ok(())
 }
 
@@ -3433,10 +3629,36 @@ fn canonical_snapshot_scope_try(conn: &Connection, device_id: &str) -> Result<se
         source = "unscoped";
     }
 
+    // The name a person can read, beside the ids only the machine cares about.
+    //
+    // The maintainer runs more than one device in a branch -- a warehouse machine and a counter
+    // machine can sit under one roof, and two tills can stand side by side. Ids cannot tell those
+    // apart on screen, and a device quietly set up as the wrong counter is a mistake that surfaces
+    // days later as stock that does not add up. `local_operational_locations` already holds the
+    // name; it has simply never been carried up to where anybody could see it.
+    //
+    // A missing row is left as null rather than filled with the id: "Counter 40" reads like a name
+    // and is not one, and a person shown it would believe the device was configured when it was not.
+    let location_name: Option<String> = match &operational_location_id {
+        Some(id) => conn
+            .query_row(
+                "SELECT location_name FROM local_operational_locations WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(to_error)?
+            .flatten()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        None => None,
+    };
+
     Ok(serde_json::json!({
         "company_id": company_id,
         "branch_id": branch_id,
         "operational_location_id": operational_location_id,
+        "location_name": location_name,
         "source": source,
         "warnings": warnings,
     }))
@@ -3562,8 +3784,56 @@ fn load_reference_snapshot_at(
                     "remarks": row.get::<_, Option<String>>(9)?,
                     "updated_at": row.get::<_, Option<String>>(10)?,
                     "entity_version": row.get::<_, i64>(11)?,
+                    // Every location's stock added together, because the join below is on
+                    // `product_id` alone. That is correct for an owner looking at the company and
+                    // wrong for a cashier looking at a shelf, and nothing in the name says which.
+                    // A counter's own figure must come from `product_stock_by_scope` (or be summed
+                    // from `inventory_lots`, which now carries scope) — never from here.
                     "current_stock": row.get::<_, f64>(12)?,
                     "lot_count": row.get::<_, i64>(13)?,
+                }))
+            })
+            .map_err(to_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?
+    };
+
+    // The same aggregate as `products`, split by the place the fruit is sitting in.
+    //
+    // This exists because `products.current_stock` cannot be made scope-aware without either
+    // filtering the snapshot (which decides for a caller that never asked) or emitting several rows
+    // per product (which every existing reader of `products` would mis-count). So the scoped answer
+    // is a second projection of the *same rows* rather than a change to the first.
+    //
+    // The predicate is a character-for-character copy of the one in `products` — same
+    // `deleted_at IS NULL`, same CANCELLED exclusion — and that is load-bearing, not tidiness. A
+    // summary and a detail that filter differently disagree eventually, and the disagreement looks
+    // exactly like data loss. `product_aggregate_and_lot_list_agree_about_which_lots_exist` fails
+    // if these two predicates are ever edited apart.
+    //
+    // `inventory_lots` remains the detail of record; this is a convenience over it, so a caller
+    // must not mix a tile from here with a table filtered by some other rule.
+    let product_stock_by_scope = {
+        let mut statement = conn
+            .prepare(
+                "SELECT l.product_id, l.branch_id, l.company_id, l.operational_location_id,
+                        COALESCE(SUM(l.balance_qty), 0) AS current_stock,
+                        COUNT(*) AS lot_count
+                 FROM local_inventory_lots l
+                 WHERE l.deleted_at IS NULL
+                   AND UPPER(COALESCE(l.status, 'ACTIVE')) <> 'CANCELLED'
+                 GROUP BY l.product_id, l.branch_id, l.company_id, l.operational_location_id
+                 ORDER BY l.product_id, l.branch_id, l.operational_location_id",
+            )
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(serde_json::json!({
+                    "product_id": row.get::<_, String>(0)?,
+                    "branch_id": row.get::<_, Option<String>>(1)?,
+                    "company_id": row.get::<_, Option<String>>(2)?,
+                    "operational_location_id": row.get::<_, Option<String>>(3)?,
+                    "current_stock": row.get::<_, f64>(4)?,
+                    "lot_count": row.get::<_, i64>(5)?,
                 }))
             })
             .map_err(to_error)?;
@@ -3573,9 +3843,21 @@ fn load_reference_snapshot_at(
     let inventory_lots = {
         let mut statement = conn
             .prepare(
+                // Scope — `branch_id`, `company_id`, `operational_location_id` — is selected but
+                // deliberately NOT filtered on. A lot belongs to one shop
+                // (docs/stock-distribution-decision.md), and until this query emitted those three
+                // columns the frontend could not filter by shop even if it wanted to: the fields
+                // simply were not in the objects it received, so every counter saw every counter's
+                // fruit. Emitting them is what makes the choice possible. The choice itself stays
+                // in the frontend local layer, where it is testable and where a filter that is
+                // active can be made visible to the person looking at it. Filtering here would
+                // instead hide rows from a caller that never asked, and would leave the product
+                // aggregate below counting a different universe than this list — the exact
+                // summary-vs-detail split CLAUDE.md warns about.
                 "SELECT id, product_id, product_name, supplier_id, supplier_name, lot_no, size_grade,
                         opening_date, opening_qty, sold_qty, adjusted_qty, balance_qty, cost_rate, sale_rate,
-                        status, remarks, created_at, updated_at, purchase_bill_status
+                        status, remarks, created_at, updated_at, purchase_bill_status,
+                        branch_id, company_id, operational_location_id
                  FROM local_inventory_lots
                  WHERE deleted_at IS NULL
                  ORDER BY product_name, opening_date, id",
@@ -3613,6 +3895,18 @@ fn load_reference_snapshot_at(
                     "remarks": row.get::<_, Option<String>>(15)?,
                     "created_at": row.get::<_, Option<String>>(16)?,
                     "updated_at": row.get::<_, Option<String>>(17)?,
+                    // Where this fruit physically is. Every one of the three is a separate column
+                    // on the table and none is an alias of another, unlike the pairs above — do
+                    // not "tidy" one away. All three are Option because a lot written before
+                    // migration 013, or pulled from a server that does not send scope, genuinely
+                    // has none: NULL here means "this device was never told", which is a different
+                    // fact from "it belongs to nowhere" and must stay distinguishable on screen.
+                    // Emitted as opaque text and never coerced with a number — `"004"` and `4` are
+                    // different entities, and comparing them numerically is what silently emptied
+                    // the Inventory table once already.
+                    "branch_id": row.get::<_, Option<String>>(19)?,
+                    "company_id": row.get::<_, Option<String>>(20)?,
+                    "operational_location_id": row.get::<_, Option<String>>(21)?,
                 }))
             })
             .map_err(to_error)?;
@@ -3771,6 +4065,7 @@ fn load_reference_snapshot_at(
         "user_profile": user_profile,
         "offline_auth": offline_auth,
         "products": products,
+        "product_stock_by_scope": product_stock_by_scope,
         "categories": categories,
         "inventory_lots": inventory_lots,
         "customers": customers,
@@ -5379,6 +5674,55 @@ fn apply_pulled_customer_order_with_tx(
         return Ok(());
     }
 
+    // The order has moved to another branch, and this device is the one losing it.
+    //
+    // **This arm has to exist, and its absence is the single most likely way to build this wrong.**
+    // Everything below treats a change that is not DELETE as an upsert, so a TRANSFER_OUT falling
+    // through would re-insert the order onto the very device it is supposed to be leaving — and
+    // because the two branches' change rows carry the same entity_version, the version guard would
+    // not save us either. Both branches would then go on believing they owed the same customer a
+    // delivery, which is exactly the confusion this whole design exists to prevent.
+    //
+    // It is deliberately not folded into the DELETE arm. "This order was cancelled" and "this order
+    // is now the other branch's" are different facts, and a counter told the wrong one rings the
+    // wrong customer.
+    //
+    // `deleted_at` is what releases the reserved stock: reservations are summed by
+    // `reservedQuantityByProduct` over the orders the board loads, and the board loads
+    // `deleted_at IS NULL`. So the release is a consequence of the rule that already governs every
+    // other order, rather than a second mechanism that could disagree with it.
+    //
+    // `branch_id` is left exactly as it was. It still says which branch this row belonged to, which
+    // is the true statement here; overwriting it with the destination would leave the losing device
+    // holding a row claiming to belong to a branch it has never been.
+    //
+    // When no such row exists — a TRANSFER_OUT for an order this device never pulled — the UPDATE
+    // touches nothing and that is the right answer: there is no local copy to take away, and
+    // inserting a tombstone would only invent a record of an order this counter never saw.
+    if change.operation_type.eq_ignore_ascii_case("TRANSFER_OUT") {
+        // Where it went. The explicit field is preferred; `branch_id` on a transfer payload is the
+        // *new* fulfilment branch and so answers the same question, and is the fallback for a
+        // server that names it only that way. Read through `order_branch_text` for the same reason
+        // every other branch here is: `as_i64` silently drops a branch id sent as a string, and
+        // "004" is not 4.
+        let destination = order_branch_text(payload, "transferred_to_branch_id")
+            .or_else(|| order_branch_text(payload, "branch_id"));
+        tx.execute(
+            "UPDATE local_customer_orders
+                SET deleted_at = COALESCE(?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    transferred_to_branch_id = ?4,
+                    transferred_away_at = COALESCE(?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    entity_version = ?3,
+                    sync_status = 'synced',
+                    sync_blocked_reason = NULL,
+                    updated_at = COALESCE(?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+              WHERE id = ?1",
+            params![change.entity_id, change.updated_at, incoming_version, destination],
+        )
+        .map_err(to_error)?;
+        return Ok(());
+    }
+
     // Status is the field that decides whether this order holds stock, so an unrecognised one is
     // not guessed at. Coercing it to RECEIVED would reserve fruit for an order that might have been
     // cancelled; letting the CHECK constraint reject it would abort the whole pull transaction and
@@ -5446,8 +5790,17 @@ fn apply_pulled_customer_order_with_tx(
         );
     }
 
+    // The branch *fulfilling* this order. It is the column the whole transport scopes by, so it is
+    // also the column a transfer changes — an order arriving here with a different `branch_id` than
+    // it had is a transfer in, and needs no special handling on this side.
     let branch_id = order_branch_text(payload, "branch_id")
         .or_else(|| change.branch_id.map(|value| value.to_string()));
+    // The branch that *took* the order. Never derived from `branch_id`: on an order transferred in
+    // from somewhere else those two are different by definition, so falling back to the fulfilment
+    // branch would quietly rewrite history to say this branch answered a call it never took. When
+    // the payload does not carry it — an older server, or a record written before the split — the
+    // UPSERT below keeps whatever this device already had rather than replacing it with NULL.
+    let taken_at_branch_id = order_branch_text(payload, "taken_at_branch_id");
 
     tx.execute(
         "INSERT INTO local_customer_orders (
@@ -5456,13 +5809,13 @@ fn apply_pulled_customer_order_with_tx(
             cancellation_reason, carrier, carrier_reference, tracking_url, carrier_contact,
             sale_id, invoice_no, notes, branch_id, created_by, created_at, updated_at, deleted_at,
             payment_state, amount_paid, payment_reference, payment_marked_at,
-            entity_version, sync_status, sync_blocked_reason
+            entity_version, sync_status, sync_blocked_reason, taken_at_branch_id
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
             ?19, ?20, ?21, ?22, ?23,
             COALESCE(?24, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
             COALESCE(?25, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-            ?26, ?27, ?28, ?29, ?30, ?31, 'synced', NULL
+            ?26, ?27, ?28, ?29, ?30, ?31, 'synced', NULL, ?32
          )
          ON CONFLICT(id) DO UPDATE SET
            order_no = excluded.order_no,
@@ -5494,6 +5847,17 @@ fn apply_pulled_customer_order_with_tx(
            payment_reference = excluded.payment_reference,
            payment_marked_at = excluded.payment_marked_at,
            entity_version = excluded.entity_version,
+           -- COALESCE, not `excluded.`, and it is the one field here treated that way. Provenance
+           -- never changes, so an incoming copy that does not carry it is saying nothing about it
+           -- rather than saying it is unknown — and overwriting a real branch with NULL would lose
+           -- the only record of who took the order, permanently and silently.
+           taken_at_branch_id = COALESCE(excluded.taken_at_branch_id, local_customer_orders.taken_at_branch_id),
+           -- Cleared, because an UPSERT reaching this device means this branch is fulfilling the
+           -- order — the pull predicate sends it nowhere else. An order transferred away and later
+           -- transferred back would otherwise come back live while still carrying the note saying
+           -- it had left, which reads as two contradictory facts about the same row.
+           transferred_to_branch_id = NULL,
+           transferred_away_at = NULL,
            sync_status = 'synced',
            sync_blocked_reason = NULL",
         params![
@@ -5533,6 +5897,7 @@ fn apply_pulled_customer_order_with_tx(
             optional_text(payload, "payment_reference"),
             optional_text(payload, "payment_marked_at"),
             incoming_version,
+            taken_at_branch_id,
         ],
     )
     .map_err(to_error)?;
@@ -6001,7 +6366,7 @@ mod tests {
     /// three at once with nothing but `left: 18, right: 17` to explain why, and the failures were
     /// mistaken for the environment for long enough to reach a merge check. One named constant is
     /// the whole fix: **bump this when you add a migration**, and the number says what it counts.
-    const EXPECTED_APPLIED_MIGRATIONS: i64 = 21;
+    const EXPECTED_APPLIED_MIGRATIONS: i64 = 22;
 
     #[test]
     fn snapshot_preflight_rejects_malformed_database_without_replacing_it() {
@@ -7052,6 +7417,329 @@ mod tests {
         let after = read_customer_order(&conn, "order-local-1").expect("read order");
         assert_eq!(after["status"], "CANCELLED");
         assert_eq!(after["entity_version"], 5);
+        drop(conn);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A transfer takes the order off this branch's board and says where it went.
+    ///
+    /// A transfer from branch A to branch B writes **two** change-log rows carrying the same
+    /// entity_version: a TRANSFER_OUT scoped to A and an UPSERT scoped to B. A's devices only pull
+    /// rows matching A, so without the first row they would never be told the order had left, and
+    /// two branches would go on believing they owed the same customer a delivery.
+    ///
+    /// The soft delete is what releases the reserved stock: reservations are summed by
+    /// `reservedQuantityByProduct` over the orders the board loads, and the board loads
+    /// `deleted_at IS NULL`. The two transfer columns are what stop the order from looking as
+    /// though it had simply vanished — a counter told "cancelled" when the truth is "it is now
+    /// Ratanada's" rings the wrong customer.
+    #[test]
+    fn a_transferred_out_order_leaves_the_board_and_records_where_it_went() {
+        let path = order_sync_test_path("transfer-out");
+        initialize_at(&path).expect("initialize order transfer database");
+        seed_order_branch(&path, "3");
+
+        save_customer_order_at(
+            &path,
+            &serde_json::json!({
+                "id": "order-moving",
+                "order_no": "ORD-MOVING",
+                "customer_name": "Anita",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 6 }]
+            }),
+        )
+        .expect("the order is taken at this branch");
+
+        // Taken here and fulfilled here, which is every order until somebody moves one.
+        let before = order_row(&path, "order-moving");
+        assert_eq!(before["branch_id"], 3);
+        assert_eq!(before["taken_at_branch_id"], "3");
+        assert!(before["transferred_to_branch_id"].is_null());
+
+        let transfer = PulledChange {
+            change_id: serde_json::json!(9101),
+            branch_id: Some(3),
+            entity_type: "customer_order".to_string(),
+            entity_id: "order-moving".to_string(),
+            operation_type: "TRANSFER_OUT".to_string(),
+            version: Some(2),
+            updated_at: Some("2026-08-28T11:00:00.000Z".to_string()),
+            payload: serde_json::json!({
+                "id": "order-moving",
+                "order_no": "ORD-MOVING",
+                "customer_name": "Anita",
+                "status": "RECEIVED",
+                // The payload describes the order as it now is: fulfilled by branch 7, still taken
+                // at branch 3.
+                "branch_id": "7",
+                "transferred_to_branch_id": "7",
+                "taken_at_branch_id": "3",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 6 }]
+            }),
+        };
+        apply_pull_changes_at(
+            &path,
+            std::slice::from_ref(&transfer),
+            "cursor-transfer-1",
+            Some("FZDEV-ORDERS".to_string()),
+            Some("2026-08-28T11:01:00.000Z".to_string()),
+        )
+        .expect("a transfer out applies");
+
+        // Gone from the query the board actually runs, which is what releases the reservation.
+        let board = list_customer_orders_at(&path).expect("orders list");
+        assert!(
+            board["orders"]
+                .as_array()
+                .expect("orders array")
+                .iter()
+                .all(|order| order["id"] != "order-moving"),
+            "an order that has moved to another branch must not stay on this branch's board"
+        );
+
+        let conn = Connection::open(&path).expect("open after transfer");
+        let after = read_customer_order(&conn, "order-moving")
+            .expect("the row stays, so it can explain itself");
+        assert_eq!(
+            after["transferred_to_branch_id"], "7",
+            "the order did not vanish; it went somewhere, and the record says where"
+        );
+        assert_eq!(after["transferred_away_at"], "2026-08-28T11:00:00.000Z");
+        assert_eq!(
+            after["taken_at_branch_id"], "3",
+            "provenance is not rewritten by a transfer — this branch did answer the phone"
+        );
+        assert_eq!(
+            after["branch_id"], 3,
+            "and the row still says which branch lost it, rather than claiming to be branch 7's"
+        );
+        assert_eq!(after["entity_version"], 2);
+        assert_eq!(after["sync_status"], "synced");
+        assert!(after["sync_blocked_reason"].is_null());
+
+        let deleted_at: Option<String> = conn
+            .query_row(
+                "SELECT deleted_at FROM local_customer_orders WHERE id = 'order-moving'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read deleted_at");
+        assert!(
+            deleted_at.is_some(),
+            "the soft delete is what releases the reserved stock, so it has to be set"
+        );
+
+        // Nothing was invented or destroyed in the stock tables: the reservation was only ever
+        // derived from the orders this device holds.
+        let lots: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_inventory_lots", [], |row| row.get(0))
+            .expect("count lots");
+        let movements: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_stock_movements", [], |row| row.get(0))
+            .expect("count movements");
+        assert_eq!(lots, 0, "releasing a reservation is not a stock movement");
+        assert_eq!(movements, 0);
+        drop(conn);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A TRANSFER_OUT must never leave a live order behind.
+    ///
+    /// `apply_pulled_customer_order_with_tx` special-cases DELETE and treats **everything else** as
+    /// an upsert. Without an explicit TRANSFER_OUT arm the change falls through to that upsert and
+    /// re-inserts the order onto the very device it is supposed to be leaving — and since both
+    /// change rows of a transfer carry the same entity_version, the version guard does not catch it
+    /// either. This test is the one that fails if that arm is ever removed.
+    #[test]
+    fn a_transfer_out_is_not_an_upsert_and_leaves_no_live_order_behind() {
+        let path = order_sync_test_path("transfer-not-upsert");
+        initialize_at(&path).expect("initialize order transfer database");
+        seed_order_branch(&path, "3");
+
+        save_customer_order_at(
+            &path,
+            &serde_json::json!({
+                "id": "order-leaving",
+                "order_no": "ORD-LEAVING",
+                "customer_name": "Ram",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 2 }]
+            }),
+        )
+        .expect("the order is taken at this branch");
+
+        let transfer = PulledChange {
+            change_id: serde_json::json!(9102),
+            branch_id: Some(3),
+            entity_type: "customer_order".to_string(),
+            entity_id: "order-leaving".to_string(),
+            operation_type: "TRANSFER_OUT".to_string(),
+            version: Some(2),
+            updated_at: Some("2026-08-28T12:00:00.000Z".to_string()),
+            payload: serde_json::json!({
+                "id": "order-leaving",
+                "order_no": "ORD-LEAVING",
+                "customer_name": "Ram",
+                // Deliberately different from the local row on every field an upsert would copy, so
+                // that a fall-through is visible rather than merely suspected.
+                "status": "PACKED",
+                "branch_id": "7",
+                "transferred_to_branch_id": "7",
+                "taken_at_branch_id": "3",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 2 }]
+            }),
+        };
+        apply_pull_changes_at(
+            &path,
+            std::slice::from_ref(&transfer),
+            "cursor-transfer-2",
+            Some("FZDEV-ORDERS".to_string()),
+            Some("2026-08-28T12:01:00.000Z".to_string()),
+        )
+        .expect("a transfer out applies");
+
+        let conn = Connection::open(&path).expect("open after transfer");
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_customer_orders
+                  WHERE id = 'order-leaving' AND deleted_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count live rows");
+        assert_eq!(
+            live, 0,
+            "a TRANSFER_OUT treated as an upsert would re-insert the order it is meant to remove"
+        );
+        let (status, branch): (String, i64) = conn
+            .query_row(
+                "SELECT status, branch_id FROM local_customer_orders WHERE id = 'order-leaving'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read the row that stayed behind");
+        assert_eq!(status, "RECEIVED", "the payload's status is not applied by a transfer out");
+        assert_eq!(branch, 3, "nor is the destination branch written over the losing branch");
+        drop(conn);
+
+        // And a transfer out for an order this device never pulled creates nothing at all. There is
+        // no local copy to take away, and a tombstone would invent a record of an order this
+        // counter never saw.
+        let unknown = PulledChange {
+            change_id: serde_json::json!(9103),
+            entity_id: "order-never-here".to_string(),
+            version: Some(1),
+            ..transfer
+        };
+        apply_pull_changes_at(
+            &path,
+            std::slice::from_ref(&unknown),
+            "cursor-transfer-3",
+            Some("FZDEV-ORDERS".to_string()),
+            Some("2026-08-28T12:02:00.000Z".to_string()),
+        )
+        .expect("a transfer out for an unknown order is not an error");
+        let conn = Connection::open(&path).expect("open after unknown transfer");
+        let created: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_customer_orders WHERE id = 'order-never-here'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count invented rows");
+        assert_eq!(created, 0, "a transfer out must never create an order");
+        drop(conn);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// An older TRANSFER_OUT arriving late must not take away a newer local order.
+    ///
+    /// The version guard applies to a transfer exactly as it does to an upsert: a re-delivery, or a
+    /// device coming back from a long offline spell, must not remove an order from a board that has
+    /// since moved it on.
+    #[test]
+    fn an_older_transfer_out_does_not_undo_a_newer_local_change() {
+        let path = order_sync_test_path("transfer-stale");
+        initialize_at(&path).expect("initialize order transfer database");
+        seed_order_branch(&path, "3");
+
+        save_customer_order_at(
+            &path,
+            &serde_json::json!({
+                "id": "order-staying",
+                "order_no": "ORD-STAYING",
+                "customer_name": "Sita",
+                "items": [{ "product_id": "004", "product_name": "Apple", "quantity": 4 }]
+            }),
+        )
+        .expect("local order saves");
+        let packed =
+            set_customer_order_status_at(&path, "order-staying", "PACKED", &serde_json::json!({}))
+                .expect("local order packs");
+        assert_eq!(packed["entity_version"], 2);
+
+        let stale = PulledChange {
+            change_id: serde_json::json!(9104),
+            branch_id: Some(3),
+            entity_type: "customer_order".to_string(),
+            entity_id: "order-staying".to_string(),
+            operation_type: "TRANSFER_OUT".to_string(),
+            version: Some(1),
+            updated_at: Some("2026-08-27T08:00:00.000Z".to_string()),
+            payload: serde_json::json!({
+                "id": "order-staying",
+                "order_no": "ORD-STAYING",
+                "customer_name": "Sita",
+                "status": "RECEIVED",
+                "branch_id": "7",
+                "transferred_to_branch_id": "7",
+                "taken_at_branch_id": "3",
+                "items": []
+            }),
+        };
+        apply_pull_changes_at(
+            &path,
+            std::slice::from_ref(&stale),
+            "cursor-transfer-4",
+            Some("FZDEV-ORDERS".to_string()),
+            Some("2026-08-28T13:00:00.000Z".to_string()),
+        )
+        .expect("a stale transfer is skipped, not an error");
+
+        let still_there = order_row(&path, "order-staying");
+        assert_eq!(
+            still_there["status"], "PACKED",
+            "a stale transfer must not remove an order the branch has since packed"
+        );
+        assert_eq!(still_there["entity_version"], 2);
+        assert!(still_there["transferred_to_branch_id"].is_null());
+        assert!(still_there["transferred_away_at"].is_null());
+
+        // A genuinely newer transfer does take it away.
+        let current = PulledChange { version: Some(3), ..stale };
+        apply_pull_changes_at(
+            &path,
+            std::slice::from_ref(&current),
+            "cursor-transfer-5",
+            Some("FZDEV-ORDERS".to_string()),
+            Some("2026-08-28T13:01:00.000Z".to_string()),
+        )
+        .expect("a newer transfer applies");
+        let board = list_customer_orders_at(&path).expect("orders list");
+        assert!(
+            board["orders"]
+                .as_array()
+                .expect("orders array")
+                .iter()
+                .all(|order| order["id"] != "order-staying"),
+            "the current transfer does move the order off this board"
+        );
+        let conn = Connection::open(&path).expect("open after newer transfer");
+        let after = read_customer_order(&conn, "order-staying").expect("read order");
+        assert_eq!(after["transferred_to_branch_id"], "7");
+        assert_eq!(after["entity_version"], 3);
         drop(conn);
 
         let _ = fs::remove_file(&path);
@@ -8231,6 +8919,129 @@ mod tests {
         assert_eq!(migration_count, EXPECTED_APPLIED_MIGRATIONS);
         assert_eq!(marker, "keep-me");
         drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Migration 023 backfills provenance from the branch that was already on the row.
+    ///
+    /// Every order written before the split was typed in on a device at the branch that is handling
+    /// it — there was no way to move one — so `taken_at_branch_id := branch_id` is the true value
+    /// and not a guess. Leaving it NULL would claim we do not know where those orders were taken.
+    /// A row that never had a branch at all stays NULL, because that is the honest answer for it.
+    #[test]
+    fn migration_023_backfills_provenance_onto_orders_written_before_the_split() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-order-transfer-backfill-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+
+        // A profile at the schema this migration upgrades from: everything up to and including 022,
+        // and nothing after it.
+        let mut conn = Connection::open(&path).expect("open pre-023 database");
+        conn.execute_batch(
+            "CREATE TABLE local_schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                checksum TEXT NOT NULL,
+                status TEXT NOT NULL
+            );",
+        )
+        .expect("create migration table");
+        for (version, sql) in [
+            ("001_local_foundation", MIGRATION_001),
+            ("002_sync_engine_foundation", MIGRATION_002),
+            ("003_local_first_pos", MIGRATION_003),
+            ("004_offline_sale_edit_cancel", MIGRATION_004),
+            ("005_mandi_tax_sale_details", MIGRATION_005),
+            ("006_multibranch_identity_foundation", MIGRATION_006),
+            ("007_cloud_runtime_and_inbox_foundation", MIGRATION_007),
+            ("009_canonical_utc_timestamps", MIGRATION_009),
+            ("010_sync_delivery_state", MIGRATION_010),
+            ("011_connectivity_mode_audit", MIGRATION_011),
+            ("012_connectivity_mode_server_time", MIGRATION_012),
+            ("013_operational_location_foundation", MIGRATION_013),
+            ("014_offline_purchase_grn", MIGRATION_014),
+            ("015_supplier_reference_cache", MIGRATION_015),
+            ("016_purchase_aggregate_reconciliation", MIGRATION_016),
+            ("017_offline_entitlement_foundation", MIGRATION_017),
+            ("018_bootstrap_credential_consumption", MIGRATION_018),
+            ("019_provisional_lot_cost_status", MIGRATION_019),
+            ("020_customer_orders", MIGRATION_020),
+            ("021_customer_order_payment", MIGRATION_021),
+            ("022_customer_order_sync", MIGRATION_022),
+        ] {
+            apply_migration(&mut conn, version, sql).expect("apply pre-023 migration");
+        }
+        conn.execute(
+            "INSERT INTO local_customer_orders (id, order_no, customer_name, status, branch_id)
+             VALUES ('order-pre-023', 'ORD-PRE-023', 'Ram', 'RECEIVED', 4)",
+            [],
+        )
+        .expect("insert a pre-split order");
+        conn.execute(
+            "INSERT INTO local_customer_orders (id, order_no, customer_name, status)
+             VALUES ('order-pre-023-branchless', 'ORD-PRE-023-NB', 'Sita', 'RECEIVED')",
+            [],
+        )
+        .expect("insert a pre-split order that never resolved a branch");
+        drop(conn);
+
+        initialize_at(&path).expect("upgrade the pre-023 profile");
+
+        let conn = Connection::open(&path).expect("inspect the upgraded profile");
+        let migrations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_schema_migrations WHERE status = 'APPLIED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration count");
+        assert_eq!(migrations, EXPECTED_APPLIED_MIGRATIONS);
+
+        let (taken, branch): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT taken_at_branch_id, branch_id FROM local_customer_orders
+                  WHERE id = 'order-pre-023'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read the backfilled order");
+        // Text, not 4. `taken_at_branch_id` is TEXT and SQLite applies the target column's affinity
+        // on UPDATE, which is the shape the rest of the codebase and the wire use for a branch id.
+        assert_eq!(taken.as_deref(), Some("4"), "provenance is backfilled from the branch that was there");
+        assert_eq!(branch, 4, "and the fulfilment branch is left exactly as it was");
+
+        let branchless: Option<String> = conn
+            .query_row(
+                "SELECT taken_at_branch_id FROM local_customer_orders
+                  WHERE id = 'order-pre-023-branchless'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read the branchless order");
+        assert!(
+            branchless.is_none(),
+            "an order that never had a branch must not be given one by the backfill"
+        );
+        drop(conn);
+
+        // Forward-only and version-gated: a restart re-runs nothing and changes nothing. SQLite has
+        // no ADD COLUMN IF NOT EXISTS, so a second run of this file would fail outright — the gate
+        // in apply_migration() is what makes it idempotent.
+        initialize_at(&path).expect("restart with the upgraded profile");
+        let conn = Connection::open(&path).expect("inspect after restart");
+        let taken_again: Option<String> = conn
+            .query_row(
+                "SELECT taken_at_branch_id FROM local_customer_orders WHERE id = 'order-pre-023'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read after restart");
+        assert_eq!(taken_again.as_deref(), Some("4"));
+        drop(conn);
+
         let _ = fs::remove_file(&path);
     }
 
@@ -9836,6 +10647,429 @@ mod tests {
         }));
         assert!(duplicate.is_err());
 
+        let _ = fs::remove_file(&path);
+    }
+    // ---- Stock is scoped to the shop it is sitting in (docs/stock-distribution-decision.md) ----
+    //
+    // Ratanada holds 15 kg of apples and Main Branch holds 20. A cashier at Ratanada must bill
+    // against Ratanada's 15 and must never be able to reach Main Branch's crate: selling it makes
+    // both shops' counts wrong and prints the wrong shop on the bill, and the error is silent for
+    // days. These four tests cover the two places the device is responsible for — what the
+    // snapshot tells the frontend, and what the pull path lets onto the shelf.
+
+    fn seed_scoped_product(conn: &Connection, id: &str, name: &str) {
+        conn.execute(
+            "INSERT INTO local_products (id, product_name, unit, sale_rate, active)
+             VALUES (?1, ?2, 'KG', 100, 1)",
+            params![id, name],
+        )
+        .expect("seed product");
+    }
+
+    /// Written with SQL rather than through the pull path on purpose: the point of the snapshot
+    /// tests is a device that already holds several shops' lots, and the pull path now refuses to
+    /// create exactly that situation.
+    #[allow(clippy::too_many_arguments)]
+    fn seed_scoped_lot(
+        conn: &Connection,
+        id: &str,
+        product_id: &str,
+        branch: &str,
+        company: &str,
+        location: &str,
+        balance: f64,
+        status: &str,
+        deleted: bool,
+    ) {
+        conn.execute(
+            "INSERT INTO local_inventory_lots (
+                id, branch_id, company_id, operational_location_id, product_id, product_name,
+                lot_no, opening_date, opening_qty, balance_qty, cost_rate, status, deleted_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'Apples', ?1, '2026-08-01', ?6, ?6, 10, ?7, ?8)",
+            params![
+                id,
+                branch,
+                company,
+                location,
+                product_id,
+                balance,
+                status,
+                if deleted { Some("2026-08-02T00:00:00.000Z") } else { None },
+            ],
+        )
+        .expect("seed lot");
+    }
+
+    #[test]
+    fn snapshot_lots_carry_the_shop_they_are_sitting_in() {
+        // Before this, the SELECT behind `inventory_lots` listed eighteen columns and none of them
+        // was scope, so `branch_id`, `company_id` and `operational_location_id` never reached
+        // JavaScript at all. The frontend could not filter a cashier down to their own shop even
+        // if it wanted to — the fields were not in the objects it received. It only looked correct
+        // because there is one shop today.
+        let path = activation_temp_path("scoped-lot-snapshot");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-STOCK-SCOPE-1";
+        seed_device_assignment(&path, device, "1", "3", "loc-ratanada");
+
+        {
+            let conn = Connection::open(&path).expect("open scoped snapshot database");
+            seed_scoped_product(&conn, "product-apple", "Apples");
+            seed_scoped_lot(&conn, "lot-ratanada", "product-apple", "3", "1", "loc-ratanada", 15.0, "ACTIVE", false);
+            seed_scoped_lot(&conn, "lot-main", "product-apple", "4", "1", "loc-main", 20.0, "ACTIVE", false);
+        }
+
+        let snapshot = load_reference_snapshot_at(&path, None, Some(device)).expect("load snapshot");
+        let lots = snapshot["inventory_lots"].as_array().expect("lot list");
+
+        // Both shops' lots are still emitted. The snapshot's job is to make the filter possible,
+        // not to apply it: filtering here would decide for a caller that never asked, and would
+        // leave the product aggregate counting a universe the list does not show.
+        assert_eq!(lots.len(), 2);
+
+        for lot in lots {
+            for field in ["branch_id", "company_id", "operational_location_id"] {
+                assert!(
+                    lot.get(field).is_some_and(|value| !value.is_null()),
+                    "lot {:?} must carry {field}; a lot with no scope cannot be filtered to a shop \
+                     and would be billable from every counter",
+                    lot["id"],
+                );
+            }
+        }
+
+        let ratanada = lots.iter().find(|lot| lot["id"] == "lot-ratanada").expect("ratanada lot");
+        assert_eq!(ratanada["branch_id"], serde_json::json!("3"));
+        assert_eq!(ratanada["company_id"], serde_json::json!("1"));
+        assert_eq!(ratanada["operational_location_id"], serde_json::json!("loc-ratanada"));
+        assert_eq!(ratanada["remaining_qty"], serde_json::json!(15.0));
+
+        let main = lots.iter().find(|lot| lot["id"] == "lot-main").expect("main lot");
+        assert_eq!(main["branch_id"], serde_json::json!("4"));
+        assert_eq!(main["operational_location_id"], serde_json::json!("loc-main"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn product_aggregate_and_lot_list_agree_about_which_lots_exist() {
+        // The summary-vs-detail guard. `products.current_stock` and `product_stock_by_scope` are
+        // separate queries from the lot list, and CLAUDE.md's rule is that a panel's total and its
+        // table must be derived from the same filtered source or they will eventually disagree —
+        // and the disagreement will look like data loss rather than like a bug. This test is what
+        // catches the two predicates being edited apart.
+        let path = activation_temp_path("scoped-aggregate-agreement");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-STOCK-SCOPE-2";
+        seed_device_assignment(&path, device, "1", "3", "loc-ratanada");
+
+        {
+            let conn = Connection::open(&path).expect("open aggregate database");
+            seed_scoped_product(&conn, "product-apple", "Apples");
+            seed_scoped_lot(&conn, "lot-r1", "product-apple", "3", "1", "loc-ratanada", 15.0, "ACTIVE", false);
+            seed_scoped_lot(&conn, "lot-r2", "product-apple", "3", "1", "loc-ratanada", 5.0, "ACTIVE", false);
+            seed_scoped_lot(&conn, "lot-m1", "product-apple", "4", "1", "loc-main", 20.0, "ACTIVE", false);
+            // Cancelled: listed as a lot, excluded from both stock figures. Present so the two
+            // aggregates are checked against a rule the lot list does not itself apply.
+            seed_scoped_lot(&conn, "lot-cancelled", "product-apple", "3", "1", "loc-ratanada", 7.0, "CANCELLED", false);
+            // Deleted: must be invisible everywhere.
+            seed_scoped_lot(&conn, "lot-deleted", "product-apple", "3", "1", "loc-ratanada", 9.0, "ACTIVE", true);
+        }
+
+        let snapshot = load_reference_snapshot_at(&path, None, Some(device)).expect("load snapshot");
+        let lots = snapshot["inventory_lots"].as_array().expect("lot list");
+        let by_scope = snapshot["product_stock_by_scope"].as_array().expect("scoped aggregate");
+        let products = snapshot["products"].as_array().expect("product list");
+
+        let live_ids = lots.iter().map(|lot| lot["id"].as_str().unwrap().to_string()).collect::<std::collections::HashSet<_>>();
+        assert!(!live_ids.contains("lot-deleted"), "a deleted lot must not reach the list");
+        assert!(live_ids.contains("lot-cancelled"), "a cancelled lot is still a lot");
+        assert_eq!(live_ids.len(), 4);
+
+        // Rebuild the scoped aggregate from the detail rows, applying the one rule the aggregate
+        // adds, and require the two to be identical. If somebody changes what one of them counts,
+        // this is the assertion that fails instead of the Inventory tiles.
+        let mut expected: std::collections::BTreeMap<(String, String, String), (f64, i64)> =
+            std::collections::BTreeMap::new();
+        for lot in lots {
+            if lot["batch_status"].as_str().unwrap_or("ACTIVE").to_uppercase() == "CANCELLED" {
+                continue;
+            }
+            let key = (
+                lot["product_id"].as_str().unwrap().to_string(),
+                lot["branch_id"].as_str().unwrap().to_string(),
+                lot["operational_location_id"].as_str().unwrap().to_string(),
+            );
+            let entry = expected.entry(key).or_insert((0.0, 0));
+            entry.0 += lot["balance_qty"].as_f64().unwrap();
+            entry.1 += 1;
+        }
+
+        let mut emitted: std::collections::BTreeMap<(String, String, String), (f64, i64)> =
+            std::collections::BTreeMap::new();
+        for row in by_scope {
+            emitted.insert(
+                (
+                    row["product_id"].as_str().unwrap().to_string(),
+                    row["branch_id"].as_str().unwrap().to_string(),
+                    row["operational_location_id"].as_str().unwrap().to_string(),
+                ),
+                (row["current_stock"].as_f64().unwrap(), row["lot_count"].as_i64().unwrap()),
+            );
+        }
+        assert_eq!(emitted, expected);
+        assert_eq!(
+            emitted.get(&("product-apple".into(), "3".into(), "loc-ratanada".into())),
+            Some(&(20.0, 2)),
+            "Ratanada's own shelf, and nothing of Main Branch's"
+        );
+
+        // And the unscoped product total is the sum of the scoped ones — the same rows again, so a
+        // caller that reads either one is reading the same fruit.
+        let product = products.iter().find(|row| row["id"] == "product-apple").expect("product row");
+        let scoped_total: f64 = by_scope.iter().map(|row| row["current_stock"].as_f64().unwrap()).sum();
+        let scoped_lots: i64 = by_scope.iter().map(|row| row["lot_count"].as_i64().unwrap()).sum();
+        assert_eq!(product["current_stock"].as_f64().unwrap(), scoped_total);
+        assert_eq!(product["lot_count"].as_i64().unwrap(), scoped_lots);
+        assert_eq!(scoped_total, 40.0);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_pulled_lot_from_another_shop_is_refused_and_the_rest_of_the_pull_lands() {
+        // The bootstrap path has always refused an `inventory_lot` outside the device's canonical
+        // scope. The incremental path — the one every pull after the first one takes — applied
+        // whatever arrived, so the rule held only until the device pulled again. What is asserted
+        // here is both halves: the foreign lot is not live, and the honest changes travelling with
+        // it in the same page still applied and the cursor still advanced.
+        let path = activation_temp_path("scoped-pull-refusal");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-STOCK-SCOPE-3";
+        seed_device_assignment(&path, device, "1", "3", "loc-ratanada");
+        {
+            let conn = Connection::open(&path).expect("open refusal database");
+            seed_scoped_product(&conn, "product-apple", "Apples");
+        }
+
+        let foreign_payload = PulledChange {
+            change_id: serde_json::json!(101),
+            branch_id: Some(4),
+            entity_type: "inventory_lot".to_string(),
+            entity_id: "lot-main-branch".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            payload: serde_json::json!({
+                "branch_id": 4,
+                "company_id": 1,
+                "operational_location_id": "loc-main",
+                "product_global_id": "product-apple",
+                "product_name": "Apples",
+                "purchase_qty": 20,
+                "remaining_qty": 20,
+                "batch_status": "ACTIVE"
+            }),
+            updated_at: Some("2026-08-30T10:00:00.000Z".to_string()),
+        };
+        // Scope stated only on the envelope. The applier falls back to it and stamps it on the row,
+        // so a guard that read the payload alone would wave this one through onto the shelf.
+        let foreign_envelope = PulledChange {
+            change_id: serde_json::json!(102),
+            branch_id: Some(4),
+            entity_type: "inventory_lot".to_string(),
+            entity_id: "lot-envelope-only".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            payload: serde_json::json!({
+                "product_global_id": "product-apple",
+                "product_name": "Apples",
+                "purchase_qty": 6,
+                "remaining_qty": 6,
+                "batch_status": "ACTIVE"
+            }),
+            updated_at: Some("2026-08-30T10:00:01.000Z".to_string()),
+        };
+        // Same page, nothing wrong with it. A hard `Err` on the lots above would have discarded
+        // this and wedged the cursor behind them for ever.
+        let innocent = PulledChange {
+            change_id: serde_json::json!(103),
+            branch_id: Some(3),
+            entity_type: "product".to_string(),
+            entity_id: "product-banana".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            payload: serde_json::json!({
+                "branch_id": 3,
+                "product_name": "Bananas",
+                "unit": "KG",
+                "selling_rate": 40,
+                "active": true
+            }),
+            updated_at: Some("2026-08-30T10:00:02.000Z".to_string()),
+        };
+
+        apply_pull_changes_at(
+            &path,
+            &[foreign_payload, foreign_envelope, innocent],
+            "103",
+            Some(device.to_string()),
+            Some("2026-08-30T10:00:03.000Z".to_string()),
+        )
+        .expect("a foreign lot must not fail the page");
+
+        let conn = Connection::open(&path).expect("inspect refusal database");
+        // Not "soft-deleted", not "applied with a corrected branch" — not present at all. A row
+        // that reached the table would be sellable from this counter.
+        let foreign_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_inventory_lots WHERE id IN ('lot-main-branch', 'lot-envelope-only')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count foreign lots");
+        assert_eq!(foreign_rows, 0, "another shop's stock must never reach this device's lots");
+
+        // Refused loudly: countable, readable, and replayable rather than dropped.
+        let refusals: Vec<(String, String)> = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT entity_id, reason FROM local_unapplied_changes
+                      WHERE entity_type = 'inventory_lot' ORDER BY entity_id",
+                )
+                .expect("prepare refusals");
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query refusals")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect refusals")
+        };
+        assert_eq!(
+            refusals,
+            vec![
+                ("lot-envelope-only".to_string(), "INVENTORY_LOT_OUTSIDE_DEVICE_SCOPE".to_string()),
+                ("lot-main-branch".to_string(), "INVENTORY_LOT_OUTSIDE_DEVICE_SCOPE".to_string()),
+            ]
+        );
+        let detail: String = conn
+            .query_row(
+                "SELECT detail FROM local_unapplied_changes WHERE entity_id = 'lot-main-branch'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("refusal detail");
+        assert!(detail.contains("branch"), "the reason has to name what was wrong: {detail}");
+
+        // The rest of the page landed, and the cursor moved, so the next pull does not re-offer it.
+        let banana: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_products WHERE id = 'product-banana'", [], |row| row.get(0))
+            .expect("count innocent product");
+        assert_eq!(banana, 1);
+        let cursor: String = conn
+            .query_row(
+                "SELECT last_pull_cursor FROM sync_state WHERE device_id = ?1",
+                params![device],
+                |row| row.get(0),
+            )
+            .expect("read cursor");
+        assert_eq!(cursor, "103");
+
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_pulled_lot_for_this_shop_still_applies() {
+        // Without this, a suite passes by refusing everything, and a counter that can sell nothing
+        // is not a fix. Three shapes that must all still go through: the device's own branch and
+        // location stated in full; scope stated only on the envelope and matching; and a payload
+        // that states no scope at all, which is an older server rather than a foreign shop.
+        let path = activation_temp_path("scoped-pull-accepts-own");
+        let _ = fs::remove_file(&path);
+        let device = "FZDEV-STOCK-SCOPE-4";
+        seed_device_assignment(&path, device, "1", "3", "loc-ratanada");
+        {
+            let conn = Connection::open(&path).expect("open accept database");
+            seed_scoped_product(&conn, "product-apple", "Apples");
+        }
+
+        let make_lot = |change_id: i64, id: &str, payload: serde_json::Value, envelope_branch: Option<i64>| PulledChange {
+            change_id: serde_json::json!(change_id),
+            branch_id: envelope_branch,
+            entity_type: "inventory_lot".to_string(),
+            entity_id: id.to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            payload,
+            updated_at: Some("2026-08-30T11:00:00.000Z".to_string()),
+        };
+
+        let changes = vec![
+            make_lot(
+                201,
+                "lot-own-full",
+                serde_json::json!({
+                    "branch_id": 3,
+                    "company_id": 1,
+                    "operational_location_id": "loc-ratanada",
+                    "product_global_id": "product-apple",
+                    "product_name": "Apples",
+                    "purchase_qty": 15,
+                    "remaining_qty": 15,
+                    "batch_status": "ACTIVE"
+                }),
+                Some(3),
+            ),
+            make_lot(
+                202,
+                "lot-own-envelope",
+                serde_json::json!({
+                    "product_global_id": "product-apple",
+                    "product_name": "Apples",
+                    "purchase_qty": 4,
+                    "remaining_qty": 4,
+                    "batch_status": "ACTIVE"
+                }),
+                Some(3),
+            ),
+            make_lot(
+                203,
+                "lot-no-scope-stated",
+                serde_json::json!({
+                    "product_global_id": "product-apple",
+                    "product_name": "Apples",
+                    "purchase_qty": 2,
+                    "remaining_qty": 2,
+                    "batch_status": "ACTIVE"
+                }),
+                None,
+            ),
+        ];
+
+        apply_pull_changes_at(
+            &path,
+            &changes,
+            "203",
+            Some(device.to_string()),
+            Some("2026-08-30T11:00:01.000Z".to_string()),
+        )
+        .expect("this device's own stock must apply");
+
+        let conn = Connection::open(&path).expect("inspect accept database");
+        let (live, balance): (i64, f64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(balance_qty), 0) FROM local_inventory_lots WHERE deleted_at IS NULL",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("count applied lots");
+        assert_eq!(live, 3);
+        assert_eq!(balance, 21.0);
+        let refused: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_unapplied_changes", [], |row| row.get(0))
+            .expect("count refusals");
+        assert_eq!(refused, 0, "nothing here is foreign, so nothing may be refused");
+
+        drop(conn);
         let _ = fs::remove_file(&path);
     }
 }

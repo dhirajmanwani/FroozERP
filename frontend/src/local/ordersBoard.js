@@ -11,6 +11,7 @@
  * that the app's buttons are suggestions. Every action listed here is one the lifecycle will accept.
  */
 
+import { canonicalInventoryId } from "./stockInventory.js";
 import {
   ORDER_STATUS,
   RESERVATION_STATE,
@@ -167,4 +168,93 @@ export const validateOrderAction = ({ order, to, carrier = "", reason = "" } = {
     return { ok: false, message: "Give a reason for cancelling, so the customer can be told why." };
   }
   return { ok: true, message: "" };
+};
+
+export const ORDER_QUEUE_STATUS = Object.freeze({
+  READY: "READY",
+  LOADING: "LOADING",
+  ERROR: "ERROR",
+  NOT_PERMITTED: "NOT_PERMITTED",
+});
+
+/**
+ * Orders that arrived with no shop attached, and what to say when there are none.
+ *
+ * A website order or a WhatsApp to the company number has nobody handling it yet.
+ * `docs/order-routing-decision.md` rules that such an order never reaches a counter -- it waits in
+ * the cloud until a person decides -- so this list is a read over the API and is empty on every
+ * device that is not entitled to see it.
+ *
+ * The three empties are kept apart, which is the CLAUDE.md rule wearing this screen's clothes.
+ * "Nobody is waiting", "you may not look" and "the list would not load" all produce no rows, and a
+ * screen that renders them identically tells an Owner there is nothing to hand out when in fact
+ * nothing could be checked -- while a customer waits for a delivery nobody has been given.
+ */
+export const resolveUnassignedQueue = ({
+  orders = [],
+  loadState = "loaded",
+  loadError = "",
+  permitted = true,
+} = {}) => {
+  const base = { orders: [], countLabel: "0", message: "" };
+  if (!permitted) {
+    return {
+      ...base,
+      status: ORDER_QUEUE_STATUS.NOT_PERMITTED,
+      // Not "0". A cashier seeing zero would reasonably conclude nothing is waiting.
+      countLabel: "",
+      message: "",
+    };
+  }
+  if (loadState === "loading" || loadState === "idle") {
+    return { ...base, status: ORDER_QUEUE_STATUS.LOADING, countLabel: "...", message: "" };
+  }
+  if (loadError) {
+    return {
+      ...base,
+      status: ORDER_QUEUE_STATUS.ERROR,
+      countLabel: "Unavailable",
+      message: loadError,
+    };
+  }
+
+  const rows = (Array.isArray(orders) ? orders : []).map((order) => ({
+    id: canonicalInventoryId(order?.global_id ?? order?.id),
+    orderNo: String(order?.order_no ?? "").trim() || "(no number)",
+    customerName: String(order?.customer_name ?? "").trim() || "Unnamed customer",
+    customerMobile: String(order?.customer_mobile ?? "").trim(),
+    deliveryAddress: String(order?.delivery_address ?? "").trim(),
+    source: String(order?.source ?? "").trim().toUpperCase() || "OTHER",
+    takenAtBranchName: String(order?.taken_at_branch_name ?? "").trim(),
+    items: Array.isArray(order?.items) ? order.items : [],
+    createdAt: order?.created_at ?? null,
+  }));
+
+  return {
+    status: ORDER_QUEUE_STATUS.READY,
+    orders: rows,
+    countLabel: String(rows.length),
+    // A real zero is a real answer here, and a good one: nobody is waiting.
+    message: rows.length === 0 ? "No orders are waiting to be given to a shop." : "",
+  };
+};
+
+/**
+ * Is this a shop this order can be handed to?
+ *
+ * Deliberately thin. The server re-checks the branch belongs to the company, is active, and has a
+ * counter that can actually receive the order -- this exists so a person is told before the round
+ * trip, not instead of it.
+ */
+export const validateOrderAssignment = ({ orderId, branchId, currentBranchId } = {}) => {
+  const problems = [];
+  if (canonicalInventoryId(orderId) === "") problems.push("Choose an order.");
+  if (canonicalInventoryId(branchId) === "") problems.push("Choose the shop that will handle it.");
+  if (
+    canonicalInventoryId(branchId) !== ""
+    && canonicalInventoryId(branchId) === canonicalInventoryId(currentBranchId)
+  ) {
+    problems.push("That shop is already handling this order.");
+  }
+  return { ok: problems.length === 0, problems };
 };

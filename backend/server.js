@@ -2071,6 +2071,31 @@ const initializeDatabase = async () => {
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS transfer_out_qty NUMERIC(14, 3) DEFAULT 0;
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS returned_qty NUMERIC(14, 3) DEFAULT 0;
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS waste_qty NUMERIC(14, 3) DEFAULT 0;
+    -- Operational-location scope. Mirrors migrations/cloud/009_operational_location_foundation.sql,
+    -- which is the only other place these two columns are ever created.
+    --
+    -- syncReferenceBootstrap.js filters lots on company_id, branch_id AND operational_location_id.
+    -- A database bootstrapped by server startup alone had neither of the outer two columns, so the
+    -- protocol could not serve its own bootstrap: the pull failed with an undefined-column error
+    -- rather than returning an empty snapshot, which is at least loud, but it happened on the first
+    -- sync of a fresh deployment.
+    --
+    -- Both startup paths must carry these. ensureProductEntrySchema also runs
+    -- CREATE TABLE IF NOT EXISTS inventory_batches, so whichever of the two runs first defines the
+    -- table and the other one is a no-op on the table itself; only the ALTERs still apply. Adding
+    -- the columns to one path and not the other leaves the outcome depending on call order.
+    -- schemaLocationScope.test.js asserts both paths, for exactly that reason.
+    --
+    -- Deliberately without the REFERENCES clauses that migration 009 carries. companies and
+    -- operational_locations are created by migrations 006 and 009 and by nothing at startup, so a
+    -- foreign key here would abort the whole bootstrap transaction on the fresh database this is
+    -- meant to repair. Migration 009 stays the owner of the constraints; startup only guarantees
+    -- the columns exist. ai_settings.company_id above is bare for the same reason.
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS company_id INTEGER;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS operational_location_id INTEGER;
+    CREATE INDEX IF NOT EXISTS inventory_batches_location_fifo_idx
+      ON inventory_batches(company_id, branch_id, operational_location_id, product_id, purchase_date, created_at, id)
+      WHERE remaining_qty > 0;
     UPDATE inventory_batches SET batch_status = 'ACTIVE' WHERE batch_status IS NULL;
     UPDATE inventory_batches SET effective_cost_per_unit = purchase_rate WHERE effective_cost_per_unit IS NULL;
     UPDATE purchase_items pi
@@ -2758,6 +2783,31 @@ const initializeDatabase = async () => {
       ON customer_orders (branch_id, reserved_at, created_at)
       WHERE status IN ('RECEIVED', 'PACKED') AND deleted_at IS NULL;
 
+    -- One field was doing two jobs. See docs/order-routing-decision.md: an order has a branch that
+    -- *took* it and a branch that is *fulfilling* it, and conflating them is why an order could
+    -- never be moved. "branch_id" keeps its name and becomes the fulfilment branch -- because
+    -- "logSyncChange" and the pull predicate both scope by that column, so fulfilment living there
+    -- is what makes a transfer an ordinary field change instead of a new transport.
+    ALTER TABLE customer_orders ADD COLUMN IF NOT EXISTS taken_at_branch_id INTEGER REFERENCES branches(id);
+
+    -- Provenance for every row written before the split. Not a guess: an order could only be typed
+    -- in on a device at the branch that was handling it, so for existing rows the two genuinely
+    -- coincide.
+    UPDATE customer_orders SET taken_at_branch_id = branch_id
+     WHERE taken_at_branch_id IS NULL AND branch_id IS NOT NULL;
+
+    -- An unassigned order -- a website order, a WhatsApp to the company number -- has no fulfilment
+    -- branch yet. "NOT NULL DEFAULT 1" answered that question by inventing branch 1, which is
+    -- exactly the confusion the routing decision exists to prevent. A NULL that admits there is no
+    -- answer is safer than a default that fabricates one, and it is also what keeps unassigned
+    -- orders off the sync road for free: "logSyncChange" already throws without a branch id.
+    ALTER TABLE customer_orders ALTER COLUMN branch_id DROP NOT NULL;
+    ALTER TABLE customer_orders ALTER COLUMN branch_id DROP DEFAULT;
+
+    CREATE INDEX IF NOT EXISTS customer_orders_unassigned_idx
+      ON customer_orders (company_id, created_at)
+      WHERE branch_id IS NULL AND deleted_at IS NULL;
+
     CREATE TABLE IF NOT EXISTS customer_order_items (
       id BIGSERIAL PRIMARY KEY,
       order_global_id VARCHAR(180) NOT NULL REFERENCES customer_orders(global_id) ON DELETE CASCADE,
@@ -3149,6 +3199,18 @@ const initializeDatabase = async () => {
     VALUES (1, '${backupDirectory.replace(/'/g, "''")}')
     ON CONFLICT (id) DO NOTHING;
 
+    -- The default branch is seeded here, before anything references it.
+    --
+    -- It used to sit 143 lines below "ai_settings", which carries a foreign key to "branches(id)"
+    -- and inserts "branch_id = 1". On any database that already has a branch 1 -- which is every
+    -- database anybody has ever run this against -- the order does not matter and nothing fails.
+    -- On a genuinely fresh one the bootstrap aborts on a foreign key violation, so a new cloud
+    -- database could not be created at all. Found by running this path against an empty Postgres
+    -- rather than by reading it.
+    INSERT INTO branches (id, branch_name, location)
+    VALUES (1, 'Main Branch', 'Primary Store')
+    ON CONFLICT (id) DO NOTHING;
+
     INSERT INTO ai_settings (id, company_id, branch_id, thresholds, ai_provider_enabled)
     VALUES (
       1,
@@ -3291,10 +3353,6 @@ const initializeDatabase = async () => {
       OR COALESCE(permissions -> 'supplier_accounts', 'false'::jsonb) = 'true'::jsonb
     ))
     WHERE NOT (permissions ? 'customer_accounts');
-
-    INSERT INTO branches (id, branch_name, location)
-    VALUES (1, 'Main Branch', 'Primary Store')
-    ON CONFLICT (id) DO NOTHING;
 
     INSERT INTO counters (id, branch_id, counter_name, counter_type, active)
     VALUES
@@ -8745,6 +8803,40 @@ const requireSyncContext = async ({ userId, deviceId, branchId, operationalLocat
   if (!userCompanyId || !branchCompanyId || userCompanyId !== branchCompanyId || deviceCompanyId !== branchCompanyId) {
     return { error: { status: 403, message: "Company or branch scope does not match this device" } };
   }
+  /**
+   * The device's operational location, for read filtering outside ENFORCE.
+   *
+   * `operationalLocationId` below is `null` in every non-ENFORCE request and must stay that way:
+   * it is the canonical, write-authorising scope, and it is only canonical when
+   * `createOperationalScopeService` has proved the user and the device share an approved
+   * assignment. This is a weaker, separate thing — where the device says it sits — and it exists
+   * so a *read* can be narrowed without pretending to authority the legacy path never established.
+   *
+   * `device_assignments` is created by migration 009 and by nothing at startup, but `/login`
+   * already queries it unconditionally on this same path, so a database that cannot answer this
+   * cannot sign anyone in either. Same ordering as `/login`, so both agree on which assignment is
+   * current when a device has been reassigned.
+   *
+   * Not read under ENFORCE, where `operationalLocationId` below is the canonical answer and this
+   * would only be a second location value able to disagree with it. Left NULL there rather than
+   * carrying both.
+   */
+  const deviceLocationResult = operationalScopeMode === SCOPE_MODES.ENFORCE
+    ? { rows: [] }
+    : await client.query(
+      `
+      SELECT da.operational_location_id
+      FROM device_assignments da
+      WHERE da.device_id = $1
+        AND da.active = TRUE
+        AND da.company_id = $2
+        AND da.branch_id = $3
+        AND da.operational_location_id IS NOT NULL
+      ORDER BY da.assignment_generation DESC, da.id DESC
+      LIMIT 1
+      `,
+      [cleanDeviceId, branchCompanyId, parsedBranchId]
+    );
   const legacyContext = {
     user,
     device,
@@ -8753,6 +8845,7 @@ const requireSyncContext = async ({ userId, deviceId, branchId, operationalLocat
     branchId: parsedBranchId,
     deviceId: cleanDeviceId,
     operationalLocationId: null,
+    deviceLocationId: parsePositiveInteger(deviceLocationResult.rows[0]?.operational_location_id),
     assignmentGeneration: null,
   };
   if (operationalScopeMode !== SCOPE_MODES.ENFORCE) return legacyContext;
@@ -9930,12 +10023,35 @@ const processCustomerOrderOperation = async (client, operation, context) => {
     // Company and branch ids are integers everywhere in this schema - unlike entity ids, they are
     // genuinely numbers, so comparing them as numbers is correct here and nowhere near the ids.
     const sameCompany = Number(current.company_id || 0) === Number(companyId || 0);
-    const sameBranch = Number(current.branch_id || 0) === branchId;
-    if (!sameCompany || !sameBranch) {
+    if (!sameCompany) {
       return rejectOperation(
         operation,
         "CONFLICT",
-        "Customer order id already exists in another company or branch"
+        "Customer order id already exists in another company"
+      );
+    }
+    // Since orders became transferable, "this order is not yours" has three distinct causes, and
+    // they are worth telling apart because only one of them is a fault. A device is refused in all
+    // three cases either way - the check itself has not been loosened.
+    const currentBranchId = parsePositiveInteger(current.branch_id);
+    if (!currentBranchId) {
+      // Unassigned. It lives in the cloud and has never been sent to a counter, so a device holding
+      // a copy to push is not something that should be able to happen at all.
+      return rejectOperation(
+        operation,
+        "CONFLICT",
+        "Customer order is unassigned and is not held by any branch"
+      );
+    }
+    if (currentBranchId !== branchId) {
+      // The ordinary race: this branch edited the order at about the moment somebody moved it
+      // elsewhere. The device will be told the order has left on its next pull, by the TRANSFER_OUT
+      // row written for it, so this refusal is the correct end of the story and not a lost edit to
+      // chase.
+      return rejectOperation(
+        operation,
+        "CONFLICT",
+        "Customer order is now being fulfilled by another branch"
       );
     }
     if (Number(current.entity_version || 0) >= incomingVersion) {
@@ -9961,7 +10077,8 @@ const processCustomerOrderOperation = async (client, operation, context) => {
   const upserted = await client.query(
     `
     INSERT INTO customer_orders (
-      global_id, order_no, source, company_id, branch_id, operational_location_id,
+      global_id, order_no, source, company_id, branch_id, taken_at_branch_id,
+      operational_location_id,
       assignment_generation, customer_id, customer_name, customer_mobile, delivery_address,
       status, reserved_at, packed_at, sent_at, delivered_at, cancelled_at, cancellation_reason,
       carrier, carrier_reference, tracking_url, carrier_contact, sale_global_id, invoice_no,
@@ -9969,7 +10086,7 @@ const processCustomerOrderOperation = async (client, operation, context) => {
       deleted_at, updated_at
     )
     VALUES (
-      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
+      $1,$2,$3,$4,$5,$32,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
       $25,$26,$27,$28,$29,$30,$31, CURRENT_TIMESTAMP
     )
     ON CONFLICT (global_id) DO UPDATE SET
@@ -9977,6 +10094,10 @@ const processCustomerOrderOperation = async (client, operation, context) => {
       source = EXCLUDED.source,
       company_id = EXCLUDED.company_id,
       branch_id = EXCLUDED.branch_id,
+      -- Provenance is written once and never rewritten. A device pushing an order it has been
+      -- given by a transfer would otherwise overwrite "who took this" with "who is holding it
+      -- now", which is the one fact the split exists to keep.
+      taken_at_branch_id = COALESCE(customer_orders.taken_at_branch_id, EXCLUDED.taken_at_branch_id),
       operational_location_id = EXCLUDED.operational_location_id,
       assignment_generation = EXCLUDED.assignment_generation,
       customer_id = EXCLUDED.customer_id,
@@ -10038,6 +10159,10 @@ const processCustomerOrderOperation = async (client, operation, context) => {
       timestamps.created_at,
       timestamps.updated_at,
       timestamps.deleted_at,
+      // $32. A device that types an order in both took it and is fulfilling it, so the two agree on
+      // creation. The payload may still carry a value - an order the device received by transfer
+      // and later edited - and that one is the truthful provenance, so it wins over the session.
+      parsePositiveInteger(payload.taken_at_branch_id) || branchId,
     ]
   );
   const row = upserted.rows[0];
@@ -10116,6 +10241,247 @@ const processCustomerOrderOperation = async (client, operation, context) => {
       entity_version: Number(row.entity_version || incomingVersion),
       duplicate: false,
     },
+  };
+};
+
+/**
+ * The operational location a change for this branch must be scoped to.
+ *
+ * The pull predicate is `branch_id = $2 AND operational_location_id = $3` -- an exact match on
+ * both. A change row written with the wrong location, or with none, is invisible to every device
+ * at the branch it was meant for: it sits in the log forever and nothing reports it, which is the
+ * silent-loss shape this codebase keeps having to design against. So a transfer resolves the
+ * destination's location *before* it writes anything, and refuses if it cannot.
+ *
+ * Returns the branch's default operational location id, or null when the branch has none.
+ */
+const resolveBranchDefaultLocationId = async (client, { companyId, branchId }) => {
+  const result = await client.query(
+    `
+    SELECT id
+    FROM operational_locations
+    WHERE company_id = $1 AND branch_id = $2 AND active = TRUE
+    ORDER BY is_default DESC, id
+    LIMIT 1
+    `,
+    [companyId, branchId]
+  );
+  return parsePositiveInteger(result.rows[0]?.id) || null;
+};
+
+const ORDER_TRANSFER_CLOSED_STATUSES = new Set(["DELIVERED", "CANCELLED", "RETURNED"]);
+
+/**
+ * Move a customer order to another branch, or assign an unassigned one for the first time.
+ *
+ * See `docs/order-routing-decision.md`. The rule this function exists to satisfy, and the one thing
+ * that must not be simplified away:
+ *
+ *   **A transfer writes two change-log rows.** `TRANSFER_OUT` scoped to the branch losing the
+ *   order, `UPSERT` scoped to the branch gaining it, both carrying the same entity_version, both in
+ *   the same transaction as the UPDATE.
+ *
+ * One row is a bug with a specific and expensive shape: the losing branch's devices have already
+ * pulled the order, they only pull rows scoped to themselves, and so they would never be told it
+ * left. The order would sit on their board as open work for ever, and two branches would each
+ * believe they owed the same customer a delivery -- which is precisely the confusion the routing
+ * decision was written to prevent.
+ *
+ * An assignment is the same operation with nobody to tell: there is no old branch, so it writes one
+ * row rather than two.
+ *
+ * The caller supplies the transaction. Nothing here commits, so the two rows and the UPDATE stand
+ * or fall together; there is no instant at which one exists without the other.
+ *
+ * @returns {{ok: true, order: object, movedFrom: number|null, movedTo: number, changes: object[]}}
+ *          or {{ok: false, code: string, message: string}} -- a refusal, never a throw, so the
+ *          route can turn it into a status code and the caller can be told why in a sentence.
+ */
+const transferCustomerOrderBranch = async (client, {
+  orderGlobalId,
+  companyId,
+  toBranchId,
+  actorUserId = null,
+  note = "",
+} = {}) => {
+  const orderId = cleanText(orderGlobalId);
+  const company = parsePositiveInteger(companyId);
+  const destination = parsePositiveInteger(toBranchId);
+  if (!orderId) {
+    return { ok: false, code: "VALIDATION_ERROR", message: "An order id is required" };
+  }
+  if (!company) {
+    return { ok: false, code: "VALIDATION_ERROR", message: "A company is required" };
+  }
+  if (!destination) {
+    return { ok: false, code: "VALIDATION_ERROR", message: "Choose the branch that will handle this order" };
+  }
+
+  const existing = await client.query(
+    `
+    SELECT global_id, order_no, company_id, branch_id, taken_at_branch_id, operational_location_id,
+           status, entity_version, deleted_at
+    FROM customer_orders
+    WHERE global_id = $1
+    FOR UPDATE
+    `,
+    [orderId]
+  );
+  const order = existing.rows[0];
+  if (!order) {
+    return { ok: false, code: "NOT_FOUND", message: "That order no longer exists" };
+  }
+  if (Number(order.company_id || 0) !== company) {
+    // Deliberately the same answer as a missing order. Confirming that an id exists in someone
+    // else's company is itself a disclosure.
+    return { ok: false, code: "NOT_FOUND", message: "That order no longer exists" };
+  }
+  if (order.deleted_at) {
+    return { ok: false, code: "CONFLICT", message: "That order has been deleted and cannot be moved" };
+  }
+
+  const status = String(order.status || "").toUpperCase();
+  if (ORDER_TRANSFER_CLOSED_STATUSES.has(status)) {
+    // Moving a finished order would hand the new branch a delivery that has already happened, and
+    // the reservation arithmetic would reserve stock for it on arrival.
+    return {
+      ok: false,
+      code: "CONFLICT",
+      message: `This order is already ${status.toLowerCase()}, so there is nothing left to hand over`,
+    };
+  }
+
+  const origin = parsePositiveInteger(order.branch_id);
+  if (origin === destination) {
+    return {
+      ok: false,
+      code: "NO_CHANGE",
+      message: "That branch is already handling this order",
+    };
+  }
+
+  const destinationBranch = await client.query(
+    "SELECT id, branch_name, company_id, active FROM branches WHERE id = $1 LIMIT 1",
+    [destination]
+  );
+  const branch = destinationBranch.rows[0];
+  if (!branch || Number(branch.company_id || 0) !== company) {
+    return { ok: false, code: "NOT_FOUND", message: "That branch is not part of this business" };
+  }
+  if (branch.active === false) {
+    return { ok: false, code: "CONFLICT", message: `${branch.branch_name || "That branch"} is closed` };
+  }
+
+  const destinationLocationId = await resolveBranchDefaultLocationId(client, {
+    companyId: company,
+    branchId: destination,
+  });
+  if (!destinationLocationId) {
+    // Refused rather than written. A change row scoped to a location that does not exist is pulled
+    // by nobody: the order would leave the old branch's board and never appear on the new one, and
+    // no error would be raised anywhere. Better to say so now, while somebody is looking at it.
+    return {
+      ok: false,
+      code: "DESTINATION_UNREACHABLE",
+      message: `${branch.branch_name || "That branch"} has no active counter set up yet, so an order sent `
+        + "there would not reach any device. Set up its counter first.",
+    };
+  }
+
+  // The location the *losing* branch's devices pull on. The order's own is the truthful one; a row
+  // written before operational locations existed may not have one, and then the branch's default is
+  // the only answer available. If neither resolves, the removal cannot be delivered -- and that has
+  // to be a refusal too, because completing the move would leave the order open on the old board
+  // for ever, which is the exact failure this whole design is built around.
+  let originLocationId = null;
+  if (origin) {
+    originLocationId = parsePositiveInteger(order.operational_location_id)
+      || (await resolveBranchDefaultLocationId(client, { companyId: company, branchId: origin }));
+    if (!originLocationId) {
+      return {
+        ok: false,
+        code: "ORIGIN_UNREACHABLE",
+        message: "The branch currently holding this order has no active counter, so it cannot be "
+          + "told the order has moved. Sort that out first, or the order would stay open on both.",
+      };
+    }
+  }
+
+  const nextVersion = Number(order.entity_version || 1) + 1;
+  const updated = await client.query(
+    `
+    UPDATE customer_orders
+       SET branch_id = $2,
+           operational_location_id = $3,
+           -- The old branch's device assignment generation has no meaning at the new branch, and
+           -- leaving it would attach a stale scope to every future change for this order.
+           assignment_generation = NULL,
+           entity_version = $4,
+           updated_at = CURRENT_TIMESTAMP
+     WHERE global_id = $1
+    RETURNING *
+    `,
+    [orderId, destination, destinationLocationId, nextVersion]
+  );
+  const row = updated.rows[0];
+
+  const itemsResult = await client.query(
+    `
+    SELECT global_id, line_index, product_global_id, product_name, unit, quantity, agreed_rate,
+           line_amount, inventory_lot_global_id
+    FROM customer_order_items
+    WHERE order_global_id = $1
+    ORDER BY line_index
+    `,
+    [orderId]
+  );
+  const items = itemsResult.rows;
+
+  const changes = [];
+
+  if (origin) {
+    // Row one of two. Written first on purpose: if anything below were ever to fail, the failure
+    // that leaves an order on nobody's board is recoverable by a person, and the one that leaves it
+    // on two boards is the one that gets a customer two deliveries or none.
+    changes.push(
+      await logSyncChange(client, {
+        branchId: origin,
+        operationalLocationId: originLocationId,
+        entityType: "customer_order",
+        entityId: orderId,
+        operationType: "TRANSFER_OUT",
+        version: nextVersion,
+        payload: {
+          global_id: orderId,
+          order_no: row.order_no || null,
+          transferred_to_branch_id: destination,
+          transferred_to_branch_name: branch.branch_name || null,
+          transferred_by_user_id: actorUserId || null,
+          transfer_note: cleanText(note) || null,
+        },
+      })
+    );
+  }
+
+  // Row two of two.
+  changes.push(
+    await logSyncChange(client, {
+      branchId: destination,
+      operationalLocationId: destinationLocationId,
+      entityType: "customer_order",
+      entityId: orderId,
+      operationType: "UPSERT",
+      version: nextVersion,
+      payload: { ...row, items },
+    })
+  );
+
+  return {
+    ok: true,
+    order: row,
+    movedFrom: origin || null,
+    movedTo: destination,
+    changes,
   };
 };
 
@@ -10978,6 +11344,34 @@ app.get("/api/sync/pull", rateLimitSyncRequest, async (req, res) => {
       rows = visible.rows;
       hasMore = visible.hasMore;
     } else {
+      /*
+       * The location predicate belongs here as much as in the ENFORCE path.
+       *
+       * `readVisibleIncrementalChanges` filters company, branch and location; the reference
+       * bootstrap this incremental pull continues filters all three too
+       * (`syncReferenceBootstrap.js`). Only this branch filtered two of the three - and
+       * `operationalScopeMode` defaults to `off` with nothing in the repository setting it, so this
+       * is the branch that actually runs. A warehouse and a shop counter under one branch would
+       * pull each other's stock, which is precisely the shape warehouse-to-shop distribution
+       * creates.
+       *
+       * Both NULLs are decided deliberately rather than left to `= NULL`, which matches nothing:
+       *
+       * - `$3` is NULL when the device has no active `device_assignments` row naming a location.
+       *   That is every device on a deployment that has not rolled out assignments, and it is not
+       *   an error - it is a device whose location nobody has stated. Narrowing it to nothing would
+       *   stop its sync dead, so it keeps exactly the branch-wide visibility it has today.
+       * - `operational_location_id IS NULL` on the row means the *change* is not location-stamped.
+       *   Everything `logSyncChange` writes on a non-ENFORCE path is like this, because
+       *   `requireSyncContext` returns `operationalLocationId: null` there, and so is every row
+       *   written before migration 009 added the column. Hiding those would empty every counter's
+       *   incremental feed of its entire history.
+       *
+       * What is left is the case that matters: both sides stamped, and they must agree. Migration
+       * 011's `froozerp_publish_inventory_lot_sync` returns early unless company, branch and
+       * location are all present, so every inventory-lot row it publishes is stamped and is now
+       * delivered only to the location that owns the stock.
+       */
       const result = await pool.query(
         `
         SELECT change_id, branch_id, entity_type, entity_id, operation_type,
@@ -10985,11 +11379,16 @@ app.get("/api/sync/pull", rateLimitSyncRequest, async (req, res) => {
         FROM sync_change_log
         WHERE company_id = $1
           AND branch_id = $2
-          AND change_id > $3
+          AND (
+            $3::INTEGER IS NULL
+            OR operational_location_id IS NULL
+            OR operational_location_id = $3
+          )
+          AND change_id > $4
         ORDER BY change_id
-        LIMIT $4
+        LIMIT $5
         `,
-        [context.companyId, context.branchId, cursor, limit + 1]
+        [context.companyId, context.branchId, context.deviceLocationId ?? null, cursor, limit + 1]
       );
       rows = result.rows.slice(0, limit);
       hasMore = result.rows.length > limit;
@@ -11099,6 +11498,137 @@ app.get("/api/sync/status", rateLimitSyncRequest, async (req, res) => {
  * writable session. The "own branch" is read from the database, not from the current token — which
  * may itself already be pointed at somebody else's shop.
  */
+/**
+ * Who may decide which shop handles an order.
+ *
+ * Owner or Admin, re-read from the database rather than trusted from the token so a demotion takes
+ * effect immediately -- and checked against the caller's own company, which `requireRateManager`
+ * alone does not do. That omission is the hole closed in `/lots/transfer-stock` today: role without
+ * company is not authorisation, it is a role check wearing authorisation's clothes.
+ */
+const requireOrderRouter = async (req, client = pool) => {
+  const companyId = parsePositiveInteger(req.auth?.companyId);
+  if (!companyId) return null;
+  const result = await client.query(
+    `SELECT u.id, u.full_name, u.company_id, r.role_name
+     FROM users u
+     JOIN roles r ON r.id = u.role_id
+     WHERE u.id = $1 AND u.active = TRUE`,
+    [parsePositiveInteger(req.auth?.userId)]
+  );
+  const user = result.rows[0];
+  if (!user || !RATE_MANAGER_ROLES.has(user.role_name)) return null;
+  if (parsePositiveInteger(user.company_id) !== companyId) return null;
+  return { ...user, companyId };
+};
+
+/**
+ * Orders nobody is handling yet.
+ *
+ * A website order or a WhatsApp to the company number arrives with no branch. `docs/order-routing-
+ * decision.md` rules that such an order **must not reach any counter**: the pull predicate scopes
+ * by branch and location and has no notion of role, so a company-wide unassigned order would land
+ * on every till including cashier machines -- carrying a customer's name, mobile and address to
+ * shops with no business seeing them.
+ *
+ * So it lives in the cloud and is read here, by a person who may decide. It enters the sync road
+ * only when somebody assigns it, and only then does it reach that branch's devices.
+ */
+app.get("/api/orders/unassigned", async (req, res) => {
+  try {
+    const router = await requireOrderRouter(req);
+    if (!router) {
+      return res.status(403).json({
+        code: "ORDER_ROUTING_DENIED",
+        message: "Only the Owner or an Administrator can hand out unassigned orders.",
+      });
+    }
+    const result = await pool.query(
+      `SELECT co.global_id, co.order_no, co.customer_name, co.customer_mobile, co.delivery_address,
+              co.status, co.source, co.notes, co.created_at, co.taken_at_branch_id,
+              tb.branch_name AS taken_at_branch_name,
+              COALESCE(items.lines, '[]'::jsonb) AS items
+       FROM customer_orders co
+       LEFT JOIN branches tb ON tb.id = co.taken_at_branch_id
+       LEFT JOIN LATERAL (
+         SELECT JSONB_AGG(JSONB_BUILD_OBJECT(
+                  'product_name', ci.product_name,
+                  'unit', ci.unit,
+                  'quantity', ci.quantity,
+                  'agreed_rate', ci.agreed_rate
+                ) ORDER BY ci.line_index) AS lines
+         FROM customer_order_items ci WHERE ci.order_global_id = co.global_id
+       ) items ON TRUE
+       WHERE co.company_id = $1
+         AND co.branch_id IS NULL
+         AND co.deleted_at IS NULL
+       ORDER BY co.created_at, co.id`,
+      [router.companyId]
+    );
+    return res.json({ orders: result.rows });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Unassigned Orders" });
+  }
+});
+
+/**
+ * Hand an order to a shop, or move it to a different one.
+ *
+ * Both are the same operation. Assigning is a transfer whose "from" is nobody, so it writes one
+ * change row rather than two -- there is no old branch to tell. `transferCustomerOrderBranch` owns
+ * that rule and everything it implies; this route is the door, the authorisation and the
+ * transaction boundary, and nothing else.
+ */
+app.post("/api/orders/:orderGlobalId/assign", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const router = await requireOrderRouter(req, client);
+    if (!router) {
+      return res.status(403).json({
+        code: "ORDER_ROUTING_DENIED",
+        message: "Only the Owner or an Administrator can decide which shop handles an order.",
+      });
+    }
+    await client.query("BEGIN");
+    const result = await transferCustomerOrderBranch(client, {
+      orderGlobalId: req.params.orderGlobalId,
+      companyId: router.companyId,
+      toBranchId: req.body?.branch_id,
+      actorUserId: router.id,
+      note: req.body?.note,
+    });
+    if (!result.ok) {
+      await client.query("ROLLBACK");
+      // The refusals are already written for a person to read, and each names what to do next.
+      const status = result.code === "NOT_FOUND" ? 404
+        : result.code === "VALIDATION_ERROR" ? 400
+        : result.code === "NO_CHANGE" ? 409
+        : 409;
+      return res.status(status).json({ code: result.code, message: result.message });
+    }
+    await client.query("COMMIT");
+    return res.json({
+      order_id: result.order.global_id,
+      order_no: result.order.order_no || null,
+      moved_from: result.movedFrom,
+      moved_to: result.movedTo,
+      // Two when it moved between shops, one when it was assigned for the first time. Reported so
+      // an operator -- or a test -- can see the rule held rather than trusting that it did.
+      change_rows: result.changes.length,
+      message: result.movedFrom
+        ? `Moved to ${result.order.branch_id}. Both shops have been told.`
+        : "Assigned. It will reach that shop's counters on their next sync.",
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => null);
+    console.error(error);
+    return res.status(500).json({ message: "Error Assigning Order" });
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/api/owner/view-branch", async (req, res) => {
   try {
     const owner = await getOwnerUser(req.auth.userId);
@@ -12729,6 +13259,14 @@ const ensureProductEntrySchema = async (client = pool) => {
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS entity_version INTEGER NOT NULL DEFAULT 1;
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
     ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP;
+    -- The second of the two startup paths that define inventory_batches. See the matching block in
+    -- initializeDatabase for why these are here, why they carry no REFERENCES clause, and why
+    -- adding them to only one path is the bug rather than the fix.
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS company_id INTEGER;
+    ALTER TABLE inventory_batches ADD COLUMN IF NOT EXISTS operational_location_id INTEGER;
+    CREATE INDEX IF NOT EXISTS inventory_batches_location_fifo_idx
+      ON inventory_batches(company_id, branch_id, operational_location_id, product_id, purchase_date, created_at, id)
+      WHERE remaining_qty > 0;
 
     CREATE TABLE IF NOT EXISTS stock_transactions (
       id SERIAL PRIMARY KEY,
@@ -18180,9 +18718,69 @@ const readPurchaseEntryPayload = (body, actorUserId) => {
     unit: nullableText(body.unit),
     originType: nullableText(body.origin_type) ? String(body.origin_type).trim().toUpperCase() : null,
     branchId: parsePositiveInteger(body.branch_id),
+    // Where the goods physically land, which is not always where the buying happened.
+    //
+    // The maintainer's fruit is bought in bulk and delivered to a warehouse, then distributed to
+    // the shops -- see docs/stock-distribution-decision.md. Until now a purchase always landed at
+    // the location of the machine that typed it in, so a purchase manager working from a shop
+    // counter silently put the whole consignment on that shop's shelf.
+    //
+    // Read under `destination_*` rather than `operational_location_id` **on purpose**:
+    // `v3WriteAdapter` unconditionally overwrites company_id, branch_id and
+    // operational_location_id in the request body with the submitting device's own scope. A
+    // destination sent under those names would be silently replaced and the field would look
+    // ignored, with no error anywhere. These names survive it.
+    destinationBranchId: parsePositiveInteger(body.destination_branch_id),
+    destinationLocationId: parsePositiveInteger(body.destination_operational_location_id),
     actorId: parsePositiveInteger(actorUserId),
     remarks: nullableText(body.remarks),
   };
+};
+
+/**
+ * Where a purchase's stock should be written, having checked the caller may put it there.
+ *
+ * Returns `{ branchId, locationId }`, or `{ error }` for the route to refuse with. It never falls
+ * back to the session's scope when a destination was named but is unusable: a silent fallback would
+ * put a whole consignment on the wrong shelf while telling the operator it went where they asked,
+ * which is the exact failure this feature exists to remove.
+ *
+ * With no destination named it returns the session's own scope, so every existing caller behaves
+ * byte-for-byte as it did before.
+ */
+const resolveGoodsReceivedAt = async (client, context, entry) => {
+  const sessionScope = {
+    branchId: entry.branchId,
+    locationId: parsePositiveInteger(context?.operational_location_id) || null,
+  };
+  if (!entry.destinationBranchId && !entry.destinationLocationId) return sessionScope;
+
+  const companyId = parsePositiveInteger(context?.company_id);
+  if (!companyId) {
+    return { error: "This device has no company scope, so it cannot direct goods to another location." };
+  }
+  if (!entry.destinationBranchId || !entry.destinationLocationId) {
+    // Half an answer is worse than none: a branch with no location would write a lot the pull
+    // predicate can never deliver, and it would sit in Postgres reaching no device, silently.
+    return { error: "Choose both the shop and the counter the goods were received at." };
+  }
+
+  const found = await client.query(
+    `SELECT ol.id, ol.branch_id
+     FROM operational_locations ol
+     JOIN branches b ON b.id = ol.branch_id AND b.company_id = ol.company_id
+     WHERE ol.id = $1
+       AND ol.branch_id = $2
+       AND ol.company_id = $3
+       AND ol.active = TRUE
+       AND b.active IS DISTINCT FROM FALSE
+     LIMIT 1`,
+    [entry.destinationLocationId, entry.destinationBranchId, companyId]
+  );
+  if (!found.rows[0]) {
+    return { error: "That location is not an active part of this business, so goods cannot be received there." };
+  }
+  return { branchId: found.rows[0].branch_id, locationId: found.rows[0].id };
 };
 
 const validatePurchaseEntry = (entry) => {
@@ -18776,6 +19374,18 @@ const createPurchaseBillHandler = async (req, res) => {
     const replay = await beginV3BusinessOperation(client, req, "purchase");
     if (replay) return sendV3Replay(client, res, replay);
     const context = req.v3OperationalContext;
+
+    // Where the fruit actually goes. Defaults to this machine's own location, so nothing changes
+    // for a purchase entered at the counter that will hold it. When a destination is named -- a
+    // purchase manager buying from a shop counter for the warehouse -- it is validated against this
+    // company before a single row is written, and an unusable one refuses the whole purchase rather
+    // than quietly landing the consignment on the wrong shelf.
+    const receivedAt = await resolveGoodsReceivedAt(client, context, baseEntry);
+    if (receivedAt.error) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ message: receivedAt.error });
+    }
+
     const operationId = v3OperationKey(req);
     const hasLegacyOfflineIdentity = rawItems.some((item, index) =>
       cleanText(item.purchase_global_id) === `offline-purchase-${operationId}-${index + 1}`
@@ -18978,9 +19588,9 @@ const createPurchaseBillHandler = async (req, res) => {
            ) RETURNING *`,
           [
             entry.productId, batchNo, entry.quantity, provisionalCost, supplier.id,
-            supplier.supplier_name, baseEntry.branchId, purchase.id, entry.temporarySaleRate,
+            supplier.supplier_name, receivedAt.branchId, purchase.id, entry.temporarySaleRate,
             entry.lotName, entry.lotSize, entry.remarks, baseEntry.purchaseDate, itemUnit,
-            itemOriginType, context?.company_id || null, context?.operational_location_id || null,
+            itemOriginType, context?.company_id || null, receivedAt.locationId,
             entry.lotGlobalId,
           ]
         );
@@ -18990,7 +19600,7 @@ const createPurchaseBillHandler = async (req, res) => {
              company_id, operational_location_id
            ) VALUES ($1,$2,'IN',$3,$4,$5,$6,$7)`,
           [entry.productId, entry.quantity, `Stock arrival pending bill #${purchase.id}`, baseEntry.actorId,
-            baseEntry.branchId, context?.company_id || null, context?.operational_location_id || null]
+            receivedAt.branchId, context?.company_id || null, receivedAt.locationId]
         );
         createdItems.push({
           ...itemResult.rows[0],
@@ -19134,12 +19744,12 @@ const createPurchaseBillHandler = async (req, res) => {
            ) RETURNING *`,
           [
             entry.productId, batchNo, entry.quantity, entry.purchaseRate, financials.effectiveCostPerUnit,
-            first.supplier.id, first.supplier.supplier_name, baseEntry.branchId,
+            first.supplier.id, first.supplier.supplier_name, receivedAt.branchId,
             financials.mandiTaxAmount, entry.freightCharges, entry.labourCharges, entry.otherCharges,
             financials.grossAmount, financials.rebateAmount, financials.netPayable, rebateRule.rule_name,
             financials.balanceAmount, purchase.id, entry.lotName, entry.lotSize, entry.remarks,
             baseEntry.purchaseDate, itemUnit, itemOriginType, context?.company_id || null,
-            context?.operational_location_id || null, entry.lotGlobalId,
+            receivedAt.locationId, entry.lotGlobalId,
           ]
         );
         await client.query(
@@ -19148,7 +19758,7 @@ const createPurchaseBillHandler = async (req, res) => {
              company_id, operational_location_id
            ) VALUES ($1,$2,'IN',$3,$4,$5,$6,$7)`,
           [entry.productId, entry.quantity, `Purchase #${purchase.id}`, baseEntry.actorId,
-            baseEntry.branchId, context?.company_id || null, context?.operational_location_id || null]
+            receivedAt.branchId, context?.company_id || null, receivedAt.locationId]
         );
         createdItems.push({
           ...itemResult.rows[0],
@@ -21775,5 +22385,8 @@ module.exports = {
   SYNC_OPERATION_TYPES,
   processSyncOperation,
   processCustomerOrderOperation,
+  transferCustomerOrderBranch,
+  resolveGoodsReceivedAt,
+  resolveBranchDefaultLocationId,
   normalizeCustomerOrderItems,
 };

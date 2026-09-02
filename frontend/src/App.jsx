@@ -44,7 +44,13 @@ import { allShopsHasFigures, resolveAllShopsPresentation } from "./local/allShop
 import { resolveShopViewPresentation, shopPickerVisible } from "./local/shopView";
 import { ORDER_STATUS } from "./local/orderLifecycle";
 import { STOCK_TRUSTED_FOR_HOURS, buildCatalogue, catalogueFilename, describeExport } from "./local/catalogueExport";
-import { buildOrdersBoard, validateOrderAction } from "./local/ordersBoard";
+import {
+  ORDER_QUEUE_STATUS,
+  buildOrdersBoard,
+  resolveUnassignedQueue,
+  validateOrderAction,
+  validateOrderAssignment,
+} from "./local/ordersBoard";
 import { ORDER_REPORT, buildOrderReports, describeOrderReportError } from "./local/orderReporting";
 import { SETTINGS_GROUPS, formatShortcut, navigationRegistry, resolveShortcutTarget } from "./local/appNavigation";
 import { DEFAULT_THEME_MODE, SYSTEM_DARK_QUERY, THEME_MODES, applyThemeMode, describeThemeMode, readThemeMode, resolveTheme, systemPrefersDarkFrom, watchSystemTheme, writeThemePreference } from "./local/themePreference";
@@ -77,7 +83,17 @@ import { createStartupConnectivityAuthority } from "./local/startupConnectivityP
 import { isCloudTargetConfigured, resolveCloudTarget } from "./local/cloudTarget";
 import { resolveApiMode } from "./local/apiModeResolution";
 import { CLOUD_CALL_REFUSAL_CODES, createCloudCallGuard, createCloudCallRefusalError, evaluateCloudCall } from "./local/cloudCallGuard";
-import { filterSellableProducts, isSellableLot, lotAvailableQuantity, selectLocalPosInventory } from "./local/posInventory";
+import { UNKNOWN_COUNTER_SCOPE, counterMaySell, resolveCounterScope } from "./local/locationScope";
+import {
+  DISTRIBUTION_BOARD_STATUS,
+  pendingAllocationLines,
+  resolveDistributionBoard,
+  transferQuantity,
+  validateAllocation,
+  validateDistributionDraft,
+  validateStockRequest,
+} from "./local/stockDistribution";
+import { filterSellableProducts, isSellableLot, lotAvailableQuantity, resolveSellableProducts, selectLocalPosInventory } from "./local/posInventory";
 import {
   activeStockFilterLabels,
   canonicalInventoryId,
@@ -818,6 +834,8 @@ const icons = {
   settings: "settings",
   "sale-rates": "trend",
   orders: "parcel",
+  distribution: "truck",
+  branches: "shopfront",
   "all-shops": "layers",
   frost: "message",
 };
@@ -835,8 +853,10 @@ const navigationItems = [
   ["sale-rates", "Sale Rate Update"],
   ["expenses", "Expenses"],
   ["orders", "Orders"],
+  ["distribution", "Stock Distribution"],
   ["reports", "Reports"],
   ["all-shops", "All Shops"],
+  ["branches", "Branches & Counters"],
   ["settings", "Settings"],
 ];
 
@@ -1627,6 +1647,8 @@ function Icon({ name, size = 18 }) {
     search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></>,
     "arrow-left": <><path d="M19 12H5" /><path d="m12 19-7-7 7-7" /></>,
     "arrow-right": <><path d="M5 12h14" /><path d="m12 5 7 7-7 7" /></>,
+    truck: <><path d="M3 7h11v9H3z" /><path d="M14 10h4l3 3v3h-7z" /><circle cx="7" cy="18" r="1.6" /><circle cx="17" cy="18" r="1.6" /></>,
+    shopfront: <><path d="M4 10v10h16V10" /><path d="M3 10 5 4h14l2 6Z" /><path d="M10 20v-6h4v6" /></>,
     barcode: <><path d="M3 5v14M7 5v14M11 5v14M15 5v14M19 5v14M21 5v14" /></>,
     trash: <><path d="M4 7h16M10 11v6M14 11v6M9 7V4h6v3M6 7l1 14h10l1-14" /></>,
     print: <><path d="M6 9V3h12v6M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2M6 14h12v7H6Z" /></>,
@@ -1882,6 +1904,17 @@ function App() {
   const [productCategories, setProductCategories] = useState([]);
   const [productDuplicateWarning, setProductDuplicateWarning] = useState("");
   const [inventory, setInventory] = useState([]);
+  // Which shop this machine is standing in, as the local snapshot reports it.
+  //
+  // Selling binds to the machine, not to the login -- see docs/stock-distribution-decision.md. So
+  // this is resolved from the device's own snapshot and never from `user.branch_id`: a cashier who
+  // signs in at another shop's counter is selling that shop's fruit off that shop's shelf, and no
+  // login may change whose stock leaves the building.
+  //
+  // Starts UNKNOWN, which is a real state and not a placeholder: until the snapshot has been read
+  // this device genuinely does not know its own shop, and every consumer of this value has an arm
+  // that says so rather than rendering an empty shelf.
+  const [counterScope, setCounterScope] = useState(UNKNOWN_COUNTER_SCOPE);
   const [salesHistory, setSalesHistory] = useState([]);
   const [saleReturns, setSaleReturns] = useState([]);
   const [wasteEntries, setWasteEntries] = useState([]);
@@ -1962,6 +1995,18 @@ function App() {
   const [shopViewState, setShopViewState] = useState({ loadState: "idle", loadError: "", branches: [], ownBranchId: null, viewingBranchId: null, viewOnly: false });
   const [shopSwitchBusy, setShopSwitchBusy] = useState(false);
   const [ordersState, setOrdersState] = useState({ loadState: "idle", loadError: "", orders: [] });
+  // Orders that arrived with no shop attached. A cloud read, never a sync entity: the pull road
+  // scopes by branch and has no notion of role, so an unassigned order on it would land on every
+  // till carrying a customer's name, mobile and home address.
+  const [orderQueueState, setOrderQueueState] = useState({ loadState: "idle", loadError: "", orders: [] });
+  const [orderRoutingBusy, setOrderRoutingBusy] = useState(false);
+  const [distributionState, setDistributionState] = useState({
+    loadState: "idle", loadError: "", transfers: [], destinations: [],
+  });
+  const [distributionBusy, setDistributionBusy] = useState(false);
+  // Where a purchase's goods were actually received. Empty means "this counter", which is what the
+  // backend assumes when no destination is sent -- so an untouched picker changes nothing.
+  const [purchaseDestinationId, setPurchaseDestinationId] = useState("");
   const [orderActionBusy, setOrderActionBusy] = useState(false);
   // The order whose bill is being rung up, and the cart POS should open with. Held here rather than
   // inside PosBilling so the link back to the order survives POS remounting.
@@ -2166,6 +2211,15 @@ function App() {
     loadOrders();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeView, ordersState.loadState]);
+
+  // Consignments load when the screen opens, not at sign-in. Unlike orders these are a cloud read,
+  // and a counter that never opens this screen should not be paying for it on every launch.
+  useEffect(() => {
+    if (activeView !== "distribution") return;
+    if (distributionState.loadState !== "idle") return;
+    loadDistribution();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeView, distributionState.loadState]);
 
   // Load the shop list once the Owner is signed in.
   //
@@ -3821,7 +3875,33 @@ function App() {
   const refreshPosInventoryFromSQLite = async (reason = "pos-open") => {
     if (!isTauriRuntime() || !user?.id) return null;
     const snapshot = await loadLocalReferenceSnapshot({ username: user.username, deviceId: deviceInfo.device_id });
-    const selected = selectLocalPosInventory(snapshot);
+    // The snapshot answers "which shop is this machine?" itself, from the same ladder the sync pull
+    // enforces, so the shelf on screen and the stock the server will send here cannot disagree.
+    const scope = resolveCounterScope(snapshot);
+    setCounterScope(scope);
+    const selected = selectLocalPosInventory(snapshot, {}, scope);
+
+    // Two different emptinesses, and collapsing them is the bug this whole path exists to prevent.
+    //
+    // "This device does not know its own shop" produces no lots, exactly as "the snapshot has not
+    // downloaded yet" does. But the caller of this function catches a throw and leaves the previous
+    // values on screen with "Existing values remain visible" -- which, for an unknown scope, means
+    // POS keeps selling from whatever list it happened to be holding, possibly another shop's,
+    // fetched over HTTP while an Owner was viewing that shop. So the scope failure clears the list
+    // and says why, rather than throwing.
+    if (!counterMaySell(selected)) {
+      setProducts(selected.products);
+      setInventory([]);
+      setSyncMessage(selected.scopeMessage || "This counter has not been told which shop it is in.");
+      writeDiagnosticLog("ERROR", "pos-local-inventory-scope-unusable", {
+        reason,
+        scopeStatus: selected.scopeStatus,
+        scopeSource: scope.source,
+        connectivityMode: readConnectivityMode(),
+      });
+      return selected;
+    }
+
     if (!selected.products.length || !selected.inventoryLots.length) {
       throw new Error("Local SQLite POS inventory snapshot is not ready.");
     }
@@ -3831,6 +3911,11 @@ function App() {
       reason,
       products: selected.products.length,
       inventoryLots: selected.inventoryLots.length,
+      // Another shop's crates reaching this device is a server-side scoping fault. The counter is
+      // right to hide them; somebody still has to be able to find out that it happened.
+      foreignLotsHidden: selected.scopeCounts?.foreign || 0,
+      untaggedLots: selected.scopeCounts?.untagged || 0,
+      scopeSource: scope.source,
       connectivityMode: readConnectivityMode(),
     });
     return selected;
@@ -4839,6 +4924,206 @@ function App() {
    * No backend call at all. G7's order half is the part that needs no cloud, no website and no
    * approvals, and reading it through the API would quietly re-introduce every one of those.
    */
+  /**
+   * Ask another shop to send stock here.
+   *
+   * The mirror of `sendConsignment`, and the difference is who decides. A request names products
+   * and quantities and no lots -- this counter cannot see the other shop's crates -- and the shop
+   * being asked chooses the crates when it approves, or refuses.
+   */
+  const requestConsignment = async (draft) => {
+    setDistributionBusy(true);
+    try {
+      const write = createOperationalWrite(user, {
+        initiation_mode: "DESTINATION_REQUESTED",
+        source_branch_id: draft.sourceBranchId,
+        source_operational_location_id: draft.sourceLocationId,
+        items: draft.lines.map((line) => ({
+          product_id: line.product_id,
+          requested_quantity: line.requested_quantity,
+        })),
+      });
+      await axios.post(`${SYNC_API_URL}/api/v3/transfers`, write.body, write.config);
+      await loadDistribution();
+      setSyncMessage("Request sent. The other shop decides what to send and when.");
+      return true;
+    } catch (error) {
+      setSyncMessage(getErrorMessage(error, "The request could not be sent"));
+      return false;
+    } finally {
+      setDistributionBusy(false);
+    }
+  };
+
+  /**
+   * What is on its way in or out of this counter.
+   *
+   * Two reads, and the destination list is loaded with the board rather than when the compose form
+   * opens: a warehouse manager who taps "Send stock" and waits for a dropdown to populate will tap
+   * it again, and the second tap is a second consignment.
+   *
+   * Unlike the Orders board this is a cloud read, because an unassigned consignment has not reached
+   * any device yet -- that is the point of the approval step. Offline, the board says so rather than
+   * showing an empty list, which would read as "nothing to receive".
+   */
+  const loadDistribution = async () => {
+    setDistributionState((current) => ({ ...current, loadState: "loading", loadError: "" }));
+    try {
+      const config = createOperationalReadConfig(user);
+      const [board, destinations] = await Promise.all([
+        axios.get(`${SYNC_API_URL}/api/v3/transfers`, config),
+        // A failed destination list must not empty the board. Somebody who cannot compose a new
+        // consignment can still receive the one standing at their door, and that is the more urgent
+        // of the two.
+        axios.get(`${SYNC_API_URL}/api/v3/transfers/destinations`, config).catch(() => null),
+      ]);
+      setDistributionState({
+        loadState: "loaded",
+        loadError: "",
+        transfers: board?.data?.transfers || [],
+        destinations: destinations?.data?.destinations || [],
+      });
+    } catch (error) {
+      setDistributionState({
+        loadState: "error",
+        loadError: getErrorMessage(error, "Consignments could not be loaded"),
+        transfers: [],
+        destinations: [],
+      });
+    }
+  };
+
+  /**
+   * Move a consignment one step along.
+   *
+   * The server decides whether the move is legal and whether this counter is the side entitled to
+   * make it; `stockDistribution.js` only decides which buttons to draw. So a refusal here is shown
+   * verbatim rather than translated -- if the two layers ever disagree, the person needs to see the
+   * server's answer, not ours.
+   */
+  const runDistributionAction = async (transferId, action, extra = {}) => {
+    setDistributionBusy(true);
+    try {
+      const write = createOperationalWrite(user, extra);
+      await axios.post(
+        `${SYNC_API_URL}/api/v3/transfers/${encodeURIComponent(transferId)}/actions/${encodeURIComponent(action)}`,
+        write.body,
+        write.config,
+      );
+      await loadDistribution();
+      // The shelf changed: approving holds stock, dispatching takes it off, receiving adds it. POS
+      // reads its own snapshot, so without this the till would go on offering fruit that has left.
+      setPosRefreshToken((token) => token + 1);
+      setSyncMessage("");
+    } catch (error) {
+      setSyncMessage(getErrorMessage(error, `The consignment could not be ${action}ed`));
+    } finally {
+      setDistributionBusy(false);
+    }
+  };
+
+  /**
+   * The other places in this business, for a screen that needs to name one.
+   *
+   * Shared by the consignment board and by Purchase Entry's "Goods received at" picker. Kept
+   * separate from `loadDistribution` so opening Purchase Entry does not also fetch every
+   * consignment, and so a failure here cannot empty a board.
+   */
+  const loadDistributionDestinations = async () => {
+    try {
+      const response = await axios.get(
+        `${SYNC_API_URL}/api/v3/transfers/destinations`,
+        createOperationalReadConfig(user),
+      );
+      setDistributionState((current) => ({ ...current, destinations: response?.data?.destinations || [] }));
+    } catch {
+      // Silent on purpose: without this list the picker simply offers "this counter", which is the
+      // behaviour every purchase had before the picker existed. Nothing is lost and nothing is wrong.
+      setDistributionState((current) => ({ ...current, destinations: [] }));
+    }
+  };
+
+  /** Send stock from this counter to another shop. */
+  const sendConsignment = async (draft) => {
+    setDistributionBusy(true);
+    try {
+      const write = createOperationalWrite(user, {
+        initiation_mode: "SOURCE_INITIATED",
+        destination_branch_id: draft.destinationBranchId,
+        destination_operational_location_id: draft.destinationLocationId,
+        items: draft.lines.map((line) => ({
+          product_id: line.product_id,
+          source_lot_id: line.source_lot_id,
+          requested_quantity: line.requested_quantity,
+        })),
+      });
+      await axios.post(`${SYNC_API_URL}/api/v3/transfers`, write.body, write.config);
+      await loadDistribution();
+      setSyncMessage("Consignment created. It is not sent until it has been approved and dispatched.");
+      return true;
+    } catch (error) {
+      setSyncMessage(getErrorMessage(error, "The consignment could not be created"));
+      return false;
+    } finally {
+      setDistributionBusy(false);
+    }
+  };
+
+  /**
+   * Orders waiting for somebody to decide which shop handles them.
+   *
+   * Only fetched for people who may act on it -- the route refuses anybody else, and asking anyway
+   * would put a refusal in the log on every Orders visit by every cashier.
+   */
+  const loadUnassignedOrders = async () => {
+    // Read from `user` here rather than from a flag computed further down the component: this runs
+    // from an effect that can fire before that flag's declaration is reached, and a temporal-dead-
+    // zone crash on the Orders screen is a worse outcome than one duplicated role test.
+    // The server checks this again and is the authority; this only avoids asking to be refused.
+    const canRouteOrders = ["Owner", "Admin"].includes(String(user?.role || ""));
+    if (!canRouteOrders) {
+      setOrderQueueState({ loadState: "loaded", loadError: "", orders: [] });
+      return;
+    }
+    setOrderQueueState((current) => ({ ...current, loadState: "loading", loadError: "" }));
+    try {
+      const response = await axios.get(`${API_URL}/api/orders/unassigned`, createOperationalReadConfig(user));
+      setOrderQueueState({ loadState: "loaded", loadError: "", orders: response?.data?.orders || [] });
+    } catch (error) {
+      setOrderQueueState({
+        loadState: "error",
+        loadError: getErrorMessage(error, "Unassigned orders could not be loaded"),
+        orders: [],
+      });
+    }
+  };
+
+  /**
+   * Hand an order to a shop, or move it to a different one.
+   *
+   * The same call for both, because they are the same act. The server writes one change row for a
+   * first assignment and two for a move -- and reports which -- so the message says what actually
+   * happened rather than what was intended.
+   */
+  const assignOrderToBranch = async (orderId, branchId, note = "") => {
+    setOrderRoutingBusy(true);
+    try {
+      const response = await axios.post(
+        `${API_URL}/api/orders/${encodeURIComponent(orderId)}/assign`,
+        { branch_id: branchId, note },
+        createOperationalReadConfig(user),
+      );
+      await Promise.all([loadUnassignedOrders(), loadOrders()]);
+      setSyncMessage(response?.data?.message || "Order handed over.");
+      return true;
+    } catch (error) {
+      setSyncMessage(getErrorMessage(error, "The order could not be handed over"));
+      return false;
+    } finally {
+      setOrderRoutingBusy(false);
+    }
+  };
+
   const loadOrders = async () => {
     setOrdersState((current) => ({ ...current, loadState: "loading", loadError: "" }));
     try {
@@ -6055,6 +6340,9 @@ function App() {
       }
       const reason = editingPurchaseId ? window.prompt("Enter purchase edit reason") : "";
       if (editingPurchaseId && !reason?.trim()) return;
+      const purchaseDestination = distributionState.destinations.find(
+        (row) => String(row.operational_location_id) === String(purchaseDestinationId),
+      ) || null;
       const payload = {
         supplier_id: purchaseSupplierId,
         product_id: purchaseProductId,
@@ -6082,6 +6370,17 @@ function App() {
         edited_by: user.id,
         reason,
         remarks: purchaseRemarks,
+        // Where the goods physically landed, when that is not this counter -- a purchase manager
+        // buying for the warehouse from a shop machine. Sent under `destination_*` because
+        // `v3WriteAdapter` overwrites `branch_id` and `operational_location_id` with the submitting
+        // device's own scope; a destination under those names would vanish with no error. Omitted
+        // entirely when the picker is untouched, which is exactly the pre-picker behaviour.
+        ...(purchaseDestination
+          ? {
+            destination_branch_id: purchaseDestination.branch_id,
+            destination_operational_location_id: purchaseDestination.operational_location_id,
+          }
+          : {}),
       };
       const aggregatePayload = { ...payload, items: purchaseCart };
       const aggregateOperationId = purchaseSubmissionRef.current.resolve(aggregatePayload);
@@ -6674,6 +6973,10 @@ function App() {
       if (["purchase", "pending-bills"].includes(view)) {
         await Promise.all([loadPurchases(), loadPurchaseRules()]);
       }
+      // The "Goods received at" picker needs the other places in the business. Not awaited with the
+      // rest: a purchase must still be enterable when this list cannot be fetched, and without it
+      // the picker simply offers "this counter", which is what every purchase did before it existed.
+      if (view === "purchase") loadDistributionDestinations();
       if (view === "pending-bills") await Promise.all([loadCustomerPendingBills(), loadCustomerData()]);
       if (view === "accounts") {
         await Promise.all([loadAccounts(), loadCustomerData(), loadSupplierData(), loadAccountOutstanding()]);
@@ -6684,7 +6987,9 @@ function App() {
       // Products too: the order form picks items from that list, and without it the "Choose an
       // item" dropdown is empty and the screen simply looks broken. Nothing else on this view
       // needed them, which is exactly why it was missed.
-      if (view === "orders") await Promise.all([loadOrders(), loadProducts()]);
+      // The waiting queue and the shop list too: without branches the "Give it to" dropdown is
+      // empty and the screen looks broken, which is exactly how the order form was missed once.
+      if (view === "orders") await Promise.all([loadOrders(), loadProducts(), loadUnassignedOrders(), loadSettingsData()]);
       if (view === "sales") await loadOrders().catch(() => null);
       if (view === "returns") await loadSaleReturns();
       if (view === "waste") await loadWasteEntries();
@@ -7167,9 +7472,28 @@ function App() {
           <div className="topbar-status-group">
             <time className="global-clock" dateTime={headerClock}>{formatKolkataHeaderClock(headerClock)}</time>
             <div className="topbar-status-row">
-              <div className="branch-pill">
+              {/* Where this person is working, which is a property of the machine and not of the
+                  login. docs/stock-distribution-decision.md: selling binds to the machine, because
+                  the fruit and the customer are standing there.
+
+                  This pill used to show `user.branch` -- the branch on the staff record. That is
+                  the wrong fact: it is what the person is *assigned* to, while every sale, every
+                  stock figure and every bill on this screen comes from the counter the machine is
+                  set up as. They agree today because login refuses a user who is not authorised
+                  for the device's counter, but showing the one that does not govern would make a
+                  future mismatch invisible at exactly the moment it mattered.
+
+                  The counter name wins when the device knows it. `user.branch` remains the
+                  fallback, so a device that has never been assigned a counter reads as it always
+                  did rather than going blank. */}
+              <div
+                className="branch-pill"
+                title={counterScope.known && counterScope.locationName
+                  ? "The counter this machine is set up as. Stock and bills come from here."
+                  : undefined}
+              >
                 <span className="status-dot" />
-                {user.branch}
+                {(counterScope.known && counterScope.locationName) || user.branch}
               </div>
               <div className="offline-pill">{connectionStatus.syncSummary}</div>
               <div className="notification-bell-wrap">
@@ -7688,6 +8012,23 @@ function App() {
                     </select>
                   </Field>
                   <Field label={purchaseBillStatus === "BILL_PENDING" ? "Arrival Date" : "Purchase Date"}><input type="date" value={purchaseDate} onChange={(event) => setPurchaseDate(event.target.value)} /></Field>
+                  {/* Where the fruit physically landed, which is not always where it was typed in.
+                      Bought in bulk into a warehouse, then distributed -- see
+                      docs/stock-distribution-decision.md. Only offered when there is somewhere else
+                      to choose: a business with one location gets no field to get wrong, and the
+                      default is always this counter, exactly as before this existed. */}
+                  {distributionState.destinations.length > 0 && (
+                    <Field label="Goods received at">
+                      <select value={purchaseDestinationId} onChange={(event) => setPurchaseDestinationId(event.target.value)}>
+                        <option value="">This counter</option>
+                        {distributionState.destinations.map((row) => (
+                          <option key={row.operational_location_id} value={row.operational_location_id}>
+                            {row.branch_name} — {row.location_name}
+                          </option>
+                        ))}
+                      </select>
+                    </Field>
+                  )}
                   {purchaseBillStatus === "BILL_COMPLETED" && (
                     <>
                       <Field label="Bill Number"><input value={purchaseBillNumber} onChange={(event) => setPurchaseBillNumber(event.target.value)} /></Field>
@@ -7875,6 +8216,7 @@ function App() {
               discountRules={discountRules}
               lotDiscounts={lotDiscounts}
               inventory={inventory}
+              counterScope={counterScope}
               onInvoice={setSelectedInvoice}
               onSaved={async (result) => {
                 // Link the bill back to the order that produced it. Done before anything else can
@@ -8036,14 +8378,43 @@ function App() {
 
           {activeView === "orders" && (
             <OrdersModule
+              branches={settingsData.branches || []}
               busy={orderActionBusy}
               onAdvance={advanceOrder}
-              onReload={loadOrders}
+              onAssign={assignOrderToBranch}
+              queue={orderQueueState}
+              routingBusy={orderRoutingBusy}
+              onReload={() => { loadOrders(); loadUnassignedOrders(); }}
               onTakeOrder={takeOrder}
               products={products}
               state={ordersState}
               user={user}
             />
+          )}
+
+          {activeView === "distribution" && (
+            <DistributionModule
+              busy={distributionBusy}
+              destinations={distributionState.destinations}
+              inventory={inventory}
+              onAction={runDistributionAction}
+              onNothingToReceive={() => setSyncMessage(
+                "This consignment has no dispatched quantity to receive. Ask the sender to check it.",
+              )}
+              onReload={loadDistribution}
+              onRequest={requestConsignment}
+              onSend={sendConsignment}
+              products={products}
+              scope={counterScope}
+              state={distributionState}
+            />
+          )}
+
+          {activeView === "branches" && (
+            // Promoted out of Settings. Adding a shop or a counter is not a preference to be
+            // adjusted once and forgotten -- it is the thing that decides which stock a machine
+            // sells from, so it belongs where a person can find it without hunting.
+            <OperationalScopeManagement canManage={settingsData.canManageSettings} user={user} />
           )}
 
           {activeView === "all-shops" && (
@@ -13246,6 +13617,16 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
     ]);
   }));
   const pagedLots = filteredLots.slice(0, Number(pageSize || 50));
+  // Deliberately not narrowed to this machine's shop, and that is the ruling rather than an
+  // omission. docs/stock-distribution-decision.md separates the two questions: *selling* binds to
+  // the machine, because the fruit and the customer are standing there, but *looking* binds to the
+  // person -- a manager over two shops is entitled to see both, and forcing the counter's own shop
+  // here would take that away.
+  //
+  // It is safe to leave open because the narrowing already happened upstream: the pull refuses a lot
+  // belonging to another shop (`DevicePullScope::refusal_for_inventory_lot`), so a counter's device
+  // holds only its own lots to begin with. This screen shows what the device has; POS decides what
+  // may be sold, and POS is scoped.
   const filteredLotsByProduct = groupInventoryLotsByProduct(filteredLots);
   const filteredProductRows = productGroups
     .map((product) => {
@@ -13910,8 +14291,392 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
  * Orders come from this device's SQLite and never from the API. That is the whole reason G7's order
  * half is available now while its website half waits behind the exposure gate.
  */
-function OrdersModule({ busy = false, onAdvance, onReload, onTakeOrder, products = [], state, user }) {
+/**
+ * Fruit moving from the warehouse to a shop.
+ *
+ * Every rule about *what may be done* lives in `frontend/src/local/stockDistribution.js`, tested on
+ * its own. This component draws what that module returns and nothing more -- in particular it never
+ * decides for itself whether a button belongs to this counter, because that judgement is the safety
+ * model of a transfer and it is checked again by the server.
+ *
+ * The board leads with what needs this counter. A warehouse manager and a shop assistant open the
+ * same screen and want opposite halves of it, and "what is waiting for me" is the only question
+ * that answers both.
+ */
+function DistributionModule({ busy = false, destinations = [], inventory = [], onAction, onNothingToReceive, onReload, onRequest, onSend, products = [], scope, state }) {
+  const [composing, setComposing] = useState(false);
+  // "SEND" moves this counter's own stock out; "ASK" requests somebody else's. They are the same
+  // form with the crate column removed, because a request cannot name crates it cannot see.
+  const [direction, setDirection] = useState("SEND");
+  const [destinationId, setDestinationId] = useState("");
+  const [draftLines, setDraftLines] = useState([]);
+  // Crate choices, keyed by the request line they answer: { [lineId]: [{ source_lot_id, quantity }] }
+  const [allocations, setAllocations] = useState({});
+
+  const board = resolveDistributionBoard({
+    transfers: state.transfers,
+    scope,
+    loadState: state.loadState,
+    loadError: state.loadError,
+  });
+
+  const destination = destinations.find((row) => String(row.operational_location_id) === String(destinationId)) || null;
+
+  // Only lots this counter actually holds, and only ones with something left in them. `inventory`
+  // has already been narrowed to this counter's shelf upstream; this is the "and not empty" half.
+  const sendableLots = (Array.isArray(inventory) ? inventory : []).filter((lot) => lotAvailableQuantity(lot) > 0);
+  const productName = (lot) => (
+    products.find((product) => inventoryIdsEqual(product?.id, lot?.product_id))?.product_name
+    || lot?.product_name
+    || "Unnamed product"
+  );
+
+  const addLine = () => setDraftLines((lines) => [...lines, { key: `line-${Date.now()}-${lines.length}`, source_lot_id: "", requested_quantity: "" }]);
+  const updateLine = (key, patch) => setDraftLines((lines) => lines.map((line) => (line.key === key ? { ...line, ...patch } : line)));
+  const removeLine = (key) => setDraftLines((lines) => lines.filter((line) => line.key !== key));
+
+  const resolvedLines = draftLines.map((line) => {
+    const lot = sendableLots.find((row) => inventoryIdsEqual(row?.id, line.source_lot_id)) || null;
+    return {
+      ...line,
+      product_id: lot?.product_id || "",
+      product_name: lot ? productName(lot) : "",
+      available_quantity: lot ? lotAvailableQuantity(lot) : null,
+    };
+  });
+  // Two different questions, so two different checks. Sending is limited by what is on this shelf;
+  // asking is not limited at all, because this counter cannot see the other shop's shelf and a
+  // guess presented as a limit is worse than no limit -- a person would believe it.
+  const asking = direction === "ASK";
+  const checkedDraft = asking
+    ? validateStockRequest({
+      sourceLocationId: destination?.operational_location_id,
+      requesterLocationId: scope?.operationalLocationId,
+      lines: draftLines,
+    })
+    : validateDistributionDraft({
+      sourceLocationId: scope?.operationalLocationId,
+      destinationLocationId: destination?.operational_location_id,
+      lines: resolvedLines,
+    });
+
+  const submitDraft = async () => {
+    const done = asking
+      ? await onRequest?.({
+        sourceBranchId: destination?.branch_id,
+        sourceLocationId: destination?.operational_location_id,
+        lines: checkedDraft.lines,
+      })
+      : await onSend?.({
+        destinationBranchId: destination?.branch_id,
+        destinationLocationId: destination?.operational_location_id,
+        lines: checkedDraft.lines,
+      });
+    if (done) {
+      setComposing(false);
+      setDraftLines([]);
+      setDestinationId("");
+    }
+  };
+
+  /** Crate choices for one request line, and whether they answer it. */
+  const allocationFor = (line) => {
+    const chosen = (allocations[line.id] || []).map((entry) => {
+      const lot = sendableLots.find((row) => inventoryIdsEqual(row?.id, entry.source_lot_id)) || null;
+      return {
+        ...entry,
+        lot_label: lot ? `${productName(lot)} ${lot.lot_no || lot.id}` : "",
+        available_quantity: lot ? lotAvailableQuantity(lot) : null,
+      };
+    });
+    return { chosen, checked: validateAllocation({ requested: line.requested, allocations: chosen }) };
+  };
+
+  const setAllocation = (lineId, index, patch) => setAllocations((current) => {
+    const list = [...(current[lineId] || [])];
+    list[index] = { ...list[index], ...patch };
+    return { ...current, [lineId]: list };
+  });
+  const addAllocation = (lineId) => setAllocations((current) => ({
+    ...current,
+    [lineId]: [...(current[lineId] || []), { source_lot_id: "", quantity: "" }],
+  }));
+
+  /**
+   * Receiving needs quantities, not just a button press.
+   *
+   * The server refuses `receive` with RECEIVED_QUANTITY_REQUIRED unless every line carries a
+   * positive received quantity -- it will not assume that what was dispatched is what turned up,
+   * which is right: a short delivery recorded as a full one is stock the shop believes it has and
+   * does not.
+   *
+   * "Receive in full" therefore means "everything dispatched arrived", and says so explicitly by
+   * echoing each line's dispatched quantity back. Found by pushing a consignment through a real
+   * database: without this the button returned 422 and the delivery could not be accepted at all.
+   */
+  const receiveInFull = async (entry, raw) => {
+    const lines = (raw?.items || [])
+      .map((line) => ({ item_id: line.id, received_quantity: transferQuantity(line.dispatched_quantity) }))
+      // A line dispatched as zero has nothing to receive, and sending it would be refused for the
+      // whole consignment rather than just that line.
+      .filter((line) => line.received_quantity !== null && line.received_quantity > 0);
+    if (lines.length === 0) {
+      onNothingToReceive?.();
+      return;
+    }
+    await onAction?.(entry.id, "receive", { items: lines });
+  };
+
+  /** Approve a request, naming the crates it will be sent from. */
+  const approveWithCrates = async (entry, lines) => {
+    const items = lines.map((line) => ({
+      item_id: line.id,
+      allocations: allocationFor(line).checked.allocations.map((choice) => ({
+        source_lot_id: choice.source_lot_id,
+        quantity: Number(choice.quantity),
+      })),
+    }));
+    await onAction?.(entry.id, "approve", { items });
+    setAllocations({});
+  };
+
+  return (
+    <section className="content-card">
+      <div className="card-heading">
+        <div>
+          <h2>Stock Distribution</h2>
+          <p className="muted-note">
+            Fruit moving between the warehouse and the shops. Stock leaves the sender when it is
+            dispatched and joins the receiver when it is received.
+          </p>
+        </div>
+        <div className="button-row">
+          {/* The count is `countLabel`, never `transfers.length`: an unanswerable board must not
+              report a total of zero. */}
+          <span className="pill">{board.countLabel} total</span>
+          {board.counts.waitingOnYou > 0 && <span className="pill stock-low">{board.counts.waitingOnYou} need you</span>}
+          <button className="secondary-button" disabled={busy} onClick={onReload}>Refresh</button>
+          {board.status === DISTRIBUTION_BOARD_STATUS.READY && destinations.length > 0 && (
+            <button className="primary-button" disabled={busy} onClick={() => setComposing((open) => !open)}>
+              {composing ? "Close" : "Send stock"}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {board.message && (
+        <div className="startup-status-panel startup-status-error">
+          <p><strong>{board.status === DISTRIBUTION_BOARD_STATUS.SCOPE_UNKNOWN ? "This counter has no shop set" : "Consignments unavailable"}</strong></p>
+          <p>{board.message}</p>
+        </div>
+      )}
+
+      {composing && (
+        <div className="content-card">
+          <h3>{asking ? "Ask another shop for stock" : "Send stock to another shop"}</h3>
+          <div className="button-row">
+            <button
+              className={asking ? "secondary-button" : "primary-button"}
+              onClick={() => { setDirection("SEND"); setDraftLines([]); }}
+            >
+              Send my stock
+            </button>
+            <button
+              className={asking ? "primary-button" : "secondary-button"}
+              onClick={() => { setDirection("ASK"); setDraftLines([]); }}
+            >
+              Ask for stock
+            </button>
+          </div>
+          <p className="muted-note">
+            {asking
+              ? "Say what you need. The other shop chooses which lots to send, and can refuse."
+              : "You choose the lots. The receiving shop confirms what actually arrives."}
+          </p>
+
+          <Field label={asking ? "Ask" : "Send to"}>
+            <select value={destinationId} onChange={(event) => setDestinationId(event.target.value)}>
+              <option value="">Choose a shop</option>
+              {destinations.map((row) => (
+                <option key={row.operational_location_id} value={row.operational_location_id}>
+                  {row.branch_name} — {row.location_name}
+                </option>
+              ))}
+            </select>
+          </Field>
+
+          {(asking ? draftLines : resolvedLines).map((line) => (
+            <div className="button-row" key={line.key}>
+              {asking ? (
+                // A request names the product only. There is no lot column, because the crates
+                // belong to the other shop and this counter cannot see them -- offering an empty
+                // dropdown would look like a fault rather than a rule.
+                <select value={line.product_id || ""} onChange={(event) => updateLine(line.key, { product_id: event.target.value })}>
+                  <option value="">Choose a product</option>
+                  {products.filter((product) => product.active !== false).map((product) => (
+                    <option key={product.id} value={product.id}>{product.product_name}</option>
+                  ))}
+                </select>
+              ) : (
+                <select value={line.source_lot_id} onChange={(event) => updateLine(line.key, { source_lot_id: event.target.value })}>
+                  <option value="">Choose a lot</option>
+                  {sendableLots.map((lot) => (
+                    <option key={lot.id} value={lot.id}>
+                      {productName(lot)} — {lot.lot_no || lot.id} ({lotAvailableQuantity(lot)} available)
+                    </option>
+                  ))}
+                </select>
+              )}
+              <input
+                inputMode="decimal"
+                placeholder="Quantity"
+                value={line.requested_quantity}
+                onChange={(event) => updateLine(line.key, { requested_quantity: event.target.value })}
+              />
+              <button className="remove-button" onClick={() => removeLine(line.key)}>Remove</button>
+            </div>
+          ))}
+
+          <div className="button-row">
+            <button className="secondary-button" onClick={addLine}>Add a product</button>
+            <button className="primary-button" disabled={busy || !checkedDraft.ok} onClick={submitDraft}>
+              {busy ? "Sending..." : (asking ? "Send request" : "Create consignment")}
+            </button>
+          </div>
+
+          {/* Every problem, named, while it can still be fixed. The server checks all of this again;
+              this exists so a person is not told "no" after a round trip with no reason. */}
+          {!checkedDraft.ok && draftLines.length > 0 && (
+            <ul className="form-note">
+              {checkedDraft.problems.map((problem) => <li key={problem}>{problem}</li>)}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {board.status === DISTRIBUTION_BOARD_STATUS.READY && (
+        <table className="data-table">
+          <thead>
+            <tr><th>Number</th><th>From</th><th>To</th><th>Status</th><th>What you can do</th></tr>
+          </thead>
+          <tbody>
+            {board.transfers.map((entry) => {
+              // The board's entries are the *described* form; the crates need the raw lines. Looked
+              // up by the same canonical id `describeTransfer` derived, never by `Number()`.
+              const raw = state.transfers.find(
+                (row) => canonicalInventoryId(row?.global_id ?? row?.id) === entry.id,
+              ) || null;
+              const toAllocate = pendingAllocationLines(raw, scope);
+              const canApprove = entry.actions.some((option) => option.action === "approve");
+              return (
+              <tr key={entry.id}>
+                <td className="primary-cell">
+                  {entry.number}
+                  {entry.waitingOnYou && <small className="cell-note stock-low">Waiting for you</small>}
+                </td>
+                <td>{entry.from}</td>
+                <td>{entry.to}</td>
+                <td><span className={entry.tone === "done" ? "stock-ok" : "stock-low"}>{entry.label}</span></td>
+                <td>
+                  <div className="table-actions">
+                    {entry.actions.map((option) => (
+                      // Approving a request means choosing the crates, so that button is drawn by
+                      // the form below instead. Drawing it here as well would give two buttons that
+                      // do different things under one word.
+                      (option.action === "approve" && toAllocate.length > 0) ? null : (
+                        <button
+                          className="table-action"
+                          disabled={busy}
+                          key={option.action}
+                          title={option.detail}
+                          onClick={() => (option.action === "receive"
+                            ? receiveInFull(entry, raw)
+                            : onAction?.(entry.id, option.action))}
+                        >
+                          {option.label}
+                        </button>
+                      )
+                    ))}
+                    {/* Not blank. "Nothing for you to do here" and "this screen forgot to draw the
+                        buttons" look identical when the cell is empty. */}
+                    {entry.actions.length === 0 && <small className="cell-note">Nothing for you to do</small>}
+                  </div>
+
+                  {canApprove && toAllocate.length > 0 && (
+                    <div className="content-card">
+                      <strong>Choose what to send</strong>
+                      {toAllocate.map((line) => {
+                        const { chosen, checked } = allocationFor(line);
+                        return (
+                          <div key={line.id}>
+                            <p className="muted-note">
+                              {line.productName}: {line.requested === null ? "quantity not recorded" : `${line.requested} ${line.unit || ""}`.trim()} asked for
+                            </p>
+                            {chosen.map((choice, index) => (
+                              <div className="button-row" key={`${line.id}-${index}`}>
+                                <select
+                                  value={choice.source_lot_id}
+                                  onChange={(event) => setAllocation(line.id, index, { source_lot_id: event.target.value })}
+                                >
+                                  <option value="">Choose a lot</option>
+                                  {sendableLots
+                                    .filter((lot) => inventoryIdsEqual(lot?.product_id, line.productId))
+                                    .map((lot) => (
+                                      <option key={lot.id} value={lot.id}>
+                                        {lot.lot_no || lot.id} ({lotAvailableQuantity(lot)} available)
+                                      </option>
+                                    ))}
+                                </select>
+                                <input
+                                  inputMode="decimal"
+                                  placeholder="Quantity"
+                                  value={choice.quantity}
+                                  onChange={(event) => setAllocation(line.id, index, { quantity: event.target.value })}
+                                />
+                              </div>
+                            ))}
+                            <button className="secondary-button" onClick={() => addAllocation(line.id)}>Add a lot</button>
+                            {!checked.ok && chosen.length > 0 && (
+                              <ul className="form-note">
+                                {checked.problems.map((problem) => <li key={problem}>{problem}</li>)}
+                              </ul>
+                            )}
+                          </div>
+                        );
+                      })}
+                      <button
+                        className="primary-button"
+                        disabled={busy || !toAllocate.every((line) => allocationFor(line).checked.ok)}
+                        onClick={() => approveWithCrates(entry, toAllocate)}
+                      >
+                        Approve and hold this stock
+                      </button>
+                    </div>
+                  )}
+                </td>
+              </tr>
+              );
+            })}
+            {board.transfers.length === 0 && (
+              <tr><td colSpan={5}>No consignments yet. Stock sent between shops will appear here.</td></tr>
+            )}
+          </tbody>
+        </table>
+      )}
+    </section>
+  );
+}
+
+function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onReload, onTakeOrder, products = [], queue, routingBusy = false, state, user }) {
   const money = (value) => currency.format(Number(value || 0));
+  const [assignDraft, setAssignDraft] = useState({});
+  const canRoute = ["Owner", "Admin"].includes(String(user?.role || ""));
+  const waiting = resolveUnassignedQueue({
+    orders: queue?.orders,
+    loadState: queue?.loadState,
+    loadError: queue?.loadError,
+    permitted: canRoute,
+  });
   const [carrierDraft, setCarrierDraft] = useState({});
   const [reasonDraft, setReasonDraft] = useState({});
   const emptyLine = { product_id: "", quantity: "", agreed_rate: "" };
@@ -13989,8 +14754,89 @@ function OrdersModule({ busy = false, onAdvance, onReload, onTakeOrder, products
 
   const board = buildOrdersBoard(state.orders);
 
+  /** Hand one waiting order to a shop. */
+  const handOver = async (orderId) => {
+    const branchId = assignDraft[orderId] || "";
+    const checked = validateOrderAssignment({ orderId, branchId });
+    if (!checked.ok) return;
+    const done = await onAssign?.(orderId, branchId);
+    if (done) setAssignDraft((current) => ({ ...current, [orderId]: "" }));
+  };
+
   return (
     <section className="settings-layout">
+      {/* Orders that arrived with nobody handling them -- a website order, or a WhatsApp to the
+          company number. They never reach a counter on their own: the sync road scopes by branch
+          and has no notion of role, so an unassigned order on it would land on every till carrying
+          a customer's name, mobile and home address. A person decides, here.
+
+          Drawn above the board because it is the only part of this screen with a customer waiting
+          on the other end of it, and hidden entirely from anybody who cannot act on it -- an
+          Owner-only queue shown to a cashier as an empty box would read as "nothing is waiting". */}
+      {waiting.status !== ORDER_QUEUE_STATUS.NOT_PERMITTED && (
+        <ModuleCard
+          eyebrow="Waiting for a shop"
+          title="Unassigned orders"
+          subtitle="These arrived without a shop. Until one is chosen, no counter can see them and no stock is set aside."
+        >
+          <p className="button-row">
+            <span className="pill">{waiting.countLabel}</span>
+            <button className="table-action" type="button" onClick={onReload}>Refresh</button>
+          </p>
+
+          {/* Never a bare empty list: "none waiting", "could not load" and "not allowed" look the
+              same as rows, and only one of them means a customer is not waiting. */}
+          {waiting.message && <p className="form-note">{waiting.message}</p>}
+
+          {waiting.orders.length > 0 && (
+            <DataTable headers={["Order", "Customer", "Going to", "What they want", "Give it to"]}>
+              {waiting.orders.map((order) => (
+                <tr key={order.id}>
+                  <td className="primary-cell">
+                    {order.orderNo}
+                    <small className="cell-note">{order.source.toLowerCase()}</small>
+                  </td>
+                  <td>
+                    {order.customerName}
+                    {order.customerMobile && <small className="cell-note">{order.customerMobile}</small>}
+                  </td>
+                  {/* The address is why a person decides this and not a rule: it is how somebody
+                      knows which shop is nearer. */}
+                  <td>{order.deliveryAddress || <span className="stock-low">No address given</span>}</td>
+                  <td>
+                    {order.items.length === 0
+                      ? <span className="stock-low">No items recorded</span>
+                      : order.items.map((line, index) => (
+                        <div key={index}>{line.product_name} — {line.quantity} {line.unit || ""}</div>
+                      ))}
+                  </td>
+                  <td>
+                    <div className="button-row">
+                      <select
+                        value={assignDraft[order.id] || ""}
+                        onChange={(event) => setAssignDraft((current) => ({ ...current, [order.id]: event.target.value }))}
+                      >
+                        <option value="">Choose a shop</option>
+                        {branches.filter((branch) => branch.active !== false).map((branch) => (
+                          <option key={branch.id} value={branch.id}>{branch.branch_name}</option>
+                        ))}
+                      </select>
+                      <button
+                        className="primary-button"
+                        disabled={routingBusy || !assignDraft[order.id]}
+                        onClick={() => handOver(order.id)}
+                      >
+                        {routingBusy ? "Sending..." : "Hand over"}
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </DataTable>
+          )}
+        </ModuleCard>
+      )}
+
       <ModuleCard
         eyebrow="Customer Orders"
         title="Orders"
@@ -15149,7 +15995,6 @@ function SettingsModule({
     "settings/permission-matrix": <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />,
     "settings/users": <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />,
     "settings/device-control": <DeviceControlSettingsSection canManage={canManage} deviceControlSettings={settingsData.deviceControlSettings} exitAttemptLogs={settingsData.exitAttemptLogs || []} onReload={onReload} user={user} />,
-    "settings/operational-scope": <OperationalScopeManagement canManage={canManage} user={user} />,
     "settings/updates": (
       <SettingsSectionErrorBoundary sectionName="Update Center">
         <UpdateCenterSection canManage={canManage} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
@@ -17854,7 +18699,7 @@ const currentDateTimeLocal = () => {
   return `${year}-${month}-${day}T${hours}:${minutes}`;
 };
 
-function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, onSeedConsumed, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
+function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, onSeedConsumed, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
   const [search, setSearch] = useState("");
   const [barcode, setBarcode] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
@@ -18015,6 +18860,17 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     [inventory]
   );
 
+  // What this counter may sell, as a *named* state rather than just a list.
+  //
+  // An array has one way to say "nothing", and POS has two very different nothings: the shelf is
+  // genuinely empty, or this machine has not been told which shop it is in and therefore cannot
+  // answer. Rendering the second as the first tells a cashier the fruit is finished while it is
+  // sitting in front of them -- the failure CLAUDE.md names as "errors must never render as zero".
+  const shelf = useMemo(
+    () => resolveSellableProducts({ products, inventoryLots: inventory, scope: counterScope }),
+    [counterScope, inventory, products],
+  );
+
   const searchResults = useMemo(() => {
     const query = search.trim().toLowerCase();
     const matchesProduct = (product) => {
@@ -18039,11 +18895,15 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
         ]),
       ].some((value) => String(value ?? "").toLowerCase().includes(query));
     };
-    return filterSellableProducts(products, inventory)
+    // Scoped here as well as at the source. `inventory` is filled by two paths -- the local snapshot,
+    // which is already narrowed, and an HTTP fetch that is not -- so the shelf is re-checked at the
+    // point of sale rather than trusted to have been checked upstream. Filtering an already-filtered
+    // list changes nothing; failing to filter an unfiltered one sells another shop's fruit.
+    return filterSellableProducts(products, inventory, new Date(), counterScope)
       .filter((product) => matchesProduct(product))
       .map((product) => ({ key: `product-${product.id}`, product, lotCount: (lotsByProduct.get(product.id) || []).filter(isSelectableLot).length }))
       .slice(0, 12);
-  }, [inventory, lotsByProduct, products, search]);
+  }, [counterScope, inventory, lotsByProduct, products, search]);
 
   const salesMandiTaxBasisLabel = {
     GROSS_BEFORE_DISCOUNTS: "Gross item value before discounts",
@@ -18323,7 +19183,10 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
   const scanBarcode = () => {
     const code = barcode.trim();
     if (!code) return;
-    const product = filterSellableProducts(products, inventory).find((item) => item.barcode === code);
+    // The barcode path reaches the same decision by a different route, so it takes the same scope.
+    // A scanner that could sell what the search list refuses would be the more dangerous of the
+    // two, because nobody reads a barcode before it beeps.
+    const product = filterSellableProducts(products, inventory, new Date(), counterScope).find((item) => item.barcode === code);
     if (!product) {
       alert(`No sellable stock is available for barcode ${code}`);
       barcodeRef.current?.focus();
@@ -18836,7 +19699,14 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
                 </button>
               );
             })}
-            {searchResults.length === 0 && <div className="cart-empty">No matching products or lots found.</div>}
+            {searchResults.length === 0 && (
+              <div className="cart-empty">
+                {shelf.usable
+                  ? "No matching products or lots found."
+                  // Not "nothing found". The search worked; the shop is the unknown.
+                  : (shelf.message || "This counter has not been told which shop it is in, so it cannot show what is on the shelf.")}
+              </div>
+            )}
           </div>
         </section>
 

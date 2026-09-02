@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 
 import { ORDER_STATUS, RESERVATION_STATE, RESERVATION_TTL_MS } from "./orderLifecycle.js";
 import { buildOrdersBoard, orderValue, presentOrder, validateOrderAction } from "./ordersBoard.js";
@@ -204,4 +205,93 @@ test("a blank status is unrecognised too, and says so readably", () => {
   const board = buildOrdersBoard([order({ id: "c", status: "" })], NOW);
   assert.equal(board.unknown.length, 1);
   assert.match(board.needsAttention[0].warning, /blank/);
+});
+
+// ---------------------------------------------------------------------------
+// Orders nobody is handling yet
+// ---------------------------------------------------------------------------
+
+test("an order waiting for a shop is listed with what a person needs to decide", async () => {
+  const { resolveUnassignedQueue, ORDER_QUEUE_STATUS } = await import("./ordersBoard.js");
+  const queue = resolveUnassignedQueue({
+    orders: [{
+      global_id: "web-1", order_no: "WEB-1", customer_name: "Anita",
+      customer_mobile: "9999999999", delivery_address: "Ratanada Road", source: "WEBSITE",
+      items: [{ product_name: "Alphonso", quantity: 5, unit: "KG" }],
+    }],
+  });
+  assert.equal(queue.status, ORDER_QUEUE_STATUS.READY);
+  assert.equal(queue.countLabel, "1");
+  // The address is the whole reason a human decides this rather than a rule: it is how somebody
+  // knows Ratanada is nearer.
+  assert.equal(queue.orders[0].deliveryAddress, "Ratanada Road");
+  assert.equal(queue.orders[0].items.length, 1);
+});
+
+test("three different emptinesses, kept apart", async () => {
+  // CLAUDE.md, in this screen's clothes. "Nobody is waiting", "you may not look" and "it would not
+  // load" all produce no rows. Rendering them the same tells an Owner there is nothing to hand out
+  // when nothing could be checked -- while a customer waits for a delivery nobody was given.
+  const { resolveUnassignedQueue, ORDER_QUEUE_STATUS } = await import("./ordersBoard.js");
+
+  const empty = resolveUnassignedQueue({ orders: [] });
+  assert.equal(empty.status, ORDER_QUEUE_STATUS.READY);
+  assert.equal(empty.countLabel, "0", "a real zero is a real answer, and a good one");
+  assert.match(empty.message, /No orders are waiting/);
+
+  const denied = resolveUnassignedQueue({ permitted: false });
+  assert.equal(denied.status, ORDER_QUEUE_STATUS.NOT_PERMITTED);
+  assert.notEqual(denied.countLabel, "0", "a cashier shown 0 would conclude nothing is waiting");
+
+  const failed = resolveUnassignedQueue({ loadError: "The service did not answer." });
+  assert.equal(failed.status, ORDER_QUEUE_STATUS.ERROR);
+  assert.notEqual(failed.countLabel, "0");
+  assert.equal(failed.message, "The service did not answer.");
+});
+
+test("an order cannot be handed to the shop already handling it", async () => {
+  const { validateOrderAssignment } = await import("./ordersBoard.js");
+  assert.equal(validateOrderAssignment({ orderId: "o1", branchId: "2", currentBranchId: "2" }).ok, false);
+  assert.equal(validateOrderAssignment({ orderId: "o1", branchId: "2", currentBranchId: "1" }).ok, true);
+  // Assigning for the first time: there is no current shop, so any shop is a move.
+  assert.equal(validateOrderAssignment({ orderId: "o1", branchId: "2", currentBranchId: null }).ok, true);
+  assert.equal(validateOrderAssignment({ orderId: "o1", branchId: "" }).ok, false);
+});
+
+test("branch ids are compared as opaque text", async () => {
+  // "02" is not 2. The same pitfall that silently emptied the Inventory table.
+  const { validateOrderAssignment } = await import("./ordersBoard.js");
+  assert.equal(
+    validateOrderAssignment({ orderId: "o1", branchId: "02", currentBranchId: "2" }).ok,
+    true,
+    '"02" and "2" are different branches and must not be treated as the same one',
+  );
+});
+
+test("the waiting queue is hidden from people who cannot act on it", () => {
+  // An Owner-only queue rendered to a cashier as an empty box reads as "nothing is waiting", which
+  // is a different and worse statement than "this is not yours to do".
+  const app = fs.readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(
+    app,
+    /\{waiting\.status !== ORDER_QUEUE_STATUS\.NOT_PERMITTED && \(/,
+    "the queue card must not render at all for somebody who may not route orders",
+  );
+  assert.match(app, /const canRoute = \["Owner", "Admin"\]\.includes\(String\(user\?\.role \|\| ""\)\)/);
+});
+
+test("the queue never renders a bare empty list", () => {
+  const app = fs.readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  // "None waiting", "could not load" and "not allowed" all produce no rows, and only one of them
+  // means no customer is waiting. The message is what tells them apart.
+  assert.match(app, /\{waiting\.message && <p className="form-note">\{waiting\.message\}<\/p>\}/);
+  assert.match(app, /\{waiting\.orders\.length > 0 && \(/);
+});
+
+test("handing an order over goes through the same check the server applies", () => {
+  const app = fs.readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(app, /const checked = validateOrderAssignment\(\{ orderId, branchId \}\)/);
+  assert.match(app, /if \(!checked\.ok\) return;/);
+  // The shop list has to be there, or an Owner sees a waiting order and has nowhere to send it.
+  assert.match(app, /branches=\{settingsData\.branches \|\| \[\]\}/);
 });

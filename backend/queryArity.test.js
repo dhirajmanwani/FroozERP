@@ -90,6 +90,22 @@ const splitTopLevel = (text) => {
       void closed;
       continue;
     }
+    // Comments are skipped for the same reason strings are: a comma inside one is prose, not an
+    // argument separator. `findClosing` above has always done this; this function did not, so a
+    // values array with an explanatory comment in it counted one value too many per comma and
+    // reported an arity mismatch that did not exist. A guard that cries wolf is how the real
+    // mismatch it was written for gets waved through -- which is this file's own stated reason for
+    // refusing to guess about interpolated SQL.
+    if (ch === "/" && text[i + 1] === "/") {
+      const newline = text.indexOf("\n", i);
+      i = newline === -1 ? text.length : newline + 1;
+      continue;
+    }
+    if (ch === "/" && text[i + 1] === "*") {
+      const end = text.indexOf("*/", i);
+      i = end === -1 ? text.length : end + 2;
+      continue;
+    }
     if ("([{".includes(ch)) { depth += 1; i += 1; continue; }
     if (")]}".includes(ch)) { depth -= 1; i += 1; continue; }
     if (ch === "," && depth === 0) { parts.push(text.slice(start, i)); start = i + 1; }
