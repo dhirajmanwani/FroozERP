@@ -2120,6 +2120,50 @@ const initializeDatabase = async () => {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    -- Other charges on a bill: crate charge, labour charge, delivery charge, and whatever the shop
+    -- invents next. Nothing here names those three. A charge is a row the maintainer creates
+    -- himself, and measure_unit is free text he types -- kg, km, days -- because a hardcoded list
+    -- of three charges and a hardcoded list of units are the same mistake in two places.
+    --
+    -- company_id is a bare INTEGER, deliberately, for the reason recorded above inventory_batches:
+    -- companies is created by migration 009 and by nothing at startup, so a REFERENCES clause
+    -- here would abort the whole bootstrap on the fresh database this path exists to repair.
+    CREATE TABLE IF NOT EXISTS charge_types (
+      id SERIAL PRIMARY KEY,
+      company_id INTEGER,
+      charge_name VARCHAR(120) NOT NULL,
+      charge_code VARCHAR(40),
+      basis VARCHAR(10) NOT NULL DEFAULT 'FLAT' CHECK (basis IN ('FLAT', 'SLAB')),
+      measure_unit VARCHAR(40),
+      flat_rate NUMERIC(14, 2) CHECK (flat_rate IS NULL OR flat_rate >= 0),
+      active BOOLEAN DEFAULT TRUE,
+      updated_by INTEGER REFERENCES users(id),
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    -- One name per company, among the live ones only. Partial on active because turning a charge
+    -- off has to leave its name free again -- the history of what it charged lives on sale_charges,
+    -- not on this row. COALESCE because NULLs are distinct in a unique index, so an install with no
+    -- company id yet (every install before migration 009) would otherwise have no uniqueness at all.
+    CREATE UNIQUE INDEX IF NOT EXISTS charge_types_company_name_key
+      ON charge_types (COALESCE(company_id, 0), LOWER(charge_name))
+      WHERE active IS NOT FALSE;
+
+    -- "Up to and including this measurement, charge this rate." A slab rounds UP: with 10 km at 100
+    -- and 15 km at 150 a 12 km delivery costs 150, because 12 km is past what 100 was meant to
+    -- cover. A measurement past the largest slab has no rate at all and is refused by name at
+    -- pricing time -- see resolveChargeRateFromType below.
+    CREATE TABLE IF NOT EXISTS charge_rate_slabs (
+      id SERIAL PRIMARY KEY,
+      charge_type_id INTEGER NOT NULL REFERENCES charge_types(id) ON DELETE CASCADE,
+      upto_value NUMERIC(14, 3) NOT NULL CHECK (upto_value > 0),
+      rate NUMERIC(14, 2) NOT NULL CHECK (rate >= 0),
+      active BOOLEAN DEFAULT TRUE,
+      updated_by INTEGER REFERENCES users(id),
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS charge_rate_slabs_type_idx
+      ON charge_rate_slabs (charge_type_id, upto_value);
+
     CREATE TABLE IF NOT EXISTS rebate_rules (
       id SERIAL PRIMARY KEY,
       rule_name VARCHAR(120) NOT NULL,
@@ -3416,6 +3460,10 @@ const initializeDatabase = async () => {
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS mandi_tax_basis VARCHAR(40);
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS mandi_tax_effective_date DATE;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS tax_config_snapshot JSONB;
+    -- Other charges land AFTER tax and are absent from taxable_amount. Routing them through the
+    -- taxable amount instead would raise Mandi Tax on every bill carrying a delivery -- money the
+    -- shop would owe and had never collected. It is a separate column for that reason and no other.
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS other_charges_amount NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS sale_status VARCHAR(20) DEFAULT 'COMPLETED';
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS edited_by INTEGER REFERENCES users(id);
     ALTER TABLE sales ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP;
@@ -3502,6 +3550,33 @@ const initializeDatabase = async () => {
     ALTER TABLE sale_payments ADD COLUMN IF NOT EXISTS branch_id INTEGER;
     ALTER TABLE sale_payments ADD COLUMN IF NOT EXISTS device_id VARCHAR(120);
     ALTER TABLE sale_payments ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'POSTED';
+
+    -- One priced charge line on one bill.
+    --
+    -- charge_name, measure_unit and rate are copied onto the row on purpose. A bill reprinted next
+    -- year has to show what was actually charged, not what Settings says by then -- the same
+    -- reasoning that put tax_config_snapshot on sales. charge_type_id is nullable and clears on
+    -- delete for the same reason: removing a charge type must not erase the history of what it
+    -- charged.
+    --
+    -- quantity and measurement are different numbers and must stay that way: four 10 kg crates
+    -- is quantity 4 at measurement 10, not one 4 kg crate. Conflating them under-charges by exactly
+    -- the amount that matters.
+    CREATE TABLE IF NOT EXISTS sale_charges (
+      id SERIAL PRIMARY KEY,
+      sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+      charge_type_id INTEGER REFERENCES charge_types(id) ON DELETE SET NULL,
+      charge_name VARCHAR(120) NOT NULL,
+      measure_unit VARCHAR(40),
+      measurement NUMERIC(14, 3),
+      quantity NUMERIC(14, 3) NOT NULL DEFAULT 1 CHECK (quantity > 0),
+      rate NUMERIC(14, 2) NOT NULL CHECK (rate >= 0),
+      amount NUMERIC(14, 2) NOT NULL CHECK (amount >= 0),
+      manual BOOLEAN NOT NULL DEFAULT FALSE,
+      slab_upto NUMERIC(14, 3),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS sale_charges_sale_idx ON sale_charges (sale_id);
 
     CREATE TABLE IF NOT EXISTS customer_ledger (
       id SERIAL PRIMARY KEY,
@@ -5701,6 +5776,369 @@ const insertCustomerLedgerEntry = async (
   );
 };
 
+/**
+ * Other charges on a bill -- crate charge, labour charge, delivery charge, and whatever the shop
+ * invents next.
+ *
+ * This is the server half of `frontend/src/local/otherCharges.js`, which is the specification and
+ * carries the reasoning in full. Restated here because nobody reading server.js will have that file
+ * open:
+ *
+ *   1. A charge is kept, not owed back. There is no returnable-deposit liability anywhere in this
+ *      feature; if that ever changes it is a different feature, not a bigger version of this one.
+ *   2. Mandi Tax does not apply to charges. Tax is on fruit. Charges are added AFTER tax and never
+ *      enter `taxable_amount` or `tax_amount`.
+ *   3. A slab rounds UP. With 10 km at 100 and 15 km at 150, a 12 km delivery costs 150 -- 12 km is
+ *      past what 100 was meant to cover.
+ *   4. A measurement past the largest slab has NO rate, and says so. It is never quietly charged at
+ *      the top slab and never at zero. Charging 150 for a 40 km trip when the rates stop at 15 km
+ *      loses money on exactly the trips where the loss is largest, silently, on every bill, forever.
+ *
+ * ## Why the price is recomputed here
+ *
+ * The client sends *which* charge, *how much of it* and *how big it is*. It does not send the
+ * price. A price accepted from the client is a discount granted by the client, and the client is a
+ * machine on a shop counter that anybody standing at it can reach. The one exception is a
+ * hand-entered amount, which is how the shop prices the 40 km trip today rather than after a
+ * settings change -- and that is gated on `manual_pos_rate_override`, the same permission that lets
+ * somebody type a sale rate the price list did not produce, and stamped `manual = TRUE` on the row
+ * so a bill can say where its number came from.
+ *
+ * ## Why a refusal fails the whole bill
+ *
+ * `buildChargesForBill` in the frontend returns priced lines and refusals side by side, because a
+ * cashier with three good crates and one unpriceable delivery needs to see both. The server has no
+ * such screen: it either writes the bill or does not. Pricing the good lines and dropping the bad
+ * one would save a bill that is quietly short by the delivery, which is the failure this whole
+ * feature is written to avoid. So one refusal refuses the request, by name, with the code the POS
+ * needs to show the operator what to fix.
+ */
+
+/** Why a charge could not price itself. Mirrors CHARGE_REFUSALS in local/otherCharges.js. */
+const CHARGE_REFUSALS = Object.freeze({
+  MEASUREMENT_REQUIRED: "MEASUREMENT_REQUIRED",
+  ABOVE_TOP_SLAB: "ABOVE_TOP_SLAB",
+  NO_SLABS: "NO_SLABS",
+  NO_RATE: "NO_RATE",
+  UNKNOWN_CHARGE: "UNKNOWN_CHARGE",
+  CHARGE_INACTIVE: "CHARGE_INACTIVE",
+  MANUAL_NOT_PERMITTED: "MANUAL_NOT_PERMITTED",
+});
+
+const CHARGE_BASES = new Set(["FLAT", "SLAB"]);
+
+const chargeBasisOf = (value) => (String(value || "").trim().toUpperCase() === "SLAB" ? "SLAB" : "FLAT");
+
+/**
+ * A stored number, or NaN when there is no number there.
+ *
+ * `Number(null)` is 0, and a rate of 0 is a legitimate rate -- a shop may deliver free inside 5 km.
+ * So a plain `Number()` on a NULL column cannot tell "free" from "nobody set a price", and would
+ * quietly charge nothing for a charge that has no rate. That is the "errors must never render as
+ * zero" failure with money in it, so an absent value becomes NaN and is refused.
+ */
+const chargeNumber = (value) => (
+  value === null || value === undefined || String(value).trim() === "" ? Number.NaN : Number(value)
+);
+
+/**
+ * Slabs, cleaned and ordered smallest first.
+ *
+ * Rows with no usable threshold or no usable rate are dropped rather than sorted to an arbitrary
+ * place: a slab with no threshold cannot be matched by any measurement, and leaving it in only makes
+ * the ordering unpredictable. A rate of 0 is a real rate -- a shop may well deliver free inside
+ * 5 km -- so the check is `>= 0` and never a truthiness test.
+ */
+const normaliseChargeSlabs = (slabs) => (Array.isArray(slabs) ? slabs : [])
+  .filter((slab) => slab && slab.active !== false)
+  .map((slab) => ({
+    upto: chargeNumber(slab.upto_value ?? slab.upto),
+    rate: chargeNumber(slab.rate),
+  }))
+  .filter((slab) => Number.isFinite(slab.upto) && slab.upto > 0 && Number.isFinite(slab.rate) && slab.rate >= 0)
+  .sort((first, second) => first.upto - second.upto);
+
+/**
+ * The rate for one charge at one measurement.
+ *
+ * @returns {{ok: true, rate: number, slab: object|null}|{ok: false, code: string, message: string}}
+ */
+const resolveChargeRateFromType = (chargeType, measurement) => {
+  const basis = chargeBasisOf(chargeType?.basis);
+  const name = cleanText(chargeType?.charge_name) || "This charge";
+  const unit = cleanText(chargeType?.measure_unit);
+
+  if (basis === "FLAT") {
+    const rate = chargeNumber(chargeType?.flat_rate);
+    if (!Number.isFinite(rate) || rate < 0) {
+      return { ok: false, code: CHARGE_REFUSALS.NO_RATE, message: `${name} has no rate set.` };
+    }
+    return { ok: true, rate: roundCurrency(rate), slab: null };
+  }
+
+  const slabs = normaliseChargeSlabs(chargeType?.slabs);
+  if (!slabs.length) {
+    return {
+      ok: false,
+      code: CHARGE_REFUSALS.NO_SLABS,
+      message: `${name} is priced by ${unit || "measurement"}, but no rates have been set for it.`,
+    };
+  }
+
+  const value = Number(measurement);
+  if (!Number.isFinite(value) || value <= 0) {
+    return {
+      ok: false,
+      code: CHARGE_REFUSALS.MEASUREMENT_REQUIRED,
+      message: `Enter the ${unit || "measurement"} for ${name}.`,
+    };
+  }
+
+  // Round up: the first slab that covers this measurement. 12 km is past the 10 km slab, so it is
+  // priced at 15 km. `<=` and not `<`, or a 10 km delivery would be charged the 15 km rate and
+  // nobody would notice until a customer argued about it.
+  const slab = slabs.find((candidate) => value <= candidate.upto);
+  if (!slab) {
+    const top = slabs[slabs.length - 1];
+    return {
+      ok: false,
+      code: CHARGE_REFUSALS.ABOVE_TOP_SLAB,
+      // The numbers are in the message because "no rate" without them sends somebody hunting
+      // through Settings for a threshold they cannot see.
+      message: `${name} has rates up to ${top.upto} ${unit || ""}`.trim()
+        + `, and this is ${value}. Add a slab, or enter the amount by hand.`,
+    };
+  }
+  return { ok: true, rate: roundCurrency(slab.rate), slab };
+};
+
+/**
+ * A hand-entered charge amount.
+ *
+ * `null` means none was typed. `NaN` means one was typed and cannot be used -- which is refused
+ * rather than falling back to the slabs, because falling back would price a bill at a number the
+ * operator did not ask for and did not see.
+ */
+const parseManualChargeAmount = (request) => {
+  const raw = request?.manual_amount ?? request?.manualAmount;
+  if (raw === null || raw === undefined || String(raw).trim() === "") return null;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? roundCurrency(parsed) : Number.NaN;
+};
+
+/** The charge lines a request is asking for, as an array, whatever field name it used. */
+const chargeRequestsFrom = (body) => {
+  const requests = body?.other_charges ?? body?.charges ?? body;
+  return Array.isArray(requests) ? requests : [];
+};
+
+/** Does any requested line carry a hand-entered amount? Decides whether a permission is needed. */
+const chargeRequestsIncludeManualAmount = (requests) =>
+  chargeRequestsFrom(requests).some((request) => parseManualChargeAmount(request) !== null);
+
+/**
+ * Price every requested charge line against the stored charge types, or refuse.
+ *
+ * @returns {{lines: object[], otherChargesAmount: number}|{error: {status: number, code: string, message: string}}}
+ */
+const resolveSaleCharges = async (client, { requests, companyId = null, allowManualAmount = false } = {}) => {
+  const parsed = chargeRequestsFrom(requests).map((request) => ({
+    chargeTypeId: parsePositiveInteger(request?.charge_type_id ?? request?.chargeTypeId ?? request?.id),
+    measurement: request?.measurement ?? request?.measure ?? null,
+    quantity: request?.quantity ?? request?.qty ?? 1,
+    manualAmount: parseManualChargeAmount(request),
+  }));
+  // No charges is the overwhelmingly common bill, and it must not cost a database round trip --
+  // every existing sale test drives a scripted client that knows nothing about charge tables.
+  if (parsed.length === 0) return { lines: [], otherChargesAmount: 0 };
+
+  const missingId = parsed.find((entry) => !entry.chargeTypeId);
+  if (missingId) {
+    return {
+      error: {
+        status: 400,
+        code: CHARGE_REFUSALS.UNKNOWN_CHARGE,
+        message: "A charge line did not name which charge it is. Remove it and add the charge again.",
+      },
+    };
+  }
+
+  const chargeTypeIds = [...new Set(parsed.map((entry) => entry.chargeTypeId))];
+  const typesResult = await client.query(
+    `
+    SELECT id, charge_name, charge_code, basis, measure_unit, flat_rate, active
+    FROM charge_types
+    WHERE id = ANY($1::int[])
+      AND ($2::INTEGER IS NULL OR company_id IS NULL OR company_id = $2)
+    `,
+    [chargeTypeIds, companyId]
+  );
+  const slabsResult = await client.query(
+    `
+    SELECT charge_type_id, upto_value, rate, active
+    FROM charge_rate_slabs
+    WHERE charge_type_id = ANY($1::int[])
+      AND active IS NOT FALSE
+    ORDER BY charge_type_id, upto_value
+    `,
+    [chargeTypeIds]
+  );
+  const typesById = new Map(typesResult.rows.map((row) => [Number(row.id), { ...row, slabs: [] }]));
+  for (const slab of slabsResult.rows) {
+    typesById.get(Number(slab.charge_type_id))?.slabs.push(slab);
+  }
+
+  const lines = [];
+  for (const entry of parsed) {
+    const chargeType = typesById.get(entry.chargeTypeId);
+    if (!chargeType) {
+      return {
+        error: {
+          status: 400,
+          code: CHARGE_REFUSALS.UNKNOWN_CHARGE,
+          charge_type_id: entry.chargeTypeId,
+          message: "This charge is no longer set up. Remove it from the bill, or add it back in Settings.",
+        },
+      };
+    }
+    const name = cleanText(chargeType.charge_name);
+    if (chargeType.active === false) {
+      return {
+        error: {
+          status: 400,
+          code: CHARGE_REFUSALS.CHARGE_INACTIVE,
+          charge_type_id: entry.chargeTypeId,
+          message: `${name} has been turned off.`,
+        },
+      };
+    }
+
+    const quantity = roundQuantity(Number(entry.quantity ?? 1));
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      return {
+        error: {
+          status: 400,
+          code: CHARGE_REFUSALS.MEASUREMENT_REQUIRED,
+          charge_type_id: entry.chargeTypeId,
+          message: `How many ${name || "charges"}?`,
+        },
+      };
+    }
+
+    const measurementValue = Number(entry.measurement);
+    const measurement = Number.isFinite(measurementValue) && measurementValue > 0 ? roundQuantity(measurementValue) : null;
+
+    if (entry.manualAmount !== null) {
+      if (Number.isNaN(entry.manualAmount)) {
+        return {
+          error: {
+            status: 400,
+            code: CHARGE_REFUSALS.NO_RATE,
+            charge_type_id: entry.chargeTypeId,
+            message: `Enter a valid amount for ${name}.`,
+          },
+        };
+      }
+      if (!allowManualAmount) {
+        return {
+          error: {
+            status: 403,
+            code: CHARGE_REFUSALS.MANUAL_NOT_PERMITTED,
+            charge_type_id: entry.chargeTypeId,
+            message: `You do not have permission to type an amount for ${name}.`,
+          },
+        };
+      }
+      lines.push({
+        charge_type_id: chargeType.id,
+        charge_name: name,
+        measure_unit: nullableText(chargeType.measure_unit),
+        measurement,
+        quantity,
+        rate: entry.manualAmount,
+        amount: roundCurrency(entry.manualAmount * quantity),
+        manual: true,
+        slab_upto: null,
+      });
+      continue;
+    }
+
+    const resolved = resolveChargeRateFromType(chargeType, entry.measurement);
+    if (!resolved.ok) {
+      return {
+        error: {
+          status: 400,
+          code: resolved.code,
+          charge_type_id: entry.chargeTypeId,
+          message: resolved.message,
+        },
+      };
+    }
+    lines.push({
+      charge_type_id: chargeType.id,
+      charge_name: name,
+      measure_unit: nullableText(chargeType.measure_unit),
+      measurement: resolved.slab ? measurement : null,
+      quantity,
+      rate: resolved.rate,
+      amount: roundCurrency(resolved.rate * quantity),
+      manual: false,
+      slab_upto: resolved.slab ? Number(resolved.slab.upto) : null,
+    });
+  }
+
+  // Rounded once at the end, not per line and again in the sum.
+  return { lines, otherChargesAmount: roundCurrency(lines.reduce((sum, line) => sum + Number(line.amount), 0)) };
+};
+
+/**
+ * Write the priced lines onto the bill.
+ *
+ * The name, the unit and the rate go onto each row rather than being looked up through
+ * charge_type_id later. That is the point of the table: what was charged is a fact about the bill,
+ * not a fact about today's settings.
+ */
+const insertSaleCharges = async (client, saleId, lines) => {
+  for (const line of Array.isArray(lines) ? lines : []) {
+    await client.query(
+      `
+      INSERT INTO sale_charges (
+        sale_id, charge_type_id, charge_name, measure_unit, measurement,
+        quantity, rate, amount, manual, slab_upto
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      `,
+      [
+        saleId,
+        line.charge_type_id || null,
+        line.charge_name,
+        line.measure_unit || null,
+        line.measurement,
+        line.quantity,
+        line.rate,
+        line.amount,
+        line.manual === true,
+        line.slab_upto,
+      ]
+    );
+  }
+};
+
+/** The charge lines already written on a bill, for reprinting and for the sale-edit refusal. */
+const getSaleCharges = async (client, saleId) => {
+  const result = await client.query(
+    `
+    SELECT id, charge_type_id, charge_name, measure_unit, measurement,
+           quantity, rate, amount, manual, slab_upto
+    FROM sale_charges
+    WHERE sale_id = $1
+    ORDER BY id
+    `,
+    [saleId]
+  );
+  return result.rows;
+};
+
 const buildSalePayload = async (
   client,
   {
@@ -5713,6 +6151,8 @@ const buildSalePayload = async (
     allowRateOverride,
     companyId = null,
     operationalLocationId = null,
+    charges = null,
+    allowManualChargeAmount = false,
   }
 ) => {
   const parsedItems = (Array.isArray(items) ? items : []).map((item) => ({
@@ -5913,8 +6353,23 @@ const buildSalePayload = async (
     config: salesMandiTaxConfig,
   });
   const taxAmount = salesMandiTax.taxAmount;
-  const totalAmount = roundCurrency(subtotalAfterItemDiscounts - invoiceDiscountAmount + taxAmount);
-  const profit = roundCurrency(totalAmount - totalCost);
+  // Charges are priced from the stored charge types, never from the amounts the request carried.
+  // They are folded in AFTER tax and are absent from taxableAmount -- rule 2 of
+  // frontend/src/local/otherCharges.js -- so a bill carrying a delivery does not raise the shop's
+  // Mandi Tax on money it never collected tax on.
+  const resolvedCharges = await resolveSaleCharges(client, {
+    requests: charges,
+    companyId,
+    allowManualAmount: allowManualChargeAmount,
+  });
+  if (resolvedCharges.error) return { error: resolvedCharges.error };
+  const otherChargesAmount = resolvedCharges.otherChargesAmount;
+  const netBeforeCharges = roundCurrency(subtotalAfterItemDiscounts - invoiceDiscountAmount + taxAmount);
+  const totalAmount = roundCurrency(netBeforeCharges + otherChargesAmount);
+  // Profit stays a fact about the fruit. A crate charge is money kept, but it is not margin on the
+  // sale, and folding it in here would move the profit figure on every bill that carries one --
+  // silently, and in the flattering direction.
+  const profit = roundCurrency(netBeforeCharges - totalCost);
   const requestedPayments = requestedPaymentsInput || [{ mode: "CASH", amount: totalAmount }];
   const parsedPayments = requestedPayments.map((payment) => ({
     mode: String(payment.mode || "").toUpperCase(),
@@ -5948,6 +6403,9 @@ const buildSalePayload = async (
     mandiTaxBasis: salesMandiTax.taxBasis,
     mandiTaxEffectiveDate: salesMandiTax.taxEffectiveDate,
     taxConfigSnapshot: salesMandiTax.taxConfigSnapshot,
+    otherChargesAmount,
+    chargeLines: resolvedCharges.lines,
+    netBeforeCharges,
     totalAmount,
     totalCost,
     profit,
@@ -8591,6 +9049,358 @@ app.delete("/settings/mandi-tax-rules/:id", async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------------------------
+// Other charges: the settings the shop maintains itself.
+//
+// Every one of these is Owner/Admin, through `requireRateManager`, for the same reason the mandi
+// tax and rebate rules above are: a charge rate is a price, and whoever can rewrite a price can
+// rewrite what every future bill collects. The shape follows those routes deliberately -- a reader
+// who knows one knows all three.
+//
+// The actor is always `req.auth.userId`. Nothing here reads an identity from a header or a body.
+// ---------------------------------------------------------------------------------------------
+
+/** Slabs for a set of charge types, smallest threshold first, ready to attach to each type. */
+const loadChargeSlabsByType = async (chargeTypeIds, includeInactive = false) => {
+  if (!chargeTypeIds.length) return new Map();
+  const result = await pool.query(
+    `
+    SELECT id, charge_type_id, upto_value, rate, active, updated_by, updated_at
+    FROM charge_rate_slabs
+    WHERE charge_type_id = ANY($1::int[])
+      AND ($2::BOOLEAN OR active IS NOT FALSE)
+    ORDER BY charge_type_id, upto_value, id
+    `,
+    [chargeTypeIds, includeInactive]
+  );
+  const byType = new Map(chargeTypeIds.map((id) => [Number(id), []]));
+  for (const row of result.rows) byType.get(Number(row.charge_type_id))?.push(row);
+  return byType;
+};
+
+/**
+ * The slabs a create/update request is asking to store, or a refusal.
+ *
+ * Thresholds must be distinct: two slabs at 10 km make "the first slab that covers this" depend on
+ * which row the database felt like returning first, which is a price that changes by itself.
+ */
+const parseChargeSlabPayload = (slabs) => {
+  if (slabs === undefined || slabs === null) return { slabs: null };
+  if (!Array.isArray(slabs)) return { error: "Enter the slabs as a list" };
+  const parsed = [];
+  for (const slab of slabs) {
+    const upto = parsePositiveNumber(slab?.upto_value ?? slab?.upto);
+    const rateRaw = slab?.rate;
+    const rate = rateRaw === null || rateRaw === undefined || String(rateRaw).trim() === ""
+      ? null
+      : parseNonNegativeNumber(rateRaw);
+    // A rate of 0 is a rate -- a shop may deliver free inside 5 km -- so this tests for absence,
+    // never for truthiness.
+    if (!upto || rate === null) return { error: "Every slab needs a measurement and a rate" };
+    parsed.push({ upto, rate: roundCurrency(rate), active: slab?.active !== false });
+  }
+  const thresholds = parsed.map((slab) => slab.upto);
+  if (new Set(thresholds).size !== thresholds.length) {
+    return { error: "Two slabs cannot share the same measurement" };
+  }
+  return { slabs: parsed.sort((first, second) => first.upto - second.upto) };
+};
+
+app.get("/settings/charge-types", async (req, res) => {
+  try {
+    const companyId = parsePositiveInteger(req.auth.companyId);
+    const includeInactive = String(req.query.include_inactive || "").toLowerCase() === "true";
+    const typesResult = await pool.query(
+      `
+      SELECT id, company_id, charge_name, charge_code, basis, measure_unit, flat_rate,
+             active, updated_by, updated_at
+      FROM charge_types
+      WHERE ($1::INTEGER IS NULL OR company_id IS NULL OR company_id = $1)
+        AND ($2::BOOLEAN OR active IS NOT FALSE)
+      ORDER BY active DESC, charge_name
+      `,
+      [companyId, includeInactive]
+    );
+    const slabsByType = await loadChargeSlabsByType(typesResult.rows.map((row) => row.id), includeInactive);
+    return res.json(typesResult.rows.map((row) => ({ ...row, slabs: slabsByType.get(Number(row.id)) || [] })));
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Loading Charge Types" });
+  }
+});
+
+app.post("/settings/charge-types", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const manager = await requireRateManager(req.auth.userId, client);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
+    const chargeName = cleanText(req.body.charge_name);
+    // Read from the request rather than through `chargeBasisOf`, which maps anything it does not
+    // recognise to FLAT. That is right for a stored row, whose CHECK constraint has already vetted
+    // it, and wrong here: a typo would silently create a flat charge the shop did not ask for.
+    const basis = cleanText(req.body.basis).toUpperCase() || "FLAT";
+    const measureUnit = nullableText(req.body.measure_unit);
+    const flatRateRaw = req.body.flat_rate;
+    const flatRate = flatRateRaw === null || flatRateRaw === undefined || String(flatRateRaw).trim() === ""
+      ? null
+      : parseNonNegativeNumber(flatRateRaw);
+    if (!chargeName) return res.status(400).json({ message: "Enter a name for this charge" });
+    if (!CHARGE_BASES.has(basis)) return res.status(400).json({ message: "Choose whether this charge is flat or measured" });
+    // A flat charge with no rate would be created here and then refuse itself on every bill. Better
+    // to refuse now, where somebody is looking at the form, than at the counter with a queue.
+    if (basis === "FLAT" && flatRate === null) return res.status(400).json({ message: "Enter a rate for this charge" });
+    if (basis === "SLAB" && !measureUnit) return res.status(400).json({ message: "Name the unit this charge is measured in" });
+    const parsedSlabs = parseChargeSlabPayload(req.body.slabs);
+    if (parsedSlabs.error) return res.status(400).json({ message: parsedSlabs.error });
+
+    await client.query("BEGIN");
+    const created = await client.query(
+      `
+      INSERT INTO charge_types (
+        company_id, charge_name, charge_code, basis, measure_unit, flat_rate, active, updated_by
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING *
+      `,
+      [
+        parsePositiveInteger(req.auth.companyId),
+        chargeName,
+        nullableText(req.body.charge_code),
+        basis,
+        measureUnit,
+        basis === "FLAT" ? roundCurrency(flatRate) : null,
+        req.body.active !== false,
+        manager.id,
+      ]
+    );
+    const chargeType = created.rows[0];
+    for (const slab of parsedSlabs.slabs || []) {
+      await client.query(
+        `
+        INSERT INTO charge_rate_slabs (charge_type_id, upto_value, rate, active, updated_by)
+        VALUES ($1, $2, $3, $4, $5)
+        `,
+        [chargeType.id, slab.upto, slab.rate, slab.active, manager.id]
+      );
+    }
+    await client.query("COMMIT");
+    const slabsByType = await loadChargeSlabsByType([chargeType.id], true);
+    return res.status(201).json({ ...chargeType, slabs: slabsByType.get(Number(chargeType.id)) || [] });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    if (error.code === "23505") return res.status(409).json({ message: "A charge with this name already exists" });
+    return res.status(500).json({ message: "Error Adding Charge Type" });
+  } finally {
+    client.release();
+  }
+});
+
+app.put("/settings/charge-types/:id", async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const manager = await requireRateManager(req.auth.userId, client);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
+    const chargeTypeId = parsePositiveInteger(req.params.id);
+    if (!chargeTypeId) return res.status(400).json({ message: "Invalid charge" });
+    const chargeName = cleanText(req.body.charge_name);
+    // Read from the request rather than through `chargeBasisOf`, which maps anything it does not
+    // recognise to FLAT. That is right for a stored row, whose CHECK constraint has already vetted
+    // it, and wrong here: a typo would silently create a flat charge the shop did not ask for.
+    const basis = cleanText(req.body.basis).toUpperCase() || "FLAT";
+    const measureUnit = nullableText(req.body.measure_unit);
+    const flatRateRaw = req.body.flat_rate;
+    const flatRate = flatRateRaw === null || flatRateRaw === undefined || String(flatRateRaw).trim() === ""
+      ? null
+      : parseNonNegativeNumber(flatRateRaw);
+    if (!chargeName) return res.status(400).json({ message: "Enter a name for this charge" });
+    if (!CHARGE_BASES.has(basis)) return res.status(400).json({ message: "Choose whether this charge is flat or measured" });
+    if (basis === "FLAT" && flatRate === null) return res.status(400).json({ message: "Enter a rate for this charge" });
+    if (basis === "SLAB" && !measureUnit) return res.status(400).json({ message: "Name the unit this charge is measured in" });
+    const parsedSlabs = parseChargeSlabPayload(req.body.slabs);
+    if (parsedSlabs.error) return res.status(400).json({ message: parsedSlabs.error });
+
+    await client.query("BEGIN");
+    const existing = await client.query(
+      `
+      SELECT id FROM charge_types
+      WHERE id = $1 AND ($2::INTEGER IS NULL OR company_id IS NULL OR company_id = $2)
+      FOR UPDATE
+      `,
+      [chargeTypeId, parsePositiveInteger(req.auth.companyId)]
+    );
+    if (!existing.rows[0]) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ message: "Charge not found" });
+    }
+    const updated = await client.query(
+      `
+      UPDATE charge_types
+      SET charge_name = $1, charge_code = $2, basis = $3, measure_unit = $4, flat_rate = $5,
+          active = $6, updated_by = $7, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $8
+      RETURNING *
+      `,
+      [
+        chargeName,
+        nullableText(req.body.charge_code),
+        basis,
+        measureUnit,
+        basis === "FLAT" ? roundCurrency(flatRate) : null,
+        req.body.active !== false,
+        manager.id,
+        chargeTypeId,
+      ]
+    );
+    // Slabs are replaced only when the request carries them. Absent means "leave the rates alone",
+    // never "this charge has no rates now" -- an edit that saved the name would otherwise wipe every
+    // threshold and the charge would start refusing itself on the next bill.
+    if (parsedSlabs.slabs) {
+      await client.query("DELETE FROM charge_rate_slabs WHERE charge_type_id = $1", [chargeTypeId]);
+      for (const slab of parsedSlabs.slabs) {
+        await client.query(
+          `
+          INSERT INTO charge_rate_slabs (charge_type_id, upto_value, rate, active, updated_by)
+          VALUES ($1, $2, $3, $4, $5)
+          `,
+          [chargeTypeId, slab.upto, slab.rate, slab.active, manager.id]
+        );
+      }
+    }
+    await client.query("COMMIT");
+    const slabsByType = await loadChargeSlabsByType([chargeTypeId], true);
+    return res.json({ ...updated.rows[0], slabs: slabsByType.get(Number(chargeTypeId)) || [] });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(error);
+    if (error.code === "23505") return res.status(409).json({ message: "A charge with this name already exists" });
+    return res.status(500).json({ message: "Error Updating Charge Type" });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * Turn a charge off.
+ *
+ * Deactivated, never deleted: `sale_charges` rows point at this id, and a bill printed next year
+ * still has to say which charge it was. A turned-off charge is refused by name at the counter
+ * rather than quietly dropped from the bill.
+ */
+app.post("/settings/charge-types/:id/deactivate", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.auth.userId);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
+    const chargeTypeId = parsePositiveInteger(req.params.id);
+    if (!chargeTypeId) return res.status(400).json({ message: "Invalid charge" });
+    const result = await pool.query(
+      `
+      UPDATE charge_types
+      SET active = FALSE, updated_by = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2 AND ($3::INTEGER IS NULL OR company_id IS NULL OR company_id = $3)
+      RETURNING *
+      `,
+      [manager.id, chargeTypeId, parsePositiveInteger(req.auth.companyId)]
+    );
+    return result.rows[0]
+      ? res.json({ success: true, charge_type: result.rows[0] })
+      : res.status(404).json({ message: "Charge not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Deactivating Charge Type" });
+  }
+});
+
+app.post("/settings/charge-types/:id/slabs", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.auth.userId);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
+    const chargeTypeId = parsePositiveInteger(req.params.id);
+    const parsed = parseChargeSlabPayload([req.body]);
+    if (!chargeTypeId) return res.status(400).json({ message: "Invalid charge" });
+    if (parsed.error) return res.status(400).json({ message: parsed.error });
+    const owner = await pool.query(
+      "SELECT id FROM charge_types WHERE id = $1 AND ($2::INTEGER IS NULL OR company_id IS NULL OR company_id = $2)",
+      [chargeTypeId, parsePositiveInteger(req.auth.companyId)]
+    );
+    if (!owner.rows[0]) return res.status(404).json({ message: "Charge not found" });
+    const [slab] = parsed.slabs;
+    const result = await pool.query(
+      `
+      INSERT INTO charge_rate_slabs (charge_type_id, upto_value, rate, active, updated_by)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING *
+      `,
+      [chargeTypeId, slab.upto, slab.rate, slab.active, manager.id]
+    );
+    return res.status(201).json(result.rows[0]);
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Adding Charge Slab" });
+  }
+});
+
+app.put("/settings/charge-types/:id/slabs/:slabId", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.auth.userId);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
+    const chargeTypeId = parsePositiveInteger(req.params.id);
+    const slabId = parsePositiveInteger(req.params.slabId);
+    const parsed = parseChargeSlabPayload([req.body]);
+    if (!chargeTypeId || !slabId) return res.status(400).json({ message: "Invalid charge slab" });
+    if (parsed.error) return res.status(400).json({ message: parsed.error });
+    const [slab] = parsed.slabs;
+    const result = await pool.query(
+      `
+      UPDATE charge_rate_slabs
+      SET upto_value = $1, rate = $2, active = $3, updated_by = $4, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $5
+        AND charge_type_id = $6
+        AND charge_type_id IN (
+          SELECT id FROM charge_types
+          WHERE id = $6 AND ($7::INTEGER IS NULL OR company_id IS NULL OR company_id = $7)
+        )
+      RETURNING *
+      `,
+      [slab.upto, slab.rate, slab.active, manager.id, slabId, chargeTypeId, parsePositiveInteger(req.auth.companyId)]
+    );
+    return result.rows[0] ? res.json(result.rows[0]) : res.status(404).json({ message: "Charge slab not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Updating Charge Slab" });
+  }
+});
+
+app.post("/settings/charge-types/:id/slabs/:slabId/deactivate", async (req, res) => {
+  try {
+    const manager = await requireRateManager(req.auth.userId);
+    if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage settings" });
+    const chargeTypeId = parsePositiveInteger(req.params.id);
+    const slabId = parsePositiveInteger(req.params.slabId);
+    if (!chargeTypeId || !slabId) return res.status(400).json({ message: "Invalid charge slab" });
+    const result = await pool.query(
+      `
+      UPDATE charge_rate_slabs
+      SET active = FALSE, updated_by = $1, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $2
+        AND charge_type_id = $3
+        AND charge_type_id IN (
+          SELECT id FROM charge_types
+          WHERE id = $3 AND ($4::INTEGER IS NULL OR company_id IS NULL OR company_id = $4)
+        )
+      RETURNING *
+      `,
+      [manager.id, slabId, chargeTypeId, parsePositiveInteger(req.auth.companyId)]
+    );
+    return result.rows[0]
+      ? res.json({ success: true, slab: result.rows[0] })
+      : res.status(404).json({ message: "Charge slab not found" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Error Deactivating Charge Slab" });
+  }
+});
+
 app.post("/settings/rebate-rules", async (req, res) => {
   try {
     const { rule_name, pay_within_days, rebate_percent, active } = req.body;
@@ -9308,6 +10118,15 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
     allowRateOverride: true,
     companyId: context.companyId,
     operationalLocationId: context.operationalLocationId,
+    // An offline bill carries its charge lines the same way it carries its items, and they are
+    // re-priced here against the server's charge types. Ignoring them would land the invoice on the
+    // server short by every crate and every delivery it collected at the counter -- silently, and
+    // only visible as a shortfall in the till weeks later.
+    charges: payload.other_charges,
+    // The counter that took the bill is not present to be asked for a permission, and the bill has
+    // already been given to the customer. A hand-entered amount that reaches here was authorised on
+    // the device that wrote it; refusing it now would strand the invoice in the sync queue forever.
+    allowManualChargeAmount: true,
   });
   if (salePayload.error) {
     if (salePayload.error.status === 409) {
@@ -9329,11 +10148,11 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
       discount_rule_payment_mode, profit_status, sale_date, transaction_date,
       bill_datetime, backdated_bill, backdate_reason, due_date, credit_remarks, credit_status,
       global_id, offline_invoice_ref, source_device_id,
-      company_id, operational_location_id, entity_version
+      company_id, operational_location_id, other_charges_amount, entity_version
     )
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
             $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
-            $32, $33, $34, $35, $36, $37, $38, 1)
+            $32, $33, $34, $35, $36, $37, $38, $39, 1)
     RETURNING *
     `,
     [
@@ -9375,11 +10194,13 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
       context.deviceId,
       context.companyId,
       context.operationalLocationId,
+      salePayload.otherChargesAmount,
     ]
   );
   const sale = saleResult.rows[0];
   const invoiceNo = `FZ-${toDateKey(sale.sale_date).replaceAll("-", "")}-${String(sale.id).padStart(6, "0")}`;
   await client.query("UPDATE sales SET invoice_no = $1 WHERE id = $2", [invoiceNo, sale.id]);
+  await insertSaleCharges(client, sale.id, salePayload.chargeLines);
 
   for (const item of salePayload.invoiceItems) {
     const subtotalAfterItemDiscounts = Math.max(salePayload.grossAmount - salePayload.itemDiscountAmount, 0);
@@ -9529,6 +10350,18 @@ const processPosSaleEditOperation = async (client, operation, context) => {
   }
   if (currentSale.sale_status === "CANCELLED") {
     return rejectOperation(operation, "CONFLICT", "Cancelled invoices cannot be edited");
+  }
+  // The edit path rebuilds the bill's totals from its items and knows nothing about other charges.
+  // Letting it through would rewrite total_amount without the crate charge while the sale_charges
+  // rows stayed where they were -- the bill's own total disagreeing with its own lines, which is
+  // the summary-versus-detail failure that reads as data loss. Refused by name until the edit path
+  // carries charges too.
+  if (Number(currentSale.other_charges_amount || 0) > 0) {
+    return rejectOperation(
+      operation,
+      "CONFLICT",
+      "This bill has other charges on it. Editing a bill with charges is not supported yet -- cancel it and bill again.",
+    );
   }
   if (Number(currentSale.entity_version || 1) >= version && currentSale.sale_status === "EDITED") {
     return {
@@ -20756,8 +21589,38 @@ const createSaleHandler = async (req, res) => {
       config: salesMandiTaxConfig,
     });
     const taxAmount = salesMandiTax.taxAmount;
-    const totalAmount = roundCurrency(subtotalAfterItemDiscounts - invoiceDiscountAmount + taxAmount);
-    const profit = roundCurrency(totalAmount - totalCost);
+
+    // Other charges -- crate, labour, delivery, anything the shop has set up. Priced here from the
+    // stored charge types and never from an amount the request carried: a client-supplied price is
+    // a client-supplied discount. A hand-entered amount is the one exception and needs the same
+    // permission as typing a sale rate the price list did not produce.
+    const chargeRequests = chargeRequestsFrom(req.body);
+    if (chargeRequestsIncludeManualAmount(chargeRequests) && !rateOverrideUser) {
+      rateOverrideUser = await getPermissionUser(parsedCreatedBy, "manual_pos_rate_override", ["Owner", "Admin"], client);
+    }
+    const resolvedCharges = await resolveSaleCharges(client, {
+      requests: chargeRequests,
+      companyId: context?.company_id || parsePositiveInteger(req.auth.companyId),
+      allowManualAmount: Boolean(rateOverrideUser),
+    });
+    // A charge that cannot price itself refuses the bill by name. Dropping the line instead would
+    // save a bill quietly short by the delivery, which is the whole failure this feature is written
+    // to avoid -- `Delivery: 0` reads as "no delivery" and the trip is free.
+    if (resolvedCharges.error) {
+      await client.query("ROLLBACK");
+      return res.status(resolvedCharges.error.status).json(resolvedCharges.error);
+    }
+    const otherChargesAmount = resolvedCharges.otherChargesAmount;
+
+    // Charges land AFTER tax and are absent from taxable_amount and tax_amount, which is rule 2 of
+    // frontend/src/local/otherCharges.js: passing them through the taxable amount would raise the
+    // shop's Mandi Tax on money it never collected tax on.
+    const netBeforeCharges = roundCurrency(subtotalAfterItemDiscounts - invoiceDiscountAmount + taxAmount);
+    const totalAmount = roundCurrency(netBeforeCharges + otherChargesAmount);
+    // Profit stays a fact about the fruit. A crate charge is money kept but it is not margin on the
+    // sale, and folding it in would move the profit figure on every bill carrying one -- silently,
+    // and in the flattering direction.
+    const profit = roundCurrency(netBeforeCharges - totalCost);
     const profitStatus = invoiceItems.some((item) => item.costStatus === "PROVISIONAL") ? "PROVISIONAL" : "FINAL";
     const requestedPayments = requestedPaymentsInput || [{ mode: "CASH", amount: totalAmount }];
     const parsedPayments = requestedPayments.map((payment) => ({
@@ -20788,9 +21651,9 @@ const createSaleHandler = async (req, res) => {
         discount_rule_id, discount_rule_name, discount_rule_type, discount_rule_value,
         discount_rule_payment_mode, profit_status, sale_date, transaction_date,
         bill_datetime, backdated_bill, backdate_reason, due_date, credit_remarks, credit_status,
-        global_id, source_device_id, company_id, operational_location_id
+        global_id, source_device_id, company_id, operational_location_id, other_charges_amount
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38)
       RETURNING *
       `,
       [
@@ -20820,6 +21683,7 @@ const createSaleHandler = async (req, res) => {
         context?.device_id || cleanText(req.body.device_id || req.body.source_device_id) || null,
         context?.company_id || null,
         context?.operational_location_id || null,
+        otherChargesAmount,
       ]
     );
     const sale = saleResult.rows[0];
@@ -20828,6 +21692,7 @@ const createSaleHandler = async (req, res) => {
       "UPDATE sales SET invoice_no = $1 WHERE id = $2",
       [invoiceNo, sale.id]
     );
+    await insertSaleCharges(client, sale.id, resolvedCharges.lines);
 
     for (const item of invoiceItems) {
       const invoiceDiscountShare = subtotalAfterItemDiscounts === 0
@@ -20961,6 +21826,9 @@ const createSaleHandler = async (req, res) => {
           lot_discount_value: item.lotDiscountValue || 0,
         })),
         payments: parsedPayments,
+        // The lines as they were written, not as Settings will describe them later.
+        other_charges: resolvedCharges.lines,
+        other_charges_amount: otherChargesAmount,
       },
     };
     if (context) {
@@ -21124,6 +21992,9 @@ const loadSalesHistoryStructured = async ({ dateFrom, dateTo, saleId = null, fla
       s.total_amount,
       s.total_cost,
       s.profit,
+      -- Without this the invoice reads as a summary that disagrees with its own detail: a bill
+      -- whose items add to 408 showing a total of 528 and nothing saying where the 120 went.
+      COALESCE(s.other_charges_amount, 0) AS other_charges_amount,
       COALESCE(
         JSON_AGG(
           JSON_BUILD_OBJECT(
@@ -21202,7 +22073,10 @@ app.get("/sales-history/:id", async (req, res) => {
     if (!saleId) return res.status(400).json({ message: "Invalid invoice" });
     const rows = await loadSalesHistoryStructured({ dateFrom: "1900-01-01", dateTo: "2999-12-31", saleId, branchId: req.auth.branchId });
     if (!rows.length) return res.status(404).json({ message: "Invoice not found" });
-    return res.json(rows[0]);
+    // Read after the branch-scoped lookup has already proved this bill belongs to the caller. The
+    // charge lines are snapshots -- the name and rate as charged, not as Settings describes them
+    // today -- which is the whole reason a reprint can be trusted a year later.
+    return res.json({ ...rows[0], other_charges: await getSaleCharges(pool, saleId) });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Sales History Invoice" });
@@ -21750,6 +22624,16 @@ const updateSaleHandler = async (req, res) => {
     if (currentSale.sale_status === "CANCELLED") {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Cancelled invoices cannot be edited" });
+    }
+    // Same refusal as the offline edit path above, and for the same reason: this handler rebuilds
+    // total_amount from the items alone, so an edit would silently drop the crate charge from the
+    // total while its sale_charges row stayed on the bill.
+    if (Number(currentSale.other_charges_amount || 0) > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        code: "SALE_HAS_OTHER_CHARGES",
+        message: "This bill has other charges on it. Editing a bill with charges is not supported yet -- cancel it and bill again.",
+      });
     }
     const requestedSaleDate = req.body.bill_date || req.body.sale_date
       ? toBusinessDateKey(req.body.bill_date || req.body.sale_date)
@@ -22389,4 +23273,11 @@ module.exports = {
   resolveGoodsReceivedAt,
   resolveBranchDefaultLocationId,
   normalizeCustomerOrderItems,
+  // Other charges. Exported so `otherCharges.test.js` can drive the pricing directly instead of
+  // asserting it exists in the source text -- the rule that a measurement past the top slab is
+  // refused rather than priced is a behaviour, and only running it proves it.
+  CHARGE_REFUSALS,
+  normaliseChargeSlabs,
+  resolveChargeRateFromType,
+  resolveSaleCharges,
 };

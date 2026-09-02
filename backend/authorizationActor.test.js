@@ -77,8 +77,12 @@ const INDIRECT_ACTORS = [
  * Pinned so that a route added later in the old style fails here rather than shipping. Raising it
  * is a normal part of adding a guarded route; lowering it, or a mismatch against the total, means
  * a call site went back to reading the request.
+ *
+ * 59 -> 65 on 2026-09-02: the six `/settings/charge-types` write routes (create, update, deactivate,
+ * and the three slab writes) each take their actor from the session. The list route reads nothing
+ * privileged and takes no guard.
  */
-const SESSION_DERIVED_RATE_MANAGER_CALLS = 59;
+const SESSION_DERIVED_RATE_MANAGER_CALLS = 65;
 
 /** Every `requireRateManager(` occurrence in the file, session-derived or listed above. */
 const TOTAL_RATE_MANAGER_CALLS = SESSION_DERIVED_RATE_MANAGER_CALLS + INDIRECT_ACTORS.length;
