@@ -233,10 +233,21 @@ export const buildChargesForBill = (chargeTypes, selections) => {
   const lines = [];
   const refusals = [];
 
+  /*
+   * Every line and every refusal carries the index of the selection it came from.
+   *
+   * Without it a screen has to line `lines[i]` up against `selections[i]`, and the moment one
+   * selection refuses, the arrays are different lengths and every row below shows the amount
+   * belonging to the row above. That is the summary-and-detail drift again: two collections
+   * describing the same thing, filtered differently, disagreeing silently.
+   */
+  let index = -1;
   for (const selection of Array.isArray(selections) ? selections : []) {
+    index += 1;
     const chargeType = byId.get(String(selection?.charge_type_id ?? selection?.id));
     if (!chargeType) {
       refusals.push({
+        selection_index: index,
         charge_type_id: selection?.charge_type_id ?? selection?.id ?? null,
         code: CHARGE_REFUSALS.NO_RATE,
         message: "This charge is no longer set up. Remove it from the bill, or add it back in Settings.",
@@ -245,6 +256,7 @@ export const buildChargesForBill = (chargeTypes, selections) => {
     }
     if (chargeType.active === false) {
       refusals.push({
+        selection_index: index,
         charge_type_id: chargeType.id,
         code: CHARGE_REFUSALS.NO_RATE,
         message: `${cleanText(chargeType.charge_name || chargeType.name)} has been turned off.`,
@@ -252,8 +264,8 @@ export const buildChargesForBill = (chargeTypes, selections) => {
       continue;
     }
     const built = buildChargeLine(chargeType, selection);
-    if (built.ok) lines.push(built.line);
-    else refusals.push({ charge_type_id: chargeType.id, code: built.code, message: built.message });
+    if (built.ok) lines.push({ ...built.line, selection_index: index });
+    else refusals.push({ selection_index: index, charge_type_id: chargeType.id, code: built.code, message: built.message });
   }
 
   return { lines, refusals, otherChargesAmount: totalCharges(lines) };

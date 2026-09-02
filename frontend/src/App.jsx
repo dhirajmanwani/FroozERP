@@ -84,6 +84,7 @@ import { isCloudTargetConfigured, resolveCloudTarget } from "./local/cloudTarget
 import { resolveApiMode } from "./local/apiModeResolution";
 import { CLOUD_CALL_REFUSAL_CODES, createCloudCallGuard, createCloudCallRefusalError, evaluateCloudCall } from "./local/cloudCallGuard";
 import { UNKNOWN_COUNTER_SCOPE, counterMaySell, resolveCounterScope } from "./local/locationScope";
+import { applyChargesToTotals, buildChargesForBill } from "./local/otherCharges";
 import {
   DISTRIBUTION_BOARD_STATUS,
   pendingAllocationLines,
@@ -813,6 +814,28 @@ const buildPurchaseLineIdentity = (item) => [
   String(Number(item?.purchase_rate || 0)),
   String(Number(item?.temporary_sale_rate || 0)),
 ].join("|");
+/**
+ * The charge price list, from whichever shape it arrived in.
+ *
+ * Three sources spell it three ways and all three are real: the cloud settings bundle, the offline
+ * reference snapshot's top-level `charge_types`, and the same snapshot's `settings_bundle`. Reading
+ * only one of them would give a counter an empty price list on exactly the day its internet is
+ * down, which is the day this feature is for.
+ *
+ * Withdrawn charges are dropped here, but withdrawn *slabs* are kept: `normaliseSlabs` in
+ * `local/otherCharges.js` filters those, and a slab list that silently lost its retired rows would
+ * make "no rate for 40 km" and "the 40 km rate was withdrawn" indistinguishable.
+ */
+const readChargeTypes = (source) => {
+  const list = source?.chargeTypes
+    || source?.charge_types
+    || source?.offlineChargeTypes
+    || source?.settings_bundle?.offlineChargeTypes
+    || source?.settingsBundle?.offlineChargeTypes
+    || [];
+  return (Array.isArray(list) ? list : []).filter((type) => type && type.active !== false);
+};
+
 const defaultPurchaseRules = {
   mandiTaxRules: [],
   rebateRules: [],
@@ -1920,6 +1943,12 @@ function App() {
   const [wasteEntries, setWasteEntries] = useState([]);
   const [purchaseRules, setPurchaseRules] = useState(defaultPurchaseRules);
   const [settingsRules, setSettingsRules] = useState(defaultPurchaseRules);
+  /**
+   * The shop's charge price list. Settings, not bill state: it arrives from the cloud or the
+   * offline snapshot and nothing at a counter edits it. What a given bill has picked lives in
+   * `PosBilling`, because it dies with the bill.
+   */
+  const [chargeTypes, setChargeTypes] = useState([]);
   const [settingsData, setSettingsData] = useState({
     businessSettings: defaultBusinessSettings,
     saleRateSettings: defaultSaleRateSettings,
@@ -3817,11 +3846,13 @@ function App() {
       branches: bundle.branches || [],
       counters: bundle.counters || [],
       systemInfo: bundle.systemInfo || {},
+      chargeTypes: readChargeTypes(bundle),
       canManageSettings: Boolean(bundle.canManageSettings),
     });
     setSettingsRules(nextPurchaseRules);
     setPurchaseRules(nextPurchaseRules);
     setDiscountRules((bundle.discountRules || []).filter((rule) => rule.active !== false));
+    setChargeTypes(readChargeTypes(bundle));
     setLotDiscounts(bundle.lotDiscounts || []);
     setProductDuplicateWarning(bundle.productDuplicateWarning || "");
     setSaleRates(bundle.saleRates || []);
@@ -4446,6 +4477,7 @@ function App() {
       branches: data.branches || [],
       counters: data.counters || [],
       systemInfo: data.systemInfo || {},
+      chargeTypes: readChargeTypes(data),
       canManageSettings: Boolean(data.canManageSettings),
     });
     setSettingsRules({
@@ -4453,6 +4485,7 @@ function App() {
       rebateRules: data.rebateRules || [],
     });
     setDiscountRules((data.discountRules || []).filter((rule) => rule.active !== false));
+    setChargeTypes(readChargeTypes(data));
     setSaleDesiredMargin(String(nextSaleRateSettings.desired_margin_percent || 25));
   };
 
@@ -8208,6 +8241,7 @@ function App() {
 
           {activeView === "sales" && (
             <PosBilling
+              chargeTypes={chargeTypes}
               customers={customers.filter((customer) => customer.active !== false)}
               orders={ordersState.orders}
               seedCart={posSeedCart}
@@ -15989,6 +16023,7 @@ function SettingsModule({
     "settings/payment-tax": <PaymentSettingsSection canManage={canManage} key={settingsData.paymentSettings?.updated_at || "payment-settings"} onReload={onReload} paymentSettings={settingsData.paymentSettings} user={user} />,
     "settings/whatsapp": <WhatsAppSettingsSection canManage={canManage} key={settingsData.whatsappSettings?.updated_at || "whatsapp-settings"} onReload={onReload} user={user} whatsappSettings={settingsData.whatsappSettings} />,
     "settings/mandi-tax": <MandiTaxSettings canManage={canManage} onReload={onReload} rules={rules.mandiTaxRules} user={user} />,
+    "settings/other-charges": <OtherChargesSettings canManage={canManage} chargeTypes={settingsData.chargeTypes || []} onReload={onReload} user={user} />,
     "settings/supplier-rebate": <RebateSettings canManage={canManage} onReload={onReload} rules={rules.rebateRules} user={user} />,
     "settings/sale-rate-suggestions": <SaleRateSettingsSection canManage={canManage} key={settingsData.saleRateSettings?.updated_at || "sale-rate-settings"} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />,
     "settings/bill-discount-slabs": <DiscountSettings canManage={canManage} discountRules={settingsData.discountRules} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />,
@@ -16378,6 +16413,174 @@ function MandiTaxSettings({ canManage, onReload, rules, user }) {
         {rules.map((rule) => <MandiRuleRow canManage={canManage} key={rule.id} onReload={onReload} rule={rule} user={user} />)}
       </DataTable>
     </ModuleCard>
+  );
+}
+
+/**
+ * The shop's own charge list: crate, labour, delivery, or anything it invents.
+ *
+ * Deliberately empty of vocabulary. There is no dropdown of charge kinds and no fixed list of
+ * units -- the shop types the name and types the unit, because the next charge it needs is one
+ * nobody has thought of yet.
+ *
+ * A charge is priced one of two ways. Flat is one rate. By-measurement is a list of slabs, each
+ * "up to this much, charge this", and the price is the first slab that covers the measurement --
+ * so 12 km with slabs at 10 and 15 costs the 15 km rate. Past the last slab there is no price at
+ * all, and the counter says so rather than guessing; that is why the table below shows the top of
+ * the range plainly.
+ */
+function OtherChargesSettings({ canManage, chargeTypes = [], onReload, user }) {
+  const blank = { charge_name: "", basis: "FLAT", measure_unit: "", flat_rate: "" };
+  const [draft, setDraft] = useState(blank);
+  const slabbed = draft.basis === "SLAB";
+
+  const addChargeType = async () => {
+    try {
+      await axios.post(`${API_URL}/settings/charge-types`, {
+        charge_name: draft.charge_name,
+        basis: draft.basis,
+        measure_unit: slabbed ? draft.measure_unit : null,
+        // Sent as null, not 0, when it does not apply. A slab charge with a flat rate of 0 would
+        // read as "this is free" to anything that later looked only at that column.
+        flat_rate: slabbed ? null : draft.flat_rate,
+        updated_by: user.id,
+      });
+      setDraft(blank);
+      await onReload();
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to add this charge"));
+    }
+  };
+
+  return (
+    <ModuleCard
+      eyebrow="Charge Settings"
+      title="Other Charges"
+      subtitle="Crate, labour, delivery, or anything else you charge for. Set one rate, or a rate that depends on a measurement."
+    >
+      <div className="form-grid settings-add-grid">
+        <Field label="Charge Name">
+          <input
+            disabled={!canManage}
+            placeholder="Crate charge"
+            value={draft.charge_name}
+            onChange={(event) => setDraft({ ...draft, charge_name: event.target.value })}
+          />
+        </Field>
+        <Field label="Priced By">
+          <select disabled={!canManage} value={draft.basis} onChange={(event) => setDraft({ ...draft, basis: event.target.value })}>
+            <option value="FLAT">One fixed rate</option>
+            <option value="SLAB">Depends on a measurement</option>
+          </select>
+        </Field>
+        {slabbed
+          ? (
+            <Field label="Measured In">
+              <input
+                disabled={!canManage}
+                placeholder="kg, km, days..."
+                value={draft.measure_unit}
+                onChange={(event) => setDraft({ ...draft, measure_unit: event.target.value })}
+              />
+            </Field>
+          )
+          : (
+            <Field label="Rate">
+              <input
+                disabled={!canManage}
+                min="0"
+                step="0.01"
+                type="number"
+                value={draft.flat_rate}
+                onChange={(event) => setDraft({ ...draft, flat_rate: event.target.value })}
+              />
+            </Field>
+          )}
+      </div>
+      <button className="primary-button" disabled={!canManage} onClick={addChargeType}>Add Charge</button>
+      {slabbed && <p className="form-note">Add the charge first, then add its rates below — 10 kg costs 40, 20 kg costs 50, and so on.</p>}
+
+      <DataTable headers={["Charge", "Priced By", "Rates", "Status", ""]}>
+        {chargeTypes.map((chargeType) => (
+          <ChargeTypeRow canManage={canManage} chargeType={chargeType} key={chargeType.id} onReload={onReload} user={user} />
+        ))}
+      </DataTable>
+      {!chargeTypes.length && <p className="form-note">No charges set up yet.</p>}
+    </ModuleCard>
+  );
+}
+
+/** One charge and its rates. Slabs are edited here because a slab means nothing on its own. */
+function ChargeTypeRow({ canManage, chargeType, onReload, user }) {
+  const [slabDraft, setSlabDraft] = useState({ upto_value: "", rate: "" });
+  const slabs = [...(chargeType.slabs || [])].sort((first, second) => Number(first.upto_value) - Number(second.upto_value));
+  const unit = chargeType.measure_unit || "";
+  const bySlab = String(chargeType.basis || "").toUpperCase() === "SLAB";
+
+  const addSlab = async () => {
+    try {
+      await axios.post(`${API_URL}/settings/charge-types/${chargeType.id}/slabs`, {
+        upto_value: slabDraft.upto_value,
+        rate: slabDraft.rate,
+        updated_by: user.id,
+      });
+      setSlabDraft({ upto_value: "", rate: "" });
+      await onReload();
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to add this rate"));
+    }
+  };
+
+  const retireSlab = async (slabId) => {
+    try {
+      await axios.post(`${API_URL}/settings/charge-types/${chargeType.id}/slabs/${slabId}/deactivate`, { updated_by: user.id });
+      await onReload();
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to remove this rate"));
+    }
+  };
+
+  const retireCharge = async () => {
+    if (!window.confirm(`Turn off "${chargeType.charge_name}"? It will stop appearing on new bills. Bills that already carry it keep it.`)) return;
+    try {
+      await axios.post(`${API_URL}/settings/charge-types/${chargeType.id}/deactivate`, { updated_by: user.id });
+      await onReload();
+    } catch (error) {
+      alert(getErrorMessage(error, "Unable to turn off this charge"));
+    }
+  };
+
+  return (
+    <tr>
+      <td className="primary-cell">{chargeType.charge_name}</td>
+      <td>{bySlab ? `By ${unit || "measurement"}` : "Fixed rate"}</td>
+      <td>
+        {bySlab
+          ? (
+            <div className="charge-slab-editor">
+              {slabs.filter((slab) => slab.active !== false).map((slab) => (
+                <div className="charge-slab-row" key={slab.id}>
+                  <span>up to {slab.upto_value} {unit} — {currency.format(Number(slab.rate || 0))}</span>
+                  <button className="remove-button" disabled={!canManage} onClick={() => retireSlab(slab.id)}><Icon name="trash" size={14} /></button>
+                </div>
+              ))}
+              {!slabs.some((slab) => slab.active !== false) && <p className="form-note stock-low">No rates yet — this charge cannot be billed until one is added.</p>}
+              <div className="table-range-inputs">
+                <input className="table-input" disabled={!canManage} min="0" placeholder={`up to (${unit || "measure"})`} step="0.001" type="number" value={slabDraft.upto_value} onChange={(event) => setSlabDraft({ ...slabDraft, upto_value: event.target.value })} />
+                <input className="table-input" disabled={!canManage} min="0" placeholder="rate" step="0.01" type="number" value={slabDraft.rate} onChange={(event) => setSlabDraft({ ...slabDraft, rate: event.target.value })} />
+                <button className="table-action" disabled={!canManage} onClick={addSlab}>Add Rate</button>
+              </div>
+            </div>
+          )
+          // Not `|| "no rate"`: a rate of 0 is a rate a shop may genuinely have set, and `||` would
+          // report it as missing. Absence is tested for on its own.
+          : (chargeType.flat_rate === null || chargeType.flat_rate === undefined
+            ? <span className="stock-low">No rate set</span>
+            : currency.format(Number(chargeType.flat_rate)))}
+      </td>
+      <td>{chargeType.active === false ? "Off" : "Active"}</td>
+      <td><button className="table-action" disabled={!canManage || chargeType.active === false} onClick={retireCharge}>Turn Off</button></td>
+    </tr>
   );
 }
 
@@ -18699,7 +18902,130 @@ const currentDateTimeLocal = () => {
   return `${year}-${month}-${day}T${hours}:${minutes}`;
 };
 
-function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, onSeedConsumed, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
+/**
+ * The charges on the bill in front of the cashier.
+ *
+ * Two things this deliberately does not do.
+ *
+ * It does not hide a charge it could not price. A crate charge that quietly vanished because nobody
+ * entered the crate size would hand the crates over free, and the till would look right. So a
+ * refusal takes the row's place, in the shop's own words, and says what to do about it.
+ *
+ * And it does not let the amount be edited directly. The rate comes from the price list; what a
+ * cashier enters is the measurement and the count. Typing an amount is a separate, deliberate act
+ * behind the same permission as typing a sale rate, and it is marked on the bill afterwards.
+ */
+function OtherChargesPanel({ canTypeAmount = false, chargeTypes = [], lines = [], onChange, refusals = [], selections = [] }) {
+  const available = chargeTypes.filter((type) => type && type.active !== false);
+  if (!available.length && !selections.length) return null;
+
+  // Matched by the selection each line came from, never by position: a refused charge makes the two
+  // lists different lengths, and position-matching would show one row's money under another's name.
+  const lineBySelection = new Map(lines.map((line) => [line.selection_index, line]));
+  const update = (index, patch) => onChange(selections.map((row, position) => (
+    position === index ? { ...row, ...patch } : row
+  )));
+  const remove = (index) => onChange(selections.filter((_, position) => position !== index));
+  const add = (chargeTypeId) => {
+    if (!chargeTypeId) return;
+    onChange([...selections, { charge_type_id: chargeTypeId, quantity: 1, measurement: "", manualAmount: "" }]);
+  };
+
+  return (
+    <div className="totals other-charges-panel">
+      <div className="other-charges-head">
+        <strong>Other Charges</strong>
+        <select
+          aria-label="Add a charge"
+          value=""
+          onChange={(event) => { add(event.target.value); event.target.value = ""; }}
+        >
+          <option value="">Add a charge...</option>
+          {available.map((type) => (
+            <option key={type.id} value={type.id}>{type.charge_name}</option>
+          ))}
+        </select>
+      </div>
+
+      {selections.map((selection, index) => {
+        const type = available.find((row) => String(row.id) === String(selection.charge_type_id))
+          || chargeTypes.find((row) => String(row.id) === String(selection.charge_type_id));
+        const slabbed = String(type?.basis || "").toUpperCase() === "SLAB";
+        const refusal = refusals.find((row) => row.selection_index === index);
+        const line = lineBySelection.get(index);
+        return (
+          <div className="other-charge-row" key={`${selection.charge_type_id}-${index}`}>
+            <div className="other-charge-fields">
+              <span className="other-charge-name">{type?.charge_name || "Unknown charge"}</span>
+              {slabbed && (
+                <label className="other-charge-field">
+                  <span>{type?.measure_unit || "measure"}</span>
+                  <input
+                    min="0"
+                    step="0.001"
+                    type="number"
+                    value={selection.measurement ?? ""}
+                    onChange={(event) => update(index, { measurement: event.target.value })}
+                  />
+                </label>
+              )}
+              <label className="other-charge-field">
+                <span>Qty</span>
+                <input
+                  min="0"
+                  step="0.001"
+                  type="number"
+                  value={selection.quantity ?? 1}
+                  onChange={(event) => update(index, { quantity: event.target.value })}
+                />
+              </label>
+              {canTypeAmount && (
+                <label className="other-charge-field">
+                  <span>Amount</span>
+                  <input
+                    min="0"
+                    placeholder="from rates"
+                    step="0.01"
+                    type="number"
+                    value={selection.manualAmount ?? ""}
+                    onChange={(event) => update(index, { manualAmount: event.target.value })}
+                  />
+                </label>
+              )}
+              <button className="secondary-button compact-button" type="button" onClick={() => remove(index)}>Remove</button>
+            </div>
+            {refusal
+              ? <p className="form-note stock-low">{refusal.message}</p>
+              : (
+                <p className="form-note other-charge-amount">
+                  {currency.format(Number(line?.amount || 0))}
+                  {line?.manual ? " (typed)" : line?.slab_upto ? ` - up to ${line.slab_upto} ${line.measure_unit || ""}`.trimEnd() : ""}
+                </p>
+              )}
+          </div>
+        );
+      })}
+
+      {/* A charge that cannot price itself but has no row left -- a charge deleted in Settings while
+          the bill was open. Its money would otherwise leave the bill with nothing said. */}
+      {refusals
+        .filter((refusal) => refusal.selection_index === undefined || refusal.selection_index >= selections.length)
+        .map((refusal) => (
+          <p className="form-note stock-low" key={`orphan-${refusal.charge_type_id}`}>{refusal.message}</p>
+        ))}
+    </div>
+  );
+}
+
+function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, onSeedConsumed, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
+  /**
+   * The charges this bill has picked: which charge, how much of it, and how many.
+   *
+   * Only the selection is stored. The price is derived from it and the shop's rates on every
+   * render, so an amount on screen can never drift away from the rate list it came from -- and a
+   * rate changed in Settings while a bill is open is reflected the moment it arrives.
+   */
+  const [chargeSelections, setChargeSelections] = useState([]);
   const [search, setSearch] = useState("");
   const [barcode, setBarcode] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
@@ -18932,6 +19258,21 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
         )
       : 0;
     const mandiTaxAmount = roundUi(taxableAmount * Number(paymentSettings.sales_mandi_tax_percent || 0) / 100);
+    /*
+     * Charges land after tax and are absent from `taxableAmount` -- the maintainer's ruling, and
+     * the reason `applyChargesToTotals` is given the tax figures rather than asked to derive them.
+     * Folding them into the taxable amount would raise Mandi Tax on money the shop never collected
+     * tax on, on every bill carrying a delivery.
+     *
+     * `refusals` travels in the totals rather than being swallowed, because a charge that could not
+     * price itself must reach the screen. A bill quietly missing its delivery looks finished.
+     */
+    const priced = buildChargesForBill(chargeTypes, chargeSelections);
+    const netBeforeCharges = Math.max(gross - itemDiscount - invoiceDiscountAmount + mandiTaxAmount, 0);
+    const withCharges = applyChargesToTotals(
+      { taxableAmount, taxAmount: mandiTaxAmount, netAmount: netBeforeCharges },
+      priced.lines,
+    );
     return {
       gross,
       itemDiscount,
@@ -18941,11 +19282,15 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
       mandiTaxAmount,
       mandiTaxBasis: basis,
       discount: itemDiscount + invoiceDiscountAmount,
-      total: Math.max(gross - itemDiscount - invoiceDiscountAmount + mandiTaxAmount, 0),
+      chargeLines: priced.lines,
+      chargeRefusals: priced.refusals,
+      otherChargesAmount: withCharges.otherChargesAmount,
+      netBeforeCharges,
+      total: withCharges.totalAmount,
       itemCount: cart.reduce((sum, item) => sum + Number(item.quantity), 0),
       discountRule,
     };
-  }, [cart, customer.account_id, customer.system_account, discountRules, paymentMode, paymentSettings.enable_sales_mandi_tax, paymentSettings.sales_mandi_tax_basis, paymentSettings.sales_mandi_tax_percent, saleRateSettings.bill_level_slab_discount_enabled]);
+  }, [cart, chargeSelections, chargeTypes, customer.account_id, customer.system_account, discountRules, paymentMode, paymentSettings.enable_sales_mandi_tax, paymentSettings.sales_mandi_tax_basis, paymentSettings.sales_mandi_tax_percent, saleRateSettings.bill_level_slab_discount_enabled]);
 
   const mixedPaymentModes = [
     ["CASH", "Cash Amount"],
@@ -19210,6 +19555,9 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     const selected = customers.find((item) => String(item.id) === String(customerId));
     if (!selected) {
       setCustomer({ account_id: "", name: "", mobile: "", notes: "", system_account: false });
+      // Charges belong to the bill that just left, not the next customer. A crate charge
+      // carried into the following sale is money taken from somebody who was not charged it.
+      setChargeSelections([]);
       return;
     }
     setCustomer({
@@ -19261,6 +19609,16 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
         source: "payment_settings",
       } : null,
       tax_total: Number(totals.mandiTaxAmount || 0),
+      /*
+       * Charges travel with the bill, always -- including as an explicit empty list.
+       *
+       * The device treats "not told" and "told there are none" as different things, and refuses an
+       * edit that is silent about charges on a bill that has them, because silence would delete
+       * money the shop collected. Sending [] rather than omitting the key is what keeps that
+       * refusal aimed at genuinely old callers instead of at this one.
+       */
+      other_charges: (totals.chargeLines || []).map((line) => ({ ...line })),
+      other_charges_amount: Number(totals.otherChargesAmount || 0),
       net_total: Number(totals.total || 0),
       status: "COMPLETED",
       sync_status: "pending",
@@ -19431,6 +19789,9 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
         setMixedPayments({ CASH: "", UPI: "", CARD: "", BANK_TRANSFER: "" });
         setPaymentMode("CASH");
         setCustomer({ account_id: "", name: "", mobile: "", notes: "", system_account: false });
+      // Charges belong to the bill that just left, not the next customer. A crate charge
+      // carried into the following sale is money taken from somebody who was not charged it.
+      setChargeSelections([]);
         setCreditInfo({ due_date: "", remarks: "" });
         setBillDateTime(currentDateTimeLocal());
         await onSaved?.({ localSale: invoice, pendingOperations: result?.pending_operations });
@@ -19462,6 +19823,17 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
         mandi_tax_rate: Number(totals.mandiTaxRate || 0),
         mandi_tax_basis: totals.mandiTaxBasis,
         tax_total: Number(totals.mandiTaxAmount || 0),
+        /*
+         * The server re-prices every one of these from its own slabs and ignores the rate and
+         * amount sent here -- a client-supplied price is a client-supplied discount. What it needs
+         * from the till is which charge, how much of it, and how many.
+         */
+        other_charges: (totals.chargeLines || []).map((line) => ({
+          charge_type_id: line.charge_type_id,
+          measurement: line.measurement,
+          quantity: line.quantity,
+          manual_amount: line.manual ? line.amount : null,
+        })),
         payments,
         branch_id: user.branch_id,
         created_by: user.id,
@@ -19481,6 +19853,9 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
       setMixedPayments({ CASH: "", UPI: "", CARD: "", BANK_TRANSFER: "" });
       setPaymentMode("CASH");
       setCustomer({ account_id: "", name: "", mobile: "", notes: "", system_account: false });
+      // Charges belong to the bill that just left, not the next customer. A crate charge
+      // carried into the following sale is money taken from somebody who was not charged it.
+      setChargeSelections([]);
       setCreditInfo({ due_date: "", remarks: "" });
       setBillDateTime(currentDateTimeLocal());
       // Hand the saved sale to `onSaved`. It was called bare, so a bill raised through this path
@@ -19867,6 +20242,14 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
             </div>
           )}
         </div>
+        <OtherChargesPanel
+          chargeTypes={chargeTypes}
+          lines={totals.chargeLines}
+          refusals={totals.chargeRefusals}
+          selections={chargeSelections}
+          canTypeAmount={canManualRateOverride}
+          onChange={setChargeSelections}
+        />
         <div className="totals">
           <TotalLine label="Gross Total" value={totals.gross} />
           <TotalLine label="Item Discount" value={-totals.itemDiscount} />
@@ -19874,6 +20257,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
           {totals.mandiTaxAmount > 0 && <TotalLine label="Taxable Amount" value={totals.taxableAmount} />}
           {totals.mandiTaxAmount > 0 && <TotalLine label={`Mandi Tax (${totals.mandiTaxRate}%)`} value={totals.mandiTaxAmount} />}
           {totals.mandiTaxAmount === 0 && <TotalLine label="Tax" value={0} muted />}
+          {totals.otherChargesAmount > 0 && <TotalLine label="Other Charges" value={totals.otherChargesAmount} />}
           <TotalLine label="Net Payable" value={totals.total} total />
           {totals.mandiTaxAmount > 0 && <p className="form-note">Mandi Tax basis: {salesMandiTaxBasisLabel[totals.mandiTaxBasis] || totals.mandiTaxBasis}</p>}
         </div>

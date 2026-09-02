@@ -5251,11 +5251,28 @@ const getSystemInfo = async (deviceId = "") => {
  * to anyone who guessed the Owner's id.
  */
 const getSettingsBundle = async (userId, deviceId = "") => {
-  const [businessResult, saleRateResult, mandiResult, rebateResult, discountResult, roleResult, updateResult, syncResult, syncQueueResult, posResult, paymentResult, whatsappResult, deviceControlResult, manager] = await Promise.all([
+  const [businessResult, saleRateResult, mandiResult, rebateResult, chargeTypesResult, discountResult, roleResult, updateResult, syncResult, syncQueueResult, posResult, paymentResult, whatsappResult, deviceControlResult, manager] = await Promise.all([
     pool.query("SELECT * FROM business_settings WHERE id = 1"),
     pool.query("SELECT * FROM sale_rate_settings WHERE id = 1"),
     pool.query("SELECT * FROM mandi_tax_rules ORDER BY origin_type"),
     pool.query("SELECT * FROM rebate_rules ORDER BY pay_within_days, id"),
+    pool.query(`
+      SELECT ct.id, ct.company_id, ct.charge_name, ct.charge_code, ct.basis, ct.measure_unit,
+             ct.flat_rate, ct.active, COALESCE(ct.entity_version, 1) AS entity_version,
+             ct.updated_by, ct.updated_at,
+             COALESCE(
+               (
+                 SELECT JSONB_AGG(TO_JSONB(slab) ORDER BY slab.upto_value, slab.id)
+                 FROM (
+                   SELECT id, charge_type_id, upto_value, rate, active, updated_by, updated_at
+                   FROM charge_rate_slabs WHERE charge_type_id = ct.id
+                 ) AS slab
+               ),
+               '[]'::JSONB
+             ) AS slabs
+      FROM charge_types ct
+      ORDER BY ct.active DESC, ct.charge_name
+    `),
     pool.query("SELECT * FROM sale_discount_rules ORDER BY minimum_bill_amount, maximum_bill_amount NULLS LAST, id"),
     pool.query("SELECT * FROM role_permission_settings ORDER BY CASE role_name WHEN 'Owner' THEN 1 WHEN 'Admin' THEN 2 WHEN 'Cashier' THEN 3 WHEN 'Purchase Manager' THEN 4 WHEN 'Inventory Manager' THEN 5 ELSE 6 END"),
     pool.query("SELECT * FROM update_center WHERE id = 1"),
@@ -5345,6 +5362,17 @@ const getSettingsBundle = async (userId, deviceId = "") => {
     },
     mandiTaxRules: mandiResult.rows,
     rebateRules: rebateResult.rows,
+    /*
+     * The charge price list travels with the settings bundle, slabs attached.
+     *
+     * A settings screen that fetched slabs charge by charge would render a half-configured price
+     * list while it did -- and a half-configured price list is one that says "no rates yet, this
+     * charge cannot be billed" about charges that are perfectly well configured.
+     *
+     * Withdrawn slabs are included: `normaliseSlabs` filters them for pricing, and a list that had
+     * silently lost them could not tell "never priced" from "price withdrawn".
+     */
+    chargeTypes: chargeTypesResult.rows,
     discountRules: discountResult.rows,
     roles: roleResult.rows,
     users: usersResult.rows,

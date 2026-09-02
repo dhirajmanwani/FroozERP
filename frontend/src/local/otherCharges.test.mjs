@@ -210,6 +210,26 @@ test("a bill returns its priced lines and its problems together", () => {
   assert.equal(result.refusals[0].code, CHARGE_REFUSALS.ABOVE_TOP_SLAB);
 });
 
+test("a line and a refusal each say which selection they came from", () => {
+  // Without this a screen lines lines[i] up against selections[i], and the moment one selection
+  // refuses the arrays are different lengths -- so every row below shows the amount belonging to
+  // the row above. Money against the wrong charge, on a screen that looks entirely normal.
+  const result = buildChargesForBill([CRATE, DELIVERY, LABOUR], [
+    { charge_type_id: 3, measurement: 40 },
+    { charge_type_id: 1, measurement: 10, quantity: 3 },
+    { charge_type_id: 2 },
+  ]);
+
+  assert.deepEqual(result.refusals.map((row) => row.selection_index), [0]);
+  assert.deepEqual(result.lines.map((row) => row.selection_index), [1, 2]);
+
+  // The point of the index, stated as the thing a screen actually does with it.
+  const bySelection = new Map(result.lines.map((line) => [line.selection_index, line]));
+  assert.equal(bySelection.get(1).amount, 120, "three crates at 40");
+  assert.equal(bySelection.get(2).amount, 30, "flat labour");
+  assert.equal(bySelection.get(0), undefined, "the refused delivery has no line at all");
+});
+
 test("a charge that was deleted or switched off is refused rather than silently dropped", () => {
   // Silently dropping it would quietly reduce the bill, which looks like the price simply changed.
   const deleted = buildChargesForBill([CRATE], [{ charge_type_id: 999 }]);
