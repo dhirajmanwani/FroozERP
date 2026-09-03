@@ -215,6 +215,54 @@ of what changed.
   folder of its own. On the maintainer's laptop today it will show one, because `F:\FroozERP` is
   both the install and the checkout. That warning disappearing is how the relocation is confirmed.
 
+**Connection simplification and the cloud address (1.0.72, 2026-09-03):**
+
+*What changed about the rehearsal itself — read this first*
+
+A rehearsal runs `tauri dev`, which is a **debug** build, and a debug build now has **no cloud
+address at all**. Three separate places make that true: `cloud_api_url()` in `src-tauri/src/lib.rs`
+returns an empty string under `cfg!(debug_assertions)`; `BUILT_IN_DESKTOP_CLOUD_API_URL` in
+`App.jsx` is empty unless `import.meta.env.DEV` is false; and a disposable profile's saved settings
+start empty, so nothing supplies one from `localStorage` either.
+
+Two consequences, and they pull in opposite directions:
+
+- **The rehearsal is much safer than it was.** Previously the only thing standing between a test
+  bill on a live-seeded profile and the shop's real books was remembering to switch the laptop's
+  internet off. Now the build cannot reach a cloud even if somebody forgets. Switch it off anyway —
+  it costs nothing and the belt is worth having alongside the braces.
+- **The rehearsal can no longer prove cloud sync.** It never proved it well, but now it cannot prove
+  it at all: the connection line will read "Working offline" throughout, correctly. Whether bills
+  actually reach the cloud has to be established on a real installed build, which means it is not a
+  precondition this rehearsal can satisfy. Say so plainly rather than letting a green rehearsal
+  imply it.
+
+  To rehearse against a cloud deliberately, set `FROOZERP_CLOUD_API_URL` — and then do **not** seed
+  from live, because a seeded profile carries the shop's real device identity and would write
+  real-looking rows into whatever it is pointed at.
+
+*What to check*
+
+- The connection banner reads **"Working offline — Billing works normally…"**, not "Local Only mode
+  selected". Nothing anywhere offers a mode to pick.
+- Settings → Sync & Connection → **Advanced Diagnostics**: no App Mode dropdown, no AUTO / LOCAL
+  ONLY pair, no editable Cloud API URL, Branch Server or Custom API box, no "Save Mode" button.
+- The addresses are still **shown** as disabled rows further down. Removing the questions was the
+  point; losing the answers would replace one silent failure with another.
+- With everything healthy and nothing queued, the banner shows **nothing at all**. That is
+  deliberate — a permanent green tick is ignored within a week.
+- Billing, start to finish, with the internet off. The whole claim is that this works unchanged.
+
+*A note about `git pull` on the maintainer's laptop*
+
+`F:\FroozERP` is both the checkout and the installed app, so a pull changes the shop's software —
+but only partly. It replaces `backend/*.js`, which the installed app runs directly, so the gateway
+changes on its next restart. It does **not** change the installed UI (`frontend/dist` is not
+committed) or the Rust binary (not rebuilt). After a pull the real app therefore runs the new
+gateway behind the old screens, which is harmless here but is worth knowing before reading anything
+into what the installed app shows. Task #76 — moving the app out of the checkout — is what ends
+this class of confusion.
+
 ### Only then
 
 A rehearsal that found nothing is the precondition for **Signing And Publishing** below. A rehearsal
