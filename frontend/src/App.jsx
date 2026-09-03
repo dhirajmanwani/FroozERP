@@ -907,6 +907,29 @@ const offlineBackendRequiredViews = new Set(["purchase", "pending-bills", "accou
 const getErrorMessage = (error, fallback) =>
   error.response?.data?.message || fallback;
 
+/**
+ * Why a settings change could not be saved, said in words somebody can act on.
+ *
+ * Settings are written by the cloud backend. The desktop gateway serves `/settings` from local
+ * SQLite so a counter can keep working with no internet, but it accepts no writes at all -- not for
+ * charges, not for tax rules, not for anything. So every settings form fails the same way offline,
+ * and every one of them used to fail with its own bare sentence: "Unable to add this charge".
+ *
+ * That sentence describes the outcome and hides the cause. Somebody reading it looks for a mistake
+ * in what they typed, and there isn't one -- the machine simply has no internet, which is a fact
+ * the app already knows and was not saying.
+ */
+const getSettingsWriteErrorMessage = (error, fallback) => {
+  const status = error?.response?.status;
+  const offline = !error?.response
+    || (typeof navigator !== "undefined" && navigator.onLine === false);
+  if (offline || status === 503) {
+    return `${fallback} — this machine has no connection to the cloud right now, and settings are `
+      + "saved there. Reconnect and try again. Billing and everything else keep working offline.";
+  }
+  return getErrorMessage(error, fallback);
+};
+
 const getFrostDiagnosticMessage = (error, { offlineMode = false, internetAvailable = true, backendHealth = {}, cloudHealth = {} } = {}) => {
   const status = error?.response?.status;
   const serverMessage = error?.response?.data?.message;
@@ -16471,7 +16494,7 @@ function OtherChargesSettings({ canManage, chargeTypes = [], onReload, user }) {
       setDraft(blank);
       await onReload();
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to add this charge"));
+      alert(getSettingsWriteErrorMessage(error, "Unable to add this charge"));
     }
   };
 
@@ -16550,7 +16573,7 @@ function ChargeTypeRow({ canManage, chargeType, onReload, user }) {
       setSlabDraft({ upto_value: "", rate: "" });
       await onReload();
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to add this rate"));
+      alert(getSettingsWriteErrorMessage(error, "Unable to add this rate"));
     }
   };
 
@@ -16559,7 +16582,7 @@ function ChargeTypeRow({ canManage, chargeType, onReload, user }) {
       await axios.post(`${API_URL}/settings/charge-types/${chargeType.id}/slabs/${slabId}/deactivate`, { updated_by: user.id });
       await onReload();
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to remove this rate"));
+      alert(getSettingsWriteErrorMessage(error, "Unable to remove this rate"));
     }
   };
 
@@ -16569,7 +16592,7 @@ function ChargeTypeRow({ canManage, chargeType, onReload, user }) {
       await axios.post(`${API_URL}/settings/charge-types/${chargeType.id}/deactivate`, { updated_by: user.id });
       await onReload();
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to turn off this charge"));
+      alert(getSettingsWriteErrorMessage(error, "Unable to turn off this charge"));
     }
   };
 
