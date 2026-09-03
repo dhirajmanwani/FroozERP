@@ -271,20 +271,78 @@ const sendJson = (res, status, payload, headers = {}) => {
   res.end(body);
 };
 
+/** Where a policy answer came from. The three cases are not interchangeable. */
+const POLICY_SOURCES = Object.freeze({
+  /** A file exists and says something. Whatever it says, stands. */
+  STORED: "STORED",
+  /** No file at all. Nobody has ever decided anything about this device. */
+  NEVER_SET: "NEVER_SET",
+  /** A file exists and cannot be understood. Somebody decided; we cannot tell what. */
+  UNREADABLE: "UNREADABLE",
+});
+
+/**
+ * The policy, from the result of trying to read its file.
+ *
+ * ## The distinction this exists to make
+ *
+ * "No file" and "unreadable file" used to get the same answer -- deny -- and they are not the same
+ * situation at all.
+ *
+ * **Unreadable still denies.** A corrupt file may well have said "lock this device down", and
+ * opening the internet because we cannot read that instruction would undo somebody's deliberate
+ * decision. That is the direction where fail-closed earns its keep, and it is unchanged.
+ *
+ * **Absent now allows, and this is a deliberate weakening of a fail-closed default.** It is called
+ * out here and in `docs/connection-simplification-decision.md` because `CLAUDE.md` requires
+ * anything that could weaken the LOCAL_ONLY guarantee to be stated loudly.
+ *
+ * The reasoning: this product is local-first *with* cloud sync. A device that has never been told
+ * anything is a device somebody just installed, and the behaviour it should have is the ordinary
+ * one. Denying instead produced a machine that silently could not sync, said "LOCAL ONLY" as though
+ * that had been chosen, and offered no way to find out why -- which is exactly what happened to the
+ * maintainer on 2026-09-02 and cost an afternoon across three wrong diagnoses.
+ *
+ * A device that cannot reach its cloud is not safer, it is broken. The kill switch remains a
+ * deliberate act; it is no longer an accident of a missing file.
+ *
+ * Every LOCAL_ONLY guarantee when the switch is genuinely ON is untouched: blocked, nothing
+ * reaching the cloud, no cloud-router calls, no external connections.
+ *
+ * Pure, so all three cases can be tested without a filesystem.
+ */
+const resolvePolicyFromRead = ({ errorCode = "", contents = null } = {}) => {
+  if (String(errorCode) === "ENOENT") {
+    return { ...failClosedPolicy(), allowInternetAccess: true, source: POLICY_SOURCES.NEVER_SET };
+  }
+  if (errorCode) return { ...failClosedPolicy(), source: POLICY_SOURCES.UNREADABLE };
+
+  let value;
+  try {
+    value = JSON.parse(contents);
+  } catch {
+    return { ...failClosedPolicy(), source: POLICY_SOURCES.UNREADABLE };
+  }
+  // A file that exists but does not answer the question is a damaged file, not a missing one.
+  if (typeof value?.allowInternetAccess !== "boolean") {
+    return { ...failClosedPolicy(), source: POLICY_SOURCES.UNREADABLE };
+  }
+  return {
+    allowInternetAccess: value.allowInternetAccess,
+    updatedAt: value.updatedAt || null,
+    confirmedAt: value.confirmedAt || value.updatedAt || null,
+    timeSource: value.timeSource || "device",
+    changedBy: value.changedBy || null,
+    deviceId: value.deviceId || null,
+    source: POLICY_SOURCES.STORED,
+  };
+};
+
 const readPolicy = () => {
   try {
-    const value = JSON.parse(fs.readFileSync(POLICY_PATH, "utf8"));
-    if (typeof value?.allowInternetAccess !== "boolean") return failClosedPolicy();
-    return {
-      allowInternetAccess: value.allowInternetAccess,
-      updatedAt: value.updatedAt || null,
-      confirmedAt: value.confirmedAt || value.updatedAt || null,
-      timeSource: value.timeSource || "device",
-      changedBy: value.changedBy || null,
-      deviceId: value.deviceId || null,
-    };
-  } catch {
-    return failClosedPolicy();
+    return resolvePolicyFromRead({ contents: fs.readFileSync(POLICY_PATH, "utf8") });
+  } catch (error) {
+    return resolvePolicyFromRead({ errorCode: error?.code || "EUNKNOWN" });
   }
 };
 
@@ -557,8 +615,10 @@ const server = http.createServer(async (req, res) => {
 module.exports = {
   CONTROL_ORIGINS,
   KILL_SWITCH_REFUSALS,
+  POLICY_SOURCES,
   classifyControlOrigin,
   resolveKillSwitchDecision,
+  resolvePolicyFromRead,
 };
 
 if (require.main === module) {

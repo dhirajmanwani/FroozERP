@@ -201,11 +201,15 @@ test("the login screen shows the countdown and drops it when the wait ends", () 
   assert.match(app, /setOfflineLockUntilMs\(0\);\s*\n\s*\/\/ Entitlement decides access/, "success must clear it too");
 });
 
-test("the banner's Return to Auto is treated as the same action as the Settings toggle", () => {
-  // Two doors to one action. The Settings toggle was disabled with an explanation and this one was
-  // left enabled, so it still produced a meaningless error.
+test("the one remaining way back keeps the guard the two doors used to need", () => {
+  // There were two doors to one action -- a Settings toggle and this banner button -- and the bug
+  // was that only one of them was disabled when the action could not succeed, so the other still
+  // produced a meaningless error. The Settings toggle is gone with the rest of the mode pickers;
+  // the guard has to survive the door that remains, or the original bug simply comes back through
+  // the survivor.
   const app = fs.readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
   assert.match(app, /disabled=\{connectivityModeSwitching \|\| bannerAutoBlockedReason !== ""\}/);
-  assert.match(app, /describeLocalServiceFailure\(error, "Unable to return to Auto mode"\)/,
+  assert.match(app, /describeLocalServiceFailure\(error, "Unable to reconnect this computer"\)/,
     "it must not discard a locally-thrown reason via getErrorMessage");
+  assert.doesNotMatch(app, /Return to Auto/, "and the mode vocabulary must not come back with it");
 });

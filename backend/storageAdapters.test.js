@@ -492,8 +492,22 @@ test("packaged desktop Local Only settings stay in SQLite without invoking cloud
   }
 });
 
-test("packaged settings fail closed before cloud routing when policy is missing or malformed", async () => {
-  for (const policyState of ["missing", "malformed", "invalid-shape"]) {
+/**
+ * The two halves of what used to be one test.
+ *
+ * It read "missing or malformed" and asserted one answer for both. That conflation is the bug it
+ * was hiding: a rehearsal profile on 2026-09-02 came up with no policy file, was refused every
+ * cloud request as though somebody had locked it down, and said nothing about why. Three wrong
+ * diagnoses followed. `backend/cloudNetworkPolicyDefault.test.js` explains the reasoning at length.
+ *
+ * So the two cases are now separated here as well, and the split is the point: an unreadable file
+ * must still fail closed — it may have said "lock this device down" — while a file nobody ever
+ * wrote must not.
+ */
+test("a policy file that exists but cannot be trusted still fails closed before cloud routing", async () => {
+  // Unchanged behaviour, and it must stay unchanged: this is the LOCAL_ONLY guarantee CLAUDE.md
+  // protects — blocked, no cloud-router call, no external connection.
+  for (const policyState of ["malformed", "invalid-shape"]) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), `froozerp-settings-fail-closed-${policyState}-`));
     const appData = path.join(root, "AppData", "Roaming");
     const databasePath = path.join(root, "profile", "froozerp-local.sqlite3");
@@ -527,11 +541,73 @@ test("packaged settings fail closed before cloud routing when policy is missing 
         { blocked: true, reachedCloud: false },
       ]);
       assert.equal(audit[0].route, "/settings?device_id=FZDEV-DELL-1781852580596");
+      assert.equal(audit[0].reason, "APP_LOCAL_ONLY");
     } finally {
       await stopChild(runtime.child);
       await new Promise((resolve) => cloudServer.close(resolve));
       fs.rmSync(root, { recursive: true, force: true });
     }
+  }
+});
+
+test("a device that was never given a policy behaves like an ordinary one, and a later lockdown still holds", async () => {
+  // A fresh profile has no policy file. Refusing the cloud on that basis produced an app that
+  // looked deliberately isolated while nobody had chosen anything, and no screen could tell the
+  // difference. The second half of this test is the safety net: the allowance belongs to the
+  // absence of a decision only, and evaporates the moment a real decision exists.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "froozerp-settings-never-set-"));
+  const appData = path.join(root, "AppData", "Roaming");
+  const databasePath = path.join(root, "profile", "froozerp-local.sqlite3");
+  writePopulatedSQLiteFixture(databasePath);
+  const cloudPort = await reservePort();
+  let cloudRequests = 0;
+  const cloudServer = require("node:http").createServer((_req, res) => {
+    cloudRequests += 1;
+    res.writeHead(500).end();
+  });
+  await new Promise((resolve, reject) => cloudServer.listen(cloudPort, "127.0.0.1", resolve).once("error", reject));
+  const policyPath = path.join(appData, "com.srtcompany.froozerp", "cloud-network-policy.json");
+  fs.mkdirSync(path.dirname(policyPath), { recursive: true });
+  assert.equal(fs.existsSync(policyPath), false, "this test is only meaningful with no policy file at all");
+  const port = await reservePort();
+  const runtime = await startDesktopBackend({
+    databasePath,
+    port,
+    extraEnv: { APPDATA: appData, CLOUD_API_URL: `http://127.0.0.1:${cloudPort}` },
+  });
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/settings?device_id=FZDEV-DELL-1781852580596`);
+    assert.equal(cloudRequests, 1, "a device nobody has locked down must be allowed to ask its cloud");
+    assert.equal(
+      response.headers.get("x-froozerp-settings-source"),
+      null,
+      "and must not be answered from the local fail-closed path",
+    );
+
+    const auditPath = path.join(appData, "com.srtcompany.froozerp", "logs", "cloud-request-audit.jsonl");
+    const audit = fs.readFileSync(auditPath, "utf8").trim().split(/\r?\n/).map(JSON.parse);
+    assert.deepEqual(audit.map(({ blocked, reachedCloud }) => ({ blocked, reachedCloud })), [
+      { blocked: false, reachedCloud: true },
+    ]);
+
+    // Now somebody decides. `readPolicy` reads the file on every request, so no restart is needed —
+    // and that is exactly the property worth pinning, because it is what makes the kill switch
+    // immediate rather than something that takes effect next time the app happens to start.
+    fs.writeFileSync(policyPath, JSON.stringify({ allowInternetAccess: false }));
+    const held = await fetch(`http://127.0.0.1:${port}/settings?device_id=FZDEV-DELL-1781852580596`);
+    assert.equal(held.status, 200);
+    assert.equal(held.headers.get("x-froozerp-settings-source"), "local-sqlite");
+    assert.equal(cloudRequests, 1, "the lockdown must stop the very next request, with no restart");
+
+    const afterLockdown = fs.readFileSync(auditPath, "utf8").trim().split(/\r?\n/).map(JSON.parse);
+    assert.deepEqual(afterLockdown.map(({ blocked, reachedCloud }) => ({ blocked, reachedCloud })), [
+      { blocked: false, reachedCloud: true },
+      { blocked: true, reachedCloud: false },
+    ]);
+  } finally {
+    await stopChild(runtime.child);
+    await new Promise((resolve) => cloudServer.close(resolve));
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 

@@ -84,10 +84,12 @@ test("the viewing-another-shop banner is rendered from the resolved presentation
 test("the banner sits above the connectivity notice", () => {
   // Local Only changes where the numbers come from; viewing another shop changes whose they are.
   // The more surprising message goes first, and ordering in JSX is ordering on screen.
+  // The connectivity banner is no longer keyed to a mode -- it reports whatever the app is doing
+  // about the internet, from `local/connectionStatus.js`. The ordering rule is unchanged.
   const shopBanner = app.indexOf('data-shop-view="OTHER_BRANCH"');
-  const localOnlyBanner = app.indexOf('data-connectivity-mode="LOCAL_ONLY"');
-  assert.ok(shopBanner > 0 && localOnlyBanner > 0, "both banners must exist");
-  assert.ok(shopBanner < localOnlyBanner, "the shop banner must render before the connectivity one");
+  const connectionBanner = app.indexOf("data-connection-state={connectionSentence.state}");
+  assert.ok(shopBanner > 0 && connectionBanner > 0, "both banners must exist");
+  assert.ok(shopBanner < connectionBanner, "the shop banner must render before the connectivity one");
 });
 
 test("All Shops asks the server for its as-at date rather than computing one", () => {

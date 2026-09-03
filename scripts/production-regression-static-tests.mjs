@@ -54,7 +54,14 @@ assert.ok(localDb.includes("ON CONFLICT(id) DO UPDATE"), "Pulled local entities 
 assert.ok(localDb.includes('apply_migration(&mut conn, "006_multibranch_identity_foundation"'), "SQLite identity migration must be active");
 assert.ok(localDb.includes('apply_migration(&mut conn, "007_cloud_runtime_and_inbox_foundation"'), "SQLite cloud inbox migration must be active");
 assert.ok(localDb.includes('apply_migration(&mut conn, "013_operational_location_foundation"'), "SQLite operational-location migration must be active");
-assert.ok(localDb.includes('"pos_sale" => apply_pulled_pos_sale_with_tx'), "Pulled POS sales must be applied to the second-device cache");
+// Pinned to the call, not to the shape of the line around it. The arm became a `match` when other
+// charges landed -- a bill whose charges cannot be priced is recorded as unapplied rather than
+// stored short of its delivery charge -- and this guard went red on a correct change while saying
+// "Pulled POS sales must be applied", which is exactly the misleading kind of failure a release
+// gate must not produce. What matters is that a pulled sale still reaches the applier.
+assert.ok(localDb.includes('"pos_sale" =>'), "Pulled POS sales must still be dispatched by entity type");
+assert.ok(localDb.includes("apply_pulled_pos_sale_with_tx(tx, change)"), "Pulled POS sales must be applied to the second-device cache");
+assert.ok(localDb.includes('record_unapplied_change(tx, change, "SALE_CHARGES_NOT_PRICEABLE"'), "An unpriceable charge must be recorded, never silently dropped from the bill");
 assert.ok(backend.includes('"/api/v3/operational-context"'), "Protocol v3 must expose canonical operational context");
 assert.ok(backend.includes('"/api/v3/inventory"'), "Protocol v3 inventory must be location-scoped");
 assert.ok(backend.includes("validateSyncBatchScope"), "Strict sync must reject mixed-location batches");

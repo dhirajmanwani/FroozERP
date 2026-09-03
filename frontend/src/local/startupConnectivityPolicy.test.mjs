@@ -112,7 +112,12 @@ test("packaged startup gates every cloud-capable scheduler until backend reconci
   assert.match(appSource, /if \(user \|\| !connectivityPolicyReady\) return undefined;/);
   assert.match(appSource, /if \(!connectivityPolicyReady\) return undefined;[\s\S]*runConnectivityCheck\("startup"/);
   assert.match(appSource, /const localOnly = isLocalOnlyConnectivitySelected\(\);[\s\S]*const realInternet = localOnly \? browserOnline/);
-  assert.match(appSource, /usesCloudBackend\(\) && !localOnly[\s\S]*checkCloudBackendHealth/);
+  // The guarantee is `!localOnly`, not whichever predicate sits beside it. That companion used to
+  // be `usesCloudBackend()`, which excluded LOCAL_SINGLE_DEVICE -- the mode every installed shop
+  // app runs in -- so the probe never ran there and the Connection panel reported "Cloud Not
+  // Configured" on a machine whose cloud was fine. It is now `CLOUD_CONFIGURED`: ask when there is
+  // something to ask. What must not drift is the Local Only half, so that is what is pinned.
+  assert.match(appSource, /&& !localOnly[\s\S]*checkCloudBackendHealth/);
   assert.match(appSource, /!localOnly && health\.online && cloudReadyForSync/);
   assert.match(appSource, /backendHealth\.online && !isLocalOnlyConnectivitySelected\(\)/);
   assert.match(appSource, /axios\.get\(`\$\{LOCAL_API_URL\}\/api\/cloud\/internet-access`/);

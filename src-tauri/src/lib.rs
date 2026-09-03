@@ -64,6 +64,29 @@ const LOCAL_BACKEND_PORT: &str = "5000";
 /// ever disagree -- because a frontend calling 5000 while its backend listens on 5051 is a dev app
 /// quietly talking to the shop's own backend, which is worse than either of them failing.
 const DEV_BACKEND_PORT: &str = "5051";
+/// The cloud this build belongs to.
+///
+/// ## Why this is a build-time fact and not a setting
+///
+/// The shell used to launch `desktopGateway.js` with no cloud address at all. The gateway therefore
+/// had no cloud target, refused every cloud route by name, and the app fell back to this computer --
+/// on a machine with perfectly good internet. Nothing on screen said so, because from the app's side
+/// that is indistinguishable from being offline.
+///
+/// The other half of the same gap was in the frontend: a **Cloud API URL** text box the shopkeeper
+/// was expected to fill in, whose placeholder read like a filled-in value. On 2026-09-02 the pair of
+/// them cost an afternoon of wrong diagnoses -- the internet, then a mode setting, then the box.
+///
+/// A shop does not choose which cloud its own ERP syncs to. There is one, it belongs to this
+/// product, and the app should know it the way it knows its own name. The maintainer put it
+/// plainly: *"mujhe khud switch krne ki zarurat hi nhi padni chahiye"*.
+///
+/// Stated plainly, because it is a real change in what a shipped build does: **an installed
+/// FroozERP now contacts this address by itself whenever it can reach it.** That is the product
+/// working as intended -- this computer when there is no internet, the cloud when there is, with
+/// nothing to switch -- and it is the behaviour that was asked for.
+const PRODUCTION_CLOUD_API_URL: &str = "https://froozerp-production-27bb.up.railway.app";
+
 const BACKEND_OWNERSHIP_FILE: &str = "local-backend-owner.json";
 const BACKEND_STARTUP_LOCK_FILE: &str = "local-backend-startup.lock";
 const UPDATE_TRANSACTION_FILE: &str = "update-transaction.json";
@@ -452,6 +475,36 @@ fn local_backend_port() -> String {
         return DEV_BACKEND_PORT.to_string();
     }
     LOCAL_BACKEND_PORT.to_string()
+}
+
+/// The cloud address handed to the gateway, or an empty string for "this installation has none".
+///
+/// Two rules, in order:
+///
+/// 1. **An explicit address always wins**, in either build. That is how a rehearsal points at a
+///    sandbox, and it is the only way a second deployment would ever be possible.
+/// 2. **A development build has no cloud unless it was given one.** `npm run app:disposable` seeds
+///    itself from a copy of live business data, and a rehearsal that quietly synced that copy into
+///    production would be worse than anything it was rehearsing for. Same reasoning as
+///    `DEV_BACKEND_PORT`, and the same mechanism: decided by how the binary was built, because an
+///    environment variable has to be set correctly in every terminal window.
+///
+/// The empty string is passed to the child explicitly rather than left unset, so an inherited
+/// `CLOUD_API_URL` from some other tool's shell cannot become a development build's cloud by
+/// accident.
+fn cloud_api_url() -> String {
+    for name in ["FROOZERP_CLOUD_API_URL", "CLOUD_API_URL"] {
+        if let Ok(configured) = env::var(name) {
+            let trimmed = configured.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    if cfg!(debug_assertions) {
+        return String::new();
+    }
+    PRODUCTION_CLOUD_API_URL.to_string()
 }
 
 fn local_backend_url() -> String {
@@ -1070,6 +1123,7 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
         .env("PORT", local_backend_port())
         .env("APP_VERSION", env!("CARGO_PKG_VERSION"))
         .env("APP_MODE", "LOCAL_SINGLE_DEVICE")
+        .env("CLOUD_API_URL", cloud_api_url())
         .env("FROOZERP_RUNTIME_MODE", "desktop-local")
         .env("FROOZERP_LOCAL_STORAGE", "sqlite")
         .env("FROOZERP_SQLITE_PATH", &sqlite_path)
