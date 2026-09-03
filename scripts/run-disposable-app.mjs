@@ -27,6 +27,18 @@
  *    the terminal instead of by forensics afterwards.
  * 5. Runs the same Tauri dev command as `npm run app`, with the isolation variables set.
  *
+ * ## What it does not have to do any more
+ *
+ * It isolated the database and not the port, and a port is exactly as exclusive as a file. A dev
+ * build begun on 2026-08-20 held port 5000 until 2026-09-02; the maintainer's installed app found
+ * the port owned by a version it did not recognise and refused to start, so the shop could not bill
+ * for thirteen days. Nothing in the message said another copy of the app was holding the port.
+ *
+ * That is now decided by how the binary was built rather than here: a debug build listens on 5051
+ * (`DEV_BACKEND_PORT` in `src-tauri/src/lib.rs`, mirrored in `frontend/src/App.jsx`), so no
+ * development run of any kind can take the shop's port. `frontend/src/local/localBackendPort.test.mjs`
+ * fails if the two sides ever disagree.
+ *
  * Usage:
  *   npm run app:disposable
  * The examples below are PowerShell, because Windows is the only shipped target and PowerShell is

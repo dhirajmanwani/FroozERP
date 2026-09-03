@@ -47,6 +47,23 @@ static LOCAL_BACKEND_START_GUARD: Mutex<()> = Mutex::new(());
 #[cfg(target_os = "windows")]
 static DESKTOP_INSTANCE_MUTEX: Mutex<Option<isize>> = Mutex::new(None);
 const LOCAL_BACKEND_PORT: &str = "5000";
+
+/// The port a **development** build uses, so it can never take the shop app's.
+///
+/// `npm run app` and `npm run app:disposable` both used to bind 5000 -- the same port the installed
+/// app needs. The disposable launcher isolates the *database* and says so at length, but it never
+/// isolated the port, and a port is just as exclusive as a file.
+///
+/// That gap cost thirteen days. A dev build started on 2026-08-20 held 5000 until 2026-09-02; the
+/// installed app started, found the port owned by something reporting a version it did not
+/// recognise, and refused to come up. The shop could not bill, and nothing in the message said
+/// "another copy of this app is running".
+///
+/// A separate port makes the two physically unable to fight. `frontend/src/App.jsx` derives the
+/// same split from `import.meta.env.DEV`, and `localBackendPort.test.mjs` fails if the two sides
+/// ever disagree -- because a frontend calling 5000 while its backend listens on 5051 is a dev app
+/// quietly talking to the shop's own backend, which is worse than either of them failing.
+const DEV_BACKEND_PORT: &str = "5051";
 const BACKEND_OWNERSHIP_FILE: &str = "local-backend-owner.json";
 const BACKEND_STARTUP_LOCK_FILE: &str = "local-backend-startup.lock";
 const UPDATE_TRANSACTION_FILE: &str = "update-transaction.json";
@@ -190,6 +207,18 @@ struct BackendServiceStatus {
     error_code: String,
     exit_code: Option<i32>,
     stderr_tail: String,
+    /// Set when a **release** build is running its backend out of a git working tree.
+    ///
+    /// `F:\\FroozERP` on the maintainer's laptop is both the installed app and the checkout, so
+    /// `current_install_dir().join("backend")` resolves to the repository's own backend folder --
+    /// which means every `git pull` silently changes the shop's backend, and a half-finished branch
+    /// is one command away from serving real customers.
+    ///
+    /// Reported rather than refused, deliberately. A refusal here would leave the shop unable to
+    /// bill on the spot, and the arrangement has been live for months; the fix is to move the
+    /// install, which needs a person and an installer. What was missing was not enforcement, it was
+    /// anybody being *told*. So the technical-details panel now says it out loud.
+    source_checkout_warning: String,
     message: String,
 }
 
@@ -416,6 +445,12 @@ fn local_backend_port() -> String {
             return port;
         }
     }
+    // Decided by how this binary was built, not by an environment variable. A variable has to be
+    // set correctly in every terminal window, and `run-disposable-app.mjs` exists precisely because
+    // that turned out not to be a safeguard.
+    if cfg!(debug_assertions) {
+        return DEV_BACKEND_PORT.to_string();
+    }
     LOCAL_BACKEND_PORT.to_string()
 }
 
@@ -518,6 +553,41 @@ fn backend_dir_candidates() -> Vec<PathBuf> {
         }
     }
     candidates
+}
+
+/// Whether this backend directory sits inside a git working tree.
+///
+/// Walks upward looking for `.git`, because the checkout root is usually the backend's parent but
+/// need not be. Bounded so a pathological path cannot spin: a repository nested deeper than this
+/// is not the arrangement being guarded against.
+fn backend_dir_is_in_checkout(backend_dir: &Path) -> bool {
+    let mut current = Some(backend_dir);
+    for _ in 0..6 {
+        let Some(dir) = current else { return false };
+        if dir.join(".git").exists() {
+            return true;
+        }
+        current = dir.parent();
+    }
+    false
+}
+
+/// The warning to show, or empty when there is nothing to say.
+///
+/// Debug builds are exempt: a development build is *supposed* to run from the checkout, and saying
+/// so on every dev run would train the reader to ignore the line that matters.
+fn source_checkout_warning_for(backend_dir: Option<&Path>) -> String {
+    if cfg!(debug_assertions) {
+        return String::new();
+    }
+    match backend_dir {
+        Some(dir) if backend_dir_is_in_checkout(dir) => format!(
+            "This app is running its backend from a source checkout ({}). Every code update pulled \
+             into that folder changes this app immediately. Move the installation to its own folder.",
+            dir.display()
+        ),
+        _ => String::new(),
+    }
 }
 
 fn resolve_backend_dir() -> Result<PathBuf, String> {
@@ -653,6 +723,8 @@ fn backend_status(
     startup_source: &str,
 ) -> BackendServiceStatus {
     let stderr_log_path = backend_stderr_log_path();
+    // Captured before `backend_dir` is consumed into the struct below.
+    let backend_dir_for_warning = backend_dir.clone();
     BackendServiceStatus {
         healthy,
         started,
@@ -674,6 +746,7 @@ fn backend_status(
         error_code: if healthy { "OK" } else { "LOCAL_BACKEND_UNHEALTHY" }.to_string(),
         exit_code: None,
         stderr_tail: tail_text_file(&stderr_log_path, 4096),
+        source_checkout_warning: source_checkout_warning_for(backend_dir_for_warning.as_deref()),
         message,
     }
 }

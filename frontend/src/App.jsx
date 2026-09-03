@@ -248,7 +248,7 @@ const sanitizeSavedApiConfigForRuntime = (config) => {
   const pointsToLocalApi = [migratedConfig.localApiUrl, migratedConfig.branchLanApiUrl, migratedConfig.cloudApiUrl, migratedConfig.customApiUrl]
     .some((value) => {
       const url = String(value || "").trim();
-      return /localhost|127\.0\.0\.1|\[::1\]|:5000/i.test(url);
+      return /localhost|127\.0\.0\.1|\[::1\]|:5000|:5051/i.test(url);
     });
   if (localModeSaved || pointsToLocalApi) {
     const nextConfig = {
@@ -309,12 +309,30 @@ const startupConnectivityAuthority = createStartupConnectivityAuthority({
   initialMode: readConnectivityMode(),
   apiMode: API_MODE,
 });
+/**
+ * The port the desktop shell's local backend listens on.
+ *
+ * A development build uses a different one, so `npm run app` can never take the installed shop
+ * app's port -- or, worse, quietly talk to the shop's own backend while believing it is its own.
+ * `src-tauri/src/lib.rs` derives exactly the same split from `cfg!(debug_assertions)`, and
+ * `local/localBackendPort.test.mjs` fails if the two sides ever disagree.
+ *
+ * This is a build-time fact rather than an environment variable on purpose: a variable has to be
+ * set correctly in every terminal window, and the disposable launcher exists because that turned
+ * out not to be a safeguard.
+ */
+const SHOP_BACKEND_PORT = "5000";
+const DEV_BACKEND_PORT = "5051";
+const LOCAL_BACKEND_PORT = import.meta.env.DEV ? DEV_BACKEND_PORT : SHOP_BACKEND_PORT;
+
 const isLocalOnlyConnectivitySelected = () => startupConnectivityAuthority.isLocalOnly();
 const LOCAL_API_URL = normalizeApiBase(
   SAVED_API_CONFIG.localApiUrl ||
   import.meta.env.VITE_LOCAL_API_URL ||
   window.__FROOZERP_LOCAL_API_URL__ ||
-  (isDesktopShell() ? "http://127.0.0.1:5000" : `${window.location.protocol}//${window.location.hostname}:5000`)
+  (isDesktopShell()
+    ? `http://127.0.0.1:${LOCAL_BACKEND_PORT}`
+    : `${window.location.protocol}//${window.location.hostname}:${LOCAL_BACKEND_PORT}`)
 );
 const BRANCH_LAN_API_URL = normalizeApiBase(
   SAVED_API_CONFIG.branchLanApiUrl ||
@@ -3354,6 +3372,7 @@ function App() {
     exitCode: localBackendService?.exit_code ?? localBackendService?.exitCode ?? "",
     startupError: localBackendService?.message || startupError || backendHealth?.message || "",
     stderrTail: localBackendService?.stderr_tail || localBackendService?.stderrTail || "",
+    sourceCheckoutWarning: localBackendService?.source_checkout_warning || localBackendService?.sourceCheckoutWarning || "",
     startupLogPath,
     stdoutLogPath: localBackendService?.stdout_log_path || localBackendService?.stdoutLogPath || "",
     stderrLogPath: localBackendService?.stderr_log_path || localBackendService?.stderrLogPath || "",
@@ -7067,12 +7086,15 @@ function App() {
     ? `${connectionStatus.internetStatus}, local service unavailable`
     : `${connectionStatus.internetStatus} - ${isCloudMode() ? connectionStatus.cloudBackendStatus : connectionStatus.localBackendStatus}`;
   const startupDetailRows = [
+    // First, because it explains failures further down the list rather than being explained by
+    // them: a backend served out of a checkout can change under this app without warning.
+    ["⚠ Running from source", startupDiagnostics.sourceCheckoutWarning],
     ["Desktop version", startupDiagnostics.desktopVersion],
     ["Backend executable", startupDiagnostics.backendExecutablePath],
     ["Backend resources", startupDiagnostics.backendResourcePath],
     ["Working directory", startupDiagnostics.workingDirectory],
     ["Backend PID", startupDiagnostics.backendPid || "Not running"],
-    ["Port 5000 PID", startupDiagnostics.port5000Pid || "No listener"],
+    [`Port ${LOCAL_BACKEND_PORT} PID`, startupDiagnostics.port5000Pid || "No listener"],
     ["Database path", startupDiagnostics.databasePath],
     ["Error code", startupDiagnostics.errorCode || "Not reported"],
     ["Exit code", startupDiagnostics.exitCode === "" ? "Not reported" : startupDiagnostics.exitCode],
