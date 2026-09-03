@@ -85,11 +85,19 @@ sale rate the price list did not produce.
 
 ## Known limitations, recorded rather than hidden
 
-- **A bill carrying charges cannot be edited yet.** Both edit handlers rebuild the total from items
-  alone, so an edit would drop the charge from the total while its `sale_charges` row stayed on the
-  bill. Refused for now. Nothing that works today is affected, because no existing bill has charges
-   — but once charges are in daily use, a mistyped weight on a delivered bill becomes uneditable,
-  and cancel-and-rebill is a poor answer on a credit sale.
+- ~~A bill carrying charges cannot be edited.~~ **Fixed 2026-09-02.** Both edit paths now hand the
+  charges to `buildSalePayload`, which re-prices them from the stored slabs, and both write the
+  result back. An edit shows what the shop would charge *today*, so if a rate has moved since the
+  bill was raised, the difference is visible on screen before it is saved rather than discovered on
+  the reprint. A hand-typed amount is carried through as typed — it was typed because no rate
+  covered it, and re-deriving it would only refuse again.
+
+  One refusal remains, deliberately: an edit that says **nothing at all** about charges, on a bill
+  that has them, is refused (`SALE_CHARGES_NOT_SUPPLIED` online, a CONFLICT on the sync path).
+  Silence is not "there are none" — it means the app sending it predates the feature, and reading
+  it as an empty list would delete collected money on every edit that device ever pushes. An
+  up-to-date app always sends the key, empty list included; sending `[]` is how a cashier removes
+  the last charge.
 - **The flat sales-history export does not carry `other_charges_amount`.** Any report summing those
   rows is short by charges. Already true of `tax_amount`, so consistent, but wrong in the same way.
 - **Charge types cannot be created offline.** They arrive from the cloud. Editing a price list is an

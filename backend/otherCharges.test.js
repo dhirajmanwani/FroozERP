@@ -634,14 +634,41 @@ test("the name on the bill survives the charge type being turned off afterwards"
   );
 });
 
-test("editing a bill that carries charges is refused rather than quietly dropping them", async () => {
-  // The sale-edit path rebuilds `total_amount` from the items alone and knows nothing about
-  // charges. Letting it through would leave the bill's own total disagreeing with its own lines,
-  // which is the summary-versus-detail failure CLAUDE.md records as reading like data loss. Both
-  // edit paths -- the online handler and the offline-sync operation -- refuse by name instead.
-  const guards = SOURCE.match(/This bill has other charges on it\./g) || [];
-  assert.equal(guards.length, 2, "both the online and the offline edit path must refuse");
-  assert.match(SOURCE, /code: "SALE_HAS_OTHER_CHARGES"/);
+test("both edit paths re-price charges instead of rebuilding the total without them", () => {
+  // A bill's total is rebuilt from its items on an edit. Before this, that meant a bill carrying a
+  // crate charge could not be edited at all -- so a mistyped weight on a delivered bill had to be
+  // cancelled and re-raised, which is a poor answer on a credit sale.
+  //
+  // Both paths now hand the charges to `buildSalePayload`, which re-prices them from the stored
+  // slabs, and both write the result. The alternative -- trusting the amounts the caller sent --
+  // would make an edit the one place a client sets its own prices.
+  for (const [label, marker] of [
+    // The route is `app.put("/sales/:id", updateSaleHandler)`, so the body is the named handler.
+    ["the online handler", "const updateSaleHandler"],
+    ["the offline-sync operation", "const processPosSaleEditOperation"],
+  ]) {
+    const start = SOURCE.indexOf(marker);
+    assert.ok(start > 0, `${label} must exist`);
+    const body = SOURCE.slice(start, start + 9000);
+    assert.match(body, /charges: editCharges \?\? \[\]/, `${label} must pass the charges through`);
+    assert.match(body, /DELETE FROM sale_charges WHERE sale_id/, `${label} must replace the lines wholesale`);
+    assert.match(body, /other_charges_amount = \$/, `${label} must rewrite the bill's charge total`);
+    assert.match(body, /insertSaleCharges\(client/, `${label} must write the re-priced lines back`);
+  }
+});
+
+test("an edit that says nothing about charges is refused only when the bill has some", () => {
+  // Silence is not "there are none". A payload from a build that predates the feature mentions no
+  // charges at all, and reading that as an empty list would delete money the shop collected -- on
+  // every edit that device pushes, with nothing reporting it.
+  //
+  // The device makes the same distinction on its own edit path, which is why an up-to-date app
+  // always sends the key, empty list included. An explicit [] is how a cashier removes a charge.
+  const guards = SOURCE.match(/editCharges === undefined && Number\(currentSale\.other_charges_amount \|\| 0\) > 0/g) || [];
+  assert.equal(guards.length, 2, "both edit paths must make the same distinction");
+  assert.match(SOURCE, /code: "SALE_CHARGES_NOT_SUPPLIED"/);
+  // Named so the refusal is actionable rather than a dead end.
+  assert.match(SOURCE, /Update the app[\s\S]{0,60}cancel the bill/);
 });
 
 test("no charge total can reach the taxable amount by any route in the file", () => {

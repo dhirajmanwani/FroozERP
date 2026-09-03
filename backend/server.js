@@ -10478,16 +10478,24 @@ const processPosSaleEditOperation = async (client, operation, context) => {
   if (currentSale.sale_status === "CANCELLED") {
     return rejectOperation(operation, "CONFLICT", "Cancelled invoices cannot be edited");
   }
-  // The edit path rebuilds the bill's totals from its items and knows nothing about other charges.
-  // Letting it through would rewrite total_amount without the crate charge while the sale_charges
-  // rows stayed where they were -- the bill's own total disagreeing with its own lines, which is
-  // the summary-versus-detail failure that reads as data loss. Refused by name until the edit path
-  // carries charges too.
-  if (Number(currentSale.other_charges_amount || 0) > 0) {
+  /*
+   * Charges on an offline edit: silence is not "there are none".
+   *
+   * A payload that says nothing about charges, on a bill that has them, comes from a device
+   * running a build that predates the feature. Reading that silence as "no charges" would rewrite
+   * total_amount without the crate charge and delete money the shop collected -- on every edit
+   * that device ever pushes, with nothing anywhere reporting it. So it is refused by name, and
+   * only when the bill actually carries charges.
+   *
+   * The device makes exactly the same distinction on its own edit path, which is why an up-to-date
+   * app always sends the key, empty list included.
+   */
+  const editCharges = payload.other_charges ?? sale.other_charges ?? invoice.other_charges;
+  if (editCharges === undefined && Number(currentSale.other_charges_amount || 0) > 0) {
     return rejectOperation(
       operation,
       "CONFLICT",
-      "This bill has other charges on it. Editing a bill with charges is not supported yet -- cancel it and bill again.",
+      "This bill has other charges on it, and this edit did not mention them. Update the app on that machine, or cancel the bill and raise it again.",
     );
   }
   if (Number(currentSale.entity_version || 1) >= version && currentSale.sale_status === "EDITED") {
@@ -10511,6 +10519,9 @@ const processPosSaleEditOperation = async (client, operation, context) => {
   await client.query("DELETE FROM sale_batch_allocations WHERE sale_item_id IN (SELECT id FROM sale_items WHERE sale_id = $1)", [currentSale.id]);
   await client.query("DELETE FROM sale_items WHERE sale_id = $1", [currentSale.id]);
   await client.query("DELETE FROM sale_payments WHERE sale_id = $1", [currentSale.id]);
+  // Replaced wholesale, like the items above: a charge line has no identity a device could address
+  // it by, so merging would be guesswork.
+  await client.query("DELETE FROM sale_charges WHERE sale_id = $1", [currentSale.id]);
 
   const normalizedItems = await normalizeSyncSaleItems(client, sale.items || payload.items);
   const salePayload = await buildSalePayload(client, {
@@ -10526,6 +10537,10 @@ const processPosSaleEditOperation = async (client, operation, context) => {
     invoiceDiscount: invoice.bill_discount_total || invoice.invoice_discount_amount || 0,
     payments: (sale.payments || []).filter((payment) => payment.posting_type !== "PAYMENT_REVERSAL"),
     allowRateOverride: ["Owner", "Admin"].includes(editor.role_name),
+    // Re-priced here from the stored slabs, exactly as a new offline bill is. The device's own
+    // arithmetic is what it shows the cashier; it is not what the shop's books record.
+    charges: editCharges ?? [],
+    allowManualChargeAmount: true,
     companyId: context.companyId,
     operationalLocationId: context.operationalLocationId,
   });
@@ -10550,6 +10565,7 @@ const processPosSaleEditOperation = async (client, operation, context) => {
       item_discount_amount = $11,
       invoice_discount_amount = $12,
       tax_amount = $13,
+      other_charges_amount = $31,
       taxable_amount = $14,
       mandi_tax_rate = $15,
       mandi_tax_basis = $16,
@@ -10591,9 +10607,11 @@ const processPosSaleEditOperation = async (client, operation, context) => {
       currentSale.id,
       editedInvoiceNo,
       version,
+      salePayload.otherChargesAmount,
     ]
   );
   const updatedSale = updateResult.rows[0];
+  await insertSaleCharges(client, currentSale.id, salePayload.chargeLines);
 
   for (const item of salePayload.invoiceItems) {
     const subtotalAfterItemDiscounts = Math.max(salePayload.grossAmount - salePayload.itemDiscountAmount, 0);
@@ -22752,14 +22770,24 @@ const updateSaleHandler = async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Cancelled invoices cannot be edited" });
     }
-    // Same refusal as the offline edit path above, and for the same reason: this handler rebuilds
-    // total_amount from the items alone, so an edit would silently drop the crate charge from the
-    // total while its sale_charges row stayed on the bill.
-    if (Number(currentSale.other_charges_amount || 0) > 0) {
+    /*
+     * Charges on an edit: silence is not "there are none".
+     *
+     * An edit rebuilds the bill from what the request carries. If the request says nothing about
+     * charges and the bill has some, treating that as "no charges" would delete money the shop
+     * collected -- quietly, on every edit made by a caller that predates the feature. So a silent
+     * request is refused, and only on bills that actually carry charges; an explicit empty list
+     * clears them, which is how a cashier removes one.
+     *
+     * The Rust side reached the same conclusion independently on the offline edit path, and this
+     * is deliberately the same rule so both agree about what an old payload means.
+     */
+    const editCharges = req.body.other_charges ?? req.body.otherCharges ?? req.body.charges;
+    if (editCharges === undefined && Number(currentSale.other_charges_amount || 0) > 0) {
       await client.query("ROLLBACK");
       return res.status(409).json({
-        code: "SALE_HAS_OTHER_CHARGES",
-        message: "This bill has other charges on it. Editing a bill with charges is not supported yet -- cancel it and bill again.",
+        code: "SALE_CHARGES_NOT_SUPPLIED",
+        message: "This bill has other charges on it, and this edit did not mention them. Update the app, or cancel the bill and raise it again.",
       });
     }
     const requestedSaleDate = req.body.bill_date || req.body.sale_date
@@ -22779,6 +22807,9 @@ const updateSaleHandler = async (req, res) => {
     await client.query("DELETE FROM sale_batch_allocations WHERE sale_item_id IN (SELECT id FROM sale_items WHERE sale_id = $1)", [saleId]);
     await client.query("DELETE FROM sale_items WHERE sale_id = $1", [saleId]);
     await client.query("DELETE FROM sale_payments WHERE sale_id = $1", [saleId]);
+    // Replaced wholesale rather than merged. A charge line has no identity a client could address
+    // it by, and half-updating a price list is how two rows end up describing one crate.
+    await client.query("DELETE FROM sale_charges WHERE sale_id = $1", [saleId]);
 
     const salePayload = await buildSalePayload(client, {
       items: req.body.items,
@@ -22788,6 +22819,10 @@ const updateSaleHandler = async (req, res) => {
       invoiceDiscount: req.body.invoice_discount,
       payments: req.body.payments,
       allowRateOverride: ["Owner", "Admin"].includes(editor.role_name),
+      // Re-priced from the stored slabs on the way through, exactly as on a new bill. An edit is
+      // not a place where a client's arithmetic starts being trusted.
+      charges: editCharges ?? [],
+      allowManualChargeAmount: Boolean(await getPermissionUser(editor.id, "manual_pos_rate_override", ["Owner", "Admin"], client)),
       companyId: context?.company_id || null,
       operationalLocationId: context?.operational_location_id || null,
     });
@@ -22813,6 +22848,7 @@ const updateSaleHandler = async (req, res) => {
         item_discount_amount = $11,
         invoice_discount_amount = $12,
         tax_amount = $13,
+        other_charges_amount = $30,
         taxable_amount = $14,
         mandi_tax_rate = $15,
         mandi_tax_basis = $16,
@@ -22852,9 +22888,11 @@ const updateSaleHandler = async (req, res) => {
         req.body.bill_datetime || `${requestedSaleDate}T00:00`,
         saleId,
         editedInvoiceNo,
+        salePayload.otherChargesAmount,
       ]
     );
     const updatedSale = updateResult.rows[0];
+    await insertSaleCharges(client, saleId, salePayload.chargeLines);
 
     for (const item of salePayload.invoiceItems) {
       const invoiceDiscountShare = salePayload.grossAmount - salePayload.itemDiscountAmount === 0

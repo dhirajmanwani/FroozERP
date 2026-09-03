@@ -8524,6 +8524,7 @@ function App() {
       {editingSale && (
         <ModuleErrorBoundary onClose={() => setEditingSale(null)}>
           <SaleEditModal
+            chargeTypes={chargeTypes}
             deviceInfo={deviceInfo}
             invoice={editingSale}
             offlineMode={offlineMode}
@@ -20442,7 +20443,7 @@ function SaleCancelModal({ draft, onClose, onConfirm, onReasonChange }) {
   );
 }
 
-function SaleEditModal({ canSaleDateEdit = false, customers = [], deviceInfo, inventory = [], invoice, offlineMode = false, onAddCustomer, onClose, onSaved, paymentSettings = {}, products, user }) {
+function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], customers = [], deviceInfo, inventory = [], invoice, offlineMode = false, onAddCustomer, onClose, onSaved, paymentSettings = {}, products, user }) {
   const activeCustomers = customers.filter((entry) => entry.active !== false);
   const walkInCustomer = activeCustomers.find((entry) => entry.system_account === true && String(entry.customer_name || "").toLowerCase().includes("walk-in")) || null;
   const customerFromAccount = (account) => account ? ({
@@ -20500,6 +20501,25 @@ function SaleEditModal({ canSaleDateEdit = false, customers = [], deviceInfo, in
   const [mixedPayments, setMixedPayments] = useState(initialMixedPayments);
   const [billDate, setBillDate] = useState(toDateKey(invoice.sale_date || invoice.transaction_date || new Date()));
   const [invoiceDiscount, setInvoiceDiscount] = useState(invoice.invoice_discount_amount || 0);
+  /*
+   * The charges already on the bill, reopened as selections.
+   *
+   * Seeded from what was charged -- the measurement and the count -- and re-priced from today's
+   * rates on every render, exactly as a new bill is. So an edit shows what the shop would charge
+   * now, and if a rate has moved since, the difference is visible on screen before it is saved
+   * rather than discovered on the printed bill.
+   *
+   * A hand-typed amount is carried through as typed. It was typed because no rate covered it, and
+   * re-deriving it would only refuse again.
+   */
+  const [chargeSelections, setChargeSelections] = useState(
+    (invoice.other_charges || invoice.sale_charges || []).map((line) => ({
+      charge_type_id: line.charge_type_id,
+      measurement: line.measurement ?? "",
+      quantity: line.quantity ?? 1,
+      manualAmount: line.manual ? line.amount : "",
+    }))
+  );
   const [reason, setReason] = useState("");
   const [saving, setSaving] = useState(false);
   const canChangeRate = ["Owner", "Admin"].includes(user.role);
@@ -20532,7 +20552,14 @@ function SaleEditModal({ canSaleDateEdit = false, customers = [], deviceInfo, in
       )
     : 0;
   const mandiTaxAmount = roundUi(taxableAmount * Number(paymentSettings.sales_mandi_tax_percent || 0) / 100);
-  const netPayable = Math.max(gross - itemDiscount - Number(invoiceDiscount || 0) + mandiTaxAmount, 0);
+  // Charges land after tax here too. Same module, same rules -- an edit screen with its own
+  // arithmetic is how a bill and its own edit come to disagree.
+  const editCharges = buildChargesForBill(chargeTypes, chargeSelections);
+  const netBeforeCharges = Math.max(gross - itemDiscount - Number(invoiceDiscount || 0) + mandiTaxAmount, 0);
+  const netPayable = applyChargesToTotals(
+    { taxableAmount, taxAmount: mandiTaxAmount, netAmount: netBeforeCharges },
+    editCharges.lines,
+  ).totalAmount;
   const mixedAllocated = roundUi(mixedPaymentModes.reduce((sum, [mode]) => sum + Number(mixedPayments[mode] || 0), 0));
   const mixedRemaining = roundUi(Math.max(netPayable - mixedAllocated, 0));
   const mixedExcess = roundUi(Math.max(mixedAllocated - netPayable, 0));
@@ -20685,6 +20712,19 @@ function SaleEditModal({ canSaleDateEdit = false, customers = [], deviceInfo, in
           source: "payment_settings",
         } : null,
         tax_total: mandiTaxAmount,
+        /*
+         * Always sent, empty list included. The server treats a missing key as "this app is too
+         * old to know about charges" and refuses the edit on a bill that has them, so that an old
+         * build cannot silently delete collected money. Sending [] is how this app says "there are
+         * none now", which is what removing the last charge means.
+         */
+        other_charges: editCharges.lines.map((line) => ({
+          charge_type_id: line.charge_type_id,
+          measurement: line.measurement,
+          quantity: line.quantity,
+          manual_amount: line.manual ? line.amount : null,
+        })),
+        other_charges_amount: editCharges.otherChargesAmount,
         net_total: netPayable,
         payments,
         branch_id: invoice.branch_id || user.branch_id,
@@ -20858,6 +20898,14 @@ function SaleEditModal({ canSaleDateEdit = false, customers = [], deviceInfo, in
               </tr>
             ))}
           </DataTable>
+          <OtherChargesPanel
+            chargeTypes={chargeTypes}
+            lines={editCharges.lines}
+            refusals={editCharges.refusals}
+            selections={chargeSelections}
+            canTypeAmount={canChangeRate}
+            onChange={setChargeSelections}
+          />
           <section className="purchase-summary sale-edit-summary">
             <div className="purchase-summary-grid">
               <SummaryMetric label="Gross Total" value={currency.format(gross)} />
@@ -20865,6 +20913,7 @@ function SaleEditModal({ canSaleDateEdit = false, customers = [], deviceInfo, in
               <SummaryMetric label="Bill Discount" value={currency.format(Number(invoiceDiscount || 0))} />
               <SummaryMetric label="Taxable Amount" value={currency.format(taxableAmount)} />
               <SummaryMetric label={`Mandi Tax (${editTaxEligible ? Number(paymentSettings.sales_mandi_tax_percent || 0) : 0}%)`} value={currency.format(mandiTaxAmount)} />
+              {editCharges.otherChargesAmount > 0 && <SummaryMetric label="Other Charges" value={currency.format(editCharges.otherChargesAmount)} />}
               <SummaryMetric label="Net Payable" value={currency.format(netPayable)} featured />
             </div>
           </section>
