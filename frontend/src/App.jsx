@@ -60,7 +60,11 @@ import { COUNTER_STOCK, buildReservedIndex, describeCounterStock, reservedForPro
 import { buildOrderCartSeed, describeOrderBillingProblems } from "./local/orderBilling";
 import { bannerForState } from "./local/entitlementState";
 import { sessionAuthHeaders, shouldAttachSessionAuth } from "./local/authHeaders";
-import { consumeStashedSessionForReload, stashSessionForReload } from "./local/reloadSessionBridge";
+// Only the consuming half is used now. `stashSessionForReload` existed so that saving an API mode
+// could reload the page without signing the Owner out; nothing reloads the page to apply a setting
+// any more, because there is no setting to apply. The module keeps both halves for the reload paths
+// that still exist elsewhere.
+import { consumeStashedSessionForReload } from "./local/reloadSessionBridge";
 import { describeLocalServiceFailure } from "./local/localServiceFailure";
 import { autoConnectivityBlockedReason as resolveAutoConnectivityBlockedReason } from "./local/autoConnectivityAvailability";
 import { clearOfflineFailures, offlineLockCountdownMessage, readOfflineLockState, registerOfflineFailure } from "./local/offlineLoginLockout";
@@ -79,6 +83,7 @@ import {
 import { buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./local/canonicalIdentity";
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode } from "./local/connectivityMode";
+import { CONNECTION_TONE, connectionNeedsAttention, resolveConnectionStatus } from "./local/connectionStatus";
 import { createStartupConnectivityAuthority } from "./local/startupConnectivityPolicy";
 import { isCloudTargetConfigured, resolveCloudTarget } from "./local/cloudTarget";
 import { resolveApiMode } from "./local/apiModeResolution";
@@ -175,17 +180,10 @@ const API_MODES = Object.freeze({
   CUSTOM_API_URL: "CUSTOM_API_URL",
   SIMULATED_OFFLINE: "SIMULATED_OFFLINE",
 });
-const API_MODE_OPTIONS = [
-  [API_MODES.HYBRID, "Hybrid: Local + Cloud"],
-  [API_MODES.LOCAL_ONLY, "Local Only"],
-  [API_MODES.CLOUD_ONLY, "Cloud Only"],
-  [API_MODES.LOCAL_SINGLE_DEVICE, "Local Single Device"],
-  [API_MODES.BRANCH_LAN_SERVER, "Branch LAN Server"],
-  [API_MODES.BRANCH_LAN_CLIENT, "Branch LAN Client"],
-  [API_MODES.CLOUD_PRODUCTION, "Cloud Production"],
-  [API_MODES.FIELD_REMOTE_DEVICE, "Field Remote Device"],
-  [API_MODES.CUSTOM_API_URL, "Custom API URL"],
-];
+// `API_MODE_OPTIONS` -- the nine entries that filled the App Mode dropdown -- is deleted rather
+// than left unused. A list of choices sitting in the file is an invitation to render it again, and
+// the modes themselves still exist below because the *engine* is unchanged: what went away is
+// asking a shopkeeper which one his shop is. `API_MODE_LABELS` still names them for diagnostics.
 const normalizeApiMode = (value) => {
   const mode = String(value || "").trim().toUpperCase();
   if (mode === "LOCAL_SHOP_SERVER") return API_MODES.LOCAL_SINGLE_DEVICE;
@@ -285,7 +283,6 @@ const mergeCloudIdentityIntoSavedConfig = (identity = {}) => {
   return next;
 };
 const SAVED_API_CONFIG = sanitizeSavedApiConfigForRuntime(readSavedApiConfig());
-const normalizeCloudConnectionMode = normalizeConnectivityMode;
 // The API mode is resolved *before* the connectivity authority is created, because
 // API_MODE=LOCAL_ONLY is authoritative over the connectivity policy (D-16 / backlog item 4,
 // option 1) and the authority needs to know it at construction.
@@ -340,12 +337,39 @@ const BRANCH_LAN_API_URL = normalizeApiBase(
   window.__FROOZERP_BRANCH_LAN_API_URL__ ||
   ""
 );
+/**
+ * The cloud this installed app belongs to, when nobody has said otherwise.
+ *
+ * An installed FroozERP used to learn its cloud from a **Cloud API URL** text box. The box was
+ * empty, and its placeholder -- `https://api.froozerp.com` -- read exactly like a filled-in value,
+ * so on 2026-09-02 the maintainer looked straight at it and reported the field as set. Everything
+ * downstream then behaved as though there were no cloud, which on screen is indistinguishable from
+ * having no internet.
+ *
+ * A shop does not choose which cloud its own ERP syncs to. `src-tauri/src/lib.rs` reaches the same
+ * conclusion for the local gateway, with the same two rules and for the same reasons, and
+ * `local/cloudAddress.test.mjs` fails if the two sides ever name different clouds.
+ *
+ * Two things this deliberately is not:
+ *
+ *   - **Not a development default.** `npm run app:disposable` opens a copy of live business data,
+ *     and a rehearsal that quietly synced that copy into production would be worse than anything it
+ *     was rehearsing for. A development build gets no cloud unless handed one.
+ *   - **Not written to localStorage.** `sanitizeSavedApiConfigForRuntime` refuses to persist a
+ *     default precisely because doing so re-poisons the saved config on every load, and clearing
+ *     cloud settings used to *escalate* cloud contact as a result. This is a runtime fallback only:
+ *     an unconfigured profile stays unconfigured on disk.
+ */
+const BUILT_IN_DESKTOP_CLOUD_API_URL = isDesktopShell() && !import.meta.env.DEV
+  ? DEFAULT_PRODUCTION_CLOUD_API_URL
+  : "";
 const CLOUD_API_URL = normalizeApiBase(
   RAILWAY_PRODUCTION_API_URL ||
   ISOLATED_LOOPBACK_CLOUD_API_URL ||
   canonicalizeCloudApiUrl(SAVED_API_CONFIG.cloudApiUrl) ||
   import.meta.env.VITE_CLOUD_API_URL ||
   window.__FROOZERP_CLOUD_API_URL__ ||
+  BUILT_IN_DESKTOP_CLOUD_API_URL ||
   ""
 );
 const CUSTOM_API_URL = normalizeApiBase(
@@ -561,7 +585,12 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
     || ["APP_SIMULATED_OFFLINE", "APP_LOCAL_ONLY"].includes(syncStatus?.lastFailureKind);
   const backendOnline = isCloudMode() ? cloudOnline : localOnline;
   const backendOffline = isCloudMode() ? cloudOffline : localOffline;
-  const cloudReachable = !cloudPaused && usesCloudBackend() && CLOUD_CONFIGURED && cloudOnline;
+  // `usesCloudBackend()` used to be part of this and made it unanswerable on the shop's own
+  // machine: an installed desktop is LOCAL_SINGLE_DEVICE, which that predicate excludes, so
+  // "is the cloud reachable" was pinned to false no matter what the cloud was doing. The honest
+  // test is the one a person would apply -- is there a cloud, is it answering, and has anybody
+  // deliberately held this machine off it.
+  const cloudReachable = !cloudPaused && CLOUD_CONFIGURED && cloudOnline;
   const deviceApproved = ["APPROVED", "ACTIVE"].includes(String(deviceRegistration?.status || "").toUpperCase());
   const devicePending = ["PENDING", "PENDING_APPROVAL"].includes(String(deviceRegistration?.status || "").toUpperCase());
   const cloudSyncActive = cloudReachable && deviceApproved && !syncStatus?.lastError;
@@ -699,6 +728,12 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
     conflicts,
     syncSummary,
     cloudConnectionMode: cloudPaused ? "Local Only" : "Auto",
+    // The two raw facts `local/connectionStatus.js` needs, kept as booleans rather than as any of
+    // the sentences above. Every other field here is already a phrase, and a screen that has to
+    // pattern-match "Cloud Backend Connected" to decide what it means is one wording change away
+    // from silently reporting the opposite.
+    cloudReachable,
+    localServiceStarting: localStarting,
     banner,
     detail: `${syncSummary}. API mode: ${apiModeLabel}.`,
   };
@@ -3271,7 +3306,15 @@ function App() {
         setStartupError((current) => (/local backend|froozERP service|backend/i.test(current) ? "" : current));
       }
     }
-    const nextCloudHealth = usesCloudBackend() && !localOnly
+    // Asked whenever there *is* a cloud to ask, rather than only in the modes historically labelled
+    // "cloud". An installed desktop runs as LOCAL_SINGLE_DEVICE, which `usesCloudBackend()` says is
+    // not a cloud mode -- true of where its business data comes from, and false of whether it has a
+    // cloud. So its cloud health was never checked, `cloudReachable` could never become true, and
+    // the Connection panel reported "Cloud Not Configured" on a machine whose cloud was fine.
+    //
+    // This decides what the screen may *say*, not what the app may *do*: the background-sync gate
+    // below is untouched, and `guardCloudCall` still refuses on its own terms.
+    const nextCloudHealth = CLOUD_CONFIGURED && !localOnly
       ? await checkCloudBackendHealth(reason, options.timeoutMs || 5000)
       : cloudHealth;
     if (generation !== connectivityGenerationRef.current) return backendHealthRef.current;
@@ -7080,9 +7123,9 @@ function App() {
   // stale closure. See `navigateRef` above.
   navigateRef.current = navigate;
 
-  // The banner's "Return to Auto" is a second door to the same action as the Settings toggle, so it
-  // needs the same answer. Computed from the saved App Mode rather than a settings draft, because
-  // this button lives outside that screen.
+  // Why reconnecting this computer cannot work, when it cannot -- shown on the banner and used to
+  // disable the button there. There were two doors to this action once, and only one of them was
+  // guarded; the Settings toggle is gone and this is the survivor, so the guard lives here.
   const bannerAutoBlockedReason = resolveAutoConnectivityBlockedReason({
     apiMode: API_MODE,
     cloudApiUrl: CLOUD_API_URL,
@@ -7415,6 +7458,25 @@ function App() {
     viewingBranchId: shopViewState.viewingBranchId,
     viewOnly: shopViewState.viewOnly,
   });
+
+  /**
+   * What the app is doing about the internet, in one sentence, for somebody who is mid-sale.
+   *
+   * This is an *observation*, not a setting. It replaces a banner that announced "Local Only mode
+   * selected" with a button to return to Auto -- wording that only makes sense to somebody who
+   * knows there are modes, and which appeared on a machine where nobody had selected anything.
+   *
+   * Deliberately silent when there is nothing to say: a badge that is always on screen is read for
+   * a week and ignored forever after, and is then worthless on the day it changes.
+   */
+  const connectionSentence = resolveConnectionStatus({
+    cloudReachable: connectionStatus.localServiceStarting ? null : connectionStatus.cloudReachable,
+    pendingCount: syncStatus?.pendingOperations,
+    lastSyncAt: syncStatus?.lastSuccessfulSyncAt,
+    heldOffline: connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY,
+    localServiceReady: backendHealth?.online === true,
+  });
+
   return (
     <main className="erp-shell">
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""} ${sidebarCollapsed ? "sidebar-rail" : ""}`}>
@@ -7628,12 +7690,25 @@ function App() {
               </button>
             </div>
           )}
-          {connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY && (
-            <div className="local-only-banner" data-connectivity-mode="LOCAL_ONLY">
+          {connectionSentence.showsInTopBar && (
+            <div
+              className="local-only-banner"
+              data-connection-state={connectionSentence.state}
+              role={connectionNeedsAttention(connectionSentence) ? "alert" : "status"}
+            >
               <div>
-                <strong>Local Only mode selected - cloud sync paused</strong>
-                <span>{bannerAutoBlockedReason || "Business modules use local SQLite. Windows internet remains connected."}</span>
+                <strong>{connectionSentence.headline}</strong>
+                <span>{connectionSentence.detail}</span>
+                {/* Rendered, never only in a `title`. A disabled button with its explanation
+                    hidden in a tooltip is a control that looks broken to anybody who does not
+                    hover -- which on a counter machine is everybody. */}
+                {bannerAutoBlockedReason && <span>{bannerAutoBlockedReason}</span>}
               </div>
+              {/* The only button left, and only on the one state that genuinely needs a person:
+                  somebody deliberately held this machine off the cloud. Being offline gets no
+                  button, because there is nothing for anybody to do -- which is precisely what the
+                  sentence says. */}
+              {connectionSentence.tone === CONNECTION_TONE.ATTENTION && (
               <button
                 className="primary-button"
                 disabled={connectivityModeSwitching || bannerAutoBlockedReason !== ""}
@@ -7642,10 +7717,11 @@ function App() {
                   // Not `getErrorMessage`: this refusal is thrown by the app's own rules and
                   // carries the reason in the Error itself, which that helper discards because it
                   // only reads a server response body.
-                  .catch((error) => setSyncMessage(describeLocalServiceFailure(error, "Unable to return to Auto mode")))}
+                  .catch((error) => setSyncMessage(describeLocalServiceFailure(error, "Unable to reconnect this computer")))}
               >
-                {connectivityModeSwitching ? "Switching..." : "Return to Auto"}
+                {connectivityModeSwitching ? "Reconnecting..." : "Reconnect this computer"}
               </button>
+              )}
             </div>
           )}
           {(startupNotice || startupError || syncMessage) && (
@@ -17754,45 +17830,10 @@ function SyncSettingsSection({
   const [cloudReadiness, setCloudReadiness] = useState(null);
   const [cloudReadinessBusy, setCloudReadinessBusy] = useState(false);
   const [cloudActionBusy, setCloudActionBusy] = useState("");
-  const [connectivityModeBusy, setConnectivityModeBusy] = useState(false);
-  const [configDraft, setConfigDraft] = useState({
-    mode: API_CONFIG.mode,
-    cloudConnectionMode: normalizeCloudConnectionMode(SAVED_API_CONFIG.cloudConnectionMode),
-    localApiUrl: API_CONFIG.localApiUrl,
-    branchLanApiUrl: BRANCH_LAN_API_URL,
-    cloudApiUrl: CLOUD_API_URL,
-    customApiUrl: CUSTOM_API_URL,
-    branchServerBindHost: API_CONFIG.branchServerBindHost,
-    branchServerPort: API_CONFIG.branchServerPort,
-  });
+  // No `configDraft` any more. It held eight fields for a form that let one person decide, on one
+  // machine, what "connected" meant -- and the machine's real behaviour then depended on all of
+  // them agreeing. Nothing here is drafted now, because nothing here is chosen.
   const [configMessage, setConfigMessage] = useState("");
-  // Recomputed from the draft, not the saved config, so the explanation tracks what the Owner is
-  // currently choosing rather than what was last saved.
-  const autoConnectivityBlockedReason = resolveAutoConnectivityBlockedReason({
-    apiMode: configDraft.mode,
-    cloudApiUrl: configDraft.cloudApiUrl,
-  });
-  useEffect(() => {
-    setConfigDraft((current) => ({ ...current, cloudConnectionMode: normalizeConnectivityMode(connectivityMode) }));
-  }, [connectivityMode]);
-  const applyConnectivityMode = async (nextMode) => {
-    if (String(user?.role || "").toUpperCase() !== "OWNER" || !onConnectivityModeChange) return;
-    setConnectivityModeBusy(true);
-    setConfigMessage("Switching...");
-    try {
-      const savedMode = await onConnectivityModeChange(nextMode);
-      setConfigDraft((current) => ({ ...current, cloudConnectionMode: savedMode }));
-      setConfigMessage(connectivityModeMessage(savedMode));
-    } catch (error) {
-      // Not `getErrorMessage`: when nothing answered, that shows this fallback as though the local
-      // service had considered the request and declined it. It had not — the request never arrived,
-      // and the remedy (restart the app so its separate local process picks up new code) is
-      // completely different from anything a refusal would call for.
-      setConfigMessage(describeLocalServiceFailure(error, "Unable to change Connectivity Mode"));
-    } finally {
-      setConnectivityModeBusy(false);
-    }
-  };
   const save = async () => {
     try {
       const response = await axios.put(`${API_URL}/settings/sync-status`, {
@@ -17808,27 +17849,21 @@ function SyncSettingsSection({
       alert(getErrorMessage(error, "Unable to save device display name"));
     }
   };
-  const modeNeedsBranchUrl = configDraft.mode === API_MODES.BRANCH_LAN_CLIENT;
-  const modeNeedsCloudUrl = configDraft.mode === API_MODES.CLOUD_PRODUCTION || configDraft.mode === API_MODES.FIELD_REMOTE_DEVICE;
-  const modeNeedsCustomUrl = configDraft.mode === API_MODES.CUSTOM_API_URL;
-  const selectedTestUrl = modeNeedsBranchUrl
-    ? configDraft.branchLanApiUrl
-    : modeNeedsCloudUrl
-      ? configDraft.cloudApiUrl
-      : modeNeedsCustomUrl
-        ? configDraft.customApiUrl
-        : configDraft.localApiUrl;
   const testApiUrl = async (url, label = "API") => {
     const apiUrl = normalizeApiBase(url);
     if (!isValidHttpApiUrl(apiUrl)) {
       setConfigMessage(`${label} URL is invalid. Use http:// or https://.`);
       return false;
     }
+    // Decided from the address being tested rather than from a mode that no longer exists. It is
+    // also the more honest question: a hosted deployment must prove it is a provisioned FroozERP
+    // cloud, and this computer's own service cannot and should not be asked to.
+    const expectsCloudIdentity = isRealCloudUrl(apiUrl);
     try {
       const response = await axios.get(`${apiUrl}/api/health`, { timeout: 3500, headers: { "Cache-Control": "no-store" } });
       const health = response.data || {};
       const healthOk = response.status >= 200 && response.status < 300 && String(health.status || "").toLowerCase() === "ok";
-      const cloudIdentityOk = !modeNeedsCloudUrl || (
+      const cloudIdentityOk = !expectsCloudIdentity || (
         health.app === "FroozERP"
         && String(health.api_version) === "1"
         && Boolean(health.version)
@@ -17842,7 +17877,7 @@ function SyncSettingsSection({
       const ok = healthOk && cloudIdentityOk;
       setConfigMessage(ok
         ? `${label} connection passed`
-        : healthOk && modeNeedsCloudUrl
+        : healthOk && expectsCloudIdentity
           ? `${label} responded, but it is not a configured FroozERP cloud deployment`
           : `${label} responded but health is not ok`);
       return ok;
@@ -17852,15 +17887,17 @@ function SyncSettingsSection({
     }
   };
   const runCloudReadinessCheck = async () => {
-    const cloudUrl = normalizeApiBase(configDraft.cloudApiUrl || CLOUD_API_URL);
+    // Reads the address the app is actually using, not a draft from a box the Owner was typing in.
+    // A readiness check that reports on an unsaved value answers a question nobody asked.
+    const cloudUrl = normalizeApiBase(CLOUD_API_URL);
     const deviceId = draft.device_id || localDbStatus?.deviceId || localDbStatus?.deviceIdentity?.device_id || "";
     const branchId = String(user?.branch_id || draft.branch_id || localDbStatus?.branchId || localDbStatus?.deviceIdentity?.branch_id || "").trim();
     const setResult = (status, detail) => {
       setCloudReadiness({ status, detail, checkedAt: new Date().toISOString() });
       return status;
     };
-    if (normalizeCloudConnectionMode(configDraft.cloudConnectionMode) === CONNECTIVITY_MODES.LOCAL_ONLY) {
-      return setResult("Cloud Paused By Owner", "Local Only mode is active. FroozERP cloud checks and sync are intentionally blocked while local SQLite stays usable.");
+    if (normalizeConnectivityMode(connectivityMode) === CONNECTIVITY_MODES.LOCAL_ONLY) {
+      return setResult("Held Off The Cloud On Purpose", "This computer is being kept off the internet deliberately, so cloud checks and sync are blocked. Everything is still saved here.");
     }
     if (!cloudUrl) {
       return setResult("Cloud Not Configured", "Cloud is not configured yet. Local and LAN modes can still work.");
@@ -17907,69 +17944,6 @@ function SyncSettingsSection({
     } finally {
       setCloudReadinessBusy(false);
     }
-  };
-  const saveApiConfig = async () => {
-    if (!canManage) return;
-    const nextConfig = {
-      ...readSavedApiConfig(),
-      mode: normalizeApiMode(configDraft.mode),
-      cloudConnectionMode: normalizeCloudConnectionMode(configDraft.cloudConnectionMode),
-      connectivityMode: normalizeConnectivityMode(configDraft.cloudConnectionMode),
-      localApiUrl: normalizeApiBase(configDraft.localApiUrl) || "http://127.0.0.1:5000",
-      branchLanApiUrl: normalizeApiBase(configDraft.branchLanApiUrl),
-      cloudApiUrl: normalizeApiBase(configDraft.cloudApiUrl),
-      customApiUrl: normalizeApiBase(configDraft.customApiUrl),
-      branchServerBindHost: String(configDraft.branchServerBindHost || "0.0.0.0").trim(),
-      branchServerPort: String(configDraft.branchServerPort || "5000").trim(),
-    };
-    if (nextConfig.mode === API_MODES.BRANCH_LAN_CLIENT) {
-      if (!isValidHttpApiUrl(nextConfig.branchLanApiUrl)) {
-        setConfigMessage("Branch LAN Client requires a branch server API URL such as http://192.168.1.41:5000.");
-        return;
-      }
-      const ok = await testApiUrl(nextConfig.branchLanApiUrl, "Branch server");
-      if (!ok && !window.confirm("Branch server health check failed. Save this URL anyway?")) return;
-    }
-    if (nextConfig.mode === API_MODES.CLOUD_PRODUCTION && nextConfig.cloudApiUrl && !isRealCloudUrl(nextConfig.cloudApiUrl)) {
-      setConfigMessage("Cloud Production requires a real hosted cloud URL. Localhost, LAN IPs and :5000 are not cloud.");
-      return;
-    }
-    if (nextConfig.mode === API_MODES.FIELD_REMOTE_DEVICE) {
-      if (!nextConfig.cloudApiUrl) {
-        setConfigMessage("Field Remote Device requires a configured Cloud Production URL.");
-      } else if (!isRealCloudUrl(nextConfig.cloudApiUrl)) {
-        setConfigMessage("Field Remote Device requires a real hosted cloud URL, not localhost or LAN.");
-        return;
-      }
-    }
-    if (nextConfig.mode === API_MODES.CUSTOM_API_URL && !isValidHttpApiUrl(nextConfig.customApiUrl)) {
-      setConfigMessage("Custom API URL is invalid. Use http:// or https://.");
-      return;
-    }
-    try {
-      // The gateway's kill-switch guard (desktopGateway.js) only unlocks cloud access for a request
-      // that proves Owner role and names the device — role and device_id were missing here, so this
-      // call refused every save with OWNER_REQUIRED regardless of who was signed in. Mirrors the
-      // working call in changeConnectivityMode.
-      await axios.put(`${LOCAL_API_URL}/api/cloud/internet-access`, {
-        user_id: user.id,
-        role: user.role,
-        device_id: deviceInfo.device_id,
-        allowInternetAccess: nextConfig.cloudConnectionMode !== CONNECTIVITY_MODES.LOCAL_ONLY,
-      }, {
-        timeout: 5000,
-        headers: { "x-user-id": user.id, "x-user-role": user.role, "x-device-id": deviceInfo.device_id },
-      });
-    } catch (error) {
-      setConfigMessage(getErrorMessage(error, "Unable to save FroozERP internet access policy."));
-      return;
-    }
-    writeSavedApiConfig(nextConfig);
-    // The reload is what makes the new API URLs take effect; stashing the session first is what
-    // stops that reload from also acting as a sign-out. See reloadSessionBridge.js.
-    stashSessionForReload(user);
-    setConfigMessage("API mode saved. FroozERP will reload to apply it.");
-    window.setTimeout(() => window.location.reload(), 500);
   };
   const runRegisterDevice = async () => {
     if (!onRegisterCloudDevice) return;
@@ -18023,6 +17997,16 @@ function SyncSettingsSection({
   const failed = Number(syncStatus?.failedOperations || 0);
   const conflicts = Number(syncStatus?.conflictOperations || 0);
   const appMode = connectionStatus?.apiModeLabel || getApiModeLabel();
+  // Recomputed here rather than passed down, from the same facts the shell uses. It is a pure
+  // function of four booleans and a count, so a second call cannot disagree with the first -- and
+  // threading one more prop through two components to save that is not a trade worth making.
+  const connectionSentence = resolveConnectionStatus({
+    cloudReachable: connectionStatus?.localServiceStarting ? null : connectionStatus?.cloudReachable,
+    pendingCount: syncStatus?.pendingOperations,
+    lastSyncAt: syncStatus?.lastSuccessfulSyncAt,
+    heldOffline: normalizeConnectivityMode(connectivityMode) === CONNECTIVITY_MODES.LOCAL_ONLY,
+    localServiceReady: backendHealth?.online === true,
+  });
   const internetStatus = connectionStatus?.internetStatus || "Not checked";
   const localServerStatus = connectionStatus?.localBackendStatus || "Not checked";
   const cloudStatus = connectionStatus?.cloudBackendStatus || "Cloud Not Configured";
@@ -18046,10 +18030,18 @@ function SyncSettingsSection({
     ? cloudIdentity?.message || cloudIdentity?.detail || `Server-confirmed cloud device ${canonicalCloudDeviceId}.`
     : "Run Sync Now to verify the approved cloud device.";
   return (
-    <ModuleCard eyebrow="Sync & Connection" title="Connection Status" subtitle="Owner view for live internet, local server and cloud sync readiness.">
+    <ModuleCard eyebrow="Sync & Connection" title="Connection Status" subtitle="What this computer is doing about the internet right now.">
+      {/* The answer first, in a sentence, before any of the rows below. Somebody opening this
+          screen has a question -- are today's bills safe -- and the rows answer a different one:
+          they describe the machine. Both belong here, in that order. */}
+      <p className={`form-note ${connectionNeedsAttention(connectionSentence) ? "stock-low" : ""}`}>
+        <strong>{connectionSentence.headline}</strong>
+        {connectionSentence.detail ? ` — ${connectionSentence.detail}` : ""}
+      </p>
       <div className="sync-owner-summary">
         {[
-          ["App Mode", appMode],
+          // "App Mode" is gone. It named a setting nobody chose and nobody could act on, and it sat
+          // at the top of this list as though it were the most important fact on the screen.
           ["Internet", internetStatus],
           ["Local Server", localServerStatus],
           ["Cloud", cloudStatus],
@@ -18087,46 +18079,25 @@ function SyncSettingsSection({
             <button className="secondary-button" disabled={!canManage || !onQueueSyncTest} onClick={onQueueSyncTest}>Queue Safe Test</button>
             <button className="secondary-button" onClick={copySafeDiagnostics}>Copy Safe Diagnostics</button>
           </div>
-          <div className="form-grid supplier-form-grid">
-            <Field label="Select App Mode">
-              <select disabled={!canManage} value={configDraft.mode} onChange={(event) => setConfigDraft({ ...configDraft, mode: event.target.value })}>
-                {API_MODE_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-              </select>
-            </Field>
-            <Field label="Connectivity Mode">
-              <div className="connectivity-segmented" role="group" aria-label="Connectivity Mode">
-                {/* AUTO is disabled, not merely refused on click, when this installation cannot
-                    reach a cloud. An App Mode of LOCAL_ONLY is authoritative over Connectivity Mode
-                    (design D-16), and a mode that needs a cloud backend still cannot sync without a
-                    cloud URL configured. Offering a button that can only ever produce an error is
-                    the same failure as rendering an error as an empty result: the screen says the
-                    action is available when it is not. */}
-                <button className={connectivityMode === CONNECTIVITY_MODES.AUTO ? "selected" : ""} disabled={connectivityModeBusy || String(user?.role || "").toUpperCase() !== "OWNER" || autoConnectivityBlockedReason !== ""} title={autoConnectivityBlockedReason || undefined} type="button" onClick={() => applyConnectivityMode(CONNECTIVITY_MODES.AUTO)}>{connectivityModeBusy ? "Switching..." : "AUTO"}</button>
-                <button className={connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY ? "selected" : ""} disabled={connectivityModeBusy || String(user?.role || "").toUpperCase() !== "OWNER"} type="button" onClick={() => applyConnectivityMode(CONNECTIVITY_MODES.LOCAL_ONLY)}>{connectivityModeBusy ? "Switching..." : "LOCAL ONLY"}</button>
-              </div>
-            </Field>
-          </div>
-          {autoConnectivityBlockedReason && <p className="form-note stock-low">{autoConnectivityBlockedReason}</p>}
-          {connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY && <p className="form-note stock-low">Local Only mode selected - cloud sync paused. Windows networking remains unchanged.</p>}
-          {configDraft.mode === API_MODES.LOCAL_SINGLE_DEVICE && <p className="form-note">Local Single Device uses this computer's local backend.</p>}
-          {configDraft.mode === API_MODES.BRANCH_LAN_SERVER && <p className="form-note">Branch LAN Server is for the main shop computer serving same-branch devices over Wi-Fi/LAN.</p>}
-          {configDraft.mode === API_MODES.BRANCH_LAN_CLIENT && <p className="form-note">Branch LAN Client must use the main branch server IP. It is same Wi-Fi/LAN only, not cloud.</p>}
-          {configDraft.mode === API_MODES.CLOUD_PRODUCTION && <p className="form-note">Cloud Production requires a real hosted backend URL. Blank, localhost, and LAN URLs remain Cloud Not Configured.</p>}
-          {configDraft.mode === API_MODES.FIELD_REMOTE_DEVICE && <p className="form-note">Field Remote Device queues new purchase arrivals locally and replays them after cloud connectivity returns.</p>}
-          {configDraft.mode === API_MODES.CUSTOM_API_URL && <p className="form-note">Custom API URL must pass the FroozERP health check before production use.</p>}
+          {/* An App Mode picker, an AUTO / LOCAL ONLY pair, three URL boxes and six notes stood
+              here. Four settings decided one behaviour, nothing on screen said which was in charge,
+              and the maintainer -- who owns the shop this runs in -- ruled they should not exist:
+              *"mujhe khud switch krne ki zarurat hi nhi padni chahiye"*.
+
+              There is one behaviour now and no choice: the cloud when it answers, this computer
+              when it does not. The address comes from the build (`BUILT_IN_DESKTOP_CLOUD_API_URL`
+              and `cloud_api_url()` in src-tauri/src/lib.rs), so there is nothing left to type and
+              nothing left to get wrong. `docs/connection-simplification-decision.md` records the
+              ruling; `local/connectionSettings.test.mjs` fails if any of it comes back. */}
           {configMessage && <p className="form-note">{configMessage}</p>}
           {(statusMessage || syncMessage || syncStatus?.lastError) && <p className="form-note">{syncMessage || statusMessage || syncStatus?.lastError}</p>}
           {localDbStatus?.error && <p className="form-note stock-low">{localDbStatus.error}</p>}
           <div className="form-grid supplier-form-grid">
-            {modeNeedsBranchUrl && (
-              <Field label="Branch Server URL/IP"><input disabled={!canManage} placeholder="http://192.168.1.41:5000" value={configDraft.branchLanApiUrl} onChange={(event) => setConfigDraft({ ...configDraft, branchLanApiUrl: event.target.value })} /></Field>
-            )}
-            {modeNeedsCloudUrl && (
-              <Field label="Cloud API URL"><input disabled={!canManage} placeholder="https://api.froozerp.com" value={configDraft.cloudApiUrl} onChange={(event) => setConfigDraft({ ...configDraft, cloudApiUrl: event.target.value })} /></Field>
-            )}
-            {modeNeedsCustomUrl && (
-              <Field label="Custom API URL"><input disabled={!canManage} placeholder="https://backend.example.com" value={configDraft.customApiUrl} onChange={(event) => setConfigDraft({ ...configDraft, customApiUrl: event.target.value })} /></Field>
-            )}
+            {/* The Cloud API URL box stood here. Its placeholder, `https://api.froozerp.com`, was
+                grey text in an empty field and read exactly like a filled-in value -- which is how
+                a whole afternoon went into three wrong diagnoses while the real answer was that
+                nobody had ever typed anything into it. The address is now part of the build, and
+                shown a few rows down as a fact rather than offered as a question. */}
             <Field label="Branch"><input disabled value={branchLabel} /></Field>
             <Field label="Local SQLite Device ID"><input disabled value={localDeviceId} /></Field>
             <Field label="Canonical Cloud Device ID"><input disabled value={canonicalCloudDeviceId} /></Field>
@@ -18187,8 +18158,10 @@ function SyncSettingsSection({
             <Field label="Notes"><textarea disabled value={draft.notes || "Cloud push/pull delivery is active for approved devices and supported sync entities."} /></Field>
           </div>
           <div className="toolbar-actions">
-            <button className="primary-button" disabled={!canManage} onClick={saveApiConfig}>Save Mode</button>
-            <button className="secondary-button" disabled={!canManage || !selectedTestUrl} onClick={() => testApiUrl(selectedTestUrl, "Selected API")}>Test Connection</button>
+            {/* "Save Mode" is gone with the mode it saved. Test Connection stays, because checking
+                what the app is actually talking to is a diagnosis, not a setting -- and it now
+                names the one address there is instead of whichever box was on screen. */}
+            <button className="secondary-button" disabled={!canManage} onClick={() => testApiUrl(API_CONFIG.apiUrl, "This app's server")}>Test Connection</button>
             <button className="primary-button" disabled={!canManage} onClick={save}>Save Device Name</button>
             <button className="secondary-button" disabled={cloudReadinessBusy} onClick={runCloudReadinessCheck}>{cloudReadinessBusy ? "Checking Cloud..." : "Cloud Readiness Check"}</button>
           </div>

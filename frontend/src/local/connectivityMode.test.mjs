@@ -26,10 +26,22 @@ test("Local Only is owner controlled, audited, prominent, and never changes Wind
   const gatewaySource = fs.readFileSync(new URL("../../../backend/desktopGateway.js", import.meta.url), "utf8");
   assert.match(appSource, /Only Owner may change Connectivity Mode/);
   assert.match(appSource, /recordConnectivityModeChange/);
-  assert.match(appSource, /Switching\.\.\./);
+  assert.match(appSource, /Reconnecting\.\.\./, "the switch must show that it is working");
   assert.match(appSource, /confirmedMode !== nextMode/);
-  assert.match(appSource, /data-connectivity-mode="LOCAL_ONLY"/);
-  assert.match(appSource, /Return to Auto/);
+
+  // These three used to pin the exact words "Local Only mode selected" and "Return to Auto", and a
+  // `data-connectivity-mode` attribute. All three are gone with the mode vocabulary: a shopkeeper
+  // reading "Local Only mode selected" on a machine where nobody selected anything learns nothing,
+  // and goes looking for the setting that did it.
+  //
+  // What the test protects is unchanged and is not about wording: a machine held off the cloud must
+  // *say so unmissably*, must be identifiable in the DOM, and must offer a way back. So the
+  // guarantee is now pinned to `local/connectionStatus.js`, which owns the sentence and is tested
+  // for its content there.
+  assert.match(appSource, /data-connection-state=\{connectionSentence\.state\}/, "the banner must carry the state");
+  assert.match(appSource, /connectionSentence\.showsInTopBar && \(/, "and must appear without anybody opening a panel");
+  assert.match(appSource, /Reconnect this computer/, "and there must be a way back");
+  assert.match(appSource, /connectionSentence\.tone === CONNECTION_TONE\.ATTENTION/, "shown only where it applies");
   assert.doesNotMatch(`${appSource}\n${gatewaySource}`, /netsh|Disable-NetAdapter|Enable-NetAdapter|Windows Firewall|hosts file/i);
   assert.match(gatewaySource, /reachedCloud: false/);
   assert.match(gatewaySource, /timeSource: "railway"/);

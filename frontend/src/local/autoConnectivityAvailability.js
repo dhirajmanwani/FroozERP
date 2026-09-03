@@ -40,13 +40,17 @@ const text = (value) => (typeof value === "string" ? value.trim() : "");
  * @returns {string} a plain-language reason, or "" when AUTO can be attempted
  */
 export const autoConnectivityBlockedReason = ({ apiMode, cloudApiUrl } = {}) => {
+  // Both sentences were rewritten when the mode pickers were removed. They used to name "App Mode"
+  // and tell the reader to "set a Cloud API URL" -- a setting and a text box that no longer exist,
+  // so following the instruction was impossible. A reason nobody can act on is worse than no
+  // reason: it sends somebody hunting through settings for a control that was deleted.
   if (isLocalOnlyApiMode(apiMode)) {
-    return "App Mode is set to Local Only, which keeps this device offline on purpose. Connectivity "
-      + "Mode cannot be set to Auto while that is the App Mode.";
+    return "This copy of FroozERP was built to stay off the internet on purpose, so it cannot be "
+      + "reconnected from here. Everything is saved on this computer.";
   }
   if (apiModeUsesCloudBackend(apiMode) && !text(cloudApiUrl)) {
-    return "No cloud backend is configured for this installation, so there is nothing for Auto to "
-      + "connect to. Set a Cloud API URL first.";
+    return "This installation has no cloud to connect to, so there is nothing to reconnect it to. "
+      + "Billing works normally and everything is saved on this computer.";
   }
   return "";
 };
