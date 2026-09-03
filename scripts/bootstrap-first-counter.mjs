@@ -20,7 +20,8 @@
  *
  * ## Usage
  *
- * On the machine running the backend, with the same DATABASE_URL it uses:
+ * On the machine running the backend, with the same DATABASE_URL it uses -- or from
+ * anywhere, with DATABASE_PUBLIC_URL set to the host's public connection string:
  *
  *   node scripts/bootstrap-first-counter.mjs \
  *     --branch 1 --name "Main Branch Counter" --code MB-COUNTER \
@@ -299,8 +300,14 @@ const main = async () => {
     dryRun: hasFlag("dry-run"),
   };
 
-  if (!env.DATABASE_URL) {
-    fail("DATABASE_URL is not set. Run this with the same database configuration the backend uses.");
+  // Both names, because these commands are run by hand from a laptop at least as often as from
+  // the server. A hosted database exposes its outside-reachable string as DATABASE_PUBLIC_URL,
+  // and accepting only DATABASE_URL sent the maintainer to "DATABASE_URL is not set" mid-setup
+  // with the right value already sitting in the shell under the other name.
+  const connectionString = env.DATABASE_PUBLIC_URL || env.DATABASE_URL;
+  if (!connectionString) {
+    fail("Neither DATABASE_PUBLIC_URL nor DATABASE_URL is set. Run this with the same database\n"
+      + "configuration the backend uses, or the public connection string from your host.");
   }
 
   // Loaded here rather than at the top so the usage message above still works on a machine that has
@@ -308,7 +315,7 @@ const main = async () => {
   // by mistake, and the moment they most need a readable error.
   const require = createRequire(new URL("../backend/package.json", import.meta.url));
   const { Pool } = require("pg");
-  const pool = new Pool({ connectionString: env.DATABASE_URL });
+  const pool = new Pool({ connectionString });
   const client = await pool.connect();
 
   try {

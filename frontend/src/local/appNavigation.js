@@ -223,6 +223,7 @@ const modules = [
       { group: "business", id: "settings/payment-tax", label: "UPI, Payment QR and Sales Mandi Tax", eyebrow: "Payment & Tax Settings", keywords: ["upi", "qr code", "payment", "sales tax", "gst", "tax", "mandi tax"] },
       { group: "business", id: "settings/whatsapp", label: "WhatsApp Business Cloud API", eyebrow: "WhatsApp Settings", keywords: ["whatsapp", "send bill", "cloud api", "token"] },
       { group: "business", id: "settings/mandi-tax", label: "Origin-Based Mandi Tax", eyebrow: "Mandi Tax Settings", keywords: ["local", "imported", "purchase tax", "percentage", "gst", "tax", "mandi tax"] },
+      { group: "business", id: "settings/other-charges", label: "Other Charges", eyebrow: "Charge Settings", keywords: ["crate", "labour", "delivery", "freight", "charge", "charges", "slab", "per km", "per kg", "extra"] },
       { group: "business", id: "settings/supplier-rebate", label: "Payment-Speed Rebate Slabs", eyebrow: "Supplier Rebate Settings", keywords: ["rebate", "early payment", "discount days", "slab"] },
       { group: "business", id: "settings/sale-rate-suggestions", label: "Sale Rate Suggestions", eyebrow: "Sale Rate Settings", keywords: ["margin", "rounding", "suggested rate"] },
       { group: "business", id: "settings/bill-discount-slabs", label: "Bill-Level Discount Slabs", eyebrow: "Overall Sale Discount Settings", keywords: ["automatic discount", "bill total", "payment mode"] },

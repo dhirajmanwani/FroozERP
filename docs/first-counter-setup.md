@@ -45,7 +45,12 @@ You need that machine's **device id**. It is on the login screen, under *Show te
 
 ## The command
 
-On the machine running the backend, with the same database settings it uses:
+The command needs to know where your database is. It reads either `DATABASE_URL` (what the backend
+itself uses) or `DATABASE_PUBLIC_URL` (the outside-reachable string your host gives you) — whichever
+is set. If you have just run the cloud migrations, the value is already in your window under the
+public name and there is nothing more to do.
+
+On the machine running the backend, or on your own laptop with the public string set:
 
 ```
 node scripts/bootstrap-first-counter.mjs \
@@ -92,3 +97,20 @@ create counters means one of them has no audit trail.
 That last one matters more than it looks. A counter written without its permissions would look set
 up and behave as though it were not, which is worse than the plain refusal you started with. So it
 is all or nothing.
+
+---
+
+## Seeing where you stand
+
+At any point, this prints the whole picture — branches, counters, which machine is posted where,
+who is posted where, and what the next step is:
+
+```
+node scripts/show-setup.mjs
+```
+
+It only reads. It is safe to point at the live shop database, and safe to run as often as you like.
+
+Its `last seen` column is also the easiest way to spot machines that were approved once and have not
+been used since. Any approved machine can still pull your data, so that list is worth going through
+once the counters are in place.

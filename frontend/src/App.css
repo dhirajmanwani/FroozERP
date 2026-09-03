@@ -2951,6 +2951,75 @@ tbody tr:last-child td {
   border-top-color: rgba(217, 172, 82, 0.18);
 }
 
+/*
+ * Other charges on a bill.
+ *
+ * Each charge is one row: its name, the fields that decide its price, and underneath either the
+ * amount or the reason there isn't one. The refusal takes the amount's place rather than sitting
+ * beside it, so a row can never show a price and a problem at the same time.
+ */
+.other-charges-panel {
+  gap: 10px;
+}
+
+.other-charges-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.other-charge-row {
+  display: grid;
+  gap: 4px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line-soft);
+}
+
+.other-charge-fields {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.other-charge-name {
+  flex: 1 1 100%;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.other-charge-field {
+  display: grid;
+  gap: 2px;
+  font-size: 11px;
+  color: var(--ink-muted);
+}
+
+/* Narrow on purpose: these hold a distance or a count, not a price. */
+.other-charge-field input {
+  width: 84px;
+}
+
+.other-charge-amount {
+  /* Numerals line up with the totals below, which is the column the eye actually checks. */
+  font-variant-numeric: tabular-nums;
+}
+
+.charge-slab-editor {
+  display: grid;
+  gap: 6px;
+  min-width: 230px;
+}
+
+.charge-slab-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
 .section-title-row {
   display: flex;
   align-items: center;

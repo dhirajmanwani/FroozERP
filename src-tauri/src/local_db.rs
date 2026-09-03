@@ -8,7 +8,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::entitlement::{self, EntitlementState};
 
-const CURRENT_SCHEMA_VERSION: &str = "023_customer_order_transfer";
+const CURRENT_SCHEMA_VERSION: &str = "024_other_charges";
 const LOCAL_DB_FILE: &str = "froozerp-local.sqlite3";
 const MIGRATION_001: &str = include_str!("../migrations/sqlite/001_local_foundation.sql");
 const MIGRATION_002: &str = include_str!("../migrations/sqlite/002_sync_engine_foundation.sql");
@@ -32,6 +32,7 @@ const MIGRATION_020: &str = include_str!("../migrations/sqlite/020_customer_orde
 const MIGRATION_021: &str = include_str!("../migrations/sqlite/021_customer_order_payment.sql");
 const MIGRATION_022: &str = include_str!("../migrations/sqlite/022_customer_order_sync.sql");
 const MIGRATION_023: &str = include_str!("../migrations/sqlite/023_customer_order_transfer.sql");
+const MIGRATION_024: &str = include_str!("../migrations/sqlite/024_other_charges.sql");
 
 #[derive(Debug, Serialize)]
 pub struct LocalDbStatus {
@@ -1392,7 +1393,7 @@ fn list_local_purchase_intents_with_conn(conn: &Connection) -> Result<Vec<serde_
     rows.collect::<Result<Vec<_>, _>>().map_err(to_error)
 }
 
-fn complete_local_pos_sale_at(path: &Path, sale: serde_json::Value) -> Result<LocalPosSaleResult, String> {
+fn complete_local_pos_sale_at(path: &Path, mut sale: serde_json::Value) -> Result<LocalPosSaleResult, String> {
     initialize_at(&path)?;
     let mut conn = Connection::open(path).map_err(to_error)?;
     let tx = conn.transaction().map_err(to_error)?;
@@ -1419,6 +1420,9 @@ fn complete_local_pos_sale_at(path: &Path, sale: serde_json::Value) -> Result<Lo
     let customer_id = optional_text(&customer, "account_id").or_else(|| optional_text(&customer, "customer_id"));
     let customer_name = optional_text(&customer, "name");
     let customer_mobile = optional_text(&customer, "mobile");
+    // Validated before anything is written. A charge that could not price itself must stop the sale
+    // here and be shown to the cashier, not land on the bill as a zero — see `normalise_sale_charges`.
+    let (charge_lines, other_charges_amount) = normalise_sale_charges(&sale)?;
     let items = sale
         .get("items")
         .and_then(|value| value.as_array())
@@ -1637,6 +1641,21 @@ fn complete_local_pos_sale_at(path: &Path, sale: serde_json::Value) -> Result<Lo
             ],
         )
         .map_err(to_error)?;
+    }
+
+    // Written here rather than on the INSERT above so that the lines and the bill's charges total
+    // have exactly one writer. A tile and a table filled from two different statements are how they
+    // start disagreeing.
+    write_sale_charges(&tx, &invoice_id, entity_version, &charge_lines, other_charges_amount)?;
+
+    // The outbox payload is the sale as it was stored, not as it arrived: the charges are put back
+    // under the canonical keys so the cloud is handed the same shape whichever key the POS used.
+    if let Some(object) = sale.as_object_mut() {
+        object.insert("other_charges".to_string(), serde_json::Value::Array(charge_lines.clone()));
+        object.insert(
+            "other_charges_amount".to_string(),
+            serde_json::json!(other_charges_amount),
+        );
     }
 
     let operation_id = required_text(&sale, "operation_id")?;
@@ -2245,6 +2264,595 @@ fn read_customer_order(conn: &Connection, order_id: &str) -> Result<serde_json::
     Ok(order)
 }
 
+/// A boolean field that a server may send as `true`, as `1`, or not at all.
+///
+/// `as_bool()` alone reads a JSON `1` as "absent", which would quietly turn every charge type an
+/// integer-flag server sends as inactive into an active one — or the reverse. The default is the
+/// caller's, so "not told" stays a decision made in one visible place.
+fn json_flag(value: &serde_json::Value, key: &str, default: bool) -> bool {
+    match value.get(key) {
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(other) => json_number(other).map(|number| number != 0.0).unwrap_or(default),
+        None => default,
+    }
+}
+
+/// The keys a sale payload may carry its charge lines under.
+///
+/// `other_charges` is the shape this code writes and hands to the cloud. The rest are accepted on
+/// the way IN only, because the alternative to accepting them is reading a bill that HAS a delivery
+/// charge as a bill that has none — the total would come out short and nothing would say so. A
+/// payload that mentions none of these keys genuinely has no charges, which is most bills.
+const SALE_CHARGE_KEYS: [&str; 4] = ["other_charges", "sale_charges", "charges", "otherCharges"];
+
+/// The keys a sale payload may carry its charges TOTAL under. Used only to cross-check the lines.
+const SALE_CHARGE_TOTAL_KEYS: [&str; 2] = ["other_charges_amount", "otherChargesAmount"];
+
+/// Money rounds to 2 decimals; the EPSILON nudge keeps 1.005 from rounding down.
+///
+/// Deliberately mirrors `roundMoney` in `frontend/src/local/otherCharges.js` rather than inventing a
+/// second rounding rule — two roundings of the same money is how a bill and its own total start
+/// disagreeing by a paisa and nobody can say which one is right.
+fn round_money(value: f64) -> f64 {
+    ((value + f64::EPSILON) * 100.0).round() / 100.0
+}
+
+/// The charge-line array on a payload, whichever of the accepted keys it arrived under.
+fn sale_charge_lines(payload: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    SALE_CHARGE_KEYS
+        .iter()
+        .find_map(|key| payload.get(*key).and_then(|value| value.as_array()))
+}
+
+/// The charges on a sale, validated and put into the one shape this codebase stores and syncs.
+///
+/// **This does not price anything.** The pricing rules — slabs, rounding up, the refusal above the
+/// top slab — live in `frontend/src/local/otherCharges.js` and are tested there. Re-deriving a rate
+/// here would give the shop two implementations of the same rule, and the day they disagree the
+/// counter and the bill disagree. What this does instead is refuse to STORE a line that cannot
+/// explain its own number:
+///
+///   * **No rate is refused, never stored as 0.** A charge that could not price itself never
+///     becomes a row: the POS shows the refusal and the cashier either types an amount or adds a
+///     slab. `Delivery: 0` on a bill reads as "no delivery", the fruit goes out and the trip is
+///     free, forever, on every bill.
+///   * **A rate of 0 is kept.** Free delivery inside 5 km is a real thing a shop sets up, and `??`
+///     falling through on 0 is a pitfall this repo has already been bitten by.
+///   * **The lines and the total must agree.** A payload whose stated `other_charges_amount`
+///     disagrees with its own lines is refused rather than reconciled, because silently preferring
+///     one of them is exactly the summary-vs-detail split that looks like data loss later. The
+///     total returned here is always derived from the lines, rounded once at the end.
+///
+/// Returns the canonical lines and their total. An absent charges collection is not an error.
+fn normalise_sale_charges(payload: &serde_json::Value) -> Result<(Vec<serde_json::Value>, f64), String> {
+    let declared_total = SALE_CHARGE_TOTAL_KEYS
+        .iter()
+        .find_map(|key| payload.get(*key).and_then(json_number))
+        .filter(|value| value.is_finite());
+
+    let Some(raw_lines) = sale_charge_lines(payload) else {
+        // A bill that says it collected charges but carries no lines is not an empty bill, it is an
+        // incomplete one. Storing the number alone would put a total on the invoice that nothing on
+        // it explains; storing 0 would drop money the shop actually took.
+        if declared_total.map(|total| total.abs() > 0.005).unwrap_or(false) {
+            return Err(format!(
+                "This bill says it carries {:.2} of other charges but lists none of them. Expected them under \"other_charges\".",
+                declared_total.unwrap_or(0.0)
+            ));
+        }
+        return Ok((Vec::new(), 0.0));
+    };
+
+    let mut lines: Vec<serde_json::Value> = Vec::with_capacity(raw_lines.len());
+    let mut total = 0.0;
+    for (index, raw) in raw_lines.iter().enumerate() {
+        let charge_name = optional_text(raw, "charge_name")
+            .or_else(|| optional_text(raw, "name"))
+            .ok_or_else(|| format!("Other charge {} has no name", index + 1))?;
+
+        // Not `unwrap_or(0.0)`. An absent rate is the state the POS is supposed to be showing a
+        // refusal for, and turning it into zero here is how that refusal would get swallowed on the
+        // way to the database.
+        let rate = raw
+            .get("rate")
+            .and_then(json_number)
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| {
+                format!("{charge_name} has no rate, so it cannot go on a bill. Price it, or enter the amount by hand.")
+            })?;
+        if rate < 0.0 {
+            return Err(format!("{charge_name} has a negative rate ({rate})"));
+        }
+
+        // How many times the charge applies — four crates, one delivery. NOT the measurement.
+        let quantity = raw.get("quantity").and_then(json_number).unwrap_or(1.0);
+        if !quantity.is_finite() || quantity <= 0.0 {
+            return Err(format!("How many {charge_name}? A charge line needs a count above zero."));
+        }
+
+        let expected_amount = round_money(rate * quantity);
+        let amount = match raw.get("amount").and_then(json_number) {
+            Some(stated) => {
+                if !stated.is_finite() || stated < 0.0 {
+                    return Err(format!("{charge_name} has an amount that is not a usable number"));
+                }
+                // A paisa of rounding is fine; a line whose amount is not its own rate times its own
+                // count is a line nobody can explain to a customer.
+                if (stated - expected_amount).abs() > 0.01 {
+                    return Err(format!(
+                        "{charge_name} is {rate} x {quantity} but its amount says {stated:.2}. The bill and its lines must agree."
+                    ));
+                }
+                round_money(stated)
+            }
+            None => expected_amount,
+        };
+
+        // What decides the rate — a 10 kg crate, a 12 km trip. A different number from `quantity`,
+        // and conflating the two prices four crates as a 4 kg crate.
+        let measurement = raw
+            .get("measurement")
+            .and_then(json_number)
+            .filter(|value| value.is_finite());
+        let slab_upto = raw
+            .get("slab_upto")
+            .and_then(json_number)
+            .filter(|value| value.is_finite());
+        let manual = json_flag(raw, "manual", false);
+
+        lines.push(serde_json::json!({
+            // Opaque text, never a number. `"004"` and `4` are different charge types.
+            "charge_type_id": optional_text(raw, "charge_type_id"),
+            "charge_name": charge_name,
+            "measure_unit": optional_text(raw, "measure_unit").or_else(|| optional_text(raw, "unit")),
+            "measurement": measurement,
+            "quantity": quantity,
+            "rate": rate,
+            "amount": amount,
+            "manual": manual,
+            "slab_upto": slab_upto,
+        }));
+        total += amount;
+    }
+
+    // Rounded once, at the end. Rounding each line and then summing drifts.
+    let total = round_money(total);
+    if let Some(declared) = declared_total {
+        if (declared - total).abs() > 0.01 {
+            return Err(format!(
+                "Other charges on this bill add up to {total:.2}, but the bill says {declared:.2}."
+            ));
+        }
+    }
+    Ok((lines, total))
+}
+
+/// Replace a bill's charge lines and its charges total, in one place.
+///
+/// Delete-then-insert rather than a merge: an edited bill's charges are whatever the operator left
+/// on the screen, and a merge would resurrect a delivery charge that had just been removed. The
+/// invoice's `other_charges_amount` is written from the same lines in the same statement run, so
+/// the tile and the table can never come from two different collections.
+fn write_sale_charges(
+    tx: &rusqlite::Transaction<'_>,
+    sale_id: &str,
+    entity_version: i64,
+    lines: &[serde_json::Value],
+    total: f64,
+) -> Result<(), String> {
+    tx.execute("DELETE FROM local_sale_charges WHERE sale_id = ?1", [sale_id])
+        .map_err(to_error)?;
+    for (index, line) in lines.iter().enumerate() {
+        let line_index = index as i64 + 1;
+        let charge_id = optional_text(line, "id")
+            .unwrap_or_else(|| format!("{sale_id}::charge::{line_index}"));
+        tx.execute(
+            "INSERT INTO local_sale_charges (
+                id, sale_id, line_index, charge_type_id, charge_name, measure_unit, measurement,
+                quantity, rate, amount, manual, slab_upto, entity_version
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                charge_id,
+                sale_id,
+                line_index,
+                optional_text(line, "charge_type_id"),
+                optional_text(line, "charge_name").unwrap_or_else(|| "Other charge".to_string()),
+                optional_text(line, "measure_unit"),
+                line.get("measurement").and_then(json_number),
+                line.get("quantity").and_then(json_number).unwrap_or(1.0),
+                line.get("rate").and_then(json_number).unwrap_or(0.0),
+                line.get("amount").and_then(json_number).unwrap_or(0.0),
+                if json_flag(line, "manual", false) { 1 } else { 0 },
+                line.get("slab_upto").and_then(json_number),
+                entity_version,
+            ],
+        )
+        .map_err(to_error)?;
+    }
+    tx.execute(
+        "UPDATE local_pos_invoices SET other_charges_amount = ?2 WHERE id = ?1",
+        params![sale_id, round_money(total)],
+    )
+    .map_err(to_error)?;
+    Ok(())
+}
+
+/// The charge lines stored against a bill, in the shape the cloud and the POS both read.
+fn read_sale_charges(conn: &Connection, sale_id: &str) -> Result<Vec<serde_json::Value>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id, sale_id, line_index, charge_type_id, charge_name, measure_unit, measurement,
+                    quantity, rate, amount, manual, slab_upto, entity_version
+             FROM local_sale_charges
+             WHERE sale_id = ?1
+             ORDER BY line_index, id",
+        )
+        .map_err(to_error)?;
+    let rows = statement
+        .query_map([sale_id], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "sale_id": row.get::<_, String>(1)?,
+                "line_index": row.get::<_, i64>(2)?,
+                "charge_type_id": row.get::<_, Option<String>>(3)?,
+                "charge_name": row.get::<_, String>(4)?,
+                "measure_unit": row.get::<_, Option<String>>(5)?,
+                "measurement": row.get::<_, Option<f64>>(6)?,
+                "quantity": row.get::<_, f64>(7)?,
+                "rate": row.get::<_, f64>(8)?,
+                "amount": row.get::<_, f64>(9)?,
+                "manual": row.get::<_, i64>(10)? != 0,
+                "slab_upto": row.get::<_, Option<f64>>(11)?,
+                "entity_version": row.get::<_, i64>(12)?,
+            }))
+        })
+        .map_err(to_error)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(to_error)
+}
+
+/// One rate slab, checked before anything is written.
+struct NormalisedChargeSlab {
+    id: Option<String>,
+    upto_value: f64,
+    rate: f64,
+    active: bool,
+}
+
+/// The slabs on a charge-type payload, or `None` when the payload does not mention slabs at all.
+///
+/// `None` and `Some(vec![])` are different facts and the difference is load-bearing: a payload that
+/// says nothing about slabs must leave the ones already stored alone, while one that carries an
+/// empty list is saying this charge has no rates any more. Treating "not told" as "told there are
+/// none" would wipe a working crate charge off every counter the first time the cloud sent a
+/// partial update.
+///
+/// A slab that cannot be used is refused rather than dropped. `normaliseSlabs` in the frontend
+/// drops unusable rows, and it is right to — a slab with no threshold cannot be matched by any
+/// measurement. But dropping one on the way INTO the database is different: it silently changes
+/// what the shop is charging. Missing the 10 km slab prices an 8 km trip at the 15 km rate; missing
+/// the top slab turns priced trips into refusals. So the whole charge type is refused, by name, and
+/// the caller decides what to do with the refusal.
+fn normalise_charge_slabs(payload: &serde_json::Value) -> Result<Option<Vec<NormalisedChargeSlab>>, String> {
+    let raw = ["slabs", "rate_slabs", "charge_rate_slabs"]
+        .iter()
+        .find_map(|key| payload.get(*key).and_then(|value| value.as_array()));
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let charge_name = optional_text(payload, "charge_name")
+        .or_else(|| optional_text(payload, "name"))
+        .unwrap_or_else(|| "This charge".to_string());
+    let mut slabs = Vec::with_capacity(raw.len());
+    for (index, entry) in raw.iter().enumerate() {
+        let upto_value = entry
+            .get("upto_value")
+            .or_else(|| entry.get("upto"))
+            .or_else(|| entry.get("threshold"))
+            .and_then(json_number)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .ok_or_else(|| {
+                format!(
+                    "{charge_name}: slab {} has no usable measurement to apply up to.",
+                    index + 1
+                )
+            })?;
+        // Not `unwrap_or(0.0)`: a free bracket is written as 0 on purpose, and an absent rate is a
+        // bracket nobody priced. Charging nothing for it would be a decision this code is not
+        // entitled to make.
+        let rate = entry
+            .get("rate")
+            .or_else(|| entry.get("charge_rate"))
+            .and_then(json_number)
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| format!("{charge_name}: the slab up to {upto_value} has no rate."))?;
+        if rate < 0.0 {
+            return Err(format!("{charge_name}: the slab up to {upto_value} has a negative rate."));
+        }
+        slabs.push(NormalisedChargeSlab {
+            id: optional_text(entry, "id").or_else(|| optional_text(entry, "global_id")),
+            upto_value,
+            rate,
+            active: json_flag(entry, "active", true),
+        });
+    }
+    Ok(Some(slabs))
+}
+
+/// Store one charge type, and its slabs when the payload carries them.
+///
+/// Every check happens BEFORE the first write. That ordering is not tidiness: this runs inside the
+/// pull transaction, and a refusal half way through would leave the transaction carrying writes
+/// belonging to a change the caller is about to record as unapplied. Refusing early means a refused
+/// charge type wrote nothing at all.
+fn upsert_charge_type_with_tx(
+    tx: &rusqlite::Transaction<'_>,
+    charge_type_id: &str,
+    payload: &serde_json::Value,
+    updated_at: Option<String>,
+    version: i64,
+    deleted: bool,
+) -> Result<(), String> {
+    let charge_name = optional_text(payload, "charge_name")
+        .or_else(|| optional_text(payload, "name"))
+        .ok_or_else(|| format!("Charge type {charge_type_id} has no name"))?;
+    // Mirrors `resolveChargeRate`: anything that is not SLAB is priced as FLAT. The same rule in
+    // both places, so a charge type cannot mean one thing on the counter and another in storage.
+    let basis = if optional_text(payload, "basis")
+        .or_else(|| optional_text(payload, "charge_basis"))
+        .map(|value| value.trim().eq_ignore_ascii_case("SLAB"))
+        .unwrap_or(false)
+    {
+        "SLAB"
+    } else {
+        "FLAT"
+    };
+    // NULL when nobody set one. Not 0 — see migration 024: a missing rate must reach the POS as a
+    // refusal, and a default of 0 would make every half-configured charge free.
+    let flat_rate = payload
+        .get("flat_rate")
+        .or_else(|| payload.get("rate"))
+        .and_then(json_number)
+        .filter(|value| value.is_finite());
+    if let Some(rate) = flat_rate {
+        if rate < 0.0 {
+            return Err(format!("{charge_name} has a negative flat rate ({rate})"));
+        }
+    }
+    let slabs = normalise_charge_slabs(payload)?;
+
+    let deleted_at = if deleted {
+        updated_at.clone()
+    } else {
+        optional_text(payload, "deleted_at")
+    };
+
+    tx.execute(
+        "INSERT INTO local_charge_types (
+            id, cloud_id, company_id, branch_id, charge_name, charge_code, basis, measure_unit,
+            flat_rate, active, created_at, updated_at, version, sync_status, deleted_at
+         ) VALUES (
+            ?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+            COALESCE(?10, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            COALESCE(?11, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?12, 'synced',
+            CASE WHEN ?14 = 1 THEN COALESCE(?13, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) ELSE ?13 END
+         )
+         ON CONFLICT(id) DO UPDATE SET
+           company_id = COALESCE(excluded.company_id, local_charge_types.company_id),
+           branch_id = COALESCE(excluded.branch_id, local_charge_types.branch_id),
+           charge_name = excluded.charge_name,
+           charge_code = excluded.charge_code,
+           basis = excluded.basis,
+           measure_unit = excluded.measure_unit,
+           flat_rate = excluded.flat_rate,
+           active = excluded.active,
+           updated_at = excluded.updated_at,
+           version = excluded.version,
+           sync_status = 'synced',
+           deleted_at = excluded.deleted_at",
+        params![
+            charge_type_id,
+            optional_text(payload, "company_id"),
+            optional_text(payload, "branch_id"),
+            charge_name,
+            optional_text(payload, "charge_code"),
+            basis,
+            optional_text(payload, "measure_unit").or_else(|| optional_text(payload, "unit")),
+            flat_rate,
+            if json_flag(payload, "active", true) { 1 } else { 0 },
+            optional_text(payload, "created_at"),
+            updated_at.clone(),
+            version,
+            deleted_at,
+            if deleted { 1 } else { 0 },
+        ],
+    )
+    .map_err(to_error)?;
+
+    if let Some(slabs) = slabs {
+        tx.execute(
+            "DELETE FROM local_charge_rate_slabs WHERE charge_type_id = ?1",
+            [charge_type_id],
+        )
+        .map_err(to_error)?;
+        for (index, slab) in slabs.iter().enumerate() {
+            let slab_id = slab
+                .id
+                .clone()
+                // Derived from the charge type and the position, so replaying the same pull twice
+                // rewrites the same rows instead of accumulating a second set of slabs.
+                .unwrap_or_else(|| format!("{charge_type_id}::slab::{}", index + 1));
+            tx.execute(
+                "INSERT INTO local_charge_rate_slabs (
+                    id, cloud_id, charge_type_id, upto_value, rate, active, updated_at, version, sync_status
+                 ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, COALESCE(?6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?7, 'synced')",
+                params![
+                    slab_id,
+                    charge_type_id,
+                    slab.upto_value,
+                    slab.rate,
+                    if slab.active { 1 } else { 0 },
+                    updated_at.clone(),
+                    version,
+                ],
+            )
+            .map_err(to_error)?;
+        }
+    }
+    Ok(())
+}
+
+/// Store one rate slab that arrived on its own, rather than nested in its charge type.
+///
+/// The nested form is the usual one — a charge type is only ever priced with all of its slabs in
+/// hand — but a server free to log a slab as its own entity would otherwise have those changes
+/// dropped. Validated exactly as the nested ones are: an unusable slab is refused by name rather
+/// than stored, because a slab stored with a rate of 0 prices a whole bracket at nothing.
+fn upsert_charge_rate_slab_with_tx(
+    tx: &rusqlite::Transaction<'_>,
+    slab_id: &str,
+    charge_type_id: &str,
+    payload: &serde_json::Value,
+    updated_at: Option<String>,
+    version: i64,
+) -> Result<(), String> {
+    let upto_value = payload
+        .get("upto_value")
+        .or_else(|| payload.get("upto"))
+        .or_else(|| payload.get("threshold"))
+        .and_then(json_number)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| format!("Rate slab {slab_id} has no usable measurement to apply up to."))?;
+    let rate = payload
+        .get("rate")
+        .or_else(|| payload.get("charge_rate"))
+        .and_then(json_number)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or_else(|| format!("Rate slab {slab_id} (up to {upto_value}) has no rate."))?;
+    tx.execute(
+        "INSERT INTO local_charge_rate_slabs (
+            id, cloud_id, charge_type_id, upto_value, rate, active, updated_at, version, sync_status, deleted_at
+         ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, COALESCE(?6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), ?7, 'synced', NULL)
+         ON CONFLICT(id) DO UPDATE SET
+           charge_type_id = excluded.charge_type_id,
+           upto_value = excluded.upto_value,
+           rate = excluded.rate,
+           active = excluded.active,
+           updated_at = excluded.updated_at,
+           version = excluded.version,
+           sync_status = 'synced',
+           deleted_at = NULL",
+        params![
+            slab_id,
+            charge_type_id,
+            upto_value,
+            rate,
+            if json_flag(payload, "active", true) { 1 } else { 0 },
+            updated_at,
+            version,
+        ],
+    )
+    .map_err(to_error)?;
+    Ok(())
+}
+
+/// Every charge type this device knows, with its slabs, in the shape `otherCharges.js` reads.
+///
+/// Inactive and unpriced charge types are emitted too, deliberately. `buildChargesForBill` has a
+/// refusal for a charge that has been turned off and one for a charge with no rate; filtering them
+/// out here would replace both messages with silence — the charge would simply not be on the
+/// screen, and nobody would know why.
+///
+/// Slab fields are emitted under their own column names and nothing else. `normaliseSlabs` already
+/// reads `upto_value`, so an `upto` alias would buy nothing and would add a second name for one
+/// column — which is the shape behind the `remaining_qty`/`balance_qty` confusion CLAUDE.md warns
+/// about.
+fn read_charge_types(conn: &Connection) -> Result<Vec<serde_json::Value>, String> {
+    let mut slabs_by_type: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    {
+        let mut statement = conn
+            .prepare(
+                "SELECT id, charge_type_id, upto_value, rate, active, updated_at, version
+                 FROM local_charge_rate_slabs
+                 WHERE deleted_at IS NULL
+                 ORDER BY upto_value, id",
+            )
+            .map_err(to_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    serde_json::json!({
+                        "id": row.get::<_, String>(0)?,
+                        "charge_type_id": row.get::<_, String>(1)?,
+                        "upto_value": row.get::<_, f64>(2)?,
+                        "rate": row.get::<_, f64>(3)?,
+                        "active": row.get::<_, i64>(4)? == 1,
+                        "updated_at": row.get::<_, Option<String>>(5)?,
+                        "entity_version": row.get::<_, i64>(6)?,
+                    }),
+                ))
+            })
+            .map_err(to_error)?;
+        for row in rows {
+            let (charge_type_id, slab) = row.map_err(to_error)?;
+            slabs_by_type.entry(charge_type_id).or_default().push(slab);
+        }
+    }
+
+    let mut statement = conn
+        .prepare(
+            "SELECT id, company_id, branch_id, charge_name, charge_code, basis, measure_unit,
+                    flat_rate, active, created_at, updated_at, version
+             FROM local_charge_types
+             WHERE deleted_at IS NULL
+             ORDER BY charge_name, id",
+        )
+        .map_err(to_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "company_id": row.get::<_, Option<String>>(1)?,
+                "branch_id": row.get::<_, Option<String>>(2)?,
+                "charge_name": row.get::<_, String>(3)?,
+                "charge_code": row.get::<_, Option<String>>(4)?,
+                "basis": row.get::<_, String>(5)?,
+                "measure_unit": row.get::<_, Option<String>>(6)?,
+                // Stays null when nobody set a rate. The POS turns that into a refusal; a 0 here
+                // would turn it into a free charge.
+                "flat_rate": row.get::<_, Option<f64>>(7)?,
+                "active": row.get::<_, i64>(8)? == 1,
+                "created_at": row.get::<_, Option<String>>(9)?,
+                "updated_at": row.get::<_, Option<String>>(10)?,
+                "entity_version": row.get::<_, i64>(11)?,
+            }))
+        })
+        .map_err(to_error)?;
+    let mut charge_types = Vec::new();
+    for row in rows {
+        let mut charge_type = row.map_err(to_error)?;
+        let id = optional_text(&charge_type, "id").unwrap_or_default();
+        let slabs = slabs_by_type.remove(&id).unwrap_or_default();
+        if let Some(object) = charge_type.as_object_mut() {
+            object.insert("slabs".to_string(), serde_json::Value::Array(slabs));
+        }
+        charge_types.push(charge_type);
+    }
+    Ok(charge_types)
+}
+
+/// The charge types carried by an online reference snapshot, wherever the server put them.
+fn snapshot_charge_types(snapshot: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    if let Some(rows) = snapshot.get("charge_types").and_then(|value| value.as_array()) {
+        return Some(rows);
+    }
+    snapshot.get("settings_bundle").and_then(|bundle| {
+        ["chargeTypes", "offlineChargeTypes", "charge_types"]
+            .iter()
+            .find_map(|key| bundle.get(*key).and_then(|value| value.as_array()))
+    })
+}
+
 fn load_invoice_snapshot(conn: &Connection, invoice_id: &str) -> Result<serde_json::Value, String> {
     let invoice = conn
         .query_row(
@@ -2253,7 +2861,8 @@ fn load_invoice_snapshot(conn: &Connection, invoice_id: &str) -> Result<serde_js
                     item_discount_total, bill_discount_total, tax_total, net_total, status,
                     sync_status, server_invoice_no, server_sale_id, entity_version, created_at,
                     updated_at, edit_reason, cancellation_reason, cancelled_by, cancelled_at, base_version,
-                    taxable_amount, mandi_tax_rate, mandi_tax_basis, tax_config_snapshot
+                    taxable_amount, mandi_tax_rate, mandi_tax_basis, tax_config_snapshot,
+                    other_charges_amount
              FROM local_pos_invoices WHERE id = ?1",
             [invoice_id],
             |row| {
@@ -2291,6 +2900,10 @@ fn load_invoice_snapshot(conn: &Connection, invoice_id: &str) -> Result<serde_js
                     "mandi_tax_rate": row.get::<_, f64>(29)?,
                     "mandi_tax_basis": row.get::<_, Option<String>>(30)?,
                     "tax_config_snapshot": row.get::<_, Option<String>>(31)?,
+                    // Charges land after Mandi Tax and are absent from `taxable_amount`. Read from
+                    // the invoice row, while the lines below are read from `local_sale_charges` —
+                    // the two are written together by `write_sale_charges` and never apart.
+                    "other_charges_amount": row.get::<_, f64>(32)?,
                 }))
             },
         )
@@ -2356,10 +2969,17 @@ fn load_invoice_snapshot(conn: &Connection, invoice_id: &str) -> Result<serde_js
         rows.collect::<Result<Vec<_>, _>>().map_err(to_error)?
     };
 
+    let other_charges = read_sale_charges(conn, invoice_id)?;
+
     Ok(serde_json::json!({
         "invoice": invoice,
         "items": items,
         "payments": payments,
+        // Emitted whether or not there are any, so that a consumer can tell "this bill has no
+        // charges" from "this build did not tell me about them" — the edit and cancel paths turn
+        // this snapshot straight into the payload the cloud is given.
+        "other_charges": other_charges,
+        "other_charges_amount": invoice.get("other_charges_amount").cloned().unwrap_or(serde_json::json!(0.0)),
     }))
 }
 
@@ -2657,6 +3277,22 @@ fn edit_local_pos_sale_at(path: &Path, edit: serde_json::Value) -> Result<LocalP
     if payments.is_empty() {
         return Err("Edited sale requires payment postings".to_string());
     }
+    // Checked before the first write, like every other precondition on this path: an edit that
+    // cannot price one of its charges must leave the bill exactly as it was.
+    let (charge_lines, other_charges_amount) = normalise_sale_charges(&edit)?;
+    // An edit payload is the whole bill as the operator left it on the screen, so an empty list of
+    // charges means the operator removed them and they are cleared. A payload that does not mention
+    // charges AT ALL is a different thing: it is a caller that does not know about them. Clearing
+    // them on its say-so would take money off a bill that was genuinely collected, quietly, on every
+    // edit — so the edit is refused instead, and the refusal names what it is protecting.
+    if sale_charge_lines(&edit).is_none()
+        && old_snapshot["other_charges"].as_array().map(|rows| !rows.is_empty()).unwrap_or(false)
+    {
+        return Err(
+            "This bill carries other charges and the edit does not say what to do with them. Send the charges with the edit, or send an empty list to remove them."
+                .to_string(),
+        );
+    }
 
     restore_invoice_stock(&tx, &invoice_id, &device_id, &reason)?;
     tx.execute("DELETE FROM local_pos_invoice_items WHERE invoice_id = ?1", [invoice_id.as_str()])
@@ -2696,6 +3332,7 @@ fn edit_local_pos_sale_at(path: &Path, edit: serde_json::Value) -> Result<LocalP
         ],
     )
     .map_err(to_error)?;
+    write_sale_charges(&tx, &invoice_id, new_version, &charge_lines, other_charges_amount)?;
     let new_snapshot = load_invoice_snapshot(&tx, &invoice_id)?;
     let audit_id = unique_local_id("sale-audit");
     tx.execute(
@@ -2916,6 +3553,7 @@ fn initialize_at(path: &Path) -> Result<(), String> {
     apply_migration(&mut conn, "021_customer_order_payment", MIGRATION_021)?;
     apply_migration(&mut conn, "022_customer_order_sync", MIGRATION_022)?;
     apply_migration(&mut conn, "023_customer_order_transfer", MIGRATION_023)?;
+    apply_migration(&mut conn, "024_other_charges", MIGRATION_024)?;
     Ok(())
 }
 
@@ -3454,6 +4092,37 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                 optional_text(supplier, "updated_at"),
                 supplier.get("entity_version").or_else(|| supplier.get("version")).and_then(|value| value.as_i64()).unwrap_or(1),
                 false,
+            )?;
+        }
+    }
+
+    // The charges the shop set up, cached so a counter with no internet can still price a crate.
+    //
+    // Charge types are NOT deleted here for being absent from the snapshot, matching how products
+    // and customers are cached on this path: a snapshot is a refresh, not a census, and a partial
+    // one must not empty a counter's charge list. Removal travels as a `charge_type` DELETE on the
+    // pull path, which soft-deletes the row.
+    if let Some(charge_types) = snapshot_charge_types(snapshot) {
+        for charge_type in charge_types {
+            let charge_type_id = optional_text(charge_type, "id")
+                .or_else(|| optional_text(charge_type, "global_id"))
+                .or_else(|| optional_text(charge_type, "charge_type_id"))
+                .ok_or_else(|| "Charge type has no canonical identity".to_string())?;
+            // Refused rather than half-applied: a charge type whose slabs cannot be read would be
+            // stored with the wrong ones, and a wrong slab is a wrong price on every bill. The
+            // whole snapshot refresh fails, the transaction rolls back, and the last good cache
+            // stays exactly as it was — the counter keeps working on data it can explain.
+            upsert_charge_type_with_tx(
+                &tx,
+                &charge_type_id,
+                charge_type,
+                optional_text(charge_type, "updated_at"),
+                charge_type
+                    .get("entity_version")
+                    .or_else(|| charge_type.get("version"))
+                    .and_then(|value| value.as_i64())
+                    .unwrap_or(1),
+                optional_text(charge_type, "deleted_at").is_some(),
             )?;
         }
     }
@@ -3998,9 +4667,15 @@ fn load_reference_snapshot_at(
             offline_purchases.push(purchase);
         }
     }
+    // One query, two places to read it from. `charge_types` at the top level is the canonical one;
+    // the settings-bundle copy is the same Vec, put where the existing offline reference collections
+    // already live so a caller that reads settings finds it. Both come from `read_charge_types`, so
+    // they cannot disagree — which is the whole reason it is one derivation and not two queries.
+    let charge_types = read_charge_types(&conn)?;
     if let Some(bundle) = settings_bundle.as_object_mut() {
         bundle.insert("offlinePurchases".to_string(), serde_json::Value::Array(offline_purchases.clone()));
         bundle.insert("offlineSuppliers".to_string(), serde_json::Value::Array(offline_suppliers));
+        bundle.insert("offlineChargeTypes".to_string(), serde_json::Value::Array(charge_types.clone()));
     }
 
     let sales_history = {
@@ -4008,7 +4683,7 @@ fn load_reference_snapshot_at(
             .prepare(
                 "SELECT id, offline_invoice_ref, bill_date, bill_datetime, customer_name, customer_mobile,
                         payment_mode, gross_total, item_discount_total, bill_discount_total, tax_total, net_total,
-                        status, sync_status, server_invoice_no, created_at
+                        status, sync_status, server_invoice_no, created_at, other_charges_amount
                  FROM local_pos_invoices
                  ORDER BY datetime(created_at) DESC, id DESC",
             )
@@ -4036,6 +4711,10 @@ fn load_reference_snapshot_at(
                     "sale_status": row.get::<_, String>(12)?,
                     "sync_status": row.get::<_, String>(13)?,
                     "created_at": row.get::<_, Option<String>>(15)?,
+                    // Already inside `total_amount`; carried separately so a bill can say what part
+                    // of its total was charges rather than fruit, and so that a bill list and a
+                    // reopened bill agree about it.
+                    "other_charges_amount": row.get::<_, f64>(16)?,
                 }))
             })
             .map_err(to_error)?;
@@ -4069,6 +4748,7 @@ fn load_reference_snapshot_at(
         "categories": categories,
         "inventory_lots": inventory_lots,
         "customers": customers,
+        "charge_types": charge_types,
         "settings_bundle": settings_bundle,
         "offline_purchases": offline_purchases,
         "sales_history": sales_history,
@@ -5355,6 +6035,15 @@ fn apply_pulled_pos_sale_with_tx(
     change: &PulledChange,
 ) -> Result<(), String> {
     let payload = &change.payload;
+    // Read and checked before the first write. A pulled bill whose charges cannot be read is
+    // refused whole by the caller and kept for replay; storing the fruit without the delivery
+    // charge would put a bill on this device that is short by exactly the amount that was hardest
+    // to collect, and nothing would say so.
+    let (charge_lines, other_charges_amount) = normalise_sale_charges(payload)?;
+    // "Not told about charges" is not "told there are none". A change that does not carry the
+    // collection at all must leave whatever this device already has alone; only a payload that
+    // actually lists them (even as an empty list) may replace them.
+    let charges_supplied = sale_charge_lines(payload).is_some();
     let existing_version: Option<i64> = tx
         .query_row(
             "SELECT entity_version FROM local_pos_invoices WHERE id = ?1",
@@ -5399,6 +6088,9 @@ fn apply_pulled_pos_sale_with_tx(
                 ],
             )
             .map_err(to_error)?;
+            if charges_supplied {
+                write_sale_charges(tx, &change.entity_id, incoming_version, &charge_lines, other_charges_amount)?;
+            }
         }
         return Ok(());
     }
@@ -5537,6 +6229,9 @@ fn apply_pulled_pos_sale_with_tx(
             )
             .map_err(to_error)?;
         }
+    }
+    if charges_supplied {
+        write_sale_charges(tx, &change.entity_id, incoming_version, &charge_lines, other_charges_amount)?;
     }
     Ok(())
 }
@@ -6221,7 +6916,84 @@ fn apply_change_with_tx(tx: &rusqlite::Transaction, change: &PulledChange) -> Re
                 .map_err(to_error)?;
             }
         }
-        "pos_sale" => apply_pulled_pos_sale_with_tx(tx, change)?,
+        // The charges are read before the sale is touched, so that a bill whose charges cannot be
+        // read writes nothing at all and is kept whole for replay. Refusing it here rather than
+        // storing it without its charges is deliberate: a stored bill that is short by its delivery
+        // charge looks finished, and nobody goes looking for the missing money.
+        "pos_sale" => match normalise_sale_charges(&change.payload) {
+            Ok(_) => apply_pulled_pos_sale_with_tx(tx, change)?,
+            Err(detail) => record_unapplied_change(tx, change, "SALE_CHARGES_NOT_PRICEABLE", Some(detail))?,
+        },
+        // A charge type the shop set up: crate, labour, delivery, or whatever it invented next.
+        // Its slabs travel nested inside it, because a charge is only ever priced with all of its
+        // slabs in hand and applying half of them would change what the shop charges.
+        "charge_type" => {
+            if let Err(detail) = upsert_charge_type_with_tx(
+                tx,
+                &change.entity_id,
+                &change.payload,
+                change.updated_at.clone(),
+                change.version.unwrap_or(1),
+                operation == "DELETE",
+            ) {
+                // Kept, named and replayable rather than applied-in-part or dropped. `Err` here
+                // means nothing was written — every check in that function runs before its first
+                // statement — so the transaction is clean and the rest of the pull still lands.
+                record_unapplied_change(tx, change, "CHARGE_TYPE_NOT_USABLE", Some(detail))?;
+            }
+        }
+        "charge_rate_slab" => {
+            let charge_type_id = optional_text(&change.payload, "charge_type_id")
+                .or_else(|| optional_text(&change.payload, "charge_type_global_id"));
+            match charge_type_id {
+                // Never invented and never attached to a guess: a slab whose charge type is unknown
+                // would price some other charge entirely.
+                None => record_unapplied_change(
+                    tx,
+                    change,
+                    "CHARGE_SLAB_HAS_NO_CHARGE_TYPE",
+                    Some("this rate slab does not say which charge it belongs to".to_string()),
+                )?,
+                Some(charge_type_id) => {
+                    let parent_present: i64 = tx
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM local_charge_types WHERE id = ?1)",
+                            [charge_type_id.as_str()],
+                            |row| row.get(0),
+                        )
+                        .map_err(to_error)?;
+                    if parent_present != 1 {
+                        // The charge type has not arrived yet. Kept rather than orphaned, so the
+                        // slab is applied on the replay that follows its charge type instead of
+                        // quietly never existing.
+                        record_unapplied_change(
+                            tx,
+                            change,
+                            "CHARGE_TYPE_NOT_PRESENT",
+                            Some(format!("charge type {charge_type_id} is not on this device yet")),
+                        )?;
+                    } else if operation == "DELETE" {
+                        tx.execute(
+                            "UPDATE local_charge_rate_slabs
+                             SET deleted_at = COALESCE(?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                                 sync_status = 'synced'
+                             WHERE id = ?1",
+                            params![change.entity_id, change.updated_at],
+                        )
+                        .map_err(to_error)?;
+                    } else if let Err(detail) = upsert_charge_rate_slab_with_tx(
+                        tx,
+                        &change.entity_id,
+                        &charge_type_id,
+                        &change.payload,
+                        change.updated_at.clone(),
+                        change.version.unwrap_or(1),
+                    ) {
+                        record_unapplied_change(tx, change, "CHARGE_SLAB_NOT_USABLE", Some(detail))?;
+                    }
+                }
+            }
+        }
         "sync_test" => {
             tx.execute(
                 "INSERT INTO local_sync_test_entities (id, branch_id, device_id, value, server_version, sync_status, updated_at, deleted_at)
@@ -6366,7 +7138,7 @@ mod tests {
     /// three at once with nothing but `left: 18, right: 17` to explain why, and the failures were
     /// mistaken for the environment for long enough to reach a merge check. One named constant is
     /// the whole fix: **bump this when you add a migration**, and the number says what it counts.
-    const EXPECTED_APPLIED_MIGRATIONS: i64 = 22;
+    const EXPECTED_APPLIED_MIGRATIONS: i64 = 23;
 
     #[test]
     fn snapshot_preflight_rejects_malformed_database_without_replacing_it() {
@@ -11070,6 +11842,961 @@ mod tests {
         assert_eq!(refused, 0, "nothing here is foreign, so nothing may be refused");
 
         drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Other charges: crate charge, labour charge, delivery charge, and whatever comes next.
+    //
+    // The pricing rules are tested in `frontend/src/local/otherCharges.test.mjs` and are NOT
+    // restated here. What these tests defend is the storage underneath them: that a charge
+    // survives a restart, reaches the cloud, comes back, and — the one that matters — that a
+    // charge which could not price itself never lands in the database as a zero.
+    // ---------------------------------------------------------------------------------------
+
+    /// Every migration up to and including 023, which is the schema 024 upgrades from.
+    fn apply_migrations_through_023(conn: &mut Connection) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS local_schema_migrations (
+                version TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                checksum TEXT NOT NULL,
+                status TEXT NOT NULL
+            );",
+        )
+        .expect("create migration table");
+        for (version, sql) in [
+            ("001_local_foundation", MIGRATION_001),
+            ("002_sync_engine_foundation", MIGRATION_002),
+            ("003_local_first_pos", MIGRATION_003),
+            ("004_offline_sale_edit_cancel", MIGRATION_004),
+            ("005_mandi_tax_sale_details", MIGRATION_005),
+            ("006_multibranch_identity_foundation", MIGRATION_006),
+            ("007_cloud_runtime_and_inbox_foundation", MIGRATION_007),
+            ("009_canonical_utc_timestamps", MIGRATION_009),
+            ("010_sync_delivery_state", MIGRATION_010),
+            ("011_connectivity_mode_audit", MIGRATION_011),
+            ("012_connectivity_mode_server_time", MIGRATION_012),
+            ("013_operational_location_foundation", MIGRATION_013),
+            ("014_offline_purchase_grn", MIGRATION_014),
+            ("015_supplier_reference_cache", MIGRATION_015),
+            ("016_purchase_aggregate_reconciliation", MIGRATION_016),
+            ("017_offline_entitlement_foundation", MIGRATION_017),
+            ("018_bootstrap_credential_consumption", MIGRATION_018),
+            ("019_provisional_lot_cost_status", MIGRATION_019),
+            ("020_customer_orders", MIGRATION_020),
+            ("021_customer_order_payment", MIGRATION_021),
+            ("022_customer_order_sync", MIGRATION_022),
+            ("023_customer_order_transfer", MIGRATION_023),
+        ] {
+            apply_migration(conn, version, sql).expect("apply pre-024 migration");
+        }
+    }
+
+    /// Migration 024 upgrades a real profile once, and a restart changes nothing.
+    ///
+    /// SQLite has no ADD COLUMN IF NOT EXISTS, so running this file twice would fail outright —
+    /// the version gate in `apply_migration` is what makes it idempotent, and that is what is being
+    /// checked here. The bill written before the migration keeps everything it had and gains a
+    /// charges total of 0, which for a bill that carried no charges is the true answer.
+    #[test]
+    fn migration_024_adds_charges_once_and_survives_a_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-other-charges-migration-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+
+        let mut conn = Connection::open(&path).expect("open pre-024 database");
+        apply_migrations_through_023(&mut conn);
+        conn.execute(
+            "INSERT INTO local_pos_invoices (
+                id, offline_invoice_ref, branch_id, device_id, bill_date, bill_datetime,
+                payment_mode, gross_total, net_total
+             ) VALUES ('bill-pre-024', 'OFF-PRE-024', '1', 'device-a', '2026-08-01',
+                       '2026-08-01T10:00', 'CASH', 120, 120)",
+            [],
+        )
+        .expect("insert a bill written before charges existed");
+        drop(conn);
+
+        initialize_at(&path).expect("upgrade the pre-024 profile");
+        initialize_at(&path).expect("restart with the upgraded profile");
+
+        let conn = Connection::open(&path).expect("inspect the upgraded profile");
+        let migrations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_schema_migrations WHERE status = 'APPLIED'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration count");
+        assert_eq!(migrations, EXPECTED_APPLIED_MIGRATIONS);
+        let applications: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_schema_migrations WHERE version = '024_other_charges'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("024 application count");
+        assert_eq!(applications, 1, "a restart must not apply 024 a second time");
+
+        for table in ["local_charge_types", "local_charge_rate_slabs", "local_sale_charges"] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("table presence");
+            assert_eq!(present, 1, "{table} must exist after the upgrade");
+        }
+
+        let (net, charges): (f64, f64) = conn
+            .query_row(
+                "SELECT net_total, other_charges_amount FROM local_pos_invoices WHERE id = 'bill-pre-024'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read the pre-024 bill");
+        assert_eq!(net, 120.0, "the bill keeps the total it always had");
+        assert_eq!(charges, 0.0, "a bill that carried no charges genuinely carries 0");
+        drop(conn);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    fn crate_and_delivery_snapshot(device_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "branch_context": { "branch_id": "1", "branch_name": "Main" },
+            "device_identity": { "device_id": device_id, "device_name": "Counter" },
+            "products": [],
+            "categories": [],
+            "inventory_lots": [],
+            "customers": [],
+            "sales_history": [],
+            "charge_types": [
+                {
+                    // Deliberately listed largest-first, because a settings screen hands back
+                    // whatever order the database felt like and the counter still has to match
+                    // "the first slab that covers this".
+                    "id": "charge-delivery",
+                    "charge_name": "Delivery charge",
+                    "charge_code": "DEL",
+                    "basis": "SLAB",
+                    "measure_unit": "km",
+                    "active": true,
+                    "slabs": [
+                        { "id": "slab-delivery-15", "upto_value": 15, "rate": 150 },
+                        { "id": "slab-delivery-10", "upto_value": 10, "rate": 100 }
+                    ]
+                },
+                {
+                    "id": "charge-crate",
+                    "charge_name": "Crate charge",
+                    "basis": "SLAB",
+                    "measure_unit": "kg",
+                    "active": true,
+                    "slabs": [
+                        { "id": "slab-crate-10", "upto_value": 10, "rate": 40 },
+                        { "id": "slab-crate-20", "upto_value": 20, "rate": 50 }
+                    ]
+                },
+                {
+                    // A genuinely free charge. 0 is a rate; it must not read as "no rate set".
+                    "id": "charge-labour",
+                    "charge_name": "Labour charge",
+                    "basis": "FLAT",
+                    "flat_rate": 0,
+                    "active": true
+                },
+                {
+                    // Set up but never priced. The POS is supposed to refuse this one by name.
+                    "id": "charge-unpriced",
+                    "charge_name": "Hamali charge",
+                    "basis": "FLAT",
+                    "active": true
+                }
+            ],
+            "settings_bundle": {}
+        })
+    }
+
+    /// A counter with no internet still knows what a crate costs.
+    ///
+    /// The snapshot has to carry every slab, not a summary of them, because the refusal above the
+    /// top slab is computed from the slabs themselves: a snapshot that dropped the 15 km row would
+    /// make a 12 km delivery unpriceable and a 40 km one look priceable at 100.
+    #[test]
+    fn a_counter_snapshot_carries_charge_types_with_every_slab() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-charge-snapshot-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize charge snapshot database");
+
+        let snapshot = crate_and_delivery_snapshot("device-charges");
+        cache_reference_snapshot_at(&path, &snapshot).expect("cache charge types");
+        cache_reference_snapshot_at(&path, &snapshot).expect("cache charge types again");
+
+        let loaded = load_reference_snapshot_at(&path, Some("offline-user"), Some("device-charges"))
+            .expect("load the counter's snapshot");
+        let charge_types = loaded["charge_types"].as_array().expect("charge types are emitted");
+        assert_eq!(charge_types.len(), 4, "caching twice must not duplicate a charge type");
+
+        let by_id = |id: &str| -> serde_json::Value {
+            charge_types
+                .iter()
+                .find(|entry| entry["id"] == serde_json::json!(id))
+                .cloned()
+                .unwrap_or_else(|| panic!("charge type {id} is missing from the snapshot"))
+        };
+
+        let delivery = by_id("charge-delivery");
+        assert_eq!(delivery["measure_unit"], "km", "the unit is the one the shop typed");
+        let slabs = delivery["slabs"].as_array().expect("delivery slabs");
+        assert_eq!(slabs.len(), 2, "caching twice must not duplicate a slab");
+        assert_eq!(
+            slabs.iter().map(|slab| slab["upto_value"].as_f64().unwrap()).collect::<Vec<_>>(),
+            vec![10.0, 15.0],
+            "slabs come back smallest first however they arrived"
+        );
+        assert_eq!(
+            slabs.iter().map(|slab| slab["rate"].as_f64().unwrap()).collect::<Vec<_>>(),
+            vec![100.0, 150.0]
+        );
+
+        let crate_charge = by_id("charge-crate");
+        assert_eq!(crate_charge["measure_unit"], "kg");
+        assert_eq!(crate_charge["slabs"].as_array().expect("crate slabs").len(), 2);
+
+        // A rate of zero is a rate. `flat_rate` must come back as 0, not as null, or a shop that
+        // set up free labour would see the charge refused instead of applied at nothing.
+        let labour = by_id("charge-labour");
+        assert_eq!(labour["flat_rate"], serde_json::json!(0.0));
+        assert!(labour["slabs"].as_array().expect("labour slabs").is_empty());
+
+        // And a charge nobody priced comes back with NO rate rather than a zero one, so the POS
+        // refuses it by name instead of putting it on the bill for nothing.
+        let unpriced = by_id("charge-unpriced");
+        assert!(
+            unpriced["flat_rate"].is_null(),
+            "an unpriced charge must not arrive at the counter as a free one"
+        );
+
+        // The settings-bundle copy is the same derivation, so the two can never disagree.
+        assert_eq!(
+            loaded["settings_bundle"]["offlineChargeTypes"],
+            loaded["charge_types"],
+            "the bundle copy and the canonical list must come from one query"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A charge type whose slabs cannot be read is kept whole, not applied in part.
+    ///
+    /// Dropping the unusable slab and storing the rest would silently change what the shop charges:
+    /// without the 15 km row, a 12 km delivery is refused and a 40 km one is priced at 100. So the
+    /// charge type is refused by name, nothing is written, and the change is kept where it can be
+    /// counted and replayed.
+    #[test]
+    fn a_charge_type_with_an_unusable_slab_is_kept_rather_than_half_applied() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-charge-type-pull-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize charge type pull database");
+
+        let good = PulledChange {
+            change_id: serde_json::json!(801),
+            branch_id: Some(1),
+            entity_type: "charge_type".to_string(),
+            entity_id: "charge-crate".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            updated_at: Some("2026-09-01T09:00:00.000Z".to_string()),
+            payload: serde_json::json!({
+                "charge_name": "Crate charge",
+                "basis": "SLAB",
+                "measure_unit": "kg",
+                "active": true,
+                "slabs": [
+                    { "id": "slab-crate-10", "upto_value": 10, "rate": 40 },
+                    { "id": "slab-crate-20", "upto_value": 20, "rate": 50 }
+                ]
+            }),
+        };
+        let broken = PulledChange {
+            change_id: serde_json::json!(802),
+            branch_id: Some(1),
+            entity_type: "charge_type".to_string(),
+            entity_id: "charge-delivery".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(1),
+            updated_at: Some("2026-09-01T09:05:00.000Z".to_string()),
+            payload: serde_json::json!({
+                "charge_name": "Delivery charge",
+                "basis": "SLAB",
+                "measure_unit": "km",
+                "slabs": [
+                    { "upto_value": 10, "rate": 100 },
+                    { "upto_value": 15 }
+                ]
+            }),
+        };
+        // The same charge type again, with no mention of slabs at all. "Not told" is not "told
+        // there are none": the slabs already stored have to survive it.
+        let silent_about_slabs = PulledChange {
+            change_id: serde_json::json!(803),
+            branch_id: Some(1),
+            entity_type: "charge_type".to_string(),
+            entity_id: "charge-crate".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(2),
+            updated_at: Some("2026-09-01T09:10:00.000Z".to_string()),
+            payload: serde_json::json!({
+                "charge_name": "Crate charge (renamed)",
+                "basis": "SLAB",
+                "measure_unit": "kg",
+                "active": true
+            }),
+        };
+
+        {
+            let mut conn = Connection::open(&path).expect("open charge type database");
+            let tx = conn.transaction().expect("start charge type transaction");
+            for change in [&good, &broken, &silent_about_slabs] {
+                apply_change_with_tx(&tx, change).expect("a refusal must not fail the whole pull");
+            }
+            tx.commit().expect("commit charge types");
+        }
+
+        let conn = Connection::open(&path).expect("inspect charge type database");
+        let crate_slabs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_charge_rate_slabs WHERE charge_type_id = 'charge-crate'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("crate slab count");
+        assert_eq!(crate_slabs, 2, "a change silent about slabs must leave them alone");
+        let crate_name: String = conn
+            .query_row(
+                "SELECT charge_name FROM local_charge_types WHERE id = 'charge-crate'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("crate charge name");
+        assert_eq!(crate_name, "Crate charge (renamed)", "the rest of the change still applied");
+
+        let delivery_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_charge_types WHERE id = 'charge-delivery'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("delivery charge type count");
+        assert_eq!(delivery_rows, 0, "a refused charge type must write nothing at all");
+        let delivery_slabs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_charge_rate_slabs WHERE charge_type_id = 'charge-delivery'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("delivery slab count");
+        assert_eq!(delivery_slabs, 0, "and none of its slabs either");
+
+        let (reason, kept): (String, i64) = conn
+            .query_row(
+                "SELECT reason, COUNT(*) FROM local_unapplied_changes WHERE entity_id = 'charge-delivery'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("kept refusal");
+        assert_eq!(kept, 1, "the refused change is kept for replay, not dropped");
+        assert_eq!(reason, "CHARGE_TYPE_NOT_USABLE");
+        drop(conn);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    fn pulled_sale_with_charges(
+        entity_id: &str,
+        version: i64,
+        charges: Option<serde_json::Value>,
+    ) -> PulledChange {
+        let mut payload = serde_json::json!({
+            "id": 901,
+            "offline_invoice_ref": format!("REMOTE-{entity_id}"),
+            "branch_id": 1,
+            "source_device_id": "device-b",
+            "customer_name": "Walk-in Customer",
+            "sale_date": "2026-09-01",
+            "bill_datetime": "2026-09-01T12:00",
+            "payment_mode": "CASH",
+            "gross_amount": 1000,
+            "tax_amount": 20,
+            "total_amount": 1330,
+            "invoice_no": "FZ-REMOTE-9",
+            "items": [{
+                "item_global_id": format!("{entity_id}-item-1"),
+                "product_id": "product-remote",
+                "product_name": "Remote Test Product",
+                "inventory_batch_id": "lot-remote",
+                "quantity": 10,
+                "selling_rate": 100,
+                "net_amount": 1000
+            }]
+        });
+        if let Some(charges) = charges {
+            if let Some(object) = payload.as_object_mut() {
+                for (key, value) in charges.as_object().expect("charges object") {
+                    object.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        PulledChange {
+            change_id: serde_json::json!(900 + version),
+            branch_id: Some(1),
+            entity_type: "pos_sale".to_string(),
+            entity_id: entity_id.to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(version),
+            updated_at: Some("2026-09-01T12:00:00.000Z".to_string()),
+            payload,
+        }
+    }
+
+    /// A bill pulled from the cloud arrives with its charges on it, and replaying it changes
+    /// nothing.
+    ///
+    /// `quantity` and `measurement` are checked separately on purpose: four 10 kg crates is 4 x 40,
+    /// and a store that flattened the two into one number would price it as a single 4 kg crate.
+    #[test]
+    fn a_pulled_sale_carrying_charges_stores_them_and_replays_without_duplicating() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-pulled-sale-charges-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize pulled charges database");
+
+        let change = pulled_sale_with_charges(
+            "remote-sale-charged",
+            1,
+            Some(serde_json::json!({
+                "other_charges_amount": 310,
+                "other_charges": [
+                    {
+                        "charge_type_id": "charge-crate",
+                        "charge_name": "Crate charge",
+                        "measure_unit": "kg",
+                        "measurement": 10,
+                        "quantity": 4,
+                        "rate": 40,
+                        "amount": 160,
+                        "manual": false,
+                        "slab_upto": 10
+                    },
+                    {
+                        "charge_type_id": "charge-delivery",
+                        "charge_name": "Delivery charge",
+                        "measure_unit": "km",
+                        "measurement": 12,
+                        "quantity": 1,
+                        "rate": 150,
+                        "amount": 150,
+                        "manual": false,
+                        "slab_upto": 15
+                    }
+                ]
+            })),
+        );
+        for _ in 0..2 {
+            let mut conn = Connection::open(&path).expect("open pulled charges database");
+            let tx = conn.transaction().expect("start pull transaction");
+            apply_change_with_tx(&tx, &change).expect("apply the pulled sale");
+            tx.commit().expect("commit the pulled sale");
+        }
+
+        let conn = Connection::open(&path).expect("inspect pulled charges database");
+        let charge_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_sale_charges WHERE sale_id = 'remote-sale-charged'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("charge line count");
+        assert_eq!(charge_count, 2, "replaying a pull must not double a bill's charges");
+
+        let total: f64 = conn
+            .query_row(
+                "SELECT other_charges_amount FROM local_pos_invoices WHERE id = 'remote-sale-charged'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stored charges total");
+        assert_eq!(total, 310.0);
+
+        let (measurement, quantity, rate, amount, unit): (f64, f64, f64, f64, String) = conn
+            .query_row(
+                "SELECT measurement, quantity, rate, amount, measure_unit FROM local_sale_charges
+                  WHERE sale_id = 'remote-sale-charged' AND charge_type_id = 'charge-crate'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .expect("stored crate charge");
+        assert_eq!(measurement, 10.0, "the crate size decides the rate");
+        assert_eq!(quantity, 4.0, "and the count is how many crates");
+        assert_eq!(rate, 40.0);
+        assert_eq!(amount, 160.0);
+        assert_eq!(unit, "kg");
+
+        let slab_upto: Option<f64> = conn
+            .query_row(
+                "SELECT slab_upto FROM local_sale_charges
+                  WHERE sale_id = 'remote-sale-charged' AND charge_type_id = 'charge-delivery'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stored delivery slab");
+        assert_eq!(
+            slab_upto,
+            Some(15.0),
+            "a bill has to be able to say which slab priced it after the slabs move"
+        );
+        drop(conn);
+
+        // A later change that says nothing about charges must not silently clear them: "not told"
+        // is not "told there are none", and a cleared charge is money the shop collected and can no
+        // longer see.
+        let silent = pulled_sale_with_charges("remote-sale-charged", 2, None);
+        {
+            let mut conn = Connection::open(&path).expect("open pulled charges database");
+            let tx = conn.transaction().expect("start second pull transaction");
+            apply_change_with_tx(&tx, &silent).expect("apply the silent update");
+            tx.commit().expect("commit the silent update");
+        }
+        let conn = Connection::open(&path).expect("inspect after the silent update");
+        let still_there: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_sale_charges WHERE sale_id = 'remote-sale-charged'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("charge line count after silent update");
+        let still_totalled: f64 = conn
+            .query_row(
+                "SELECT other_charges_amount FROM local_pos_invoices WHERE id = 'remote-sale-charged'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("charges total after silent update");
+        assert_eq!(still_there, 2);
+        assert_eq!(still_totalled, 310.0);
+        drop(conn);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A pulled bill whose charge has no rate is kept whole rather than stored short.
+    ///
+    /// This is the headline rule in storage form. Storing the fruit and dropping the delivery
+    /// charge would leave a bill that looks finished and is short by exactly the amount hardest to
+    /// collect, with nothing anywhere saying so. Refusing it keeps the whole change where it can be
+    /// counted and replayed, and leaves nothing half-written behind.
+    #[test]
+    fn a_pulled_sale_whose_charge_has_no_rate_is_refused_rather_than_stored_as_zero() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-pulled-sale-no-rate-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize refusal database");
+
+        let change = pulled_sale_with_charges(
+            "remote-sale-unpriced",
+            1,
+            Some(serde_json::json!({
+                "other_charges_amount": 150,
+                "other_charges": [{
+                    "charge_type_id": "charge-delivery",
+                    "charge_name": "Delivery charge",
+                    "measure_unit": "km",
+                    "measurement": 40,
+                    "quantity": 1
+                }]
+            })),
+        );
+        {
+            let mut conn = Connection::open(&path).expect("open refusal database");
+            let tx = conn.transaction().expect("start refusal transaction");
+            apply_change_with_tx(&tx, &change).expect("a refusal must not fail the whole pull");
+            tx.commit().expect("commit the refusal");
+        }
+
+        let conn = Connection::open(&path).expect("inspect refusal database");
+        let invoices: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_pos_invoices WHERE id = 'remote-sale-unpriced'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("invoice count");
+        assert_eq!(invoices, 0, "the bill must not be stored without the charge it carried");
+        let charges: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_sale_charges", [], |row| row.get(0))
+            .expect("charge count");
+        assert_eq!(charges, 0, "and above all it must not be stored as a charge of zero");
+
+        let (reason, detail): (String, Option<String>) = conn
+            .query_row(
+                "SELECT reason, detail FROM local_unapplied_changes WHERE entity_id = 'remote-sale-unpriced'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("kept refusal");
+        assert_eq!(reason, "SALE_CHARGES_NOT_PRICEABLE");
+        assert!(
+            detail.unwrap_or_default().contains("Delivery charge"),
+            "the refusal has to name the charge, or nobody knows where to look"
+        );
+        drop(conn);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A bill billed at the counter keeps its charges through the push and gets them back on the
+    /// pull, with the total and the lines still agreeing at every step.
+    #[test]
+    fn other_charges_survive_a_push_and_come_back_on_the_pull() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-charges-round-trip-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize round trip database");
+
+        let mut sale = test_sale_payload("invoice-charged-1", "op-charged-1", 2.0, 20.0);
+        sale["other_charges"] = serde_json::json!([
+            {
+                "charge_type_id": "charge-crate",
+                "charge_name": "Crate charge",
+                "measure_unit": "kg",
+                "measurement": 10,
+                "quantity": 4,
+                "rate": 40,
+                "amount": 160,
+                "manual": false,
+                "slab_upto": 10
+            },
+            {
+                // The 40 km trip nobody wrote a rate for, priced by hand at the counter. It is on
+                // the bill because a person typed it, and the bill has to be able to say so.
+                "charge_type_id": "charge-delivery",
+                "charge_name": "Delivery charge",
+                "measure_unit": "km",
+                "measurement": 40,
+                "quantity": 1,
+                "rate": 400,
+                "amount": 400,
+                "manual": true,
+                "slab_upto": null
+            }
+        ]);
+        sale["other_charges_amount"] = serde_json::json!(560);
+
+        let result = complete_local_pos_sale_at(&path, sale).expect("bill a sale carrying charges");
+        assert_eq!(
+            result.invoice["other_charges_amount"],
+            serde_json::json!(560.0),
+            "the bill handed back must carry what it charged"
+        );
+
+        let conn = Connection::open(&path).expect("inspect round trip database");
+        let stored_total: f64 = conn
+            .query_row(
+                "SELECT other_charges_amount FROM local_pos_invoices WHERE id = 'invoice-charged-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stored charges total");
+        let (lines, summed): (i64, f64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM local_sale_charges WHERE sale_id = 'invoice-charged-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("stored charge lines");
+        assert_eq!(lines, 2);
+        assert_eq!(stored_total, 560.0);
+        assert_eq!(summed, stored_total, "the tile and the table are one collection");
+
+        let manual: i64 = conn
+            .query_row(
+                "SELECT manual FROM local_sale_charges
+                  WHERE sale_id = 'invoice-charged-1' AND charge_type_id = 'charge-delivery'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("manual flag");
+        assert_eq!(manual, 1, "a hand-entered amount has to stay marked as one");
+
+        // The push: the outbox row carries the charges in the shape the cloud is given, whichever
+        // key the POS used on the way in.
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM sync_outbox WHERE operation_id = 'op-charged-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("outbox payload");
+        let payload: serde_json::Value = serde_json::from_str(&payload).expect("parse outbox payload");
+        assert_eq!(payload["other_charges_amount"], serde_json::json!(560.0));
+        assert_eq!(
+            payload["other_charges"].as_array().expect("queued charges").len(),
+            2,
+            "the charges have to travel with the sale, or the cloud bills the fruit alone"
+        );
+        drop(conn);
+
+        // Reopening the bill reads back both halves.
+        let conn = Connection::open(&path).expect("reopen the bill");
+        let reopened = load_invoice_snapshot(&conn, "invoice-charged-1").expect("reopen the bill");
+        drop(conn);
+        assert_eq!(reopened["invoice"]["other_charges_amount"], serde_json::json!(560.0));
+        assert_eq!(reopened["other_charges"].as_array().expect("reopened charges").len(), 2);
+
+        // The pull: the cloud sends the same bill back, and the total survives it.
+        let echoed = PulledChange {
+            change_id: serde_json::json!(950),
+            branch_id: Some(1),
+            entity_type: "pos_sale".to_string(),
+            entity_id: "invoice-charged-1".to_string(),
+            operation_type: "UPSERT".to_string(),
+            version: Some(2),
+            updated_at: Some("2026-09-01T13:00:00.000Z".to_string()),
+            payload: serde_json::json!({
+                "id": 990,
+                "invoice_no": "FZ-990",
+                "status": "COMPLETED",
+                "other_charges_amount": 560,
+                "other_charges": payload["other_charges"].clone(),
+            }),
+        };
+        {
+            let mut conn = Connection::open(&path).expect("open round trip database");
+            let tx = conn.transaction().expect("start echo transaction");
+            apply_change_with_tx(&tx, &echoed).expect("apply the echoed sale");
+            tx.commit().expect("commit the echoed sale");
+        }
+
+        let conn = Connection::open(&path).expect("inspect after the echo");
+        let (after_lines, after_total): (i64, f64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM local_sale_charges WHERE sale_id = 'invoice-charged-1'),
+                        other_charges_amount
+                   FROM local_pos_invoices WHERE id = 'invoice-charged-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("charges after the echo");
+        assert_eq!(after_lines, 2, "the round trip must not double or drop a line");
+        assert_eq!(after_total, 560.0, "nor change what the customer was charged");
+        let server_invoice_no: Option<String> = conn
+            .query_row(
+                "SELECT server_invoice_no FROM local_pos_invoices WHERE id = 'invoice-charged-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("server invoice no");
+        assert_eq!(server_invoice_no.as_deref(), Some("FZ-990"), "and the pull still did its own job");
+        drop(conn);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A bill whose stated charges total does not match its own lines is refused at the counter.
+    ///
+    /// Preferring one of the two numbers would be a guess about which is right, and the wrong guess
+    /// is either money the shop did not collect or money it collected and cannot account for. This
+    /// is the same failure the Inventory table had when a summary tile and its table came from two
+    /// different collections; the answer then and now is to make them one collection and refuse
+    /// when they arrive disagreeing.
+    #[test]
+    fn a_bill_whose_charges_do_not_add_up_is_refused_at_the_counter() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-charges-disagree-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize disagreement database");
+
+        let mut sale = test_sale_payload("invoice-disagree-1", "op-disagree-1", 2.0, 20.0);
+        sale["other_charges"] = serde_json::json!([{
+            "charge_name": "Crate charge",
+            "quantity": 4,
+            "rate": 40,
+            "amount": 160
+        }]);
+        sale["other_charges_amount"] = serde_json::json!(40);
+
+        let error = complete_local_pos_sale_at(&path, sale).expect_err("the bill must be refused");
+        assert!(error.contains("160.00") && error.contains("40.00"), "the refusal says both numbers: {error}");
+
+        let conn = Connection::open(&path).expect("inspect disagreement database");
+        let invoices: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_pos_invoices", [], |row| row.get(0))
+            .expect("invoice count");
+        assert_eq!(invoices, 0, "a refused bill writes nothing");
+        drop(conn);
+
+        // A free charge is not a broken one. Zero is a rate a shop can genuinely set.
+        let mut free = test_sale_payload("invoice-free-charge", "op-free-charge", 2.0, 20.0);
+        free["other_charges"] = serde_json::json!([{
+            "charge_name": "Delivery charge",
+            "measure_unit": "km",
+            "measurement": 3,
+            "quantity": 1,
+            "rate": 0,
+            "amount": 0
+        }]);
+        free["other_charges_amount"] = serde_json::json!(0);
+        complete_local_pos_sale_at(&path, free).expect("a free charge is a charge");
+
+        let conn = Connection::open(&path).expect("inspect free charge database");
+        let (rate, name): (f64, String) = conn
+            .query_row(
+                "SELECT rate, charge_name FROM local_sale_charges WHERE sale_id = 'invoice-free-charge'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("free charge line");
+        assert_eq!(rate, 0.0);
+        assert_eq!(name, "Delivery charge", "a free delivery is still on the bill by name");
+        drop(conn);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Editing a bill that carries charges.
+    ///
+    /// Three different things a caller can mean, and only one of them may quietly remove money from
+    /// a bill: an explicit empty list. An edit that simply does not mention charges is a caller that
+    /// does not know about them, and is refused rather than allowed to clear them.
+    #[test]
+    fn an_edit_may_change_or_clear_charges_but_never_forget_them() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-charges-edit-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize charge edit database");
+
+        let mut sale = test_sale_payload("invoice-edit-charges", "op-edit-charges-create", 2.0, 20.0);
+        sale["other_charges"] = serde_json::json!([{
+            "charge_type_id": "charge-crate",
+            "charge_name": "Crate charge",
+            "measure_unit": "kg",
+            "measurement": 10,
+            "quantity": 4,
+            "rate": 40,
+            "amount": 160
+        }]);
+        sale["other_charges_amount"] = serde_json::json!(160);
+        complete_local_pos_sale_at(&path, sale).expect("bill a charged sale");
+
+        let base_edit = |operation: &str| serde_json::json!({
+            "operation_id": operation,
+            "invoice_global_id": "invoice-edit-charges",
+            "branch_id": "1",
+            "device_id": "device-test",
+            "user_id": "1",
+            "reason": "Customer reduced quantity",
+            "customer": { "name": "Walk-in Customer", "mobile": "" },
+            "bill_date": "2026-06-16",
+            "bill_datetime": "2026-06-16T10:00",
+            "payment_mode": "CASH",
+            "gross_total": 10.0,
+            "item_discount_total": 0.0,
+            "bill_discount_total": 0.0,
+            "tax_total": 0.0,
+            "net_total": 10.0,
+            "items": [{
+                "item_global_id": "line-edit-charges-1",
+                "product_id": "product-test",
+                "product_name": "Test Product",
+                "lot_id": "lot-test",
+                "quantity": 1.0,
+                "unit": "KG",
+                "rate": 10.0,
+                "discount": 0.0,
+                "amount": 10.0
+            }],
+            "payments": [{ "posting_id": "posting-edit-charges-1", "mode": "CASH", "amount": 10.0 }]
+        });
+
+        let silent = base_edit("op-edit-charges-silent");
+        let error = edit_local_pos_sale_at(&path, silent).expect_err("a silent edit must be refused");
+        assert!(
+            error.contains("other charges"),
+            "the refusal has to say what it is protecting: {error}"
+        );
+
+        let conn = Connection::open(&path).expect("inspect after the refused edit");
+        let (lines, total): (i64, f64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM local_sale_charges WHERE sale_id = 'invoice-edit-charges'),
+                        other_charges_amount
+                   FROM local_pos_invoices WHERE id = 'invoice-edit-charges'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("charges after the refused edit");
+        assert_eq!(lines, 1, "a refused edit leaves the bill exactly as it was");
+        assert_eq!(total, 160.0);
+        drop(conn);
+
+        let mut changed = base_edit("op-edit-charges-changed");
+        changed["other_charges"] = serde_json::json!([{
+            "charge_type_id": "charge-crate",
+            "charge_name": "Crate charge",
+            "measure_unit": "kg",
+            "measurement": 20,
+            "quantity": 2,
+            "rate": 50,
+            "amount": 100
+        }]);
+        changed["other_charges_amount"] = serde_json::json!(100);
+        let edited = edit_local_pos_sale_at(&path, changed).expect("edit the charges");
+        assert_eq!(edited.invoice["invoice"]["other_charges_amount"], serde_json::json!(100.0));
+        assert_eq!(
+            edited.invoice["other_charges"].as_array().expect("edited charges").len(),
+            1,
+            "the replaced line must not sit beside the one it replaced"
+        );
+
+        let mut cleared = base_edit("op-edit-charges-cleared");
+        cleared["other_charges"] = serde_json::json!([]);
+        cleared["other_charges_amount"] = serde_json::json!(0);
+        let cleared = edit_local_pos_sale_at(&path, cleared).expect("clear the charges");
+        assert_eq!(cleared.invoice["invoice"]["other_charges_amount"], serde_json::json!(0.0));
+        assert!(
+            cleared.invoice["other_charges"].as_array().expect("cleared charges").is_empty(),
+            "an explicit empty list is the one way a charge comes off a bill"
+        );
+
         let _ = fs::remove_file(&path);
     }
 }
