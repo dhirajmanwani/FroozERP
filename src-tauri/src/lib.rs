@@ -1124,6 +1124,11 @@ fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceS
         .env("APP_VERSION", env!("CARGO_PKG_VERSION"))
         .env("APP_MODE", "LOCAL_SINGLE_DEVICE")
         .env("CLOUD_API_URL", cloud_api_url())
+        // The gateway used to derive this from %APPDATA% itself, which meant a disposable run --
+        // whose whole purpose is isolation -- still read and wrote the real machine's connectivity
+        // policy and audit log. `app_data_dir()` already honours FROOZERP_ISOLATED_SQLITE_DIR, so
+        // passing it through makes the gateway isolated by the same rule as everything else.
+        .env("FROOZERP_APP_DATA_DIR", app_data_dir())
         .env("FROOZERP_RUNTIME_MODE", "desktop-local")
         .env("FROOZERP_LOCAL_STORAGE", "sqlite")
         .env("FROOZERP_SQLITE_PATH", &sqlite_path)
