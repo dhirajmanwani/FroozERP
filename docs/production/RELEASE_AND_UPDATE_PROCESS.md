@@ -148,6 +148,73 @@ Each release adds its own rows here, because the generic list above cannot know 
 - Two devices, if two are available: an order taken on one appears on the other after a sync. This
   is the release's whole point and the part with no automated coverage at all.
 
+**Counters, stock scoping, distribution, order routing and other charges (1.0.71, 2026-09-02):**
+
+This is a 92-commit release. The generic list above is not enough on its own, and the two things it
+can least vouch for — a migration meeting a real database, and whether a screen renders — are most
+of what changed.
+
+*Before anything else*
+
+- **Turn the laptop's internet off for the billing checks.** A disposable profile seeded from live
+  carries the real device identity, so a test bill raised with the internet on syncs to the real
+  cloud and lands in the shop's real books. Nothing in the app stops that, and a fabricated sale in
+  the accounts is not undone by deleting a row. Sync is rehearsed separately, on a second machine.
+- The installed shop app should still open **while the rehearsal is running**. Since 1.0.71 a debug
+  build listens on 5051 and the installed app on 5000, so the two cannot fight. If the installed app
+  refuses to start with a port or version message, that separation did not work and nothing else
+  here matters.
+
+*Migrations against a seeded profile*
+
+- SQLite `023_customer_order_transfer` and `024_other_charges` apply without error. Both are
+  forward-only and additive, and neither has met a real database.
+- The terminal, read to the end. A migration that failed and was swallowed looks identical from the
+  UI to one that worked.
+
+*Counters and stock scoping — the core of the release*
+
+- The topbar names the counter this machine is standing at.
+- **Branches & Counters** opens as its own module and lists the counter created on 2026-09-02.
+- The till shows **only its own shelf**. With stock at more than one place, a cashier must not be
+  able to select a lot belonging to another branch. This is the release's whole point.
+- Summary tiles and the table below them agree. A non-zero stock value beside `Products: 0` is a
+  bug, not an empty result.
+
+*Distribution*
+
+- **Stock Distribution** opens. Send stock from one place to another: the sender's count goes down,
+  the receiver's goes up, and the receiving lot carries the sender's cost.
+- Receiving asks for quantities. "Receive in full" alone used to be refused by the server.
+- One branch requests stock from another by product and quantity; the holding branch chooses which
+  crates to send when it approves.
+
+*Purchases and orders*
+
+- Purchase Entry asks **where the goods were received** and honours the answer.
+- An order with nobody handling it appears in the unassigned queue, and assigning it moves it.
+
+*Other charges — new, and money*
+
+- Settings → **Other Charges**: create a charge, name its unit, add slabs.
+- POS: 12 km on a 10/15 km delivery charges the **15 km** rate. Four 10 kg crates is four times the
+  10 kg rate, not one 4 kg crate.
+- A measurement past the last slab shows a refusal naming both numbers — never a price, never zero.
+- Taxable Amount and Mandi Tax are **unchanged** by any charge; only Net Payable moves.
+- A bill carrying a charge can be edited, and the charge survives the edit.
+
+*Appearance*
+
+- Light, Dark and System all render. No unreadable text on either ground.
+- The logo is not clipped and does not double.
+- Keyboard shortcuts and the command palette open and navigate.
+
+*And one thing to look for that has nothing to do with a feature*
+
+- Technical details shows **no "⚠ Running from source" row** once the app has been installed to a
+  folder of its own. On the maintainer's laptop today it will show one, because `F:\FroozERP` is
+  both the install and the checkout. That warning disappearing is how the relocation is confirmed.
+
 ### Only then
 
 A rehearsal that found nothing is the precondition for **Signing And Publishing** below. A rehearsal
