@@ -25,6 +25,7 @@ import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
 const require = createRequire(new URL("../backend/package.json", import.meta.url));
+const { classifyStoredPassword, PASSWORD_FORMATS } = require("../backend/passwordHash");
 
 const pad = (value, width) => String(value ?? "").padEnd(width);
 const date = (value) => (value ? new Date(value).toISOString().slice(0, 10) : "—");
@@ -54,11 +55,25 @@ export const collectSetup = async (client) => {
        WHERE s.active = TRUE
        ORDER BY s.user_id, s.operational_location_id`
   );
+  // The password column is read, classified by shape, and never returned. `classifyStoredPassword`
+  // compares nothing, so this cannot confirm a guess -- and the hash itself must not travel further
+  // than the line that classifies it.
+  const users = await client.query(
+      `SELECT u.id, u.username, u.full_name, u.active, u.password_hash, u.locked_until, u.last_login_at,
+              r.role_name
+       FROM users u
+       LEFT JOIN roles r ON r.id = u.role_id
+       ORDER BY u.id`
+  );
   return {
     branches: branches.rows,
     counters: counters.rows,
     devices: devices.rows,
     staff: staff.rows,
+    users: users.rows.map(({ password_hash, ...row }) => ({
+      ...row,
+      password_format: classifyStoredPassword(password_hash),
+    })),
   };
 };
 
@@ -69,7 +84,29 @@ export const collectSetup = async (client) => {
  * nothing is posted to them" are different situations that look the same in a table, and getting
  * that distinction wrong is what sends somebody to the wrong command.
  */
-export const nextStep = ({ counters, devices }) => {
+/**
+ * Accounts that would stop being able to sign in if the current release went live.
+ *
+ * A-5 retired every password format but scrypt: a row still holding the old unsalted digest, or a
+ * plaintext value from before the migration, is refused as `PASSWORD_RESET_REQUIRED` rather than
+ * being verified. That is right, and it is also invisible until somebody tries to sign in -- which,
+ * after a deploy that reaches every machine at once, means finding out at the counter.
+ *
+ * Kept separate from the printing so it can be asserted on, and so the caller can treat "somebody
+ * would be locked out" as the headline rather than as a row in a table.
+ */
+export const lockedOutByRelease = (users = []) =>
+  users.filter((row) => row.active !== false && row.password_format !== "SCRYPT");
+
+export const nextStep = ({ counters, devices, users = [] }) => {
+  // Ordered before the counter advice on purpose: a shop with perfect counters and nobody able to
+  // sign in is not a shop that is set up.
+  const lockedOut = lockedOutByRelease(users);
+  if (lockedOut.length) {
+    return `${lockedOut.length} active account(s) would be unable to sign in after this release: `
+      + `${lockedOut.map((row) => row.username).join(", ")}. `
+      + "Reset each with scripts/reset-password.mjs BEFORE deploying, not after.";
+  }
   const live = counters.filter((row) => row.active !== false);
   if (live.length === 0) {
     const approved = devices.filter((row) => String(row.status).toUpperCase() === "APPROVED");
@@ -124,6 +161,18 @@ const render = (setup) => {
     lines.push(`  ${pad(row.username || `user ${row.user_id}`, 20)}`
       + `${pad(counterName.get(Number(row.operational_location_id)) || `counter ${row.operational_location_id}`, 26)}`
       + `${row.is_default ? "(their default)" : ""}`);
+  }
+
+  const users = setup.users || [];
+  lines.push("", `SIGN-IN (${users.length})`);
+  lines.push(`  ${pad("username", 20)}${pad("role", 16)}${pad("password", 16)}${pad("active", 8)}last signed in`);
+  if (!users.length) lines.push("  none");
+  for (const row of users) {
+    // The format is spelled in words an operator can act on. "LEGACY_SHA256" names an algorithm;
+    // "needs reset" names what to do about it.
+    const password = row.password_format === PASSWORD_FORMATS.SCRYPT ? "ok" : "NEEDS RESET";
+    lines.push(`  ${pad(row.username, 20)}${pad(row.role_name || "—", 16)}${pad(password, 16)}`
+      + `${pad(row.active === false ? "no" : "yes", 8)}${date(row.last_login_at)}`);
   }
 
   lines.push("", `NEXT: ${nextStep(setup)}`, "");

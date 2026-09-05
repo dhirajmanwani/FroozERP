@@ -126,6 +126,33 @@ const cleanText = (value) => (typeof value === "string" ? value.trim() : "");
  */
 const LEGACY_SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
+/**
+ * What shape a stored password is in, without checking any password against it.
+ *
+ * `verifyPassword` already reports the format, but only as a by-product of an attempt to log in --
+ * it needs a candidate password, and for a scrypt row it does the full key derivation before it can
+ * say anything. Neither is acceptable for the question an operator actually needs answered before a
+ * deployment: *would anybody be locked out by this release?*
+ *
+ * A-5 retired every format but scrypt. A row still holding the unsalted SHA-256 digest, or a
+ * plaintext value from before the migration, no longer authenticates at all -- it is refused as
+ * `PASSWORD_RESET_REQUIRED`, with `scripts/reset-password.mjs` as the way back. That is correct, and
+ * it is also silent until somebody tries to sign in. Finding out at the counter, after a deploy that
+ * reaches every machine at once, is the worst possible moment.
+ *
+ * Shape only, deliberately. Nothing here compares against a supplied password, so this cannot
+ * confirm a guess to whoever called it, and it is cheap enough to run over every row.
+ */
+const classifyStoredPassword = (storedHash) => {
+  const stored = cleanText(storedHash);
+  if (!stored) return PASSWORD_FORMATS.EMPTY;
+  if (stored.startsWith(`${PREFIX}$`)) {
+    return decodeHash(stored) ? PASSWORD_FORMATS.SCRYPT : PASSWORD_FORMATS.UNKNOWN;
+  }
+  if (LEGACY_SHA256_PATTERN.test(stored)) return PASSWORD_FORMATS.LEGACY_SHA256;
+  return PASSWORD_FORMATS.UNRECOGNIZED;
+};
+
 const encodeHash = (salt, derived, params = SCRYPT_PARAMS) =>
   [
     PREFIX,
@@ -271,6 +298,7 @@ const verifyPassword = async (password, storedHash) => {
 };
 
 module.exports = {
+  classifyStoredPassword,
   hashPassword,
   hashPasswordSync,
   verifyPassword,

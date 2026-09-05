@@ -93,3 +93,44 @@ test("the queries do not run concurrently on one client", async () => {
     .join("\n");
   assert.doesNotMatch(code, /Promise\.all/, "one client, one query at a time");
 });
+
+test("an account that could not sign in after this release is the headline, not a footnote", async () => {
+  // A-5 retired every password format but scrypt. A row still holding the old unsalted digest is
+  // refused as PASSWORD_RESET_REQUIRED rather than verified -- correct, and invisible until
+  // somebody tries to sign in. After a deploy that reaches every machine at once, that moment is
+  // at the counter, mid-sale.
+  const { nextStep, lockedOutByRelease } = await loadScript();
+  const users = [
+    { username: "dhirajmanwani", active: true, password_format: "SCRYPT" },
+    { username: "radhika", active: true, password_format: "LEGACY_SHA256" },
+    { username: "old-staff", active: false, password_format: "UNRECOGNIZED" },
+  ];
+
+  assert.deepEqual(lockedOutByRelease(users).map((row) => row.username), ["radhika"],
+    "inactive accounts cannot be locked out of anything, and must not raise a false alarm");
+
+  const line = nextStep({ counters: [COUNTER], devices: [{ ...APPROVED, posted_counter_id: 1 }], users });
+  assert.match(line, /radhika/, "it must name who");
+  assert.match(line, /reset-password\.mjs/, "and the command that fixes it");
+  assert.match(line, /BEFORE deploying/, "and that the order matters");
+});
+
+test("a healthy sign-in list does not shout, and does not hide the counter advice", async () => {
+  const { nextStep, lockedOutByRelease } = await loadScript();
+  const users = [{ username: "dhirajmanwani", active: true, password_format: "SCRYPT" }];
+  assert.deepEqual(lockedOutByRelease(users), []);
+  assert.match(
+    nextStep({ counters: [COUNTER], devices: [APPROVED], users }),
+    /no machine is posted/,
+    "with nobody locked out, the ordinary next step must still come through",
+  );
+});
+
+test("no password hash leaves the row it was read from", async () => {
+  // The script reads password_hash to classify it. That value must not survive into anything the
+  // caller can print, copy into a diagnostics paste, or forward to somebody helping.
+  const source = fs.readFileSync(SCRIPT, "utf8");
+  assert.match(source, /classifyStoredPassword\(password_hash\)/, "it must classify by shape");
+  assert.match(source, /\{ password_hash, \.\.\.row \}/, "and drop the hash in the same expression");
+  assert.doesNotMatch(source, /password_hash:/, "no mapped field may carry it forward");
+});
