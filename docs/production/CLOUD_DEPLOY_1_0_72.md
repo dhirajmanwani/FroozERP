@@ -34,7 +34,16 @@ scrypt, so resetting first leaves no window where nobody can sign in.
 
 Re-check with `node scripts/show-setup.mjs` if any account is added before the merge.
 
-### 2. `DEVICE_SESSION_SECRET` on Railway — **check this or the cloud goes down**
+### 2. `DEVICE_SESSION_SECRET` on Railway — confirmed present 2026-09-05
+
+**Already satisfied, and provable without opening the dashboard.** `sessionSecret.js` is on `main`,
+so the deployed 1.0.64 runs this same check with the same `exposed` condition, and its health
+endpoint reports `deployment_type: "cloud"`. A missing or short key would have exited the process at
+startup, and `/api/health` would answer nothing at all. It answers — so the variable is set and is
+at least 32 characters.
+
+Kept below for the next person, and for the next deploy, because the failure it describes is silent
+until it is total.
 
 `backend/sessionSecret.js` refuses to start a *cloud* deployment whose signing key is missing, too
 short (under 32 characters), or borrowed from a database credential. `server.js` calls
