@@ -89,3 +89,31 @@ test("App.jsx resolves the API mode before the connectivity authority and has no
   assert.ok(modeIndex > 0 && authorityIndex > modeIndex, "API_MODE must be resolved before the connectivity authority");
   assert.match(appSource.slice(authorityIndex, authorityIndex + 400), /apiMode: API_MODE,/);
 });
+
+test("a saved mode is ignored on the desktop, because the control that wrote it is gone", () => {
+  // The App Mode dropdown was removed on 2026-09-03. A mode it had saved then became unreachable:
+  // the maintainer's own machine carried `mode: "LOCAL_ONLY"` from an old "Save Mode" press, which
+  // pinned the app to local-only with no screen left that could change it back.
+  //
+  // Ignoring the rung is self-healing -- nothing has to be migrated or rewritten -- and it is only
+  // safe because the desktop's unconfigured default is a real, working mode.
+  assert.deepEqual(
+    resolveApiMode({ savedMode: "LOCAL_ONLY", desktopRuntime: true }),
+    { mode: "LOCAL_SINGLE_DEVICE", source: "unconfigured-default", configured: false },
+  );
+
+  // Build-time configuration still wins over the ignored saved value, so a deliberately built
+  // installation is unaffected.
+  assert.equal(
+    resolveApiMode({ savedMode: "LOCAL_ONLY", envMode: "CLOUD_PRODUCTION", desktopRuntime: true }).mode,
+    "CLOUD_PRODUCTION",
+  );
+});
+
+test("a browser still honours a saved mode", () => {
+  // There is no shell there to know better, and a hosted deployment is configured deliberately.
+  assert.deepEqual(
+    resolveApiMode({ savedMode: "BRANCH_LAN_SERVER", envMode: "HYBRID", desktopRuntime: false }),
+    { mode: "BRANCH_LAN_SERVER", source: "saved-config", configured: true },
+  );
+});

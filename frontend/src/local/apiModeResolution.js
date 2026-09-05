@@ -67,8 +67,16 @@ export const resolveApiMode = ({
   desktopRuntime = false,
 } = {}) => {
   if (railwayProductionHost) return { mode: "CLOUD_PRODUCTION", source: "railway-production-host", configured: true };
+  // The saved rung existed to carry the App Mode dropdown's choice. That control is gone -- the app
+  // decides for itself whether to use the cloud now -- so on the desktop a saved mode is a decision
+  // nobody can revisit, and one machine was already stuck behind it: a `mode: "LOCAL_ONLY"` written
+  // by the old "Save Mode" button pinned the app to local-only with no screen left that could
+  // change it back. Ignoring it here is self-healing and needs no migration write.
+  //
+  // A browser keeps the rung: a hosted deployment is still configured deliberately, and there is no
+  // desktop shell there to know better.
   const rungs = [
-    ["saved-config", savedMode],
+    ...(desktopRuntime ? [] : [["saved-config", savedMode]]),
     ["build-env", envMode],
     ["runtime-global", globalMode],
   ];

@@ -323,14 +323,38 @@ const DEV_BACKEND_PORT = "5051";
 const LOCAL_BACKEND_PORT = import.meta.env.DEV ? DEV_BACKEND_PORT : SHOP_BACKEND_PORT;
 
 const isLocalOnlyConnectivitySelected = () => startupConnectivityAuthority.isLocalOnly();
-const LOCAL_API_URL = normalizeApiBase(
-  SAVED_API_CONFIG.localApiUrl ||
-  import.meta.env.VITE_LOCAL_API_URL ||
-  window.__FROOZERP_LOCAL_API_URL__ ||
-  (isDesktopShell()
-    ? `http://127.0.0.1:${LOCAL_BACKEND_PORT}`
-    : `${window.location.protocol}//${window.location.hostname}:${LOCAL_BACKEND_PORT}`)
-);
+/**
+ * Where this computer's own backend is.
+ *
+ * ## Why nothing may override this on the desktop
+ *
+ * A saved `localApiUrl` used to win here, and on 2026-09-03 that turned a rehearsal into the exact
+ * accident `localBackendPort.test.mjs` exists to prevent. The disposable profile's backend came up
+ * healthy on 5051, and the app called **5000** — because `http://127.0.0.1:5000` was sitting in
+ * saved settings, written there by the old "Save Mode" button, whose `saveApiConfig` had that port
+ * as a literal fallback.
+ *
+ * It presented as "Local service could not start", which was lucky. The shop's app happened to be
+ * closed, so there was nothing on 5000 to answer. Had it been open, the rehearsal would have
+ * reached **the shop's backend** and billed into live data while reporting a sandbox — which is
+ * word for word the failure that file was written about, and it got past it because that test
+ * compares the two *constants* and never checks which address is actually used.
+ *
+ * A saved address outlives the build that wrote it. A port does not: the desktop shell starts this
+ * backend itself and therefore knows exactly where it is, so on the desktop the build decides and
+ * nothing else gets a vote — not saved settings, not `VITE_LOCAL_API_URL` (which `.env.example`
+ * still ships pointing at 5000), not a runtime global.
+ *
+ * In a browser there is no shell starting anything, so the old precedence stands there.
+ */
+const LOCAL_API_URL = isDesktopShell()
+  ? `http://127.0.0.1:${LOCAL_BACKEND_PORT}`
+  : normalizeApiBase(
+    SAVED_API_CONFIG.localApiUrl ||
+    import.meta.env.VITE_LOCAL_API_URL ||
+    window.__FROOZERP_LOCAL_API_URL__ ||
+    `${window.location.protocol}//${window.location.hostname}:${LOCAL_BACKEND_PORT}`
+  );
 const BRANCH_LAN_API_URL = normalizeApiBase(
   SAVED_API_CONFIG.branchLanApiUrl ||
   import.meta.env.VITE_BRANCH_LAN_API_URL ||

@@ -145,3 +145,36 @@ test("the shell's content policy lets a development build reach its own backend"
     "and must not be widened to the development port -- the shipped app never talks to it",
   );
 });
+
+test("nothing saved or configured can point the desktop at another port", () => {
+  // The gap this file had, and what it cost.
+  //
+  // Every test above compares the two *constants*. None of them checked which address is actually
+  // used -- and on 2026-09-03 a rehearsal called 5000 while its own backend listened on 5051,
+  // because `http://127.0.0.1:5000` was sitting in saved settings, written there by the old "Save
+  // Mode" button whose `saveApiConfig` carried that port as a literal fallback.
+  //
+  // It surfaced as "Local service could not start", which was luck: the shop's app was closed, so
+  // nothing answered on 5000. Had it been open, the disposable run would have reached the shop's
+  // backend and billed into live business data -- the failure described at the top of this file,
+  // arrived at through a door the file never looked at.
+  //
+  // So the desktop branch must take the port from the build and nothing else. `.env.example` still
+  // ships `VITE_LOCAL_API_URL=http://127.0.0.1:5000`, which is a second door to the same place.
+  assert.match(
+    APP,
+    /const LOCAL_API_URL = isDesktopShell\(\)\s*\n\s*\? `http:\/\/127\.0\.0\.1:\$\{LOCAL_BACKEND_PORT\}`/,
+    "the desktop address must be built from LOCAL_BACKEND_PORT with no override ahead of it",
+  );
+
+  // The precedence chain must not reappear on the desktop side of that branch. Checked by position:
+  // a saved value may still win in a browser, where no shell is starting anything.
+  const declaration = APP.slice(
+    APP.indexOf("const LOCAL_API_URL = isDesktopShell()"),
+    APP.indexOf("const BRANCH_LAN_API_URL"),
+  );
+  const desktopBranch = declaration.slice(0, declaration.indexOf(": normalizeApiBase("));
+  assert.doesNotMatch(desktopBranch, /SAVED_API_CONFIG/, "saved settings must not reach the desktop address");
+  assert.doesNotMatch(desktopBranch, /VITE_LOCAL_API_URL/, "nor a build-time URL override");
+  assert.match(declaration, /SAVED_API_CONFIG\.localApiUrl/, "the browser branch keeps the old precedence");
+});
