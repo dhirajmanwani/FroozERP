@@ -28,6 +28,8 @@ import {
   liveProfileDir,
   seedDisposableProfile,
   webviewDataDir,
+  devBackendBinary,
+  clearOrphanedDevBackends,
 } from "../../../scripts/run-disposable-app.mjs";
 
 test("a path inside the live application data directory is refused", () => {
@@ -292,4 +294,46 @@ test("the launcher actually hands that folder to the child, and prints it", () =
   // The banner is the only thing a person reads before trusting the run, so the claim it already
   // makes about live data must still be there beside the new line.
   assert.match(script, /Live app data {2}: untouched \(read only, never written\)/);
+});
+
+test("a leftover development backend is scoped to this repository's own debug build", () => {
+  // The one thing that must never widen. A running *shop* backend lives in the install directory,
+  // and since the port split the two are meant to run side by side -- so matching by process name
+  // alone would let this script stop the shop's till mid-sale.
+  const binary = devBackendBinary("F:\\FroozERP");
+  assert.ok(binary.includes(path.join("src-tauri", "target", "debug", "binaries")), "debug build only");
+  assert.ok(binary.endsWith("froozerp-backend-node.exe"));
+
+  const script = fs.readFileSync(new URL("../../../scripts/run-disposable-app.mjs", import.meta.url), "utf8");
+  assert.match(script, /\$_\.ExecutablePath -eq/, "processes must be matched on full path, not on name");
+  assert.doesNotMatch(script, /Stop-Process -Name/, "never by name -- that would reach the installed app");
+});
+
+test("nothing is stopped off Windows, and nothing is stopped silently", () => {
+  // Killing processes is the kind of help that must announce itself. A script that does it quietly
+  // is worse than the failure it prevents.
+  const said = [];
+  const result = clearOrphanedDevBackends({
+    repoRoot: "/repo",
+    platform: "linux",
+    out: { write: (line) => said.push(line) },
+  });
+  assert.equal(result.checked, false);
+  assert.deepEqual(result.killed, []);
+  assert.deepEqual(said, [], "and it must not narrate anything it did not do");
+
+  const script = fs.readFileSync(new URL("../../../scripts/run-disposable-app.mjs", import.meta.url), "utf8");
+  assert.match(script, /Leftover development backend/, "it must name what it found");
+  assert.match(script, /out\.write\(`  \$\{binary\}/, "and the exact path it matched");
+});
+
+test("the launcher clears leftovers before it builds, not after", () => {
+  // After the build is useless: the build is the step that fails. `os error 32` from a cargo build
+  // script names a path and nothing else, which is why this cost three debugging sessions -- one of
+  // them the thirteen days the shop could not bill.
+  const script = fs.readFileSync(new URL("../../../scripts/run-disposable-app.mjs", import.meta.url), "utf8");
+  const clears = script.indexOf("clearOrphanedDevBackends({ repoRoot });");
+  const spawns = script.indexOf("spawn(process.execPath, [cliEntry");
+  assert.ok(clears > 0 && spawns > 0, "both steps must exist");
+  assert.ok(clears < spawns, "leftovers must be cleared before the Tauri CLI is started");
 });

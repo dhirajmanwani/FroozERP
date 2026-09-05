@@ -68,7 +68,7 @@
  *   FROOZERP_DISPOSABLE_PROFILE=test FROOZERP_DISPOSABLE_SEED=live npm run app:disposable
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -272,6 +272,84 @@ export const seedDisposableProfile = ({ sourceDir, destinationDir, fileSystem = 
  */
 export const webviewDataDir = (disposableDir) => path.join(disposableDir, "webview");
 
+/**
+ * The development backend binary a run of this script starts, and therefore locks.
+ *
+ * Scoped to the repository's own `target/debug` copy on purpose. The installed shop app runs its
+ * backend from the install directory, and nothing here may ever reach that: the point is to clear
+ * this tool's own leftovers, not to police the machine.
+ */
+export const devBackendBinary = (repoRoot) =>
+  path.join(repoRoot, "src-tauri", "target", "debug", "binaries", "froozerp-backend-node.exe");
+
+/**
+ * Kill a previous run's backend, which is still holding the binary the build is about to replace.
+ *
+ * ## Why this is needed at all
+ *
+ * Closing the app window does not stop the backend. On Windows a child process is not killed with
+ * its parent, and stopping `tauri dev` with Ctrl+C kills the shell abruptly enough that its
+ * cleanup never runs. The Node process it started keeps running, keeps the port, and keeps an open
+ * handle on its own executable.
+ *
+ * The next build then fails inside a cargo build script with `os error 32`, "The process cannot
+ * access the file because it is being used by another process" -- naming a path and nothing else.
+ * Nothing in that message says another copy of this app's backend is running, which is why it has
+ * now cost three separate debugging sessions, one of them thirteen days long: on 2026-08-20 an
+ * orphan held port 5000 until 2026-09-02 and the shop could not bill.
+ *
+ * ## Why killing is the right response, and what stops it going wrong
+ *
+ * The process is unambiguously this tool's own leftover: it is identified by its executable path
+ * being the repository's `target/debug` copy, which only a development build ever runs. A running
+ * *shop* backend lives elsewhere and is never matched. Nothing is killed silently -- every process
+ * is named on stdout before and after -- because a script that kills processes without saying so
+ * is worse than the problem it solves.
+ *
+ * Advisory: any failure here is reported and the run continues. If the leftover really is holding
+ * the file, the build fails immediately afterwards with its own message, which is no worse than
+ * today; and being unable to enumerate processes must not be a reason to refuse to start.
+ */
+export const clearOrphanedDevBackends = ({ repoRoot, platform = process.platform, out = process.stdout } = {}) => {
+  if (platform !== "win32") return { checked: false, reason: "not Windows", killed: [] };
+  const binary = devBackendBinary(repoRoot);
+
+  const listed = spawnSync("powershell.exe", [
+    "-NoProfile", "-NonInteractive", "-Command",
+    // Matched on the full executable path, not the process name. Two builds of FroozERP can be
+    // running at once by design since the port split, and only this one is ours to stop.
+    `Get-CimInstance Win32_Process -Filter "Name='froozerp-backend-node.exe'" `
+    + `| Where-Object { $_.ExecutablePath -eq '${binary.replace(/'/g, "''")}' } `
+    + `| ForEach-Object { $_.ProcessId }`,
+  ], { encoding: "utf8" });
+
+  if (listed.error || listed.status !== 0) {
+    out.write(`  Note: could not check for leftover development backends (${listed.error?.message || `exit ${listed.status}`}).\n`);
+    return { checked: true, reason: "enumeration failed", killed: [] };
+  }
+
+  const pids = String(listed.stdout || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (pids.length === 0) return { checked: true, reason: "none running", killed: [] };
+
+  out.write(`\n  Leftover development backend${pids.length === 1 ? "" : "s"} still running: PID ${pids.join(", ")}\n`);
+  out.write(`  ${binary}\n`);
+  out.write("  Stopping them -- they hold this file and the build cannot replace it.\n");
+
+  const stopped = spawnSync("powershell.exe", [
+    "-NoProfile", "-NonInteractive", "-Command",
+    `Stop-Process -Id ${pids.join(",")} -Force`,
+  ], { encoding: "utf8" });
+
+  if (stopped.error || stopped.status !== 0) {
+    out.write(`  Could not stop them: ${stopped.error?.message || stopped.stderr || `exit ${stopped.status}`}\n`);
+    out.write("  Stop them by hand and run this again.\n\n");
+    return { checked: true, reason: "stop failed", killed: [] };
+  }
+
+  out.write(`  Stopped.\n\n`);
+  return { checked: true, reason: "stopped", killed: pids };
+};
+
 export const tauriCliEntry = (repoRoot) =>
   path.join(repoRoot, "frontend", "node_modules", "@tauri-apps", "cli", "tauri.js");
 
@@ -307,6 +385,8 @@ const main = () => {
       "",
     ].join("\n"),
   );
+
+  clearOrphanedDevBackends({ repoRoot });
 
   const cliEntry = tauriCliEntry(repoRoot);
   if (!fs.existsSync(cliEntry)) {
