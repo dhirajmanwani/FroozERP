@@ -155,19 +155,58 @@ const main = async () => {
     if (password !== confirmation) fail("Those did not match. Nothing was changed.");
 
     const hashed = await hashPassword(password);
+
+    // Only the columns this database actually has.
+    //
+    // The `users` table gains its hardening columns from the backend's startup bootstrap
+    // (`CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`), not from a
+    // versioned migration -- so a database whose deployed backend predates auth-hardening does not
+    // have `failed_login_attempts`, `session_revocation_version` and the rest, and naming them made
+    // this command fail outright with `column ... does not exist`.
+    //
+    // That failure landed in exactly the situation this command exists for. A shop whose Owner
+    // holds a retired hash cannot sign in; the deploy that would add the columns is the same deploy
+    // that stops the retired hash authenticating; and the tool meant to break that circle refused
+    // to run because the circle had not been broken yet. An ops backstop that only works after the
+    // thing it rescues you from has already happened is not a backstop.
+    //
+    // The password itself is not optional -- without `password_hash` there is nothing to do, and a
+    // database without that column is not a FroozERP database.
+    const present = new Set(
+      (await pool.query(
+        `SELECT column_name FROM information_schema.columns
+          WHERE table_schema = current_schema() AND table_name = 'users'`
+      )).rows.map((row) => row.column_name)
+    );
+    if (!present.has("password_hash")) fail("This database has no users.password_hash column. Nothing was changed.");
+
+    const optional = [
+      ["password_changed_at", "password_changed_at = CURRENT_TIMESTAMP"],
+      ["session_revocation_version", "session_revocation_version = COALESCE(session_revocation_version, 0) + 1"],
+      ["force_password_change", "force_password_change = FALSE"],
+      ["failed_login_attempts", "failed_login_attempts = 0"],
+      ["last_failed_login_at", "last_failed_login_at = NULL"],
+      ["locked_until", "locked_until = NULL"],
+      ["updated_at", "updated_at = CURRENT_TIMESTAMP"],
+    ];
+    const applied = optional.filter(([column]) => present.has(column));
+    const skipped = optional.filter(([column]) => !present.has(column)).map(([column]) => column);
+
     await pool.query(
-      `UPDATE users
-          SET password_hash = $2,
-              password_changed_at = CURRENT_TIMESTAMP,
-              session_revocation_version = COALESCE(session_revocation_version, 0) + 1,
-              force_password_change = FALSE,
-              failed_login_attempts = 0,
-              last_failed_login_at = NULL,
-              locked_until = NULL,
-              updated_at = CURRENT_TIMESTAMP
+      `UPDATE users SET password_hash = $2${applied.map(([, clause]) => `, ${clause}`).join("")}
         WHERE id = $1`,
       [user.id, hashed],
     );
+
+    // Named rather than passed over. Skipping `session_revocation_version` means existing sessions
+    // are NOT ended, and the operator must know that -- silently doing less than the docblock
+    // promises is how somebody believes an account is secured when it is not.
+    if (skipped.length) {
+      console.log(`\n  Note: this database has an older users table, so these were not touched: ${skipped.join(", ")}.`);
+      if (skipped.includes("session_revocation_version")) {
+        console.log("  Sessions already issued for this account were NOT ended -- that column does not exist here yet.");
+      }
+    }
 
     // Best-effort: the reset has already happened, and failing to record it must not leave the
     // operator believing it did not. Reported rather than swallowed, so a missing trail is known.
@@ -180,7 +219,9 @@ const main = async () => {
     });
 
     console.log(`\n  Password set for ${user.username}.`);
-    console.log("  Every session that account already had has been ended; it must sign in again.\n");
+    console.log(present.has("session_revocation_version")
+      ? "  Every session that account already had has been ended; it must sign in again.\n"
+      : "  It can sign in with the new password now.\n");
   } finally {
     await pool.end().catch(() => {});
   }
