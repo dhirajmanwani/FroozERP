@@ -99,3 +99,58 @@ test("no script that connects to a database is missing from the list", () => {
     `these scripts open a database connection but are not checked: ${unchecked.join(", ")}`,
   );
 });
+
+/**
+ * The rescue command must run against the database as it is, not as the release will leave it.
+ *
+ * `users` gains its hardening columns from the backend's startup bootstrap, not from a versioned
+ * migration. So a database whose deployed backend predates auth-hardening has no
+ * `failed_login_attempts`, no `session_revocation_version`, and naming them in the UPDATE made this
+ * command fail outright with `column ... does not exist`.
+ *
+ * It failed in precisely the situation it exists for. The Owner held a retired hash and could not
+ * sign in; the deploy that adds those columns is the same deploy that stops the retired hash
+ * authenticating; and the tool meant to break that circle refused to run because the circle was
+ * still closed. Reported by the maintainer on 2026-09-05, against the real production database,
+ * with one Owner account and no other way in.
+ */
+test("reset-password works on a users table that predates auth hardening", () => {
+  const source = read("reset-password.mjs");
+
+  assert.match(source, /information_schema\.columns/, "it must ask which columns exist");
+  assert.match(source, /table_name = 'users'/);
+  assert.match(
+    source,
+    /UPDATE users SET password_hash = \$2\$\{applied/,
+    "the SET clause must be built from the columns that are actually there",
+  );
+
+  // The one column that is not optional: without it there is nothing to write.
+  assert.match(source, /if \(!present\.has\("password_hash"\)\) fail\(/);
+
+  // Every hardening column must be in the optional list rather than hardcoded into the statement.
+  for (const column of [
+    "password_changed_at",
+    "session_revocation_version",
+    "force_password_change",
+    "failed_login_attempts",
+    "last_failed_login_at",
+    "locked_until",
+  ]) {
+    assert.match(source, new RegExp(`\\["${column}",`), `${column} must be optional`);
+  }
+});
+
+test("doing less than promised is said out loud", () => {
+  // Skipping `session_revocation_version` means existing sessions are NOT ended. The docblock
+  // promises they are. Silently doing less is how somebody believes an account is secured when it
+  // is not -- worse than the original failure, because it leaves no error to notice.
+  const source = read("reset-password.mjs");
+  assert.match(source, /so these were not touched: \$\{skipped\.join/, "skipped columns must be named");
+  assert.match(source, /Sessions already issued for this account were NOT ended/);
+  assert.match(
+    source,
+    /present\.has\("session_revocation_version"\)\s*\?\s*"  Every session/,
+    "the closing line must not claim sessions ended when the column is absent",
+  );
+});
