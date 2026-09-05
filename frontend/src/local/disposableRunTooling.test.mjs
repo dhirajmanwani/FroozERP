@@ -14,6 +14,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -26,6 +27,7 @@ import {
   PROFILE_DATABASE,
   liveProfileDir,
   seedDisposableProfile,
+  webviewDataDir,
 } from "../../../scripts/run-disposable-app.mjs";
 
 test("a path inside the live application data directory is refused", () => {
@@ -258,4 +260,36 @@ test("the live profile path matches where the app actually stores its database",
   assert.match(liveProfileDir({ APPDATA: "C:\\Users\\x\\AppData\\Roaming" }, "win32"), /com\.srtcompany\.froozerp$/);
   assert.match(liveProfileDir({}, "linux"), /com\.srtcompany\.froozerp$/);
   assert.equal(PROFILE_DATABASE, "froozerp-local.sqlite3");
+});
+
+test("a disposable run gets its own browser storage, not the installed app's", () => {
+  // The gap that produced today's tangle. This script isolated the database and nothing else, so
+  // `localStorage` -- `froozerp.apiConfig`, the connectivity mode -- was shared with the installed
+  // app. A rehearsal inherited a saved `localApiUrl` of `http://127.0.0.1:5000` written by a "Save
+  // Mode" press months earlier, and called the shop's port while its own backend sat on 5051.
+  //
+  // It read as "Local service could not start" only because the shop's app was closed. Open, and
+  // the rehearsal would have reached the shop's backend and billed into live business data.
+  const dir = resolveDisposableDir({ root: "/tmp/froozerp-disposable", profile: "rehearsal" });
+  const webview = webviewDataDir(dir);
+
+  assert.ok(webview.startsWith(dir + path.sep), "browser storage must live inside the disposable profile");
+  assert.equal(isLiveAppDataPath(webview), false, "and must never resolve into live app data");
+});
+
+test("the launcher actually hands that folder to the child, and prints it", () => {
+  // Source-text, because the alternative is launching a Windows webview from a Linux gate. The two
+  // things that can silently rot are the variable not being passed at all, and it being passed a
+  // path computed some other way than the one asserted above.
+  const script = fs.readFileSync(new URL("../../../scripts/run-disposable-app.mjs", import.meta.url), "utf8");
+  assert.match(
+    script,
+    /WEBVIEW2_USER_DATA_FOLDER: webviewDataDir\(dir\),/,
+    "the child process must be given the isolated webview folder",
+  );
+  assert.match(script, /Browser storage: \$\{webviewDataDir\(dir\)\}/, "and the run banner must say where it is");
+
+  // The banner is the only thing a person reads before trusting the run, so the claim it already
+  // makes about live data must still be there beside the new line.
+  assert.match(script, /Live app data {2}: untouched \(read only, never written\)/);
 });

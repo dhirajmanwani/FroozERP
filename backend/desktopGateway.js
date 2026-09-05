@@ -27,9 +27,30 @@ const cloudNotConfiguredError = (route) => {
   error.route = route;
   return error;
 };
-const APP_DATA = process.env.APPDATA
-  ? path.join(process.env.APPDATA, "com.srtcompany.froozerp")
-  : path.join(os.homedir(), "AppData", "Roaming", "com.srtcompany.froozerp");
+/**
+ * Where this gateway keeps its policy file and audit log.
+ *
+ * The shell passes `FROOZERP_APP_DATA_DIR`, which for an ordinary install is the real app-data
+ * directory and for a disposable run is the isolated one. Deriving it from `%APPDATA%` was the only
+ * way before, and it left a hole: `run-disposable-app.mjs` isolates the *database* -- and says so at
+ * length -- but the gateway went on reading and writing the real machine's
+ * `cloud-network-policy.json` and appending to the real `cloud-request-audit.jsonl`.
+ *
+ * Found on 2026-09-03, during a rehearsal. A disposable profile seeded from live reported "This
+ * computer is being kept off the internet on purpose" -- correctly, because it had read the real
+ * laptop's policy file, which still said so from an earlier session. The rehearsal was reporting on
+ * the shop's machine rather than on itself, which is precisely what a disposable run must never do.
+ * Worse in the other direction: a rehearsal that changed the setting would have changed it for the
+ * real app.
+ *
+ * The environment variable is preferred rather than required, so an older shell binary paired with
+ * newer backend files still resolves the same path it always did.
+ */
+const APP_DATA = process.env.FROOZERP_APP_DATA_DIR
+  ? path.resolve(String(process.env.FROOZERP_APP_DATA_DIR))
+  : process.env.APPDATA
+    ? path.join(process.env.APPDATA, "com.srtcompany.froozerp")
+    : path.join(os.homedir(), "AppData", "Roaming", "com.srtcompany.froozerp");
 const SQLITE_PATH = path.resolve(String(
   process.env.FROOZERP_SQLITE_PATH || path.join(APP_DATA, "froozerp-local.sqlite3")
 ));
@@ -613,8 +634,10 @@ const server = http.createServer(async (req, res) => {
 // remembered to add to that list would be missing from the installer, and the gateway would die on
 // startup in the packaged app only.
 module.exports = {
+  CLOUD_REQUEST_AUDIT_PATH,
   CONTROL_ORIGINS,
   KILL_SWITCH_REFUSALS,
+  POLICY_PATH,
   POLICY_SOURCES,
   classifyControlOrigin,
   resolveKillSwitchDecision,

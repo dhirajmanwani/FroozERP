@@ -245,6 +245,33 @@ export const seedDisposableProfile = ({ sourceDir, destinationDir, fileSystem = 
  * Running the CLI's own `.js` through `process.execPath` sidesteps both problems and behaves
  * identically on Windows, macOS and Linux — there is no shell in the picture to disagree about.
  */
+/**
+ * The browser storage a disposable run is allowed to touch.
+ *
+ * ## Why this exists
+ *
+ * This script isolates the SQLite database, and says so at length above. It never isolated the
+ * webview's own storage -- `localStorage`, where `froozerp.apiConfig` and the connectivity mode
+ * live -- because that folder belongs to WebView2, which picks it from the app identity rather than
+ * from anything this script sets. A disposable run therefore read and wrote the **installed app's**
+ * saved settings.
+ *
+ * On 2026-09-03 that produced a rehearsal calling port 5000 while its own backend listened on 5051,
+ * because the real machine's saved `localApiUrl` said `http://127.0.0.1:5000` -- written by a "Save
+ * Mode" press months earlier. The shop's app happened to be closed, so it presented as "Local
+ * service could not start" rather than as a rehearsal billing into live data.
+ *
+ * The app no longer lets saved settings decide either of those things, so this is now the second
+ * lock on the same door rather than the only one. It is worth having anyway: a rehearsal that
+ * inherits the shop's saved state is not rehearsing the release, it is rehearsing that machine, and
+ * anything it changes it changes for the real app.
+ *
+ * `WEBVIEW2_USER_DATA_FOLDER` is read by WebView2 itself on Windows; on other platforms it is
+ * ignored, which is harmless -- the packaged product is Windows-only and the other platforms are
+ * developer machines with nothing live to protect.
+ */
+export const webviewDataDir = (disposableDir) => path.join(disposableDir, "webview");
+
 export const tauriCliEntry = (repoRoot) =>
   path.join(repoRoot, "frontend", "node_modules", "@tauri-apps", "cli", "tauri.js");
 
@@ -270,6 +297,7 @@ const main = () => {
       `  SQLite profile : ${dir}`,
       `  Profile mode   : ${profile ? `named "${profile}" — ${reused ? "REUSED, already activated" : "new"}` : "fresh every run — will open on the activation screen"}`,
       `  Seeded         : ${seed.seeded ? `yes, ${seed.files.join(", ")} — opens already activated` : seed.reason}`,
+      `  Browser storage: ${webviewDataDir(dir)}`,
       "  Live app data  : untouched (read only, never written)",
       "",
       "  This run cannot reach the real profile: NODE_ENV=test and an absolute",
@@ -294,6 +322,7 @@ const main = () => {
       ...process.env,
       NODE_ENV: "test",
       FROOZERP_ISOLATED_SQLITE_DIR: dir,
+      WEBVIEW2_USER_DATA_FOLDER: webviewDataDir(dir),
     },
   });
 
