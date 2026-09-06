@@ -11,3 +11,11 @@ npm-debug.log*
 .env.*
 release
 src-tauri/target
+
+# Tests and fixtures do not run in the image; the gates run them before it is built.
+# Listed here rather than by omitting them from a COPY list -- see the Dockerfile for why that
+# distinction cost two months.
+*.test.js
+*.test.mjs
+Dockerfile
+.dockerignore
