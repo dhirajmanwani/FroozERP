@@ -1,11 +1,42 @@
 # Deploying the cloud from 1.0.64
 
-Written on 2026-09-05, while working out why the shop's app could never reach its cloud. It is
-specific to this one deploy, because this one is unusual: `main` is 103 commits behind, the gap
-contains the whole auth-hardening track, and Railway deploys `main` automatically the moment it
-changes. There is no staging step between the merge and every counter.
+**Done 2026-09-06.** `froozerp-production-27bb` now runs 1.0.71 against the shop's own database:
+`version` 1.0.71, `tenant_configured: true`, `cloud_ready: true`, and `company_name` correctly
+absent from an unauthenticated health response.
 
-Ordinary releases do not need a document. This one does.
+Written while working out why the shop's app could never reach its cloud, and finished as the record
+of a two-month silent outage. Kept because almost none of it was where anyone looked first.
+
+## The short version
+
+The cloud had been running code from **2026-07-12** for nearly two months. Five separate things had
+to be true at once before a single byte of new code could run, and each hid the next:
+
+1. **`backend/Dockerfile` copied eight files by name.** Every module written after that line was
+   missing from the image; the container died on its first `require` and Railway kept the previous
+   one. **This was the root cause** — see the Dockerfile's own comment and
+   `backend/deployImageContents.test.js`.
+2. **Two Railway projects with near-identical names.** `cheerful-reflection` serves
+   `froozerp-production` against an empty database; `rare-cat` serves `froozerp-production-27bb`
+   against the shop's. Deploying the first succeeded and changed nothing.
+3. **`rare-cat` was not watching `main`.** Merging to `main` did nothing until its branch was
+   repointed.
+4. **The Owner password was in a retired format** and would have been refused by the new code.
+5. **`DEVICE_SESSION_SECRET` was not set**, so the new code refused to start — correctly, and
+   fatally for the health check.
+
+Every one of these presented identically from the outside: something that should work, not working.
+Most of two days went into the app, the connection settings and the network before the answer turned
+out to be eight filenames in a file the ordinary workflow never touches.
+
+## What to do differently
+
+- **Check what is *running*, not what was *deployed*.** "Deployment successful" meant the build
+  succeeded. `/api/health` is the only thing that knew, and only the health *check* noticed.
+- **Read the deploy logs, not the healthcheck log.** The healthcheck only ever says "service
+  unavailable". Every actual answer in this outage came from the container's own stdout.
+- **A merge merges your local branch.** `git merge <branch>` said "Already up to date" while the fix
+  sat on the remote. `git fetch origin && git merge origin/<branch>` is the form that cannot lie.
 
 ---
 
@@ -34,7 +65,7 @@ scrypt, so resetting first leaves no window where nobody can sign in.
 
 Re-check with `node scripts/show-setup.mjs` if any account is added before the merge.
 
-### 2. `DEVICE_SESSION_SECRET` on Railway — **the thing that failed**
+### 2. `DEVICE_SESSION_SECRET` on Railway — set 2026-09-06, after it stopped the boot
 
 `backend/sessionSecret.js` refuses to start a *cloud* deployment whose signing key is missing, too
 short (under 32 characters), or borrowed from a database credential, and `server.js` calls
