@@ -34,35 +34,46 @@ scrypt, so resetting first leaves no window where nobody can sign in.
 
 Re-check with `node scripts/show-setup.mjs` if any account is added before the merge.
 
-### 2. `DEVICE_SESSION_SECRET` on Railway — confirmed present 2026-09-05
-
-**Already satisfied, and provable without opening the dashboard.** `sessionSecret.js` is on `main`,
-so the deployed 1.0.64 runs this same check with the same `exposed` condition, and its health
-endpoint reports `deployment_type: "cloud"`. A missing or short key would have exited the process at
-startup, and `/api/health` would answer nothing at all. It answers — so the variable is set and is
-at least 32 characters.
-
-Kept below for the next person, and for the next deploy, because the failure it describes is silent
-until it is total.
+### 2. `DEVICE_SESSION_SECRET` on Railway — **the thing that failed**
 
 `backend/sessionSecret.js` refuses to start a *cloud* deployment whose signing key is missing, too
-short (under 32 characters), or borrowed from a database credential. `server.js` calls
-`process.exit(1)` on that verdict. Refusing to boot is the right behaviour — a server running with
-a forgeable signing key is worse than one that is down, because nobody finds out — but it means an
-unset variable turns this deploy into an outage.
+short (under 32 characters), or borrowed from a database credential, and `server.js` calls
+`process.exit(1)` on that verdict. Refusing to boot is right — a server running with a forgeable
+signing key is worse than one that is down, because nobody finds out — but a process that exits at
+startup fails Railway's health check, and Railway then keeps the previous deployment. Which is
+exactly what happened on 2026-09-05.
 
-On Railway, open the **backend** service (not Postgres) → **Variables**, and confirm
-`DEVICE_SESSION_SECRET` exists and is long. If it does not, generate one:
+**A correction, recorded because the reasoning was wrong and the wrong reasoning was written here
+first.** This section previously claimed the variable was already set, on the grounds that the live
+service runs the same check and answers `/api/health` at all. That inference does not hold:
+`sessionSecret.js` landed on **2026-08-20**, and the live service runs code from **2026-07-12**. The
+check it was supposed to be proving did not exist in the code that was answering. A deployed
+artifact only demonstrates the behaviour of *the code it is running*, and here that was code a month
+older than the rule being tested.
+
+On Railway, open the service that serves the shop's data → **Variables**, and confirm
+`DEVICE_SESSION_SECRET` exists and is at least 32 characters. If it does not:
 
 ```powershell
 node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
 ```
 
-Add it as a variable **before** merging. Do not paste it into a chat, a file, or a commit; it is
-worth as much as the database password, and for a different reason.
+Add it as a variable, then redeploy. Do not paste it into a chat, a file, or a commit; it is worth
+as much as the database password, and for a different reason.
 
-Setting or changing it invalidates every session token, so everyone signs in again. That is
-expected here — there are no sessions worth keeping across this deploy.
+Setting or changing it invalidates every session token, so everyone signs in again. That is expected
+here — there are no sessions worth keeping across this deploy.
+
+### 2a. There are two services, and only one has the shop's data
+
+`froozerp-production.up.railway.app` and `froozerp-production-27bb.up.railway.app` are different
+deployments. The first took the new code happily and reports `tenant_configured: false` — its
+database has no company row, so it is not the shop's. The second is the one the app talks to, the one
+holding SRT Company, and the one that must actually receive this release.
+
+`App.jsx` maps the first to the second in `LEGACY_CLOUD_API_URLS`, so the naming is already known to
+be a trap. Deploying the wrong one succeeds and changes nothing, which is the most expensive kind of
+success.
 
 ### 3. Your own unpushed work
 
