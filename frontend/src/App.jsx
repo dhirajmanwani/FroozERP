@@ -737,6 +737,13 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
 
   return {
     apiModeLabel,
+    // Where the mode came from, not just what it is.
+    //
+    // On 2026-09-07 this field's absence cost an evening. The app reported "Local Only" -- true,
+    // and useless, because the one question that mattered was *who said so*. It turned out to be
+    // `VITE_API_MODE=LOCAL_ONLY` in a gitignored `frontend/.env.local`, baked into the build months
+    // earlier. Reading "build-env" here instead of guessing would have ended it in a minute.
+    apiModeSource: API_MODE_RESOLUTION.source,
     internetStatus: internetAvailable ? "Internet Available" : "Internet Offline",
     froozErpCloudAccess: cloudPaused ? "Disabled by Owner" : cloudReachable ? "Online" : "Not Verified",
     localBackendStatus,
@@ -3388,6 +3395,21 @@ function App() {
   useEffect(() => {
     connectivityCheckRef.current = performConnectivityCheck;
   }, [performConnectivityCheck]);
+
+  // Say once, on the record, which mode this build resolved and where it came from.
+  //
+  // The connectivity policy below logs whether it reconciled. It never runs at all when
+  // `API_MODE=LOCAL_ONLY`, because that mode outranks the policy -- so the *absence* of its line
+  // was the only trace of the fault of 2026-09-07, and an absence is not evidence anybody reads.
+  // This line is present either way, and names the rung that decided it.
+  useEffect(() => {
+    writeDiagnosticLog("INFO", "api-mode-resolved", {
+      mode: API_MODE,
+      source: API_MODE_RESOLUTION.source,
+      configured: API_MODE_RESOLUTION.configured,
+      outranksConnectivityPolicy: startupConnectivityAuthority.isApiModeLocalOnly(),
+    });
+  }, []);
 
   useEffect(() => {
     if (!isTauriRuntime() || connectivityPolicyReady || mandatoryRuntimeState !== "ready") return undefined;
@@ -18005,6 +18027,8 @@ function SyncSettingsSection({
   const copySafeDiagnostics = async () => {
     const diagnostics = {
       appMode,
+      // Always next to appMode: on its own the mode names a state, and this names its cause.
+      appModeSource: connectionStatus?.apiModeSource || "unknown",
       internetStatus,
       localServerStatus,
       cloudStatus,
