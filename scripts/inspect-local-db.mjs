@@ -38,19 +38,15 @@ const defaultDatabasePath = () => {
   return path.join(roaming, APP_DIR_NAME, DB_FILE);
 };
 
-/** Tables worth counting, and what each one means to somebody who is not a programmer. */
-const TABLES_OF_INTEREST = [
-  ["local_device_identity", "this computer's identity"],
-  ["local_entitlements", "activation"],
-  ["users", "sign-in accounts"],
-  ["products", "products"],
-  ["inventory_batches", "stock lots"],
-  ["pos_sales", "bills"],
-  ["pos_sale_items", "bill lines"],
-  ["purchases", "purchases"],
-  ["parties", "customers and suppliers"],
-  ["sync_outbox", "bills waiting to reach the cloud"],
-];
+/**
+ * Tables whose row counts mean "there is a business in here", by name in the local schema.
+ *
+ * Deliberately resolved against the tables the database actually has rather than assumed. The
+ * first version of this script hardcoded a guessed list, and every guess that missed printed
+ * "table not present" -- which reads as "empty" and is not the same thing at all. On a shop that
+ * had just lost its database, that is precisely the wrong way to be wrong.
+ */
+const BUSINESS_TABLE_HINTS = ["product", "sale", "invoice", "bill", "purchase", "part", "stock", "inventory", "lot", "customer", "supplier", "payment", "order", "user"];
 
 const openDatabase = async (file) => {
   let DatabaseSync;
@@ -97,23 +93,34 @@ const main = async () => {
     return;
   }
 
-  console.log("\nWhat is in it:");
-  let businessRows = 0;
-  for (const [table, meaning] of TABLES_OF_INTEREST) {
-    if (!tables.includes(table)) {
-      console.log(`  ${meaning.padEnd(34)} table not present`);
-      continue;
-    }
+  // Count every table, not a list somebody remembered. A table this script has never heard of
+  // holding a thousand rows is exactly the evidence that matters, and a hardcoded list hides it.
+  const counts = [];
+  for (const table of tables) {
     try {
       const { count } = db.prepare(`SELECT COUNT(*) AS count FROM "${table}"`).get();
-      console.log(`  ${meaning.padEnd(34)} ${count}`);
-      if (["products", "pos_sales", "purchases", "parties", "inventory_batches"].includes(table)) {
-        businessRows += Number(count) || 0;
-      }
+      counts.push([table, Number(count) || 0]);
     } catch (error) {
-      console.log(`  ${meaning.padEnd(34)} could not be read: ${error.message}`);
+      counts.push([table, `unreadable: ${error.message}`]);
     }
   }
+
+  const populated = counts.filter(([, count]) => typeof count === "number" && count > 0);
+  const unreadable = counts.filter(([, count]) => typeof count !== "number");
+
+  console.log("\nTables that have rows in them:");
+  if (populated.length === 0) console.log("  (none -- every table is empty)");
+  for (const [table, count] of populated.sort((a, b) => b[1] - a[1])) {
+    console.log(`  ${String(count).padStart(8)}  ${table}`);
+  }
+  console.log(`\nEmpty tables: ${counts.length - populated.length - unreadable.length} of ${counts.length}`);
+  for (const [table, reason] of unreadable) console.log(`  ${table}: ${reason}`);
+
+  // "Is there a business in here" is judged on the tables that would hold one, whatever they are
+  // called, and never on a table failing to exist.
+  const businessRows = populated
+    .filter(([table]) => BUSINESS_TABLE_HINTS.some((hint) => table.toLowerCase().includes(hint)))
+    .reduce((total, [, count]) => total + count, 0);
 
   // The identity rows, because a missing one is what sends the app to the activation screen. Ids
   // and status only -- these are not secrets and they are exactly what a diagnosis needs.
@@ -130,8 +137,8 @@ const main = async () => {
 
   console.log("");
   console.log(businessRows > 0
-    ? `RESULT: this database holds business data (${businessRows} rows across products, stock, bills, purchases and parties).`
-    : "RESULT: this database has the FroozERP tables but no business data in them. It is a fresh database.");
+    ? `RESULT: this database holds business data -- ${businessRows} rows in tables that carry products, stock, bills, purchases, parties or accounts.`
+    : "RESULT: this database has the FroozERP tables and no business rows in any of them. It is a fresh database.");
 
   db.close();
 };
