@@ -1597,7 +1597,7 @@ const getOwnerUser = async (userId, client = pool) => {
   if (!parsedUserId) return null;
   const result = await client.query(
     `
-    SELECT u.id, u.full_name, u.username, u.branch_id, r.role_name
+    SELECT u.id, u.full_name, u.username, u.branch_id, u.session_revocation_version, r.role_name
     FROM users u
     JOIN roles r ON r.id = u.role_id
     WHERE u.id = $1 AND u.active = TRUE
@@ -12642,6 +12642,18 @@ app.post("/api/owner/view-branch", async (req, res) => {
       companyId,
       branchId: requestedBranchId,
       role: owner.role_name,
+      // Carried, because `issueDeviceSession` defaults it to 0 and `revokedSessionGuard` compares
+      // it against the row on every authenticated request. Omitting it minted a token claiming
+      // version 0 for an account whose real version had moved on -- and it moves on every time
+      // anybody signs out. The next request then failed the comparison, returned SESSION_REVOKED,
+      // and the app signed the Owner out.
+      //
+      // Reported on 2026-09-07 as "Settings logs me out while scrolling": opening Settings reaches
+      // the All Shops controls, a view token is issued, and from that moment every request is
+      // refused. It looked like an expired sign-in, so signing back in and trying again reproduced
+      // it exactly -- and each sign-out incremented the version again, making it permanent rather
+      // than intermittent.
+      sessionRevocationVersion: owner.session_revocation_version || 0,
       viewOnly: !returningHome,
       ttlSeconds: returningHome ? undefined : VIEW_ONLY_TTL_SECONDS,
       secret: deviceSessionSecret,
