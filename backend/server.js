@@ -888,6 +888,14 @@ const revokedSessionGuard = async (req, res, next) => {
       return res.status(401).json({ code: "SESSION_REVOKED", message: "This account is no longer active." });
     }
     if (Number(user.session_revocation_version || 0) !== Number(req.auth.sessionRevocationVersion || 0)) {
+      // Both numbers, because the mismatch is the whole story and neither one is visible anywhere
+      // else. A token minted without the claim reads as 0 here against a row that has moved on, and
+      // that is indistinguishable from a genuinely revoked session unless the pair is written down.
+      console.warn(
+        `[auth-refused] 401 SESSION_REVOKED ${req.method} ${req.originalUrl || req.url} `
+        + `user=${req.auth.userId} row=${Number(user.session_revocation_version || 0)} `
+        + `token=${Number(req.auth.sessionRevocationVersion || 0)}`
+      );
       return res.status(401).json({ code: "SESSION_REVOKED", message: "This sign-in was ended. Sign in again." });
     }
     return next();

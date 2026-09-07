@@ -98,3 +98,33 @@ test("the guard that compares them is still mounted on every authenticated reque
   assert.match(SERVER, /^app\.use\(revokedSessionGuard\);$/m);
   assert.match(SERVER, /code: "SESSION_REVOKED"/);
 });
+
+test("a refusal is written down where somebody can read it", () => {
+  // The reason this took a day. `sendAuthError` returned the refusal and logged nothing, so the one
+  // fact that settles any sign-out question -- which route, under which code -- existed only inside
+  // a response body nobody could see. Seven explanations were eliminated from source instead.
+  const middleware = fs.readFileSync(path.join(__dirname, "authMiddleware.js"), "utf8");
+  assert.match(middleware, /\[auth-refused\]/, "every auth refusal must be logged");
+  assert.match(middleware, /const sendAuthError = \(res, error, req = null\)/, "and must be able to name the route");
+
+  // Every call site passes the request, or the log line names no route and is useless.
+  const callSites = middleware.match(/sendAuthError\([^)]*\)/g) || [];
+  const calls = callSites.filter((line) => !line.includes("res, error, req = null"));
+  assert.ok(calls.length >= 8, "sanity: the call sites could not be found");
+  for (const call of calls) {
+    assert.match(call, /, req\)$/, `refusal does not name its request: ${call}`);
+  }
+
+  // The token itself must never appear in a log line. A refusal record that leaks the credential it
+  // refused is worse than no record.
+  const logLine = middleware.slice(middleware.indexOf("[auth-refused]") - 200, middleware.indexOf("[auth-refused]") + 200);
+  assert.doesNotMatch(logLine, /token\b(?!=)/, "the token value must not be logged");
+});
+
+test("the revocation mismatch logs both numbers", () => {
+  // Without the pair, "session revoked" and "token minted without the claim" look identical - and
+  // the second is a bug in this server, not an ended session.
+  assert.match(SERVER, /\[auth-refused\] 401 SESSION_REVOKED/);
+  assert.match(SERVER, /row=\$\{Number\(user\.session_revocation_version \|\| 0\)\}/);
+  assert.match(SERVER, /token=\$\{Number\(req\.auth\.sessionRevocationVersion \|\| 0\)\}/);
+});

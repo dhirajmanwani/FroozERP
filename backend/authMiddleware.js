@@ -142,10 +142,30 @@ const submittedIdentityFrom = (req) => {
   };
 };
 
-const sendAuthError = (res, error) => res.status(error.status).json({
-  code: error.code,
-  message: error.message,
-});
+/**
+ * Refuse a request, and say so where somebody can read it.
+ *
+ * This used to return the refusal and log nothing. That silence cost most of 2026-09-07: the Owner
+ * was being signed out of Settings, seven explanations were eliminated from source one at a time,
+ * and none of them was it -- because the one fact that would have settled it in a minute, *which
+ * route was refused and under which code*, existed only inside a response body nobody could see.
+ *
+ * A default-deny system that does not record its denials is a system that can only be debugged by
+ * guessing. One line per refusal is cheap; the alternative is what this session actually cost.
+ *
+ * Deliberately never logs the token, only the code, the route and the user id. A refusal record
+ * that leaks the credential it refused would be worse than no record.
+ */
+const sendAuthError = (res, error, req = null) => {
+  const method = req?.method || "";
+  const route = req?.originalUrl || req?.url || "";
+  const userId = req?.auth?.userId ?? "";
+  console.warn(`[auth-refused] ${error.status} ${error.code} ${method} ${route}${userId === "" ? "" : ` user=${userId}`}`);
+  return res.status(error.status).json({
+    code: error.code,
+    message: error.message,
+  });
+};
 
 /**
  * Build the `requireAuth` middleware.
@@ -157,17 +177,17 @@ const createRequireAuth = ({ secret, verify = verifyDeviceSession, now = () => D
   (req, res, next) => {
     if (!text(secret)) {
       // A missing secret must never degrade to "allow". It is a server fault, reported as one.
-      return sendAuthError(res, AUTH_ERRORS.MISCONFIGURED);
+      return sendAuthError(res, AUTH_ERRORS.MISCONFIGURED, req);
     }
 
     const token = extractSessionToken(req);
-    if (!token) return sendAuthError(res, AUTH_ERRORS.MISSING);
+    if (!token) return sendAuthError(res, AUTH_ERRORS.MISSING, req);
 
     const result = verify(token, secret, now());
-    if (result.error) return sendAuthError(res, result.error);
+    if (result.error) return sendAuthError(res, result.error, req);
 
     const substitution = rejectDeviceSessionSubstitution(result.claims, submittedIdentityFrom(req));
-    if (substitution) return sendAuthError(res, substitution);
+    if (substitution) return sendAuthError(res, substitution, req);
 
     const auth = authContextFromClaims(result.claims);
 
@@ -185,7 +205,7 @@ const createRequireAuth = ({ secret, verify = verifyDeviceSession, now = () => D
     // which is worse than a sync that waits. The token also expires in 30 minutes, so this is a
     // state nobody can sit in for long.
     if (auth.viewOnly && !SAFE_METHODS.has(req.method)) {
-      return sendAuthError(res, AUTH_ERRORS.VIEW_ONLY);
+      return sendAuthError(res, AUTH_ERRORS.VIEW_ONLY, req);
     }
 
     req.auth = auth;
@@ -239,11 +259,11 @@ const requireRole = (...allowed) => {
     .filter(Boolean);
 
   return (req, res, next) => {
-    if (!req.auth) return sendAuthError(res, AUTH_ERRORS.MISSING);
-    if (!req.auth.normalizedRole) return sendAuthError(res, AUTH_ERRORS.ROLE_UNKNOWN);
-    if (permitted.length === 0) return sendAuthError(res, AUTH_ERRORS.ROLE_FORBIDDEN);
+    if (!req.auth) return sendAuthError(res, AUTH_ERRORS.MISSING, req);
+    if (!req.auth.normalizedRole) return sendAuthError(res, AUTH_ERRORS.ROLE_UNKNOWN, req);
+    if (permitted.length === 0) return sendAuthError(res, AUTH_ERRORS.ROLE_FORBIDDEN, req);
     if (!permitted.includes(req.auth.normalizedRole)) {
-      return sendAuthError(res, AUTH_ERRORS.ROLE_FORBIDDEN);
+      return sendAuthError(res, AUTH_ERRORS.ROLE_FORBIDDEN, req);
     }
     return next();
   };
