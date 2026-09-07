@@ -1,7 +1,7 @@
 {
   "name": "froozerp-workspace",
   "private": true,
-  "version": "1.0.71",
+  "version": "1.0.72",
   "scripts": {
     "app": "frontend\\node_modules\\.bin\\tauri.cmd dev",
     "app:disposable": "node scripts/run-disposable-app.mjs",
