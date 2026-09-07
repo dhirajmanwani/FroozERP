@@ -487,12 +487,15 @@ test("App.jsx reacts to an ended session in exactly one place, and only when sig
   //   - one interceptor, not per-panel handling, so the user gets one sentence not twenty;
   //   - it is inert on the login screen, where a 401 means "wrong password", not "session ended";
   //   - it passes the offline flag, without which an outage reads as a sign-out;
+  //   - it passes which kind of session is held, without which an offline sign-in is ended by the
+  //     first cloud route it touches — the fix in this module is inert unless the call site sends it;
   //   - it rethrows, so panels error rather than rendering empty;
   //   - it ejects, or every re-render stacks another copy and the user is prompted N times.
   const app = fs.readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
   assert.match(app, /axios\.interceptors\.response\.use\(undefined, \(error\) => \{/);
   assert.match(app, /if \(!user\) return undefined;/);
   assert.match(app, /online: !offlineMode/);
+  assert.match(app, /offlineSession: user\?\.offline_session === true/);
   assert.match(app, /return Promise\.reject\(error\);/);
   assert.match(app, /axios\.interceptors\.response\.eject\(interceptorId\)/);
   assert.equal(
@@ -500,4 +503,62 @@ test("App.jsx reacts to an ended session in exactly one place, and only when sig
     1,
     "a second response interceptor would mean two answers to the same question",
   );
+});
+
+/**
+ * The loop of 2026-09-07: signed in offline, signed out by the cloud, told to sign in again.
+ *
+ * The app has a second way in. When it cannot reach the cloud it signs somebody in from the profile
+ * cached on this device — `authentication_source: "secure_offline_cache"` — and that user has no
+ * `device_session_token`, because the cloud never issued one. Every cloud route then answers
+ * `AUTH_SESSION_REQUIRED`, which is literally true and says nothing at all about the person.
+ *
+ * Read as "your sign-in has ended", it produced a loop on the shop's own machine: signed in offline,
+ * opened Settings, the panels there reach cloud routes, the first 401 signed the Owner out, and
+ * signing in again landed in exactly the same place. Billing was unaffected throughout — it is local
+ * — which is what made the sign-out so obviously wrong once the cause was visible.
+ */
+test("an offline session is not ended by a cloud route refusing it", () => {
+  // The cloud never issued this session, so the cloud cannot end it.
+  const verdict = resolveSessionAction({
+    token: "",
+    offlineSession: true,
+    failure: { response: { status: 401, data: { code: "AUTH_SESSION_REQUIRED" } } },
+  });
+
+  assert.equal(verdict.requiresSignIn, false, "signing in again is the one thing that cannot help");
+  assert.equal(verdict.offline, true);
+  assert.match(verdict.message, /signed in on this device only/i);
+  assert.match(verdict.message, /Billing/, "the shop must be told what still works");
+  assert.doesNotMatch(verdict.message, /sign in again/i, "and never told to do the thing that loops");
+});
+
+test("an ordinary session is still ended by the same refusal", () => {
+  // The guard is narrow on purpose. A real session that the server rejects must still sign out —
+  // that is the whole point of Gate 1.5, and widening this would keep revoked sessions alive.
+  const verdict = resolveSessionAction({
+    token: "header.payload.signature",
+    offlineSession: false,
+    failure: { response: { status: 401, data: { code: "SESSION_REVOKED" } } },
+  });
+  assert.equal(verdict.requiresSignIn, true);
+});
+
+test("an offline session still reports permission and server faults as themselves", () => {
+  // Only authentication is reinterpreted. A 403 means this account may not do it, whatever kind of
+  // session it holds, and a 500 is still the other end failing.
+  const denied = resolveSessionAction({
+    token: "",
+    offlineSession: true,
+    failure: { response: { status: 403, data: { code: "AUTH_ROLE_FORBIDDEN" } } },
+  });
+  assert.equal(denied.requiresSignIn, false);
+  assert.match(denied.message, /permission/i);
+
+  const fault = resolveSessionAction({
+    token: "",
+    offlineSession: true,
+    failure: { response: { status: 500, data: {} } },
+  });
+  assert.match(fault.message, /went wrong at the other end/i);
 });

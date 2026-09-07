@@ -374,6 +374,9 @@ export const describeRemainingTime = (seconds) => {
  */
 const MESSAGES = Object.freeze({
   OFFLINE: "You are working offline. Everything you do is saved on this device and will be sent to the main system when the connection comes back.",
+  // Says what is true and what to do, and deliberately never says "sign in again" -- that is the
+  // one instruction that cannot help an offline session, and following it is what made this a loop.
+  OFFLINE_ONLY_SESSION: "You are signed in on this device only, so this part needs the main system and cannot open yet. Billing and everything saved here keep working.",
   SIGN_IN_ENDED: "Your sign-in has ended. Please sign in again to continue. Everything saved on this device is safe.",
   SIGN_IN_NEEDED: "Please sign in again to continue. Everything saved on this device is safe.",
   PERMISSION: "Your account does not have permission to do this. Ask the owner if you need access.",
@@ -418,6 +421,7 @@ export const resolveSessionAction = ({
   nowMs = Date.now(),
   online = true,
   canRenew = false,
+  offlineSession = false,
 } = {}) => {
   const expiry = describeTokenExpiry(token, nowMs);
   const classified = classifySessionFailure(failure);
@@ -429,6 +433,32 @@ export const resolveSessionAction = ({
     expiry,
     secondsRemaining: expiry.secondsRemaining,
   };
+
+  // An offline session cannot be ended by the cloud, because the cloud never issued it.
+  //
+  // The app has a second way in: when it cannot reach the cloud it signs somebody in from the
+  // profile cached on this device (`authentication_source: "secure_offline_cache"`). That user has
+  // no `device_session_token` -- there is nothing for the cloud to have signed -- so every cloud
+  // route answers `AUTH_SESSION_REQUIRED`, which is literally true and says nothing whatever about
+  // the person's standing.
+  //
+  // Read as "your sign-in has ended", that produced a loop on the shop's own machine on 2026-09-07:
+  // signed in offline, opened Settings, the panels there reach cloud routes, the first 401 signed
+  // the Owner out, and signing in again landed in exactly the same place. The single action the
+  // message recommended was the one that could not help.
+  //
+  // Checked before `classified.authentication` deliberately, and narrowly: only *authentication* is
+  // reinterpreted. A 403 still means this account may not do it, and a 500 is still the other end
+  // failing -- neither of those is about which kind of session is held.
+  if (offlineSession && classified.authentication) {
+    return decision({
+      ...base,
+      action: SESSION_ACTIONS.WORK_OFFLINE,
+      offline: true,
+      evidence: "SERVER",
+      message: MESSAGES.OFFLINE_ONLY_SESSION,
+    });
+  }
 
   if (classified.authentication) {
     // A refusal we can point at beats every local guess, including a stale `online: false` flag —

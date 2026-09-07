@@ -2404,6 +2404,11 @@ function App() {
         // Without this a network outage on a local-first app would read as "you have been signed
         // out" — wrong, and alarming at a busy counter.
         online: !offlineMode,
+        // And without this, an offline sign-in was ended by the first cloud route it touched. That
+        // session has no cloud token by construction, so every cloud route answers 401 — true, and
+        // not a statement about the person. Signing them out sent them back to a screen whose only
+        // offer was to do the thing that had just failed.
+        offlineSession: user?.offline_session === true,
       });
       if (verdict.requiresSignIn) {
         setStartupNotice(verdict.message);
