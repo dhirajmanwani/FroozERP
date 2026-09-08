@@ -13867,8 +13867,27 @@ app.post("/login", async (req, res) => {
       device_session_token: deviceSessionToken,
     });
   } catch (error) {
-    console.error(error);
-    return res.status(500).json({ message: "Login Error" });
+    // A 500 here has to be findable, and it was not.
+    //
+    // This used to `console.error(error)` and answer `{ message: "Login Error" }`. On 2026-09-08 the
+    // shop's newly rebuilt device could not sign in, and that is all anybody could see: a 500, no
+    // code, and two words that name the screen rather than the fault. The stack trace existed only
+    // in Railway's log, findable solely by guessing the minute the attempt happened.
+    //
+    // The incident id is the fix. It is generated here, written into the log line, and returned to
+    // the caller, so "it says LOGIN_FAILED 3f9c2a1b" turns a log hunt into one grep. It carries no
+    // information about the fault, so it is safe to show, read aloud, or paste into a chat.
+    //
+    // The message itself stays deliberately incurious: an unhandled error can be anything at all,
+    // including a database error whose text names columns and hosts, and a sign-in route is not the
+    // place to find out. The code is constant, the id is unique, the detail stays in the log.
+    const incidentId = crypto.randomUUID().slice(0, 8);
+    console.error(`[login-error] incident=${incidentId}`, error);
+    return res.status(500).json({
+      code: "LOGIN_FAILED",
+      incident_id: incidentId,
+      message: `Sign-in could not be completed because of a fault at the FroozERP server. Quote reference ${incidentId} when reporting this.`,
+    });
   }
 });
 
