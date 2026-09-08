@@ -33,13 +33,24 @@ const { pathToFileURL } = require("node:url");
 
 const modulePath = pathToFileURL(path.join(__dirname, "..", "scripts", "approve-device.mjs")).href;
 
-/** A client that answers the one SELECT and records every write. */
-const fakeClient = (row) => {
+/**
+ * A client that answers SELECTs from a script and records every write.
+ *
+ * Transaction control is not a write. Counting BEGIN and COMMIT as writes would make
+ * "a refusal writes nothing" pass or fail on bookkeeping rather than on what reached a table,
+ * which is the property that matters.
+ */
+const fakeClient = (rowsByTurn) => {
+  const answers = Array.isArray(rowsByTurn) ? [...rowsByTurn] : [rowsByTurn];
   const writes = [];
   return {
     writes,
     query: async (sql, params) => {
-      if (/^\s*SELECT/i.test(sql)) return { rows: row ? [row] : [] };
+      if (/^\s*(BEGIN|COMMIT|ROLLBACK)/i.test(sql)) return { rows: [] };
+      if (/^\s*SELECT/i.test(sql)) {
+        const next = answers.length > 1 ? answers.shift() : answers[0];
+        return { rows: next ? [next] : [] };
+      }
       writes.push({ sql, params });
       return { rows: [] };
     },
@@ -103,9 +114,9 @@ test("a dry run is the default, and writes nothing", async () => {
   assert.equal(result.plan.previousStatus, "PENDING");
 });
 
-test("applying sets APPROVED and nothing else", async () => {
-  // Narrow on purpose. Assignments and permissions belong to the ordinary screens; a second,
-  // unaudited way to grant them is not something a recovery command should install.
+test("applying without --counter sets APPROVED and nothing else", async () => {
+  // Posting is opt-in. Approval and posting are different decisions, and asking for one must not
+  // quietly perform the other.
   const { approveDevice } = await import(modulePath);
   const client = fakeClient(PENDING);
   const result = await approveDevice(client, { deviceId: "FZDEV-A", apply: true });
@@ -115,11 +126,77 @@ test("applying sets APPROVED and nothing else", async () => {
   assert.match(sql, /UPDATE authorized_devices/);
   assert.match(sql, /status = 'APPROVED'/);
   assert.match(sql, /COALESCE\(approved_at, CURRENT_TIMESTAMP\)/, "an earlier approval date is history, not something to overwrite");
-  assert.doesNotMatch(sql, /device_assignments|permissions|users/i, "it must not reach past the device row");
+  assert.doesNotMatch(sql, /device_assignments|users/i, "without --counter it must not reach past the device row");
 });
 
 test("no device id at all is usage, not a crash", async () => {
   const { approveDevice, REFUSALS } = await import(modulePath);
   const result = await approveDevice(fakeClient(PENDING), {});
   assert.equal(result.code, REFUSALS.USAGE);
+});
+
+/**
+ * Posting, which the first version of this command deliberately did not do.
+ *
+ * The reasoning was that assignments belong to Branches & Counters. That was wrong for the one case
+ * this command exists to serve: a machine with no posting has no operational scope, so every screen
+ * filters to nothing and Branches & Counters itself refuses with "User and device do not share an
+ * approved operational location" — the very screen that would fix it. Approve-only moved the
+ * maintainer one step further into the same deadlock.
+ */
+
+const COUNTER = { id: 1, location_name: "Main Branch Counter", company_id: 1, branch_id: 1, active: true, branch_name: "Main Branch" };
+const NO_POSTING = { generation: 0, active_count: 0 };
+const STAFFED = { count: 1 };
+
+test("posting to a counter that does not exist is refused", async () => {
+  const { approveDevice, REFUSALS } = await import(modulePath);
+  const client = fakeClient([PENDING, null]);
+  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 99, apply: true });
+  assert.equal(result.code, REFUSALS.NO_COUNTER);
+  assert.equal(client.writes.length, 0, "and the approval must not happen either");
+});
+
+test("posting a machine where nobody is posted is refused", async () => {
+  // The half-fix that looks like a fix. `requireAssignmentOwner` reads manage_assignments from the
+  // device assignment *and* the staff assignment; a machine posted where no person is posted still
+  // fails login with DEVICE_LOCATION_MISMATCH, which is indistinguishable from having done nothing.
+  const { approveDevice, REFUSALS } = await import(modulePath);
+  const client = fakeClient([PENDING, COUNTER, NO_POSTING, { count: 0 }]);
+  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 1, apply: true });
+  assert.equal(result.code, REFUSALS.NOBODY_AT_COUNTER);
+  assert.equal(client.writes.length, 0);
+  assert.match(result.message, /needs both/);
+});
+
+test("a machine already standing at a counter is not moved from here", async () => {
+  // A relocation carries an audit trail, and that belongs in the app.
+  const { approveDevice, REFUSALS } = await import(modulePath);
+  const client = fakeClient([PENDING, COUNTER, { generation: 2, active_count: 1 }, STAFFED]);
+  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 1, apply: true });
+  assert.equal(result.code, REFUSALS.ALREADY_POSTED);
+  assert.equal(client.writes.length, 0);
+});
+
+test("--counter approves and posts, together", async () => {
+  const { approveDevice } = await import(modulePath);
+  const client = fakeClient([PENDING, COUNTER, NO_POSTING, STAFFED]);
+  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 1, apply: true });
+  assert.equal(result.ok, true);
+  assert.equal(client.writes.length, 2, "the approval and the posting");
+  assert.match(client.writes[0].sql, /UPDATE authorized_devices/);
+  assert.match(client.writes[1].sql, /INSERT INTO device_assignments/);
+  // The generation continues rather than restarting: (device_id, assignment_generation) is unique,
+  // and a machine whose earlier posting was ended keeps its old rows.
+  assert.equal(client.writes[1].params[5], 1);
+  assert.equal(result.plan.counter.name, "Main Branch Counter");
+});
+
+test("a dry run with --counter still writes nothing, and says what it would post", async () => {
+  const { approveDevice } = await import(modulePath);
+  const client = fakeClient([PENDING, COUNTER, NO_POSTING, STAFFED]);
+  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 1 });
+  assert.equal(result.dryRun, true);
+  assert.equal(client.writes.length, 0);
+  assert.equal(result.plan.counter.id, 1);
 });

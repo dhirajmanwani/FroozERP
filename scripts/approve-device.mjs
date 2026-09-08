@@ -56,12 +56,22 @@ import { argv, env, exit, stdout } from "node:process";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
+// Imported, not copied. `bootstrap-first-counter.mjs` establishes what a counter machine may do,
+// and its own comment warns that granting one half of the pair leaves the deadlock intact. Two
+// copies of that set would drift, and the drift would be invisible until a screen refused.
+import { DEVICE_PERMISSIONS } from "./bootstrap-first-counter.mjs";
+
 /** Every way this can say no, named so a caller never has to compare on message text. */
 export const REFUSALS = Object.freeze({
   USAGE: "USAGE",
   NO_DEVICE: "NO_DEVICE",
   ALREADY_APPROVED: "ALREADY_APPROVED",
   DELIBERATELY_BLOCKED: "DELIBERATELY_BLOCKED",
+  NO_COUNTER: "NO_COUNTER",
+  COUNTER_CLOSED: "COUNTER_CLOSED",
+  ALREADY_POSTED: "ALREADY_POSTED",
+  NOBODY_AT_COUNTER: "NOBODY_AT_COUNTER",
+  WRITE_FAILED: "WRITE_FAILED",
 });
 
 const refuse = (code, message) => ({ ok: false, code, message });
@@ -70,6 +80,7 @@ const USAGE = `Usage:
   node scripts/approve-device.mjs --device-id <id shown on the app's login screen> [--apply]
 
   --apply        actually write. Without it this is a dry run.
+  --counter <id> also post this machine to that counter (an operational location id).
   --reinstate    also allow a DISABLED or REVOKED device to be approved again.`;
 
 /** Statuses that mean somebody deliberately shut this device out. */
@@ -84,6 +95,9 @@ export const approveDevice = async (client, options = {}) => {
   const deviceId = String(options.deviceId || "").trim();
   const apply = Boolean(options.apply);
   const reinstate = Boolean(options.reinstate);
+  const counterId = options.counterId === undefined || options.counterId === null || options.counterId === ""
+    ? null
+    : Number(options.counterId);
 
   if (!deviceId) return refuse(REFUSALS.USAGE, USAGE);
 
@@ -123,17 +137,117 @@ export const approveDevice = async (client, options = {}) => {
     deviceName: device.device_name || "unnamed",
     previousStatus: status || "UNKNOWN",
     lastActiveAt: device.last_active_at,
+    counter: null,
   };
+
+  // Posting the machine to a counter, when asked.
+  //
+  // This command was written approve-only, on the reasoning that assignments belong to Branches &
+  // Counters. That reasoning was wrong for the case the command exists to serve. A machine with no
+  // posting has no operational scope, so every screen filters to nothing and Branches & Counters
+  // itself refuses with "User and device do not share an approved operational location" -- the very
+  // screen that would fix it. Approve-only left the maintainer exactly one step further into the
+  // same deadlock, at one in the morning.
+  //
+  // Still opt-in. Approval and posting are different decisions, and the default stays the narrow
+  // one.
+  if (counterId !== null) {
+    const location = await client.query(
+      `SELECT ol.id, ol.location_name, ol.company_id, ol.branch_id, ol.active, b.branch_name
+         FROM operational_locations ol
+         JOIN branches b ON b.id = ol.branch_id AND b.company_id = ol.company_id
+        WHERE ol.id = $1`,
+      [counterId]
+    );
+    const counter = location.rows[0];
+    if (!counter) return refuse(REFUSALS.NO_COUNTER, `No counter has id ${counterId}. \`node scripts/show-setup.mjs\` lists them under COUNTERS.`);
+    if (counter.active === false) {
+      return refuse(REFUSALS.COUNTER_CLOSED, `Counter ${counterId} (${counter.location_name}) is closed. Reopen it in the app before posting a machine to it.`);
+    }
+
+    // A machine stands at one counter: `device_assignments_one_active_idx` is unique on device_id
+    // where active. An existing posting means either a working scope already, or a relocation --
+    // and a relocation carries an audit trail that belongs in the app.
+    const posting = await client.query(
+      `SELECT COALESCE(MAX(assignment_generation), 0) AS generation,
+              COUNT(*) FILTER (WHERE active) AS active_count
+         FROM device_assignments WHERE device_id = $1`,
+      [deviceId]
+    );
+    if (Number(posting.rows[0]?.active_count || 0) > 0) {
+      return refuse(
+        REFUSALS.ALREADY_POSTED,
+        `${deviceId} is already posted to a counter.\n`
+        + "A machine stands at one counter at a time. Move it from Branches & Counters, which records the move."
+      );
+    }
+
+    // Both halves or neither. `requireAssignmentOwner` reads manage_assignments from the device
+    // assignment *and* the staff assignment; posting a machine where nobody is posted produces a
+    // login that still fails DEVICE_LOCATION_MISMATCH, which looks identical to doing nothing.
+    const staffed = await client.query(
+      `SELECT COUNT(*)::INTEGER AS count
+         FROM staff_location_assignments
+        WHERE operational_location_id = $1 AND active = TRUE`,
+      [counterId]
+    );
+    if (Number(staffed.rows[0]?.count || 0) === 0) {
+      return refuse(
+        REFUSALS.NOBODY_AT_COUNTER,
+        `Nobody is posted to counter ${counterId} (${counter.location_name}).\n`
+        + "A machine posted where no person is posted still cannot sign in -- the login gate needs both.\n"
+        + "Post a person there first; `node scripts/show-setup.mjs` lists them under PEOPLE POSTED TO COUNTERS."
+      );
+    }
+
+    // Not always 1: a machine whose earlier posting was ended keeps its old generation rows, and
+    // (device_id, assignment_generation) is unique. Continuing the count is what the app does.
+    plan.counter = {
+      id: counter.id,
+      name: counter.location_name,
+      branchName: counter.branch_name,
+      companyId: counter.company_id,
+      branchId: counter.branch_id,
+      generation: Number(posting.rows[0]?.generation || 0) + 1,
+    };
+  }
+
   if (!apply) return { ok: true, dryRun: true, plan };
 
-  await client.query(
-    `UPDATE authorized_devices
-        SET status = 'APPROVED',
-            approved_at = COALESCE(approved_at, CURRENT_TIMESTAMP),
-            updated_at = CURRENT_TIMESTAMP
-      WHERE device_id = $1`,
-    [deviceId]
-  );
+  // One transaction. A device approved but not posted, or posted but not approved, is a machine
+  // that looks set up and behaves as though it is not -- which is the state this whole command
+  // exists to get out of.
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `UPDATE authorized_devices
+          SET status = 'APPROVED',
+              approved_at = COALESCE(approved_at, CURRENT_TIMESTAMP),
+              updated_at = CURRENT_TIMESTAMP
+        WHERE device_id = $1`,
+      [deviceId]
+    );
+    if (plan.counter) {
+      await client.query(
+        `INSERT INTO device_assignments
+           (device_id, company_id, branch_id, operational_location_id, device_type, intended_usage,
+            fixed_operational, permission_set, assignment_generation, active)
+         VALUES ($1,$2,$3,$4,'desktop','COUNTER',TRUE,$5::jsonb,$6,TRUE)`,
+        [
+          deviceId,
+          plan.counter.companyId,
+          plan.counter.branchId,
+          plan.counter.id,
+          JSON.stringify(DEVICE_PERMISSIONS),
+          plan.counter.generation,
+        ]
+      );
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => null);
+    return refuse(REFUSALS.WRITE_FAILED, `Nothing was written. ${error.message}`);
+  }
   return { ok: true, dryRun: false, plan };
 };
 
@@ -157,11 +271,15 @@ const describe = (plan) =>
   + "\n  Name        " + plan.deviceName
   + "\n  Status      " + plan.previousStatus + " -> APPROVED"
   + "\n  Last seen   " + (plan.lastActiveAt ? new Date(plan.lastActiveAt).toISOString() : "never")
+  + (plan.counter
+    ? "\n  Counter     " + plan.counter.name + " (" + plan.counter.branchName + "), id " + plan.counter.id
+    : "\n  Counter     not posted -- pass --counter <id> to post it")
   + "\n\n";
 
 const main = async () => {
   const options = {
     deviceId: readFlag("device-id"),
+    counterId: readFlag("counter"),
     apply: hasFlag("apply"),
     reinstate: hasFlag("reinstate"),
   };
@@ -192,9 +310,11 @@ const main = async () => {
       return;
     }
     stdout.write(
-      "  Approved.\n\n"
-      + "  Sign in again on that machine. Approval alone does not give it a counter — assign one\n"
-      + "  from Branches & Counters once you are in.\n\n"
+      (result.plan.counter
+        ? "  Approved and posted.\n\n  Sign in again on that machine.\n\n"
+        : "  Approved.\n\n"
+          + "  Approval alone gives no counter, and without one every screen filters to nothing.\n"
+          + "  Re-run with --counter <id> (see COUNTERS in show-setup), or post it from the app.\n\n")
     );
   } finally {
     client.release();
