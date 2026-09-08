@@ -146,13 +146,16 @@ test("no device id at all is usage, not a crash", async () => {
  */
 
 const COUNTER = { id: 1, location_name: "Main Branch Counter", company_id: 1, branch_id: 1, active: true, branch_name: "Main Branch" };
+const OWNER = { id: 7, username: "owner", active: true, role_name: "Owner" };
 const NO_POSTING = { generation: 0, active_count: 0 };
 const STAFFED = { count: 1 };
+/** The SELECT order the posting path takes: device, counter, owner, existing posting, staffing. */
+const POSTING_TURNS = (device = PENDING) => [device, COUNTER, OWNER, NO_POSTING, STAFFED];
 
 test("posting to a counter that does not exist is refused", async () => {
   const { approveDevice, REFUSALS } = await import(modulePath);
   const client = fakeClient([PENDING, null]);
-  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 99, apply: true });
+  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 99, username: "owner", apply: true });
   assert.equal(result.code, REFUSALS.NO_COUNTER);
   assert.equal(client.writes.length, 0, "and the approval must not happen either");
 });
@@ -162,8 +165,8 @@ test("posting a machine where nobody is posted is refused", async () => {
   // device assignment *and* the staff assignment; a machine posted where no person is posted still
   // fails login with DEVICE_LOCATION_MISMATCH, which is indistinguishable from having done nothing.
   const { approveDevice, REFUSALS } = await import(modulePath);
-  const client = fakeClient([PENDING, COUNTER, NO_POSTING, { count: 0 }]);
-  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 1, apply: true });
+  const client = fakeClient([PENDING, COUNTER, OWNER, NO_POSTING, { count: 0 }]);
+  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 1, username: "owner", apply: true });
   assert.equal(result.code, REFUSALS.NOBODY_AT_COUNTER);
   assert.equal(client.writes.length, 0);
   assert.match(result.message, /needs both/);
@@ -172,16 +175,16 @@ test("posting a machine where nobody is posted is refused", async () => {
 test("a machine already standing at a counter is not moved from here", async () => {
   // A relocation carries an audit trail, and that belongs in the app.
   const { approveDevice, REFUSALS } = await import(modulePath);
-  const client = fakeClient([PENDING, COUNTER, { generation: 2, active_count: 1 }, STAFFED]);
-  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 1, apply: true });
+  const client = fakeClient([PENDING, COUNTER, OWNER, { generation: 2, active_count: 1 }, STAFFED]);
+  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 1, username: "owner", apply: true });
   assert.equal(result.code, REFUSALS.ALREADY_POSTED);
   assert.equal(client.writes.length, 0);
 });
 
 test("--counter approves and posts, together", async () => {
   const { approveDevice } = await import(modulePath);
-  const client = fakeClient([PENDING, COUNTER, NO_POSTING, STAFFED]);
-  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 1, apply: true });
+  const client = fakeClient(POSTING_TURNS());
+  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 1, username: "owner", apply: true });
   assert.equal(result.ok, true);
   assert.equal(client.writes.length, 2, "the approval and the posting");
   assert.match(client.writes[0].sql, /UPDATE authorized_devices/);
@@ -194,8 +197,8 @@ test("--counter approves and posts, together", async () => {
 
 test("a dry run with --counter still writes nothing, and says what it would post", async () => {
   const { approveDevice } = await import(modulePath);
-  const client = fakeClient([PENDING, COUNTER, NO_POSTING, STAFFED]);
-  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 1 });
+  const client = fakeClient(POSTING_TURNS());
+  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 1, username: "owner" });
   assert.equal(result.dryRun, true);
   assert.equal(client.writes.length, 0);
   assert.equal(result.plan.counter.id, 1);
@@ -210,8 +213,8 @@ test("an already-approved device can still be posted to a counter", async () => 
   // Nothing above covered it: the no-op test passes no counter, and the posting tests start from
   // PENDING. Two correct tests, and the gap between them was the bug.
   const { approveDevice } = await import(modulePath);
-  const client = fakeClient([APPROVED, COUNTER, NO_POSTING, STAFFED]);
-  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 1, apply: true });
+  const client = fakeClient(POSTING_TURNS(APPROVED));
+  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 1, username: "owner", apply: true });
   assert.equal(result.ok, true, "an approved device with --counter must proceed");
   assert.equal(result.plan.previousStatus, "APPROVED");
   assert.equal(client.writes.length, 2);
@@ -227,4 +230,60 @@ test("without a counter, an already-approved device is still a no-op, and says h
   assert.equal(result.code, REFUSALS.ALREADY_APPROVED);
   assert.equal(client.writes.length, 0);
   assert.match(result.message, /--counter/);
+});
+
+test("the posting names who made it", async () => {
+  // `device_assignments.approved_by` is NOT NULL and it is an audit field. The first version of the
+  // insert simply omitted the column, which the database caught and no test did -- a fake client
+  // cannot enforce a constraint. So this pins the value, and the test below pins the column list
+  // against the one bootstrap-first-counter.mjs already gets right.
+  const { approveDevice } = await import(modulePath);
+  const client = fakeClient(POSTING_TURNS());
+  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 1, username: "owner", apply: true });
+  assert.equal(result.ok, true);
+  const insert = client.writes[1];
+  assert.match(insert.sql, /approved_by/);
+  assert.equal(insert.params[6], OWNER.id, "recorded against the Owner who ran it");
+});
+
+test("posting without a username is refused rather than attributed to nobody", async () => {
+  const { approveDevice, REFUSALS } = await import(modulePath);
+  const client = fakeClient(POSTING_TURNS());
+  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 1, apply: true });
+  assert.equal(result.code, REFUSALS.USAGE);
+  assert.equal(client.writes.length, 0);
+});
+
+test("only an Owner may post a machine to a counter", async () => {
+  const { approveDevice, REFUSALS } = await import(modulePath);
+  for (const [actor, code] of [
+    [{ ...OWNER, role_name: "Cashier" }, REFUSALS.NOT_OWNER],
+    [{ ...OWNER, active: false }, REFUSALS.USER_INACTIVE],
+    [null, REFUSALS.NO_USER],
+  ]) {
+    const client = fakeClient([PENDING, COUNTER, actor, NO_POSTING, STAFFED]);
+    const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 1, username: "someone", apply: true });
+    assert.equal(result.code, code);
+    assert.equal(client.writes.length, 0);
+  }
+});
+
+test("the assignment insert names the same columns bootstrap-first-counter uses", async () => {
+  // The guard for the class, not the instance. Both files write the same row into the same table,
+  // and one of them has been correct since it was written. A fake client proves behaviour and
+  // cannot prove a schema, so the check that catches a missing NOT NULL column is this one:
+  // compare the two column lists directly.
+  const fs = require("node:fs");
+  const columnsOf = (file) => {
+    const source = fs.readFileSync(path.join(__dirname, "..", "scripts", file), "utf8");
+    const at = source.indexOf("INSERT INTO device_assignments");
+    assert.notEqual(at, -1, `${file} must still insert a device assignment`);
+    const list = source.slice(source.indexOf("(", at) + 1, source.indexOf(")", source.indexOf("(", at)));
+    return list.split(",").map((name) => name.trim()).filter(Boolean).sort();
+  };
+  assert.deepEqual(
+    columnsOf("approve-device.mjs"),
+    columnsOf("bootstrap-first-counter.mjs"),
+    "the two device_assignments inserts must write the same columns",
+  );
 });

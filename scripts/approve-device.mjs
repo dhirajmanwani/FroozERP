@@ -20,16 +20,22 @@
  * which the deployment already has and already protects. There is nothing here for a stranger to
  * reach, because nothing is listening.
  *
- * ## Deliberately narrow
+ * ## Narrow by default, and posting is opt-in
  *
- * It sets `authorized_devices.status` to `APPROVED` and nothing else. It does not create a device
- * assignment, does not grant permissions, and does not touch users — those are the ordinary
- * screens' work, and duplicating them here would build a second, unaudited way to do them.
+ * On its own it sets `authorized_devices.status` to `APPROVED` and nothing else. `--counter` also
+ * posts the machine to an operational location, because approval alone leaves a device with no
+ * scope: every screen filters to nothing, and Branches & Counters — the screen that would fix it —
+ * refuses with "User and device do not share an approved operational location". The way out of a
+ * deadlock cannot itself require being out of it.
+ *
+ * Nothing beyond those two rows. It does not grant permissions beyond the counter-machine set
+ * `bootstrap-first-counter.mjs` defines, and it never touches users.
  *
  * ## Usage
  *
  *   node scripts/approve-device.mjs --device-id FZDEV-...            (dry run: says what it would do)
  *   node scripts/approve-device.mjs --device-id FZDEV-... --apply
+ *   node scripts/approve-device.mjs --device-id FZDEV-... --counter 1 --username owner --apply
  *
  * Dry run is the default, matching `run-cloud-migrations.js`: these are writes to a live shop's
  * database, and the shape that does something should be the one you have to ask for.
@@ -71,6 +77,9 @@ export const REFUSALS = Object.freeze({
   COUNTER_CLOSED: "COUNTER_CLOSED",
   ALREADY_POSTED: "ALREADY_POSTED",
   NOBODY_AT_COUNTER: "NOBODY_AT_COUNTER",
+  NO_USER: "NO_USER",
+  USER_INACTIVE: "USER_INACTIVE",
+  NOT_OWNER: "NOT_OWNER",
   WRITE_FAILED: "WRITE_FAILED",
 });
 
@@ -81,6 +90,7 @@ const USAGE = `Usage:
 
   --apply        actually write. Without it this is a dry run.
   --counter <id> also post this machine to that counter (an operational location id).
+  --username <n> the Owner the posting is recorded against. Required with --counter.
   --reinstate    also allow a DISABLED or REVOKED device to be approved again.`;
 
 /** Statuses that mean somebody deliberately shut this device out. */
@@ -98,6 +108,7 @@ export const approveDevice = async (client, options = {}) => {
   const counterId = options.counterId === undefined || options.counterId === null || options.counterId === ""
     ? null
     : Number(options.counterId);
+  const username = String(options.username || "").trim();
 
   if (!deviceId) return refuse(REFUSALS.USAGE, USAGE);
 
@@ -172,6 +183,28 @@ export const approveDevice = async (client, options = {}) => {
       return refuse(REFUSALS.COUNTER_CLOSED, `Counter ${counterId} (${counter.location_name}) is closed. Reopen it in the app before posting a machine to it.`);
     }
 
+    // Who the posting is recorded against. `device_assignments.approved_by` is NOT NULL, and it is
+    // an audit field: a posting made from a shell still has a person behind it, and writing
+    // somebody plausible rather than asking would be a worse answer than failing.
+    if (!username) {
+      return refuse(
+        REFUSALS.USAGE,
+        "--counter also needs --username <owner>, because a posting is recorded against the person who made it."
+      );
+    }
+    const owner = await client.query(
+      `SELECT u.id, u.username, u.active, r.role_name
+         FROM users u JOIN roles r ON r.id = u.role_id
+        WHERE LOWER(u.username) = LOWER($1)`,
+      [username]
+    );
+    const actor = owner.rows[0];
+    if (!actor) return refuse(REFUSALS.NO_USER, `No user is named "${username}". \`node scripts/show-setup.mjs\` lists them under SIGN-IN.`);
+    if (actor.active === false) return refuse(REFUSALS.USER_INACTIVE, `User "${username}" is not active.`);
+    if (String(actor.role_name || "").toUpperCase() !== "OWNER") {
+      return refuse(REFUSALS.NOT_OWNER, `User "${username}" is ${actor.role_name || "unknown"}, not Owner. Only an Owner posts a machine to a counter.`);
+    }
+
     // A machine stands at one counter: `device_assignments_one_active_idx` is unique on device_id
     // where active. An existing posting means either a working scope already, or a relocation --
     // and a relocation carries an audit trail that belongs in the app.
@@ -209,6 +242,8 @@ export const approveDevice = async (client, options = {}) => {
 
     // Not always 1: a machine whose earlier posting was ended keeps its old generation rows, and
     // (device_id, assignment_generation) is unique. Continuing the count is what the app does.
+    plan.actorId = actor.id;
+    plan.actorName = actor.username;
     plan.counter = {
       id: counter.id,
       name: counter.location_name,
@@ -236,10 +271,14 @@ export const approveDevice = async (client, options = {}) => {
     );
     if (plan.counter) {
       await client.query(
+        // Column-for-column the same insert bootstrap-first-counter.mjs makes. `approved_by` is
+        // NOT NULL and was missing from the first version of this list, which failed at the
+        // database rather than in review -- a fake client cannot enforce a constraint.
+        // `approveDeviceAssignmentColumns.test.js` now pins that the two lists agree.
         `INSERT INTO device_assignments
            (device_id, company_id, branch_id, operational_location_id, device_type, intended_usage,
-            fixed_operational, permission_set, assignment_generation, active)
-         VALUES ($1,$2,$3,$4,'desktop','COUNTER',TRUE,$5::jsonb,$6,TRUE)`,
+            fixed_operational, permission_set, assignment_generation, active, approved_by)
+         VALUES ($1,$2,$3,$4,'desktop','COUNTER',TRUE,$5::jsonb,$6,TRUE,$7)`,
         [
           deviceId,
           plan.counter.companyId,
@@ -247,6 +286,7 @@ export const approveDevice = async (client, options = {}) => {
           plan.counter.id,
           JSON.stringify(DEVICE_PERMISSIONS),
           plan.counter.generation,
+          plan.actorId,
         ]
       );
     }
@@ -287,6 +327,7 @@ const main = async () => {
   const options = {
     deviceId: readFlag("device-id"),
     counterId: readFlag("counter"),
+    username: readFlag("username"),
     apply: hasFlag("apply"),
     reinstate: hasFlag("reinstate"),
   };
