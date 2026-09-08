@@ -36,6 +36,10 @@ const migrationFiles = [
   "backend/migrations/cloud/011_inventory_incremental_publication.sql",
   "backend/migrations/cloud/012_scope_management.sql",
   "backend/migrations/cloud/013_transfer_request_without_lot.sql",
+  // 014 carries the two A-5 columns onto the hosted database. They are declared in
+  // `initializeDatabase()`, which is switched off on a hosted deployment, so on the cloud they
+  // had never existed -- and `/login` selects one of them, which made every cloud sign-in a 500.
+  "backend/migrations/cloud/014_login_lockout_columns.sql",
 ];
 
 module.exports = { migrationFiles, deliberatelyNotRun };
