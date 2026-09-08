@@ -24,6 +24,7 @@ const SCRIPTS_DIR = path.join(__dirname, "..", "scripts");
 
 /** Commands that connect to the cloud database and are run by hand. */
 const OPS_COMMANDS = [
+  "approve-device.mjs",
   "bootstrap-first-counter.mjs",
   "bootstrap-first-owner.mjs",
   "reset-password.mjs",
