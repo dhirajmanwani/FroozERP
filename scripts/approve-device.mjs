@@ -118,10 +118,17 @@ export const approveDevice = async (client, options = {}) => {
   }
 
   const status = String(device.status || "").toUpperCase();
-  if (status === "APPROVED") {
+  // "Already approved" is only *nothing to do* when approving was the whole request.
+  //
+  // The first version returned here unconditionally, which made the command useless in exactly the
+  // situation it was extended for: a device approved an hour earlier, still posted nowhere, and
+  // `--counter` refused with "Nothing to do." An early return that ignores the rest of the request
+  // is not a no-op, it is a silent refusal to do the part that was asked for.
+  if (status === "APPROVED" && counterId === null) {
     return refuse(
       REFUSALS.ALREADY_APPROVED,
-      `${deviceId} is already approved (${device.device_name || "unnamed"}). Nothing to do.`
+      `${deviceId} is already approved (${device.device_name || "unnamed"}). Nothing to do.\n`
+      + "To post it to a counter as well, pass --counter <id>."
     );
   }
   if (BLOCKED_STATUSES.includes(status) && !reinstate) {
@@ -311,7 +318,7 @@ const main = async () => {
     }
     stdout.write(
       (result.plan.counter
-        ? "  Approved and posted.\n\n  Sign in again on that machine.\n\n"
+        ? `  ${result.plan.previousStatus === "APPROVED" ? "Posted" : "Approved and posted"}.\n\n  Sign in again on that machine -- the session carries the old scope until you do.\n\n`
         : "  Approved.\n\n"
           + "  Approval alone gives no counter, and without one every screen filters to nothing.\n"
           + "  Re-run with --counter <id> (see COUNTERS in show-setup), or post it from the app.\n\n")

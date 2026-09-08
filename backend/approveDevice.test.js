@@ -200,3 +200,31 @@ test("a dry run with --counter still writes nothing, and says what it would post
   assert.equal(client.writes.length, 0);
   assert.equal(result.plan.counter.id, 1);
 });
+
+test("an already-approved device can still be posted to a counter", async () => {
+  // The case that shipped broken. The ALREADY_APPROVED refusal returned before the posting ran, so
+  // a device approved an hour earlier and posted nowhere -- the exact state this command creates
+  // when run without --counter -- could never be posted at all. It answered "Nothing to do." to a
+  // request that plainly had something to do.
+  //
+  // Nothing above covered it: the no-op test passes no counter, and the posting tests start from
+  // PENDING. Two correct tests, and the gap between them was the bug.
+  const { approveDevice } = await import(modulePath);
+  const client = fakeClient([APPROVED, COUNTER, NO_POSTING, STAFFED]);
+  const result = await approveDevice(client, { deviceId: "FZDEV-A", counterId: 1, apply: true });
+  assert.equal(result.ok, true, "an approved device with --counter must proceed");
+  assert.equal(result.plan.previousStatus, "APPROVED");
+  assert.equal(client.writes.length, 2);
+  assert.match(client.writes[1].sql, /INSERT INTO device_assignments/);
+});
+
+test("without a counter, an already-approved device is still a no-op, and says how to post it", async () => {
+  // The control for the test above, and the message has to lead somewhere: "Nothing to do." on its
+  // own is what sent the maintainer back here.
+  const { approveDevice, REFUSALS } = await import(modulePath);
+  const client = fakeClient(APPROVED);
+  const result = await approveDevice(client, { deviceId: "FZDEV-A", apply: true });
+  assert.equal(result.code, REFUSALS.ALREADY_APPROVED);
+  assert.equal(client.writes.length, 0);
+  assert.match(result.message, /--counter/);
+});
