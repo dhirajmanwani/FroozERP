@@ -15,9 +15,11 @@
         "title": "FroozERP - Feel the Freakin' Frooz",
         "width": 1280,
         "height": 800,
-        "minWidth": 1024,
-        "minHeight": 700,
-        "visible": false
+        "minWidth": 800,
+        "minHeight": 520,
+        "visible": false,
+        "center": true,
+        "maximized": true
       }
     ],
     "security": {
