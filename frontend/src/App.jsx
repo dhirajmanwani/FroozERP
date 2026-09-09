@@ -124,7 +124,7 @@ import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./loc
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, resolveReportDateRange } from "./local/reportRefresh";
 import { approvedDeviceCredentialMessage, normalizeDeviceBootstrapStatus } from "./local/freshDeviceOnboarding";
-import { getUserDisplayName, getUserGreetingName, getUserInitial, getUserRoleLabel } from "./local/userPresentation";
+import { NAME_TITLES, getUserDisplayName, getUserGreetingName, getUserInitial, getUserRoleLabel, joinPersonName, splitPersonName } from "./local/userPresentation";
 import { describeUpdateAvailability, normalizeUpdateMetadata } from "./local/updateMetadata";
 import { RUNTIME_FAILURE_EVENT, describeRequestFailure, initialiseMandatoryRuntime, resolveLocalServiceRenderState, resolveMandatoryRuntimeRenderState, settleNamedRequests } from "./local/startupResilience";
 import {
@@ -17167,6 +17167,7 @@ function DeviceControlSettingsSection({ canManage, deviceControlSettings = defau
 
 function UserManagementSection({ canManage, onReload, roles = [], user, users = [] }) {
   const emptyForm = {
+    title: "",
     full_name: "",
     username: "",
     mobile_number: "",
@@ -17188,8 +17189,12 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
   const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
   const startEdit = (item) => {
     setEditingId(item.id);
+    // `full_name` is one stored column. The form shows it as a title and a name so nobody has to
+    // type "Mr." correctly every time; `joinPersonName` puts it back together on save.
+    const parsed = splitPersonName(item.full_name || "");
     setDraft({
-      full_name: item.full_name || "",
+      title: parsed.title,
+      full_name: parsed.name,
       username: item.username || "",
       mobile_number: item.mobile_number || "",
       email: item.email || "",
@@ -17231,7 +17236,8 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
         alert("Enter matching password with at least 4 characters.");
         return;
       }
-      const payload = { ...draft, updated_by: user.id };
+      const { title, ...rest } = draft;
+      const payload = { ...rest, full_name: joinPersonName(title, draft.full_name), updated_by: user.id };
       if (editingId) await axios.put(`${API_URL}/users/${editingId}`, payload);
       else await axios.post(`${API_URL}/users`, payload);
       resetForm();
@@ -17300,7 +17306,17 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
   return (
     <ModuleCard eyebrow="User Management" title="Owner User Administration" subtitle="Add, edit, reset password, deactivate and protect user records with transaction history.">
       <div className="form-grid supplier-form-grid">
-        <Field label="Full Name"><input disabled={!canManage} value={draft.full_name} onChange={(event) => updateDraft("full_name", event.target.value)} /></Field>
+        <Field label="Title">
+          <select disabled={!canManage} value={draft.title} onChange={(event) => updateDraft("title", event.target.value)}>
+            <option value="">(none)</option>
+            {/* A title already stored but not on the offered list -- "Dr.", say -- is kept as an
+                option, so opening this form never silently drops it. */}
+            {[...new Set([...NAME_TITLES, draft.title].filter(Boolean))].map((option) => (
+              <option key={option} value={option}>{option}</option>
+            ))}
+          </select>
+        </Field>
+        <Field label="Name"><input disabled={!canManage} value={draft.full_name} onChange={(event) => updateDraft("full_name", event.target.value)} /></Field>
         <Field label="Username"><input disabled={!canManage} value={draft.username} onChange={(event) => updateDraft("username", event.target.value)} /></Field>
         <Field label="Mobile"><input disabled={!canManage} value={draft.mobile_number} onChange={(event) => updateDraft("mobile_number", event.target.value)} /></Field>
         <Field label="Email"><input disabled={!canManage} type="email" value={draft.email} onChange={(event) => updateDraft("email", event.target.value)} /></Field>
