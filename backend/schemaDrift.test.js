@@ -144,90 +144,118 @@ test("a Windows checkout is parsed too", async () => {
 });
 
 /**
- * A migration that fills the drift must define the same table the bootstrap does.
+ * A migration that recreates a bootstrap table must recreate the whole of it.
  *
- * Two definitions of one table drift, and the drift is invisible: a query written against the
- * bootstrap's shape runs against the migration's shape and fails on a column that "exists" in the
- * only place the author looked. Migration 015 copies five tables out of `initializeDatabase()`
- * verbatim; this is what keeps "verbatim" true.
+ * ## What went wrong once already
+ *
+ * Migration 015 copied the `CREATE TABLE` for five tables out of `initializeDatabase()` and
+ * stopped there. But a table in that function is not only its CREATE TABLE. `customer_orders` is
+ * followed by an added column, a backfill, two `ALTER COLUMN`s and a third index -- the whole
+ * order routing split -- so copying the CREATE alone reproduced the table as it looked before that
+ * work, on a live shop's cloud.
+ *
+ * The first version of this test compared CREATE TABLE bodies, so it watched 015 do exactly that
+ * and passed. The drift checker did not catch it either: it found the added column only after 015
+ * created the table (a column of a missing table is deliberately not reported), and it cannot see
+ * the rest at all -- it compares tables and columns, and `branch_id NOT NULL DEFAULT 1` is a column
+ * that exists. What was left on the cloud was a table that puts an unassigned order onto branch 1
+ * and onto the sync road: the exact confusion `docs/order-routing-decision.md` exists to remove.
+ *
+ * ## The rule
+ *
+ * For every table a registered migration creates, every statement in `initializeDatabase()` that
+ * names that table must also appear in the migrations. Not the column list -- the statements: the
+ * CREATE, the ALTERs, the indexes and the backfills, because between them they are the table.
+ *
+ * Tables a migration creates that the bootstrap does not are out of scope: they came from a
+ * migration in the first place and have no bootstrap definition to agree with.
  */
 
-/**
- * `table -> Map(column -> definition)`, from every CREATE TABLE in a piece of SQL.
- *
- * The definition, not just the name. A migration that declares `carrier VARCHAR(999)` where the
- * bootstrap declares `VARCHAR(160)` has the same columns and a different table, and the difference
- * only ever surfaces as a value the shop's cloud accepts and its laptop refuses. Comparing names
- * alone let that through, so this compares the whole line: type, NOT NULL, DEFAULT, CHECK and
- * REFERENCES included.
- */
-const tableColumns = (sql) => {
-  const tables = new Map();
-  for (const match of sql.matchAll(/CREATE TABLE IF NOT EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([\s\S]*?)\n\s*\);/g)) {
-    const [, name, body] = match;
-    const columns = new Map();
-    for (const raw of body.split("\n")) {
-      // Comments differ freely between the two files; whitespace and a trailing comma do not carry
-      // meaning either. Everything else does.
-      const line = raw.replace(/--.*$/, "").trim().replace(/,$/, "").replace(/\s+/g, " ");
-      if (!line) continue;
-      // A column line starts with the column name; a table constraint starts with a keyword.
-      if (/^(UNIQUE|PRIMARY|FOREIGN|CHECK|CONSTRAINT)\b/i.test(line)) continue;
-      const column = (line.match(/^([A-Za-z_][A-Za-z0-9_]*)/) || [])[1];
-      if (column) columns.set(column, line);
-    }
-    tables.set(name.toLowerCase(), columns);
-  }
-  return tables;
+/** Every statement in a piece of SQL that names `table`, normalised for comparison. */
+const statementsNaming = (sql, table) => {
+  // Comments differ freely between the two files and whitespace does not carry meaning; a
+  // statement is otherwise compared as written, so a changed type or a dropped NOT NULL is a
+  // difference.
+  const normalise = (text) => text.replace(/--.*$/gm, "").replace(/\s+/g, " ").trim().replace(/;$/, "");
+  const patterns = [
+    new RegExp(`CREATE TABLE IF NOT EXISTS\\s+${table}\\s*\\([^;]*\\);`, "gi"),
+    new RegExp(`ALTER TABLE\\s+${table}\\s+[^;]*;`, "gi"),
+    new RegExp(`CREATE (?:UNIQUE )?INDEX IF NOT EXISTS\\s+[^;]*?\\bON ${table}\\b[^;]*;`, "gi"),
+    new RegExp(`UPDATE\\s+${table}\\s+[^;]*;`, "gi"),
+  ];
+  return new Set(patterns.flatMap((pattern) => [...sql.matchAll(pattern)].map(([text]) => normalise(text))));
 };
 
-test("migration 015 defines its tables exactly as the bootstrap does", async () => {
+const createdTables = (sql) =>
+  [...sql.matchAll(/CREATE TABLE IF NOT EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)/gi)].map(([, name]) => name.toLowerCase());
+
+test("every migration that recreates a bootstrap table recreates all of it", async () => {
   const { bootstrapSql } = await import(modulePath);
-  const migration = fs.readFileSync(
-    path.join(__dirname, "migrations", "cloud", "015_charges_and_customer_orders.sql"),
-    "utf8",
-  );
+  const { migrationFiles } = require(path.join(__dirname, "..", "scripts", "run-cloud-migrations.js"));
 
-  const fromBootstrap = tableColumns(bootstrapSql(SERVER));
-  const fromMigration = tableColumns(migration);
+  const bootstrap = bootstrapSql(SERVER);
+  const bootstrapTables = new Set(createdTables(bootstrap));
 
-  assert.ok(fromMigration.size >= 5, `the migration must still create its tables, found ${fromMigration.size}`);
-  for (const [table, columns] of fromMigration) {
-    assert.ok(fromBootstrap.has(table), `${table} is created by the migration but not by the bootstrap`);
-    const declared = fromBootstrap.get(table);
-    assert.deepEqual(
-      [...columns.keys()].sort(),
-      [...declared.keys()].sort(),
-      `${table} has different columns in the migration and the bootstrap`,
-    );
-    for (const [column, definition] of columns) {
-      assert.equal(
-        definition,
-        declared.get(column),
-        `${table}.${column} is declared differently in the migration and the bootstrap`,
-      );
+  // Everything the runner applies, as one body of SQL -- a table may legitimately be created by
+  // one migration and corrected by a later one, which is exactly what 015 and 016 do.
+  const applied = migrationFiles
+    .map((file) => fs.readFileSync(path.join(__dirname, "..", file), "utf8"))
+    .join("\n");
+
+  const covered = [...new Set(createdTables(applied))].filter((table) => bootstrapTables.has(table));
+  assert.ok(covered.length >= 5, `expected the migrations to recreate bootstrap tables, found ${covered.length}`);
+
+  const missing = [];
+  for (const table of covered) {
+    const declared = statementsNaming(bootstrap, table);
+    const reproduced = statementsNaming(applied, table);
+    for (const statement of declared) {
+      if (!reproduced.has(statement)) missing.push(`${table}: ${statement}`);
     }
   }
+
+  assert.deepEqual(
+    missing,
+    [],
+    "initializeDatabase() runs these against a bootstrapped database and no migration runs them "
+      + "against the cloud, so the hosted table is not the table the code expects:\n  "
+      + missing.join("\n  "),
+  );
 });
 
-test("the column extractor reads a definition, not just a name", () => {
-  // Without this the test above passes on an extractor that returns nothing, which is the failure
-  // mode of every comparison that iterates a list. It also pins the normalisation: a comment, the
-  // trailing comma and runs of whitespace are not differences; everything after the name is.
+test("the statement extractor sees more than the CREATE TABLE", () => {
+  // Without this the test above passes on an extractor that returns nothing -- the failure mode of
+  // every comparison that iterates a list -- and it would have passed on one that returns only the
+  // CREATE, which is the bug it exists to catch.
   const sql = [
     "CREATE TABLE IF NOT EXISTS example (",
     "  id SERIAL PRIMARY KEY,",
-    "  -- a comment, not a column",
-    "  order_global_id  VARCHAR(180) NOT NULL REFERENCES customer_orders(global_id),",
-    "  line_index INTEGER NOT NULL,",
-    "  UNIQUE (order_global_id, line_index)",
+    "  branch_id INTEGER NOT NULL DEFAULT 1",
     ");",
+    "-- a comment naming example, which is not a statement",
+    "ALTER TABLE example ADD COLUMN IF NOT EXISTS taken_at_branch_id INTEGER;",
+    "ALTER TABLE example ALTER COLUMN branch_id DROP NOT NULL;",
+    "CREATE INDEX IF NOT EXISTS example_idx ON example (id);",
+    "UPDATE example SET taken_at_branch_id = branch_id WHERE taken_at_branch_id IS NULL;",
+    "CREATE TABLE IF NOT EXISTS example_items ( id SERIAL PRIMARY KEY );",
+    "ALTER TABLE example_items ADD COLUMN IF NOT EXISTS note TEXT;",
   ].join("\n");
-  const columns = tableColumns(sql).get("example");
-  assert.deepEqual([...columns.keys()].sort(), ["id", "line_index", "order_global_id"]);
-  assert.equal(
-    columns.get("order_global_id"),
-    "order_global_id VARCHAR(180) NOT NULL REFERENCES customer_orders(global_id)",
-    "the type and its constraints must survive into the comparison",
-  );
+
+  const found = statementsNaming(sql, "example");
+  assert.equal(found.size, 5, `expected the CREATE, two ALTERs, the index and the backfill, got ${[...found].join(" | ")}`);
+  assert.ok([...found].some((s) => s.startsWith("CREATE TABLE IF NOT EXISTS example (")));
+  assert.ok(found.has("ALTER TABLE example ALTER COLUMN branch_id DROP NOT NULL"));
+  assert.ok(found.has("CREATE INDEX IF NOT EXISTS example_idx ON example (id)"));
+  // A longer sibling table must not be collected as this one.
+  assert.ok(![...found].some((s) => s.includes("example_items")), "example_items is a different table");
+});
+
+test("a changed declaration is a difference, not a match", () => {
+  // The comparison must be on the statement, not on the column name: `branch_id NOT NULL DEFAULT 1`
+  // and a nullable `branch_id` are the same column and different tables, and that difference is
+  // precisely what reached the shop's cloud.
+  const bootstrap = "CREATE TABLE IF NOT EXISTS example (\n  branch_id INTEGER\n);";
+  const migration = "CREATE TABLE IF NOT EXISTS example (\n  branch_id INTEGER NOT NULL DEFAULT 1\n);";
+  const declared = [...statementsNaming(bootstrap, "example")][0];
+  assert.ok(!statementsNaming(migration, "example").has(declared), "a changed column must not compare equal");
 });

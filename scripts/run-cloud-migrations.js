@@ -45,6 +45,12 @@ const migrationFiles = [
   // and Customer Orders. `charge_types` missing is why the reference bootstrap answered 500,
   // and therefore why a rebuilt device could not be filled from the cloud at all.
   "backend/migrations/cloud/015_charges_and_customer_orders.sql",
+  // 016 is the rest of what 015 should have carried. A table in `initializeDatabase()` is not
+  // only its CREATE TABLE: `customer_orders` is followed by an added column, a backfill, two
+  // ALTER COLUMNs and a third index, and 015 copied the CREATE and stopped. The two ALTER COLUMNs
+  // matter most -- without them `branch_id` stays NOT NULL DEFAULT 1, which puts an unassigned
+  // order onto branch 1 and onto the sync road, the exact confusion the routing split removed.
+  "backend/migrations/cloud/016_customer_orders_routing_split.sql",
 ];
 
 module.exports = { migrationFiles, deliberatelyNotRun };
