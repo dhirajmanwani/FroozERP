@@ -79,7 +79,20 @@ export const NOT_COUNTED = Object.freeze({
   charge_rate_slabs: "read only as a nested subquery of charge_types, never on its own",
 });
 
-export const explainEmptiness = ({ assignment, sent, available }) => {
+export const explainEmptiness = ({ assignment, sent, available, schemaFaults = [] }) => {
+  // A filter column that does not exist outranks everything below it. The bootstrap's query does
+  // not return zero rows in that case -- it raises, the route answers 500, and no count taken here
+  // describes anything. `products.company_id` and `inventory_batches.company_id` are both added by
+  // an ALTER rather than by their CREATE TABLE, and a hosted deployment never runs those, so this
+  // is the ordinary state of a drifted cloud rather than an exotic one.
+  if (schemaFaults.length) {
+    return {
+      code: "SCHEMA_INCOMPLETE",
+      message: "The bootstrap filters on columns this database does not have, so the query raises "
+        + "rather than returning rows. Run scripts/cloud/check-schema-drift.mjs and write a "
+        + "migration for what it reports; no count below can mean anything until then.",
+    };
+  }
   if (!assignment) {
     return {
       code: "NO_ACTIVE_ASSIGNMENT",
@@ -109,6 +122,9 @@ export const explainEmptiness = ({ assignment, sent, available }) => {
 
 const pad = (value, width) => String(value).padEnd(width);
 
+/** Which of `candidates` this database actually has, in order. */
+const present = (columns, table, candidates) => candidates.filter((column) => columns.get(table)?.has(column));
+
 const main = async () => {
   const deviceId = argv[2];
   if (!deviceId) {
@@ -127,76 +143,120 @@ const main = async () => {
   const pool = new Pool({ connectionString });
   const client = await pool.connect();
   try {
-    const device = (await client.query(
-      "SELECT device_id, device_name, status, branch_id, counter_id FROM authorized_devices WHERE device_id = $1",
-      [deviceId],
-    )).rows[0];
+    // Every column this report intends to use, read once, before any of it is used. A diagnostic
+    // run against a database that is known to be behind the code must not die on the first column
+    // it assumed -- the absence is itself part of the answer, and it was the first thing this
+    // script did wrong.
+    const columns = new Map();
+    for (const row of (await client.query(
+      "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'public'"
+    )).rows) {
+      if (!columns.has(row.table_name)) columns.set(row.table_name, new Set());
+      columns.get(row.table_name).add(row.column_name);
+    }
+
     stdout.write(`\nDevice ${deviceId}\n`);
+    if (!columns.has("authorized_devices")) {
+      stdout.write("  This database has no authorized_devices table. Nothing else can be true of it.\n\n");
+      return;
+    }
+
+    // The bootstrap-era name is assigned_branch_id / assigned_counter_id; older and newer shapes
+    // of this table have been seen, so ask rather than assume.
+    const deviceColumns = present(columns, "authorized_devices",
+      ["device_id", "device_name", "status", "assigned_branch_id", "assigned_counter_id", "branch_id", "counter_id"]);
+    const device = (await client.query(
+      `SELECT ${deviceColumns.join(", ")} FROM authorized_devices WHERE device_id = $1`, [deviceId],
+    )).rows[0];
     if (!device) {
       stdout.write("  Not present in authorized_devices at all. Nothing else can be true of it.\n\n");
       return;
     }
-    stdout.write(`  name=${device.device_name || "(none)"}  status=${device.status}  `
-      + `branch=${device.branch_id ?? "(none)"}  counter=${device.counter_id ?? "(none)"}\n`);
+    stdout.write("  " + deviceColumns.map((column) => `${column}=${device[column] ?? "(none)"}`).join("  ") + "\n");
 
-    const assignment = (await client.query(
-      `SELECT company_id, branch_id, operational_location_id, assignment_generation, active
-       FROM device_assignments WHERE device_id = $1 AND active = TRUE
-       ORDER BY assignment_generation DESC LIMIT 1`,
-      [deviceId],
-    )).rows[0];
-    if (assignment) {
-      stdout.write(`  assignment: company=${assignment.company_id} branch=${assignment.branch_id} `
-        + `location=${assignment.operational_location_id} generation=${assignment.assignment_generation}\n`);
+    const schemaFaults = [];
+    let assignment = null;
+    if (!columns.has("device_assignments")) {
+      schemaFaults.push("device_assignments (table missing)");
     } else {
-      stdout.write("  assignment: none active\n");
+      assignment = (await client.query(
+        `SELECT company_id, branch_id, operational_location_id, assignment_generation, active
+         FROM device_assignments WHERE device_id = $1 AND active = TRUE
+         ORDER BY assignment_generation DESC LIMIT 1`,
+        [deviceId],
+      )).rows[0] || null;
+      stdout.write(assignment
+        ? `  assignment: company=${assignment.company_id} branch=${assignment.branch_id} `
+          + `location=${assignment.operational_location_id} generation=${assignment.assignment_generation}\n`
+        : "  assignment: none active\n");
     }
 
     const sent = {};
     const available = {};
-    if (assignment) {
-      for (const scope of BOOTSTRAP_SCOPES) {
-        const where = scope.by.map((column, index) => `${column} = $${index + 1}`);
-        if (scope.softDelete) where.push("deleted_at IS NULL");
-        const values = scope.by.map((column) =>
-          column === "company_id" ? assignment.company_id
-            : column === "branch_id" ? assignment.branch_id
-              : assignment.operational_location_id);
-        sent[scope.entity] = Number((await client.query(
-          `SELECT COUNT(*)::INT AS n FROM ${scope.table} WHERE ${where.join(" AND ")}`, values,
-        )).rows[0].n);
-      }
-    }
+    const usable = [];
     for (const scope of BOOTSTRAP_SCOPES) {
+      if (!columns.has(scope.table)) {
+        schemaFaults.push(`${scope.table} (table missing)`);
+        continue;
+      }
+      const absent = scope.by.filter((column) => !columns.get(scope.table).has(column));
+      if (scope.softDelete && !columns.get(scope.table).has("deleted_at")) absent.push("deleted_at");
+      if (absent.length) {
+        schemaFaults.push(`${scope.table}.${absent.join(", ")}`);
+        continue;
+      }
+      usable.push(scope);
+    }
+
+    for (const scope of usable) {
       available[scope.table] = Number((await client.query(
         `SELECT COUNT(*)::INT AS n FROM ${scope.table}${scope.softDelete ? " WHERE deleted_at IS NULL" : ""}`,
       )).rows[0].n);
+      if (!assignment) continue;
+      const where = scope.by.map((column, index) => `${column} = $${index + 1}`);
+      if (scope.softDelete) where.push("deleted_at IS NULL");
+      const values = scope.by.map((column) =>
+        column === "company_id" ? assignment.company_id
+          : column === "branch_id" ? assignment.branch_id
+            : assignment.operational_location_id);
+      sent[scope.entity] = Number((await client.query(
+        `SELECT COUNT(*)::INT AS n FROM ${scope.table} WHERE ${where.join(" AND ")}`, values,
+      )).rows[0].n);
     }
 
-    stdout.write("\nWhat the bootstrap would send to this device:\n");
-    for (const { entity, table } of BOOTSTRAP_SCOPES) {
-      stdout.write(`  ${pad(entity, 20)} ${pad(assignment ? sent[entity] : "-", 8)}`
-        + `(rows in ${table}: ${available[table]})\n`);
+    if (schemaFaults.length) {
+      stdout.write("\nThe bootstrap filters on these, and this database does not have them:\n");
+      for (const fault of schemaFaults) stdout.write(`  ${fault}\n`);
     }
 
-    stdout.write("\nWhere the rows are instead, grouped by the columns the filter uses:\n");
-    for (const scope of BOOTSTRAP_SCOPES) {
-      if (!available[scope.table]) continue;
-      if (assignment && sent[scope.entity] === available[scope.table]) continue;
-      const columns = scope.by.join(", ");
-      const rows = (await client.query(
-        `SELECT ${columns}, COUNT(*)::INT AS n FROM ${scope.table}`
-        + `${scope.softDelete ? " WHERE deleted_at IS NULL" : ""}`
-        + ` GROUP BY ${columns} ORDER BY n DESC LIMIT 10`,
-      )).rows;
-      stdout.write(`  ${scope.table}:\n`);
-      for (const row of rows) {
-        const scopeText = scope.by.map((column) => `${column}=${row[column] ?? "NULL"}`).join(" ");
-        stdout.write(`    ${pad(scopeText, 62)} ${row.n} rows\n`);
+    if (usable.length) {
+      stdout.write("\nWhat the bootstrap would send to this device:\n");
+      for (const { entity, table } of usable) {
+        stdout.write(`  ${pad(entity, 20)} ${pad(assignment ? sent[entity] : "-", 8)}`
+          + `(rows in ${table}: ${available[table]})\n`);
+      }
+
+      const mismatched = usable.filter((scope) =>
+        available[scope.table] && (!assignment || sent[scope.entity] !== available[scope.table]));
+      if (mismatched.length) {
+        stdout.write("\nWhere the rows are instead, grouped by the columns the filter uses:\n");
+        for (const scope of mismatched) {
+          const grouping = scope.by.join(", ");
+          const rows = (await client.query(
+            `SELECT ${grouping}, COUNT(*)::INT AS n FROM ${scope.table}`
+            + `${scope.softDelete ? " WHERE deleted_at IS NULL" : ""}`
+            + ` GROUP BY ${grouping} ORDER BY n DESC LIMIT 10`,
+          )).rows;
+          stdout.write(`  ${scope.table}:\n`);
+          for (const row of rows) {
+            const scopeText = scope.by.map((column) => `${column}=${row[column] ?? "NULL"}`).join(" ");
+            stdout.write(`    ${pad(scopeText, 62)} ${row.n} rows\n`);
+          }
+        }
       }
     }
 
-    const verdict = explainEmptiness({ assignment, sent, available });
+    const verdict = explainEmptiness({ assignment, sent, available, schemaFaults });
     stdout.write(`\nRESULT (${verdict.code}): ${verdict.message}\n\n`);
   } finally {
     client.release();

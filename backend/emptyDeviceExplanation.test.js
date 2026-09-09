@@ -125,6 +125,44 @@ test("a device receiving everything is not blamed on scope", async () => {
   assert.equal(explainEmptiness({ assignment: {}, sent, available }).code, "SCOPE_MATCHES");
 });
 
+test("a missing filter column outranks every count", async () => {
+  // products.company_id and inventory_batches.company_id are both added by an ALTER rather than by
+  // their CREATE TABLE, and a hosted deployment never runs those. When one is absent the
+  // bootstrap's query does not return zero rows -- it raises -- so counting and then blaming scope
+  // would be a confident wrong answer. The first version of this script died on exactly such a
+  // column ("column branch_id does not exist") instead of reporting it.
+  const { explainEmptiness, BOOTSTRAP_SCOPES } = await import(modulePath);
+  const sent = Object.fromEntries(BOOTSTRAP_SCOPES.map(({ entity }) => [entity, 0]));
+  const available = Object.fromEntries(BOOTSTRAP_SCOPES.map(({ table }) => [table, 0]));
+  available.products = 25;
+
+  const verdict = explainEmptiness({
+    assignment: { company_id: 1 }, sent, available, schemaFaults: ["products.company_id"],
+  });
+  assert.equal(verdict.code, "SCHEMA_INCOMPLETE", "a schema fault must not be reported as a scope mismatch");
+  assert.match(verdict.message, /check-schema-drift/, "the verdict must name the tool that lists them");
+
+  // And with no fault the same inputs give the ordinary answer, so the branch is doing the work.
+  assert.equal(
+    explainEmptiness({ assignment: { company_id: 1 }, sent, available }).code,
+    "SCOPE_MISMATCH",
+  );
+});
+
+test("the report asks the database which columns exist before using them", async () => {
+  // The guard against the bug that produced "column branch_id does not exist": the column names
+  // this script uses on authorized_devices and on every counted table must be checked against
+  // information_schema first, not assumed from the code's idea of the schema.
+  const source = fs.readFileSync(SCRIPT, "utf8");
+  assert.match(source, /information_schema\.columns/, "the report must read the live column list");
+  const informationSchemaAt = source.indexOf("information_schema.columns");
+  const firstCount = source.indexOf("SELECT COUNT(*)");
+  assert.ok(
+    informationSchemaAt !== -1 && informationSchemaAt < firstCount,
+    "the column list must be read before any table is counted",
+  );
+});
+
 test("the report only reads", async () => {
   // It is run against a live shop's database, always when something is already wrong. Moving
   // business rows between companies or locations is not something a diagnostic may do.
