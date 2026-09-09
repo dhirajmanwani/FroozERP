@@ -113,3 +113,70 @@ test("with nothing configured, only same-origin requests carry the token", () =>
 test("an unparseable allowed origin is ignored, not treated as a wildcard", () => {
   assert.equal(shouldAttachSessionAuth("https://api.example.com/x", ["not a url"]), false);
 });
+
+/**
+ * The token a request carries must be the one the session actually has.
+ *
+ * ## What went wrong
+ *
+ * The request interceptor closed over `user?.device_session_token` and re-installed whenever `user`
+ * changed. That is one render too late for the requests that matter most, because `login()` does:
+ *
+ *     setUser(response.data);
+ *     await registerCloudDevice(...);
+ *     await hydrateOnlineSession(...);   // /products, /settings, /inventory, /customers ...
+ *
+ * `setUser` only schedules a render, so every await above ran under the *previous* interceptor with
+ * the *previous* token. The shop's cloud log on 2026-09-09 showed both halves of that, one per
+ * sign-in: `401 AUTH_SESSION_REQUIRED` on the first (no earlier session, so no token at all) and
+ * `401 DEVICE_SESSION_EXPIRED` on the next (the token belonging to the session just signed out).
+ *
+ * ## Why it presented as nothing at all
+ *
+ * `fetchOnlineReferenceSnapshot` falls back to locally cached values when a request fails. On a
+ * device whose database had just been cleared those values were empty, so the failure rendered as
+ * empty POS and Dashboard screens under a banner reading "Cloud sync active", with `lastSync` blank
+ * and `failedSync` zero. Every visible signal said healthy.
+ *
+ * ## What is pinned
+ *
+ * Two halves, because either alone leaves the bug: the interceptor must read the token when the
+ * request is made, and `login()` must put the new session in the ref before it awaits anything.
+ */
+test("the interceptor reads the session when the request is made, not when it was installed", () => {
+  const app = readSource("../App.jsx");
+  const start = app.indexOf("axios.interceptors.request.use");
+  assert.notEqual(start, -1, "the request interceptor must still exist");
+  const block = app.slice(app.lastIndexOf("useEffect", start), app.indexOf("}, [", start));
+
+  assert.match(
+    block,
+    /const token = userRef\.current\?\.device_session_token/,
+    "the token must be read inside the handler, from a ref",
+  );
+  assert.doesNotMatch(
+    block,
+    /const token = user\?\.device_session_token/,
+    "closing over the rendered user is what made the first requests after login carry a stale token",
+  );
+  // Installed once. A dependency on `user` is what tied the interceptor's lifetime to the render
+  // cycle in the first place.
+  assert.match(app.slice(start, start + 900), /\}, \[\]\);/);
+});
+
+test("login puts the new session in the ref before it awaits anything", () => {
+  // The other half. A request-time read is useless if the ref still holds the old session when the
+  // post-login calls run.
+  const app = readSource("../App.jsx");
+  const at = app.indexOf("userRef.current = response.data;");
+  assert.notEqual(at, -1, "login must record the new session synchronously");
+
+  const setUserAt = app.lastIndexOf("setUser(response.data);", at);
+  assert.notEqual(setUserAt, -1);
+  const between = app.slice(setUserAt, at);
+  assert.doesNotMatch(between, /await /, "nothing may be awaited between signing in and recording the session");
+
+  // And it must come before the calls that were failing.
+  const registerAt = app.indexOf("await registerCloudDevice(response.data", at);
+  assert.ok(registerAt > at, "the ref must be set before the post-login calls run");
+});

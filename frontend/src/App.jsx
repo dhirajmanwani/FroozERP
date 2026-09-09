@@ -2315,11 +2315,33 @@ function App() {
   // process, and a bearer token sent to a host we do not own is a working credential handed to a
   // stranger. `shouldAttachSessionAuth` allows same-origin and the configured API bases, nothing
   // else.
+  // Read at request time, not at render time.
+  //
+  // This used to close over `user?.device_session_token` and re-install on every change of `user`.
+  // That is one render too late for the requests that matter most. `login()` does
+  //
+  //     setUser(response.data);
+  //     await registerCloudDevice(...);      // runs now
+  //     await hydrateOnlineSession(...);     // /products, /settings, /inventory, /customers ...
+  //
+  // and `setUser` only schedules a render, so every one of those awaits ran under the *previous*
+  // interceptor, carrying the *previous* token. On a first sign-in there was none, and the cloud
+  // answered AUTH_SESSION_REQUIRED; on any later one it was the token from the session that had
+  // just been signed out, and the cloud answered DEVICE_SESSION_EXPIRED. Both were in the shop's
+  // log on 2026-09-09, one under each description, from two consecutive sign-ins.
+  //
+  // The visible symptom was not an error. `fetchOnlineReferenceSnapshot` falls back to local values
+  // when a request fails, and on a device whose database had just been cleared the local values were
+  // empty -- so the app signed in, reported "Cloud sync active", and showed empty POS and Dashboard
+  // screens with nothing anywhere saying why.
+  //
+  // `userRef` is assigned synchronously in `login()` before those awaits, so a request made in that
+  // window now carries the session that was just issued.
   useEffect(() => {
-    const token = user?.device_session_token;
-    if (!token) return undefined;
     const allowedOrigins = [API_URL, SYNC_API_URL, LOCAL_OPERATIONAL_API_URL, CLOUD_OPERATIONAL_API_URL];
     const interceptorId = axios.interceptors.request.use((config) => {
+      const token = userRef.current?.device_session_token;
+      if (!token) return config;
       const target = config.baseURL ? `${config.baseURL}${config.url || ""}` : config.url;
       if (!shouldAttachSessionAuth(target, allowedOrigins)) return config;
       // Never overwrite a header a call site set deliberately.
@@ -2327,7 +2349,7 @@ function App() {
       return config;
     });
     return () => axios.interceptors.request.eject(interceptorId);
-  }, [user]);
+  }, []);
 
   // Load orders when the screen is opened and has nothing yet.
   //
@@ -5707,6 +5729,10 @@ function App() {
         cloud_api_url: CLOUD_API_URL,
       });
       setUser(response.data);
+      // Synchronously, and before anything is awaited. `setUser` only schedules a render, and the
+      // request interceptor reads this ref -- so without this line every call below goes out under
+      // the previous session's token. See the interceptor for what that cost.
+      userRef.current = response.data;
       await registerCloudDevice(response.data, latestDevice);
       if (response.data?.force_password_change) {
         setStartupNotice("Sign in succeeded. This account must change its temporary password from User Management before regular use.");
