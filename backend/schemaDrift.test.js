@@ -125,3 +125,20 @@ test("the checker only reads", async () => {
   assert.ok(executed.some((s) => s.includes("information_schema.tables")));
   assert.ok(executed.some((s) => s.includes("information_schema.columns")));
 });
+
+test("a Windows checkout is parsed too", async () => {
+  // The shipped target is Windows and its checkout has CRLF endings. The first version searched for
+  // "\n};\n" and therefore found nothing there -- the command failed with "the end of
+  // initializeDatabase() was not found" on the one machine it exists to serve, while passing on
+  // every machine it was tested on.
+  const { bootstrapSql, declaredTables } = await import(modulePath);
+
+  const crlf = SERVER.replace(/\r?\n/g, "\r\n");
+  const lf = SERVER.replace(/\r\n/g, "\n");
+
+  const fromCrlf = declaredTables(bootstrapSql(crlf));
+  const fromLf = declaredTables(bootstrapSql(lf));
+
+  assert.ok(fromLf.length > 50, "sanity: the LF form must still parse");
+  assert.deepEqual(fromCrlf, fromLf, "both line endings must yield the same declarations");
+});

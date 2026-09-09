@@ -60,9 +60,16 @@ const SERVER = path.join(here, "..", "..", "backend", "server.js");
 export const bootstrapSql = (source) => {
   const start = source.indexOf("const initializeDatabase = async");
   if (start === -1) throw new Error("initializeDatabase() was not found in server.js");
-  const end = source.indexOf("\n};\n", start);
-  if (end === -1) throw new Error("the end of initializeDatabase() was not found");
-  return source.slice(start, end);
+
+  // `\r?\n`, not `\n`. Windows is the shipped target and the checkout there has CRLF endings, so a
+  // search for "\n};\n" finds nothing and the whole command fails with "the end of
+  // initializeDatabase() was not found" -- on the one machine it was written for, while passing
+  // everywhere it was tested.
+  const closing = /\r?\n\};\r?\n/g;
+  closing.lastIndex = start;
+  const match = closing.exec(source);
+  if (!match) throw new Error("the end of initializeDatabase() was not found");
+  return source.slice(start, match.index);
 };
 
 /** Tables the bootstrap creates. */
