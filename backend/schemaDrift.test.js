@@ -142,3 +142,92 @@ test("a Windows checkout is parsed too", async () => {
   assert.ok(fromLf.length > 50, "sanity: the LF form must still parse");
   assert.deepEqual(fromCrlf, fromLf, "both line endings must yield the same declarations");
 });
+
+/**
+ * A migration that fills the drift must define the same table the bootstrap does.
+ *
+ * Two definitions of one table drift, and the drift is invisible: a query written against the
+ * bootstrap's shape runs against the migration's shape and fails on a column that "exists" in the
+ * only place the author looked. Migration 015 copies five tables out of `initializeDatabase()`
+ * verbatim; this is what keeps "verbatim" true.
+ */
+
+/**
+ * `table -> Map(column -> definition)`, from every CREATE TABLE in a piece of SQL.
+ *
+ * The definition, not just the name. A migration that declares `carrier VARCHAR(999)` where the
+ * bootstrap declares `VARCHAR(160)` has the same columns and a different table, and the difference
+ * only ever surfaces as a value the shop's cloud accepts and its laptop refuses. Comparing names
+ * alone let that through, so this compares the whole line: type, NOT NULL, DEFAULT, CHECK and
+ * REFERENCES included.
+ */
+const tableColumns = (sql) => {
+  const tables = new Map();
+  for (const match of sql.matchAll(/CREATE TABLE IF NOT EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([\s\S]*?)\n\s*\);/g)) {
+    const [, name, body] = match;
+    const columns = new Map();
+    for (const raw of body.split("\n")) {
+      // Comments differ freely between the two files; whitespace and a trailing comma do not carry
+      // meaning either. Everything else does.
+      const line = raw.replace(/--.*$/, "").trim().replace(/,$/, "").replace(/\s+/g, " ");
+      if (!line) continue;
+      // A column line starts with the column name; a table constraint starts with a keyword.
+      if (/^(UNIQUE|PRIMARY|FOREIGN|CHECK|CONSTRAINT)\b/i.test(line)) continue;
+      const column = (line.match(/^([A-Za-z_][A-Za-z0-9_]*)/) || [])[1];
+      if (column) columns.set(column, line);
+    }
+    tables.set(name.toLowerCase(), columns);
+  }
+  return tables;
+};
+
+test("migration 015 defines its tables exactly as the bootstrap does", async () => {
+  const { bootstrapSql } = await import(modulePath);
+  const migration = fs.readFileSync(
+    path.join(__dirname, "migrations", "cloud", "015_charges_and_customer_orders.sql"),
+    "utf8",
+  );
+
+  const fromBootstrap = tableColumns(bootstrapSql(SERVER));
+  const fromMigration = tableColumns(migration);
+
+  assert.ok(fromMigration.size >= 5, `the migration must still create its tables, found ${fromMigration.size}`);
+  for (const [table, columns] of fromMigration) {
+    assert.ok(fromBootstrap.has(table), `${table} is created by the migration but not by the bootstrap`);
+    const declared = fromBootstrap.get(table);
+    assert.deepEqual(
+      [...columns.keys()].sort(),
+      [...declared.keys()].sort(),
+      `${table} has different columns in the migration and the bootstrap`,
+    );
+    for (const [column, definition] of columns) {
+      assert.equal(
+        definition,
+        declared.get(column),
+        `${table}.${column} is declared differently in the migration and the bootstrap`,
+      );
+    }
+  }
+});
+
+test("the column extractor reads a definition, not just a name", () => {
+  // Without this the test above passes on an extractor that returns nothing, which is the failure
+  // mode of every comparison that iterates a list. It also pins the normalisation: a comment, the
+  // trailing comma and runs of whitespace are not differences; everything after the name is.
+  const sql = [
+    "CREATE TABLE IF NOT EXISTS example (",
+    "  id SERIAL PRIMARY KEY,",
+    "  -- a comment, not a column",
+    "  order_global_id  VARCHAR(180) NOT NULL REFERENCES customer_orders(global_id),",
+    "  line_index INTEGER NOT NULL,",
+    "  UNIQUE (order_global_id, line_index)",
+    ");",
+  ].join("\n");
+  const columns = tableColumns(sql).get("example");
+  assert.deepEqual([...columns.keys()].sort(), ["id", "line_index", "order_global_id"]);
+  assert.equal(
+    columns.get("order_global_id"),
+    "order_global_id VARCHAR(180) NOT NULL REFERENCES customer_orders(global_id)",
+    "the type and its constraints must survive into the comparison",
+  );
+});

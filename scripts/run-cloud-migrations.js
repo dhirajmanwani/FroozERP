@@ -40,6 +40,11 @@ const migrationFiles = [
   // `initializeDatabase()`, which is switched off on a hosted deployment, so on the cloud they
   // had never existed -- and `/login` selects one of them, which made every cloud sign-in a 500.
   "backend/migrations/cloud/014_login_lockout_columns.sql",
+  // 015 is the whole measured difference between the code and the hosted database, found by
+  // `scripts/cloud/check-schema-drift.mjs`: five tables and one column, all from Other Charges
+  // and Customer Orders. `charge_types` missing is why the reference bootstrap answered 500,
+  // and therefore why a rebuilt device could not be filled from the cloud at all.
+  "backend/migrations/cloud/015_charges_and_customer_orders.sql",
 ];
 
 module.exports = { migrationFiles, deliberatelyNotRun };
