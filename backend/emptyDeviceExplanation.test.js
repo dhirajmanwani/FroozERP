@@ -101,6 +101,23 @@ test("no active assignment is reported as that, not as a scope mismatch", async 
   assert.equal(verdict.code, "NO_ACTIVE_ASSIGNMENT");
 });
 
+test("a table that is genuinely empty does not outvote rows that are arriving", async () => {
+  // The bug this pins: after the repair the shop's database would send 25 products, 13 suppliers
+  // and 70 lots, and the report announced NOTHING_TO_SEND -- because product_categories and
+  // operational_location_products happened to hold nothing. A verdict that contradicts the table
+  // printed directly above it destroys trust in the whole report.
+  const { explainEmptiness, BOOTSTRAP_SCOPES } = await import(modulePath);
+  const sent = Object.fromEntries(BOOTSTRAP_SCOPES.map(({ entity }) => [entity, 0]));
+  const available = Object.fromEntries(BOOTSTRAP_SCOPES.map(({ table }) => [table, 0]));
+  sent.product = 25; available.products = 25;
+  sent.supplier = 13; available.suppliers = 13;
+  sent.inventory_lot = 70; available.inventory_batches = 70;
+
+  const verdict = explainEmptiness({ assignment: {}, sent, available });
+  assert.equal(verdict.code, "SCOPE_MATCHES");
+  assert.match(verdict.message, /108 rows/, "the verdict must state how much would arrive");
+});
+
 test("an empty cloud is not reported as a scope mismatch", async () => {
   // The two are fixed in opposite ways -- one by posting the device, the other by entering data --
   // so telling them apart is the whole value of the report.

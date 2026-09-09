@@ -100,23 +100,34 @@ export const explainEmptiness = ({ assignment, sent, available, schemaFaults = [
         + "before it reads any business data. Post the device to a counter first.",
     };
   }
-  const empty = BOOTSTRAP_SCOPES.filter(({ entity }) => !sent[entity]);
-  if (!empty.length) {
-    return { code: "SCOPE_MATCHES", message: "The bootstrap would send rows for every entity. An empty device is not explained by scope." };
+  // A table that is genuinely empty is not evidence of anything. What matters is whether any
+  // table holds rows this device is not getting -- so the mismatch is tested first, and only
+  // then the question of whether anything at all would arrive. Judged the other way round, a
+  // repaired database that sends 108 rows reported NOTHING_TO_SEND because two unrelated tables
+  // happened to be empty.
+  const withheld = BOOTSTRAP_SCOPES.filter(({ entity, table }) =>
+    available[table] > 0 && (sent[entity] || 0) < available[table]);
+  if (withheld.length) {
+    return {
+      code: "SCOPE_MISMATCH",
+      message: "Rows exist that this device is not receiving. Each line under 'where the rows are "
+        + "instead' shows a scope the data carries and this device does not, and the difference is "
+        + "the reason the screens are blank.",
+    };
   }
-  const emptyBecauseNothingExists = empty.filter(({ table }) => !available[table]);
-  if (emptyBecauseNothingExists.length === empty.length) {
+
+  const total = BOOTSTRAP_SCOPES.reduce((sum, { entity }) => sum + (sent[entity] || 0), 0);
+  if (!total) {
     return {
       code: "NOTHING_TO_SEND",
-      message: "The scope matches, but these tables have no rows at all on the cloud. The device is "
-        + "empty because the cloud is empty -- this is not a scope fault.",
+      message: "The scope matches and nothing is being withheld -- these tables have no rows at all "
+        + "on the cloud. The device is empty because the cloud is empty; this is not a scope fault.",
     };
   }
   return {
-    code: "SCOPE_MISMATCH",
-    message: "Rows exist that this device is not receiving. Each line under 'where the rows are "
-      + "instead' shows a scope the data carries and this device does not, and the difference is "
-      + "the reason the screens are blank.",
+    code: "SCOPE_MATCHES",
+    message: `The bootstrap would send ${total} rows to this device. An empty device is not `
+      + "explained by scope, so the next thing to look at is what the device does with them.",
   };
 };
 
