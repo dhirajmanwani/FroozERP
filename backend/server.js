@@ -16010,10 +16010,33 @@ app.post("/accounts", async (req, res) => {
         message: "You do not have permission to save this account.",
       });
     }
+
+    // The company this row belongs to, from the verified token and nowhere else -- never the body,
+    // which is the identity rule the whole auth track exists to hold.
+    //
+    // Without it these two INSERTs left `company_id` NULL, and a NULL company is not merely untidy:
+    // every reader scopes with `company_id = $1`, and `NULL = 1` is NULL rather than false, so the
+    // row is silently dropped from every result. The reference bootstrap is one of those readers,
+    // which is how the shop ended up with 13 suppliers on the cloud that no device could ever be
+    // given -- the rows existed, the sync succeeded, and the screens stayed empty.
+    //
+    // The duplicate checks below take the same scope. A uniqueness rule that spans companies while
+    // the insert files the row under one of them is the two-definitions problem again: the shop
+    // would be refused a supplier name on the grounds of a row it cannot see.
+    const companyId = Number.isInteger(req.auth.companyId) && req.auth.companyId > 0
+      ? req.auth.companyId
+      : null;
+
     if (account.account_type === "CUSTOMER") {
       const duplicate = await pool.query(
-        "SELECT id FROM customers WHERE LOWER(customer_name) = LOWER($1) AND COALESCE(mobile_number, '') = COALESCE($2, '') LIMIT 1",
-        [account.account_name, account.mobile_number]
+        `
+        SELECT id FROM customers
+        WHERE LOWER(customer_name) = LOWER($1)
+          AND COALESCE(mobile_number, '') = COALESCE($2, '')
+          AND ($3::INTEGER IS NULL OR company_id = $3)
+        LIMIT 1
+        `,
+        [account.account_name, account.mobile_number, companyId]
       );
       if (duplicate.rows.length) return res.status(409).json({ message: "This customer already exists." });
       const result = await pool.query(
@@ -16021,16 +16044,16 @@ app.post("/accounts", async (req, res) => {
         INSERT INTO customers (
           customer_name, customer_type, firm_name, mobile_number, alternate_number, address,
           city, gst_number, bank_name, account_number, ifsc_code, upi_id, notes,
-          opening_balance, active, whatsapp_number, whatsapp_opt_in
+          opening_balance, active, whatsapp_number, whatsapp_opt_in, company_id
         )
-        VALUES ($1, 'RETAIL', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        VALUES ($1, 'RETAIL', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
         RETURNING id
         `,
         [
           account.account_name, account.firm_name, account.mobile_number, account.alternate_number,
           account.address, account.city, account.gst_number, account.bank_name, account.account_number,
           account.ifsc_code, account.upi_id, account.notes, account.opening_balance, account.active,
-          account.whatsapp_number, account.whatsapp_opt_in,
+          account.whatsapp_number, account.whatsapp_opt_in, companyId,
         ]
       );
       return res.status(201).json({ success: true, account_key: `CUSTOMER-${result.rows[0].id}` });
@@ -16040,11 +16063,14 @@ app.post("/accounts", async (req, res) => {
         `
         SELECT id
         FROM suppliers
-        WHERE LOWER(supplier_name) = LOWER($1)
-           OR ($2::TEXT IS NOT NULL AND LOWER(COALESCE(firm_name, '')) = LOWER($2))
+        WHERE (
+                LOWER(supplier_name) = LOWER($1)
+                OR ($2::TEXT IS NOT NULL AND LOWER(COALESCE(firm_name, '')) = LOWER($2))
+              )
+          AND ($3::INTEGER IS NULL OR company_id = $3)
         LIMIT 1
         `,
-        [account.account_name, account.firm_name]
+        [account.account_name, account.firm_name, companyId]
       );
       if (duplicate.rows.length) return res.status(409).json({ message: "This supplier already exists." });
       const result = await pool.query(
@@ -16052,9 +16078,9 @@ app.post("/accounts", async (req, res) => {
         INSERT INTO suppliers (
           supplier_name, firm_name, mobile_number, alternate_number, address, city,
           gst_number, bank_name, account_number, ifsc_code, upi_id, notes,
-          opening_balance, supplier_type, active, whatsapp_number, whatsapp_opt_in
+          opening_balance, supplier_type, active, whatsapp_number, whatsapp_opt_in, company_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
         RETURNING id
         `,
         [
@@ -16062,7 +16088,7 @@ app.post("/accounts", async (req, res) => {
           account.address, account.city, account.gst_number, account.bank_name, account.account_number,
           account.ifsc_code, account.upi_id, account.notes, account.opening_balance,
           supplierTypeFromAccountType(account.account_type), account.active,
-          account.whatsapp_number, account.whatsapp_opt_in,
+          account.whatsapp_number, account.whatsapp_opt_in, companyId,
         ]
       );
       return res.status(201).json({ success: true, account_key: `SUPPLIER-${result.rows[0].id}` });
@@ -16118,14 +16144,28 @@ app.put("/accounts/:accountKey", async (req, res) => {
         });
       }
     }
+
+    const companyId = Number.isInteger(req.auth.companyId) && req.auth.companyId > 0
+      ? req.auth.companyId
+      : null;
+
     if (source === "CUSTOMER") {
       const existingCustomer = await pool.query("SELECT id, system_account FROM customers WHERE id = $1", [sourceId]);
       if (existingCustomer.rows[0]?.system_account === true && (account.account_name !== "Walk-in Customer" || account.active !== true)) {
         return res.status(400).json({ message: "Walk-in Customer is a protected system account." });
       }
+      // Scoped like the insert it guards: a rename must not be refused on the strength of a row
+      // in another company, which the shop cannot see and cannot rename its way around.
       const duplicate = await pool.query(
-        "SELECT id FROM customers WHERE id <> $3 AND LOWER(customer_name) = LOWER($1) AND COALESCE(mobile_number, '') = COALESCE($2, '') LIMIT 1",
-        [account.account_name, account.mobile_number, sourceId]
+        `
+        SELECT id FROM customers
+        WHERE id <> $3
+          AND LOWER(customer_name) = LOWER($1)
+          AND COALESCE(mobile_number, '') = COALESCE($2, '')
+          AND ($4::INTEGER IS NULL OR company_id = $4)
+        LIMIT 1
+        `,
+        [account.account_name, account.mobile_number, sourceId, companyId]
       );
       if (duplicate.rows.length) return res.status(409).json({ message: "This customer already exists." });
       const result = await pool.query(
@@ -16148,6 +16188,8 @@ app.put("/accounts/:accountKey", async (req, res) => {
       return result.rows[0] ? res.json({ success: true }) : res.status(404).json({ message: "Account not found" });
     }
     if (source === "SUPPLIER") {
+      // Scoped like the insert it guards: a rename must not be refused on the strength of a row
+      // in another company, which the shop cannot see and cannot rename its way around.
       const duplicate = await pool.query(
         `
         SELECT id
@@ -16157,9 +16199,10 @@ app.put("/accounts/:accountKey", async (req, res) => {
             LOWER(supplier_name) = LOWER($1)
             OR ($2::TEXT IS NOT NULL AND LOWER(COALESCE(firm_name, '')) = LOWER($2))
           )
+          AND ($4::INTEGER IS NULL OR company_id = $4)
         LIMIT 1
         `,
-        [account.account_name, account.firm_name, sourceId]
+        [account.account_name, account.firm_name, sourceId, companyId]
       );
       if (duplicate.rows.length) return res.status(409).json({ message: "This supplier already exists." });
       const result = await pool.query(
@@ -16767,15 +16810,23 @@ app.post("/suppliers", async (req, res) => {
         message: "You do not have permission to save supplier accounts.",
       });
     }
+    // Same rule as POST /accounts: the company comes from the verified token, and a row written
+    // without one is invisible to every company-scoped reader, the reference bootstrap included.
+    const companyId = Number.isInteger(req.auth.companyId) && req.auth.companyId > 0
+      ? req.auth.companyId
+      : null;
     const duplicate = await pool.query(
       `
       SELECT id
       FROM suppliers
-      WHERE LOWER(supplier_name) = LOWER($1)
-         OR ($2::TEXT IS NOT NULL AND LOWER(COALESCE(firm_name, '')) = LOWER($2))
+      WHERE (
+              LOWER(supplier_name) = LOWER($1)
+              OR ($2::TEXT IS NOT NULL AND LOWER(COALESCE(firm_name, '')) = LOWER($2))
+            )
+        AND ($3::INTEGER IS NULL OR company_id = $3)
       LIMIT 1
       `,
-      [supplier.supplier_name, supplier.firm_name]
+      [supplier.supplier_name, supplier.firm_name, companyId]
     );
     if (duplicate.rows.length) return res.status(409).json({ message: "This supplier already exists." });
 
@@ -16784,16 +16835,16 @@ app.post("/suppliers", async (req, res) => {
       INSERT INTO suppliers (
         supplier_name, firm_name, mobile_number, alternate_number, address, city,
         gst_number, bank_name, account_number, ifsc_code, upi_id, notes,
-        opening_balance, supplier_type, active, whatsapp_number, whatsapp_opt_in
+        opening_balance, supplier_type, active, whatsapp_number, whatsapp_opt_in, company_id
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
       RETURNING *
       `,
       [
         supplier.supplier_name, supplier.firm_name, supplier.mobile_number, supplier.alternate_number,
         supplier.address, supplier.city, supplier.gst_number, supplier.bank_name, supplier.account_number,
         supplier.ifsc_code, supplier.upi_id, supplier.notes, supplier.opening_balance, supplier.supplier_type,
-        supplier.active, supplier.whatsapp_number, supplier.whatsapp_opt_in,
+        supplier.active, supplier.whatsapp_number, supplier.whatsapp_opt_in, companyId,
       ]
     );
     return res.status(201).json(result.rows[0]);
@@ -16830,6 +16881,11 @@ app.put("/suppliers/:id", async (req, res) => {
         message: "You do not have permission to edit supplier accounts.",
       });
     }
+    const companyId = Number.isInteger(req.auth.companyId) && req.auth.companyId > 0
+      ? req.auth.companyId
+      : null;
+    // Scoped like the insert it guards: a rename must not be refused on the strength of a row in
+    // another company, which the shop cannot see and cannot rename its way around.
     const duplicate = await pool.query(
       `
       SELECT id
@@ -16839,9 +16895,10 @@ app.put("/suppliers/:id", async (req, res) => {
           LOWER(supplier_name) = LOWER($1)
           OR ($2::TEXT IS NOT NULL AND LOWER(COALESCE(firm_name, '')) = LOWER($2))
         )
+        AND ($4::INTEGER IS NULL OR company_id = $4)
       LIMIT 1
       `,
-      [supplier.supplier_name, supplier.firm_name, supplierId]
+      [supplier.supplier_name, supplier.firm_name, supplierId, companyId]
     );
     if (duplicate.rows.length) return res.status(409).json({ message: "This supplier already exists." });
 
@@ -16951,9 +17008,20 @@ app.post("/customers", async (req, res) => {
         message: "You do not have permission to save customer accounts.",
       });
     }
+    // Same rule as POST /accounts: the company comes from the verified token, and a row written
+    // without one is invisible to every company-scoped reader, the reference bootstrap included.
+    const companyId = Number.isInteger(req.auth.companyId) && req.auth.companyId > 0
+      ? req.auth.companyId
+      : null;
     const duplicate = await pool.query(
-      "SELECT id FROM customers WHERE LOWER(customer_name) = LOWER($1) AND COALESCE(mobile_number, '') = COALESCE($2, '') LIMIT 1",
-      [customer.customer_name, customer.mobile_number]
+      `
+      SELECT id FROM customers
+      WHERE LOWER(customer_name) = LOWER($1)
+        AND COALESCE(mobile_number, '') = COALESCE($2, '')
+        AND ($3::INTEGER IS NULL OR company_id = $3)
+      LIMIT 1
+      `,
+      [customer.customer_name, customer.mobile_number, companyId]
     );
     if (duplicate.rows.length) return res.status(409).json({ message: "This customer already exists." });
     const result = await pool.query(
@@ -16961,16 +17029,17 @@ app.post("/customers", async (req, res) => {
       INSERT INTO customers (
         customer_name, customer_type, firm_name, mobile_number, alternate_number, address,
         city, gst_number, bank_name, account_number, ifsc_code, upi_id, notes,
-        opening_balance, active, whatsapp_number, whatsapp_opt_in
+        opening_balance, active, whatsapp_number, whatsapp_opt_in, company_id
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
       RETURNING *
       `,
       [
         customer.customer_name, customer.customer_type, customer.firm_name, customer.mobile_number,
         customer.alternate_number, customer.address, customer.city, customer.gst_number,
         customer.bank_name, customer.account_number, customer.ifsc_code, customer.upi_id,
-        customer.notes, customer.opening_balance, customer.active, customer.whatsapp_number, customer.whatsapp_opt_in,
+        customer.notes, customer.opening_balance, customer.active, customer.whatsapp_number,
+        customer.whatsapp_opt_in, companyId,
       ]
     );
     return res.status(201).json(result.rows[0]);
@@ -16999,9 +17068,21 @@ app.put("/customers/:id", async (req, res) => {
     if (existingCustomer.rows[0]?.system_account === true && (customer.customer_name !== "Walk-in Customer" || customer.active !== true)) {
       return res.status(400).json({ message: "Walk-in Customer is a protected system account." });
     }
+    const companyId = Number.isInteger(req.auth.companyId) && req.auth.companyId > 0
+      ? req.auth.companyId
+      : null;
+    // Scoped like the insert it guards: a rename must not be refused on the strength of a row in
+    // another company, which the shop cannot see and cannot rename its way around.
     const duplicate = await pool.query(
-      "SELECT id FROM customers WHERE id <> $3 AND LOWER(customer_name) = LOWER($1) AND COALESCE(mobile_number, '') = COALESCE($2, '') LIMIT 1",
-      [customer.customer_name, customer.mobile_number, customerId]
+      `
+      SELECT id FROM customers
+      WHERE id <> $3
+        AND LOWER(customer_name) = LOWER($1)
+        AND COALESCE(mobile_number, '') = COALESCE($2, '')
+        AND ($4::INTEGER IS NULL OR company_id = $4)
+      LIMIT 1
+      `,
+      [customer.customer_name, customer.mobile_number, customerId, companyId]
     );
     if (duplicate.rows.length) return res.status(409).json({ message: "This customer already exists." });
     const result = await pool.query(
