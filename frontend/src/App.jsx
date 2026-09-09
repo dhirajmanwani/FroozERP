@@ -124,7 +124,7 @@ import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./loc
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, resolveReportDateRange } from "./local/reportRefresh";
 import { approvedDeviceCredentialMessage, normalizeDeviceBootstrapStatus } from "./local/freshDeviceOnboarding";
-import { getUserDisplayName, getUserInitial, getUserRoleLabel } from "./local/userPresentation";
+import { getUserDisplayName, getUserGreetingName, getUserInitial, getUserRoleLabel } from "./local/userPresentation";
 import { describeUpdateAvailability, normalizeUpdateMetadata } from "./local/updateMetadata";
 import { RUNTIME_FAILURE_EVENT, describeRequestFailure, initialiseMandatoryRuntime, resolveLocalServiceRenderState, resolveMandatoryRuntimeRenderState, settleNamedRequests } from "./local/startupResilience";
 import {
@@ -7838,7 +7838,7 @@ function App() {
                 <div>
                   <BrandLogo />
                   <span className="eyebrow">Retail Intelligence</span>
-                  <h2>Good to see you, {userDisplayName.split(" ")[0]}.</h2>
+                  <h2>Good to see you, {getUserGreetingName(user)}.</h2>
                   <p>Monitor today's performance and keep your inventory moving.</p>
                 </div>
                 <button className="primary-button" onClick={() => navigate("sales")}>
