@@ -36,6 +36,21 @@ const migrationFiles = [
   "backend/migrations/cloud/011_inventory_incremental_publication.sql",
   "backend/migrations/cloud/012_scope_management.sql",
   "backend/migrations/cloud/013_transfer_request_without_lot.sql",
+  // 014 carries the two A-5 columns onto the hosted database. They are declared in
+  // `initializeDatabase()`, which is switched off on a hosted deployment, so on the cloud they
+  // had never existed -- and `/login` selects one of them, which made every cloud sign-in a 500.
+  "backend/migrations/cloud/014_login_lockout_columns.sql",
+  // 015 is the whole measured difference between the code and the hosted database, found by
+  // `scripts/cloud/check-schema-drift.mjs`: five tables and one column, all from Other Charges
+  // and Customer Orders. `charge_types` missing is why the reference bootstrap answered 500,
+  // and therefore why a rebuilt device could not be filled from the cloud at all.
+  "backend/migrations/cloud/015_charges_and_customer_orders.sql",
+  // 016 is the rest of what 015 should have carried. A table in `initializeDatabase()` is not
+  // only its CREATE TABLE: `customer_orders` is followed by an added column, a backfill, two
+  // ALTER COLUMNs and a third index, and 015 copied the CREATE and stopped. The two ALTER COLUMNs
+  // matter most -- without them `branch_id` stays NOT NULL DEFAULT 1, which puts an unassigned
+  // order onto branch 1 and onto the sync road, the exact confusion the routing split removed.
+  "backend/migrations/cloud/016_customer_orders_routing_split.sql",
 ];
 
 module.exports = { migrationFiles, deliberatelyNotRun };

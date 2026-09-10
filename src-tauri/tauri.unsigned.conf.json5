@@ -1,0 +1,22 @@
+// Local build flavour: an installer, and nothing for the update feed.
+//
+// The main config sets `createUpdaterArtifacts: true`, which is right for a real release and is
+// pinned by scripts/verify-update-safety.mjs. Its cost is that `tauri build` then insists on
+// TAURI_SIGNING_PRIVATE_KEY and stops with "A public key has been found, but no private key" -- so
+// the ordinary act of putting a fixed build on the shop's own machine required the release signing
+// key, which CLAUDE.md says is never to be used for one.
+//
+// Merged over the main config by `npm run build:windows:local` (`tauri build --config`), this turns off
+// only the *update feed artifacts*: the .zip and its .sig. The NSIS installer is byte-for-byte the
+// same build, and the app it installs still carries the updater pubkey, so it still checks for and
+// accepts real signed releases later. Nothing about the shipped app changes -- only what is left
+// in the bundle folder for a feed nobody is publishing to from here.
+//
+// Publishing a real update is a different command -- `npm run build:windows`, which the release
+// workflow runs -- and it does not use this file, so it still requires the key. That split is the
+// point: the everyday build cannot quietly stop producing update artifacts for a real release.
+{
+  bundle: {
+    createUpdaterArtifacts: false,
+  },
+}

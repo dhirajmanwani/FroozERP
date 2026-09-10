@@ -15,6 +15,11 @@ npm.cmd run build:windows
 npm.cmd run release:windows
 ```
 
+This is the **release** build and it requires `TAURI_SIGNING_PRIVATE_KEY`, because it also produces
+the signed artifacts the update feed needs. To build an installer for a machine you have in front of
+you — no key, no update artifacts, same app — use `npm.cmd run build:windows:local` instead. See
+`RELEASE_AND_UPDATE_PROCESS.md`, "Build Commands".
+
 Verification command:
 
 ```powershell

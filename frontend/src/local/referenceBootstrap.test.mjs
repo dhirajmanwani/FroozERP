@@ -12,8 +12,14 @@ const supplierMigration = fs.readFileSync(
   "utf8",
 );
 
-test("cursor zero opts into reference bootstrap and applies it atomically", () => {
-  assert.match(syncService, /bootstrap_protocol: cursor === "0" \? "reference-v1" : undefined/);
+test("a device that needs filling opts into reference bootstrap and applies it atomically", () => {
+  // Was `cursor === "0"` inline. That test alone could not tell "never bootstrapped" from
+  // "bootstrapped, received nothing, and stored the watermark anyway", and the second state
+  // trapped the shop's DELL with no way to ask again. The decision moved to
+  // referenceBootstrapDecision.js; what must not change is that the answer still drives this
+  // request and that the result is still applied in one transaction.
+  assert.match(syncService, /bootstrap_protocol: bootstrapProtocolFor\(\{/);
+  assert.match(syncService, /cursor,\s*\n\s*referenceRows: localStatus\.referenceRows,/);
   assert.match(syncService, /headers: optionalSessionAuthHeaders\(context\.deviceSessionToken\)/);
   assert.match(syncService, /response\.data\?\.reference_bootstrap/);
   assert.match(syncService, /repositories\.pull\.bootstrap/);

@@ -1,4 +1,5 @@
 import axios from "axios";
+import { bootstrapProtocolFor } from "./referenceBootstrapDecision.js";
 import { optionalSessionAuthHeaders } from "./authHeaders";
 import { SESSION_FAILURE_KINDS, classifySessionFailure } from "./sessionExpiry";
 import { checkFroozBackendHealth, getConnectivitySnapshot } from "./connectivityService";
@@ -429,7 +430,13 @@ export async function pullServerChanges({ apiUrl, user, deviceInfo, branchId }) 
       operational_location_id: context.operationalLocationId,
       cursor,
       limit: 50,
-      bootstrap_protocol: cursor === "0" ? "reference-v1" : undefined,
+      // Not `cursor === "0"`. A bootstrap that delivered nothing still stores the watermark, so
+      // testing the cursor alone made an empty device unable to ever ask again. See
+      // referenceBootstrapDecision.js.
+      bootstrap_protocol: bootstrapProtocolFor({
+        cursor,
+        referenceRows: localStatus.referenceRows,
+      }),
     },
   });
   const pullReceivedAt = Date.now();

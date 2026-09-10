@@ -18,11 +18,35 @@ Do not change the bundle identifier after release without a migration plan for l
 
 ## Build Commands
 
+There are two, and picking the wrong one is how a day gets lost.
+
+**Putting a build on a machine — the everyday one:**
+
+```powershell
+npm.cmd run build:windows:local
+```
+
+An NSIS installer and nothing else. It needs no signing key, because it does not produce anything
+for the update feed. The installer, and the app inside it, are the same build the release command
+produces; only the `.zip` and `.sig` that a published update would need are absent. That is why the
+maintainer can install a fix on the shop's own laptop without ever touching the release key, which
+`CLAUDE.md` forbids using for exactly this.
+
+**Publishing a release to the update feed:**
+
 ```powershell
 npm.cmd run verify:windows
 npm.cmd run build:windows
 npm.cmd run release:windows
 ```
+
+This one *does* require `TAURI_SIGNING_PRIVATE_KEY`, deliberately — an update with no signature is
+an update nobody can install. It is what `.github/workflows/windows-updater-release.yml` runs.
+
+`verify:update-safety` keeps the two apart: it fails if the release workflow or the release script
+ever picks up the local flavour, and if the local overlay ever changes anything but that one flag.
+Without those checks the failure would be silent — the main config would still say updater artifacts
+are on, and every published release would carry no update.
 
 Output:
 

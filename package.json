@@ -1,13 +1,14 @@
 {
   "name": "froozerp-workspace",
   "private": true,
-  "version": "1.0.71",
+  "version": "1.0.72",
   "scripts": {
     "app": "frontend\\node_modules\\.bin\\tauri.cmd dev",
     "app:disposable": "node scripts/run-disposable-app.mjs",
     "app:dev": "frontend\\node_modules\\.bin\\tauri.cmd dev",
     "app:build": "frontend\\node_modules\\.bin\\tauri.cmd build",
     "build:windows": "frontend\\node_modules\\.bin\\tauri.cmd build --bundles nsis",
+    "build:windows:local": "frontend\\node_modules\\.bin\\tauri.cmd build --bundles nsis --config src-tauri/tauri.unsigned.conf.json5",
     "verify:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\verify-windows.ps1",
     "release:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\copy-windows-release.ps1",
     "release:manifest": "node scripts\\generate-tauri-update-manifest.mjs",

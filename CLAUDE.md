@@ -23,7 +23,8 @@ cargo check --manifest-path src-tauri/Cargo.toml
 npm run verify:disposable-matrix       # acceptance matrix
 npm run verify:update-safety           # updater safety
 npm run verify:production              # production static regressions
-npm run build:windows                  # NSIS bundle (unsigned unless keys are set)
+npm run build:windows:local            # NSIS installer for this machine (no signing key needed)
+npm run build:windows                  # release build: also emits update artifacts, needs the key
 ```
 
 Always run lint, build, `backend:check`, both test suites and `cargo check` before

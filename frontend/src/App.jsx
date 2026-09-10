@@ -124,7 +124,7 @@ import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./loc
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, resolveReportDateRange } from "./local/reportRefresh";
 import { approvedDeviceCredentialMessage, normalizeDeviceBootstrapStatus } from "./local/freshDeviceOnboarding";
-import { getUserDisplayName, getUserInitial, getUserRoleLabel } from "./local/userPresentation";
+import { NAME_TITLES, getUserDisplayName, getUserGreetingName, getUserInitial, getUserRoleLabel, joinPersonName, splitPersonName } from "./local/userPresentation";
 import { describeUpdateAvailability, normalizeUpdateMetadata } from "./local/updateMetadata";
 import { RUNTIME_FAILURE_EVENT, describeRequestFailure, initialiseMandatoryRuntime, resolveLocalServiceRenderState, resolveMandatoryRuntimeRenderState, settleNamedRequests } from "./local/startupResilience";
 import {
@@ -737,6 +737,13 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
 
   return {
     apiModeLabel,
+    // Where the mode came from, not just what it is.
+    //
+    // On 2026-09-07 this field's absence cost an evening. The app reported "Local Only" -- true,
+    // and useless, because the one question that mattered was *who said so*. It turned out to be
+    // `VITE_API_MODE=LOCAL_ONLY` in a gitignored `frontend/.env.local`, baked into the build months
+    // earlier. Reading "build-env" here instead of guessing would have ended it in a minute.
+    apiModeSource: API_MODE_RESOLUTION.source,
     internetStatus: internetAvailable ? "Internet Available" : "Internet Offline",
     froozErpCloudAccess: cloudPaused ? "Disabled by Owner" : cloudReachable ? "Online" : "Not Verified",
     localBackendStatus,
@@ -797,7 +804,7 @@ const receiptCurrency = new Intl.NumberFormat("en-IN", {
   minimumFractionDigits: 0,
   maximumFractionDigits: 2,
 });
-const APP_VERSION = "1.0.71";
+const APP_VERSION = "1.0.72";
 const APP_DISPLAY_NAME = "FroozERP - Feel the Freakin' Frooz";
 const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
@@ -2308,11 +2315,33 @@ function App() {
   // process, and a bearer token sent to a host we do not own is a working credential handed to a
   // stranger. `shouldAttachSessionAuth` allows same-origin and the configured API bases, nothing
   // else.
+  // Read at request time, not at render time.
+  //
+  // This used to close over `user?.device_session_token` and re-install on every change of `user`.
+  // That is one render too late for the requests that matter most. `login()` does
+  //
+  //     setUser(response.data);
+  //     await registerCloudDevice(...);      // runs now
+  //     await hydrateOnlineSession(...);     // /products, /settings, /inventory, /customers ...
+  //
+  // and `setUser` only schedules a render, so every one of those awaits ran under the *previous*
+  // interceptor, carrying the *previous* token. On a first sign-in there was none, and the cloud
+  // answered AUTH_SESSION_REQUIRED; on any later one it was the token from the session that had
+  // just been signed out, and the cloud answered DEVICE_SESSION_EXPIRED. Both were in the shop's
+  // log on 2026-09-09, one under each description, from two consecutive sign-ins.
+  //
+  // The visible symptom was not an error. `fetchOnlineReferenceSnapshot` falls back to local values
+  // when a request fails, and on a device whose database had just been cleared the local values were
+  // empty -- so the app signed in, reported "Cloud sync active", and showed empty POS and Dashboard
+  // screens with nothing anywhere saying why.
+  //
+  // `userRef` is assigned synchronously in `login()` before those awaits, so a request made in that
+  // window now carries the session that was just issued.
   useEffect(() => {
-    const token = user?.device_session_token;
-    if (!token) return undefined;
     const allowedOrigins = [API_URL, SYNC_API_URL, LOCAL_OPERATIONAL_API_URL, CLOUD_OPERATIONAL_API_URL];
     const interceptorId = axios.interceptors.request.use((config) => {
+      const token = userRef.current?.device_session_token;
+      if (!token) return config;
       const target = config.baseURL ? `${config.baseURL}${config.url || ""}` : config.url;
       if (!shouldAttachSessionAuth(target, allowedOrigins)) return config;
       // Never overwrite a header a call site set deliberately.
@@ -2320,7 +2349,7 @@ function App() {
       return config;
     });
     return () => axios.interceptors.request.eject(interceptorId);
-  }, [user]);
+  }, []);
 
   // Load orders when the screen is opened and has nothing yet.
   //
@@ -2404,6 +2433,11 @@ function App() {
         // Without this a network outage on a local-first app would read as "you have been signed
         // out" — wrong, and alarming at a busy counter.
         online: !offlineMode,
+        // And without this, an offline sign-in was ended by the first cloud route it touched. That
+        // session has no cloud token by construction, so every cloud route answers 401 — true, and
+        // not a statement about the person. Signing them out sent them back to a screen whose only
+        // offer was to do the thing that had just failed.
+        offlineSession: user?.offline_session === true,
       });
       if (verdict.requiresSignIn) {
         setStartupNotice(verdict.message);
@@ -3383,6 +3417,21 @@ function App() {
   useEffect(() => {
     connectivityCheckRef.current = performConnectivityCheck;
   }, [performConnectivityCheck]);
+
+  // Say once, on the record, which mode this build resolved and where it came from.
+  //
+  // The connectivity policy below logs whether it reconciled. It never runs at all when
+  // `API_MODE=LOCAL_ONLY`, because that mode outranks the policy -- so the *absence* of its line
+  // was the only trace of the fault of 2026-09-07, and an absence is not evidence anybody reads.
+  // This line is present either way, and names the rung that decided it.
+  useEffect(() => {
+    writeDiagnosticLog("INFO", "api-mode-resolved", {
+      mode: API_MODE,
+      source: API_MODE_RESOLUTION.source,
+      configured: API_MODE_RESOLUTION.configured,
+      outranksConnectivityPolicy: startupConnectivityAuthority.isApiModeLocalOnly(),
+    });
+  }, []);
 
   useEffect(() => {
     if (!isTauriRuntime() || connectivityPolicyReady || mandatoryRuntimeState !== "ready") return undefined;
@@ -5680,6 +5729,10 @@ function App() {
         cloud_api_url: CLOUD_API_URL,
       });
       setUser(response.data);
+      // Synchronously, and before anything is awaited. `setUser` only schedules a render, and the
+      // request interceptor reads this ref -- so without this line every call below goes out under
+      // the previous session's token. See the interceptor for what that cost.
+      userRef.current = response.data;
       await registerCloudDevice(response.data, latestDevice);
       if (response.data?.force_password_change) {
         setStartupNotice("Sign in succeeded. This account must change its temporary password from User Management before regular use.");
@@ -7785,7 +7838,7 @@ function App() {
                 <div>
                   <BrandLogo />
                   <span className="eyebrow">Retail Intelligence</span>
-                  <h2>Good to see you, {userDisplayName.split(" ")[0]}.</h2>
+                  <h2>Good to see you, {getUserGreetingName(user)}.</h2>
                   <p>Monitor today's performance and keep your inventory moving.</p>
                 </div>
                 <button className="primary-button" onClick={() => navigate("sales")}>
@@ -17114,6 +17167,7 @@ function DeviceControlSettingsSection({ canManage, deviceControlSettings = defau
 
 function UserManagementSection({ canManage, onReload, roles = [], user, users = [] }) {
   const emptyForm = {
+    title: "",
     full_name: "",
     username: "",
     mobile_number: "",
@@ -17135,8 +17189,12 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
   const updateDraft = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
   const startEdit = (item) => {
     setEditingId(item.id);
+    // `full_name` is one stored column. The form shows it as a title and a name so nobody has to
+    // type "Mr." correctly every time; `joinPersonName` puts it back together on save.
+    const parsed = splitPersonName(item.full_name || "");
     setDraft({
-      full_name: item.full_name || "",
+      title: parsed.title,
+      full_name: parsed.name,
       username: item.username || "",
       mobile_number: item.mobile_number || "",
       email: item.email || "",
@@ -17178,7 +17236,8 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
         alert("Enter matching password with at least 4 characters.");
         return;
       }
-      const payload = { ...draft, updated_by: user.id };
+      const { title, ...rest } = draft;
+      const payload = { ...rest, full_name: joinPersonName(title, draft.full_name), updated_by: user.id };
       if (editingId) await axios.put(`${API_URL}/users/${editingId}`, payload);
       else await axios.post(`${API_URL}/users`, payload);
       resetForm();
@@ -17247,7 +17306,17 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
   return (
     <ModuleCard eyebrow="User Management" title="Owner User Administration" subtitle="Add, edit, reset password, deactivate and protect user records with transaction history.">
       <div className="form-grid supplier-form-grid">
-        <Field label="Full Name"><input disabled={!canManage} value={draft.full_name} onChange={(event) => updateDraft("full_name", event.target.value)} /></Field>
+        <Field label="Title">
+          <select disabled={!canManage} value={draft.title} onChange={(event) => updateDraft("title", event.target.value)}>
+            <option value="">(none)</option>
+            {/* A title already stored but not on the offered list -- "Dr.", say -- is kept as an
+                option, so opening this form never silently drops it. */}
+            {[...new Set([...NAME_TITLES, draft.title].filter(Boolean))].map((option) => (
+              <option key={option} value={option}>{option}</option>
+            ))}
+          </select>
+        </Field>
+        <Field label="Name"><input disabled={!canManage} value={draft.full_name} onChange={(event) => updateDraft("full_name", event.target.value)} /></Field>
         <Field label="Username"><input disabled={!canManage} value={draft.username} onChange={(event) => updateDraft("username", event.target.value)} /></Field>
         <Field label="Mobile"><input disabled={!canManage} value={draft.mobile_number} onChange={(event) => updateDraft("mobile_number", event.target.value)} /></Field>
         <Field label="Email"><input disabled={!canManage} type="email" value={draft.email} onChange={(event) => updateDraft("email", event.target.value)} /></Field>
@@ -18000,6 +18069,8 @@ function SyncSettingsSection({
   const copySafeDiagnostics = async () => {
     const diagnostics = {
       appMode,
+      // Always next to appMode: on its own the mode names a state, and this names its cause.
+      appModeSource: connectionStatus?.apiModeSource || "unknown",
       internetStatus,
       localServerStatus,
       cloudStatus,
