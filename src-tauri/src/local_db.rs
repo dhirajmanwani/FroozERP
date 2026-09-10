@@ -46,6 +46,14 @@ pub struct LocalDbStatus {
     /// the alternative is the failure that reports itself as health: sync green, cursor advanced,
     /// records gone.
     pub unapplied_changes: i64,
+    /// How many reference rows this device actually holds - products, suppliers and inventory
+    /// lots together.
+    ///
+    /// It exists so the app can tell two states apart that otherwise look identical: "the shop has
+    /// nothing" and "the bootstrap delivered nothing and can never be asked again". A device that
+    /// holds a cursor and no reference rows at all is in the second, and until this count existed
+    /// there was no way for it to know.
+    pub reference_rows: i64,
     pub last_successful_sync_at: Option<String>,
     pub last_push_at: Option<String>,
     pub last_pull_at: Option<String>,
@@ -198,6 +206,7 @@ pub fn status(app: &AppHandle) -> Result<LocalDbStatus, String> {
             failed_operations: 0,
             conflict_operations: 0,
             unapplied_changes: 0,
+            reference_rows: 0,
             last_successful_sync_at: None,
             last_push_at: None,
             last_pull_at: None,
@@ -3608,6 +3617,20 @@ fn status_at(path: &Path) -> Result<LocalDbStatus, String> {
         conflict_operations: count_outbox_status(&conn, &["conflict"])?,
         unapplied_changes: conn
             .query_row("SELECT COUNT(*) FROM local_unapplied_changes", [], |row| row.get(0))
+            .optional()
+            .map_err(to_error)?
+            .unwrap_or(0),
+        // One query, three tables. A device that has been filled has rows in all of them; a device
+        // that received an empty bootstrap has rows in none, which is the state worth detecting.
+        reference_rows: conn
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM local_products) +
+                   (SELECT COUNT(*) FROM local_supplier_references) +
+                   (SELECT COUNT(*) FROM local_inventory_lots)",
+                [],
+                |row| row.get(0),
+            )
             .optional()
             .map_err(to_error)?
             .unwrap_or(0),

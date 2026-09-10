@@ -16,6 +16,7 @@ const emptyStatus = {
   lastPullAt: "",
   lastPushResult: "",
   currentCursor: "",
+  referenceRows: null,
   error: "",
 };
 
@@ -60,6 +61,9 @@ const normalizeStatus = (status, fallback = {}) => ({
   lastPushAt: status?.last_push_at || "",
   lastPullAt: status?.last_pull_at || "",
   lastPushResult: status?.last_push_result || "",
+  // `?? null`, not `|| 0`: an absent count and a genuinely empty device are different, and
+  // `decideReferenceBootstrap` only acts on a number it actually received.
+  referenceRows: Number.isFinite(Number(status?.reference_rows)) ? Number(status.reference_rows) : null,
   currentCursor: status?.current_cursor || "",
   error: status?.error || "",
 });

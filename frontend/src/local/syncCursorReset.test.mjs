@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { decideReferenceBootstrap } from "./referenceBootstrapDecision.js";
 
 /**
  * The one-way door in the bootstrap, and the way back out of it.
@@ -29,14 +30,24 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(here, "..", "..", "..", "scripts", "reset-sync-cursor.mjs");
 const modulePath = new URL(`file://${SCRIPT}`).href;
 
-test("the bootstrap really is gated on a zero cursor", () => {
-  // If this ever stops being true the script below is solving a problem that no longer exists,
-  // and it should be deleted rather than left to reset a cursor for no reason.
+test("setting the cursor to zero still causes a bootstrap", () => {
+  // The gate this script was written against has since been replaced: the app now also asks again
+  // when it holds a cursor and no reference rows at all, so a device on a current build recovers
+  // from an empty bootstrap by itself and never needs this.
+  //
+  // The script is not therefore dead. It is the escape hatch for a device running a build older
+  // than that fix -- which is every counter until the next installer reaches it, including the one
+  // this was written for. What it depends on is narrower now, and this is that dependency: a zero
+  // cursor must still mean "ask for everything".
+  const decision = decideReferenceBootstrap({ cursor: "0", referenceRows: 0 });
+  assert.equal(decision.bootstrap, true, "the reset only helps while a zero cursor asks for a bootstrap");
+  assert.equal(decision.reason, "NEVER_BOOTSTRAPPED");
+
   const syncService = fs.readFileSync(path.join(here, "syncService.js"), "utf8");
   assert.match(
     syncService,
-    /bootstrap_protocol: cursor === "0" \? "reference-v1" : undefined/,
-    "the reset only helps while the bootstrap is requested exactly at cursor zero",
+    /bootstrap_protocol: bootstrapProtocolFor\(\{/,
+    "the pull must still decide through the shared rule",
   );
 });
 
