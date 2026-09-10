@@ -32,6 +32,10 @@ const OPS_COMMANDS = [
   "run-cloud-migrations.js",
   "show-setup.mjs",
   "audit-cloud-time-identity.js",
+  "retire-devices.mjs",
+  "cloud/explain-empty-device.mjs",
+  "cloud/backfill-company-scope.mjs",
+  "multibranch/export-production-snapshot-readonly.js",
 ];
 
 const read = (name) => fs.readFileSync(path.join(SCRIPTS_DIR, name), "utf8");
@@ -90,10 +94,34 @@ test("every ops command listed here exists", () => {
 test("no script that connects to a database is missing from the list", () => {
   // The list is the only thing being checked, so a new ops command added outside it would inherit
   // exactly the problem this file exists to stop.
-  const candidates = fs
-    .readdirSync(SCRIPTS_DIR)
-    .filter((name) => /\.(mjs|js)$/.test(name))
-    .filter((name) => /new Pool\(|new Client\(/.test(read(name)));
+  // Recursive, and it has to be. This scan read only the top level, so `scripts/cloud/` was a
+  // blind spot -- `check-schema-drift.mjs` was in the list by hand while two later commands in the
+  // same folder were never checked at all. A guard with a directory it does not look in is a guard
+  // that reports success for the files most likely to be new.
+  const walk = (dir, prefix = "") => fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const name = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) return walk(path.join(dir, entry.name), name);
+    return /\.(mjs|js)$/.test(entry.name) ? [name] : [];
+  });
+
+  // A script that takes its connection from `STAGING_DATABASE_URL` is deliberately not a production
+  // command: the different variable name is the safety, because nobody sets STAGING_DATABASE_URL to
+  // the shop's cloud by accident. Encoded as a rule rather than a list of names, so a new rehearsal
+  // harness is excused automatically and a new production command is caught automatically -- a
+  // hardcoded exclusion list would go stale in exactly the direction that matters.
+  //
+  // `TEST_BACKEND_PORT` is the second marker because two of the isolated harnesses read plain
+  // `DATABASE_URL` rather than the staging name their siblings use. They are excused here for what
+  // they are -- they start a backend on a local port against a scratch database -- but the
+  // inconsistency is real: on a machine where DATABASE_URL points at the shop, they would run an
+  // integration test against it. Recorded separately rather than papered over.
+  const isStagingHarness = (source) => !/DATABASE_PUBLIC_URL/.test(source)
+    && (/STAGING_DATABASE_URL/.test(source) || /TEST_BACKEND_PORT/.test(source));
+
+  const candidates = walk(SCRIPTS_DIR)
+    .filter((name) => /new Pool\(|new Client\(/.test(read(name)))
+    .filter((name) => !isStagingHarness(read(name)));
+  assert.ok(candidates.length >= 8, `expected the ops commands to be found, got ${candidates.length}`);
   const unchecked = candidates.filter((name) => !OPS_COMMANDS.includes(name));
   assert.deepEqual(
     unchecked,
