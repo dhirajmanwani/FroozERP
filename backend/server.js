@@ -9727,11 +9727,13 @@ const requireSyncContext = async ({ userId, deviceId, branchId, operationalLocat
   );
   const device = deviceResult.rows[0];
   if (!device) return { error: { status: 403, message: "Device is not registered for sync" } };
+  // An allowlist, deliberately: only `APPROVED` syncs. A denylist of `DISABLED`/`REVOKED` used to
+  // follow this line and could never run — every status that is not exactly `APPROVED` has already
+  // returned here — so it read as defence in depth while providing none. The allowlist is the
+  // stricter rule and the only one worth having: a status this file has never heard of is refused
+  // by default rather than waved through because it is absent from a list.
   if (device.status !== "APPROVED") {
     return { error: { status: 403, message: "Device is not approved for sync" } };
-  }
-  if (["DISABLED", "REVOKED"].includes(String(device.status || "").toUpperCase())) {
-    return { error: { status: 403, message: "Device is disabled or revoked" } };
   }
   const branchResult = await client.query("SELECT id, company_id, active FROM branches WHERE id = $1 LIMIT 1", [parsedBranchId]);
   const branch = branchResult.rows[0];
