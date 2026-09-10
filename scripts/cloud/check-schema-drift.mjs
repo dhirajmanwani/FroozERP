@@ -57,66 +57,13 @@ const SERVER = path.join(here, "..", "..", "backend", "server.js");
  * full of SQL. Scanning the whole file would collect statements that were never part of the schema
  * bootstrap and report drift that does not exist.
  */
-export const bootstrapSql = (source) => {
-  const start = source.indexOf("const initializeDatabase = async");
-  if (start === -1) throw new Error("initializeDatabase() was not found in server.js");
+// The comparison itself lives in `backend/schemaContract.js`, because `server.js` now runs it at
+// startup too. Two copies of "what the schema should be" is the failure this whole area keeps
+// producing; this file is the command-line face of the one copy.
+const require = createRequire(new URL("../../backend/package.json", import.meta.url));
+const contract = require("./schemaContract.js");
 
-  // `\r?\n`, not `\n`. Windows is the shipped target and the checkout there has CRLF endings, so a
-  // search for "\n};\n" finds nothing and the whole command fails with "the end of
-  // initializeDatabase() was not found" -- on the one machine it was written for, while passing
-  // everywhere it was tested.
-  const closing = /\r?\n\};\r?\n/g;
-  closing.lastIndex = start;
-  const match = closing.exec(source);
-  if (!match) throw new Error("the end of initializeDatabase() was not found");
-  return source.slice(start, match.index);
-};
-
-/** Tables the bootstrap creates. */
-export const declaredTables = (sql) =>
-  [...sql.matchAll(/CREATE TABLE IF NOT EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)/g)]
-    .map(([, name]) => name.toLowerCase());
-
-/** Columns the bootstrap adds, as `table.column`. */
-export const declaredColumns = (sql) =>
-  [...sql.matchAll(/ALTER TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD COLUMN IF NOT EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)/g)]
-    .map(([, table, column]) => [table.toLowerCase(), column.toLowerCase()]);
-
-/**
- * Compare what is declared with what exists.
- *
- * Pure: takes the declarations and the live catalogue, returns the difference. The whole judgement
- * is here so it can be tested without a database, the way every other decision in this repository is.
- *
- * A column of a table that is itself missing is not reported separately — the table line already
- * says everything, and repeating each of its columns turns a short report into an unreadable one.
- *
- * Every name is folded to lower case on the way in, both sides. Postgres folds unquoted identifiers
- * itself, so `Users` in the source and `users` in the catalogue are one table; comparing them as
- * written would report a column that is plainly there.
- */
-export const compareSchema = ({ tables, columns, liveTables, liveColumns }) => {
-  const lower = (value) => String(value).toLowerCase();
-  const declared = tables.map(lower);
-  const declaredCols = columns.map(([table, column]) => [lower(table), lower(column)]);
-  const live = new Set(liveTables.map(lower));
-  const liveColumnSet = new Set(liveColumns.map(([t, c]) => `${lower(t)}.${lower(c)}`));
-
-  const missingTables = [...new Set(declared.filter((name) => !live.has(name)))].sort();
-  const missingTableSet = new Set(missingTables);
-
-  const missingColumns = declaredCols
-    .filter(([table]) => live.has(table) && !missingTableSet.has(table))
-    .filter(([table, column]) => !liveColumnSet.has(`${table}.${column}`))
-    .map(([table, column]) => `${table}.${column}`);
-
-  return {
-    missingTables,
-    missingColumns: [...new Set(missingColumns)].sort(),
-    declaredTables: declared.length,
-    declaredColumns: declaredCols.length,
-  };
-};
+export const { bootstrapSql, declaredTables, declaredColumns, compareSchema } = contract;
 
 const main = async () => {
   const connectionString = env.DATABASE_PUBLIC_URL || env.DATABASE_URL;
@@ -130,7 +77,6 @@ const main = async () => {
   const tables = declaredTables(sql);
   const columns = declaredColumns(sql);
 
-  const require = createRequire(new URL("../../backend/package.json", import.meta.url));
   const { Pool } = require("pg");
   const pool = new Pool({ connectionString });
   const client = await pool.connect();

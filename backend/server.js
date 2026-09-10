@@ -3,6 +3,7 @@ process.env.TZ = "UTC";
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
+const { findSchemaDrift, describeSchemaDrift } = require("./schemaContract");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -23351,6 +23352,48 @@ const verifyRequiredDatabaseSchema = async () => {
   }
 };
 
+/**
+ * Refuse to start a hosted deployment whose database is behind the code.
+ *
+ * `runStartupSchemaBootstrap` is off here (line 208), so `initializeDatabase()` never runs on the
+ * cloud and the schema only advances when somebody applies a migration. The check above looks for a
+ * short list of required tables; everything else it declares -- 88 tables and 268 added columns --
+ * went unchecked, and each absence waited for whichever route read it first:
+ *
+ *     column u.failed_login_attempts does not exist   -> every cloud sign-in answered 500, for two
+ *                                                        weeks, discovered from a Railway log
+ *     relation "charge_types" does not exist          -> the reference bootstrap answered 500, so a
+ *                                                        rebuilt counter could never be filled
+ *
+ * Both were deployed, healthy and silent. This is the same comparison the ops script runs, moved to
+ * the one moment when acting on it is free.
+ *
+ * ## Why refusing is safer than warning
+ *
+ * A refusal here fails the deployment, and a deployment that fails does not replace the one already
+ * serving the shop. So the cost of being wrong is "the new version does not go live", and the cost
+ * of being right is "the shop never runs on a schema the code cannot use". A warning would be read
+ * once, by nobody, in a log -- which is exactly how both of those failures got two weeks to work.
+ *
+ * The escape hatch exists because a refusal that cannot be overridden becomes a reason to delete
+ * the check. It is deliberately loud, and it names the drift it is ignoring.
+ */
+const verifyDeclaredSchema = async () => {
+  if (!hostedCloudDeployment) return;
+  const serverSource = fs.readFileSync(__filename, "utf8");
+  const drift = await findSchemaDrift(serverSource, pool);
+  if (!drift.missingTables.length && !drift.missingColumns.length) {
+    console.log(`schema contract verified: ${drift.declaredTables} tables, ${drift.declaredColumns} added columns, no drift`);
+    return;
+  }
+  const description = describeSchemaDrift(drift);
+  if (readOptionalBoolean(process.env.FROOZERP_ALLOW_SCHEMA_DRIFT, false)) {
+    console.error(`[schema-drift] STARTING ANYWAY because FROOZERP_ALLOW_SCHEMA_DRIFT is set. ${description}`);
+    return;
+  }
+  throw new Error(description);
+};
+
 const countPublicDatabaseTables = async () => {
   const result = await pool.query(
     "SELECT COUNT(*)::INTEGER AS count FROM pg_tables WHERE schemaname = 'public'"
@@ -23447,6 +23490,7 @@ const prepareDatabaseForStartup = async () => {
   }
   await ensureProductEntrySchema();
   await verifyRequiredDatabaseSchema();
+  await verifyDeclaredSchema();
   await reportLegacyPasswordHashes();
   if (!desktopLocalRuntime) {
     const aiSchema = await ensureAiBusinessAssistantSchema(pool);
