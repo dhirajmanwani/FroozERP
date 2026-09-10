@@ -156,3 +156,118 @@ test("doing less than promised is said out loud", () => {
     "the closing line must not claim sessions ended when the column is absent",
   );
 });
+
+/**
+ * `scripts/multibranch/` is the other half of the same mistake, pointing the other way.
+ *
+ * Those are not hand-run ops commands; they are rehearsal harnesses. Several of them start a real
+ * backend on `TEST_BACKEND_PORT` and drive writes through it against whatever database they are
+ * handed. So for them the name is not a convenience, it is the isolation: `STAGING_DATABASE_URL` is
+ * a name nobody sets to the shop's cloud by accident, while `DATABASE_URL` is the name production
+ * uses and is routinely already sitting in a shell during ops work -- the same shell someone would
+ * run a rehearsal from.
+ *
+ * `isolated-mixed-version-rollout.js` and `isolated-scope-management-integration.js` both read
+ * `DATABASE_URL` while their five siblings read `STAGING_DATABASE_URL`. Nothing invoked them that
+ * way, and nothing caught it either: the checks above enumerate `scripts/` without descending, so
+ * this whole directory was never looked at. Both now read `STAGING_DATABASE_URL` and refuse without
+ * it, and the rules below are directory-driven, so a harness added tomorrow is checked on arrival
+ * rather than when somebody remembers to add it to a list.
+ *
+ * Note the inversion: up there, naming only `DATABASE_URL` is a usability bug. Down here it is a
+ * safety one, and the fix is the opposite -- these must not accept that name at all.
+ */
+
+const MULTIBRANCH_DIR = path.join(SCRIPTS_DIR, "multibranch");
+
+/**
+ * The one harness allowed to name the production variable, because reaching production is its
+ * purpose: it exports a snapshot for the rehearsals to run against. It is safe only for as long as
+ * it stays read-only, so that is asserted below rather than assumed -- give it a write path or a
+ * backend and it stops qualifying for this exemption.
+ */
+const READ_ONLY_PRODUCTION_SCRIPTS = ["export-production-snapshot-readonly.js"];
+
+/** Source with comment lines removed, so prose about `DATABASE_URL` is not mistaken for a read. */
+const readCode = (name) =>
+  read(name)
+    .split("\n")
+    .filter((line) => {
+      const trimmed = line.trim();
+      return !trimmed.startsWith("//") && !trimmed.startsWith("*") && !trimmed.startsWith("/*");
+    })
+    .join("\n");
+
+const multibranchScripts = () =>
+  fs
+    .readdirSync(MULTIBRANCH_DIR)
+    .filter((name) => /\.(mjs|js)$/.test(name))
+    .sort();
+
+/** Harnesses subject to the staging-only rule: everything but the read-only production export. */
+const rehearsalHarnesses = () =>
+  multibranchScripts().filter((name) => !READ_ONLY_PRODUCTION_SCRIPTS.includes(name));
+
+test("no rehearsal harness reads DATABASE_URL", () => {
+  // Reading it is what this forbids. Passing it *down* -- `DATABASE_URL: stagingDatabaseUrl` in a
+  // spawned backend's env -- is fine and stays matchable only as a write, never as `env.DATABASE_URL`.
+  const offenders = rehearsalHarnesses().filter((name) =>
+    /(?:process\.)?env\.DATABASE_URL/.test(readCode(path.join("multibranch", name))),
+  );
+  assert.deepEqual(
+    offenders,
+    [],
+    "these harnesses take the name production uses, so a shell already pointed at the shop would "
+    + `run them against live data: ${offenders.join(", ")}`,
+  );
+});
+
+test("every rehearsal harness that opens a connection takes STAGING_DATABASE_URL", () => {
+  const connecting = rehearsalHarnesses().filter((name) =>
+    /new Pool\(|new Client\(/.test(readCode(path.join("multibranch", name))),
+  );
+  assert.ok(connecting.length >= 5, "the harnesses stopped being detected as database clients");
+
+  for (const name of connecting) {
+    assert.match(
+      readCode(path.join("multibranch", name)),
+      /process\.env\.STAGING_DATABASE_URL/,
+      `${name} must name the staging variable, which nobody sets to the shop by accident`,
+    );
+  }
+});
+
+test("a rehearsal harness refuses before it connects", () => {
+  // An empty variable must not reach `new Pool`. Every one of these guards its connection string
+  // first; ordering is the part source text can prove, and moving a pool above its guard breaks it.
+  for (const name of rehearsalHarnesses()) {
+    const code = readCode(path.join("multibranch", name));
+    const connection = code.search(/new Pool\(|new Client\(/);
+    if (connection < 0) continue;
+    const refusal = code.indexOf("throw new Error(");
+    assert.ok(refusal >= 0, `${name} opens a connection and refuses nothing`);
+    assert.ok(
+      refusal < connection,
+      `${name} builds its connection before it refuses a bad one, so an unintended database is `
+      + "already open by the time the guard runs",
+    );
+  }
+});
+
+test("the read-only exemption is still read-only", () => {
+  for (const name of READ_ONLY_PRODUCTION_SCRIPTS) {
+    const relative = path.join("multibranch", name);
+    assert.ok(fs.existsSync(path.join(SCRIPTS_DIR, relative)), `${name} is exempted but does not exist`);
+    const code = readCode(relative);
+    assert.match(
+      code,
+      /BEGIN READ ONLY/,
+      `${name} is allowed production's variable only because the database refuses to let it write`,
+    );
+    assert.doesNotMatch(
+      code,
+      /spawn\(/,
+      `${name} starts a backend, so it is a harness now and cannot keep the read-only exemption`,
+    );
+  }
+});

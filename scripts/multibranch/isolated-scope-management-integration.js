@@ -8,16 +8,22 @@ const { spawn } = require("node:child_process");
 const { Pool } = require("../../backend/node_modules/pg");
 const { issueDeviceSession } = require("../../backend/deviceSession");
 
-const databaseUrl = String(process.env.DATABASE_URL || "");
+// STAGING_DATABASE_URL, never DATABASE_URL: this harness starts a real backend and writes
+// through it, and DATABASE_URL is the name production uses and the one already sitting in a
+// shell during ops work. Naming the staging variable is what keeps a stray shell out of the shop.
+const stagingDatabaseUrl = String(process.env.STAGING_DATABASE_URL || "");
 const evidenceDir = String(process.env.EVIDENCE_DIR || "");
 const port = Number(process.env.TEST_BACKEND_PORT || 55553);
-if (!/^postgres(?:ql)?:\/\/[^/]*(?:127\.0\.0\.1|localhost)[^/]*\/[^/?]*_staging(?:[?]|$)/i.test(databaseUrl)) {
+if (!stagingDatabaseUrl) {
+  throw new Error("Usage: STAGING_DATABASE_URL=... EVIDENCE_DIR=... node isolated-scope-management-integration.js");
+}
+if (!/^postgres(?:ql)?:\/\/[^/]*(?:127\.0\.0\.1|localhost)[^/]*\/[^/?]*_staging(?:[?]|$)/i.test(stagingDatabaseUrl)) {
   throw new Error("Scope-management integration requires a loopback *_staging database");
 }
 if (!evidenceDir) throw new Error("EVIDENCE_DIR is required");
 fs.mkdirSync(evidenceDir, { recursive: true });
 
-const pool = new Pool({ connectionString: databaseUrl });
+const pool = new Pool({ connectionString: stagingDatabaseUrl });
 const ownerDeviceId = "FZDEV-STAGING-SCOPE-OWNER";
 const pendingDeviceId = "FZDEV-STAGING-SCOPE-PENDING";
 const rejectedDeviceId = "FZDEV-STAGING-SCOPE-UNAPPROVED";
@@ -93,7 +99,7 @@ const run = async () => {
       FROOZERP_RUNTIME_MODE: "cloud-server",
       FROOZERP_ALLOW_LOOPBACK_POSTGRES_FOR_ISOLATED_TESTS: "true",
       FROOZERP_OPERATIONAL_SCOPE_MODE: "enforce",
-      DATABASE_URL: databaseUrl,
+      DATABASE_URL: stagingDatabaseUrl,
       DB_SSL: "false",
       DEVICE_SESSION_SECRET: secret,
       PORT: String(port),
