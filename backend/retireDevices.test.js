@@ -137,10 +137,18 @@ test("it disables rather than deletes, and only what it planned", async () => {
 
   const joined = source.replace(/"\s*\+\s*"/g, "");
   const updates = [...joined.matchAll(/UPDATE [^`"]*/g)].map(([text]) => text).filter((t) => t.includes("SET"));
-  assert.equal(updates.length, 1, `expected exactly one write, found ${updates.length}`);
-  assert.match(updates[0], /status = 'DISABLED'/, "DISABLED is the status the app already uses");
-  assert.match(updates[0], /device_id = ANY\(\$1::TEXT\[\]\)/, "it must write only to the planned ids");
-  assert.match(updates[0], /status = ANY\(\$2::TEXT\[\]\)/, "and only to rows still in a retirable state");
+  assert.equal(updates.length, 2, `expected exactly two writes, found ${updates.length}`);
+
+  const [retire, unpost] = updates;
+  assert.match(retire, /status = 'DISABLED'/, "DISABLED is the status the app already uses");
+  assert.match(retire, /device_id = ANY\(\$1::TEXT\[\]\)/, "it must write only to the planned ids");
+  assert.match(retire, /status = ANY\(\$2::TEXT\[\]\)/, "and only to rows still in a retirable state");
+
+  // The second write exists because retiring a posted row must end its posting too. It is bounded
+  // to the one named device, and to a posting that is actually active -- a broader UPDATE here
+  // would unpost counters nobody asked about.
+  assert.match(unpost, /UPDATE device_assignments SET active = FALSE/);
+  assert.match(unpost, /WHERE device_id = \$1 AND active = TRUE/, "one device, and only its live posting");
 });
 
 test("it writes nothing without --apply", async () => {
@@ -151,4 +159,75 @@ test("it writes nothing without --apply", async () => {
   assert.notEqual(guardAt, -1, "the dry-run guard must exist");
   assert.notEqual(writeAt, -1, "the transaction must exist");
   assert.ok(guardAt < writeAt, "the dry run must return before the transaction");
+});
+
+/**
+ * Naming one row is the other half of refusing to guess.
+ *
+ * The bulk rule leaves posted devices alone because it cannot tell which of two identical rows is
+ * the real till. That is correct and it is not the whole job: the shop's cloud ended up with two
+ * posted rows for one laptop -- one last seen today, one 43 days ago and holding a counter -- and
+ * somebody who can see the counter has to be able to say which.
+ */
+
+test("a named row is retired even though the bulk rule would leave it", async () => {
+  const { planNamedRetirement } = await import(modulePath);
+  const plan = planNamedRetirement({
+    devices: [
+      device({ device_id: "LIVE", posted: true, last_seen: daysAgo(0) }),
+      device({ device_id: "OLD", posted: true, last_seen: daysAgo(43) }),
+    ],
+    deviceId: "OLD",
+  });
+  assert.deepEqual(plan.retire.map((d) => d.device_id), ["OLD"]);
+  assert.equal(plan.unpost, true, "a posted row must lose its posting as well");
+});
+
+test("retiring a posted row ends its posting, or it becomes a till that cannot sync", async () => {
+  // A DISABLED device still holding an active assignment is exactly
+  // "User and device do not share an approved operational location" -- an error that says nothing
+  // about its cause and has already cost a session here.
+  const source = fs.readFileSync(SCRIPT, "utf8");
+  assert.match(
+    source,
+    /UPDATE device_assignments SET active = FALSE WHERE device_id = \$1 AND active = TRUE/,
+    "the posting must be ended in the same transaction",
+  );
+  const unpostAt = source.indexOf("UPDATE device_assignments SET active = FALSE");
+  const commitAt = source.indexOf('await client.query("COMMIT")');
+  assert.ok(unpostAt !== -1 && unpostAt < commitAt, "and before the commit, not after it");
+});
+
+test("an unposted named row is retired without touching any posting", async () => {
+  const { planNamedRetirement } = await import(modulePath);
+  const plan = planNamedRetirement({
+    devices: [
+      device({ device_id: "LIVE", posted: true }),
+      device({ device_id: "SPARE", posted: false, last_seen: daysAgo(7) }),
+    ],
+    deviceId: "SPARE",
+  });
+  assert.equal(plan.unpost, false);
+});
+
+test("the last posted device is refused, however deliberately it was named", async () => {
+  // Naming a row is permission to resolve an ambiguity, not permission to take the shop off the air.
+  const { planNamedRetirement } = await import(modulePath);
+  const plan = planNamedRetirement({
+    devices: [device({ device_id: "ONLY", posted: true })],
+    deviceId: "ONLY",
+  });
+  assert.equal(plan.refused, "LAST_POSTED_DEVICE");
+  assert.match(plan.message, /approve-device/);
+  assert.equal(plan.retire, undefined);
+});
+
+test("a name that is not there, or already retired, says so", async () => {
+  const { planNamedRetirement } = await import(modulePath);
+  const devices = [
+    device({ device_id: "LIVE", posted: true }),
+    device({ device_id: "GONE", status: "DISABLED" }),
+  ];
+  assert.equal(planNamedRetirement({ devices, deviceId: "NOPE" }).refused, "NO_SUCH_DEVICE");
+  assert.equal(planNamedRetirement({ devices, deviceId: "GONE" }).refused, "ALREADY_RETIRED");
 });
