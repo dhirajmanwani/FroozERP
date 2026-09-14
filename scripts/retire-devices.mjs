@@ -39,6 +39,7 @@
  *   node scripts/retire-devices.mjs --days 60       # stricter idea of "recent" (default 30)
  *   node scripts/retire-devices.mjs --apply
  *   node scripts/retire-devices.mjs --device FZDEV-... --apply   # retire one row by name
+ *   node scripts/retire-devices.mjs --restore FZDEV-... --apply  # bring a retired row back
  */
 
 import { argv, env, exit, stdout } from "node:process";
@@ -140,6 +141,36 @@ export const planNamedRetirement = ({ devices, deviceId }) => {
   return { retire: [target], unpost: target.posted };
 };
 
+/**
+ * Bring a retired row back to PENDING.
+ *
+ * Retirement was built without this and should not have been. A device id belongs to an
+ * installation, not to a machine: it is a GUID minted once and kept in the local database
+ * (`local_db.rs`, `generate_opaque_device_id`). So a laptop that is reinstalled *without* its data
+ * being cleared comes back under the same id -- and a row retired while it was quiet is then the
+ * row it needs. That happened the same afternoon this script was written, to the second laptop,
+ * because "it has been idle 45 days" and "it is finished with" are not the same statement and only
+ * the first one is visible from here.
+ *
+ * Back to PENDING, never straight to APPROVED. Approval is a deliberate act with its own command
+ * and its own record; undoing a retirement should return a device to the queue, not wave it
+ * through.
+ */
+export const planRestore = ({ devices, deviceId }) => {
+  const target = devices.find((device) => device.device_id === deviceId);
+  if (!target) {
+    return { refused: "NO_SUCH_DEVICE", message: `No device row has the id ${deviceId}.` };
+  }
+  const status = String(target.status).toUpperCase();
+  if (RETIRABLE.includes(status)) {
+    return {
+      refused: "NOT_RETIRED",
+      message: `${deviceId} is ${status}, which is already a usable state. Nothing to restore.`,
+    };
+  }
+  return { restore: target, from: status };
+};
+
 const pad = (value, width) => String(value ?? "").padEnd(width);
 const describe = (device, now) => `${pad(device.device_id, 44)} ${pad(device.status, 9)} `
   + `${pad(device.device_name, 22)} ${device.last_seen ? `last seen ${Math.floor(daysBetween(device.last_seen, now))}d ago` : "never seen"}`;
@@ -185,6 +216,35 @@ const main = async () => {
 
     const now = new Date();
     stdout.write(`\n${devices.length} device rows on this cloud.\n`);
+
+    const restoreFlag = argv.indexOf("--restore");
+    const restoreId = restoreFlag === -1 ? null : String(argv[restoreFlag + 1] || "").trim();
+    if (restoreFlag !== -1 && !restoreId) {
+      stdout.write("\n--restore needs a device id.\n\n");
+      exit(1);
+    }
+    if (restoreId) {
+      const plan = planRestore({ devices, deviceId: restoreId });
+      if (plan.refused) {
+        stdout.write(`\nNothing was written (${plan.refused}).\n${plan.message}\n\n`);
+        exit(plan.refused === "NOT_RETIRED" ? 0 : 1);
+      }
+      stdout.write(`\nWould restore this row to PENDING:\n  ${describe(plan.restore, now)}\n`);
+      stdout.write(`\n  It is ${plan.from} now. Restoring returns it to the approval queue, not to\n`
+        + "  approved -- posting it to a counter stays a separate, deliberate act\n"
+        + "  (scripts/approve-device.mjs --counter).\n");
+      if (!apply) {
+        stdout.write("\nDRY RUN. Nothing was changed. Re-run with --apply.\n\n");
+        return;
+      }
+      const restored = await client.query(
+        "UPDATE authorized_devices SET status = 'PENDING', updated_at = CURRENT_TIMESTAMP"
+        + " WHERE device_id = $1 AND status <> ALL($2::TEXT[])",
+        [restoreId, RETIRABLE],
+      );
+      stdout.write(`\nRestored ${restored.rowCount} device row to PENDING.\n\n`);
+      return;
+    }
 
     const namedFlag = argv.indexOf("--device");
     const namedId = namedFlag === -1 ? null : String(argv[namedFlag + 1] || "").trim();

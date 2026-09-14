@@ -137,9 +137,14 @@ test("it disables rather than deletes, and only what it planned", async () => {
 
   const joined = source.replace(/"\s*\+\s*"/g, "");
   const updates = [...joined.matchAll(/UPDATE [^`"]*/g)].map(([text]) => text).filter((t) => t.includes("SET"));
-  assert.equal(updates.length, 2, `expected exactly two writes, found ${updates.length}`);
+  assert.equal(updates.length, 3, `expected exactly three writes, found ${updates.length}`);
 
-  const [retire, unpost] = updates;
+  // Order is the order they appear in the file: the restore path returns early, before the bulk
+  // retirement and its unpost.
+  const restore = updates.find((sql) => /status = 'PENDING'/.test(sql));
+  const retire = updates.find((sql) => /status = 'DISABLED'/.test(sql));
+  const unpost = updates.find((sql) => /device_assignments/.test(sql));
+  assert.ok(restore && retire && unpost, "all three writes must be identifiable by what they do");
   assert.match(retire, /status = 'DISABLED'/, "DISABLED is the status the app already uses");
   assert.match(retire, /device_id = ANY\(\$1::TEXT\[\]\)/, "it must write only to the planned ids");
   assert.match(retire, /status = ANY\(\$2::TEXT\[\]\)/, "and only to rows still in a retirable state");
@@ -230,4 +235,59 @@ test("a name that is not there, or already retired, says so", async () => {
   ];
   assert.equal(planNamedRetirement({ devices, deviceId: "NOPE" }).refused, "NO_SUCH_DEVICE");
   assert.equal(planNamedRetirement({ devices, deviceId: "GONE" }).refused, "ALREADY_RETIRED");
+});
+
+/**
+ * Retirement needed a way back, and was built without one.
+ *
+ * A device id belongs to an installation, not to a machine: it is a GUID minted once and kept in
+ * the local database. A laptop reinstalled *without* its data being cleared returns under the same
+ * id -- so a row retired while that laptop was quiet is the row it needs when it comes back.
+ *
+ * That happened the same afternoon this script was written. "Idle for 45 days" and "finished with"
+ * are different statements, and only the first is visible from here.
+ */
+
+test("a retired row can be brought back", async () => {
+  const { planRestore } = await import(modulePath);
+  const plan = planRestore({
+    devices: [device({ device_id: "BACK", status: "DISABLED", last_seen: daysAgo(45) })],
+    deviceId: "BACK",
+  });
+  assert.equal(plan.refused, undefined);
+  assert.equal(plan.from, "DISABLED");
+  assert.equal(plan.restore.device_id, "BACK");
+});
+
+test("restoring returns a device to the queue, not to approved", async () => {
+  // Approval is a deliberate act with its own command and its own record. Undoing a retirement
+  // must not wave a machine through it.
+  const source = fs.readFileSync(SCRIPT, "utf8");
+  const joined = source.replace(/"\s*\+\s*"/g, "");
+  const restore = [...joined.matchAll(/UPDATE authorized_devices SET status = 'PENDING'[^"]*/g)];
+  assert.equal(restore.length, 1, "exactly one restore write");
+  assert.match(restore[0][0], /WHERE device_id = \$1/, "one device only");
+  assert.match(
+    restore[0][0],
+    /status <> ALL\(\$2::TEXT\[\]\)/,
+    "and only a row that is actually retired -- never overwriting a live APPROVED row",
+  );
+});
+
+test("a row that is already usable is not restored", async () => {
+  // Otherwise this becomes a way to knock an approved device back to the queue by typo.
+  const { planRestore } = await import(modulePath);
+  for (const status of ["PENDING", "APPROVED"]) {
+    const plan = planRestore({
+      devices: [device({ device_id: "LIVE", status })],
+      deviceId: "LIVE",
+    });
+    assert.equal(plan.refused, "NOT_RETIRED", `${status} must be left alone`);
+    assert.equal(plan.restore, undefined);
+  }
+});
+
+test("restoring a name that is not there says so", async () => {
+  const { planRestore } = await import(modulePath);
+  assert.equal(planRestore({ devices: [], deviceId: "NOPE" }).refused, "NO_SUCH_DEVICE");
 });
