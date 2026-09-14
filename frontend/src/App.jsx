@@ -68,6 +68,7 @@ import { consumeStashedSessionForReload } from "./local/reloadSessionBridge";
 import { describeLocalServiceFailure } from "./local/localServiceFailure";
 import { autoConnectivityBlockedReason as resolveAutoConnectivityBlockedReason } from "./local/autoConnectivityAvailability";
 import { clearOfflineFailures, offlineLockCountdownMessage, readOfflineLockState, registerOfflineFailure } from "./local/offlineLoginLockout";
+import { mayOpenOfflineSession } from "./local/offlineSessionEligibility";
 import { resolveSessionAction } from "./local/sessionExpiry";
 import {
   addNotification,
@@ -5771,7 +5772,11 @@ function App() {
         setStartupError(credentialMessage);
         return;
       }
-      if (isTauriRuntime()) {
+      // An offline session may answer "the cloud could not be reached". It may not answer "the
+      // cloud refused this password" -- the local copy of a credential outlives a change made on
+      // the cloud, so without this a changed password keeps working here, signs somebody in with no
+      // cloud token, and every sync afterwards fails with a message about sync.
+      if (isTauriRuntime() && mayOpenOfflineSession(error)) {
         const latestDevice = await resolveLocalDeviceInfo(getClientDeviceInfo());
         const opened = await continueOffline(latestDevice);
         if (opened) return;
