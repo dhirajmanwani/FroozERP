@@ -38,6 +38,8 @@
  *   node scripts/retire-devices.mjs                 # show what would be retired
  *   node scripts/retire-devices.mjs --days 60       # stricter idea of "recent" (default 30)
  *   node scripts/retire-devices.mjs --apply
+ *   node scripts/retire-devices.mjs --device FZDEV-... --apply   # retire one row by name
+ *   node scripts/retire-devices.mjs --restore FZDEV-... --apply  # bring a retired row back
  */
 
 import { argv, env, exit, stdout } from "node:process";
@@ -101,6 +103,74 @@ export const planRetirement = ({ devices, now = new Date(), idleDays = 30 }) => 
   return { retire: candidates, posted, recentlyActive, survivors };
 };
 
+/**
+ * Retire one row the maintainer has named.
+ *
+ * The bulk rule refuses to touch a posted device because it cannot know which of two identical
+ * rows is the real till. That refusal is right and this is its other half: somebody who can see the
+ * counter says which, and takes responsibility for it.
+ *
+ * Retiring a posted row must also end its posting. A device that is DISABLED while still holding an
+ * active `device_assignments` row is a counter with a till that cannot sync -- the exact shape of
+ * "User and device do not share an approved operational location", which has already cost a
+ * session here.
+ */
+export const planNamedRetirement = ({ devices, deviceId }) => {
+  const target = devices.find((device) => device.device_id === deviceId);
+  if (!target) {
+    return { refused: "NO_SUCH_DEVICE", message: `No device row has the id ${deviceId}.` };
+  }
+  if (!RETIRABLE.includes(String(target.status).toUpperCase())) {
+    return {
+      refused: "ALREADY_RETIRED",
+      message: `${deviceId} is ${target.status}, which is not a state this retires from. Nothing to do.`,
+    };
+  }
+  const otherPosted = devices.filter(
+    (device) => device.posted && device.device_id !== deviceId
+      && RETIRABLE.includes(String(device.status).toUpperCase()),
+  );
+  if (target.posted && !otherPosted.length) {
+    return {
+      refused: "LAST_POSTED_DEVICE",
+      message: `${deviceId} is the only device posted to a counter. Retiring it would leave the shop `
+        + "with no till. Post the machine that is actually in use first "
+        + "(scripts/approve-device.mjs --counter), then retire this one.",
+    };
+  }
+  return { retire: [target], unpost: target.posted };
+};
+
+/**
+ * Bring a retired row back to PENDING.
+ *
+ * Retirement was built without this and should not have been. A device id belongs to an
+ * installation, not to a machine: it is a GUID minted once and kept in the local database
+ * (`local_db.rs`, `generate_opaque_device_id`). So a laptop that is reinstalled *without* its data
+ * being cleared comes back under the same id -- and a row retired while it was quiet is then the
+ * row it needs. That happened the same afternoon this script was written, to the second laptop,
+ * because "it has been idle 45 days" and "it is finished with" are not the same statement and only
+ * the first one is visible from here.
+ *
+ * Back to PENDING, never straight to APPROVED. Approval is a deliberate act with its own command
+ * and its own record; undoing a retirement should return a device to the queue, not wave it
+ * through.
+ */
+export const planRestore = ({ devices, deviceId }) => {
+  const target = devices.find((device) => device.device_id === deviceId);
+  if (!target) {
+    return { refused: "NO_SUCH_DEVICE", message: `No device row has the id ${deviceId}.` };
+  }
+  const status = String(target.status).toUpperCase();
+  if (RETIRABLE.includes(status)) {
+    return {
+      refused: "NOT_RETIRED",
+      message: `${deviceId} is ${status}, which is already a usable state. Nothing to restore.`,
+    };
+  }
+  return { restore: target, from: status };
+};
+
 const pad = (value, width) => String(value ?? "").padEnd(width);
 const describe = (device, now) => `${pad(device.device_id, 44)} ${pad(device.status, 9)} `
   + `${pad(device.device_name, 22)} ${device.last_seen ? `last seen ${Math.floor(daysBetween(device.last_seen, now))}d ago` : "never seen"}`;
@@ -147,9 +217,47 @@ const main = async () => {
     const now = new Date();
     stdout.write(`\n${devices.length} device rows on this cloud.\n`);
 
-    const plan = planRetirement({ devices, now, idleDays });
+    const restoreFlag = argv.indexOf("--restore");
+    const restoreId = restoreFlag === -1 ? null : String(argv[restoreFlag + 1] || "").trim();
+    if (restoreFlag !== -1 && !restoreId) {
+      stdout.write("\n--restore needs a device id.\n\n");
+      exit(1);
+    }
+    if (restoreId) {
+      const plan = planRestore({ devices, deviceId: restoreId });
+      if (plan.refused) {
+        stdout.write(`\nNothing was written (${plan.refused}).\n${plan.message}\n\n`);
+        exit(plan.refused === "NOT_RETIRED" ? 0 : 1);
+      }
+      stdout.write(`\nWould restore this row to PENDING:\n  ${describe(plan.restore, now)}\n`);
+      stdout.write(`\n  It is ${plan.from} now. Restoring returns it to the approval queue, not to\n`
+        + "  approved -- posting it to a counter stays a separate, deliberate act\n"
+        + "  (scripts/approve-device.mjs --counter).\n");
+      if (!apply) {
+        stdout.write("\nDRY RUN. Nothing was changed. Re-run with --apply.\n\n");
+        return;
+      }
+      const restored = await client.query(
+        "UPDATE authorized_devices SET status = 'PENDING', updated_at = CURRENT_TIMESTAMP"
+        + " WHERE device_id = $1 AND status <> ALL($2::TEXT[])",
+        [restoreId, RETIRABLE],
+      );
+      stdout.write(`\nRestored ${restored.rowCount} device row to PENDING.\n\n`);
+      return;
+    }
 
-    if (plan.posted?.length) {
+    const namedFlag = argv.indexOf("--device");
+    const namedId = namedFlag === -1 ? null : String(argv[namedFlag + 1] || "").trim();
+    if (namedFlag !== -1 && !namedId) {
+      stdout.write("\n--device needs a device id.\n\n");
+      exit(1);
+    }
+
+    const plan = namedId
+      ? planNamedRetirement({ devices, deviceId: namedId })
+      : planRetirement({ devices, now, idleDays });
+
+    if (!namedId && plan.posted?.length) {
       stdout.write(`\nPosted to a counter -- left alone, whatever their age:\n`);
       for (const device of plan.posted) stdout.write(`  ${describe(device, now)}\n`);
       if (plan.posted.length > 1) {
@@ -158,7 +266,7 @@ const main = async () => {
           + "  the counter.\n");
       }
     }
-    if (plan.recentlyActive?.length) {
+    if (!namedId && plan.recentlyActive?.length) {
       stdout.write(`\nSynced within ${idleDays} days -- left alone:\n`);
       for (const device of plan.recentlyActive) stdout.write(`  ${describe(device, now)}\n`);
     }
@@ -168,9 +276,15 @@ const main = async () => {
       exit(plan.refused === "NOTHING_TO_RETIRE" ? 0 : 1);
     }
 
-    stdout.write(`\nWould retire (unposted, and not seen for ${idleDays} days or never):\n`);
+    stdout.write(namedId
+      ? "\nWould retire this one row, named deliberately:\n"
+      : `\nWould retire (unposted, and not seen for ${idleDays} days or never):\n`);
     for (const device of plan.retire) stdout.write(`  ${describe(device, now)}\n`);
-    stdout.write(`\n${plan.survivors} device rows stay usable.\n`);
+    if (plan.unpost) {
+      stdout.write("\n  It is posted to a counter, so its posting ends too -- a disabled device left\n"
+        + "  holding a counter is a till that cannot sync, and nothing would say why.\n");
+    }
+    if (!namedId) stdout.write(`\n${plan.survivors} device rows stay usable.\n`);
 
     if (!apply) {
       stdout.write("\nDRY RUN. Nothing was changed. Re-run with --apply.\n\n");
@@ -183,8 +297,15 @@ const main = async () => {
        WHERE device_id = ANY($1::TEXT[]) AND status = ANY($2::TEXT[])`,
       [plan.retire.map((device) => device.device_id), RETIRABLE],
     );
+    if (plan.unpost) {
+      await client.query(
+        "UPDATE device_assignments SET active = FALSE WHERE device_id = $1 AND active = TRUE",
+        [plan.retire[0].device_id],
+      );
+    }
     await client.query("COMMIT");
-    stdout.write(`\nRetired ${result.rowCount} device rows. Their history is kept; they can no longer sync.\n\n`);
+    stdout.write(`\nRetired ${result.rowCount} device rows. Their history is kept; they can no longer sync.\n`);
+    stdout.write(plan.unpost ? "Its counter posting was ended too.\n\n" : "\n");
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
     throw error;
