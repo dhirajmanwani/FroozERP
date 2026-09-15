@@ -51,6 +51,12 @@ const migrationFiles = [
   // matter most -- without them `branch_id` stays NOT NULL DEFAULT 1, which puts an unassigned
   // order onto branch 1 and onto the sync road, the exact confusion the routing split removed.
   "backend/migrations/cloud/016_customer_orders_routing_split.sql",
+  // 017 is the record behind in-app device activation: the table every issued `.lic` is written
+  // to, and the single global sequence its serial comes from. The table is also declared in
+  // `initializeDatabase()`, which never runs on a hosted deployment -- so on the cloud this file
+  // is the only way it can exist, and `verifyDeclaredSchema` will refuse to start the server
+  // until it does.
+  "backend/migrations/cloud/017_activation_licences.sql",
 ];
 
 module.exports = { migrationFiles, deliberatelyNotRun };

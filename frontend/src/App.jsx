@@ -121,6 +121,22 @@ import {
   sanitizedInventoryLoadError,
   validateStockDateRange,
 } from "./local/stockInventory";
+import {
+  DEFAULT_VALID_DAYS,
+  DEVICE_ACTIVATION_STATE,
+  LICENCE_STATUS,
+  VALIDITY_PRESETS,
+  VALID_DAYS_MAX,
+  VALID_DAYS_MIN,
+  buildActivationIssuingView,
+  buildIssueRequest,
+  describeIssueFailure,
+  describeIssuedLicence,
+  describeLicenceFileFailure,
+  describeValidity,
+  orderDevicesForIssuing,
+  validateValidDays,
+} from "./local/activationIssuing";
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, resolveReportDateRange } from "./local/reportRefresh";
@@ -9901,7 +9917,7 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
         <div className="device-activation-panel">
           <span className="eyebrow">This device</span>
           <small>Device ID: {deviceInfo?.device_id || "(resolving...)"}</small>
-          <p>Read this Device ID to the owner so a matching activation file can be issued for it.</p>
+          <p>Ask the FroozERP owner to issue an activation for this device from Settings &gt; Counter &amp; Display &gt; Device Activation Licences. This device is listed there by name once it has connected to the shop; the ID above is only needed if it is not.</p>
           <input
             ref={fileInputRef}
             type="file"
@@ -9930,6 +9946,344 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
         </div>
       </section>
     </main>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Owner-side activation issuing (Settings -> Counter & Display -> Device Activation).
+//
+// Bringing a new counter online used to mean the maintainer running
+// `src-tauri/tools/sign_activation.rs` on his own machine, after somebody read a
+// `FZDEV-...` id down the phone. This screen is that, done by the Owner, from
+// whatever machine he is sitting at.
+//
+// Two things it deliberately does not do:
+//   * It never asks anybody to type or read out a device id. Devices register
+//     themselves, so the Owner picks one out of a list.
+//   * It decides nothing. Validity rules, expiry dates, grace and what each device
+//     needs all live in `local/activationIssuing.js`, where they are tested. This is
+//     a form, a table and a file.
+//
+// Authority is the backend's: `POST /api/activation/licences` answers `NOT_OWNER`
+// to anyone else. Hiding the section from non-Owners is a courtesy, not the check.
+// ---------------------------------------------------------------------------
+
+function DeviceActivationIssuingSection({ canIssue, devices, devicesError, onReload, user }) {
+  const [licences, setLicences] = useState(null);
+  const [licencesError, setLicencesError] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [selectedDeviceId, setSelectedDeviceId] = useState("");
+  const [validityChoice, setValidityChoice] = useState(String(DEFAULT_VALID_DAYS));
+  const [customDays, setCustomDays] = useState("");
+  const [issuing, setIssuing] = useState(false);
+  const [issued, setIssued] = useState(null);
+  const [outcome, setOutcome] = useState(null);
+
+  const loadLicences = useCallback(async () => {
+    setLoading(true);
+    try {
+      const response = await axios.get(`${API_URL}/api/activation/licences`);
+      const rows = response.data?.licences;
+      if (!Array.isArray(rows)) {
+        // A 200 that carries no list is not an empty list. Saying "no licences issued"
+        // here would be an error rendered as an empty state.
+        setLicences(null);
+        setLicencesError(new Error("the server answered without a licence list"));
+        return;
+      }
+      setLicences(rows);
+      setLicencesError(null);
+    } catch (error) {
+      setLicences(null);
+      setLicencesError(new Error(getErrorMessage(error, "the request failed")));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { loadLicences(); }, [loadLicences]);
+
+  // Summary tiles and both tables come out of this one call, so a tile can never
+  // disagree with the row it is counting (CLAUDE.md, "summary vs detail").
+  const view = useMemo(
+    () => buildActivationIssuingView({ devices, licences, devicesError, licencesError }),
+    [devices, licences, devicesError, licencesError],
+  );
+  const orderedRows = useMemo(() => (view.ok ? orderDevicesForIssuing(view.rows) : []), [view]);
+  const selectedRow = orderedRows.find((row) => inventoryIdsEqual(row.deviceId, selectedDeviceId)) || null;
+
+  const chosenValidity = validityChoice === "custom" ? customDays : validityChoice;
+  const validity = validateValidDays(chosenValidity);
+
+  const issue = async () => {
+    setOutcome(null);
+    setIssued(null);
+    const request = buildIssueRequest({ deviceId: selectedDeviceId, validDays: chosenValidity });
+    if (!request.ok) {
+      setOutcome({ tone: "error", text: request.message });
+      return;
+    }
+    setIssuing(true);
+    try {
+      const response = await axios.post(`${API_URL}/api/activation/licences`, request.body);
+      // A success that carries no usable file is a failure with a green tick on it.
+      const described = describeIssuedLicence(response.data, {
+        fallbackDeviceId: request.body.device_id,
+        fallbackDeviceName: selectedRow?.deviceName,
+      });
+      if (!described.ok) {
+        setOutcome({ tone: "error", text: described.message });
+        return;
+      }
+      setIssued(described);
+      setOutcome({ tone: "ok", text: "Licence issued. Save the file below and import it on that device's activation screen." });
+      await loadLicences();
+    } catch (error) {
+      const payload = error?.response?.data || {};
+      setOutcome({
+        tone: "error",
+        text: describeIssueFailure({ code: payload.code, message: payload.message || getErrorMessage(error, ""), status: error?.response?.status }),
+      });
+    } finally {
+      setIssuing(false);
+    }
+  };
+
+  /**
+   * The file for a licence already issued, fetched again.
+   *
+   * Deliberately not a re-issue: issuing again burns a serial and supersedes the licence already
+   * sitting on that machine, which is a real change to a working counter made by somebody who
+   * only mislaid a file.
+   */
+  const downloadAgain = async (entry) => {
+    setOutcome(null);
+    setIssued(null);
+    if (!entry?.downloadable) {
+      setOutcome({ tone: "error", text: "This licence record carries no id, so its file cannot be fetched again." });
+      return;
+    }
+    setIssuing(true);
+    try {
+      const response = await axios.get(`${API_URL}/api/activation/licences/${encodeURIComponent(entry.id)}/file`);
+      const described = describeIssuedLicence(response.data, {
+        fallbackDeviceId: entry.deviceId,
+        fallbackDeviceName: entry.deviceName,
+      });
+      if (!described.ok) {
+        setOutcome({ tone: "error", text: described.message });
+        return;
+      }
+      setIssued(described);
+      setOutcome({ tone: "ok", text: "This is the same file that was issued before — nothing new has been issued." });
+    } catch (error) {
+      const payload = error?.response?.data || {};
+      setOutcome({
+        tone: "error",
+        text: describeLicenceFileFailure({ code: payload.code, message: payload.message || getErrorMessage(error, ""), status: error?.response?.status }),
+      });
+    } finally {
+      setIssuing(false);
+    }
+  };
+
+  // How the .lic reaches the disk. The shell has no general-purpose save dialog --
+  // `save_pdf_with_dialog` is PDF-only (PDF filter, .pdf default extension) -- so this
+  // follows the one file export the app already has, `WebsiteCatalogueExport`: a blob
+  // the webview downloads. Copy is not a consolation prize: a `.lic` is plain text by
+  // design (src-tauri/src/activation.rs) and pasting it into a file works exactly as well.
+  const saveLicenceFile = () => {
+    if (!issued) return;
+    try {
+      const blob = new Blob([issued.lic], { type: "text/plain" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = issued.fileName;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+      setOutcome({ tone: "ok", text: `Saved as ${issued.fileName}. Send it to the device and import it on its activation screen.` });
+    } catch (error) {
+      setOutcome({
+        tone: "error",
+        text: `The file could not be saved (${error?.message || String(error)}). Copy the text below instead and save it on the device as ${issued.fileName}.`,
+      });
+    }
+  };
+
+  const copyLicence = async () => {
+    if (!issued) return;
+    try {
+      await navigator.clipboard.writeText(issued.lic);
+      setOutcome({ tone: "ok", text: `Copied. Paste it into a file named ${issued.fileName} and import that on the device.` });
+    } catch (error) {
+      setOutcome({
+        tone: "error",
+        text: `Could not copy (${error?.message || String(error)}). Use Save Activation File instead, or select the text below by hand.`,
+      });
+    }
+  };
+
+  const stateClass = (state) => {
+    if (state === DEVICE_ACTIVATION_STATE.ACTIVE) return "stock-ok";
+    if (state === DEVICE_ACTIVATION_STATE.GRACE) return "origin-rate";
+    return "stock-low";
+  };
+  const licenceClass = (status) => (status === LICENCE_STATUS.ACTIVE ? "stock-ok" : status === LICENCE_STATUS.GRACE ? "origin-rate" : "stock-low");
+
+  if (!canIssue) {
+    return (
+      <ModuleCard
+        eyebrow="Security / Device Activation"
+        title="Device Activation Licences"
+        subtitle="Only the Owner can admit a machine to the business."
+      >
+        <p className="cart-empty">Issuing an activation licence is what lets a new counter start billing, so it is restricted to the Owner account. Ask the Owner to issue one for this device.</p>
+      </ModuleCard>
+    );
+  }
+
+  return (
+    <ModuleCard
+      eyebrow="Security / Device Activation"
+      title="Device Activation Licences"
+      subtitle="Issue the activation file that lets a counter start working. Pick the device, choose how long it should last, and save the .lic file."
+    >
+      {!view.ok ? (
+        // Never zeros. With one of the two lists missing, every device would render as
+        // "needs a licence" -- a confident claim made out of a failed request.
+        <div className="startup-status-error" role="alert">
+          <strong>Devices cannot be listed right now.</strong>
+          <p>{view.error.message}</p>
+          <div className="button-row">
+            <button className="secondary-button" disabled={loading} onClick={() => { loadLicences(); onReload?.(); }} type="button">
+              {loading ? "Checking..." : "Try Again"}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <>
+          <div className="purchase-summary-grid supplier-payment-preview">
+            <SummaryMetric featured label="Awaiting Activation" value={view.summary.needsLicence} />
+            <SummaryMetric label="Activated" value={view.summary.active} />
+            <SummaryMetric label="In Grace Period" value={view.summary.grace} />
+            <SummaryMetric label="Expired" value={view.summary.expired} />
+            {view.summary.unreadable > 0 && <SummaryMetric label="Cannot Be Read" value={view.summary.unreadable} />}
+          </div>
+          <DataTable headers={["", "Device", "Branch / Counter", "Activation", "Expires", "Last Seen"]}>
+            {orderedRows.map((row) => (
+              <tr key={row.deviceId || row.deviceName}>
+                <td>
+                  <input
+                    aria-label={`Select ${row.deviceName}`}
+                    checked={inventoryIdsEqual(row.deviceId, selectedDeviceId)}
+                    disabled={!row.issuable}
+                    name="activation-device"
+                    onChange={() => setSelectedDeviceId(row.deviceId)}
+                    type="radio"
+                  />
+                </td>
+                <td className="primary-cell">{row.deviceName}<small className="cell-note">{row.deviceId || "No device ID"}</small></td>
+                <td>{row.branchName || "Main Branch"}<small className="cell-note">{row.counterName || "No counter assigned"}</small></td>
+                <td>
+                  <span className={stateClass(row.state)}>{row.label}</span>
+                  <small className="cell-note">{row.detail}</small>
+                </td>
+                <td>{row.latest?.expiresOn || "-"}</td>
+                <td>{row.lastActiveAt ? new Date(row.lastActiveAt).toLocaleString("en-IN") : "Not seen yet"}</td>
+              </tr>
+            ))}
+            {orderedRows.length === 0 && (
+              <tr><td className="empty-cell" colSpan="6">No device has registered with this shop yet. A device appears here after it has connected once.</td></tr>
+            )}
+          </DataTable>
+
+          <div className="form-grid supplier-form-grid">
+            <Field label="Selected Device">
+              <input readOnly value={selectedRow ? `${selectedRow.deviceName} (${selectedRow.deviceId})` : "None selected"} />
+            </Field>
+            <Field label="Valid For">
+              <select onChange={(event) => setValidityChoice(event.target.value)} value={validityChoice}>
+                {VALIDITY_PRESETS.map((days) => (
+                  <option key={days} value={String(days)}>{describeValidity(days)}</option>
+                ))}
+                <option value="custom">Custom...</option>
+              </select>
+            </Field>
+            {validityChoice === "custom" && (
+              <Field label={`Custom Days (${VALID_DAYS_MIN}-${VALID_DAYS_MAX})`}>
+                <input
+                  max={VALID_DAYS_MAX}
+                  min={VALID_DAYS_MIN}
+                  onChange={(event) => setCustomDays(event.target.value)}
+                  placeholder="e.g. 180"
+                  type="number"
+                  value={customDays}
+                />
+              </Field>
+            )}
+          </div>
+          {!validity.ok && <small className="startup-status-error">{validity.message}</small>}
+          <div className="button-row">
+            <button className="primary-button" disabled={issuing || !selectedRow || !validity.ok} onClick={issue} type="button">
+              <Icon name="settings" /> {issuing ? "Issuing..." : "Issue Activation Licence"}
+            </button>
+            <button className="secondary-button" disabled={loading || issuing} onClick={() => { loadLicences(); onReload?.(); }} type="button">
+              {loading ? "Refreshing..." : "Refresh"}
+            </button>
+          </div>
+          {outcome && <small className={outcome.tone === "error" ? "startup-status-error" : "form-note"}>{outcome.text}</small>}
+
+          {issued && (
+            <div className="device-activation-panel">
+              <span className="eyebrow">Activation file ready</span>
+              <strong>{issued.fileName}</strong>
+              <p>{issued.detail}</p>
+              <div className="button-row">
+                <button className="primary-button" onClick={saveLicenceFile} type="button">Save Activation File</button>
+                <button className="secondary-button" onClick={copyLicence} type="button">Copy File Text</button>
+              </div>
+              <textarea aria-label="Activation file text" readOnly rows={8} value={issued.lic} />
+              <p className="form-note">This text is the whole file. If saving is blocked, copy it into a plain text file named {issued.fileName} and import that on the device.</p>
+            </div>
+          )}
+
+          <h3>Issued Licences</h3>
+          <DataTable headers={["Device", "Serial", "Issued", "Valid For", "Expires", "Status", "Issued By", "File"]}>
+            {view.history.map((entry, index) => (
+              <tr key={entry.id || `${entry.deviceId}-${entry.serial}-${index}`}>
+                <td className="primary-cell">
+                  {entry.deviceName}
+                  <small className="cell-note">{entry.deviceId || "No device ID"}</small>
+                  {entry.renamedSince && <small className="cell-note">Now called {entry.currentDeviceName}</small>}
+                  {entry.deviceRetired && <small className="cell-note">This device has since been retired</small>}
+                </td>
+                <td>{entry.serial || "-"}</td>
+                <td>{entry.classification.issuedOn || entry.issuedAt || "Not recorded"}</td>
+                <td>{describeValidity(entry.validDays)}</td>
+                <td>{entry.classification.expiresOn || "-"}</td>
+                <td>
+                  <span className={licenceClass(entry.classification.status)}>{entry.classification.label}</span>
+                  <small className="cell-note">{entry.classification.detail}</small>
+                </td>
+                <td>{entry.issuedBy}</td>
+                <td>
+                  <button className="table-action" disabled={issuing || !entry.downloadable} onClick={() => downloadAgain(entry)} type="button">
+                    Get File Again
+                  </button>
+                </td>
+              </tr>
+            ))}
+            {view.history.length === 0 && (
+              <tr><td className="empty-cell" colSpan="8">No activation licence has been issued yet.</td></tr>
+            )}
+          </DataTable>
+          <p className="form-note">Signed in as {user?.username || user?.name || "Owner"}. Every licence issued here is recorded above with who issued it.</p>
+        </>
+      )}
+    </ModuleCard>
   );
 }
 
@@ -16211,7 +16565,19 @@ function SettingsModule({
    * links: changing a WhatsApp token should be two clicks, not three.
    */
   const settingsSections = navigationRegistry.find((item) => item.id === "settings")?.sections || [];
-  const sectionsInGroup = (groupId) => settingsSections.filter((section) => section.group === groupId);
+  /**
+   * Issuing a device activation licence is the act that admits a machine to the business, so that
+   * section is shown only to the Owner -- not to Admin, who may approve a device but must not be
+   * able to license one.
+   *
+   * The section is declared once, in the registry, carrying `ownerOnly`. The registry is shared
+   * with the sidebar and the command palette and neither of those knows who is signed in, so the
+   * filtering happens here, where the signed-in user is. Hiding a card is a courtesy either way:
+   * `POST /api/activation/licences` answers NOT_OWNER regardless of what is on screen.
+   */
+  const isOwnerAccount = String(user?.role || user?.role_name || "").toUpperCase() === "OWNER";
+  const visibleSettingsSections = settingsSections.filter((section) => !section.ownerOnly || isOwnerAccount);
+  const sectionsInGroup = (groupId) => visibleSettingsSections.filter((section) => section.group === groupId);
   /**
    * Each section keyed by its registry id.
    *
@@ -16234,6 +16600,17 @@ function SettingsModule({
     "settings/permission-matrix": <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />,
     "settings/users": <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />,
     "settings/device-control": <DeviceControlSettingsSection canManage={canManage} deviceControlSettings={settingsData.deviceControlSettings} exitAttemptLogs={settingsData.exitAttemptLogs || []} onReload={onReload} user={user} />,
+    "settings/device-activation": (
+      <SettingsSectionErrorBoundary sectionName="Device Activation Licences">
+        <DeviceActivationIssuingSection
+          canIssue={isOwnerAccount}
+          devices={settingsData.authorizedDevices}
+          devicesError={settingsData.canManageSettings ? null : "this account cannot read the device list"}
+          onReload={onReload}
+          user={user}
+        />
+      </SettingsSectionErrorBoundary>
+    ),
     "settings/updates": (
       <SettingsSectionErrorBoundary sectionName="Update Center">
         <UpdateCenterSection canManage={canManage} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />

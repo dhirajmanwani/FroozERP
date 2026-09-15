@@ -277,6 +277,38 @@ original shelved patch was tested 2026-08-15.
 
 ## Stage 9 — Cloud side: registration, renewal, revocation
 
+> **Amendment, 2026-09-14 — in-app issuing, and what it costs D-2.**
+>
+> The maintainer asked for the other half of this feature in his own words: *"jese me khud hi
+> activate kr sku, koi b device, aur uska time frame b add kr saku, aur track b"* — to activate a
+> device himself, any device, choose the time frame, and be able to look up what was issued. A
+> batch step run from his machine does not answer that: it needs him at that machine, with the
+> key, at the moment a counter is down.
+>
+> So `POST /api/activation/licences` does sign on demand, on the server, and **D-2 as written no
+> longer holds**. What is kept is its purpose, through the rotation slots the design provided for:
+>
+> - **Key id 1 is the root.** It never enters Railway, never enters the repo, never enters CI.
+>   Encrypted file plus the separate paper backup, exactly as D-3 says. It is what can still
+>   provision a device if the hosted environment is lost or untrusted.
+> - **Key id 2 is the online key.** Its seed is the Railway environment variable
+>   `FROOZERP_ACTIVATION_SIGNING_KEY`, and `FROOZERP_ACTIVATION_KEY_ID` selects it (the route
+>   defaults to 2, so setting slot 1's seed by mistake is refused loudly rather than quietly
+>   putting the root key to work on a hosted box).
+> - **The remedy for a leak is unchanged and now cheap:** an app update that drops key id 2 from
+>   `TRUSTED_ACTIVATION_KEYS`. Slot 1 is untouched by that compromise and can re-issue every
+>   device. Before this change the same leak would have been the root key and the remedy would
+>   have been the same app update with nothing left behind it.
+>
+> The cost is real and should not be written down as zero: anyone who can read that environment
+> can mint an entitlement for any device until the next app update reaches every counter. It is
+> accepted because the same environment already holds the session signing secret and the business
+> database, and because the alternative is a shop that cannot activate a counter without the
+> maintainer being reachable.
+>
+> The rest of this stage — pre-signed blob delivery, silent renewal, the revocation list — is
+> untouched and still pending.
+
 Per D-2, no private key ever touches Railway, so "online registration" cannot mean on-demand
 server-side signing. Concretely:
 
