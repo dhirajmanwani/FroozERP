@@ -213,7 +213,7 @@ const modules = [
     icon: "settings",
     shortcut: null,
     keywords: ["configuration", "setup", "preferences", "admin", "master"],
-    // Seventeen cards stacked on one page. The `eyebrow` is kept exactly as `SettingsModule`
+    // Eighteen cards stacked on one page. The `eyebrow` is kept exactly as `SettingsModule`
     // renders it — it is the grouping the maintainer already wrote, and repeating it here means
     // the drill-down and the page agree about what a group is called.
     sections: [
@@ -230,6 +230,12 @@ const modules = [
       { group: "people", id: "settings/permission-matrix", label: "Permission Matrix", eyebrow: "Role Management", keywords: ["roles", "access", "permissions", "cashier", "admin"] },
       { group: "people", id: "settings/users", label: "Owner User Administration", eyebrow: "User Management", keywords: ["staff", "add user", "reset password", "deactivate"] },
       { group: "counter", id: "settings/device-control", label: "Fullscreen Lock & Owner Exit Code", eyebrow: "Security / Device Control", keywords: ["kiosk", "fullscreen", "exit code", "lock"] },
+      // `ownerOnly` is read by `SettingsModule`, which knows who is signed in; this registry does
+      // not and must not guess. It is a flag here rather than a second list in App.jsx because a
+      // section defined in two places is a section that will eventually be in one of them only --
+      // and the half that goes missing is the half nobody is looking at. The flag hides the card
+      // from anyone but the Owner; the refusal that matters is the backend's NOT_OWNER.
+      { group: "counter", ownerOnly: true, id: "settings/device-activation", label: "Device Activation Licences", eyebrow: "Security / Device Activation", keywords: ["activate", "licence", "new counter", "entitlement", "lic file", "expiry"] },
       { group: "system", id: "settings/updates", label: "FroozERP Windows Updates", eyebrow: "Software Updates", keywords: ["update", "version", "installer", "upgrade"] },
       { group: "system", id: "settings/sync", label: "Connection Status", eyebrow: "Sync & Connection", keywords: ["sync", "internet", "cloud", "offline", "local only", "server"] },
       { group: "system", id: "settings/backup", label: "Auto Backup and Safe Shutdown", eyebrow: "Backup & Restore", keywords: ["backup", "restore", "shutdown", "safety"] },
