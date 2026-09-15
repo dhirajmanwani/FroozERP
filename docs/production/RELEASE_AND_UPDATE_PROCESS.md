@@ -287,6 +287,47 @@ gateway behind the old screens, which is harmless here but is worth knowing befo
 into what the installed app shows. Task #76 — moving the app out of the checkout — is what ends
 this class of confusion.
 
+**In-app device activation, and the first published release since July (1.0.73, 2026-09-15):**
+
+*Read this first: this is not a one-feature release*
+
+The in-app updater points at `releases/latest`, and the newest **published** GitHub release is
+**v1.0.51, 14 July 2026**. Everything since — through 1.0.72 — reached the shop only because the
+maintainer installed builds by hand. So whatever this release contains, what the updater will
+actually deliver is "every change since the version each machine happens to be on", silently, in
+`quiet` mode.
+
+Before rehearsing, write down what each machine reports in Settings → Software Updates. If a
+counter is on 1.0.72 this is a one-step update and the list below is the whole risk. If a counter
+is still near 1.0.51 it is a two-month jump and the rehearsal must be seeded from **that** machine's
+database, not from the newest one — an upgrade is only proven against the state it will actually
+meet.
+
+*What to check*
+
+- Settings → Counter & Display → **Device Activation Licences** appears for the Owner, and does
+  **not** appear for any other role. Check with a Cashier account, not by reasoning about it.
+- The device list is the shop's real devices, by name. Nobody should have to type or read out an
+  `FZDEV-...` id anywhere in this flow.
+- Issue one licence for **30 days** against a device, and do **not** import the file anywhere.
+  Issuing alone changes nothing on any machine — a licence is superseded only when the new file is
+  imported on the device itself — so this is safe on a live shop. Check: the file saves, the
+  history row appears with the right dates, and "Get File Again" returns the same file rather than
+  issuing a second one.
+- If the server has no signing key, the screen must say so in words and issue nothing. A screen
+  that fails silently here would look identical to one that worked.
+- Cloud side, before the rehearsal is even worth running: migration 017 applied, and
+  `FROOZERP_ACTIVATION_SIGNING_KEY` set to **key id 2's** seed. Key id 1 never goes on a server.
+- The window opens maximized with nothing cut off at the left, at 1366x768 and above.
+- The greeting reads "Good to see you, Dhiraj", not "Good to see you, Mr.".
+
+*What this rehearsal cannot prove*
+
+Issuing needs a cloud, and a debug build has no cloud address (see the 1.0.72 note above), so the
+activation screen will correctly report that it cannot list devices. Everything above that touches
+the cloud has to be checked on a real installed build, or the screen has to be checked in a browser
+against the deployed frontend. Do not let a green rehearsal imply that issuing works.
+
 ### Only then
 
 A rehearsal that found nothing is the precondition for **Signing And Publishing** below. A rehearsal
