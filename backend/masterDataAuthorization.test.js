@@ -232,7 +232,11 @@ const collectWriteRegistrations = () => {
   // then also requires the caller's company to match the session's. Role without company is the
   // shape of the cross-tenant hole found in /lots/transfer-stock today -- a role check wearing
   // authorisation's clothes.
-  const GUARDS = /getPermissionUser\(|requireRateManager\(|getSalePermissionUser\(|requireSelfOrRateManager\(|requireSyncContext\(|requireOrderRouter\(/;
+  // `requireOwnerOnly` is listed for the same reason: it re-reads the role from the database
+  // exactly as `requireRateManager` does and then admits one role instead of two. It guards the
+  // activation routes, where an Admin able to mint a device entitlement could authorise a machine
+  // nobody approved.
+  const GUARDS = /getPermissionUser\(|requireRateManager\(|getSalePermissionUser\(|requireSelfOrRateManager\(|requireSyncContext\(|requireOrderRouter\(|requireOwnerOnly\(/;
   const registrations = [];
   codeLines.forEach((line, index) => {
     const match = /^app\.(post|put|patch|delete)\("([^"]+)"/.exec(line);

@@ -167,6 +167,9 @@ supposed to be uneventful.
 - **Private key never ships, never enters the repo, never enters Railway, never enters CI.**
   Signing is a local CLI (`scripts/sign-activation.mjs` or a small Rust bin) excluded from the
   bundle.
+  *(Amended 2026-09-14: this still holds for key id 1, the root. Key id 2 is deliberately held by
+  the server so the Owner can activate a device from inside the app — see the amendment to Stage 9
+  in `offline-activation-plan.md` for what that costs and why it was accepted.)*
 - **[D-3]** Where the root private key lives and how it is backed up: encrypted file on the
   maintainer's machine, hardware token, or offline paper backup. This is the single point of
   failure for the whole scheme — lost, and no device can ever be provisioned offline again;

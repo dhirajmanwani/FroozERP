@@ -57,6 +57,14 @@ const { lockMessage, registerFailedAttempt, resolveLockState } = require("./logi
 const { reconcileCompanyTotals, summariseBranches } = require("./allBranchesSummary");
 const { callerKey, registerAttempt, throttleMessage } = require("./publicRouteThrottle");
 const {
+  issueLicence,
+  ActivationLicenceError,
+  dayToIso,
+  GRACE_DAYS,
+  FORMAT_VERSION,
+} = require("./activationLicence");
+const { normaliseLicenceRequest } = require("./activationLicenceRequest");
+const {
   REFERENCE_BOOTSTRAP_PROTOCOL,
   captureReferenceBootstrap,
   lockReferenceBootstrapBoundary,
@@ -2693,6 +2701,41 @@ const initializeDatabase = async () => {
       used_at TIMESTAMP,
       status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE'
     );
+
+    -- Every offline activation file this installation has ever issued. Declared here so a local or
+    -- self-hosted backend has it; on a hosted deployment this whole function never runs and
+    -- backend/migrations/cloud/017_activation_licences.sql is the only way it can exist. The two
+    -- must stay identical: verifyDeclaredSchema compares this declaration against the live
+    -- database and refuses to start the server when they differ.
+    --
+    -- A row records an issue, not an entitlement in force: the device's own verified copy decides
+    -- that, offline, and there is no status column here that could disagree with it. See the
+    -- migration for why there is no foreign key to authorized_devices.
+    CREATE SEQUENCE IF NOT EXISTS activation_licence_serial_seq
+      AS BIGINT MINVALUE 1 MAXVALUE 4294967295 START WITH 1 NO CYCLE;
+
+    CREATE TABLE IF NOT EXISTS activation_licences (
+      id SERIAL PRIMARY KEY,
+      entitlement_serial BIGINT UNIQUE NOT NULL,
+      device_id VARCHAR(160) NOT NULL,
+      device_name VARCHAR(160),
+      company_id INTEGER,
+      branch_id INTEGER,
+      key_id INTEGER NOT NULL,
+      format_version INTEGER NOT NULL,
+      valid_days INTEGER NOT NULL,
+      issued_on DATE NOT NULL,
+      expires_on DATE NOT NULL,
+      grace_until DATE NOT NULL,
+      public_key_hex VARCHAR(64) NOT NULL,
+      lic_text TEXT NOT NULL,
+      issued_by INTEGER REFERENCES users(id),
+      issued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS activation_licences_device_idx
+      ON activation_licences (device_id, issued_at DESC);
+    CREATE INDEX IF NOT EXISTS activation_licences_company_idx
+      ON activation_licences (company_id, issued_at DESC);
 
     CREATE TABLE IF NOT EXISTS device_audit_trail (
       id SERIAL PRIMARY KEY,
@@ -13239,6 +13282,317 @@ app.put("/settings/activation-codes/:id/revoke", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Revoking Activation Code" });
+  }
+});
+
+/**
+ * ============================================================================================
+ * Offline device activation, issued from inside the app.
+ * ============================================================================================
+ *
+ * The decoder (`src-tauri/src/entitlement.rs`) and the encoder (`backend/activationLicence.js`)
+ * already existed. What did not was a way for the Owner to *use* them without a maintainer at a
+ * keyboard: "jese me khud hi activate kr sku, koi b device, aur uska time frame b add kr saku,
+ * aur track b" -- activate it himself, any device, with a chosen time frame, and be able to look
+ * up afterwards what was issued. These two routes are that, and `activation_licences` is the
+ * record.
+ *
+ * ## Owner only, not Owner-or-Admin
+ *
+ * Every other settings route here uses `requireRateManager`, which is Owner **or** Admin. This one
+ * does not, and the difference is deliberate: an activation file is what makes a machine able to
+ * run the business at all, and the maintainer asked for it in as many words -- "as an owner hi
+ * activate option ... aur koi nahi". An Admin who can mint entitlements can hand the shop to a
+ * device nobody approved.
+ *
+ * ## Why the signing key is an environment variable and never ships
+ *
+ * The key that signs these files is the key that authorises any device anywhere. If it were in the
+ * installer, anyone holding a copy of the app could mint a licence for their own machine and the
+ * whole scheme would be decoration. It lives as FROOZERP_ACTIVATION_SIGNING_KEY on the server
+ * only, is read on each request, and is never logged, never stored and never returned -- the
+ * encoder returns the *public* half, which is what the record keeps.
+ *
+ * ## Why an unreadable key table is a refusal and not a warning
+ *
+ * `activationLicence.js` refuses to sign unless the public half of the key matches
+ * TRUSTED_ACTIVATION_KEYS in the decoder's own source. That check needs the Rust file. If the
+ * deployment does not carry it, the honest answer is "this server cannot issue", not "issued, and
+ * we will find out on a counter in another town whether it works".
+ */
+
+/** The 32-byte Ed25519 seed, hex. Server-side only; see the note above. */
+const ACTIVATION_SIGNING_KEY_ENV = "FROOZERP_ACTIVATION_SIGNING_KEY";
+/**
+ * Which slot in TRUSTED_ACTIVATION_KEYS signs. Defaults to 2, not 1, and that is the whole of this
+ * feature's answer to decision D-2.
+ *
+ * D-2 says the private key never enters Railway. Issuing from inside the app means *a* key has to
+ * be reachable from the server, so D-2 cannot be kept whole -- but its purpose can. Slot 1 is the
+ * root: it stays on the maintainer's machine, encrypted, with the paper backup, and it is what can
+ * still authorise a device if everything else is lost. Slot 2 is the one that goes online. If the
+ * hosted environment is ever compromised, the remedy is an app update that drops key id 2, and
+ * slot 1 -- which never touched a server -- is untouched and can re-issue every device.
+ *
+ * Defaulting to 2 also fails in the safe direction: setting slot 1's seed while this says 2 is
+ * refused loudly by the encoder (the public halves will not match) instead of quietly putting the
+ * root key to work on a hosted box.
+ */
+const ACTIVATION_KEY_ID_ENV = "FROOZERP_ACTIVATION_KEY_ID";
+const ACTIVATION_KEY_ID_DEFAULT = 2;
+/** The decoder's own source, which owns the list of keys a device will trust. */
+const TRUSTED_KEYS_PATH = path.join(__dirname, "..", "src-tauri", "src", "entitlement.rs");
+
+/**
+ * Owner, and only Owner. Deliberately not `requireRateManager` -- see the section note.
+ */
+const requireOwnerOnly = async (userId, client = pool) => {
+  const parsedUserId = parsePositiveInteger(userId);
+  if (!parsedUserId) return null;
+  const result = await client.query(
+    `
+    SELECT u.id, u.full_name, u.company_id, r.role_name
+    FROM users u
+    JOIN roles r ON r.id = u.role_id
+    WHERE u.id = $1 AND u.active = TRUE
+    `,
+    [parsedUserId]
+  );
+  const user = result.rows[0];
+  return user && user.role_name === "Owner" ? user : null;
+};
+
+app.post("/api/activation/licences", async (req, res) => {
+  try {
+    const owner = await requireOwnerOnly(req.auth.userId);
+    if (!owner) {
+      return res.status(403).json({ code: "NOT_OWNER", message: "Only the Owner can activate a device." });
+    }
+
+    const request = normaliseLicenceRequest(req.body);
+    if (!request.ok) {
+      return res.status(request.status).json({ code: request.code, message: request.message });
+    }
+
+    const signingKeyHex = cleanText(process.env[ACTIVATION_SIGNING_KEY_ENV] || "");
+    if (!signingKeyHex) {
+      return res.status(503).json({
+        code: "SIGNING_KEY_UNAVAILABLE",
+        message: `This server cannot sign activation files: ${ACTIVATION_SIGNING_KEY_ENV} is not set.`,
+      });
+    }
+    let trustedKeysSource;
+    try {
+      trustedKeysSource = fs.readFileSync(TRUSTED_KEYS_PATH, "utf8");
+    } catch (error) {
+      // Loud, not silent. Signing without this check would produce a file that looks correct here
+      // and is refused by the app, which is the worst of the three possible outcomes.
+      return res.status(503).json({
+        code: "TRUSTED_KEYS_UNAVAILABLE",
+        message:
+          "This server cannot check which signing keys the app trusts, so it will not sign. " +
+          `Expected ${TRUSTED_KEYS_PATH} (${error.code || "unreadable"}).`,
+      });
+    }
+
+    // The session's company, not one the caller can name. A null claim means a single-company
+    // installation from before multi-company; a device row with no company is from the same era,
+    // so it is reachable rather than invisible. A device that *does* carry a company must match.
+    const companyId =
+      Number.isInteger(req.auth.companyId) && req.auth.companyId > 0 ? req.auth.companyId : null;
+    const deviceResult = await pool.query(
+      `
+      SELECT device_id, device_name, company_id, assigned_branch_id, status
+      FROM authorized_devices
+      WHERE device_id = $1
+        AND ($2::INTEGER IS NULL OR company_id IS NULL OR company_id = $2)
+      `,
+      [request.deviceId, companyId]
+    );
+    const device = deviceResult.rows[0];
+    if (!device) {
+      return res.status(404).json({
+        code: "NO_SUCH_DEVICE",
+        message: "This installation has never registered with the shop, so there is nothing to activate.",
+      });
+    }
+
+    // One global counter, claimed before signing because the serial is part of what gets signed.
+    // A failure after this point leaves a gap in the sequence, and a gap is the truth: a serial was
+    // claimed and never issued. Reusing it would risk two different files sharing one serial, which
+    // the device's ledger keys on and could not tell apart.
+    const serialResult = await pool.query("SELECT nextval('activation_licence_serial_seq') AS serial");
+    const serial = Number(serialResult.rows[0].serial);
+    if (!Number.isSafeInteger(serial) || serial < 1) {
+      return res.status(500).json({
+        code: "SERIAL_UNAVAILABLE",
+        message: "The activation counter did not return a usable number.",
+      });
+    }
+
+    const keyId =
+      parsePositiveInteger(process.env[ACTIVATION_KEY_ID_ENV]) || ACTIVATION_KEY_ID_DEFAULT;
+    let licence;
+    try {
+      licence = issueLicence({
+        deviceId: device.device_id,
+        validDays: request.validDays,
+        companyId: parsePositiveInteger(device.company_id) || companyId || 1,
+        branchId: parsePositiveInteger(device.assigned_branch_id) || 1,
+        serial,
+        keyId,
+        signingKeyHex,
+        trustedKeysSource,
+      });
+    } catch (error) {
+      if (error instanceof ActivationLicenceError) {
+        // The encoder's messages are written for a person and never carry key material.
+        console.error("Activation licence refused", error.code, error.message);
+        return res.status(503).json({ code: error.code, message: error.message });
+      }
+      throw error;
+    }
+
+    const issuedOn = dayToIso(licence.issuedAtDay);
+    const expiresOn = dayToIso(licence.expiresOnDay);
+    const graceUntil = dayToIso(licence.expiresOnDay + GRACE_DAYS);
+
+    await pool.query(
+      `
+      INSERT INTO activation_licences (
+        entitlement_serial, device_id, device_name, company_id, branch_id, key_id, format_version,
+        valid_days, issued_on, expires_on, grace_until, public_key_hex, lic_text, issued_by
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::date, $10::date, $11::date, $12, $13, $14)
+      `,
+      [
+        serial,
+        device.device_id,
+        device.device_name,
+        parsePositiveInteger(device.company_id) || companyId,
+        parsePositiveInteger(device.assigned_branch_id),
+        licence.keyId,
+        FORMAT_VERSION,
+        request.validDays,
+        issuedOn,
+        expiresOn,
+        graceUntil,
+        licence.publicKeyHex,
+        licence.lic,
+        owner.id,
+      ]
+    );
+
+    return res.json({
+      lic: licence.lic,
+      device_id: device.device_id,
+      device_name: device.device_name,
+      serial,
+      valid_days: request.validDays,
+      issued_at: issuedOn,
+      issued_on: issuedOn,
+      expires_on: expiresOn,
+      grace_until: graceUntil,
+      key_id: licence.keyId,
+    });
+  } catch (error) {
+    console.error("Activation licence issue failed", error.message);
+    return res.status(500).json({ code: "ISSUE_FAILED", message: "Could not create the activation file." });
+  }
+});
+
+/**
+ * What has been issued. The file itself is not in this list -- it is large, and a list is read far
+ * more often than a file is re-downloaded. `/api/activation/licences/:id/file` returns one.
+ *
+ * No live/expired status is computed here. The dates are the facts; the reading of them belongs
+ * where it is shown, so there is only ever one definition of "in grace".
+ */
+app.get("/api/activation/licences", async (req, res) => {
+  try {
+    const owner = await requireOwnerOnly(req.auth.userId);
+    if (!owner) {
+      return res.status(403).json({ code: "NOT_OWNER", message: "Only the Owner can see issued activation files." });
+    }
+    const companyId =
+      Number.isInteger(req.auth.companyId) && req.auth.companyId > 0 ? req.auth.companyId : null;
+    const deviceFilter = cleanText(req.query.device_id);
+    const result = await pool.query(
+      `
+      SELECT l.id, l.entitlement_serial, l.device_id, l.device_name, l.branch_id, l.key_id,
+             l.valid_days, l.issued_at,
+             -- As text, not as DATE. The driver turns a DATE into a JavaScript Date at the
+             -- server's midnight, which JSON then renders as a timestamp the screen has to guess
+             -- a calendar day back out of. These three are calendar days out of a signed payload;
+             -- they are sent as the days they are.
+             to_char(l.issued_on, 'YYYY-MM-DD') AS issued_on,
+             to_char(l.expires_on, 'YYYY-MM-DD') AS expires_on,
+             to_char(l.grace_until, 'YYYY-MM-DD') AS grace_until,
+             u.full_name AS issued_by_name,
+             d.device_name AS current_device_name, d.status AS device_status
+      FROM activation_licences l
+      LEFT JOIN users u ON u.id = l.issued_by
+      LEFT JOIN authorized_devices d ON d.device_id = l.device_id
+      WHERE ($1::INTEGER IS NULL OR l.company_id IS NULL OR l.company_id = $1)
+        AND ($2::VARCHAR IS NULL OR l.device_id = $2)
+      ORDER BY l.issued_at DESC, l.id DESC
+      LIMIT 200
+      `,
+      [companyId, deviceFilter || null]
+    );
+    return res.json({ licences: result.rows });
+  } catch (error) {
+    console.error("Activation licence list failed", error.message);
+    return res.status(500).json({ code: "LIST_FAILED", message: "Could not read the activation history." });
+  }
+});
+
+/**
+ * Hand back a file that was already issued, rather than issuing a second one. A re-issue burns a
+ * serial and supersedes the licence on the machine; someone who mislaid the file wants neither.
+ */
+app.get("/api/activation/licences/:id/file", async (req, res) => {
+  try {
+    const owner = await requireOwnerOnly(req.auth.userId);
+    if (!owner) {
+      return res.status(403).json({ code: "NOT_OWNER", message: "Only the Owner can download an activation file." });
+    }
+    const licenceId = parsePositiveInteger(req.params.id);
+    if (!licenceId) {
+      return res.status(400).json({ code: "INVALID_LICENCE_ID", message: "Choose which activation file to download." });
+    }
+    const companyId =
+      Number.isInteger(req.auth.companyId) && req.auth.companyId > 0 ? req.auth.companyId : null;
+    const result = await pool.query(
+      `
+      SELECT id, entitlement_serial, device_id, device_name, valid_days, lic_text,
+             -- Calendar days as text, for the reason the list query gives.
+             to_char(issued_on, 'YYYY-MM-DD') AS issued_on,
+             to_char(expires_on, 'YYYY-MM-DD') AS expires_on,
+             to_char(grace_until, 'YYYY-MM-DD') AS grace_until
+      FROM activation_licences
+      WHERE id = $1
+        AND ($2::INTEGER IS NULL OR company_id IS NULL OR company_id = $2)
+      `,
+      [licenceId, companyId]
+    );
+    const licence = result.rows[0];
+    if (!licence) {
+      return res.status(404).json({ code: "NO_SUCH_LICENCE", message: "No activation file with that number." });
+    }
+    return res.json({
+      lic: licence.lic_text,
+      device_id: licence.device_id,
+      device_name: licence.device_name,
+      serial: Number(licence.entitlement_serial),
+      valid_days: licence.valid_days,
+      issued_on: licence.issued_on,
+      expires_on: licence.expires_on,
+      grace_until: licence.grace_until,
+    });
+  } catch (error) {
+    console.error("Activation licence download failed", error.message);
+    return res.status(500).json({ code: "DOWNLOAD_FAILED", message: "Could not read that activation file." });
   }
 });
 
