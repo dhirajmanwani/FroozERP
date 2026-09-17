@@ -64,7 +64,17 @@ if (fs.existsSync(unsignedOverlayPath)) {
   if (releaseWorkflow.includes("build:windows:local")) {
     failures.push("The release workflow runs the unsigned local build; published releases would carry no update.");
   }
-  if (!releaseWorkflow.includes("npm run build:windows\n")) {
+  // The trailing newline is what distinguishes `build:windows` from `build:windows:local`, so it
+  // has to be part of the match -- but it must not be *one particular* newline. This check was
+  // added on 2026-09-07 and first met a Windows runner on 2026-09-17, where `actions/checkout`
+  // writes CRLF: the file said `npm run build:windows\r\n`, the check asked for `\n`, and the
+  // release failed at the gate with "the release workflow no longer runs npm run build:windows"
+  // about a workflow that plainly does.
+  //
+  // Every other gate in this repository runs on Linux, and the release is the one thing that only
+  // ever runs on Windows, so a line-ending assumption here is invisible until the moment it is
+  // most expensive. End of line, or end of file, either ending.
+  if (!/npm run build:windows(\r?\n|$)/.test(releaseWorkflow)) {
     failures.push("The release workflow no longer runs `npm run build:windows`.");
   }
   if (!rootPackage.scripts?.["build:windows:local"]?.includes("tauri.unsigned.conf.json5")) {
