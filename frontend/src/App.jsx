@@ -137,6 +137,7 @@ import {
   orderDevicesForIssuing,
   validateValidDays,
 } from "./local/activationIssuing";
+import { settingsWriteErrorMessage } from "./local/settingsWriteError";
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, resolveReportDateRange } from "./local/reportRefresh";
@@ -991,27 +992,15 @@ const getErrorMessage = (error, fallback) =>
   error.response?.data?.message || fallback;
 
 /**
- * Why a settings change could not be saved, said in words somebody can act on.
+ * Why a settings change could not be saved, in words somebody can act on.
  *
- * Settings are written by the cloud backend. The desktop gateway serves `/settings` from local
- * SQLite so a counter can keep working with no internet, but it accepts no writes at all -- not for
- * charges, not for tax rules, not for anything. So every settings form fails the same way offline,
- * and every one of them used to fail with its own bare sentence: "Unable to add this charge".
- *
- * That sentence describes the outcome and hides the cause. Somebody reading it looks for a mistake
- * in what they typed, and there isn't one -- the machine simply has no internet, which is a fact
- * the app already knows and was not saying.
+ * The rule itself lives in `local/settingsWriteError.js`, where it is tested. It is the rule that
+ * cost an evening on 2026-09-17 by reading `navigator.onLine` as though it were a measurement, so
+ * it belongs somewhere a test can hold it still.
  */
-const getSettingsWriteErrorMessage = (error, fallback) => {
-  const status = error?.response?.status;
-  const offline = !error?.response
-    || (typeof navigator !== "undefined" && navigator.onLine === false);
-  if (offline || status === 503) {
-    return `${fallback} — this machine has no connection to the cloud right now, and settings are `
-      + "saved there. Reconnect and try again. Billing and everything else keep working offline.";
-  }
-  return getErrorMessage(error, fallback);
-};
+const getSettingsWriteErrorMessage = (error, fallback) => settingsWriteErrorMessage(error, fallback, {
+  browserReportsOffline: typeof navigator !== "undefined" ? navigator.onLine === false : null,
+});
 
 const getFrostDiagnosticMessage = (error, { offlineMode = false, internetAvailable = true, backendHealth = {}, cloudHealth = {} } = {}) => {
   const status = error?.response?.status;
