@@ -54,14 +54,23 @@ export const describeSettingsWriteFailure = (error, fallback, { browserReportsOf
   const serverMessage = text(response?.data?.message);
 
   if (!response) {
+    // The underlying reason is named, not swallowed. "No reply" has several very different
+    // causes -- the network, a blocked request inside the webview, a bug that threw before the
+    // request was ever made -- and they are indistinguishable from the outside. On 2026-09-17 a
+    // write that produced no reply could not be told apart from an outage for hours, because the
+    // one string that knew the difference was thrown away here. It is shown in brackets, at the
+    // end, so it costs a reader nothing and is there when somebody needs it.
+    const detail = text(error?.message) || text(error?.code);
     return {
       reason: SETTINGS_WRITE_FAILURE.NO_REPLY,
       status: null,
       code: text(error?.code),
+      detail,
       message: `${lead} — this machine got no reply at all`
         + (browserReportsOffline === true ? " and Windows reports it is offline" : "")
         + ". Settings are saved in the cloud, so reconnect and try again."
-        + " Billing and everything else keep working offline.",
+        + " Billing and everything else keep working offline."
+        + (detail ? ` [${detail}]` : ""),
     };
   }
 

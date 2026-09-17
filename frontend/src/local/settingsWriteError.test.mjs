@@ -100,3 +100,19 @@ test("App.jsx uses this module and keeps no second copy of the rule", () => {
     "the old inline rule must be gone, not left beside the new one",
   );
 });
+
+test("a no-reply failure names the underlying reason instead of swallowing it", () => {
+  // "No reply" has several causes that look identical from outside: the network, a request the
+  // webview refused to make, a bug that threw before anything was sent. The one string that can
+  // tell them apart is the thrown error's own message, and it used to be discarded here.
+  const network = describeSettingsWriteFailure(new Error("Network Error"), "Unable to add this charge");
+  assert.match(network.message, /\[Network Error\]$/);
+  assert.equal(network.detail, "Network Error");
+
+  const blocked = describeSettingsWriteFailure(new TypeError("Failed to fetch"), "Unable to add this charge");
+  assert.match(blocked.message, /\[Failed to fetch\]$/);
+
+  // A throw with nothing to say must not leave an empty bracket dangling.
+  const bare = describeSettingsWriteFailure({}, "Unable to add this charge");
+  assert.doesNotMatch(bare.message, /\[\]/);
+});
