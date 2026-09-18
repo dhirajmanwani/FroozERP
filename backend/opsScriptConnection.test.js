@@ -36,6 +36,7 @@ const OPS_COMMANDS = [
   "cloud/explain-empty-device.mjs",
   "cloud/backfill-company-scope.mjs",
   "cloud/backup-cloud.mjs",
+  "cloud/restore-cloud.mjs",
   "multibranch/export-production-snapshot-readonly.js",
 ];
 

@@ -81,8 +81,55 @@ rather than becoming a timestamp that can shift a day across time zones, and a `
 exact digits rather than becoming a float. This matters more here than anywhere else in the system:
 everything else can be corrected later from the data, and this *is* the data.
 
-## What this does not do yet
+# Putting A Backup Back
 
-**It does not restore.** Putting data back into a live shop is a different and far more dangerous
-command, and it is the next piece of work. Until it exists, these files are a copy you can read,
-verify and hand to somebody — say that, and do not say more.
+```powershell
+$env:DATABASE_PUBLIC_URL = "<the public connection string from Railway>"
+node scripts/cloud/restore-cloud.mjs --file "D:\FroozERP-Backups\froozerp-cloud-....jsonl.gz"
+```
+
+That writes nothing. It reads the file, reads the target, and prints a table-by-table comparison of
+how many rows are there now against how many are in the backup — then stops and shows you the
+command that would actually do it.
+
+Only when that looks right:
+
+```powershell
+node scripts/cloud/restore-cloud.mjs --file "..." --confirm-host <host> --apply
+```
+
+`--confirm-host` has to match the host the connection string points at, typed back by hand. This is
+not ceremony. The expensive mistake here is not restoring — it is restoring into the right-looking
+wrong database, which destroys two shops instead of one, and a host typed by hand is the one check
+a tired person cannot pass by accident.
+
+**Take a backup of the target first.** A restore replaces every row of every table in the file. It
+cannot be undone, and the only thing that can undo it is a copy of what was there a minute ago.
+
+## What it refuses
+
+- **A file it cannot vouch for.** Same check as `--verify`. A backup with no closing summary stopped
+  halfway, and half a shop restored over a whole one is worse than no restore at all.
+- **A schema that does not fit.** The backup carries data, not table definitions. A missing table or
+  column is named and the command stops, rather than restoring what happens to fit and leaving the
+  rest silently absent. Run `node scripts/run-cloud-migrations.js --apply` first.
+- **Half a job.** The whole restore is one transaction. If anything fails, nothing changed.
+
+## What it does that is easy to forget
+
+- **Inserts children after parents.** `sale_items` before `sales` fails on the foreign key, and the
+  file lists tables alphabetically, which is not an insert order. The order is computed from the
+  real foreign keys every time.
+- **Resets the id counters.** After restoring rows with their original ids, every `SERIAL` is behind
+  and the next bill collides on the primary key. This is the step whose absence shows up at the
+  counter rather than in the restore.
+- **Leaves tables the backup does not contain exactly as they are**, and says which ones had rows.
+  Emptying a table nobody asked about is not this command's decision to make.
+
+## Proven, not assumed
+
+On 2026-09-18 the round trip was run against a real PostgreSQL: a shop with foreign keys, `SERIAL`
+ids, `NUMERIC` rates, `JSONB`, `NULL`s, an embedded newline, a `DATE`, and a table named `order`.
+Backed up, truncated with `RESTART IDENTITY`, restored — every row came back identical, and the
+next `INSERT` got id 4 instead of colliding on 1. Restoring a second time over a database that had
+since gained rows produced the same identical result.
