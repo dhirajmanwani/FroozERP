@@ -1371,6 +1371,17 @@ const exportReportTextPdf = async ({ element, fileName, title, printProfile = ""
   const saveResult = save ? await savePdfResult({ blob, fileName: finalFileName, pdf }) : null;
   return { blob, fileName: finalFileName, pdf, saveResult };
 };
+
+// Every A4 document in this app wants the same thing: real text when the page has tables or
+// metrics to read out of it, and a picture of the screen only when it has not. Both halves used
+// to be written out again at each call site, and the account ledger was written without the
+// first half - so a ledger went to WhatsApp as a 2x-scale lossless PNG, which is tens of
+// megabytes against a 25mb body limit, and failed to send on anything but a very short one.
+// One helper so a new document cannot be added to the picture path by omission.
+const exportDocumentPdf = async ({ element, fileName, title = "", printProfile = "", save = true }) => (
+  await exportReportTextPdf({ element, fileName, title, printProfile, save })
+  || await exportElementToPdf({ element, fileName, mode: "A4", printProfile, save })
+);
 const normalizeWhatsappNumber = (value, defaultCountryCode = "91") => {
   let digits = String(value || "").trim().replace(/[^\d+]/g, "");
   if (!digits) return "";
@@ -11284,15 +11295,7 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
     setExporting(true);
     try {
       await new Promise((resolve) => setTimeout(resolve, 80));
-      const textResult = await exportReportTextPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile });
-      if (!textResult) {
-        await exportElementToPdf({
-          element: reportRef.current,
-          fileName: fileName || `${title}.pdf`,
-          mode: "A4",
-          printProfile,
-        });
-      }
+      await exportDocumentPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile });
     } catch (error) {
       alert(`Unable to export PDF: ${error.message}`);
     } finally {
@@ -11307,14 +11310,7 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
     setExporting(true);
     try {
       await new Promise((resolve) => setTimeout(resolve, 80));
-      const result = await exportReportTextPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile, save: false })
-        || await exportElementToPdf({
-          element: reportRef.current,
-          fileName: fileName || `${title}.pdf`,
-          mode: "A4",
-          printProfile,
-          save: false,
-        });
+      const result = await exportDocumentPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile, save: false });
       setPdfPreview({ ...result });
     } catch (error) {
       alert(`Unable to view PDF: ${error.message}`);
@@ -11330,14 +11326,7 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
     setExporting(true);
     try {
       await new Promise((resolve) => setTimeout(resolve, 80));
-      return await exportReportTextPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile, save: false })
-        || await exportElementToPdf({
-          element: reportRef.current,
-          fileName: fileName || `${title}.pdf`,
-          mode: "A4",
-          printProfile,
-          save: false,
-        });
+      return await exportDocumentPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile, save: false });
     } finally {
       setExporting(false);
       setPrintTarget(false);
@@ -16069,14 +16058,15 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
     (!ledgerDateRange.date_from || toDateKey(row.date) >= ledgerDateRange.date_from) &&
     (!ledgerDateRange.date_to || toDateKey(row.date) <= ledgerDateRange.date_to)
   );
+  const ledgerDocumentTitle = `${accountLedger.account?.account_name || accountLedger.account?.customer_name || accountLedger.account?.supplier_name || "Account"} - Ledger Statement`;
   const exportLedgerPdf = async () => {
     if (!ledgerPrintRef.current) return;
     setLedgerExporting(true);
     try {
-      await exportElementToPdf({
+      await exportDocumentPdf({
         element: ledgerPrintRef.current,
         fileName: `${accountLedger.account?.account_name || "Account_Ledger"}_${formatFileDate(ledgerDateRange.date_from || "all")}_to_${formatFileDate(ledgerDateRange.date_to || toDateKey(new Date()))}.pdf`,
-        mode: "A4",
+        title: ledgerDocumentTitle,
       });
     } catch (error) {
       alert(`Unable to export ledger PDF: ${error.message}`);
@@ -16094,10 +16084,10 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
   }), [accountLedger.account]);
   const generateLedgerWhatsappPdf = async () => {
     if (!ledgerPrintRef.current) throw new Error("Select an account ledger first");
-    return exportElementToPdf({
+    return exportDocumentPdf({
       element: ledgerPrintRef.current,
       fileName: ledgerDocumentName,
-      mode: "A4",
+      title: ledgerDocumentTitle,
       save: false,
     });
   };

@@ -111,6 +111,40 @@ test("a large report renders as text and stays far below the 25 MB request-body 
   assert.ok(bytes < 2 * 1024 * 1024, `text PDF should stay small, got ${bytes} bytes`);
 });
 
+test("an account ledger extracts, so it can never fall back to the picture path", () => {
+  // The bug this pins. The ledger's two export buttons used to call the raster exporter directly,
+  // with no attempt at text first, so every ledger went to WhatsApp as a 2x lossless PNG - tens of
+  // megabytes against a 25mb body limit, which fails on anything but a very short statement. Both
+  // now go through the shared helper, and the helper only reaches the raster path when this
+  // returns false. So what actually has to hold is that a ledger's own shape extracts: summary
+  // metrics read from their `title` attribute, and the statement table read as rows.
+  const ledger = rootWith([
+    el({ tag: "SPAN", classes: ["summary-metric"], attrs: { title: "Opening Balance: ₹12,480.00" } }),
+    el({ tag: "SPAN", classes: ["summary-metric"], attrs: { title: "Closing Balance: ₹1,08,940.50" } }),
+    tableNode(
+      ["Date", "Invoice Number", "Transaction Type", "Sale Amount", "Payment Mode", "Debit", "Credit", "Balance", "Narration"],
+      Array.from({ length: 400 }, (_, index) => [
+        "2026-08-15", `INV-${1000 + index}`, "Sale", "₹4,820.00", "Cash",
+        "₹4,820.00", "₹0.00", "₹1,08,940.50", "Counter sale",
+      ]),
+    ),
+  ]);
+
+  const model = buildReportPdfModel(ledger, { title: "Rajesh Traders - Ledger Statement", meta: [] });
+  assert.ok(reportPdfHasContent(model), "a ledger must have extractable content, or it silently becomes a screenshot");
+
+  const metrics = model.blocks.find((block) => block.type === "metrics");
+  assert.deepEqual(metrics.items[0], { label: "Opening Balance", value: "₹12,480.00" });
+  const table = model.blocks.find((block) => block.type === "table");
+  assert.equal(table.columns.length, 9, "every ledger column must survive, including Narration");
+  assert.equal(table.rows.length, 400);
+
+  const doc = renderReportPdf({ model, jsPDF, generatedAt: "2026-09-18 14:00" });
+  const bytes = doc.output("arraybuffer").byteLength;
+  const base64Bytes = Math.ceil(bytes / 3) * 4;
+  assert.ok(base64Bytes < 25 * 1024 * 1024, `base64 body ${base64Bytes} must fit the 25mb limit WhatsApp sends through`);
+});
+
 test("an empty report still produces a valid single-page document", () => {
   const doc = renderReportPdf({ model: { title: "Empty", meta: [], blocks: [] }, jsPDF });
   assert.equal(doc.internal.getNumberOfPages(), 1);
