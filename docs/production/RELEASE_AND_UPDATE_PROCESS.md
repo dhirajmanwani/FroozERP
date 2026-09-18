@@ -321,12 +321,44 @@ meet.
 - The window opens maximized with nothing cut off at the left, at 1366x768 and above.
 - The greeting reads "Good to see you, Dhiraj", not "Good to see you, Mr.".
 
-*What this rehearsal cannot prove*
+*Giving the rehearsal a cloud*
 
-Issuing needs a cloud, and a debug build has no cloud address (see the 1.0.72 note above), so the
-activation screen will correctly report that it cannot list devices. Everything above that touches
-the cloud has to be checked on a real installed build, or the screen has to be checked in a browser
-against the deployed frontend. Do not let a green rehearsal imply that issuing works.
+A debug build has no cloud address **unless it is given one** (see the 1.0.72 note above), so by
+default the activation screen correctly reports that it cannot list devices, with "No cloud backend
+is configured for this installation. Local modules remain available." That is not a limit of the
+rehearsal, it is an unset variable.
+
+The screen calls the *local* backend, and the desktop gateway proxies the call onward. The address
+the gateway proxies to comes from `FROOZERP_CLOUD_API_URL` (or `CLOUD_API_URL`) read at runtime by
+`cloud_api_url()` in `src-tauri/src/lib.rs`, so no rebuild is needed - it only has to be set in the
+same terminal window that launches the app:
+
+```powershell
+# window 1 - the stand-in cloud, pointed at a COPY of the database, never live
+$env:NODE_ENV = "test"
+$env:FROOZERP_ALLOW_LOOPBACK_CLOUD_FOR_ISOLATED_TESTS = "true"
+$env:PORT = "5090"
+$env:DATABASE_URL = "<connection string for the copy>"
+$env:FROOZERP_ACTIVATION_SIGNING_KEY = "<key id 2 seed>"
+node backend/server.js
+
+# window 2 - the disposable app, told where its cloud is
+$env:FROOZERP_CLOUD_API_URL = "http://127.0.0.1:5090"
+npm run app:disposable
+```
+
+Both halves are needed: without `NODE_ENV=test` and the isolated-tests flag, `server.js` refuses to
+treat a localhost address as a real cloud (`allowLoopbackCloudForIsolatedTests`), and without
+`FROOZERP_CLOUD_API_URL` the gateway has no target at all.
+
+If the screen still refuses after this, read the message rather than assuming. "Local Only mode
+selected" means the app's own kill switch is on, which is a different fact from having no cloud.
+
+*What this rehearsal still cannot prove*
+
+The stand-in cloud is not the real one. TLS, the deployed frontend, and anything that depends on the
+hosted database's actual contents are still unproven by a rehearsal. Do not let a green rehearsal
+imply that issuing works against production.
 
 ### Only then
 
