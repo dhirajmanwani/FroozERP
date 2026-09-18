@@ -43,6 +43,7 @@ import { resolveOfflineOpenDecision } from "./local/offlineDataReadiness";
 import { allShopsHasFigures, resolveAllShopsPresentation } from "./local/allShopsSummary";
 import { resolveShopViewPresentation, shopPickerVisible } from "./local/shopView";
 import { ORDER_STATUS } from "./local/orderLifecycle";
+import { frostMarkGeometry } from "./local/frostMark";
 import { STOCK_TRUSTED_FOR_HOURS, buildCatalogue, catalogueFilename, describeExport } from "./local/catalogueExport";
 import {
   ORDER_QUEUE_STATUS,
@@ -8921,6 +8922,36 @@ function App() {
   );
 }
 
+/**
+ * The FROST mark.
+ *
+ * Every measurement comes from `local/frostMark.js`, which is where the shape is tested; this
+ * draws what that returns and nothing else. The letter is not in here — it stays the button's own
+ * `<strong>`, so it keeps the app's font and needs no separate sizing inside an SVG.
+ *
+ * `aria-hidden`, deliberately: the button already says "Open FROST", and a decorative mark that
+ * announces itself makes a screen reader read the control twice.
+ */
+function FrostMark() {
+  const mark = frostMarkGeometry();
+  return (
+    <svg aria-hidden="true" className="frost-mark" focusable="false" viewBox={mark.viewBox}>
+      <defs>
+        <linearGradient id="frost-mark-metal" x1="0" x2="1" y1="0" y2="1">
+          <stop className="frost-mark-sheen" offset="0%" />
+          <stop className="frost-mark-metal" offset="48%" />
+          <stop className="frost-mark-shade" offset="100%" />
+        </linearGradient>
+      </defs>
+      <path className="frost-mark-body" d={mark.body} fill="url(#frost-mark-metal)" />
+      {mark.lobes.map((lobe) => (
+        <circle className="frost-mark-ball" cx={lobe.cx} cy={lobe.cy} key={lobe.angle} r={lobe.ball} />
+      ))}
+      <circle className="frost-mark-cap" cx={mark.centre} cy={mark.centre} r={mark.capRadius} />
+    </svg>
+  );
+}
+
 function FrostFloatingCopilot({
   activeTab,
   data,
@@ -8955,7 +8986,7 @@ function FrostFloatingCopilot({
         onClick={onOpen}
         type="button"
       >
-        <span className="frost-orbit" />
+        <FrostMark />
         <strong>F</strong>
         {unreadCount > 0 && <em>{Math.min(unreadCount, 99)}</em>}
       </button>

@@ -6021,62 +6021,83 @@ tbody tr:last-child td {
   font-size: clamp(14px, 1.55vw, 21px);
 }
 
+/*
+ * The FROST launcher wears the mark itself, so the button has no shape of its own: no border, no
+ * radius, no background. The silhouette is the rosette drawn in `local/frostMark.js`, and a
+ * background here would show up as a square behind it.
+ *
+ * The mark's colours are the same values the old round launcher used, deliberately: the shape
+ * changed, the palette did not. They are literals rather than theme tokens because this is a piece
+ * of branding and keeps its colour in both themes, where a token would repaint it with the page.
+ */
 .frost-floating-launcher {
   position: fixed;
   right: max(22px, env(safe-area-inset-right));
   bottom: max(22px, env(safe-area-inset-bottom));
   z-index: 45;
-  width: 62px;
-  height: 62px;
+  width: 66px;
+  height: 66px;
   display: grid;
   place-items: center;
-  border: 1px solid rgba(230, 194, 116, 0.58);
-  border-radius: 50%;
+  padding: 0;
+  border: 0;
+  background: none;
+  /* Inherited by the letter and by the balls, which fill with currentColor. */
   color: #faf6ea;
-  background:
-    radial-gradient(circle at 35% 30%, rgba(255, 255, 255, 0.24), transparent 21%),
-    conic-gradient(from 140deg, #d9ac52, #082116, #2c5d43, #d9ac52);
-  box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 8px rgba(217, 172, 82, 0.09);
+  /* A pierced shape cannot use box-shadow: it would draw the shadow of the button's box, which is
+     a square the mark does not fill. drop-shadow follows the ink. */
+  filter: drop-shadow(0 12px 24px var(--shadow-soft));
   cursor: pointer;
 }
 
+/* The letter sits in the cap the mark draws, so it is sized to that cap and not to the button. */
 .frost-floating-launcher strong {
   position: relative;
   z-index: 1;
-  font-size: 25px;
+  font-size: 13px;
   font-weight: 950;
   letter-spacing: 0;
 }
 
-.frost-orbit {
+.frost-mark {
   position: absolute;
-  inset: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.28);
-  border-radius: 50%;
+  inset: 0;
+  width: 100%;
+  height: 100%;
 }
 
-.frost-orbit::before,
-.frost-orbit::after {
-  content: "";
-  position: absolute;
-  inset: 12px -3px;
-  border-block: 1px solid rgba(255, 255, 255, 0.34);
-  border-radius: 50%;
-  transform: rotate(35deg);
+.frost-mark-sheen {
+  stop-color: #e6c274;
 }
 
-.frost-orbit::after {
-  transform: rotate(-35deg);
+.frost-mark-metal {
+  stop-color: #d9ac52;
+}
+
+.frost-mark-shade {
+  stop-color: #8a6520;
+}
+
+.frost-mark-ball {
+  fill: currentColor;
+}
+
+.frost-mark-cap {
+  fill: #082116;
+  stroke: #d9ac52;
+  stroke-width: 2;
 }
 
 .frost-floating-launcher-alert {
   animation: frostPulse 2.2s ease-in-out infinite;
 }
 
+/* Pushed further out than the old round launcher needed: the rosette's lobes reach almost to the
+   corners of the button, so a badge tucked in tight would sit on top of one of them. */
 .frost-floating-launcher em {
   position: absolute;
-  top: -5px;
-  right: -3px;
+  top: -7px;
+  right: -7px;
   min-width: 20px;
   height: 20px;
   display: grid;
@@ -6090,9 +6111,10 @@ tbody tr:last-child td {
   font-weight: 900;
 }
 
+/* Glows around the mark's own outline rather than around the button's box, for the reason above. */
 @keyframes frostPulse {
-  0%, 100% { box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 8px rgba(217, 172, 82, 0.1); }
-  50% { box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 15px rgba(217, 172, 82, 0.18); }
+  0%, 100% { filter: drop-shadow(0 12px 24px var(--shadow-soft)) drop-shadow(0 0 2px var(--accent-soft)); }
+  50% { filter: drop-shadow(0 12px 24px var(--shadow-soft)) drop-shadow(0 0 9px var(--accent-line-strong)); }
 }
 
 .frost-drawer-backdrop,
@@ -6201,8 +6223,12 @@ tbody tr:last-child td {
   .frost-floating-launcher {
     right: 16px;
     bottom: 16px;
-    width: 56px;
-    height: 56px;
+    width: 60px;
+    height: 60px;
+  }
+
+  .frost-floating-launcher strong {
+    font-size: 12px;
   }
 
   .frost-drawer {
