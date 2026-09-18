@@ -6069,9 +6069,11 @@ tbody tr:last-child td {
   stop-color: #8a6520;
 }
 
-/* The plate the gold is laid on, and the two cuts of every inset stone: a lighter bevel with a
-   darker table sunk into it, which is what makes a flat hexagon read as a cut stone. */
-.frost-mark-plate {
+/* The plate the gold is laid on, the groove each cabochon is seated in, and the two cuts of every
+   inset stone: a lighter bevel with a darker table sunk into it, which is what makes a flat
+   hexagon read as a cut stone. */
+.frost-mark-plate,
+.frost-mark-groove {
   fill: #082116;
 }
 

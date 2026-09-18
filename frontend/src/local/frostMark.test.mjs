@@ -57,12 +57,14 @@ test("every lobe is the same size and the same distance out", () => {
   assert.equal(new Set(lobes.map((lobe) => lobe.gem)).size, 1);
 });
 
-test("a cabochon sits inside the bezel that holds it", () => {
-  // Get this wrong in either direction and the lobe stops reading as a stone in a ring: too big a
-  // stone hides the gold, too small a one turns the lobe into a gold disc with a dot on it.
+test("a cabochon sits in its groove, and the groove inside the bezel", () => {
+  // Three radii in order, and every one of them matters: too big a stone hides the gold, too
+  // small a one turns the lobe into a gold disc with a dot on it, and a groove that is not
+  // between the two leaves the stone reading as a flat green hole punched in the bezel.
   const { lobes } = frostMarkGeometry();
   for (const lobe of lobes) {
-    assert.ok(lobe.gem < lobe.bezel, "the stone must leave a bezel around it");
+    assert.ok(lobe.gem < lobe.groove, "the stone must sit down in its groove");
+    assert.ok(lobe.groove < lobe.bezel, "the groove must leave a bezel around it");
     assert.ok(lobe.gem > lobe.bezel * 0.6, "the bezel must read as a rim, not as the whole lobe");
   }
 });

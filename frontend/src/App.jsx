@@ -8963,6 +8963,7 @@ function FrostMark() {
       {mark.lobes.map((lobe) => (
         <g key={lobe.angle}>
           <circle className="frost-mark-bezel" cx={lobe.cx} cy={lobe.cy} fill="url(#frost-mark-gold)" r={lobe.bezel} />
+          <circle className="frost-mark-groove" cx={lobe.cx} cy={lobe.cy} r={lobe.groove} />
           <circle className="frost-mark-cabochon" cx={lobe.cx} cy={lobe.cy} fill="url(#frost-mark-dome)" r={lobe.gem} />
           <ellipse
             className="frost-mark-gloss"

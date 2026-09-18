@@ -41,27 +41,37 @@ const SECTOR_OFFSET_DEGREES = LOBE_OFFSET_DEGREES + 360 / FROST_MARK_LOBES / 2;
 const DEFAULTS = Object.freeze({
   // Centre of each lobe, from the middle of the mark.
   lobeOrbit: 37.4,
-  // The gold bezel, and the cabochon seated in it.
+  // The gold bezel, the groove cut inside it, and the cabochon seated in the groove. The
+  // groove is what keeps the stone from reading as a flat green hole in the gold.
   lobeBezelRadius: 10.4,
+  lobeGrooveRadius: 8.8,
   lobeGemRadius: 8.1,
   // The centre ring: gold from `capOuterRadius` in to `capInnerRadius`, green inside that.
   capOuterRadius: 17.6,
   capInnerRadius: 14.8,
-  // The bars from the centre ring out to each bezel.
-  spokeHalfWidth: 4.2,
+  // The bars from the centre ring out to each bezel. Deliberately narrow: in the reference
+  // there is more green than gold inside the rim, and the first pass had this at 4.2, which
+  // filled the mark in and made it read as a gold wheel rather than a setting of stones.
+  spokeHalfWidth: 3.4,
   // The octagonal rim, as two octagons with their corners on the lobes: the band between
   // them is the frame, and the hole inside it is where the stones show through.
-  frameOuterRadius: 38,
-  frameInnerRadius: 34.6,
+  frameOuterRadius: 38.6,
+  frameInnerRadius: 35.2,
   // Two rings of inset stones per sector, small one inboard and wide one outboard, as in
   // the reference. Each is an elongated hexagon: `Radial` is half its length along the
   // spoke, `Tangential` half its width across it.
-  innerGemOrbit: 21.7,
-  innerGemRadial: 3.1,
-  innerGemTangential: 2.9,
-  outerGemOrbit: 28.5,
-  outerGemRadial: 3.1,
-  outerGemTangential: 6.6,
+  //
+  // These are cut close: at the tightest corner a stone clears the spoke beside it and the
+  // frame outside it by about a tenth of a unit, which is what leaves the gold reading as
+  // thin walls rather than as a wheel. That margin is deliberate and it is the whole look,
+  // so it is also fragile - nudge any of these six numbers and the clearance tests below
+  // fail rather than letting a stone quietly climb onto the gold.
+  innerGemOrbit: 21.4,
+  innerGemRadial: 3.2,
+  innerGemTangential: 4.5,
+  outerGemOrbit: 28.8,
+  outerGemRadial: 3.6,
+  outerGemTangential: 7.3,
   // The raised table each stone is cut with, as a fraction of the stone. The rest of it
   // reads as the bevel around the table.
   gemTableScale: 0.66,
@@ -209,7 +219,14 @@ export const frostMarkGeometry = (overrides = {}) => {
   const lobes = Array.from({ length: FROST_MARK_LOBES }, (_, index) => {
     const angle = LOBE_OFFSET_DEGREES + index * step;
     const { x, y } = pointAt(angle, spec.lobeOrbit);
-    return { angle, cx: x, cy: y, bezel: spec.lobeBezelRadius, gem: spec.lobeGemRadius };
+    return {
+      angle,
+      cx: x,
+      cy: y,
+      bezel: spec.lobeBezelRadius,
+      groove: spec.lobeGrooveRadius,
+      gem: spec.lobeGemRadius,
+    };
   });
 
   // The spokes start inside the gold of the ring rather than at its edge, so the two weld
