@@ -114,6 +114,17 @@ cannot be undone, and the only thing that can undo it is a copy of what was ther
   column is named and the command stops, rather than restoring what happens to fit and leaving the
   rest silently absent. Run `node scripts/run-cloud-migrations.js --apply` first.
 - **Half a job.** The whole restore is one transaction. If anything fails, nothing changed.
+- **Emptying a table the backup does not carry.** If a table outside the backup points at one
+  inside it, the restore stops and names it with its row count. This normally means the backup
+  predates a migration that added the table. Either restore into a database that matches the
+  backup, or say yes by name:
+
+  ```powershell
+  node scripts/cloud/restore-cloud.mjs --file "..." --confirm-host <host> --and-empty loyalty_points --apply
+  ```
+
+  A table named that way is emptied and *not* refilled, because the backup has nothing to put in
+  it. The command says so before it runs and again after.
 
 ## What it does that is easy to forget
 
@@ -124,7 +135,10 @@ cannot be undone, and the only thing that can undo it is a copy of what was ther
   and the next bill collides on the primary key. This is the step whose absence shows up at the
   counter rather than in the restore.
 - **Leaves tables the backup does not contain exactly as they are**, and says which ones had rows.
-  Emptying a table nobody asked about is not this command's decision to make.
+  Emptying a table nobody asked about is not this command's decision to make. This was once only
+  half true: the truncate used `CASCADE`, which emptied any table pointing into the backup on the
+  same run that printed this promise about it. The truncate now names its tables and the rest is
+  refused, per `--and-empty` above.
 
 ## Proven, not assumed
 
@@ -133,3 +147,7 @@ ids, `NUMERIC` rates, `JSONB`, `NULL`s, an embedded newline, a `DATE`, and a tab
 Backed up, truncated with `RESTART IDENTITY`, restored — every row came back identical, and the
 next `INSERT` got id 4 instead of colliding on 1. Restoring a second time over a database that had
 since gained rows produced the same identical result.
+
+On the same day, against the same kind of scratch database, the `CASCADE` bug above was reproduced
+and then confirmed fixed: a `loyalty_points` table added after the backup was taken went from 2
+rows to 0 without a word, and now stops the command by name until `--and-empty` says otherwise.

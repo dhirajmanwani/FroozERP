@@ -22,6 +22,11 @@
  *   * **It will not restore into a schema that does not fit.** The backup carries data, not table
  *     definitions. A missing table or column is named and the command stops, rather than restoring
  *     what happens to fit and leaving the rest silently absent.
+ *   * **It will not empty a table the backup does not carry.** The truncate names its tables and
+ *     does not cascade. A table outside the backup that points into it is named, with its row
+ *     count, and the command stops until somebody names it in `--and-empty`. This one was a bug
+ *     first: `TRUNCATE ... CASCADE` emptied such tables silently, on the same run that printed
+ *     "left exactly as they are" about them.
  *   * **All of it, or none of it.** One transaction. A restore that stops halfway leaves a shop
  *     that is neither the old one nor the new one, and nobody can tell which rows are which.
  *
@@ -30,6 +35,7 @@
  *     $env:DATABASE_PUBLIC_URL = "..."
  *     node scripts/cloud/restore-cloud.mjs --file "D:\FroozERP-Backups\froozerp-cloud-....jsonl.gz"
  *     node scripts/cloud/restore-cloud.mjs --file "..." --confirm-host <host> --apply
+ *     node scripts/cloud/restore-cloud.mjs --file "..." --confirm-host <host> --and-empty <t1,t2> --apply
  */
 
 import fs from "node:fs";
@@ -37,6 +43,7 @@ import path from "node:path";
 import zlib from "node:zlib";
 import readline from "node:readline";
 import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 
 const require = createRequire(import.meta.url);
 const pg = require("../../backend/node_modules/pg");
@@ -119,13 +126,14 @@ const readBackup = async (file) => {
 // ---------------------------------------------------------------------------------------------
 
 /**
- * `TRUNCATE ... CASCADE` sorts itself out, but inserts do not: `sale_items` before `sales` fails
- * on the foreign key, and the file lists tables alphabetically, which is not an insert order.
+ * One `TRUNCATE` over all of them at once sorts itself out, but inserts do not: `sale_items`
+ * before `sales` fails on the foreign key, and the file lists tables alphabetically, which is not
+ * an insert order.
  *
  * Deferring the constraints instead would need them declared DEFERRABLE (they are not) or
  * superuser (we are not), so the order is computed from the real foreign keys.
  */
-const orderByDependency = (names, foreignKeys) => {
+export const orderByDependency = (names, foreignKeys) => {
   const remaining = new Set(names);
   const parentsOf = new Map(names.map((name) => [name, new Set()]));
   for (const { child, parent } of foreignKeys) {
@@ -155,6 +163,71 @@ const orderByDependency = (names, foreignKeys) => {
 };
 
 // ---------------------------------------------------------------------------------------------
+// What gets emptied, and what stands in the way
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Which tables this restore must empty, and which tables make that impossible without a decision.
+ *
+ * ## The bug this replaces
+ *
+ * This used to be one statement: `TRUNCATE <tables in the backup> CASCADE`. CASCADE does not mean
+ * "sort the foreign keys out among these tables"; it means "and also empty every other table that
+ * references them". So a table the backup had never heard of was emptied without a word -- on the
+ * same run, and a few lines below, the command printed:
+ *
+ *     Not in this backup, and left exactly as they are:
+ *       loyalty_points (2)
+ *
+ * Reproduced on a real PostgreSQL 16 on 2026-09-18: that line printed, `--apply` ran, and
+ * `loyalty_points` went from 2 rows to 0. The closing line said "Restored 5 rows into 2 tables"
+ * and never mentioned the third. The test that was meant to cover this only asserted that the
+ * sentence appears in the source, which is why it passed throughout.
+ *
+ * And it is not a corner: the reason to restore is usually that something went wrong *after* the
+ * backup was taken, which is exactly when the target has tables the backup does not.
+ *
+ * ## What happens instead
+ *
+ * The truncate names its tables and does not cascade. A table outside the backup that points into
+ * it is reported by name and row count, and the command stops -- same posture as `--confirm-host`
+ * and the foreign-key cycle: where the answer costs a shop its data, a person picks it, not a
+ * default. Naming it in `--and-empty` is the way to say yes, and then it is emptied on purpose.
+ *
+ * @param {object} options
+ * @param {string[]} options.fileTables   Tables the backup carries.
+ * @param {string[]} options.liveTables   Tables the target database actually has.
+ * @param {{child: string, parent: string}[]} options.foreignKeys  Real FKs in the public schema.
+ * @param {string[]} [options.alsoEmpty]  Tables the operator named on `--and-empty`.
+ */
+export const planTruncate = ({ fileTables, liveTables, foreignKeys, alsoEmpty = [] }) => {
+  const inBackup = new Set(fileTables);
+  const live = new Set(liveTables);
+  const opted = new Set(alsoEmpty.filter((name) => live.has(name) && !inBackup.has(name)));
+  // Everything that will be emptied. A table named in --and-empty counts, which is what lets a
+  // chain resolve: empty the child on purpose and whatever points at *it* is the next question.
+  const emptied = new Set([...inBackup, ...opted]);
+
+  const blocked = new Map();
+  for (const { child, parent } of foreignKeys) {
+    if (child === parent) continue;          // rows, not tables -- reported separately
+    if (!live.has(child) || emptied.has(child)) continue;
+    if (!emptied.has(parent)) continue;
+    if (!blocked.has(child)) blocked.set(child, new Set());
+    blocked.get(child).add(parent);
+  }
+
+  return {
+    tables: [...fileTables].sort(),
+    alsoEmpty: [...opted].sort(),
+    unknown: alsoEmpty.filter((name) => !live.has(name)).sort(),
+    blocked: [...blocked.entries()]
+      .map(([child, parents]) => ({ child, parents: [...parents].sort() }))
+      .sort((a, b) => a.child.localeCompare(b.child)),
+  };
+};
+
+// ---------------------------------------------------------------------------------------------
 // Value coercion
 // ---------------------------------------------------------------------------------------------
 
@@ -166,7 +239,7 @@ const orderByDependency = (names, foreignKeys) => {
  * rather than left to a guess. `bytea` comes out of JSON as `{type:"Buffer",data:[...]}` and has
  * to become a Buffer again or it is restored as the text of that object.
  */
-const coerce = (value, dataType) => {
+export const coerce = (value, dataType) => {
   if (value === null || value === undefined) return null;
   const type = String(dataType || "").toLowerCase();
   if (type === "json" || type === "jsonb") return JSON.stringify(value);
@@ -191,6 +264,9 @@ const main = async () => {
   }
   const apply = has("apply");
   const confirmHost = flag("confirm-host");
+  // Tables outside the backup that the operator accepts will be emptied. Typed out by name, for
+  // the same reason --confirm-host is typed out by name: this is the flag that loses data.
+  const andEmpty = (flag("and-empty") || "").split(",").map((name) => name.trim()).filter(Boolean);
 
   // The file is judged before the database is asked for. Whether a backup is whole is knowable
   // without credentials, and somebody checking a file they were handed should not have to produce
@@ -269,13 +345,61 @@ const main = async () => {
     }
     console.log(`${"".padEnd(38)}${String(targetTotal).padStart(11)}${String(fileTotal).padStart(11)}`);
 
-    // Tables the target has and the backup does not. They are not emptied -- emptying a table
-    // nobody asked about is not this command's decision -- but they are named, because rows left
-    // behind can reference rows that are about to be replaced.
-    const untouched = [...liveTables].filter((name) => !backup.tables.has(name)).sort();
+    // --- what will be emptied, and what refuses to be -------------------------------------
+    const foreignKeys = (await client.query(`
+      SELECT child.relname AS child, parent.relname AS parent
+      FROM pg_constraint c
+      JOIN pg_class child ON child.oid = c.conrelid
+      JOIN pg_class parent ON parent.oid = c.confrelid
+      JOIN pg_namespace n ON n.oid = child.relnamespace
+      WHERE c.contype = 'f' AND n.nspname = 'public'
+    `)).rows;
+
+    const plan = planTruncate({
+      fileTables,
+      liveTables: [...liveTables],
+      foreignKeys,
+      alsoEmpty: andEmpty,
+    });
+    if (plan.unknown.length) {
+      fail(`--and-empty names tables this database does not have: ${plan.unknown.join(", ")}`);
+    }
+
+    const countOf = async (name) => Number(
+      (await client.query(`SELECT COUNT(*)::INTEGER AS count FROM "${name}"`)).rows[0].count,
+    );
+
+    // A table outside the backup that points into it cannot be left alone and cannot be emptied
+    // without being asked about. This is where CASCADE used to answer for the operator.
+    if (plan.blocked.length) {
+      const described = [];
+      for (const { child, parents } of plan.blocked) {
+        described.push(`  ${child} (${await countOf(child)} rows) -> ${parents.join(", ")}`);
+      }
+      fail(
+        "These tables are not in the backup, but they point at tables that are. They cannot be\n"
+        + "left as they are, and they will not be emptied unless you say so. Nothing was written.\n\n"
+        + `${described.join("\n")}\n\n`
+        + "This usually means the backup predates a migration that added them. Either restore into\n"
+        + "a database that matches the backup, or name them to be emptied as well:\n\n"
+        + `  --and-empty ${plan.blocked.map((entry) => entry.child).join(",")}`,
+      );
+    }
+
+    if (plan.alsoEmpty.length) {
+      const described = [];
+      for (const name of plan.alsoEmpty) described.push(`  ${name} (${await countOf(name)} rows)`);
+      console.log(
+        `\nEMPTIED because you named them in --and-empty, and not refilled by this backup:\n${described.join("\n")}`,
+      );
+    }
+
+    // Tables the target has that this restore does not touch at all. Now that the truncate names
+    // its tables and does not cascade, this line is true.
+    const emptied = new Set([...fileTables, ...plan.alsoEmpty]);
     const populatedUntouched = [];
-    for (const name of untouched) {
-      const count = Number((await client.query(`SELECT COUNT(*)::INTEGER AS count FROM "${name}"`)).rows[0].count);
+    for (const name of [...liveTables].filter((name) => !emptied.has(name)).sort()) {
+      const count = await countOf(name);
       if (count > 0) populatedUntouched.push(`${name} (${count})`);
     }
     if (populatedUntouched.length) {
@@ -285,14 +409,6 @@ const main = async () => {
     }
 
     // --- ordering ------------------------------------------------------------------------
-    const foreignKeys = (await client.query(`
-      SELECT child.relname AS child, parent.relname AS parent
-      FROM pg_constraint c
-      JOIN pg_class child ON child.oid = c.conrelid
-      JOIN pg_class parent ON parent.oid = c.confrelid
-      JOIN pg_namespace n ON n.oid = child.relnamespace
-      WHERE c.contype = 'f' AND n.nspname = 'public'
-    `)).rows;
     const selfReferencing = foreignKeys
       .filter((row) => row.child === row.parent && backup.tables.has(row.child))
       .map((row) => row.child);
@@ -309,9 +425,13 @@ const main = async () => {
       console.log(
         "\nDRY RUN — nothing was written.\n\n"
         + "To restore, run again with the host named and --apply:\n\n"
-        + `  node scripts/cloud/restore-cloud.mjs --file "${file}" --confirm-host ${targetHost} --apply\n\n`
+        + `  node scripts/cloud/restore-cloud.mjs --file "${file}" --confirm-host ${targetHost} --apply`
+        + `${plan.alsoEmpty.length ? ` --and-empty ${plan.alsoEmpty.join(",")}` : ""}\n\n`
         + `This will REPLACE every row of the ${fileTables.length} tables listed above with the rows in\n`
-        + "the backup. It cannot be undone. Take a fresh backup of the target first:\n\n"
+        + (plan.alsoEmpty.length
+          ? `the backup, and EMPTY ${plan.alsoEmpty.join(", ")} without refilling them.\n`
+          : "the backup.\n")
+        + "It cannot be undone. Take a fresh backup of the target first:\n\n"
         + '  node scripts/cloud/backup-cloud.mjs --out "<somewhere>"\n',
       );
       return;
@@ -338,8 +458,12 @@ const main = async () => {
     // --- do it ---------------------------------------------------------------------------
     console.log(`\nRestoring into ${targetHost} ...`);
     await client.query("BEGIN");
-    // One statement, so the foreign keys between these tables do not have to be ordered away.
-    await client.query(`TRUNCATE ${fileTables.map((name) => `"${name}"`).join(", ")} CASCADE`);
+    // One statement, so the foreign keys *between* these tables do not have to be ordered away --
+    // and no CASCADE, so a foreign key from outside this list is an error rather than a silent
+    // extra truncation. The tables that would have been caught by CASCADE were checked above and
+    // either named in --and-empty or refused.
+    const truncating = [...fileTables, ...plan.alsoEmpty];
+    await client.query(`TRUNCATE ${truncating.map((name) => `"${name}"`).join(", ")}`);
 
     let written = 0;
     for (const name of ordered) {
@@ -383,6 +507,11 @@ const main = async () => {
 
     await client.query("COMMIT");
     console.log(`\nRestored ${written} rows into ${fileTables.length} tables, and reset ${sequences.length} id counters.`);
+    if (plan.alsoEmpty.length) {
+      // Said again, after the fact, because a table that lost every row and got none back is the
+      // thing somebody will want to find in the scrollback tomorrow.
+      console.log(`Emptied and not refilled, as named in --and-empty: ${plan.alsoEmpty.join(", ")}.`);
+    }
     if (selfReferencing.length) {
       console.log(
         `\nNOTE: these tables reference themselves, so their rows were inserted in the order the\n`
@@ -404,4 +533,7 @@ const main = async () => {
   }
 };
 
-main().catch((error) => fail(error?.stack || String(error)));
+// Only when run as a command. The pure pieces above are imported by backend/restoreCloudCommand.test.js.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => fail(error?.stack || String(error)));
+}

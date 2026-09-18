@@ -21,6 +21,7 @@ const os = require("node:os");
 const path = require("node:path");
 const zlib = require("node:zlib");
 const { spawnSync } = require("node:child_process");
+const { pathToFileURL } = require("node:url");
 
 const SCRIPT = path.join(__dirname, "..", "scripts", "cloud", "restore-cloud.mjs");
 const SOURCE = fs.readFileSync(SCRIPT, "utf8");
@@ -161,6 +162,117 @@ test("the connection is closed on every path, including the dry run", () => {
   assert.match(SOURCE, /\} finally \{[\s\S]{0,400}await client\.end\(\)/);
 });
 
-test("tables the backup does not contain are reported, not quietly emptied", () => {
-  assert.match(SOURCE, /Not in this backup, and left exactly as they are/);
+// ---------------------------------------------------------------------------------------------
+// Behaviour, not source text.
+//
+// The test that used to sit here asserted that the string "Not in this backup, and left exactly
+// as they are" appears in the source. It does, and it always did -- while `TRUNCATE ... CASCADE`
+// a few lines below emptied those very tables. Reproduced on a real PostgreSQL 16 on 2026-09-18:
+// the line printed `loyalty_points (2)`, `--apply` ran, and the table came back with 0 rows.
+//
+// So these import the real planner and check what it decides.
+// ---------------------------------------------------------------------------------------------
+
+const importScript = () => import(pathToFileURL(SCRIPT).href);
+
+const SHOP = {
+  liveTables: ["products", "sales", "loyalty_points"],
+  foreignKeys: [
+    { child: "sales", parent: "products" },
+    { child: "loyalty_points", parent: "sales" },   // added by a migration after the backup
+  ],
+};
+
+test("a table outside the backup that points into it stops the restore", async () => {
+  const { planTruncate } = await importScript();
+  const plan = planTruncate({ fileTables: ["products", "sales"], ...SHOP });
+
+  assert.deepEqual(plan.blocked, [{ child: "loyalty_points", parents: ["sales"] }]);
+  assert.deepEqual(plan.alsoEmpty, [], "nothing is emptied that nobody named");
+  assert.ok(!plan.tables.includes("loyalty_points"), "and it is not in the truncate list either");
+});
+
+test("naming it in --and-empty is what makes it a decision instead of an accident", async () => {
+  const { planTruncate } = await importScript();
+  const plan = planTruncate({ fileTables: ["products", "sales"], ...SHOP, alsoEmpty: ["loyalty_points"] });
+
+  assert.deepEqual(plan.blocked, [], "asked and answered");
+  assert.deepEqual(plan.alsoEmpty, ["loyalty_points"], "and it is emptied on purpose, and said so");
+});
+
+test("a backup that covers the whole schema blocks nothing", async () => {
+  const { planTruncate } = await importScript();
+  const plan = planTruncate({ fileTables: ["products", "sales", "loyalty_points"], ...SHOP });
+  assert.deepEqual(plan.blocked, []);
+  assert.deepEqual(plan.alsoEmpty, []);
+});
+
+test("a table outside the backup that nothing in the backup feeds is genuinely left alone", async () => {
+  const { planTruncate } = await importScript();
+  const plan = planTruncate({
+    fileTables: ["products", "sales"],
+    liveTables: ["products", "sales", "audit_log"],
+    foreignKeys: [{ child: "sales", parent: "products" }],
+  });
+  assert.deepEqual(plan.blocked, [], "no foreign key, no reason to touch it");
+  assert.deepEqual(plan.alsoEmpty, []);
+});
+
+test("emptying one table on purpose surfaces whatever points at that one next", async () => {
+  // A chain, so the question is asked once per table rather than answered wholesale by CASCADE.
+  const { planTruncate } = await importScript();
+  const plan = planTruncate({
+    fileTables: ["sales"],
+    liveTables: ["sales", "loyalty_points", "loyalty_adjustments"],
+    foreignKeys: [
+      { child: "loyalty_points", parent: "sales" },
+      { child: "loyalty_adjustments", parent: "loyalty_points" },
+    ],
+    alsoEmpty: ["loyalty_points"],
+  });
+  assert.deepEqual(plan.blocked, [{ child: "loyalty_adjustments", parents: ["loyalty_points"] }]);
+});
+
+test("--and-empty naming a table that does not exist is caught, not ignored", async () => {
+  const { planTruncate } = await importScript();
+  const plan = planTruncate({ fileTables: ["products"], ...SHOP, alsoEmpty: ["typo_table"] });
+  assert.deepEqual(plan.unknown, ["typo_table"]);
+});
+
+test("the truncate names its tables and does not cascade", () => {
+  const applyPart = SOURCE.slice(SOURCE.indexOf("Restoring into"));
+  assert.match(applyPart, /TRUNCATE \$\{truncating\.map/, "the list is explicit");
+  // Scoped to the statements, because the comments above explain at length why CASCADE is gone.
+  const statements = [...SOURCE.matchAll(/client\.query\(`([^`]*)`/g)].map((match) => match[1]);
+  const cascading = statements.filter((sql) => /TRUNCATE/i.test(sql) && /CASCADE/i.test(sql));
+  assert.deepEqual(cascading, [], "CASCADE answers the question for the operator");
+});
+
+test("children are still ordered after their parents, and a loop is reported", async () => {
+  const { orderByDependency } = await importScript();
+  const ordered = orderByDependency(
+    ["sale_items", "sales", "products"],
+    [{ child: "sale_items", parent: "sales" }, { child: "sales", parent: "products" }],
+  );
+  assert.deepEqual(ordered.ordered, ["products", "sales", "sale_items"]);
+  assert.equal(ordered.cycle, null);
+
+  const looped = orderByDependency(
+    ["a", "b"],
+    [{ child: "a", parent: "b" }, { child: "b", parent: "a" }],
+  );
+  assert.equal(looped.ordered, null, "guessing here means a restore that fails halfway through");
+  assert.deepEqual(looped.cycle, ["a", "b"]);
+});
+
+test("jsonb is sent as text and bytea as bytes, whatever JSON turned them into", async () => {
+  const { coerce } = await importScript();
+  // The driver turns a JS array into a PostgreSQL array literal, which is right for an ARRAY
+  // column and wrong for a jsonb column holding [1,2].
+  assert.equal(coerce([1, 2], "jsonb"), "[1,2]");
+  assert.equal(coerce({ a: 1 }, "json"), '{"a":1}');
+  assert.deepEqual(coerce({ type: "Buffer", data: [1, 2, 3] }, "bytea"), Buffer.from([1, 2, 3]));
+  assert.equal(coerce(null, "jsonb"), null);
+  assert.equal(coerce("Alphonso", "text"), "Alphonso");
+  assert.equal(coerce("240.500", "numeric"), "240.500", "numerics keep their exact digits");
 });

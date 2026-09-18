@@ -18,6 +18,7 @@ const os = require("node:os");
 const path = require("node:path");
 const zlib = require("node:zlib");
 const { spawnSync } = require("node:child_process");
+const { pathToFileURL } = require("node:url");
 
 const SCRIPT = path.join(__dirname, "..", "scripts", "cloud", "backup-cloud.mjs");
 const SOURCE = fs.readFileSync(SCRIPT, "utf8");
@@ -147,7 +148,9 @@ test("an interrupted run leaves nothing that could be mistaken for a backup", ()
 
 test("the written file is read back before the command claims success", () => {
   const backupFn = SOURCE.slice(SOURCE.indexOf("const backup ="), SOURCE.indexOf("const main ="));
-  assert.match(backupFn, /await verify\(finished\)/, "a backup nobody has opened is a belief, not a backup");
+  // `partial`, not `finished`: the read-back is a gate in front of the rename, not a report after
+  // it. The ordering this depends on is asserted on its own further down.
+  assert.match(backupFn, /await verify\(partial, /, "a backup nobody has opened is a belief, not a backup");
 });
 
 test("the connection string never reaches the file or the screen", () => {
@@ -177,4 +180,68 @@ test("calendar days come back as calendar days, and times keep their precision",
     assert.ok(oids.includes(oid), `type ${oid} is still parsed into a JavaScript Date`);
   }
   assert.match(SOURCE, /pg\.types\.setTypeParser\(oid, \(value\) => value\)/, "they must be kept as the database's own text");
+});
+
+// -------------------------------------------------------------------------------------------
+// Behaviour, not source text. The bugs below were both live while this file was green, because
+// every test in it asserted that the source says something rather than that the command does it.
+// -------------------------------------------------------------------------------------------
+
+const importScript = () => import(pathToFileURL(SCRIPT).href);
+
+test("a destination that cannot be written to fails the caller, and does not kill the process", async () => {
+  // `gzip.pipe(out)` does not forward the destination's errors and nothing listened for them, so
+  // a drive that filled up or was pulled out arrived as an unhandled 'error' event and took the
+  // process down where it stood -- skipping the catch that rolls back, closes the connection and
+  // deletes the half-written `.partial`.
+  //
+  // A directory stands in for the unwritable destination because it errors the same way on both
+  // Windows and Linux: the stream fails on open instead of on write, through the same handler.
+  const { createBackupWriter } = await importScript();
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "frooz-backup-writer-"));
+
+  const writer = createBackupWriter(directory);
+  await assert.rejects(
+    async () => {
+      for (let index = 0; index < 50; index += 1) await writer.write({ kind: "row", table: "t", data: { index } });
+      await writer.finish();
+    },
+    (error) => typeof error.code === "string",
+    "the failure has to arrive as a rejection the command can catch",
+  );
+  writer.destroy();
+
+  // The point of the test: we are still here to make the assertion.
+  assert.ok(true, "the process survived a destination that could not be written to");
+});
+
+test("a destination that runs out of space fails the caller too", { skip: !fs.existsSync("/dev/full") }, async () => {
+  // The real shape of the bug -- ENOSPC part-way through, after the stream opened fine. /dev/full
+  // accepts an open and fails every write, which is what a full USB stick does.
+  const { createBackupWriter } = await importScript();
+  const writer = createBackupWriter("/dev/full");
+  await assert.rejects(
+    async () => {
+      for (let index = 0; index < 20000; index += 1) {
+        await writer.write({ kind: "row", table: "t", data: { index, pad: "x".repeat(200) } });
+      }
+      await writer.finish();
+    },
+    (error) => error.code === "ENOSPC",
+  );
+  writer.destroy();
+  assert.ok(true, "the process survived a full destination");
+});
+
+test("a backup is read back before it is named, and before --keep deletes anything", () => {
+  // Order, and the order is the whole point: verify used to run last, so the file was given its
+  // final name while still unproven and --keep could delete a good backup to make room for a bad
+  // one. A check that runs after the irreversible steps is a report, not a gate.
+  const body = SOURCE.slice(SOURCE.indexOf("const backup = async ("));
+  const verifyAt = body.indexOf("await verify(partial");
+  const renameAt = body.indexOf("fs.renameSync(partial, finished)");
+  const pruneAt = body.indexOf("prune(outDir, keep)");
+  assert.ok(verifyAt > 0 && renameAt > 0 && pruneAt > 0, "all three steps still exist");
+  assert.ok(verifyAt < renameAt, "the file is read back before it is given its real name");
+  assert.ok(verifyAt < pruneAt, "nothing old is deleted before the new backup has been read back");
 });

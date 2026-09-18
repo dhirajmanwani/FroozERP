@@ -22,8 +22,8 @@
  * since. This takes every base table in the schema, whatever they are.
  *
  * It also does not restore. Writing a restore into a live shop is a different and much more
- * dangerous command, and it is the next piece of work, not this one. Until it exists, this file
- * is a copy you can read, verify and hand to somebody -- say that, and do not say more.
+ * dangerous command, and it lives in its own file: `scripts/cloud/restore-cloud.mjs`, which is
+ * mostly refusals. This file only ever reads.
  *
  * ## Usage
  *
@@ -44,6 +44,7 @@ import os from "node:os";
 import zlib from "node:zlib";
 import readline from "node:readline";
 import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 
 const require = createRequire(import.meta.url);
 const pg = require("../../backend/node_modules/pg");
@@ -91,7 +92,7 @@ const fail = (message) => {
 // Verify: read a file back and say what is in it. No database, no network.
 // -------------------------------------------------------------------------------------------
 
-const verify = async (file) => {
+const verify = async (file, label = path.basename(file)) => {
   if (!fs.existsSync(file)) fail(`No such backup file: ${file}`);
   const counted = new Map();
   let header = null;
@@ -140,7 +141,7 @@ const verify = async (file) => {
   }
 
   const size = fs.statSync(file).size;
-  console.log(`\nBackup verified: ${path.basename(file)}`);
+  console.log(`\nBackup verified: ${label}`);
   console.log(`  taken at   : ${header.generated_at}`);
   console.log(`  host       : ${header.database_host}`);
   console.log(`  tables     : ${Object.keys(summary.tables || {}).length}`);
@@ -158,6 +159,63 @@ const timestamp = () => {
   const pad = (value) => String(value).padStart(2, "0");
   return `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`
     + `-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+};
+
+/**
+ * The gzip -> file pipeline, with its failures wired to the caller instead of to the process.
+ *
+ * `gzip.pipe(out)` does not forward the destination's errors, and nothing here listened for them.
+ * So the one failure a backup-onto-a-drive command exists to survive -- the drive filling up, or
+ * being pulled out mid-run -- arrived as an unhandled 'error' event and killed the process where
+ * it stood. The `catch` in `backup()` never ran: no "nothing was kept" message, the half-written
+ * `.partial` left on disk looking like a file somebody could use, the read transaction never
+ * rolled back and the connection never closed.
+ *
+ * Proven against `/dev/full`: before this, an `ENOSPC` on write printed a stack trace out of
+ * Node's stream machinery and exited. Now it rejects whichever `write()` or `finish()` is
+ * outstanding, and the caller cleans up.
+ */
+export const createBackupWriter = (destination) => {
+  const gzip = zlib.createGzip();
+  const out = fs.createWriteStream(destination);
+  gzip.pipe(out);
+
+  // One rejected promise shared by every await below, so a stream error surfaces at whichever
+  // write -- or the final flush -- happens to be outstanding when it lands. A write can also
+  // complete before the error reaches the file, which is why `streamError` is remembered.
+  let streamError = null;
+  const failed = new Promise((_, reject) => {
+    const onError = (error) => {
+      streamError = streamError || error;
+      reject(error);
+    };
+    out.on("error", onError);
+    gzip.on("error", onError);
+  });
+  // It is consumed by racing, so on the happy path nobody ever awaits it. Without this, a stream
+  // error after a successful run would be an unhandled rejection -- the same class of bug again.
+  failed.catch(() => null);
+
+  const raced = (promise) => Promise.race([failed, promise]);
+
+  return {
+    write: (record) => raced(new Promise((resolve, reject) => {
+      if (streamError) {
+        reject(streamError);
+        return;
+      }
+      gzip.write(`${JSON.stringify(record)}\n`, (error) => (error ? reject(error) : resolve()));
+    })),
+    finish: () => raced(new Promise((resolve, reject) => {
+      out.on("finish", resolve);
+      out.on("error", reject);
+      gzip.end();
+    })),
+    destroy: () => {
+      gzip.destroy();
+      out.destroy();
+    },
+  };
 };
 
 const prune = (folder, keep) => {
@@ -186,12 +244,8 @@ const backup = async ({ outDir, keep }) => {
   });
   await client.connect();
 
-  const gzip = zlib.createGzip();
-  const out = fs.createWriteStream(partial);
-  gzip.pipe(out);
-  const write = (record) => new Promise((resolve, reject) => {
-    gzip.write(`${JSON.stringify(record)}\n`, (error) => (error ? reject(error) : resolve()));
-  });
+  const writer = createBackupWriter(partial);
+  const write = (record) => writer.write(record);
 
   const tables = {};
   try {
@@ -245,25 +299,31 @@ const backup = async ({ outDir, keep }) => {
       tables,
       rows_total: Object.values(tables).reduce((sum, count) => sum + count, 0),
     });
+    // Inside the try, because the flush is where a full or unplugged drive usually reports
+    // itself, and that has to clean up like any other failure rather than escaping this block.
+    await writer.finish();
   } catch (error) {
     await client.query("ROLLBACK").catch(() => null);
     await client.end().catch(() => null);
-    gzip.destroy();
-    out.destroy();
+    writer.destroy();
     // The half-written file keeps its `.partial` name and is deleted, so an interrupted run can
     // never be mistaken for a backup.
     fs.rmSync(partial, { force: true });
     fail(`Backup failed, and nothing was kept:\n  ${error.message || error}`);
   }
 
-  await new Promise((resolve, reject) => {
-    out.on("finish", resolve);
-    out.on("error", reject);
-    gzip.end();
-  });
   await client.end().catch(() => null);
 
-  // Named only once it is whole.
+  // Reading it back is the only proof that what was written can be read. A backup nobody has
+  // ever opened is a belief, not a backup.
+  //
+  // This happens here, before the rename and before `--keep` deletes anything, and the order is
+  // the point. It used to run last: the file was given its final name while still unproven, and
+  // `--keep` could delete a good backup to make room for a bad one. A verification that runs
+  // after the irreversible steps is a report, not a gate.
+  await verify(partial, path.basename(finished));
+
+  // Named only once it is whole AND has been read back.
   fs.renameSync(partial, finished);
 
   const rowsTotal = Object.values(tables).reduce((sum, count) => sum + count, 0);
@@ -276,10 +336,6 @@ const backup = async ({ outDir, keep }) => {
     const removed = prune(outDir, keep);
     if (!removed) console.log("  nothing old enough to remove");
   }
-
-  // Reading it back is the only proof that what was written can be read. A backup nobody has
-  // ever opened is a belief, not a backup.
-  await verify(finished);
 };
 
 const main = async () => {
@@ -304,4 +360,7 @@ const main = async () => {
   return backup({ outDir: path.resolve(outDir), keep });
 };
 
-main().catch((error) => fail(error?.stack || String(error)));
+// Only when run as a command. The pure pieces above are imported by backend/backupCloudCommand.test.js.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => fail(error?.stack || String(error)));
+}
