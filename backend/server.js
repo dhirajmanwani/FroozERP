@@ -56,6 +56,7 @@ const { resolveSessionSecret } = require("./sessionSecret");
 const { lockMessage, registerFailedAttempt, resolveLockState } = require("./loginLockout");
 const { reconcileCompanyTotals, summariseBranches } = require("./allBranchesSummary");
 const { callerKey, registerAttempt, throttleMessage } = require("./publicRouteThrottle");
+const { resolveBackupLocation } = require("./backupLocation");
 const {
   issueLicence,
   ActivationLicenceError,
@@ -112,7 +113,6 @@ const pool = storageAdapter;
 const operationalScopeMode = normalizeScopeMode(process.env.FROOZERP_OPERATIONAL_SCOPE_MODE);
 const operationalScopeService = createOperationalScopeService(pool);
 const PORT = process.env.PORT || 5000;
-const backupDirectory = process.env.BACKUP_DIR || path.join(__dirname, "..", "backups");
 const readReleaseVersion = () => {
   try {
     const manifestPath = fs.existsSync(path.join(__dirname, "..", "package.json"))
@@ -202,6 +202,18 @@ app.set("trust proxy", deploymentType === "cloud" ? 1 : false);
 const requestedAppMode = runtimeAppMode || "LOCAL_SINGLE_DEVICE";
 const configuredAppMode = APP_MODES.has(requestedAppMode) ? requestedAppMode : "LOCAL_SINGLE_DEVICE";
 const hostedCloudDeployment = deploymentType === "cloud" && configuredAppMode === "CLOUD_PRODUCTION";
+
+// Where backups go, and whether writing them there means anything. See backend/backupLocation.js:
+// the old `path.join(__dirname, "..", "backups")` is right on a desktop install and resolves to
+// `/backups` in the container, which is why every scheduled backup on the hosted deployment had
+// been dying with EACCES -- nightly, for as long as it had been deployed, seen by nobody.
+const backupLocation = resolveBackupLocation({ dirname: __dirname, env: process.env, hostedCloudDeployment });
+const backupDirectory = backupLocation.directory;
+if (backupLocation.warning) {
+  // Loud, and at every startup. The failure this replaces was a line in a log nobody reads; a
+  // success that means nothing would be worse, so it says so in the same place.
+  console.warn(`[backup] ${backupLocation.warning}`);
+}
 const configuredCompanyId = String(process.env.COMPANY_ID || process.env.FROOZERP_COMPANY_ID || "").trim() || null;
 const configuredCompanyName = String(process.env.FROOZERP_COMPANY_NAME || "").trim() || null;
 const configuredBranchId = String(process.env.BRANCH_ID || "").trim() || null;
@@ -5293,6 +5305,12 @@ const getSystemInfo = async (deviceId = "") => {
     currentBranch: branchResult.rows[0] || null,
     lastBackup: backupResult.rows[0] || null,
     backupLocation: backupDirectory,
+    // Whether a file written there is worth anything. On a hosted deployment with no BACKUP_DIR
+    // the container filesystem is replaced on every deploy and nobody can download the file, so a
+    // successful backup is not a backup. The screen must be able to say that instead of showing a
+    // green tick beside a filename that no longer exists.
+    backupDurable: backupLocation.durable,
+    backupLocationWarning: backupLocation.warning || "",
   };
 };
 
@@ -5446,7 +5464,12 @@ const getSettingsBundle = async (userId, deviceId = "") => {
 };
 
 const createDatabaseBackup = async ({ backupType = "Manual", createdBy = null } = {}) => {
-  await ensureDirectory(backupDirectory);
+  // The directory is created inside the try below, not here, so that failing to create it is
+  // recorded like every other failure. It used to be the first statement in this function, which
+  // meant a backup that could not even start left no `backup_logs` row at all -- and the Backup
+  // panel, which reads that table, showed the last success as though nothing had happened since.
+  // The hosted deployment failed this way every night with EACCES on `/backups` and said so only
+  // in a container log.
   const startedAt = new Date();
   const timestamp = formatBackupTimestamp(startedAt);
   const baseName = `FroozERP_Backup_${timestamp}`;
@@ -5463,6 +5486,7 @@ const createDatabaseBackup = async ({ backupType = "Manual", createdBy = null } 
   );
   const logId = logResult.rows[0].id;
   try {
+    await ensureDirectory(backupDirectory);
     await ensureDirectory(workDir);
     const tablesResult = await pool.query(
       `
