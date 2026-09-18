@@ -116,3 +116,35 @@ export const describeSettingsWriteFailure = (error, fallback, { browserReportsOf
 /** The sentence only, for call sites that just want something to show. */
 export const settingsWriteErrorMessage = (error, fallback, options) =>
   describeSettingsWriteFailure(error, fallback, options).message;
+
+/**
+ * A refresh that failed after a save that worked.
+ *
+ * On 2026-09-17 adding a charge rate said "Unable to add this rate — this machine got no reply at
+ * all", and the rate was added. So was the next one, when it was tried again; the shop's charge
+ * ended up with the same slab listed twice, and deleting one said "Unable to remove this rate"
+ * while removing it. The save was never the thing that failed.
+ *
+ * The cause is a shape, not a typo, and it was in twenty settings handlers:
+ *
+ *     try {
+ *       await axios.post(...);   // this worked
+ *       await onReload();        // this did not
+ *     } catch (error) {
+ *       alert("Unable to add this rate");   // and this blamed the wrong one
+ *     }
+ *
+ * `onReload` was `Promise.all([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()])`, so
+ * any one of three unrelated reads could fail a charge save that had already been committed. The
+ * message was accurate about a failure and wrong about which one, which is worse than saying
+ * nothing: it sends somebody to do the save again, and a second save is a duplicate row.
+ *
+ * What a person needs to know here is exactly two things: what you saved is saved, and this screen
+ * may be showing yesterday's version of it.
+ */
+export const refreshAfterSaveMessage = (error) => {
+  const detail = text(error?.message) || text(error?.code);
+  return "This screen could not refresh itself, so it may be showing old information."
+    + " Anything you just saved is saved — reopen Settings to see the latest."
+    + (detail ? ` [${detail}]` : "");
+};

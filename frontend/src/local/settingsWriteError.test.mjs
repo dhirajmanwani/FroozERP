@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   SETTINGS_WRITE_FAILURE,
   describeSettingsWriteFailure,
+  refreshAfterSaveMessage,
   settingsWriteErrorMessage,
 } from "./settingsWriteError.js";
 
@@ -115,4 +116,42 @@ test("a no-reply failure names the underlying reason instead of swallowing it", 
   // A throw with nothing to say must not leave an empty bracket dangling.
   const bare = describeSettingsWriteFailure({}, "Unable to add this charge");
   assert.doesNotMatch(bare.message, /\[\]/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// The save worked; the refresh did not
+// ---------------------------------------------------------------------------------------------
+
+test("a failed refresh says the save is safe, and never says the save failed", () => {
+  // The actual evening of 2026-09-17: "Unable to add this rate" about a rate that was added,
+  // twice, leaving the shop's crate charge with the same slab listed twice.
+  const message = refreshAfterSaveMessage(new Error("Network Error"));
+  assert.match(message, /Anything you just saved is saved/);
+  assert.match(message, /may be showing old information/);
+  assert.doesNotMatch(message, /unable|could not save|failed to save/i);
+  assert.match(message, /\[Network Error\]$/);
+});
+
+test("the settings refresh never rejects, and never fails one read because another failed", () => {
+  // The fix is in App.jsx because that is where onReload is built. Both halves matter: allSettled
+  // so one bad read does not fail the other two, and no rethrow so a write handler awaiting this
+  // inside its own try cannot be blamed for it.
+  const anchor = appSource.indexOf("loadSettingsData(), loadPurchaseRules(), loadDiscountRules()");
+  assert.notEqual(anchor, -1, "the Settings reload bundle is gone");
+  const reload = appSource.slice(appSource.lastIndexOf("onReload={async () => {", anchor), appSource.indexOf("onRegisterCloudDevice=", anchor));
+  assert.match(reload, /Promise\.allSettled\(/, "one failed read must not fail the refresh");
+  assert.doesNotMatch(reload, /Promise\.all\(/, "Promise.all rejects the whole refresh on any single failure");
+  assert.match(reload, /refreshAfterSaveMessage\(/, "a failed refresh must still be reported, as itself");
+  assert.doesNotMatch(reload, /throw\b/, "a rejection here is reported by twenty handlers as a failed save");
+});
+
+test("every settings write that reloads inside its own try is covered by that guarantee", () => {
+  // This is the count that made the one-line fix the right one: twenty handlers share the shape
+  //     await axios.post(...); await onReload();  } catch { alert("Unable to ...") }
+  // and each would otherwise need its own correction. If this number grows, the new handler has
+  // the same shape and is protected by the same guarantee — which is why this asserts a floor and
+  // not an exact number.
+  const pattern = /await onReload\(\);\s*\}\s*catch/g;
+  const count = (appSource.match(pattern) || []).length;
+  assert.ok(count >= 15, `expected the shared shape to still be widespread, found ${count}`);
 });

@@ -137,7 +137,7 @@ import {
   orderDevicesForIssuing,
   validateValidDays,
 } from "./local/activationIssuing";
-import { settingsWriteErrorMessage } from "./local/settingsWriteError";
+import { refreshAfterSaveMessage, settingsWriteErrorMessage } from "./local/settingsWriteError";
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, resolveReportDateRange } from "./local/reportRefresh";
@@ -8570,7 +8570,19 @@ function App() {
                 onCheckConnection={() => performConnectivityCheck("settings-sync-check", { force: true, timeoutMs: 3500 })}
                 onConnectivityModeChange={changeConnectivityMode}
                 onApproveCloudDevice={approveCloudDevice}
-                onReload={async () => { await Promise.all([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()]); }}
+                // Never rejects, and never lets one failed read fail the other two.
+                //
+                // Twenty settings handlers await this inside the same try as their own write, so a
+                // rejection here is reported as "Unable to add this rate" about a rate that was
+                // added. `Promise.all` made it worse: a failure in the discount rules could fail a
+                // charge save. `allSettled` refreshes everything that can be refreshed, and the
+                // failure is reported as what it is — a stale screen, not a lost save.
+                onReload={async () => {
+                  const results = await Promise.allSettled([loadSettingsData(), loadPurchaseRules(), loadDiscountRules()]);
+                  const failed = results.find((result) => result.status === "rejected");
+                  if (failed) alert(refreshAfterSaveMessage(failed.reason));
+                  return !failed;
+                }}
                 onRegisterCloudDevice={registerCloudDevice}
                 onRetrySync={retrySyncFailures}
                 onRunCloudDiagnostics={runCloudDiagnostics}
