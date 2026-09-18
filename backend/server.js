@@ -16024,11 +16024,13 @@ app.get("/sale-rates", async (req, res) => {
       LEFT JOIN inventory_batches ib ON ib.product_id = p.id
         AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
         AND ib.remaining_qty > 0
+        AND ib.branch_id = $2
       LEFT JOIN LATERAL (
         SELECT ib.effective_cost_per_unit
         FROM inventory_batches ib
         WHERE ib.product_id = p.id
           AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+          AND ib.branch_id = $2
         ORDER BY ib.purchase_date DESC, ib.created_at DESC, ib.id DESC
         LIMIT 1
       ) latest ON TRUE
@@ -16040,11 +16042,12 @@ app.get("/sale-rates", async (req, res) => {
         FROM inventory_batches ib
         WHERE ib.product_id = p.id
           AND COALESCE(ib.batch_status, 'ACTIVE') <> 'CANCELLED'
+          AND ib.branch_id = $2
       ) stock ON TRUE
       WHERE p.active = TRUE
       ORDER BY p.product_name, ib.purchase_date, ib.created_at, ib.id
       `,
-      [desiredMargin]
+      [desiredMargin, req.auth.branchId]
     );
     return res.json(result.rows.map((row) => ({
       ...row,

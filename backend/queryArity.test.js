@@ -27,7 +27,20 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const SOURCE = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
+/**
+ * The files scanned.
+ *
+ * `aiBusinessAssistantService.js` was added when A-7's branch scoping reached FROST. It runs its own
+ * `pool.query` calls against the same business tables, so it carries exactly the arity risk this
+ * file exists to catch -- and it was outside the scan while that risk was being introduced.
+ */
+const SOURCES = [
+  { file: "server.js", text: fs.readFileSync(path.join(__dirname, "server.js"), "utf8") },
+  {
+    file: "aiBusinessAssistantService.js",
+    text: fs.readFileSync(path.join(__dirname, "aiBusinessAssistantService.js"), "utf8"),
+  },
+];
 
 /** Walk from an opening bracket to its match, respecting strings, template literals and comments. */
 const findClosing = (text, openIndex) => {
@@ -118,19 +131,22 @@ const splitTopLevel = (text) => {
 /** Every `.query(...)` call site with its SQL argument and its values argument. */
 const collectQueryCalls = () => {
   const calls = [];
-  const pattern = /\b(?:pool|client|db|tx)\.query\s*\(/g;
-  let match;
-  while ((match = pattern.exec(SOURCE)) !== null) {
-    const open = match.index + match[0].length - 1;
-    const close = findClosing(SOURCE, open);
-    if (close === -1) continue;
-    const args = splitTopLevel(SOURCE.slice(open + 1, close)).map((part) => part.trim()).filter(Boolean);
-    calls.push({
-      line: SOURCE.slice(0, match.index).split("\n").length,
-      sql: args[0] || "",
-      values: args[1] || null,
-    });
-    pattern.lastIndex = close;
+  for (const { file, text } of SOURCES) {
+    const pattern = /\b(?:pool|client|db|tx)\.query\s*\(/g;
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      const open = match.index + match[0].length - 1;
+      const close = findClosing(text, open);
+      if (close === -1) continue;
+      const args = splitTopLevel(text.slice(open + 1, close)).map((part) => part.trim()).filter(Boolean);
+      calls.push({
+        file,
+        line: text.slice(0, match.index).split("\n").length,
+        sql: args[0] || "",
+        values: args[1] || null,
+      });
+      pattern.lastIndex = close;
+    }
   }
   return calls;
 };
@@ -157,7 +173,26 @@ const literalArrayLength = (call) => {
 };
 
 const calls = collectQueryCalls();
-const isStatic = (call) => !call.sql.includes("${");
+/**
+ * A call site whose SQL can be read from the source alone.
+ *
+ * Two conditions, not one. The obvious one is no `${...}` interpolation. The second was missing and
+ * produced false failures: the SQL argument must actually be a **string literal**. Where a handler
+ * picks its statement first and binds second --
+ *
+ *     let query = "";
+ *     if (action === "SNOOZE") query = "UPDATE ... $4 ... WHERE id = $1";
+ *     await pool.query(query, [id, user.id, notes, until]);
+ *
+ * -- the first argument is the identifier `query`, which contains no placeholders at all, so the
+ * check read it as "references $0, binds 4" and reported a mismatch on correct code. Which branch
+ * is chosen is a runtime fact; this file's own rule is that what cannot be read statically is
+ * counted, not guessed at.
+ */
+const isStatic = (call) => {
+  if (call.sql.includes("${")) return false;
+  return call.sql.startsWith("`") || call.sql.startsWith('"') || call.sql.startsWith("'");
+};
 
 test("the scanner actually found the query call sites", () => {
   // Every assertion below passes vacuously if the parser breaks. server.js has hundreds of these.
@@ -171,7 +206,7 @@ test("no SQL string references a placeholder it was given no value for", () => {
     .filter(isStatic)
     .map((call) => ({ ...call, needs: highestPlaceholder(call.sql), has: literalArrayLength(call) }))
     .filter((call) => call.has !== null && call.needs > call.has)
-    .map((call) => `server.js:${call.line} references $${call.needs} but binds ${call.has} value(s)`);
+    .map((call) => `${call.file}:${call.line} references $${call.needs} but binds ${call.has} value(s)`);
   assert.deepEqual(mismatches, []);
 });
 
@@ -182,7 +217,7 @@ test("no SQL string is handed values it never references", () => {
     .filter(isStatic)
     .map((call) => ({ ...call, needs: highestPlaceholder(call.sql), has: literalArrayLength(call) }))
     .filter((call) => call.has !== null && call.has > call.needs)
-    .map((call) => `server.js:${call.line} binds ${call.has} value(s) but references only $${call.needs}`);
+    .map((call) => `${call.file}:${call.line} binds ${call.has} value(s) but references only $${call.needs}`);
   assert.deepEqual(mismatches, []);
 });
 
@@ -193,6 +228,6 @@ test("the interpolated queries this cannot check are counted, not ignored", () =
   const dynamic = calls.filter((call) => !isStatic(call));
   assert.ok(
     dynamic.length < calls.length / 2,
-    `${dynamic.length} of ${calls.length} query call sites build SQL dynamically and cannot be checked statically`,
+    `${dynamic.length} of ${calls.length} query call sites build SQL dynamically or from a variable and cannot be checked statically`,
   );
 });

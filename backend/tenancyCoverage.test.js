@@ -56,18 +56,38 @@ const { TENANT_TABLE_PATTERN, SCOPE_PREDICATE_PATTERN, collectTenancyCoverage } 
  * Each now filters on `branch_id` from the verified session. 37 -> 26 -> 16 -> 3 -> 2.
  */
 /*
- * Two entries below cannot be removed by any amount of work in Phase 1, and saying so here stops
- * the next person burning an afternoon on them. `GET /accounts` and `GET /accounts/outstanding`
- * scope both of their money halves already; what keeps them on the list is the third statement,
- * `SELECT * FROM accounts`, and the `accounts` table has no `branch_id` — it is company-wide master
- * data, like `customers` and `suppliers`. They become measurable when Phase 2 backfills
- * `company_id` (see docs/tenancy-backfill-plan.md). They are left on the list rather than
- * reclassified, because moving a table out of TENANT_TABLES to make the number fall would be
- * scoring the exam.
+ * The entries below cannot be removed by any amount of work in Phase 1, and saying so here stops
+ * the next person burning an afternoon on them. Every one of them is blocked on the same thing: a
+ * statement against a table that has **no `branch_id` column at all**.
+ *
+ * `GET /accounts` and `GET /accounts/outstanding` scope both of their money halves already; what
+ * keeps them here is the third statement, `SELECT * FROM accounts`. The three dashboard routes
+ * each end at `SELECT COUNT(*) FROM suppliers`. `accounts` and `suppliers` are company-wide master
+ * data, like `customers` and `products` — branch-shared by design, per the tenancy table in
+ * docs/branch-isolation-audit.md §1.1 — so a count of them *is* company-wide, correctly. They
+ * become measurable when Phase 2 backfills `company_id` (docs/tenancy-backfill-plan.md), which the
+ * maintainer ruled out on 2026-08-22 while a single company exists. They are left on the list
+ * rather than reclassified, because moving a table out of TENANT_TABLES to make the number fall
+ * would be scoring the exam.
+ *
+ * ## Why this list grew from 2 to 5, without any route getting worse
+ *
+ * The three dashboard routes were always in this state. They were invisible because the harness
+ * could not get past `getPermissionUser`, so they bailed early and were filed under "no tenant
+ * data" — see the note on the scripted permission row in `tenancyCoverage.js`. Unlocking that
+ * moved 20 FROST routes and these three into the measured set at once. The FROST routes were then
+ * scoped; these three cannot be, so they are recorded here instead.
+ *
+ * A number that rises because the measurement got honest is worth more than one that stayed at 2
+ * by not looking. The rule below still holds going forward: from this baseline it may shrink, and
+ * a *new* entry still means a new leak.
  */
 const KNOWN_UNSCOPED_READS = [
   "GET /accounts",
   "GET /accounts/outstanding",
+  "GET /api/owner/dashboard-foundation",
+  "GET /dashboard-analytics",
+  "GET /dashboard-metrics",
 ];
 
 let coverage;
@@ -106,6 +126,13 @@ test("the measurement actually ran, rather than passing on an empty result", asy
   // measured ~285 registrations; a GET count in the low hundreds is the shape to expect.
   const { total, unscoped, scoped, noTenantData } = await measure();
   assert.ok(total > 80, `expected a substantial GET surface, measured ${total}`);
+  // The FROST routes are the reason the scripted permission row exists. If that responder stops
+  // matching, all 28 fall back to an early 403 and land in `noTenantData`, and every count above
+  // still passes while the largest read surface in the app goes unmeasured again.
+  assert.ok(
+    scoped.filter((route) => route.startsWith("GET /api/ai/")).length >= 20,
+    "the FROST routes must reach their fact queries, or they are not being measured at all",
+  );
   assert.equal(unscoped.length + scoped.length + noTenantData.length, total, "every route must be classified");
   assert.ok(unscoped.length > 0, "a clean sweep here means the harness stopped detecting anything");
 });
