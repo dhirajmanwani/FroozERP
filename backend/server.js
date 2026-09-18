@@ -55,6 +55,11 @@ const { resolveOwnerBootstrapTransport } = require("./ownerBootstrapPolicy");
 const { resolveSessionSecret } = require("./sessionSecret");
 const { lockMessage, registerFailedAttempt, resolveLockState } = require("./loginLockout");
 const { reconcileCompanyTotals, summariseBranches } = require("./allBranchesSummary");
+const {
+  resolveUserDirectoryScope,
+  buildUserDirectoryQuery,
+  buildSettingsUserListQuery,
+} = require("./userDirectoryScope");
 const { callerKey, registerAttempt, throttleMessage } = require("./publicRouteThrottle");
 const { resolveBackupLocation } = require("./backupLocation");
 const {
@@ -5315,12 +5320,20 @@ const getSystemInfo = async (deviceId = "") => {
 };
 
 /**
- * `userId` decides how much of this bundle is returned: with a rate manager it also carries the
- * entire users table, every authorized device, every activation code and the backup log. It must
- * therefore be a verified session id — `GET /settings?user_id=1` was a full staff and device dump
- * to anyone who guessed the Owner's id.
+ * The caller's session decides how much of this bundle is returned: with a rate manager it also
+ * carries the users table, every authorized device, every activation code and the backup log. It
+ * must therefore be the verified session — `GET /settings?user_id=1` was a full staff and device
+ * dump to anyone who guessed the Owner's id.
+ *
+ * Since A-7 the session's *branch* decides which staff come back as well: only the Owner sees every
+ * shop's people. See `userDirectoryScope.js`.
  */
-const getSettingsBundle = async (userId, deviceId = "") => {
+const getSettingsBundle = async (auth, deviceId = "") => {
+  // `auth` is the verified session (`req.auth`), not an id the caller wrote. It used to be the id
+  // alone, which was enough to decide *whether* the users, devices and activation-code tables came
+  // back; A-7 also needs the caller's branch to decide *which* staff do, and the only trustworthy
+  // source of that is the same verified session.
+  const userId = auth?.userId;
   const [businessResult, saleRateResult, mandiResult, rebateResult, chargeTypesResult, discountResult, roleResult, updateResult, syncResult, syncQueueResult, posResult, paymentResult, whatsappResult, deviceControlResult, manager] = await Promise.all([
     pool.query("SELECT * FROM business_settings WHERE id = 1"),
     pool.query("SELECT * FROM sale_rate_settings WHERE id = 1"),
@@ -5354,18 +5367,15 @@ const getSettingsBundle = async (userId, deviceId = "") => {
     pool.query("SELECT * FROM device_control_settings WHERE id = 1"),
     userId ? requireRateManager(userId) : Promise.resolve(null),
   ]);
-  const usersResult = manager ? await pool.query(
-    `
-    SELECT
-      u.id, u.full_name, u.username, u.mobile_number, u.email, u.active,
-      u.joining_date, u.notes, u.last_login_at, u.created_at, u.updated_at,
-      r.role_name AS role, b.branch_name AS branch
-    FROM users u
-    LEFT JOIN roles r ON r.id = u.role_id
-    LEFT JOIN branches b ON b.id = u.branch_id
-    ORDER BY u.active DESC, u.full_name
-    `
-  ) : { rows: [] };
+  // A-7. The same population as `GET /users`, built by the same filter, because this is the list
+  // the settings screen actually renders: scoping one and not the other would have fixed the API
+  // and left the screen showing every branch's staff.
+  let usersResult = { rows: [] };
+  if (manager) {
+    const scope = resolveUserDirectoryScope({ roleName: manager.role_name, branchId: auth?.branchId });
+    const { text, values } = buildSettingsUserListQuery(scope);
+    usersResult = await pool.query(text, values);
+  }
   const [devicesResult, activationResult, branchesResult, countersResult, backupSettingsResult, backupLogsResult, systemInfo, exitLogsResult] = manager ? await Promise.all([
     pool.query(`
       SELECT d.*, b.branch_name, c.counter_name, u.full_name AS approved_by_name
@@ -6864,8 +6874,11 @@ app.get("/settings/purchase-rules", async (req, res) => {
 
 app.get("/settings", async (req, res) => {
   try {
-    return res.json(await getSettingsBundle(req.auth.userId, req.query.device_id));
+    return res.json(await getSettingsBundle(req.auth, req.query.device_id));
   } catch (error) {
+    if (error?.code === "USER_DIRECTORY_BRANCH_REQUIRED") {
+      return res.status(error.status || 403).json({ code: error.code, message: error.message });
+    }
     console.error(error);
     return res.status(500).json({ message: "Error Loading Settings" });
   }
@@ -7670,30 +7683,27 @@ const getUserTransactionCount = async (userId) => {
   return Number(result.rows[0]?.transaction_count || 0);
 };
 
+/**
+ * A-7. The staff list, scoped to the caller's own shop unless the caller is the Owner.
+ *
+ * The role decides how wide the list is and is read from the database by `requireRateManager`; the
+ * branch decides which shop and is read from the verified session. Neither may come from the
+ * request. See `userDirectoryScope.js` for why this scopes by branch rather than by company.
+ */
 app.get("/users", async (req, res) => {
   try {
     const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can view users" });
-    const result = await pool.query(
-      `
-      SELECT
-        u.id, u.full_name, u.username, u.mobile_number, u.email, u.active,
-        u.joining_date, u.notes, u.last_login_at, u.created_at, u.updated_at,
-        u.verified_email, u.verified_mobile, u.recovery_enabled,
-        u.recovery_email, u.recovery_email_verified, u.recovery_email_verified_at,
-        u.recovery_mobile, u.recovery_mobile_verified, u.recovery_mobile_verified_at,
-        u.pending_recovery_email, u.pending_recovery_mobile,
-        u.staff_self_recovery_enabled, u.force_password_change,
-        u.session_revocation_version, u.locked_until,
-        r.role_name AS role, b.branch_name AS branch
-      FROM users u
-      LEFT JOIN roles r ON r.id = u.role_id
-      LEFT JOIN branches b ON b.id = u.branch_id
-      ORDER BY u.active DESC, u.full_name
-      `
-    );
+    const scope = resolveUserDirectoryScope({ roleName: manager.role_name, branchId: req.auth.branchId });
+    const { text, values } = buildUserDirectoryQuery(scope);
+    const result = await pool.query(text, values);
     return res.json(result.rows);
   } catch (error) {
+    // A session we cannot place in a branch is refused with its own code rather than answered with
+    // an empty array, which would read on screen as a shop with no staff in it.
+    if (error?.code === "USER_DIRECTORY_BRANCH_REQUIRED") {
+      return res.status(error.status || 403).json({ code: error.code, message: error.message });
+    }
     console.error(error);
     return res.status(500).json({ message: "Error Loading Users" });
   }

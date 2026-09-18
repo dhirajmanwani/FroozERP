@@ -1629,3 +1629,106 @@ have been overwritten by that middleware and the test would have passed while pr
 
 Both are operational-location concerns and both wait on the Phase 3 business decision recorded in
 `docs/tenancy-backfill-plan.md`. Neither is a reason to keep task 12 open under its current title.
+
+---
+
+## A-7 record — the staff list, the assignment screen, and an alert nobody could acknowledge (2026-09-18)
+
+Three reads that the branch-isolation audit listed and that A-7's earlier batches did not close,
+plus one bug found while closing them. The decision behind the first was Dhiraj's, taken on
+2026-09-18: **branch staff see their own branch, the Owner keeps seeing everyone.** The alternative
+put to him — everyone keeps seeing everyone, with the recovery fields removed from the payload —
+was declined.
+
+### The staff list is two reads, not one
+
+The audit named `GET /users` (§2.4): every user row in the database, every company, with
+`recovery_email`, `recovery_mobile`, `locked_until`, the verification flags and
+`session_revocation_version`, gated on `requireRateManager` alone — which admits **Admin**, not only
+Owner. So an Admin of one shop could read the fields another shop's account is recovered with.
+
+What the audit did not say, and what matters more in practice, is that **the screen does not call
+that route.** `frontend/src/App.jsx` renders `settingsData.users`, which comes from `GET /settings`
+→ `getSettingsBundle`, and that helper ran its *own* `SELECT ... FROM users`, equally unscoped.
+Fixing `GET /users` alone would have closed the documented hole and changed nothing an Admin
+actually sees.
+
+Both now go through `backend/userDirectoryScope.js`, which owns the decision and both statements, so
+the API and the screen cannot drift apart on who is in the list.
+
+- **The role comes from the database** (`requireRateManager(...).role_name`), not from
+  `req.auth.normalizedRole`. A token minted before a demotion must not widen the list.
+- **The branch comes from the verified session** (`req.auth.branchId`) and from nowhere else.
+- **A session with no usable branch is refused**, with `USER_DIRECTORY_BRANCH_REQUIRED`. There is no
+  safe default: widening is the bug, guessing a branch shows the wrong shop's staff, and an empty
+  list reads as a shop with no staff in it.
+- **Company scoping is not used, deliberately.** `users.company_id` exists and is NULL on every row
+  — `POST /users` has never written it and the Phase 2 backfill was ruled out on 2026-08-22 — so
+  `WHERE u.company_id = $1` would have returned zero users to everybody including the Owner.
+  `users.branch_id` is written on every row `POST /users` creates.
+
+### The assignment screen's two unscoped queries
+
+`GET /api/v3/admin/scope-management` bound `context.company_id` in five of its seven reads; the
+audit named the other two (§2.3, `scopeManagement.js` lines 110-115): the staff list and the pending
+device requests, both company-wide.
+
+Both are scoped now, and both reach the company through the row's branch as well as its own column —
+`COALESCE(u.company_id, ub.company_id) = $1` — because `authorized_devices.company_id` is as empty
+as `users.company_id`: nothing writes it at registration either. Matching on the column alone would
+have emptied both lists.
+
+A row that cannot be placed at all — no company, and a branch that no longer resolves — stays
+visible. Hiding it would mean a device request nobody can approve and a staff member nobody can
+assign, with nothing on screen to say why, and this route is Owner-only. That looseness is asserted
+in `scopeManagement.test.js` so it stays a decision rather than becoming an accident.
+
+### `PATCH /api/ai/alerts/:id` — an arity bug, and a second tenancy hole under it
+
+Both status-change handlers picked one of three SQL strings into a variable and then bound the same
+four values to whichever was chosen. Only the `SNOOZE` string referenced `$4`, so `ACKNOWLEDGE` and
+`RESOLVE` sent Postgres four parameters for a statement naming three — `bind message supplies 4
+parameters, but prepared statement requires 3` — and two of the three actions on the alerts screen
+could never have worked against a real database.
+
+`queryArity.test.js` could not see it: that file reads the string literals handed to `pool.query`,
+and these were handed a variable. The statement and its values are now built together, in one
+object, by `buildStatusChange`.
+
+Underneath it was a tenancy hole the audit had not reached: `WHERE id = $1` with no branch
+predicate, on sequential ids, so a signed-in user of one shop could acknowledge, snooze or resolve
+another shop's alerts and reminders. The predicate is added; a cross-branch id now matches nothing,
+and nothing matching now answers **404** rather than `res.json(undefined)`, which was HTTP 200 with
+an empty body — a silent success for an action that did nothing.
+
+### How this was tested
+
+Behaviour, not source text. `userDirectoryScope.test.js` and the new section of
+`scopeManagement.test.js` execute the handlers' real SQL against an in-memory SQLite holding two
+shops' data and read the rows out of the HTTP response, so "the Admin of the Market Yard shop sees
+Meena and Rahul and not Asha" is asserted as a list of names. `aiAlertStatusScope.test.js` refuses a
+mis-bound statement the way Postgres refuses it, on parameter count, so the arity bug appears as the
+500 it would be in production.
+
+Each suite was re-run with the fix reverted: 7 of 14, 5 of 10 and 7 of 12 assertions fail without
+it. A test that cannot fail is the thing this repository has been bitten by before.
+
+### Gate results (2026-09-18, run locally — this repository runs no CI on pull requests)
+
+| Gate | Result |
+| --- | --- |
+| `npm --prefix backend test` | **780 / 780** |
+| `node --test frontend/src/local/*.test.mjs` | **948 / 948** |
+| `npm --prefix frontend run lint` | Pass — 0 errors, 39 pre-existing warnings |
+| `npm run build` | Pass |
+| `npm run backend:check` | Pass |
+| `npm run verify:production` | 9 of 10 checks pass; the Rust step needs GTK dev libraries this container does not have |
+| `cargo check` | **Not run** — same missing libraries; unchanged by this work, which touches no Rust |
+
+### Still open after this
+
+- The settings bundle's *other* manager-only tables — authorized devices, counters, branches,
+  activation codes, the exit-attempt log — are still company-wide for an Admin. Same class of leak
+  as the staff list, not the same decision, so not widened into this change.
+- The audit-trail reads in §2.4 remain unscoped, and still cannot be scoped: those tables carry no
+  `branch_id`.
