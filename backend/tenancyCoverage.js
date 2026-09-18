@@ -32,6 +32,8 @@ const {
   probe,
   startQueryRecording,
   stopQueryRecording,
+  setQueryResponder,
+  clearQueryResponder,
 } = require("./routeAuthCoverage");
 const { issueDeviceSession } = require("./deviceSession");
 
@@ -66,6 +68,40 @@ const session = ({ userId = 7, branchId = 1, companyId = 1 } = {}) => issueDevic
 
 /** A URL a parameterised route will actually match. Ids are opaque strings, so any token works. */
 const probeUrl = (routePath) => routePath.replace(/:[A-Za-z0-9_]+/g, "1");
+
+/**
+ * `getPermissionUser`'s lookup, which the 28 FROST routes gate on before they read anything.
+ *
+ * ## Why this had to be scripted, and what it was hiding
+ *
+ * Every `/api/ai/*` route begins with `requireAiPermission`, which resolves the caller through this
+ * query. Against the default stub it returns no rows, so each route answered
+ * `403 FROST_PERMISSION_DENIED` and returned **before issuing a single business query**. The
+ * classifier then saw a route that touched no tenant table and filed all 28 under `noTenantData` --
+ * indistinguishable, in the totals, from a route that has no business data to leak.
+ *
+ * So the suite reported a clean sweep over precisely the routes the branch-isolation audit called
+ * its highest remaining read exposure (F-5). The measurement was not wrong about what it measured;
+ * it was silently not measuring this at all, which is the more dangerous failure and the one this
+ * file's own header warns about -- a number that keeps working while the thing it counts drifts.
+ *
+ * Answering it with an Owner row lets the handlers run their fact queries, which is the only state
+ * in which they can be classified. It grants no authority anywhere else: the stub answers this one
+ * statement and nothing more.
+ */
+const PERMISSION_USER_SQL = /FROM\s+users\s+u\s+JOIN\s+roles\s+r/i;
+
+const PROBE_PERMISSION_USER = {
+  rows: [{
+    id: 7,
+    full_name: "Tenancy Probe",
+    username: "tenancy-probe",
+    branch_id: 1,
+    role_name: "Owner",
+    permissions: {},
+  }],
+  rowCount: 1,
+};
 
 /**
  * Drive one route and classify the SQL it ran.
@@ -104,19 +140,26 @@ const collectTenancyCoverage = async () => {
   const scoped = [];
   const unscoped = [];
   const noTenantData = [];
-  for (const { method, path: routePath } of routes) {
-    let result;
-    try {
-      result = await inspectRoute(app, method, routePath, token);
-    } catch {
-      // A handler that throws before issuing SQL tells us nothing either way; counting it as
-      // scoped would be a false pass and as unscoped a false alarm.
-      noTenantData.push(`${method} ${routePath}`);
-      continue;
+  setQueryResponder((sql) => (PERMISSION_USER_SQL.test(sql) ? PROBE_PERMISSION_USER : undefined));
+  try {
+    for (const { method, path: routePath } of routes) {
+      let result;
+      try {
+        result = await inspectRoute(app, method, routePath, token);
+      } catch {
+        // A handler that throws before issuing SQL tells us nothing either way; counting it as
+        // scoped would be a false pass and as unscoped a false alarm.
+        noTenantData.push(`${method} ${routePath}`);
+        continue;
+      }
+      if (!result.touchedTenantTable) noTenantData.push(result.route);
+      else if (result.scoped) scoped.push(result.route);
+      else unscoped.push(result.route);
     }
-    if (!result.touchedTenantTable) noTenantData.push(result.route);
-    else if (result.scoped) scoped.push(result.route);
-    else unscoped.push(result.route);
+  } finally {
+    // The responder is process-wide state on a shared module; leaving it set would hand this row
+    // to whichever suite ran next.
+    clearQueryResponder();
   }
   return { scoped, unscoped, noTenantData, total: routes.length };
 };
