@@ -17,7 +17,7 @@ With those defaults, the backend performs a read-only required-table check and s
 
 1. Stop billing writes during the final backup window.
 2. Record PostgreSQL row counts and local SQLite queue status.
-3. Create and verify a full local PostgreSQL backup.
+3. Create a full local PostgreSQL backup, and prove it restores with `verify-restore-roundtrip.ps1`. A backup nobody has restored is a guess.
 4. Restore the backup into a separate hosted PostgreSQL database.
 5. Do not overwrite or delete the local PostgreSQL database.
 6. Compare core row counts and financial totals before starting the hosted API.
@@ -33,8 +33,16 @@ Example backup:
 Example provider restore using its secret-managed URL:
 
 ```powershell
-pg_restore --dbname $env:DATABASE_URL --no-owner --no-privileges C:\FroozERPBackups\cloud-migration\froozerp_YYYYMMDD_HHMMSS.dump
+pg_restore --dbname $env:DATABASE_URL --single-transaction --exit-on-error --no-owner --no-privileges C:\FroozERPBackups\cloud-migration\froozerp_YYYYMMDD_HHMMSS.dump
 ```
+
+`--single-transaction --exit-on-error` is not optional. Without it, restoring into a database the
+backend has already started against restores the parent tables and leaves the child tables empty:
+every invoice present, not one line item, no stock. pg_restore reports this by exiting non-zero and
+nothing else, so a restore that "printed no obvious error" is not evidence.
+
+The hosted target must be an empty database. If the backend has bootstrapped its schema there
+already, the tables exist with live foreign keys and that is exactly the case above.
 
 Only run restore against the explicitly selected hosted target. Never restore over the live local shop database.
 
@@ -65,11 +73,15 @@ At minimum compare:
 - expenses
 - sync processed operations and change log
 
-Use:
+Compare the two databases rather than reading one side's numbers:
 
 ```powershell
-.\scripts\cloud\verify-row-counts.ps1
+.\scripts\cloud\verify-row-counts.ps1 -Database froozerp -CompareDatabase froozerp_hosted_copy
 ```
+
+This counts every table in the schema, not the list above, and exits non-zero on any difference.
+The list is kept here because it names what a person should look at first, not because it is what
+gets checked.
 
 ## Rollback
 
