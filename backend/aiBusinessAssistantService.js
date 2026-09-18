@@ -1437,6 +1437,53 @@ const runAlertRules = async (pool, branchId, settings) => {
   }
 };
 
+/**
+ * The tables a status change may be applied to. Named here rather than taken from a request, since
+ * the table goes into the statement text; nothing outside this file may choose it.
+ */
+const STATUS_CHANGE_TABLES = new Set(["ai_alerts", "ai_reminders"]);
+
+/**
+ * Acknowledge, snooze or resolve one alert or reminder.
+ *
+ * ## Two bugs this replaces
+ *
+ * The two `PATCH` handlers each picked one of three SQL strings into a variable and then bound the
+ * same four values to all of them. Only the `SNOOZE` string referenced `$4`, so `ACKNOWLEDGE` and
+ * `RESOLVE` sent Postgres four parameters for a statement naming three: `bind message supplies 4
+ * parameters, but prepared statement requires 3`, a 500 every time anyone tried to acknowledge or
+ * resolve anything. `queryArity.test.js` could not see it — it reads string literals handed to
+ * `pool.query`, and these were handed a variable — which is why the statement and its values are
+ * built together here, as one object that cannot disagree with itself.
+ *
+ * The second bug was tenancy: `WHERE id = $1` alone let a signed-in user of one branch acknowledge
+ * or resolve another branch's alerts. The ids are sequential, so that needed no guesswork. The
+ * branch predicate makes a cross-branch id match nothing, which the caller sees as "not found"
+ * rather than as a silent success.
+ */
+const buildStatusChange = ({ table, action, id, branchId, userId, ownerNotes, snoozedUntil }) => {
+  if (!STATUS_CHANGE_TABLES.has(table)) throw new Error(`FROST_UNKNOWN_STATUS_TABLE: ${table}`);
+  if (action === "ACKNOWLEDGE") {
+    return {
+      text: `UPDATE ${table} SET status = 'ACKNOWLEDGED', acknowledged_by = $2, acknowledged_at = CURRENT_TIMESTAMP, owner_notes = COALESCE(NULLIF($3, ''), owner_notes), updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND branch_id = $4 RETURNING *`,
+      values: [id, userId, ownerNotes, branchId],
+    };
+  }
+  if (action === "SNOOZE") {
+    return {
+      text: `UPDATE ${table} SET status = 'SNOOZED', snoozed_until = COALESCE($3::timestamp, CURRENT_TIMESTAMP + INTERVAL '1 day'), owner_notes = COALESCE(NULLIF($2, ''), owner_notes), updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND branch_id = $4 RETURNING *`,
+      values: [id, ownerNotes, snoozedUntil, branchId],
+    };
+  }
+  if (action === "RESOLVE") {
+    return {
+      text: `UPDATE ${table} SET status = 'RESOLVED', resolved_by = $2, resolved_at = CURRENT_TIMESTAMP, owner_notes = COALESCE(NULLIF($3, ''), owner_notes), updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND branch_id = $4 RETURNING *`,
+      values: [id, userId, ownerNotes, branchId],
+    };
+  }
+  return null;
+};
+
 const getStoredAlerts = async (pool, branchId) => {
   const branch = requireBranchScope(branchId);
   const result = await pool.query(`
@@ -1749,12 +1796,22 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     const id = parsePositiveInteger(req.params.id);
     const action = cleanText(req.body.action).toUpperCase();
     const ownerNotes = cleanText(req.body.owner_notes);
-    let query = "";
-    if (action === "ACKNOWLEDGE") query = "UPDATE ai_alerts SET status = 'ACKNOWLEDGED', acknowledged_by = $2, acknowledged_at = CURRENT_TIMESTAMP, owner_notes = COALESCE(NULLIF($3, ''), owner_notes), updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *";
-    if (action === "SNOOZE") query = "UPDATE ai_alerts SET status = 'SNOOZED', snoozed_until = COALESCE($4::timestamp, CURRENT_TIMESTAMP + INTERVAL '1 day'), owner_notes = COALESCE(NULLIF($3, ''), owner_notes), updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *";
-    if (action === "RESOLVE") query = "UPDATE ai_alerts SET status = 'RESOLVED', resolved_by = $2, resolved_at = CURRENT_TIMESTAMP, owner_notes = COALESCE(NULLIF($3, ''), owner_notes), updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *";
-    if (!id || !query) return res.status(400).json({ message: "Valid alert id and action are required" });
-    const result = await pool.query(query, [id, user.id, ownerNotes, req.body.snoozed_until || null]);
+    const branchId = parsePositiveInteger(req.auth.branchId);
+    if (!branchId) return res.status(403).json({ code: "FROST_BRANCH_SCOPE_REQUIRED", message: "A verified branch is required to change an alert" });
+    const statement = buildStatusChange({
+      table: "ai_alerts",
+      action,
+      id,
+      branchId,
+      userId: user.id,
+      ownerNotes,
+      snoozedUntil: req.body.snoozed_until || null,
+    });
+    if (!id || !statement) return res.status(400).json({ message: "Valid alert id and action are required" });
+    const result = await pool.query(statement.text, statement.values);
+    // No row means the id belongs to another branch, or to nothing. Answering 200 with an empty
+    // body — which is what `res.json(undefined)` did — told the screen the action had worked.
+    if (!result.rows[0]) return res.status(404).json({ message: "Alert not found" });
     return res.json(result.rows[0]);
   });
 
@@ -2072,12 +2129,20 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     const id = parsePositiveInteger(req.params.id);
     const action = cleanText(req.body.action).toUpperCase();
     const ownerNotes = cleanText(req.body.owner_notes);
-    let query = "";
-    if (action === "ACKNOWLEDGE") query = "UPDATE ai_reminders SET status = 'ACKNOWLEDGED', acknowledged_by = $2, acknowledged_at = CURRENT_TIMESTAMP, owner_notes = COALESCE(NULLIF($3, ''), owner_notes), updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *";
-    if (action === "SNOOZE") query = "UPDATE ai_reminders SET status = 'SNOOZED', snoozed_until = COALESCE($4::timestamp, CURRENT_TIMESTAMP + INTERVAL '1 day'), owner_notes = COALESCE(NULLIF($3, ''), owner_notes), updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *";
-    if (action === "RESOLVE") query = "UPDATE ai_reminders SET status = 'RESOLVED', resolved_by = $2, resolved_at = CURRENT_TIMESTAMP, owner_notes = COALESCE(NULLIF($3, ''), owner_notes), updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *";
-    if (!id || !query) return res.status(400).json({ message: "Valid reminder id and action are required" });
-    const result = await pool.query(query, [id, user.id, ownerNotes, req.body.snoozed_until || null]);
+    const branchId = parsePositiveInteger(req.auth.branchId);
+    if (!branchId) return res.status(403).json({ code: "FROST_BRANCH_SCOPE_REQUIRED", message: "A verified branch is required to change a reminder" });
+    const statement = buildStatusChange({
+      table: "ai_reminders",
+      action,
+      id,
+      branchId,
+      userId: user.id,
+      ownerNotes,
+      snoozedUntil: req.body.snoozed_until || null,
+    });
+    if (!id || !statement) return res.status(400).json({ message: "Valid reminder id and action are required" });
+    const result = await pool.query(statement.text, statement.values);
+    if (!result.rows[0]) return res.status(404).json({ message: "Reminder not found" });
     return res.json(result.rows[0]);
   });
 
@@ -2291,4 +2356,5 @@ module.exports = {
   registerAiBusinessAssistantRoutes,
   buildFrostPolicy,
   normalizeRoleName,
+  buildStatusChange,
 };

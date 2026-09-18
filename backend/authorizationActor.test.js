@@ -59,7 +59,7 @@ const INDIRECT_ACTORS = [
   ],
   [
     "userId ? requireRateManager(userId) : Promise.resolve(null),",
-    "inside `getSettingsBundle`, a helper with no `req`; its one caller passes `req.auth.userId`",
+    "inside `getSettingsBundle`, a helper with no `req`; its one caller passes `req.auth`, and the id\n     it reads off that is the verified one",
   ],
   [
     "const actorId = req.auth.userId;",

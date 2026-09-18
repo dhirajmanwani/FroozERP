@@ -108,11 +108,29 @@ const registerScopeManagementRoutes = ({ use, database, serverTimePayload = () =
         FROM device_assignments da JOIN authorized_devices d ON d.device_id = da.device_id
         JOIN operational_locations ol ON ol.id = da.operational_location_id JOIN branches b ON b.id = da.branch_id
         WHERE da.company_id = $1 ORDER BY da.active DESC, d.device_name, da.assignment_generation DESC`, [context.company_id]),
+      // A-7. Both of these read a company-wide table with no tenancy predicate at all: every
+      // company's staff, and every company's pending device requests, in an Owner's assignment
+      // screen. `users.company_id` and `authorized_devices.company_id` both exist and are both
+      // NULL on every row written so far, so the company has to be reached through the row's
+      // branch as well as read from the column — `COALESCE` does that in one predicate, and
+      // matching on the column alone would have emptied both lists.
+      //
+      // A row we cannot place at all — no company, and a branch that no longer resolves — stays
+      // visible. Hiding it would mean a device request nobody can approve and a staff member
+      // nobody can assign, with nothing on screen to say why, and this route is Owner-only.
       database.query(`SELECT u.id, u.full_name, u.username, u.active, u.role_id, r.role_name
-        FROM users u LEFT JOIN roles r ON r.id = u.role_id WHERE u.active = TRUE ORDER BY u.full_name, u.id`),
-      database.query(`SELECT device_id, device_name, device_type, platform, status, request_time,
-        requested_physical_location, requested_intended_usage, requested_user_id, requested_role_id
-        FROM authorized_devices WHERE status = 'PENDING' ORDER BY request_time, id`),
+        FROM users u LEFT JOIN roles r ON r.id = u.role_id
+        LEFT JOIN branches ub ON ub.id = u.branch_id
+        WHERE u.active = TRUE
+          AND (COALESCE(u.company_id, ub.company_id) = $1 OR COALESCE(u.company_id, ub.company_id) IS NULL)
+        ORDER BY u.full_name, u.id`, [context.company_id]),
+      database.query(`SELECT d.device_id, d.device_name, d.device_type, d.platform, d.status, d.request_time,
+        d.requested_physical_location, d.requested_intended_usage, d.requested_user_id, d.requested_role_id
+        FROM authorized_devices d
+        LEFT JOIN branches db ON db.id = d.assigned_branch_id
+        WHERE d.status = 'PENDING'
+          AND (COALESCE(d.company_id, db.company_id) = $1 OR COALESCE(d.company_id, db.company_id) IS NULL)
+        ORDER BY d.request_time, d.id`, [context.company_id]),
       database.query("SELECT id, role_name FROM roles ORDER BY role_name, id"),
     ]);
     return res.json({
