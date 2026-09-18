@@ -339,10 +339,15 @@ the one outcome a rehearsal must not produce. The repo's own scripts do this, an
 `restore-postgres.ps1` refuses a non-empty target, and `server.js` fills a database with empty tables
 the moment it starts against it, so restore *before* starting anything.
 
+The target database **must be named with a `_staging` suffix**. `CloudPostgresAdapter` refuses a
+loopback PostgreSQL host outright, and the single exception it makes is a database whose name ends
+in `_staging` while the isolated-tests flag is set. Any other name dies at startup with
+"Cloud-server PostgreSQL cannot use a loopback host."
+
 ```powershell
 powershell -File scripts\cloud\backup-postgres.ps1        # prints the .dump path it wrote
-createdb -U postgres froozerp_rehearsal
-powershell -File scripts\cloud\restore-postgres.ps1 -DumpFile <that path> -Database froozerp_rehearsal
+createdb -U postgres froozerp_staging
+powershell -File scripts\cloud\restore-postgres.ps1 -DumpFile <that path> -Database froozerp_staging
 ```
 
 Cloud migration 017 does not have to be applied by hand: `activation_licences` is declared in
@@ -352,9 +357,12 @@ Cloud migration 017 does not have to be applied by hand: `activation_licences` i
 ```powershell
 # window 1 - the stand-in cloud, pointed at the COPY, never live
 $env:NODE_ENV = "test"
+$env:FROOZERP_RUNTIME_MODE = "cloud-server"
+$env:FROOZERP_ALLOW_LOOPBACK_POSTGRES_FOR_ISOLATED_TESTS = "true"
 $env:FROOZERP_ALLOW_LOOPBACK_CLOUD_FOR_ISOLATED_TESTS = "true"
+$env:DEVICE_SESSION_SECRET = "<32+ random characters, this rehearsal only>"
+$env:DATABASE_URL = "postgresql://postgres@127.0.0.1:5432/froozerp_staging"
 $env:PORT = "5090"
-$env:DATABASE_URL = "postgresql://postgres@localhost:5432/froozerp_rehearsal"
 $env:FROOZERP_ACTIVATION_SIGNING_KEY = "<key id 2 seed>"
 node backend/server.js
 
@@ -363,9 +371,23 @@ $env:FROOZERP_CLOUD_API_URL = "http://127.0.0.1:5090"
 npm run app:disposable
 ```
 
-Both halves are needed: without `NODE_ENV=test` and the isolated-tests flag, `server.js` refuses to
-treat a localhost address as a real cloud (`allowLoopbackCloudForIsolatedTests`), and without
-`FROOZERP_CLOUD_API_URL` the gateway has no target at all.
+Every variable in window 1 is load-bearing, and leaving one out fails at startup rather than
+quietly:
+
+- `FROOZERP_RUNTIME_MODE=cloud-server` is what makes `server.js` use PostgreSQL at all. Without it
+  `resolveRuntimeMode` returns `desktop-local`, `DATABASE_URL` is ignored entirely and the process
+  runs on embedded SQLite - which looks like it started fine.
+- `FROOZERP_ALLOW_LOOPBACK_POSTGRES_FOR_ISOLATED_TESTS` plus the `_staging` name is the only way a
+  loopback database is accepted (`storageAdapters.js`, `CloudPostgresAdapter`).
+- `DEVICE_SESSION_SECRET` of at least 32 characters. A cloud-server runtime counts as exposed, so
+  `sessionSecret.js` makes a borrowed key fatal rather than a warning, and the process exits.
+- `NODE_ENV=test` gates both isolated-test flags.
+- `FROOZERP_CLOUD_API_URL` in window 2, or the gateway has no target at all.
+
+Verified on 2026-09-18 by booting `server.js` against a local PostgreSQL 16 with exactly this set:
+schema bootstrap completes, the server listens, and `GET /api/activation/licences` answers
+`AUTH_SESSION_REQUIRED` rather than 404 or 500. Renaming the database to anything without the
+`_staging` suffix reproduces the loopback refusal.
 
 If the screen still refuses after this, read the message rather than assuming. "Local Only mode
 selected" means the app's own kill switch is on, which is a different fact from having no cloud.
