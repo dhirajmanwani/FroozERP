@@ -40,6 +40,10 @@ Example:
 .\scripts\cloud\restore-postgres.ps1 -DumpFile C:\FroozERPBackups\cloud-migration\froozerp_YYYYMMDD_HHMMSS.dump
 ```
 
+The target must be an empty database. The command refuses one that already holds tables, because
+restoring into a schema the backend has already bootstrapped restores the parents and silently
+leaves `inventory_batches`, `sale_items` and every other child table empty.
+
 ## 4. Verify Row Counts
 
 Run row-count verification locally and against cloud.
@@ -67,8 +71,23 @@ Core tables to compare:
 Example:
 
 ```powershell
-.\scripts\cloud\verify-row-counts.ps1
+.\scripts\cloud\verify-row-counts.ps1 -Database froozerp -CompareDatabase froozerp_cloud_copy
 ```
+
+Every table in the schema is counted, not only the list above, and any difference exits non-zero.
+
+## 4b. Prove the Backup Restores
+
+Row counts compare two databases that both already exist. They say nothing about whether the dump
+file on disk can be turned back into a shop. Before a release depends on a backup:
+
+```powershell
+.\scripts\cloud\verify-restore-roundtrip.ps1 -SourceDatabase froozerp_disposable_copy
+```
+
+It dumps, restores into a scratch database of its own, compares every table's row counts and then
+the rows themselves, and drops the scratch database. It refuses any host that is not local, because
+it creates and drops databases. Run it against a disposable copy, never the live shop database.
 
 ## 5. Functional Verification
 
@@ -96,4 +115,4 @@ Rollback must preserve local data.
 - Sync queue is truthful.
 - Duplicate operations are blocked server-side.
 - Owner dashboard shows data freshness and device status.
-- Cloud backup/restore has been tested.
+- Cloud backup/restore has been tested end to end with `verify-restore-roundtrip.ps1`, not merely run.
