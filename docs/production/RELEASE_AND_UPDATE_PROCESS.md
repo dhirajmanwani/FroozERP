@@ -331,14 +331,30 @@ rehearsal, it is an unset variable.
 The screen calls the *local* backend, and the desktop gateway proxies the call onward. The address
 the gateway proxies to comes from `FROOZERP_CLOUD_API_URL` (or `CLOUD_API_URL`) read at runtime by
 `cloud_api_url()` in `src-tauri/src/lib.rs`, so no rebuild is needed - it only has to be set in the
-same terminal window that launches the app:
+same terminal window that launches the app.
+
+First make the copy the stand-in cloud will use. Pointing it at the live database would let a
+disposable run - which is itself seeded from a copy of live - sync back into the real shop, which is
+the one outcome a rehearsal must not produce. The repo's own scripts do this, and the order matters:
+`restore-postgres.ps1` refuses a non-empty target, and `server.js` fills a database with empty tables
+the moment it starts against it, so restore *before* starting anything.
 
 ```powershell
-# window 1 - the stand-in cloud, pointed at a COPY of the database, never live
+powershell -File scripts\cloud\backup-postgres.ps1        # prints the .dump path it wrote
+createdb -U postgres froozerp_rehearsal
+powershell -File scripts\cloud\restore-postgres.ps1 -DumpFile <that path> -Database froozerp_rehearsal
+```
+
+Cloud migration 017 does not have to be applied by hand: `activation_licences` is declared in
+`server.js`'s own startup bootstrap for exactly the local and self-hosted case, and
+`verifyDeclaredSchema` refuses to start if the two ever drift.
+
+```powershell
+# window 1 - the stand-in cloud, pointed at the COPY, never live
 $env:NODE_ENV = "test"
 $env:FROOZERP_ALLOW_LOOPBACK_CLOUD_FOR_ISOLATED_TESTS = "true"
 $env:PORT = "5090"
-$env:DATABASE_URL = "<connection string for the copy>"
+$env:DATABASE_URL = "postgresql://postgres@localhost:5432/froozerp_rehearsal"
 $env:FROOZERP_ACTIVATION_SIGNING_KEY = "<key id 2 seed>"
 node backend/server.js
 
