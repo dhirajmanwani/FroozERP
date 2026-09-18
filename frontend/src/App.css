@@ -6026,9 +6026,10 @@ tbody tr:last-child td {
  * radius, no background. The silhouette is the rosette drawn in `local/frostMark.js`, and a
  * background here would show up as a square behind it.
  *
- * The mark's colours are the same values the old round launcher used, deliberately: the shape
- * changed, the palette did not. They are literals rather than theme tokens because this is a piece
- * of branding and keeps its colour in both themes, where a token would repaint it with the page.
+ * Every colour below is a brand value from `local/brandPalette.js` - the logo's gold and its two
+ * greens plus the ramp around them. They are written as literals rather than theme tokens on
+ * purpose: this is a piece of branding and it has to look the same in both themes, where a token
+ * would repaint it along with the page and the gold would go flat on a light ground.
  */
 .frost-floating-launcher {
   position: fixed;
@@ -6042,21 +6043,10 @@ tbody tr:last-child td {
   padding: 0;
   border: 0;
   background: none;
-  /* Inherited by the letter and by the balls, which fill with currentColor. */
-  color: #faf6ea;
   /* A pierced shape cannot use box-shadow: it would draw the shadow of the button's box, which is
      a square the mark does not fill. drop-shadow follows the ink. */
   filter: drop-shadow(0 12px 24px var(--shadow-soft));
   cursor: pointer;
-}
-
-/* The letter sits in the cap the mark draws, so it is sized to that cap and not to the button. */
-.frost-floating-launcher strong {
-  position: relative;
-  z-index: 1;
-  font-size: 13px;
-  font-weight: 950;
-  letter-spacing: 0;
 }
 
 .frost-mark {
@@ -6066,33 +6056,59 @@ tbody tr:last-child td {
   height: 100%;
 }
 
-.frost-mark-sheen {
-  stop-color: #e6c274;
+/* The gold, lit once across the whole mark. */
+.frost-mark-gold-sheen {
+  stop-color: #f2dfae;
 }
 
-.frost-mark-metal {
+.frost-mark-gold-mid {
   stop-color: #d9ac52;
 }
 
-.frost-mark-shade {
+.frost-mark-gold-shade {
   stop-color: #8a6520;
 }
 
-.frost-mark-ball {
-  fill: currentColor;
+/* The plate the gold is laid on, and the two cuts of every inset stone: a lighter bevel with a
+   darker table sunk into it, which is what makes a flat hexagon read as a cut stone. */
+.frost-mark-plate {
+  fill: #082116;
 }
 
-.frost-mark-cap {
-  fill: #082116;
-  stroke: #d9ac52;
-  stroke-width: 2;
+.frost-mark-gem-bevel {
+  fill: #2c5d43;
+}
+
+.frost-mark-gem-table {
+  fill: #123623;
+}
+
+/* The domed stones: lit off-centre, with a gloss over the light side. */
+.frost-mark-dome-lit {
+  stop-color: #2c5d43;
+}
+
+.frost-mark-dome-deep {
+  stop-color: #0a2d1c;
+}
+
+.frost-mark-gloss {
+  fill: #c8d8ce;
+  opacity: 0.34;
+}
+
+.frost-mark-flake {
+  fill: none;
+  stroke: #e6c274;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .frost-floating-launcher-alert {
   animation: frostPulse 2.2s ease-in-out infinite;
 }
 
-/* Pushed further out than the old round launcher needed: the rosette's lobes reach almost to the
+/* Pushed further out than the old round launcher needed: the rosette's bezels reach almost to the
    corners of the button, so a badge tucked in tight would sit on top of one of them. */
 .frost-floating-launcher em {
   position: absolute;
@@ -6225,10 +6241,6 @@ tbody tr:last-child td {
     bottom: 16px;
     width: 60px;
     height: 60px;
-  }
-
-  .frost-floating-launcher strong {
-    font-size: 12px;
   }
 
   .frost-drawer {

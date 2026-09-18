@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  FLAKE_ARMS,
   FROST_MARK_LOBES,
   FROST_MARK_SIZE,
   circlePath,
@@ -10,6 +11,7 @@ import {
   pointAt,
   polygonPath,
   signedArea,
+  snowflakePath,
 } from "./frostMark.js";
 
 // What these are for.
@@ -17,14 +19,18 @@ import {
 // A mark is not like the rest of this layer: nothing throws when it is wrong, no number comes out
 // different, and the app keeps working. It just looks wrong, at 66 pixels, in the corner of a
 // screen somebody stopped noticing weeks ago. So the properties that decide whether it looks right
-// are pinned here instead of being left to the eye: the eight lobes evenly spaced, nothing drawn
-// outside the field it is drawn in, and every hole wound against the body it is cut from.
+// are pinned here instead of being left to the eye: the eight lobes evenly spaced and squared to
+// the frame, nothing drawn outside the field it is drawn in, every stone landing in the pocket the
+// gold leaves for it, and both holes in the gold wound against it.
 //
 // The winding one is the only true trap. A hole wound the same way as its body does not fail, it
-// fills in — so the lattice silently becomes a solid disc and the mark turns back into roughly the
-// circle it replaced.
+// fills in — so the frame becomes a solid octagon, the centre ring swallows its own face, and the
+// mark turns back into roughly the disc it replaced.
 
-const centreOf = (point) => Math.hypot(point.x - FROST_MARK_SIZE / 2, point.y - FROST_MARK_SIZE / 2);
+const CENTRE = FROST_MARK_SIZE / 2;
+const radiusOf = (point) => Math.hypot(point.x - CENTRE, point.y - CENTRE);
+const angleOf = (point) => (Math.atan2(point.y - CENTRE, point.x - CENTRE) * 180) / Math.PI;
+const angleGap = (a, b) => Math.abs(((((a - b) % 360) + 540) % 360) - 180);
 
 test("the mark has eight lobes, evenly spaced", () => {
   const { lobes } = frostMarkGeometry();
@@ -33,42 +39,46 @@ test("the mark has eight lobes, evenly spaced", () => {
   assert.deepEqual([...new Set(gaps)], [45], "the lobes must sit one eighth of a turn apart");
 });
 
-test("no lobe sits on an axis, so two straddle the top", () => {
-  // The half-step offset is what makes this a rosette rather than a compass rose, and it is the
-  // first thing that would be lost by someone "tidying" the angles to 0, 45, 90.
+test("a lobe points straight up, and four sit on the axes", () => {
+  // The reference is squared to its own frame: a stone at twelve o'clock, one at six, one at each
+  // side. Rotate the ring by half a step and it becomes a pinwheel — still eight lobes, no longer
+  // this mark.
   const { lobes } = frostMarkGeometry();
-  for (const lobe of lobes) {
-    assert.ok(!isAxisAngle(lobe.angle), `a lobe at ${lobe.angle}° points straight up, down or sideways`);
-  }
+  const top = lobes.find((lobe) => lobe.cy < CENTRE && Math.abs(lobe.cx - CENTRE) < 0.001);
+  assert.ok(top, "no lobe sits directly above the middle");
+  assert.equal(lobes.filter((lobe) => isAxisAngle(lobe.angle)).length, 4);
 });
 
 test("every lobe is the same size and the same distance out", () => {
   const { lobes } = frostMarkGeometry();
-  const distances = lobes.map((lobe) => Number(centreOf(lobe).toFixed(3)));
+  const distances = lobes.map((lobe) => Number(radiusOf({ x: lobe.cx, y: lobe.cy }).toFixed(3)));
   assert.equal(new Set(distances).size, 1, `lobes sit at ${[...new Set(distances)].join(", ")} from the middle`);
-  assert.equal(new Set(lobes.map((lobe) => lobe.radius)).size, 1);
-  assert.equal(new Set(lobes.map((lobe) => lobe.ball)).size, 1);
+  assert.equal(new Set(lobes.map((lobe) => lobe.bezel)).size, 1);
+  assert.equal(new Set(lobes.map((lobe) => lobe.gem)).size, 1);
 });
 
-test("a ball fits inside its socket, and the socket inside its ring", () => {
-  // Get this wrong in either direction and the lobe stops reading as a ball in a ring: too big a
-  // ball hides the ring, too small a socket hides the ball.
+test("a cabochon sits inside the bezel that holds it", () => {
+  // Get this wrong in either direction and the lobe stops reading as a stone in a ring: too big a
+  // stone hides the gold, too small a one turns the lobe into a gold disc with a dot on it.
   const { lobes } = frostMarkGeometry();
   for (const lobe of lobes) {
-    assert.ok(lobe.ball < lobe.socket, "the ball must sit inside the socket cut for it");
-    assert.ok(lobe.socket < lobe.radius, "the socket must leave a ring around it");
+    assert.ok(lobe.gem < lobe.bezel, "the stone must leave a bezel around it");
+    assert.ok(lobe.gem > lobe.bezel * 0.6, "the bezel must read as a rim, not as the whole lobe");
   }
 });
 
-test("adjacent lobes meet without swallowing each other", () => {
-  // They touch in the reference, which is what makes the outline a continuous rosette rather than
-  // eight separate dots. Touching is wanted; a lobe whose centre falls inside its neighbour is not.
-  const { lobes } = frostMarkGeometry();
-  const first = lobes[0];
-  const second = lobes[1];
+test("the lobes stand clear of each other, and the frame is what joins them", () => {
+  // In this reference the bezels do not touch: the octagonal frame runs between them and the gap
+  // is where the stones show. Lobes pushed together far enough to overlap would swallow that gap
+  // and the rim would read as one lumpy ring.
+  const mark = frostMarkGeometry();
+  const [first, second] = mark.lobes;
   const gap = Math.hypot(first.cx - second.cx, first.cy - second.cy);
-  assert.ok(gap > first.radius, `neighbouring lobes are ${gap.toFixed(2)} apart and would merge into one blob`);
-  assert.ok(gap < first.radius * 2, "neighbouring lobes must overlap enough to read as one outline");
+  assert.ok(gap > first.bezel * 2, `neighbouring bezels are ${gap.toFixed(2)} apart and overlap each other`);
+  // The frame's corners land on the lobes, which is what welds the ring shut.
+  const corners = mark.frameOuter.map(radiusOf);
+  assert.ok(Math.max(...corners) > radiusOf({ x: first.cx, y: first.cy }) - first.bezel,
+    "the frame must reach the bezels it is meant to join");
 });
 
 test("nothing is drawn outside the field it is drawn in", () => {
@@ -77,37 +87,72 @@ test("nothing is drawn outside the field it is drawn in", () => {
   const mark = frostMarkGeometry();
   assert.ok(mark.extent < FROST_MARK_SIZE / 2, `the mark reaches ${mark.extent} of a ${FROST_MARK_SIZE / 2} half-field`);
   for (const lobe of mark.lobes) {
-    for (const edge of [lobe.cx - lobe.radius, lobe.cy - lobe.radius]) {
+    for (const edge of [lobe.cx - lobe.bezel, lobe.cy - lobe.bezel]) {
       assert.ok(edge > 0, "a lobe crosses the top or left edge");
     }
-    for (const edge of [lobe.cx + lobe.radius, lobe.cy + lobe.radius]) {
+    for (const edge of [lobe.cx + lobe.bezel, lobe.cy + lobe.bezel]) {
       assert.ok(edge < FROST_MARK_SIZE, "a lobe crosses the bottom or right edge");
     }
   }
 });
 
-test("the lattice sits between the cap and the rim, touching neither", () => {
-  // A diamond that reaches under the cap is invisible; one that reaches past the body's edge stops
-  // being a hole and opens the outline instead. Both are decisions, and neither is this one.
+test("every inset stone lands in the pocket the gold leaves for it", () => {
+  // The stones are drawn on top of the gold, so one that strays is not clipped — it is painted
+  // over the frame or the spoke it overlaps, and the gold silently grows a green bite out of it.
   const mark = frostMarkGeometry();
-  const bodyEdge = Math.min(...mark.octagon.map(centreOf)) * Math.cos(Math.PI / FROST_MARK_LOBES);
-  for (const diamond of mark.diamonds) {
-    const radii = diamond.points.map(centreOf);
-    assert.ok(Math.min(...radii) > mark.capRadius, `a diamond at ${diamond.angle}° runs under the cap`);
-    assert.ok(Math.max(...radii) < bodyEdge, `a diamond at ${diamond.angle}° breaks through the rim`);
+  const frameEdge = mark.frameInner.map(radiusOf)[0] * Math.cos(Math.PI / FROST_MARK_LOBES);
+  const spokeHalfWidth = Math.hypot(
+    mark.spokes[0].points[0].x - mark.spokes[0].points[3].x,
+    mark.spokes[0].points[0].y - mark.spokes[0].points[3].y,
+  ) / 2;
+
+  assert.equal(mark.gems.length, FROST_MARK_LOBES * 2, "two rings of stones, one per sector each");
+  for (const gem of mark.gems) {
+    for (const point of gem.points) {
+      const radius = radiusOf(point);
+      assert.ok(radius > mark.capOuterRadius, `a ${gem.ring} stone at ${gem.angle}° runs under the centre ring`);
+      assert.ok(radius < frameEdge, `a ${gem.ring} stone at ${gem.angle}° runs under the frame`);
+      const clearance = Math.min(...mark.spokes.map((spoke) => radius * Math.sin((angleGap(angleOf(point), spoke.angle) * Math.PI) / 180)));
+      assert.ok(clearance > spokeHalfWidth, `a ${gem.ring} stone at ${gem.angle}° overlaps a spoke`);
+    }
   }
 });
 
-test("the four diamonds on the axes are the long ones", () => {
-  // The reference's up/down/left/right spurs. Without the difference the lattice is eight identical
-  // lozenges and the mark loses its orientation.
-  const { diamonds } = frostMarkGeometry();
-  const lengthOf = (diamond) => Math.max(...diamond.points.map(centreOf)) - Math.min(...diamond.points.map(centreOf));
-  const onAxis = diamonds.filter((diamond) => isAxisAngle(diamond.angle));
-  const offAxis = diamonds.filter((diamond) => !isAxisAngle(diamond.angle));
-  assert.equal(onAxis.length, 4);
-  assert.equal(offAxis.length, 4);
-  assert.ok(lengthOf(onAxis[0]) > lengthOf(offAxis[0]), "the axis diamonds must be the longer pair");
+test("the two rings of stones do not sit on each other", () => {
+  // They are a pair per sector, not a smear: the inner one small, the outer one wide, with gold
+  // between. Overlapping them reads as one long blob and loses the reference's depth.
+  const mark = frostMarkGeometry();
+  const sector = mark.gems.filter((gem) => gem.angle === mark.gems[0].angle);
+  const [inner, outer] = ["inner", "outer"].map((ring) => sector.find((gem) => gem.ring === ring));
+  assert.ok(Math.max(...inner.points.map(radiusOf)) < Math.min(...outer.points.map(radiusOf)),
+    "the inner stone reaches into the outer one");
+
+  const widthOf = (gem) => Math.max(...gem.points.map((point) => Math.hypot(point.x - gem.points[0].x, point.y - gem.points[0].y)));
+  assert.ok(widthOf(outer) > widthOf(inner), "the outer ring carries the bigger stones, as in the reference");
+});
+
+test("each stone's table sits inside its own bevel", () => {
+  // The table is what makes a flat green hexagon read as a cut stone. Drawn the same size as the
+  // stone it disappears; drawn bigger it becomes the stone and the bevel vanishes.
+  for (const gem of frostMarkGeometry().gems) {
+    assert.equal(gem.table.length, gem.points.length);
+    assert.ok(Math.abs(signedArea(gem.table)) < Math.abs(signedArea(gem.points)), "the table must be the smaller shape");
+    assert.ok(Math.abs(signedArea(gem.table)) > 0, "a table shrunk to nothing leaves a stone with no face");
+  }
+});
+
+test("the spokes weld the ring to the lobes without crossing its face", () => {
+  // A spoke that reaches past the ring's inner edge fills the disc the snowflake is cut into,
+  // because they share one path and one winding. Nothing errors; the snowflake just loses its
+  // ground and the middle turns solid gold.
+  const mark = frostMarkGeometry();
+  assert.equal(mark.spokes.length, FROST_MARK_LOBES);
+  for (const spoke of mark.spokes) {
+    const radii = spoke.points.map(radiusOf);
+    assert.ok(Math.min(...radii) >= mark.capInnerRadius, `the spoke at ${spoke.angle}° reaches into the ring's face`);
+    assert.ok(Math.min(...radii) < mark.capOuterRadius, `the spoke at ${spoke.angle}° stops short of the ring and leaves a seam`);
+    assert.ok(Math.max(...radii) >= mark.lobes[0].bezel, `the spoke at ${spoke.angle}° does not reach its lobe`);
+  }
 });
 
 test("a polygon is wound the way it was asked for, whatever order its corners came in", () => {
@@ -138,39 +183,60 @@ test("a circle's winding shows up in its sweep flag", () => {
   assert.match(circlePath(50, 50, 10, { clockwise: false }), /A 10 10 0 1 0 /);
 });
 
-test("every hole in the body is wound against it", () => {
+test("both holes in the gold are wound against it", () => {
   // The property the whole mark rests on. Counted from the path itself rather than from the code
   // that built it, so a later edit that appends a subpath by hand is held to the same rule.
   const mark = frostMarkGeometry();
-  const subpaths = mark.body.split("M ").filter(Boolean).map((part) => `M ${part.trim()}`);
+  const subpaths = mark.gold.split("M ").filter(Boolean).map((part) => `M ${part.trim()}`);
 
   const arcs = subpaths.filter((part) => part.includes("A "));
-  const solidArcs = arcs.filter((part) => / 0 1 1 /.test(part));
-  const hollowArcs = arcs.filter((part) => / 0 1 0 /.test(part));
-  assert.equal(solidArcs.length, FROST_MARK_LOBES, "one filled ring per lobe");
-  assert.equal(hollowArcs.length, FROST_MARK_LOBES, "one socket cut out of each");
+  assert.equal(arcs.filter((part) => / 0 1 1 /.test(part)).length, 1, "the centre ring's outside must be solid");
+  assert.equal(arcs.filter((part) => / 0 1 0 /.test(part)).length, 1, "its face must be cut out of it");
 
-  const polygons = subpaths.filter((part) => !part.includes("A "));
-  const areas = polygons.map((part) => {
+  const areas = subpaths.filter((part) => !part.includes("A ")).map((part) => {
     const numbers = part.match(/-?\d+(?:\.\d+)?/g).map(Number);
     const points = [];
     for (let index = 0; index < numbers.length; index += 2) points.push({ x: numbers[index], y: numbers[index + 1] });
     return signedArea(points);
   });
-  assert.equal(areas.length, FROST_MARK_LOBES + 1, "the octagon body and one diamond per web");
-  assert.ok(areas[0] > 0, "the body octagon must be wound solid");
-  for (const area of areas.slice(1)) {
-    assert.ok(area < 0, "a diamond wound with the body fills in instead of piercing it");
+  assert.equal(areas.length, FROST_MARK_LOBES + 2, "the two frame octagons and one spoke per lobe");
+  assert.equal(areas.filter((area) => area < 0).length, 1, "exactly one of them is a hole: the frame's inside");
+  assert.ok(areas[0] > 0 && areas[1] < 0, "the frame must be an outer octagon with an inner one cut from it");
+});
+
+test("the snowflake has six arms and stays on the ring's face", () => {
+  // Six, not eight: the mark's own symmetry is eightfold and a snowflake's is not, and copying the
+  // rosette's count here is the change that would quietly turn it into a star.
+  const mark = frostMarkGeometry();
+  assert.equal(FLAKE_ARMS.length, 6);
+  assert.ok(FLAKE_ARMS.includes(90) && FLAKE_ARMS.includes(270), "an arm must point straight up and down");
+
+  const points = mark.flake.match(/-?\d+(?:\.\d+)?/g).map(Number);
+  let furthest = 0;
+  for (let index = 0; index < points.length; index += 2) {
+    furthest = Math.max(furthest, radiusOf({ x: points[index], y: points[index + 1] }));
   }
+  assert.ok(furthest + mark.flakeStroke / 2 < mark.capInnerRadius,
+    `the snowflake reaches ${furthest.toFixed(2)} and the face it is drawn on ends at ${mark.capInnerRadius}`);
+});
+
+test("the snowflake is drawn as strokes, not as one continuous scribble", () => {
+  // Every branch has to start with its own move. Dropping one joins two branches with a line
+  // across the middle of the flake, which renders as a smudge rather than as an error.
+  const flake = snowflakePath(10);
+  const moves = flake.match(/M /g).length;
+  const lines = flake.match(/L /g).length;
+  assert.equal(moves, lines, "each stroke is exactly one move and one line");
+  assert.equal(moves, 3 + FLAKE_ARMS.length * 4, "three diameters, plus two pairs of branches per arm");
 });
 
 test("the shape can be retuned without escaping its own field", () => {
   // The knobs exist so the mark can be adjusted; this is the guard rail on adjusting them. A lobe
   // orbit pushed out far enough to clip is caught here rather than on a shopkeeper's screen.
-  const wide = frostMarkGeometry({ lobeOrbit: 36, lobeOuterRadius: 13 });
+  const wide = frostMarkGeometry({ lobeOrbit: 38, lobeBezelRadius: 11 });
   assert.equal(wide.extent, 49);
   assert.ok(wide.extent < FROST_MARK_SIZE / 2);
-  const tooWide = frostMarkGeometry({ lobeOrbit: 44, lobeOuterRadius: 13 });
+  const tooWide = frostMarkGeometry({ lobeOrbit: 44, lobeBezelRadius: 11 });
   assert.ok(tooWide.extent > FROST_MARK_SIZE / 2, "the extent must report an overflow rather than hide it");
 });
 

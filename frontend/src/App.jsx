@@ -8926,28 +8926,55 @@ function App() {
  * The FROST mark.
  *
  * Every measurement comes from `local/frostMark.js`, which is where the shape is tested; this
- * draws what that returns and nothing else. The letter is not in here — it stays the button's own
- * `<strong>`, so it keeps the app's font and needs no separate sizing inside an SVG.
+ * draws what that returns and nothing else. It is drawn back to front — the plate, then the
+ * stones set into it, then the gold laid over them, then the cabochons proud of the gold, then
+ * the snowflake last — so a shape that ever strayed out of its pocket would be covered by the
+ * gold rather than painted over it.
  *
  * `aria-hidden`, deliberately: the button already says "Open FROST", and a decorative mark that
  * announces itself makes a screen reader read the control twice.
  */
 function FrostMark() {
   const mark = frostMarkGeometry();
+  const corners = (points) => points.map((point) => `${point.x},${point.y}`).join(" ");
   return (
     <svg aria-hidden="true" className="frost-mark" focusable="false" viewBox={mark.viewBox}>
       <defs>
-        <linearGradient id="frost-mark-metal" x1="0" x2="1" y1="0" y2="1">
-          <stop className="frost-mark-sheen" offset="0%" />
-          <stop className="frost-mark-metal" offset="48%" />
-          <stop className="frost-mark-shade" offset="100%" />
+        {/* One ramp across the whole mark, so the gold is lit from a single direction. */}
+        <linearGradient id="frost-mark-gold" x1="0" x2="1" y1="0" y2="1">
+          <stop className="frost-mark-gold-sheen" offset="0%" />
+          <stop className="frost-mark-gold-mid" offset="46%" />
+          <stop className="frost-mark-gold-shade" offset="100%" />
         </linearGradient>
+        {/* Off-centre, which is what makes a flat circle read as a domed stone. */}
+        <radialGradient cx="38%" cy="32%" id="frost-mark-dome" r="74%">
+          <stop className="frost-mark-dome-lit" offset="0%" />
+          <stop className="frost-mark-dome-deep" offset="100%" />
+        </radialGradient>
       </defs>
-      <path className="frost-mark-body" d={mark.body} fill="url(#frost-mark-metal)" />
-      {mark.lobes.map((lobe) => (
-        <circle className="frost-mark-ball" cx={lobe.cx} cy={lobe.cy} key={lobe.angle} r={lobe.ball} />
+      <path className="frost-mark-plate" d={mark.plate} />
+      {mark.gems.map((gem) => (
+        <g key={`${gem.ring}-${gem.angle}`}>
+          <polygon className="frost-mark-gem-bevel" points={corners(gem.points)} />
+          <polygon className="frost-mark-gem-table" points={corners(gem.table)} />
+        </g>
       ))}
-      <circle className="frost-mark-cap" cx={mark.centre} cy={mark.centre} r={mark.capRadius} />
+      <path className="frost-mark-gold" d={mark.gold} fill="url(#frost-mark-gold)" />
+      {mark.lobes.map((lobe) => (
+        <g key={lobe.angle}>
+          <circle className="frost-mark-bezel" cx={lobe.cx} cy={lobe.cy} fill="url(#frost-mark-gold)" r={lobe.bezel} />
+          <circle className="frost-mark-cabochon" cx={lobe.cx} cy={lobe.cy} fill="url(#frost-mark-dome)" r={lobe.gem} />
+          <ellipse
+            className="frost-mark-gloss"
+            cx={lobe.cx - lobe.gem * 0.3}
+            cy={lobe.cy - lobe.gem * 0.44}
+            rx={lobe.gem * 0.42}
+            ry={lobe.gem * 0.25}
+          />
+        </g>
+      ))}
+      <circle className="frost-mark-face" cx={mark.centre} cy={mark.centre} fill="url(#frost-mark-dome)" r={mark.capInnerRadius} />
+      <path className="frost-mark-flake" d={mark.flake} strokeWidth={mark.flakeStroke} />
     </svg>
   );
 }
@@ -8987,7 +9014,6 @@ function FrostFloatingCopilot({
         type="button"
       >
         <FrostMark />
-        <strong>F</strong>
         {unreadCount > 0 && <em>{Math.min(unreadCount, 99)}</em>}
       </button>
       {open && <button aria-label="Close FROST" className="frost-drawer-backdrop" onClick={onClose} type="button" />}
