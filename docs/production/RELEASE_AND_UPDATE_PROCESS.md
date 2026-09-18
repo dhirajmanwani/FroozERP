@@ -361,6 +361,7 @@ $env:FROOZERP_RUNTIME_MODE = "cloud-server"
 $env:FROOZERP_ALLOW_LOOPBACK_POSTGRES_FOR_ISOLATED_TESTS = "true"
 $env:FROOZERP_ALLOW_LOOPBACK_CLOUD_FOR_ISOLATED_TESTS = "true"
 $env:DEVICE_SESSION_SECRET = "<32+ random characters, this rehearsal only>"
+$env:PGPASSWORD = '<the postgres password, single quotes>'
 $env:DATABASE_URL = "postgresql://postgres@127.0.0.1:5432/froozerp_staging"
 $env:PORT = "5090"
 $env:FROOZERP_ACTIVATION_SIGNING_KEY = "<key id 2 seed>"
@@ -383,6 +384,13 @@ quietly:
   `sessionSecret.js` makes a borrowed key fatal rather than a warning, and the process exits.
 - `NODE_ENV=test` gates both isolated-test flags.
 - `FROOZERP_CLOUD_API_URL` in window 2, or the gateway has no target at all.
+
+Keep the password out of `DATABASE_URL` and pass it as `PGPASSWORD`. node-postgres falls back to
+`PGPASSWORD` when the connection string carries no password, and a password containing `@`, `:`,
+`/`, `#` or `%` either mis-parses - the driver reports `28P01`, password authentication failed,
+which reads like a wrong password rather than a mangled one - or throws `ERR_INVALID_URL` outright.
+Both were reproduced on 2026-09-18 with the password `p@ss:w/rd#1`; the same password in
+`PGPASSWORD` connects and the server starts.
 
 Verified on 2026-09-18 by booting `server.js` against a local PostgreSQL 16 with exactly this set:
 schema bootstrap completes, the server listens, and `GET /api/activation/licences` answers
