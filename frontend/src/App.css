@@ -6021,101 +6021,62 @@ tbody tr:last-child td {
   font-size: clamp(14px, 1.55vw, 21px);
 }
 
-/*
- * The FROST launcher wears the mark itself, so the button has no shape of its own: no border, no
- * radius, no background. The silhouette is the rosette drawn in `local/frostMark.js`, and a
- * background here would show up as a square behind it.
- *
- * Every colour below is a brand value from `local/brandPalette.js` - the logo's gold and its two
- * greens plus the ramp around them. They are written as literals rather than theme tokens on
- * purpose: this is a piece of branding and it has to look the same in both themes, where a token
- * would repaint it along with the page and the gold would go flat on a light ground.
- */
 .frost-floating-launcher {
   position: fixed;
   right: max(22px, env(safe-area-inset-right));
   bottom: max(22px, env(safe-area-inset-bottom));
   z-index: 45;
-  width: 66px;
-  height: 66px;
+  width: 62px;
+  height: 62px;
   display: grid;
   place-items: center;
-  padding: 0;
-  border: 0;
-  background: none;
-  /* A pierced shape cannot use box-shadow: it would draw the shadow of the button's box, which is
-     a square the mark does not fill. drop-shadow follows the ink. */
-  filter: drop-shadow(0 12px 24px var(--shadow-soft));
+  border: 1px solid rgba(230, 194, 116, 0.58);
+  border-radius: 50%;
+  color: #faf6ea;
+  background:
+    radial-gradient(circle at 35% 30%, rgba(255, 255, 255, 0.24), transparent 21%),
+    conic-gradient(from 140deg, #d9ac52, #082116, #2c5d43, #d9ac52);
+  box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 8px rgba(217, 172, 82, 0.09);
   cursor: pointer;
 }
 
-.frost-mark {
+.frost-floating-launcher strong {
+  position: relative;
+  z-index: 1;
+  font-size: 25px;
+  font-weight: 950;
+  letter-spacing: 0;
+}
+
+.frost-orbit {
   position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
+  inset: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 50%;
 }
 
-/* The gold, lit once across the whole mark. */
-.frost-mark-gold-sheen {
-  stop-color: #f2dfae;
+.frost-orbit::before,
+.frost-orbit::after {
+  content: "";
+  position: absolute;
+  inset: 12px -3px;
+  border-block: 1px solid rgba(255, 255, 255, 0.34);
+  border-radius: 50%;
+  transform: rotate(35deg);
 }
 
-.frost-mark-gold-mid {
-  stop-color: #d9ac52;
-}
-
-.frost-mark-gold-shade {
-  stop-color: #8a6520;
-}
-
-/* The plate the gold is laid on, the groove each cabochon is seated in, and the two cuts of every
-   inset stone: a lighter bevel with a darker table sunk into it, which is what makes a flat
-   hexagon read as a cut stone. */
-.frost-mark-plate,
-.frost-mark-groove {
-  fill: #082116;
-}
-
-.frost-mark-gem-bevel {
-  fill: #2c5d43;
-}
-
-.frost-mark-gem-table {
-  fill: #123623;
-}
-
-/* The domed stones: lit off-centre, with a gloss over the light side. */
-.frost-mark-dome-lit {
-  stop-color: #2c5d43;
-}
-
-.frost-mark-dome-deep {
-  stop-color: #0a2d1c;
-}
-
-.frost-mark-gloss {
-  fill: #c8d8ce;
-  opacity: 0.34;
-}
-
-.frost-mark-flake {
-  fill: none;
-  stroke: #e6c274;
-  stroke-linecap: round;
-  stroke-linejoin: round;
+.frost-orbit::after {
+  transform: rotate(-35deg);
 }
 
 .frost-floating-launcher-alert {
   animation: frostPulse 2.2s ease-in-out infinite;
 }
 
-/* Pushed further out than the old round launcher needed: the rosette's bezels reach almost to the
-   corners of the button, so a badge tucked in tight would sit on top of one of them. */
 .frost-floating-launcher em {
   position: absolute;
-  top: -7px;
-  right: -7px;
+  top: -5px;
+  right: -3px;
   min-width: 20px;
   height: 20px;
   display: grid;
@@ -6129,10 +6090,9 @@ tbody tr:last-child td {
   font-weight: 900;
 }
 
-/* Glows around the mark's own outline rather than around the button's box, for the reason above. */
 @keyframes frostPulse {
-  0%, 100% { filter: drop-shadow(0 12px 24px var(--shadow-soft)) drop-shadow(0 0 2px var(--accent-soft)); }
-  50% { filter: drop-shadow(0 12px 24px var(--shadow-soft)) drop-shadow(0 0 9px var(--accent-line-strong)); }
+  0%, 100% { box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 8px rgba(217, 172, 82, 0.1); }
+  50% { box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 15px rgba(217, 172, 82, 0.18); }
 }
 
 .frost-drawer-backdrop,
@@ -6241,8 +6201,8 @@ tbody tr:last-child td {
   .frost-floating-launcher {
     right: 16px;
     bottom: 16px;
-    width: 60px;
-    height: 60px;
+    width: 56px;
+    height: 56px;
   }
 
   .frost-drawer {
