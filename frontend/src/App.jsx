@@ -17949,6 +17949,17 @@ function AutoUpdateRunner({ busyReasons = [], enabled = false, lastActivityAt = 
   const [tick, setTick] = useState(0);
   const updateRef = useRef(null);
   const stepRunningRef = useRef(false);
+  const installingRef = useRef(false);
+  /**
+   * Alive, not "this effect run is still the current one".
+   *
+   * The effect below re-runs on every beat, so a per-run cancellation flag would be set on the
+   * download started a minute ago -- and a download takes longer than a minute. Its result would
+   * then be thrown away with the phase left on `downloading`, which refuses every later step and
+   * parks the device there for good. Only unmounting is a reason to drop an answer.
+   */
+  const mountedRef = useRef(true);
+  useEffect(() => () => { mountedRef.current = false; }, []);
 
   // One beat a minute. Everything below does at most one thing per beat, so a slow download or a
   // sidecar that takes its time unlocking can never have a second attempt started on top of it.
@@ -17961,7 +17972,6 @@ function AutoUpdateRunner({ busyReasons = [], enabled = false, lastActivityAt = 
 
   useEffect(() => {
     if (!isDesktopShell()) return undefined;
-    let abandoned = false;
     const step = async () => {
       if (stepRunningRef.current) return;
       stepRunningRef.current = true;
@@ -17986,7 +17996,7 @@ function AutoUpdateRunner({ busyReasons = [], enabled = false, lastActivityAt = 
           try {
             const { check: pluginCheck } = await import("@tauri-apps/plugin-updater");
             const found = await pluginCheck();
-            if (abandoned) return;
+            if (!mountedRef.current) return;
             updateRef.current = found || null;
             setState((current) => ({
               ...current,
@@ -17998,7 +18008,7 @@ function AutoUpdateRunner({ busyReasons = [], enabled = false, lastActivityAt = 
               failureMessage: "",
             }));
           } catch (error) {
-            if (abandoned) return;
+            if (!mountedRef.current) return;
             // Counted rather than shouted about. One failed check is the internet; the sentence on
             // screen only appears once it has happened twice, because a shop that has silently
             // stopped checking looks exactly like a shop that is up to date.
@@ -18026,13 +18036,13 @@ function AutoUpdateRunner({ busyReasons = [], enabled = false, lastActivityAt = 
           setState((current) => ({ ...current, phase: "downloading" }));
           try {
             await updateRef.current.download();
-            if (abandoned) return;
+            if (!mountedRef.current) return;
             // The plugin verifies the signature against the public key in tauri.conf.json and
             // rejects the payload itself if it does not match, so reaching here is the
             // verification having passed.
             setState((current) => ({ ...current, phase: "ready_to_install", signatureVerified: true }));
           } catch (error) {
-            if (abandoned) return;
+            if (!mountedRef.current) return;
             setState((current) => ({
               ...current,
               phase: "error",
@@ -18046,7 +18056,7 @@ function AutoUpdateRunner({ busyReasons = [], enabled = false, lastActivityAt = 
       }
     };
     step();
-    return () => { abandoned = true; };
+    return undefined;
   }, [tick, enabled, online, state.phase, state.lastCheckedAt, state.lastCheckFailed, state.signatureVerified]);
 
   const decision = resolveInstallDecision({
@@ -18072,6 +18082,11 @@ function AutoUpdateRunner({ busyReasons = [], enabled = false, lastActivityAt = 
       requestedByUser,
     });
     if (!verdict.install || !update) return;
+    // `decision.install` stays true until the state below commits, and the effect that calls this
+    // re-runs on every beat, so without this a second install can start while the first is still
+    // in its first await.
+    if (installingRef.current) return;
+    installingRef.current = true;
     setState((current) => ({ ...current, phase: "installing" }));
     try {
       // The same preflight the manual path runs. `sync_outbox_count` is already one of the busy
@@ -18088,6 +18103,7 @@ function AutoUpdateRunner({ busyReasons = [], enabled = false, lastActivityAt = 
       const { relaunch } = await import("@tauri-apps/plugin-process");
       await relaunch();
     } catch (error) {
+      installingRef.current = false;
       setState((current) => ({
         ...current,
         phase: "error",

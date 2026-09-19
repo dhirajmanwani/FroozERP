@@ -500,3 +500,17 @@ test("the unattended install never asks a question nobody is there to answer", a
   assert.match(runner, /sync_outbox_count/);
   assert.match(runner, /prepare_update_installation/);
 });
+
+test("a download outliving one beat is not thrown away", async () => {
+  // The runner's effect re-runs every minute. A per-run cancellation flag would therefore be set
+  // on a download started a minute ago -- and a download takes longer than a minute. Its answer
+  // would be dropped with the phase left on "downloading", which refuses every later step and
+  // parks that device there for good. Only unmounting may drop an answer.
+  const fs = await import("node:fs");
+  const app = fs.readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  const start = app.indexOf("function AutoUpdateRunner");
+  const runner = app.slice(start, app.indexOf("\nfunction ", start + 1));
+  assert.match(runner, /mountedRef/, "results must be dropped on unmount, not on re-run");
+  assert.doesNotMatch(runner, /let abandoned/, "a per-effect-run cancellation flag strands the download");
+  assert.match(runner, /installingRef/, "the unattended install must not be startable twice");
+});
