@@ -23722,6 +23722,20 @@ const REQUIRED_DATABASE_TABLES = [
   "expenses",
   "sync_processed_operations",
   "sync_change_log",
+  // Everything /login's single SELECT names. PostgreSQL resolves every relation in a statement at
+  // parse time, so a table referenced only inside that query's guarded EXISTS subquery still has
+  // to exist for anybody to sign in at all.
+  //
+  // None of these come from the startup bootstrap; they arrive with cloud migrations 006 and 009.
+  // Without them the server starts entirely clean -- "schema bootstrap completed", row counts and
+  // all -- and then answers every single login with a 500 whose cause appears nowhere a person
+  // would look. Found on 2026-09-19 rehearsing 1.0.73 against a copy that had never had the cloud
+  // migrations applied: `relation "companies" does not exist`, once per attempt, with a healthy
+  // startup above it. Listing them here turns that into one refusal that names the missing table.
+  "companies",
+  "device_assignments",
+  "operational_locations",
+  "staff_location_assignments",
 ];
 
 const getMissingRequiredDatabaseTables = async () => {
