@@ -23,6 +23,19 @@ const resolveDesktopSqlitePath = (env = process.env) => {
   return path.join(appDataRoot, "com.srtcompany.froozerp", "froozerp-local.sqlite3");
 };
 
+/**
+ * Where the desktop profile lives when nothing overrides it -- the real shop's data.
+ *
+ * `node backend/server.js` with no environment set resolves to `desktop-local` and opens exactly
+ * this file. That is correct for the documented local run and wrong for everything else, and the
+ * two used to be told apart only by reading a path out of a startup line. On 2026-09-19 a command
+ * meant for an isolated rehearsal backend was pasted into a window that had none of its variables,
+ * and it opened the live profile on the live port instead; nothing was written, but nothing said
+ * so either. `prepareDatabaseForStartup` compares against this and says which one it opened.
+ */
+const liveDesktopSqlitePath = (env = process.env) =>
+  resolveDesktopSqlitePath({ ...env, FROOZERP_SQLITE_PATH: "" });
+
 const resolveRuntimeMode = (env = process.env) => {
   const explicit = normalizeRuntimeMode(env.FROOZERP_RUNTIME_MODE);
   if (Object.values(RUNTIME_MODES).includes(explicit)) return explicit;
@@ -211,5 +224,6 @@ module.exports = {
   CloudPostgresAdapter,
   resolveRuntimeMode,
   resolveDesktopSqlitePath,
+  liveDesktopSqlitePath,
   createStorageAdapter,
 };

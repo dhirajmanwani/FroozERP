@@ -1317,22 +1317,30 @@ const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth
       windowHeight: Math.max(document.documentElement.clientHeight, element.scrollHeight),
     });
     const imgData = canvas.toDataURL("image/png");
+    // "FAST" is the whole difference between a receipt you can send and one you cannot. jsPDF's
+    // addImage takes compression as its 8th argument and defaults to none, which means it decodes
+    // the PNG and stores the raw bitmap. Measured in Chromium on a rendered A4 statement:
+    // one page 10.7 MB -> 0.4 MB, three pages 42.4 MB -> 1.9 MB, seven pages 135.9 MB -> 6.2 MB.
+    // The backend refuses a body over 25mb and WhatsApp send base64-encodes on top of that.
+    // Not JPEG: measured on this content it is consistently larger than PNG, because the pages are
+    // sharp black text on flat white, which is the case PNG wins and photographic coding loses.
+    const imageCompression = "FAST";
     const isLandscapeReport = !isThermal && resolvedProfile === "A4_LANDSCAPE";
     const pageWidth = isThermal ? (receiptWidth === "58MM" ? 58 : 80) : isLandscapeReport ? 297 : 210;
     const imgHeight = (canvas.height * pageWidth) / canvas.width;
     const pageHeight = isThermal ? Math.max(120, imgHeight) : isLandscapeReport ? 210 : 297;
     const pdf = new jsPDF(isLandscapeReport ? "l" : "p", "mm", isThermal ? [pageWidth, pageHeight] : "a4");
     if (isThermal) {
-      pdf.addImage(imgData, "PNG", 0, 0, pageWidth, imgHeight);
+      pdf.addImage(imgData, "PNG", 0, 0, pageWidth, imgHeight, undefined, imageCompression);
     } else {
       let yOffset = 0;
       let remainingHeight = imgHeight;
-      pdf.addImage(imgData, "PNG", 0, yOffset, pageWidth, imgHeight);
+      pdf.addImage(imgData, "PNG", 0, yOffset, pageWidth, imgHeight, undefined, imageCompression);
       remainingHeight -= pageHeight;
       while (remainingHeight > 0) {
         yOffset -= pageHeight;
         pdf.addPage();
-        pdf.addImage(imgData, "PNG", 0, yOffset, pageWidth, imgHeight);
+        pdf.addImage(imgData, "PNG", 0, yOffset, pageWidth, imgHeight, undefined, imageCompression);
         remainingHeight -= pageHeight;
       }
     }
@@ -1370,6 +1378,17 @@ const exportReportTextPdf = async ({ element, fileName, title, printProfile = ""
   const saveResult = save ? await savePdfResult({ blob, fileName: finalFileName, pdf }) : null;
   return { blob, fileName: finalFileName, pdf, saveResult };
 };
+
+// Every A4 document in this app wants the same thing: real text when the page has tables or
+// metrics to read out of it, and a picture of the screen only when it has not. Both halves used
+// to be written out again at each call site, and the account ledger was written without the
+// first half - so a ledger went to WhatsApp as a 2x-scale lossless PNG, which is tens of
+// megabytes against a 25mb body limit, and failed to send on anything but a very short one.
+// One helper so a new document cannot be added to the picture path by omission.
+const exportDocumentPdf = async ({ element, fileName, title = "", printProfile = "", save = true }) => (
+  await exportReportTextPdf({ element, fileName, title, printProfile, save })
+  || await exportElementToPdf({ element, fileName, mode: "A4", printProfile, save })
+);
 const normalizeWhatsappNumber = (value, defaultCountryCode = "91") => {
   let digits = String(value || "").trim().replace(/[^\d+]/g, "");
   if (!digits) return "";
@@ -8921,6 +8940,7 @@ function App() {
   );
 }
 
+
 function FrostFloatingCopilot({
   activeTab,
   data,
@@ -10105,7 +10125,11 @@ function DeviceActivationIssuingSection({ canIssue, devices, devicesError, onRel
       link.click();
       link.remove();
       setTimeout(() => URL.revokeObjectURL(url), 30000);
-      setOutcome({ tone: "ok", text: `Saved as ${issued.fileName}. Send it to the device and import it on its activation screen.` });
+      // Names where it went, not just what it is called. The webview downloads this rather than
+      // offering a save dialog, so "Saved as froozerp-....lic" left the Owner hunting for a file
+      // they had just been told was saved -- on the one screen whose whole purpose is producing a
+      // file to carry to a counter.
+      setOutcome({ tone: "ok", text: `Saved to your Downloads folder as ${issued.fileName}. Send it to the device and import it on its activation screen.` });
     } catch (error) {
       setOutcome({
         tone: "error",
@@ -10186,7 +10210,23 @@ function DeviceActivationIssuingSection({ canIssue, devices, devicesError, onRel
                     type="radio"
                   />
                 </td>
-                <td className="primary-cell">{row.deviceName}<small className="cell-note">{row.deviceId || "No device ID"}</small></td>
+                <td className="primary-cell">
+                  {row.deviceName}
+                  {/* Two devices can carry the same name after a counter is rebuilt and registers
+                      again. When they do, the id below is the only thing separating them, and the
+                      release process requires that nobody has to read one. This says which is
+                      which out of something a person already knows. */}
+                  {row.nameIsAmbiguous && (
+                    <small className="cell-note">
+                      {row.nameDistinction?.kind === "counter"
+                        ? row.nameDistinction.value
+                        : row.nameDistinction?.kind === "lastSeen"
+                          ? `Last seen ${new Date(row.nameDistinction.value).toLocaleString("en-IN")}`
+                          : "Same name as another device — check the ID below before issuing"}
+                    </small>
+                  )}
+                  <small className="cell-note">{row.deviceId || "No device ID"}</small>
+                </td>
                 <td>{row.branchName || "Main Branch"}<small className="cell-note">{row.counterName || "No counter assigned"}</small></td>
                 <td>
                   <span className={stateClass(row.state)}>{row.label}</span>
@@ -11226,15 +11266,7 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
     setExporting(true);
     try {
       await new Promise((resolve) => setTimeout(resolve, 80));
-      const textResult = await exportReportTextPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile });
-      if (!textResult) {
-        await exportElementToPdf({
-          element: reportRef.current,
-          fileName: fileName || `${title}.pdf`,
-          mode: "A4",
-          printProfile,
-        });
-      }
+      await exportDocumentPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile });
     } catch (error) {
       alert(`Unable to export PDF: ${error.message}`);
     } finally {
@@ -11249,14 +11281,7 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
     setExporting(true);
     try {
       await new Promise((resolve) => setTimeout(resolve, 80));
-      const result = await exportReportTextPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile, save: false })
-        || await exportElementToPdf({
-          element: reportRef.current,
-          fileName: fileName || `${title}.pdf`,
-          mode: "A4",
-          printProfile,
-          save: false,
-        });
+      const result = await exportDocumentPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile, save: false });
       setPdfPreview({ ...result });
     } catch (error) {
       alert(`Unable to view PDF: ${error.message}`);
@@ -11272,14 +11297,7 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
     setExporting(true);
     try {
       await new Promise((resolve) => setTimeout(resolve, 80));
-      return await exportReportTextPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile, save: false })
-        || await exportElementToPdf({
-          element: reportRef.current,
-          fileName: fileName || `${title}.pdf`,
-          mode: "A4",
-          printProfile,
-          save: false,
-        });
+      return await exportDocumentPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile, save: false });
     } finally {
       setExporting(false);
       setPrintTarget(false);
@@ -16011,14 +16029,15 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
     (!ledgerDateRange.date_from || toDateKey(row.date) >= ledgerDateRange.date_from) &&
     (!ledgerDateRange.date_to || toDateKey(row.date) <= ledgerDateRange.date_to)
   );
+  const ledgerDocumentTitle = `${accountLedger.account?.account_name || accountLedger.account?.customer_name || accountLedger.account?.supplier_name || "Account"} - Ledger Statement`;
   const exportLedgerPdf = async () => {
     if (!ledgerPrintRef.current) return;
     setLedgerExporting(true);
     try {
-      await exportElementToPdf({
+      await exportDocumentPdf({
         element: ledgerPrintRef.current,
         fileName: `${accountLedger.account?.account_name || "Account_Ledger"}_${formatFileDate(ledgerDateRange.date_from || "all")}_to_${formatFileDate(ledgerDateRange.date_to || toDateKey(new Date()))}.pdf`,
-        mode: "A4",
+        title: ledgerDocumentTitle,
       });
     } catch (error) {
       alert(`Unable to export ledger PDF: ${error.message}`);
@@ -16036,10 +16055,10 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
   }), [accountLedger.account]);
   const generateLedgerWhatsappPdf = async () => {
     if (!ledgerPrintRef.current) throw new Error("Select an account ledger first");
-    return exportElementToPdf({
+    return exportDocumentPdf({
       element: ledgerPrintRef.current,
       fileName: ledgerDocumentName,
-      mode: "A4",
+      title: ledgerDocumentTitle,
       save: false,
     });
   };

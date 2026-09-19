@@ -321,12 +321,90 @@ meet.
 - The window opens maximized with nothing cut off at the left, at 1366x768 and above.
 - The greeting reads "Good to see you, Dhiraj", not "Good to see you, Mr.".
 
-*What this rehearsal cannot prove*
+*Giving the rehearsal a cloud*
 
-Issuing needs a cloud, and a debug build has no cloud address (see the 1.0.72 note above), so the
-activation screen will correctly report that it cannot list devices. Everything above that touches
-the cloud has to be checked on a real installed build, or the screen has to be checked in a browser
-against the deployed frontend. Do not let a green rehearsal imply that issuing works.
+A debug build has no cloud address **unless it is given one** (see the 1.0.72 note above), so by
+default the activation screen correctly reports that it cannot list devices, with "No cloud backend
+is configured for this installation. Local modules remain available." That is not a limit of the
+rehearsal, it is an unset variable.
+
+The screen calls the *local* backend, and the desktop gateway proxies the call onward. The address
+the gateway proxies to comes from `FROOZERP_CLOUD_API_URL` (or `CLOUD_API_URL`) read at runtime by
+`cloud_api_url()` in `src-tauri/src/lib.rs`, so no rebuild is needed - it only has to be set in the
+same terminal window that launches the app.
+
+First make the copy the stand-in cloud will use. Pointing it at the live database would let a
+disposable run - which is itself seeded from a copy of live - sync back into the real shop, which is
+the one outcome a rehearsal must not produce. The repo's own scripts do this, and the order matters:
+`restore-postgres.ps1` refuses a non-empty target, and `server.js` fills a database with empty tables
+the moment it starts against it, so restore *before* starting anything.
+
+The target database **must be named with a `_staging` suffix**. `CloudPostgresAdapter` refuses a
+loopback PostgreSQL host outright, and the single exception it makes is a database whose name ends
+in `_staging` while the isolated-tests flag is set. Any other name dies at startup with
+"Cloud-server PostgreSQL cannot use a loopback host."
+
+```powershell
+powershell -File scripts\cloud\backup-postgres.ps1        # prints the .dump path it wrote
+createdb -U postgres froozerp_staging
+powershell -File scripts\cloud\restore-postgres.ps1 -DumpFile <that path> -Database froozerp_staging
+```
+
+Cloud migration 017 does not have to be applied by hand: `activation_licences` is declared in
+`server.js`'s own startup bootstrap for exactly the local and self-hosted case, and
+`verifyDeclaredSchema` refuses to start if the two ever drift.
+
+```powershell
+# window 1 - the stand-in cloud, pointed at the COPY, never live
+$env:NODE_ENV = "test"
+$env:FROOZERP_RUNTIME_MODE = "cloud-server"
+$env:FROOZERP_ALLOW_LOOPBACK_POSTGRES_FOR_ISOLATED_TESTS = "true"
+$env:FROOZERP_ALLOW_LOOPBACK_CLOUD_FOR_ISOLATED_TESTS = "true"
+$env:DEVICE_SESSION_SECRET = "<32+ random characters, this rehearsal only>"
+$env:PGPASSWORD = '<the postgres password, single quotes>'
+$env:DATABASE_URL = "postgresql://postgres@127.0.0.1:5432/froozerp_staging"
+$env:PORT = "5090"
+$env:FROOZERP_ACTIVATION_SIGNING_KEY = "<key id 2 seed>"
+node backend/server.js
+
+# window 2 - the disposable app, told where its cloud is
+$env:FROOZERP_CLOUD_API_URL = "http://127.0.0.1:5090"
+npm run app:disposable
+```
+
+Every variable in window 1 is load-bearing, and leaving one out fails at startup rather than
+quietly:
+
+- `FROOZERP_RUNTIME_MODE=cloud-server` is what makes `server.js` use PostgreSQL at all. Without it
+  `resolveRuntimeMode` returns `desktop-local`, `DATABASE_URL` is ignored entirely and the process
+  runs on embedded SQLite - which looks like it started fine.
+- `FROOZERP_ALLOW_LOOPBACK_POSTGRES_FOR_ISOLATED_TESTS` plus the `_staging` name is the only way a
+  loopback database is accepted (`storageAdapters.js`, `CloudPostgresAdapter`).
+- `DEVICE_SESSION_SECRET` of at least 32 characters. A cloud-server runtime counts as exposed, so
+  `sessionSecret.js` makes a borrowed key fatal rather than a warning, and the process exits.
+- `NODE_ENV=test` gates both isolated-test flags.
+- `FROOZERP_CLOUD_API_URL` in window 2, or the gateway has no target at all.
+
+Keep the password out of `DATABASE_URL` and pass it as `PGPASSWORD`. node-postgres falls back to
+`PGPASSWORD` when the connection string carries no password, and a password containing `@`, `:`,
+`/`, `#` or `%` either mis-parses - the driver reports `28P01`, password authentication failed,
+which reads like a wrong password rather than a mangled one - or throws `ERR_INVALID_URL` outright.
+Both were reproduced on 2026-09-18 with the password `p@ss:w/rd#1`; the same password in
+`PGPASSWORD` connects and the server starts.
+
+Verified on 2026-09-18 by booting `server.js` against a local PostgreSQL 16 with exactly this set:
+schema bootstrap completes, the server listens, and `GET /api/activation/licences` answers
+`AUTH_SESSION_REQUIRED` rather than 404 or 500. Renaming the database to anything without the
+`_staging` suffix reproduces the loopback refusal.
+
+If the screen still refuses after this, read the message rather than assuming. "Local Only mode
+selected" means the app's own kill switch is on, which is a different fact from having no cloud.
+
+*What this rehearsal still cannot prove*
+
+The stand-in cloud is not the real one. TLS, the deployed frontend, and anything that depends on the
+hosted database's actual contents are still unproven by a rehearsal. Do not let a green rehearsal
+imply that issuing works against production.
 
 ### Only then
 

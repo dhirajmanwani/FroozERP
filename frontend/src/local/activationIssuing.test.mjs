@@ -22,6 +22,7 @@ import {
   VALID_DAYS_MIN,
   WIRE_VALID_DAYS_MAX,
   buildActivationIssuingView,
+  markAmbiguousDeviceNames,
   buildIssueRequest,
   classifyLicence,
   dayNumberToIso,
@@ -856,4 +857,87 @@ test("a 200 with no licence list is not read as an empty list", () => {
 test("the activation gate points at the new screen instead of a phone call", () => {
   const gate = appSource.slice(appSource.indexOf("function ActivationGate("), appSource.indexOf("function DeviceActivationIssuingSection("));
   assert.match(gate, /Device Activation Licences/, "the gate must name where the Owner issues it");
+});
+
+test("a saved licence says where it landed, not only what it is called", () => {
+  // Found rehearsing 1.0.73 on 2026-09-19: the save worked and the Owner's next words were "pata
+  // nahi kahan" -- it saved, but nowhere. The shell has no save dialog, so the webview drops the
+  // file in the browser's download folder and the screen is the only thing that could say so. On
+  // the one screen whose entire purpose is producing a file to carry to a counter, a confirmation
+  // that names the file but not the folder sends the reader hunting for what they were just told
+  // was saved.
+  const save = sectionSource.slice(sectionSource.indexOf("const saveLicenceFile"), sectionSource.indexOf("const copyLicence"));
+  const success = save.slice(save.indexOf('tone: "ok"'));
+  assert.match(success, /Downloads folder/, "the success message must name where the file went");
+  assert.match(success, /\$\{issued\.fileName\}/, "and still name the file, so it can be found by name");
+});
+
+// Two devices answering to the same name, seen on a real device list on 2026-09-19: a counter
+// rebuilt and registered again leaves two rows both called "DELL - FroozERP", same branch, both
+// awaiting a licence. The release process requires that nobody has to read out an FZDEV id, and
+// with identical names the id is the only thing left to read -- so a licence goes to whichever
+// machine the Owner guessed, and fails at the counter rather than here.
+
+test("devices sharing a name are told apart by something a person already knows", () => {
+  const rows = markAmbiguousDeviceNames([
+    { deviceName: "DELL - FroozERP", counterName: "", lastActiveAt: "2026-09-19T13:52:48Z" },
+    { deviceName: "DELL - FroozERP", counterName: "", lastActiveAt: "2026-06-19T11:31:53Z" },
+    { deviceName: "Phase 1 Verification Browser", counterName: "", lastActiveAt: "2026-07-10T12:52:05Z" },
+  ]);
+
+  assert.equal(rows[0].nameIsAmbiguous, true);
+  assert.equal(rows[1].nameIsAmbiguous, true);
+  assert.deepEqual(rows[0].nameDistinction, { kind: "lastSeen", value: "2026-09-19T13:52:48Z" });
+  assert.deepEqual(rows[1].nameDistinction, { kind: "lastSeen", value: "2026-06-19T11:31:53Z" });
+
+  // The device whose name is already unique is left alone. Marking every row would make the
+  // marking meaningless and add noise to the rows that were never in doubt.
+  assert.equal(rows[2].nameIsAmbiguous, false);
+  assert.equal(rows[2].nameDistinction, null);
+});
+
+test("a counter name is preferred over a timestamp, and only when it discriminates", () => {
+  const distinct = markAmbiguousDeviceNames([
+    { deviceName: "Counter PC", counterName: "Till 1", lastActiveAt: "2026-09-19T13:52:48Z" },
+    { deviceName: "Counter PC", counterName: "Till 2", lastActiveAt: "2026-09-19T13:52:48Z" },
+  ]);
+  assert.deepEqual(distinct[0].nameDistinction, { kind: "counter", value: "Till 1" });
+
+  // A counter both of them share separates nothing. Offering it would read as an answer to
+  // "which one is this?" while leaving the reader exactly where they started.
+  const shared = markAmbiguousDeviceNames([
+    { deviceName: "Counter PC", counterName: "Till 1", lastActiveAt: "2026-09-19T13:52:48Z" },
+    { deviceName: "Counter PC", counterName: "Till 1", lastActiveAt: "2026-06-19T11:31:53Z" },
+  ]);
+  assert.deepEqual(shared[0].nameDistinction, { kind: "lastSeen", value: "2026-09-19T13:52:48Z" });
+});
+
+test("when nothing separates two rows, no distinction is invented", () => {
+  const rows = markAmbiguousDeviceNames([
+    { deviceName: "Counter PC", counterName: "Till 1", lastActiveAt: "2026-09-19T13:52:48Z" },
+    { deviceName: "Counter PC", counterName: "Till 1", lastActiveAt: "2026-09-19T13:52:48Z" },
+  ]);
+  assert.equal(rows[0].nameIsAmbiguous, true, "the reader still has to be told the name is not unique");
+  assert.equal(rows[0].nameDistinction, null, "but a label that does not discriminate is worse than none");
+});
+
+test("the view marks ambiguity, so every screen reading rows gets it", () => {
+  const view = buildActivationIssuingView({
+    devices: [
+      { device_id: "FZDEV-A", device_name: "DELL - FroozERP", last_active_at: "2026-09-19T13:52:48Z" },
+      { device_id: "FZDEV-B", device_name: "DELL - FroozERP", last_active_at: "2026-06-19T11:31:53Z" },
+    ],
+    licences: [],
+    today: "2026-09-19",
+  });
+  assert.equal(view.ok, true);
+  assert.equal(view.rows.every((row) => row.nameIsAmbiguous), true);
+});
+
+test("the screen shows the distinction, not only the id", () => {
+  const cell = sectionSource.slice(sectionSource.indexOf('<td className="primary-cell">'));
+  const nameCell = cell.slice(0, cell.indexOf("</td>"));
+  assert.match(nameCell, /row\.nameIsAmbiguous/, "the name cell must react to a shared name");
+  assert.match(nameCell, /Last seen /, "and date a device the reader can place in time");
+  assert.match(nameCell, /row\.deviceId/, "the id stays: this decides what has to be read, not what is shown");
 });
