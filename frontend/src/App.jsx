@@ -10267,7 +10267,23 @@ function DeviceActivationIssuingSection({ canIssue, devices, devicesError, onRel
                     type="radio"
                   />
                 </td>
-                <td className="primary-cell">{row.deviceName}<small className="cell-note">{row.deviceId || "No device ID"}</small></td>
+                <td className="primary-cell">
+                  {row.deviceName}
+                  {/* Two devices can carry the same name after a counter is rebuilt and registers
+                      again. When they do, the id below is the only thing separating them, and the
+                      release process requires that nobody has to read one. This says which is
+                      which out of something a person already knows. */}
+                  {row.nameIsAmbiguous && (
+                    <small className="cell-note">
+                      {row.nameDistinction?.kind === "counter"
+                        ? row.nameDistinction.value
+                        : row.nameDistinction?.kind === "lastSeen"
+                          ? `Last seen ${new Date(row.nameDistinction.value).toLocaleString("en-IN")}`
+                          : "Same name as another device — check the ID below before issuing"}
+                    </small>
+                  )}
+                  <small className="cell-note">{row.deviceId || "No device ID"}</small>
+                </td>
                 <td>{row.branchName || "Main Branch"}<small className="cell-note">{row.counterName || "No counter assigned"}</small></td>
                 <td>
                   <span className={stateClass(row.state)}>{row.label}</span>

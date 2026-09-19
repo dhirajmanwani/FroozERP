@@ -491,6 +491,58 @@ const EMPTY_SUMMARY = Object.freeze({
  * The summary is folded out of `rows`, the same array the table maps over, so the tiles and the
  * table cannot disagree.
  */
+/**
+ * Tell apart two devices that answer to the same name.
+ *
+ * A shop rebuilds a counter and registers it again, and the device list then holds two rows both
+ * called "DELL - FroozERP" -- same branch, both awaiting a licence, differing only in their
+ * `FZDEV-...` id and when they were last seen. Seen on a real device list on 2026-09-19.
+ *
+ * That matters more than it looks. `docs/production/RELEASE_AND_UPDATE_PROCESS.md` requires that
+ * "nobody should have to type or read out an FZDEV-... id anywhere in this flow", and with two
+ * identical names the id is the only thing left to read. A licence issued to the wrong one is
+ * bound to a machine that is not the one waiting to bill, and it fails at the counter rather than
+ * here.
+ *
+ * So the rows say which is which, out of facts a person already understands: the counter it is
+ * assigned to, or when it was last seen. The id stays on screen as it always was -- this decides
+ * what somebody has to *read* to choose correctly, not what is shown.
+ *
+ * When neither fact separates them the distinction is null rather than invented. Two devices with
+ * the same name, the same counter and the same last-seen genuinely cannot be told apart by
+ * anything but their id, and saying so beats a confident label that does not discriminate.
+ */
+export const markAmbiguousDeviceNames = (rows) => {
+  if (!Array.isArray(rows)) return [];
+  const byName = new Map();
+  for (const row of rows) {
+    const key = firstText(row?.deviceName).trim().toLowerCase();
+    if (!key) continue;
+    byName.set(key, [...(byName.get(key) || []), row]);
+  }
+
+  return rows.map((row) => {
+    const key = firstText(row?.deviceName).trim().toLowerCase();
+    const sharing = byName.get(key) || [];
+    if (sharing.length < 2) return { ...row, nameIsAmbiguous: false, nameDistinction: null };
+
+    // Unique *within the group of same-named rows* -- a counter every one of them shares
+    // distinguishes nothing, and offering it would read as an answer.
+    const uniqueWithin = (field) => {
+      const mine = firstText(row?.[field]);
+      if (!mine) return false;
+      return sharing.filter((other) => firstText(other?.[field]) === mine).length === 1;
+    };
+
+    const kind = uniqueWithin("counterName") ? "counter" : uniqueWithin("lastActiveAt") ? "lastSeen" : null;
+    return {
+      ...row,
+      nameIsAmbiguous: true,
+      nameDistinction: kind ? { kind, value: firstText(row[kind === "counter" ? "counterName" : "lastActiveAt"]) } : null,
+    };
+  });
+};
+
 export const buildActivationIssuingView = ({
   devices,
   licences,
@@ -519,7 +571,7 @@ export const buildActivationIssuingView = ({
     return failure("LICENCES_UNAVAILABLE", "The issued licences have not loaded yet, so it is not known which devices already have one.");
   }
 
-  const rows = devices.map((device) => describeDeviceActivation(device, licences, { today }));
+  const rows = markAmbiguousDeviceNames(devices.map((device) => describeDeviceActivation(device, licences, { today })));
 
   const summary = rows.reduce((totals, row) => ({
     total: totals.total + 1,
