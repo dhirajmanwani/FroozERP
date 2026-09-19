@@ -464,3 +464,39 @@ test("an unreadable clock does not count as inside the window", () => {
   assert.equal(window.within, false);
   assert.equal(window.reason, "UNREADABLE_TIME");
 });
+
+// --- the LOCAL_ONLY promise ---------------------------------------------------------------------
+
+test("the unattended runner refuses LOCAL_ONLY before it can reach anything", async () => {
+  // This is the one that matters most in this file. A device held in LOCAL_ONLY must make no
+  // outbound connection at all, and the updater's own `check()` reaches github.com from inside
+  // Rust where no JavaScript guard can see it. So the authority has to be asked before the plugin
+  // is even imported -- not after, and not from React state, which is one render behind it.
+  const fs = await import("node:fs");
+  const app = fs.readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  const start = app.indexOf("function AutoUpdateRunner");
+  assert.ok(start > 0, "the unattended runner must exist");
+  const runner = app.slice(start, app.indexOf("\nfunction ", start + 1));
+
+  const guard = runner.indexOf("isLocalOnlyConnectivitySelected()");
+  const pluginImport = runner.indexOf('import("@tauri-apps/plugin-updater")');
+  assert.ok(guard > 0, "the runner must ask the startup connectivity authority");
+  assert.ok(pluginImport > 0, "the runner must be the thing that loads the updater plugin");
+  assert.ok(guard < pluginImport, "LOCAL_ONLY must be refused before the updater plugin is loaded");
+
+  // And it must be an early return, not a condition wrapped around the check only.
+  assert.match(runner, /if \(isLocalOnlyConnectivitySelected\(\)\) return;/);
+  // The runner must never reach the feed over HTTP itself; the plugin is the only route out.
+  assert.doesNotMatch(runner, /axios\./, "the runner must not make its own HTTP calls");
+});
+
+test("the unattended install never asks a question nobody is there to answer", async () => {
+  const fs = await import("node:fs");
+  const app = fs.readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  const start = app.indexOf("function AutoUpdateRunner");
+  const runner = app.slice(start, app.indexOf("\nfunction ", start + 1));
+  assert.doesNotMatch(runner, /window\.confirm/, "a confirm dialog on an unattended machine is a counter stuck on a modal");
+  // It must still run the same preflight the manual path runs.
+  assert.match(runner, /sync_outbox_count/);
+  assert.match(runner, /prepare_update_installation/);
+});

@@ -6504,6 +6504,48 @@ tbody tr:last-child td {
   color: var(--info-ink);
 }
 
+/* The third bar in this band, and the only one that is normally absent. Given the attention family
+   rather than info or the gold base so that three bars stacked -- offline, viewing another shop,
+   and an update waiting -- are still three distinguishable things rather than one striped block.
+   The warning tone re-colours it again, because "the signature did not verify" and "this will
+   install tonight" must not look alike. */
+.local-only-banner[data-auto-update] {
+  border-color: var(--attention-line);
+  background: var(--attention-soft);
+}
+
+.local-only-banner[data-auto-update] strong {
+  color: var(--attention-ink);
+}
+
+.local-only-banner[data-auto-update] span {
+  color: var(--attention-ink);
+}
+
+.local-only-banner[data-auto-update="warning"] {
+  border-color: var(--warning-line);
+  background: var(--warning-soft);
+}
+
+.local-only-banner[data-auto-update="warning"] strong,
+.local-only-banner[data-auto-update="warning"] span {
+  color: var(--warning-ink);
+}
+
+/* The seven day boxes wrap rather than scroll: a counter screen is narrow and a day that has
+   scrolled out of sight is a day nobody knows is selected. */
+.auto-update-day-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+
+.auto-update-time-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+
 /* ---------------------------------------------------------------------------------------------
    Shell chrome: the collapsing rail, the top-bar controls, and the shortcut chips.
 
