@@ -6478,6 +6478,15 @@ tbody tr:last-child td {
   font: inherit;
 }
 
+/* The failure line that stands in for the dropdown. Warning-coloured rather than muted: this is
+   the app admitting it could not answer, and a grey sentence in a sidebar is read as a caption. */
+.sidebar-shop-notice {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--warning-ink);
+}
+
 /* Viewing another shop reuses the Local Only banner's layout: same shape, same place, and the
    reader already knows what a bar across the top of the content area means. The attribute selector
    re-colours it, so the two are never mistaken for one another -- and both can be on screen at

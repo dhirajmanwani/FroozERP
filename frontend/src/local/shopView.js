@@ -105,3 +105,15 @@ export const resolveShopViewPresentation = ({
 /** True when the picker itself should be on screen. */
 export const shopPickerVisible = (presentation) =>
   Boolean(presentation && presentation.status === SHOP_VIEW_STATUS.READY);
+
+/**
+ * True when the picker is absent for a reason the Owner has to be told about.
+ *
+ * `UNAVAILABLE` and the single-shop `HIDDEN` look identical on screen -- in both cases the
+ * dropdown simply is not there. One of them means "there is nothing to pick", the other means
+ * "we could not find out what there is to pick", and an Owner who reads the second as the first
+ * concludes their other shops have gone. This module already writes the sentence that tells them
+ * apart; this is what puts it on screen.
+ */
+export const shopPickerNoticeVisible = (presentation) =>
+  Boolean(presentation && presentation.status === SHOP_VIEW_STATUS.UNAVAILABLE && presentation.message);
