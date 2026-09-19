@@ -133,7 +133,7 @@ export const withinInstallWindow = ({ now = new Date(), schedule = null } = {}) 
   const crossesMidnight = plan.endMinute <= plan.startMinute;
   const allDay = plan.startMinute === plan.endMinute;
 
-  let within = false;
+  let within;
   if (allDay) {
     within = plan.days.includes(today);
   } else if (crossesMidnight) {
