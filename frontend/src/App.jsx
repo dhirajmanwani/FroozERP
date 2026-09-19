@@ -42,6 +42,17 @@ import {
 import { resolveOfflineOpenDecision } from "./local/offlineDataReadiness";
 import { allShopsHasFigures, resolveAllShopsPresentation } from "./local/allShopsSummary";
 import { resolveShopViewPresentation, shopPickerVisible, shopPickerNoticeVisible } from "./local/shopView";
+import {
+  AUTO_UPDATE_DEFAULTS,
+  WEEKDAY_NAMES,
+  describeAutoUpdateNotice,
+  formatMinuteOfDay,
+  normalizeInstallSchedule,
+  resolveInstallDecision,
+  shouldCheckForUpdate,
+  shouldDownloadUpdate,
+} from "./local/autoUpdate";
+import { collectWorkInProgress } from "./local/deviceWorkInProgress";
 import { ORDER_STATUS } from "./local/orderLifecycle";
 import { STOCK_TRUSTED_FOR_HOURS, buildCatalogue, catalogueFilename, describeExport } from "./local/catalogueExport";
 import {
@@ -1652,6 +1663,13 @@ const defaultDeviceControlSettings = {
   fullscreen_lock_enabled: false,
   require_exit_code_to_close: true,
   exit_code_configured: false,
+  // Matches the column defaults: on, every day, ten at night until six in the morning. A device
+  // whose settings have not loaded yet therefore reads as "on", which is the safe way round --
+  // the schedule and the work-in-progress rules still decide whether anything actually happens.
+  auto_update_enabled: true,
+  auto_update_days: "0,1,2,3,4,5,6",
+  auto_update_start_minute: 22 * 60,
+  auto_update_end_minute: 6 * 60,
   updated_at: "",
 };
 
@@ -2315,6 +2333,43 @@ function App() {
   const [selectedInvoice, setSelectedInvoice] = useState(null);
   const [selectedInvoicePrintMode, setSelectedInvoicePrintMode] = useState(null);
   const [cancelDraft, setCancelDraft] = useState(null);
+  /**
+   * What the two components that hold their own work are doing.
+   *
+   * The POS cart and the backup flag live inside their components and are invisible from here,
+   * which was harmless while every update was installed by a person who could see the screen. An
+   * update that installs itself has to know, so both report up. The setters compare before they
+   * store: a fresh object on every render would restart the effects below on every keystroke.
+   */
+  const [posWork, setPosWork] = useState({ cartLines: 0, saving: false });
+  const [backupBusy, setBackupBusy] = useState(false);
+  const handlePosWorkChange = useCallback((next) => {
+    setPosWork((current) => (
+      current.cartLines === next.cartLines && current.saving === next.saving ? current : next
+    ));
+  }, []);
+  const handleBackupBusyChange = useCallback((busy) => {
+    setBackupBusy((current) => (current === busy ? current : busy));
+  }, []);
+  /**
+   * Roughly when somebody last touched this machine.
+   *
+   * Only an automatic install reads it, and it only ever asks "has this been quiet for five
+   * minutes", so it is stored at a one-minute resolution. Storing every event would re-render the
+   * whole shell on every keystroke of every bill, which is a real cost for an answer nobody needs
+   * that precisely.
+   */
+  const [lastActivityAt, setLastActivityAt] = useState(() => Date.now());
+  useEffect(() => {
+    const note = () => {
+      setLastActivityAt((current) => (Date.now() - current > 60 * 1000 ? Date.now() : current));
+    };
+    const events = ["pointerdown", "keydown", "wheel", "touchstart"];
+    for (const name of events) window.addEventListener(name, note, { passive: true });
+    return () => {
+      for (const name of events) window.removeEventListener(name, note);
+    };
+  }, []);
   const [posRefreshToken, setPosRefreshToken] = useState(0);
   const [editingSale, setEditingSale] = useState(null);
   const [saleEditLoading, setSaleEditLoading] = useState(false);
@@ -7554,6 +7609,47 @@ function App() {
       ))
     : null;
 
+  /**
+   * Everything on this machine that a restart would interrupt, and when somebody last touched it.
+   *
+   * Assembled here because this is the only place that can see all of it. The list itself is
+   * decided in `local/deviceWorkInProgress.js`, and a fact missing from this literal reads there
+   * as "not busy" -- which is why that module's test reads this file and fails if any of them
+   * stops being passed.
+   */
+  const deviceWorkInProgress = collectWorkInProgress({
+    posCartLines: posWork.cartLines,
+    posSaving: posWork.saving,
+    purchaseCartLines: purchaseCart.length,
+    purchaseSaving: purchaseSaveBusy,
+    pendingOrderBill,
+    editingSale,
+    cancelDraft,
+    lotAction,
+    editingProductId,
+    editingPurchaseId,
+    addingOpeningStock: addOpeningStock || showOpeningLotForm,
+    printingInvoice: selectedInvoicePrintMode,
+    pendingSyncOperations: syncStatus?.pendingOperations,
+    backupRunning: backupBusy,
+    shopSwitching: shopSwitchBusy,
+    distributionBusy,
+    orderActionBusy,
+    orderRoutingBusy,
+    connectivitySwitching: connectivityModeSwitching,
+    startupSettled: localServiceStartupState !== "starting",
+  });
+
+  const deviceControl = settingsData.deviceControlSettings || {};
+  const autoUpdateEnabled = deviceControl.auto_update_enabled !== false;
+  const autoUpdateSchedule = normalizeInstallSchedule({
+    days: typeof deviceControl.auto_update_days === "string"
+      ? deviceControl.auto_update_days.split(",")
+      : deviceControl.auto_update_days,
+    startMinute: deviceControl.auto_update_start_minute,
+    endMinute: deviceControl.auto_update_end_minute,
+  });
+
   const shopView = resolveShopViewPresentation({
     loadState: shopViewState.loadState,
     loadError: shopViewState.loadError,
@@ -7839,6 +7935,15 @@ function App() {
               )}
             </div>
           )}
+          {/* Below both of the above on purpose: an update that will install tonight is the least
+              urgent of the three, and unlike them it is usually absent. */}
+          <AutoUpdateRunner
+            busyReasons={deviceWorkInProgress}
+            enabled={autoUpdateEnabled}
+            lastActivityAt={lastActivityAt}
+            online={Boolean(backendHealth.online) && !offlineMode}
+            schedule={autoUpdateSchedule}
+          />
           {(startupNotice || startupError || syncMessage) && (
             <div className={`startup-status-panel ${startupError ? "startup-status-error" : ""}`}>
               {startupError && <p>{startupError}</p>}
@@ -8477,6 +8582,7 @@ function App() {
 
           {activeView === "sales" && (
             <PosBilling
+              onWorkChange={handlePosWorkChange}
               chargeTypes={chargeTypes}
               customers={customers.filter((customer) => customer.active !== false)}
               orders={ordersState.orders}
@@ -8577,6 +8683,7 @@ function App() {
           {activeView === "settings" && (
             <ModuleErrorBoundary onClose={() => setActiveView("dashboard")}>
               <SettingsModule
+                onBackupBusyChange={handleBackupBusyChange}
                 themeMode={themeMode}
                 setThemeMode={setThemeMode}
                 systemPrefersDark={systemPrefersDark}
@@ -16512,6 +16619,7 @@ class SettingsSectionErrorBoundary extends React.Component {
 
 function SettingsModule({
   applicationFontSize,
+  onBackupBusyChange,
   themeMode,
   setThemeMode,
   systemPrefersDark,
@@ -16642,7 +16750,7 @@ function SettingsModule({
     ),
     "settings/updates": (
       <SettingsSectionErrorBoundary sectionName="Update Center">
-        <UpdateCenterSection canManage={canManage} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
+        <UpdateCenterSection canManage={canManage} deviceControlSettings={settingsData.deviceControlSettings} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
       </SettingsSectionErrorBoundary>
     ),
     "settings/sync": (
@@ -16677,7 +16785,7 @@ function SettingsModule({
         user={user}
       />
     ),
-    "settings/backup": <BackupSettings backupLogs={settingsData.backupLogs || []} backupSettings={settingsData.backupSettings} canManage={canManage} onReload={onReload} user={user} />,
+    "settings/backup": <BackupSettings backupLogs={settingsData.backupLogs || []} backupSettings={settingsData.backupSettings} canManage={canManage} onBusyChange={onBackupBusyChange} onReload={onReload} user={user} />,
     "settings/system-info": <SystemInfoSection systemInfo={settingsData.systemInfo || {}} />,
   };
 
@@ -17805,7 +17913,291 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
   );
 }
 
-function UpdateCenterSection({ canManage }) {
+/**
+ * Updating without anybody standing at the machine.
+ *
+ * `UpdateCenterSection` below is the screen a person opens to update by hand. It only checks while
+ * that screen is open, which is fine on one laptop and useless across a shop full of counters --
+ * nobody walks to each machine, so most of them are never updated at all.
+ *
+ * This is the other half: it runs in the shell, so it runs everywhere, all the time. Everything it
+ * is allowed to do is decided in `local/autoUpdate.js`, which is where the reasoning is written
+ * down and tested. This component is only the hands.
+ *
+ * Two guards are here rather than in that module because they are about this file's own plumbing:
+ *
+ * LOCAL_ONLY. A device held offline must make no outbound connection at all, and the updater's
+ * `check()` reaches github.com from inside Rust where no JavaScript guard can see it. So the
+ * authority is asked here, before the plugin is even imported, and again on every step. The policy
+ * module refuses LOCAL_ONLY too; this is the belt to its braces, and neither is redundant, because
+ * the React connectivity state is one render behind the authority.
+ *
+ * No confirmation dialog. The manual path asks `window.confirm` before installing. Unattended there
+ * is nobody to answer, so instead of a dialog this waits for a machine with no work on it, inside
+ * the hours that machine was given, and says on screen what it is waiting for.
+ */
+function AutoUpdateRunner({ busyReasons = [], enabled = false, lastActivityAt = null, online = false, schedule = null }) {
+  const [state, setState] = useState({
+    phase: "idle",
+    latestVersion: "",
+    lastCheckedAt: null,
+    lastCheckFailed: false,
+    consecutiveFailures: 0,
+    failureMessage: "",
+    signatureVerified: false,
+  });
+  const [tick, setTick] = useState(0);
+  const updateRef = useRef(null);
+  const stepRunningRef = useRef(false);
+  const installingRef = useRef(false);
+  /**
+   * Alive, not "this effect run is still the current one".
+   *
+   * The effect below re-runs on every beat, so a per-run cancellation flag would be set on the
+   * download started a minute ago -- and a download takes longer than a minute. Its result would
+   * then be thrown away with the phase left on `downloading`, which refuses every later step and
+   * parks the device there for good. Only unmounting is a reason to drop an answer.
+   */
+  const mountedRef = useRef(true);
+  useEffect(() => () => { mountedRef.current = false; }, []);
+
+  // One beat a minute. Everything below does at most one thing per beat, so a slow download or a
+  // sidecar that takes its time unlocking can never have a second attempt started on top of it.
+  useEffect(() => {
+    const timer = setInterval(() => setTick((current) => current + 1), 60 * 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const busyIds = busyReasons.map((entry) => entry.id).join("|");
+
+  useEffect(() => {
+    if (!isDesktopShell()) return undefined;
+    const step = async () => {
+      if (stepRunningRef.current) return;
+      stepRunningRef.current = true;
+      try {
+        // Asked first, every beat, and asked of the startup authority rather than React state so
+        // it cannot be a render out of date.
+        if (isLocalOnlyConnectivitySelected()) return;
+
+        const check = shouldCheckForUpdate({
+          enabled,
+          feedConfigured: Boolean(UPDATE_FEED_URL),
+          updaterAvailable: true,
+          online,
+          connectivityMode: isLocalOnlyConnectivitySelected() ? CONNECTIVITY_MODES.LOCAL_ONLY : CONNECTIVITY_MODES.AUTO,
+          phase: state.phase,
+          lastCheckedAt: state.lastCheckedAt,
+          lastCheckFailed: state.lastCheckFailed,
+          checkIntervalMs: AUTO_UPDATE_DEFAULTS.checkIntervalMs,
+        });
+        if (check.check) {
+          setState((current) => ({ ...current, phase: "checking" }));
+          try {
+            const { check: pluginCheck } = await import("@tauri-apps/plugin-updater");
+            const found = await pluginCheck();
+            if (!mountedRef.current) return;
+            updateRef.current = found || null;
+            setState((current) => ({
+              ...current,
+              phase: found ? "update_available" : "up_to_date",
+              latestVersion: found?.version || "",
+              lastCheckedAt: new Date().toISOString(),
+              lastCheckFailed: false,
+              consecutiveFailures: 0,
+              failureMessage: "",
+            }));
+          } catch (error) {
+            if (!mountedRef.current) return;
+            // Counted rather than shouted about. One failed check is the internet; the sentence on
+            // screen only appears once it has happened twice, because a shop that has silently
+            // stopped checking looks exactly like a shop that is up to date.
+            setState((current) => ({
+              ...current,
+              phase: "error",
+              lastCheckedAt: new Date().toISOString(),
+              lastCheckFailed: true,
+              consecutiveFailures: current.consecutiveFailures + 1,
+              failureMessage: getErrorMessage(error, "the update feed could not be reached"),
+            }));
+          }
+          return;
+        }
+
+        const download = shouldDownloadUpdate({
+          enabled,
+          phase: state.phase,
+          updateAvailable: Boolean(updateRef.current) && state.phase === "update_available",
+          alreadyDownloaded: state.signatureVerified,
+          online,
+          connectivityMode: isLocalOnlyConnectivitySelected() ? CONNECTIVITY_MODES.LOCAL_ONLY : CONNECTIVITY_MODES.AUTO,
+        });
+        if (download.download && updateRef.current) {
+          setState((current) => ({ ...current, phase: "downloading" }));
+          try {
+            await updateRef.current.download();
+            if (!mountedRef.current) return;
+            // The plugin verifies the signature against the public key in tauri.conf.json and
+            // rejects the payload itself if it does not match, so reaching here is the
+            // verification having passed.
+            setState((current) => ({ ...current, phase: "ready_to_install", signatureVerified: true }));
+          } catch (error) {
+            if (!mountedRef.current) return;
+            setState((current) => ({
+              ...current,
+              phase: "error",
+              signatureVerified: false,
+              failureMessage: getErrorMessage(error, "the update could not be downloaded"),
+            }));
+          }
+        }
+      } finally {
+        stepRunningRef.current = false;
+      }
+    };
+    step();
+    return undefined;
+  }, [tick, enabled, online, state.phase, state.lastCheckedAt, state.lastCheckFailed, state.signatureVerified]);
+
+  const decision = resolveInstallDecision({
+    enabled,
+    readyToInstall: state.phase === "ready_to_install",
+    signatureVerified: state.signatureVerified,
+    phase: state.phase,
+    busyReasons,
+    lastActivityAt,
+    schedule,
+  });
+
+  const install = async (requestedByUser) => {
+    const update = updateRef.current;
+    const verdict = resolveInstallDecision({
+      enabled,
+      readyToInstall: state.phase === "ready_to_install",
+      signatureVerified: state.signatureVerified,
+      phase: state.phase,
+      busyReasons,
+      lastActivityAt,
+      schedule,
+      requestedByUser,
+    });
+    if (!verdict.install || !update) return;
+    // `decision.install` stays true until the state below commits, and the effect that calls this
+    // re-runs on every beat, so without this a second install can start while the first is still
+    // in its first await.
+    if (installingRef.current) return;
+    installingRef.current = true;
+    setState((current) => ({ ...current, phase: "installing" }));
+    try {
+      // The same preflight the manual path runs. `sync_outbox_count` is already one of the busy
+      // reasons above, but it is asked again here because the answer may have changed between the
+      // decision and this line, and an install that strands unsent sales is not recoverable by
+      // re-billing.
+      const localStatus = await invokeTauriCommand("local_db_status");
+      const pendingSync = await invokeTauriCommand("sync_outbox_count");
+      if (pendingSync && Number(pendingSync) > 0) throw new Error(`${pendingSync} sale(s) are still waiting to be sent.`);
+      if (localStatus?.initialized === false) throw new Error("The local database is not ready.");
+      const preparation = await invokeTauriCommand("prepare_update_installation", { targetVersion: state.latestVersion || "" });
+      if (preparation && preparation.unlocked === false) throw new Error(preparation.message || "The backend is still running.");
+      await update.install();
+      const { relaunch } = await import("@tauri-apps/plugin-process");
+      await relaunch();
+    } catch (error) {
+      installingRef.current = false;
+      setState((current) => ({
+        ...current,
+        phase: "error",
+        failureMessage: getErrorMessage(error, "the update could not be installed"),
+      }));
+    }
+  };
+
+  useEffect(() => {
+    if (decision.install) install(false);
+    // `busyIds` rather than the array: a new array with the same contents must not retry.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [decision.install, busyIds, tick]);
+
+  const notice = describeAutoUpdateNotice({
+    enabled,
+    phase: state.phase,
+    latestVersion: state.latestVersion,
+    decision,
+    consecutiveFailures: state.consecutiveFailures,
+    failureMessage: state.failureMessage,
+  });
+  if (!notice) return null;
+
+  return (
+    <div className="local-only-banner" data-auto-update={notice.tone} role={notice.tone === "warning" ? "alert" : "status"}>
+      <div>
+        <strong>FroozERP update</strong>
+        <span>{notice.text}</span>
+        {notice.nextWindowAt && (
+          <span>Next update time: {new Date(notice.nextWindowAt).toLocaleString("en-IN")}</span>
+        )}
+      </div>
+      {notice.actionLabel === "Install now" && (
+        <button className="primary-button" disabled={state.phase === "installing"} onClick={() => install(true)}>
+          {state.phase === "installing" ? "Installing..." : "Install now"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceControlSettings, onReload }) {
+  /**
+   * When this particular counter is allowed to update itself.
+   *
+   * Kept per device rather than per shop, because the point of the setting is that two counters
+   * can be given different nights: a release then reaches the whole shop unattended but in waves,
+   * and the first wave is small enough to notice before the second.
+   */
+  const storedSchedule = normalizeInstallSchedule({
+    days: typeof deviceControlSettings?.auto_update_days === "string"
+      ? deviceControlSettings.auto_update_days.split(",")
+      : deviceControlSettings?.auto_update_days,
+    startMinute: deviceControlSettings?.auto_update_start_minute,
+    endMinute: deviceControlSettings?.auto_update_end_minute,
+  });
+  const [scheduleDraft, setScheduleDraft] = useState(() => ({
+    enabled: deviceControlSettings?.auto_update_enabled !== false,
+    days: storedSchedule.days,
+    startMinute: storedSchedule.startMinute,
+    endMinute: storedSchedule.endMinute,
+  }));
+  const [scheduleMessage, setScheduleMessage] = useState("");
+  const [scheduleBusy, setScheduleBusy] = useState(false);
+  const toggleDay = (day) => setScheduleDraft((current) => {
+    const days = current.days.includes(day)
+      ? current.days.filter((entry) => entry !== day)
+      : [...current.days, day].sort((a, b) => a - b);
+    return { ...current, days };
+  });
+  const saveSchedule = async () => {
+    // Refused here as well as in the backend. A device with no days can never install and looks
+    // exactly like the feature being broken, so it must not be possible to save one by accident.
+    if (!scheduleDraft.days.length) {
+      setScheduleMessage("Pick at least one day, or switch automatic updates off instead.");
+      return;
+    }
+    setScheduleBusy(true);
+    try {
+      await axios.put(`${API_URL}/settings/device-control`, {
+        auto_update_enabled: scheduleDraft.enabled === true,
+        auto_update_days: scheduleDraft.days.join(","),
+        auto_update_start_minute: scheduleDraft.startMinute,
+        auto_update_end_minute: scheduleDraft.endMinute,
+      });
+      setScheduleMessage("Update hours saved for this device.");
+      if (onReload) await onReload();
+    } catch (error) {
+      setScheduleMessage(getErrorMessage(error, "Unable to save the update hours for this device"));
+    } finally {
+      setScheduleBusy(false);
+    }
+  };
   const [cleanupResult, setCleanupResult] = useState(null);
   const [cleanupBusy, setCleanupBusy] = useState(false);
   const [installDiagnostics, setInstallDiagnostics] = useState(null);
@@ -18261,6 +18653,33 @@ function UpdateCenterSection({ canManage }) {
         <button className="secondary-button" disabled={!canManage || !desktopUpdaterAvailable || !updateAvailable || updateDownloaded || buttonsBusy} onClick={downloadUpdate}>Download Update</button>
         <button className="primary-button" disabled={!canManage || !desktopUpdaterAvailable || !canInstallUpdate || buttonsBusy} onClick={installAndRestart}>Install and Restart</button>
         {updateAvailable && <button className="secondary-button" disabled={!canManage || buttonsBusy} onClick={() => setUpdaterState((current) => ({ ...current, errorMessage: "Reminder saved for this session." }))}>Remind Me Later</button>}
+      </div>
+      <div className="maintenance-cleanup-panel">
+        <strong>Automatic Updates</strong>
+        <span>This device checks on its own and installs during the hours below. A bill in progress always wins: nothing restarts until the counter is free.</span>
+        <label className="check-field report-check-field">
+          <input checked={scheduleDraft.enabled} disabled={!canManage} type="checkbox" onChange={(event) => setScheduleDraft((current) => ({ ...current, enabled: event.target.checked }))} />
+          <span>Install updates on this device automatically</span>
+        </label>
+        <div className="auto-update-day-row">
+          {WEEKDAY_NAMES.map((name, day) => (
+            <label className="check-field report-check-field" key={name}>
+              <input checked={scheduleDraft.days.includes(day)} disabled={!canManage || !scheduleDraft.enabled} type="checkbox" onChange={() => toggleDay(day)} />
+              <span>{name}</span>
+            </label>
+          ))}
+        </div>
+        {/* Its own class rather than the settings form grid: that one is guarded against inside
+            this section, because a duplicate of it here was a legacy bug once. */}
+        <div className="auto-update-time-row">
+          <Field label="From"><input disabled={!canManage || !scheduleDraft.enabled} type="time" value={formatMinuteOfDay(scheduleDraft.startMinute)} onChange={(event) => setScheduleDraft((current) => ({ ...current, startMinute: normalizeInstallSchedule({ days: current.days, start: event.target.value, end: current.endMinute }).startMinute }))} /></Field>
+          <Field label="Until"><input disabled={!canManage || !scheduleDraft.enabled} type="time" value={formatMinuteOfDay(scheduleDraft.endMinute)} onChange={(event) => setScheduleDraft((current) => ({ ...current, endMinute: normalizeInstallSchedule({ days: current.days, start: current.startMinute, end: event.target.value }).endMinute }))} /></Field>
+        </div>
+        <small>A time that ends before it starts runs overnight, so 22:00 until 06:00 means that night into the next morning.</small>
+        {scheduleMessage && <small>{scheduleMessage}</small>}
+        <div className="button-row">
+          <button className="primary-button" disabled={!canManage || scheduleBusy} onClick={saveSchedule}>{scheduleBusy ? "Saving..." : "Save Update Hours"}</button>
+        </div>
       </div>
       <div className="maintenance-cleanup-panel">
         <strong>Updates / Maintenance</strong>
@@ -19080,7 +19499,7 @@ function LegacyBranchCounterSettings({ branches, canManage, counters, onReload, 
   );
 }
 
-function BackupSettings({ backupLogs = [], backupSettings, canManage, onReload, user }) {
+function BackupSettings({ backupLogs = [], backupSettings, canManage, onBusyChange, onReload, user }) {
   const [draft, setDraft] = useState({
     auto_backup_enabled: backupSettings?.auto_backup_enabled !== false,
     backup_on_shutdown: backupSettings?.backup_on_shutdown !== false,
@@ -19089,6 +19508,11 @@ function BackupSettings({ backupLogs = [], backupSettings, canManage, onReload, 
     backup_location: backupSettings?.backup_location || "",
   });
   const [busy, setBusy] = useState(false);
+  // A backup mid-write is the one thing on this screen a restart would leave truncated, and the
+  // shell cannot see this flag from outside the component.
+  useEffect(() => {
+    onBusyChange?.(busy);
+  }, [busy, onBusyChange]);
   const save = async () => {
     try {
       await axios.put(`${API_URL}/settings/backup`, { ...draft, updated_by: user.id });
@@ -19542,7 +19966,7 @@ function OtherChargesPanel({ canTypeAmount = false, chargeTypes = [], lines = []
   );
 }
 
-function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, onSeedConsumed, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
+function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, onSeedConsumed, onWorkChange, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
   /**
    * The charges this bill has picked: which charge, how much of it, and how many.
    *
@@ -19571,6 +19995,17 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
   const [billDateTime, setBillDateTime] = useState(currentDateTimeLocal);
   const [saving, setSaving] = useState(false);
   const [lastInvoice, setLastInvoice] = useState(null);
+  /**
+   * Tell the shell whether this counter is mid-bill.
+   *
+   * The cart lives here and nowhere else, so without this the rest of the app cannot tell a
+   * counter with a half-made bill on it from an idle one. That matters now that an update can
+   * install itself: a restart in the wrong second loses the bill with the customer standing
+   * there. Only the two facts that decide it go up, never the cart itself.
+   */
+  useEffect(() => {
+    onWorkChange?.({ cartLines: cart.length, saving });
+  }, [cart.length, saving, onWorkChange]);
   const searchRef = useRef(null);
   const barcodeRef = useRef(null);
   const quantityRefs = useRef({});

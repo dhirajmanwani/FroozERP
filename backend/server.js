@@ -696,6 +696,134 @@ const maskAccessToken = (value) => {
   if (!token) return "";
   return `${token.slice(0, 5)}...${token.slice(-4)}`;
 };
+
+/*
+ * Unattended updates: when this device is allowed to install one and restart itself.
+ *
+ * The decision is made in `frontend/src/local/autoUpdate.js`; everything here is only about
+ * storing the answer and handing it back in the shape that module speaks. The defaults are its
+ * `AUTO_UPDATE_DEFAULT_SCHEDULE` -- every day, 22:00 to 06:00, switched on -- and they are
+ * repeated here rather than imported because that module is ESM in the frontend tree and this
+ * file is CommonJS. If one side moves, `autoUpdateDeviceSettings.test.js` fails.
+ *
+ * Two rules run through all of it, and both exist because the failure they prevent is invisible:
+ *
+ *   - **An empty day list is never stored.** A device with no days can never install, which looks
+ *     exactly like the feature being broken and which nobody chooses on purpose. Unreadable input
+ *     is refused at the route; an unreadable *stored* value reads back as all seven days.
+ *   - **A minute is never coerced.** 0 is midnight, a perfectly good setting, so silently turning
+ *     a bad value into 0 would move a shop's restart to midnight and look deliberate. Anything
+ *     that is not a minute of the day is refused instead.
+ */
+const AUTO_UPDATE_ALL_DAYS = "0,1,2,3,4,5,6";
+const AUTO_UPDATE_DEFAULT_START_MINUTE = 22 * 60;
+const AUTO_UPDATE_DEFAULT_END_MINUTE = 6 * 60;
+const MINUTES_IN_DAY = 24 * 60;
+// `Date.getDay()` order, so the index is the stored number. Accepted on input because
+// autoUpdate.js speaks these too and a body that carries them should not be a 400.
+const AUTO_UPDATE_WEEKDAY_NAMES = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+
+// "t"/"f" are here for a SQLite sidecar or a driver that hands booleans back as 0/1 or as single
+// characters. `=== true` would read every one of those as off.
+const BOOLEAN_TRUE_TEXT = new Set(["true", "t", "1", "yes", "on"]);
+const BOOLEAN_FALSE_TEXT = new Set(["false", "f", "0", "no", "off"]);
+
+/** A boolean, or null for "that was not a boolean" -- never a silent false. */
+const parseStrictBoolean = (value) => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (value === 1) return true;
+    if (value === 0) return false;
+    return null;
+  }
+  if (typeof value === "string") {
+    const text = value.trim().toLowerCase();
+    if (BOOLEAN_TRUE_TEXT.has(text)) return true;
+    if (BOOLEAN_FALSE_TEXT.has(text)) return false;
+  }
+  return null;
+};
+
+/** One day of the week as 0-6, or null. Accepts 3, "3" and "WED". */
+const parseAutoUpdateDay = (value) => {
+  if (typeof value === "number") {
+    return Number.isInteger(value) && value >= 0 && value <= 6 ? value : null;
+  }
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  if (/^\d+$/.test(text)) {
+    const day = Number(text);
+    return day <= 6 ? day : null;
+  }
+  const index = AUTO_UPDATE_WEEKDAY_NAMES.indexOf(text.toUpperCase().slice(0, 3));
+  return index === -1 ? null : index;
+};
+
+/**
+ * An array or a comma-separated string of days, as the normalised stored string -- or null if any
+ * entry is unreadable or nothing readable is left.
+ *
+ * Null rather than a fallback on purpose: the two callers want opposite things from it. The route
+ * refuses, so a typo is told to the person who made it; the presenter falls back to all seven, so
+ * a row written before these columns existed is not reported as a device that can never update.
+ * De-duplicated and sorted so "6,1,1" and [1, 6] are the same stored value and a settings screen
+ * cannot show two devices as different when they are not.
+ */
+const normalizeAutoUpdateDays = (value) => {
+  const entries = Array.isArray(value) ? value : String(value ?? "").split(",");
+  const present = entries.filter((entry) => !(entry === null || entry === undefined || (typeof entry === "string" && !entry.trim())));
+  if (!present.length) return null;
+  const parsed = present.map(parseAutoUpdateDay);
+  if (parsed.some((day) => day === null)) return null;
+  return [...new Set(parsed)].sort((a, b) => a - b).join(",");
+};
+
+/** A minute of the day as 0-1439, or null. Accepts 1320, "1320" and "22:00". */
+const parseMinuteOfDay = (value) => {
+  if (typeof value === "number") {
+    return Number.isInteger(value) && value >= 0 && value < MINUTES_IN_DAY ? value : null;
+  }
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (!text) return null;
+  if (/^\d+$/.test(text)) {
+    const minute = Number(text);
+    return minute < MINUTES_IN_DAY ? minute : null;
+  }
+  const match = /^(\d{1,2}):(\d{2})(?::\d{2})?$/.exec(text);
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours > 23 || minutes > 59) return null;
+  return (hours * 60) + minutes;
+};
+
+/**
+ * The one definition of what a device-control row looks like on the wire.
+ *
+ * `GET /settings/device-control`, the `deviceControlSettings` slice of `getSettingsBundle` and the
+ * response of `PUT /settings/device-control` all return this and nothing else. They used to hold
+ * three hand-written copies of the same four fields with a comment asking future readers to keep
+ * them identical; with seven fields that comment was going to lose. `exit_code_hash` is reported
+ * only as the boolean `exit_code_configured` -- the hash itself never leaves the server, and this
+ * being the only presenter is what keeps that true on all three routes at once.
+ */
+const presentDeviceControlSettings = (row) => {
+  const settings = row && typeof row === "object" ? row : {};
+  const autoUpdateEnabled = parseStrictBoolean(settings.auto_update_enabled);
+  return {
+    fullscreen_lock_enabled: settings.fullscreen_lock_enabled === true,
+    require_exit_code_to_close: settings.require_exit_code_to_close !== false,
+    exit_code_configured: Boolean(settings.exit_code_hash),
+    // Absent (an install whose row predates the columns) reads as the default, which is on. A
+    // device silently reported as opted out is the failure this whole feature is trying to end.
+    auto_update_enabled: autoUpdateEnabled === null ? true : autoUpdateEnabled,
+    auto_update_days: normalizeAutoUpdateDays(settings.auto_update_days) || AUTO_UPDATE_ALL_DAYS,
+    auto_update_start_minute: parseMinuteOfDay(settings.auto_update_start_minute) ?? AUTO_UPDATE_DEFAULT_START_MINUTE,
+    auto_update_end_minute: parseMinuteOfDay(settings.auto_update_end_minute) ?? AUTO_UPDATE_DEFAULT_END_MINUTE,
+    updated_at: settings.updated_at || "",
+  };
+};
 const hashSensitiveValue = (value) =>
   crypto.createHash("sha256").update(String(value || "").trim().toLowerCase(), "utf8").digest("hex");
 const recoveryOtpSecret = process.env.RECOVERY_OTP_HASH_SECRET || process.env.OTP_HASH_SECRET || process.env.DB_PASSWORD || "froozerp-local-dev-otp-secret";
@@ -2633,9 +2761,38 @@ const initializeDatabase = async () => {
       fullscreen_lock_enabled BOOLEAN DEFAULT FALSE,
       require_exit_code_to_close BOOLEAN DEFAULT TRUE,
       exit_code_hash TEXT,
+      -- When this machine is allowed to update itself, unattended.
+      --
+      -- This table is the right home for it because it is a single row (id = 1) in whatever
+      -- database this backend instance serves -- and on a counter machine that is that machine's
+      -- own local SQLite sidecar. So each counter carries its own answer and it does not
+      -- replicate to the counter beside it, which is the whole point: a shop can put one counter
+      -- on Saturday night and another on Sunday night, so a bad release arrives in waves small
+      -- enough to notice rather than reaching every till at once.
+      --
+      -- The decision logic that reads these lives in frontend/src/local/autoUpdate.js. The
+      -- defaults here are its AUTO_UPDATE_DEFAULT_SCHEDULE, written out: every day, 22:00 to
+      -- 06:00, switched on. Nights, because the counter is shut then and the restart costs nobody
+      -- anything; a default of "whenever" would put the first automatic restart in the middle of
+      -- a working afternoon on a machine whose owner never opened the setting.
+      --
+      -- auto_update_days is comma-separated Date.getDay() numbers, 0 = Sunday. Stored as text
+      -- rather than an array because the same four columns have to exist in the SQLite sidecar,
+      -- which has no array type.
+      auto_update_enabled BOOLEAN DEFAULT TRUE,
+      auto_update_days TEXT DEFAULT '0,1,2,3,4,5,6',
+      auto_update_start_minute INTEGER DEFAULT 1320,
+      auto_update_end_minute INTEGER DEFAULT 360,
       updated_by INTEGER REFERENCES users(id),
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    -- CREATE TABLE IF NOT EXISTS above does nothing on an install that already has this table, so
+    -- every existing device would be missing all four. These carry them forward, and they are what
+    -- schemaContract.js reads to know the columns are declared at all.
+    ALTER TABLE device_control_settings ADD COLUMN IF NOT EXISTS auto_update_enabled BOOLEAN DEFAULT TRUE;
+    ALTER TABLE device_control_settings ADD COLUMN IF NOT EXISTS auto_update_days TEXT DEFAULT '0,1,2,3,4,5,6';
+    ALTER TABLE device_control_settings ADD COLUMN IF NOT EXISTS auto_update_start_minute INTEGER DEFAULT 1320;
+    ALTER TABLE device_control_settings ADD COLUMN IF NOT EXISTS auto_update_end_minute INTEGER DEFAULT 360;
 
     CREATE TABLE IF NOT EXISTS device_exit_attempt_logs (
       id SERIAL PRIMARY KEY,
@@ -5434,12 +5591,8 @@ const getSettingsBundle = async (auth, deviceId = "") => {
       access_token_masked: maskAccessToken(whatsappSettings.access_token),
       updated_at: whatsappSettings.updated_at || "",
     },
-    deviceControlSettings: {
-      fullscreen_lock_enabled: deviceControlSettings.fullscreen_lock_enabled === true,
-      require_exit_code_to_close: deviceControlSettings.require_exit_code_to_close !== false,
-      exit_code_configured: Boolean(deviceControlSettings.exit_code_hash),
-      updated_at: deviceControlSettings.updated_at || "",
-    },
+    // Same presenter as `GET /settings/device-control`, so the two shapes cannot drift.
+    deviceControlSettings: presentDeviceControlSettings(deviceControlSettings),
     mandiTaxRules: mandiResult.rows,
     rebateRules: rebateResult.rows,
     /*
@@ -6894,22 +7047,23 @@ app.get("/settings", async (req, res) => {
  * behind the session gate.
  *
  * The response shape is deliberately identical to the `deviceControlSettings` slice of
- * `getSettingsBundle`, so the caller reads the same object from either route. `exit_code_hash` is
+ * `getSettingsBundle`, so the caller reads the same object from either route -- both now call
+ * `presentDeviceControlSettings`, so that is enforced rather than remembered. `exit_code_hash` is
  * reported only as the boolean `exit_code_configured`; the hash itself never leaves the server, on
  * this route least of all.
+ *
+ * The four auto-update fields ride along, and they are readable before sign-in as a consequence.
+ * Attacker gets: the hours this counter is willing to restart itself in. That is a small hint about
+ * when nobody is watching the shop, and it is accepted here because the shell has to know its own
+ * schedule before anyone signs in -- an unattended update on a counter left at the login screen
+ * overnight is the exact case this feature exists for. It is worth revisiting if this API is ever
+ * exposed beyond a shop LAN.
  */
 app.get("/settings/device-control", async (_req, res) => {
   try {
     const result = await pool.query("SELECT * FROM device_control_settings WHERE id = 1");
     const settings = result.rows[0] || {};
-    return res.json({
-      deviceControlSettings: {
-        fullscreen_lock_enabled: settings.fullscreen_lock_enabled === true,
-        require_exit_code_to_close: settings.require_exit_code_to_close !== false,
-        exit_code_configured: Boolean(settings.exit_code_hash),
-        updated_at: settings.updated_at || "",
-      },
-    });
+    return res.json({ deviceControlSettings: presentDeviceControlSettings(settings) });
   } catch (error) {
     console.error("Device control settings load failed", error);
     return res.status(500).json({
@@ -6982,32 +7136,115 @@ app.put("/settings/device-control", async (req, res) => {
       exitCodeHash = hashExitCode(newExitCode);
       updateExitCode = true;
     }
+    /*
+     * The two kiosk booleans keep their stored value when the body does not mention them.
+     *
+     * They used to be bound as `req.body.x === true` / `!== false`, which reads an absent field as
+     * a decision: a PUT that did not mention `fullscreen_lock_enabled` switched the fullscreen
+     * lock off. That was invisible while the only caller sent both fields every time. It stopped
+     * being invisible when a second screen began saving this row for the update hours alone, and
+     * a settings save about updates has no business unlocking a counter. No existing caller
+     * changes behaviour: the device-control screen still sends both.
+     *
+     * The four auto-update columns, validated before anything is written.
+     *
+     * Each is optional and each keeps its stored value when the body does not mention it -- the
+     * `CASE WHEN ... ELSE <column> END` that `exit_code_hash` already uses, for the same reason.
+     * This matters more here than it does for a kiosk flag: the settings screen that saves the
+     * fullscreen lock has no business resetting when this shop's counter is allowed to restart,
+     * and a device silently handed back the default window would install at a time nobody chose.
+     *
+     * A bad value is refused rather than repaired. What is being decided is when a shop's machine
+     * restarts itself, unattended, so "we guessed" is not an acceptable outcome for a typo.
+     */
+    const hasAutoUpdateEnabled = Object.prototype.hasOwnProperty.call(req.body, "auto_update_enabled");
+    const hasAutoUpdateDays = Object.prototype.hasOwnProperty.call(req.body, "auto_update_days");
+    const hasStartMinute = Object.prototype.hasOwnProperty.call(req.body, "auto_update_start_minute");
+    const hasEndMinute = Object.prototype.hasOwnProperty.call(req.body, "auto_update_end_minute");
+
+    let autoUpdateEnabled = null;
+    if (hasAutoUpdateEnabled) {
+      autoUpdateEnabled = parseStrictBoolean(req.body.auto_update_enabled);
+      if (autoUpdateEnabled === null) {
+        return res.status(400).json({
+          code: "AUTO_UPDATE_ENABLED_INVALID",
+          message: "auto_update_enabled must be true or false",
+        });
+      }
+    }
+
+    let autoUpdateDays = null;
+    if (hasAutoUpdateDays) {
+      autoUpdateDays = normalizeAutoUpdateDays(req.body.auto_update_days);
+      if (autoUpdateDays === null) {
+        // Including the empty list. A device with no days can never install, and a counter stuck
+        // months behind with no error anywhere is indistinguishable from the feature being broken.
+        return res.status(400).json({
+          code: "AUTO_UPDATE_DAYS_INVALID",
+          message: "auto_update_days must name at least one day of the week as numbers 0-6, 0 = Sunday",
+        });
+      }
+    }
+
+    let startMinute = null;
+    if (hasStartMinute) {
+      startMinute = parseMinuteOfDay(req.body.auto_update_start_minute);
+      if (startMinute === null) {
+        return res.status(400).json({
+          code: "AUTO_UPDATE_WINDOW_INVALID",
+          message: "auto_update_start_minute must be a minute of the day, 0-1439",
+        });
+      }
+    }
+
+    let endMinute = null;
+    if (hasEndMinute) {
+      endMinute = parseMinuteOfDay(req.body.auto_update_end_minute);
+      if (endMinute === null) {
+        return res.status(400).json({
+          code: "AUTO_UPDATE_WINDOW_INVALID",
+          message: "auto_update_end_minute must be a minute of the day, 0-1439",
+        });
+      }
+    }
+
     const result = await pool.query(
       `
       UPDATE device_control_settings
-      SET fullscreen_lock_enabled = $1,
-          require_exit_code_to_close = $2,
-          exit_code_hash = CASE WHEN $3::BOOLEAN THEN $4 ELSE exit_code_hash END,
-          updated_by = $5,
+      SET fullscreen_lock_enabled = CASE WHEN $1::BOOLEAN THEN $2::BOOLEAN ELSE fullscreen_lock_enabled END,
+          require_exit_code_to_close = CASE WHEN $3::BOOLEAN THEN $4::BOOLEAN ELSE require_exit_code_to_close END,
+          exit_code_hash = CASE WHEN $5::BOOLEAN THEN $6 ELSE exit_code_hash END,
+          auto_update_enabled = CASE WHEN $7::BOOLEAN THEN $8::BOOLEAN ELSE auto_update_enabled END,
+          auto_update_days = CASE WHEN $9::BOOLEAN THEN $10 ELSE auto_update_days END,
+          auto_update_start_minute = CASE WHEN $11::BOOLEAN THEN $12::INTEGER ELSE auto_update_start_minute END,
+          auto_update_end_minute = CASE WHEN $13::BOOLEAN THEN $14::INTEGER ELSE auto_update_end_minute END,
+          updated_by = $15,
           updated_at = CURRENT_TIMESTAMP
       WHERE id = 1
-      RETURNING id, fullscreen_lock_enabled, require_exit_code_to_close, exit_code_hash, updated_at
+      RETURNING id, fullscreen_lock_enabled, require_exit_code_to_close, exit_code_hash,
+                auto_update_enabled, auto_update_days, auto_update_start_minute, auto_update_end_minute,
+                updated_at
       `,
       [
+        Object.prototype.hasOwnProperty.call(req.body, "fullscreen_lock_enabled"),
         req.body.fullscreen_lock_enabled === true,
+        Object.prototype.hasOwnProperty.call(req.body, "require_exit_code_to_close"),
         req.body.require_exit_code_to_close !== false,
         updateExitCode,
         exitCodeHash,
+        hasAutoUpdateEnabled,
+        autoUpdateEnabled,
+        hasAutoUpdateDays,
+        autoUpdateDays,
+        hasStartMinute,
+        startMinute,
+        hasEndMinute,
+        endMinute,
         manager.id,
       ]
     );
-    const row = result.rows[0] || {};
-    return res.json({
-      fullscreen_lock_enabled: row.fullscreen_lock_enabled === true,
-      require_exit_code_to_close: row.require_exit_code_to_close !== false,
-      exit_code_configured: Boolean(row.exit_code_hash),
-      updated_at: row.updated_at || "",
-    });
+    // Same presenter as the GET and the settings bundle: one shape, three callers.
+    return res.json(presentDeviceControlSettings(result.rows[0] || {}));
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Updating Device Control Settings" });
