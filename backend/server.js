@@ -9,7 +9,7 @@ const os = require("os");
 const path = require("path");
 const { execFile } = require("child_process");
 const nodemailer = require("nodemailer");
-const { RUNTIME_MODES, createStorageAdapter } = require("./storageAdapters");
+const { RUNTIME_MODES, createStorageAdapter, liveDesktopSqlitePath } = require("./storageAdapters");
 const {
   hashPassword,
   hashPasswordSync,
@@ -23862,6 +23862,24 @@ const prepareDatabaseForStartup = async () => {
   if (desktopLocalRuntime) {
     const storageHealth = await storageAdapter.initialize();
     console.log(`desktop SQLite ready: ${storageHealth.databasePath}`);
+    // Say which profile this is, not just where it is. An operator who meant to start an isolated
+    // backend and forgot its variables lands here, because desktop-local against the live profile
+    // is what this process falls back to when nothing is set -- and the only thing that used to
+    // distinguish the two was recognising an AppData path in a startup line.
+    if (path.resolve(storageHealth.databasePath) === path.resolve(liveDesktopSqlitePath())) {
+      console.warn(
+        "\n"
+        + "  ****************************************************************\n"
+        + "  *  THIS IS THE LIVE PROFILE -- the real shop's data.           *\n"
+        + "  ****************************************************************\n"
+        + `  ${storageHealth.databasePath}\n`
+        + "\n"
+        + "  No isolation was configured, so this fell back to the default\n"
+        + "  desktop profile. If you meant to run an isolated or rehearsal\n"
+        + "  backend, stop this now: its variables are missing from this\n"
+        + "  shell. `npm run app:disposable` is the isolated launcher.\n"
+      );
+    }
     console.log("schema bootstrap completed by Tauri SQLite migration runner");
     return;
   }
