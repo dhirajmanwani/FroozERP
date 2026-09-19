@@ -76,6 +76,14 @@ test("the shop picker is only rendered when the state module says so", () => {
   assert.doesNotMatch(app, /shopViewState\.branches\.length/);
 });
 
+test("a shop list that could not be loaded is said out loud in the sidebar", () => {
+  // Without this the failure renders as nothing at all, which is indistinguishable from a
+  // single-shop business -- the same class of bug as an error rendering as zero.
+  assert.match(app, /shopPickerNoticeVisible\(shopView\)/);
+  assert.match(app, /className="sidebar-shop-notice"/);
+  assert.match(app, /\{shopView\.message\}/);
+});
+
 test("the viewing-another-shop banner is rendered from the resolved presentation", () => {
   assert.match(app, /shopView\.banner && \(/);
   assert.match(app, /switchShopView\(shopView\.banner\.returnBranchId\)/);

@@ -41,7 +41,7 @@ import {
 } from "./local/bootstrapCredential";
 import { resolveOfflineOpenDecision } from "./local/offlineDataReadiness";
 import { allShopsHasFigures, resolveAllShopsPresentation } from "./local/allShopsSummary";
-import { resolveShopViewPresentation, shopPickerVisible } from "./local/shopView";
+import { resolveShopViewPresentation, shopPickerVisible, shopPickerNoticeVisible } from "./local/shopView";
 import { ORDER_STATUS } from "./local/orderLifecycle";
 import { STOCK_TRUSTED_FOR_HOURS, buildCatalogue, catalogueFilename, describeExport } from "./local/catalogueExport";
 import {
@@ -7626,6 +7626,15 @@ function App() {
                 <option key={shop.id} value={shop.id}>{shop.name}</option>
               ))}
             </select>
+          </div>
+        )}
+        {/* A missing dropdown and a dropdown that could not be loaded look the same -- both are
+            simply not there. Said plainly, so nobody reads a failed request as "my other shops
+            are gone". */}
+        {shopPickerNoticeVisible(shopView) && (
+          <div className="sidebar-shop-picker">
+            <span className="sidebar-section">Viewing Shop</span>
+            <p className="sidebar-shop-notice">{shopView.message}</p>
           </div>
         )}
           <div className="sidebar-profile" onClick={() => setProfileOpen(true)} role="button" tabIndex={0} onKeyDown={(event) => event.key === "Enter" && setProfileOpen(true)}>

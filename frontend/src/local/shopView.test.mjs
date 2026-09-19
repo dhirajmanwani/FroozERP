@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { SHOP_VIEW_STATUS, resolveShopViewPresentation, shopPickerVisible } from "./shopView.js";
+import { SHOP_VIEW_STATUS, resolveShopViewPresentation, shopPickerVisible, shopPickerNoticeVisible } from "./shopView.js";
 
 const owner = (overrides = {}) => ({
   loadState: "loaded",
@@ -113,4 +113,40 @@ test("malformed shop entries are dropped rather than rendered as blanks", () => 
     branches: [{ id: 1, branch_name: "Real" }, null, { id: "abc" }, { id: 3, branch_name: "Also Real" }],
   }));
   assert.deepEqual(view.shops.map((shop) => shop.id), [1, 3]);
+});
+
+test("a shop list that failed to load says so instead of just vanishing", () => {
+  // An Owner cannot tell an absent dropdown from a broken one. Both are nothing on screen, and
+  // the second one read as the first means "my other shops are gone".
+  const view = resolveShopViewPresentation(owner({
+    loadState: "error",
+    loadError: "The shop list could not be loaded.",
+    branches: [],
+  }));
+  assert.equal(shopPickerVisible(view), false);
+  assert.equal(shopPickerNoticeVisible(view), true);
+  assert.match(view.message, /could not be loaded/i);
+});
+
+test("being offline while viewing another shop is said out loud too", () => {
+  const view = resolveShopViewPresentation(owner({ offline: true, viewingBranchId: 2, viewOnly: true }));
+  assert.equal(shopPickerNoticeVisible(view), true);
+  assert.match(view.message, /connection/i);
+});
+
+test("a single-shop business is not warned about anything", () => {
+  // The picker is missing here because there is genuinely nothing to pick. Explaining that would
+  // be noise on every counter machine in the business.
+  const view = resolveShopViewPresentation(owner({ branches: [{ id: 1, branch_name: "Jodhpur" }] }));
+  assert.equal(shopPickerNoticeVisible(view), false);
+});
+
+test("a non-Owner is never shown a failure about a feature they do not have", () => {
+  const view = resolveShopViewPresentation(owner({ isOwner: false, loadState: "error", loadError: "Network down" }));
+  assert.equal(shopPickerNoticeVisible(view), false);
+});
+
+test("a loading list is not a failed one", () => {
+  const view = resolveShopViewPresentation(owner({ loadState: "loading", branches: [] }));
+  assert.equal(shopPickerNoticeVisible(view), false);
 });
