@@ -163,6 +163,9 @@ const installable = (overrides = {}) => ({
   busyReasons: [],
   lastActivityAt: NOW - (10 * 60 * 1000),
   schedule: ALWAYS,
+  // The Owner's own machine, so these tests are about the busy and idle rules. The wait that
+  // every other counter serves has its own tests further down.
+  isPilotDevice: true,
   now: NOW,
   ...overrides,
 });
@@ -513,4 +516,129 @@ test("a download outliving one beat is not thrown away", async () => {
   assert.match(runner, /mountedRef/, "results must be dropped on unmount, not on re-run");
   assert.doesNotMatch(runner, /let abandoned/, "a per-effect-run cancellation flag strands the download");
   assert.match(runner, /installingRef/, "the unattended install must not be startable twice");
+});
+
+// --- one machine goes first ---------------------------------------------------------------------
+//
+// Dhiraj's ask, 19 Sep 2026: "jaha se b me (owner) login kru vo main laptop bn jaye, aur vo wale
+// pr phle update krk dekh lu aur fir vha se me jab publish kru, to sab pr hojaye." The second half
+// needs the counters to hear an instruction from him, which they cannot today -- each is
+// standalone and the cloud that would carry it is not answering. The wait below does that work.
+
+const DAY = 24 * 60 * 60 * 1000;
+
+const counter = (overrides = {}) => installable({
+  isPilotDevice: false,
+  releasePublishedAt: NOW - (3 * DAY),
+  holdbackDays: 2,
+  ...overrides,
+});
+
+test("the Owner's own machine takes a release the moment it is published", () => {
+  const decision = resolveInstallDecision(counter({
+    isPilotDevice: true,
+    releasePublishedAt: NOW - 1000,
+  }));
+  assert.equal(decision.install, true);
+});
+
+test("an ordinary counter ignores a release until it has aged", () => {
+  const decision = resolveInstallDecision(counter({ releasePublishedAt: NOW - (6 * HOUR) }));
+  assert.equal(decision.install, false);
+  assert.equal(decision.reason, "WAITING_FOR_PILOT");
+  assert.ok(decision.releasesAt, "the screen must be able to say when this counter will take it");
+  assert.equal(Date.parse(decision.releasesAt), NOW - (6 * HOUR) + (2 * DAY));
+});
+
+test("a counter takes a release once the wait is served", () => {
+  const decision = resolveInstallDecision(counter({ releasePublishedAt: NOW - (2 * DAY) }));
+  assert.equal(decision.install, true);
+});
+
+test("a release with no readable date is treated as brand new, not as old", () => {
+  // Falling the other way would let a counter take a release nobody can vouch for the age of,
+  // which is exactly the case this wait exists to cover.
+  for (const value of [null, "", "not a date", undefined]) {
+    const decision = resolveInstallDecision(counter({ releasePublishedAt: value }));
+    assert.equal(decision.install, false, `a ${String(value)} publish date must not release the wait`);
+    assert.equal(decision.reason, "WAITING_FOR_PILOT");
+  }
+});
+
+test("a holdback of zero days makes every counter a pilot", () => {
+  // The setting the Owner would turn down once he trusts a release, or once the devices can hear
+  // an explicit approval and the wait is no longer doing that job.
+  const decision = resolveInstallDecision(counter({ holdbackDays: 0, releasePublishedAt: NOW - 1000 }));
+  assert.equal(decision.install, true);
+});
+
+test("Install now beats the wait", () => {
+  const decision = resolveInstallDecision(counter({ releasePublishedAt: NOW, requestedByUser: true }));
+  assert.equal(decision.install, true);
+  assert.equal(decision.reason, "REQUESTED_BY_USER");
+});
+
+test("a bill in progress still beats everything, pilot or not", () => {
+  const decision = resolveInstallDecision(counter({
+    isPilotDevice: true,
+    releasePublishedAt: NOW - 1000,
+    busyReasons: [{ id: "bill", label: "a bill in progress" }],
+  }));
+  assert.equal(decision.install, false);
+  assert.equal(decision.reason, "DEVICE_BUSY");
+});
+
+test("the wait is served before the device's hours are considered, and both must pass", () => {
+  // Aged past the wait but outside this counter's hours: still not now.
+  const decision = resolveInstallDecision(counter({
+    releasePublishedAt: NOW - (5 * DAY),
+    schedule: { days: ["SUN"], startMinute: 22 * 60, endMinute: 6 * 60 },
+    now: at(19, 15).getTime(),
+    lastActivityAt: at(19, 10).getTime(),
+  }));
+  assert.equal(decision.install, false);
+  assert.equal(decision.reason, "OUTSIDE_WINDOW");
+});
+
+test("a waiting counter says so on screen, and says when", () => {
+  const notice = describeAutoUpdateNotice({
+    enabled: true,
+    phase: "ready_to_install",
+    latestVersion: "1.0.74",
+    decision: {
+      install: false,
+      reason: "WAITING_FOR_PILOT",
+      waitingFor: [],
+      releasesAt: new Date(NOW + DAY).toISOString(),
+    },
+  });
+  assert.match(notice.text, /1\.0\.74/);
+  assert.match(notice.text, /Owner's device/);
+  assert.equal(notice.actionLabel, "Install now");
+  assert.equal(Date.parse(notice.releasesAt), NOW + DAY);
+});
+
+test("the shipped default is no wait at all", () => {
+  // The Owner's own words: once he presses publish, each counter takes it at the time that
+  // counter was given. Not days later. The wait is an opt-in safety margin, not the default.
+  assert.equal(AUTO_UPDATE_DEFAULTS.holdbackDays, 0);
+  const decision = resolveInstallDecision(installable({
+    isPilotDevice: false,
+    releasePublishedAt: NOW - 1000,
+  }));
+  assert.equal(decision.install, true, "with no wait configured a counter takes a fresh release");
+});
+
+test("an unreadable wait behaves as the shipped default, not as some other number", () => {
+  for (const value of [null, undefined, "soon", NaN, -1]) {
+    const decision = resolveInstallDecision(counter({ holdbackDays: value, releasePublishedAt: NOW - 1000 }));
+    assert.equal(decision.install, true, `a ${String(value)} wait must read as the default, which is none`);
+  }
+});
+
+test("a wait that was configured is not quietly dropped", () => {
+  // The other direction of the same rule: a shop that set two days gets two days.
+  const decision = resolveInstallDecision(counter({ holdbackDays: 2, releasePublishedAt: NOW - HOUR }));
+  assert.equal(decision.install, false);
+  assert.equal(decision.reason, "WAITING_FOR_PILOT");
 });

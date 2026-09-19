@@ -59,6 +59,7 @@ const AUTO_UPDATE_COLUMNS = [
   "auto_update_days",
   "auto_update_start_minute",
   "auto_update_end_minute",
+  "auto_update_holdback_days",
 ];
 
 // -------------------------------------------------------------------------------------------
@@ -434,4 +435,38 @@ test("the device-control screen still writes both kiosk booleans", async () => {
   assert.equal(wroteColumn(update, "fullscreen_lock_enabled").value, false);
   assert.equal(wroteColumn(update, "require_exit_code_to_close").mentioned, true);
   assert.equal(wroteColumn(update, "require_exit_code_to_close").value, false);
+});
+
+test("the shipped default wait is none", () => {
+  // The instruction was that once the Owner presses publish, each counter takes the release at
+  // the time that counter was given -- not days later. The wait is opt-in.
+  assert.match(SOURCE, /auto_update_holdback_days INTEGER DEFAULT 0/);
+  assert.match(SOURCE, /const AUTO_UPDATE_DEFAULT_HOLDBACK_DAYS = 0;/);
+});
+
+test("a wait nobody could have meant is refused rather than repaired", async () => {
+  for (const value of [-1, 400, "soon", 1.5, null, {}]) {
+    const { response, statements } = await putAs({ auto_update_holdback_days: value });
+    assert.equal(response.status, 400, `${JSON.stringify(value)} was accepted as a number of days`);
+    assert.equal(response.body.code, "AUTO_UPDATE_HOLDBACK_INVALID");
+    assert.equal(updateStatement(statements), undefined, "a refused value must not reach the UPDATE");
+  }
+});
+
+test("a wait inside the range is written as given", async () => {
+  for (const value of [0, 1, 2, 14, "3"]) {
+    const { response, statements } = await putAs({ auto_update_holdback_days: value });
+    assert.equal(response.status, 200, `${JSON.stringify(value)} should be a valid number of days`);
+    assert.equal(wroteColumn(updateStatement(statements), "auto_update_holdback_days").value, Number(value));
+  }
+});
+
+test("a row written before this column reads back as no wait", async () => {
+  // Every device in the field is such a row until its next startup. Reading it as some other
+  // number would hold a counter back for days that nobody asked for.
+  const { response } = await call("GET", "/settings/device-control", {
+    row: { id: 1, fullscreen_lock_enabled: false, require_exit_code_to_close: true },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.body.deviceControlSettings.auto_update_holdback_days, 0);
 });

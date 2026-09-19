@@ -1670,6 +1670,9 @@ const defaultDeviceControlSettings = {
   auto_update_days: "0,1,2,3,4,5,6",
   auto_update_start_minute: 22 * 60,
   auto_update_end_minute: 6 * 60,
+  // No wait: once a release is published this counter takes it at the hours above, not days
+  // later. Turned up, it lags the Owner's own machine by that many days.
+  auto_update_holdback_days: 0,
   updated_at: "",
 };
 
@@ -7642,6 +7645,10 @@ function App() {
 
   const deviceControl = settingsData.deviceControlSettings || {};
   const autoUpdateEnabled = deviceControl.auto_update_enabled !== false;
+  // `??`, not `||`: zero is the ordinary setting here and `||` would read it as absent.
+  const autoUpdateHoldbackDays = Number.isFinite(Number(deviceControl.auto_update_holdback_days))
+    ? Number(deviceControl.auto_update_holdback_days)
+    : 0;
   const autoUpdateSchedule = normalizeInstallSchedule({
     days: typeof deviceControl.auto_update_days === "string"
       ? deviceControl.auto_update_days.split(",")
@@ -7940,6 +7947,8 @@ function App() {
           <AutoUpdateRunner
             busyReasons={deviceWorkInProgress}
             enabled={autoUpdateEnabled}
+            holdbackDays={autoUpdateHoldbackDays}
+            isPilotDevice={String(user?.role || "").toUpperCase() === "OWNER"}
             lastActivityAt={lastActivityAt}
             online={Boolean(backendHealth.online) && !offlineMode}
             schedule={autoUpdateSchedule}
@@ -17936,10 +17945,11 @@ function UserManagementSection({ canManage, onReload, roles = [], user, users = 
  * is nobody to answer, so instead of a dialog this waits for a machine with no work on it, inside
  * the hours that machine was given, and says on screen what it is waiting for.
  */
-function AutoUpdateRunner({ busyReasons = [], enabled = false, lastActivityAt = null, online = false, schedule = null }) {
+function AutoUpdateRunner({ busyReasons = [], enabled = false, holdbackDays = 0, isPilotDevice = false, lastActivityAt = null, online = false, schedule = null }) {
   const [state, setState] = useState({
     phase: "idle",
     latestVersion: "",
+    releasePublishedAt: null,
     lastCheckedAt: null,
     lastCheckFailed: false,
     consecutiveFailures: 0,
@@ -18002,6 +18012,10 @@ function AutoUpdateRunner({ busyReasons = [], enabled = false, lastActivityAt = 
               ...current,
               phase: found ? "update_available" : "up_to_date",
               latestVersion: found?.version || "",
+              // How old this release is decides whether an ordinary counter may take it yet, so
+              // an unreadable date has to stay unreadable rather than become "now" here -- the
+              // decision treats a missing one as just-published, which is the safe reading.
+              releasePublishedAt: found?.date || null,
               lastCheckedAt: new Date().toISOString(),
               lastCheckFailed: false,
               consecutiveFailures: 0,
@@ -18067,6 +18081,9 @@ function AutoUpdateRunner({ busyReasons = [], enabled = false, lastActivityAt = 
     busyReasons,
     lastActivityAt,
     schedule,
+    isPilotDevice,
+    releasePublishedAt: state.releasePublishedAt,
+    holdbackDays,
   });
 
   const install = async (requestedByUser) => {
@@ -18079,6 +18096,9 @@ function AutoUpdateRunner({ busyReasons = [], enabled = false, lastActivityAt = 
       busyReasons,
       lastActivityAt,
       schedule,
+      isPilotDevice,
+      releasePublishedAt: state.releasePublishedAt,
+      holdbackDays,
       requestedByUser,
     });
     if (!verdict.install || !update) return;
@@ -18136,6 +18156,9 @@ function AutoUpdateRunner({ busyReasons = [], enabled = false, lastActivityAt = 
         {notice.nextWindowAt && (
           <span>Next update time: {new Date(notice.nextWindowAt).toLocaleString("en-IN")}</span>
         )}
+        {notice.releasesAt && (
+          <span>This counter takes it after {new Date(notice.releasesAt).toLocaleString("en-IN")}</span>
+        )}
       </div>
       {notice.actionLabel === "Install now" && (
         <button className="primary-button" disabled={state.phase === "installing"} onClick={() => install(true)}>
@@ -18166,6 +18189,11 @@ function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceC
     days: storedSchedule.days,
     startMinute: storedSchedule.startMinute,
     endMinute: storedSchedule.endMinute,
+    // `??` rather than `||`: zero is the ordinary setting, meaning this counter goes as soon as
+    // the release is published, at its own hours.
+    holdbackDays: Number.isFinite(Number(deviceControlSettings?.auto_update_holdback_days))
+      ? Number(deviceControlSettings.auto_update_holdback_days)
+      : 0,
   }));
   const [scheduleMessage, setScheduleMessage] = useState("");
   const [scheduleBusy, setScheduleBusy] = useState(false);
@@ -18189,6 +18217,7 @@ function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceC
         auto_update_days: scheduleDraft.days.join(","),
         auto_update_start_minute: scheduleDraft.startMinute,
         auto_update_end_minute: scheduleDraft.endMinute,
+        auto_update_holdback_days: scheduleDraft.holdbackDays,
       });
       setScheduleMessage("Update hours saved for this device.");
       if (onReload) await onReload();
@@ -18676,6 +18705,18 @@ function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceC
           <Field label="Until"><input disabled={!canManage || !scheduleDraft.enabled} type="time" value={formatMinuteOfDay(scheduleDraft.endMinute)} onChange={(event) => setScheduleDraft((current) => ({ ...current, endMinute: normalizeInstallSchedule({ days: current.days, start: current.startMinute, end: event.target.value }).endMinute }))} /></Field>
         </div>
         <small>A time that ends before it starts runs overnight, so 22:00 until 06:00 means that night into the next morning.</small>
+        <Field label="Wait before taking a new release (days)">
+          <input
+            disabled={!canManage || !scheduleDraft.enabled}
+            inputMode="numeric"
+            max="14"
+            min="0"
+            type="number"
+            value={scheduleDraft.holdbackDays}
+            onChange={(event) => setScheduleDraft((current) => ({ ...current, holdbackDays: Math.max(0, Math.min(14, Number(event.target.value) || 0)) }))}
+          />
+        </Field>
+        <small>Zero means this counter takes a release as soon as it is published, at the hours above. Set it to one or two and this counter waits while the Owner&apos;s own machine runs the release first. A machine the Owner is signed in on never waits.</small>
         {scheduleMessage && <small>{scheduleMessage}</small>}
         <div className="button-row">
           <button className="primary-button" disabled={!canManage || scheduleBusy} onClick={saveSchedule}>{scheduleBusy ? "Saving..." : "Save Update Hours"}</button>
