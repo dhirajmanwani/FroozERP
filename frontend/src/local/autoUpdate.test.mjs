@@ -4,11 +4,21 @@ import assert from "node:assert/strict";
 import { CONNECTIVITY_MODES } from "./connectivityMode.js";
 import {
   AUTO_UPDATE_DEFAULTS,
+  AUTO_UPDATE_DEFAULT_SCHEDULE,
+  WEEKDAY_NAMES,
   describeAutoUpdateNotice,
+  formatMinuteOfDay,
+  normalizeInstallSchedule,
   resolveInstallDecision,
   shouldCheckForUpdate,
   shouldDownloadUpdate,
+  withinInstallWindow,
 } from "./autoUpdate.js";
+
+// Start and end on the same minute means "any hour of these days". The install tests below are
+// about the idle and busy rules, so they open the window fully and leave the hours to their own
+// tests further down.
+const ALWAYS = { days: [0, 1, 2, 3, 4, 5, 6], startMinute: 0, endMinute: 0 };
 
 const HOUR = 60 * 60 * 1000;
 const NOW = Date.parse("2026-09-19T10:00:00.000Z");
@@ -152,6 +162,7 @@ const installable = (overrides = {}) => ({
   phase: "ready_to_install",
   busyReasons: [],
   lastActivityAt: NOW - (10 * 60 * 1000),
+  schedule: ALWAYS,
   now: NOW,
   ...overrides,
 });
@@ -290,4 +301,166 @@ test("the intervals are the ones the comments describe", () => {
   assert.equal(AUTO_UPDATE_DEFAULTS.checkIntervalMs, 4 * HOUR);
   assert.equal(AUTO_UPDATE_DEFAULTS.retryIntervalMs, 15 * 60 * 1000);
   assert.equal(AUTO_UPDATE_DEFAULTS.idleBeforeInstallMs, 5 * 60 * 1000);
+});
+
+// --- the hours each device was given ------------------------------------------------------------
+//
+// Every Date below is built with the local-time constructor on purpose. The window is the
+// device's own wall clock -- somebody choosing "Saturday night" means night where the counter
+// stands -- so a test written in UTC would pass or fail depending on where it ran.
+//
+// 19 Sep 2026 is a Saturday, 20 Sep a Sunday, 21 Sep a Monday.
+
+const at = (day, hour, minute = 0) => new Date(2026, 8, day, hour, minute, 0, 0);
+
+test("the default window is every night from ten to six", () => {
+  assert.deepEqual([...AUTO_UPDATE_DEFAULT_SCHEDULE.days], [0, 1, 2, 3, 4, 5, 6]);
+  assert.equal(formatMinuteOfDay(AUTO_UPDATE_DEFAULT_SCHEDULE.startMinute), "22:00");
+  assert.equal(formatMinuteOfDay(AUTO_UPDATE_DEFAULT_SCHEDULE.endMinute), "06:00");
+});
+
+test("a working afternoon is outside the default window", () => {
+  const window = withinInstallWindow({ now: at(19, 15) });
+  assert.equal(window.within, false);
+  assert.equal(window.reason, "OUTSIDE_WINDOW");
+  assert.equal(new Date(window.nextOpensAt).getHours(), 22);
+  assert.equal(new Date(window.nextOpensAt).getDate(), 19, "tonight, not tomorrow night");
+});
+
+test("late at night and early morning are both inside a window that crosses midnight", () => {
+  assert.equal(withinInstallWindow({ now: at(19, 23, 30) }).within, true);
+  assert.equal(withinInstallWindow({ now: at(20, 5, 30) }).within, true);
+  assert.equal(withinInstallWindow({ now: at(20, 6, 0) }).within, false, "six o'clock is the end, not still inside");
+  assert.equal(withinInstallWindow({ now: at(19, 21, 59) }).within, false);
+});
+
+test("a weekend-only device ignores weeknights", () => {
+  // The whole point of the per-device setting: one counter on Saturday, another on Sunday, so a
+  // bad release arrives in waves instead of everywhere at once.
+  const saturdayNights = { days: ["SAT"], startMinute: 22 * 60, endMinute: 6 * 60 };
+  assert.equal(withinInstallWindow({ now: at(21, 23), schedule: saturdayNights }).within, false, "Monday night");
+  assert.equal(withinInstallWindow({ now: at(19, 23), schedule: saturdayNights }).within, true, "Saturday night");
+});
+
+test("a window that crosses midnight belongs to the day it starts on", () => {
+  // Somebody picking Saturday means Saturday night into Sunday morning. Sunday's own small hours
+  // are not Sunday's window.
+  const saturdayNights = { days: ["SAT"], startMinute: 22 * 60, endMinute: 6 * 60 };
+  assert.equal(withinInstallWindow({ now: at(20, 3), schedule: saturdayNights }).within, true, "Sunday 3am is Saturday's window");
+  const sundayNights = { days: ["SUN"], startMinute: 22 * 60, endMinute: 6 * 60 };
+  assert.equal(withinInstallWindow({ now: at(20, 3), schedule: sundayNights }).within, false, "Sunday 3am is not Sunday's own window");
+  assert.equal(withinInstallWindow({ now: at(20, 23), schedule: sundayNights }).within, true);
+});
+
+test("a window inside one day does not wrap around", () => {
+  const lunchtime = { days: [6], startMinute: 13 * 60, endMinute: 14 * 60 };
+  assert.equal(withinInstallWindow({ now: at(19, 13, 30), schedule: lunchtime }).within, true);
+  assert.equal(withinInstallWindow({ now: at(19, 3), schedule: lunchtime }).within, false);
+  assert.equal(withinInstallWindow({ now: at(19, 23), schedule: lunchtime }).within, false);
+});
+
+test("the next opening is found on a later day when today has none", () => {
+  const sundayNights = { days: ["SUN"], startMinute: 22 * 60, endMinute: 6 * 60 };
+  const window = withinInstallWindow({ now: at(19, 15), schedule: sundayNights });
+  assert.equal(window.within, false);
+  const opens = new Date(window.nextOpensAt);
+  assert.equal(opens.getDay(), 0);
+  assert.equal(opens.getDate(), 20);
+  assert.equal(opens.getHours(), 22);
+});
+
+test("start and end on the same minute means the whole of those days", () => {
+  const allSaturday = { days: ["SAT"], startMinute: 0, endMinute: 0 };
+  assert.equal(withinInstallWindow({ now: at(19, 4), schedule: allSaturday }).within, true);
+  assert.equal(withinInstallWindow({ now: at(19, 16), schedule: allSaturday }).within, true);
+  assert.equal(withinInstallWindow({ now: at(20, 16), schedule: allSaturday }).within, false);
+});
+
+test("day names and day numbers mean the same thing", () => {
+  const byName = normalizeInstallSchedule({ days: ["sat", "Sunday", "MON"] });
+  assert.deepEqual(byName.days, [0, 1, 6]);
+  assert.deepEqual(normalizeInstallSchedule({ days: [0, 1, 6] }).days, [0, 1, 6]);
+  assert.deepEqual(WEEKDAY_NAMES[6], "SAT");
+});
+
+test("times may be stored as \"22:00\" or as a minute count", () => {
+  assert.equal(normalizeInstallSchedule({ start: "22:00", end: "06:00" }).startMinute, 22 * 60);
+  assert.equal(normalizeInstallSchedule({ start: "22:00:00" }).startMinute, 22 * 60);
+  assert.equal(normalizeInstallSchedule({ startMinute: 90 }).startMinute, 90);
+});
+
+test("an unreadable setting falls back to the default, never to \"any time\"", () => {
+  // A corrupt value must not widen when this device is allowed to restart itself.
+  const plan = normalizeInstallSchedule({ days: ["nonsense"], start: "99:99", end: "" });
+  assert.deepEqual(plan.days, [...AUTO_UPDATE_DEFAULT_SCHEDULE.days]);
+  assert.equal(plan.startMinute, AUTO_UPDATE_DEFAULT_SCHEDULE.startMinute);
+  assert.equal(plan.endMinute, AUTO_UPDATE_DEFAULT_SCHEDULE.endMinute);
+  assert.deepEqual(normalizeInstallSchedule(null).days, [...AUTO_UPDATE_DEFAULT_SCHEDULE.days]);
+});
+
+test("an empty day list is not read as \"never\"", () => {
+  // A device that can never install looks exactly like the feature being broken, and nobody chose
+  // it on purpose.
+  assert.deepEqual(normalizeInstallSchedule({ days: [] }).days, [...AUTO_UPDATE_DEFAULT_SCHEDULE.days]);
+});
+
+test("an install outside this device's hours waits, and says when it will happen", () => {
+  const decision = resolveInstallDecision(installable({
+    schedule: { days: ["SUN"], startMinute: 22 * 60, endMinute: 6 * 60 },
+    now: at(19, 15).getTime(),
+    lastActivityAt: at(19, 10).getTime(),
+  }));
+  assert.equal(decision.install, false);
+  assert.equal(decision.reason, "OUTSIDE_WINDOW");
+  assert.ok(decision.nextWindowAt, "the screen has to be able to say when");
+  assert.equal(new Date(decision.nextWindowAt).getDay(), 0);
+});
+
+test("inside the hours and idle, it installs", () => {
+  const decision = resolveInstallDecision(installable({
+    schedule: { days: ["SAT"], startMinute: 22 * 60, endMinute: 6 * 60 },
+    now: at(19, 23).getTime(),
+    lastActivityAt: at(19, 22).getTime(),
+  }));
+  assert.equal(decision.install, true);
+  assert.equal(decision.reason, "IDLE");
+});
+
+test("Install now works outside the device's hours", () => {
+  // The hours govern the machine acting on its own. A person standing at it has already decided.
+  const decision = resolveInstallDecision(installable({
+    schedule: { days: ["SUN"], startMinute: 22 * 60, endMinute: 6 * 60 },
+    now: at(19, 15).getTime(),
+    requestedByUser: true,
+  }));
+  assert.equal(decision.install, true);
+});
+
+test("a bill in progress still wins inside the hours", () => {
+  const decision = resolveInstallDecision(installable({
+    schedule: { days: ["SAT"], startMinute: 22 * 60, endMinute: 6 * 60 },
+    now: at(19, 23).getTime(),
+    busyReasons: [{ id: "bill", label: "a bill in progress" }],
+  }));
+  assert.equal(decision.install, false);
+  assert.equal(decision.reason, "DEVICE_BUSY");
+});
+
+test("waiting for the hours is said on screen, with when", () => {
+  const notice = describeAutoUpdateNotice({
+    enabled: true,
+    phase: "ready_to_install",
+    latestVersion: "1.0.74",
+    decision: { install: false, reason: "OUTSIDE_WINDOW", waitingFor: [], nextWindowAt: at(20, 22).toISOString() },
+  });
+  assert.match(notice.text, /1\.0\.74/);
+  assert.match(notice.text, /update hours/i);
+  assert.equal(notice.actionLabel, "Install now");
+  assert.equal(new Date(notice.nextWindowAt).getHours(), 22);
+});
+
+test("an unreadable clock does not count as inside the window", () => {
+  const window = withinInstallWindow({ now: new Date("not a date") });
+  assert.equal(window.within, false);
+  assert.equal(window.reason, "UNREADABLE_TIME");
 });

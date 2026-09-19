@@ -15,7 +15,13 @@
  *   - nothing happens unless the device was explicitly switched on for it,
  *   - nothing is downloaded on a device that has chosen to stay off the network,
  *   - nothing is installed that has not verified its signature,
- *   - and nothing is installed while the machine is in the middle of somebody's work.
+ *   - nothing is installed while the machine is in the middle of somebody's work,
+ *   - and nothing is installed outside the hours that device was given.
+ *
+ * That last one is also the answer to "a bad release reaches everything at once". Each device
+ * carries its own day and hour, so a shop can put one counter on Saturday night and another on
+ * Sunday night. The release still reaches every machine without anybody walking to it, but it
+ * arrives in waves, and the first wave is small enough to notice before the second.
  *
  * Every decision returns a reason alongside it rather than a bare boolean. A silent "no" is
  * indistinguishable from a broken check, and this app has been bitten by that shape of bug before.
@@ -36,6 +42,122 @@ export const AUTO_UPDATE_DEFAULTS = Object.freeze({
   // break, which is exactly the window we want.
   idleBeforeInstallMs: 5 * 60 * 1000,
 });
+
+export const WEEKDAY_NAMES = Object.freeze(["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]);
+
+/**
+ * Every night between ten and six, on every day.
+ *
+ * Chosen because a counter is shut then, so the restart costs nobody anything, and because a
+ * default of "whenever" would put the first automatic restart in the middle of a working
+ * afternoon on machines whose owner never opened the setting. A shop that wants weekends only
+ * narrows `days` on that device.
+ */
+export const AUTO_UPDATE_DEFAULT_SCHEDULE = Object.freeze({
+  days: Object.freeze([0, 1, 2, 3, 4, 5, 6]),
+  startMinute: 22 * 60,
+  endMinute: 6 * 60,
+});
+
+const MINUTES_IN_DAY = 24 * 60;
+
+const asMinuteOfDay = (value, fallback) => {
+  if (Number.isFinite(value)) {
+    const rounded = Math.trunc(value);
+    if (rounded >= 0 && rounded <= MINUTES_IN_DAY) return rounded % MINUTES_IN_DAY;
+    return fallback;
+  }
+  // "22:00" and "22:00:00" both appear: the settings screen writes the first, a stored value
+  // round-tripped through a time input can carry the second.
+  const match = /^(\d{1,2}):(\d{2})(?::\d{2})?$/.exec(String(value || "").trim());
+  if (!match) return fallback;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours > 23 || minutes > 59) return fallback;
+  return (hours * 60) + minutes;
+};
+
+const asDay = (value) => {
+  if (Number.isFinite(value)) {
+    const rounded = Math.trunc(value);
+    return rounded >= 0 && rounded <= 6 ? rounded : null;
+  }
+  const index = WEEKDAY_NAMES.indexOf(String(value || "").trim().toUpperCase().slice(0, 3));
+  return index === -1 ? null : index;
+};
+
+/**
+ * Turn whatever was stored for this device into a schedule that can be reasoned about.
+ *
+ * Anything unreadable falls back to the default rather than to "any time". A corrupt setting must
+ * never widen when this device is allowed to restart itself.
+ */
+export const normalizeInstallSchedule = (raw) => {
+  const source = raw && typeof raw === "object" ? raw : {};
+  const days = [...new Set((Array.isArray(source.days) ? source.days : AUTO_UPDATE_DEFAULT_SCHEDULE.days)
+    .map(asDay)
+    .filter((day) => day !== null))].sort((a, b) => a - b);
+  return {
+    // No days at all would mean this device can never install, which is a setting nobody chose on
+    // purpose and which would look exactly like the feature being broken.
+    days: days.length ? days : [...AUTO_UPDATE_DEFAULT_SCHEDULE.days],
+    startMinute: asMinuteOfDay(source.startMinute ?? source.start, AUTO_UPDATE_DEFAULT_SCHEDULE.startMinute),
+    endMinute: asMinuteOfDay(source.endMinute ?? source.end, AUTO_UPDATE_DEFAULT_SCHEDULE.endMinute),
+  };
+};
+
+/** "22:00" for a stored minute count, for the settings screen and for the sentence on the shell. */
+export const formatMinuteOfDay = (minute) => {
+  const safe = ((Math.trunc(Number(minute) || 0) % MINUTES_IN_DAY) + MINUTES_IN_DAY) % MINUTES_IN_DAY;
+  return `${String(Math.floor(safe / 60)).padStart(2, "0")}:${String(safe % 60).padStart(2, "0")}`;
+};
+
+/**
+ * Is this device inside the hours it was given, and if not, when does it next open?
+ *
+ * A window may cross midnight -- ten at night until six in the morning is the normal case -- and
+ * when it does it belongs to the day it *starts* on. "Saturday" therefore means Saturday night
+ * into Sunday morning, which is what somebody picking Saturday means by it.
+ *
+ * Times are the device's own local clock, deliberately. The person choosing "Saturday night" means
+ * night where the counter stands.
+ */
+export const withinInstallWindow = ({ now = new Date(), schedule = null } = {}) => {
+  const plan = normalizeInstallSchedule(schedule);
+  const moment = now instanceof Date ? new Date(now.getTime()) : new Date(now);
+  if (Number.isNaN(moment.getTime())) return { within: false, reason: "UNREADABLE_TIME", nextOpensAt: null };
+
+  const minuteOfDay = (moment.getHours() * 60) + moment.getMinutes();
+  const today = moment.getDay();
+  const yesterday = (today + 6) % 7;
+  const crossesMidnight = plan.endMinute <= plan.startMinute;
+  const allDay = plan.startMinute === plan.endMinute;
+
+  let within = false;
+  if (allDay) {
+    within = plan.days.includes(today);
+  } else if (crossesMidnight) {
+    // Two halves: tonight's opening, and this morning's tail of the window that opened yesterday.
+    within = (minuteOfDay >= plan.startMinute && plan.days.includes(today))
+      || (minuteOfDay < plan.endMinute && plan.days.includes(yesterday));
+  } else {
+    within = plan.days.includes(today) && minuteOfDay >= plan.startMinute && minuteOfDay < plan.endMinute;
+  }
+
+  if (within) return { within: true, reason: "IN_WINDOW", nextOpensAt: null };
+
+  // Walk forward a week rather than doing the arithmetic in one expression -- a week is seven
+  // cheap steps and the off-by-one cases around midnight are where this would otherwise go wrong.
+  for (let offset = 0; offset <= 7; offset += 1) {
+    const day = new Date(moment.getFullYear(), moment.getMonth(), moment.getDate() + offset, 0, 0, 0, 0);
+    if (!plan.days.includes(day.getDay())) continue;
+    const opensAt = new Date(day.getTime() + (plan.startMinute * 60 * 1000));
+    if (opensAt.getTime() > moment.getTime()) {
+      return { within: false, reason: "OUTSIDE_WINDOW", nextOpensAt: opensAt.toISOString() };
+    }
+  }
+  return { within: false, reason: "OUTSIDE_WINDOW", nextOpensAt: null };
+};
 
 /** Phases in which a request is already in flight and a second one would collide. */
 const BUSY_PHASES = new Set(["checking", "downloading", "installing"]);
@@ -129,9 +251,9 @@ export const shouldDownloadUpdate = ({
  * labels come back out in `waitingFor` so the screen can say what it is waiting on instead of
  * looking stuck.
  *
- * `requestedByUser` is the one thing that overrides the idle wait, because a person who presses
- * "Install now" has already decided this is a good moment. It does not override a missing
- * signature, and nothing does.
+ * `requestedByUser` is the one thing that overrides the idle wait and the device's hours, because a
+ * person who presses "Install now" has already decided this is a good moment. It does not override
+ * a missing signature, and nothing does.
  */
 export const resolveInstallDecision = ({
   enabled = false,
@@ -141,6 +263,7 @@ export const resolveInstallDecision = ({
   busyReasons = [],
   lastActivityAt = null,
   requestedByUser = false,
+  schedule = null,
   now = Date.now(),
   idleBeforeInstallMs = AUTO_UPDATE_DEFAULTS.idleBeforeInstallMs,
 } = {}) => {
@@ -157,6 +280,11 @@ export const resolveInstallDecision = ({
   if (blocking.length) return { install: false, reason: "DEVICE_BUSY", waitingFor };
   if (requestedByUser) return { install: true, reason: "REQUESTED_BY_USER", waitingFor: [] };
   if (!enabled) return { install: false, reason: "AUTO_UPDATE_OFF", waitingFor: [] };
+
+  const window = withinInstallWindow({ now: new Date(asTime(now) ?? Date.now()), schedule });
+  if (!window.within) {
+    return { install: false, reason: "OUTSIDE_WINDOW", waitingFor: [], nextWindowAt: window.nextOpensAt };
+  }
 
   const last = asTime(lastActivityAt);
   const moment = asTime(now) ?? Date.now();
@@ -207,6 +335,14 @@ export const describeAutoUpdateNotice = ({
       tone: "warning",
       text: `${named} was downloaded but its signature could not be verified, so it has not been installed.`,
       actionLabel: "Open Update Center",
+    };
+  }
+  if (decision && decision.install === false && decision.reason === "OUTSIDE_WINDOW") {
+    return {
+      tone: "info",
+      text: `${named} is ready and will install during this counter's update hours.`,
+      actionLabel: "Install now",
+      nextWindowAt: decision.nextWindowAt || null,
     };
   }
   if (phase === "ready_to_install") {
