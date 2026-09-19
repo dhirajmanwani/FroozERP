@@ -857,3 +857,16 @@ test("the activation gate points at the new screen instead of a phone call", () 
   const gate = appSource.slice(appSource.indexOf("function ActivationGate("), appSource.indexOf("function DeviceActivationIssuingSection("));
   assert.match(gate, /Device Activation Licences/, "the gate must name where the Owner issues it");
 });
+
+test("a saved licence says where it landed, not only what it is called", () => {
+  // Found rehearsing 1.0.73 on 2026-09-19: the save worked and the Owner's next words were "pata
+  // nahi kahan" -- it saved, but nowhere. The shell has no save dialog, so the webview drops the
+  // file in the browser's download folder and the screen is the only thing that could say so. On
+  // the one screen whose entire purpose is producing a file to carry to a counter, a confirmation
+  // that names the file but not the folder sends the reader hunting for what they were just told
+  // was saved.
+  const save = sectionSource.slice(sectionSource.indexOf("const saveLicenceFile"), sectionSource.indexOf("const copyLicence"));
+  const success = save.slice(save.indexOf('tone: "ok"'));
+  assert.match(success, /Downloads folder/, "the success message must name where the file went");
+  assert.match(success, /\$\{issued\.fileName\}/, "and still name the file, so it can be found by name");
+});

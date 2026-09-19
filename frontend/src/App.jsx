@@ -10182,7 +10182,11 @@ function DeviceActivationIssuingSection({ canIssue, devices, devicesError, onRel
       link.click();
       link.remove();
       setTimeout(() => URL.revokeObjectURL(url), 30000);
-      setOutcome({ tone: "ok", text: `Saved as ${issued.fileName}. Send it to the device and import it on its activation screen.` });
+      // Names where it went, not just what it is called. The webview downloads this rather than
+      // offering a save dialog, so "Saved as froozerp-....lic" left the Owner hunting for a file
+      // they had just been told was saved -- on the one screen whose whole purpose is producing a
+      // file to carry to a counter.
+      setOutcome({ tone: "ok", text: `Saved to your Downloads folder as ${issued.fileName}. Send it to the device and import it on its activation screen.` });
     } catch (error) {
       setOutcome({
         tone: "error",
