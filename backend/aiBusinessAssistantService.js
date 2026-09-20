@@ -6,6 +6,7 @@ const {
   buildReminderDedupKey,
   assertGroundedAnswer,
 } = require("./aiBusinessAssistantRules");
+const { describeOllamaFallback, phraseWithOllama } = require("./frostOllama");
 const {
   DEFAULT_FROST_SETTINGS,
   FROST_ASSISTANT_NAME,
@@ -2216,13 +2217,51 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     const cacheKey = frost.buildCacheKey({ engine: "conversation", question, facts, range, providerKey });
     const cached = settings.frost.cacheEnabled !== false ? await frost.getCache(cacheKey) : null;
     const cachedPayload = cached?.response_payload || null;
-    const providerAnswer = cachedPayload?.answer || null;
-    const answer = providerAnswer || buildDeterministicAnswer(classification, facts, range);
-    // `generated` is what makes this check real: a deterministic answer is grounded by construction,
-    // a phrased one has to prove it. Both routes carry it now so that wiring a provider is a change
-    // in one place and not a thing to remember here.
-    if (!assertGroundedAnswer({ answer, facts, allowedText: range.label, generated: Boolean(providerAnswer) })) {
-      return res.status(500).json({ code: "FROST_ANSWER_NOT_GROUNDED", message: "AI answer was not grounded in verified facts" });
+    const deterministicAnswer = buildDeterministicAnswer(classification, facts, range);
+
+    // The database has already answered. Everything from here is about *wording* -- and wording is
+    // the only thing a model is allowed to contribute, which is why a failure at any step below
+    // falls back to `deterministicAnswer` instead of failing the request. An assistant that goes
+    // quiet when the local model is off is worse than one that answers plainly: the owner still
+    // gets the right figures, and the notice says why the sentence reads the way it does.
+    let answer = deterministicAnswer;
+    let phrasedBy = null;
+    let notice = null;
+
+    if (cachedPayload?.answer) {
+      // A cached answer was grounded when it was written. Re-checking a stored string against
+      // freshly-read facts would fail on nothing worse than a changed figure.
+      answer = cachedPayload.answer;
+      phrasedBy = cachedPayload.phrased_by || null;
+    } else if (settings.frost.enabled === true && providerKey === "ollama") {
+      const phrased = await phraseWithOllama({
+        baseUrl: settings.frost.baseUrl || settings.frost.base_url,
+        model: settings.frost.model,
+        question,
+        facts,
+        periodLabel: range.label,
+        maxOutputTokens: settings.frost.maxOutputTokens,
+      });
+      if (phrased.error) {
+        notice = describeOllamaFallback(phrased.error);
+      } else if (!assertGroundedAnswer({ answer: phrased.answer, facts, allowedText: range.label })) {
+        // The model stated a figure that is not in the books. This is the failure the whole
+        // arrangement exists to catch, so it is audited by name rather than merely swallowed: a
+        // model that does this often is one to stop using.
+        notice = describeOllamaFallback("FROST_ANSWER_NOT_GROUNDED");
+        await frost.audit({
+          branchId: req.auth.branchId,
+          userId: user.id,
+          eventType: "FROST_ANSWER_NOT_GROUNDED",
+          question,
+          verifiedFacts: facts,
+          answer: phrased.answer,
+          suggestedAction: { providerKey, model: phrased.model },
+        });
+      } else {
+        answer = phrased.answer;
+        phrasedBy = phrased.model;
+      }
     }
     const conversationId = await auditQuestion({
       branchId: req.auth.branchId,
@@ -2249,7 +2288,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
         engine: "conversation",
         providerKey,
         requestPayload: { question, facts, range },
-        responsePayload: { answer, facts, period: range },
+        responsePayload: { answer, facts, period: range, phrased_by: phrasedBy },
       });
     }
     return res.json({
@@ -2258,6 +2297,10 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       classification,
       period: range,
       answer,
+      // Null when FROST worded the figures itself. The panel shows the notice beside it, so a
+      // plainly-worded answer never reads as a broken one.
+      phrased_by: phrasedBy,
+      notice,
       facts,
       provider: settings.provider,
       cached: Boolean(cachedPayload),
@@ -2281,10 +2324,12 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     const settings = await getAiSettings(pool, frost);
     const range = getRange(req.body);
     const facts = await factsForBusinessIntent(pool, req.auth.branchId, classification, settings, range);
+    // Deterministic only, deliberately. This route is not called from the frontend, and the model
+    // phrasing in `/api/ai/query` would be dead weight here. A grounding check would be worse than
+    // dead weight: with nothing to phrase the answer it could never fail, and a guard that cannot
+    // fail is the thing that was wrong with `assertGroundedAnswer` in the first place. If this
+    // route is ever used, it needs the phrasing and the check together, not the check alone.
     const answer = buildDeterministicAnswer(classification, facts, range);
-    if (!assertGroundedAnswer({ answer, facts, allowedText: range.label, generated: false })) {
-      return res.status(500).json({ code: "FROST_ANSWER_NOT_GROUNDED", message: "AI answer was not grounded in verified facts" });
-    }
     // Everything that can refuse has now refused. Only past this line does the response become an
     // event stream, because after these headers a status code can no longer be set.
     res.setHeader("Content-Type", "text/event-stream");

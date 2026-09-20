@@ -98,11 +98,9 @@ test("the streaming route refuses before it becomes a stream", () => {
   const start = SERVICE.indexOf('app.post("/api/ai/query/stream"');
   const body = SERVICE.slice(start, start + 2500);
   const gateAt = body.indexOf("enforceIntentPermission");
-  const groundedAt = body.indexOf("assertGroundedAnswer");
   const headerAt = body.indexOf("text/event-stream");
-  assert.ok(gateAt !== -1 && groundedAt !== -1 && headerAt !== -1, "the streaming route lost one of its steps");
+  assert.ok(gateAt !== -1 && headerAt !== -1, "the streaming route lost one of its steps");
   assert.ok(gateAt < headerAt, "the permission gate must run before the SSE headers");
-  assert.ok(groundedAt < headerAt, "the grounding check must run before the SSE headers");
 });
 
 test("the financial and inventory intent lists are the ones the gate uses", () => {

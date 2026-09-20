@@ -4764,6 +4764,15 @@ tbody tr:last-child td {
   opacity: 0.6;
 }
 
+/* Shown when the local model could not word the answer. The figures are still correct, so this
+   reads as an explanation rather than an error -- but it must be visible, because a plainly-worded
+   answer is otherwise indistinguishable from a normal one. */
+.ai-answer-notice {
+  color: var(--warning-ink);
+  font-size: 0.84rem;
+  margin-top: 8px;
+}
+
 .ai-answer-panel,
 .ai-history-item {
   background: var(--shadow-soft);

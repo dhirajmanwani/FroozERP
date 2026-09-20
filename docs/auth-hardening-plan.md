@@ -1865,3 +1865,45 @@ and told us nothing about either subject. Who may use FROST is tested in `frostO
 | `npm run verify:disposable-matrix` | **8 / 8** |
 | `npm run verify:production` | 9 of 10 checks pass; the Rust step needs GTK dev libraries this container does not have |
 | `cargo check` | **Not run** — same missing libraries; unchanged by this work, which touches no Rust |
+
+### Addendum — FROST's local model, and the LOCAL_ONLY boundary (2026-09-20)
+
+The owner chose a local model (Ollama) over a paid API. FROST is Owner-only, so the model only has
+to run where he signs in; the counters need nothing. That makes this compatible with the rule
+CLAUDE.md states as *external connections at 0* — but only if the address it calls cannot become an
+external one.
+
+`backend/frostOllama.js` therefore **refuses any host that is not loopback**
+(`FROST_OLLAMA_URL_NOT_LOOPBACK`), before any request is made. "The base URL is a setting" and "the
+setting is only ever loopback" are different claims and only the second is safe: pointing FROST at
+a model on another machine is now a deliberate code change with a comment in front of it, not a
+typo in a settings field that quietly starts sending the shop's figures over the network. An
+invalid URL is named rather than silently replaced by the default, so a mistyped host cannot look
+like a working one.
+
+The cautionary case is in the same tree: `frostCore.js`'s `createRealtimeSession` calls
+`api.openai.com` with a raw `fetch` from inside the backend process, which the desktop gateway's
+LOCAL_ONLY block never sees. It is unreachable today only because no key is configured — the
+protection is positional, not intrinsic. This module does not add a second such path.
+
+**What the model is and is not allowed to do.** It phrases; it never computes. Every figure has
+already been read by SQL before `phraseWithOllama` is called. If the phrased answer contains a
+number that is not in the facts, `assertGroundedAnswer` rejects it, the route falls back to the
+deterministic wording, and the attempt is audited as `FROST_ANSWER_NOT_GROUNDED` — swallowing it
+would make a model that invents figures indistinguishable from one that does not.
+
+**Every failure falls back rather than failing the request.** No Ollama running, an unpulled model,
+a timeout, an unreadable body, an empty reply: each is a named code, and each produces the correct
+figures in FROST's own plain wording plus a notice saying why. The previous behaviour on an
+ungrounded answer was a 500. For an assistant the owner opens between customers, a 500 is worse
+than a plainer sentence, and the figures were always correct and always available.
+
+`maxOutputTokens` is honoured for the first time since it was added (`num_predict`). The remaining
+cost controls — `TOKEN_PRICING_PER_1K` all zeros, `costAlertAmount` read by nothing — are harmless
+while the model is local and free, and are the thing that bites on the day a paid provider is
+selected. They are not fixed here.
+
+**Not verified:** there is no Ollama in the build container and no way to reach one, so every test
+drives an injected `fetchImpl`. That covers the request shape, the refusals, the timeout path and
+the failure codes. It does **not** prove that a real Ollama accepts this body, or that a 3B model
+phrases well enough to be worth using. Both need a run on the owner's machine.

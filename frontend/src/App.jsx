@@ -4874,6 +4874,11 @@ function App() {
             provider: response.data.provider,
             usage: response.data.usage,
             cached: response.data.cached,
+            // Null unless the local model could not word the answer. Without carrying it here the
+            // owner would see FROST's plain wording with no indication that the model was off --
+            // a degradation that looks exactly like normal operation.
+            notice: response.data.notice || null,
+            phrasedBy: response.data.phrased_by || null,
           },
           ...current.history,
         ].slice(0, 20),
@@ -9391,6 +9396,7 @@ function AiBusinessAssistantModule({
               <span className="eyebrow">{latestAnswer.period?.label || periodLabel}</span>
               <h3>{latestAnswer.question}</h3>
               <p>{latestAnswer.answer}</p>
+              {latestAnswer.notice && <p className="ai-answer-notice">{latestAnswer.notice}</p>}
               <small>Source modules: {[...new Set((latestAnswer.facts || []).map((fact) => fact.sourceModule))].join(", ") || "Verified FroozERP facts"}</small>
             </article>
           )}
@@ -9783,6 +9789,7 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
     assistantName: "FROST",
     providerKey: frost.providerKey || "deterministic",
     model: frost.model || "",
+    baseUrl: frost.baseUrl || "",
     realtimeModel: frost.realtimeModel || "gpt-realtime",
     voice: frost.voice || "alloy",
     languageMode: frost.languageMode || "hindi_english_hinglish",
@@ -9804,6 +9811,7 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
       assistantName: "FROST",
       providerKey: frost.providerKey || "deterministic",
       model: frost.model || "",
+      baseUrl: frost.baseUrl || "",
       realtimeModel: frost.realtimeModel || "gpt-realtime",
       voice: frost.voice || "alloy",
       languageMode: frost.languageMode || "hindi_english_hinglish",
@@ -9819,7 +9827,7 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
       maxOutputTokens: frost.maxOutputTokens || 1200,
       costAlertAmount: frost.costAlertAmount || 500,
     });
-  }, [frost.providerKey, frost.model, frost.realtimeModel, frost.voice, frost.languageMode, frost.enabled, frost.streamingEnabled, frost.cacheEnabled, frost.voicePrepared, frost.voiceActivityDetection, frost.noiseSuppression, frost.fullDuplexEnabled, frost.maxInputTokens, frost.maxOutputTokens, frost.costAlertAmount]);
+  }, [frost.providerKey, frost.model, frost.baseUrl, frost.realtimeModel, frost.voice, frost.languageMode, frost.enabled, frost.streamingEnabled, frost.cacheEnabled, frost.voicePrepared, frost.voiceActivityDetection, frost.noiseSuppression, frost.fullDuplexEnabled, frost.maxInputTokens, frost.maxOutputTokens, frost.costAlertAmount]);
 
   const update = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
   const save = async () => {
@@ -9841,7 +9849,10 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
             {(data.providers || []).map((provider) => <option key={provider.key} value={provider.key}>{provider.label}</option>)}
           </select>
         </Field>
-        <Field label="Model / Deployment"><input disabled={!canManage} value={draft.model} onChange={(event) => update("model", event.target.value)} placeholder="Configured outside secrets" /></Field>
+        <Field label="Model / Deployment"><input disabled={!canManage} value={draft.model} onChange={(event) => update("model", event.target.value)} placeholder={draft.providerKey === "ollama" ? "llama3.2:3b" : "Configured outside secrets"} /></Field>
+        {draft.providerKey === "ollama" && (
+          <Field label="Local Model Address"><input disabled={!canManage} value={draft.baseUrl} onChange={(event) => update("baseUrl", event.target.value)} placeholder="http://127.0.0.1:11434" /></Field>
+        )}
         <Field label="Realtime Model"><input disabled={!canManage} value={draft.realtimeModel} onChange={(event) => update("realtimeModel", event.target.value)} /></Field>
         <Field label="Voice">
           <select disabled={!canManage} value={draft.voice} onChange={(event) => update("voice", event.target.value)}>

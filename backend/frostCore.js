@@ -50,6 +50,10 @@ const DEFAULT_FROST_SETTINGS = {
   assistantName: FROST_ASSISTANT_NAME,
   providerKey: "deterministic",
   model: "",
+  // Empty means the loopback default. Only a loopback host is ever accepted -- see
+  // `frostOllama.js`'s resolveOllamaBaseUrl, which refuses anything else so that a LOCAL_ONLY
+  // counter cannot be turned into one that talks to another machine by a typo in a settings field.
+  baseUrl: "",
   realtimeModel: "gpt-realtime",
   voice: "alloy",
   languageMode: "hindi_english_hinglish",
