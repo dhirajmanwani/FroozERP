@@ -121,8 +121,13 @@ const applyStatement = (sql, values) => {
   return { rows: [{ ...row, status }], rowCount: 1 };
 };
 
+// Owner, not Admin. FROST is Owner-only as of the owner-only change -- see
+// `frostOwnerOnlyAccess.test.js`, which is where *who may use FROST* is tested. This suite is about
+// parameter binding and branch scoping, so its fixture needs a role that gets through the door;
+// leaving it as Admin would have turned every assertion below into a 403 and told us nothing about
+// either subject.
 const PERMISSION_USER = {
-  rows: [{ id: 7, full_name: "Rahul", username: "rahul", branch_id: 2, role_name: "Admin", permissions: {} }],
+  rows: [{ id: 7, full_name: "Rahul", username: "rahul", branch_id: 2, role_name: "Owner", permissions: {} }],
   rowCount: 1,
 };
 
@@ -142,7 +147,7 @@ const changeStatus = async (route, { id, action, branchId, snoozedUntil = null }
     deviceId: "FZDEV-ALERT-STATUS",
     companyId: 1,
     branchId,
-    role: "Admin",
+    role: "Owner",
     secret: TEST_SIGNING_KEY,
   });
   const statements = [];

@@ -3553,9 +3553,14 @@ const initializeDatabase = async () => {
     SET permissions = permissions || '{"whatsapp_send":true,"whatsapp_settings":true}'::jsonb
     WHERE role_name IN ('Owner', 'Admin');
 
+    -- Owner only. Admin used to be on this line, and this statement carries no
+    -- NOT (permissions ? ...) guard, so it re-applied on every single start -- which means no
+    -- tightening below could ever have stuck while Admin was named here. FROST is the owner's
+    -- assistant; an Admin who should have it is granted it from the role-permissions screen, and
+    -- that grant now survives a restart.
     UPDATE role_permission_settings
     SET permissions = permissions || '{"ai_assistant_view":true,"ai_financial_insights":true,"ai_inventory_insights":true,"ai_reminder_manage":true,"ai_action_approve":true,"ai_settings_manage":true}'::jsonb
-    WHERE role_name IN ('Owner', 'Admin');
+    WHERE role_name = 'Owner';
 
     UPDATE role_permission_settings
     SET permissions = permissions || '{"dashboard":true}'::jsonb
@@ -3588,14 +3593,29 @@ const initializeDatabase = async () => {
       AND NOT (permissions ? 'whatsapp_send');
 
     UPDATE role_permission_settings
-    SET permissions = permissions || '{"ai_assistant_view":true,"ai_financial_insights":false,"ai_inventory_insights":false,"ai_reminder_manage":false,"ai_action_approve":false,"ai_settings_manage":false}'::jsonb
-    WHERE role_name = 'Cashier'
+    SET permissions = permissions || '{"ai_assistant_view":false,"ai_financial_insights":false,"ai_inventory_insights":false,"ai_reminder_manage":false,"ai_action_approve":false,"ai_settings_manage":false}'::jsonb
+    WHERE role_name IN ('Cashier', 'Purchase Manager', 'Inventory Manager')
       AND NOT (permissions ? 'ai_assistant_view');
 
+    -- FROST is the owner's assistant. These three roles used to be seeded ai_assistant_view:true,
+    -- which meant a Cashier could open it and read the daily briefing and the low-stock answers.
+    -- The per-route role lists did not save it: getPermissionUser returns the user as soon as the
+    -- stored permission is true and never consults the list.
+    --
+    -- This bootstrap re-runs on every start, so a blanket UPDATE would undo a deliberate grant made
+    -- from the role-permissions screen afterwards. The marker key makes it a one-time tightening:
+    -- it closes what was opened by the old seeding, and never fires again on this database.
     UPDATE role_permission_settings
-    SET permissions = permissions || '{"ai_assistant_view":true,"ai_financial_insights":false,"ai_inventory_insights":true,"ai_reminder_manage":false,"ai_action_approve":false,"ai_settings_manage":false}'::jsonb
-    WHERE role_name IN ('Purchase Manager', 'Inventory Manager')
-      AND NOT (permissions ? 'ai_assistant_view');
+    SET permissions = permissions
+      || '{"ai_assistant_view":false,"ai_financial_insights":false,"ai_inventory_insights":false,"ai_reminder_manage":false,"ai_action_approve":false,"ai_settings_manage":false}'::jsonb
+      || '{"ai_owner_only_applied":true}'::jsonb
+    WHERE role_name <> 'Owner'
+      AND NOT (permissions ? 'ai_owner_only_applied');
+
+    -- Roles seeded after the tightening only need the marker, so they are not re-tightened later.
+    UPDATE role_permission_settings
+    SET permissions = permissions || '{"ai_owner_only_applied":true}'::jsonb
+    WHERE NOT (permissions ? 'ai_owner_only_applied');
 
     UPDATE role_permission_settings
     SET permissions = permissions || '{"dashboard":false}'::jsonb

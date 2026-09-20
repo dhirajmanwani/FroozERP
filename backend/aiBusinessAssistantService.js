@@ -163,7 +163,21 @@ const buildFrostPolicy = (identity = {}, actionClass = "READ_ONLY") => {
   };
 };
 
-const requireAiPermission = async ({ req, res, getPermissionUser, getCanonicalIdentity, permission, fallbackRoles = ["Owner", "Admin"], actionClass = "READ_ONLY" }) => {
+// FROST is the owner's assistant and nobody else's. Asked for in as many words: "it should be
+// available just for me ... it works like my assistant."
+//
+// This is the *fallback* only -- `getPermissionUser` consults it just when a role's stored
+// `ai_assistant_view` is undefined. A role that has been granted the permission explicitly from the
+// role-permissions screen still gets in, which is the supported way to widen this later. What it
+// stops is a role quietly inheriting FROST because a route's own list happened to name it.
+//
+// Every FROST route used to carry its own list, several of them naming Cashier, and those lists
+// read like a restriction while granting nothing and blocking nothing: the roles were seeded
+// `ai_assistant_view: true`, so `storedPermission === true` short-circuited the list entirely
+// (`server.js`, `getPermissionUser`). One list, and it means what it says.
+const FROST_DEFAULT_ROLES = ["Owner"];
+
+const requireAiPermission = async ({ req, res, getPermissionUser, getCanonicalIdentity, permission, fallbackRoles = FROST_DEFAULT_ROLES, actionClass = "READ_ONLY" }) => {
   // A-4: the caller is whoever the signed session says, and nothing else.
   //
   // This read used to be `req.query.user_id || req.body?.user_id || req.headers["x-user-id"]`,
@@ -219,6 +233,35 @@ const requireAiPermission = async ({ req, res, getPermissionUser, getCanonicalId
     return null;
   }
   return { ...user, identity, frostPolicy: policy };
+};
+
+// `ai_assistant_view` only buys you the door. What is behind it is decided per question, because
+// the same endpoint answers "what is low on stock" and "what was today's gross profit" and those
+// are not the same disclosure.
+//
+// This lived inline in `POST /api/ai/query` and was simply absent from `POST /api/ai/query/stream`,
+// which meant a Cashier could ask the streaming route for SALES_FINANCE and receive the whole fact
+// bundle -- sales, gross profit, expenses, collections -- that the non-streaming route refuses
+// them. Two copies of a security rule is one copy too many, so there is now one.
+const FINANCIAL_INTENTS = ["SALES_FINANCE", "CASH_DRAWER", "SUPPLIER_MARGIN", "PROFIT_RANKING", "LOSS_REVIEW", "SALE_RATE_REVIEW"];
+const INVENTORY_INTENTS = ["INVENTORY", "INVENTORY_EXPIRY", "PURCHASE_PLANNING"];
+
+const enforceIntentPermission = async ({ classification, user, getPermissionUser, res }) => {
+  if (FINANCIAL_INTENTS.includes(classification)) {
+    const allowed = await getPermissionUser(user.id, "ai_financial_insights", FROST_DEFAULT_ROLES);
+    if (!allowed) {
+      res.status(403).json({ code: "FROST_FINANCIAL_INSIGHTS_DENIED", message: "Financial FROST answers are available to the Owner" });
+      return false;
+    }
+  }
+  if (INVENTORY_INTENTS.includes(classification)) {
+    const allowed = await getPermissionUser(user.id, "ai_inventory_insights", FROST_DEFAULT_ROLES);
+    if (!allowed) {
+      res.status(403).json({ code: "FROST_INVENTORY_INSIGHTS_DENIED", message: "Inventory FROST answers are not enabled for this role" });
+      return false;
+    }
+  }
+  return true;
 };
 
 const getAiSettings = async (pool, frost = new FrostServiceLayer({ pool })) => {
@@ -1713,7 +1756,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
   const frost = new FrostServiceLayer({ pool });
 
   app.get("/api/ai/frost/status", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     const [settings, usage] = await Promise.all([frost.getSettings(), frost.getUsageSummary()]);
     return res.json({
@@ -1734,7 +1777,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
   });
 
   app.get("/api/ai/suggested-questions", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     return res.json({ questions: SUGGESTED_QUESTIONS });
   });
@@ -1757,10 +1800,17 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
   });
 
   app.put("/api/ai/settings", async (req, res) => {
-    const manager = await requireRateManager(req.body.updated_by || req.body.user_id);
-    if (!manager) return res.status(403).json({ message: "Only Owner/Admin can manage AI settings" });
+    // A-4, again. `requireAiPermission` above was fixed to read `req.auth`, but these four writer
+    // routes kept taking the actor from the body, and the app-wide substitution check
+    // (`deviceSession.js:102-108`) compares only user_id, device_id, company_id and branch_id --
+    // `updated_by` is on none of those lists. So a signed-in Cashier who sent
+    // `{"updated_by": <owner id>}` and omitted `user_id` passed every check and wrote FROST's
+    // settings as the Owner. `req.auth` is the only identity.
+    const manager = await requireRateManager(req.auth.userId);
+    if (!manager) return res.status(403).json({ message: "Only the Owner can manage FROST settings" });
     const thresholds = { ...DEFAULT_THRESHOLDS, ...(req.body.thresholds || {}) };
     const result = await frost.updateSettings({
+      branchId: req.auth.branchId,
       thresholds,
       frostSettings: req.body.frost || {
         providerKey: req.body.provider_key || req.body.providerKey,
@@ -1776,7 +1826,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
   });
 
   app.get("/api/ai/briefing", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     const settings = await getAiSettings(pool, frost);
     const range = getRange(req.query);
@@ -1785,7 +1835,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
   });
 
   app.get("/api/ai/alerts", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     return res.json({ alerts: await getStoredAlerts(pool, req.auth.branchId) });
   });
@@ -1816,20 +1866,20 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
   });
 
   app.get("/api/ai/reminders", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     return res.json({ reminders: await getReminders(pool, req.auth.branchId) });
   });
 
   app.get("/api/ai/memory", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     const memories = await getMemoryRows(pool, req.auth.branchId, req.query);
     return res.json({ memories });
   });
 
   app.post("/api/ai/memory/propose", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     const draft = req.body.content ? { ...buildMemoryDraftFromText(req.body.content), ...req.body } : req.body;
     if (containsSensitiveMemory(`${draft.title || ""} ${draft.content || ""}`)) {
@@ -1854,27 +1904,31 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       Number(draft.confidence || 0.55),
       user.id,
     ]);
-    await frost.audit({ userId: user.id, deviceId: req.body.device_id || "", eventType: "FROST_MEMORY_PROPOSED", answer: "FROST memory proposed", suggestedAction: result.rows[0], approvalStatus: "PENDING_OWNER_APPROVAL" });
+    await frost.audit({ branchId: req.auth.branchId, userId: user.id, deviceId: req.body.device_id || "", eventType: "FROST_MEMORY_PROPOSED", answer: "FROST memory proposed", suggestedAction: result.rows[0], approvalStatus: "PENDING_OWNER_APPROVAL" });
     return res.status(201).json(result.rows[0]);
   });
 
   app.post("/api/ai/memory/:id/approve", async (req, res) => {
-    const manager = await requireRateManager(req.body.user_id || req.body.updated_by);
-    if (!manager) return res.status(403).json({ message: "Only Owner/Admin can approve FROST memories" });
+    const manager = await requireRateManager(req.auth.userId);
+    if (!manager) return res.status(403).json({ message: "Only the Owner can approve FROST memories" });
     const id = parsePositiveInteger(req.params.id);
+    // The insert below scopes by branch; these three writers did not, so an id from another branch
+    // was editable from here. A missing row must also refuse rather than return an empty body --
+    // `res.json(undefined)` sends `` and the panel would have shown it as a silent success.
     const result = await pool.query(`
       UPDATE frost_memories
       SET approval_status = 'APPROVED', approved_by = $2, updated_at = CURRENT_TIMESTAMP
-      WHERE id = $1
+      WHERE id = $1 AND branch_id = $3
       RETURNING *
-    `, [id, manager.id]);
-    await frost.audit({ userId: manager.id, eventType: "FROST_MEMORY_APPROVED", answer: "FROST memory approved", suggestedAction: result.rows[0], approvalStatus: "APPROVED" });
+    `, [id, manager.id, requireBranchScope(req.auth.branchId)]);
+    if (!result.rows[0]) return res.status(404).json({ code: "FROST_MEMORY_NOT_FOUND", message: "That FROST memory does not exist in this branch" });
+    await frost.audit({ branchId: req.auth.branchId, userId: manager.id, eventType: "FROST_MEMORY_APPROVED", answer: "FROST memory approved", suggestedAction: result.rows[0], approvalStatus: "APPROVED" });
     return res.json(result.rows[0]);
   });
 
   app.patch("/api/ai/memory/:id", async (req, res) => {
-    const manager = await requireRateManager(req.body.user_id || req.body.updated_by);
-    if (!manager) return res.status(403).json({ message: "Only Owner/Admin can edit FROST memories" });
+    const manager = await requireRateManager(req.auth.userId);
+    if (!manager) return res.status(403).json({ message: "Only the Owner can edit FROST memories" });
     const id = parsePositiveInteger(req.params.id);
     if (containsSensitiveMemory(`${req.body.title || ""} ${req.body.content || ""}`)) {
       return res.status(400).json({ message: "FROST memory cannot store secrets, API keys, passwords or payment credentials" });
@@ -1889,7 +1943,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
           confidence = COALESCE($7, confidence),
           is_active = COALESCE($8, is_active),
           updated_at = CURRENT_TIMESTAMP
-      WHERE id = $1
+      WHERE id = $1 AND branch_id = $9
       RETURNING *
     `, [
       id,
@@ -1900,47 +1954,49 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       req.body.content === undefined ? null : cleanText(req.body.content),
       req.body.confidence === undefined ? null : Number(req.body.confidence),
       req.body.is_active === undefined ? null : req.body.is_active === true,
+      requireBranchScope(req.auth.branchId),
     ]);
-    await frost.audit({ userId: manager.id, eventType: "FROST_MEMORY_UPDATED", answer: "FROST memory updated", suggestedAction: result.rows[0] });
+    if (!result.rows[0]) return res.status(404).json({ code: "FROST_MEMORY_NOT_FOUND", message: "That FROST memory does not exist in this branch" });
+    await frost.audit({ branchId: req.auth.branchId, userId: manager.id, eventType: "FROST_MEMORY_UPDATED", answer: "FROST memory updated", suggestedAction: result.rows[0] });
     return res.json(result.rows[0]);
   });
 
   app.delete("/api/ai/memory/:id", async (req, res) => {
-    const manager = await requireRateManager(req.body.user_id || req.query.user_id);
-    if (!manager) return res.status(403).json({ message: "Only Owner/Admin can delete FROST memories" });
+    const manager = await requireRateManager(req.auth.userId);
+    if (!manager) return res.status(403).json({ message: "Only the Owner can delete FROST memories" });
     const id = parsePositiveInteger(req.params.id);
-    const result = await pool.query("DELETE FROM frost_memories WHERE id = $1 RETURNING *", [id]);
-    await frost.audit({ userId: manager.id, eventType: "FROST_MEMORY_DELETED", answer: "FROST memory deleted", suggestedAction: { id } });
+    const result = await pool.query("DELETE FROM frost_memories WHERE id = $1 AND branch_id = $2 RETURNING *", [id, requireBranchScope(req.auth.branchId)]);
+    await frost.audit({ branchId: req.auth.branchId, userId: manager.id, eventType: "FROST_MEMORY_DELETED", answer: "FROST memory deleted", suggestedAction: { id } });
     return res.json({ deleted: Boolean(result.rows[0]), memory: result.rows[0] || null });
   });
 
   app.get("/api/ai/predictions/inventory", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_inventory_insights", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     return res.json({ predictions: await getInventoryPredictions(pool, req.auth.branchId) });
   });
 
   app.get("/api/ai/predictions/sales", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_financial_insights", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_financial_insights", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     return res.json({ predictions: await getSalesPredictions(pool, req.auth.branchId) });
   });
 
   app.get("/api/ai/predictions/cashflow", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_financial_insights", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_financial_insights", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     const settings = await getAiSettings(pool, frost);
     return res.json({ predictions: await getCashflowPredictions(pool, req.auth.branchId, settings) });
   });
 
   app.get("/api/ai/predictions/waste", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_inventory_insights", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     return res.json({ predictions: await getWastePredictions(pool, req.auth.branchId) });
   });
 
   app.get("/api/ai/predictions", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     const settings = await getAiSettings(pool, frost);
     const [inventory, sales, cashflow, waste] = await Promise.all([
@@ -1953,13 +2009,13 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
   });
 
   app.get("/api/ai/profit-advisor", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_financial_insights", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_financial_insights", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     return res.json({ recommendations: await getProfitAdvisorRows(pool, req.auth.branchId) });
   });
 
   app.get("/api/ai/profit-advisor/products/:id", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_financial_insights", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_financial_insights", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     const productId = parsePositiveInteger(req.params.id);
     const rows = await getProfitAdvisorRows(pool, req.auth.branchId);
@@ -1967,7 +2023,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
   });
 
   app.get("/api/ai/daily-plan", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     const settings = await getAiSettings(pool, frost);
     const range = getRange(req.query);
@@ -1995,7 +2051,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     res,
     getPermissionUser,
     permission: "ai_financial_insights",
-    fallbackRoles: ["Owner", "Admin"],
+    fallbackRoles: FROST_DEFAULT_ROLES,
   });
 
   app.get("/api/ai/intelligence/pricing", async (req, res) => {
@@ -2005,13 +2061,13 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
   });
 
   app.get("/api/ai/intelligence/purchase-planner", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_inventory_insights", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     return res.json({ recommendations: await getSmartPurchasePlanner(pool, req.auth.branchId), action_class: "READ_ONLY", approval_required: false });
   });
 
   app.get("/api/ai/intelligence/waste-prevention", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_inventory_insights", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     return res.json({ lots: await getWastePreventionIntelligence(pool, req.auth.branchId), action_class: "READ_ONLY", approval_required: false });
   });
@@ -2042,7 +2098,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
   });
 
   app.get("/api/ai/intelligence/demand", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_inventory_insights", fallbackRoles: ["Owner", "Admin", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_inventory_insights", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     return res.json({ forecasts: await getDemandForecast(pool, req.auth.branchId), action_class: "READ_ONLY", approval_required: false });
   });
@@ -2149,19 +2205,12 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
   app.post("/api/ai/query", async (req, res) => {
     const question = cleanText(req.body.question);
     if (!question) return res.status(400).json({ message: "Question is required" });
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     const settings = await getAiSettings(pool, frost);
     const range = getRange(req.body);
     const classification = classifyBusinessIntent(question);
-    if (["SALES_FINANCE", "CASH_DRAWER", "SUPPLIER_MARGIN", "PROFIT_RANKING", "LOSS_REVIEW", "SALE_RATE_REVIEW"].includes(classification)) {
-      const allowed = await getPermissionUser(user.id, "ai_financial_insights", ["Owner", "Admin"]);
-      if (!allowed) return res.status(403).json({ message: "Financial AI insights require Owner/Admin permission" });
-    }
-    if (["INVENTORY", "INVENTORY_EXPIRY", "PURCHASE_PLANNING"].includes(classification)) {
-      const allowed = await getPermissionUser(user.id, "ai_inventory_insights", ["Owner", "Admin", "Purchase Manager", "Inventory Manager"]);
-      if (!allowed) return res.status(403).json({ message: "Inventory AI insights are not enabled for this role" });
-    }
+    if (!(await enforceIntentPermission({ classification, user, getPermissionUser, res }))) return;
     const facts = await factsForBusinessIntent(pool, req.auth.branchId, classification, settings, range);
     const providerKey = settings.provider?.key || "deterministic";
     const cacheKey = frost.buildCacheKey({ engine: "conversation", question, facts, range, providerKey });
@@ -2169,7 +2218,12 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     const cachedPayload = cached?.response_payload || null;
     const providerAnswer = cachedPayload?.answer || null;
     const answer = providerAnswer || buildDeterministicAnswer(classification, facts, range);
-    if (!assertGroundedAnswer({ answer, facts })) return res.status(500).json({ message: "AI answer was not grounded in verified facts" });
+    // `generated` is what makes this check real: a deterministic answer is grounded by construction,
+    // a phrased one has to prove it. Both routes carry it now so that wiring a provider is a change
+    // in one place and not a thing to remember here.
+    if (!assertGroundedAnswer({ answer, facts, allowedText: range.label, generated: Boolean(providerAnswer) })) {
+      return res.status(500).json({ code: "FROST_ANSWER_NOT_GROUNDED", message: "AI answer was not grounded in verified facts" });
+    }
     const conversationId = await auditQuestion({
       branchId: req.auth.branchId,
       pool,
@@ -2217,16 +2271,25 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
   app.post("/api/ai/query/stream", async (req, res) => {
     const question = cleanText(req.body.question);
     if (!question) return res.status(400).json({ message: "Question is required" });
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
+    const classification = classifyBusinessIntent(question);
+    // The gate runs before the SSE headers go out. Once this response is an event stream a 403
+    // status can no longer be sent, and the refusal would reach the client as a stream that just
+    // never explains itself.
+    if (!(await enforceIntentPermission({ classification, user, getPermissionUser, res }))) return;
+    const settings = await getAiSettings(pool, frost);
+    const range = getRange(req.body);
+    const facts = await factsForBusinessIntent(pool, req.auth.branchId, classification, settings, range);
+    const answer = buildDeterministicAnswer(classification, facts, range);
+    if (!assertGroundedAnswer({ answer, facts, allowedText: range.label, generated: false })) {
+      return res.status(500).json({ code: "FROST_ANSWER_NOT_GROUNDED", message: "AI answer was not grounded in verified facts" });
+    }
+    // Everything that can refuse has now refused. Only past this line does the response become an
+    // event stream, because after these headers a status code can no longer be set.
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
-    const settings = await getAiSettings(pool, frost);
-    const range = getRange(req.body);
-    const classification = classifyBusinessIntent(question);
-    const facts = await factsForBusinessIntent(pool, req.auth.branchId, classification, settings, range);
-    const answer = buildDeterministicAnswer(classification, facts, range);
     const conversationId = await auditQuestion({
       branchId: req.auth.branchId,
       pool,
@@ -2255,11 +2318,12 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
   });
 
   app.post("/api/ai/actions/propose", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin", "Cashier", "Purchase Manager", "Inventory Manager"], actionClass: "BUSINESS_WRITE" });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES, actionClass: "BUSINESS_WRITE" });
     if (!user) return;
     const actionType = cleanText(req.body.action_type || req.body.action || "").toUpperCase().replace(/\s+/g, "_");
     if (!actionType) return res.status(400).json({ message: "Action type is required" });
     const proposal = await frost.createActionProposal({
+      branchId: req.auth.branchId,
       conversationId: parsePositiveInteger(req.body.conversation_id),
       actionType,
       payload: req.body.payload || {},
@@ -2275,10 +2339,11 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
   });
 
   app.post("/api/ai/voice/session", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     try {
       const session = await frost.createRealtimeSession({
+        branchId: req.auth.branchId,
         userId: user.id,
         deviceId: req.body.device_id || req.headers["x-device-id"],
         providerKey: req.body.provider_key || "openai",
@@ -2291,7 +2356,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
   });
 
   app.get("/api/ai/voice/status", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     const apiKeyConfigured = Boolean(String(process.env.OPENAI_API_KEY || "").trim());
     const provider = String(process.env.AI_PROVIDER || "openai").trim() || "openai";
@@ -2310,7 +2375,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
   });
 
   app.post("/api/ai/voice/transcribe", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     if (!String(process.env.OPENAI_API_KEY || "").trim()) {
       return res.status(503).json({
@@ -2331,7 +2396,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
   });
 
   app.post("/api/ai/voice/speak", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: ["Owner", "Admin"] });
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     if (!String(process.env.OPENAI_API_KEY || "").trim()) {
       return res.status(503).json({
@@ -2357,4 +2422,8 @@ module.exports = {
   buildFrostPolicy,
   normalizeRoleName,
   buildStatusChange,
+  FROST_DEFAULT_ROLES,
+  FINANCIAL_INTENTS,
+  INVENTORY_INTENTS,
+  SUGGESTED_QUESTIONS,
 };

@@ -28,10 +28,19 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 
+const stripComments = (source) =>
+  source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+
 const SOURCE = fs.readFileSync(path.join(__dirname, "aiBusinessAssistantService.js"), "utf8");
-const CODE = SOURCE
-  .replace(/\/\*[\s\S]*?\*\//g, "")
-  .replace(/(^|[^:])\/\/[^\n]*/g, "$1");
+const CODE = stripComments(SOURCE);
+
+// `frostCore.js` is the other half of FROST and was never read here. The literal the test below
+// forbids -- `VALUES (1, 1,` -- was still sitting in its `audit()` the whole time this file was
+// green, because the file that contained it was not one of the files being checked. A guard that
+// names a rule but reads only one of the two places the rule applies is worth less than it looks.
+const CORE = stripComments(fs.readFileSync(path.join(__dirname, "frostCore.js"), "utf8"));
 
 test("an absent branch refuses instead of widening to every branch", () => {
   // The whole point. `|| 1` here would have been the same bug in a new place: a default that
@@ -105,4 +114,37 @@ test("the alert and reminder dedup keys cannot collide across branches", () => {
   assert.match(CODE, /purchase-pending:\$\{branchId\}:/);
   assert.match(CODE, /low-stock:\$\{branchId\}:/);
   assert.match(CODE, /buildReminderDedupKey\(\{[^}]*branchId: req\.auth\.branchId/);
+});
+
+test("frostCore writes the branch it was given, never a hard-coded one", () => {
+  // Every settings change, action proposal and voice session went into ai_audit_log as company 1 /
+  // branch 1. The row existed, which is why nothing looked wrong; it just named the wrong shop.
+  assert.doesNotMatch(CORE, /VALUES \(1, 1,/, "frostCore's audit must not pin company 1 / branch 1");
+  assert.match(CORE, /async audit\(\{ branchId = null, companyId = null,/);
+  assert.match(CORE, /asAuditScope\(companyId\), asAuditScope\(branchId\)/);
+});
+
+test("an unknown audit scope is written as NULL, not coerced to a branch", () => {
+  // The failure mode this prevents is quiet: `Number(undefined) || 1` would have turned every
+  // un-scoped call into a claim about branch 1, and a row that names a real branch cannot be told
+  // apart from a true one afterwards.
+  const { asAuditScope } = require("./frostCore");
+  assert.equal(asAuditScope(undefined), null);
+  assert.equal(asAuditScope(null), null);
+  assert.equal(asAuditScope(""), null);
+  assert.equal(asAuditScope(0), null);
+  assert.equal(asAuditScope("not a branch"), null);
+  assert.equal(asAuditScope(-3), null);
+  assert.equal(asAuditScope(4), 4);
+  assert.equal(asAuditScope("7"), 7);
+});
+
+test("the FROST audit call sites pass the verified branch", () => {
+  // `req.auth.branchId` and nothing else. A `req.body.branch_id` here would be the A-4 hole again,
+  // one layer down.
+  const auditCalls = [...CODE.matchAll(/frost\.audit\(\{([^}]*)/g)].map(([, args]) => args);
+  assert.ok(auditCalls.length >= 4, `expected the audit call sites, found ${auditCalls.length}`);
+  for (const args of auditCalls) {
+    assert.ok(args.includes("branchId: req.auth.branchId"), `an audit call omits the verified branch: ${args.trim()}`);
+  }
 });

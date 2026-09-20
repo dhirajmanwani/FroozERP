@@ -154,6 +154,7 @@ import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, resolveReportDateRange } from "./local/reportRefresh";
 import { approvedDeviceCredentialMessage, normalizeDeviceBootstrapStatus } from "./local/freshDeviceOnboarding";
 import { NAME_TITLES, getUserDisplayName, getUserGreetingName, getUserInitial, getUserRoleLabel, joinPersonName, splitPersonName } from "./local/userPresentation";
+import { FROST_GREETING_PROMPT, resolveFrostGreeting } from "./local/frostGreeting";
 import { describeUpdateAvailability, normalizeUpdateMetadata } from "./local/updateMetadata";
 import { RUNTIME_FAILURE_EVENT, describeRequestFailure, initialiseMandatoryRuntime, resolveLocalServiceRenderState, resolveMandatoryRuntimeRenderState, settleNamedRequests } from "./local/startupResilience";
 import {
@@ -9281,6 +9282,10 @@ function AiBusinessAssistantModule({
   const latestAnswer = data.history[0];
   const canManageReminders = user?.role === "Owner" || user?.role === "Admin";
   const canManageFrost = user?.role === "Owner" || user?.role === "Admin";
+  // Recomputed each render rather than memoised, so a panel left open across 17:00 says "Good
+  // evening" the next time it draws instead of holding the greeting it opened with. The band logic
+  // and the unreadable-clock fallback live in local/frostGreeting.js, with the tests.
+  const frostGreeting = resolveFrostGreeting({ now: new Date(), name: getUserGreetingName(user) });
   const periodLabel = data.period?.label || briefing.period?.label || "Current data";
   const cardValue = (section, key, fallback = 0) => cards[section]?.[key] ?? fallback;
   const money = (value) => currency.format(Number(value || 0));
@@ -9357,15 +9362,30 @@ function AiBusinessAssistantModule({
         {activeTab === "ask" && (
         <ModuleCard eyebrow="Ask FROST" title="Controlled Business Questions" subtitle="Answers use the shared FROST service layer. No write action is performed without owner approval.">
           {data.loading && <div className="ai-thinking"><span /> FROST is thinking</div>}
+          <div className="ai-frost-greeting">
+            <strong>{frostGreeting.line}</strong>
+            <span>{FROST_GREETING_PROMPT}</span>
+          </div>
           <div className="ai-question-box">
             <textarea value={question} onChange={(event) => onQuestionChange(event.target.value)} placeholder="Ask about overdue payments, low stock, sales, profit, expenses or pending purchase bills." />
             <button className="primary-button" disabled={data.loading || !question.trim()} onClick={() => onAsk()}><Icon name="message" /> Ask</button>
           </div>
-          <div className="ai-suggestion-grid">
-            {(data.suggestedQuestions || []).map((item) => (
-              <button className="ai-suggestion" key={item} disabled={data.loading} onClick={() => onSelectQuestion(item)}>{item}</button>
-            ))}
-          </div>
+          <label className="ai-suggestion-picker">
+            <span>Or pick a question</span>
+            <select
+              value=""
+              disabled={data.loading || !(data.suggestedQuestions || []).length}
+              onChange={(event) => {
+                const picked = event.target.value;
+                if (picked) onSelectQuestion(picked);
+              }}
+            >
+              <option value="">{(data.suggestedQuestions || []).length ? "Choose a question" : "No questions available"}</option>
+              {(data.suggestedQuestions || []).map((item) => (
+                <option key={item} value={item}>{item}</option>
+              ))}
+            </select>
+          </label>
           {latestAnswer && (
             <article className="ai-answer-panel">
               <span className="eyebrow">{latestAnswer.period?.label || periodLabel}</span>

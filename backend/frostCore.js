@@ -76,6 +76,14 @@ const TOKEN_PRICING_PER_1K = {
 
 const stableJson = (value) => JSON.stringify(value, Object.keys(value || {}).sort());
 
+// An audit row's scope is whatever the caller could verify, or nothing. A zero, an empty string or
+// a NaN means "the caller did not know", and that must reach the column as NULL rather than being
+// coerced into a real branch id.
+const asAuditScope = (value) => {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
 const hashPayload = (value) =>
   crypto.createHash("sha256").update(typeof value === "string" ? value : stableJson(value)).digest("hex");
 
@@ -108,7 +116,12 @@ const classifyBusinessIntent = (question = "") => {
   if (/(profit.*month|most profit|top profit|generated.*profit)/.test(text)) return "PROFIT_RANKING";
   if (/(today.*sale|sales|revenue|profit|compare|month|last month|gross profit)/.test(text)) return "SALES_FINANCE";
   if (/(supplier.*bill|purchase bill|payment|pending|receivable|outstanding|ledger|customer.*pay|supplier.*pay)/.test(text)) return "PAYMENTS";
-  if (/(customer.*recent|haven.?t purchased|inactive customer|not purchased)/.test(text)) return "CUSTOMER_ACTIVITY";
+  // `inactive customer` as a literal never matched FROST's own suggested question, "Which customers
+  // have become inactive?" -- the words are in the other order. The one query written to answer it,
+  // getCustomerActivitySummary, was unreachable from the button that asks it, and the user got a
+  // generic briefing with no sign anything had been missed. `frostSuggestedQuestions.test.js` now
+  // runs every shipped suggestion through this classifier, so the two lists cannot drift again.
+  if (/(customer.*recent|haven.?t purchased|inactive customer|customer.*inactive|not purchased)/.test(text)) return "CUSTOMER_ACTIVITY";
   if (/(expiry|expire|close to expiry|near expiry|old lot|lot aging|fruits close)/.test(text)) return "INVENTORY_EXPIRY";
   if (/(supplier.*margin|best margin|margin supplier)/.test(text)) return "SUPPLIER_MARGIN";
   if (/(low stock|stock|inventory|run out|waste|lowest-selling|highest-selling|fruit)/.test(text)) return "INVENTORY";
@@ -211,7 +224,7 @@ class FrostServiceLayer {
     };
   }
 
-  async updateSettings({ thresholds, frostSettings, updatedBy }) {
+  async updateSettings({ thresholds, frostSettings, updatedBy, branchId = null, companyId = null }) {
     const current = await this.getSettings();
     const nextFrost = { ...current.frost, ...(frostSettings || {}), assistantName: FROST_ASSISTANT_NAME };
     const result = await this.pool.query(
@@ -233,6 +246,8 @@ class FrostServiceLayer {
       ]
     );
     await this.audit({
+      branchId,
+      companyId,
       userId: updatedBy,
       eventType: "FROST_SETTINGS_UPDATED",
       answer: "FROST settings updated",
@@ -285,6 +300,8 @@ class FrostServiceLayer {
     payload = {},
     proposedBy = null,
     approvalStatus,
+    branchId = null,
+    companyId = null,
   }) {
     const status = approvalStatus || (actionRequiresApproval(actionType) ? "PENDING_OWNER_APPROVAL" : "READ_ONLY");
     const result = await this.pool.query(
@@ -296,6 +313,8 @@ class FrostServiceLayer {
       [conversationId, actionType, JSON.stringify(payload), status, proposedBy]
     );
     await this.audit({
+      branchId,
+      companyId,
       userId: proposedBy,
       eventType: "FROST_ACTION_PROPOSED",
       answer: `FROST proposed ${actionType}`,
@@ -305,7 +324,7 @@ class FrostServiceLayer {
     return result.rows[0];
   }
 
-  async createRealtimeSession({ userId, deviceId = "", providerKey = "openai", instructions = "" }) {
+  async createRealtimeSession({ userId, deviceId = "", providerKey = "openai", instructions = "", branchId = null, companyId = null }) {
     const settings = await this.getSettings();
     const frost = settings.frost || DEFAULT_FROST_SETTINGS;
     const selectedProvider = providerKey || frost.providerKey || "openai";
@@ -319,6 +338,8 @@ class FrostServiceLayer {
     const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
     if (!apiKey) {
       await this.audit({
+        branchId,
+        companyId,
         userId,
         deviceId,
         eventType: "FROST_VOICE_SESSION_UNAVAILABLE",
@@ -354,6 +375,8 @@ class FrostServiceLayer {
     if (!response.ok) {
       const text = await response.text();
       await this.audit({
+        branchId,
+        companyId,
         userId,
         deviceId,
         eventType: "FROST_VOICE_SESSION_FAILED",
@@ -369,6 +392,8 @@ class FrostServiceLayer {
     }
     const body = await response.json();
     await this.audit({
+      branchId,
+      companyId,
       userId,
       deviceId,
       eventType: "FROST_VOICE_SESSION_CREATED",
@@ -390,13 +415,21 @@ class FrostServiceLayer {
     };
   }
 
-  async audit({ userId = null, deviceId = "", eventType, question = "", verifiedFacts = [], answer = "", suggestedAction = {}, approvalStatus = "READ_ONLY" }) {
+  // Every settings change, action proposal and voice session used to be logged as `VALUES (1, 1,`
+  // -- company 1, branch 1 -- whoever did it and wherever they were. `auditQuestion` in the service
+  // had always written the real branch; only this one did not, and `frostBranchScope.test.js` reads
+  // only that other file, so the literal it exists to forbid sat here uncovered.
+  //
+  // An unknown branch is written as NULL, never as 1. Both columns are nullable, and a row that
+  // says "branch unknown" can be found and fixed; a row that says "branch 1" cannot be told from a
+  // true one.
+  async audit({ branchId = null, companyId = null, userId = null, deviceId = "", eventType, question = "", verifiedFacts = [], answer = "", suggestedAction = {}, approvalStatus = "READ_ONLY" }) {
     await this.pool.query(
       `
       INSERT INTO ai_audit_log (company_id, branch_id, user_id, device_id, event_type, question, verified_facts, answer, suggested_action, approval_status)
-      VALUES (1, 1, $1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8)
+      VALUES ($9, $10, $1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8)
       `,
-      [userId, deviceId, eventType, question, JSON.stringify(verifiedFacts), answer, JSON.stringify(suggestedAction), approvalStatus]
+      [userId, deviceId, eventType, question, JSON.stringify(verifiedFacts), answer, JSON.stringify(suggestedAction), approvalStatus, asAuditScope(companyId), asAuditScope(branchId)]
     );
   }
 
@@ -423,6 +456,7 @@ module.exports = {
   FrostProviderRegistry,
   FrostServiceLayer,
   actionRequiresApproval,
+  asAuditScope,
   classifyBusinessIntent,
   estimateCost,
   estimateTokens,
