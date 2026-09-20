@@ -718,6 +718,10 @@ const maskAccessToken = (value) => {
 const AUTO_UPDATE_ALL_DAYS = "0,1,2,3,4,5,6";
 const AUTO_UPDATE_DEFAULT_START_MINUTE = 22 * 60;
 const AUTO_UPDATE_DEFAULT_END_MINUTE = 6 * 60;
+const AUTO_UPDATE_DEFAULT_HOLDBACK_DAYS = 0;
+// A fortnight. Long enough for any "let the Owner run it for a while first" a shop could mean,
+// short enough that a typo of 300 is refused rather than parking a counter for a year.
+const AUTO_UPDATE_MAX_HOLDBACK_DAYS = 14;
 const MINUTES_IN_DAY = 24 * 60;
 // `Date.getDay()` order, so the index is the stored number. Accepted on input because
 // autoUpdate.js speaks these too and a body that carries them should not be a 400.
@@ -778,6 +782,24 @@ const normalizeAutoUpdateDays = (value) => {
   return [...new Set(parsed)].sort((a, b) => a - b).join(",");
 };
 
+/**
+ * Whole days a counter lags a release, 0-14, or null for "that was not a number of days".
+ *
+ * Zero is a real answer, not a missing one, so it is returned rather than refused -- it means this
+ * counter goes when the Owner's machine goes, which is the shipped default. Null is reserved for
+ * input nobody could have meant, which the route refuses and the presenter reads as the default.
+ */
+const parseHoldbackDays = (value) => {
+  if (typeof value === "number") {
+    return Number.isInteger(value) && value >= 0 && value <= AUTO_UPDATE_MAX_HOLDBACK_DAYS ? value : null;
+  }
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (!text || !/^\d+$/.test(text)) return null;
+  const days = Number(text);
+  return days <= AUTO_UPDATE_MAX_HOLDBACK_DAYS ? days : null;
+};
+
 /** A minute of the day as 0-1439, or null. Accepts 1320, "1320" and "22:00". */
 const parseMinuteOfDay = (value) => {
   if (typeof value === "number") {
@@ -821,6 +843,10 @@ const presentDeviceControlSettings = (row) => {
     auto_update_days: normalizeAutoUpdateDays(settings.auto_update_days) || AUTO_UPDATE_ALL_DAYS,
     auto_update_start_minute: parseMinuteOfDay(settings.auto_update_start_minute) ?? AUTO_UPDATE_DEFAULT_START_MINUTE,
     auto_update_end_minute: parseMinuteOfDay(settings.auto_update_end_minute) ?? AUTO_UPDATE_DEFAULT_END_MINUTE,
+    // `??`, not `||`: zero is a real setting here -- "go when the Owner's machine goes" -- and
+    // `||` would read it as absent and hand back the default, which happens to be zero today and
+    // would stop being harmless the moment that default changed.
+    auto_update_holdback_days: parseHoldbackDays(settings.auto_update_holdback_days) ?? AUTO_UPDATE_DEFAULT_HOLDBACK_DAYS,
     updated_at: settings.updated_at || "",
   };
 };
@@ -2783,6 +2809,11 @@ const initializeDatabase = async () => {
       auto_update_days TEXT DEFAULT '0,1,2,3,4,5,6',
       auto_update_start_minute INTEGER DEFAULT 1320,
       auto_update_end_minute INTEGER DEFAULT 360,
+      -- How many days this counter lags a release. Zero by default, because the instruction was
+      -- that once the Owner presses publish each counter takes it at the time that counter was
+      -- given, not days later. Turned up, it makes this machine wait while the Owner's own runs
+      -- the release alone, so a bad one is replaced before the shop sees it.
+      auto_update_holdback_days INTEGER DEFAULT 0,
       updated_by INTEGER REFERENCES users(id),
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
@@ -2793,6 +2824,7 @@ const initializeDatabase = async () => {
     ALTER TABLE device_control_settings ADD COLUMN IF NOT EXISTS auto_update_days TEXT DEFAULT '0,1,2,3,4,5,6';
     ALTER TABLE device_control_settings ADD COLUMN IF NOT EXISTS auto_update_start_minute INTEGER DEFAULT 1320;
     ALTER TABLE device_control_settings ADD COLUMN IF NOT EXISTS auto_update_end_minute INTEGER DEFAULT 360;
+    ALTER TABLE device_control_settings ADD COLUMN IF NOT EXISTS auto_update_holdback_days INTEGER DEFAULT 0;
 
     CREATE TABLE IF NOT EXISTS device_exit_attempt_logs (
       id SERIAL PRIMARY KEY,
@@ -7161,6 +7193,7 @@ app.put("/settings/device-control", async (req, res) => {
     const hasAutoUpdateDays = Object.prototype.hasOwnProperty.call(req.body, "auto_update_days");
     const hasStartMinute = Object.prototype.hasOwnProperty.call(req.body, "auto_update_start_minute");
     const hasEndMinute = Object.prototype.hasOwnProperty.call(req.body, "auto_update_end_minute");
+    const hasHoldback = Object.prototype.hasOwnProperty.call(req.body, "auto_update_holdback_days");
 
     let autoUpdateEnabled = null;
     if (hasAutoUpdateEnabled) {
@@ -7208,6 +7241,17 @@ app.put("/settings/device-control", async (req, res) => {
       }
     }
 
+    let holdbackDays = null;
+    if (hasHoldback) {
+      holdbackDays = parseHoldbackDays(req.body.auto_update_holdback_days);
+      if (holdbackDays === null) {
+        return res.status(400).json({
+          code: "AUTO_UPDATE_HOLDBACK_INVALID",
+          message: `auto_update_holdback_days must be a whole number of days, 0-${AUTO_UPDATE_MAX_HOLDBACK_DAYS}`,
+        });
+      }
+    }
+
     const result = await pool.query(
       `
       UPDATE device_control_settings
@@ -7218,12 +7262,13 @@ app.put("/settings/device-control", async (req, res) => {
           auto_update_days = CASE WHEN $9::BOOLEAN THEN $10 ELSE auto_update_days END,
           auto_update_start_minute = CASE WHEN $11::BOOLEAN THEN $12::INTEGER ELSE auto_update_start_minute END,
           auto_update_end_minute = CASE WHEN $13::BOOLEAN THEN $14::INTEGER ELSE auto_update_end_minute END,
-          updated_by = $15,
+          auto_update_holdback_days = CASE WHEN $15::BOOLEAN THEN $16::INTEGER ELSE auto_update_holdback_days END,
+          updated_by = $17,
           updated_at = CURRENT_TIMESTAMP
       WHERE id = 1
       RETURNING id, fullscreen_lock_enabled, require_exit_code_to_close, exit_code_hash,
                 auto_update_enabled, auto_update_days, auto_update_start_minute, auto_update_end_minute,
-                updated_at
+                auto_update_holdback_days, updated_at
       `,
       [
         Object.prototype.hasOwnProperty.call(req.body, "fullscreen_lock_enabled"),
@@ -7240,6 +7285,8 @@ app.put("/settings/device-control", async (req, res) => {
         startMinute,
         hasEndMinute,
         endMinute,
+        hasHoldback,
+        holdbackDays,
         manager.id,
       ]
     );

@@ -41,6 +41,14 @@ export const AUTO_UPDATE_DEFAULTS = Object.freeze({
   // minutes is longer than any gap between two customers at a busy counter and shorter than a tea
   // break, which is exactly the window we want.
   idleBeforeInstallMs: 5 * 60 * 1000,
+  // How long an ordinary counter waits after a release is published before taking it.
+  //
+  // Zero, deliberately. The Owner's instruction was that once he presses publish, each counter
+  // takes the release at the time that counter was given -- not days later. So the shipped
+  // behaviour is exactly that, and this is an opt-in for a shop that wants a safety margin: set
+  // it to one or two and the counters lag the Owner's own machine by that long, which turns a
+  // bad release into something replaced before the shop ever sees it.
+  holdbackDays: 0,
 });
 
 export const WEEKDAY_NAMES = Object.freeze(["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]);
@@ -251,9 +259,21 @@ export const shouldDownloadUpdate = ({
  * labels come back out in `waitingFor` so the screen can say what it is waiting on instead of
  * looking stuck.
  *
- * `requestedByUser` is the one thing that overrides the idle wait and the device's hours, because a
- * person who presses "Install now" has already decided this is a good moment. It does not override
- * a missing signature, and nothing does.
+ * `requestedByUser` is the one thing that overrides the idle wait, the device's hours and the
+ * holdback, because a person who presses "Install now" has already decided this is a good moment.
+ * It does not override a missing signature, and nothing does.
+ *
+ * `isPilotDevice` is what makes one machine go first. The Owner asked for "wherever I log in
+ * becomes the main one, I check it there, and then it goes to the rest", and the second half of
+ * that needs the devices to hear an instruction from him -- which today they cannot, because each
+ * counter is standalone and the cloud that would carry it is not answering.
+ *
+ * He then said what he actually wanted from it: after he presses publish, each counter should take
+ * the release at the time that counter was given. That is what happens by default, and
+ * `holdbackDays` is zero to match. Turned up, it makes every other counter ignore a release until
+ * it is that many days old, so the Owner's machine runs it alone first and a bad one is replaced
+ * before the shop ever sees it. The day the devices can hear each other, an explicit approval can
+ * replace the wait without changing anything else here.
  */
 export const resolveInstallDecision = ({
   enabled = false,
@@ -264,6 +284,9 @@ export const resolveInstallDecision = ({
   lastActivityAt = null,
   requestedByUser = false,
   schedule = null,
+  isPilotDevice = false,
+  releasePublishedAt = null,
+  holdbackDays = AUTO_UPDATE_DEFAULTS.holdbackDays,
   now = Date.now(),
   idleBeforeInstallMs = AUTO_UPDATE_DEFAULTS.idleBeforeInstallMs,
 } = {}) => {
@@ -281,13 +304,31 @@ export const resolveInstallDecision = ({
   if (requestedByUser) return { install: true, reason: "REQUESTED_BY_USER", waitingFor: [] };
   if (!enabled) return { install: false, reason: "AUTO_UPDATE_OFF", waitingFor: [] };
 
-  const window = withinInstallWindow({ now: new Date(asTime(now) ?? Date.now()), schedule });
+  const moment = asTime(now) ?? Date.now();
+  // `positive` is wrong here: zero is a real setting, not a missing one -- "this counter goes
+  // when the Owner's machine goes" -- and treating it as absent would quietly reinstate a wait
+  // somebody turned off. Anything unreadable falls back to the shipped default, which is also
+  // zero, so an absent setting behaves as the Owner described.
+  const days = Number.isFinite(holdbackDays) && holdbackDays >= 0
+    ? holdbackDays
+    : AUTO_UPDATE_DEFAULTS.holdbackDays;
+  const wait = days * 24 * 60 * 60 * 1000;
+  if (!isPilotDevice && wait > 0) {
+    const published = asTime(releasePublishedAt);
+    // An unreadable or missing publish date is treated as "published just now", so an ordinary
+    // counter waits the full holdback rather than taking a release whose age nobody can vouch for.
+    const readyAt = (published === null ? moment : published) + wait;
+    if (moment < readyAt) {
+      return { install: false, reason: "WAITING_FOR_PILOT", waitingFor: [], releasesAt: new Date(readyAt).toISOString() };
+    }
+  }
+
+  const window = withinInstallWindow({ now: new Date(moment), schedule });
   if (!window.within) {
     return { install: false, reason: "OUTSIDE_WINDOW", waitingFor: [], nextWindowAt: window.nextOpensAt };
   }
 
   const last = asTime(lastActivityAt);
-  const moment = asTime(now) ?? Date.now();
   // No activity ever recorded means nobody has touched this machine since it started, which is as
   // idle as it gets.
   if (last === null) return { install: true, reason: "IDLE", waitingFor: [] };
@@ -335,6 +376,14 @@ export const describeAutoUpdateNotice = ({
       tone: "warning",
       text: `${named} was downloaded but its signature could not be verified, so it has not been installed.`,
       actionLabel: "Open Update Center",
+    };
+  }
+  if (decision && decision.install === false && decision.reason === "WAITING_FOR_PILOT") {
+    return {
+      tone: "info",
+      text: `${named} is published. This counter takes it once it has been running on the Owner's device for a few days.`,
+      actionLabel: "Install now",
+      releasesAt: decision.releasesAt || null,
     };
   }
   if (decision && decision.install === false && decision.reason === "OUTSIDE_WINDOW") {
