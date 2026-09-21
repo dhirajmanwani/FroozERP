@@ -171,6 +171,7 @@ import {
 } from "./local/cloudAvailability";
 import {
   describeFrostTransportFailure,
+  hasCloudSession,
   resolveFrostLoadDecision,
   resolveFrostProviderOptions,
 } from "./local/frostAvailability";
@@ -4795,6 +4796,10 @@ function App() {
       desktopShell: isDesktopShell(),
       internetAvailable: runtimeConnectivity.internetAvailable,
       cloudOnline: cloudHealth?.online === false ? false : null,
+      // An offline session has no cloud token to send, and FROST is cloud-served here. Without this
+      // the panel fired all eleven requests, collected eleven 401s, and told the owner the session
+      // had expired -- see `resolveFrostLoadDecision` for why that advice could never work.
+      cloudSession: hasCloudSession(user),
     });
     if (!loadDecision.shouldLoad) {
       setAiAssistantData((current) => ({
