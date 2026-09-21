@@ -4713,25 +4713,73 @@ tbody tr:last-child td {
   resize: vertical;
 }
 
-.ai-suggestion-grid {
-  display: grid;
-  gap: 10px;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+/* FROST's opening line. The greeting itself is resolved in local/frostGreeting.js, including what
+   it says when the clock cannot be read. */
+.ai-frost-greeting {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 12px;
+}
+
+.ai-frost-greeting strong {
+  color: var(--ink-body);
+  font-size: 1.05rem;
+}
+
+.ai-frost-greeting span {
+  color: var(--ink-muted);
+  font-size: 0.86rem;
+}
+
+/* Replaced the twelve-button grid. Asked for as a dropdown, and it also stops the panel opening
+   with a wall of buttons above the answer. */
+.ai-suggestion-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
   margin-top: 14px;
 }
 
-.ai-suggestion {
+.ai-suggestion-picker span {
+  color: var(--ink-muted);
+  font-size: 0.82rem;
+}
+
+.ai-suggestion-picker select {
   background: var(--card-veil);
   border: 1px solid rgba(143, 171, 156, 0.2);
   border-radius: 8px;
-  /* Was `var(--text)`, which is defined nowhere in this repository -- so the declaration was
-     invalid and this text simply inherited whatever the parent gave it. It happened to look right
-     on dark and would have had no theme at all in light. Ten rules in this panel were like it. */
+  /* `var(--text)` is defined nowhere in this repository; the neighbouring rules used it and were
+     therefore invalid, inheriting whatever the parent gave them. Use the real token. */
   color: var(--ink-body);
   cursor: pointer;
-  min-height: 48px;
-  padding: 11px 13px;
-  text-align: left;
+  min-height: 44px;
+  padding: 10px 12px;
+  width: 100%;
+}
+
+.ai-suggestion-picker select:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* Shown when the local model could not word the answer. The figures are still correct, so this
+   reads as an explanation rather than an error -- but it must be visible, because a plainly-worded
+   answer is otherwise indistinguishable from a normal one. */
+.ai-answer-notice {
+  color: var(--warning-ink);
+  font-size: 0.84rem;
+  margin-top: 8px;
+}
+
+/* A field whose choices could not be read. It has to look unlike a field that simply has few
+   choices, or the owner reads a failure as a decision already made for them. */
+.field-error-note {
+  color: var(--warning-ink);
+  display: block;
+  font-size: 0.8rem;
+  margin-top: 6px;
 }
 
 .ai-answer-panel,

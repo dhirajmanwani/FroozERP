@@ -1732,3 +1732,178 @@ it. A test that cannot fail is the thing this repository has been bitten by befo
   as the staff list, not the same decision, so not widened into this change.
 - The audit-trail reads in §2.4 remain unscoped, and still cannot be scoped: those tables carry no
   `branch_id`.
+
+---
+
+## FROST — the assistant is the Owner's, and its writers read the verified session (2026-09-20)
+
+Asked for in these words: *"i wanna make it like a real jarvis in the app. but again it should be
+available just for me. it works like my assistant."* Auditing what FROST actually did before
+building on it turned up three access faults, and the first two had been invisible for the same
+reason: the code that looked like the policy was not the code that decided.
+
+### The role lists were decorative
+
+Every FROST route carried its own `fallbackRoles`, several naming `Cashier`. They read like
+restrictions and restricted nothing. `getPermissionUser` (`server.js`) resolves like this:
+
+```js
+if (storedPermission === true || (storedPermission === undefined && roleMatches(user.role_name, defaultRoles)))
+```
+
+`fallbackRoles` is consulted **only when the stored permission is `undefined`** — and `server.js`
+seeded `Cashier`, `Purchase Manager` and `Inventory Manager` with `"ai_assistant_view":true`. So a
+route annotated `["Owner", "Admin"]` was open to a Cashier, and the annotation is why nobody looked
+twice. A Cashier could open FROST and read the daily briefing and the low-stock answers. The money
+questions were genuinely refused, by the second per-intent check inside `POST /api/ai/query`.
+
+Three changes, because any one of them alone leaves the door open:
+
+1. One shared list, `FROST_DEFAULT_ROLES = ["Owner"]`, referenced by all 26 routes. A literal list
+   at a route is now a test failure.
+2. The seeding grants FROST to the Owner alone. `Admin` was on that line too — and that statement
+   carries no `AND NOT (permissions ? ...)` guard, so it re-applied on **every start**: no
+   tightening could ever have survived a restart while `Admin` was named there.
+3. A one-time tightening closes what the old seeding opened on databases that already exist, keyed
+   on a marker (`ai_owner_only_applied`) so the bootstrap — which runs on every start — cannot
+   silently revoke a permission the Owner later grants from the role-permissions screen.
+
+Widening it again is supported and deliberate: grant `ai_assistant_view` to a role and the stored
+`true` wins, as it always did. What is gone is a role inheriting FROST because a route's own list
+happened to name it.
+
+### `POST /api/ai/query/stream` had no per-intent check at all
+
+`/api/ai/query` re-checks `ai_financial_insights` before answering a money question. Its streaming
+sibling went from "may you open FROST" straight to `factsForBusinessIntent` and handed back the
+whole bundle — sales, gross profit, expenses, collections — as SSE. Two copies of a security rule
+had drifted, which is what two copies of a security rule do. There is now one
+`enforceIntentPermission`, called by both, and a test asserting exactly two call sites.
+
+It also has to refuse **before** the response becomes an event stream: after
+`Content-Type: text/event-stream` a status code can no longer be set, and the refusal would arrive
+as a stream that never explains itself. The SSE headers now come after every check that can refuse.
+
+The route is not called from the frontend at all, which is why the gap survived. Dead code that
+bypasses a live gate is still a bypass.
+
+### Four writer routes took the actor from the request body
+
+```js
+const manager = await requireRateManager(req.body.updated_by || req.body.user_id);
+```
+
+on `PUT /api/ai/settings`, `POST /api/ai/memory/:id/approve`, `PATCH /api/ai/memory/:id` and
+`DELETE /api/ai/memory/:id`. The app-wide substitution check (`deviceSession.js`) compares
+`user_id`, `device_id`, `company_id` and `branch_id` — **`updated_by` is on none of those lists.**
+So a signed-in Cashier who sent `{"updated_by": <owner id>}` and omitted `user_id` passed every
+check; `requireRateManager` looked up the Owner, found the Owner role, and returned it. The Cashier
+then wrote FROST's settings, or approved and edited its stored memories, recorded as the Owner.
+
+This is the A-4 hole exactly, one layer below the comment in `requireAiPermission` that describes
+A-4 as closed — and it is the second time the same shape has been found after the fix (see the
+Task 12 record). `req.auth` is the only identity. All four now read `req.auth.userId`, and a test
+asserts that every `requireRateManager` call in the module does.
+
+### Three more things fixed in passing
+
+- **`frost_memories` approve, patch and delete matched on `id` alone.** The insert had always
+  scoped by branch; the three writers had not, so an id from another branch was editable. Scoped,
+  and an unmatched row is now a 404 with a code rather than `res.json(undefined)` — HTTP 200 with
+  an empty body, which the panel would have drawn as a save that worked.
+- **`frostCore.js` wrote `VALUES (1, 1, ...)` into `ai_audit_log`.** Every settings change, action
+  proposal and voice session was attributed to company 1 / branch 1 regardless of who did it or
+  where. `frostBranchScope.test.js` explicitly forbids that literal — and read only
+  `aiBusinessAssistantService.js`, so the file containing it was never checked. The test now reads
+  both. An unknown scope is written as `NULL`, never coerced to `1`: a row that says "unknown" can
+  be found and fixed, a row that says "branch 1" cannot be told from a true one.
+- **`assertGroundedAnswer` was a no-op.** It matched only currency-prefixed numbers
+  (`/(?:₹|Rs\.?|INR)\s*\d.../`) while `buildDeterministicAnswer` emits bare ones — "sales 48250,
+  estimated gross profit 9110". The match array was empty on every real answer, `[].every()` is
+  `true`, and `if (!assertGroundedAnswer(...)) return 500` has never been able to fire. It checks
+  every number now, against the facts plus the period label we insert ourselves, and only for
+  answers a model phrased — a deterministic answer is grounded by construction. The flag defaults
+  to the strict check, so a caller that forgets is not silently trusted. This matters on the day a
+  provider is wired and not before, which is precisely when nobody would have noticed it was dead.
+
+### What this deliberately does not do
+
+FROST still calls no model. `buildRuntime` returns the same null-returning stub for all four
+declared providers, so every figure comes from one of 45 SQL queries and none has ever originated
+in generated text. Wiring a provider is separate work, and voice must not be switched on before it:
+the realtime path is complete, has never been run, and carries **no tools and no access to those
+queries** — asked the day's sales by voice it would answer from nothing. That is the one place in
+FROST where "the model phrases, the database answers" is actively broken today.
+
+`getUsageSummary` still sums token spend across every branch. Left as is: FROST is now Owner-only
+and the Owner owns every branch, so the global number is the one they want.
+
+### Tests
+
+| Suite | Covers |
+| --- | --- |
+| `backend/frostOwnerOnlyAccess.test.js` (10) | the shared role list, no inline lists, every `requireRateManager` reading `req.auth`, both routes running the one gate, refusals before the SSE headers, branch-scoped memory writes, the 404, the Owner-only seeding, the once-only tightening |
+| `backend/frostSuggestedQuestions.test.js` (4) | every shipped suggestion reaches the intent written to answer it — "Which customers have become inactive?" classified as `BUSINESS_BRIEFING`, so the one query that answers it was unreachable from the button that asks it, and the user got a different answer with nothing to indicate the substitution |
+| `backend/frostBranchScope.test.js` (+4, now 12) | `frostCore.js` is read at last; `asAuditScope` refuses `0`, `""` and junk |
+| `backend/aiBusinessAssistantRules.test.js` (+3, now 11) | a bare invented figure is caught; a deterministic answer is not policed; our own date range is not read as a figure |
+| `frontend/src/local/frostGreeting.test.mjs` (8) | every hour lands in exactly one band including the one that wraps midnight; an unreadable clock greets neutrally rather than guessing |
+
+`backend/aiAlertStatusScope.test.js` signed in as `Admin` with an empty permission row, which is
+now a 403. Its fixture moved to `Owner`. That suite's subject is parameter binding and branch
+scoping, not access, and leaving it as `Admin` would have turned all twelve assertions into 403s
+and told us nothing about either subject. Who may use FROST is tested in `frostOwnerOnlyAccess`.
+
+### Gate results (2026-09-20, run locally — this repository runs no CI on pull requests)
+
+| Gate | Result |
+| --- | --- |
+| `npm --prefix backend test` | **853 / 853** |
+| `node --test frontend/src/local/*.test.mjs` | **1054 / 1054** |
+| `npm --prefix frontend run lint` | Pass — 0 errors, 39 pre-existing warnings |
+| `npm run build` | Pass |
+| `npm run backend:check` | Pass |
+| `npm run verify:disposable-matrix` | **8 / 8** |
+| `npm run verify:production` | 9 of 10 checks pass; the Rust step needs GTK dev libraries this container does not have |
+| `cargo check` | **Not run** — same missing libraries; unchanged by this work, which touches no Rust |
+
+### Addendum — FROST's local model, and the LOCAL_ONLY boundary (2026-09-20)
+
+The owner chose a local model (Ollama) over a paid API. FROST is Owner-only, so the model only has
+to run where he signs in; the counters need nothing. That makes this compatible with the rule
+CLAUDE.md states as *external connections at 0* — but only if the address it calls cannot become an
+external one.
+
+`backend/frostOllama.js` therefore **refuses any host that is not loopback**
+(`FROST_OLLAMA_URL_NOT_LOOPBACK`), before any request is made. "The base URL is a setting" and "the
+setting is only ever loopback" are different claims and only the second is safe: pointing FROST at
+a model on another machine is now a deliberate code change with a comment in front of it, not a
+typo in a settings field that quietly starts sending the shop's figures over the network. An
+invalid URL is named rather than silently replaced by the default, so a mistyped host cannot look
+like a working one.
+
+The cautionary case is in the same tree: `frostCore.js`'s `createRealtimeSession` calls
+`api.openai.com` with a raw `fetch` from inside the backend process, which the desktop gateway's
+LOCAL_ONLY block never sees. It is unreachable today only because no key is configured — the
+protection is positional, not intrinsic. This module does not add a second such path.
+
+**What the model is and is not allowed to do.** It phrases; it never computes. Every figure has
+already been read by SQL before `phraseWithOllama` is called. If the phrased answer contains a
+number that is not in the facts, `assertGroundedAnswer` rejects it, the route falls back to the
+deterministic wording, and the attempt is audited as `FROST_ANSWER_NOT_GROUNDED` — swallowing it
+would make a model that invents figures indistinguishable from one that does not.
+
+**Every failure falls back rather than failing the request.** No Ollama running, an unpulled model,
+a timeout, an unreadable body, an empty reply: each is a named code, and each produces the correct
+figures in FROST's own plain wording plus a notice saying why. The previous behaviour on an
+ungrounded answer was a 500. For an assistant the owner opens between customers, a 500 is worse
+than a plainer sentence, and the figures were always correct and always available.
+
+`maxOutputTokens` is honoured for the first time since it was added (`num_predict`). The remaining
+cost controls — `TOKEN_PRICING_PER_1K` all zeros, `costAlertAmount` read by nothing — are harmless
+while the model is local and free, and are the thing that bites on the day a paid provider is
+selected. They are not fixed here.
+
+**Not verified:** there is no Ollama in the build container and no way to reach one, so every test
+drives an injected `fetchImpl`. That covers the request shape, the refusals, the timeout path and
+the failure codes. It does **not** prove that a real Ollama accepts this body, or that a 3B model
+phrases well enough to be worth using. Both need a run on the owner's machine.

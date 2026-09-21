@@ -55,14 +55,34 @@ const forecastStockRunout = ({ availableStock = 0, dailySales = [], minimumHisto
 const buildReminderDedupKey = ({ companyId = 1, branchId = 1, reminderType, entityType, entityId, dueDate }) =>
   [companyId, branchId, reminderType, entityType, entityId || "none", dueDate || "none"].join(":");
 
-const assertGroundedAnswer = ({ answer = "", facts = [] } = {}) => {
-  const unsupportedMoney = answer.match(/(?:₹|Rs\.?|INR)\s*\d[\d,]*(?:\.\d+)?/gi) || [];
-  const factText = JSON.stringify(facts || []);
-  const numericFacts = new Set((factText.match(/-?\d+(?:\.\d+)?/g) || []).map((value) => Number(value).toFixed(2)));
-  return unsupportedMoney.every((amount) => {
-    const normalized = amount.replace(/(?:₹|Rs\.?|INR|\s|,)/gi, "");
-    return numericFacts.has(Number(normalized).toFixed(2));
-  });
+// FROST's one non-negotiable rule: the model phrases, the database answers. No figure may
+// originate in generated text.
+//
+// This used to match only numbers carrying a currency prefix -- /(?:₹|Rs\.?|INR)\s*\d.../ -- while
+// the answers it guards are built by `buildDeterministicAnswer`, which emits bare numbers
+// ("sales 48250, estimated gross profit 9110"). The match array was therefore always empty,
+// `.every()` over an empty array is `true`, and the guard passed everything ever put to it. It read
+// like a safety net and caught nothing, which is worse than having none: the route around it says
+// `if (!assertGroundedAnswer(...)) return 500`, and that line has never once been able to fire.
+//
+// `generated` defaults to `true` so a caller that forgets to say gets the strict check rather than
+// a silent pass. A deterministic answer is grounded by construction -- we built it out of the facts
+// -- and policing our own formatting only produces false alarms, so the route passes
+// `generated: false` for that path and the check does real work exactly when a model wrote the
+// words.
+//
+// `allowedText` is for text we inserted ourselves that carries digits of its own, such as the
+// period label "01/09/2026 to 20/09/2026". Without it, our own date range would read as an
+// ungrounded figure.
+const assertGroundedAnswer = ({ answer = "", facts = [], allowedText = "", generated = true } = {}) => {
+  if (!generated) return true;
+  const normalize = (value) => Number(String(value).replace(/,/g, "")).toFixed(2);
+  const numbersIn = (text) => String(text || "").match(/-?\d[\d,]*(?:\.\d+)?/g) || [];
+  const grounded = new Set([
+    ...numbersIn(JSON.stringify(facts || [])),
+    ...numbersIn(allowedText),
+  ].map(normalize));
+  return numbersIn(answer).every((value) => grounded.has(normalize(value)));
 };
 
 module.exports = {

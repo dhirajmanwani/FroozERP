@@ -229,7 +229,18 @@ assistant that can act is a different risk class and should be a separate, later
 **Classification.** Enhancement — with the caveat that if FROST becomes the primary interface, its
 absence offline must degrade to the ordinary modules, never to a dead end.
 
-**Depends on.** Cloud restored; an LLM provider key; a spend cap.
+**Depends on.** A phrasing model reachable from the owner's machine, and a spend cap for the day a
+paid provider is chosen.
+
+**Not the cloud — corrected 21 Sep 2026.** FROST reads eleven endpoints and every one of them is
+served by the backend on the owner's own machine, against the embedded SQLite database; with a local
+model configured the phrasing runs on loopback too. Nothing FROST needs is in the cloud. The loader
+nevertheless refused to run whenever the cloud was unreachable, so the Railway outage took FROST's
+whole data set down with it — including the provider list, which left the Provider dropdown showing
+only the single option written into the page, looking like a working choice rather than a failure.
+Both are fixed in `frontend/src/local/frostAvailability.js`: availability is decided from where
+FROST's endpoints actually live, and a list that did not load is reported as one. **FROST now works
+in Local Only mode**, which is the mode it was designed for once the model is local.
 
 **[P-5]** Cost control: per-query cost is real and unbounded by default. A monthly cap, and a
 decision about what happens when it is hit (degrade to deterministic reports, or stop), is required
