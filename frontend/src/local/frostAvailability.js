@@ -17,8 +17,41 @@
  * load is reported as a list that did not load.
  */
 
-/** FROST's endpoints are on this machine unless the app is pointed at a cloud backend. */
-export const resolveFrostDataSource = ({ apiUrl = "", cloudApiMode = false } = {}) => {
+/**
+ * Whether FROST can be reached at all, and what its Provider dropdown is allowed to show.
+ *
+ * ## Where FROST actually runs, because this module got it wrong once
+ *
+ * An earlier version of this file said every FROST endpoint is served by the backend on this
+ * machine against the embedded SQLite database. That is false for every shipped desktop build, and
+ * writing it down without following a request cost a release rehearsal an evening.
+ *
+ * The desktop shell does not run `backend/server.js` at all. It spawns `backend/desktopGateway.js`
+ * (`src-tauri/src/lib.rs`), and the installer bundles only that gateway, `cloudProxyError.js`,
+ * `localSettingsStore.js` and the Node binary (`src-tauri/tauri.conf.json`, `resources`).
+ * `server.js` says so itself: "this file is the hosted backend and never runs on a shop's own
+ * machine, where the desktop gateway serves instead." The gateway answers a handful of routes
+ * locally -- health, version, compatibility, the cloud probes -- and proxies everything else to the
+ * cloud. It contains no `/api/ai/` route, so **on a desktop install FROST is entirely cloud-served**:
+ * its facts are queried on the cloud server against PostgreSQL, not on the counter. With no cloud
+ * the gateway answers 503 and FROST has nothing to show.
+ *
+ * So "FROST requires cloud access" was accurate, and the pre-emptive refusal this module was written
+ * to remove was right for the desktop. What was genuinely wrong, and is still fixed here, is the
+ * Provider dropdown drawing a list it could not read as a list with one entry in it: the owner saw
+ * a choice where there had been a failure, which is CLAUDE.md's "errors must never render as zero".
+ * That honesty is what made the architecture above visible in the first place.
+ */
+
+/**
+ * Where FROST's data comes from for this client.
+ *
+ * A desktop shell is always "cloud", whatever its API URL looks like: the URL is the local gateway,
+ * and the gateway forwards every FROST route onward. Judging this by the address would say "local"
+ * for `http://127.0.0.1:5051` and be wrong in exactly the way that started all this.
+ */
+export const resolveFrostDataSource = ({ apiUrl = "", cloudApiMode = false, desktopShell = false } = {}) => {
+  if (desktopShell === true) return "cloud";
   const local = /^(https?:\/\/)?(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::|\/|$)/i.test(String(apiUrl || "").trim());
   return cloudApiMode === true && !local ? "cloud" : "local";
 };
@@ -33,10 +66,11 @@ export const resolveFrostDataSource = ({ apiUrl = "", cloudApiMode = false } = {
 export const resolveFrostLoadDecision = ({
   apiUrl = "",
   cloudApiMode = false,
+  desktopShell = false,
   internetAvailable = true,
   cloudOnline = null,
 } = {}) => {
-  if (resolveFrostDataSource({ apiUrl, cloudApiMode }) === "local") {
+  if (resolveFrostDataSource({ apiUrl, cloudApiMode, desktopShell }) === "local") {
     return { shouldLoad: true, reason: "", source: "local" };
   }
   if (internetAvailable === false || cloudOnline === false) {

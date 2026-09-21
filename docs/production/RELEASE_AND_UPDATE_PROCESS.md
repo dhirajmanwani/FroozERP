@@ -429,13 +429,23 @@ also the last release the counters need installed by hand; from 1.0.75 they upda
   the list did not load from the backend, and the note under the dropdown should say so rather than
   leaving a menu that looks complete. This is what 1.0.74 fixes; if it is still one option, the fix
   did not reach this build.
-- **Switch the app to Local Only and open FROST.** It must work — that is the change in this
-  release, and it is the mode FROST is meant for. Before 1.0.74 it said "FROST requires cloud
-  access" and showed nothing.
 - **Stop the local server and open FROST.** The message must name *this machine's* server, not the
   cloud. Pointing at the cloud here sends the reader to the wrong machine.
 - Every figure FROST states must be checkable against the same figure in the ordinary reports. This
   is the release's one non-negotiable: the model phrases, the database answers.
+
+*FROST needs the cloud, so most of the rows above cannot be checked without one*
+
+Corrected 21 Sep 2026, after this list was first written. On a desktop install every FROST request
+is forwarded to the cloud (`backend/server.js:647`; only the nine routes in `desktopLocalRoutes` are
+served on the device), so with the cloud down FROST answers nothing and these rows neither pass nor
+fail — they go unanswered. An earlier version of this section claimed the opposite and told the
+rehearser that FROST "must work" in Local Only. It does not, and that instruction would have been
+read as a release defect.
+
+Either give the rehearsal a stand-in cloud, using the recipe in the 1.0.73 section above, or skip
+the FROST rows and say in the rehearsal notes that they were skipped. Skipping them is the honest
+outcome; recording them as passed because nothing visibly broke is not.
 
 *With Ollama installed, if it is*
 
