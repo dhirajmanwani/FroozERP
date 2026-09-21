@@ -134,6 +134,40 @@ test("the schema contract sees the four columns, so a database missing them is r
   assert.deepEqual(declared, [...AUTO_UPDATE_COLUMNS].sort());
 });
 
+test("the hosted database gets these columns too, via a registered cloud migration", () => {
+  // Declaring the ALTERs above is enough for a counter, whose backend runs the startup bootstrap.
+  // It is not enough for the cloud: `runStartupSchemaBootstrap` is hard-off on a hosted deployment
+  // (server.js:208), so `initializeDatabase()` never runs there and a column declared only in it
+  // reaches that database never.
+  //
+  // On 2026-09-21 that stopped the shop's cloud booting at all -- `verifyDeclaredSchema` refused
+  // the deployment naming all five of these. The refusal was correct and it is why nothing worse
+  // happened; the mistake was shipping the columns in PR #12 and PR #13 with no migration behind
+  // them. `014_login_lockout_columns.sql` is the same gap found the other way, from a 500 on
+  // `/login` after two weeks in production.
+  //
+  // Derived from the bootstrap rather than from a list, so a sixth column added to this table
+  // without a migration fails here rather than in Railway's log.
+  const { migrationFiles } = require("../scripts/run-cloud-migrations.js");
+  const applied = migrationFiles
+    .map((file) => fs.readFileSync(path.join(__dirname, "..", file), "utf8"))
+    .join("\n");
+
+  const declared = declaredColumns(bootstrapSql(SOURCE))
+    .filter(([table]) => table === "device_control_settings")
+    .map(([, column]) => column);
+  assert.ok(declared.length > 0, "nothing is declared for device_control_settings");
+
+  for (const column of declared) {
+    assert.match(
+      applied,
+      new RegExp(`ALTER TABLE device_control_settings ADD COLUMN IF NOT EXISTS ${column}\\s`),
+      `${column} is declared in initializeDatabase() but no cloud migration carries it, `
+      + "so the hosted database will refuse to start",
+    );
+  }
+});
+
 // -------------------------------------------------------------------------------------------
 // Reading: the public route, the settings bundle, and what an old row reads back as
 // -------------------------------------------------------------------------------------------
