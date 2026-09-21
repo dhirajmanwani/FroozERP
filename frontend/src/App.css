@@ -4773,6 +4773,15 @@ tbody tr:last-child td {
   margin-top: 8px;
 }
 
+/* A field whose choices could not be read. It has to look unlike a field that simply has few
+   choices, or the owner reads a failure as a decision already made for them. */
+.field-error-note {
+  color: var(--warning-ink);
+  display: block;
+  font-size: 0.8rem;
+  margin-top: 6px;
+}
+
 .ai-answer-panel,
 .ai-history-item {
   background: var(--shadow-soft);

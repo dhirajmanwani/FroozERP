@@ -170,6 +170,11 @@ import {
   preserveVerifiedLocalCollection,
 } from "./local/cloudAvailability";
 import {
+  describeFrostTransportFailure,
+  resolveFrostLoadDecision,
+  resolveFrostProviderOptions,
+} from "./local/frostAvailability";
+import {
   checkBackendHealth,
   getSyncStatus,
   initialPullForApprovedDevice,
@@ -1065,6 +1070,16 @@ const frostDiagnosticsSummary = (diagnostics = []) => {
   if (first.status === 401) return "FROST session expired. Sign in again to refresh owner permissions.";
   if (first.status === 403) return first.message || "FROST is blocked by owner role permissions.";
   if (first.status === 404) return `${first.label} endpoint is not available in the selected backend. Installed frontend and backend may be out of sync.`;
+  // A request that never got a status failed in transport, and `isCloudUnavailableError` reads
+  // ECONNREFUSED and friends as a cloud failure. That is right for a cloud-hosted FROST and wrong
+  // for a local one, where the same code means the server on this machine is not running -- and
+  // sending the owner to check the cloud sends them to the wrong machine entirely.
+  const transportFailure = describeFrostTransportFailure({
+    apiUrl: first.apiUrl,
+    cloudApiMode: isCloudMode(first.apiMode),
+    status: first.status,
+  });
+  if (transportFailure) return transportFailure;
   if (first.code === "CLOUD_UNAVAILABLE" || [502, 503, 504].includes(Number(first.status))) return FROST_CLOUD_UNAVAILABLE_MESSAGE;
   if (first.localBackendHealth === "offline" && !isCloudMode()) return "Local backend is not running. Start FroozERP local server, then refresh FROST.";
   if (first.cloudBackendHealth === "offline") return FROST_CLOUD_UNAVAILABLE_MESSAGE;
@@ -3279,8 +3294,22 @@ function App() {
           message: "Local Only mode selected - cloud sync paused.",
           lastCheckedAt: response.data?.confirmedAt || new Date().toISOString(),
         }));
-        setAiAssistantData((current) => ({ ...current, loading: false, error: FROST_CLOUD_UNAVAILABLE_MESSAGE }));
+        // Choosing Local Only used to put "FROST requires cloud access" on the panel. On a desktop
+        // install FROST is entirely local -- its facts come from the SQLite database on this machine
+        // and, when one is configured, the phrasing model answers on loopback -- so Local Only is
+        // the mode FROST was designed for, not one that disables it. Only a cloud-hosted FROST
+        // loses anything here.
+        const localOnlyFrost = resolveFrostLoadDecision({
+          apiUrl: API_URL,
+          cloudApiMode: isCloudMode(),
+          internetAvailable: false,
+          cloudOnline: false,
+        });
+        setAiAssistantData((current) => ({ ...current, loading: false, error: localOnlyFrost.reason }));
         setSyncStatus((current) => ({ ...(current || {}), online: false, syncing: false, lastFailureKind: "APP_LOCAL_ONLY", lastError: "" }));
+        // Clearing the error is not the same as having the data. A local FROST is fully usable in
+        // Local Only, so load it here rather than leaving an empty panel with nothing to explain it.
+        if (localOnlyFrost.shouldLoad && frostDrawerOpen) await loadAiAssistant(aiRange).catch(() => null);
         return nextMode;
       }
       const health = await performConnectivityCheck("connectivity-mode-auto", { force: true, timeoutMs: 5000 });
@@ -4754,11 +4783,22 @@ function App() {
       cloudHealth,
       deviceApproved: approved,
     });
-    if (!runtimeConnectivity.internetAvailable || cloudHealth?.online === false) {
+    // FROST used to refuse to load anything whenever the cloud was unreachable. In the desktop app
+    // every one of the requests below goes to the backend on this machine, against the embedded
+    // SQLite database, so a cloud outage took FROST down for no reason -- and took the provider list
+    // with it, leaving the Provider dropdown showing only the one option the page writes itself.
+    // Now the refusal only fires when FROST really is being read from the cloud.
+    const loadDecision = resolveFrostLoadDecision({
+      apiUrl: API_URL,
+      cloudApiMode: isCloudMode(),
+      internetAvailable: runtimeConnectivity.internetAvailable,
+      cloudOnline: cloudHealth?.online === false ? false : null,
+    });
+    if (!loadDecision.shouldLoad) {
       setAiAssistantData((current) => ({
         ...current,
         loading: false,
-        error: FROST_CLOUD_UNAVAILABLE_MESSAGE,
+        error: loadDecision.reason,
         diagnostics: [],
       }));
       return;
@@ -9829,6 +9869,11 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
     });
   }, [frost.providerKey, frost.model, frost.baseUrl, frost.realtimeModel, frost.voice, frost.languageMode, frost.enabled, frost.streamingEnabled, frost.cacheEnabled, frost.voicePrepared, frost.voiceActivityDetection, frost.noiseSuppression, frost.fullDuplexEnabled, frost.maxInputTokens, frost.maxOutputTokens, frost.costAlertAmount]);
 
+  // Resolved from the draft, not the saved value, so the option the select is pointing at is always
+  // one of the options it lists. A `<select>` whose value matches nothing silently shows its first
+  // entry instead, which would read as "Deterministic only" over a FROST set to a local model.
+  const providerOptions = resolveFrostProviderOptions(data.providers, draft.providerKey);
+
   const update = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
   const save = async () => {
     try {
@@ -9845,9 +9890,12 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
         <Field label="Assistant"><input readOnly value="FROST" /></Field>
         <Field label="Provider">
           <select disabled={!canManage} value={draft.providerKey} onChange={(event) => update("providerKey", event.target.value)}>
-            <option value="deterministic">Deterministic only</option>
-            {(data.providers || []).map((provider) => <option key={provider.key} value={provider.key}>{provider.label}</option>)}
+            {providerOptions.options.map((provider) => <option key={provider.key} value={provider.key}>{provider.label}</option>)}
           </select>
+          {/* Without this the dropdown draws a list it could not read as a list with one entry in
+              it, and the owner picks "Deterministic only" believing it is the only provider there
+              is. A list that did not arrive has to look different from a list of one. */}
+          {!providerOptions.usable && <small className="field-error-note">{providerOptions.message}</small>}
         </Field>
         <Field label="Model / Deployment"><input disabled={!canManage} value={draft.model} onChange={(event) => update("model", event.target.value)} placeholder={draft.providerKey === "ollama" ? "llama3.2:3b" : "Configured outside secrets"} /></Field>
         {draft.providerKey === "ollama" && (
