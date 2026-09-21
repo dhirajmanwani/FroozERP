@@ -16,8 +16,19 @@
  *
  * One primary surface, always the conversation. Everything else becomes a menu entry with a label
  * and a plain-language line saying what is in there, ordered by how often an owner running a fruit
- * shop would actually open it. Voice stops being a place at all: talking is a control on the
- * composer, in the same way typing is.
+ * shop would actually open it. Talking becomes a control on the composer, in the same way typing
+ * is, so the everyday way to hear FROST is not a place you navigate to.
+ *
+ * The old Voice tab is not deleted, and not promoted either. It opens a live microphone session
+ * with a third-party provider that is sent no tools, so it cannot read the books and would speak a
+ * number nobody can check. It fails closed today because no key is configured. Removing it would
+ * hide a thing that still exists in the code; leaving it in the row would offer it as an equal to
+ * the parts that work. So it sits in the footer with a label that says what is true about it.
+ *
+ * The old Briefing tab splits in two rather than disappearing, because it was two things wearing
+ * one name. Its recommendations are what FROST would say if asked how today looks, so they open the
+ * conversation. Its six metric tiles and insight cards are something to look at rather than
+ * something said, so they stay a place, under the name an owner would use for them.
  *
  * ## Access is not decided here
  *
@@ -36,12 +47,14 @@
  * opens most sits nearest.
  */
 const SECTIONS = Object.freeze([
+  { key: "today", label: "Today's numbers", blurb: "Sales, profit, dues and low stock at a glance", daily: true },
   { key: "alerts", label: "Alerts", blurb: "What needs attention today", daily: true },
   { key: "reminders", label: "Reminders", blurb: "What you asked FROST to remember", daily: true, requires: "reminders" },
   { key: "decision", label: "Decision Center", blurb: "Actions waiting for your approval" },
   { key: "predictions", label: "Predictions", blurb: "Where stock, sales and cash are heading" },
   { key: "profit", label: "Profit Advisor", blurb: "Where the margin is going" },
   { key: "memory", label: "Memory", blurb: "What FROST knows about your shop", requires: "frost" },
+  { key: "voice", label: "Live voice", blurb: "Not connected to your books yet", requires: "frost", footer: true },
   { key: "settings", label: "FROST Settings", blurb: "Provider, model and limits", requires: "frost", footer: true },
 ]);
 

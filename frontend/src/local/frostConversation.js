@@ -71,6 +71,22 @@ const exchangeTurns = (entry) => {
       at: text(entry?.askedAt),
     });
   }
+  // A question that failed used to leave the thread entirely: only the error strip changed, and
+  // the question itself was never recorded. So the thread showed a conversation in which that
+  // question was never asked, which is the "errors must never render as zero" pitfall wearing
+  // different clothes -- a failure rendered as an absence.
+  const failure = text(entry?.failureMessage);
+  if (failure) {
+    turns.push({
+      id: turnId(entry, "failure"),
+      speaker: "frost",
+      kind: "failure",
+      text: failure,
+      at: text(entry?.answeredAt),
+      speakable: false,
+    });
+    return turns;
+  }
   const answer = text(entry?.answer);
   if (answer) {
     turns.push({
@@ -100,6 +116,7 @@ const exchangeTurns = (entry) => {
  * @param {string} input.prompt       the one-line invitation under the greeting
  * @param {Array<string>} input.brief the day's recommendations, already computed from the books
  * @param {string} input.periodLabel  which period those recommendations describe
+ * @param {object|null} input.pending the question sent but not yet answered
  * @returns {Array<object>} turns in reading order
  */
 export const buildFrostConversation = ({
@@ -108,6 +125,7 @@ export const buildFrostConversation = ({
   prompt = "",
   brief = [],
   periodLabel = "",
+  pending = null,
 } = {}) => {
   const turns = [];
   const greetingText = text(greeting);
@@ -137,6 +155,27 @@ export const buildFrostConversation = ({
   }
   const entries = Array.isArray(history) ? [...history].reverse() : [];
   for (const entry of entries) turns.push(...exchangeTurns(entry));
+  // The question in flight, last, so it reads where it was asked. It is not in `history` because
+  // `history` is persisted to localStorage and an unanswered question is not a record of anything.
+  // Without it the panel accepted a question and showed nothing until the answer landed, which on a
+  // slow cloud is several seconds of looking like the send did not work.
+  const pendingQuestion = text(pending?.question);
+  if (pendingQuestion) {
+    turns.push({
+      id: "frost-pending-ask",
+      speaker: "owner",
+      kind: "question",
+      text: pendingQuestion,
+      at: text(pending?.askedAt),
+    });
+    turns.push({
+      id: "frost-pending-answer",
+      speaker: "frost",
+      kind: "thinking",
+      text: "",
+      speakable: false,
+    });
+  }
   return turns;
 };
 

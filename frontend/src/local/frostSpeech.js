@@ -33,8 +33,14 @@ export const SPEECH_REFUSALS = Object.freeze({
  * Takes the object rather than reaching for a global, so the decision is testable without a
  * browser and so a caller in a non-browser context cannot crash on `window`.
  */
-export const speechSupported = (synthesis) =>
-  Boolean(synthesis) && typeof synthesis.speak === "function" && typeof synthesis.cancel === "function";
+export const speechSupported = (synthesis, utterance) =>
+  Boolean(synthesis)
+  && typeof synthesis.speak === "function"
+  && typeof synthesis.cancel === "function"
+  // The constructor is checked too, because a runtime with `speechSynthesis` but no
+  // `SpeechSynthesisUtterance` would pass a check on the synthesiser alone and then throw on
+  // `new undefined(...)` -- an unsupported device crashing instead of saying it cannot speak.
+  && typeof utterance === "function";
 
 const spokenText = (turn) => {
   if (!turn || turn.speaker !== "frost" || turn.speakable !== true) return "";
@@ -48,11 +54,12 @@ const spokenText = (turn) => {
  * @param {object} input
  * @param {object|null} input.turn      the turn to read, from `latestSpokenTurn`
  * @param {object|null} input.synthesis the browser's `speechSynthesis`, or null
+ * @param {Function|null} input.utterance the `SpeechSynthesisUtterance` constructor, or null
  * @param {boolean} input.loading       true while a request is in flight
  * @returns {{allowed: boolean, text: string, reason: string, code: string}}
  */
-export const resolveSpeechPlan = ({ turn = null, synthesis = null, loading = false } = {}) => {
-  if (!speechSupported(synthesis)) {
+export const resolveSpeechPlan = ({ turn = null, synthesis = null, utterance = null, loading = false } = {}) => {
+  if (!speechSupported(synthesis, utterance)) {
     return { allowed: false, text: "", code: "UNSUPPORTED", reason: SPEECH_REFUSALS.UNSUPPORTED };
   }
   // Checked before the turn, because during a request the newest turn on screen is the *previous*

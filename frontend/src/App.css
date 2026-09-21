@@ -4673,28 +4673,239 @@ tbody tr:last-child td {
   grid-template-columns: 1fr;
 }
 
-.frost-tabs {
+/* The panel's whole chrome, replacing a row of eleven tabs, a period dropdown, a Refresh button
+   and a second FROST heading. An assistant has one surface; everything else is one tap away. */
+.frost-strip {
+  align-items: center;
+  border-bottom: 1px solid var(--line-soft);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: space-between;
+  padding-bottom: 10px;
+}
+
+/* The effective period, in words. The picker moved into the menu, and a filter the owner cannot
+   see is the Report Center bug: today-to-today applied while the inputs looked empty. */
+.frost-strip-period {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.frost-strip-period small {
+  color: var(--ink-faint);
+  font-size: 0.76rem;
+}
+
+.frost-strip-button {
+  align-items: center;
+  background: var(--veil-heavy);
+  border: 1px solid var(--line-control);
+  border-radius: 8px;
+  color: var(--ink-muted);
+  cursor: pointer;
+  display: inline-flex;
+  font-weight: 800;
+  gap: 6px;
+  min-height: 36px;
+  padding: 7px 12px;
+  position: relative;
+}
+
+.frost-strip-button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+/* A dot, not a number. The count itself is on the Alerts row inside the menu, where there is room
+   to say what it counts; a bare number on the button would be a figure with no label. */
+.frost-strip-badge {
+  background: var(--attention);
+  border-radius: 50%;
+  height: 7px;
+  width: 7px;
+}
+
+.frost-menu {
+  background: var(--card-veil-solid);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow-soft);
+  display: grid;
+  gap: 2px;
+  margin-top: 10px;
+  padding: 8px;
+}
+
+.frost-menu-range {
+  align-items: center;
+  border-bottom: 1px solid var(--line-soft);
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  padding: 4px 8px 10px;
+}
+
+.frost-menu-range span {
+  color: var(--ink-muted);
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.frost-menu-item {
+  background: none;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+  display: grid;
+  gap: 2px;
+  padding: 9px 10px;
+  text-align: left;
+}
+
+.frost-menu-item:hover {
+  background: var(--hover);
+}
+
+.frost-menu-item-active {
+  background: var(--accent-wash);
+}
+
+.frost-menu-item strong {
+  color: var(--ink-body);
+  font-size: 0.93rem;
+}
+
+.frost-menu-item small {
+  color: var(--ink-faint);
+  font-size: 0.78rem;
+}
+
+.frost-menu-footer {
+  border-top: 1px solid var(--line-soft);
+  display: grid;
+  gap: 2px;
+  margin-top: 6px;
+  padding-top: 6px;
+}
+
+.frost-back {
+  align-items: center;
+  background: none;
+  border: 0;
+  color: var(--ink-muted);
+  cursor: pointer;
+  display: inline-flex;
+  font-weight: 800;
+  gap: 6px;
+  padding: 4px 0;
+}
+
+.frost-conversation {
+  display: grid;
+  gap: 14px;
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+.frost-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* A turn, not a row in a table. The owner's questions sit right and FROST's answers left, which is
+   the only thing that makes a thread readable at a glance. */
+.frost-turn {
+  border-radius: 12px;
+  display: grid;
+  gap: 5px;
+  max-width: 88%;
+  padding: 11px 13px;
+}
+
+.frost-turn-frost {
+  align-self: flex-start;
+  background: var(--veil-heavy);
+  border: 1px solid var(--line-soft);
+}
+
+.frost-turn-owner {
+  align-self: flex-end;
+  background: var(--accent-wash);
+  border: 1px solid var(--accent-line);
+}
+
+.frost-turn p {
+  color: var(--ink-body);
+  line-height: 1.5;
+  margin: 0;
+}
+
+.frost-turn strong {
+  color: var(--ink-strong);
+  font-size: 1.02rem;
+}
+
+/* The line that lets a figure be checked against the ordinary report. Quiet, and always present. */
+.frost-turn small {
+  color: var(--ink-faint);
+  font-size: 0.75rem;
+}
+
+.frost-turn-greeting,
+.frost-turn-brief {
+  background: none;
+  border: 0;
+  max-width: 100%;
+  padding: 4px 0;
+}
+
+.frost-composer {
+  background: var(--card-veil-soft);
+  border: 1px solid var(--line-control);
+  border-radius: 12px;
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+
+.frost-composer textarea {
+  min-height: 64px;
+  resize: vertical;
+}
+
+.frost-composer-actions {
+  align-items: center;
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
 }
 
-.frost-tab {
+.frost-composer-suggestions {
+  flex: 1 1 180px;
+  min-width: 0;
+}
+
+/* Speaking is a control beside typing, not a place to navigate to. */
+.frost-speak-button {
+  align-items: center;
   background: var(--veil-heavy);
-  border: 1px solid rgba(143, 171, 156, 0.18);
+  border: 1px solid var(--line-control);
   border-radius: 8px;
   color: var(--ink-muted);
   cursor: pointer;
+  display: inline-flex;
   font-weight: 800;
+  gap: 6px;
   min-height: 38px;
-  padding: 8px 11px;
+  padding: 8px 12px;
 }
 
-.frost-tab-active {
-  background: rgba(14, 165, 233, 0.16);
-  border-color: rgba(125, 211, 252, 0.46);
-  color: #e0f2fe;
-  box-shadow: inset 0 0 0 1px rgba(125, 211, 252, 0.12);
+.frost-speech-notice {
+  margin: 0;
 }
 
 .frost-panel-stack {
@@ -5044,6 +5255,14 @@ tbody tr:last-child td {
 }
 
 @media (max-width: 920px) {
+  .frost-turn {
+    max-width: 96%;
+  }
+
+  .frost-composer-actions {
+    display: grid;
+  }
+
   .ai-toolbar,
   .ai-question-box {
     align-items: stretch;

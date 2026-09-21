@@ -176,6 +176,19 @@ import {
   resolveFrostProviderOptions,
 } from "./local/frostAvailability";
 import {
+  buildFrostConversation,
+  latestSpokenTurn,
+} from "./local/frostConversation";
+import {
+  FROST_PRIMARY_SECTION,
+  describeFrostRange,
+  resolveFrostSurface,
+} from "./local/frostSurface";
+import {
+  resolveSpeechPlan,
+  speechWithNotice,
+} from "./local/frostSpeech";
+import {
   checkBackendHealth,
   getSyncStatus,
   initialPullForApprovedDevice,
@@ -2230,7 +2243,7 @@ function App() {
     engines: [],
     usage: null,
     voice: { status: "idle", transcript: "", error: "", supported: false },
-    activeTab: "briefing",
+    activeSection: FROST_PRIMARY_SECTION,
     memories: [],
     predictions: { inventory: [], sales: [], cashflow: [], waste: [] },
     profitAdvisor: [],
@@ -2240,14 +2253,17 @@ function App() {
     period: { range: "today", label: "Today" },
     loading: false,
     error: "",
+    // The question sent and not yet answered. Deliberately not part of `history`, which is
+    // persisted to localStorage: an unanswered question is not a record of anything.
+    pending: null,
   });
   const [aiQuestion, setAiQuestion] = useState("");
   const [aiRange, setAiRange] = useState("today");
   const [frostActiveTab, setFrostActiveTab] = useState(() => {
     try {
-      return localStorage.getItem(FROST_ACTIVE_TAB_STORAGE_KEY) || "briefing";
+      return localStorage.getItem(FROST_ACTIVE_TAB_STORAGE_KEY) || FROST_PRIMARY_SECTION;
     } catch {
-      return "briefing";
+      return FROST_PRIMARY_SECTION;
     }
   });
   const [frostDrawerOpen, setFrostDrawerOpen] = useState(false);
@@ -4899,7 +4915,16 @@ function App() {
   const askAiAssistant = async (question = aiQuestion) => {
     const trimmed = question.trim();
     if (!trimmed) return;
-    setAiAssistantData((current) => ({ ...current, loading: true, error: "" }));
+    // Stamped here rather than on arrival, because this is when the owner asked. `pending` carries
+    // the question into the thread immediately: the panel used to accept it and show nothing until
+    // the answer landed, which on a slow cloud reads as a send that did not work.
+    const askedAt = authoritativeUtcNowIso();
+    setAiAssistantData((current) => ({
+      ...current,
+      loading: true,
+      error: "",
+      pending: { question: trimmed, askedAt },
+    }));
     try {
       const response = await axios.post(`${API_URL}/api/ai/query`, {
         user_id: user?.id,
@@ -4910,11 +4935,14 @@ function App() {
       setAiAssistantData((current) => ({
         ...current,
         loading: false,
+        pending: null,
         period: { range: aiRange, ...(response.data.period || {}) },
         history: [
           {
             id: response.data.conversation_id || Date.now(),
             question: trimmed,
+            askedAt,
+            answeredAt: authoritativeUtcNowIso(),
             answer: response.data.answer,
             facts: response.data.facts || [],
             period: response.data.period,
@@ -4932,7 +4960,27 @@ function App() {
       }));
       setAiQuestion("");
     } catch (error) {
-      setAiAssistantData((current) => ({ ...current, loading: false, error: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth }) }));
+      // The question is kept, with why it failed. It used to be dropped entirely: only the error
+      // strip changed, so the thread showed a conversation in which the question was never asked.
+      // A failure rendered as an absence is the same pitfall as an error rendered as zero.
+      const failureMessage = getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth });
+      setAiAssistantData((current) => ({
+        ...current,
+        loading: false,
+        pending: null,
+        error: failureMessage,
+        history: [
+          {
+            id: `failed-${askedAt}`,
+            question: trimmed,
+            askedAt,
+            answeredAt: authoritativeUtcNowIso(),
+            failureMessage,
+            facts: [],
+          },
+          ...current.history,
+        ].slice(0, 20),
+      }));
     }
   };
 
@@ -4968,6 +5016,20 @@ function App() {
   const startFrostVoice = async () => {
     if (!navigator.mediaDevices?.getUserMedia || typeof RTCPeerConnection === "undefined") {
       setAiAssistantData((state) => ({ ...state, voice: { status: "unavailable", supported: false, transcript: "", error: "Voice requires microphone and WebRTC support." } }));
+      return;
+    }
+    // CLAUDE.md: LOCAL_ONLY must keep blocked=true, reachedCloud=false and external connections at
+    // zero. This is the one path in FROST that can open an external connection from the counter
+    // itself: the SDP exchange below goes straight from this machine to the provider, not through
+    // API_URL and not through the desktop gateway, so the gateway's LOCAL_ONLY block never sees it
+    // and it writes no line to the cloud-request audit. Every other FROST call is guarded; this one
+    // was not, and was held shut only by the cloud declining to mint a client secret -- a guarantee
+    // enforced somewhere else, by accident, rather than here on purpose.
+    //
+    // Checked before getUserMedia, so a refused device never opens the microphone at all.
+    const voiceGate = guardCloudCall("frost-realtime-voice", CLOUD_OPERATIONAL_API_URL);
+    if (!voiceGate.allowed) {
+      setAiAssistantData((state) => ({ ...state, voice: { status: "blocked", supported: true, transcript: "", error: voiceGate.message } }));
       return;
     }
     setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "connecting", supported: true, error: "" } }));
@@ -5026,6 +5088,11 @@ function App() {
       };
       const offer = await peer.createOffer();
       await peer.setLocalDescription(offer);
+      // Re-checked at the call itself. The owner can switch the device to Local Only while the
+      // session is being negotiated, and the gate above would then be a decision made seconds ago
+      // about a connection opening now.
+      const sdpGate = guardCloudCall("frost-realtime-voice-sdp", CLOUD_OPERATIONAL_API_URL);
+      if (!sdpGate.allowed) throw createCloudCallRefusalError(sdpGate);
       const realtimeResponse = await fetch(session.realtimeUrl, {
         method: "POST",
         headers: {
@@ -7640,8 +7707,8 @@ function App() {
   });
 
   const frostUnreadCount = (aiAssistantData.alerts || []).filter((alert) => ["CRITICAL", "HIGH", "ATTENTION"].includes(String(alert.severity || "").toUpperCase())).length;
-  const openFrostDrawer = (tab = frostActiveTab || "briefing") => {
-    setFrostActiveTab(tab);
+  const openFrostDrawer = (section = frostActiveTab || FROST_PRIMARY_SECTION) => {
+    setFrostActiveTab(section);
     setFrostDrawerOpen(true);
   };
   /**
@@ -9077,14 +9144,14 @@ function App() {
         </div>
       )}
       <FrostFloatingCopilot
-        activeTab={frostActiveTab}
+        activeSection={frostActiveTab}
         data={aiAssistantData}
         onAlertAction={updateAiAlert}
         onAsk={askAiAssistant}
         onClose={() => setFrostDrawerOpen(false)}
         onMemoryAction={updateFrostMemory}
         onNavigate={navigate}
-        onOpen={() => openFrostDrawer("briefing")}
+        onOpen={() => openFrostDrawer(FROST_PRIMARY_SECTION)}
         onProposeAction={proposeFrostAction}
         onProposeMemory={proposeFrostMemory}
         onQuestionChange={setAiQuestion}
@@ -9098,7 +9165,7 @@ function App() {
         onSelectQuestion={(question) => askAiAssistant(question)}
         onStartVoice={startFrostVoice}
         onStopVoice={stopFrostVoice}
-        onTabChange={setFrostActiveTab}
+        onSectionChange={setFrostActiveTab}
         open={frostDrawerOpen}
         question={aiQuestion}
         range={aiRange}
@@ -9120,7 +9187,7 @@ function App() {
 
 
 function FrostFloatingCopilot({
-  activeTab,
+  activeSection,
   data,
   onAlertAction,
   onAsk,
@@ -9138,7 +9205,7 @@ function FrostFloatingCopilot({
   onSelectQuestion,
   onStartVoice,
   onStopVoice,
-  onTabChange,
+  onSectionChange,
   open,
   question,
   range,
@@ -9161,14 +9228,16 @@ function FrostFloatingCopilot({
       <aside aria-label="FROST" className={`frost-drawer ${open ? "frost-drawer-open" : ""}`}>
         <div className="frost-drawer-header">
           <div>
-            <span className="eyebrow">Floating Copilot</span>
+            {/* One heading. There used to be two: this one, and a second <h2>FROST</h2> two
+                hundred lines down in the module's own toolbar, stacked in the same drawer. */}
             <h2>FROST</h2>
+            <span className="eyebrow">Ask about your shop</span>
           </div>
           <button aria-label="Close FROST" className="remove-button" onClick={onClose} type="button"><Icon name="close" /></button>
         </div>
         <div className="frost-drawer-body">
           <AiBusinessAssistantModule
-            activeTab={activeTab}
+            activeSection={activeSection}
             data={data}
             onAlertAction={onAlertAction}
             onAsk={onAsk}
@@ -9184,7 +9253,7 @@ function FrostFloatingCopilot({
             onSelectQuestion={onSelectQuestion}
             onStartVoice={onStartVoice}
             onStopVoice={onStopVoice}
-            onTabChange={onTabChange}
+            onSectionChange={onSectionChange}
             question={question}
             range={range}
             user={user}
@@ -9308,7 +9377,7 @@ function CommandPalette({ index, recentIds = [], onNavigate, onClose }) {
 const aiSeverityClass = (severity = "INFO") => `ai-severity ai-severity-${String(severity).toLowerCase()}`;
 
 function AiBusinessAssistantModule({
-  activeTab = "briefing",
+  activeSection = FROST_PRIMARY_SECTION,
   data,
   onAlertAction,
   onAsk,
@@ -9322,16 +9391,21 @@ function AiBusinessAssistantModule({
   onSaveSettings,
   onStartVoice,
   onStopVoice,
-  onTabChange,
+  onSectionChange,
   onProposeAction,
   onSelectQuestion,
   question,
   range,
   user,
 }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const threadEndRef = useRef(null);
+  // Why a refusal is state rather than a disabled button: a Speak button that is simply greyed out
+  // tells the owner nothing about which of the three reasons applies, and "this device cannot read
+  // aloud" and "FROST has not answered anything yet" need different responses from them.
+  const [speechNotice, setSpeechNotice] = useState("");
   const briefing = data.briefing || {};
   const cards = briefing.cards || {};
-  const latestAnswer = data.history[0];
   const canManageReminders = user?.role === "Owner" || user?.role === "Admin";
   const canManageFrost = user?.role === "Owner" || user?.role === "Admin";
   // Recomputed each render rather than memoised, so a panel left open across 17:00 says "Good
@@ -9341,44 +9415,133 @@ function AiBusinessAssistantModule({
   const periodLabel = data.period?.label || briefing.period?.label || "Current data";
   const cardValue = (section, key, fallback = 0) => cards[section]?.[key] ?? fallback;
   const money = (value) => currency.format(Number(value || 0));
-  const tabItems = [
-    ["briefing", "Briefing"],
-    ["ask", "Ask FROST"],
-    ["voice", "Voice"],
-    ["alerts", "Alerts"],
-    ["decision", "Decision Center"],
-    ["predictions", "Predictions"],
-    ["profit", "Profit Advisor"],
-    ["memory", "Memory"],
-    ["reminders", "Reminders"],
-    ["history", "History"],
-    ["settings", "Settings"],
+  const surface = resolveFrostSurface({
+    activeSection,
+    // Passed through exactly as computed above. This module narrows what is shown; it is never the
+    // thing that decides who may do what, and a hidden section is not a permission -- the server's
+    // own checks are.
+    canManageFrost,
+    canManageReminders,
+    alertCount: (data.alerts || []).length,
+  });
+  // The old Briefing tab was two things under one name. Its lines are what FROST would say if
+  // asked how today looks, so they open the conversation; its tiles stay a place of their own.
+  const briefLines = [
+    ...(data.dailyPlan?.top_priorities || []).slice(0, 5).map((item) => `Start with: ${item}`),
+    ...(data.dailyPlan?.topPriorities || []).slice(0, 5).map((item) => `Start with: ${item}`),
+    ...(briefing.recommendations || []),
+    ...(data.dailyPlan?.can_wait || []).slice(0, 3).map((item) => `Can wait: ${item}`),
   ];
+  const conversation = buildFrostConversation({
+    history: data.history || [],
+    greeting: frostGreeting.line,
+    prompt: FROST_GREETING_PROMPT,
+    brief: briefLines,
+    periodLabel,
+    pending: data.pending,
+  });
+  const speechPlan = resolveSpeechPlan({
+    turn: latestSpokenTurn(conversation),
+    synthesis: typeof window === "undefined" ? null : window.speechSynthesis,
+    utterance: typeof window === "undefined" ? null : window.SpeechSynthesisUtterance,
+    loading: data.loading,
+  });
+  const speakLatestAnswer = () => {
+    if (!speechPlan.allowed) {
+      setSpeechNotice(speechPlan.reason);
+      return;
+    }
+    setSpeechNotice("");
+    const synthesis = window.speechSynthesis;
+    // Cancel first: pressing the button twice otherwise queues a second reading behind the first,
+    // and the owner hears the same answer again rather than the one they just asked for.
+    synthesis.cancel();
+    synthesis.speak(new window.SpeechSynthesisUtterance(speechWithNotice(speechPlan, latestSpokenTurn(conversation))));
+  };
   const openLinkedModule = (type) => {
     if (type === "customer") return onNavigate("accounts");
     if (type === "supplier" || type === "purchase") return onNavigate("pending-bills");
     if (type === "product") return onNavigate("products");
     return onNavigate("reports");
   };
+  const goTo = (key) => {
+    setMenuOpen(false);
+    onSectionChange?.(key);
+  };
+  const sendQuestion = () => {
+    if (data.loading || !question.trim()) return;
+    onAsk();
+  };
+  // A thread that does not follow itself shows the oldest exchange and keeps the newest answer
+  // below the fold, which is the complaint this panel was rebuilt for wearing a different hat:
+  // the owner asks a question and appears to get nothing back.
+  useEffect(() => {
+    threadEndRef.current?.scrollIntoView({ block: "end" });
+  }, [conversation.length]);
 
   return (
     <section className="ai-assistant-shell">
-      <div className="ai-toolbar">
-        <div>
-          <span className="eyebrow">Verified Business Facts</span>
-          <h2>FROST</h2>
-          <p>FroozERP AI operating system. Data period: {periodLabel}. Every figure comes from verified modules before explanation.</p>
+      <div className="frost-strip">
+        <div className="frost-strip-period">
+          {/* The period has to stay in words. The picker moves into the menu, and CLAUDE.md's
+              Report Center lesson is that an effective filter the user cannot see is one that
+              silently decides every figure on screen. */}
+          <span className="eyebrow">{describeFrostRange(range)}</span>
+          {periodLabel && periodLabel !== describeFrostRange(range) && <small>{periodLabel}</small>}
         </div>
         <div className="button-row">
-          <select value={range} onChange={(event) => onRangeChange(event.target.value)}>
-            <option value="today">Today</option>
-            <option value="yesterday">Yesterday</option>
-            <option value="last_7_days">Last 7 Days</option>
-            <option value="this_month">This Month</option>
-          </select>
-          <button className="secondary-button" disabled={data.loading} onClick={onRefresh}><Icon name="history" /> Refresh data</button>
+          <button
+            aria-expanded={menuOpen}
+            className="frost-strip-button"
+            onClick={() => setMenuOpen((open) => !open)}
+            type="button"
+          >
+            <Icon name="menu" /> More
+            {surface.menu.some((entry) => entry.badge > 0) && <em className="frost-strip-badge" />}
+          </button>
+          <button className="frost-strip-button" disabled={data.loading} onClick={onRefresh} type="button">
+            <Icon name="history" /> Refresh
+          </button>
         </div>
       </div>
+
+      {menuOpen && (
+        <div className="frost-menu">
+          <label className="frost-menu-range">
+            <span>Period</span>
+            <select value={range} onChange={(event) => { onRangeChange(event.target.value); setMenuOpen(false); }}>
+              <option value="today">Today</option>
+              <option value="yesterday">Yesterday</option>
+              <option value="last_7_days">Last 7 Days</option>
+              <option value="this_month">This Month</option>
+            </select>
+          </label>
+          {surface.menu.map((entry) => (
+            <button
+              className={entry.active ? "frost-menu-item frost-menu-item-active" : "frost-menu-item"}
+              key={entry.key}
+              onClick={() => goTo(entry.key)}
+              type="button"
+            >
+              <strong>{entry.label}{entry.badge > 0 ? ` (${entry.badge})` : ""}</strong>
+              <small>{entry.blurb}</small>
+            </button>
+          ))}
+          <div className="frost-menu-footer">
+            {surface.footer.map((entry) => (
+              <button
+                className={entry.active ? "frost-menu-item frost-menu-item-active" : "frost-menu-item"}
+                key={entry.key}
+                onClick={() => goTo(entry.key)}
+                type="button"
+              >
+                <strong>{entry.label}</strong>
+                <small>{entry.blurb}</small>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {data.error && (
         <div className="startup-status-panel startup-status-error">
@@ -9388,20 +9551,95 @@ function AiBusinessAssistantModule({
         </div>
       )}
 
-      <div className="frost-tabs" role="tablist" aria-label="FROST sections">
-        {tabItems.map(([key, label]) => (
-          <button
-            className={activeTab === key ? "frost-tab frost-tab-active" : "frost-tab"}
-            key={key}
-            onClick={() => onTabChange?.(key)}
-            type="button"
-          >
-            {label}
-          </button>
-        ))}
-      </div>
+      {!surface.onConversation && (
+        <button className="frost-back" onClick={() => goTo(FROST_PRIMARY_SECTION)} type="button">
+          <Icon name="close" /> Back to the conversation
+        </button>
+      )}
 
-      {activeTab === "briefing" && <div className="ai-brief-grid">
+      {surface.onConversation && (
+        <div className="frost-conversation">
+          <div className="frost-thread">
+            {conversation.map((turn) => (
+              <article className={`frost-turn frost-turn-${turn.speaker} frost-turn-${turn.kind}`} key={turn.id}>
+                {turn.kind === "greeting" && (
+                  <>
+                    <strong>{turn.text}</strong>
+                    {turn.prompt && <p>{turn.prompt}</p>}
+                  </>
+                )}
+                {turn.kind === "brief" && (
+                  <>
+                    {turn.periodLabel && <span className="eyebrow">{turn.periodLabel}</span>}
+                    {turn.lines.map((line) => <p key={line}>{line}</p>)}
+                  </>
+                )}
+                {turn.kind === "question" && <p>{turn.text}</p>}
+                {turn.kind === "thinking" && <div className="ai-thinking"><span /> FROST is thinking</div>}
+                {turn.kind === "failure" && <p className="ai-answer-notice">{turn.text}</p>}
+                {turn.kind === "answer" && (
+                  <>
+                    <p>{turn.text}</p>
+                    {turn.notice && <p className="ai-answer-notice">{turn.notice}</p>}
+                    {/* The line that lets a figure be checked against the ordinary report. It is
+                        derived from the facts the server sent, so an answer with no facts says so
+                        rather than carrying a reassuring default. */}
+                    <small>{turn.sources.length ? `From ${turn.sources.join(", ")}` : "No source modules reported"}
+                      {turn.periodLabel ? ` - ${turn.periodLabel}` : ""}</small>
+                  </>
+                )}
+              </article>
+            ))}
+            {conversation.length === 0 && <div className="cart-empty">Ask FROST anything about your shop.</div>}
+            <div ref={threadEndRef} />
+          </div>
+
+          {speechNotice && <p className="ai-answer-notice frost-speech-notice">{speechNotice}</p>}
+
+          <div className="frost-composer">
+            <textarea
+              onChange={(event) => onQuestionChange(event.target.value)}
+              onKeyDown={(event) => {
+                // Enter sends, Shift+Enter makes a new line. The box had neither: it was
+                // mouse-only, which is not how anyone types a question.
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  sendQuestion();
+                }
+              }}
+              placeholder="Ask about sales, profit, overdue payments, low stock or pending bills."
+              value={question}
+            />
+            <div className="frost-composer-actions">
+              <select
+                className="frost-composer-suggestions"
+                disabled={data.loading || !(data.suggestedQuestions || []).length}
+                onChange={(event) => { if (event.target.value) onSelectQuestion(event.target.value); }}
+                value=""
+              >
+                <option value="">{(data.suggestedQuestions || []).length ? "Suggested questions" : "No questions available"}</option>
+                {(data.suggestedQuestions || []).map((item) => (
+                  <option key={item} value={item}>{item}</option>
+                ))}
+              </select>
+              <button
+                aria-label="Read the last answer aloud"
+                className="frost-speak-button"
+                onClick={speakLatestAnswer}
+                title={speechPlan.allowed ? "Read the last answer aloud" : speechPlan.reason}
+                type="button"
+              >
+                <Icon name="message" /> Speak
+              </button>
+              <button className="primary-button" disabled={data.loading || !question.trim()} onClick={sendQuestion} type="button">
+                Ask
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeSection === "today" && <div className="ai-brief-grid">
         <SummaryMetric featured label="Sales" value={money(cardValue("sales", "totalSales"))} />
         <SummaryMetric label="Gross Profit" positive value={money(cardValue("sales", "estimatedGrossProfit"))} />
         <SummaryMetric label="Customer Overdue" value={money(cardValue("customerOutstanding", "totalOutstanding"))} />
@@ -9410,65 +9648,14 @@ function AiBusinessAssistantModule({
         <SummaryMetric label="Low Stock" value={cardValue("lowStock", "count")} />
       </div>}
 
-      {(activeTab === "ask" || activeTab === "briefing") && <div className="ai-layout">
-        {activeTab === "ask" && (
-        <ModuleCard eyebrow="Ask FROST" title="Controlled Business Questions" subtitle="Answers use the shared FROST service layer. No write action is performed without owner approval.">
-          {data.loading && <div className="ai-thinking"><span /> FROST is thinking</div>}
-          <div className="ai-frost-greeting">
-            <strong>{frostGreeting.line}</strong>
-            <span>{FROST_GREETING_PROMPT}</span>
-          </div>
-          <div className="ai-question-box">
-            <textarea value={question} onChange={(event) => onQuestionChange(event.target.value)} placeholder="Ask about overdue payments, low stock, sales, profit, expenses or pending purchase bills." />
-            <button className="primary-button" disabled={data.loading || !question.trim()} onClick={() => onAsk()}><Icon name="message" /> Ask</button>
-          </div>
-          <label className="ai-suggestion-picker">
-            <span>Or pick a question</span>
-            <select
-              value=""
-              disabled={data.loading || !(data.suggestedQuestions || []).length}
-              onChange={(event) => {
-                const picked = event.target.value;
-                if (picked) onSelectQuestion(picked);
-              }}
-            >
-              <option value="">{(data.suggestedQuestions || []).length ? "Choose a question" : "No questions available"}</option>
-              {(data.suggestedQuestions || []).map((item) => (
-                <option key={item} value={item}>{item}</option>
-              ))}
-            </select>
-          </label>
-          {latestAnswer && (
-            <article className="ai-answer-panel">
-              <span className="eyebrow">{latestAnswer.period?.label || periodLabel}</span>
-              <h3>{latestAnswer.question}</h3>
-              <p>{latestAnswer.answer}</p>
-              {latestAnswer.notice && <p className="ai-answer-notice">{latestAnswer.notice}</p>}
-              <small>Source modules: {[...new Set((latestAnswer.facts || []).map((fact) => fact.sourceModule))].join(", ") || "Verified FroozERP facts"}</small>
-            </article>
-          )}
-        </ModuleCard>
-        )}
-
-        {activeTab === "briefing" && (
-        <ModuleCard eyebrow="Daily Owner Brief" title="Top Recommendations" subtitle="Deterministic alerts remain available even when external AI providers are disabled.">
-          <div className="ai-recommendations">
-            {(data.dailyPlan?.top_priorities || []).slice(0, 5).map((item) => <p key={`priority-${item}`}>Start My Day: {item}</p>)}
-            {(data.dailyPlan?.topPriorities || []).slice(0, 5).map((item) => <p key={`priority-${item}`}>Start My Day: {item}</p>)}
-            {(briefing.recommendations || ["No briefing loaded yet."]).map((item) => <p key={item}>{item}</p>)}
-            {(data.dailyPlan?.can_wait || []).slice(0, 3).map((item) => <p key={`wait-${item}`}>Can wait: {item}</p>)}
-          </div>
-          <div className="ai-collection-strip">
-            <span>Cash {money(cardValue("collections", "cash"))}</span>
-            <span>UPI {money(cardValue("collections", "upi"))}</span>
-            <span>Card/Bank {money(cardValue("collections", "card"))}</span>
-            <span>Waste {money(cardValue("waste", "totalWasteCost"))}</span>
-          </div>
-        </ModuleCard>
-        )}
+      {activeSection === "today" && <div className="ai-collection-strip">
+        <span>Cash {money(cardValue("collections", "cash"))}</span>
+        <span>UPI {money(cardValue("collections", "upi"))}</span>
+        <span>Card/Bank {money(cardValue("collections", "card"))}</span>
+        <span>Waste {money(cardValue("waste", "totalWasteCost"))}</span>
       </div>}
 
-      {activeTab === "voice" && (
+      {activeSection === "voice" && (
         <FrostVoicePanel
           onStart={onStartVoice}
           onStop={onStopVoice}
@@ -9476,19 +9663,19 @@ function AiBusinessAssistantModule({
         />
       )}
 
-      {activeTab === "predictions" && (
+      {activeSection === "predictions" && (
         <FrostPredictionsPanel predictions={data.predictions || {}} onProposeAction={onProposeAction} />
       )}
 
-      {activeTab === "decision" && (
+      {activeSection === "decision" && (
         <FrostAutonomousDecisionCenter data={data.autonomous || {}} onProposeAction={onProposeAction} />
       )}
 
-      {activeTab === "profit" && (
+      {activeSection === "profit" && (
         <FrostProfitAdvisorPanel recommendations={data.profitAdvisor || []} onProposeAction={onProposeAction} />
       )}
 
-      {activeTab === "memory" && (
+      {activeSection === "memory" && (
         <FrostMemoryPanel
           canManage={canManageFrost}
           memories={data.memories || []}
@@ -9497,13 +9684,13 @@ function AiBusinessAssistantModule({
         />
       )}
 
-      {activeTab === "settings" && <FrostConfigurationPanel
+      {activeSection === "settings" && <FrostConfigurationPanel
         canManage={canManageFrost}
         data={data}
         onSave={onSaveSettings}
       />}
 
-      {activeTab === "briefing" && <ModuleCard eyebrow="AI Briefing Cards" title="Owner Copilot Priorities" subtitle="Each action is read-only or recorded for owner approval. FROST never executes business changes directly.">
+      {activeSection === "today" && <ModuleCard eyebrow="Today's cards" title="Owner Copilot Priorities" subtitle="Each action is read-only or recorded for owner approval. FROST never executes business changes directly.">
         <div className="frost-card-grid">
           {(briefing.insightCards || []).map((card) => (
             <article className={`frost-insight-card frost-priority-${String(card.priority || "Information").toLowerCase()}`} key={card.id}>
@@ -9522,8 +9709,8 @@ function AiBusinessAssistantModule({
         </div>
       </ModuleCard>}
 
-      {(activeTab === "alerts" || activeTab === "reminders") && <div className="ai-layout ai-layout-single">
-        {activeTab === "alerts" && (
+      {(activeSection === "alerts" || activeSection === "reminders") && <div className="ai-layout ai-layout-single">
+        {activeSection === "alerts" && (
         <ModuleCard eyebrow="Priority Alerts" title="Needs Attention" subtitle="Acknowledge, snooze or resolve after reviewing the linked module.">
           <DataTable headers={["Severity", "Alert", "Source", "Actions"]}>
             {(data.alerts || []).slice(0, 12).map((alert) => (
@@ -9545,7 +9732,7 @@ function AiBusinessAssistantModule({
         </ModuleCard>
         )}
 
-        {activeTab === "reminders" && (
+        {activeSection === "reminders" && (
         <ModuleCard eyebrow="Reminder Centre" title="Drafts and Follow-ups" subtitle="WhatsApp messages are drafts only until an owner reviews and approves them.">
           <DataTable headers={["Priority", "Reminder", "Due", "Actions"]}>
             {(data.reminders || []).slice(0, 10).map((reminder) => (
@@ -9568,18 +9755,12 @@ function AiBusinessAssistantModule({
         )}
       </div>}
 
-      {activeTab === "history" && <ModuleCard eyebrow="Conversation History" title="Audited FROST Answers" subtitle="Questions, verified facts, token usage and provider context are recorded on the backend.">
-        <div className="ai-history-list">
-          {data.history.map((item) => (
-            <article key={item.id} className="ai-history-item">
-              <strong>{item.question}</strong>
-              <p>{item.answer}</p>
-              <small>{item.period?.label || periodLabel}{item.cached ? " - cached" : ""}{item.usage ? ` - ${item.usage.inputTokens + item.usage.outputTokens} estimated tokens` : ""}</small>
-            </article>
-          ))}
-          {data.history.length === 0 && <div className="cart-empty">Ask a question to start an audited business conversation.</div>}
-        </div>
-      </ModuleCard>}
+      {/* The History section is gone because the conversation IS the history. It used to be the
+          other half of a conversation split across two screens, and the split cost the owner the
+          one signal that mattered: History rendered `cached` and token usage but dropped `notice`,
+          so an answer FROST had to word itself after the local model failed looked, one render
+          later, exactly like an answer the model had worded. The thread carries the notice with
+          every answer. */}
     </section>
   );
 }

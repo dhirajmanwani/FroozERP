@@ -114,3 +114,61 @@ test("speaking picks the last grounded thing FROST said, never the greeting", ()
   assert.equal(latestSpokenTurn([]), null);
   assert.equal(latestSpokenTurn(), null);
 });
+
+// -------------------------------------------------------------------------------------------
+// The two things the thread used to lose: a question in flight, and a question that failed
+// -------------------------------------------------------------------------------------------
+
+test("the question being asked right now appears at the end, with a thinking turn", () => {
+  // Without this the panel took the question and showed nothing until the answer landed. On a slow
+  // cloud that is several seconds of looking like the send did not work.
+  const turns = buildFrostConversation({
+    history: [exchange()],
+    pending: { question: "And the overdue suppliers?", askedAt: "2026-09-21T19:40:00.000Z" },
+  });
+  assert.deepEqual(turns.slice(-2).map((turn) => turn.kind), ["question", "thinking"]);
+  assert.equal(turns[turns.length - 2].text, "And the overdue suppliers?");
+  assert.equal(turns[turns.length - 2].at, "2026-09-21T19:40:00.000Z");
+  assert.equal(turns[turns.length - 1].speaker, "frost");
+});
+
+test("a thinking turn is never spoken aloud", () => {
+  const turns = buildFrostConversation({ pending: { question: "Today's sales?" } });
+  assert.equal(latestSpokenTurn(turns), null);
+});
+
+test("nothing pending means no pending turns", () => {
+  for (const pending of [null, undefined, {}, { question: "   " }]) {
+    assert.deepEqual(buildFrostConversation({ history: [exchange()], pending }).length, 2);
+  }
+});
+
+test("a question that failed stays in the thread with the reason", () => {
+  // It used to vanish: only the error strip changed, so the thread showed a conversation in which
+  // that question was never asked. A failure rendered as an absence is the same pitfall as an
+  // error rendered as zero.
+  const turns = buildFrostConversation({
+    history: [exchange({ answer: "", failureMessage: "FROST requires cloud access." })],
+  });
+  assert.deepEqual(turns.map((turn) => turn.kind), ["question", "failure"]);
+  assert.equal(turns[1].text, "FROST requires cloud access.");
+  assert.equal(turns[1].speakable, false);
+});
+
+test("a failure is never read aloud as though it were an answer", () => {
+  const turns = buildFrostConversation({
+    greeting: "Good evening.",
+    history: [exchange({ answer: "", failureMessage: "FROST requires cloud access." })],
+  });
+  assert.equal(latestSpokenTurn(turns), null);
+});
+
+test("a failure wins over a stale answer on the same entry", () => {
+  // If an entry ever carried both, showing the old answer beside a failure would be the worst of
+  // both: a figure presented as current that the failure says could not be refreshed.
+  const turns = buildFrostConversation({
+    history: [exchange({ failureMessage: "The cloud did not answer." })],
+  });
+  assert.deepEqual(turns.map((turn) => turn.kind), ["question", "failure"]);
+  assert.doesNotMatch(JSON.stringify(turns), /42,300/);
+});

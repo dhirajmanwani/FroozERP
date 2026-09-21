@@ -23,16 +23,23 @@ test("the eleven tabs become a conversation plus a short menu", () => {
   // talking is a control on the composer, not a place to go.
   const surface = resolveFrostSurface(owner);
   const keys = surface.menu.map((entry) => entry.key);
-  assert.deepEqual(keys, ["alerts", "reminders", "decision", "predictions", "profit", "memory"]);
-  assert.deepEqual(surface.footer.map((entry) => entry.key), ["settings"]);
+  assert.deepEqual(keys, ["today", "alerts", "reminders", "decision", "predictions", "profit", "memory"]);
+  assert.deepEqual(surface.footer.map((entry) => entry.key), ["voice", "settings"]);
+  // Live voice is neither deleted nor offered as an equal: it opens a microphone session that is
+  // sent no tools, so it cannot read the books. It sits in the footer, labelled for what it is.
   assert.equal(keys.includes("voice"), false);
-  assert.equal(keys.includes("briefing"), false, "the brief opens the thread instead");
+  assert.equal(surface.shortcuts.some((entry) => entry.key === "voice"), false);
+  assert.match(surface.footer[0].blurb, /not connected to your books/i);
   assert.equal(keys.includes("ask"), false, "asking is the surface");
   assert.equal(keys.includes("history"), false, "the thread is the history");
+  // The old Briefing tab was two things under one name. Its recommendations open the conversation;
+  // its tiles stay a place, renamed to what an owner would call them.
+  assert.equal(keys.includes("briefing"), false);
+  assert.equal(keys.includes("today"), true);
 });
 
 test("the two an owner opens daily are shortcuts, not buried in the menu", () => {
-  assert.deepEqual(resolveFrostSurface(owner).shortcuts.map((entry) => entry.key), ["alerts", "reminders"]);
+  assert.deepEqual(resolveFrostSurface(owner).shortcuts.map((entry) => entry.key), ["today", "alerts", "reminders"]);
 });
 
 test("every menu entry says in plain words what is inside it", () => {
@@ -51,8 +58,8 @@ test("a user who may not manage FROST is not offered its settings or memory", ()
   assert.equal(keys.includes("settings"), false);
   assert.equal(keys.includes("memory"), false);
   assert.equal(keys.includes("reminders"), false);
-  assert.deepEqual(limited.shortcuts.map((entry) => entry.key), ["alerts"]);
-  assert.deepEqual(keys, ["alerts", "decision", "predictions", "profit"]);
+  assert.deepEqual(limited.shortcuts.map((entry) => entry.key), ["today", "alerts"]);
+  assert.deepEqual(keys, ["today", "alerts", "decision", "predictions", "profit"]);
 });
 
 test("a section the user cannot reach falls back to the conversation, not to a blank panel", () => {
@@ -72,10 +79,12 @@ test("an open section is marked active, and only that one", () => {
   assert.deepEqual(surface.menu.filter((entry) => entry.active).map((entry) => entry.key), ["predictions"]);
 });
 
-test("the alert badge counts and never shows a zero or a guess", () => {
-  assert.equal(resolveFrostSurface({ ...owner, alertCount: 3 }).menu[0].badge, 3);
+test("the alert badge counts, sits only on alerts, and never shows a zero or a guess", () => {
+  const badgeFor = (surface, key) => surface.menu.find((entry) => entry.key === key)?.badge;
+  assert.equal(badgeFor(resolveFrostSurface({ ...owner, alertCount: 3 }), "alerts"), 3);
+  assert.equal(badgeFor(resolveFrostSurface({ ...owner, alertCount: 3 }), "today"), 0);
   for (const alertCount of [0, -2, null, undefined, Number.NaN, "lots"]) {
-    assert.equal(resolveFrostSurface({ ...owner, alertCount }).menu[0].badge, 0, `${alertCount}`);
+    assert.equal(badgeFor(resolveFrostSurface({ ...owner, alertCount }), "alerts"), 0, `${alertCount}`);
   }
 });
 
