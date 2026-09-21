@@ -406,6 +406,53 @@ The stand-in cloud is not the real one. TLS, the deployed frontend, and anything
 hosted database's actual contents are still unproven by a rehearsal. Do not let a green rehearsal
 imply that issuing works against production.
 
+**FROST becomes the Owner's assistant, and speaks from a local model (1.0.74, 2026-09-21):**
+
+*Read this first: two different machines, two different risks*
+
+The maintainer's own laptop runs 1.0.73, installed by hand on 19 Sep, so for it this is a one-step
+update and the list below is the whole risk. The counters are still near **v1.0.51, 14 July** — the
+newest published release — so for them it is a two-month jump, and the rows for 1.0.71, 1.0.72 and
+1.0.73 above all still apply. Seed the rehearsal from the **oldest** machine's database. This is
+also the last release the counters need installed by hand; from 1.0.75 they update themselves.
+
+*What to check*
+
+- FROST opens for the **Owner** and is refused for everyone else. Check with a Cashier account and
+  an Admin account, not by reasoning about it — Admin loses FROST in this release, deliberately,
+  and it is reversible from the role-permissions screen.
+- The greeting matches the clock. Open FROST in the morning and again in the evening, or change the
+  machine's time, and the line should change with it.
+- The suggested questions are a **dropdown**, not a grid of buttons, and picking one answers that
+  question rather than returning a general briefing.
+- **Settings → FROST Configuration → Provider lists five options**, not one. One option alone means
+  the list did not load from the backend, and the note under the dropdown should say so rather than
+  leaving a menu that looks complete. This is what 1.0.74 fixes; if it is still one option, the fix
+  did not reach this build.
+- **Switch the app to Local Only and open FROST.** It must work — that is the change in this
+  release, and it is the mode FROST is meant for. Before 1.0.74 it said "FROST requires cloud
+  access" and showed nothing.
+- **Stop the local server and open FROST.** The message must name *this machine's* server, not the
+  cloud. Pointing at the cloud here sends the reader to the wrong machine.
+- Every figure FROST states must be checkable against the same figure in the ordinary reports. This
+  is the release's one non-negotiable: the model phrases, the database answers.
+
+*With Ollama installed, if it is*
+
+- With Ollama running and `llama3.2:3b` pulled, FROST's answers should read as sentences rather than
+  `Period: Today. sales 48250`. The figures must still match the reports.
+- **Stop Ollama and ask again.** FROST must still answer, in its plain wording, with a line saying
+  the local model is not running. A blank panel or an error here is a bug.
+- Type a non-loopback address into **Local Model Address** and save. It must be refused. That field
+  is the one place a typo could send the shop's figures to another machine, and LOCAL_ONLY mode
+  requires external connections to stay at zero.
+
+*What this rehearsal cannot prove*
+
+Nothing in this repository has ever talked to a real Ollama — the automated tests drive an injected
+`fetch`. Whether a real Ollama accepts the request body, and whether a 3B model phrases well enough
+to be worth keeping, are open until this rehearsal answers them.
+
 ### Only then
 
 A rehearsal that found nothing is the precondition for **Signing And Publishing** below. A rehearsal
