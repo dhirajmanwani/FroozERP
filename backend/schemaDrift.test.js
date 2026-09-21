@@ -259,3 +259,59 @@ test("a changed declaration is a difference, not a match", () => {
   const declared = [...statementsNaming(bootstrap, "example")][0];
   assert.ok(!statementsNaming(migration, "example").has(declared), "a changed column must not compare equal");
 });
+
+// -------------------------------------------------------------------------------------------
+// Comments are not declarations
+// -------------------------------------------------------------------------------------------
+
+test("a comment that quotes the syntax does not declare a table", async () => {
+  // How the cloud stopped booting on 2026-09-21. `initializeDatabase()` explains its own
+  // `IF NOT EXISTS` statements, and the only way to explain one is to write one:
+  //
+  //     -- CREATE TABLE IF NOT EXISTS above does nothing on an install that already has this table
+  //
+  // The regex read that as a table named `above`. Nothing can ever satisfy it, so
+  // verifyDeclaredSchema refused every hosted deployment for good, naming a table that does not
+  // exist and never did. A check that cannot pass is worse than no check: it teaches everyone to
+  // set FROOZERP_ALLOW_SCHEMA_DRIFT and stop reading.
+  const { bootstrapSql, declaredTables, declaredColumns } = await import(modulePath);
+  const source = [
+    "const initializeDatabase = async () => {",
+    "  await pool.query(`",
+    "    CREATE TABLE IF NOT EXISTS real_table ( id SERIAL PRIMARY KEY );",
+    "    -- CREATE TABLE IF NOT EXISTS above does nothing on an install that already has this table",
+    "    -- ALTER TABLE real_table ADD COLUMN IF NOT EXISTS commented_out TEXT;",
+    "    ALTER TABLE real_table ADD COLUMN IF NOT EXISTS real_column TEXT;",
+    "  `);",
+    "  // CREATE TABLE IF NOT EXISTS js_comment_table ( id SERIAL PRIMARY KEY );",
+    "  /* CREATE TABLE IF NOT EXISTS block_comment_table ( id SERIAL PRIMARY KEY ); */",
+    "};",
+    "",
+  ].join("\n");
+
+  const sql = bootstrapSql(source);
+  assert.deepEqual(declaredTables(sql), ["real_table"]);
+  assert.deepEqual(declaredColumns(sql), [["real_table", "real_column"]]);
+});
+
+test("nothing server.js only talks about is reported as missing", async () => {
+  // The regression itself, against the real file rather than a fixture. `above` is not a name
+  // anybody would add back deliberately, so this fails only if comment stripping is removed.
+  const { bootstrapSql, declaredTables } = await import(modulePath);
+  const tables = declaredTables(bootstrapSql(SERVER));
+  assert.ok(!tables.includes("above"), "`above` is a word in a comment, not a table");
+
+  // Every declared name must survive a round trip through the catalogue: a database containing
+  // exactly what is declared must report no drift. A phantom name cannot, because no database can
+  // ever contain it -- which is what made the old failure permanent.
+  const { declaredColumns, compareSchema } = await import(modulePath);
+  const sql = bootstrapSql(SERVER);
+  const drift = compareSchema({
+    tables: declaredTables(sql),
+    columns: declaredColumns(sql),
+    liveTables: declaredTables(sql),
+    liveColumns: declaredColumns(sql),
+  });
+  assert.deepEqual(drift.missingTables, []);
+  assert.deepEqual(drift.missingColumns, []);
+});

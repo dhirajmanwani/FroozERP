@@ -32,6 +32,43 @@
  */
 
 /**
+ * The same text with every comment removed.
+ *
+ * ## Why this has to happen before anything is matched
+ *
+ * `declaredTables` and `declaredColumns` below are regexes over source text. They cannot tell a
+ * statement from a sentence about a statement, and `initializeDatabase()` is heavily commented --
+ * with comments that quote the very syntax being matched, because that is how you explain what an
+ * `IF NOT EXISTS` does:
+ *
+ *     -- CREATE TABLE IF NOT EXISTS above does nothing on an install that already has this table
+ *
+ * That line declared a table named `above`. No such table can ever exist, so `verifyDeclaredSchema`
+ * refused to start every hosted deployment, permanently, whatever the database contained. The check
+ * written to stop a bad deploy going live was instead stopping all of them, and the refusal named a
+ * table nobody could find because there was nothing to find.
+ *
+ * A comment is also how a second `CREATE TABLE IF NOT EXISTS inventory_batches` got counted, which
+ * is harmless only because the real one is counted too.
+ *
+ * ## Why stripping is safe here
+ *
+ * Removing a comment can only remove text that follows a comment marker. A real declaration never
+ * does: each one begins a statement on its own line inside a template literal. So the worst this
+ * can do is drop a declaration written after `--` or `//` on the same line, which would not be a
+ * declaration. `schemaDrift.test.js` pins the count either way.
+ *
+ * `--` is required to be followed by whitespace or end of line, which is how SQL comments are
+ * written and how a decrement is not. `//` is only honoured at the start of a line, so a `//` inside
+ * a URL in a string literal does not eat the rest of it.
+ */
+const withoutComments = (text) =>
+  String(text)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/^[ \t]*\/\/.*$/gm, "")
+    .replace(/--(?=[ \t]|$).*$/gm, "");
+
+/**
  * The SQL `initializeDatabase()` would run, as text.
  *
  * Bounded to that function on purpose: `server.js` is one 19.7k-line file and its route handlers
@@ -50,7 +87,8 @@ const bootstrapSql = (source) => {
   closing.lastIndex = start;
   const match = closing.exec(source);
   if (!match) throw new Error("the end of initializeDatabase() was not found");
-  return source.slice(start, match.index);
+  // Comments out, before any caller matches over this. See `withoutComments`.
+  return withoutComments(source.slice(start, match.index));
 };
 
 /** Tables the bootstrap creates. */
@@ -140,6 +178,7 @@ const describeSchemaDrift = (drift) => {
 };
 
 module.exports = {
+  withoutComments,
   bootstrapSql,
   declaredTables,
   declaredColumns,

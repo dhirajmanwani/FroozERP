@@ -229,18 +229,35 @@ assistant that can act is a different risk class and should be a separate, later
 **Classification.** Enhancement — with the caveat that if FROST becomes the primary interface, its
 absence offline must degrade to the ordinary modules, never to a dead end.
 
-**Depends on.** A phrasing model reachable from the owner's machine, and a spend cap for the day a
-paid provider is chosen.
+**Depends on.** The cloud, today — see below. Plus a phrasing model reachable from wherever FROST
+runs, and a spend cap for the day a paid provider is chosen.
 
-**Not the cloud — corrected 21 Sep 2026.** FROST reads eleven endpoints and every one of them is
-served by the backend on the owner's own machine, against the embedded SQLite database; with a local
-model configured the phrasing runs on loopback too. Nothing FROST needs is in the cloud. The loader
-nevertheless refused to run whenever the cloud was unreachable, so the Railway outage took FROST's
-whole data set down with it — including the provider list, which left the Provider dropdown showing
-only the single option written into the page, looking like a working choice rather than a failure.
-Both are fixed in `frontend/src/local/frostAvailability.js`: availability is decided from where
-FROST's endpoints actually live, and a list that did not load is reported as one. **FROST now works
-in Local Only mode**, which is the mode it was designed for once the model is local.
+**FROST is a cloud feature on the desktop, and that is not a bug — recorded 21 Sep 2026, correcting
+what this section said earlier the same day.** An earlier note here claimed FROST's endpoints are
+served by the backend on the owner's own machine and that nothing FROST needs is in the cloud. That
+is wrong, and it was written from reading the FROST route file without following what happens to a
+FROST request on a desktop install.
+
+`backend/server.js:647` forwards **every** request on a desktop runtime to the cloud except the nine
+routes in `desktopLocalRoutes` (`server.js:592`): health, version, time, compatibility and the cloud
+device-registration pair. Every `/api/ai/*` route falls outside that list, so FROST's facts are
+queried on the cloud server against PostgreSQL, not on the counter. With no cloud reachable the
+proxy answers `503` (`CLOUD_NOT_CONFIGURED`, or a transport failure through `safeCloudError`), which
+the frontend renders as "FROST requires cloud access". That message was accurate.
+
+Billing and POS are unaffected by the same outage because they never use these HTTP routes: they read
+the device's SQLite through the Tauri layer (`frontend/src/local/`, `src-tauri/src/local_db.rs`).
+FROST has never been on that path.
+
+What *is* fixed in `frontend/src/local/frostAvailability.js`: a provider list that did not load is
+now reported as one instead of being drawn as a working dropdown holding the single option the page
+writes itself, and a transport failure against a local API no longer reads as a cloud outage. The
+first of those is what made the architecture above visible at all — the old dropdown looked like a
+deliberate choice of "Deterministic only".
+
+**Open question, not yet answered:** whether making FROST genuinely local is worth doing. It would
+mean serving the `/api/ai/*` routes on the device and having FROST's fact queries read the device's
+own data, and it is real work, not a flag. Until it is decided, FROST needs the cloud up.
 
 **[P-5]** Cost control: per-query cost is real and unbounded by default. A monthly cap, and a
 decision about what happens when it is hit (degrade to deterministic reports, or stop), is required

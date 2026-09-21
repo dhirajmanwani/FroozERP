@@ -3294,21 +3294,22 @@ function App() {
           message: "Local Only mode selected - cloud sync paused.",
           lastCheckedAt: response.data?.confirmedAt || new Date().toISOString(),
         }));
-        // Choosing Local Only used to put "FROST requires cloud access" on the panel. On a desktop
-        // install FROST is entirely local -- its facts come from the SQLite database on this machine
-        // and, when one is configured, the phrasing model answers on loopback -- so Local Only is
-        // the mode FROST was designed for, not one that disables it. Only a cloud-hosted FROST
-        // loses anything here.
+        // Local Only genuinely does disable FROST on a desktop install, because the gateway proxies
+        // every FROST route to the cloud and Local Only is the switch that stops it doing so. The
+        // message is the truth here, not a stale assumption; it is resolved rather than hard-coded
+        // so that a browser client talking straight to a FROST-serving backend is not told it.
         const localOnlyFrost = resolveFrostLoadDecision({
           apiUrl: API_URL,
           cloudApiMode: isCloudMode(),
+          desktopShell: isDesktopShell(),
           internetAvailable: false,
           cloudOnline: false,
         });
         setAiAssistantData((current) => ({ ...current, loading: false, error: localOnlyFrost.reason }));
         setSyncStatus((current) => ({ ...(current || {}), online: false, syncing: false, lastFailureKind: "APP_LOCAL_ONLY", lastError: "" }));
-        // Clearing the error is not the same as having the data. A local FROST is fully usable in
-        // Local Only, so load it here rather than leaving an empty panel with nothing to explain it.
+        // A client that can still reach FROST (a browser against a FROST-serving backend) should be
+        // refreshed rather than left with a stale panel and no explanation. A desktop client cannot,
+        // and keeps the message above.
         if (localOnlyFrost.shouldLoad && frostDrawerOpen) await loadAiAssistant(aiRange).catch(() => null);
         return nextMode;
       }
@@ -4783,14 +4784,15 @@ function App() {
       cloudHealth,
       deviceApproved: approved,
     });
-    // FROST used to refuse to load anything whenever the cloud was unreachable. In the desktop app
-    // every one of the requests below goes to the backend on this machine, against the embedded
-    // SQLite database, so a cloud outage took FROST down for no reason -- and took the provider list
-    // with it, leaving the Provider dropdown showing only the one option the page writes itself.
-    // Now the refusal only fires when FROST really is being read from the cloud.
+    // The refusal below is correct on the desktop and was briefly removed on the belief that it was
+    // not. It is restored, via `frostAvailability.js`, which now carries why: the desktop shell runs
+    // `desktopGateway.js`, not `server.js`, and that gateway has no `/api/ai/` route -- it proxies
+    // every FROST request to the cloud. So a desktop FROST with no cloud has nothing to read, and
+    // firing eleven requests to find that out only makes the answer slower.
     const loadDecision = resolveFrostLoadDecision({
       apiUrl: API_URL,
       cloudApiMode: isCloudMode(),
+      desktopShell: isDesktopShell(),
       internetAvailable: runtimeConnectivity.internetAvailable,
       cloudOnline: cloudHealth?.online === false ? false : null,
     });
