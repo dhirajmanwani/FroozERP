@@ -135,9 +135,18 @@ test("a failure that carries a status is left to the caller's own ladder", () =>
 test("App.jsx resolves FROST availability through this module, desktop shell included", () => {
   assert.match(appSource, /resolveFrostLoadDecision\(/);
   assert.match(appSource, /resolveFrostProviderOptions\(/);
-  // Both decision call sites must say whether this is the desktop shell. Without it the resolver
+  // EVERY decision call site must say whether this is the desktop shell. Without it the resolver
   // reads 127.0.0.1 as "FROST is served here", which is the mistake this module was corrected for.
-  assert.equal((appSource.match(/desktopShell: isDesktopShell\(\)/g) || []).length, 2);
+  //
+  // This counted the call sites until 22 Sep 2026, when the bell's own loader became a third one
+  // and a correct change failed the gate while saying nothing about what was actually at risk.
+  // Counting also never checked the thing it was for: two call sites and two mentions anywhere in
+  // the file would have passed with neither of them carrying it. So it is matched per call site now.
+  const callSites = (appSource.match(/resolveFrostLoadDecision\(\{[^}]*\}/g) || []);
+  assert.ok(callSites.length >= 2, "expected at least the panel's and the bell's decision call sites");
+  for (const site of callSites) {
+    assert.match(site, /desktopShell: isDesktopShell\(\)/, `a resolveFrostLoadDecision call omits desktopShell: ${site}`);
+  }
 });
 
 // -------------------------------------------------------------------------------------------

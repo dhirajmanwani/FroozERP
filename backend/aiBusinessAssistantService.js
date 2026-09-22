@@ -8,7 +8,8 @@ const {
 } = require("./aiBusinessAssistantRules");
 const { describeOllamaFallback, phraseWithOllama } = require("./frostOllama");
 const { ANSWER_FORMAT_VERSION, buildDeterministicAnswer } = require("./frostAnswer");
-const { detectSmallTalk, detectSpokenRange, reminderTitleFrom } = require("./frostLanguage");
+const { detectReminderDueDate, detectSmallTalk, detectSpokenRange, reminderTitleFrom } = require("./frostLanguage");
+const { CONTACT_STATUS, normalizeReminderDueAt, prepareCustomerDueReminder } = require("./frostReminders");
 const {
   DEFAULT_FROST_SETTINGS,
   FROST_ASSISTANT_NAME,
@@ -426,13 +427,130 @@ const getCustomerOutstanding = async (pool, branchId, settings) => {
   });
 };
 
+/**
+ * The three `due_status` values that mean the money is late.
+ *
+ * This list was written out three times -- here, in `runAlertRules`, and now in the dues panel --
+ * and three copies of a classification drift apart the first time a fourth status is added. The
+ * overdue alert (`CUSTOMER_PAYMENT_OVERDUE`) and the prepared-reminder panel have to agree about
+ * which customers are late, or the bell and the panel will show different people for the same
+ * reason and neither will look wrong.
+ */
+const OVERDUE_DUE_STATUSES = Object.freeze(["OVERDUE", "SERIOUSLY_OVERDUE", "CRITICAL_OUTSTANDING"]);
+
 const getOverdueCustomerInvoices = async (pool, branchId, settings) => {
   const outstanding = await getCustomerOutstanding(pool, branchId, settings);
-  const rows = outstanding.rows.filter((row) => ["OVERDUE", "SERIOUSLY_OVERDUE", "CRITICAL_OUTSTANDING"].includes(row.due_status));
+  const rows = outstanding.rows.filter((row) => OVERDUE_DUE_STATUSES.includes(row.due_status));
   return buildFact("overdue_customer_invoices", "Customer Ledgers", "Current outstanding", rows, {
     totalOverdue: roundCurrency(rows.reduce((sum, row) => sum + row.outstanding_amount, 0)),
     count: rows.length,
   });
+};
+
+/**
+ * Entity ids are opaque strings, and the two halves of the dues panel are joined on one.
+ *
+ * `getCustomerOutstanding` groups on `COALESCE(s.customer_id, c.id)` and the contact query returns
+ * `c.id`; both arrive from `pg` as whatever the column type deserialises to. Coercing either side
+ * with `Number()` is the join failure `CLAUDE.md` records -- "004" and 4 are different entities --
+ * and here it would not empty the table, it would attach one customer's phone number to another
+ * customer's debt. A string key on both sides, or nothing.
+ */
+const contactKey = (value) => String(value ?? "").trim();
+
+/**
+ * Whether each customer can be messaged at all, for the customers who have traded at this branch.
+ *
+ * Deliberately a second query rather than two more columns on `getCustomerOutstanding`. That
+ * function's rows become `facts`: they go into the model prompt, the thirty-minute answer cache and
+ * the audit trail, which is exactly why `mobile_number` is masked there. Putting a dialable number
+ * on those rows would push the shop's whole debtor contact list through all three.
+ *
+ * Scoped through `sales.branch_id` rather than through `customers`, which is company-wide master
+ * data with no branch column of its own (docs/branch-isolation-audit.md 1.1). Joining through the
+ * sales that earned the debt is both the honest scope -- these are the customers who bought here --
+ * and a real tenancy predicate, which `tenancyCoverage.test.js` measures rather than assumes.
+ */
+const getCustomerContactChannels = async (pool, branchId) => {
+  const branch = requireBranchScope(branchId);
+  const result = await pool.query(`
+    SELECT DISTINCT
+      c.id AS customer_id,
+      c.whatsapp_number,
+      c.mobile_number,
+      c.whatsapp_opt_in
+    FROM customers c
+    JOIN sales s ON s.customer_id = c.id
+    WHERE s.branch_id = $1
+  `, [branch]);
+  const byCustomer = new Map();
+  for (const row of result.rows) byCustomer.set(contactKey(row.customer_id), row);
+  return byCustomer;
+};
+
+/**
+ * The shop's own name, for the message that has to say who it is from.
+ *
+ * "" when it cannot be read, and the draft then says "aapki dukaan se" rather than naming a shop
+ * that does not exist. A settings read failing must not take the dues list down with it.
+ */
+const getBusinessName = async (pool) => {
+  try {
+    const result = await pool.query("SELECT business_name FROM business_settings WHERE id = 1");
+    return cleanText(result.rows[0]?.business_name);
+  } catch (error) {
+    // Not swallowed into a zero: the empty name is reported on the payload as `shop_name`, the
+    // draft visibly says "aapki dukaan se" instead of naming a shop, and the reason is logged. A
+    // settings read failing must not take the whole dues list down with it.
+    console.warn("FROST dues panel could not read the shop name", error.message);
+    return "";
+  }
+};
+
+/**
+ * Every customer who owes money, with a message the owner could send them -- and nothing that sends it.
+ *
+ * The owner asked that FROST either message customers who owe him money or remind him about them.
+ * This is the reminding half, and the messaging half is deliberately absent: the draft is a string
+ * on a row. `POST /api/whatsapp/send-document` is not called here, is not scheduled here, and is
+ * not made reachable from here. It spends the shop's live WhatsApp Cloud credentials against real
+ * customers, so the only version of this that is safe to ship is one where a person read the words
+ * and pressed send for that one message.
+ *
+ * Every customer with a balance is returned, not only the late ones, because the summary and the
+ * table have to be derived from the same filtered source -- a panel whose total comes from one
+ * collection and whose rows come from another eventually disagrees, and the disagreement reads as
+ * data loss. `due_status` and `overdue_count` are on the payload so the panel can narrow it without
+ * asking for a different list.
+ */
+const getCustomerDueReminders = async (pool, branchId, settings) => {
+  const [outstanding, contacts, shopName] = await Promise.all([
+    getCustomerOutstanding(pool, branchId, settings),
+    getCustomerContactChannels(pool, branchId),
+    getBusinessName(pool),
+  ]);
+  const customers = outstanding.rows.map((row) => {
+    // `mobile_number` arrives from the fact query already masked. Dropping it before the contact
+    // row is merged keeps one field from meaning two different things -- a masked string and a real
+    // number -- which is how "has a number" and "has four visible digits" quietly become the same
+    // question.
+    const { mobile_number: maskedByFactQuery, ...figures } = row;
+    const contact = contacts.get(contactKey(row.customer_id)) || {};
+    return prepareCustomerDueReminder({ ...figures, ...contact }, { shopName, maskNumber: maskPhone });
+  });
+  const countWhere = (predicate) => customers.filter(predicate).length;
+  return {
+    shop_name: shopName,
+    customers,
+    summary: {
+      count: customers.length,
+      total_outstanding: roundCurrency(customers.reduce((sum, customer) => sum + toNumber(customer.outstanding_amount), 0)),
+      overdue_count: countWhere((customer) => OVERDUE_DUE_STATUSES.includes(customer.due_status)),
+      ready_for_review: countWhere((customer) => customer.contact_status === CONTACT_STATUS.READY),
+      no_number: countWhere((customer) => customer.contact_status === CONTACT_STATUS.NO_NUMBER),
+      opted_out: countWhere((customer) => customer.contact_status === CONTACT_STATUS.OPTED_OUT),
+    },
+  };
 };
 
 const getSupplierOutstanding = async (pool, branchId) => {
@@ -1507,7 +1625,7 @@ const runAlertRules = async (pool, branchId, settings) => {
     getPendingPurchaseBills(pool, branchId),
     getLowStockProducts(pool, branchId),
   ]);
-  for (const row of customerOutstanding.rows.filter((item) => ["OVERDUE", "SERIOUSLY_OVERDUE", "CRITICAL_OUTSTANDING"].includes(item.due_status))) {
+  for (const row of customerOutstanding.rows.filter((item) => OVERDUE_DUE_STATUSES.includes(item.due_status))) {
     await upsertAlert(pool, branchId, {
       dedupKey: `customer-overdue:${branchId}:${row.customer_id || row.customer_name}`,
       type: "CUSTOMER_PAYMENT_OVERDUE",
@@ -1572,8 +1690,29 @@ const STATUS_CHANGE_TABLES = new Set(["ai_alerts", "ai_reminders"]);
  * branch predicate makes a cross-branch id match nothing, which the caller sees as "not found"
  * rather than as a silent success.
  */
-const buildStatusChange = ({ table, action, id, branchId, userId, ownerNotes, snoozedUntil }) => {
+const buildStatusChange = ({ table, action, id, branchId, userId, ownerNotes, snoozedUntil, dueAt }) => {
   if (!STATUS_CHANGE_TABLES.has(table)) throw new Error(`FROST_UNKNOWN_STATUS_TABLE: ${table}`);
+  if (action === "SET_DUE_DATE") {
+    // Only reminders have a due date. An alert is raised by a rule and cleared by the condition
+    // going away; there is no date on the row and no column to write, so this is refused rather
+    // than allowed to fail against Postgres as a 500 that reads like a broken button.
+    if (table !== "ai_reminders") return null;
+    // Setting a date on a reminder that is asleep has to wake it, or the button does nothing the
+    // owner can see: `getReminders` hides a reminder until its snooze runs out, so a date set on a
+    // snoozed row would be stored correctly and still leave the panel unchanged, which is
+    // indistinguishable from a failed save.
+    return {
+      text: `UPDATE ai_reminders
+        SET due_at = $2::timestamp,
+            status = CASE WHEN status = 'SNOOZED' THEN 'OPEN' ELSE status END,
+            snoozed_until = CASE WHEN status = 'SNOOZED' THEN NULL ELSE snoozed_until END,
+            owner_notes = COALESCE(NULLIF($3, ''), owner_notes),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 AND branch_id = $4
+        RETURNING *`,
+      values: [id, dueAt || null, ownerNotes, branchId],
+    };
+  }
   if (action === "ACKNOWLEDGE") {
     return {
       text: `UPDATE ${table} SET status = 'ACKNOWLEDGED', acknowledged_by = $2, acknowledged_at = CURRENT_TIMESTAMP, owner_notes = COALESCE(NULLIF($3, ''), owner_notes), updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND branch_id = $4 RETURNING *`,
@@ -1929,6 +2068,46 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     return res.json({ reminders: await getReminders(pool, req.auth.branchId) });
   });
 
+  /**
+   * The customers who owe money, each with a message the owner can read, edit and send himself.
+   *
+   * **This route sends nothing.** It reads the ledger and returns text. No WhatsApp call is made
+   * here, none is queued, and nothing on the payload is a handle to one: `whatsapp_number_masked`
+   * is masked, and the dialable number is not on the response at all. The owner sends from the
+   * screen that already sends, one message at a time, after reading it.
+   *
+   * ## Why the number is masked when the panel might want to dial it
+   *
+   * `maskPhone` is the rule this file already applies to a customer's number
+   * (`getCustomerOutstanding`), and the two reasons behind it both still hold here. FROST's door is
+   * `ai_assistant_view`, and `FROST_DEFAULT_ROLES` is only the *fallback* -- a role granted that
+   * permission explicitly from the role-permissions screen gets in without ever holding
+   * `customer_accounts`, so an unmasked list here would hand every debtor's phone number to a role
+   * the customer screen refuses. And a full contact list of everyone who owes the shop money is a
+   * worse thing to leak in one response than any single figure on it.
+   *
+   * The cost is real and is not pretended away: a masked number cannot be dialled, so the panel
+   * cannot offer "send" from this payload alone. That is the point rather than an oversight -- the
+   * one ingredient a future caller would need to send automatically is the one ingredient that is
+   * missing. `has_whatsapp_number` and `whatsapp_opt_in` carry everything the owner needs to be
+   * *told* ("Ravi has no number on file", "Sita has opted out"), and the number itself lives one
+   * screen away in Customers, where sending already happens and already requires `whatsapp_send`.
+   */
+  app.get("/api/ai/reminders/customer-dues", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
+    if (!user) return;
+    const settings = await getAiSettings(pool, frost);
+    const dues = await getCustomerDueReminders(pool, req.auth.branchId, settings);
+    return res.json({
+      ...dues,
+      action_class: "READ_ONLY",
+      approval_required: false,
+      // Stated on the wire, not only in this comment, so a panel or a script reading the payload is
+      // told the same thing the code says.
+      delivery_policy: "FROST prepares the text only. No message is sent by this route; the owner reviews each message and sends it himself.",
+    });
+  });
+
   app.get("/api/ai/memory", async (req, res) => {
     const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
@@ -2245,6 +2424,16 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     const ownerNotes = cleanText(req.body.owner_notes);
     const branchId = parsePositiveInteger(req.auth.branchId);
     if (!branchId) return res.status(403).json({ code: "FROST_BRANCH_SCOPE_REQUIRED", message: "A verified branch is required to change a reminder" });
+    // Checked here, in JavaScript, rather than left to the `::timestamp` cast. A date Postgres
+    // cannot read comes back as a 500, which the panel shows as "something went wrong" -- a wrong
+    // date is the owner's typo and deserves to be named as one.
+    let dueAt = null;
+    if (action === "SET_DUE_DATE") {
+      dueAt = normalizeReminderDueAt(req.body.due_at);
+      if (dueAt === undefined) {
+        return res.status(400).json({ code: "FROST_REMINDER_DUE_DATE_INVALID", message: "That due date could not be read. Use a date like 2026-09-30." });
+      }
+    }
     const statement = buildStatusChange({
       table: "ai_reminders",
       action,
@@ -2253,6 +2442,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       userId: user.id,
       ownerNotes,
       snoozedUntil: req.body.snoozed_until || null,
+      dueAt,
     });
     if (!id || !statement) return res.status(400).json({ message: "Valid reminder id and action are required" });
     const result = await pool.query(statement.text, statement.values);
@@ -2283,6 +2473,10 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     const cached = settings.frost.cacheEnabled !== false ? await frost.getCache(cacheKey) : null;
     const cachedPayload = cached?.response_payload || null;
     const reminderTitle = classification === "REMINDER_CREATE" ? reminderTitleFrom(question) : "";
+    // "kal", "agle hafte", "15 tarikh" -- when he said the reminder is for. Read from a reference
+    // moment passed in rather than from a clock inside the parser, so the same question asked twice
+    // a millisecond apart across midnight cannot resolve to two different days.
+    const reminderDueDate = classification === "REMINDER_CREATE" ? detectReminderDueDate(question, new Date()) : "";
     const deterministicAnswer = buildDeterministicAnswer(classification, facts, range, smallTalkKind, reminderTitle);
 
     // The database has already answered. Everything from here is about *wording* -- and wording is
@@ -2367,7 +2561,11 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       // What the panel should write to the reminders route, when the owner asked to be reminded.
       // This route does not write it: `/api/ai/query` is READ_ONLY and its own tests hold it to
       // that, and `POST /api/ai/reminders` already carries the permission check and the dedup key.
-      reminder_draft: classification === "REMINDER_CREATE" && reminderTitle ? { title: reminderTitle } : null,
+      // `due_at` is null when the question named no date, never today: a reminder quietly dated
+      // today fires once, today, and is gone, while an undated one is still there for him to date.
+      reminder_draft: classification === "REMINDER_CREATE" && reminderTitle
+        ? { title: reminderTitle, due_at: reminderDueDate || null }
+        : null,
       // Echoed back as it was *stored*, not as it was sent. An id the column could not hold was
       // filed under no chat at all, and a panel told otherwise would keep sending follow-ups into
       // a thread that is not accumulating.
@@ -2661,6 +2859,10 @@ module.exports = {
   buildFrostPolicy,
   normalizeRoleName,
   buildStatusChange,
+  // Exported for `frostReminders.test.js`, which drives the dues panel against a scripted database
+  // to prove the branch predicate and the prepared message rather than reading them out of source.
+  getCustomerDueReminders,
+  OVERDUE_DUE_STATUSES,
   normalizeChatSessionId,
   CHAT_SESSION_ID_MAX_LENGTH,
   FROST_DEFAULT_ROLES,

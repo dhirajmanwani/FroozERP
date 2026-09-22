@@ -43,30 +43,77 @@ const TEST_SIGNING_KEY = "route-auth-coverage-isolated-signing-key-000000";
 
 /* --------------------------------------------------------------------- the statement builder */
 
+/**
+ * Every action the builder answers to.
+ *
+ * Kept as one list so a new action joins both gates below at once. `SET_DUE_DATE` joined on
+ * 22 Sep 2026 and applies to reminders only -- an alert has no due date -- so a table that refuses
+ * an action is skipped rather than asserted against. That skip is itself checked further down, so
+ * "not applicable" cannot become a way for an action to quietly avoid these two rules.
+ */
+const STATUS_ACTIONS = ["ACKNOWLEDGE", "SNOOZE", "RESOLVE", "SET_DUE_DATE"];
+
+const eachStatement = (visit) => {
+  let seen = 0;
+  for (const table of ["ai_alerts", "ai_reminders"]) {
+    for (const action of STATUS_ACTIONS) {
+      const statement = buildStatusChange({
+        table, action, id: 5, branchId: 2, userId: 7, ownerNotes: "", snoozedUntil: null, dueAt: "2026-09-30 00:00:00",
+      });
+      if (!statement) continue;
+      seen += 1;
+      visit({ table, action, ...statement });
+    }
+  }
+  assert.ok(seen >= STATUS_ACTIONS.length, "expected every action to produce a statement for at least one table");
+};
+
 test("every action binds exactly the parameters its statement names", () => {
   // The bug, stated as the rule it broke. A prepared statement's parameter count is its highest
   // `$N`; supplying any other number is rejected by Postgres before a row is touched.
-  for (const table of ["ai_alerts", "ai_reminders"]) {
-    for (const action of ["ACKNOWLEDGE", "SNOOZE", "RESOLVE"]) {
-      const { text, values } = buildStatusChange({
-        table, action, id: 5, branchId: 2, userId: 7, ownerNotes: "", snoozedUntil: null,
-      });
-      const highest = Math.max(...[...text.matchAll(/\$(\d+)/g)].map(([, position]) => Number(position)));
-      assert.equal(highest, values.length, `${table} ${action} names $${highest} and binds ${values.length}`);
-    }
-  }
+  eachStatement(({ table, action, text, values }) => {
+    const highest = Math.max(...[...text.matchAll(/\$(\d+)/g)].map(([, position]) => Number(position)));
+    assert.equal(highest, values.length, `${table} ${action} names $${highest} and binds ${values.length}`);
+  });
 });
 
 test("every action is scoped to one branch", () => {
-  for (const table of ["ai_alerts", "ai_reminders"]) {
-    for (const action of ["ACKNOWLEDGE", "SNOOZE", "RESOLVE"]) {
-      const { text, values } = buildStatusChange({
-        table, action, id: 5, branchId: 2, userId: 7, ownerNotes: "", snoozedUntil: null,
-      });
-      const branch = text.match(/branch_id = \$(\d+)/);
-      assert.ok(branch, `${table} ${action} must carry a branch predicate`);
-      assert.equal(values[Number(branch[1]) - 1], 2, "and must bind the session's branch to it");
-    }
+  eachStatement(({ table, action, text, values }) => {
+    const branch = text.match(/branch_id = \$(\d+)/);
+    assert.ok(branch, `${table} ${action} must carry a branch predicate`);
+    assert.equal(values[Number(branch[1]) - 1], 2, "and must bind the session's branch to it");
+  });
+});
+
+/* ------------------------------------------------------------------ setting a reminder's date */
+
+test("a due date can only be set on a reminder, never on an alert", () => {
+  // An alert is raised by a rule and cleared when the condition goes away; `ai_alerts` has no
+  // `due_at`. Returning a statement anyway would fail against Postgres as a 500, which the panel
+  // shows as "something went wrong" rather than as a button that does not apply here.
+  assert.equal(buildStatusChange({ table: "ai_alerts", action: "SET_DUE_DATE", id: 5, branchId: 2, userId: 7, dueAt: "2026-09-30" }), null);
+  assert.ok(buildStatusChange({ table: "ai_reminders", action: "SET_DUE_DATE", id: 5, branchId: 2, userId: 7, dueAt: "2026-09-30" }));
+});
+
+test("setting a date wakes a reminder that was asleep", () => {
+  // `getReminders` hides a snoozed reminder until the snooze runs out. A date set on one would be
+  // stored correctly and change nothing the owner can see -- indistinguishable from a failed save.
+  const { text } = buildStatusChange({ table: "ai_reminders", action: "SET_DUE_DATE", id: 5, branchId: 2, userId: 7, dueAt: "2026-09-30" });
+  assert.match(text, /status = CASE WHEN status = 'SNOOZED' THEN 'OPEN'/);
+  assert.match(text, /snoozed_until = CASE WHEN status = 'SNOOZED' THEN NULL/);
+});
+
+test("clearing a date is passed through as null, not as an empty string", () => {
+  // `due_at = ''::timestamp` is a Postgres error; `NULL` is the undated reminder FROST creates when
+  // no day was named.
+  const { values } = buildStatusChange({ table: "ai_reminders", action: "SET_DUE_DATE", id: 5, branchId: 2, userId: 7, dueAt: "" });
+  assert.equal(values[1], null);
+});
+
+test("setting a date changes the date and the sleep, and nothing else about the row", () => {
+  const { text } = buildStatusChange({ table: "ai_reminders", action: "SET_DUE_DATE", id: 5, branchId: 2, userId: 7, dueAt: "2026-09-30" });
+  for (const column of ["resolved_by", "resolved_at", "acknowledged_by", "acknowledged_at"]) {
+    assert.ok(!text.includes(`${column} =`), `SET_DUE_DATE must not write ${column}`);
   }
 });
 

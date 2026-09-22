@@ -23,7 +23,7 @@ test("the eleven tabs become a conversation plus a short menu", () => {
   // talking is a control on the composer, not a place to go.
   const surface = resolveFrostSurface(owner);
   const keys = surface.menu.map((entry) => entry.key);
-  assert.deepEqual(keys, ["today", "alerts", "reminders", "decision", "predictions", "profit", "memory"]);
+  assert.deepEqual(keys, ["today", "alerts", "reminders", "dues", "decision", "predictions", "profit", "memory"]);
   assert.deepEqual(surface.footer.map((entry) => entry.key), ["voice", "settings"]);
   // Live voice is neither deleted nor offered as an equal: it opens a microphone session that is
   // sent no tools, so it cannot read the books. It sits in the footer, labelled for what it is.
@@ -60,6 +60,7 @@ test("a user who may not manage FROST is not offered its settings or memory", ()
   assert.equal(keys.includes("reminders"), false);
   assert.deepEqual(limited.shortcuts.map((entry) => entry.key), ["today", "alerts"]);
   assert.deepEqual(keys, ["today", "alerts", "decision", "predictions", "profit"]);
+  assert.equal(keys.includes("dues"), false, "who owes you is a reminders section, so it follows the same permission");
 });
 
 test("a section the user cannot reach falls back to the conversation, not to a blank panel", () => {

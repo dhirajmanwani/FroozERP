@@ -181,6 +181,16 @@ import {
   latestSpokenTurn,
 } from "./local/frostConversation";
 import {
+  FROST_BELL_STATUS,
+  buildFrostBellNotifications,
+} from "./local/frostBellNotifications";
+import {
+  DUE_OUTREACH_ACTION,
+  DUE_OUTREACH_STATUS,
+  buildDueOutreachRows,
+  normalizeWhatsappNumber,
+} from "./local/frostDuesOutreach";
+import {
   FROST_CHAT_SELECTION,
   buildChatList,
   historyFromExchanges,
@@ -1230,6 +1240,18 @@ const formatDisplayDate = (dateValue) => {
   const [year, month, day] = key.split("-");
   return `${day}/${month}/${year}`;
 };
+/**
+ * A stored due date, in the form an `<input type="date">` will accept.
+ *
+ * `toDateKey` on purpose, and nothing cleverer: it takes the first ten characters of the string the
+ * server sent. Re-parsing into a `Date` and formatting it back would apply the device's timezone to
+ * a timestamp the backend stores and compares without one, which in IST moves every midnight
+ * reminder to the previous day. The box then shows a day the server never stored.
+ */
+const toDateInputValue = (dateValue) => {
+  const key = toDateKey(dateValue || "");
+  return /^\d{4}-\d{2}-\d{2}$/.test(key) ? key : "";
+};
 const formatFileDate = (dateValue) => formatDisplayDate(dateValue).replaceAll("/", "-");
 const safeFileName = (value) =>
   String(value || "FroozERP_Document")
@@ -1444,17 +1466,6 @@ const exportDocumentPdf = async ({ element, fileName, title = "", printProfile =
   await exportReportTextPdf({ element, fileName, title, printProfile, save })
   || await exportElementToPdf({ element, fileName, mode: "A4", printProfile, save })
 );
-const normalizeWhatsappNumber = (value, defaultCountryCode = "91") => {
-  let digits = String(value || "").trim().replace(/[^\d+]/g, "");
-  if (!digits) return "";
-  if (digits.startsWith("00")) digits = digits.slice(2);
-  if (digits.startsWith("+")) digits = digits.slice(1);
-  digits = digits.replace(/\D/g, "");
-  const countryCode = String(defaultCountryCode || "91").replace(/\D/g, "") || "91";
-  if (digits.length === 10) digits = `${countryCode}${digits}`;
-  return digits.length >= 11 && digits.length <= 15 ? digits : "";
-};
-
 const blobToBase64 = (blob) => new Promise((resolve, reject) => {
   const reader = new FileReader();
   reader.onloadend = () => resolve(String(reader.result || "").replace(/^data:application\/pdf;base64,/i, ""));
@@ -2278,7 +2289,27 @@ function App() {
     chats: [],
     chatsFailure: "",
     chatsLoading: false,
+    // The customers who owe money, each with a message FROST has already worded. Loaded only when
+    // that section is opened -- it is a second pass over the ledger, and the panel's eleven
+    // requests are already the slowest thing about opening FROST.
+    dues: null,
+    duesFailure: "",
+    duesLoading: false,
   });
+  /**
+   * What FROST is watching, for the bell in the header.
+   *
+   * Deliberately separate from `aiAssistantData`. That one is loaded only while the FROST drawer is
+   * open, which is exactly the problem the maintainer reported on 2026-09-22 -- *"reminders
+   * notification bell me dikh jane chahiye"*. A reminder that only appears once you decide to open
+   * the panel is a reminder you have already remembered without it.
+   *
+   * `read` is false until the two lists have actually been fetched. Nothing is published to the
+   * bell while it is false, because an empty list before the first fetch is not "nothing is due".
+   * `skipped` means FROST is deliberately not being asked here (LOCAL_ONLY, no cloud session,
+   * offline) -- also not a failure, and also not something to ring an error about.
+   */
+  const [frostBell, setFrostBell] = useState({ alerts: [], reminders: [], error: "", read: false, skipped: false });
   const [aiQuestion, setAiQuestion] = useState("");
   const [aiRange, setAiRange] = useState("today");
   const [frostActiveTab, setFrostActiveTab] = useState(() => {
@@ -4548,6 +4579,131 @@ function App() {
   }, [ordersState.orders, ordersState.loadState, notify, clearNotice]);
 
   /**
+   * Whether this person is shown FROST at all.
+   *
+   * The same expression the FROST panel uses for `canManageFrost`. It is not a permission -- the
+   * server decides that, and `/api/ai/*` refuses a Cashier on its own -- it is about not firing
+   * requests on behalf of someone who would be refused, and not putting FROST's rows in a bell
+   * belonging to someone who has no FROST.
+   */
+  const frostBellAllowed = user?.role === "Owner" || user?.role === "Admin";
+
+  /**
+   * Read what FROST is watching, for the bell.
+   *
+   * Two requests, not the panel's eleven. This runs on a timer whether or not the drawer has ever
+   * been opened, which is the whole point: the bell is the place the owner already looks.
+   *
+   * A deliberate skip and a failure are different answers and are stored differently. LOCAL_ONLY, no
+   * internet, or an offline session with no cloud token all mean FROST was never asked -- ringing
+   * "could not be read" for those would be an error message about a decision. A request that was
+   * made and failed is carried as `error`, and the bell says so out loud.
+   */
+  const loadFrostBell = useCallback(async () => {
+    if (!user || !frostBellAllowed) return;
+    const approved = ["APPROVED", "ACTIVE"].includes(String(cloudDeviceRegistration?.status || "").toUpperCase());
+    const runtimeConnectivity = deriveRuntimeConnectivity({
+      localHealth: backendHealth,
+      internetAvailable,
+      cloudHealth,
+      deviceApproved: approved,
+    });
+    const loadDecision = resolveFrostLoadDecision({
+      apiUrl: API_URL,
+      cloudApiMode: isCloudMode(),
+      desktopShell: isDesktopShell(),
+      internetAvailable: runtimeConnectivity.internetAvailable,
+      cloudOnline: cloudHealth?.online === false ? false : null,
+      cloudSession: hasCloudSession(user),
+    });
+    if (!loadDecision.shouldLoad) {
+      setFrostBell((current) => ({ ...current, error: "", read: false, skipped: true }));
+      return;
+    }
+    const params = { user_id: user?.id, device_id: deviceInfo?.device_id };
+    try {
+      const [alerts, reminders] = await Promise.all([
+        axios.get(`${API_URL}/api/ai/alerts`, { params, timeout: 12000 }),
+        axios.get(`${API_URL}/api/ai/reminders`, { params, timeout: 12000 }),
+      ]);
+      setFrostBell({
+        alerts: alerts.data?.alerts || [],
+        reminders: reminders.data?.reminders || [],
+        error: "",
+        read: true,
+        skipped: false,
+      });
+    } catch (error) {
+      setFrostBell((current) => ({
+        ...current,
+        // The same ladder the panel uses, so the bell and the panel never explain one failure in
+        // two different ways. `describeFrostTransportFailure` is inside it and takes a request
+        // description, not an error.
+        error: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth })
+          || "FROST alerts and reminders did not load.",
+        read: true,
+        skipped: false,
+      }));
+    }
+  }, [user, frostBellAllowed, cloudDeviceRegistration?.status, backendHealth, internetAvailable, cloudHealth, offlineMode, deviceInfo?.device_id]);
+
+  useEffect(() => {
+    if (!user || !frostBellAllowed) return undefined;
+    loadFrostBell();
+    // Five minutes. These are dues and reminders, which move on the scale of a day; a shorter timer
+    // would spend the counter's connection to learn nothing. Anything the owner does inside FROST
+    // refreshes this immediately, so the timer is the floor, not the only path.
+    const timer = window.setInterval(() => { loadFrostBell(); }, 300000);
+    return () => window.clearInterval(timer);
+  }, [user, frostBellAllowed, loadFrostBell]);
+
+  /**
+   * Put what FROST is watching into the bell, and take it out again when it clears.
+   *
+   * The judgement is all in `local/frostBellNotifications.js`, which is tested. Two things here are
+   * not incidental:
+   *
+   * A row is raised only when it is new, or when its wording changed. `addNotification` collapses a
+   * repeat by bumping its count and marking it unread again -- correct for a recurrence, wrong for
+   * a five-minute poll, which would make every FROST row unread forever and teach the owner that
+   * the bell's badge means nothing.
+   *
+   * Retraction happens only when the two lists were actually read. On an unreadable answer this
+   * knows nothing about what it raised last time, and clearing those rows would delete real
+   * warnings because a request timed out -- an error rendering as an empty bell.
+   */
+  const raisedFrostBellRows = useRef(new Map());
+
+  useEffect(() => {
+    if (!frostBellAllowed) {
+      for (const key of raisedFrostBellRows.current.keys()) clearNotice(key);
+      raisedFrostBellRows.current = new Map();
+      return;
+    }
+    if (!frostBell.read) return;
+    const bell = buildFrostBellNotifications({
+      alerts: frostBell.alerts,
+      reminders: frostBell.reminders,
+      nowMs: Date.now(),
+      failure: frostBell.error,
+    });
+    const raised = raisedFrostBellRows.current;
+    for (const item of bell.items) {
+      if (raised.get(item.dedupeKey) === item.message) continue;
+      notify(item);
+      raised.set(item.dedupeKey, item.message);
+    }
+    if (bell.status === FROST_BELL_STATUS.OK) {
+      const live = new Set(bell.keys);
+      for (const key of [...raised.keys()]) {
+        if (live.has(key)) continue;
+        clearNotice(key);
+        raised.delete(key);
+      }
+    }
+  }, [frostBell, frostBellAllowed, notify, clearNotice]);
+
+  /**
    * Surface the activation state in the notification centre.
    *
    * `Active` deliberately produces nothing — a licence that is simply working is not news, and a
@@ -4941,6 +5097,37 @@ function App() {
    * never rendering as zero applies to a list too: a sidebar that silently shows nothing after a
    * failed request looks exactly like a shop that has never asked FROST anything.
    */
+  /**
+   * The customers who owe money, with the message FROST prepared for each of them.
+   *
+   * A second pass over the ledger, so it is fetched when that section is opened rather than added
+   * to the eleven requests that already make opening FROST slow.
+   *
+   * The failure is carried as a message, never as an empty list. "Nobody owes you anything" is a
+   * sentence this panel must only say when it is true.
+   */
+  const loadFrostDues = async () => {
+    setAiAssistantData((current) => ({ ...current, duesLoading: true, duesFailure: "" }));
+    try {
+      const response = await axios.get(`${API_URL}/api/ai/reminders/customer-dues`, {
+        params: { user_id: user?.id, device_id: deviceInfo?.device_id },
+        timeout: 15000,
+      });
+      setAiAssistantData((current) => ({
+        ...current,
+        dues: response.data || null,
+        duesFailure: "",
+        duesLoading: false,
+      }));
+    } catch (error) {
+      setAiAssistantData((current) => ({
+        ...current,
+        duesLoading: false,
+        duesFailure: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth }),
+      }));
+    }
+  };
+
   const loadFrostChats = async () => {
     setAiAssistantData((current) => ({ ...current, chatsLoading: true }));
     try {
@@ -5097,9 +5284,17 @@ function App() {
             priority: "ATTENTION",
             title: draft.title,
             message: draft.title,
+            // Null unless he named a day. Never today: a reminder quietly dated today comes up
+            // once, today, and is gone -- while an undated one is still there for him to date.
+            due_at: draft.due_at || null,
           });
-          settle(`Saved. I will remind you: "${draft.title}". It is under Reminders.`);
+          // The date is said back to him. A date that was misread is only findable if FROST states
+          // what it understood; "saved" alone would hide a reminder sitting on the wrong day.
+          settle(draft.due_at
+            ? `Saved for ${formatDisplayDate(draft.due_at)}. I will remind you: "${draft.title}". It is under Reminders.`
+            : `Saved. I will remind you: "${draft.title}". It is under Reminders, where you can put a date on it.`);
           await loadAiAssistant(aiRange).catch(() => null);
+          loadFrostBell().catch(() => null);
         } catch (reminderError) {
           writeDiagnosticLog("WARN", "frost-reminder-save-failed", describeRequestFailure(reminderError, { url: `${API_URL}/api/ai/reminders` }));
           settle(`I could not save that reminder: ${getFrostDiagnosticMessage(reminderError, { offlineMode, internetAvailable, backendHealth, cloudHealth })} You can add it yourself under Reminders.`);
@@ -5133,11 +5328,35 @@ function App() {
   const updateAiAlert = async (alertId, action) => {
     await axios.patch(`${API_URL}/api/ai/alerts/${alertId}`, { user_id: user?.id, action });
     await loadAiAssistant(aiRange);
+    // The bell polls on a five-minute timer. Resolving an alert inside the panel and watching it
+    // sit in the bell for another five minutes would read as the button not having worked.
+    loadFrostBell().catch(() => null);
   };
 
   const updateAiReminder = async (reminderId, action) => {
     await axios.patch(`${API_URL}/api/ai/reminders/${reminderId}`, { user_id: user?.id, action });
     await loadAiAssistant(aiRange);
+    loadFrostBell().catch(() => null);
+  };
+
+  /**
+   * Put a date on a reminder, or take one off.
+   *
+   * FROST reads a date out of the question when he says one ("kal", "agle hafte", "15 tarikh").
+   * This is the other half of what he asked for -- setting the date afterwards, on a reminder that
+   * arrived without one, or moving a date that has passed.
+   *
+   * An empty date clears it rather than being refused: a reminder with no date is a real state, and
+   * it is the one FROST creates when no day was named.
+   */
+  const updateReminderDueDate = async (reminderId, dueAt) => {
+    await axios.patch(`${API_URL}/api/ai/reminders/${reminderId}`, {
+      user_id: user?.id,
+      action: "SET_DUE_DATE",
+      due_at: dueAt || null,
+    });
+    await loadAiAssistant(aiRange);
+    loadFrostBell().catch(() => null);
   };
 
   const saveFrostSettings = async (frostSettings) => {
@@ -7853,6 +8072,26 @@ function App() {
   });
 
   const frostUnreadCount = (aiAssistantData.alerts || []).filter((alert) => ["CRITICAL", "HIGH", "ATTENTION"].includes(String(alert.severity || "").toUpperCase())).length;
+  /**
+   * The dues rows and the number to send each one to, joined here rather than on the server.
+   *
+   * `/api/ai/reminders/customer-dues` returns masked numbers on purpose -- it is a FROST route, and
+   * a full contact list of everyone who owes the shop money is the worst single thing on it. The
+   * dialable number is already on this device, in the customers collection the customer screens and
+   * the WhatsApp recipient picker both use, so the row and the number meet here and the server
+   * discloses nothing it did not already.
+   */
+  // `null` until there is something to judge. Before the first load there is no list and no failure
+  // either, and handing `undefined` to the builder would read as "FROST sent a shape I cannot read"
+  // on a section nobody has opened yet.
+  const frostDuesOutreach = (aiAssistantData.dues || aiAssistantData.duesFailure)
+    ? buildDueOutreachRows({
+      dues: aiAssistantData.dues?.customers,
+      customers,
+      canSend: canWhatsappSend,
+      failure: aiAssistantData.duesFailure,
+    })
+    : null;
   const openFrostDrawer = (section = frostActiveTab || FROST_PRIMARY_SECTION) => {
     setFrostActiveTab(section);
     setFrostDrawerOpen(true);
@@ -9297,6 +9536,7 @@ function App() {
       <FrostFloatingCopilot
         activeSection={frostActiveTab}
         data={aiAssistantData}
+        duesOutreach={frostDuesOutreach}
         onAlertAction={updateAiAlert}
         onAsk={askAiAssistant}
         onClose={() => setFrostDrawerOpen(false)}
@@ -9312,8 +9552,10 @@ function App() {
           setAiRange(range);
           loadAiAssistant(range);
         }}
+        onLoadDues={loadFrostDues}
         onRefresh={() => loadAiAssistant(aiRange)}
         onReminderAction={updateAiReminder}
+        onReminderDueDate={updateReminderDueDate}
         onSaveSettings={saveFrostSettings}
         onSelectQuestion={(question) => askAiAssistant(question)}
         onStartVoice={startFrostVoice}
@@ -9345,6 +9587,7 @@ function FrostFloatingCopilot({
   onAlertAction,
   onAsk,
   onClose,
+  onLoadDues,
   onMemoryAction,
   onNavigate,
   onNewChat,
@@ -9356,12 +9599,14 @@ function FrostFloatingCopilot({
   onRangeChange,
   onRefresh,
   onReminderAction,
+  onReminderDueDate,
   onSaveSettings,
   onSelectQuestion,
   onStartVoice,
   onStopVoice,
   onSectionChange,
   open,
+  duesOutreach = null,
   question,
   range,
   unreadCount = 0,
@@ -9394,8 +9639,10 @@ function FrostFloatingCopilot({
           <AiBusinessAssistantModule
             activeSection={activeSection}
             data={data}
+            duesOutreach={duesOutreach}
             onAlertAction={onAlertAction}
             onAsk={onAsk}
+            onLoadDues={onLoadDues}
             onMemoryAction={onMemoryAction}
             onNavigate={onNavigate}
             onNewChat={onNewChat}
@@ -9406,6 +9653,7 @@ function FrostFloatingCopilot({
             onRangeChange={onRangeChange}
             onRefresh={onRefresh}
             onReminderAction={onReminderAction}
+            onReminderDueDate={onReminderDueDate}
             onSaveSettings={onSaveSettings}
             onSelectQuestion={onSelectQuestion}
             onStartVoice={onStartVoice}
@@ -9536,8 +9784,10 @@ const aiSeverityClass = (severity = "INFO") => `ai-severity ai-severity-${String
 function AiBusinessAssistantModule({
   activeSection = FROST_PRIMARY_SECTION,
   data,
+  duesOutreach = null,
   onAlertAction,
   onAsk,
+  onLoadDues,
   onNavigate,
   onNewChat,
   onOpenChat,
@@ -9545,6 +9795,7 @@ function AiBusinessAssistantModule({
   onRangeChange,
   onRefresh,
   onReminderAction,
+  onReminderDueDate,
   onMemoryAction,
   onProposeMemory,
   onSaveSettings,
@@ -9920,6 +10171,17 @@ function AiBusinessAssistantModule({
         </div>
       </ModuleCard>}
 
+      {activeSection === "dues" && (
+        <FrostDuesPanel
+          canManageReminders={canManageReminders}
+          failure={data.duesFailure}
+          loading={data.duesLoading === true}
+          onLoad={onLoadDues}
+          outreach={duesOutreach}
+          summary={data.dues?.summary || null}
+        />
+      )}
+
       {(activeSection === "alerts" || activeSection === "reminders") && <div className="ai-layout ai-layout-single">
         {activeSection === "alerts" && (
         <ModuleCard eyebrow="Priority Alerts" title="Needs Attention" subtitle="Acknowledge, snooze or resolve after reviewing the linked module.">
@@ -9950,7 +10212,13 @@ function AiBusinessAssistantModule({
               <tr key={reminder.id}>
                 <td><span className={aiSeverityClass(reminder.priority)}>{reminder.priority}</span></td>
                 <td className="primary-cell">{reminder.title}<small className="cell-note">{reminder.draft_message || reminder.message}</small></td>
-                <td>{formatDisplayDate(reminder.due_at)}</td>
+                <td>
+                  <FrostReminderDueDate
+                    canManage={canManageReminders}
+                    dueAt={reminder.due_at}
+                    onSet={(value) => onReminderDueDate(reminder.id, value)}
+                  />
+                </td>
                 <td>
                   <div className="button-row table-actions-row">
                     <button className="table-action" disabled={!canManageReminders} onClick={() => onReminderAction(reminder.id, "ACKNOWLEDGE")}>Review</button>
@@ -9973,6 +10241,141 @@ function AiBusinessAssistantModule({
           later, exactly like an answer the model had worded. The thread carries the notice with
           every answer. */}
     </section>
+  );
+}
+
+/**
+ * The date on one reminder, which the owner can set, change or take off.
+ *
+ * A plain date box and a Save button, not an auto-saving input. A date field that writes on every
+ * keystroke fires a request per digit typed and lands on 2026-01-01 on the way to 2026-01-15.
+ *
+ * The draft is local until saved, and the saved value is what is shown again afterwards -- so a
+ * failed save leaves the box showing what he typed, with the reason, rather than silently snapping
+ * back to the old date as though he had never touched it.
+ */
+function FrostReminderDueDate({ canManage = false, dueAt, onSet }) {
+  const saved = toDateInputValue(dueAt);
+  const [draft, setDraft] = useState(saved);
+  const [saving, setSaving] = useState(false);
+  const [failure, setFailure] = useState("");
+  const [lastSaved, setLastSaved] = useState(saved);
+  // The row was refreshed from the server and now carries a different date. Follow it, unless the
+  // owner has typed something that is not yet saved -- overwriting that would throw away his edit.
+  if (saved !== lastSaved && draft === lastSaved) {
+    setLastSaved(saved);
+    setDraft(saved);
+  }
+  const dirty = draft !== saved;
+  const save = async () => {
+    setSaving(true);
+    setFailure("");
+    try {
+      await onSet(draft || null);
+    } catch (error) {
+      setFailure(getErrorMessage(error, "That date could not be saved."));
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <div className="frost-due-date">
+      <input
+        aria-label="Reminder due date"
+        disabled={!canManage || saving}
+        onChange={(event) => setDraft(event.target.value)}
+        type="date"
+        value={draft}
+      />
+      {dirty && (
+        <button className="table-action" disabled={!canManage || saving} onClick={save} type="button">
+          {saving ? "Saving..." : (draft ? "Set date" : "Clear date")}
+        </button>
+      )}
+      {!dirty && !saved && <small className="cell-note">No date</small>}
+      {failure && <small className="frost-due-date-failure">{failure}</small>}
+    </div>
+  );
+}
+
+/**
+ * Who owes the shop money, and the message FROST has already written for each of them.
+ *
+ * ## FROST does not send these
+ *
+ * The owner asked for FROST to either message the customers who owe him or remind him about them.
+ * This panel is the reminding, and Send here opens WhatsApp with the words already typed so that he
+ * reads them and presses send himself, once, for that one customer. Nothing on this screen posts to
+ * `/api/whatsapp/send-document`, and there is no "send all". A message that goes out under the
+ * shop's name to a neighbour is not a thing to get wrong in bulk.
+ *
+ * ## What is shown when a row cannot be sent
+ *
+ * The row, and why. A customer with no number, or one who asked not to be messaged, still appears
+ * with their balance and their draft -- he can ring them. Dropping those rows would make "opted
+ * out" look like "owes nothing", which is the same fault as an error rendering as zero.
+ */
+function FrostDuesPanel({ canManageReminders = false, failure = "", loading = false, onLoad, outreach = null, summary = null }) {
+  // Loaded on open rather than with the panel's other eleven requests: it is a second pass over the
+  // whole ledger, and most openings of FROST are not about dues.
+  useEffect(() => {
+    if (typeof onLoad === "function") onLoad();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const subtitle = "FROST writes the message. You read it and send it yourself, one customer at a time.";
+  if (loading && !outreach) {
+    return <ModuleCard eyebrow="Reminder Centre" title="Who owes you" subtitle={subtitle}><div className="cart-empty">Reading the ledger...</div></ModuleCard>;
+  }
+  if (!outreach) {
+    return <ModuleCard eyebrow="Reminder Centre" title="Who owes you" subtitle={subtitle}><div className="cart-empty">Open this section to read the ledger.</div></ModuleCard>;
+  }
+  if (outreach.status === DUE_OUTREACH_STATUS.UNREADABLE) {
+    // Never an empty table. "Nobody owes you anything" is a sentence this panel may only say when
+    // it is true, and a failed read is not that.
+    return (
+      <ModuleCard eyebrow="Reminder Centre" title="Who owes you" subtitle={subtitle}>
+        <div className="inline-error">{outreach.message || failure}</div>
+        <div className="button-row"><button className="secondary-button" onClick={onLoad} type="button">Try again</button></div>
+      </ModuleCard>
+    );
+  }
+  return (
+    <ModuleCard eyebrow="Reminder Centre" title="Who owes you" subtitle={subtitle}>
+      {summary && (
+        <div className="frost-dues-summary">
+          <span><strong>{summary.count}</strong> customers</span>
+          <span><strong>{currency.format(Number(summary.total_outstanding) || 0)}</strong> outstanding</span>
+          <span><strong>{summary.overdue_count}</strong> overdue</span>
+          <span><strong>{outreach.sendableCount}</strong> ready to send</span>
+        </div>
+      )}
+      <DataTable headers={["Customer", "Outstanding", "Since", "Message", "Send"]}>
+        {outreach.rows.map((row) => (
+          <tr key={row.key}>
+            <td className="primary-cell">
+              {row.customer_name || "Walk-in customer"}
+              <small className="cell-note">{row.due_status === "NO_DUE_DATE" ? "No due date set" : row.due_status.replace(/_/g, " ").toLowerCase()}</small>
+            </td>
+            <td>{currency.format(Number(row.outstanding_amount) || 0)}</td>
+            <td>{formatDisplayDate(row.oldest_invoice_date)}</td>
+            <td className="frost-dues-message">{row.prepared_message || "No balance to write about."}</td>
+            <td>
+              {row.action === DUE_OUTREACH_ACTION.SEND ? (
+                <a className="table-action" href={row.link} rel="noopener noreferrer" target="_blank">Open in WhatsApp</a>
+              ) : (
+                <small className="cell-note">{row.blockedReason}</small>
+              )}
+            </td>
+          </tr>
+        ))}
+        {outreach.rows.length === 0 && <tr><td colSpan="5" className="empty-cell">Nobody has a balance outstanding.</td></tr>}
+      </DataTable>
+      <div className="button-row">
+        <button className="secondary-button" disabled={loading} onClick={onLoad} type="button">{loading ? "Refreshing..." : "Refresh"}</button>
+        {!canManageReminders && <small className="cell-note">You can read this list. Setting reminders needs an owner.</small>}
+      </div>
+    </ModuleCard>
   );
 }
 

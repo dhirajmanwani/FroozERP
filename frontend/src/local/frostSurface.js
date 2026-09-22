@@ -50,6 +50,10 @@ const SECTIONS = Object.freeze([
   { key: "today", label: "Today's numbers", blurb: "Sales, profit, dues and low stock at a glance", daily: true },
   { key: "alerts", label: "Alerts", blurb: "What needs attention today", daily: true },
   { key: "reminders", label: "Reminders", blurb: "What you asked FROST to remember", daily: true, requires: "reminders" },
+  // Next to Reminders rather than in the daily row, because the approved strip is the approved
+  // strip. The overdue customers already reach the owner through the bell; this is where he goes
+  // when he wants to do something about them.
+  { key: "dues", label: "Who owes you", blurb: "Every customer with a balance, and a message ready to send", requires: "reminders" },
   { key: "decision", label: "Decision Center", blurb: "Actions waiting for your approval" },
   { key: "predictions", label: "Predictions", blurb: "Where stock, sales and cash are heading" },
   { key: "profit", label: "Profit Advisor", blurb: "Where the margin is going" },

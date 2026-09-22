@@ -7048,3 +7048,49 @@ tbody tr:last-child td {
 .frost-new-chat {
   padding-inline: 10px;
 }
+
+/* The date on one reminder. The Save button only appears once the box differs from what is stored,
+   so the cell is one control wide at rest and does not push the actions column off a narrow
+   drawer. */
+.frost-due-date {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.frost-due-date input {
+  min-width: 140px;
+}
+
+/* A failed save is said in the cell it failed in, in the danger ink the rest of the app uses for
+   the same thing, rather than as a toast that is gone before he looks up. */
+.frost-due-date-failure {
+  color: var(--danger-ink);
+  flex-basis: 100%;
+}
+
+/* The counts above the dues table. Derived from the same rows the table is, so the two cannot
+   disagree -- the summary-versus-detail pitfall in CLAUDE.md. */
+.frost-dues-summary {
+  color: var(--ink-muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 0.86rem;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.frost-dues-summary strong {
+  color: var(--ink);
+}
+
+/* The message is the point of the row, so it gets the width. It wraps rather than truncating: a
+   message he is about to send under the shop's name has to be readable in full before he sends
+   it, and an ellipsis is how an unread draft goes out. */
+.frost-dues-message {
+  font-size: 0.86rem;
+  line-height: 1.45;
+  max-width: 420px;
+  white-space: normal;
+}
