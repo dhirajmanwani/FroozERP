@@ -68,6 +68,35 @@ const parsePositiveInteger = (value) => {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 };
+
+/** The widest `ai_conversations.session_id` the column can hold. Kept beside the check that uses it. */
+const CHAT_SESSION_ID_MAX_LENGTH = 80;
+
+/**
+ * The chat a question belongs to, or nothing.
+ *
+ * The client mints this id and sends it back with every follow-up, so it is caller-supplied text
+ * and is treated as such: a string, trimmed, and no longer than the column. Anything else becomes
+ * `null`.
+ *
+ * It returns `null` rather than refusing the request, which is the opposite of the rule
+ * `requireBranchScope` follows two functions below, and deliberately so. That one guards *which
+ * shop's books are read*, where an absent value widening to "all of them" is a disclosure. This one
+ * only decides which heading a question is filed under. A 400 here would lose an answer the owner
+ * asked for and already waited on, over a grouping label -- so a malformed id costs the chat
+ * grouping for that one question and nothing else. The question, the answer and the audit row are
+ * written either way.
+ *
+ * The length cap is not cosmetic: Postgres refuses an over-length `VARCHAR(80)` outright, so
+ * without the cap a long id turns the whole `auditQuestion` write -- conversation, messages, fact
+ * snapshots and audit row -- into a 500 after the books have already been read.
+ */
+const normalizeChatSessionId = (value) => {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > CHAT_SESSION_ID_MAX_LENGTH) return null;
+  return trimmed;
+};
 /**
  * The branch whose data a FROST answer may be built from.
  *
@@ -114,6 +143,21 @@ const getRange = (query = {}) => {
   }
   if (range === "last_7_days" || range === "7") return { dateFrom: addDays(today, -6), dateTo: today, label: "Last 7 Days" };
   if (range === "this_month" || range === "month") return { dateFrom: today.slice(0, 8) + "01", dateTo: today, label: "This Month" };
+  // The three below were missing while `detectSpokenRange` already understood the words for them, so
+  // "which product was in high demand this year" was answered with today's figures under a source
+  // line reading "- Today". The question named a period, this function did not know the key, and the
+  // default at the bottom quietly answered about a different span of time. `frostLanguage.test.js`
+  // now walks `SPOKEN_RANGE_KEYS` against this function so the two lists cannot drift apart again.
+  if (range === "last_month") {
+    const firstOfThisMonth = `${today.slice(0, 8)}01`;
+    const lastOfLastMonth = addDays(firstOfThisMonth, -1);
+    return { dateFrom: `${lastOfLastMonth.slice(0, 8)}01`, dateTo: lastOfLastMonth, label: "Last Month" };
+  }
+  if (range === "this_year") return { dateFrom: `${today.slice(0, 4)}-01-01`, dateTo: today, label: "This Year" };
+  if (range === "last_year") {
+    const lastYear = String(Number(today.slice(0, 4)) - 1);
+    return { dateFrom: `${lastYear}-01-01`, dateTo: `${lastYear}-12-31`, label: "Last Year" };
+  }
   return { dateFrom: today, dateTo: today, label: "Today" };
 };
 
@@ -223,7 +267,15 @@ const requireAiPermission = async ({ req, res, getPermissionUser, getCanonicalId
     return null;
   }
   const identity = getCanonicalIdentity
-    ? await getCanonicalIdentity({ userId: user.id, sessionId: req.body?.session_id || req.headers["x-session-id"] })
+    // The header only. This read was `req.body?.session_id || req.headers["x-session-id"]`, and
+    // `session_id` in the body now means the *chat* a question belongs to (see
+    // `normalizeChatSessionId`). This argument is the sign-in session's label -- it travels to
+    // `/api/auth/me` as `x-session-id` and comes back as `identity.session_id` -- so leaving the
+    // body read in place would have made the chat id impersonate the session label the first time
+    // the panel sent one, and misreported it to whoever was next debugging a session problem.
+    // Nothing is lost: no caller sends the sign-in session in a FROST body, and neither value
+    // authenticates anything -- `req.auth` is the only identity, and it comes from the verified token.
+    ? await getCanonicalIdentity({ userId: user.id, sessionId: req.headers["x-session-id"] || "" })
     : {
         user_id: user.id,
         username: user.username || "",
@@ -1735,13 +1787,13 @@ const factsForBusinessIntent = async (pool, branchId, intent, settings, range) =
   return [await getDailySalesSummary(pool, branchId, range), await getCustomerOutstanding(pool, branchId, settings), await getSupplierOutstanding(pool, branchId), await getLowStockProducts(pool, branchId), await getInventoryNearingExpiry(pool, branchId, settings), await getProductSalesRanking(pool, branchId, range)];
 };
 
-const auditQuestion = async ({ pool, branchId, user, deviceId, question, classification, range, facts, answer }) => {
+const auditQuestion = async ({ pool, branchId, user, deviceId, question, classification, range, facts, answer, sessionId = null }) => {
   const branch = requireBranchScope(branchId);
   const conversation = await pool.query(`
-    INSERT INTO ai_conversations (company_id, branch_id, user_id, device_id, question, classification, period_label)
-    VALUES (NULL, $1, $2, $3, $4, $5, $6)
+    INSERT INTO ai_conversations (company_id, branch_id, user_id, device_id, question, classification, period_label, session_id)
+    VALUES (NULL, $1, $2, $3, $4, $5, $6, $7)
     RETURNING id
-  `, [branch, user.id, deviceId || "", question, classification, range.label]);
+  `, [branch, user.id, deviceId || "", question, classification, range.label, sessionId]);
   const conversationId = conversation.rows[0].id;
   await pool.query("INSERT INTO ai_messages (conversation_id, role, content) VALUES ($1, 'user', $2)", [conversationId, question]);
   await pool.query("INSERT INTO ai_messages (conversation_id, role, content, facts_used) VALUES ($1, 'assistant', $2, $3::jsonb)", [conversationId, answer, JSON.stringify(facts)]);
@@ -2213,6 +2265,9 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     if (!question) return res.status(400).json({ message: "Question is required" });
     const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
+    // Which chat this question belongs to, if the panel said. A question with no chat is still
+    // answered and still audited; it just does not appear in the sidebar.
+    const chatSessionId = normalizeChatSessionId(req.body.session_id);
     const settings = await getAiSettings(pool, frost);
     const range = getRange(rangeQueryFor(question, req.body));
     const classification = classifyBusinessIntent(question);
@@ -2286,6 +2341,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       range,
       facts,
       answer,
+      sessionId: chatSessionId,
     });
     const usage = await frost.recordTokenUsage({
       conversationId,
@@ -2307,6 +2363,10 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     return res.json({
       assistant: FROST_ASSISTANT_NAME,
       conversation_id: conversationId,
+      // Echoed back as it was *stored*, not as it was sent. An id the column could not hold was
+      // filed under no chat at all, and a panel told otherwise would keep sending follow-ups into
+      // a thread that is not accumulating.
+      session_id: chatSessionId,
       classification,
       // Null for a greeting. A period label under "Hello." is a filter the owner cannot act on, and
       // the panel prints it beside the source list it does not have either.
@@ -2331,6 +2391,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     if (!question) return res.status(400).json({ message: "Question is required" });
     const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
+    const chatSessionId = normalizeChatSessionId(req.body.session_id);
     const classification = classifyBusinessIntent(question);
     // The gate runs before the SSE headers go out. Once this response is an event stream a 403
     // status can no longer be sent, and the refusal would reach the client as a stream that just
@@ -2360,6 +2421,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       range,
       facts,
       answer,
+      sessionId: chatSessionId,
     });
     const usage = await frost.recordTokenUsage({
       conversationId,
@@ -2375,6 +2437,108 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     }
     res.write(`event: done\ndata: ${JSON.stringify({ done: true })}\n\n`);
     return res.end();
+  });
+
+  /**
+   * The chat sidebar: one row per `session_id`, newest chat first.
+   *
+   * Scoped to the branch *and* to the person. Branch alone is not enough here, which is a weaker
+   * rule than the rest of FROST needs and a stronger one than the rest of FROST applies: a sales
+   * figure is the shop's, but a question is the asker's, and two Owners sharing a branch would
+   * otherwise read each other's chats -- including the ones they only half asked.
+   *
+   * `session_id IS NULL` is excluded rather than collected under one heading. Every row written
+   * before the column existed has no chat, and gathering them would produce a sidebar entry
+   * containing months of unrelated questions that reads exactly like a conversation. They remain in
+   * the audit trail, which is where they have always been and what they were written for.
+   */
+  app.get("/api/ai/conversations", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
+    if (!user) return;
+    // `req.auth.userId`, not `user.id`. They are the same number -- `getPermissionUser` was handed
+    // the verified claim to find this row -- but the predicate that decides whose chats these are
+    // reads from the token directly, so no later change to how the permission row is resolved can
+    // quietly move it.
+    const chats = await pool.query(`
+      SELECT
+        c.session_id,
+        -- The first question asked, which is the only title anybody wrote. ARRAY_AGG with its own
+        -- ORDER BY rather than a correlated subquery: one pass, and the tie-break on id keeps the
+        -- title stable when two questions land inside the same timestamp.
+        (ARRAY_AGG(c.question ORDER BY c.created_at ASC, c.id ASC))[1] AS title,
+        MIN(c.created_at) AS started_at,
+        MAX(c.created_at) AS last_at,
+        COUNT(*)::int AS message_count
+      FROM ai_conversations c
+      WHERE c.branch_id = $1 AND c.user_id = $2 AND c.session_id IS NOT NULL
+      GROUP BY c.session_id
+      ORDER BY MAX(c.created_at) DESC
+      LIMIT 30
+    `, [requireBranchScope(req.auth.branchId), req.auth.userId]);
+    return res.json({ chats: chats.rows });
+  });
+
+  /**
+   * One chat reopened, oldest question first.
+   *
+   * The same two predicates as the list, for the same reason and with more at stake: this route
+   * returns the questions and the answers in full, and the ids are caller-supplied strings that a
+   * curious person could try. A chat belonging to another branch or another person is not
+   * "forbidden" here, it is *absent* -- the predicates simply match nothing and the 404 below says
+   * so, which tells a prober nothing they did not already know.
+   *
+   * The assistant message is a LEFT JOIN LATERAL, not an inner join. A question whose answer never
+   * landed -- the local model down, the process restarted between the two inserts -- has an
+   * `ai_conversations` row and no assistant `ai_messages` row, and an inner join would delete it
+   * from the reopened chat. CLAUDE.md's rule is that a failure must never render as an absence; a
+   * question the owner remembers asking, gone from the transcript with no trace, is that rule
+   * broken in the place it is hardest to notice.
+   */
+  app.get("/api/ai/conversations/:session_id", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
+    if (!user) return;
+    // Normalised with the same function that decided what could be stored. An id too long to be in
+    // the column cannot name a chat, so it is not-found rather than a query that cannot match.
+    const sessionId = normalizeChatSessionId(req.params.session_id);
+    const notFound = () => res.status(404).json({ message: "That FROST chat was not found." });
+    if (!sessionId) return notFound();
+    const result = await pool.query(`
+      SELECT
+        c.id,
+        c.question,
+        c.classification,
+        c.period_label,
+        c.created_at AS asked_at,
+        m.content AS answer,
+        m.facts_used AS facts,
+        m.created_at AS answered_at
+      FROM ai_conversations c
+      LEFT JOIN LATERAL (
+        SELECT a.content, a.facts_used, a.created_at
+        FROM ai_messages a
+        WHERE a.conversation_id = c.id AND a.role = 'assistant'
+        ORDER BY a.created_at ASC, a.id ASC
+        LIMIT 1
+      ) m ON TRUE
+      WHERE c.branch_id = $1 AND c.user_id = $2 AND c.session_id = $3
+      ORDER BY c.created_at ASC, c.id ASC
+      LIMIT 50
+    `, [requireBranchScope(req.auth.branchId), req.auth.userId, sessionId]);
+    if (!result.rows.length) return notFound();
+    const exchanges = result.rows.map((row) => ({
+      id: row.id,
+      question: row.question,
+      // Empty string, never null, and never a missing key. The panel prints this straight into the
+      // thread, and an unanswered question has to read as an unanswered question rather than as
+      // `undefined` or as nothing at all.
+      answer: typeof row.answer === "string" ? row.answer : "",
+      classification: row.classification,
+      period_label: row.period_label,
+      facts: Array.isArray(row.facts) ? row.facts : [],
+      asked_at: row.asked_at,
+      answered_at: row.answered_at || null,
+    }));
+    return res.json({ session_id: sessionId, title: exchanges[0].question, exchanges });
   });
 
   app.post("/api/ai/actions/propose", async (req, res) => {
@@ -2479,9 +2643,15 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
 
 module.exports = {
   registerAiBusinessAssistantRoutes,
+  // Exported so `frostLanguage.test.js` can assert that every period a question can name is a
+  // period this function actually serves. A guard that cannot reach the thing it guards is the
+  // shape of failure `assertGroundedAnswer` already cost this codebase once.
+  getRange,
   buildFrostPolicy,
   normalizeRoleName,
   buildStatusChange,
+  normalizeChatSessionId,
+  CHAT_SESSION_ID_MAX_LENGTH,
   FROST_DEFAULT_ROLES,
   FINANCIAL_INTENTS,
   INVENTORY_INTENTS,

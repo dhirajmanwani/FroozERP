@@ -99,6 +99,15 @@ test("the period is said in words, because a hidden filter is the Report Center 
   assert.equal(describeFrostRange("last_quarter"), "Period: last_quarter");
   assert.equal(describeFrostRange(""), "No period selected");
   assert.equal(describeFrostRange(undefined), "No period selected");
-  // Every value the picker can produce has a label.
-  assert.deepEqual(Object.keys(FROST_RANGE_LABELS), ["today", "yesterday", "last_7_days", "this_month"]);
+  assert.equal(describeFrostRange("last_month"), "Last month");
+  assert.equal(describeFrostRange("this_year"), "This year");
+  assert.equal(describeFrostRange("last_year"), "Last year");
+  // Every value the picker can produce has a label. Last month and this year were added because the
+  // owner asked "which product was in high demand this year" and got today's figures back under a
+  // source line reading "- Today": the question named a period the range layer did not know, so the
+  // answer quietly described a different span of time.
+  assert.deepEqual(
+    Object.keys(FROST_RANGE_LABELS),
+    ["today", "yesterday", "last_7_days", "this_month", "last_month", "this_year", "last_year"],
+  );
 });

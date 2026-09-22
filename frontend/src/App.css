@@ -7027,3 +7027,24 @@ tbody tr:last-child td {
 
 :root[data-theme="dark"] .brand-monogram .brand-art-on-dark { display: block; }
 :root[data-theme="dark"] .brand-monogram .brand-art-on-light { display: none; }
+
+/* The chat sidebar reuses the menu's card, because it is the same kind of thing: a short list that
+   opens over the conversation and closes when you pick from it. Giving it a second look would have
+   made the panel feel like two panels. */
+.frost-chats {
+  max-height: 46vh;
+  overflow-y: auto;
+}
+
+.frost-chats-empty {
+  color: var(--ink-muted);
+  font-size: 0.86rem;
+  margin: 0;
+  padding: 10px;
+}
+
+/* Square, so the one control that is always in the same corner reads as a control and not as a
+   fourth word in the row. */
+.frost-new-chat {
+  padding-inline: 10px;
+}

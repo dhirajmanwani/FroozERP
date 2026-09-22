@@ -81,6 +81,9 @@ const APPROVED_CHROME = [
   "frost-composer-actions",
   "frost-composer-suggestions",
   "frost-speak-button",
+  "frost-chats",          // the sidebar of past chats
+  "frost-chats-empty",
+  "frost-new-chat",       // the one control always in the same corner
 ];
 
 for (const name of APPROVED_CHROME) {

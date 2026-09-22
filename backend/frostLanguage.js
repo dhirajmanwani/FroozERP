@@ -108,10 +108,35 @@ const FUTURE_MARKERS = /\b(mangwa|mangwana|mangana|mangau|mangwau|kharid|khareed
  * none. "" is the honest answer for "pichle mahine": the range list has no last-month key, and
  * quietly serving this month instead would put a wrong figure under a right-sounding sentence.
  */
+/**
+ * Every period key `detectSpokenRange` may return. `getRange` in `aiBusinessAssistantService.js`
+ * must serve all of them, and `frostPeriodCoverage` in the tests asserts exactly that.
+ *
+ * This list exists because of the failure it now prevents. "which product was in high demand this
+ * year" was answered with today's figures, under a source line reading "- Today": the question named
+ * a period, the range layer did not know the word, and the answer came back about a different span
+ * of time with nothing to say so. A key this module can return but `getRange` cannot serve produces
+ * that silently, every time.
+ */
+const SPOKEN_RANGE_KEYS = Object.freeze([
+  "today", "yesterday", "last_7_days", "this_month", "last_month", "this_year", "last_year",
+]);
+
+// "last", in either language, has to be attached to the unit it modifies. An earlier version matched
+// the bare prefix `pichl`, which made "pichle pandrah din" -- the last fifteen days -- resolve to
+// last month, and "pichle saal" resolve to last month too. Both are silent substitutions of one span
+// of time for another, which is the exact failure this whole module exists to stop.
+const PAST = "(?:pichl\\w*|pichhl\\w*|gaye|gaya|last|previous)";
+const THIS = "(?:is|iss|this|es)";
+const YEAR = "(?:saal|saalo|varsh|year)";
+const MONTH = "(?:mahine|mahina|maheene|maheena|month)";
+
 const detectSpokenRange = (question = "") => {
   const text = String(question || "").toLowerCase();
-  if (/\b(pichl|pichhl|gaye\s*mahine|gaya\s*mahina|last\s*month|last\s*week)/.test(text)) return "";
-  if (/\b(is\s*mahine|iss\s*mahine|is\s*maheene|mahine|mahina|maheena|month)\b/.test(text)) return "this_month";
+  if (new RegExp(`\\b${PAST}\\s+${YEAR}\\b`).test(text)) return "last_year";
+  if (new RegExp(`\\b${PAST}\\s+${MONTH}\\b`).test(text)) return "last_month";
+  if (new RegExp(`\\b(?:${THIS}\\s+)?${YEAR}\\b`).test(text) || /\b(salana|saalana)\b/.test(text)) return "this_year";
+  if (new RegExp(`\\b(?:${THIS}\\s+)?${MONTH}\\b`).test(text)) return "this_month";
   if (/\b(hafte|hafta|haftey|saptah|week|saat\s*din|7\s*din)\b/.test(text)) return "last_7_days";
   if (/\b(aaj|aj|today)\b/.test(text)) return "today";
   if (/\b(kal|kl|yesterday)\b/.test(text) && !FUTURE_MARKERS.test(text)) return "yesterday";
@@ -157,6 +182,10 @@ const detectSmallTalk = (question = "") => {
     // Without this the list below has to carry every spelling of the copula, which is how an
     // allow-list of greetings quietly stops covering the greetings people actually type.
     .replace(/\s+(hai|hain|he|hein|h|na)$/, "")
+    // "kya haal bhai k" -- the stray letter is a half-typed word or a slip of the thumb, and it
+    // turned a greeting into a question FROST could not place. A one-letter token at the end of a
+    // sentence carries no meaning in either language, so it is dropped rather than matched.
+    .replace(/(\s+[a-z]){1,2}$/, "")
     .trim();
   if (!stripped) return "";
   for (const entry of SMALL_TALK_KINDS) {
@@ -185,9 +214,14 @@ module.exports.detectSmallTalk = detectSmallTalk;
 const BRIEFING_SIGNALS = /\b(attention|dhyan|zaroori|jaruri|important|urgent|today|aaj|summary|brief|briefing|overview|business|shop|dukan|dukaan|report|position|pending|overdue|total|problem|dikkat|issue|status|number|figure|book|khata|khaata|accounts?|money|paisa|paise|check|karna|karu|karna hai|chal raha|chal rahi|how is|hows|how.s)\b/;
 
 const hasBusinessSignal = (question = "") => {
+  // Naming a period is saying something about the shop. "this year", typed on its own as a
+  // follow-up, was answered with "I did not catch that" -- which is true of the words and useless
+  // to the owner, who had just asked a question and was narrowing it.
+  if (detectSpokenRange(question)) return true;
   const normalized = normalizeQuestion(question);
   return normalized.hints.length > 0 || BRIEFING_SIGNALS.test(normalized.text);
 };
 
 module.exports.BRIEFING_SIGNALS = BRIEFING_SIGNALS;
+module.exports.SPOKEN_RANGE_KEYS = SPOKEN_RANGE_KEYS;
 module.exports.hasBusinessSignal = hasBusinessSignal;

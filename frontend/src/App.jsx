@@ -181,6 +181,13 @@ import {
   latestSpokenTurn,
 } from "./local/frostConversation";
 import {
+  FROST_CHAT_SELECTION,
+  buildChatList,
+  historyFromExchanges,
+  newChatSessionId,
+  resolveChatSelection,
+} from "./local/frostChats";
+import {
   FROST_PRIMARY_SECTION,
   describeFrostRange,
   resolveFrostSurface,
@@ -860,6 +867,12 @@ const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
 const FROST_ACTIVE_TAB_STORAGE_KEY = "froozerp_frost_active_tab";
 const FROST_RECENT_CONVERSATION_STORAGE_KEY = "froozerp_frost_recent_conversation";
+// How many exchanges the open chat keeps on screen. It is not the same number as the twenty written
+// to localStorage below, and separating them is the point: a chat reopened from the sidebar can be
+// fifty exchanges long, and a shared cap of twenty meant the next question silently threw away
+// everything above it -- the conversation shrank while the owner was reading it. The server returns
+// at most fifty, so this holds a full one with room for the answers still to come.
+const FROST_OPEN_CHAT_LIMIT = 60;
 const getStoredFrostConversation = () => {
   try {
     const parsed = JSON.parse(localStorage.getItem(FROST_RECENT_CONVERSATION_STORAGE_KEY) || "[]");
@@ -1862,6 +1875,8 @@ function Icon({ name, size = 18 }) {
     message: <><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.8 8.8 0 0 1-3.8-1L3 20l1.3-4A8.3 8.3 0 1 1 21 11.5Z" /></>,
     close: <><path d="M18 6 6 18M6 6l12 12" /></>,
     parcel: <><path d="M3 8h18v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" /><path d="M3 8l2-4h14l2 4" /><path d="M12 4v17" /></>,
+    add: <><path d="M12 5v14M5 12h14" /></>,
+    refresh: <><path d="M21 12a9 9 0 1 1-2.6-6.4" /><path d="M21 3v6h-6" /></>,
   };
 
   return (
@@ -2257,6 +2272,12 @@ function App() {
     // The question sent and not yet answered. Deliberately not part of `history`, which is
     // persisted to localStorage: an unanswered question is not a record of anything.
     pending: null,
+    // The chat these questions belong to, minted when the panel opens and sent with every ask. The
+    // sidebar is built from the server's own record of them, not from this.
+    sessionId: "",
+    chats: [],
+    chatsFailure: "",
+    chatsLoading: false,
   });
   const [aiQuestion, setAiQuestion] = useState("");
   const [aiRange, setAiRange] = useState("today");
@@ -4913,6 +4934,91 @@ function App() {
     }
   };
 
+  /**
+   * The list of past chats, for the sidebar.
+   *
+   * A failure is carried as a message rather than as an empty list. CLAUDE.md's rule about errors
+   * never rendering as zero applies to a list too: a sidebar that silently shows nothing after a
+   * failed request looks exactly like a shop that has never asked FROST anything.
+   */
+  const loadFrostChats = async () => {
+    setAiAssistantData((current) => ({ ...current, chatsLoading: true }));
+    try {
+      const response = await axios.get(`${API_URL}/api/ai/conversations`, {
+        params: { user_id: user?.id, device_id: deviceInfo.device_id },
+        timeout: 12000,
+      });
+      setAiAssistantData((current) => ({
+        ...current,
+        chatsLoading: false,
+        chats: buildChatList(response.data),
+        chatsFailure: "",
+      }));
+    } catch (error) {
+      const failure = describeRequestFailure(error, { url: `${API_URL}/api/ai/conversations` });
+      writeDiagnosticLog("WARN", "frost-chat-list-failed", failure);
+      setAiAssistantData((current) => ({
+        ...current,
+        chatsLoading: false,
+        chats: [],
+        chatsFailure: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth }),
+      }));
+    }
+  };
+
+  /**
+   * Start a new chat.
+   *
+   * The id is minted here and not by the server, so the first question of a chat already carries it
+   * and the chat exists from its first answer rather than from its second. `authoritativeUtcNowIso`
+   * is passed in because `frostChats.js` is a pure module and must not reach for a clock of its own.
+   */
+  const startNewFrostChat = () => {
+    setAiAssistantData((current) => ({
+      ...current,
+      sessionId: newChatSessionId({ nowIso: authoritativeUtcNowIso() }),
+      history: [],
+      pending: null,
+      error: "",
+    }));
+    setAiQuestion("");
+  };
+
+  /**
+   * Reopen a chat from the sidebar.
+   *
+   * On failure the open chat is left exactly as it was and the reason is shown. Replacing a thread
+   * the owner can still read with a blank one, because a request failed, would destroy the only copy
+   * of it on screen.
+   */
+  const openFrostChat = async (chatId) => {
+    const id = String(chatId || "").trim();
+    if (!id) return;
+    setAiAssistantData((current) => ({ ...current, loading: true, error: "" }));
+    try {
+      const response = await axios.get(`${API_URL}/api/ai/conversations/${encodeURIComponent(id)}`, {
+        params: { user_id: user?.id, device_id: deviceInfo.device_id },
+        timeout: 12000,
+      });
+      setAiAssistantData((current) => ({
+        ...current,
+        loading: false,
+        sessionId: id,
+        history: historyFromExchanges(response.data),
+        pending: null,
+        error: "",
+      }));
+    } catch (error) {
+      const failure = describeRequestFailure(error, { url: `${API_URL}/api/ai/conversations/${id}` });
+      writeDiagnosticLog("WARN", "frost-chat-open-failed", failure);
+      setAiAssistantData((current) => ({
+        ...current,
+        loading: false,
+        error: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth }),
+      }));
+    }
+  };
+
   const askAiAssistant = async (question = aiQuestion) => {
     const trimmed = question.trim();
     if (!trimmed) return;
@@ -4932,11 +5038,18 @@ function App() {
         device_id: deviceInfo.device_id,
         question: trimmed,
         range: aiRange,
+        // Which chat this question belongs to. The server echoes back what it actually stored, so a
+        // panel is never told a question was filed under a chat that it was not.
+        session_id: aiAssistantData.sessionId || "",
       });
       setAiAssistantData((current) => ({
         ...current,
         loading: false,
         pending: null,
+        // The server's word on where the question was filed. An id it could not hold comes back
+        // null, and keeping the panel's own copy then would send every follow-up into a chat that
+        // is not accumulating.
+        sessionId: response.data.session_id || current.sessionId,
         period: { range: aiRange, ...(response.data.period || {}) },
         history: [
           {
@@ -4958,7 +5071,7 @@ function App() {
             phrasedBy: response.data.phrased_by || null,
           },
           ...current.history,
-        ].slice(0, 20),
+        ].slice(0, FROST_OPEN_CHAT_LIMIT),
       }));
       setAiQuestion("");
     } catch (error) {
@@ -4981,7 +5094,7 @@ function App() {
             facts: [],
           },
           ...current.history,
-        ].slice(0, 20),
+        ].slice(0, FROST_OPEN_CHAT_LIMIT),
       }));
     }
   };
@@ -7712,6 +7825,11 @@ function App() {
   const openFrostDrawer = (section = frostActiveTab || FROST_PRIMARY_SECTION) => {
     setFrostActiveTab(section);
     setFrostDrawerOpen(true);
+    // FROST opens on an empty chat, the way an assistant does, rather than on whatever was said
+    // last time. What was said last time is not lost -- it is in the sidebar, which is refreshed
+    // here so the chat just finished is already in it.
+    startNewFrostChat();
+    loadFrostChats().catch(() => null);
   };
   /**
    * Everything a person can navigate to, searchable.
@@ -9153,7 +9271,9 @@ function App() {
         onClose={() => setFrostDrawerOpen(false)}
         onMemoryAction={updateFrostMemory}
         onNavigate={navigate}
+        onNewChat={startNewFrostChat}
         onOpen={() => openFrostDrawer(FROST_PRIMARY_SECTION)}
+        onOpenChat={openFrostChat}
         onProposeAction={proposeFrostAction}
         onProposeMemory={proposeFrostMemory}
         onQuestionChange={setAiQuestion}
@@ -9196,7 +9316,9 @@ function FrostFloatingCopilot({
   onClose,
   onMemoryAction,
   onNavigate,
+  onNewChat,
   onOpen,
+  onOpenChat,
   onProposeAction,
   onProposeMemory,
   onQuestionChange,
@@ -9245,6 +9367,8 @@ function FrostFloatingCopilot({
             onAsk={onAsk}
             onMemoryAction={onMemoryAction}
             onNavigate={onNavigate}
+            onNewChat={onNewChat}
+            onOpenChat={onOpenChat}
             onProposeAction={onProposeAction}
             onProposeMemory={onProposeMemory}
             onQuestionChange={onQuestionChange}
@@ -9384,6 +9508,8 @@ function AiBusinessAssistantModule({
   onAlertAction,
   onAsk,
   onNavigate,
+  onNewChat,
+  onOpenChat,
   onQuestionChange,
   onRangeChange,
   onRefresh,
@@ -9401,6 +9527,7 @@ function AiBusinessAssistantModule({
   user,
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [chatsOpen, setChatsOpen] = useState(false);
   const threadEndRef = useRef(null);
   // Why a refusal is state rather than a disabled button: a Speak button that is simply greyed out
   // tells the owner nothing about which of the three reasons applies, and "this device cannot read
@@ -9429,6 +9556,13 @@ function AiBusinessAssistantModule({
   // The old Briefing tab was two things under one name. Its lines are what FROST would say if
   // asked how today looks, so they open the conversation; its tiles stay a place of their own.
   const briefLines = buildFrostBrief({ dailyPlan: data.dailyPlan, recommendations: briefing.recommendations });
+  // Which chat is open, and whether the list behind the sidebar could be read at all. A failed load
+  // must not look like a shop that has never asked FROST anything.
+  const chatSelection = resolveChatSelection({
+    chats: data.chats,
+    activeId: data.sessionId,
+    failure: data.chatsFailure,
+  });
   const conversation = buildFrostConversation({
     history: data.history || [],
     greeting: frostGreeting.line,
@@ -9488,19 +9622,63 @@ function AiBusinessAssistantModule({
         </div>
         <div className="button-row">
           <button
+            aria-expanded={chatsOpen}
+            className="frost-strip-button"
+            onClick={() => { setChatsOpen((open) => !open); setMenuOpen(false); }}
+            type="button"
+          >
+            <Icon name="history" /> Chats
+          </button>
+          <button
             aria-expanded={menuOpen}
             className="frost-strip-button"
-            onClick={() => setMenuOpen((open) => !open)}
+            onClick={() => { setMenuOpen((open) => !open); setChatsOpen(false); }}
             type="button"
           >
             <Icon name="menu" /> More
             {surface.menu.some((entry) => entry.badge > 0) && <em className="frost-strip-badge" />}
           </button>
           <button className="frost-strip-button" disabled={data.loading} onClick={onRefresh} type="button">
-            <Icon name="history" /> Refresh
+            <Icon name="refresh" /> Refresh
+          </button>
+          {/* The one control that is always in the same corner, because starting over is the thing
+              an owner reaches for without wanting to think about where it is. */}
+          <button
+            aria-label="New chat"
+            className="frost-strip-button frost-new-chat"
+            onClick={() => { onNewChat(); setChatsOpen(false); setMenuOpen(false); }}
+            title="New chat"
+            type="button"
+          >
+            <Icon name="add" />
           </button>
         </div>
       </div>
+
+      {chatsOpen && (
+        <div className="frost-menu frost-chats">
+          {/* A failed load says so. An empty list and an unreadable one look identical on screen
+              unless one of them is made to speak, and the owner acts very differently on "you have
+              not asked anything yet" than on "your chats could not be loaded". */}
+          {chatSelection.status === FROST_CHAT_SELECTION.UNREADABLE && (
+            <p className="ai-answer-notice">{chatSelection.message}</p>
+          )}
+          {chatSelection.status !== FROST_CHAT_SELECTION.UNREADABLE && chatSelection.chats.length === 0 && (
+            <p className="frost-chats-empty">{data.chatsLoading ? "Loading your chats..." : "No earlier chats yet."}</p>
+          )}
+          {chatSelection.chats.map((chat) => (
+            <button
+              className={chat.id === data.sessionId ? "frost-menu-item frost-menu-item-active" : "frost-menu-item"}
+              key={chat.id}
+              onClick={() => { onOpenChat(chat.id); setChatsOpen(false); }}
+              type="button"
+            >
+              <strong>{chat.title}</strong>
+              <small>{chat.messageCount === null ? "" : `${chat.messageCount} question${chat.messageCount === 1 ? "" : "s"}`}</small>
+            </button>
+          ))}
+        </div>
+      )}
 
       {menuOpen && (
         <div className="frost-menu">
@@ -9511,6 +9689,9 @@ function AiBusinessAssistantModule({
               <option value="yesterday">Yesterday</option>
               <option value="last_7_days">Last 7 Days</option>
               <option value="this_month">This Month</option>
+              <option value="last_month">Last Month</option>
+              <option value="this_year">This Year</option>
+              <option value="last_year">Last Year</option>
             </select>
           </label>
           {surface.menu.map((entry) => (

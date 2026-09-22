@@ -63,6 +63,13 @@ const migrationFiles = [
   // start on declared-but-absent columns, their absence stopped the cloud booting at all
   // rather than waiting to 500 on the first route that read one.
   "backend/migrations/cloud/018_auto_update_device_settings.sql",
+  // 019 carries `ai_conversations.session_id`, the key that groups a run of FROST questions into
+  // one chat and the only thing the two new conversation-list routes read. It is declared in
+  // `initializeDatabase()`, which never runs on a hosted deployment, so without this file the
+  // column does not exist there -- and `verifyDeclaredSchema` refuses to start on a
+  // declared-but-absent column, so its absence stops the cloud booting rather than waiting to 500
+  // on the first owner who opens the chat sidebar.
+  "backend/migrations/cloud/019_ai_conversation_sessions.sql",
 ];
 
 module.exports = { migrationFiles, deliberatelyNotRun };

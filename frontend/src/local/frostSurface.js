@@ -118,11 +118,18 @@ export const resolveFrostSurface = ({
  * select behind a menu, so the label has to appear in the thread instead, and an unrecognised value
  * is named rather than silently drawn as "Today".
  */
+// These are the periods the owner can pick, and they are also the periods he can name inside a
+// question -- "is saal", "pichle mahine". The two lists have to stay the same length: a period the
+// question layer understands but this one cannot show leaves the panel labelling the answer with
+// the wrong span of time, which is worse than not offering it.
 export const FROST_RANGE_LABELS = Object.freeze({
   today: "Today",
   yesterday: "Yesterday",
   last_7_days: "Last 7 days",
   this_month: "This month",
+  last_month: "Last month",
+  this_year: "This year",
+  last_year: "Last year",
 });
 
 export const describeFrostRange = (range) => {

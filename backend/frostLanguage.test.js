@@ -88,11 +88,12 @@ test("a period named in the question is recognised", () => {
 });
 
 test("a period the range list cannot serve is refused rather than approximated", () => {
-  // There is no last-month key. Serving this month under a "pichle mahine" question would put a
-  // wrong figure behind a right-sounding sentence, so the question names no period and the one the
-  // owner picked on screen stands.
-  assert.equal(detectSpokenRange("pichle mahine ki sale"), "");
-  assert.equal(detectSpokenRange("last month sales"), "");
+  // The rule, not the example. "pichle mahine" used to land here because there was no last-month
+  // key, and answering it with this month's figures would have put a wrong number behind a
+  // right-sounding sentence. Last month is served now, so the rule is asserted against a period
+  // that genuinely is not one of the six spans FROST can produce.
+  assert.equal(detectSpokenRange("pichle pandrah din ka hisab"), "");
+  assert.equal(detectSpokenRange("kitni sale hui"), "");
 });
 
 test("kal is read as tomorrow, not yesterday, when the question is about buying", () => {
@@ -186,4 +187,62 @@ test("dhyan dena hai is not a payment question", () => {
   // way of asking for the briefing was answered with the payments ledger.
   assert.equal(classifyBusinessIntent("aaj kya dhyan dena hai"), "BUSINESS_BRIEFING");
   assert.equal(classifyBusinessIntent("supplier ka kitna dena hai"), "PAYMENTS");
+});
+
+test("a stray half-typed letter does not hide a greeting", () => {
+  // "kya haal bhai k" -- the k is a slip of the thumb. It turned a greeting into a question FROST
+  // could not place, and the owner got "I did not catch that" for saying hello.
+  assert.equal(classifyBusinessIntent("kya haal bhai k"), "SMALL_TALK");
+  assert.equal(classifyBusinessIntent("kya haal bhai"), "SMALL_TALK");
+  assert.equal(classifyBusinessIntent("hello there a"), "SMALL_TALK");
+});
+
+test("a period named in the question is one FROST can actually serve", () => {
+  // "which product was in high demand this year" came back with today's figures under a source line
+  // reading "- Today". The question named a period, the range layer did not know the word, and the
+  // answer described a different span of time with nothing in it to say so.
+  assert.equal(detectSpokenRange("this year"), "this_year");
+  assert.equal(detectSpokenRange("is saal kitni sale hui"), "this_year");
+  assert.equal(detectSpokenRange("which product was in high demand this year"), "this_year");
+  assert.equal(detectSpokenRange("pichle mahine ki sale"), "last_month");
+  assert.equal(detectSpokenRange("last month sales"), "last_month");
+  assert.equal(detectSpokenRange("pichle saal ki sale"), "last_year");
+});
+
+test("last is attached to the unit it modifies", () => {
+  // Matching the bare prefix `pichl` made "pichle pandrah din" -- the last fifteen days -- resolve
+  // to last month, and "pichle saal" resolve to last month as well. Both swap one span of time for
+  // another without saying so.
+  assert.equal(detectSpokenRange("pichle pandrah din ka hisab"), "");
+  assert.equal(detectSpokenRange("last quarter"), "");
+});
+
+test("every period the question layer can name is a period the range layer serves", () => {
+  // The guard for the whole class. A key this module returns that `getRange` does not know falls
+  // through to today, silently, under a label that says Today -- which is the bug above, not a
+  // hypothetical one.
+  const { SPOKEN_RANGE_KEYS } = require("./frostLanguage");
+  const { getRange } = require("./aiBusinessAssistantService");
+  const today = getRange({ range: "today" });
+  for (const key of SPOKEN_RANGE_KEYS) {
+    const range = getRange({ range: key });
+    assert.ok(range && range.dateFrom && range.dateTo && range.label, `getRange does not serve "${key}"`);
+    // An unserved key falls through to the default, which is today. Every key except "today" itself
+    // must therefore describe a different span -- that is what "served" means here, and checking the
+    // label alone would not catch it, because the default carries a perfectly convincing one.
+    if (key === "today") continue;
+    assert.notEqual(
+      `${range.dateFrom}:${range.dateTo}`,
+      `${today.dateFrom}:${today.dateTo}`,
+      `"${key}" resolves to the same span as today, so it is not really served`,
+    );
+  }
+});
+
+test("naming a period is enough to be a business question", () => {
+  // "this year", typed on its own as a follow-up, was answered with "I did not catch that" -- true
+  // of the words and useless to the owner, who had just asked a question and was narrowing it.
+  assert.notEqual(classifyBusinessIntent("this year"), "UNCLEAR");
+  assert.notEqual(classifyBusinessIntent("is saal"), "UNCLEAR");
+  assert.notEqual(classifyBusinessIntent("pichle mahine"), "UNCLEAR");
 });

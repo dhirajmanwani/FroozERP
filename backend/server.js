@@ -3308,6 +3308,21 @@ const initializeDatabase = async () => {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    -- One ai_conversations row is one question. A chat -- the thing the owner sees in the sidebar
+    -- and reopens -- is the rows sharing a session_id, which the client mints and sends back with
+    -- every follow-up question. Mirrors migrations/cloud/019_ai_conversation_sessions.sql, which is
+    -- the only way this column reaches the hosted database, since this bootstrap never runs there.
+    --
+    -- Nullable, and permanently so. Every row written before the column existed belongs to no chat,
+    -- and inventing one for them would gather a run of unrelated questions under a single heading
+    -- that reads like a conversation nobody had. GET /api/ai/conversations excludes NULL for that
+    -- reason; those rows keep their place in the audit trail.
+    ALTER TABLE ai_conversations ADD COLUMN IF NOT EXISTS session_id VARCHAR(80);
+    -- The list query groups by session inside one branch and one user and orders by time, so the
+    -- index leads with the two predicates that are always present.
+    CREATE INDEX IF NOT EXISTS ai_conversations_session_idx
+      ON ai_conversations (branch_id, user_id, session_id, created_at);
+
     CREATE TABLE IF NOT EXISTS ai_messages (
       id SERIAL PRIMARY KEY,
       conversation_id INTEGER REFERENCES ai_conversations(id) ON DELETE CASCADE,
