@@ -1712,10 +1712,15 @@ const factsForQuestion = async (pool, branchId, classification, settings, range)
   ];
 };
 
+// The two answers that read no books: a greeting, and a question FROST did not recognise. Neither
+// has a period, a source list or a figure, and neither is handed to the local model -- with no facts
+// the grounding check cannot fail, which is exactly where an invented figure would come from.
+const FACTLESS_INTENTS = ["SMALL_TALK", "UNCLEAR"];
+
 const factsForBusinessIntent = async (pool, branchId, intent, settings, range) => {
   // A greeting reads no books at all. Fetching six queries to answer "hi there" is both the wrong
   // answer and six needless round trips to the cloud.
-  if (intent === "SMALL_TALK") return [];
+  if (intent === "SMALL_TALK" || intent === "UNCLEAR") return [];
   if (intent === "CASH_DRAWER") return [await getCashDrawerSummary(pool, branchId, range), await getCollectionSummary(pool, branchId, range)];
   if (intent === "PURCHASE_PLANNING") return [await getPurchaseRecommendationFact(pool, branchId), await getLowStockProducts(pool, branchId), await getSupplierOutstanding(pool, branchId)];
   if (intent === "SALE_RATE_REVIEW") return [await getSaleRateReviewFact(pool, branchId), await getProfitAdvisorRows(pool, branchId).then((rows) => buildFact("profit_advisor", "Profit Advisor", "Last 30 days", rows, { count: rows.length }))];
@@ -2238,7 +2243,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       // freshly-read facts would fail on nothing worse than a changed figure.
       answer = cachedPayload.answer;
       phrasedBy = cachedPayload.phrased_by || null;
-    } else if (settings.frost.enabled === true && providerKey === "ollama" && classification !== "SMALL_TALK") {
+    } else if (settings.frost.enabled === true && providerKey === "ollama" && !FACTLESS_INTENTS.includes(classification)) {
       // Small talk is not phrased by the model. There are no facts to ground it against, so the
       // grounding check could never fail, and a 3B model asked to be friendly about a fruit shop is
       // exactly where an invented figure would come from.
@@ -2305,7 +2310,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       classification,
       // Null for a greeting. A period label under "Hello." is a filter the owner cannot act on, and
       // the panel prints it beside the source list it does not have either.
-      period: classification === "SMALL_TALK" ? null : range,
+      period: FACTLESS_INTENTS.includes(classification) ? null : range,
       answer,
       // Null when FROST worded the figures itself. The panel shows the notice beside it, so a
       // plainly-worded answer never reads as a broken one.

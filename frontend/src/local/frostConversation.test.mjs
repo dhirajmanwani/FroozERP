@@ -215,6 +215,11 @@ test("a greeting carries no source footer, and every other answer still does", (
   assert.equal(chitchat.chitchat, true);
   assert.deepEqual(chitchat.sources, []);
 
+  const [, unclear] = buildFrostConversation({
+    history: [{ id: "c3", question: "who won the match", answer: "I did not catch that.", classification: "UNCLEAR", facts: [] }],
+  });
+  assert.equal(unclear.chitchat, true, "a question FROST did not understand has no sources either");
+
   const [, business] = buildFrostConversation({
     history: [{ id: "c2", question: "what needs my attention today?", answer: "Today: no sales yet.", classification: "BUSINESS_BRIEFING", facts: [] }],
   });

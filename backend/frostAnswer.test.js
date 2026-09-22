@@ -188,3 +188,10 @@ test("the answer format carries a version, so a cached answer cannot outlive its
   // cached for thirty minutes under a key that did not include the code that wrote them.
   assert.ok(Number.isInteger(ANSWER_FORMAT_VERSION) && ANSWER_FORMAT_VERSION > 0);
 });
+
+test("an unrecognised question says so instead of reciting the books", () => {
+  const answer = buildDeterministicAnswer("UNCLEAR", [], { label: "Today" });
+  assert.match(answer, /did not catch that/);
+  assert.doesNotMatch(answer, /\d/);
+  assert.doesNotMatch(answer, /^Today: /);
+});

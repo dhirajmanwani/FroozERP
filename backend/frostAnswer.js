@@ -38,7 +38,16 @@
  * improvement looked like it had not been deployed. Including this in the cache key makes an old
  * entry unreachable instead of stale.
  */
-const ANSWER_FORMAT_VERSION = 2;
+const ANSWER_FORMAT_VERSION = 3;
+
+/**
+ * What FROST says to a question it did not recognise.
+ *
+ * It says it plainly, because the alternative -- and what it did until now -- is a fluent briefing
+ * about something else, which the owner has no way to tell apart from an answer.
+ */
+const UNCLEAR_REPLY =
+  "I did not catch that. Ask me about sales, dues, stock, purchases, rates or waste, in Hindi or English.";
 
 /**
  * What FROST says to a greeting. Short, and carrying no figures at all -- the point is that a
@@ -344,6 +353,7 @@ const buildDeterministicAnswer = (classification, facts, range = {}, smallTalkKi
   if (classification === "SMALL_TALK") {
     return SMALL_TALK_REPLIES[smallTalkKind] || SMALL_TALK_REPLIES.greeting;
   }
+  if (classification === "UNCLEAR") return UNCLEAR_REPLY;
   const period = String(range.label || "Today");
   const ordered = orderForIntent(dedupeByType(facts), classification);
   const sentences = ordered.map(sentenceFor).filter(Boolean);
@@ -360,6 +370,7 @@ module.exports = {
   ANSWER_FORMAT_VERSION,
   FACT_LABELS,
   SMALL_TALK_REPLIES,
+  UNCLEAR_REPLY,
   LEAD_ORDER,
   buildDeterministicAnswer,
   dedupeByType,

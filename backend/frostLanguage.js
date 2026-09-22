@@ -24,7 +24,10 @@
 // before the short ones they contain.
 const HINGLISH_HINTS = Object.freeze([
   // Dues, ledgers, who owes whom. The single most common thing he asks about.
-  { pattern: /\b(udhaar|udhar|udhari|udhaari|baki|baaki|bakaya|bakaaya|hisaab|hisab|lena\s*hai|dena\s*hai|len\s*den|lendel)\b/, hints: "outstanding ledger payment" },
+  // "dhyan dena hai" is "I have to pay attention", not "I have to pay". Without the lookbehind
+  // "aaj kya dhyan dena hai" -- the owner's own way of asking for the briefing -- was answered with
+  // the payments ledger.
+  { pattern: /\b(udhaar|udhar|udhari|udhaari|baki|baaki|bakaya|bakaaya|hisaab|hisab|lena\s*hai|(?<!dhyan )dena\s*hai|len\s*den|lendel)\b/, hints: "outstanding ledger payment" },
   { pattern: /\b(vasooli|vasuli|recovery|bhugtan)\b/, hints: "payment outstanding" },
 
   // Cash actually in the box. Kept ahead of the generic money words because the drawer question
@@ -138,7 +141,7 @@ module.exports = {
 const SMALL_TALK_KINDS = Object.freeze([
   { kind: "thanks", pattern: /^(thanks?|thank you|thanku|thankyou|thx|ty|shukriya|dhanyawad|dhanyavad|ok|okay|theek hai|thik hai|sahi hai|badhiya|nice|good|great|cool|done|got it|samajh gaya)$/ },
   { kind: "identity", pattern: /^(who are you|what are you|what can you do|what do you do|tum kaun ho|aap kaun ho|kaun ho|tum kya kar sakte ho|kya kar sakte ho|help|madad)$/ },
-  { kind: "wellbeing", pattern: /^(how are you|how are you doing|how r u|how do you do|kaise ho|kaisi ho|kaise hain|kya haal|kya hal|kya chal raha hai|sab theek|sab thik|whats up|what's up|sup)$/ },
+  { kind: "wellbeing", pattern: /^(how are you|how are you doing|how r u|how do you do|kaise ho|kaisi ho|kaise|kaisa|kaisi|kya haal|kya hal|kya haal chaal|kya chal raha|sab theek|sab thik|sab badhiya|whats up|what's up|sup)$/ },
   { kind: "greeting", pattern: /^(hi|hii+|hiya|hello|helo|hey|heyy+|yo|hi there|hello there|hey there|namaste|namaskar|ram ram|salaam|salam|good morning|good afternoon|good evening|gud morning|gm|morning)$/ },
 ]);
 
@@ -149,6 +152,11 @@ const detectSmallTalk = (question = "") => {
     // Vocatives carry no meaning here and would otherwise defeat the whole-question match.
     .replace(/\b(frost|bhai|yaar|yar|ji|sir|boss|dost)\b/g, " ")
     .replace(/\s+/g, " ")
+    .trim()
+    // "kya haal" and "kya haal hai" are the same thing, and he writes both, plus "he" and "h".
+    // Without this the list below has to carry every spelling of the copula, which is how an
+    // allow-list of greetings quietly stops covering the greetings people actually type.
+    .replace(/\s+(hai|hain|he|hein|h|na)$/, "")
     .trim();
   if (!stripped) return "";
   for (const entry of SMALL_TALK_KINDS) {
@@ -159,3 +167,27 @@ const detectSmallTalk = (question = "") => {
 
 module.exports.SMALL_TALK_KINDS = SMALL_TALK_KINDS;
 module.exports.detectSmallTalk = detectSmallTalk;
+
+/**
+ * Does this question say anything about the shop at all?
+ *
+ * The classifier's last branch is the general briefing, so anything it does not recognise comes back
+ * as every due, every low stock line and every old lot. That is the same failure as an error
+ * rendering as zero, in language rather than numbers: a well-formed, plausible answer about
+ * something the owner did not ask, with nothing in it to say the question was missed.
+ *
+ * A list of greetings can never be complete -- "kya haal" was covered and "kya haal hai" was not --
+ * so the briefing is now earned rather than defaulted to. Anything with no business signal in it is
+ * answered with a plain "I did not catch that", which is honest and costs the owner one retype.
+ * Deliberately broad: answering a stretched question is a much smaller failure than refusing a real
+ * one, so every Hinglish word the hints already know counts, plus the words a briefing is asked in.
+ */
+const BRIEFING_SIGNALS = /\b(attention|dhyan|zaroori|jaruri|important|urgent|today|aaj|summary|brief|briefing|overview|business|shop|dukan|dukaan|report|position|pending|overdue|total|problem|dikkat|issue|status|number|figure|book|khata|khaata|accounts?|money|paisa|paise|check|karna|karu|karna hai|chal raha|chal rahi|how is|hows|how.s)\b/;
+
+const hasBusinessSignal = (question = "") => {
+  const normalized = normalizeQuestion(question);
+  return normalized.hints.length > 0 || BRIEFING_SIGNALS.test(normalized.text);
+};
+
+module.exports.BRIEFING_SIGNALS = BRIEFING_SIGNALS;
+module.exports.hasBusinessSignal = hasBusinessSignal;

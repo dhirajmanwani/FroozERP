@@ -1,5 +1,5 @@
 const crypto = require("crypto");
-const { detectSmallTalk, normalizeQuestion } = require("./frostLanguage");
+const { detectSmallTalk, hasBusinessSignal, normalizeQuestion } = require("./frostLanguage");
 
 const FROST_ASSISTANT_NAME = "FROST";
 
@@ -144,7 +144,10 @@ const classifyBusinessIntent = (question = "") => {
   if (/(expiry|expire|close to expiry|near expiry|old lot|lot aging|fruits close)/.test(text)) return "INVENTORY_EXPIRY";
   if (/(supplier.*margin|best margin|margin supplier)/.test(text)) return "SUPPLIER_MARGIN";
   if (/(low stock|stock|inventory|run out|waste|lowest-selling|highest-selling|fruit)/.test(text)) return "INVENTORY";
-  return "BUSINESS_BRIEFING";
+  // The briefing is earned, not defaulted to. Everything the cascade does not recognise used to land
+  // here and come back as every due, every low stock line and every old lot -- a plausible answer to
+  // a question nobody asked, with nothing in it to say so.
+  return hasBusinessSignal(question) ? "BUSINESS_BRIEFING" : "UNCLEAR";
 };
 
 const actionRequiresApproval = (actionType = "") => {

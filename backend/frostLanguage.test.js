@@ -151,3 +151,39 @@ test("a demand question reaches the sales ranking", () => {
     assert.equal(classifyBusinessIntent(question), "PROFIT_RANKING", question);
   }
 });
+
+test("a copula on the end does not hide a greeting", () => {
+  // "kya haal" was covered and "kya haal hai" was not, so the owner's second attempt at the same
+  // greeting came back as the whole ledger. An allow-list of greetings can never be complete, which
+  // is why the unrecognised-question fallback below exists as well as this.
+  for (const question of ["kya haal", "kya haal hai", "kya haal he", "kaise hain", "sab theek hai"]) {
+    assert.equal(classifyBusinessIntent(question), "SMALL_TALK", question);
+  }
+});
+
+test("a question that says nothing about the shop is not answered with the shop's figures", () => {
+  for (const question of ["who won the match", "tell me a joke", "asdfgh", ""]) {
+    assert.equal(classifyBusinessIntent(question), "UNCLEAR", question);
+  }
+});
+
+test("a question that does say something about the shop still earns the briefing", () => {
+  // The risk of the check above is refusing a real question, which is worse than stretching to
+  // answer a vague one, so the signal list is deliberately broad.
+  for (const question of [
+    "What needs my attention today?",
+    "aaj kya dhyan dena hai",
+    "business kaisa chal raha hai",
+    "how is the shop",
+    "kya problem hai",
+  ]) {
+    assert.notEqual(classifyBusinessIntent(question), "UNCLEAR", question);
+  }
+});
+
+test("dhyan dena hai is not a payment question", () => {
+  // "dena hai" means "have to give"; "dhyan dena hai" means "have to pay attention". The owner's own
+  // way of asking for the briefing was answered with the payments ledger.
+  assert.equal(classifyBusinessIntent("aaj kya dhyan dena hai"), "BUSINESS_BRIEFING");
+  assert.equal(classifyBusinessIntent("supplier ka kitna dena hai"), "PAYMENTS");
+});
