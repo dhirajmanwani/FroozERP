@@ -120,3 +120,42 @@ module.exports = {
   normalizeQuestion,
   detectSpokenRange,
 };
+
+/**
+ * Chitchat, and which kind it is.
+ *
+ * "hi there" and "how are you" used to return the full business briefing -- every due, every low
+ * stock line, every old lot -- because the classifier has no branch for a greeting and the briefing
+ * is what it falls through to. It is the single thing that made FROST read like a machine rather
+ * than someone at the counter, and no amount of better wording on the figures fixes it, because the
+ * figures should not have been fetched at all.
+ *
+ * Matched against the WHOLE question, never a substring: "hi, aaj kitni sale hui" is a question
+ * about sales that happens to open with a greeting, and answering it with "Hello" would be a worse
+ * failure than the one being fixed. Vocatives and punctuation are stripped first, because "hello
+ * frost!" and "thanks bhai" are the same two things.
+ */
+const SMALL_TALK_KINDS = Object.freeze([
+  { kind: "thanks", pattern: /^(thanks?|thank you|thanku|thankyou|thx|ty|shukriya|dhanyawad|dhanyavad|ok|okay|theek hai|thik hai|sahi hai|badhiya|nice|good|great|cool|done|got it|samajh gaya)$/ },
+  { kind: "identity", pattern: /^(who are you|what are you|what can you do|what do you do|tum kaun ho|aap kaun ho|kaun ho|tum kya kar sakte ho|kya kar sakte ho|help|madad)$/ },
+  { kind: "wellbeing", pattern: /^(how are you|how are you doing|how r u|how do you do|kaise ho|kaisi ho|kaise hain|kya haal|kya hal|kya chal raha hai|sab theek|sab thik|whats up|what's up|sup)$/ },
+  { kind: "greeting", pattern: /^(hi|hii+|hiya|hello|helo|hey|heyy+|yo|hi there|hello there|hey there|namaste|namaskar|ram ram|salaam|salam|good morning|good afternoon|good evening|gud morning|gm|morning)$/ },
+]);
+
+const detectSmallTalk = (question = "") => {
+  const stripped = String(question || "")
+    .toLowerCase()
+    .replace(/[!?.,;:]+/g, " ")
+    // Vocatives carry no meaning here and would otherwise defeat the whole-question match.
+    .replace(/\b(frost|bhai|yaar|yar|ji|sir|boss|dost)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!stripped) return "";
+  for (const entry of SMALL_TALK_KINDS) {
+    if (entry.pattern.test(stripped)) return entry.kind;
+  }
+  return "";
+};
+
+module.exports.SMALL_TALK_KINDS = SMALL_TALK_KINDS;
+module.exports.detectSmallTalk = detectSmallTalk;

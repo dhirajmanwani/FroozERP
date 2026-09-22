@@ -13,6 +13,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
+  ANSWER_FORMAT_VERSION,
   buildDeterministicAnswer,
   dedupeByType,
   formatIndianNumber,
@@ -129,4 +130,61 @@ test("every figure in the answer is one of the verified figures", () => {
     true,
     answer,
   );
+});
+
+test("a greeting is answered as a greeting, with no figures at all", () => {
+  for (const kind of ["greeting", "wellbeing", "thanks", "identity"]) {
+    const answer = buildDeterministicAnswer("SMALL_TALK", [], { label: "Today" }, kind);
+    assert.ok(answer.length > 0, kind);
+    assert.doesNotMatch(answer, /\d/, `${kind} must carry no figure: ${answer}`);
+    assert.doesNotMatch(answer, /^Today: /, `${kind} must carry no period: ${answer}`);
+  }
+});
+
+test("an unrecognised small-talk kind still gets a sentence rather than nothing", () => {
+  assert.ok(buildDeterministicAnswer("SMALL_TALK", [], {}, "").length > 0);
+});
+
+test("a rate review names what to change, not how many rows there were", () => {
+  // "Sale Rate Update: 5 matching records" threw away `action_text`, which is the only part of the
+  // row the owner can act on.
+  const facts = [{
+    type: "sale_rate_review", sourceModule: "Sale Rate Update", periodLabel: "Current pricing review",
+    rows: [
+      { product_name: "ALPHONSO", action_text: "Reduce ALPHONSO 12/kg" },
+      { product_name: "TOTA", action_text: "Increase TOTA 5/kg" },
+      { product_name: "PN", action_text: "Reduce PN 3/kg" },
+      { product_name: "X", action_text: "Keep X" },
+    ],
+    summary: { count: 4 },
+  }];
+  const answer = buildDeterministicAnswer("SALE_RATE_REVIEW", facts, { label: "Today" });
+  assert.match(answer, /Reduce ALPHONSO 12\/kg/);
+  assert.match(answer, /1 more\./, "the rows not named must still be counted");
+  assert.doesNotMatch(answer, /matching records/);
+});
+
+test("a demand question names the products, not just the top one", () => {
+  const facts = [{
+    type: "product_sales_ranking", sourceModule: "Sales History", periodLabel: "Today", rows: [],
+    summary: {
+      highestSelling: [
+        { product_name: "ALPHONSO", quantity_sold: 120, unit: "kg", sale_amount: 24000 },
+        { product_name: "TOTA", quantity_sold: 80, unit: "kg", sale_amount: 9600 },
+        { product_name: "PN", quantity_sold: 12.5, unit: "kg", sale_amount: 1500 },
+        { product_name: "Imli", quantity_sold: 4, unit: "kg", sale_amount: 400 },
+      ],
+    },
+  }];
+  const answer = buildDeterministicAnswer("PROFIT_RANKING", facts, { label: "Today" });
+  assert.match(answer, /ALPHONSO \(120 kg, ₹24,000\)/);
+  assert.match(answer, /TOTA/);
+  assert.match(answer, /PN \(12.5 kg/);
+  assert.doesNotMatch(answer, /Imli/, "three is enough; the fourth is noise");
+});
+
+test("the answer format carries a version, so a cached answer cannot outlive its wording", () => {
+  // The whole previous rebuild was invisible to the owner for exactly this reason: answers are
+  // cached for thirty minutes under a key that did not include the code that wrote them.
+  assert.ok(Number.isInteger(ANSWER_FORMAT_VERSION) && ANSWER_FORMAT_VERSION > 0);
 });

@@ -204,3 +204,20 @@ test("a missing daily plan produces no lines rather than throwing", () => {
   assert.deepEqual(buildFrostBrief(), []);
   assert.deepEqual(buildFrostBrief({ dailyPlan: null, recommendations: null }), []);
 });
+
+test("a greeting carries no source footer, and every other answer still does", () => {
+  // The footer says where a figure came from, and says so loudly when it came from nowhere. A
+  // greeting reads no books, so "No source modules reported" under "Hello." is a warning about
+  // nothing -- but the warning has to stay for a business answer that really arrived factless.
+  const [, chitchat] = buildFrostConversation({
+    history: [{ id: "c1", question: "hi there", answer: "Hello.", classification: "SMALL_TALK", facts: [] }],
+  });
+  assert.equal(chitchat.chitchat, true);
+  assert.deepEqual(chitchat.sources, []);
+
+  const [, business] = buildFrostConversation({
+    history: [{ id: "c2", question: "what needs my attention today?", answer: "Today: no sales yet.", classification: "BUSINESS_BRIEFING", facts: [] }],
+  });
+  assert.equal(business.chitchat, false);
+  assert.deepEqual(business.sources, []);
+});

@@ -13,7 +13,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { normalizeQuestion, detectSpokenRange } = require("./frostLanguage");
+const { detectSmallTalk, normalizeQuestion, detectSpokenRange } = require("./frostLanguage");
 const { classifyBusinessIntent } = require("./frostCore");
 
 const HINGLISH_QUESTIONS = [
@@ -114,5 +114,40 @@ test("no hint pattern is written with a trailing boundary it cannot match", () =
         `${entry.pattern} cannot match its own alternative "${alternative[1]}"`,
       );
     }
+  }
+});
+
+test("a greeting is a greeting, not a request for the whole briefing", () => {
+  // "hi there" and "how are you" each returned every due, every low stock line and every old lot,
+  // because the classifier has no branch for chitchat and the briefing is what it falls through to.
+  for (const question of ["hi", "hi there", "hello", "hey", "namaste", "good morning", "hello frost!"]) {
+    assert.equal(classifyBusinessIntent(question), "SMALL_TALK", question);
+    assert.equal(detectSmallTalk(question), "greeting", question);
+  }
+  assert.equal(detectSmallTalk("how are you"), "wellbeing");
+  assert.equal(detectSmallTalk("kaise ho"), "wellbeing");
+  assert.equal(detectSmallTalk("thanks bhai"), "thanks");
+  assert.equal(detectSmallTalk("who are you"), "identity");
+});
+
+test("a business question that opens with a greeting is still a business question", () => {
+  // The whole-question match is the entire safety of this feature. A substring match would answer
+  // "hi, aaj kitni sale hui" with "Hello", which is worse than the wall of figures it replaced.
+  assert.equal(detectSmallTalk("hi, aaj kitni sale hui"), "");
+  assert.equal(classifyBusinessIntent("hi, aaj kitni sale hui"), "SALES_FINANCE");
+  assert.equal(detectSmallTalk("hello, what needs my attention today?"), "");
+  assert.equal(detectSmallTalk("good morning, kitna udhaar baaki hai"), "");
+});
+
+test("a demand question reaches the sales ranking", () => {
+  // "what product is more demanding" reached none of the twelve branches and came back as a general
+  // briefing -- a plausible answer about something else, with nothing to say so.
+  for (const question of [
+    "what product is more demanding",
+    "which item is in most demand",
+    "best selling product",
+    "kaun sa maal sabse zyada bikta hai",
+  ]) {
+    assert.equal(classifyBusinessIntent(question), "PROFIT_RANKING", question);
   }
 });

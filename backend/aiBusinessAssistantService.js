@@ -7,8 +7,8 @@ const {
   assertGroundedAnswer,
 } = require("./aiBusinessAssistantRules");
 const { describeOllamaFallback, phraseWithOllama } = require("./frostOllama");
-const { buildDeterministicAnswer } = require("./frostAnswer");
-const { detectSpokenRange } = require("./frostLanguage");
+const { ANSWER_FORMAT_VERSION, buildDeterministicAnswer } = require("./frostAnswer");
+const { detectSmallTalk, detectSpokenRange } = require("./frostLanguage");
 const {
   DEFAULT_FROST_SETTINGS,
   FROST_ASSISTANT_NAME,
@@ -1713,6 +1713,9 @@ const factsForQuestion = async (pool, branchId, classification, settings, range)
 };
 
 const factsForBusinessIntent = async (pool, branchId, intent, settings, range) => {
+  // A greeting reads no books at all. Fetching six queries to answer "hi there" is both the wrong
+  // answer and six needless round trips to the cloud.
+  if (intent === "SMALL_TALK") return [];
   if (intent === "CASH_DRAWER") return [await getCashDrawerSummary(pool, branchId, range), await getCollectionSummary(pool, branchId, range)];
   if (intent === "PURCHASE_PLANNING") return [await getPurchaseRecommendationFact(pool, branchId), await getLowStockProducts(pool, branchId), await getSupplierOutstanding(pool, branchId)];
   if (intent === "SALE_RATE_REVIEW") return [await getSaleRateReviewFact(pool, branchId), await getProfitAdvisorRows(pool, branchId).then((rows) => buildFact("profit_advisor", "Profit Advisor", "Last 30 days", rows, { count: rows.length }))];
@@ -2211,10 +2214,15 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     if (!(await enforceIntentPermission({ classification, user, getPermissionUser, res }))) return;
     const facts = await factsForBusinessIntent(pool, req.auth.branchId, classification, settings, range);
     const providerKey = settings.provider?.key || "deterministic";
-    const cacheKey = frost.buildCacheKey({ engine: "conversation", question, facts, range, providerKey });
+    const smallTalkKind = detectSmallTalk(question);
+    // `answerFormat` is in the key so that changing how an answer is worded retires the entries
+    // written by the old wording. Without it a thirty-minute cache serves the previous shape of
+    // sentence back to the owner and the change reads as never deployed -- which is exactly what
+    // happened on 22 Sep 2026.
+    const cacheKey = frost.buildCacheKey({ engine: "conversation", question, facts, range, providerKey, answerFormat: ANSWER_FORMAT_VERSION });
     const cached = settings.frost.cacheEnabled !== false ? await frost.getCache(cacheKey) : null;
     const cachedPayload = cached?.response_payload || null;
-    const deterministicAnswer = buildDeterministicAnswer(classification, facts, range);
+    const deterministicAnswer = buildDeterministicAnswer(classification, facts, range, smallTalkKind);
 
     // The database has already answered. Everything from here is about *wording* -- and wording is
     // the only thing a model is allowed to contribute, which is why a failure at any step below
@@ -2230,7 +2238,10 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       // freshly-read facts would fail on nothing worse than a changed figure.
       answer = cachedPayload.answer;
       phrasedBy = cachedPayload.phrased_by || null;
-    } else if (settings.frost.enabled === true && providerKey === "ollama") {
+    } else if (settings.frost.enabled === true && providerKey === "ollama" && classification !== "SMALL_TALK") {
+      // Small talk is not phrased by the model. There are no facts to ground it against, so the
+      // grounding check could never fail, and a 3B model asked to be friendly about a fruit shop is
+      // exactly where an invented figure would come from.
       const phrased = await phraseWithOllama({
         baseUrl: settings.frost.baseUrl || settings.frost.base_url,
         model: settings.frost.model,
@@ -2292,7 +2303,9 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       assistant: FROST_ASSISTANT_NAME,
       conversation_id: conversationId,
       classification,
-      period: range,
+      // Null for a greeting. A period label under "Hello." is a filter the owner cannot act on, and
+      // the panel prints it beside the source list it does not have either.
+      period: classification === "SMALL_TALK" ? null : range,
       answer,
       // Null when FROST worded the figures itself. The panel shows the notice beside it, so a
       // plainly-worded answer never reads as a broken one.
@@ -2326,7 +2339,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     // dead weight: with nothing to phrase the answer it could never fail, and a guard that cannot
     // fail is the thing that was wrong with `assertGroundedAnswer` in the first place. If this
     // route is ever used, it needs the phrasing and the check together, not the check alone.
-    const answer = buildDeterministicAnswer(classification, facts, range);
+    const answer = buildDeterministicAnswer(classification, facts, range, detectSmallTalk(question));
     // Everything that can refuse has now refused. Only past this line does the response become an
     // event stream, because after these headers a status code can no longer be set.
     res.setHeader("Content-Type", "text/event-stream");

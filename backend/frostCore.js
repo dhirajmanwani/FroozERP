@@ -1,5 +1,5 @@
 const crypto = require("crypto");
-const { normalizeQuestion } = require("./frostLanguage");
+const { detectSmallTalk, normalizeQuestion } = require("./frostLanguage");
 
 const FROST_ASSISTANT_NAME = "FROST";
 
@@ -118,12 +118,21 @@ const maskProviderConfig = (config = {}) => {
 // cannot be reached without it -- there are four callers and the suggested-question test asserts
 // against this function, not against the routes.
 const classifyBusinessIntent = (question = "") => {
+  // Checked before anything else, and against the whole question rather than a substring. A
+  // greeting is not a business question, and answering "hi there" with every due and every old lot
+  // is what made FROST read like a report generator with a chat box bolted on.
+  if (detectSmallTalk(question)) return "SMALL_TALK";
   const text = normalizeQuestion(question).text;
   if (/(cash|bank|drawer|till|counter cash|payable|receivable|position)/.test(text)) return "CASH_DRAWER";
   if (/(purchase tomorrow|what should i purchase|buy tomorrow|reorder|purchase quantity|purchase quantities)/.test(text)) return "PURCHASE_PLANNING";
   if (/(sale rate|selling rate|rate revision|revise.*rate|price revision|pricing)/.test(text)) return "SALE_RATE_REVIEW";
   if (/(loss|lose money|lost money|waste|expense|low margin|margin problem)/.test(text)) return "LOSS_REVIEW";
   if (/(profit.*month|most profit|top profit|generated.*profit)/.test(text)) return "PROFIT_RANKING";
+  // "what product is more demanding" reached none of the twelve branches and came back as a general
+  // briefing -- an answer about something else, with nothing to say the question had been missed.
+  // The sales ranking is what answers it, and PROFIT_RANKING is where that query lives. The two
+  // hyphenated spellings the suggested questions use are left to INVENTORY on purpose.
+  if (/(in demand|more demand|most demand|high demand|demanding|fast moving|fast-moving|fastest selling|best selling|top selling|most sold|sabse zyada bik)/.test(text)) return "PROFIT_RANKING";
   if (/(today.*sale|sales|revenue|profit|compare|month|last month|gross profit)/.test(text)) return "SALES_FINANCE";
   if (/(supplier.*bill|purchase bill|payment|pending|receivable|outstanding|ledger|customer.*pay|supplier.*pay)/.test(text)) return "PAYMENTS";
   // `inactive customer` as a literal never matched FROST's own suggested question, "Which customers
@@ -266,8 +275,11 @@ class FrostServiceLayer {
     return result.rows[0];
   }
 
-  buildCacheKey({ engine, question, facts, range, providerKey }) {
-    return hashPayload({ engine, question, facts, range, providerKey });
+  // `answerFormat` is part of the key, not decoration: the cached string was written by a
+  // particular version of the wording, and serving it after that wording changes hands the owner an
+  // answer the code can no longer produce.
+  buildCacheKey({ engine, question, facts, range, providerKey, answerFormat = 0 }) {
+    return hashPayload({ engine, question, facts, range, providerKey, answerFormat });
   }
 
   async getCache(cacheKey) {

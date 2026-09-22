@@ -28,6 +28,29 @@
  * answer, and repeating them was most of what made the old wording read like a machine.
  */
 
+/**
+ * Bumped whenever the wording below changes shape.
+ *
+ * Answers are cached for thirty minutes under a key built from the question, the facts and the
+ * provider -- but not from the code that wrote the sentence. So the first rebuild of this file
+ * shipped, and the owner asked the same three questions he had asked before and got the old machine
+ * wording back, verbatim, while a question he had never asked came back in the new wording. The
+ * improvement looked like it had not been deployed. Including this in the cache key makes an old
+ * entry unreachable instead of stale.
+ */
+const ANSWER_FORMAT_VERSION = 2;
+
+/**
+ * What FROST says to a greeting. Short, and carrying no figures at all -- the point is that a
+ * greeting does not fetch the books.
+ */
+const SMALL_TALK_REPLIES = Object.freeze({
+  greeting: "Hello. Ask me anything about the shop \u2014 today's sales, who owes money, what stock is low.",
+  wellbeing: "All good here. The books are open, so ask away \u2014 sales, dues, stock or waste.",
+  thanks: "Anytime.",
+  identity: "I am FROST. I read this shop's own books \u2014 sales, dues, purchases, stock and waste \u2014 and answer only from them, so I never make a figure up. Ask in Hindi or English.",
+});
+
 const round2 = (value) => {
   const number = Number(value);
   if (!Number.isFinite(number)) return 0;
@@ -168,9 +191,44 @@ const SENTENCES = Object.freeze({
     return `Cash in ${money(cashIn)}, cash out ${money(cashOut)}, so the drawer should hold ${money(expectedDrawerCash)}.`;
   },
   product_sales_ranking: (fact) => {
-    const top = (fact.summary?.highestSelling || [])[0];
-    if (!top) return "";
-    return `Top seller: ${nameOf(top)} (${quantity(top.quantity_sold)} ${top.unit || "units"}, ${money(top.sale_amount)}).`;
+    const top = (fact.summary?.highestSelling || []).filter(Boolean).slice(0, 3);
+    if (!top.length) return "";
+    const described = top.map((row) => `${nameOf(row)} (${quantity(row.quantity_sold)} ${row.unit || "units"}, ${money(row.sale_amount)})`);
+    return `Selling most: ${listOf(described)}.`;
+  },
+  sale_rate_review: (fact) => {
+    const rows = (Array.isArray(fact.rows) ? fact.rows : []).filter(Boolean);
+    if (!rows.length) return "";
+    // `action_text` is already a whole instruction -- "Reduce ALPHONSO 12/kg" -- written by the
+    // pricing layer. Reducing it to a count was throwing away the only part the owner can act on.
+    const described = rows.slice(0, 3).map((row) => String(row.action_text || nameOf(row))).filter(Boolean);
+    const rest = rows.length > described.length ? ` ${rows.length - described.length} more.` : "";
+    return `${plural(rows.length, "rate looks", "rates look")} worth changing: ${listOf(described)}.${rest}`;
+  },
+  purchase_recommendations: (fact) => {
+    const rows = (Array.isArray(fact.rows) ? fact.rows : []).filter(Boolean);
+    if (!rows.length) return "";
+    const described = rows.slice(0, 3).map((row) =>
+      `${quantity(row.recommended_quantity)} ${nameOf(row)}${row.suggested_supplier ? ` from ${row.suggested_supplier}` : ""}`);
+    const cost = Number(fact.summary?.estimatedCost || 0);
+    const tail = cost > 0 ? ` About ${money(cost)} in all.` : "";
+    return `Worth buying: ${listOf(described)}.${tail}`;
+  },
+  profit_advisor: (fact) => {
+    const rows = (Array.isArray(fact.rows) ? fact.rows : []).filter(Boolean);
+    const thin = rows
+      .filter((row) => Number.isFinite(Number(row.estimated_gross_margin)))
+      .sort((a, b) => Number(a.estimated_gross_margin) - Number(b.estimated_gross_margin))
+      .slice(0, 3);
+    if (!thin.length) return "";
+    const described = thin.map((row) => `${nameOf(row)} at ${Number(row.estimated_gross_margin).toFixed(1)}%`);
+    return `Thinnest margins: ${listOf(described)}.`;
+  },
+  margin_risks: (fact) => {
+    const rows = (Array.isArray(fact.rows) ? fact.rows : []).filter(Boolean);
+    if (!rows.length) return "";
+    const described = rows.slice(0, 3).map((row) => nameOf(row)).filter(Boolean);
+    return `${plural(rows.length, "product is", "products are")} on thin margin or wasting: ${listOf(described)}.`;
   },
 });
 
@@ -281,7 +339,11 @@ const NOTHING_FOUND = Object.freeze({
  * The answer, as sentences. The period always leads, because Report Center has already taught this
  * codebase what an invisible date filter costs.
  */
-const buildDeterministicAnswer = (classification, facts, range = {}) => {
+const buildDeterministicAnswer = (classification, facts, range = {}, smallTalkKind = "") => {
+  // No period, no figures, no source list. A greeting is answered as a greeting.
+  if (classification === "SMALL_TALK") {
+    return SMALL_TALK_REPLIES[smallTalkKind] || SMALL_TALK_REPLIES.greeting;
+  }
   const period = String(range.label || "Today");
   const ordered = orderForIntent(dedupeByType(facts), classification);
   const sentences = ordered.map(sentenceFor).filter(Boolean);
@@ -295,7 +357,9 @@ const buildDeterministicAnswer = (classification, facts, range = {}) => {
 };
 
 module.exports = {
+  ANSWER_FORMAT_VERSION,
   FACT_LABELS,
+  SMALL_TALK_REPLIES,
   LEAD_ORDER,
   buildDeterministicAnswer,
   dedupeByType,

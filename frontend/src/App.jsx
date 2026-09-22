@@ -4945,6 +4945,7 @@ function App() {
             askedAt,
             answeredAt: authoritativeUtcNowIso(),
             answer: response.data.answer,
+            classification: response.data.classification,
             facts: response.data.facts || [],
             period: response.data.period,
             provider: response.data.provider,
@@ -9580,8 +9581,10 @@ function AiBusinessAssistantModule({
                     {/* The line that lets a figure be checked against the ordinary report. It is
                         derived from the facts the server sent, so an answer with no facts says so
                         rather than carrying a reassuring default. */}
-                    <small>{turn.sources.length ? `From ${turn.sources.join(", ")}` : "No source modules reported"}
-                      {turn.periodLabel ? ` - ${turn.periodLabel}` : ""}</small>
+                    {!turn.chitchat && (
+                      <small>{turn.sources.length ? `From ${turn.sources.join(", ")}` : "No source modules reported"}
+                        {turn.periodLabel ? ` - ${turn.periodLabel}` : ""}</small>
+                    )}
                   </>
                 )}
               </article>

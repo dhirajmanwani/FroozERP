@@ -4,6 +4,7 @@ const {
   DEFAULT_FROST_SETTINGS,
   FROST_ASSISTANT_NAME,
   FrostProviderRegistry,
+  FrostServiceLayer,
   actionRequiresApproval,
   classifyBusinessIntent,
   estimateCost,
@@ -53,4 +54,21 @@ test("provider config masks secrets for UI and audit", () => {
     model: "x",
     endpoint: "https://example.test",
   });
+});
+
+test("the cache key changes when the answer wording changes", () => {
+  // Answers are cached for thirty minutes. The key was built from the question, the facts, the range
+  // and the provider -- but not from the code that wrote the sentence, so the rebuilt wording was
+  // invisible: the owner asked the same three questions he had asked before and got the old machine
+  // wording back verbatim, while a question he had never asked came back in the new wording.
+  const frost = new FrostServiceLayer({ pool: null });
+  const base = { engine: "conversation", question: "what needs my attention today?", facts: [{ type: "x" }], range: { label: "Today" }, providerKey: "deterministic" };
+  assert.notEqual(
+    frost.buildCacheKey({ ...base, answerFormat: 1 }),
+    frost.buildCacheKey({ ...base, answerFormat: 2 }),
+  );
+  assert.equal(
+    frost.buildCacheKey({ ...base, answerFormat: 2 }),
+    frost.buildCacheKey({ ...base, answerFormat: 2 }),
+  );
 });

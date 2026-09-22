@@ -96,6 +96,10 @@ const exchangeTurns = (entry) => {
       text: answer,
       notice: text(entry?.notice),
       sources: answerSources(entry),
+      // A greeting is the one answer that legitimately reads no books. Without this the panel prints
+      // "No source modules reported" under "Hello.", which is a warning about nothing -- and that
+      // default has to stay for every other answer, where no facts really is an anomaly.
+      chitchat: text(entry?.classification) === "SMALL_TALK",
       periodLabel: text(entry?.period?.label),
       phrasedBy: text(entry?.phrasedBy),
       at: text(entry?.answeredAt),
