@@ -8,7 +8,7 @@ const {
 } = require("./aiBusinessAssistantRules");
 const { describeOllamaFallback, phraseWithOllama } = require("./frostOllama");
 const { ANSWER_FORMAT_VERSION, buildDeterministicAnswer } = require("./frostAnswer");
-const { detectSmallTalk, detectSpokenRange } = require("./frostLanguage");
+const { detectSmallTalk, detectSpokenRange, reminderTitleFrom } = require("./frostLanguage");
 const {
   DEFAULT_FROST_SETTINGS,
   FROST_ASSISTANT_NAME,
@@ -1767,12 +1767,12 @@ const factsForQuestion = async (pool, branchId, classification, settings, range)
 // The two answers that read no books: a greeting, and a question FROST did not recognise. Neither
 // has a period, a source list or a figure, and neither is handed to the local model -- with no facts
 // the grounding check cannot fail, which is exactly where an invented figure would come from.
-const FACTLESS_INTENTS = ["SMALL_TALK", "UNCLEAR"];
+const FACTLESS_INTENTS = ["SMALL_TALK", "UNCLEAR", "REMINDER_CREATE"];
 
 const factsForBusinessIntent = async (pool, branchId, intent, settings, range) => {
   // A greeting reads no books at all. Fetching six queries to answer "hi there" is both the wrong
   // answer and six needless round trips to the cloud.
-  if (intent === "SMALL_TALK" || intent === "UNCLEAR") return [];
+  if (FACTLESS_INTENTS.includes(intent)) return [];
   if (intent === "CASH_DRAWER") return [await getCashDrawerSummary(pool, branchId, range), await getCollectionSummary(pool, branchId, range)];
   if (intent === "PURCHASE_PLANNING") return [await getPurchaseRecommendationFact(pool, branchId), await getLowStockProducts(pool, branchId), await getSupplierOutstanding(pool, branchId)];
   if (intent === "SALE_RATE_REVIEW") return [await getSaleRateReviewFact(pool, branchId), await getProfitAdvisorRows(pool, branchId).then((rows) => buildFact("profit_advisor", "Profit Advisor", "Last 30 days", rows, { count: rows.length }))];
@@ -2282,7 +2282,8 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     const cacheKey = frost.buildCacheKey({ engine: "conversation", question, facts, range, providerKey, answerFormat: ANSWER_FORMAT_VERSION });
     const cached = settings.frost.cacheEnabled !== false ? await frost.getCache(cacheKey) : null;
     const cachedPayload = cached?.response_payload || null;
-    const deterministicAnswer = buildDeterministicAnswer(classification, facts, range, smallTalkKind);
+    const reminderTitle = classification === "REMINDER_CREATE" ? reminderTitleFrom(question) : "";
+    const deterministicAnswer = buildDeterministicAnswer(classification, facts, range, smallTalkKind, reminderTitle);
 
     // The database has already answered. Everything from here is about *wording* -- and wording is
     // the only thing a model is allowed to contribute, which is why a failure at any step below
@@ -2363,6 +2364,10 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     return res.json({
       assistant: FROST_ASSISTANT_NAME,
       conversation_id: conversationId,
+      // What the panel should write to the reminders route, when the owner asked to be reminded.
+      // This route does not write it: `/api/ai/query` is READ_ONLY and its own tests hold it to
+      // that, and `POST /api/ai/reminders` already carries the permission check and the dedup key.
+      reminder_draft: classification === "REMINDER_CREATE" && reminderTitle ? { title: reminderTitle } : null,
       // Echoed back as it was *stored*, not as it was sent. An id the column could not hold was
       // filed under no chat at all, and a panel told otherwise would keep sending follow-ups into
       // a thread that is not accumulating.
@@ -2405,7 +2410,13 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     // dead weight: with nothing to phrase the answer it could never fail, and a guard that cannot
     // fail is the thing that was wrong with `assertGroundedAnswer` in the first place. If this
     // route is ever used, it needs the phrasing and the check together, not the check alone.
-    const answer = buildDeterministicAnswer(classification, facts, range, detectSmallTalk(question));
+    const answer = buildDeterministicAnswer(
+      classification,
+      facts,
+      range,
+      detectSmallTalk(question),
+      classification === "REMINDER_CREATE" ? reminderTitleFrom(question) : "",
+    );
     // Everything that can refuse has now refused. Only past this line does the response become an
     // event stream, because after these headers a status code can no longer be set.
     res.setHeader("Content-Type", "text/event-stream");

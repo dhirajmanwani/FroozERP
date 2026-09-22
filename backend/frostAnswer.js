@@ -38,7 +38,7 @@
  * improvement looked like it had not been deployed. Including this in the cache key makes an old
  * entry unreachable instead of stale.
  */
-const ANSWER_FORMAT_VERSION = 3;
+const ANSWER_FORMAT_VERSION = 4;
 
 /**
  * What FROST says to a question it did not recognise.
@@ -348,12 +348,22 @@ const NOTHING_FOUND = Object.freeze({
  * The answer, as sentences. The period always leads, because Report Center has already taught this
  * codebase what an invisible date filter costs.
  */
-const buildDeterministicAnswer = (classification, facts, range = {}, smallTalkKind = "") => {
+const buildDeterministicAnswer = (classification, facts, range = {}, smallTalkKind = "", reminderTitle = "") => {
   // No period, no figures, no source list. A greeting is answered as a greeting.
   if (classification === "SMALL_TALK") {
     return SMALL_TALK_REPLIES[smallTalkKind] || SMALL_TALK_REPLIES.greeting;
   }
   if (classification === "UNCLEAR") return UNCLEAR_REPLY;
+  if (classification === "REMINDER_CREATE") {
+    // Deliberately a statement of what FROST can do, not a claim that it is done. This route reads;
+    // the reminder is written by the panel through the permission-gated reminders route, and it may
+    // be refused. Saying "saved" here would be a lie on every refusal, and the owner would find out
+    // weeks later by not being reminded.
+    const title = String(reminderTitle || "").trim();
+    return title
+      ? `I can remember this for you: "${title}".`
+      : "Tell me what to remind you about, and I will keep it.";
+  }
   const period = String(range.label || "Today");
   const ordered = orderForIntent(dedupeByType(facts), classification);
   const sentences = ordered.map(sentenceFor).filter(Boolean);

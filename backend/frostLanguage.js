@@ -19,6 +19,11 @@
  * without reading the cascade in frostCore.js will silently re-route questions.
  */
 
+// A trailing `s` is spelled out on every English noun below. `\bsupplier\b` does not match
+// "suppliers" -- the boundary after the r wants a non-word character and an s follows -- so "pay my
+// suppliers" and "which products are low" reached no branch at all and came back as "I did not
+// catch that". It is the same trailing-boundary trap that `pichl` fell into, in a different dress.
+//
 // Ordered on purpose: the first entry whose pattern matches contributes its hints, and every
 // entry is tested, so a question can collect several. Longer and more specific spellings come
 // before the short ones they contain.
@@ -41,37 +46,37 @@ const HINGLISH_HINTS = Object.freeze([
   { pattern: /\b(nafa|nafaa|munafa|munaafa|faida|fayda|faayda|labh|profit)\b/, hints: "profit" },
   { pattern: /\b(sabse\s*(zyada|jyada|adhik)\s*(nafa|nafaa|munafa|munaafa|faida|fayda|profit))\b/, hints: "most profit" },
   { pattern: /\b(nuksan|nuqsan|nukshan|ghata|ghaata|loss)\b/, hints: "loss" },
-  { pattern: /\b(kharch|kharcha|kharche|laagat|lagat|expense)\b/, hints: "expense" },
+  { pattern: /\b(kharch|kharcha|kharche|laagat|lagat|expenses?)\b/, hints: "expense" },
 
   // Waste and spoilage -- a fruit shop's daily reality.
   { pattern: /\b(kharab|kharaab|sad|sada|sadi|sadd|sadne|barbad|barbaad|fek|feka|fenka|phenk)\b/, hints: "waste" },
 
   // Stock on hand.
-  { pattern: /\b(maal|samaan|saman|stock|inventory)\b/, hints: "stock inventory" },
+  { pattern: /\b(maal|samaan|saman|stock|inventory|products?|items?)\b/, hints: "stock inventory" },
   { pattern: /\b(khatam|khatm|khatham|kam\s*pad|kam\s*hai|kam\s*ho|nahi\s*bacha|na\s*bacha)\b/, hints: "low stock" },
-  { pattern: /\b(fal|phal|phall)\b/, hints: "fruit" },
+  { pattern: /\b(fal|phal|phall|fruits?)\b/, hints: "fruit" },
 
   // Old lots. He says "purana maal", never "nearing expiry".
   { pattern: /\b(purana|puraana|purane|puraane|purani|sadne\s*wala|expiry|expire)\b/, hints: "old lot near expiry" },
 
   // Rates and pricing.
-  { pattern: /\b(bhav|bhaav|bhaw|daam|dam|keemat|kimat|rate)\b/, hints: "sale rate pricing" },
+  { pattern: /\b(bhav|bhaav|bhaw|daam|dam|keemat|kimat|rates?)\b/, hints: "sale rate pricing" },
 
   // Buying for tomorrow.
   { pattern: /\b(kharid|khareed|kharidna|mangwa|mangwana|mangana|mangau|mangwau|order\s*karna|order\s*karu|lana\s*hai)\b/, hints: "what should i purchase reorder" },
 
   // Customers who have gone quiet.
-  { pattern: /\b(grahak|gaahak|gahak|party|customer)\b/, hints: "customer" },
+  { pattern: /\b(grahak|gaahak|gahak|party|parties|customers?)\b/, hints: "customer" },
   { pattern: /\b(grahak|gaahak|gahak|party|customer)[^.?!]{0,30}(nahi\s*aaya|nahi\s*aya|nahi\s*aa\s*rah|band\s*ho|gayab)/, hints: "inactive customer" },
 
   // Suppliers.
-  { pattern: /\b(supplier|vyapari|vyaapari|arhat|arhatiya|mandi|dukandar)\b/, hints: "supplier" },
+  { pattern: /\b(suppliers?|vyapari|vyaapari|arhat|arhatiya|mandi|dukandar)\b/, hints: "supplier" },
 
   // English shorthand the cascade never covered either. "How much did I sell today?" is a plain
   // English question that fell through to the generic briefing because the classifier only knows
   // the noun "sales", not the verb.
   { pattern: /\b(sell|selling|sold)\b/, hints: "sales" },
-  { pattern: /\b(owe|owes|owed|owing|dues)\b/, hints: "outstanding ledger payment" },
+  { pattern: /\b(owe|owes|owed|owing|dues?|pay|pays|paid|paying|payments?)\b/, hints: "outstanding ledger payment" },
   { pattern: /\b(running\s*(low|out)|out\s*of\s*stock|short\s*of)\b/, hints: "low stock" },
 ]);
 
@@ -225,3 +230,41 @@ const hasBusinessSignal = (question = "") => {
 module.exports.BRIEFING_SIGNALS = BRIEFING_SIGNALS;
 module.exports.SPOKEN_RANGE_KEYS = SPOKEN_RANGE_KEYS;
 module.exports.hasBusinessSignal = hasBusinessSignal;
+
+/**
+ * "remind me to pay my suppliers" is an instruction, not a question.
+ *
+ * FROST has had a reminders table, a reminders route and a Reminders section the whole time, and no
+ * way to reach any of it by saying so. The owner asked in the most natural words there are and was
+ * told his question was not understood -- which was true of the classifier and false of the product.
+ *
+ * Matched on the asking phrase rather than the subject, because the subject is a business topic and
+ * would otherwise route the sentence to the ledger it mentions: "remind me to pay my suppliers"
+ * classifies as PAYMENTS on every word except the first two.
+ */
+const REMINDER_PHRASES = /\b(remind me|reminder|remind|yaad dila|yaad dilana|yaad rakh|yaad rakhna|note kar|note karlo|likh lo|likh lena)\b/;
+
+const isReminderRequest = (question = "") => REMINDER_PHRASES.test(String(question || "").toLowerCase());
+
+/**
+ * What the reminder should say, from the sentence that asked for it.
+ *
+ * The asking phrase is stripped and the rest is kept verbatim -- his words, not a paraphrase. A
+ * reminder that reads "Follow up required" is a reminder about nothing; the owner has to be able to
+ * tell from the list what he meant, weeks later.
+ */
+const reminderTitleFrom = (question = "") => {
+  const text = String(question || "")
+    .replace(/[!?.]+\s*$/, "")
+    .trim();
+  const stripped = text
+    .replace(/^\s*(please|plz|zara|bhai)\s+/i, "")
+    .replace(/^\s*(remind me to|remind me|reminder for|reminder to|set a reminder to|set a reminder for|remind|mujhe yaad dilana|yaad dilana|yaad dila do|yaad rakhna|note kar lo|note karlo|likh lo|likh lena)\s*/i, "")
+    .replace(/^\s*(that|ki|ke liye|to)\s+/i, "")
+    .trim();
+  return stripped || text;
+};
+
+module.exports.REMINDER_PHRASES = REMINDER_PHRASES;
+module.exports.isReminderRequest = isReminderRequest;
+module.exports.reminderTitleFrom = reminderTitleFrom;

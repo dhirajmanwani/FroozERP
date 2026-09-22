@@ -1,5 +1,5 @@
 const crypto = require("crypto");
-const { detectSmallTalk, hasBusinessSignal, normalizeQuestion } = require("./frostLanguage");
+const { detectSmallTalk, hasBusinessSignal, isReminderRequest, normalizeQuestion } = require("./frostLanguage");
 
 const FROST_ASSISTANT_NAME = "FROST";
 
@@ -122,6 +122,10 @@ const classifyBusinessIntent = (question = "") => {
   // greeting is not a business question, and answering "hi there" with every due and every old lot
   // is what made FROST read like a report generator with a chat box bolted on.
   if (detectSmallTalk(question)) return "SMALL_TALK";
+  // Checked before the cascade, because the cascade reads the subject and a reminder's subject is a
+  // business topic: "remind me to pay my suppliers" is a PAYMENTS question on every word except the
+  // first two, and answering it with the supplier ledger is not what was asked for.
+  if (isReminderRequest(question)) return "REMINDER_CREATE";
   const text = normalizeQuestion(question).text;
   if (/(cash|bank|drawer|till|counter cash|payable|receivable|position)/.test(text)) return "CASH_DRAWER";
   if (/(purchase tomorrow|what should i purchase|buy tomorrow|reorder|purchase quantity|purchase quantities)/.test(text)) return "PURCHASE_PLANNING";

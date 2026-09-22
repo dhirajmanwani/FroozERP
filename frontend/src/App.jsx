@@ -5074,6 +5074,37 @@ function App() {
         ].slice(0, FROST_OPEN_CHAT_LIMIT),
       }));
       setAiQuestion("");
+      // "remind me to pay my suppliers" is an instruction. The query route only reads -- it is
+      // READ_ONLY by contract and its own tests hold it there -- so the write happens here, against
+      // the reminders route that already carries the permission check. The answer is rewritten with
+      // what actually happened, because the one thing worse than refusing to remember something is
+      // saying it was remembered when it was not.
+      const draft = response.data.reminder_draft;
+      if (draft?.title) {
+        const conversationId = response.data.conversation_id || null;
+        const settle = (answer) => setAiAssistantData((current) => ({
+          ...current,
+          history: current.history.map((entry) =>
+            (conversationId && entry.id === conversationId) || (!conversationId && entry.askedAt === askedAt)
+              ? { ...entry, answer }
+              : entry),
+        }));
+        try {
+          await axios.post(`${API_URL}/api/ai/reminders`, {
+            user_id: user?.id,
+            device_id: deviceInfo.device_id,
+            reminder_type: "OWNER_NOTE",
+            priority: "ATTENTION",
+            title: draft.title,
+            message: draft.title,
+          });
+          settle(`Saved. I will remind you: "${draft.title}". It is under Reminders.`);
+          await loadAiAssistant(aiRange).catch(() => null);
+        } catch (reminderError) {
+          writeDiagnosticLog("WARN", "frost-reminder-save-failed", describeRequestFailure(reminderError, { url: `${API_URL}/api/ai/reminders` }));
+          settle(`I could not save that reminder: ${getFrostDiagnosticMessage(reminderError, { offlineMode, internetAvailable, backendHealth, cloudHealth })} You can add it yourself under Reminders.`);
+        }
+      }
     } catch (error) {
       // The question is kept, with why it failed. It used to be dropped entirely: only the error
       // strip changed, so the thread showed a conversation in which the question was never asked.

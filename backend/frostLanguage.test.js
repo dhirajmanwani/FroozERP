@@ -246,3 +246,41 @@ test("naming a period is enough to be a business question", () => {
   assert.notEqual(classifyBusinessIntent("is saal"), "UNCLEAR");
   assert.notEqual(classifyBusinessIntent("pichle mahine"), "UNCLEAR");
 });
+
+test("a plural noun is still the noun", () => {
+  // `\bsupplier\b` does not match "suppliers" -- the boundary wants a non-word character and an s
+  // follows. "pay my suppliers" and "which products are low" therefore reached no branch at all and
+  // came back as "I did not catch that". Same trailing-boundary trap as `pichl`, different dress.
+  assert.equal(classifyBusinessIntent("pay my suppliers"), "PAYMENTS");
+  assert.equal(classifyBusinessIntent("which suppliers do i owe"), "PAYMENTS");
+  assert.equal(classifyBusinessIntent("which products are low"), "INVENTORY");
+  assert.equal(classifyBusinessIntent("rates for apples"), "SALE_RATE_REVIEW");
+  assert.equal(classifyBusinessIntent("my customers dues"), "PAYMENTS");
+});
+
+test("asking to be reminded is an instruction, not a question about the topic", () => {
+  // "remind me to pay my suppliers" is a PAYMENTS question on every word except the first two, so
+  // the reminder phrase has to be read before the cascade reads the subject. FROST has had a
+  // reminders table, route and section the whole time and no way to reach any of it by saying so.
+  for (const question of [
+    "remind me to pay my suppliers",
+    "set a reminder to check old lots",
+    "yaad dilana supplier ko paisa dena hai",
+    "note kar lo ki kal mandi jana hai",
+  ]) {
+    assert.equal(classifyBusinessIntent(question), "REMINDER_CREATE", question);
+  }
+  // A question that merely mentions the topic is still a question.
+  assert.equal(classifyBusinessIntent("which suppliers do i owe"), "PAYMENTS");
+});
+
+test("the reminder keeps the owner's own words", () => {
+  // A reminder that reads "Follow up required" is a reminder about nothing. Weeks later the list has
+  // to say what he meant, so the asking phrase is stripped and the rest is kept verbatim.
+  const { reminderTitleFrom } = require("./frostLanguage");
+  assert.equal(reminderTitleFrom("remind me to pay my suppliers"), "pay my suppliers");
+  assert.equal(reminderTitleFrom("set a reminder to check old lots"), "check old lots");
+  assert.equal(reminderTitleFrom("note kar lo ki kal mandi jana hai"), "kal mandi jana hai");
+  // Nothing left after stripping is not an empty title; it is the sentence as typed.
+  assert.ok(reminderTitleFrom("remind me").length > 0);
+});

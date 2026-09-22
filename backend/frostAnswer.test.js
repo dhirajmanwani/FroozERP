@@ -195,3 +195,15 @@ test("an unrecognised question says so instead of reciting the books", () => {
   assert.doesNotMatch(answer, /\d/);
   assert.doesNotMatch(answer, /^Today: /);
 });
+
+test("a reminder is acknowledged without claiming it was saved", () => {
+  // The query route reads; the panel writes it through the permission-gated reminders route, and
+  // that write can be refused. "Saved" here would be a lie on every refusal, and the owner would
+  // find out weeks later by not being reminded.
+  const answer = buildDeterministicAnswer("REMINDER_CREATE", [], { label: "Today" }, "", "pay my suppliers");
+  assert.match(answer, /pay my suppliers/);
+  assert.doesNotMatch(answer, /saved|Saved/);
+  assert.doesNotMatch(answer, /^Today: /);
+  // And with nothing to remember, it asks rather than saving an empty note.
+  assert.match(buildDeterministicAnswer("REMINDER_CREATE", [], {}, "", ""), /Tell me what to remind you about/);
+});
