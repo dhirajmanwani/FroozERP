@@ -59,7 +59,7 @@ const buildReminderDedupKey = ({ companyId = 1, branchId = 1, reminderType, enti
 // originate in generated text.
 //
 // This used to match only numbers carrying a currency prefix -- /(?:₹|Rs\.?|INR)\s*\d.../ -- while
-// the answers it guards are built by `buildDeterministicAnswer`, which emits bare numbers
+// the answers it guards were built by `buildDeterministicAnswer`, which then emitted bare numbers
 // ("sales 48250, estimated gross profit 9110"). The match array was therefore always empty,
 // `.every()` over an empty array is `true`, and the guard passed everything ever put to it. It read
 // like a safety net and caught nothing, which is worse than having none: the route around it says

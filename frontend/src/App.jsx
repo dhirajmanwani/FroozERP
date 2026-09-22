@@ -176,6 +176,7 @@ import {
   resolveFrostProviderOptions,
 } from "./local/frostAvailability";
 import {
+  buildFrostBrief,
   buildFrostConversation,
   latestSpokenTurn,
 } from "./local/frostConversation";
@@ -9426,12 +9427,7 @@ function AiBusinessAssistantModule({
   });
   // The old Briefing tab was two things under one name. Its lines are what FROST would say if
   // asked how today looks, so they open the conversation; its tiles stay a place of their own.
-  const briefLines = [
-    ...(data.dailyPlan?.top_priorities || []).slice(0, 5).map((item) => `Start with: ${item}`),
-    ...(data.dailyPlan?.topPriorities || []).slice(0, 5).map((item) => `Start with: ${item}`),
-    ...(briefing.recommendations || []),
-    ...(data.dailyPlan?.can_wait || []).slice(0, 3).map((item) => `Can wait: ${item}`),
-  ];
+  const briefLines = buildFrostBrief({ dailyPlan: data.dailyPlan, recommendations: briefing.recommendations });
   const conversation = buildFrostConversation({
     history: data.history || [],
     greeting: frostGreeting.line,

@@ -1,0 +1,118 @@
+"use strict";
+
+/**
+ * The owner writes Hinglish. Before this module every one of the questions below fell through all
+ * twelve branches of `classifyBusinessIntent` and came back as a generic briefing, which is a wall
+ * of every figure in the shop with no sign that the question had been missed.
+ *
+ * The assertions run the real classifier, not a copy of it: a hint word that stops landing in the
+ * branch it was chosen for is exactly the regression this file exists to catch, and it cannot be
+ * seen by testing the hints alone.
+ */
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+
+const { normalizeQuestion, detectSpokenRange } = require("./frostLanguage");
+const { classifyBusinessIntent } = require("./frostCore");
+
+const HINGLISH_QUESTIONS = [
+  ["aaj kitni sale hui", "SALES_FINANCE"],
+  ["kal kitna bika", "SALES_FINANCE"],
+  ["aaj ka dhandha kaisa raha", "SALES_FINANCE"],
+  ["kiska udhaar baaki hai", "PAYMENTS"],
+  ["kitna bakaya hai customers ka", "PAYMENTS"],
+  ["supplier ka kitna dena hai", "PAYMENTS"],
+  ["is mahine sabse zyada nafa kisme hua", "PROFIT_RANKING"],
+  ["kharcha kitna hua is mahine", "LOSS_REVIEW"],
+  ["kitna maal kharab hua", "LOSS_REVIEW"],
+  ["maal kam pad raha hai kya", "INVENTORY"],
+  ["kaun sa phal khatam ho raha hai", "INVENTORY"],
+  ["purana maal kitna pada hai", "INVENTORY_EXPIRY"],
+  ["kal kitna maal mangwana hai", "PURCHASE_PLANNING"],
+  ["golak me kitna cash hai", "CASH_DRAWER"],
+  ["bhav badalna chahiye kya", "SALE_RATE_REVIEW"],
+  ["kaun sa grahak nahi aa raha", "CUSTOMER_ACTIVITY"],
+];
+
+for (const [question, expected] of HINGLISH_QUESTIONS) {
+  test(`"${question}" reaches ${expected}`, () => {
+    assert.equal(classifyBusinessIntent(question), expected);
+  });
+}
+
+// English the classifier never covered either. "sell" is a verb; the cascade only knew the noun.
+const ENGLISH_SHORTHAND = [
+  ["How much did I sell today?", "SALES_FINANCE"],
+  ["who owes me money", "PAYMENTS"],
+  ["which fruits are running low", "INVENTORY"],
+];
+
+for (const [question, expected] of ENGLISH_SHORTHAND) {
+  test(`"${question}" reaches ${expected}`, () => {
+    assert.equal(classifyBusinessIntent(question), expected);
+  });
+}
+
+test("the owner's own words are never replaced, only added to", () => {
+  const normalized = normalizeQuestion("Kiska UDHAAR baaki hai");
+  assert.equal(normalized.original, "Kiska UDHAAR baaki hai");
+  assert.match(normalized.text, /kiska udhaar baaki hai/);
+  assert.ok(normalized.hints.length > 0, "the Hinglish words must earn hints");
+});
+
+test("a question with no Hinglish in it is left exactly as it was, lowercased", () => {
+  assert.equal(normalizeQuestion("What needs my attention today?").text, "what needs my attention today?");
+  assert.deepEqual(normalizeQuestion("What needs my attention today?").hints, []);
+});
+
+test("an English-only briefing question still falls through to the briefing", () => {
+  // The fallback has to stay reachable. If every question now matches something, the generic
+  // briefing becomes dead code and "what needs my attention" stops being answerable.
+  assert.equal(classifyBusinessIntent("What needs my attention today?"), "BUSINESS_BRIEFING");
+  assert.equal(classifyBusinessIntent("kya dhyan dena chahiye"), "BUSINESS_BRIEFING");
+});
+
+test("hints are appended as phrases so a multi-word match survives", () => {
+  // "most profit" is matched as a phrase by PROFIT_RANKING. A de-duplicated word list emitted
+  // "profit most" and the phrase never matched, which sent every ranking question to SALES_FINANCE.
+  assert.match(normalizeQuestion("sabse zyada nafa kisme hua").text, /most profit/);
+});
+
+test("a period named in the question is recognised", () => {
+  assert.equal(detectSpokenRange("aaj kitni sale hui"), "today");
+  assert.equal(detectSpokenRange("kal kitna bika"), "yesterday");
+  assert.equal(detectSpokenRange("is hafte ka hisab"), "last_7_days");
+  assert.equal(detectSpokenRange("is mahine kitna kharcha"), "this_month");
+  assert.equal(detectSpokenRange("How much did I sell today?"), "today");
+});
+
+test("a period the range list cannot serve is refused rather than approximated", () => {
+  // There is no last-month key. Serving this month under a "pichle mahine" question would put a
+  // wrong figure behind a right-sounding sentence, so the question names no period and the one the
+  // owner picked on screen stands.
+  assert.equal(detectSpokenRange("pichle mahine ki sale"), "");
+  assert.equal(detectSpokenRange("last month sales"), "");
+});
+
+test("kal is read as tomorrow, not yesterday, when the question is about buying", () => {
+  // "kal" is both. Reading "kal kitna maal mangwana hai" as yesterday would answer about the wrong
+  // day entirely, so a question carrying a future marker names no period at all.
+  assert.equal(detectSpokenRange("kal kitna maal mangwana hai"), "");
+  assert.equal(detectSpokenRange("kal kya kharidna chahiye"), "");
+  assert.equal(detectSpokenRange("kal kitna bika"), "yesterday");
+});
+
+test("no hint pattern is written with a trailing boundary it cannot match", () => {
+  // `/\b(pichl)\b/` never matches "pichle": the boundary after the l requires a non-word character
+  // and an e follows. Two patterns shipped with this bug and silently matched nothing.
+  const { HINGLISH_HINTS } = require("./frostLanguage");
+  for (const entry of HINGLISH_HINTS) {
+    for (const alternative of String(entry.pattern.source).matchAll(/\|([a-z]+)\)\\b/g)) {
+      assert.ok(
+        entry.pattern.test(alternative[1]),
+        `${entry.pattern} cannot match its own alternative "${alternative[1]}"`,
+      );
+    }
+  }
+});

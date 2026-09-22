@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   answerSources,
+  buildFrostBrief,
   buildFrostConversation,
   latestSpokenTurn,
 } from "./frostConversation.js";
@@ -171,4 +172,35 @@ test("a failure wins over a stale answer on the same entry", () => {
   });
   assert.deepEqual(turns.map((turn) => turn.kind), ["question", "failure"]);
   assert.doesNotMatch(JSON.stringify(turns), /42,300/);
+});
+
+test("the daily plan's two spellings never print the same line twice", () => {
+  // The owner saw "Start with: Collect from kalu a17" three times over: the cloud sends
+  // `top_priorities`, an older shape sends `topPriorities`, and the panel concatenated both along
+  // with the briefing's own recommendations.
+  const lines = buildFrostBrief({
+    dailyPlan: {
+      top_priorities: ["Collect from kalu a17", "Check old apple lots"],
+      topPriorities: ["Collect from kalu a17", "Check old apple lots"],
+      can_wait: ["Review supplier rates"],
+    },
+    recommendations: ["Start with: Collect from kalu a17"],
+  });
+  assert.deepEqual(lines, [
+    "Start with: Collect from kalu a17",
+    "Start with: Check old apple lots",
+    "Can wait: Review supplier rates",
+  ]);
+});
+
+test("the camel spelling is used when it is the only one carrying lines", () => {
+  assert.deepEqual(
+    buildFrostBrief({ dailyPlan: { top_priorities: [], topPriorities: ["Pay Mandi Traders"] } }),
+    ["Start with: Pay Mandi Traders"],
+  );
+});
+
+test("a missing daily plan produces no lines rather than throwing", () => {
+  assert.deepEqual(buildFrostBrief(), []);
+  assert.deepEqual(buildFrostBrief({ dailyPlan: null, recommendations: null }), []);
 });

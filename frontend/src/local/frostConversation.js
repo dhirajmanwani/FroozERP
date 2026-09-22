@@ -194,3 +194,34 @@ export const latestSpokenTurn = (turns = []) => {
   }
   return null;
 };
+
+/**
+ * The lines that open the conversation: what FROST would say if asked how today looks.
+ *
+ * The daily plan is served under two spellings -- `top_priorities` from the cloud and
+ * `topPriorities` from an older shape -- and the panel used to concatenate both plus the briefing's
+ * own recommendations. When more than one of them was populated the owner saw the same three
+ * sentences printed two and three times over, which reads as a bug in the books rather than in the
+ * wording.
+ *
+ * So: one spelling wins, and the whole list is de-duplicated on the text the owner will actually
+ * read. Nothing is dropped that is not a repeat.
+ */
+export const buildFrostBrief = ({ dailyPlan = null, recommendations = [] } = {}) => {
+  const plan = dailyPlan && typeof dailyPlan === "object" ? dailyPlan : {};
+  const listOf = (value) => (Array.isArray(value) ? value.map(text).filter(Boolean) : []);
+  // Whichever spelling actually carries lines, never both.
+  const priorities = listOf(plan.top_priorities).length ? listOf(plan.top_priorities) : listOf(plan.topPriorities);
+  const lines = [
+    ...priorities.slice(0, 5).map((item) => `Start with: ${item}`),
+    ...listOf(recommendations),
+    ...listOf(plan.can_wait).slice(0, 3).map((item) => `Can wait: ${item}`),
+  ];
+  const seen = new Set();
+  return lines.filter((line) => {
+    const key = line.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+};

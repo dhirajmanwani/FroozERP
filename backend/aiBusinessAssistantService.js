@@ -7,6 +7,8 @@ const {
   assertGroundedAnswer,
 } = require("./aiBusinessAssistantRules");
 const { describeOllamaFallback, phraseWithOllama } = require("./frostOllama");
+const { buildDeterministicAnswer } = require("./frostAnswer");
+const { detectSpokenRange } = require("./frostLanguage");
 const {
   DEFAULT_FROST_SETTINGS,
   FROST_ASSISTANT_NAME,
@@ -113,6 +115,19 @@ const getRange = (query = {}) => {
   if (range === "last_7_days" || range === "7") return { dateFrom: addDays(today, -6), dateTo: today, label: "Last 7 Days" };
   if (range === "this_month" || range === "month") return { dateFrom: today.slice(0, 8) + "01", dateTo: today, label: "This Month" };
   return { dateFrom: today, dateTo: today, label: "Today" };
+};
+
+/**
+ * "kal kitna bika" names its own period, and answering it with whatever the period dropdown happens
+ * to be set to answers a different question. A period spoken in the question therefore wins over
+ * the dropdown -- except when the owner typed explicit from/to dates, which are a deliberate choice
+ * he made on screen and outrank a word. The chosen period always leads the answer, so a question
+ * that moved the period never does so silently.
+ */
+const rangeQueryFor = (question, body = {}) => {
+  if (body.date_from && body.date_to) return body;
+  const spoken = detectSpokenRange(question);
+  return spoken ? { ...body, range: spoken } : body;
 };
 
 const maskPhone = (value) => {
@@ -1712,24 +1727,6 @@ const factsForBusinessIntent = async (pool, branchId, intent, settings, range) =
   return [await getDailySalesSummary(pool, branchId, range), await getCustomerOutstanding(pool, branchId, settings), await getSupplierOutstanding(pool, branchId), await getLowStockProducts(pool, branchId), await getInventoryNearingExpiry(pool, branchId, settings), await getProductSalesRanking(pool, branchId, range)];
 };
 
-const buildDeterministicAnswer = (classification, facts, range) => {
-  const parts = [`Period: ${range.label}.`];
-  for (const fact of facts) {
-    if (fact.summary.totalOutstanding !== undefined) parts.push(`${fact.sourceModule}: outstanding ${fact.summary.totalOutstanding} across ${fact.summary.count || 0} records.`);
-    if (fact.summary.totalSales !== undefined) parts.push(`${fact.sourceModule}: sales ${fact.summary.totalSales}, estimated gross profit ${fact.summary.estimatedGrossProfit}.`);
-    if (fact.summary.totalExpenses !== undefined) parts.push(`${fact.sourceModule}: expenses ${fact.summary.totalExpenses}.`);
-    if (fact.summary.totalWasteCost !== undefined) parts.push(`${fact.sourceModule}: waste cost ${fact.summary.totalWasteCost}.`);
-    if (fact.summary.count !== undefined && fact.summary.totalOutstanding === undefined && fact.summary.totalSales === undefined) parts.push(`${fact.sourceModule}: ${fact.summary.count} matching records.`);
-  }
-  const firstRows = facts.flatMap((fact) => fact.rows.slice(0, 3).map((row) => ({ fact, row }))).slice(0, 3);
-  if (firstRows.length) {
-    parts.push(`Top details: ${firstRows.map(({ row }) => row.customer_name || row.supplier_name || row.product_name || row.invoice_no || row.title || `#${row.id}`).join(", ")}.`);
-  }
-  parts.push("Source modules: " + [...new Set(facts.map((fact) => fact.sourceModule))].join(", ") + ".");
-  if (classification === "ATTENTION" && !firstRows.length) parts.push("No urgent deterministic issue was found from the available data.");
-  return parts.join(" ");
-};
-
 const auditQuestion = async ({ pool, branchId, user, deviceId, question, classification, range, facts, answer }) => {
   const branch = requireBranchScope(branchId);
   const conversation = await pool.query(`
@@ -2209,7 +2206,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     const settings = await getAiSettings(pool, frost);
-    const range = getRange(req.body);
+    const range = getRange(rangeQueryFor(question, req.body));
     const classification = classifyBusinessIntent(question);
     if (!(await enforceIntentPermission({ classification, user, getPermissionUser, res }))) return;
     const facts = await factsForBusinessIntent(pool, req.auth.branchId, classification, settings, range);
@@ -2322,7 +2319,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     // never explains itself.
     if (!(await enforceIntentPermission({ classification, user, getPermissionUser, res }))) return;
     const settings = await getAiSettings(pool, frost);
-    const range = getRange(req.body);
+    const range = getRange(rangeQueryFor(question, req.body));
     const facts = await factsForBusinessIntent(pool, req.auth.branchId, classification, settings, range);
     // Deterministic only, deliberately. This route is not called from the frontend, and the model
     // phrasing in `/api/ai/query` would be dead weight here. A grounding check would be worse than

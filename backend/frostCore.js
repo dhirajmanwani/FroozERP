@@ -1,4 +1,5 @@
 const crypto = require("crypto");
+const { normalizeQuestion } = require("./frostLanguage");
 
 const FROST_ASSISTANT_NAME = "FROST";
 
@@ -111,8 +112,13 @@ const maskProviderConfig = (config = {}) => {
   return masked;
 };
 
+// The owner types Hinglish. `normalizeQuestion` lowercases the question and appends the English
+// hint words his words earned, so every regex below keeps working on questions that contain not one
+// English business term. It is applied here rather than at each call site so that the classifier
+// cannot be reached without it -- there are four callers and the suggested-question test asserts
+// against this function, not against the routes.
 const classifyBusinessIntent = (question = "") => {
-  const text = String(question || "").toLowerCase();
+  const text = normalizeQuestion(question).text;
   if (/(cash|bank|drawer|till|counter cash|payable|receivable|position)/.test(text)) return "CASH_DRAWER";
   if (/(purchase tomorrow|what should i purchase|buy tomorrow|reorder|purchase quantity|purchase quantities)/.test(text)) return "PURCHASE_PLANNING";
   if (/(sale rate|selling rate|rate revision|revise.*rate|price revision|pricing)/.test(text)) return "SALE_RATE_REVIEW";

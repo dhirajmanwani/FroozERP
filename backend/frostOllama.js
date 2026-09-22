@@ -86,6 +86,8 @@ const buildPhrasingMessages = ({ question, facts = [], periodLabel = "" }) => [
       "Answer the owner's question using ONLY those figures.",
       "Never state a number that does not appear in the data you were given. Never estimate, project or round.",
       "If the data does not contain what was asked, say plainly that you do not have it.",
+      "The question may be Hindi written in English letters, the way it is spoken at a shop counter. Understand it, and reply in simple English.",
+      "Lead with the one figure that was actually asked for. Do not read out every figure you were given.",
       "Reply in two or three short sentences. Plain words. The owner reads Hindi and English.",
       "Amounts are Indian rupees.",
     ].join(" "),
