@@ -3002,23 +3002,6 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     });
   });
 
-  app.post("/api/ai/voice/session", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
-    if (!user) return;
-    try {
-      const session = await frost.createRealtimeSession({
-        branchId: req.auth.branchId,
-        userId: user.id,
-        deviceId: req.body.device_id || req.headers["x-device-id"],
-        providerKey: req.body.provider_key || "openai",
-      });
-      return res.json(session);
-    } catch (error) {
-      console.error("FROST voice session error", error);
-      return res.status(500).json({ configured: false, message: "Unable to prepare FROST voice session" });
-    }
-  });
-
   app.get("/api/ai/voice/status", async (req, res) => {
     const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
@@ -3054,7 +3037,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       configured: true,
       code: "VOICE_TRANSCRIPTION_UPLOAD_NOT_IMPLEMENTED",
       status: "Error",
-      message: "Server-side audio upload transcription is not enabled in this build. Use the installed app text fallback or Realtime voice session.",
+      message: "Server-side audio upload transcription is not enabled in this build. Use the installed app text fallback.",
       text_fallback_available: true,
     });
   });
@@ -3075,7 +3058,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       configured: true,
       code: "VOICE_SPEECH_OUTPUT_NOT_IMPLEMENTED",
       status: "Error",
-      message: "Server-side speech output is not enabled in this build. Use the installed app text answer or Realtime voice session.",
+      message: "Server-side speech output is not enabled in this build. Use the installed app text answer.",
       text_fallback_available: true,
     });
   });

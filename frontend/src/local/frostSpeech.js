@@ -16,9 +16,11 @@
  * zero. So `resolveSpeechPlan` returns text for a local synthesiser and has no concept of an
  * endpoint. A future provider that uploads audio or text does not belong behind this function.
  *
- * There is an unrelated OpenAI Realtime path elsewhere in the tree that has never been switched on
- * and sends no tools, so it cannot read the books at all. This is deliberately not that: reading a
- * verified answer aloud is the version of "talk to me" that cannot state a number nobody can check.
+ * The OpenAI Realtime path that used to sit beside this -- a microphone streamed to a third party
+ * and answered by a model that could not read the books -- has been removed. Live voice
+ * (`frostLiveVoice.js`) now hears a question on the device, asks it through the typed route, and
+ * speaks the answer through `resolveSpeechPlan` here: reading a verified answer aloud is the version
+ * of "talk to me" that cannot state a number nobody can check.
  */
 
 export const SPEECH_REFUSALS = Object.freeze({

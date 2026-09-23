@@ -225,6 +225,12 @@ import {
   speechWithNotice,
 } from "./local/frostSpeech";
 import {
+  LIVE_VOICE_PHASE_LABELS,
+  LIVE_VOICE_STOP_MESSAGES,
+  createLiveVoiceController,
+  speechSetupView,
+} from "./local/frostLiveVoice";
+import {
   checkBackendHealth,
   getSyncStatus,
   initialPullForApprovedDevice,
@@ -2287,7 +2293,6 @@ function App() {
     providers: [],
     engines: [],
     usage: null,
-    voice: { status: "idle", transcript: "", error: "", supported: false },
     activeSection: FROST_PRIMARY_SECTION,
     memories: [],
     predictions: { inventory: [], sales: [], cashflow: [], waste: [] },
@@ -2356,7 +2361,13 @@ function App() {
   });
   const [frostDrawerOpen, setFrostDrawerOpen] = useState(false);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
-  const frostVoiceRef = useRef({ peer: null, stream: null, audio: null, channel: null });
+  // FROST live voice. The controller (local/frostLiveVoice.js) owns the microphone; this component
+  // only hands it the browser objects and the two routes it may use. `frostLiveVoice` is what the
+  // switch and the indicator draw; `frostSpeechSetup` is the gateway's word on whether whisper is
+  // installed, and the last failure reading or starting it.
+  const frostLiveVoiceRef = useRef(null);
+  const [frostLiveVoice, setFrostLiveVoice] = useState({ on: false, phase: "off", message: "", tone: "info" });
+  const [frostSpeechSetup, setFrostSpeechSetup] = useState({ open: false, status: null, failure: null });
   const [supplierDashboard, setSupplierDashboard] = useState({
     todaySales: 0,
     todayProfit: 0,
@@ -5433,9 +5444,17 @@ function App() {
     }
   };
 
-  const askAiAssistant = async (question = aiQuestion) => {
-    const trimmed = question.trim();
-    if (!trimmed) return;
+  /**
+   * Ask FROST. The typed box, a suggested question and live voice all come through here, so a
+   * spoken question is filed, answered and shown exactly like a typed one.
+   *
+   * Resolves to the history entry it stored (with the final answer, after a reminder is saved or
+   * refused), or null for an empty question. Live voice reads that entry aloud. `fromVoice` only
+   * stops a spoken question from wiping whatever is half-typed in the box.
+   */
+  const askAiAssistant = async (question = aiQuestion, { fromVoice = false } = {}) => {
+    const trimmed = String(question || "").trim();
+    if (!trimmed) return null;
     // Stamped here rather than on arrival, because this is when the owner asked. `pending` carries
     // the question into the thread immediately: the panel used to accept it and show nothing until
     // the answer landed, which on a slow cloud reads as a send that did not work.
@@ -5456,6 +5475,24 @@ function App() {
         // panel is never told a question was filed under a chat that it was not.
         session_id: aiAssistantData.sessionId || "",
       });
+      const answeredEntry = {
+        id: response.data.conversation_id || Date.now(),
+        question: trimmed,
+        askedAt,
+        answeredAt: authoritativeUtcNowIso(),
+        answer: response.data.answer,
+        classification: response.data.classification,
+        facts: response.data.facts || [],
+        period: response.data.period,
+        provider: response.data.provider,
+        usage: response.data.usage,
+        cached: response.data.cached,
+        // Null unless the local model could not word the answer. Without carrying it here the
+        // owner would see FROST's plain wording with no indication that the model was off --
+        // a degradation that looks exactly like normal operation.
+        notice: response.data.notice || null,
+        phrasedBy: response.data.phrased_by || null,
+      };
       setAiAssistantData((current) => ({
         ...current,
         loading: false,
@@ -5465,29 +5502,9 @@ function App() {
         // is not accumulating.
         sessionId: response.data.session_id || current.sessionId,
         period: { range: aiRange, ...(response.data.period || {}) },
-        history: [
-          {
-            id: response.data.conversation_id || Date.now(),
-            question: trimmed,
-            askedAt,
-            answeredAt: authoritativeUtcNowIso(),
-            answer: response.data.answer,
-            classification: response.data.classification,
-            facts: response.data.facts || [],
-            period: response.data.period,
-            provider: response.data.provider,
-            usage: response.data.usage,
-            cached: response.data.cached,
-            // Null unless the local model could not word the answer. Without carrying it here the
-            // owner would see FROST's plain wording with no indication that the model was off --
-            // a degradation that looks exactly like normal operation.
-            notice: response.data.notice || null,
-            phrasedBy: response.data.phrased_by || null,
-          },
-          ...current.history,
-        ].slice(0, FROST_OPEN_CHAT_LIMIT),
+        history: [answeredEntry, ...current.history].slice(0, FROST_OPEN_CHAT_LIMIT),
       }));
-      setAiQuestion("");
+      if (!fromVoice) setAiQuestion("");
       // "remind me to pay my suppliers" is an instruction. The query route only reads -- it is
       // READ_ONLY by contract and its own tests hold it there -- so the write happens here, against
       // the reminders route that already carries the permission check. The answer is rewritten with
@@ -5496,13 +5513,16 @@ function App() {
       const draft = response.data.reminder_draft;
       if (draft?.title) {
         const conversationId = response.data.conversation_id || null;
-        const settle = (answer) => setAiAssistantData((current) => ({
-          ...current,
-          history: current.history.map((entry) =>
-            (conversationId && entry.id === conversationId) || (!conversationId && entry.askedAt === askedAt)
-              ? { ...entry, answer }
-              : entry),
-        }));
+        const settle = (answer) => {
+          answeredEntry.answer = answer;
+          setAiAssistantData((current) => ({
+            ...current,
+            history: current.history.map((entry) =>
+              (conversationId && entry.id === conversationId) || (!conversationId && entry.askedAt === askedAt)
+                ? { ...entry, answer }
+                : entry),
+          }));
+        };
         try {
           await axios.post(`${API_URL}/api/ai/reminders`, {
             user_id: user?.id,
@@ -5534,28 +5554,28 @@ function App() {
           settle(`I could not save that reminder: ${getFrostDiagnosticMessage(reminderError, { offlineMode, internetAvailable, backendHealth, cloudHealth })} You can add it yourself under Reminders.`);
         }
       }
+      return answeredEntry;
     } catch (error) {
       // The question is kept, with why it failed. It used to be dropped entirely: only the error
       // strip changed, so the thread showed a conversation in which the question was never asked.
       // A failure rendered as an absence is the same pitfall as an error rendered as zero.
       const failureMessage = getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth });
+      const failedEntry = {
+        id: `failed-${askedAt}`,
+        question: trimmed,
+        askedAt,
+        answeredAt: authoritativeUtcNowIso(),
+        failureMessage,
+        facts: [],
+      };
       setAiAssistantData((current) => ({
         ...current,
         loading: false,
         pending: null,
         error: failureMessage,
-        history: [
-          {
-            id: `failed-${askedAt}`,
-            question: trimmed,
-            askedAt,
-            answeredAt: authoritativeUtcNowIso(),
-            failureMessage,
-            facts: [],
-          },
-          ...current.history,
-        ].slice(0, FROST_OPEN_CHAT_LIMIT),
+        history: [failedEntry, ...current.history].slice(0, FROST_OPEN_CHAT_LIMIT),
       }));
+      return failedEntry;
     }
   };
 
@@ -5605,113 +5625,135 @@ function App() {
     await loadAiAssistant(aiRange);
   };
 
-  const stopFrostVoice = () => {
-    const current = frostVoiceRef.current;
-    if (current.channel) current.channel.close();
-    if (current.peer) current.peer.close();
-    if (current.stream) current.stream.getTracks().forEach((track) => track.stop());
-    if (current.audio) current.audio.srcObject = null;
-    frostVoiceRef.current = { peer: null, stream: null, audio: null, channel: null };
-    setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "idle" } }));
+  // ---- FROST live voice ---------------------------------------------------------------------
+  //
+  // Every speech route is on LOCAL_API_URL -- the desktop gateway on 127.0.0.1, the same base the
+  // connectivity-policy routes use -- and none goes through guardCloudCall or a cloud URL. The
+  // gateway runs whisper.cpp on this laptop; the one external fetch it can ever make is the
+  // one-time engine download, which it refuses itself in LOCAL_ONLY. Audio goes to
+  // /api/local/speech/transcribe and nowhere else.
+  const aiLoadingRef = useRef(false);
+  aiLoadingRef.current = aiAssistantData.loading === true;
+  const askAiAssistantRef = useRef(null);
+  askAiAssistantRef.current = askAiAssistant;
+  // Read after the status check below: the drawer can close, or the owner sign out, while it is in
+  // flight, and the microphone must not open into a panel that is no longer there.
+  const frostDrawerOpenRef = useRef(false);
+  frostDrawerOpenRef.current = frostDrawerOpen;
+  const frostLiveVoiceStartingRef = useRef(false);
+
+  // A gateway that did not answer and one that answered with an error read differently, because
+  // the owner does different things about them.
+  const speechRouteFailure = (error, stage) => ({
+    stage,
+    status: error?.response?.status ?? null,
+    code: error?.response?.data?.code || "",
+    message: error?.response
+      ? (error.response.data?.message || `the voice service answered with HTTP ${error.response.status}`)
+      : "the voice service on this laptop did not answer",
+  });
+
+  const readFrostSpeechStatus = async () => {
+    try {
+      const response = await axios.get(`${LOCAL_API_URL}/api/local/speech/status`, {
+        timeout: 5000,
+        headers: { "Cache-Control": "no-store" },
+      });
+      setFrostSpeechSetup((current) => ({ ...current, status: response.data ?? null, failure: null }));
+      return response.data ?? null;
+    } catch (error) {
+      setFrostSpeechSetup((current) => ({ ...current, failure: speechRouteFailure(error, "status") }));
+      return null;
+    }
   };
 
-  const startFrostVoice = async () => {
-    if (!navigator.mediaDevices?.getUserMedia || typeof RTCPeerConnection === "undefined") {
-      setAiAssistantData((state) => ({ ...state, voice: { status: "unavailable", supported: false, transcript: "", error: "Voice requires microphone and WebRTC support." } }));
-      return;
-    }
-    // CLAUDE.md: LOCAL_ONLY must keep blocked=true, reachedCloud=false and external connections at
-    // zero. This is the one path in FROST that can open an external connection from the counter
-    // itself: the SDP exchange below goes straight from this machine to the provider, not through
-    // API_URL and not through the desktop gateway, so the gateway's LOCAL_ONLY block never sees it
-    // and it writes no line to the cloud-request audit. Every other FROST call is guarded; this one
-    // was not, and was held shut only by the cloud declining to mint a client secret -- a guarantee
-    // enforced somewhere else, by accident, rather than here on purpose.
-    //
-    // Checked before getUserMedia, so a refused device never opens the microphone at all.
-    const voiceGate = guardCloudCall("frost-realtime-voice", CLOUD_OPERATIONAL_API_URL);
-    if (!voiceGate.allowed) {
-      setAiAssistantData((state) => ({ ...state, voice: { status: "blocked", supported: true, transcript: "", error: voiceGate.message } }));
-      return;
-    }
-    setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "connecting", supported: true, error: "" } }));
+  const installFrostSpeech = async () => {
     try {
-      const sessionResponse = await axios.post(`${API_URL}/api/ai/voice/session`, {
-        user_id: user?.id,
-        device_id: deviceInfo.device_id,
-        provider_key: "openai",
-      });
-      const session = sessionResponse.data;
-      if (!session.configured || !session.clientSecret) {
-        setAiAssistantData((state) => ({ ...state, voice: { status: "unconfigured", supported: true, transcript: "", error: session.message || "FROST voice is not configured." } }));
-        return;
-      }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: session.noiseSuppression !== false,
-          autoGainControl: true,
-        },
-      });
-      const peer = new RTCPeerConnection();
-      const audio = new Audio();
-      audio.autoplay = true;
-      peer.ontrack = (event) => {
-        audio.srcObject = event.streams[0];
-        setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "speaking" } }));
-      };
-      stream.getTracks().forEach((track) => peer.addTrack(track, stream));
-      const channel = peer.createDataChannel("oai-events");
-      channel.onopen = () => {
-        channel.send(JSON.stringify({
-          type: "session.update",
-          session: {
-            instructions: "You are FROST, FroozERP's business copilot. Speak naturally in Hindi, English, or Hinglish. Use business tools; never execute actions without owner confirmation.",
-          },
-        }));
-        setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "listening" } }));
-      };
-      channel.onmessage = (event) => {
-        try {
-          const message = JSON.parse(event.data);
-          const delta = message.delta || message.transcript || message.text || "";
-          if (delta) {
-            setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, transcript: `${state.voice.transcript || ""}${delta}` } }));
-          }
-          if (String(message.type || "").includes("input_audio_buffer.speech_started")) {
-            setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "listening" } }));
-          }
-          if (String(message.type || "").includes("response.audio.done")) {
-            setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "listening" } }));
-          }
-        } catch {
-          // Realtime data channel can include provider-specific events; ignore unknown payloads.
-        }
-      };
-      const offer = await peer.createOffer();
-      await peer.setLocalDescription(offer);
-      // Re-checked at the call itself. The owner can switch the device to Local Only while the
-      // session is being negotiated, and the gate above would then be a decision made seconds ago
-      // about a connection opening now.
-      const sdpGate = guardCloudCall("frost-realtime-voice-sdp", CLOUD_OPERATIONAL_API_URL);
-      if (!sdpGate.allowed) throw createCloudCallRefusalError(sdpGate);
-      const realtimeResponse = await fetch(session.realtimeUrl, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${session.clientSecret}`,
-          "Content-Type": "application/sdp",
-        },
-        body: offer.sdp,
-      });
-      if (!realtimeResponse.ok) throw new Error("Realtime voice connection failed");
-      const answer = { type: "answer", sdp: await realtimeResponse.text() };
-      await peer.setRemoteDescription(answer);
-      frostVoiceRef.current = { peer, stream, audio, channel };
+      await axios.post(`${LOCAL_API_URL}/api/local/speech/install`, { model: "small" }, { timeout: 10000 });
+      setFrostSpeechSetup((current) => ({ ...current, failure: null }));
+      await readFrostSpeechStatus();
     } catch (error) {
-      stopFrostVoice();
-      setAiAssistantData((state) => ({ ...state, voice: { status: "error", supported: true, transcript: "", error: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth }) } }));
+      setFrostSpeechSetup((current) => ({ ...current, failure: speechRouteFailure(error, "install") }));
+      // A download already running is not a failure to show on its own: read where it has got to.
+      if (error?.response?.data?.code === "SPEECH_INSTALL_IN_PROGRESS") await readFrostSpeechStatus();
     }
   };
+
+  const stopFrostLiveVoice = (reason) => {
+    frostLiveVoiceRef.current?.stop(reason);
+  };
+
+  const startFrostLiveVoice = async () => {
+    // The switch is only drawn for these roles. Checked again here so a stray call cannot open the
+    // microphone for a Cashier; the gateway's own origin check is the real boundary.
+    if (!frostBellAllowed) {
+      setFrostLiveVoice({ on: false, phase: "off", message: LIVE_VOICE_STOP_MESSAGES.not_permitted, tone: "error" });
+      return;
+    }
+    const status = await readFrostSpeechStatus();
+    if (!frostDrawerOpenRef.current || !userRef.current) return;
+    if (status?.state !== "ready") {
+      // Not ready, not readable, or failed: the setup card says which, and the microphone stays shut.
+      setFrostSpeechSetup((current) => ({ ...current, open: true }));
+      setFrostLiveVoice({ on: false, phase: "off", message: "", tone: "info" });
+      return;
+    }
+    setFrostSpeechSetup((current) => ({ ...current, open: false }));
+    const controller = createLiveVoiceController({
+      mediaDevices: typeof navigator === "undefined" ? null : navigator.mediaDevices,
+      AudioContextImpl: typeof window === "undefined" ? null : (window.AudioContext || window.webkitAudioContext || null),
+      synthesis: typeof window === "undefined" ? null : window.speechSynthesis,
+      Utterance: typeof window === "undefined" ? null : window.SpeechSynthesisUtterance,
+      // Raw WAV bytes to the local gateway. This is the only place audio leaves the controller.
+      transcribe: async (wavBytes) => {
+        const response = await axios.post(`${LOCAL_API_URL}/api/local/speech/transcribe`, wavBytes, {
+          headers: { "Content-Type": "audio/wav" },
+          timeout: 45000,
+        });
+        return response.data;
+      },
+      ask: (question) => askAiAssistantRef.current(question, { fromVoice: true }),
+      isBusy: () => aiLoadingRef.current,
+      onChange: (view) => setFrostLiveVoice(view),
+    });
+    frostLiveVoiceRef.current?.stop("switched_off");
+    frostLiveVoiceRef.current = controller;
+    await controller.start();
+  };
+
+  const toggleFrostLiveVoice = () => {
+    if (frostLiveVoiceRef.current?.active) {
+      stopFrostLiveVoice("switched_off");
+      return;
+    }
+    // One start at a time: a second click while the status check is in flight would otherwise
+    // build a second controller over the first.
+    if (frostLiveVoiceStartingRef.current) return;
+    frostLiveVoiceStartingRef.current = true;
+    startFrostLiveVoice()
+      .catch((error) => {
+        stopFrostLiveVoice("switched_off");
+        setFrostLiveVoice({ on: false, phase: "off", message: `Live voice could not start: ${getErrorMessage(error, error?.message || "unknown error")}`, tone: "error" });
+      })
+      .finally(() => { frostLiveVoiceStartingRef.current = false; });
+  };
+
+  // The microphone closes with the drawer, on sign-out and when the app unmounts. Each says why.
+  useEffect(() => {
+    if (!frostDrawerOpen) frostLiveVoiceRef.current?.stop("drawer_closed");
+  }, [frostDrawerOpen]);
+  useEffect(() => {
+    if (!user) frostLiveVoiceRef.current?.stop("signed_out");
+  }, [user]);
+  useEffect(() => () => frostLiveVoiceRef.current?.stop("unmounted"), []);
+  // While the gateway is downloading, ask it where it has got to. Only while the drawer is open:
+  // the download carries on in the gateway either way, and reopening reads it again.
+  useEffect(() => {
+    if (!frostDrawerOpen || frostSpeechSetup.status?.state !== "installing") return undefined;
+    const timer = window.setInterval(() => { readFrostSpeechStatus(); }, 1500);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [frostDrawerOpen, frostSpeechSetup.status?.state]);
 
   const proposeFrostAction = async (action, payload = {}) => {
     try {
@@ -9822,8 +9864,12 @@ function App() {
         onReminderDueDate={updateReminderDueDate}
         onSaveSettings={saveFrostSettings}
         onSelectQuestion={(question) => askAiAssistant(question)}
-        onStartVoice={startFrostVoice}
-        onStopVoice={stopFrostVoice}
+        liveVoice={frostLiveVoice}
+        onToggleLiveVoice={toggleFrostLiveVoice}
+        speechSetup={frostSpeechSetup.open ? speechSetupView(frostSpeechSetup.status, frostSpeechSetup.failure) : null}
+        onInstallSpeech={installFrostSpeech}
+        onRetrySpeechStatus={readFrostSpeechStatus}
+        onCloseSpeechSetup={() => setFrostSpeechSetup((current) => ({ ...current, open: false }))}
         onSectionChange={setFrostActiveTab}
         open={frostDrawerOpen}
         question={aiQuestion}
@@ -9866,8 +9912,12 @@ function FrostFloatingCopilot({
   onReminderDueDate,
   onSaveSettings,
   onSelectQuestion,
-  onStartVoice,
-  onStopVoice,
+  liveVoice = null,
+  onToggleLiveVoice,
+  speechSetup = null,
+  onInstallSpeech,
+  onRetrySpeechStatus,
+  onCloseSpeechSetup,
   onSectionChange,
   open,
   duesOutreach = null,
@@ -9926,8 +9976,12 @@ function FrostFloatingCopilot({
             onReminderDueDate={onReminderDueDate}
             onSaveSettings={onSaveSettings}
             onSelectQuestion={onSelectQuestion}
-            onStartVoice={onStartVoice}
-            onStopVoice={onStopVoice}
+            liveVoice={liveVoice}
+            onToggleLiveVoice={onToggleLiveVoice}
+            speechSetup={speechSetup}
+            onInstallSpeech={onInstallSpeech}
+            onRetrySpeechStatus={onRetrySpeechStatus}
+            onCloseSpeechSetup={onCloseSpeechSetup}
             onSectionChange={onSectionChange}
             question={question}
             range={range}
@@ -10072,8 +10126,12 @@ function AiBusinessAssistantModule({
   onMemoryAction,
   onProposeMemory,
   onSaveSettings,
-  onStartVoice,
-  onStopVoice,
+  liveVoice = null,
+  onToggleLiveVoice,
+  speechSetup = null,
+  onInstallSpeech,
+  onRetrySpeechStatus,
+  onCloseSpeechSetup,
   onSectionChange,
   onProposeAction,
   onSelectQuestion,
@@ -10158,6 +10216,16 @@ function AiBusinessAssistantModule({
     if (data.loading || !question.trim()) return;
     onAsk();
   };
+  const liveVoiceBar = (
+    <FrostLiveVoiceBar
+      liveVoice={liveVoice}
+      onCloseSetup={onCloseSpeechSetup}
+      onInstall={onInstallSpeech}
+      onRetry={onRetrySpeechStatus}
+      onToggle={onToggleLiveVoice}
+      setup={speechSetup}
+    />
+  );
   // A thread that does not follow itself shows the oldest exchange and keeps the newest answer
   // below the fold, which is the complaint this panel was rebuilt for wearing a different hat:
   // the owner asks a question and appears to get nothing back.
@@ -10290,6 +10358,10 @@ function AiBusinessAssistantModule({
         </button>
       )}
 
+      {/* Live voice stays visible anywhere in the panel while it is on: a microphone that is open
+          must never be open somewhere the owner cannot see it. Owner and Admin only. */}
+      {canManageFrost && !surface.onConversation && liveVoice?.on && liveVoiceBar}
+
       {surface.onConversation && (
         <div className="frost-conversation">
           <div className="frost-thread">
@@ -10330,6 +10402,8 @@ function AiBusinessAssistantModule({
           </div>
 
           {speechNotice && <p className="ai-answer-notice frost-speech-notice">{speechNotice}</p>}
+
+          {canManageFrost && liveVoiceBar}
 
           <div className="frost-composer">
             <textarea
@@ -10389,14 +10463,6 @@ function AiBusinessAssistantModule({
         <span>Card/Bank {money(cardValue("collections", "card"))}</span>
         <span>Waste {money(cardValue("waste", "totalWasteCost"))}</span>
       </div>}
-
-      {activeSection === "voice" && (
-        <FrostVoicePanel
-          onStart={onStartVoice}
-          onStop={onStopVoice}
-          voice={data.voice || {}}
-        />
-      )}
 
       {activeSection === "predictions" && (
         <FrostPredictionsPanel predictions={data.predictions || {}} onProposeAction={onProposeAction} />
@@ -11045,27 +11111,61 @@ function FrostMemoryPanel({ canManage, memories = [], onMemoryAction, onProposeM
   );
 }
 
-function FrostVoicePanel({ onStart, onStop, voice }) {
-  const active = ["connecting", "listening", "speaking"].includes(voice.status);
+/**
+ * The Live voice switch, what it is doing right now, and the one-time setup card.
+ *
+ * Every decision is made in local/frostLiveVoice.js: `liveVoice` is the controller's view and
+ * `setup` is `speechSetupView(...)`. This only draws them. A failed or unreadable setup is drawn as
+ * a failure with its reason; only `setup.ready` ever says voice is ready.
+ */
+function FrostLiveVoiceBar({ liveVoice = null, onCloseSetup, onInstall, onRetry, onToggle, setup = null }) {
+  const on = liveVoice?.on === true;
+  const phase = liveVoice?.phase || "off";
+  const message = liveVoice?.message || "";
   return (
-    <section className={`frost-voice-panel frost-voice-${voice.status || "idle"}`}>
-      <div>
-        <span className="eyebrow">Voice Copilot</span>
-        <h3>Push-to-talk with FROST</h3>
-        <p>Hindi, English and Hinglish ready. Wake word architecture is prepared and disabled.</p>
-      </div>
-      <div className="frost-voice-controls">
-        <button className={active ? "remove-button frost-mic-button" : "primary-button frost-mic-button"} onClick={active ? onStop : onStart}>
-          <Icon name={active ? "close" : "message"} /> {active ? "Interrupt / Stop" : "Hold to Talk"}
+    <div className="frost-live-bar">
+      <div className="frost-live-row">
+        <button
+          aria-checked={on}
+          className={on ? "frost-live-switch frost-live-switch-on" : "frost-live-switch"}
+          onClick={onToggle}
+          role="switch"
+          title={on ? "Turn live voice off and close the microphone" : "Talk to FROST. Say \"Frost\" and then your question."}
+          type="button"
+        >
+          <span className="frost-live-knob" /> Live voice
         </button>
-        <span className="frost-voice-state">{voice.status || "idle"}</span>
+        {on && (
+          <span aria-live="polite" className={`frost-live-indicator frost-live-indicator-${phase}`}>
+            <span className="frost-live-dot" />
+            {LIVE_VOICE_PHASE_LABELS[phase] || phase}
+          </span>
+        )}
       </div>
-      {(voice.transcript || voice.error) && (
-        <div className="frost-transcript">
-          {voice.error ? <p>{voice.error}</p> : <p>{voice.transcript}</p>}
+      {message && <p className={liveVoice?.tone === "error" ? "frost-live-message frost-live-message-error" : "frost-live-message"}>{message}</p>}
+      {setup && !on && (
+        <div className={`frost-voice-setup frost-voice-setup-${setup.tone}`}>
+          <p>{setup.text}</p>
+          {setup.detail && <small>{setup.detail}</small>}
+          {setup.percent !== null && (
+            <div className="frost-voice-setup-bar" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={setup.percent}>
+              <span style={{ width: `${setup.percent}%` }} />
+            </div>
+          )}
+          <div className="button-row">
+            {setup.action === "download" && (
+              <button className="primary-button" onClick={onInstall} type="button">Download</button>
+            )}
+            {setup.action === "retry" && (
+              <button className="secondary-button" onClick={setup.kind === "unreadable" ? onRetry : onInstall} type="button">
+                {setup.kind === "unreadable" ? "Check again" : "Try the download again"}
+              </button>
+            )}
+            <button className="frost-strip-button" onClick={onCloseSetup} type="button">Close</button>
+          </div>
         </div>
       )}
-    </section>
+    </div>
   );
 }
 
@@ -11120,6 +11220,10 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
   // entry instead, which would read as "Deterministic only" over a FROST set to a local model.
   const providerOptions = resolveFrostProviderOptions(data.providers, draft.providerKey);
 
+  // The realtime-model, OpenAI voice and duplex/wake-word controls are gone with the OpenAI Realtime
+  // path they configured. Their values stay in the draft and are saved back unchanged, so this
+  // panel never quietly rewrites settings it no longer shows. Live voice is on-device and has no
+  // settings here: it is the switch in the conversation.
   const update = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
   const save = async () => {
     try {
@@ -11147,15 +11251,6 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
         {draft.providerKey === "ollama" && (
           <Field label="Local Model Address"><input disabled={!canManage} value={draft.baseUrl} onChange={(event) => update("baseUrl", event.target.value)} placeholder="http://127.0.0.1:11434" /></Field>
         )}
-        <Field label="Realtime Model"><input disabled={!canManage} value={draft.realtimeModel} onChange={(event) => update("realtimeModel", event.target.value)} /></Field>
-        <Field label="Voice">
-          <select disabled={!canManage} value={draft.voice} onChange={(event) => update("voice", event.target.value)}>
-            <option value="alloy">Alloy</option>
-            <option value="verse">Verse</option>
-            <option value="marin">Marin</option>
-            <option value="cedar">Cedar</option>
-          </select>
-        </Field>
         <Field label="Language Mode">
           <select disabled={!canManage} value={draft.languageMode} onChange={(event) => update("languageMode", event.target.value)}>
             <option value="hindi_english_hinglish">Hindi + English + Hinglish</option>
@@ -11167,11 +11262,6 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
         <label className="check-field"><input checked={draft.enabled} disabled={!canManage} type="checkbox" onChange={(event) => update("enabled", event.target.checked)} /><span>External provider enabled</span></label>
         <label className="check-field"><input checked={draft.streamingEnabled} disabled={!canManage} type="checkbox" onChange={(event) => update("streamingEnabled", event.target.checked)} /><span>Streaming responses</span></label>
         <label className="check-field"><input checked={draft.cacheEnabled} disabled={!canManage} type="checkbox" onChange={(event) => update("cacheEnabled", event.target.checked)} /><span>Response caching</span></label>
-        <label className="check-field"><input checked={draft.voicePrepared} disabled={!canManage} type="checkbox" onChange={(event) => update("voicePrepared", event.target.checked)} /><span>Voice engine prepared</span></label>
-        <label className="check-field"><input checked={draft.voiceActivityDetection} disabled={!canManage} type="checkbox" onChange={(event) => update("voiceActivityDetection", event.target.checked)} /><span>Voice activity detection</span></label>
-        <label className="check-field"><input checked={draft.noiseSuppression} disabled={!canManage} type="checkbox" onChange={(event) => update("noiseSuppression", event.target.checked)} /><span>Noise suppression</span></label>
-        <label className="check-field"><input checked={draft.fullDuplexEnabled} disabled={!canManage} type="checkbox" onChange={(event) => update("fullDuplexEnabled", event.target.checked)} /><span>Full duplex conversation</span></label>
-        <label className="check-field"><input checked={false} disabled type="checkbox" /><span>Wake word disabled</span></label>
       </div>
       <div className="ai-engine-grid">
         {(data.engines || []).map((engine) => (

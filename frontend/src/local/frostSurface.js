@@ -19,11 +19,10 @@
  * shop would actually open it. Talking becomes a control on the composer, in the same way typing
  * is, so the everyday way to hear FROST is not a place you navigate to.
  *
- * The old Voice tab is not deleted, and not promoted either. It opens a live microphone session
- * with a third-party provider that is sent no tools, so it cannot read the books and would speak a
- * number nobody can check. It fails closed today because no key is configured. Removing it would
- * hide a thing that still exists in the code; leaving it in the row would offer it as an equal to
- * the parts that work. So it sits in the footer with a label that says what is true about it.
+ * The old Voice tab is gone, and so is what it opened: a live microphone session with a
+ * third-party provider that was sent no tools, so it could not read the books. Live voice is now a
+ * switch in the conversation itself (see `frostLiveVoice.js`): speech is turned into text on this
+ * laptop and asked through the same route as a typed question, so it is not a place to go.
  *
  * The old Briefing tab splits in two rather than disappearing, because it was two things wearing
  * one name. Its recommendations are what FROST would say if asked how today looks, so they open the
@@ -58,7 +57,6 @@ const SECTIONS = Object.freeze([
   { key: "predictions", label: "Predictions", blurb: "Where stock, sales and cash are heading" },
   { key: "profit", label: "Profit Advisor", blurb: "Where the margin is going" },
   { key: "memory", label: "Memory", blurb: "What FROST knows about your shop", requires: "frost" },
-  { key: "voice", label: "Live voice", blurb: "Not connected to your books yet", requires: "frost", footer: true },
   { key: "settings", label: "FROST Settings", blurb: "Provider, model and limits", requires: "frost", footer: true },
 ]);
 

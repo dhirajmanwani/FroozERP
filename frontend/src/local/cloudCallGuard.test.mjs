@@ -116,36 +116,33 @@ test("App.jsx routes every cloud-bound call site through the guard", () => {
   assert.match(appSource, /!localOnly && health\.online && cloudReadyForSync/);
 });
 
-test("FROST's realtime voice path is guarded before the microphone opens", () => {
-  // This is the one FROST call that can open an external connection FROM THE COUNTER: the SDP
-  // exchange goes straight from the machine to the provider, not through API_URL and not through
-  // the desktop gateway, so the gateway's LOCAL_ONLY block never sees it and it writes no line to
-  // the cloud-request audit. It was held shut only by the cloud declining to mint a client secret,
-  // which is a guarantee enforced somewhere else by accident rather than here on purpose.
-  //
-  // CLAUDE.md: LOCAL_ONLY must keep blocked=true, reachedCloud=false and external connections at 0.
+test("FROST voice has no path to the cloud at all", () => {
+  // This used to check that the OpenAI Realtime voice path asked the guard before opening the
+  // microphone: it was the one FROST call that could open an external connection FROM THE COUNTER,
+  // straight from the machine to the provider, where the gateway's LOCAL_ONLY block never saw it.
+  // The intent -- LOCAL_ONLY keeps blocked=true, reachedCloud=false and external connections at 0
+  // with the microphone on -- is now kept structurally rather than by a guard: that path is removed,
+  // and live voice talks only to the desktop gateway on LOCAL_API_URL (/api/local/speech/*), where
+  // speech-to-text runs on the laptop. The one external fetch left is the gateway's own one-time
+  // engine download, which the gateway refuses in LOCAL_ONLY.
   const appSource = fs.readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
-  const start = appSource.indexOf("const startFrostVoice = async () => {");
-  assert.ok(start > 0, "startFrostVoice must still exist");
-  const body = appSource.slice(start, appSource.indexOf("frostVoiceRef.current = { peer, stream, audio, channel };", start));
-
-  const gate = body.indexOf('guardCloudCall("frost-realtime-voice"');
-  const microphone = body.indexOf("navigator.mediaDevices.getUserMedia(");
-  assert.ok(gate > 0, "the voice path must ask the cloud-call guard before starting");
-  assert.ok(microphone > 0, "the microphone call should still be in this function");
-  assert.ok(gate < microphone, "a refused device must never open the microphone");
-
-  // And again at the connection itself: the owner can switch to Local Only while the session is
-  // being negotiated, which would make the first check a decision about a different moment.
-  const sdpGate = body.indexOf('guardCloudCall("frost-realtime-voice-sdp"');
-  const sdpFetch = body.indexOf("fetch(session.realtimeUrl");
-  assert.ok(sdpGate > 0 && sdpGate < sdpFetch, "the SDP exchange must be guarded at the call");
+  assert.equal(appSource.includes("startFrostVoice"), false, "the realtime voice function is gone");
+  assert.equal(appSource.includes("api/ai/voice/session"), false);
+  assert.equal(appSource.includes("realtimeUrl"), false);
+  assert.equal(appSource.includes("RTCPeerConnection"), false);
+  assert.doesNotMatch(appSource, /guardCloudCall\("frost-realtime-voice/);
+  // Every speech route is on the local gateway, never on a cloud base.
+  const speechCalls = [...appSource.matchAll(/axios\.(?:get|post)\(`\$\{(\w+)\}\/api\/local\/speech\//g)];
+  assert.ok(speechCalls.length >= 3, "status, install and transcribe are all called");
+  assert.deepEqual([...new Set(speechCalls.map((match) => match[1]))], ["LOCAL_API_URL"]);
 });
 
-test("every refusal the voice gate can return carries a message the owner can act on", () => {
+test("every refusal the guard can return carries a message the owner can act on", () => {
+  // Written for the realtime voice gate, which is gone; the property it pinned is the guard's own
+  // and every FROST cloud call still depends on it.
   for (const code of Object.values(CLOUD_CALL_REFUSAL_CODES)) {
     const decision = evaluateCloudCall({
-      operation: "frost-realtime-voice",
+      operation: "frost-query",
       target: code === CLOUD_CALL_REFUSAL_CODES.CLOUD_NOT_CONFIGURED ? "" : "https://cloud.example.com",
       localOnly: code === CLOUD_CALL_REFUSAL_CODES.APP_LOCAL_ONLY,
       apiMode: code === CLOUD_CALL_REFUSAL_CODES.API_MODE_LOCAL_ONLY ? "LOCAL_ONLY" : "",

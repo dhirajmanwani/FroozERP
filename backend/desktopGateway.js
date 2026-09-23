@@ -5,6 +5,7 @@ const path = require("path");
 const { CLOUD_UNAVAILABLE_MESSAGE, normalizeCloudProxyError } = require("./cloudProxyError");
 const { DatabaseSync } = require("node:sqlite");
 const { readLocalSettingsBundle } = require("./localSettingsStore");
+const { WAV_MAX_BYTES, createLocalSpeech, resolveSpeechDir } = require("./localSpeech");
 
 const PORT = Number(process.env.PORT || 5000);
 const APP_VERSION = String(process.env.APP_VERSION || "0.0.0");
@@ -508,6 +509,114 @@ const proxy = async (res, response) => {
   res.end(body);
 };
 
+// ---------------------------------------------------------------------------------------------
+// On-device speech (FROST live voice)
+//
+// Served here and nowhere else: these paths are answered before the body is read and before
+// `localRoute`, so no request under /api/local/speech/ -- known or unknown, any method -- can ever
+// fall through to `cloudRequest`. The microphone audio posted to /transcribe stays on this machine.
+//
+// Origin: the same classification as the kill switch. A website (including the opaque `null`
+// origin) is refused; the app's own webview origins and the dev server are accepted. A caller with
+// no Origin at all is not a browser, and is accepted for the same reason the kill switch accepts it:
+// a browser always sends Origin on a POST and cannot forge it, while a local process could forge
+// any header it liked, so refusing it would protect nothing (see classifyControlOrigin).
+//
+// Install is the one route that can make an external connection. localSpeech.js consults
+// readPolicy().allowInternetAccess -- the same policy cloudRequest obeys -- before any request,
+// before every redirect hop and while the bytes flow, and audits a LOCAL_ONLY refusal through
+// auditCloudRequest (blocked: true, reachedCloud: false, reason APP_LOCAL_ONLY, source
+// speech-install). Each permitted download request is audited too, as externalConnection: true.
+// ---------------------------------------------------------------------------------------------
+
+const SPEECH_ROUTE_PREFIX = "/api/local/speech/";
+const SPEECH_INSTALL_BODY_LIMIT = 4096;
+const SPEECH_ROUTES = Object.freeze({
+  "/api/local/speech/status": "GET",
+  "/api/local/speech/install": "POST",
+  "/api/local/speech/transcribe": "POST",
+});
+
+let speechService = null;
+const getSpeechService = () => {
+  if (!speechService) speechService = createLocalSpeech({ speechDir: resolveSpeechDir(), readPolicy, audit: auditCloudRequest });
+  return speechService;
+};
+
+const isSpeechRoute = (pathname) => pathname.startsWith(SPEECH_ROUTE_PREFIX);
+
+/**
+ * The raw request bytes (a Buffer, never decoded), or `null` once more than `limit` bytes arrive.
+ * On overflow it stops reading and leaves the socket to the `connection: close` response, so the
+ * caller can still answer with a code; a for-await reader that threw here would destroy the
+ * socket and the app would see a network error instead of SPEECH_AUDIO_INVALID.
+ */
+const readSpeechBody = (req, limit) => new Promise((resolve, reject) => {
+  const chunks = [];
+  let size = 0;
+  const onData = (chunk) => {
+    size += chunk.length;
+    if (size > limit) {
+      req.off("data", onData);
+      req.pause();
+      chunks.length = 0;
+      resolve(null);
+      return;
+    }
+    chunks.push(chunk);
+  };
+  req.on("data", onData);
+  req.once("end", () => resolve(Buffer.concat(chunks)));
+  req.once("error", reject);
+});
+
+const speechAudioInvalid = (res, message) => sendJson(res, 400, { code: "SPEECH_AUDIO_INVALID", message }, { connection: "close" });
+
+/** Handler for every /api/local/speech/ path. `speech` is injectable so tests can drive it in-process. */
+const createSpeechRequestHandler = ({ speech = null } = {}) => async (req, res, url) => {
+  const service = speech || getSpeechService();
+  try {
+    if (classifyControlOrigin(req.headers.origin) === CONTROL_ORIGINS.FOREIGN_WEBSITE) {
+      return sendJson(res, 403, { code: "SPEECH_ORIGIN_REFUSED", message: "Voice is only available from FroozERP on this device." }, { connection: "close" });
+    }
+    const expectedMethod = SPEECH_ROUTES[url.pathname];
+    if (!expectedMethod) return sendJson(res, 404, { code: "SPEECH_ROUTE_UNKNOWN", message: "Unknown speech route." }, { connection: "close" });
+    if (req.method !== expectedMethod) {
+      return sendJson(res, 405, { code: "METHOD_NOT_ALLOWED", message: `Use ${expectedMethod}.` }, { allow: expectedMethod, connection: "close" });
+    }
+
+    if (url.pathname === "/api/local/speech/status") return sendJson(res, 200, service.status());
+
+    if (url.pathname === "/api/local/speech/install") {
+      let input = {};
+      try {
+        const raw = await readSpeechBody(req, SPEECH_INSTALL_BODY_LIMIT);
+        if (raw === null) throw new Error("install request too large");
+        input = raw.length ? JSON.parse(raw.toString("utf8")) : {};
+      } catch {
+        return sendJson(res, 400, { code: "SPEECH_MODEL_UNKNOWN", message: "The install request could not be read." }, { connection: "close" });
+      }
+      const result = service.install({ model: input && typeof input === "object" ? input.model : undefined });
+      return sendJson(res, result.status, result.body);
+    }
+
+    // /api/local/speech/transcribe: raw WAV bytes, capped before they are buffered.
+    const declared = Number(req.headers["content-length"]);
+    if (Number.isFinite(declared) && declared > WAV_MAX_BYTES) {
+      return speechAudioInvalid(res, "The audio is larger than 1,000,000 bytes.");
+    }
+    const audio = await readSpeechBody(req, WAV_MAX_BYTES);
+    if (audio === null) return speechAudioInvalid(res, "The audio is larger than 1,000,000 bytes.");
+    const result = await service.transcribe(audio);
+    return sendJson(res, result.status, result.body);
+  } catch (error) {
+    if (res.headersSent) return undefined;
+    return sendJson(res, 503, { code: "SPEECH_TRANSCRIBE_FAILED", message: `The speech service failed: ${error?.message || "unknown error"}` });
+  }
+};
+
+const handleSpeechRequest = createSpeechRequestHandler();
+
 const localRoute = async (req, res, url, body) => {
   if (["/health", "/api/health"].includes(url.pathname)) return sendJson(res, 200, health());
   if (url.pathname === "/api/version") return sendJson(res, 200, { ...health(), api: "FroozERP Desktop Gateway" });
@@ -606,6 +715,8 @@ const server = http.createServer(async (req, res) => {
   }
   try {
     const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
+    // Before readBody: the speech routes cap and read their own bodies, and are never proxied.
+    if (isSpeechRoute(url.pathname)) return await handleSpeechRequest(req, res, url);
     const body = await readBody(req);
     if (await localRoute(req, res, url, body) !== false) return;
     return proxy(res, await cloudRequest(req, body));
@@ -630,16 +741,19 @@ const server = http.createServer(async (req, res) => {
 //
 // The exports stay inside this file rather than moving to a module of their own because
 // src-tauri/tauri.conf.json lists the gateway's dependencies as individual bundle resources
-// (desktopGateway.js, cloudProxyError.js, localSettingsStore.js). A new require target that nobody
-// remembered to add to that list would be missing from the installer, and the gateway would die on
-// startup in the packaged app only.
+// (desktopGateway.js, cloudProxyError.js, localSettingsStore.js, localSpeech.js). A new require
+// target that nobody remembered to add to that list would be missing from the installer, and the
+// gateway would die on startup in the packaged app only. localSpeech.test.js asserts that every
+// relative require in this file is listed there.
 module.exports = {
   CLOUD_REQUEST_AUDIT_PATH,
   CONTROL_ORIGINS,
   KILL_SWITCH_REFUSALS,
   POLICY_PATH,
   POLICY_SOURCES,
+  SPEECH_ROUTE_PREFIX,
   classifyControlOrigin,
+  createSpeechRequestHandler,
   resolveKillSwitchDecision,
   resolvePolicyFromRead,
 };

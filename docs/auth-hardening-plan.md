@@ -1886,6 +1886,14 @@ The cautionary case is in the same tree: `frostCore.js`'s `createRealtimeSession
 LOCAL_ONLY block never sees. It is unreachable today only because no key is configured — the
 protection is positional, not intrinsic. This module does not add a second such path.
 
+*Update, 23 Sep 2026:* that path is gone. `createRealtimeSession`, `POST /api/ai/voice/session` and
+the screen's direct call to `api.openai.com/v1/realtime/calls` were removed when live voice was
+rebuilt on the device: speech is turned into text by whisper.cpp inside the desktop gateway
+(`backend/localSpeech.js`, `/api/local/speech/*`, 127.0.0.1 only), the question goes through the
+ordinary grounded `POST /api/ai/query`, and the answer is read aloud by the on-device synthesiser.
+The one external connection it adds is the engine and model download, made only on an explicit
+click, refused and audited in LOCAL_ONLY, and hash-checked before use.
+
 **What the model is and is not allowed to do.** It phrases; it never computes. Every figure has
 already been read by SQL before `phraseWithOllama` is called. If the phrased answer contains a
 number that is not in the facts, `assertGroundedAnswer` rejects it, the route falls back to the

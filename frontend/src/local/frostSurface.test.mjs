@@ -20,16 +20,19 @@ test("the panel opens onto the conversation and nothing else is primary", () => 
 
 test("the eleven tabs become a conversation plus a short menu", () => {
   // The complaint was the row itself, so the count is the assertion. Voice is absent by design:
-  // talking is a control on the composer, not a place to go.
+  // talking is a control on the conversation, not a place to go.
   const surface = resolveFrostSurface(owner);
   const keys = surface.menu.map((entry) => entry.key);
   assert.deepEqual(keys, ["today", "alerts", "reminders", "dues", "decision", "predictions", "profit", "memory"]);
-  assert.deepEqual(surface.footer.map((entry) => entry.key), ["voice", "settings"]);
-  // Live voice is neither deleted nor offered as an equal: it opens a microphone session that is
-  // sent no tools, so it cannot read the books. It sits in the footer, labelled for what it is.
+  assert.deepEqual(surface.footer.map((entry) => entry.key), ["settings"]);
+  // The old Voice section opened a microphone session with a provider that was sent no tools, so
+  // it could not read the books. It is gone, not demoted: live voice is now the switch in the
+  // conversation, answered from the books like a typed question. A "voice" place must not return.
   assert.equal(keys.includes("voice"), false);
+  assert.equal(surface.footer.some((entry) => entry.key === "voice"), false);
   assert.equal(surface.shortcuts.some((entry) => entry.key === "voice"), false);
-  assert.match(surface.footer[0].blurb, /not connected to your books/i);
+  assert.equal(resolveFrostSurface({ ...owner, activeSection: "voice" }).onConversation, true,
+    "a panel remembered on the old Voice section opens on the conversation");
   assert.equal(keys.includes("ask"), false, "asking is the surface");
   assert.equal(keys.includes("history"), false, "the thread is the history");
   // The old Briefing tab was two things under one name. Its recommendations open the conversation;
