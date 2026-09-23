@@ -668,16 +668,19 @@ export const LIVE_VOICE_STOP_MESSAGES = Object.freeze({
 });
 
 /**
- * A microphone that delivers frames but no sound. Seen 23 Sep 2026 with Bluetooth earphones on the
- * owner's laptop: Windows handed the app the earphones' hands-free microphone, which sent pure
- * silence, and the bar said "Listening" for ever. Frames were arriving, so the no-frames watchdog
- * never fired. Below this level for this long, the screen says so and names the microphone.
+ * A microphone that delivers frames but no sound. Seen 23 Sep 2026 on the owner's laptop, first
+ * with Bluetooth earphones connected and then with the laptop's own "Microphone Array" chosen: the
+ * bar said "Listening" for ever. Frames were arriving, so the no-frames watchdog never fired. Below
+ * this level for this long, the screen says so and names the microphone.
  */
 export const LIVE_VOICE_SILENT_RMS = 0.0004;
 export const LIVE_VOICE_SILENT_MS = 5000;
 export const silentMicrophoneMessage = (label = "") => {
   const name = String(label || "").trim();
-  return `FROST hears nothing from ${name ? `"${name}"` : "this microphone"}. If you are speaking, choose another microphone below, or pick the laptop's own microphone in Windows Settings > System > Sound > Input. Bluetooth earphones often send silence.`;
+  // Windows hands a blocked app a microphone that opens normally and sends pure silence, so the
+  // privacy switch comes first: on 23 Sep 2026 the laptop's own microphone did this too, not only
+  // the Bluetooth earphones.
+  return `FROST hears nothing from ${name ? `"${name}"` : "this microphone"}. If you are speaking: in Windows Settings > Privacy & security > Microphone, turn on "Let desktop apps access your microphone"; check its volume in System > Sound > Input; or choose another microphone below.`;
 };
 
 /**

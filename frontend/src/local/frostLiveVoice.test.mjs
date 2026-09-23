@@ -1647,6 +1647,7 @@ test("silentMicrophoneMessage names the microphone, or says 'this microphone' wh
   assert.match(silentMicrophoneMessage("Mic Array"), /^FROST hears nothing from "Mic Array"\./);
   assert.match(silentMicrophoneMessage(""), /^FROST hears nothing from this microphone\./);
   assert.match(silentMicrophoneMessage("x"), /choose another microphone below/);
+  assert.match(silentMicrophoneMessage("x"), /Let desktop apps access your microphone/, "Windows' privacy switch sends silence, not an error");
 });
 
 test("listMicrophones: real devices only, the default stand-in names the current default, failures are empty", async () => {
