@@ -259,7 +259,11 @@ const reminderTitleFrom = (question = "") => {
     .trim();
   const stripped = text
     .replace(/^\s*(please|plz|zara|bhai)\s+/i, "")
-    .replace(/^\s*(remind me to|remind me|reminder for|reminder to|set a reminder to|set a reminder for|remind|mujhe yaad dilana|yaad dilana|yaad dila do|yaad rakhna|note kar lo|note karlo|likh lo|likh lena)\s*/i, "")
+    // `\b` after the group, so "remind" can no longer eat the front of "reminder": "reminder set karo
+    // supplier payment kal" was saved with the title "er set karo supplier payment kal". Every
+    // alternative is a whole phrase, which is why a trailing boundary is right here -- the trap noted
+    // at the top of this file is a boundary after a *prefix*, and none of these is one.
+    .replace(/^\s*(remind me to|remind me|reminder set karo|reminder set kar do|reminder laga do|reminder lagao|reminder for|reminder to|set a reminder to|set a reminder for|reminder|remind|mujhe yaad dilana|yaad dilana|yaad dila do|yaad rakhna|note kar lo|note karlo|likh lo|likh lena)\b\s*/i, "")
     .replace(/^\s*(that|ki|ke liye|to)\s+/i, "")
     .trim();
   return stripped || text;

@@ -5290,9 +5290,12 @@ function App() {
           });
           // The date is said back to him. A date that was misread is only findable if FROST states
           // what it understood; "saved" alone would hide a reminder sitting on the wrong day.
+          // Said out loud when the bell will ring. A reminder for tomorrow correctly stays out of the
+          // bell today, and on 23 Sep 2026 that read to the owner as "the reminder is not working":
+          // he asked, FROST said saved, and the bell stayed quiet with nothing to say why.
           settle(draft.due_at
-            ? `Saved for ${formatDisplayDate(draft.due_at)}. I will remind you: "${draft.title}". It is under Reminders.`
-            : `Saved. I will remind you: "${draft.title}". It is under Reminders, where you can put a date on it.`);
+            ? `Saved for ${formatDisplayDate(draft.due_at)}: "${draft.title}". The bell will ring on that day. Until then it is under Reminders.`
+            : `Saved: "${draft.title}". It is in the bell now and under Reminders, where you can put a date on it.`);
           await loadAiAssistant(aiRange).catch(() => null);
           loadFrostBell().catch(() => null);
         } catch (reminderError) {

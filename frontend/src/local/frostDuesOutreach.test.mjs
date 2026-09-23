@@ -249,5 +249,8 @@ test("a date FROST read out of the question is said back to the owner", () => {
   // A misread date is only findable if FROST states what it understood. "Saved" alone hides a
   // reminder sitting on the wrong day.
   assert.match(appJsx, /Saved for \$\{formatDisplayDate\(draft\.due_at\)\}/);
+  // And when the bell will ring. A reminder for tomorrow correctly stays out of today's bell, and
+  // with nothing saying so that read as "the reminder is not working" (23 Sep 2026).
+  assert.match(appJsx, /The bell will ring on that day\./);
   assert.match(appJsx, /due_at: draft\.due_at \|\| null/);
 });

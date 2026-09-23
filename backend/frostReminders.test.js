@@ -37,6 +37,7 @@ const {
   contactStatusFor,
   normalizeReminderDueAt,
   prepareCustomerDueReminder,
+  reminderDueAtWallClock,
 } = require("./frostReminders");
 const { assertGroundedAnswer } = require("./aiBusinessAssistantRules");
 const { getCustomerDueReminders, OVERDUE_DUE_STATUSES } = require("./aiBusinessAssistantService");
@@ -724,4 +725,43 @@ test("the words are read in one place only", () => {
     assert.ok(!new RegExp(`["'\`][^"'\`]*\\b${word}\\b`).test(source),
       `frostReminders.js reads the word "${word}"; that belongs to detectReminderDueDate`);
   }
+});
+
+/* ------------------------------------------------ the stored day, whatever the server's zone */
+
+/**
+ * Found 23 Sep 2026: the rehearsal's stand-in cloud runs on the owner's laptop in India, and every
+ * dated reminder showed one day early. node-postgres reads a zone-less TIMESTAMP as the server's
+ * local time, so "2026-09-24 00:00:00" serialised as "2026-09-23T18:30:00.000Z" and the first ten
+ * characters said the 23rd. These tests build the Date the same way node-postgres does -- from
+ * local components -- so they hold in any zone the suite runs in, including UTC where the bug hid.
+ */
+
+test("a stored midnight comes back as the same day, not the server's reading of it", () => {
+  const asPgBuildsIt = new Date(2026, 8, 24, 0, 0, 0);
+  assert.equal(reminderDueAtWallClock(asPgBuildsIt), "2026-09-24T00:00:00");
+});
+
+test("the time of day survives too", () => {
+  assert.equal(reminderDueAtWallClock(new Date(2026, 0, 5, 7, 3, 9)), "2026-01-05T07:03:09");
+});
+
+test("no date stays no date, and a string is left as the adapter sent it", () => {
+  for (const value of [null, undefined, ""]) assert.equal(reminderDueAtWallClock(value), null);
+  assert.equal(reminderDueAtWallClock(new Date("nonsense")), null);
+  assert.equal(reminderDueAtWallClock("2026-09-24 00:00:00"), "2026-09-24 00:00:00");
+});
+
+test("the result carries no zone, so the counter reads it as its own local day", () => {
+  assert.doesNotMatch(reminderDueAtWallClock(new Date(2026, 8, 24)), /Z$|[+-]\d\d:\d\d$/);
+});
+
+test("the reminders list goes through it, and snoozed_until does not", () => {
+  // `snoozed_until` is an instant (CURRENT_TIMESTAMP + 1 day), not a day the owner picked; giving it
+  // wall-clock treatment would wake a snooze hours early when server and counter disagree on a zone.
+  const source = fs.readFileSync(path.join(__dirname, "aiBusinessAssistantService.js"), "utf8");
+  const start = source.indexOf("const getReminders = async");
+  const body = source.slice(start, source.indexOf("\n};", start));
+  assert.match(body, /due_at: reminderDueAtWallClock\(row\.due_at\)/);
+  assert.doesNotMatch(body, /snoozed_until: reminderDueAtWallClock/);
 });

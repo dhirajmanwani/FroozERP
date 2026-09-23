@@ -168,10 +168,44 @@ const normalizeReminderDueAt = (value) => {
   return parsed.toISOString();
 };
 
+/**
+ * A reminder's due date as the day that was stored, not as an instant shifted by the server's clock.
+ *
+ * ## The bug this fixes
+ *
+ * `ai_reminders.due_at` is a `TIMESTAMP` with no zone, and node-postgres turns one into a JS `Date`
+ * by reading it as the *server's* local time. On a backend running in India, "2026-09-24 00:00:00"
+ * becomes 23 Sep 18:30 UTC, serialises as `"2026-09-23T18:30:00.000Z"`, and every screen that
+ * reads the first ten characters -- the date box, `formatDisplayDate` -- shows the 23rd. The owner
+ * says "kal", FROST answers "Saved for 24/09", and the Reminders list shows 23/09. Found in the
+ * 23 Sep 2026 rehearsal, whose stand-in cloud runs on his laptop. On a UTC host the two agree, which
+ * is exactly why it was invisible until then.
+ *
+ * ## Why wall-clock is right for this column and not for `snoozed_until`
+ *
+ * `due_at` is a *day* the owner picked -- "the 24th", wherever the shop is. The local components of
+ * the `Date` node-postgres built are the stored wall-clock value, exactly, whatever zone the server
+ * is in, so reading them back recovers what was written. The result carries no zone, and the
+ * browser reads such a string as its own local time: the 24th at midnight in the shop.
+ *
+ * `snoozed_until` is different: it is `CURRENT_TIMESTAMP + 1 day`, an instant, and giving it the
+ * same treatment would wake a snooze hours early whenever server and counter disagree on a zone.
+ * It is left exactly as it was.
+ */
+const reminderDueAtWallClock = (value) => {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "string") return value;
+  if (!(value instanceof Date) || Number.isNaN(value.getTime())) return null;
+  const pad = (part) => String(part).padStart(2, "0");
+  return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`
+    + `T${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}`;
+};
+
 module.exports = {
   CONTACT_STATUS,
   buildCustomerReminderMessage,
   contactStatusFor,
   normalizeReminderDueAt,
   prepareCustomerDueReminder,
+  reminderDueAtWallClock,
 };

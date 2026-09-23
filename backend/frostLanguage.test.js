@@ -284,3 +284,18 @@ test("the reminder keeps the owner's own words", () => {
   // Nothing left after stripping is not an empty title; it is the sentence as typed.
   assert.ok(reminderTitleFrom("remind me").length > 0);
 });
+
+test("\"remind\" never eats the front of \"reminder\"", () => {
+  // Found 23 Sep 2026: "reminder set karo supplier payment kal" was saved with the title
+  // "er set karo supplier payment kal", and a bare "reminder" became "er". The strip matched the
+  // word "remind" inside "reminder" and left the tail behind.
+  const { reminderTitleFrom } = require("./frostLanguage");
+  assert.equal(reminderTitleFrom("reminder set karo supplier payment kal"), "supplier payment kal");
+  assert.equal(reminderTitleFrom("reminder laga do rent ka"), "rent ka");
+  assert.equal(reminderTitleFrom("set a reminder for rent"), "rent");
+  assert.equal(reminderTitleFrom("reminder"), "reminder");
+  // Whatever he types, a title must never start with the torn-off end of an asking word.
+  for (const question of ["reminder set karo x", "reminders dikhao", "reminder", "remind karna kal", "remind me to pay"]) {
+    assert.doesNotMatch(reminderTitleFrom(question), /^(er|ers|ed|ing)\b/, `${question} left a fragment`);
+  }
+});

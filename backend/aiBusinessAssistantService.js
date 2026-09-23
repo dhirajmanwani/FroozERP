@@ -9,7 +9,7 @@ const {
 const { describeOllamaFallback, phraseWithOllama } = require("./frostOllama");
 const { ANSWER_FORMAT_VERSION, buildDeterministicAnswer } = require("./frostAnswer");
 const { detectReminderDueDate, detectSmallTalk, detectSpokenRange, reminderTitleFrom } = require("./frostLanguage");
-const { CONTACT_STATUS, normalizeReminderDueAt, prepareCustomerDueReminder } = require("./frostReminders");
+const { CONTACT_STATUS, normalizeReminderDueAt, prepareCustomerDueReminder, reminderDueAtWallClock } = require("./frostReminders");
 const {
   DEFAULT_FROST_SETTINGS,
   FROST_ASSISTANT_NAME,
@@ -1758,7 +1758,9 @@ const getReminders = async (pool, branchId) => {
     ORDER BY due_at NULLS LAST, CASE priority WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2 WHEN 'ATTENTION' THEN 3 ELSE 4 END, id DESC
     LIMIT 100
   `, [branch]);
-  return result.rows;
+  // The stored day, not the server's reading of it -- see `reminderDueAtWallClock`. Without this a
+  // backend in India shows every dated reminder one day early.
+  return result.rows.map((row) => ({ ...row, due_at: reminderDueAtWallClock(row.due_at) }));
 };
 
 const emptyBriefingFact = (type, sourceModule, periodLabel, summary = {}, error = "") => buildFact(
