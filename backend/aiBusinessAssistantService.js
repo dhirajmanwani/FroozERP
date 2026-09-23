@@ -11,6 +11,15 @@ const { ANSWER_FORMAT_VERSION, buildDeterministicAnswer } = require("./frostAnsw
 const { detectReminderDueDate, detectSmallTalk, detectSpokenRange, reminderTitleFrom } = require("./frostLanguage");
 const { CONTACT_STATUS, normalizeReminderDueAt, prepareCustomerDueReminder, reminderDueAtWallClock } = require("./frostReminders");
 const {
+  buildCustomerLedger,
+  buildDuesAnswer,
+  buildPaymentsDue,
+  buildSupplierLedger,
+  linkReminderDraft,
+  resolvePaymentsDueDate,
+  shortDay,
+} = require("./frostAccounts");
+const {
   DEFAULT_FROST_SETTINGS,
   FROST_ASSISTANT_NAME,
   FrostServiceLayer,
@@ -575,6 +584,172 @@ const getSupplierOutstanding = async (pool, branchId) => {
   return buildFact("supplier_outstanding", "Purchases", "Current outstanding", rows, {
     totalOutstanding: roundCurrency(rows.reduce((sum, row) => sum + row.outstanding_amount, 0)),
     count: rows.length,
+  });
+};
+
+/**
+ * The per-bill input the FIFO in `frostAccounts.js` needs, which `getCustomerOutstanding` cannot give.
+ *
+ * `getCustomerOutstanding` answers "how much" with one row per customer, which is right for the
+ * alerts and the dues panel, and it stays exactly as it is -- `runAlertRules` reads its
+ * `oldest_due_date`. But "since when" is a question about bills: the oldest bill's due date is the
+ * wrong answer for a customer who has paid that bill and the next one. So the same three sources are
+ * read again here, at the grain FIFO needs, and with the same rules: non-cancelled CREDIT sales,
+ * payments not cancelled, and credit-note returns.
+ *
+ * Unlimited, unlike the fact query's `LIMIT 50`. A payment reminder due today for the fifty-first
+ * largest debtor must show that customer's balance, not read as "settled" because the balance fell
+ * off the end of a top-50 list.
+ */
+const getCustomerCreditInputs = async (pool, branchId) => {
+  const branch = requireBranchScope(branchId);
+  const bills = await pool.query(`
+    SELECT
+      s.id,
+      s.customer_id,
+      COALESCE(c.customer_name, s.customer_name, 'Walk-in Customer') AS customer_name,
+      s.sale_date,
+      s.due_date,
+      s.total_amount
+    FROM sales s
+    LEFT JOIN customers c ON c.id = s.customer_id
+    WHERE s.branch_id = $1
+      AND s.payment_mode = 'CREDIT'
+      AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
+    ORDER BY s.sale_date, s.id
+  `, [branch]);
+  // A return with no customer is left out, as it is in `getCustomerOutstanding`, whose join on
+  // `customer_id` can never match a NULL. Keeping it here would pay down the walk-in group's bills
+  // with money that query never credits, and the two totals would disagree.
+  const credits = await pool.query(`
+    WITH payments AS (
+      SELECT customer_id, SUM(payment_amount) AS paid_amount, MAX(payment_date) AS last_payment_date
+      FROM customer_payments
+      WHERE cancelled IS DISTINCT FROM TRUE AND branch_id = $1
+      GROUP BY customer_id
+    ),
+    returns AS (
+      SELECT s.customer_id, SUM(sr.total_return_amount) AS returned_amount
+      FROM sale_returns sr
+      JOIN sales s ON s.id = sr.sale_id
+      WHERE sr.refund_type IN ('CREDIT_NOTE', 'FUTURE_ADJUSTMENT')
+        AND s.branch_id = $1
+      GROUP BY s.customer_id
+    )
+    SELECT
+      COALESCE(p.customer_id, r.customer_id) AS customer_id,
+      c.customer_name,
+      COALESCE(p.paid_amount, 0) AS paid_amount,
+      COALESCE(r.returned_amount, 0) AS returned_amount,
+      p.last_payment_date
+    FROM payments p
+    FULL OUTER JOIN returns r ON r.customer_id = p.customer_id
+    LEFT JOIN customers c ON c.id = COALESCE(p.customer_id, r.customer_id)
+    WHERE COALESCE(p.customer_id, r.customer_id) IS NOT NULL
+  `, [branch]);
+  return { customers: credits.rows, customerBills: bills.rows };
+};
+
+/**
+ * Every supplier this branch has bought from, with what is still owed -- zero included.
+ *
+ * The same balance `getSupplierOutstanding` sums, without its `LIMIT 50` and without dropping the
+ * suppliers who are paid up: "Verma ko kitna dena hai" about a supplier owed nothing is answered
+ * "nothing now", not "I could not find Verma".
+ */
+const getSupplierBalanceRows = async (pool, branchId) => {
+  const branch = requireBranchScope(branchId);
+  const result = await pool.query(`
+    SELECT
+      p.supplier_id,
+      COALESCE(s.supplier_name, p.supplier_name, 'Supplier') AS supplier_name,
+      MIN(CASE WHEN COALESCE(p.balance_amount, 0) > 0 THEN COALESCE(p.bill_date, p.purchase_date) END) AS oldest_purchase_date,
+      SUM(CASE WHEN COALESCE(p.balance_amount, 0) > 0 THEN p.balance_amount ELSE 0 END) AS outstanding_amount
+    FROM purchases p
+    LEFT JOIN suppliers s ON s.id = p.supplier_id
+    WHERE COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
+      AND p.branch_id = $1
+    GROUP BY p.supplier_id, COALESCE(s.supplier_name, p.supplier_name, 'Supplier')
+  `, [branch]);
+  return result.rows;
+};
+
+/**
+ * Open COLLECT_PAYMENT and PAY_SUPPLIER reminders, dated or not.
+ *
+ * "Open" is what `getReminders` means by it -- anything not RESOLVED -- so a reminder the Reminders
+ * list still shows is one this route still knows about. A snooze that has not run out is flagged
+ * rather than filtered, against the database's clock: the popup must stay quiet until it ends, while
+ * the account's row in the panel still shows that a reminder exists.
+ *
+ * The account's name is joined here for a reminder whose account has no ledger row at this branch,
+ * so a settled reminder still says whose it was. `id::text` against the stored string, never the
+ * other way round: `linked_entity_id` is an opaque string, and "004" must not find customer 4.
+ */
+const getOpenPaymentReminders = async (pool, branchId) => {
+  const branch = requireBranchScope(branchId);
+  const result = await pool.query(`
+    SELECT
+      r.id,
+      r.reminder_type,
+      r.linked_entity_type,
+      r.linked_entity_id,
+      r.due_at,
+      r.status,
+      (r.status = 'SNOOZED' AND COALESCE(r.snoozed_until > CURRENT_TIMESTAMP, FALSE)) AS currently_snoozed,
+      COALESCE(c.customer_name, sp.supplier_name) AS linked_entity_name
+    FROM ai_reminders r
+    LEFT JOIN customers c ON r.linked_entity_type = 'customer' AND c.id::text = r.linked_entity_id
+    LEFT JOIN suppliers sp ON r.linked_entity_type = 'supplier' AND sp.id::text = r.linked_entity_id
+    WHERE r.status <> 'RESOLVED'
+      AND r.branch_id = $1
+      AND r.reminder_type IN ('COLLECT_PAYMENT', 'PAY_SUPPLIER')
+    ORDER BY r.due_at NULLS LAST, r.id
+  `, [branch]);
+  // The stored day, not the server's reading of it -- see `reminderDueAtWallClock`.
+  return result.rows.map((row) => ({ ...row, due_at: reminderDueAtWallClock(row.due_at) }));
+};
+
+const getPaymentsDueInputs = async (pool, branchId) => {
+  const { customers, customerBills } = await getCustomerCreditInputs(pool, branchId);
+  const suppliers = await getSupplierBalanceRows(pool, branchId);
+  const reminders = await getOpenPaymentReminders(pool, branchId);
+  return { customers, customerBills, suppliers, reminders };
+};
+
+/**
+ * The answer to a PAYMENTS question, and the `payments_due` fact that grounds it.
+ *
+ * Built from the same inputs as `GET /api/ai/payments-due` for the same day, so "aaj kisse payment
+ * maangna hai" in the chat and the popup on the screen cannot name different people.
+ */
+const answerDuesQuestion = async (pool, branchId, question, date = toDateKey()) => {
+  const inputs = await getPaymentsDueInputs(pool, branchId);
+  const paymentsDue = buildPaymentsDue({ date, ...inputs });
+  const dues = buildDuesAnswer({
+    question,
+    customers: buildCustomerLedger(inputs),
+    suppliers: buildSupplierLedger(inputs.suppliers),
+    paymentsDue,
+  });
+  return {
+    answer: dues.answer,
+    fact: buildFact("payments_due", "Accounts", `Balances as of ${shortDay(date)}`, dues.rows, dues.summary),
+  };
+};
+
+/**
+ * The account a spoken reminder names, when there is exactly one and the words point its way.
+ * See `linkReminderDraft`; this only reads the names it matches against.
+ */
+const linkSpokenReminder = async (pool, branchId, question, title) => {
+  const { customers, customerBills } = await getCustomerCreditInputs(pool, branchId);
+  const suppliers = await getSupplierBalanceRows(pool, branchId);
+  return linkReminderDraft({
+    question,
+    title,
+    customers: buildCustomerLedger({ customers, customerBills }),
+    suppliers: buildSupplierLedger(suppliers),
   });
 };
 
@@ -2071,6 +2246,42 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
   });
 
   /**
+   * Who to collect from and who to pay on one day, for the popup and the dues panel.
+   *
+   * **This route sends nothing.** It reads the ledger and the owner's own payment reminders and
+   * returns them; asking a customer for money is still something the owner does himself.
+   *
+   * `date` is the caller's calendar day, because the laptop is in India and the server may not be:
+   * for five and a half hours after midnight IST the server's day is still yesterday. It is bounded
+   * to two days either side of the server's day and refused otherwise -- a wrong clock must not
+   * quietly ask about another week.
+   *
+   * A failure is a 500 with a code, never an empty list. `collect: []` is the answer "nobody owes
+   * you today", and a query that failed must not be able to say that.
+   */
+  app.get("/api/ai/payments-due", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
+    if (!user) return;
+    const date = resolvePaymentsDueDate(req.query.date, toDateKey());
+    if (!date) {
+      return res.status(400).json({
+        code: "FROST_PAYMENTS_DATE_INVALID",
+        message: "Use a real date like 2026-09-23, within two days of today.",
+      });
+    }
+    try {
+      const inputs = await getPaymentsDueInputs(pool, req.auth.branchId);
+      return res.json(buildPaymentsDue({ date, ...inputs }));
+    } catch (error) {
+      console.error("FROST payments-due could not be read", error.message);
+      return res.status(500).json({
+        code: "FROST_PAYMENTS_DUE_UNAVAILABLE",
+        message: "Payments due could not be read just now. Nothing is known to be due or settled until it can.",
+      });
+    }
+  });
+
+  /**
    * The customers who owe money, each with a message the owner can read, edit and send himself.
    *
    * **This route sends nothing.** It reads the ledger and returns text. No WhatsApp call is made
@@ -2465,6 +2676,11 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     const classification = classifyBusinessIntent(question);
     if (!(await enforceIntentPermission({ classification, user, getPermissionUser, res }))) return;
     const facts = await factsForBusinessIntent(pool, req.auth.branchId, classification, settings, range);
+    // A dues question is answered per account -- "Ramesh owes you the most: ₹12,000" -- and the fact
+    // holding those accounts joins the others before the cache key is built, so an answer is never
+    // served against facts it was not written from.
+    const dues = classification === "PAYMENTS" ? await answerDuesQuestion(pool, req.auth.branchId, question) : null;
+    if (dues) facts.push(dues.fact);
     const providerKey = settings.provider?.key || "deterministic";
     const smallTalkKind = detectSmallTalk(question);
     // `answerFormat` is in the key so that changing how an answer is worded retires the entries
@@ -2479,7 +2695,16 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     // moment passed in rather than from a clock inside the parser, so the same question asked twice
     // a millisecond apart across midnight cannot resolve to two different days.
     const reminderDueDate = classification === "REMINDER_CREATE" ? detectReminderDueDate(question, new Date()) : "";
-    const deterministicAnswer = buildDeterministicAnswer(classification, facts, range, smallTalkKind, reminderTitle);
+    // "xyz ko payment dena hai" about a supplier the books know becomes a PAY_SUPPLIER reminder
+    // linked to him, so it pops up on the day with his balance beside it. Null -- and a plain owner
+    // note -- whenever the account or the direction is anything less than certain.
+    const reminderLink = classification === "REMINDER_CREATE" && reminderTitle
+      ? await linkSpokenReminder(pool, req.auth.branchId, question, reminderTitle)
+      : null;
+    // No period prefix on a dues answer: a balance is not a period figure.
+    const deterministicAnswer = dues
+      ? dues.answer
+      : buildDeterministicAnswer(classification, facts, range, smallTalkKind, reminderTitle);
 
     // The database has already answered. Everything from here is about *wording* -- and wording is
     // the only thing a model is allowed to contribute, which is why a failure at any step below
@@ -2566,7 +2791,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       // `due_at` is null when the question named no date, never today: a reminder quietly dated
       // today fires once, today, and is gone, while an undated one is still there for him to date.
       reminder_draft: classification === "REMINDER_CREATE" && reminderTitle
-        ? { title: reminderTitle, due_at: reminderDueDate || null }
+        ? { title: reminderTitle, due_at: reminderDueDate || null, ...(reminderLink || {}) }
         : null,
       // Echoed back as it was *stored*, not as it was sent. An id the column could not hold was
       // filed under no chat at all, and a panel told otherwise would keep sending follow-ups into
@@ -2605,12 +2830,16 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     const settings = await getAiSettings(pool, frost);
     const range = getRange(rangeQueryFor(question, req.body));
     const facts = await factsForBusinessIntent(pool, req.auth.branchId, classification, settings, range);
+    // The same per-account dues answer as `/api/ai/query`, so the two routes cannot word one
+    // question two ways.
+    const dues = classification === "PAYMENTS" ? await answerDuesQuestion(pool, req.auth.branchId, question) : null;
+    if (dues) facts.push(dues.fact);
     // Deterministic only, deliberately. This route is not called from the frontend, and the model
     // phrasing in `/api/ai/query` would be dead weight here. A grounding check would be worse than
     // dead weight: with nothing to phrase the answer it could never fail, and a guard that cannot
     // fail is the thing that was wrong with `assertGroundedAnswer` in the first place. If this
     // route is ever used, it needs the phrasing and the check together, not the check alone.
-    const answer = buildDeterministicAnswer(
+    const answer = dues ? dues.answer : buildDeterministicAnswer(
       classification,
       facts,
       range,
@@ -2864,6 +3093,10 @@ module.exports = {
   // Exported for `frostReminders.test.js`, which drives the dues panel against a scripted database
   // to prove the branch predicate and the prepared message rather than reading them out of source.
   getCustomerDueReminders,
+  // Exported for `frostAccounts.test.js`, which drives them against a scripted database to prove
+  // the branch predicate and the shape of what the pure layer is handed.
+  getPaymentsDueInputs,
+  answerDuesQuestion,
   OVERDUE_DUE_STATUSES,
   normalizeChatSessionId,
   CHAT_SESSION_ID_MAX_LENGTH,

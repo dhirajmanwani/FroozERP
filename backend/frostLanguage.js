@@ -33,7 +33,11 @@ const HINGLISH_HINTS = Object.freeze([
   // "aaj kya dhyan dena hai" -- the owner's own way of asking for the briefing -- was answered with
   // the payments ledger.
   { pattern: /\b(udhaar|udhar|udhari|udhaari|baki|baaki|bakaya|bakaaya|hisaab|hisab|lena\s*hai|(?<!dhyan )dena\s*hai|len\s*den|lendel)\b/, hints: "outstanding ledger payment" },
-  { pattern: /\b(vasooli|vasuli|recovery|bhugtan)\b/, hints: "payment outstanding" },
+  // "aaj kiska paisa vasool karna hai" and "aaj kise paisa chukana hai" are the owner's own words
+  // for the day's collect and pay lists, and both fell through to the general briefing because only
+  // "vasooli" and "bhugtan" were known. "maangna" is spelled with the double a on purpose: "mangana"
+  // is ordering stock, and belongs to the purchase hint below.
+  { pattern: /\b(vasooli|vasuli|vasool|vasul|recovery|bhugtan|chukana|chukani|chukane|maangna|maangni|maangne)\b/, hints: "payment outstanding" },
 
   // Cash actually in the box. Kept ahead of the generic money words because the drawer question
   // has its own facts.

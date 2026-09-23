@@ -7094,3 +7094,59 @@ tbody tr:last-child td {
   max-width: 420px;
   white-space: normal;
 }
+
+/* "Today's payments": the once-a-day popup of who to collect from and who to pay. A narrow card,
+   one line per payment with its buttons beside it, so a day with three dues reads in one glance. */
+.payments-due-modal {
+  width: min(620px, 100%);
+}
+
+.payments-due-body {
+  display: grid;
+  gap: 10px;
+  padding: 0 16px 16px;
+}
+
+.payments-due-summary {
+  color: var(--ink-muted);
+  font-size: 0.9rem;
+  margin: 0;
+}
+
+.payments-due-heading {
+  color: var(--ink);
+  font-size: 0.95rem;
+  margin: 6px 0 0;
+}
+
+.payments-due-list {
+  display: grid;
+  gap: 8px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.payments-due-row {
+  align-items: center;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  justify-content: space-between;
+  padding: 10px 12px;
+}
+
+.payments-due-text {
+  color: var(--ink);
+  flex: 1 1 260px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.payments-due-actions {
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+}

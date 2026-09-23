@@ -191,6 +191,24 @@ import {
   normalizeWhatsappNumber,
 } from "./local/frostDuesOutreach";
 import {
+  PAYMENTS_DUE_MEMORY_STORAGE_KEY,
+  PAYMENTS_DUE_STATUS,
+  PAYMENT_KIND,
+  attachWhatsappLinks,
+  buildPaymentPlan,
+  buildPaymentsDuePopup,
+  formatRupees,
+  isPaymentReminder,
+  localDateKey,
+  nextPaymentsDueMemory,
+  paymentReminderRequest,
+  paymentsDueBellItems,
+  readPaymentsDueMemory,
+  reminderDraftLinkFields,
+  resolvePaymentReminderRequest,
+  shiftDateKey,
+} from "./local/paymentsDue";
+import {
   FROST_CHAT_SELECTION,
   buildChatList,
   historyFromExchanges,
@@ -2310,6 +2328,23 @@ function App() {
    * offline) -- also not a failure, and also not something to ring an error about.
    */
   const [frostBell, setFrostBell] = useState({ alerts: [], reminders: [], error: "", read: false, skipped: false });
+  /**
+   * Today's payments (`GET /api/ai/payments-due`): who to collect from and who to pay, for the
+   * popup, the bell and the dues panel. Same rules as `frostBell`: `read` false until fetched,
+   * `skipped` for a deliberate no-ask (LOCAL_ONLY, offline), and a failure kept as `error`, never as
+   * an empty list. `dateKey` is the local day the list was asked for.
+   */
+  const [paymentsDue, setPaymentsDue] = useState({ payload: null, error: "", read: false, skipped: false, dateKey: "" });
+  // The popup's per-day memory: closed today, and rows dealt with today. Held in state so the popup
+  // closes even when localStorage refuses the write; localStorage only carries it across a restart.
+  const [paymentsMemory, setPaymentsMemory] = useState(() => {
+    const today = localDateKey(new Date());
+    try {
+      return readPaymentsDueMemory(localStorage.getItem(PAYMENTS_DUE_MEMORY_STORAGE_KEY), today);
+    } catch {
+      return readPaymentsDueMemory(null, today);
+    }
+  });
   const [aiQuestion, setAiQuestion] = useState("");
   const [aiRange, setAiRange] = useState("today");
   const [frostActiveTab, setFrostActiveTab] = useState(() => {
@@ -4683,7 +4718,9 @@ function App() {
     if (!frostBell.read) return;
     const bell = buildFrostBellNotifications({
       alerts: frostBell.alerts,
-      reminders: frostBell.reminders,
+      // Payment reminders ring through the payments rows below, worded with the amount and the
+      // day; ringing them here as well would put every one in the bell twice.
+      reminders: (frostBell.reminders || []).filter((row) => !isPaymentReminder(row)),
       nowMs: Date.now(),
       failure: frostBell.error,
     });
@@ -4702,6 +4739,96 @@ function App() {
       }
     }
   }, [frostBell, frostBellAllowed, notify, clearNotice]);
+
+  /**
+   * Read today's payments: who to collect from and who to pay (`GET /api/ai/payments-due`).
+   *
+   * Same gate, same timer and same skip-versus-failure rule as `loadFrostBell`, because it is the
+   * same door on the server (FROST's reminders permission) and the same connection: LOCAL_ONLY or
+   * offline is a skip that makes no request at all. The day asked for is the laptop's local day --
+   * `localDateKey`, never `toISOString`, which in IST names yesterday until 05:30.
+   */
+  const loadPaymentsDue = useCallback(async () => {
+    if (!user || !frostBellAllowed) return;
+    const approved = ["APPROVED", "ACTIVE"].includes(String(cloudDeviceRegistration?.status || "").toUpperCase());
+    const runtimeConnectivity = deriveRuntimeConnectivity({
+      localHealth: backendHealth,
+      internetAvailable,
+      cloudHealth,
+      deviceApproved: approved,
+    });
+    const loadDecision = resolveFrostLoadDecision({
+      apiUrl: API_URL,
+      cloudApiMode: isCloudMode(),
+      desktopShell: isDesktopShell(),
+      internetAvailable: runtimeConnectivity.internetAvailable,
+      cloudOnline: cloudHealth?.online === false ? false : null,
+      cloudSession: hasCloudSession(user),
+    });
+    if (!loadDecision.shouldLoad) {
+      setPaymentsDue((current) => ({ ...current, error: "", read: false, skipped: true }));
+      return;
+    }
+    const dateKey = localDateKey(new Date());
+    try {
+      const response = await axios.get(`${API_URL}/api/ai/payments-due`, {
+        params: { user_id: user?.id, device_id: deviceInfo?.device_id, date: dateKey },
+        timeout: 15000,
+      });
+      setPaymentsDue({ payload: response.data || null, error: "", read: true, skipped: false, dateKey });
+    } catch (error) {
+      setPaymentsDue((current) => ({
+        ...current,
+        error: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth })
+          || "Today's payments did not load.",
+        read: true,
+        skipped: false,
+        dateKey,
+      }));
+    }
+  }, [user, frostBellAllowed, cloudDeviceRegistration?.status, backendHealth, internetAvailable, cloudHealth, offlineMode, deviceInfo?.device_id]);
+
+  useEffect(() => {
+    if (!user || !frostBellAllowed) return undefined;
+    loadPaymentsDue();
+    // The bell's five minutes. It also re-asks after local midnight, which is what rolls the popup
+    // over to the new day's list.
+    const timer = window.setInterval(() => { loadPaymentsDue(); }, 300000);
+    return () => window.clearInterval(timer);
+  }, [user, frostBellAllowed, loadPaymentsDue]);
+
+  /**
+   * Today's payments in the bell, under the FROST bell's rules: raise a row only when it is new or
+   * its words changed, and retract only after a read that succeeded.
+   */
+  const raisedPaymentBellRows = useRef(new Map());
+
+  useEffect(() => {
+    if (!frostBellAllowed) {
+      for (const key of raisedPaymentBellRows.current.keys()) clearNotice(key);
+      raisedPaymentBellRows.current = new Map();
+      return;
+    }
+    if (!paymentsDue.read) return;
+    const bell = paymentsDueBellItems(paymentsDue.payload, paymentsDue.dateKey, {
+      failure: paymentsDue.error,
+      nowMs: Date.now(),
+    });
+    const raised = raisedPaymentBellRows.current;
+    for (const item of bell.items) {
+      if (raised.get(item.dedupeKey) === item.message) continue;
+      notify(item);
+      raised.set(item.dedupeKey, item.message);
+    }
+    if (bell.status === PAYMENTS_DUE_STATUS.OK) {
+      const live = new Set(bell.keys);
+      for (const key of [...raised.keys()]) {
+        if (live.has(key)) continue;
+        clearNotice(key);
+        raised.delete(key);
+      }
+    }
+  }, [paymentsDue, frostBellAllowed, notify, clearNotice]);
 
   /**
    * Surface the activation state in the notification centre.
@@ -5128,6 +5255,106 @@ function App() {
     }
   };
 
+  /**
+   * "Today's payments": the popup, the actions on its rows, and the dates in the dues panel.
+   *
+   * What to show is decided in `local/paymentsDue.js`, which is tested: the popup opens only on
+   * its `show` flag, which is never true for a failed read. The memory of "closed today" and "dealt
+   * with today" is per local day, so it lapses by itself at midnight.
+   */
+  const paymentsToday = localDateKey(new Date());
+  const paymentsMemoryToday = paymentsMemory.date === paymentsToday
+    ? paymentsMemory
+    : readPaymentsDueMemory(null, paymentsToday);
+  const paymentsPopup = frostBellAllowed && paymentsDue.read
+    ? buildPaymentsDuePopup({
+      payload: paymentsDue.payload,
+      failure: paymentsDue.error,
+      dateKey: paymentsToday,
+      dismissedDateKey: paymentsMemoryToday.dismissed ? paymentsToday : "",
+      hiddenKeys: paymentsMemoryToday.hiddenKeys,
+    })
+    : { status: "", show: false, collectRows: [], payRows: [], message: "", collectTotal: 0, payTotal: 0 };
+  const [paymentsAction, setPaymentsAction] = useState({ busyKey: "", failure: "" });
+
+  const rememberPaymentsDue = (change) => {
+    const next = nextPaymentsDueMemory(paymentsMemoryToday, paymentsToday, change);
+    setPaymentsMemory(next);
+    try {
+      localStorage.setItem(PAYMENTS_DUE_MEMORY_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // A per-device convenience. The state above already holds it for this session.
+    }
+  };
+
+  /** Send one request built by `local/paymentsDue.js`. Nothing is sent for a `null` request. */
+  const sendPaymentRequest = async (request) => {
+    if (!request) return;
+    const body = { user_id: user?.id, device_id: deviceInfo?.device_id, ...request.body };
+    if (request.method === "POST") await axios.post(`${API_URL}${request.path}`, body, { timeout: 15000 });
+    else await axios.patch(`${API_URL}${request.path}`, body, { timeout: 15000 });
+  };
+
+  /**
+   * "Done" or "Remind tomorrow" on one popup row. On success the row is put away for today on this
+   * device as well: a bill that is still overdue would otherwise bring the same row straight back
+   * on the reload, and the button would look as if it had done nothing.
+   */
+  const actOnPaymentRow = async (row, action) => {
+    setPaymentsAction({ busyKey: row.key, failure: "" });
+    try {
+      if (action === "done") {
+        await sendPaymentRequest(resolvePaymentReminderRequest(row.reminderId));
+      } else {
+        await sendPaymentRequest(paymentReminderRequest({
+          kind: row.kind,
+          entityId: row.entityId,
+          entityName: row.entityName,
+          amount: row.amount,
+          dueDate: shiftDateKey(paymentsToday, 1),
+          existingReminderId: row.reminderId,
+        }));
+      }
+      rememberPaymentsDue({ hideKey: row.key });
+      setPaymentsAction({ busyKey: "", failure: "" });
+    } catch (error) {
+      setPaymentsAction({
+        busyKey: "",
+        failure: `${row.entityName}: ${getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth }) || "That could not be saved."}`,
+      });
+    }
+    loadPaymentsDue().catch(() => null);
+    loadFrostBell().catch(() => null);
+  };
+
+  /**
+   * Set, move or clear the "ask for payment on" / "pay on" date from the dues panel. Errors are
+   * thrown back to the date box, which shows them in place. The list is re-read before returning so
+   * a second edit PATCHes the reminder the first one created instead of creating another.
+   */
+  const setPaymentDate = async ({ kind, entityId, entityName, amount, reminderId }, dueDate) => {
+    await sendPaymentRequest(paymentReminderRequest({
+      kind,
+      entityId,
+      entityName,
+      amount,
+      dueDate: dueDate || "",
+      existingReminderId: reminderId,
+    }));
+    await loadPaymentsDue().catch(() => null);
+    loadFrostBell().catch(() => null);
+  };
+
+  // The popup's "Prepare WhatsApp" links come from the dues outreach list, which is otherwise read
+  // only when the dues section is opened. Read it once when the popup has a customer to show.
+  const paymentsPopupNeedsDues = paymentsPopup.show && paymentsPopup.collectRows.length > 0;
+  useEffect(() => {
+    if (!paymentsPopupNeedsDues) return;
+    if (aiAssistantData.dues || aiAssistantData.duesLoading || aiAssistantData.duesFailure) return;
+    loadFrostDues();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paymentsPopupNeedsDues]);
+
   const loadFrostChats = async () => {
     setAiAssistantData((current) => ({ ...current, chatsLoading: true }));
     try {
@@ -5280,7 +5507,10 @@ function App() {
           await axios.post(`${API_URL}/api/ai/reminders`, {
             user_id: user?.id,
             device_id: deviceInfo.device_id,
-            reminder_type: "OWNER_NOTE",
+            // OWNER_NOTE, unless the backend recognised exactly one customer to collect from or one
+            // supplier to pay; then the reminder is linked to that account and shows up in the
+            // day's payments popup. Passed through only as a consistent set -- see the helper.
+            ...reminderDraftLinkFields(draft),
             priority: "ATTENTION",
             title: draft.title,
             message: draft.title,
@@ -5298,6 +5528,7 @@ function App() {
             : `Saved: "${draft.title}". It is in the bell now and under Reminders, where you can put a date on it.`);
           await loadAiAssistant(aiRange).catch(() => null);
           loadFrostBell().catch(() => null);
+          loadPaymentsDue().catch(() => null);
         } catch (reminderError) {
           writeDiagnosticLog("WARN", "frost-reminder-save-failed", describeRequestFailure(reminderError, { url: `${API_URL}/api/ai/reminders` }));
           settle(`I could not save that reminder: ${getFrostDiagnosticMessage(reminderError, { offlineMode, internetAvailable, backendHealth, cloudHealth })} You can add it yourself under Reminders.`);
@@ -5340,6 +5571,8 @@ function App() {
     await axios.patch(`${API_URL}/api/ai/reminders/${reminderId}`, { user_id: user?.id, action });
     await loadAiAssistant(aiRange);
     loadFrostBell().catch(() => null);
+    // A payment reminder resolved or snoozed here must leave today's payments too.
+    loadPaymentsDue().catch(() => null);
   };
 
   /**
@@ -5360,6 +5593,7 @@ function App() {
     });
     await loadAiAssistant(aiRange);
     loadFrostBell().catch(() => null);
+    loadPaymentsDue().catch(() => null);
   };
 
   const saveFrostSettings = async (frostSettings) => {
@@ -8095,6 +8329,14 @@ function App() {
       failure: aiAssistantData.duesFailure,
     })
     : null;
+  // The popup's customer rows with the prepared-message link, where the outreach list can send to
+  // that customer. Joined on the canonical id inside the tested module.
+  const paymentsPopupCollectRows = attachWhatsappLinks(paymentsPopup.collectRows, frostDuesOutreach, DUE_OUTREACH_ACTION.SEND);
+  // The dates beside each customer and supplier in the dues panel. `null` until the list has been
+  // read, so the panel can tell "not read yet" from "read and failed".
+  const paymentPlan = frostBellAllowed && paymentsDue.read
+    ? buildPaymentPlan({ payload: paymentsDue.payload, failure: paymentsDue.error })
+    : null;
   const openFrostDrawer = (section = frostActiveTab || FROST_PRIMARY_SECTION) => {
     setFrostActiveTab(section);
     setFrostDrawerOpen(true);
@@ -9536,10 +9778,26 @@ function App() {
           </section>
         </div>
       )}
+      {paymentsPopup.show && (
+        <PaymentsDuePopup
+          busyKey={paymentsAction.busyKey}
+          collectRows={paymentsPopupCollectRows}
+          collectTotal={paymentsPopup.collectTotal}
+          failure={paymentsAction.failure}
+          message={paymentsPopup.message}
+          onAct={actOnPaymentRow}
+          onClose={() => rememberPaymentsDue({ dismiss: true })}
+          payRows={paymentsPopup.payRows}
+          payTotal={paymentsPopup.payTotal}
+        />
+      )}
       <FrostFloatingCopilot
         activeSection={frostActiveTab}
         data={aiAssistantData}
         duesOutreach={frostDuesOutreach}
+        onPaymentDate={setPaymentDate}
+        paymentPlan={paymentPlan}
+        paymentsSkipped={paymentsDue.skipped}
         onAlertAction={updateAiAlert}
         onAsk={askAiAssistant}
         onClose={() => setFrostDrawerOpen(false)}
@@ -9555,7 +9813,10 @@ function App() {
           setAiRange(range);
           loadAiAssistant(range);
         }}
-        onLoadDues={loadFrostDues}
+        onLoadDues={() => {
+          loadFrostDues();
+          loadPaymentsDue().catch(() => null);
+        }}
         onRefresh={() => loadAiAssistant(aiRange)}
         onReminderAction={updateAiReminder}
         onReminderDueDate={updateReminderDueDate}
@@ -9610,6 +9871,9 @@ function FrostFloatingCopilot({
   onSectionChange,
   open,
   duesOutreach = null,
+  onPaymentDate,
+  paymentPlan = null,
+  paymentsSkipped = false,
   question,
   range,
   unreadCount = 0,
@@ -9643,6 +9907,9 @@ function FrostFloatingCopilot({
             activeSection={activeSection}
             data={data}
             duesOutreach={duesOutreach}
+            onPaymentDate={onPaymentDate}
+            paymentPlan={paymentPlan}
+            paymentsSkipped={paymentsSkipped}
             onAlertAction={onAlertAction}
             onAsk={onAsk}
             onLoadDues={onLoadDues}
@@ -9788,6 +10055,9 @@ function AiBusinessAssistantModule({
   activeSection = FROST_PRIMARY_SECTION,
   data,
   duesOutreach = null,
+  onPaymentDate,
+  paymentPlan = null,
+  paymentsSkipped = false,
   onAlertAction,
   onAsk,
   onLoadDues,
@@ -10180,8 +10450,19 @@ function AiBusinessAssistantModule({
           failure={data.duesFailure}
           loading={data.duesLoading === true}
           onLoad={onLoadDues}
+          onPaymentDate={onPaymentDate}
           outreach={duesOutreach}
+          paymentPlan={paymentPlan}
+          paymentsSkipped={paymentsSkipped}
           summary={data.dues?.summary || null}
+        />
+      )}
+      {activeSection === "dues" && (
+        <FrostSupplierPaymentsPanel
+          canManageReminders={canManageReminders}
+          onPaymentDate={onPaymentDate}
+          paymentPlan={paymentPlan}
+          paymentsSkipped={paymentsSkipped}
         />
       )}
 
@@ -10248,6 +10529,142 @@ function AiBusinessAssistantModule({
 }
 
 /**
+ * "Today's payments": who to collect from and who to pay today, once per local day.
+ *
+ * What it lists is decided in `local/paymentsDue.js`; this only draws it. Nothing here sends a
+ * message: "Prepare WhatsApp" opens the prepared message from the dues outreach list in WhatsApp,
+ * and the owner reads it and presses send himself. "Done" closes the reminder behind the row, or
+ * for a row that came from a bill alone, puts it away for today on this device.
+ */
+function PaymentsDuePopup({ busyKey = "", collectRows = [], collectTotal = 0, failure = "", message = "", onAct, onClose, payRows = [], payTotal = 0 }) {
+  const renderRow = (item) => (
+    <li className="payments-due-row" key={item.key}>
+      <span className="payments-due-text">{item.text}</span>
+      <div className="button-row payments-due-actions">
+        {item.whatsappLink && (
+          <a className="table-action" href={item.whatsappLink} rel="noopener noreferrer" target="_blank">Prepare WhatsApp</a>
+        )}
+        <button className="table-action" disabled={Boolean(busyKey)} onClick={() => onAct(item, "done")} type="button">
+          {busyKey === item.key ? "Saving..." : "Done"}
+        </button>
+        <button className="table-action" disabled={Boolean(busyKey)} onClick={() => onAct(item, "tomorrow")} type="button">Remind tomorrow</button>
+      </div>
+    </li>
+  );
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section aria-labelledby="payments-due-title" aria-modal="true" className="invoice-modal payments-due-modal" role="dialog">
+        <div className="invoice-toolbar">
+          <div>
+            <span className="eyebrow">Payments</span>
+            <strong id="payments-due-title">Today's payments</strong>
+          </div>
+          <button aria-label="Close today's payments" className="remove-button" onClick={onClose} type="button"><Icon name="close" /></button>
+        </div>
+        <div className="payments-due-body">
+          <p className="payments-due-summary">{message}</p>
+          {collectRows.length > 0 && (
+            <>
+              <h3 className="payments-due-heading">To collect{collectTotal > 0 ? ` (${formatRupees(collectTotal)})` : ""}</h3>
+              <ul className="payments-due-list">{collectRows.map(renderRow)}</ul>
+            </>
+          )}
+          {payRows.length > 0 && (
+            <>
+              <h3 className="payments-due-heading">To pay{payTotal > 0 ? ` (${formatRupees(payTotal)})` : ""}</h3>
+              <ul className="payments-due-list">{payRows.map(renderRow)}</ul>
+            </>
+          )}
+          {failure && <div className="error-banner">{failure}</div>}
+          <div className="button-row">
+            <button className="secondary-button" onClick={onClose} type="button">Close for today</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+/**
+ * The "ask for payment on" / "pay on" date for one customer or supplier in the dues panel.
+ *
+ * Before the payments list is read, and when it could not be read, this says so instead of showing
+ * an empty date box: an empty box reads as "no date set", and typing into it would create a second
+ * reminder beside one the app simply could not see.
+ */
+function FrostPaymentDate({ amount, canManage = false, entityId, entityName = "", kind, label, onPaymentDate, plan = null, skipped = false }) {
+  if (!plan) {
+    return <small className="cell-note">{skipped ? "Payment dates need the cloud connection." : "Reading payment dates..."}</small>;
+  }
+  if (plan.status !== PAYMENTS_DUE_STATUS.OK) {
+    return <small className="frost-due-date-failure">Date could not be read</small>;
+  }
+  const reminder = kind === PAYMENT_KIND.COLLECT
+    ? plan.customersById.get(canonicalInventoryId(entityId))?.reminder || null
+    : plan.suppliers.find((entry) => inventoryIdsEqual(entry.supplierId, entityId))?.reminder || null;
+  return (
+    <FrostReminderDueDate
+      canManage={canManage && typeof onPaymentDate === "function"}
+      dueAt={reminder?.dueAt || ""}
+      label={label}
+      onSet={(value) => onPaymentDate({ kind, entityId, entityName, amount, reminderId: reminder?.id || null }, value)}
+    />
+  );
+}
+
+/**
+ * "You owe suppliers": every supplier with a balance, and the day he means to pay each one.
+ *
+ * Its own card rather than a second table inside "Who owes you", so a failure to read the customer
+ * ledger does not also hide what he owes, and the other way round.
+ */
+function FrostSupplierPaymentsPanel({ canManageReminders = false, onPaymentDate, paymentPlan = null, paymentsSkipped = false }) {
+  const subtitle = "Set the day you mean to pay. On that day it comes up in Today's payments.";
+  if (!paymentPlan) {
+    return (
+      <ModuleCard eyebrow="Payments" title="You owe suppliers" subtitle={subtitle}>
+        <div className="cart-empty">{paymentsSkipped ? "Supplier balances need the cloud connection, which this device is not using right now." : "Reading supplier balances..."}</div>
+      </ModuleCard>
+    );
+  }
+  if (paymentPlan.status !== PAYMENTS_DUE_STATUS.OK) {
+    return (
+      <ModuleCard eyebrow="Payments" title="You owe suppliers" subtitle={subtitle}>
+        <div className="error-banner">{paymentPlan.message}</div>
+      </ModuleCard>
+    );
+  }
+  return (
+    <ModuleCard eyebrow="Payments" title="You owe suppliers" subtitle={subtitle}>
+      <DataTable headers={["Supplier", "You owe", "Pay on"]}>
+        {paymentPlan.suppliers.map((supplier) => (
+          <tr key={supplier.key}>
+            <td className="primary-cell">
+              {supplier.name}
+              {supplier.oldestPurchaseDate && <small className="cell-note">Oldest unpaid purchase {formatDisplayDate(supplier.oldestPurchaseDate)}</small>}
+            </td>
+            <td>{supplier.amountText}</td>
+            <td>
+              <FrostPaymentDate
+                amount={supplier.amount}
+                canManage={canManageReminders}
+                entityId={supplier.supplierId}
+                entityName={supplier.name}
+                kind={PAYMENT_KIND.PAY}
+                label="Pay on"
+                onPaymentDate={onPaymentDate}
+                plan={paymentPlan}
+              />
+            </td>
+          </tr>
+        ))}
+        {paymentPlan.suppliers.length === 0 && <tr><td colSpan="3" className="empty-cell">No supplier balance is outstanding.</td></tr>}
+      </DataTable>
+    </ModuleCard>
+  );
+}
+
+/**
  * The date on one reminder, which the owner can set, change or take off.
  *
  * A plain date box and a Save button, not an auto-saving input. A date field that writes on every
@@ -10257,7 +10674,7 @@ function AiBusinessAssistantModule({
  * failed save leaves the box showing what he typed, with the reason, rather than silently snapping
  * back to the old date as though he had never touched it.
  */
-function FrostReminderDueDate({ canManage = false, dueAt, onSet }) {
+function FrostReminderDueDate({ canManage = false, dueAt, label = "Reminder due date", onSet }) {
   const saved = toDateInputValue(dueAt);
   const [draft, setDraft] = useState(saved);
   const [saving, setSaving] = useState(false);
@@ -10284,7 +10701,7 @@ function FrostReminderDueDate({ canManage = false, dueAt, onSet }) {
   return (
     <div className="frost-due-date">
       <input
-        aria-label="Reminder due date"
+        aria-label={label}
         disabled={!canManage || saving}
         onChange={(event) => setDraft(event.target.value)}
         type="date"
@@ -10318,7 +10735,17 @@ function FrostReminderDueDate({ canManage = false, dueAt, onSet }) {
  * with their balance and their draft -- he can ring them. Dropping those rows would make "opted
  * out" look like "owes nothing", which is the same fault as an error rendering as zero.
  */
-function FrostDuesPanel({ canManageReminders = false, failure = "", loading = false, onLoad, outreach = null, summary = null }) {
+function FrostDuesPanel({
+  canManageReminders = false,
+  failure = "",
+  loading = false,
+  onLoad,
+  onPaymentDate,
+  outreach = null,
+  paymentPlan = null,
+  paymentsSkipped = false,
+  summary = null,
+}) {
   // Loaded on open rather than with the panel's other eleven requests: it is a second pass over the
   // whole ledger, and most openings of FROST are not about dues.
   useEffect(() => {
@@ -10353,7 +10780,8 @@ function FrostDuesPanel({ canManageReminders = false, failure = "", loading = fa
           <span><strong>{outreach.sendableCount}</strong> ready to send</span>
         </div>
       )}
-      <DataTable headers={["Customer", "Outstanding", "Since", "Message", "Send"]}>
+      {paymentPlan?.status === PAYMENTS_DUE_STATUS.UNREADABLE && <div className="error-banner">{paymentPlan.message}</div>}
+      <DataTable headers={["Customer", "Outstanding", "Since", "Ask for payment on", "Message", "Send"]}>
         {outreach.rows.map((row) => (
           <tr key={row.key}>
             <td className="primary-cell">
@@ -10362,6 +10790,19 @@ function FrostDuesPanel({ canManageReminders = false, failure = "", loading = fa
             </td>
             <td>{currency.format(Number(row.outstanding_amount) || 0)}</td>
             <td>{formatDisplayDate(row.oldest_invoice_date)}</td>
+            <td>
+              <FrostPaymentDate
+                canManage={canManageReminders}
+                entityId={row.customer_id}
+                entityName={row.customer_name}
+                amount={row.outstanding_amount}
+                kind={PAYMENT_KIND.COLLECT}
+                label="Ask for payment on"
+                onPaymentDate={onPaymentDate}
+                plan={paymentPlan}
+                skipped={paymentsSkipped}
+              />
+            </td>
             <td className="frost-dues-message">{row.prepared_message || "No balance to write about."}</td>
             <td>
               {row.action === DUE_OUTREACH_ACTION.SEND ? (
@@ -10372,7 +10813,7 @@ function FrostDuesPanel({ canManageReminders = false, failure = "", loading = fa
             </td>
           </tr>
         ))}
-        {outreach.rows.length === 0 && <tr><td colSpan="5" className="empty-cell">Nobody has a balance outstanding.</td></tr>}
+        {outreach.rows.length === 0 && <tr><td colSpan="6" className="empty-cell">Nobody has a balance outstanding.</td></tr>}
       </DataTable>
       <div className="button-row">
         <button className="secondary-button" disabled={loading} onClick={onLoad} type="button">{loading ? "Refreshing..." : "Refresh"}</button>

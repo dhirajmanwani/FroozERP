@@ -38,7 +38,8 @@
  * improvement looked like it had not been deployed. Including this in the cache key makes an old
  * entry unreachable instead of stale.
  */
-const ANSWER_FORMAT_VERSION = 5;
+// 6: PAYMENTS answers per account ("Ramesh owes you the most: ...") with no period prefix.
+const ANSWER_FORMAT_VERSION = 6;
 
 /**
  * What FROST says to a question it did not recognise.
