@@ -1730,6 +1730,9 @@ test("silentMicrophoneMessage: names the microphone, and tells zeros, faint and 
   assert.match(faint, /^"Mic Array" sends sound, but far too quietly/);
   assert.match(faint, /\(tried with and without Windows voice processing; loudest sample 0\.00020\)$/);
   assert.match(silentMicrophoneMessage("", { peak: 0.0002 }), /^This microphone sends sound/);
+  // Printed as 0.00000 on the owner's laptop, and not exactly zero: still nothing, not "faint".
+  assert.match(silentMicrophoneMessage("Mic Array", { peak: 0.000003, triedRaw: true }), /complete silence[\s\S]*loudest sample 0\.00000\)$/);
+  assert.match(silentMicrophoneMessage("Mic Array", { peak: 0.0001 }), /far too quietly/);
   assert.match(silentMicrophoneMessage("x", { peak: 0.2, muted: true }), /complete silence[\s\S]*Windows reports the microphone muted/);
 });
 

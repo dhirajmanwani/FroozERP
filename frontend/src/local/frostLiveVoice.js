@@ -675,6 +675,13 @@ export const LIVE_VOICE_STOP_MESSAGES = Object.freeze({
  */
 export const LIVE_VOICE_SILENT_RMS = 0.0004;
 export const LIVE_VOICE_SILENT_MS = 5000;
+/**
+ * Below this peak a stream carries nothing a microphone could have picked up: about three steps of a
+ * 16-bit sample. A real microphone's own hiss is well above it. On 23 Sep 2026 the owner's laptop
+ * sent a peak that printed as 0.00000 yet was not exactly zero, and was wrongly called "faint".
+ */
+export const LIVE_VOICE_NOTHING_PEAK = 0.0001;
+
 export const silentMicrophoneMessage = (label = "", { peak = null, muted = false, triedRaw = false } = {}) => {
   const name = String(label || "").trim();
   const quoted = name ? `"${name}"` : "this microphone";
@@ -688,10 +695,10 @@ export const silentMicrophoneMessage = (label = "", { peak = null, muted = false
   const tail = facts ? ` (${facts})` : "";
   // A real microphone always picks up some room noise. Exact zeros mean Windows or the driver is
   // handing over nothing at all, which no amount of speaking louder changes.
-  if (muted || (Number.isFinite(loudest) && loudest === 0)) {
+  if (muted || (Number.isFinite(loudest) && loudest < LIVE_VOICE_NOTHING_PEAK)) {
     return `FROST hears nothing from ${quoted}: Windows is sending complete silence, not even room noise, so the microphone is switched off somewhere rather than quiet. Check the microphone mute key (often F4, with a light), that ${quoted} is not muted and its volume is up in Windows Settings > System > Sound > Input, and "Let desktop apps access your microphone" in Privacy & security > Microphone. Or choose another microphone below.${tail}`;
   }
-  if (Number.isFinite(loudest) && loudest > 0) {
+  if (Number.isFinite(loudest)) {
     return `${name ? quoted : "This microphone"} sends sound, but far too quietly for FROST to hear speech. Turn its volume up in Windows Settings > System > Sound > Input, speak closer, or choose another microphone below.${tail}`;
   }
   return `FROST hears nothing from ${quoted}. If you are speaking: in Windows Settings > Privacy & security > Microphone, turn on "Let desktop apps access your microphone"; check its volume in System > Sound > Input; or choose another microphone below.${tail}`;
