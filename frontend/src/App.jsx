@@ -2378,7 +2378,7 @@ function App() {
   // switch and the indicator draw; `frostSpeechSetup` is the gateway's word on whether whisper is
   // installed, and the last failure reading or starting it.
   const frostLiveVoiceRef = useRef(null);
-  const [frostLiveVoice, setFrostLiveVoice] = useState({ on: false, phase: "off", message: "", tone: "info", heard: "", engine: null, microphone: "", microphoneId: "" });
+  const [frostLiveVoice, setFrostLiveVoice] = useState({ on: false, phase: "off", message: "", tone: "info", heard: "", engine: null, microphone: "", microphoneId: "", microphoneRaw: false });
   const [frostSpeechSetup, setFrostSpeechSetup] = useState({ open: false, status: null, failure: null });
   // "Listen for Frost everywhere": per device, remembered in localStorage. An unreadable store reads
   // as off, and a store that refuses the write says so (the choice still holds for this session).
@@ -11424,7 +11424,9 @@ function FrostLiveVoiceBar({ liveVoice = null, onCloseSetup, onInstall, onRetry,
           Bluetooth headset that sends silence looked exactly like FROST ignoring the owner. */}
       {(on && liveVoice?.microphone) || voice?.microphoneOptions?.length ? (
         <div className="frost-live-mic">
-          {on && liveVoice?.microphone && <span>Hearing: &quot;{liveVoice.microphone}&quot;</span>}
+          {on && liveVoice?.microphone && (
+            <span>Hearing: &quot;{liveVoice.microphone}&quot;{liveVoice?.microphoneRaw && " (without Windows voice processing)"}</span>
+          )}
           {voice?.microphoneOptions?.length > 0 && (
             <label>
               Microphone{" "}

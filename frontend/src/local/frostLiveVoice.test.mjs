@@ -48,6 +48,8 @@ import {
   listMicrophones,
   microphoneOptions,
   silentMicrophoneMessage,
+  rawRetryMessage,
+  microphoneConstraints,
 } from "./frostLiveVoice.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -597,6 +599,7 @@ const makeRig = ({
   onWake = null,
   micLabel = "Headset (Boat Rockerz 255)",
   micDeviceId = "mic-headset",
+  micMuted = false,
 } = {}) => {
   const rig = {
     log: [],
@@ -620,6 +623,7 @@ const makeRig = ({
     const item = {
       stopped: false,
       label: micLabel,
+      muted: micMuted,
       stop() { item.stopped = true; },
       getSettings: () => ({ deviceId: micDeviceId }),
     };
@@ -1220,8 +1224,11 @@ test("always-on: switched on under a running drawer session, the same microphone
   rig.clock += 10 * 60 * 1000;
   rig.frame(silence());
   rig.tick();
+  await settle();
   assert.equal(rig.controller.view.on, true);
-  assert.equal(rig.tracks.length, 1, "one microphone");
+  // Ten silent minutes also reopen the microphone once without voice processing; the old stream is
+  // closed first, so there is still only ever one microphone open.
+  assert.equal(rig.tracks.filter((item) => !item.stopped).length, 1, "one microphone");
   assert.equal(rig.contexts.length, 1);
   // And back: the three minutes start from now, not from the last question.
   rig.controller.setIdleLimit(180_000);
@@ -1586,24 +1593,91 @@ test("the voice bar: always-on switch for Owner/Admin, drawer switch only when a
 // ---------------------------------------------------------------------------------------------
 // A microphone that is on and silent, and choosing another one (23 Sep 2026: Bluetooth earphones).
 // ---------------------------------------------------------------------------------------------
-test("controller: frames of pure silence for 5 s name the microphone and say it hears nothing", async () => {
+test("controller: 5 s of silence reopens the microphone without voice processing, then says why if still silent", async () => {
+  const label = "Headset (Boat Rockerz 255)";
   const rig = makeRig();
   await rig.controller.start();
-  assert.equal(rig.controller.view.microphone, "Headset (Boat Rockerz 255)", "the screen can say which microphone is open");
+  assert.equal(rig.controller.view.microphone, label, "the screen can say which microphone is open");
   assert.equal(rig.controller.view.microphoneId, "mic-headset");
+  assert.equal(rig.controller.view.microphoneRaw, false);
+  assert.equal(rig.constraints.audio.echoCancellation, true, "processed first");
   for (let index = 0; index < 45; index += 1) rig.frame(silence());
   rig.tick();
-  assert.notEqual(rig.controller.view.message, silentMicrophoneMessage("Headset (Boat Rockerz 255)"), "4.5 s is not yet silence");
+  assert.equal(rig.tracks.length, 1, "4.5 s is not yet silence");
   for (let index = 0; index < 10; index += 1) rig.frame(silence());
   rig.tick();
-  assert.equal(rig.controller.view.message, silentMicrophoneMessage("Headset (Boat Rockerz 255)"));
-  assert.match(rig.controller.view.message, /"Headset \(Boat Rockerz 255\)"/);
+  assert.equal(rig.controller.view.message, rawRetryMessage(label));
+  assert.equal(rig.controller.view.tone, "attention");
+  await settle();
+  assert.deepEqual(rig.constraints, microphoneConstraints({ deviceId: "mic-headset", raw: true }));
+  assert.deepEqual(rig.constraints.audio, {
+    echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1, deviceId: { ideal: "mic-headset" },
+  });
+  assert.equal(rig.tracks.length, 2);
+  assert.equal(rig.tracks[0].stopped, true, "the processed stream is closed");
+  assert.equal(rig.tracks[1].stopped, false);
+  assert.equal(rig.contexts.length, 1, "same AudioContext, only the source changes");
+  assert.equal(rig.controller.view.microphoneRaw, true);
+  // Silent on the plain stream too: now it says so, with what it measured.
+  for (let index = 0; index < 55; index += 1) rig.frame(silence());
+  rig.tick();
+  await settle();
+  assert.equal(rig.tracks.length, 2, "reopened once, not in a loop");
+  assert.equal(rig.controller.view.message, silentMicrophoneMessage(label, { peak: 0, muted: false, triedRaw: true }));
+  assert.match(rig.controller.view.message, /complete silence/);
+  assert.match(rig.controller.view.message, /tried with and without Windows voice processing; loudest sample 0\.00000/);
   assert.equal(rig.controller.view.tone, "error");
   assert.equal(rig.controller.view.on, true, "still listening: the owner may simply be quiet");
-  // Any sound clears it.
   rig.frame(tone(0.01));
   assert.equal(rig.controller.view.message, LIVE_VOICE_READY_HINT);
   assert.equal(rig.controller.view.tone, "info");
+});
+
+test("controller: sound on the plain stream clears the retry, and later starts open it that way at once", async () => {
+  const rig = makeRig();
+  await rig.controller.start();
+  for (let index = 0; index < 55; index += 1) rig.frame(silence());
+  rig.tick();
+  await settle();
+  rig.frame(tone(0.01));
+  assert.equal(rig.controller.view.message, LIVE_VOICE_READY_HINT);
+  rig.controller.stop("switched_off");
+  await rig.controller.start();
+  assert.equal(rig.constraints.audio.echoCancellation, false);
+  assert.equal(rig.controller.view.microphoneRaw, true);
+});
+
+test("controller: a faint microphone is told apart from one sending nothing, and a muted one says so", async () => {
+  const faint = makeRig();
+  await faint.controller.start();
+  for (let round = 0; round < 2; round += 1) {
+    for (let index = 0; index < 55; index += 1) faint.frame(tone(0.0003));
+    faint.tick();
+    await settle();
+  }
+  assert.match(faint.controller.view.message, /sends sound, but far too quietly/);
+  assert.match(faint.controller.view.message, /loudest sample 0\.000[23]/);
+  const muted = makeRig({ micMuted: true });
+  await muted.controller.start();
+  for (let round = 0; round < 2; round += 1) {
+    for (let index = 0; index < 55; index += 1) muted.frame(silence());
+    muted.tick();
+    await settle();
+  }
+  assert.match(muted.controller.view.message, /Windows reports the microphone muted/);
+  assert.match(muted.controller.view.message, /mute key/);
+});
+
+test("controller: a plain-stream reopen that fails says what it measured instead of going quiet", async () => {
+  const rig = makeRig();
+  await rig.controller.start();
+  rig.mediaDevices.getUserMedia = () => Promise.reject(Object.assign(new Error("busy"), { name: "NotReadableError" }));
+  for (let index = 0; index < 55; index += 1) rig.frame(silence());
+  rig.tick();
+  await settle();
+  assert.match(rig.controller.view.message, /complete silence/);
+  assert.equal(rig.controller.view.on, true, "the processed stream is still open and listening");
+  assert.equal(rig.tracks[0].stopped, false);
 });
 
 test("controller: a quiet but live microphone (room noise) is not called silent", async () => {
@@ -1643,11 +1717,20 @@ test("controller: a chosen microphone is asked for as `ideal`, so an unplugged o
   assert.equal("deviceId" in plain.constraints.audio, false, "no choice, Windows' default");
 });
 
-test("silentMicrophoneMessage names the microphone, or says 'this microphone' when it has no name", () => {
+test("silentMicrophoneMessage: names the microphone, and tells zeros, faint and unknown apart", () => {
   assert.match(silentMicrophoneMessage("Mic Array"), /^FROST hears nothing from "Mic Array"\./);
   assert.match(silentMicrophoneMessage(""), /^FROST hears nothing from this microphone\./);
+  assert.match(silentMicrophoneMessage("x"), /Let desktop apps access your microphone/);
   assert.match(silentMicrophoneMessage("x"), /choose another microphone below/);
-  assert.match(silentMicrophoneMessage("x"), /Let desktop apps access your microphone/, "Windows' privacy switch sends silence, not an error");
+  const zeros = silentMicrophoneMessage("Mic Array", { peak: 0 });
+  assert.match(zeros, /complete silence, not even room noise/);
+  assert.match(zeros, /mute key/);
+  assert.match(zeros, /loudest sample 0\.00000\)$/);
+  const faint = silentMicrophoneMessage("Mic Array", { peak: 0.0002, triedRaw: true });
+  assert.match(faint, /^"Mic Array" sends sound, but far too quietly/);
+  assert.match(faint, /\(tried with and without Windows voice processing; loudest sample 0\.00020\)$/);
+  assert.match(silentMicrophoneMessage("", { peak: 0.0002 }), /^This microphone sends sound/);
+  assert.match(silentMicrophoneMessage("x", { peak: 0.2, muted: true }), /complete silence[\s\S]*Windows reports the microphone muted/);
 });
 
 test("listMicrophones: real devices only, the default stand-in names the current default, failures are empty", async () => {
@@ -1704,5 +1787,6 @@ test("App: the voice bar shows which microphone FROST hears and lets the owner c
   assert.match(choose[0], /frostVoiceOffCountRef\.current \+= 1;\s*controller\.stop\("switched_off", "Switching microphone\.\.\."\);\s*controller\.prime\(\);\s*beginFrostLiveVoice\(\);/);
   assert.match(code, /devices\.addEventListener\("devicechange", onChange\);\s*return \(\) => devices\.removeEventListener\("devicechange", onChange\);/);
   assert.match(code, /Hearing: &quot;\{liveVoice\.microphone\}&quot;/);
+  assert.match(code, /\{liveVoice\?\.microphoneRaw && " \(without Windows voice processing\)"\}/);
   assert.match(code, /onChange=\{\(event\) => voice\.onChooseMicrophone\(event\.target\.value\)\} value=\{voice\.microphoneId \|\| ""\}/);
 });

@@ -675,12 +675,62 @@ export const LIVE_VOICE_STOP_MESSAGES = Object.freeze({
  */
 export const LIVE_VOICE_SILENT_RMS = 0.0004;
 export const LIVE_VOICE_SILENT_MS = 5000;
-export const silentMicrophoneMessage = (label = "") => {
+export const silentMicrophoneMessage = (label = "", { peak = null, muted = false, triedRaw = false } = {}) => {
   const name = String(label || "").trim();
-  // Windows hands a blocked app a microphone that opens normally and sends pure silence, so the
-  // privacy switch comes first: on 23 Sep 2026 the laptop's own microphone did this too, not only
-  // the Bluetooth earphones.
-  return `FROST hears nothing from ${name ? `"${name}"` : "this microphone"}. If you are speaking: in Windows Settings > Privacy & security > Microphone, turn on "Let desktop apps access your microphone"; check its volume in System > Sound > Input; or choose another microphone below.`;
+  const quoted = name ? `"${name}"` : "this microphone";
+  // Number(null) is 0, which would read "not measured" as "measured exact silence".
+  const loudest = peak === null || peak === undefined || peak === "" ? Number.NaN : Number(peak);
+  const facts = [
+    triedRaw ? "tried with and without Windows voice processing" : "",
+    muted ? "Windows reports the microphone muted" : "",
+    Number.isFinite(loudest) ? `loudest sample ${loudest.toFixed(5)}` : "",
+  ].filter(Boolean).join("; ");
+  const tail = facts ? ` (${facts})` : "";
+  // A real microphone always picks up some room noise. Exact zeros mean Windows or the driver is
+  // handing over nothing at all, which no amount of speaking louder changes.
+  if (muted || (Number.isFinite(loudest) && loudest === 0)) {
+    return `FROST hears nothing from ${quoted}: Windows is sending complete silence, not even room noise, so the microphone is switched off somewhere rather than quiet. Check the microphone mute key (often F4, with a light), that ${quoted} is not muted and its volume is up in Windows Settings > System > Sound > Input, and "Let desktop apps access your microphone" in Privacy & security > Microphone. Or choose another microphone below.${tail}`;
+  }
+  if (Number.isFinite(loudest) && loudest > 0) {
+    return `${name ? quoted : "This microphone"} sends sound, but far too quietly for FROST to hear speech. Turn its volume up in Windows Settings > System > Sound > Input, speak closer, or choose another microphone below.${tail}`;
+  }
+  return `FROST hears nothing from ${quoted}. If you are speaking: in Windows Settings > Privacy & security > Microphone, turn on "Let desktop apps access your microphone"; check its volume in System > Sound > Input; or choose another microphone below.${tail}`;
+};
+
+/** Shown while a silent microphone is reopened without Windows' voice processing. */
+export const rawRetryMessage = (label = "") => {
+  const name = String(label || "").trim();
+  return `FROST heard nothing from ${name ? `"${name}"` : "this microphone"}, so it is opening it again without Windows voice processing...`;
+};
+
+/**
+ * What FROST asks the browser for. Normally with echo cancellation and noise suppression, which
+ * keep FROST's own voice and the shop's hum out of the question. `raw` turns every stage of that
+ * processing off: on some laptops (Realtek microphone arrays among them) the processed, "voice
+ * call" stream arrives as pure silence while the plain one works.
+ */
+export const microphoneConstraints = ({ deviceId = "", raw = false } = {}) => {
+  const id = String(deviceId || "").trim();
+  return {
+    audio: {
+      ...(raw
+        ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+        : { echoCancellation: true, noiseSuppression: true }),
+      channelCount: 1,
+      // `ideal`, not `exact`: a remembered microphone that has since been unplugged falls back to
+      // the default one instead of failing to open at all.
+      ...(id ? { deviceId: { ideal: id } } : {}),
+    },
+  };
+};
+
+const framePeak = (frame) => {
+  let peak = 0;
+  for (let index = 0; index < (frame?.length || 0); index += 1) {
+    const value = Math.abs(frame[index]);
+    if (Number.isFinite(value) && value > peak) peak = value;
+  }
+  return peak;
 };
 
 /**
@@ -953,8 +1003,11 @@ export const createLiveVoiceController = ({
   slowTranscribeMs = LIVE_VOICE_TRANSCRIBE_SLOW_MS,
   tickMs = 500,
 } = {}) => {
-  let view = { on: false, phase: "off", message: "", tone: "info", heard: "", engine: null, microphone: "", microphoneId: "" };
+  let view = { on: false, phase: "off", message: "", tone: "info", heard: "", engine: null, microphone: "", microphoneId: "", microphoneRaw: false };
   let session = null;
+  // Set once the unprocessed stream has carried sound in this app's life: later starts open it that
+  // way at once instead of sitting through five silent seconds each time.
+  let preferRaw = false;
   let primed = null;
   let idleLimit = idleLimitMs;
   // Whether the speech engine has answered once in this app's life. Until it has, the first
@@ -1241,11 +1294,14 @@ export const createLiveVoiceController = ({
     current.lastFrameAtMs = now();
     const rms = frameRms(frame);
     publishLevel(levelFromRms(rms));
+    current.peak = Math.max(current.peak || 0, framePeak(frame));
     if (rms >= LIVE_VOICE_SILENT_RMS) {
       current.lastAudibleAtMs = current.lastFrameAtMs;
-      if (current.silentNoted) {
+      if (current.raw) preferRaw = true;
+      const retrying = current.raw && view.message === rawRetryMessage(current.microphoneLabel);
+      if (current.silentNoted || retrying) {
         current.silentNoted = false;
-        if (view.message === current.silentMessage) refresh(current, { message: LIVE_VOICE_READY_HINT, tone: "info" });
+        if (retrying || view.message === current.silentMessage) refresh(current, { message: LIVE_VOICE_READY_HINT, tone: "info" });
       }
     }
     if (current.stalled || STALL_MESSAGES.has(view.message)) {
@@ -1327,9 +1383,88 @@ export const createLiveVoiceController = ({
     if (!current.stalled && !current.silentNoted && framesFlowing
       && Number.isFinite(audibleSince) && at - audibleSince >= silentMs) {
       current.silentNoted = true;
-      current.silentMessage = silentMicrophoneMessage(current.microphoneLabel);
-      refresh(current, { message: current.silentMessage, tone: "error" });
+      if (!current.raw && !current.rawTried) {
+        reopenRaw(current);
+        return;
+      }
+      noteSilent(current);
     }
+  };
+
+  const noteSilent = (current) => {
+    if (!current.active || session !== current) return;
+    const track = (current.stream?.getAudioTracks?.() || current.stream?.getTracks?.() || [])[0];
+    current.silentNoted = true;
+    current.silentMessage = silentMicrophoneMessage(current.microphoneLabel, {
+      peak: Number.isFinite(current.peak) ? current.peak : null,
+      muted: track?.muted === true,
+      triedRaw: current.rawTried || current.raw,
+    });
+    refresh(current, { message: current.silentMessage, tone: "error" });
+  };
+
+  const watchTracks = (current, stream) => {
+    for (const track of stream?.getTracks?.() || []) {
+      track.onended = () => {
+        if (session === current && current.stream === stream) stop("microphone_lost", "The microphone stopped working, so live voice is off.");
+      };
+    }
+  };
+
+  const labelMicrophone = (current) => {
+    const track = (current.stream?.getAudioTracks?.() || current.stream?.getTracks?.() || [])[0];
+    current.microphoneLabel = String(track?.label || "").trim();
+    current.microphoneId = String(track?.getSettings?.()?.deviceId || "").trim();
+    emit({ microphone: current.microphoneLabel, microphoneId: current.microphoneId, microphoneRaw: current.raw === true });
+  };
+
+  /**
+   * Five silent seconds on the processed stream: open the same microphone again with every stage of
+   * voice processing off, and carry on listening on that. The processor, the detector and the
+   * AudioContext stay; only the source changes, so nothing the owner sees resets but the message.
+   */
+  const reopenRaw = async (current) => {
+    current.rawTried = true;
+    refresh(current, { message: rawRetryMessage(current.microphoneLabel), tone: "attention" });
+    let stream;
+    try {
+      stream = await mediaDevices.getUserMedia(microphoneConstraints({ deviceId: current.microphoneId || current.requestedDeviceId, raw: true }));
+    } catch {
+      noteSilent(current);
+      return;
+    }
+    if (!current.active || session !== current) {
+      for (const track of stream?.getTracks?.() || []) {
+        try { track.stop(); } catch { /* already stopped */ }
+      }
+      return;
+    }
+    let source;
+    try {
+      source = current.context.createMediaStreamSource(stream);
+      source.connect(current.processor);
+    } catch {
+      for (const track of stream?.getTracks?.() || []) {
+        try { track.stop(); } catch { /* already stopped */ }
+      }
+      noteSilent(current);
+      return;
+    }
+    const oldStream = current.stream;
+    try { current.source?.disconnect(); } catch { /* already detached */ }
+    for (const track of oldStream?.getTracks?.() || []) {
+      track.onended = null;
+      try { track.stop(); } catch { /* already stopped */ }
+    }
+    current.stream = stream;
+    current.source = source;
+    current.raw = true;
+    watchTracks(current, stream);
+    labelMicrophone(current);
+    // A fresh five seconds for the new stream, measured from now.
+    current.peak = 0;
+    current.lastAudibleAtMs = now();
+    current.silentNoted = false;
   };
 
   const resume = () => {
@@ -1410,21 +1545,16 @@ export const createLiveVoiceController = ({
       silentNoted: false,
       silentMessage: "",
       microphoneLabel: "",
+      microphoneId: "",
+      requestedDeviceId: String(options?.deviceId || "").trim(),
+      raw: preferRaw,
+      rawTried: false,
+      peak: 0,
     };
     session = current;
-    emit({ on: true, phase: "starting", message: "", tone: "info", heard: "", engine: null, microphone: "", microphoneId: "" });
+    emit({ on: true, phase: "starting", message: "", tone: "info", heard: "", engine: null, microphone: "", microphoneId: "", microphoneRaw: false });
     try {
-      const deviceId = String(options?.deviceId || "").trim();
-      current.stream = await mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          channelCount: 1,
-          // `ideal`, not `exact`: a remembered microphone that has since been unplugged falls back to
-          // the default one instead of failing to open at all.
-          ...(deviceId ? { deviceId: { ideal: deviceId } } : {}),
-        },
-      });
+      current.stream = await mediaDevices.getUserMedia(microphoneConstraints({ deviceId: current.requestedDeviceId, raw: current.raw }));
     } catch (error) {
       if (session === current) stop("microphone_failed", microphoneFailureMessage(error));
       else release(current);
@@ -1437,15 +1567,8 @@ export const createLiveVoiceController = ({
     }
     // A microphone unplugged or taken by another program mid-session ends its track. Without this
     // the switch would stay on, listening to nothing. (A track we stop ourselves does not fire it.)
-    const audioTrack = (current.stream.getAudioTracks?.() || current.stream.getTracks?.() || [])[0];
-    current.microphoneLabel = String(audioTrack?.label || "").trim();
-    current.microphoneId = String(audioTrack?.getSettings?.()?.deviceId || "").trim();
-    emit({ microphone: current.microphoneLabel, microphoneId: current.microphoneId });
-    for (const track of current.stream.getTracks?.() || []) {
-      track.onended = () => {
-        if (session === current) stop("microphone_lost", "The microphone stopped working, so live voice is off.");
-      };
-    }
+    labelMicrophone(current);
+    watchTracks(current, current.stream);
     try {
       current.sampleRate = Number(context.sampleRate);
       current.detector = createUtteranceDetector({ ...detectorOptions, sampleRate: current.sampleRate });
