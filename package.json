@@ -5,6 +5,7 @@
   "scripts": {
     "app": "frontend\\node_modules\\.bin\\tauri.cmd dev",
     "app:disposable": "node scripts/run-disposable-app.mjs",
+    "app:rehearsal": "node scripts/run-rehearsal.mjs",
     "app:dev": "frontend\\node_modules\\.bin\\tauri.cmd dev",
     "app:build": "frontend\\node_modules\\.bin\\tauri.cmd build",
     "build:windows": "frontend\\node_modules\\.bin\\tauri.cmd build --bundles nsis",

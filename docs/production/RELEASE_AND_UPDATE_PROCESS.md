@@ -354,6 +354,22 @@ Cloud migration 017 does not have to be applied by hand: `activation_licences` i
 `server.js`'s own startup bootstrap for exactly the local and self-hosted case, and
 `verifyDeclaredSchema` refuses to start if the two ever drift.
 
+**Since 2026-09-23 there is one command for both windows**, once the `_staging` copy exists:
+
+```powershell
+$env:PGPASSWORD = '<the postgres password, single quotes>'
+npm run app:rehearsal
+```
+
+`scripts/run-rehearsal.mjs` sets every variable below itself, overriding anything already in the
+shell (a `DATABASE_URL` left over from applying cloud migrations included), stops this checkout's
+own leftover `server.js` on 5090 and Vite on 5173, **refuses to start if either port is still held**
+-- a second `server.js` dies on EADDRINUSE and the old one keeps answering with old code -- prints
+the commit it is running, removes `FROOZERP_DISPOSABLE_SEED`, and stops the stand-in cloud when the
+app closes. Profile defaults to `rehearsal2` (`FROOZERP_REHEARSAL_PROFILE` to change it; the name,
+never the `profile-` folder name). The session secret is generated once and kept in the disposable
+root. The two windows below are what it does, kept for when something needs doing by hand.
+
 ```powershell
 # window 1 - the stand-in cloud, pointed at the COPY, never live
 $env:NODE_ENV = "test"

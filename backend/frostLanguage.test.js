@@ -281,6 +281,12 @@ test("the reminder keeps the owner's own words", () => {
   assert.equal(reminderTitleFrom("remind me to pay my suppliers"), "pay my suppliers");
   assert.equal(reminderTitleFrom("set a reminder to check old lots"), "check old lots");
   assert.equal(reminderTitleFrom("note kar lo ki kal mandi jana hai"), "kal mandi jana hai");
+  // A leading day word goes with the asking phrase -- the day is in due_at -- and a trailing asking
+  // phrase is dropped too. A day word inside his own words stays.
+  assert.equal(reminderTitleFrom("kal yaad dilana ramesh se paisa lena"), "ramesh se paisa lena");
+  assert.equal(reminderTitleFrom("mujhe parso yaad dilana ki GST bharna hai"), "GST bharna hai");
+  assert.equal(reminderTitleFrom("ramesh se paisa lena yaad dilana"), "ramesh se paisa lena");
+  assert.equal(reminderTitleFrom("kal mandi jana hai yaad dila dena"), "kal mandi jana hai");
   // Nothing left after stripping is not an empty title; it is the sentence as typed.
   assert.ok(reminderTitleFrom("remind me").length > 0);
 });

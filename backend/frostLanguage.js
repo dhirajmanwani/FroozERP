@@ -263,8 +263,15 @@ const reminderTitleFrom = (question = "") => {
     // supplier payment kal" was saved with the title "er set karo supplier payment kal". Every
     // alternative is a whole phrase, which is why a trailing boundary is right here -- the trap noted
     // at the top of this file is a boundary after a *prefix*, and none of these is one.
-    .replace(/^\s*(remind me to|remind me|reminder set karo|reminder set kar do|reminder laga do|reminder lagao|reminder for|reminder to|set a reminder to|set a reminder for|reminder|remind|mujhe yaad dilana|yaad dilana|yaad dila do|yaad rakhna|note kar lo|note karlo|likh lo|likh lena)\b\s*/i, "")
+    //
+    // A day word may come first -- "kal yaad dilana ramesh se paisa lena" -- and is dropped with the
+    // asking phrase: the day is already in `due_at` and said back to him, and left in the title it
+    // read "kal yaad dilana ramesh se paisa lena" on the 24th, when "kal" no longer meant that day.
+    // Only directly before an asking phrase, so "note kar lo ki kal mandi jana hai" keeps its "kal".
+    .replace(/^\s*(?:mujhe\s+)?(?:(?:kal|parso|aaj|tomorrow|today)\s+)?(?:mujhe\s+)?(remind me to|remind me|reminder set karo|reminder set kar do|reminder laga do|reminder lagao|reminder for|reminder to|set a reminder to|set a reminder for|reminder|remind|yaad dilana|yaad dila dena|yaad dila do|yaad rakhna|note kar lo|note karlo|likh lo|likh lena)\b\s*/i, "")
     .replace(/^\s*(that|ki|ke liye|to)\s+/i, "")
+    // The Hindi order puts the asking phrase last: "ramesh se paisa lena yaad dilana".
+    .replace(/\s+(?:mujhe\s+)?(yaad dilana|yaad dila dena|yaad dila do|yaad rakhna|remind karna|remind kar dena)\s*$/i, "")
     .trim();
   return stripped || text;
 };
