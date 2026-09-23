@@ -285,8 +285,13 @@ class FrostServiceLayer {
   // `answerFormat` is part of the key, not decoration: the cached string was written by a
   // particular version of the wording, and serving it after that wording changes hands the owner an
   // answer the code can no longer produce.
-  buildCacheKey({ engine, question, facts, range, providerKey, answerFormat = 0 }) {
-    return hashPayload({ engine, question, facts, range, providerKey, answerFormat });
+  // `classification` is in the key because two different readings of one question can share every
+  // other input. "remind me to pay my suppliers" was UNCLEAR before reminders existed and is
+  // REMINDER_CREATE now; neither fetches facts, so without this the thirty-minute cache could hand
+  // the new reading the old one's "I did not catch that". An answer is only reusable for the same
+  // question understood the same way.
+  buildCacheKey({ engine, question, facts, range, providerKey, answerFormat = 0, classification = "" }) {
+    return hashPayload({ engine, question, facts, range, providerKey, answerFormat, classification });
   }
 
   async getCache(cacheKey) {

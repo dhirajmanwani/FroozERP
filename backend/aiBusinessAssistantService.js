@@ -2471,7 +2471,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     // written by the old wording. Without it a thirty-minute cache serves the previous shape of
     // sentence back to the owner and the change reads as never deployed -- which is exactly what
     // happened on 22 Sep 2026.
-    const cacheKey = frost.buildCacheKey({ engine: "conversation", question, facts, range, providerKey, answerFormat: ANSWER_FORMAT_VERSION });
+    const cacheKey = frost.buildCacheKey({ engine: "conversation", question, facts, range, providerKey, answerFormat: ANSWER_FORMAT_VERSION, classification });
     const cached = settings.frost.cacheEnabled !== false ? await frost.getCache(cacheKey) : null;
     const cachedPayload = cached?.response_payload || null;
     const reminderTitle = classification === "REMINDER_CREATE" ? reminderTitleFrom(question) : "";

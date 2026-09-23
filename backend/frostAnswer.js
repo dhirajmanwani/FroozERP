@@ -38,7 +38,7 @@
  * improvement looked like it had not been deployed. Including this in the cache key makes an old
  * entry unreachable instead of stale.
  */
-const ANSWER_FORMAT_VERSION = 4;
+const ANSWER_FORMAT_VERSION = 5;
 
 /**
  * What FROST says to a question it did not recognise.
