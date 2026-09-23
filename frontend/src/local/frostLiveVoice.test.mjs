@@ -37,10 +37,17 @@ import {
   microphoneFailureMessage,
   questionFromTranscript,
   readAlwaysOnPreference,
+  readMicrophonePreference,
   speechEngineNotice,
   speechSetupView,
   spokenAnswerFor,
   writeAlwaysOnPreference,
+  writeMicrophonePreference,
+  LIVE_VOICE_MICROPHONE_STORAGE_KEY,
+  LIVE_VOICE_SILENT_MS,
+  listMicrophones,
+  microphoneOptions,
+  silentMicrophoneMessage,
 } from "./frostLiveVoice.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -588,6 +595,8 @@ const makeRig = ({
   speechError = null,
   allowed = () => true,
   onWake = null,
+  micLabel = "Headset (Boat Rockerz 255)",
+  micDeviceId = "mic-headset",
 } = {}) => {
   const rig = {
     log: [],
@@ -608,7 +617,12 @@ const makeRig = ({
     finishSpeech: null,
   };
   const track = () => {
-    const item = { stopped: false, stop() { item.stopped = true; } };
+    const item = {
+      stopped: false,
+      label: micLabel,
+      stop() { item.stopped = true; },
+      getSettings: () => ({ deviceId: micDeviceId }),
+    };
     rig.tracks.push(item);
     return item;
   };
@@ -1458,7 +1472,7 @@ test("the microphone is released on switch-off, drawer close (unless always-on),
   assert.match(appSource, /if \(frostDrawerOpen \|\| frostVoiceAlwaysOnRef\.current\) return;\s*frostVoiceOffCountRef\.current \+= 1;\s*frostLiveVoiceRef\.current\?\.stop\("drawer_closed"\);/);
   // A start still waiting on the status check when any of those happened does not open the microphone.
   assert.match(appSource, /const offCount = frostVoiceOffCountRef\.current;\s*const status = await readFrostSpeechStatus\(\);[\s\S]{0,120}if \(offCount !== frostVoiceOffCountRef\.current \|\|/);
-  assert.equal((appSource.match(/frostVoiceOffCountRef\.current \+= 1;/g) || []).length, 4, "switch off, always-on off, drawer close, sign-out");
+  assert.equal((appSource.match(/frostVoiceOffCountRef\.current \+= 1;/g) || []).length, 5, "switch off, always-on off, drawer close, sign-out, microphone change");
   assert.match(appSource, /if \(!user\) \{\s*frostVoiceOffCountRef\.current \+= 1;\s*frostLiveVoiceRef\.current\?\.stop\("signed_out"\);/);
   assert.match(appSource, /useEffect\(\(\) => \(\) => frostLiveVoiceRef\.current\?\.stop\("unmounted"\), \[\]\);/);
   // And release() itself stops the tracks and closes the context -- the controller tests above
@@ -1531,7 +1545,7 @@ test("always-on: remembered per device, started once after sign-in, and not stop
   assert.match(appSource, /useState\(\(\) => readAlwaysOnPreference\(\(\) => window\.localStorage\)\)/);
   assert.match(block, /const saved = writeAlwaysOnPreference\(\(\) => window\.localStorage, next\);\s*setFrostVoicePreferenceNote\(saved \? "" : LIVE_VOICE_PREFERENCE_NOT_SAVED\);/);
   assert.match(block, /if \(!user \|\| !frostBellAllowed \|\| !frostVoiceAlwaysOn\) return;[\s\S]*?if \(frostVoiceAutoStartedRef\.current === key\) return;[\s\S]*?beginFrostLiveVoice\(\{ auto: true \}\);/);
-  assert.match(block, /controller\.start\(\{ idleLimitMs: alwaysOn \? null : LIVE_VOICE_IDLE_LIMIT_MS \}\)/, "no idle switch-off when always-on");
+  assert.match(block, /controller\.start\(\{ idleLimitMs: alwaysOn \? null : LIVE_VOICE_IDLE_LIMIT_MS, deviceId: frostMicrophoneIdRef\.current \}\)/, "no idle switch-off when always-on");
   assert.match(block, /if \(controller\.active\) \{\s*controller\.setIdleLimit\(null\);\s*return;/);
   // The drawer check that refuses to open a microphone into a closed drawer is skipped for always-on.
   assert.match(block, /\|\| !userRef\.current \|\| \(!alwaysOn && !frostDrawerOpenRef\.current\)\)/);
@@ -1567,4 +1581,127 @@ test("the voice bar: always-on switch for Owner/Admin, drawer switch only when a
   assert.match(appSource, /\{engineNotice\.action === "install" && \(/);
   // Every piece of the bar is still behind canManageFrost.
   assert.match(appSource, /\{canManageFrost && liveVoiceBar\}/);
+});
+
+// ---------------------------------------------------------------------------------------------
+// A microphone that is on and silent, and choosing another one (23 Sep 2026: Bluetooth earphones).
+// ---------------------------------------------------------------------------------------------
+test("controller: frames of pure silence for 5 s name the microphone and say it hears nothing", async () => {
+  const rig = makeRig();
+  await rig.controller.start();
+  assert.equal(rig.controller.view.microphone, "Headset (Boat Rockerz 255)", "the screen can say which microphone is open");
+  assert.equal(rig.controller.view.microphoneId, "mic-headset");
+  for (let index = 0; index < 45; index += 1) rig.frame(silence());
+  rig.tick();
+  assert.notEqual(rig.controller.view.message, silentMicrophoneMessage("Headset (Boat Rockerz 255)"), "4.5 s is not yet silence");
+  for (let index = 0; index < 10; index += 1) rig.frame(silence());
+  rig.tick();
+  assert.equal(rig.controller.view.message, silentMicrophoneMessage("Headset (Boat Rockerz 255)"));
+  assert.match(rig.controller.view.message, /"Headset \(Boat Rockerz 255\)"/);
+  assert.equal(rig.controller.view.tone, "error");
+  assert.equal(rig.controller.view.on, true, "still listening: the owner may simply be quiet");
+  // Any sound clears it.
+  rig.frame(tone(0.01));
+  assert.equal(rig.controller.view.message, LIVE_VOICE_READY_HINT);
+  assert.equal(rig.controller.view.tone, "info");
+});
+
+test("controller: a quiet but live microphone (room noise) is not called silent", async () => {
+  const rig = makeRig();
+  await rig.controller.start();
+  for (let index = 0; index < 80; index += 1) rig.frame(tone(0.002));
+  rig.tick();
+  assert.ok(!String(rig.controller.view.message).startsWith("FROST hears nothing"));
+  assert.ok(LIVE_VOICE_SILENT_MS <= 8000);
+});
+
+test("controller: time spent answering is not counted as silence", async () => {
+  const rig = makeRig({ holdSpeech: true });
+  await rig.controller.start();
+  rig.say();
+  await settle();
+  assert.equal(rig.controller.view.phase, "speaking");
+  for (let index = 0; index < 80; index += 1) rig.frame(silence());
+  rig.tick();
+  assert.ok(!String(rig.controller.view.message).startsWith("FROST hears nothing"));
+});
+
+test("controller: no frames at all is the no-sound watchdog, not the silent-microphone message", async () => {
+  const rig = makeRig();
+  await rig.controller.start();
+  rig.clock += 8000;
+  rig.tick();
+  assert.ok(!String(rig.controller.view.message).startsWith("FROST hears nothing"));
+});
+
+test("controller: a chosen microphone is asked for as `ideal`, so an unplugged one falls back to the default", async () => {
+  const rig = makeRig();
+  await rig.controller.start({ deviceId: "mic-laptop" });
+  assert.deepEqual(rig.constraints.audio.deviceId, { ideal: "mic-laptop" });
+  const plain = makeRig();
+  await plain.controller.start({ deviceId: "  " });
+  assert.equal("deviceId" in plain.constraints.audio, false, "no choice, Windows' default");
+});
+
+test("silentMicrophoneMessage names the microphone, or says 'this microphone' when it has no name", () => {
+  assert.match(silentMicrophoneMessage("Mic Array"), /^FROST hears nothing from "Mic Array"\./);
+  assert.match(silentMicrophoneMessage(""), /^FROST hears nothing from this microphone\./);
+  assert.match(silentMicrophoneMessage("x"), /choose another microphone below/);
+});
+
+test("listMicrophones: real devices only, the default stand-in names the current default, failures are empty", async () => {
+  const list = await listMicrophones({
+    enumerateDevices: async () => [
+      { kind: "audioinput", deviceId: "default", label: "Default - Headset (Boat)" },
+      { kind: "audioinput", deviceId: "communications", label: "Communications - Headset (Boat)" },
+      { kind: "audioinput", deviceId: "mic-laptop", label: "Microphone Array (Realtek)" },
+      { kind: "audioinput", deviceId: "mic-headset", label: "" },
+      { kind: "audiooutput", deviceId: "spk", label: "Speakers" },
+      { kind: "audioinput", deviceId: "", label: "" },
+    ],
+  });
+  assert.deepEqual(list, {
+    devices: [
+      { deviceId: "mic-laptop", label: "Microphone Array (Realtek)" },
+      { deviceId: "mic-headset", label: "Microphone 2" },
+    ],
+    defaultLabel: "Headset (Boat)",
+  });
+  assert.deepEqual(await listMicrophones(null), { devices: [], defaultLabel: "" });
+  assert.deepEqual(await listMicrophones({ enumerateDevices: async () => { throw new Error("no"); } }), { devices: [], defaultLabel: "" });
+});
+
+test("microphoneOptions: default first, and a remembered but unplugged microphone stays visible", () => {
+  const list = { devices: [{ deviceId: "a", label: "A" }], defaultLabel: "A" };
+  assert.deepEqual(microphoneOptions(list, ""), [{ value: "", label: "Windows default (A)" }, { value: "a", label: "A" }]);
+  assert.deepEqual(microphoneOptions(list, "gone").at(-1), { value: "gone", label: "Chosen microphone (not connected now)" });
+  assert.equal(microphoneOptions({ devices: [] }, "")[0].label, "Windows default");
+});
+
+test("microphone preference: per device, unreadable is the default, a refused write says so", () => {
+  const store = new Map();
+  const storage = { getItem: (key) => store.get(key) ?? null, setItem: (key, value) => store.set(key, value), removeItem: (key) => store.delete(key) };
+  assert.equal(readMicrophonePreference(storage), "");
+  assert.equal(writeMicrophonePreference(storage, "mic-laptop"), true);
+  assert.equal(store.get(LIVE_VOICE_MICROPHONE_STORAGE_KEY), "mic-laptop");
+  assert.equal(readMicrophonePreference(() => storage), "mic-laptop");
+  assert.equal(writeMicrophonePreference(storage, ""), true);
+  assert.equal(store.has(LIVE_VOICE_MICROPHONE_STORAGE_KEY), false);
+  const broken = { getItem() { throw new Error("denied"); }, setItem() { throw new Error("denied"); } };
+  assert.equal(readMicrophonePreference(broken), "");
+  assert.equal(writeMicrophonePreference(broken, "x"), false);
+  assert.equal(writeMicrophonePreference(() => { throw new Error("no storage"); }, "x"), false);
+});
+
+test("App: the voice bar shows which microphone FROST hears and lets the owner choose another", () => {
+  const code = stripComments(appSource);
+  assert.match(code, /useState\(\(\) => readMicrophonePreference\(\(\) => window\.localStorage\)\)/);
+  const choose = code.match(/const chooseFrostMicrophone = \(deviceId\) => \{[\s\S]*?\n {2}\};/);
+  assert.ok(choose);
+  assert.match(choose[0], /const saved = writeMicrophonePreference\(\(\) => window\.localStorage, id\);\s*setFrostVoicePreferenceNote\(saved \? "" : LIVE_VOICE_PREFERENCE_NOT_SAVED\);/);
+  // Switching while listening closes the old microphone and opens the new one in the same click.
+  assert.match(choose[0], /frostVoiceOffCountRef\.current \+= 1;\s*controller\.stop\("switched_off", "Switching microphone\.\.\."\);\s*controller\.prime\(\);\s*beginFrostLiveVoice\(\);/);
+  assert.match(code, /devices\.addEventListener\("devicechange", onChange\);\s*return \(\) => devices\.removeEventListener\("devicechange", onChange\);/);
+  assert.match(code, /Hearing: &quot;\{liveVoice\.microphone\}&quot;/);
+  assert.match(code, /onChange=\{\(event\) => voice\.onChooseMicrophone\(event\.target\.value\)\} value=\{voice\.microphoneId \|\| ""\}/);
 });

@@ -231,11 +231,15 @@ import {
   LIVE_VOICE_PREFERENCE_NOT_SAVED,
   createLiveVoiceController,
   createVoiceLevelChannel,
+  listMicrophones,
   liveVoiceIndicatorView,
+  microphoneOptions,
   readAlwaysOnPreference,
+  readMicrophonePreference,
   speechEngineNotice,
   speechSetupView,
   writeAlwaysOnPreference,
+  writeMicrophonePreference,
 } from "./local/frostLiveVoice";
 import {
   checkBackendHealth,
@@ -2374,12 +2378,18 @@ function App() {
   // switch and the indicator draw; `frostSpeechSetup` is the gateway's word on whether whisper is
   // installed, and the last failure reading or starting it.
   const frostLiveVoiceRef = useRef(null);
-  const [frostLiveVoice, setFrostLiveVoice] = useState({ on: false, phase: "off", message: "", tone: "info", heard: "", engine: null });
+  const [frostLiveVoice, setFrostLiveVoice] = useState({ on: false, phase: "off", message: "", tone: "info", heard: "", engine: null, microphone: "", microphoneId: "" });
   const [frostSpeechSetup, setFrostSpeechSetup] = useState({ open: false, status: null, failure: null });
   // "Listen for Frost everywhere": per device, remembered in localStorage. An unreadable store reads
   // as off, and a store that refuses the write says so (the choice still holds for this session).
   const [frostVoiceAlwaysOn, setFrostVoiceAlwaysOn] = useState(() => readAlwaysOnPreference(() => window.localStorage));
   const [frostVoicePreferenceNote, setFrostVoicePreferenceNote] = useState("");
+  // Which microphone FROST opens: per device, remembered like the switch above; "" is Windows'
+  // default. The list is read from the browser once the microphone has been opened (before that it
+  // has no names) and again whenever a device is plugged in or out.
+  const [frostMicrophoneId, setFrostMicrophoneId] = useState(() => readMicrophonePreference(() => window.localStorage));
+  const frostMicrophoneIdRef = useRef(frostMicrophoneId);
+  const [frostMicrophones, setFrostMicrophones] = useState({ devices: [], defaultLabel: "" });
   // The microphone level goes to the meters only, through its own tiny store, so a frame does not
   // redraw the whole of App.
   const frostVoiceLevelRef = useRef(null);
@@ -5778,7 +5788,7 @@ function App() {
       return;
     }
     setFrostSpeechSetup((current) => ({ ...current, open: false }));
-    await controller.start({ idleLimitMs: alwaysOn ? null : LIVE_VOICE_IDLE_LIMIT_MS });
+    await controller.start({ idleLimitMs: alwaysOn ? null : LIVE_VOICE_IDLE_LIMIT_MS, deviceId: frostMicrophoneIdRef.current });
   };
 
   // One start at a time: a second click while the status check is in flight would otherwise start
@@ -5843,6 +5853,42 @@ function App() {
   const resumeFrostLiveVoice = () => {
     frostLiveVoiceRef.current?.resume();
   };
+
+  const refreshFrostMicrophones = () => {
+    if (typeof navigator === "undefined") return;
+    listMicrophones(navigator.mediaDevices).then((list) => {
+      // Before permission the browser names nothing; keep the list already shown rather than blank it.
+      if (list.devices.length) setFrostMicrophones(list);
+    });
+  };
+
+  // The microphone picker. Choosing one while listening closes the old microphone and opens the new
+  // one inside the same click, so WebView2 lets the audio run.
+  const chooseFrostMicrophone = (deviceId) => {
+    const id = String(deviceId || "").trim();
+    frostMicrophoneIdRef.current = id;
+    setFrostMicrophoneId(id);
+    const saved = writeMicrophonePreference(() => window.localStorage, id);
+    setFrostVoicePreferenceNote(saved ? "" : LIVE_VOICE_PREFERENCE_NOT_SAVED);
+    const controller = ensureFrostLiveVoiceController();
+    if (!controller.active || frostLiveVoiceStartingRef.current) return;
+    frostVoiceOffCountRef.current += 1;
+    controller.stop("switched_off", "Switching microphone...");
+    controller.prime();
+    beginFrostLiveVoice();
+  };
+  useEffect(() => {
+    if (!frostLiveVoice.on || !frostLiveVoice.microphoneId) return;
+    refreshFrostMicrophones();
+  }, [frostLiveVoice.on, frostLiveVoice.microphoneId]);
+  useEffect(() => {
+    const devices = typeof navigator === "undefined" ? null : navigator.mediaDevices;
+    if (!frostBellAllowed || typeof devices?.addEventListener !== "function") return undefined;
+    refreshFrostMicrophones();
+    const onChange = () => refreshFrostMicrophones();
+    devices.addEventListener("devicechange", onChange);
+    return () => devices.removeEventListener("devicechange", onChange);
+  }, [frostBellAllowed]);
 
   // The microphone closes with the drawer -- unless it is listening everywhere -- on sign-out and
   // when the app unmounts. Each says why.
@@ -5912,6 +5958,9 @@ function App() {
     level: frostVoiceLevelRef.current,
     engineNotice: speechEngineNotice(frostSpeechSetup.status, { engine: frostLiveVoice.engine }),
     preferenceNote: frostVoicePreferenceNote,
+    microphoneOptions: frostMicrophones.devices.length ? microphoneOptions(frostMicrophones, frostMicrophoneId) : [],
+    microphoneId: frostMicrophoneId,
+    onChooseMicrophone: chooseFrostMicrophone,
   };
 
   const proposeFrostAction = async (action, payload = {}) => {
@@ -11371,6 +11420,23 @@ function FrostLiveVoiceBar({ liveVoice = null, onCloseSetup, onInstall, onRetry,
         {/* Outside the live region: a meter that changes a dozen times a second is not news. */}
         {on && <FrostVoiceLevel channel={voice?.level} />}
       </div>
+      {/* Which microphone FROST is actually hearing, by name, and the choice of another one. A
+          Bluetooth headset that sends silence looked exactly like FROST ignoring the owner. */}
+      {(on && liveVoice?.microphone) || voice?.microphoneOptions?.length ? (
+        <div className="frost-live-mic">
+          {on && liveVoice?.microphone && <span>Hearing: &quot;{liveVoice.microphone}&quot;</span>}
+          {voice?.microphoneOptions?.length > 0 && (
+            <label>
+              Microphone{" "}
+              <select onChange={(event) => voice.onChooseMicrophone(event.target.value)} value={voice.microphoneId || ""}>
+                {voice.microphoneOptions.map((option) => (
+                  <option key={option.value || "default"} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            </label>
+          )}
+        </div>
+      ) : null}
       {message && (stalled
         ? <button className={`${messageClass} frost-live-message-action`} onClick={voice?.onResume} type="button">{message}</button>
         : <p className={messageClass}>{message}</p>)}

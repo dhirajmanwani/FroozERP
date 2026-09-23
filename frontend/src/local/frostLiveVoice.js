@@ -79,6 +79,8 @@ export const LIVE_VOICE_NO_FRAMES_MS = 2500;
 export const LIVE_VOICE_HEARD_MS = 6000;
 /** Per device, not per profile or per user: it is about this laptop's microphone. */
 export const LIVE_VOICE_ALWAYS_ON_STORAGE_KEY = "froozerp_frost_voice_always_on";
+/** The microphone chosen in FROST's picker, per device. Empty means Windows' default. */
+export const LIVE_VOICE_MICROPHONE_STORAGE_KEY = "froozerp_frost_voice_microphone";
 
 export const DETECTOR_DEFAULTS = Object.freeze({
   // RMS of a float frame in [-1, 1]. Round 1 started at 0.02, measured against a desk microphone.
@@ -665,6 +667,62 @@ export const LIVE_VOICE_STOP_MESSAGES = Object.freeze({
   speech_unsupported: "This device cannot read answers aloud, so live voice is off.",
 });
 
+/**
+ * A microphone that delivers frames but no sound. Seen 23 Sep 2026 with Bluetooth earphones on the
+ * owner's laptop: Windows handed the app the earphones' hands-free microphone, which sent pure
+ * silence, and the bar said "Listening" for ever. Frames were arriving, so the no-frames watchdog
+ * never fired. Below this level for this long, the screen says so and names the microphone.
+ */
+export const LIVE_VOICE_SILENT_RMS = 0.0004;
+export const LIVE_VOICE_SILENT_MS = 5000;
+export const silentMicrophoneMessage = (label = "") => {
+  const name = String(label || "").trim();
+  return `FROST hears nothing from ${name ? `"${name}"` : "this microphone"}. If you are speaking, choose another microphone below, or pick the laptop's own microphone in Windows Settings > System > Sound > Input. Bluetooth earphones often send silence.`;
+};
+
+/**
+ * The microphones this device offers, for the picker. Chromium adds two stand-ins, "default" and
+ * "communications", that only point at a real device; they are left out of the list, and the
+ * "default" one's label says which microphone Windows' default currently is. Labels are only filled
+ * in once the page has microphone permission, so an unnamed one is called by its position rather
+ * than left blank. An unreadable list is an empty one: the picker is simply not drawn.
+ */
+export const listMicrophones = async (mediaDevices) => {
+  const empty = { devices: [], defaultLabel: "" };
+  if (typeof mediaDevices?.enumerateDevices !== "function") return empty;
+  let all;
+  try {
+    all = await mediaDevices.enumerateDevices();
+  } catch {
+    return empty;
+  }
+  const inputs = (Array.isArray(all) ? all : []).filter((device) => device?.kind === "audioinput" && device.deviceId);
+  const stand = inputs.find((device) => device.deviceId === "default");
+  const real = inputs.filter((device) => device.deviceId !== "default" && device.deviceId !== "communications");
+  return {
+    devices: real.map((device, index) => ({
+      deviceId: String(device.deviceId),
+      label: String(device.label || "").trim() || `Microphone ${index + 1}`,
+    })),
+    defaultLabel: String(stand?.label || "").trim().replace(/^default\s*-\s*/i, ""),
+  };
+};
+
+/**
+ * The picker's options: Windows' default first, then every microphone. A remembered microphone that
+ * is not plugged in right now stays in the list, marked, so the choice is visible and not silently
+ * lost; `ideal` in start() falls back to the default for it.
+ */
+export const microphoneOptions = ({ devices = [], defaultLabel = "" } = {}, chosenId = "") => {
+  const options = [{ value: "", label: defaultLabel ? `Windows default (${defaultLabel})` : "Windows default" }];
+  for (const device of devices) options.push({ value: device.deviceId, label: device.label });
+  const chosen = String(chosenId || "").trim();
+  if (chosen && !devices.some((device) => device.deviceId === chosen)) {
+    options.push({ value: chosen, label: "Chosen microphone (not connected now)" });
+  }
+  return options;
+};
+
 /** Shown while the AudioContext is suspended and waiting for a click or a key. */
 export const LIVE_VOICE_PAUSED_MESSAGE = "Click anywhere to start listening.";
 /** Shown when no microphone frame has arrived for LIVE_VOICE_NO_FRAMES_MS. */
@@ -738,6 +796,29 @@ export const writeAlwaysOnPreference = (source, on) => {
     if (!storage) return false;
     if (on) storage.setItem(LIVE_VOICE_ALWAYS_ON_STORAGE_KEY, "1");
     else storage.removeItem(LIVE_VOICE_ALWAYS_ON_STORAGE_KEY);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** The microphone chosen on this device, or "" for Windows' default. Anything unreadable is "". */
+export const readMicrophonePreference = (source) => {
+  try {
+    return String(storageFrom(source)?.getItem(LIVE_VOICE_MICROPHONE_STORAGE_KEY) || "").trim();
+  } catch {
+    return "";
+  }
+};
+
+/** Remember the microphone ("" forgets it). False when it could not be stored. */
+export const writeMicrophonePreference = (source, deviceId) => {
+  try {
+    const storage = storageFrom(source);
+    if (!storage) return false;
+    const id = String(deviceId || "").trim();
+    if (id) storage.setItem(LIVE_VOICE_MICROPHONE_STORAGE_KEY, id);
+    else storage.removeItem(LIVE_VOICE_MICROPHONE_STORAGE_KEY);
     return true;
   } catch {
     return false;
@@ -864,11 +945,12 @@ export const createLiveVoiceController = ({
   bufferSize = 4096,
   postSpeechGuardMs = 300,
   noFramesMs = LIVE_VOICE_NO_FRAMES_MS,
+  silentMs = LIVE_VOICE_SILENT_MS,
   heardMs = LIVE_VOICE_HEARD_MS,
   slowTranscribeMs = LIVE_VOICE_TRANSCRIBE_SLOW_MS,
   tickMs = 500,
 } = {}) => {
-  let view = { on: false, phase: "off", message: "", tone: "info", heard: "", engine: null };
+  let view = { on: false, phase: "off", message: "", tone: "info", heard: "", engine: null, microphone: "", microphoneId: "" };
   let session = null;
   let primed = null;
   let idleLimit = idleLimitMs;
@@ -1154,7 +1236,15 @@ export const createLiveVoiceController = ({
     // Before anything can return early: a frame arriving is what the watchdog and the meter watch,
     // whether or not FROST is speaking over it.
     current.lastFrameAtMs = now();
-    publishLevel(levelFromRms(frameRms(frame)));
+    const rms = frameRms(frame);
+    publishLevel(levelFromRms(rms));
+    if (rms >= LIVE_VOICE_SILENT_RMS) {
+      current.lastAudibleAtMs = current.lastFrameAtMs;
+      if (current.silentNoted) {
+        current.silentNoted = false;
+        if (view.message === current.silentMessage) refresh(current, { message: LIVE_VOICE_READY_HINT, tone: "info" });
+      }
+    }
     if (current.stalled || STALL_MESSAGES.has(view.message)) {
       current.stalled = false;
       refresh(current, STALL_MESSAGES.has(view.message) ? { message: LIVE_VOICE_READY_HINT, tone: "info" } : {});
@@ -1225,6 +1315,17 @@ export const createLiveVoiceController = ({
         message: current.resumeTried ? LIVE_VOICE_STILL_NO_SOUND_MESSAGE : LIVE_VOICE_NO_SOUND_MESSAGE,
         tone: "error",
       });
+    }
+    // Frames are arriving but carry nothing: a microphone that is on and silent. Time spent working
+    // out an answer or speaking it is not silence the owner could have filled.
+    if (current.speaking || current.working) current.lastAudibleAtMs = at;
+    const framesFlowing = Number.isFinite(current.lastFrameAtMs) && at - current.lastFrameAtMs < noFramesMs;
+    const audibleSince = Number.isFinite(current.lastAudibleAtMs) ? current.lastAudibleAtMs : current.watchFromMs;
+    if (!current.stalled && !current.silentNoted && framesFlowing
+      && Number.isFinite(audibleSince) && at - audibleSince >= silentMs) {
+      current.silentNoted = true;
+      current.silentMessage = silentMicrophoneMessage(current.microphoneLabel);
+      refresh(current, { message: current.silentMessage, tone: "error" });
     }
   };
 
@@ -1302,12 +1403,24 @@ export const createLiveVoiceController = ({
       heardUntilMs: null,
       transcribeStartedAtMs: null,
       slowNoted: false,
+      lastAudibleAtMs: null,
+      silentNoted: false,
+      silentMessage: "",
+      microphoneLabel: "",
     };
     session = current;
-    emit({ on: true, phase: "starting", message: "", tone: "info", heard: "", engine: null });
+    emit({ on: true, phase: "starting", message: "", tone: "info", heard: "", engine: null, microphone: "", microphoneId: "" });
     try {
+      const deviceId = String(options?.deviceId || "").trim();
       current.stream = await mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          channelCount: 1,
+          // `ideal`, not `exact`: a remembered microphone that has since been unplugged falls back to
+          // the default one instead of failing to open at all.
+          ...(deviceId ? { deviceId: { ideal: deviceId } } : {}),
+        },
       });
     } catch (error) {
       if (session === current) stop("microphone_failed", microphoneFailureMessage(error));
@@ -1321,6 +1434,10 @@ export const createLiveVoiceController = ({
     }
     // A microphone unplugged or taken by another program mid-session ends its track. Without this
     // the switch would stay on, listening to nothing. (A track we stop ourselves does not fire it.)
+    const audioTrack = (current.stream.getAudioTracks?.() || current.stream.getTracks?.() || [])[0];
+    current.microphoneLabel = String(audioTrack?.label || "").trim();
+    current.microphoneId = String(audioTrack?.getSettings?.()?.deviceId || "").trim();
+    emit({ microphone: current.microphoneLabel, microphoneId: current.microphoneId });
     for (const track of current.stream.getTracks?.() || []) {
       track.onended = () => {
         if (session === current) stop("microphone_lost", "The microphone stopped working, so live voice is off.");

@@ -5279,6 +5279,9 @@ tbody tr:last-child td {
 
 .frost-voice-level {
   background: var(--track);
+  /* The outline keeps the meter visible at zero, where a silent microphone is exactly what it
+     has to show. Without it the empty track vanished into the dark theme. */
+  border: 1px solid var(--line-control);
   border-radius: 999px;
   display: inline-block;
   height: 6px;
@@ -5305,6 +5308,20 @@ tbody tr:last-child td {
   padding: 0;
   text-align: left;
   text-decoration: underline;
+}
+
+.frost-live-mic {
+  align-items: center;
+  color: var(--ink-muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: var(--font-size-sm);
+  gap: 6px 8px;
+}
+
+.frost-live-mic select {
+  max-width: 100%;
+  min-width: 0;
 }
 
 .frost-live-heard {
