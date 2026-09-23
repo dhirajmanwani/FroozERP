@@ -24,9 +24,36 @@
  * ## Which utterances are questions
  *
  * A counter is loud and most of what the microphone hears is not addressed to FROST. An utterance
- * is a question only when it starts with the wake word ("Frost", "Hey Frost", "OK Frost"), or when it
- * comes within ten seconds of FROST finishing an answer (a follow-up). Everything else is
- * transcribed on the laptop and dropped: it is never sent to the question route and never shown.
+ * is a question only when it starts with the wake word ("Frost", "Hey Frost", "OK Frost" -- and the
+ * ways Whisper writes an Indian-English "Frost": "Forest", "Frosty", "Prost"... see
+ * `WAKE_WORD_VARIANTS`), or when it comes within ten seconds of FROST finishing an answer (a
+ * follow-up). Everything else is transcribed on the laptop and never sent to the question route.
+ * It IS shown, on this screen only, for about six seconds ("Heard: "..." -- say Frost first"):
+ * round 1 hid it, and a FROST that silently ignored a mis-heard "Frost" looked exactly like a FROST
+ * that heard nothing at all.
+ *
+ * ## Round 2: why "Listening" could sit there doing nothing, and what now says so
+ *
+ * The first build was tested on the owner's laptop and "just says listening but doesnt do anything".
+ * Every link in the chain now either works or puts words on the screen:
+ *   - the AudioContext is created inside the click (`prime()`), before the permission wait, because
+ *     WebView2 leaves a context made after an await "suspended" and a suspended context never
+ *     delivers a frame. A context that is suspended anyway says "Click anywhere to start listening"
+ *     and the App resumes it on the next pointerdown or keydown;
+ *   - a frame watchdog: no microphone frames for 2.5 s says "No sound is reaching FROST from the
+ *     microphone. Click here to start it.";
+ *   - a live level meter (`onLevel`), so "the microphone hears me" is visible without FROST;
+ *   - detector thresholds low enough for a laptop microphone behind noise suppression;
+ *   - what was heard is shown every time, wake word or not.
+ *
+ * ## Always listening
+ *
+ * The same controller serves the in-drawer "Live voice" switch and the app-wide "Listen for Frost
+ * everywhere" switch; there is only ever one microphone. `start({ idleLimitMs: null })` turns off
+ * the three-minute idle switch-off, `setIdleLimit()` changes it on a running session, and `onWake`
+ * lets the App pop the FROST drawer open on the conversation before the question is asked. The
+ * App draws `liveVoiceIndicatorView(...)` next to the bell whenever the microphone is on, in either
+ * mode, so it is never on invisibly.
  *
  * ## Why the pieces are separate functions
  *
@@ -46,14 +73,22 @@ export const LIVE_VOICE_INSTALL_PATH = "/api/local/speech/install";
 export const LIVE_VOICE_TARGET_RATE = 16000;
 export const LIVE_VOICE_FOLLOW_UP_MS = 10000;
 export const LIVE_VOICE_IDLE_LIMIT_MS = 180000;
+/** No microphone frame for this long while live voice is on is said out loud, not waited out. */
+export const LIVE_VOICE_NO_FRAMES_MS = 2500;
+/** How long "Heard: ..." stays on the screen. */
+export const LIVE_VOICE_HEARD_MS = 6000;
+/** Per device, not per profile or per user: it is about this laptop's microphone. */
+export const LIVE_VOICE_ALWAYS_ON_STORAGE_KEY = "froozerp_frost_voice_always_on";
 
 export const DETECTOR_DEFAULTS = Object.freeze({
-  // RMS of a float frame in [-1, 1]. With noise suppression on, a quiet room sits well under 0.005
-  // and ordinary speech a foot or two from a laptop microphone is 0.02 to 0.2.
-  startThreshold: 0.02,
+  // RMS of a float frame in [-1, 1]. Round 1 started at 0.02, measured against a desk microphone.
+  // A laptop's own microphone behind WebView2's noise suppression puts quiet, ordinary speech a
+  // couple of feet away at about 0.01 -- under 0.02, so round 1 never heard it start. A quiet room
+  // with suppression on sits near 0.001 to 0.003.
+  startThreshold: 0.008,
   // Lower than the start threshold on purpose: the gap is the hysteresis that stops the tail of a
   // word, which is quieter than its start, from being counted as silence.
-  stopThreshold: 0.01,
+  stopThreshold: 0.004,
   silenceMs: 800,
   minMs: 400,
   maxMs: 20000,
@@ -63,10 +98,13 @@ export const DETECTOR_DEFAULTS = Object.freeze({
   // Kept after the last loud frame, so the end of the last word is not clipped either.
   tailMs: 250,
   // A shop is not a quiet room. When the background is loud the thresholds follow it up, to a
-  // ceiling, so a fan or a road does not read as one endless utterance.
+  // ceiling, so a fan or a road does not read as one endless utterance. Round 1's x3 up to 0.15
+  // could climb above normal speech on a laptop microphone; x2.5 capped at 0.06 cannot. The cost:
+  // a background steadily louder than about 0.03 keeps the detector from ever hearing a pause, and
+  // that is reported ("too_loud") rather than sitting quietly on "Listening".
   adaptive: true,
-  noiseMultiplier: 3,
-  maxStartThreshold: 0.15,
+  noiseMultiplier: 2.5,
+  maxStartThreshold: 0.06,
 });
 
 /** Root-mean-square energy of one frame. Non-finite samples count as silence. */
@@ -79,6 +117,45 @@ export const frameRms = (frame) => {
     if (Number.isFinite(value)) sum += value * value;
   }
   return Math.sqrt(sum / length);
+};
+
+/**
+ * A microphone level for the meter, 0 to 1, from one frame's RMS.
+ *
+ * Logarithmic, because that is how loudness is heard: 60 dB of range, so RMS 0.001 (a silent room)
+ * is 0, the detector's start threshold (0.008) is about 0.3, ordinary speech (0.03 to 0.1) is 0.5
+ * to 0.67, and full scale is 1. Rounded to two places so a steady room does not redraw the meter
+ * for every frame.
+ */
+export const levelFromRms = (rms) => {
+  const value = Number(rms);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  const level = (20 * Math.log10(value) + 60) / 60;
+  return Math.round(Math.max(0, Math.min(1, level)) * 100) / 100;
+};
+
+/**
+ * Where the level goes. A tiny store with `get`/`subscribe`, so only the meter re-renders on every
+ * frame -- routing ~12 updates a second through App's state would redraw all of App.jsx each time.
+ */
+export const createVoiceLevelChannel = () => {
+  let level = 0;
+  const listeners = new Set();
+  return {
+    get: () => level,
+    set(next) {
+      const value = Number.isFinite(next) ? Math.max(0, Math.min(1, next)) : 0;
+      if (value === level) return;
+      level = value;
+      for (const listener of listeners) {
+        try { listener(); } catch { /* a broken meter must not break the microphone loop */ }
+      }
+    },
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
+  };
 };
 
 const finiteOr = (value, fallback) => (Number.isFinite(value) ? value : fallback);
@@ -108,7 +185,8 @@ const concatFrames = (chunks, length) => {
  *
  * `push(frame)` returns the events that frame completed:
  *   `{ type: "utterance", samples: Float32Array, durationMs }` or
- *   `{ type: "discarded", reason: "too_short" | "too_long", durationMs }`.
+ *   `{ type: "discarded", reason: "too_short" | "too_long" | "too_loud", durationMs }`.
+ * `too_loud` is emitted once when `overflow` lasts another whole `maxMs` without a pause.
  *
  * Frames are copied; the caller may reuse its buffer (a ScriptProcessorNode does).
  */
@@ -151,6 +229,8 @@ export const createUtteranceDetector = (options = {}) => {
   let preRollTotal = 0;
   let noiseFloor = 0;
   let noiseSeen = false;
+  let overflowRun = 0;
+  let tooLoudReported = false;
 
   const thresholds = () => {
     if (!cfg.adaptive || !noiseSeen) return { start: cfg.startThreshold, stop: cfg.stopThreshold };
@@ -215,6 +295,8 @@ export const createUtteranceDetector = (options = {}) => {
       if (voiced > maxSamples) {
         events.push({ type: "discarded", reason: "too_long", durationMs: msFor(voiced) });
         clearUtterance();
+        overflowRun = 0;
+        tooLoudReported = false;
         state = "overflow";
         return events;
       }
@@ -235,9 +317,17 @@ export const createUtteranceDetector = (options = {}) => {
     learn(rms);
     if (rms < stop) silenceRun += frame.length;
     else silenceRun = 0;
+    overflowRun += frame.length;
     if (silenceRun >= silenceSamples) {
       clearUtterance();
+      overflowRun = 0;
+      tooLoudReported = false;
       state = "idle";
+    } else if (!tooLoudReported && overflowRun >= maxSamples) {
+      // Another whole maximum without one pause: not somebody talking, a background the adaptive
+      // ceiling cannot climb over. Said once, so the screen explains why nothing is being sent.
+      tooLoudReported = true;
+      events.push({ type: "discarded", reason: "too_loud", durationMs: msFor(overflowRun) });
     }
     return events;
   };
@@ -246,6 +336,8 @@ export const createUtteranceDetector = (options = {}) => {
     clearUtterance();
     preRoll = [];
     preRollTotal = 0;
+    overflowRun = 0;
+    tooLoudReported = false;
     state = "idle";
   };
 
@@ -329,10 +421,55 @@ export const encodeWav16kMono = (samples) => {
 // Bracketed or parenthesised markers whisper writes for non-speech: [BLANK_AUDIO], (music),
 // [Music], *coughs*. The gateway strips [BLANK_AUDIO]; the rest are stripped here too.
 const MARKERS = /\[[^\]]*\]|\([^)]*\)|\*[^*]*\*/g;
-// "Frost" as the first word, optionally after hey/hi/ok/okay. "Frosty" and "frosted" are not the
-// wake word: \b after "frost" requires the word to end there.
-// "Frost's" is a possessive in a sentence about something else, not somebody addressing FROST.
-const WAKE = /^[\s"'“‘«(-]*(?:(?:hey|hi|ok|okay)\b[\s,.!-]*)?frost\b(?!['’]s\b)[\s,.:;!?-]*/i;
+
+/**
+ * What Whisper writes when somebody says "Frost" in Indian English, as the first word.
+ *
+ * Decided (round 2, from the owner's own test): an explicit list, not an edit distance. Edit
+ * distance 1 or 2 from "frost" takes in "first", "front", "froth" and "frosh", and a counter says
+ * "first" all day ("first give me the bill"). The list is every spelling seen or reasonably
+ * expected for this one word, plus two of our own: "forrest" (Whisper's spelling of the name, which
+ * "Frost" said with a vowel between f and r lands on) and "frosts". Ordinary words that merely
+ * start like it -- first, for, from, frozen, fresh, fruit, frost-free, frostbite, forests -- are
+ * NOT wake words; the tests hold both lists.
+ *
+ * The price, accepted knowingly: "Frosty the snowman" and "Frosted flakes..." as the first words of
+ * a sentence now go to FROST as a question. At a fruit counter that is rare, and FROST answering a
+ * stray sentence is visible and harmless; FROST ignoring its own name is the bug being fixed.
+ */
+export const WAKE_WORD_VARIANTS = Object.freeze([
+  "frost", "frosty", "frost's", "frosts", "frosted",
+  "forest", "forrest", "frust", "frast", "prost", "froast", "fraust", "fross",
+]);
+const WAKE_SET = new Set(WAKE_WORD_VARIANTS);
+const LEADING = /^[\s"'“‘«(-]+/u;
+const GREETING = /^(?:hey|hi|ok|okay)(?![\p{L}'’])[\s,.!-]*/iu;
+// A word, with at most one apostrophe inside it ("frost's", "frost’s").
+const FIRST_WORD = /^\p{L}+(?:['’]\p{L}+)?/u;
+
+/** The transcript with non-speech markers removed and whitespace collapsed. */
+export const cleanTranscript = (text) => String(text ?? "").replace(MARKERS, " ").replace(/\s+/g, " ").trim();
+
+/**
+ * The text after the wake word, or null when the transcript does not start with one.
+ * "Frost", "Hey Frost", "OK, Forest" -- the wake word is the first word, or the second after a
+ * greeting. A hyphen straight after it ("Frost-free fridge") means it was part of another word.
+ */
+export const textAfterWakeWord = (cleaned) => {
+  const tryAt = (text) => {
+    const match = FIRST_WORD.exec(text);
+    if (!match) return null;
+    if (!WAKE_SET.has(match[0].toLowerCase().replace(/’/g, "'"))) return null;
+    const rest = text.slice(match[0].length);
+    if (/^-\p{L}/u.test(rest)) return null;
+    return rest;
+  };
+  const text = String(cleaned ?? "").replace(LEADING, "");
+  const direct = tryAt(text);
+  if (direct !== null) return direct;
+  const greeting = GREETING.exec(text);
+  return greeting ? tryAt(text.slice(greeting[0].length)) : null;
+};
 
 /**
  * Whether a transcript is a question for FROST, and the question it is.
@@ -342,11 +479,11 @@ const WAKE = /^[\s"'“‘«(-]*(?:(?:hey|hi|ok|okay)\b[\s,.!-]*)?frost\b(?!['�
  *   window so the next utterance is taken as the question.
  */
 export const questionFromTranscript = (text, { lastSpokeEndedAtMs = null, nowMs = null, followUpMs = LIVE_VOICE_FOLLOW_UP_MS } = {}) => {
-  const cleaned = String(text ?? "").replace(MARKERS, " ").replace(/\s+/g, " ").trim();
+  const cleaned = cleanTranscript(text);
   if (!/[\p{L}\p{N}]/u.test(cleaned)) return { ask: false, question: "", reason: "empty" };
-  const wake = WAKE.exec(cleaned);
-  if (wake) {
-    const question = cleaned.slice(wake[0].length).replace(/^[\s,.:;!?-]+/, "").trim();
+  const afterWake = textAfterWakeWord(cleaned);
+  if (afterWake !== null) {
+    const question = afterWake.replace(/^[\s,.:;!?-]+/, "").trim();
     if (!/[\p{L}\p{N}]/u.test(question)) return { ask: false, question: "", reason: "wake_only" };
     return { ask: true, question, reason: "wake_word" };
   }
@@ -358,6 +495,22 @@ export const questionFromTranscript = (text, { lastSpokeEndedAtMs = null, nowMs 
     return { ask: true, question: cleaned, reason: "follow_up" };
   }
   return { ask: false, question: "", reason: "no_wake_word" };
+};
+
+const HEARD_MAX_CHARS = 140;
+
+/**
+ * The line shown for ~6 s after every transcription, so a mishearing -- or a "Frost" Whisper wrote
+ * as something else -- is visible. Shown on this screen only; nothing here is sent anywhere.
+ */
+export const heardLineFor = (text, reason) => {
+  const cleaned = cleanTranscript(text);
+  if (reason === "empty" || !/[\p{L}\p{N}]/u.test(cleaned)) {
+    return "Heard nothing clear. Say it again, a little closer to the microphone.";
+  }
+  const shown = cleaned.length > HEARD_MAX_CHARS ? `${cleaned.slice(0, HEARD_MAX_CHARS - 1).trimEnd()}…` : cleaned;
+  if (reason === "no_wake_word") return `Heard: "${shown}" — say Frost first`;
+  return `Heard: "${shown}"`;
 };
 
 /** True when live voice should turn itself off. An unreadable clock turns it off too. */
@@ -458,9 +611,42 @@ export const speechSetupView = (status, failure = null) => {
   return view("not_installed", SPEECH_SETUP_PROMPT, { action: "download" });
 };
 
+/**
+ * A line about the speech engine itself, for a status that is otherwise ready. Tolerates a gateway
+ * from before round 2, which sends neither `engine` nor `engine_update_available`: then it is null.
+ *
+ * @param {object|null} status  GET /api/local/speech/status
+ * @param {{engine?: string|null}} [latest]  the `engine` the last transcription reported, if any
+ * @returns {null | {kind: "update"|"slow", text: string, detail: string, action: "install"|null}}
+ */
+export const speechEngineNotice = (status, { engine = null } = {}) => {
+  if (!status || typeof status !== "object" || status.state !== "ready") return null;
+  if (status.engine_update_available === true) {
+    const allowed = status.internet_allowed === true;
+    return {
+      kind: "update",
+      text: "Voice engine update available. It makes answers come back faster; it is a 4 MB download and the speech model is kept.",
+      detail: allowed ? "" : "This laptop is in Local Only mode, so the update cannot be downloaded. Switch Connectivity to Auto to install it.",
+      action: allowed ? "install" : null,
+    };
+  }
+  const running = typeof engine === "string" && engine ? engine : status.engine;
+  if (running === "cli") {
+    return {
+      kind: "slow",
+      text: "Voice is using its slower engine on this laptop, so each answer takes a few seconds longer.",
+      detail: "",
+      action: null,
+    };
+  }
+  return null;
+};
+
 export const LIVE_VOICE_PHASE_LABELS = Object.freeze({
   off: "Off",
   starting: "Opening the microphone",
+  paused: "Click anywhere to start listening",
+  no_sound: "No sound from the microphone",
   listening: "Listening",
   hearing: "Hearing you",
   transcribing: "Working out what you said",
@@ -478,6 +664,87 @@ export const LIVE_VOICE_STOP_MESSAGES = Object.freeze({
   unsupported: "This device cannot use the microphone here, so live voice is off.",
   speech_unsupported: "This device cannot read answers aloud, so live voice is off.",
 });
+
+/** Shown while the AudioContext is suspended and waiting for a click or a key. */
+export const LIVE_VOICE_PAUSED_MESSAGE = "Click anywhere to start listening.";
+/** Shown when no microphone frame has arrived for LIVE_VOICE_NO_FRAMES_MS. */
+export const LIVE_VOICE_NO_SOUND_MESSAGE = "No sound is reaching FROST from the microphone. Click here to start it.";
+/** Shown when a click to resume did not bring frames back either. */
+export const LIVE_VOICE_STILL_NO_SOUND_MESSAGE = "Still no sound from the microphone after starting it. Check the microphone in Windows Sound settings, or turn voice off and on again.";
+export const LIVE_VOICE_RESUMING_MESSAGE = "Starting the microphone...";
+export const LIVE_VOICE_READY_HINT = "Say \"Frost\" and then your question.";
+export const LIVE_VOICE_TOO_LOUD_MESSAGE = "It is too loud here for FROST to hear where you stop talking, so nothing is being sent. Move somewhere quieter or closer to the microphone.";
+// The gateway loads the speech model into its server on the first transcription after it starts
+// (up to ~30 s, then the request itself), so the first one can take up to a minute. Said, so the
+// bar does not look stuck on "Working out what you said".
+export const LIVE_VOICE_ENGINE_STARTING_MESSAGE = "Starting the speech engine (the first time can take up to a minute)...";
+export const LIVE_VOICE_TRANSCRIBE_SLOW_MESSAGE = "Still working out what you said. The speech engine is taking longer than usual.";
+/** A transcription still running after this long says so, whether or not it is the first. */
+export const LIVE_VOICE_TRANSCRIBE_SLOW_MS = 6000;
+const WORKING_MESSAGES = new Set([LIVE_VOICE_ENGINE_STARTING_MESSAGE, LIVE_VOICE_TRANSCRIBE_SLOW_MESSAGE]);
+export const LIVE_VOICE_SPEAK_FAILED_MESSAGE = "FROST could not read the answer aloud on this device. The answer is on the screen.";
+const STALL_MESSAGES = new Set([
+  LIVE_VOICE_PAUSED_MESSAGE,
+  LIVE_VOICE_NO_SOUND_MESSAGE,
+  LIVE_VOICE_STILL_NO_SOUND_MESSAGE,
+  LIVE_VOICE_RESUMING_MESSAGE,
+]);
+
+/**
+ * The small always-visible indicator next to the bell.
+ *
+ * Drawn whenever the microphone is on -- in either mode, for anybody, whatever `allowed` and
+ * `alwaysOn` say -- because a microphone must never be on without something on screen saying so.
+ * When "listen everywhere" is chosen but FROST is not listening because something failed, it is
+ * drawn too, with the reason, since the drawer that would otherwise say so may be closed.
+ *
+ * @returns {null | {kind: "on"|"stopped", phase: string, label: string, tone: "active"|"attention"|"error", detail: string}}
+ */
+export const liveVoiceIndicatorView = ({ view = null, alwaysOn = false, allowed = false } = {}) => {
+  const message = String(view?.message || "");
+  if (view?.on === true) {
+    const phase = String(view.phase || "listening");
+    const stalled = phase === "paused" || phase === "no_sound";
+    return {
+      kind: "on",
+      phase,
+      label: LIVE_VOICE_PHASE_LABELS[phase] || LIVE_VOICE_PHASE_LABELS.listening,
+      tone: phase === "no_sound" || view.tone === "error" ? "error" : stalled ? "attention" : "active",
+      // A slow first transcription is said next to the bell too, or a closed drawer looks stuck.
+      detail: stalled || view.tone === "error" || WORKING_MESSAGES.has(message) ? message : "",
+    };
+  }
+  if (alwaysOn && allowed && view?.tone === "error" && message) {
+    return { kind: "stopped", phase: "off", label: "FROST is not listening", tone: "error", detail: message };
+  }
+  return null;
+};
+
+const storageFrom = (source) => (typeof source === "function" ? source() : source);
+
+/** The "listen everywhere" choice on this device. Anything unreadable is "off". */
+export const readAlwaysOnPreference = (source) => {
+  try {
+    return storageFrom(source)?.getItem(LIVE_VOICE_ALWAYS_ON_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+};
+
+/** Remember the choice. False when it could not be stored; the choice still holds this session. */
+export const writeAlwaysOnPreference = (source, on) => {
+  try {
+    const storage = storageFrom(source);
+    if (!storage) return false;
+    if (on) storage.setItem(LIVE_VOICE_ALWAYS_ON_STORAGE_KEY, "1");
+    else storage.removeItem(LIVE_VOICE_ALWAYS_ON_STORAGE_KEY);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+export const LIVE_VOICE_PREFERENCE_NOT_SAVED = "This choice could not be saved on this laptop, so it lasts only until FroozERP closes.";
 
 /** One short line for why the microphone could not open. */
 export const microphoneFailureMessage = (error) => {
@@ -543,19 +810,35 @@ export const spokenAnswerFor = (entry, { synthesis = null, utterance = null } = 
   return speechWithNotice(plan, turn);
 };
 
+
 /**
  * The microphone, the detector, transcription, the question and the spoken answer, in one loop.
  *
  * Everything with a side effect is passed in:
- *   mediaDevices     navigator.mediaDevices
- *   AudioContextImpl window.AudioContext
- *   synthesis        window.speechSynthesis
- *   Utterance        window.SpeechSynthesisUtterance
- *   transcribe(wav)  resolves to the gateway's JSON `{ text }`; rejects axios-shaped
- *   ask(question)    resolves to the history entry the typed path stored (or null)
- *   isBusy()         true while a typed question is in flight
- *   now()            milliseconds
- *   onChange(view)   `{ on, phase, message, tone }`
+ *   mediaDevices      navigator.mediaDevices
+ *   AudioContextImpl  window.AudioContext
+ *   synthesis         window.speechSynthesis
+ *   Utterance         window.SpeechSynthesisUtterance
+ *   transcribe(wav)   resolves to the gateway's JSON `{ text, engine? }`; rejects axios-shaped
+ *   ask(question)     resolves to the history entry the typed path stored (or null)
+ *   isBusy()          true while a typed question is in flight
+ *   isAllowed()       false for anybody but the Owner or an Admin: start() and prime() refuse, and a
+ *                     running session stops on its next tick
+ *   onWake({reason})  awaited before a question is asked, and after "Frost" alone, so the App can
+ *                     pop the FROST drawer open on the conversation first
+ *   onLevel(level)    0..1 for every microphone frame, and 0 when the microphone closes
+ *   now()             milliseconds
+ *   onChange(view)    `{ on, phase, message, tone, heard, engine }`
+ *
+ * And the controller's own methods:
+ *   prime()           call synchronously inside the click that turns voice on, before any await:
+ *                     creates and resumes the AudioContext while the gesture still counts
+ *   discardPrimed()   closes a primed context start() will not use (voice not set up, etc.)
+ *   start({ idleLimitMs })  `idleLimitMs: null` means no idle switch-off (always listening)
+ *   setIdleLimit(ms)  the same, on a running session
+ *   resume()          call from a gesture: resumes a suspended context and re-arms the watchdog
+ *   note(message, tone)  a line while off, e.g. why it did not start
+ *   stop(reason, message)
  *
  * `stop(reason)` is idempotent and always releases the microphone: tracks stopped, processor
  * detached, AudioContext closed. It is safe to call while `start()` is still awaiting permission --
@@ -569,6 +852,9 @@ export const createLiveVoiceController = ({
   transcribe,
   ask,
   isBusy = () => false,
+  isAllowed = () => true,
+  onWake = null,
+  onLevel = null,
   now = () => Date.now(),
   timers = globalThis,
   onChange = () => {},
@@ -577,23 +863,78 @@ export const createLiveVoiceController = ({
   followUpMs = LIVE_VOICE_FOLLOW_UP_MS,
   bufferSize = 4096,
   postSpeechGuardMs = 300,
-  resumeTimeoutMs = 3000,
+  noFramesMs = LIVE_VOICE_NO_FRAMES_MS,
+  heardMs = LIVE_VOICE_HEARD_MS,
+  slowTranscribeMs = LIVE_VOICE_TRANSCRIBE_SLOW_MS,
+  tickMs = 500,
 } = {}) => {
-  let view = { on: false, phase: "off", message: "", tone: "info" };
+  let view = { on: false, phase: "off", message: "", tone: "info", heard: "", engine: null };
   let session = null;
+  let primed = null;
+  let idleLimit = idleLimitMs;
+  // Whether the speech engine has answered once in this app's life. Until it has, the first
+  // transcription is expected to be slow (the gateway is loading the model) and says so.
+  let engineWarm = false;
 
   const emit = (patch) => {
     const next = { ...view, ...patch };
-    if (next.on === view.on && next.phase === view.phase && next.message === view.message && next.tone === view.tone) return;
+    if (Object.keys(next).every((key) => next[key] === view[key])) return;
     view = next;
     onChange(view);
+  };
+
+  // A permission check that throws is a refusal, not a crash with the microphone open.
+  const allowed = () => {
+    try { return isAllowed() === true; } catch { return false; }
+  };
+
+  const publishLevel = (level) => {
+    if (typeof onLevel !== "function") return;
+    try { onLevel(level); } catch { /* a broken meter must not stop the microphone loop */ }
+  };
+
+  const closeContext = (context) => {
+    if (!context) return;
+    try { context.onstatechange = null; } catch { /* read-only in some fakes */ }
+    if (context.state === "closed") return;
+    try { Promise.resolve(context.close()).catch(() => null); } catch { /* already closing */ }
+  };
+
+  // Not awaited. Called inside a gesture it takes effect; called outside one it may wait for ever,
+  // and nothing here waits with it -- the phase says "paused" and the App resumes on the next click.
+  const resumeContext = (context) => {
+    if (!context || context.state !== "suspended" || typeof context.resume !== "function") return;
+    try { Promise.resolve(context.resume()).catch(() => null); } catch { /* the phase says paused */ }
+  };
+
+  const discardPrimed = () => {
+    const context = primed;
+    primed = null;
+    closeContext(context);
+  };
+
+  const prime = () => {
+    if (session) return true;
+    if (primed) {
+      resumeContext(primed);
+      return true;
+    }
+    if (!allowed() || typeof AudioContextImpl !== "function") return false;
+    try {
+      primed = new AudioContextImpl();
+    } catch {
+      primed = null;
+      return false;
+    }
+    resumeContext(primed);
+    return true;
   };
 
   const release = (current) => {
     if (!current) return;
     current.active = false;
-    if (current.idleTimer) timers.clearInterval(current.idleTimer);
-    current.idleTimer = null;
+    if (current.ticker) timers.clearInterval(current.ticker);
+    current.ticker = null;
     if (current.processor) {
       current.processor.onaudioprocess = null;
       try { current.processor.disconnect(); } catch { /* already detached */ }
@@ -605,9 +946,7 @@ export const createLiveVoiceController = ({
         try { track.stop(); } catch { /* a track that cannot stop is already stopped */ }
       }
     }
-    if (current.context && current.context.state !== "closed") {
-      try { Promise.resolve(current.context.close()).catch(() => null); } catch { /* already closing */ }
-    }
+    closeContext(current.context);
     if (current.speaking && synthesis) {
       try { synthesis.cancel(); } catch { /* nothing queued */ }
     }
@@ -615,45 +954,64 @@ export const createLiveVoiceController = ({
   };
 
   const stop = (reason = "switched_off", message = null) => {
+    discardPrimed();
     const current = session;
     if (!current && !view.on) return false;
     session = null;
     release(current);
+    publishLevel(0);
     const text = message || LIVE_VOICE_STOP_MESSAGES[reason] || LIVE_VOICE_STOP_MESSAGES.switched_off;
     const tone = reason === "switched_off" || reason === "idle" || reason === "drawer_closed"
       || reason === "signed_out" || reason === "unmounted" ? "info" : "error";
-    emit({ on: false, phase: "off", message: text, tone });
+    emit({ on: false, phase: "off", message: text, tone, heard: "" });
     return true;
   };
 
+  const note = (message, tone = "info") => {
+    if (session) return false;
+    emit({ on: false, phase: "off", message: String(message || ""), tone, heard: "" });
+    return true;
+  };
+
+  const setIdleLimit = (ms) => {
+    const wasOff = !Number.isFinite(idleLimit);
+    idleLimit = ms;
+    // Turning the idle limit back on starts its three minutes now, not from the last question.
+    if (wasOff && Number.isFinite(ms) && session) session.lastQuestionAtMs = now();
+  };
+
+  /** Resolves true when the synthesiser read it (or was cut off by us), false when it failed. */
   const speak = (current, text) => new Promise((resolve) => {
-    if (!text || !current.active) { resolve(); return; }
+    if (!text || !current.active) { resolve(true); return; }
     let settled = false;
     let guard = null;
-    const done = () => {
+    const done = (ok) => {
       if (settled) return;
       settled = true;
       if (guard) timers.clearTimeout(guard);
-      resolve();
+      resolve(ok);
     };
     try {
       synthesis.cancel();
       const utterance = new Utterance(text);
-      utterance.onend = done;
-      utterance.onerror = done;
+      utterance.onend = () => done(true);
+      // "interrupted" and "canceled" are this module or the Speak button cancelling, not a fault.
+      utterance.onerror = (event) => done(event?.error === "interrupted" || event?.error === "canceled");
       // Chromium does not always fire `end` for a long utterance. Without this the loop would wait
       // for ever with every frame ignored -- a microphone that is on and hears nothing.
-      guard = timers.setTimeout(done, Math.max(8000, text.length * 150));
+      guard = timers.setTimeout(() => done(true), Math.max(8000, text.length * 150));
       synthesis.speak(utterance);
     } catch {
-      done();
+      done(false);
     }
   });
 
   const phaseFor = (current) => {
     if (current.speaking) return "speaking";
     if (current.working) return current.working;
-    return current.detector.hearing ? "hearing" : "listening";
+    if (current.stalled) return "no_sound";
+    if (current.context?.state === "suspended") return "paused";
+    return current.detector?.hearing ? "hearing" : "listening";
   };
 
   const refresh = (current, patch = {}) => {
@@ -661,9 +1019,27 @@ export const createLiveVoiceController = ({
     emit({ on: true, phase: phaseFor(current), ...patch });
   };
 
+  const showHeard = (current, line) => {
+    if (!current.active) return;
+    current.heardUntilMs = now() + heardMs;
+    emit({ heard: line });
+  };
+
+  const reveal = async (reason) => {
+    if (typeof onWake !== "function") return;
+    try {
+      await onWake({ reason });
+    } catch {
+      // The drawer failing to open must not lose the question: it is still asked and answered
+      // aloud, and it is in the conversation the next time FROST is opened.
+    }
+  };
+
   const handleOne = async (current, item) => {
     current.working = "transcribing";
-    refresh(current);
+    current.transcribeStartedAtMs = now();
+    current.slowNoted = false;
+    refresh(current, engineWarm ? {} : { message: LIVE_VOICE_ENGINE_STARTING_MESSAGE, tone: "info" });
     let wav;
     try {
       wav = encodeWav16kMono(downsampleTo16k(item.samples, current.sampleRate));
@@ -683,7 +1059,14 @@ export const createLiveVoiceController = ({
         throw unreadable;
       }
       text = data.text;
+      engineWarm = true;
+      current.transcribeStartedAtMs = null;
+      if (WORKING_MESSAGES.has(view.message)) emit({ message: "", tone: "info" });
+      // Round 2's gateway says which engine did the work. "cli" is the slow fallback and the App
+      // says so; a gateway from before round 2 sends nothing and nothing is said.
+      if (typeof data.engine === "string" && data.engine) emit({ engine: data.engine });
     } catch (error) {
+      current.transcribeStartedAtMs = null;
       if (!current.active) return;
       const failure = describeTranscribeFailure(error);
       if (failure.stop) {
@@ -703,14 +1086,16 @@ export const createLiveVoiceController = ({
       nowMs: item.endedAtMs,
       followUpMs,
     });
+    // Every time, question or not: what Whisper made of it is the only way to see a mishearing.
+    showHeard(current, heardLineFor(text, decision.reason));
     if (!decision.ask) {
       current.working = null;
       if (decision.reason === "wake_only") {
         current.wakeHeardAtMs = item.endedAtMs;
+        current.lastQuestionAtMs = now();
+        await reveal("wake_only");
+        if (!current.active) return;
         refresh(current, { message: "Go ahead, FROST is listening.", tone: "info" });
-      } else if (decision.reason === "no_wake_word") {
-        // Not shown word for word: what the counter says to customers is not FROST's business.
-        refresh(current, { message: "Heard speech without \"Frost\" first, so it was ignored.", tone: "info" });
       } else {
         refresh(current);
       }
@@ -723,6 +1108,8 @@ export const createLiveVoiceController = ({
     }
     current.wakeHeardAtMs = null;
     current.lastQuestionAtMs = now();
+    await reveal(decision.reason);
+    if (!current.active) return;
     current.working = "thinking";
     refresh(current, { message: "", tone: "info" });
     let entry;
@@ -739,10 +1126,11 @@ export const createLiveVoiceController = ({
       current.speaking = true;
       current.detector.reset();
       refresh(current);
-      await speak(current, spoken);
+      const spokenOk = await speak(current, spoken);
       current.speaking = false;
       current.detector.reset();
       if (!current.active) return;
+      if (!spokenOk) refresh(current, { message: LIVE_VOICE_SPEAK_FAILED_MESSAGE, tone: "error" });
     }
     current.lastSpokeEndedAtMs = now();
     refresh(current);
@@ -763,6 +1151,14 @@ export const createLiveVoiceController = ({
 
   const onFrame = (current, frame) => {
     if (!current.active) return;
+    // Before anything can return early: a frame arriving is what the watchdog and the meter watch,
+    // whether or not FROST is speaking over it.
+    current.lastFrameAtMs = now();
+    publishLevel(levelFromRms(frameRms(frame)));
+    if (current.stalled || STALL_MESSAGES.has(view.message)) {
+      current.stalled = false;
+      refresh(current, STALL_MESSAGES.has(view.message) ? { message: LIVE_VOICE_READY_HINT, tone: "info" } : {});
+    }
     const externallySpeaking = Boolean(synthesis?.speaking) && !current.speaking;
     const guarded = Number.isFinite(current.lastSpokeEndedAtMs) && now() - current.lastSpokeEndedAtMs < postSpeechGuardMs;
     // FROST speaking into its own microphone would transcribe its own answer as the next question.
@@ -778,25 +1174,114 @@ export const createLiveVoiceController = ({
         drain(current);
       } else if (event.reason === "too_long") {
         refresh(current, { message: "That was longer than 20 seconds, so it was not sent. Ask a shorter question.", tone: "info" });
+      } else if (event.reason === "too_loud") {
+        refresh(current, { message: LIVE_VOICE_TOO_LOUD_MESSAGE, tone: "error" });
       }
     }
     refresh(current);
   };
 
-  const start = async () => {
+  const onContextState = (current) => {
+    if (!current.active || session !== current) return;
+    const state = current.context?.state;
+    if (state === "suspended") {
+      refresh(current, { message: LIVE_VOICE_PAUSED_MESSAGE, tone: "attention" });
+    } else if (state === "closed") {
+      // Not by us: release() detaches this handler before it closes the context.
+      stop("audio_failed", "Audio processing stopped on its own, so live voice is off.");
+    } else {
+      refresh(current);
+    }
+  };
+
+  const tick = (current) => {
+    if (!current.active || session !== current) return;
+    if (!allowed()) {
+      stop("not_permitted");
+      return;
+    }
+    const at = now();
+    if (Number.isFinite(idleLimit) && idleLimit > 0
+      && liveVoiceIdle({ lastQuestionAtMs: current.lastQuestionAtMs, nowMs: at, limitMs: idleLimit })) {
+      stop("idle");
+      return;
+    }
+    if (view.heard && Number.isFinite(current.heardUntilMs) && at >= current.heardUntilMs) {
+      current.heardUntilMs = null;
+      emit({ heard: "" });
+    }
+    if (current.working === "transcribing" && !current.slowNoted && Number.isFinite(current.transcribeStartedAtMs)
+      && at - current.transcribeStartedAtMs >= slowTranscribeMs && view.message !== LIVE_VOICE_ENGINE_STARTING_MESSAGE) {
+      current.slowNoted = true;
+      refresh(current, { message: LIVE_VOICE_TRANSCRIBE_SLOW_MESSAGE, tone: "info" });
+    }
+    // A context that was never given a gesture is waiting for one, and already says "Click
+    // anywhere to start listening"; the watchdog would only repeat it in other words.
+    const waitingForClick = current.context?.state === "suspended" && !current.primedByGesture && !current.resumeTried;
+    const since = Number.isFinite(current.lastFrameAtMs) ? current.lastFrameAtMs : current.watchFromMs;
+    if (!current.stalled && !waitingForClick && Number.isFinite(since) && at - since >= noFramesMs) {
+      current.stalled = true;
+      refresh(current, {
+        message: current.resumeTried ? LIVE_VOICE_STILL_NO_SOUND_MESSAGE : LIVE_VOICE_NO_SOUND_MESSAGE,
+        tone: "error",
+      });
+    }
+  };
+
+  const resume = () => {
+    const current = session;
+    if (!current?.active || !current.context) return false;
+    const suspended = current.context.state === "suspended";
+    if (!suspended && !current.stalled) return false;
+    current.resumeTried = true;
+    resumeContext(current.context);
+    current.stalled = false;
+    current.watchFromMs = now();
+    current.lastFrameAtMs = null;
+    refresh(current, { message: LIVE_VOICE_RESUMING_MESSAGE, tone: "info" });
+    return true;
+  };
+
+  const start = async (options = {}) => {
     if (session) return view;
+    if (options && Object.prototype.hasOwnProperty.call(options, "idleLimitMs")) idleLimit = options.idleLimitMs;
+    if (!allowed()) {
+      discardPrimed();
+      emit({ on: false, phase: "off", message: LIVE_VOICE_STOP_MESSAGES.not_permitted, tone: "error", heard: "" });
+      return view;
+    }
     if (typeof mediaDevices?.getUserMedia !== "function" || typeof AudioContextImpl !== "function") {
-      emit({ on: false, phase: "off", message: LIVE_VOICE_STOP_MESSAGES.unsupported, tone: "error" });
+      discardPrimed();
+      emit({ on: false, phase: "off", message: LIVE_VOICE_STOP_MESSAGES.unsupported, tone: "error", heard: "" });
       return view;
     }
     if (!speechSupported(synthesis, Utterance)) {
-      emit({ on: false, phase: "off", message: LIVE_VOICE_STOP_MESSAGES.speech_unsupported, tone: "error" });
+      discardPrimed();
+      emit({ on: false, phase: "off", message: LIVE_VOICE_STOP_MESSAGES.speech_unsupported, tone: "error", heard: "" });
       return view;
     }
+    // Before the first await. WebView2 lets an AudioContext run only if it was created (or resumed)
+    // inside a user gesture, and the permission wait below ends the gesture. Round 1 created it
+    // after that wait: the context stayed suspended, no frame ever arrived, and the bar said
+    // "Listening" to nothing.
+    const primedByGesture = Boolean(primed);
+    let context = primed;
+    primed = null;
+    if (!context) {
+      try {
+        context = new AudioContextImpl();
+      } catch (error) {
+        const detail = String(error?.message || error?.name || "").trim();
+        emit({ on: false, phase: "off", message: `Audio processing could not start${detail ? ` (${detail})` : ""}, so live voice is off.`, tone: "error", heard: "" });
+        return view;
+      }
+    }
+    resumeContext(context);
     const current = {
       active: true,
       stream: null,
-      context: null,
+      context,
+      primedByGesture,
       source: null,
       processor: null,
       sink: null,
@@ -806,19 +1291,27 @@ export const createLiveVoiceController = ({
       draining: false,
       working: null,
       speaking: false,
-      idleTimer: null,
+      ticker: null,
       lastQuestionAtMs: now(),
       lastSpokeEndedAtMs: null,
       wakeHeardAtMs: null,
+      lastFrameAtMs: null,
+      watchFromMs: null,
+      stalled: false,
+      resumeTried: false,
+      heardUntilMs: null,
+      transcribeStartedAtMs: null,
+      slowNoted: false,
     };
     session = current;
-    emit({ on: true, phase: "starting", message: "", tone: "info" });
+    emit({ on: true, phase: "starting", message: "", tone: "info", heard: "", engine: null });
     try {
       current.stream = await mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
       });
     } catch (error) {
       if (session === current) stop("microphone_failed", microphoneFailureMessage(error));
+      else release(current);
       return view;
     }
     if (!current.active) {
@@ -834,20 +1327,6 @@ export const createLiveVoiceController = ({
       };
     }
     try {
-      const context = new AudioContextImpl();
-      current.context = context;
-      if (context.state === "suspended" && typeof context.resume === "function") {
-        // resume() can wait indefinitely for a user gesture the page never gets. Bounded, and a
-        // context still paused afterwards is an error, not a switch that says Listening and hears nothing.
-        let timer = null;
-        await Promise.race([
-          Promise.resolve(context.resume()).catch(() => null),
-          new Promise((resolve) => { timer = timers.setTimeout(resolve, resumeTimeoutMs); }),
-        ]);
-        if (timer !== null) timers.clearTimeout(timer);
-        if (context.state !== "running") throw new Error("audio stayed paused");
-      }
-      if (!current.active) { release(current); return view; }
       current.sampleRate = Number(context.sampleRate);
       current.detector = createUtteranceDetector({ ...detectorOptions, sampleRate: current.sampleRate });
       current.source = context.createMediaStreamSource(current.stream);
@@ -860,25 +1339,29 @@ export const createLiveVoiceController = ({
       current.source.connect(current.processor);
       current.processor.connect(current.sink);
       current.sink.connect(context.destination);
+      context.onstatechange = () => onContextState(current);
     } catch (error) {
       const detail = String(error?.message || error?.name || "").trim();
       if (session === current) stop("audio_failed", `Audio processing could not start${detail ? ` (${detail})` : ""}, so live voice is off.`);
       else release(current);
       return view;
     }
-    current.idleTimer = timers.setInterval(() => {
-      if (!current.active) return;
-      if (liveVoiceIdle({ lastQuestionAtMs: current.lastQuestionAtMs, nowMs: now(), limitMs: idleLimitMs })) {
-        stop("idle");
-      }
-    }, 5000);
-    refresh(current, { message: "Say \"Frost\" and then your question.", tone: "info" });
+    resumeContext(context);
+    current.watchFromMs = now();
+    current.ticker = timers.setInterval(() => tick(current), tickMs);
+    if (context.state === "suspended") refresh(current, { message: LIVE_VOICE_PAUSED_MESSAGE, tone: "attention" });
+    else refresh(current, { message: LIVE_VOICE_READY_HINT, tone: "info" });
     return view;
   };
 
   return {
+    prime,
+    discardPrimed,
     start,
     stop,
+    resume,
+    note,
+    setIdleLimit,
     get view() { return view; },
     get active() { return Boolean(session?.active); },
   };

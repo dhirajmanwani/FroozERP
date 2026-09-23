@@ -5,22 +5,42 @@ import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  DETECTOR_DEFAULTS,
+  LIVE_VOICE_ALWAYS_ON_STORAGE_KEY,
   LIVE_VOICE_INSTALL_PATH,
+  LIVE_VOICE_NO_SOUND_MESSAGE,
+  LIVE_VOICE_PAUSED_MESSAGE,
+  LIVE_VOICE_PHASE_LABELS,
+  LIVE_VOICE_ENGINE_STARTING_MESSAGE,
+  LIVE_VOICE_READY_HINT,
+  LIVE_VOICE_TRANSCRIBE_SLOW_MESSAGE,
+  LIVE_VOICE_RESUMING_MESSAGE,
+  LIVE_VOICE_SPEAK_FAILED_MESSAGE,
   LIVE_VOICE_STATUS_PATH,
+  LIVE_VOICE_STILL_NO_SOUND_MESSAGE,
   LIVE_VOICE_STOP_MESSAGES,
+  LIVE_VOICE_TOO_LOUD_MESSAGE,
   LIVE_VOICE_TRANSCRIBE_PATH,
   SPEECH_SETUP_PROMPT,
+  WAKE_WORD_VARIANTS,
   createLiveVoiceController,
   createUtteranceDetector,
+  createVoiceLevelChannel,
   describeTranscribeFailure,
   downsampleTo16k,
   encodeWav16kMono,
   frameRms,
+  heardLineFor,
+  levelFromRms,
   liveVoiceIdle,
+  liveVoiceIndicatorView,
   microphoneFailureMessage,
   questionFromTranscript,
+  readAlwaysOnPreference,
+  speechEngineNotice,
   speechSetupView,
   spokenAnswerFor,
+  writeAlwaysOnPreference,
 } from "./frostLiveVoice.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -130,8 +150,8 @@ test("hangover: a pause shorter than 800 ms inside a sentence does not split it"
 
 test("hysteresis: a trailing word between the two thresholds keeps the utterance open", () => {
   const detector = createUtteranceDetector(fixed);
-  // RMS of a 0.021 sine is about 0.015: under the start threshold (0.02), over the stop one (0.01).
-  const soft = () => tone(0.021);
+  // RMS of a 0.0085 sine is about 0.006: under the start threshold (0.008), over the stop one (0.004).
+  const soft = () => tone(0.0085);
   assert.deepEqual(feed(detector, repeat(10, soft)), [], "too soft to start an utterance");
   assert.equal(detector.state, "idle");
   const events = feed(detector, [...repeat(3, () => tone()), ...repeat(7, soft), ...repeat(8, silence)]);
@@ -153,15 +173,45 @@ test("frames are copied, so a reused capture buffer cannot rewrite an utterance"
 
 test("adaptive: a loud steady background is learned, and stops reading as speech", () => {
   const detector = createUtteranceDetector({ sampleRate: RATE });
-  const hum = () => tone(0.045); // RMS ~0.032, over the fixed start threshold
+  const hum = () => tone(0.028); // RMS ~0.0198, well over the fixed start threshold (0.008)
   const events = feed(detector, repeat(300, hum));
   assert.deepEqual(events.map((event) => event.reason), ["too_long"], "the first 20 s are one overflow, not a stream of questions");
   assert.equal(detector.state, "idle", "after learning the hum it is quiet again");
   assert.deepEqual(feed(detector, repeat(100, hum)), []);
-  assert.ok(detector.thresholds.start > 0.032);
+  assert.ok(detector.thresholds.start > 0.0198);
+  assert.ok(detector.thresholds.start <= 0.06, "the adaptive start never climbs over its cap");
   // Somebody speaking over the hum is still heard.
   const speech = feed(detector, [...repeat(10, () => tone(0.4)), ...repeat(10, hum)]);
   assert.deepEqual(speech.map((event) => event.type), ["utterance"]);
+});
+
+test("adaptive: a background too loud for the capped threshold is reported once as too_loud, not left on Listening", () => {
+  const detector = createUtteranceDetector({ sampleRate: RATE });
+  const roar = () => tone(0.05); // RMS ~0.035: over the cap's stop threshold (0.06 * 0.5 = 0.03)
+  const first = feed(detector, repeat(201, roar));
+  assert.deepEqual(first.map((event) => event.reason), ["too_long"]);
+  assert.equal(detector.state, "overflow");
+  const next = feed(detector, repeat(200, roar));
+  assert.deepEqual(next.map((event) => event.reason), ["too_loud"], "another whole 20 s without a pause is said");
+  assert.deepEqual(feed(detector, repeat(400, roar)), [], "said once, not every frame");
+  // Quiet again: it recovers.
+  feed(detector, repeat(8, silence));
+  assert.equal(detector.state, "idle");
+});
+
+test("round 2 thresholds: quiet laptop speech (RMS ~0.012) is heard now, and round 1's thresholds missed it", () => {
+  assert.equal(DETECTOR_DEFAULTS.startThreshold, 0.008);
+  assert.equal(DETECTOR_DEFAULTS.stopThreshold, 0.004);
+  assert.equal(DETECTOR_DEFAULTS.noiseMultiplier, 2.5);
+  assert.equal(DETECTOR_DEFAULTS.maxStartThreshold, 0.06);
+  const quiet = () => tone(0.017); // RMS 0.0120
+  assert.ok(Math.abs(frameRms(quiet()) - 0.012) < 0.0005);
+  const room = () => tone(0.0028); // RMS ~0.002: a quiet room with noise suppression on
+  const speech = [...repeat(20, room), ...repeat(10, quiet), ...repeat(8, room)];
+  const now = createUtteranceDetector({ sampleRate: RATE });
+  assert.deepEqual(feed(now, speech).map((event) => event.type), ["utterance"]);
+  const round1 = createUtteranceDetector({ sampleRate: RATE, startThreshold: 0.02, stopThreshold: 0.01, noiseMultiplier: 3, maxStartThreshold: 0.15 });
+  assert.deepEqual(feed(round1, speech), [], "the old start threshold never saw it begin");
 });
 
 test("the detector refuses a configuration it cannot honour", () => {
@@ -252,12 +302,40 @@ test("the wake word opens a question and is stripped from it", () => {
   }
 });
 
-test("conservative: Frost has to be the first word, and not Frosty or Frost's", () => {
+test("tolerant: every way Whisper writes an Indian-English 'Frost' is the wake word, with or without a greeting", () => {
+  // The addendum's list, plus two of our own (forrest, frosts). Pinned so a variant cannot be
+  // dropped, or a new one slipped in, without this test changing.
+  assert.deepEqual([...WAKE_WORD_VARIANTS].sort(), [
+    "forest", "forrest", "fraust", "frast", "fross", "frost", "frost's", "frosted", "frosts", "frosty", "froast", "frust", "prost",
+  ].sort());
+  for (const variant of [...WAKE_WORD_VARIANTS, "Frost’s", "FOREST", "Prost"]) {
+    for (const lead of ["", "Hey ", "Hey, ", "hi ", "OK ", "Okay, ", "\"", "[BLANK_AUDIO] "]) {
+      const heard = `${lead}${variant}, what are today's sales?`;
+      const decision = questionFromTranscript(heard);
+      assert.equal(decision.ask, true, heard);
+      assert.equal(decision.reason, "wake_word", heard);
+      assert.equal(decision.question, "what are today's sales?", heard);
+    }
+    assert.equal(questionFromTranscript(`${variant}.`).reason, "wake_only", variant);
+  }
+});
+
+test("tolerant, not loose: ordinary words that start like Frost are not the wake word", () => {
   for (const heard of [
-    "Frosty the snowman",
-    "Frosted flakes are on the second shelf",
+    "First give me the bill",
+    "For how much?",
+    "From tomorrow the rate changes",
+    "Frozen peas are finished",
+    "Fresh apples came today",
+    "Fruit is on the second shelf",
+    "Frost-free fridge is on sale",
+    "Frostbite is not a fruit",
+    "Forests are green",
+    "Front counter please",
+    "Froth on the milk",
+    "Hey, first one please",
+    "OK for now",
     "I told the frost guy to come tomorrow",
-    "Frost's delivery is late",
     "Give me two kilos of apples",
   ]) {
     const decision = questionFromTranscript(heard);
@@ -265,6 +343,23 @@ test("conservative: Frost has to be the first word, and not Frosty or Frost's", 
     assert.equal(decision.reason, "no_wake_word", heard);
     assert.equal(decision.question, "");
   }
+});
+
+test("decided trade-off: a sentence that merely starts with a variant is taken as a question", () => {
+  // Documented beside WAKE_WORD_VARIANTS. Kept visible here so the choice is not reversed by accident.
+  assert.deepEqual(questionFromTranscript("Frosty the snowman"), { ask: true, question: "the snowman", reason: "wake_word" });
+  assert.equal(questionFromTranscript("Frost's delivery is late").question, "delivery is late");
+});
+
+test("heard line: shown for every transcription, with the nudge when Frost was not said first", () => {
+  assert.equal(heardLineFor("Frost, sales today?", "wake_word"), 'Heard: "Frost, sales today?"');
+  assert.equal(heardLineFor("Give me two kilos of apples.", "no_wake_word"), 'Heard: "Give me two kilos of apples." — say Frost first');
+  assert.equal(heardLineFor("  [BLANK_AUDIO]  ", "empty"), "Heard nothing clear. Say it again, a little closer to the microphone.");
+  assert.equal(heardLineFor("", "no_wake_word"), "Heard nothing clear. Say it again, a little closer to the microphone.");
+  assert.equal(heardLineFor("And (music) yesterday?", "follow_up"), 'Heard: "And yesterday?"');
+  const long = heardLineFor("word ".repeat(100), "no_wake_word");
+  assert.ok(long.length < 200, "a long transcript is shortened on screen");
+  assert.match(long, /…" — say Frost first$/);
 });
 
 test("the wake word on its own is not a question, but says so", () => {
@@ -489,8 +584,16 @@ const makeRig = ({
   suspended = false,
   resumes = true,
   sampleRate = RATE,
+  speakThrows = false,
+  speechError = null,
+  allowed = () => true,
+  onWake = null,
 } = {}) => {
   const rig = {
+    log: [],
+    levels: [],
+    timeouts: [],
+    wakes: [],
     clock: 1_000_000,
     tracks: [],
     contexts: [],
@@ -516,6 +619,7 @@ const makeRig = ({
   rig.mediaDevices = {
     getUserMedia(constraints) {
       rig.constraints = constraints;
+      rig.log.push("getUserMedia");
       if (micError) return Promise.reject(micError);
       if (holdMic) return new Promise((resolve) => { rig.releaseMic = () => resolve(stream()); });
       return Promise.resolve(stream());
@@ -527,7 +631,10 @@ const makeRig = ({
       this.state = suspended ? "suspended" : "running";
       this.destination = { kind: "destination" };
       this.processor = null;
+      this.onstatechange = null;
+      this.resumeCalls = 0;
       rig.contexts.push(this);
+      rig.log.push("new AudioContext");
     }
     createMediaStreamSource(input) { return { input, connect() {}, disconnect() {} }; }
     createScriptProcessor() {
@@ -537,19 +644,26 @@ const makeRig = ({
     }
     createGain() { return { gain: { value: 1 }, connect() {}, disconnect() {} }; }
     resume() {
-      if (resumes) { this.state = "running"; return Promise.resolve(); }
+      this.resumeCalls += 1;
+      rig.log.push("resume");
+      if (resumes || rig.resumesNow) { this.state = "running"; this.onstatechange?.(); return Promise.resolve(); }
       return new Promise(() => {});
     }
-    close() { this.state = "closed"; return Promise.resolve(); }
+    close() { this.state = "closed"; this.onstatechange?.(); return Promise.resolve(); }
   }
   rig.synthesis = {
     speaking: false,
     cancelled: 0,
     cancel() { rig.synthesis.cancelled += 1; rig.synthesis.speaking = false; },
     speak(utterance) {
+      if (speakThrows) throw new Error("no voices");
       rig.spoken.push(utterance.text);
       rig.synthesis.speaking = true;
-      const end = () => { rig.synthesis.speaking = false; utterance.onend?.(); };
+      const end = () => {
+        rig.synthesis.speaking = false;
+        if (speechError) utterance.onerror?.({ error: speechError });
+        else utterance.onend?.();
+      };
       if (holdSpeech) rig.finishSpeech = end;
       else setImmediate(end);
     },
@@ -558,8 +672,10 @@ const makeRig = ({
   rig.timers = {
     setInterval(fn) { rig.intervals.push(fn); return rig.intervals.length; },
     clearInterval() {},
-    setTimeout(fn, ms) { return setTimeout(fn, Math.min(ms, 5)); },
-    clearTimeout(id) { clearTimeout(id); },
+    // Held, not run: the only timeout left is the speech guard, and a real one firing under a
+    // loaded test run would end "speaking" before the test looked at it.
+    setTimeout(fn, ms) { rig.timeouts.push({ fn, ms }); return rig.timeouts.length; },
+    clearTimeout() {},
   };
   rig.controller = createLiveVoiceController({
     mediaDevices: rig.mediaDevices,
@@ -572,9 +688,17 @@ const makeRig = ({
     },
     ask: async (question) => {
       rig.asked.push(question);
+      rig.log.push(`ask:${question}`);
       return askResult(question);
     },
     isBusy: () => rig.busy,
+    isAllowed: () => allowed(),
+    onWake: async (wake) => {
+      rig.wakes.push(wake.reason);
+      rig.log.push(`wake:${wake.reason}`);
+      if (onWake) await onWake(wake);
+    },
+    onLevel: (level) => rig.levels.push(level),
     now: () => rig.clock,
     timers: rig.timers,
     onChange: (view) => rig.views.push(view),
@@ -589,6 +713,7 @@ const makeRig = ({
     for (let index = 0; index < 10; index += 1) rig.frame(tone());
     for (let index = 0; index < 8; index += 1) rig.frame(silence());
   };
+  rig.tick = () => rig.intervals.at(-1)();
   return rig;
 };
 
@@ -632,15 +757,36 @@ test("controller: a question with the wake word is transcribed locally, asked, a
   assert.equal(rig.controller.view.phase, "listening");
 });
 
-test("controller: speech without the wake word is dropped, never asked", async () => {
+test("controller: speech without the wake word is never asked, but what was heard is shown for ~6 s", async () => {
   const rig = makeRig({ transcribeResult: () => ({ text: "Give me two kilos of apples." }) });
   await rig.controller.start();
   rig.say();
   await settle();
   assert.equal(rig.transcribed.length, 1);
-  assert.deepEqual(rig.asked, []);
-  assert.doesNotMatch(rig.controller.view.message, /apples/, "what the counter says is not repeated on screen");
-  assert.match(rig.controller.view.message, /without "Frost"/);
+  assert.deepEqual(rig.asked, [], "nothing is sent to the question route");
+  assert.deepEqual(rig.wakes, [], "and the drawer is not popped");
+  // Round 1 hid this line; round 2 shows it, on this screen only, so a mis-heard "Frost" is visible.
+  assert.equal(rig.controller.view.heard, 'Heard: "Give me two kilos of apples." — say Frost first');
+  rig.clock += 5_000;
+  rig.tick();
+  assert.notEqual(rig.controller.view.heard, "", "still shown at 5 s");
+  rig.clock += 1_000;
+  rig.tick();
+  assert.equal(rig.controller.view.heard, "", "gone after ~6 s");
+});
+
+test("controller: a question's heard text is shown too, and an empty transcript says it heard nothing clear", async () => {
+  const replies = ["Frost, what are today's sales?", "[BLANK_AUDIO]"];
+  const rig = makeRig({ transcribeResult: () => ({ text: replies.shift() }) });
+  await rig.controller.start();
+  rig.say();
+  await settle();
+  assert.ok(rig.views.some((view) => view.heard === 'Heard: "Frost, what are today\'s sales?"'));
+  rig.clock += 20_000;
+  rig.say();
+  await settle();
+  assert.match(rig.controller.view.heard, /Heard nothing clear/);
+  assert.deepEqual(rig.asked, ["what are today's sales?"]);
 });
 
 test("controller: after FROST speaks, a follow-up needs no wake word", async () => {
@@ -700,7 +846,11 @@ test("controller: a refused microphone is an error in words, and nothing else st
   assert.equal(rig.controller.view.on, false);
   assert.equal(rig.controller.view.tone, "error");
   assert.match(rig.controller.view.message, /permission was refused/);
-  assert.equal(rig.contexts.length, 0);
+  // Round 2 makes the AudioContext before the permission wait (it has to be inside the click), so
+  // one exists -- and it is closed again, with nothing wired to it.
+  assert.equal(rig.contexts.length, 1);
+  assert.equal(rig.contexts[0].state, "closed");
+  assert.equal(rig.contexts[0].processor, null);
 });
 
 test("controller: switched off while Windows was still asking for the microphone, the late stream is released", async () => {
@@ -711,7 +861,9 @@ test("controller: switched off while Windows was still asking for the microphone
   rig.releaseMic();
   await starting;
   assert.ok(rig.tracks.length === 1 && rig.tracks[0].stopped);
-  assert.equal(rig.contexts.length, 0);
+  assert.equal(rig.contexts.length, 1);
+  assert.equal(rig.contexts[0].state, "closed");
+  assert.equal(rig.contexts[0].processor, null, "nothing was wired to the late stream");
   assert.equal(rig.controller.view.on, false);
   assert.equal(rig.controller.view.message, LIVE_VOICE_STOP_MESSAGES.drawer_closed);
 });
@@ -778,15 +930,38 @@ test("controller: a microphone that dies mid-session turns live voice off and sa
   assert.equal(rig.contexts[0].state, "closed");
 });
 
-test("controller: audio that stays paused is an error, not a switch that says Listening", async () => {
+test("controller: audio that stays paused never says Listening; it says to click, and a click resumes it", async () => {
+  // Always-on after sign-in: no click, so WebView2 keeps the context suspended.
   const rig = makeRig({ suspended: true, resumes: false });
-  await rig.controller.start();
-  assert.equal(rig.controller.view.on, false);
-  assert.match(rig.controller.view.message, /Audio processing could not start \(audio stayed paused\)/);
-  assert.ok(rig.tracks.every((item) => item.stopped));
+  await rig.controller.start({ idleLimitMs: null });
+  assert.equal(rig.controller.view.on, true, "the microphone is open, and the indicator says so");
+  assert.equal(rig.controller.view.phase, "paused");
+  assert.notEqual(rig.controller.view.phase, "listening");
+  assert.equal(rig.controller.view.message, LIVE_VOICE_PAUSED_MESSAGE);
+  assert.equal(LIVE_VOICE_PHASE_LABELS.paused, "Click anywhere to start listening");
+  // Waiting for the click is already said; the watchdog does not replace it.
+  rig.clock += 10_000;
+  rig.tick();
+  assert.equal(rig.controller.view.phase, "paused");
+  // The click.
+  rig.resumesNow = true;
+  assert.equal(rig.controller.resume(), true);
+  assert.equal(rig.contexts[0].state, "running");
+  assert.equal(rig.controller.view.message, LIVE_VOICE_RESUMING_MESSAGE);
+  rig.frame(silence());
+  assert.equal(rig.controller.view.phase, "listening");
+  assert.equal(rig.controller.view.message, LIVE_VOICE_READY_HINT);
   const resumed = makeRig({ suspended: true, resumes: true });
   await resumed.controller.start();
   assert.equal(resumed.controller.view.phase, "listening");
+});
+
+test("controller: resume() does nothing while frames are arriving and the context runs", async () => {
+  const rig = makeRig();
+  await rig.controller.start();
+  rig.frame(silence());
+  assert.equal(rig.controller.resume(), false);
+  assert.equal(rig.controller.view.message, LIVE_VOICE_READY_HINT);
 });
 
 test("controller: a microphone rate the engine cannot take is said as that, not as a gateway fault", async () => {
@@ -806,6 +981,20 @@ test("controller: without a synthesiser it refuses before opening the microphone
   assert.equal(rig.controller.view.message, LIVE_VOICE_STOP_MESSAGES.speech_unsupported);
 });
 
+test("controller: a synthesiser that never says it finished does not hold the microphone deaf for ever", async () => {
+  const rig = makeRig({ holdSpeech: true });
+  await rig.controller.start();
+  rig.say();
+  await settle();
+  assert.equal(rig.controller.view.phase, "speaking");
+  const guard = rig.timeouts.at(-1);
+  assert.ok(guard.ms >= 8000);
+  guard.fn();
+  await settle();
+  assert.equal(rig.controller.view.phase, "listening");
+  assert.notEqual(rig.controller.view.message, LIVE_VOICE_SPEAK_FAILED_MESSAGE, "a missing end event is not a failure");
+});
+
 test("controller: switching off while FROST is speaking cancels the speech too", async () => {
   const rig = makeRig({ holdSpeech: true });
   await rig.controller.start();
@@ -814,6 +1003,396 @@ test("controller: switching off while FROST is speaking cancels the speech too",
   const before = rig.synthesis.cancelled;
   rig.controller.stop("switched_off");
   assert.ok(rig.synthesis.cancelled > before);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Round 2: the gesture, the frame watchdog, the level meter.
+// ---------------------------------------------------------------------------------------------
+test("controller: prime() makes and resumes the AudioContext synchronously, before the microphone is asked for", async () => {
+  const rig = makeRig({ suspended: true, resumes: true });
+  // Inside the click: no await between the click and these two lines.
+  assert.equal(rig.controller.prime(), true);
+  assert.deepEqual(rig.log, ["new AudioContext", "resume"], "created and resumed synchronously inside the gesture");
+  assert.equal(rig.contexts[0].state, "running");
+  assert.equal(rig.controller.prime(), true, "a second prime reuses the first");
+  assert.equal(rig.contexts.length, 1);
+  await rig.controller.start();
+  assert.equal(rig.contexts.length, 1, "start() used the primed context rather than making one after the await");
+  assert.ok(rig.log.indexOf("new AudioContext") < rig.log.indexOf("getUserMedia"));
+  assert.equal(rig.controller.view.phase, "listening");
+});
+
+test("controller: start() without prime() still creates the context before the permission wait", async () => {
+  const rig = makeRig();
+  const starting = rig.controller.start();
+  assert.deepEqual(rig.log.slice(0, 2), ["new AudioContext", "getUserMedia"]);
+  await starting;
+});
+
+test("controller: a primed context that start() will not use is closed, and so is one left when voice stops", () => {
+  const rig = makeRig();
+  rig.controller.prime();
+  rig.controller.discardPrimed();
+  assert.equal(rig.contexts[0].state, "closed");
+  rig.controller.prime();
+  rig.controller.stop("drawer_closed");
+  assert.equal(rig.contexts[1].state, "closed");
+});
+
+test("watchdog: no frames for 2.5 s says so in words, keeps the microphone on, and frames arriving clear it", async () => {
+  const rig = makeRig();
+  await rig.controller.start();
+  rig.clock += 2_400;
+  rig.tick();
+  assert.equal(rig.controller.view.phase, "listening", "not before 2.5 s");
+  rig.clock += 100;
+  rig.tick();
+  assert.equal(rig.controller.view.on, true);
+  assert.equal(rig.controller.view.phase, "no_sound");
+  assert.equal(rig.controller.view.message, LIVE_VOICE_NO_SOUND_MESSAGE);
+  assert.equal(LIVE_VOICE_NO_SOUND_MESSAGE, "No sound is reaching FROST from the microphone. Click here to start it.");
+  assert.equal(rig.controller.view.tone, "error");
+  assert.ok(rig.tracks.every((item) => !item.stopped), "the watchdog reports; it does not close the microphone");
+  rig.frame(silence());
+  assert.equal(rig.controller.view.phase, "listening");
+  assert.equal(rig.controller.view.message, LIVE_VOICE_READY_HINT);
+  // Frames stopping later in the session are caught too.
+  rig.clock += 3_000;
+  rig.tick();
+  assert.equal(rig.controller.view.phase, "no_sound");
+});
+
+test("watchdog: a click that does not bring frames back says so differently", async () => {
+  const rig = makeRig();
+  await rig.controller.start();
+  rig.clock += 2_500;
+  rig.tick();
+  assert.equal(rig.controller.resume(), true, "the click on the message");
+  assert.equal(rig.controller.view.message, LIVE_VOICE_RESUMING_MESSAGE);
+  assert.equal(rig.controller.view.phase, "listening");
+  rig.clock += 2_500;
+  rig.tick();
+  assert.equal(rig.controller.view.phase, "no_sound");
+  assert.equal(rig.controller.view.message, LIVE_VOICE_STILL_NO_SOUND_MESSAGE);
+});
+
+test("watchdog: a context primed in the click that still will not run is reported after 2.5 s", async () => {
+  const rig = makeRig({ suspended: true, resumes: false });
+  rig.controller.prime();
+  await rig.controller.start();
+  assert.equal(rig.controller.view.phase, "paused");
+  rig.clock += 2_500;
+  rig.tick();
+  assert.equal(rig.controller.view.phase, "no_sound");
+  assert.equal(rig.controller.view.message, LIVE_VOICE_NO_SOUND_MESSAGE);
+  assert.equal(rig.controller.resume(), true);
+  assert.ok(rig.contexts[0].resumeCalls >= 2, "the click resumes the context again");
+});
+
+test("controller: an AudioContext suspended mid-session says to click, and a context closed from outside ends voice in words", async () => {
+  const rig = makeRig();
+  await rig.controller.start();
+  rig.contexts[0].state = "suspended";
+  rig.contexts[0].onstatechange();
+  assert.equal(rig.controller.view.phase, "paused");
+  assert.equal(rig.controller.view.message, LIVE_VOICE_PAUSED_MESSAGE);
+  rig.contexts[0].state = "closed";
+  rig.contexts[0].onstatechange();
+  assert.equal(rig.controller.view.on, false);
+  assert.match(rig.controller.view.message, /stopped on its own/);
+  assert.ok(rig.tracks.every((item) => item.stopped));
+});
+
+test("level: RMS becomes a 0..1 meter value on a 60 dB scale", () => {
+  assert.equal(levelFromRms(0), 0);
+  assert.equal(levelFromRms(NaN), 0);
+  assert.equal(levelFromRms(-1), 0);
+  assert.equal(levelFromRms(0.001), 0);
+  assert.equal(levelFromRms(1), 1);
+  assert.equal(levelFromRms(4), 1);
+  assert.equal(levelFromRms(0.01), 0.33);
+  assert.equal(levelFromRms(0.1), 0.67);
+  assert.ok(levelFromRms(0.008) > 0.25 && levelFromRms(0.008) < 0.35, "the start threshold shows as a visible bar");
+});
+
+test("level: every microphone frame publishes its level, even while FROST speaks, and closing publishes 0", async () => {
+  const rig = makeRig({ holdSpeech: true });
+  await rig.controller.start();
+  rig.frame(silence());
+  rig.frame(tone(0.2));
+  assert.deepEqual(rig.levels, [0, levelFromRms(0.2 / Math.SQRT2)]);
+  assert.ok(rig.levels[1] > 0.6);
+  rig.say();
+  await settle();
+  assert.equal(rig.controller.view.phase, "speaking");
+  const before = rig.levels.length;
+  rig.frame(tone(0.2));
+  assert.equal(rig.levels.length, before + 1, "the meter still moves while capture is ignored");
+  rig.controller.stop("switched_off");
+  assert.equal(rig.levels.at(-1), 0);
+});
+
+test("level channel: subscribers hear changes only, and a throwing subscriber does not break it", () => {
+  const channel = createVoiceLevelChannel();
+  let calls = 0;
+  channel.subscribe(() => { throw new Error("broken meter"); });
+  const off = channel.subscribe(() => { calls += 1; });
+  assert.equal(channel.get(), 0);
+  channel.set(0.5);
+  channel.set(0.5);
+  assert.equal(calls, 1);
+  channel.set(2);
+  assert.equal(channel.get(), 1);
+  channel.set(NaN);
+  assert.equal(channel.get(), 0);
+  off();
+  channel.set(0.3);
+  assert.equal(calls, 3);
+});
+
+test("controller: a background too loud to find a pause in is said, not sat on", async () => {
+  const rig = makeRig();
+  await rig.controller.start();
+  for (let index = 0; index < 401; index += 1) rig.frame(tone(0.4));
+  assert.ok(rig.views.some((view) => /longer than 20 seconds/.test(view.message)));
+  assert.equal(rig.controller.view.message, LIVE_VOICE_TOO_LOUD_MESSAGE);
+  assert.equal(rig.controller.view.tone, "error");
+  assert.equal(rig.transcribed.length, 0);
+});
+
+test("controller: a synthesiser error is said on screen, but our own cancel is not an error", async () => {
+  const failed = makeRig({ speechError: "synthesis-failed" });
+  await failed.controller.start();
+  failed.say();
+  await settle();
+  assert.equal(failed.controller.view.message, LIVE_VOICE_SPEAK_FAILED_MESSAGE);
+  const cancelled = makeRig({ speechError: "interrupted" });
+  await cancelled.controller.start();
+  cancelled.say();
+  await settle();
+  assert.notEqual(cancelled.controller.view.message, LIVE_VOICE_SPEAK_FAILED_MESSAGE);
+  assert.equal(cancelled.controller.view.tone, "info");
+});
+
+test("controller: a synthesiser that fails to speak is said on screen", async () => {
+  const rig = makeRig({ speakThrows: true });
+  await rig.controller.start();
+  rig.say();
+  await settle();
+  assert.deepEqual(rig.asked, ["what are today's sales?"]);
+  assert.equal(rig.controller.view.message, LIVE_VOICE_SPEAK_FAILED_MESSAGE);
+  assert.equal(rig.controller.view.tone, "error");
+  assert.equal(rig.controller.view.on, true, "the question was answered on screen; listening carries on");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Round 2: always listening.
+// ---------------------------------------------------------------------------------------------
+test("always-on: no idle switch-off, however long nobody asks anything", async () => {
+  const rig = makeRig();
+  await rig.controller.start({ idleLimitMs: null });
+  rig.frame(silence());
+  rig.clock += 60 * 60 * 1000;
+  rig.frame(silence());
+  rig.tick();
+  assert.equal(rig.controller.view.on, true);
+  assert.ok(rig.tracks.every((item) => !item.stopped));
+});
+
+test("always-on: switched on under a running drawer session, the same microphone carries on without the idle limit", async () => {
+  const rig = makeRig();
+  await rig.controller.start();
+  rig.controller.setIdleLimit(null);
+  rig.clock += 10 * 60 * 1000;
+  rig.frame(silence());
+  rig.tick();
+  assert.equal(rig.controller.view.on, true);
+  assert.equal(rig.tracks.length, 1, "one microphone");
+  assert.equal(rig.contexts.length, 1);
+  // And back: the three minutes start from now, not from the last question.
+  rig.controller.setIdleLimit(180_000);
+  rig.tick();
+  assert.equal(rig.controller.view.on, true);
+  rig.clock += 180_000;
+  rig.frame(silence());
+  rig.tick();
+  assert.equal(rig.controller.view.on, false);
+  assert.equal(rig.controller.view.message, LIVE_VOICE_STOP_MESSAGES.idle);
+});
+
+test("always-on: hearing Frost pops FROST open before the question is asked", async () => {
+  const rig = makeRig();
+  await rig.controller.start({ idleLimitMs: null });
+  rig.say();
+  await settle();
+  assert.deepEqual(rig.wakes, ["wake_word"]);
+  assert.ok(rig.log.indexOf("wake:wake_word") < rig.log.indexOf("ask:what are today's sales?"), "drawer first, then the question");
+  assert.deepEqual(rig.spoken, ["Sales today are Rs 42,300.00."]);
+});
+
+test("always-on: 'Frost' alone pops FROST open and waits 10 s for the question", async () => {
+  const replies = ["Frost.", "How much did I sell today?"];
+  const rig = makeRig({ transcribeResult: () => ({ text: replies.shift() }) });
+  await rig.controller.start({ idleLimitMs: null });
+  rig.say();
+  await settle();
+  assert.deepEqual(rig.wakes, ["wake_only"]);
+  assert.deepEqual(rig.asked, []);
+  assert.match(rig.controller.view.message, /Go ahead/);
+  rig.say();
+  await settle();
+  assert.deepEqual(rig.asked, ["How much did I sell today?"]);
+  assert.deepEqual(rig.wakes, ["wake_only", "follow_up"]);
+});
+
+test("always-on: a drawer that fails to open does not lose the question", async () => {
+  const rig = makeRig({ onWake: () => { throw new Error("render failed"); } });
+  await rig.controller.start({ idleLimitMs: null });
+  rig.say();
+  await settle();
+  assert.deepEqual(rig.asked, ["what are today's sales?"]);
+});
+
+test("permission: a Cashier gets no microphone, and a role lost mid-session closes it", async () => {
+  const cashier = makeRig({ allowed: () => false });
+  assert.equal(cashier.controller.prime(), false);
+  await cashier.controller.start({ idleLimitMs: null });
+  assert.equal(cashier.constraints, null, "getUserMedia was never called");
+  assert.equal(cashier.contexts.length, 0);
+  assert.equal(cashier.controller.view.on, false);
+  assert.equal(cashier.controller.view.message, LIVE_VOICE_STOP_MESSAGES.not_permitted);
+  const throwing = makeRig({ allowed: () => { throw new Error("no user"); } });
+  await throwing.controller.start();
+  assert.equal(throwing.constraints, null, "a check that throws is a refusal");
+  let owner = true;
+  const rig = makeRig({ allowed: () => owner });
+  await rig.controller.start({ idleLimitMs: null });
+  owner = false;
+  rig.tick();
+  assert.equal(rig.controller.view.on, false);
+  assert.ok(rig.tracks.every((item) => item.stopped));
+});
+
+test("preference: read and write tolerate a storage that throws, is missing, or holds garbage", () => {
+  const store = new Map();
+  const storage = {
+    getItem: (key) => (store.has(key) ? store.get(key) : null),
+    setItem: (key, value) => store.set(key, String(value)),
+    removeItem: (key) => store.delete(key),
+  };
+  assert.equal(readAlwaysOnPreference(storage), false);
+  assert.equal(writeAlwaysOnPreference(storage, true), true);
+  assert.equal(store.get(LIVE_VOICE_ALWAYS_ON_STORAGE_KEY), "1");
+  assert.equal(readAlwaysOnPreference(() => storage), true, "a getter works as well as the storage");
+  assert.equal(writeAlwaysOnPreference(storage, false), true);
+  assert.equal(readAlwaysOnPreference(storage), false);
+  store.set(LIVE_VOICE_ALWAYS_ON_STORAGE_KEY, "yes");
+  assert.equal(readAlwaysOnPreference(storage), false, "only the value we write means on");
+  const broken = { getItem() { throw new Error("SecurityError"); }, setItem() { throw new Error("QuotaExceededError"); }, removeItem() { throw new Error("x"); } };
+  assert.equal(readAlwaysOnPreference(broken), false);
+  assert.equal(writeAlwaysOnPreference(broken, true), false);
+  assert.equal(writeAlwaysOnPreference(broken, false), false);
+  const denied = () => { throw new Error("localStorage is not available"); };
+  assert.equal(readAlwaysOnPreference(denied), false);
+  assert.equal(writeAlwaysOnPreference(denied, true), false);
+  assert.equal(readAlwaysOnPreference(null), false);
+  assert.equal(writeAlwaysOnPreference(null, true), false);
+});
+
+test("indicator: drawn whenever the microphone is on, in every phase, whoever is signed in", () => {
+  for (const phase of Object.keys(LIVE_VOICE_PHASE_LABELS).filter((name) => name !== "off")) {
+    for (const alwaysOn of [true, false]) {
+      for (const allowed of [true, false]) {
+        const indicator = liveVoiceIndicatorView({ view: { on: true, phase, message: "", tone: "info" }, alwaysOn, allowed });
+        assert.ok(indicator, `${phase} ${alwaysOn} ${allowed}`);
+        assert.equal(indicator.kind, "on");
+        assert.equal(indicator.label, LIVE_VOICE_PHASE_LABELS[phase]);
+      }
+    }
+  }
+  const stalled = liveVoiceIndicatorView({ view: { on: true, phase: "no_sound", message: LIVE_VOICE_NO_SOUND_MESSAGE, tone: "error" } });
+  assert.equal(stalled.tone, "error");
+  assert.equal(stalled.detail, LIVE_VOICE_NO_SOUND_MESSAGE, "with the drawer closed the reason is carried in words");
+  assert.equal(liveVoiceIndicatorView({ view: { on: true, phase: "paused", message: LIVE_VOICE_PAUSED_MESSAGE, tone: "attention" } }).tone, "attention");
+});
+
+test("indicator: always-on that stopped on a failure says so next to the bell; otherwise off draws nothing", () => {
+  const failed = { on: false, phase: "off", message: "No microphone was found, so live voice is off.", tone: "error" };
+  const stopped = liveVoiceIndicatorView({ view: failed, alwaysOn: true, allowed: true });
+  assert.equal(stopped.kind, "stopped");
+  assert.equal(stopped.detail, failed.message);
+  assert.equal(liveVoiceIndicatorView({ view: failed, alwaysOn: false, allowed: true }), null);
+  assert.equal(liveVoiceIndicatorView({ view: failed, alwaysOn: true, allowed: false }), null, "not for a Cashier, who has no voice");
+  assert.equal(liveVoiceIndicatorView({ view: { on: false, phase: "off", message: LIVE_VOICE_STOP_MESSAGES.switched_off, tone: "info" }, alwaysOn: true, allowed: true }), null);
+  assert.equal(liveVoiceIndicatorView(), null);
+});
+
+test("engine notice: tolerates a gateway without the round-2 fields, offers the update, and says when it is slow", () => {
+  const ready = { state: "ready", model: "small", internet_allowed: true };
+  assert.equal(speechEngineNotice(ready), null, "no engine fields: nothing said");
+  assert.equal(speechEngineNotice({ ...ready, engine: "server" }), null);
+  assert.equal(speechEngineNotice({ ...ready, engine: null, engine_update_available: null }), null, "null is tolerated like absent");
+  assert.equal(speechEngineNotice({ state: "not_installed", engine: null, internet_allowed: true }), null);
+  assert.equal(speechEngineNotice(null), null);
+  assert.equal(speechEngineNotice({ state: "installing", engine_update_available: true }), null);
+  const update = speechEngineNotice({ ...ready, engine: "cli", engine_update_available: true });
+  assert.equal(update.kind, "update");
+  assert.match(update.text, /^Voice engine update available/);
+  assert.equal(update.action, "install");
+  const blocked = speechEngineNotice({ ...ready, internet_allowed: false, engine_update_available: true });
+  assert.equal(blocked.action, null);
+  assert.match(blocked.detail, /Local Only/);
+  const slow = speechEngineNotice({ ...ready, engine: "cli" });
+  assert.equal(slow.kind, "slow");
+  assert.match(slow.text, /slower engine/);
+  assert.equal(speechEngineNotice(ready, { engine: "cli" }).kind, "slow", "the transcribe response's engine counts too");
+  assert.equal(speechEngineNotice({ ...ready, engine: "cli" }, { engine: "server" }), null, "the latest transcription wins");
+});
+
+test("controller: the first transcription says the speech engine is starting; later ones do not", async () => {
+  let release = null;
+  const rig = makeRig({ transcribeResult: () => new Promise((resolve) => { release = () => resolve({ text: "Give me apples." }); }) });
+  await rig.controller.start({ idleLimitMs: null });
+  rig.say();
+  await settle();
+  assert.equal(rig.controller.view.phase, "transcribing");
+  assert.equal(rig.controller.view.message, LIVE_VOICE_ENGINE_STARTING_MESSAGE);
+  assert.equal(liveVoiceIndicatorView({ view: rig.controller.view }).detail, LIVE_VOICE_ENGINE_STARTING_MESSAGE, "next to the bell too");
+  rig.clock += 30_000;
+  rig.frame(silence()); // the microphone keeps delivering frames meanwhile
+  rig.tick();
+  assert.equal(rig.controller.view.message, LIVE_VOICE_ENGINE_STARTING_MESSAGE, "not replaced by the slow line while the engine starts");
+  release();
+  await settle();
+  assert.equal(rig.controller.view.message, "", "cleared once the engine has answered");
+  rig.say();
+  await settle();
+  assert.equal(rig.controller.view.phase, "transcribing");
+  assert.notEqual(rig.controller.view.message, LIVE_VOICE_ENGINE_STARTING_MESSAGE, "the engine is warm now");
+  // A later one that runs long says so.
+  rig.clock += 6_000;
+  rig.frame(silence());
+  rig.tick();
+  assert.equal(rig.controller.view.message, LIVE_VOICE_TRANSCRIBE_SLOW_MESSAGE);
+  release();
+  await settle();
+  assert.equal(rig.controller.view.message, "");
+});
+
+test("the transcribe request waits long enough for the first, model-loading transcription (>= 65 s)", () => {
+  const transcribe = appSource.match(/transcribe: async \(wavBytes\) => \{[\s\S]*?\n {6}\},/);
+  assert.ok(transcribe);
+  const timeout = Number((transcribe[0].match(/timeout: (\d+)/) || [])[1]);
+  assert.ok(timeout >= 65000, `timeout ${timeout}`);
+});
+
+test("controller: the engine a transcription reports is kept in the view; none reported is null", async () => {
+  const rig = makeRig({ transcribeResult: () => ({ text: "Frost, sales?", elapsed_ms: 900, engine: "cli" }) });
+  await rig.controller.start();
+  assert.equal(rig.controller.view.engine, null);
+  rig.say();
+  await settle();
+  assert.equal(rig.controller.view.engine, "cli");
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -873,24 +1452,34 @@ test("every speech route is called on LOCAL_API_URL and none goes through the cl
   assert.doesNotMatch(block, /guardCloudCall|CLOUD_OPERATIONAL_API_URL|SYNC_API_URL|fetch\(/);
 });
 
-test("the microphone is released on switch-off, drawer close, sign-out and unmount", () => {
-  assert.match(appSource, /frostLiveVoiceRef\.current\?\.active\) \{\s*stopFrostLiveVoice\("switched_off"\)/);
-  assert.match(appSource, /if \(!frostDrawerOpen\) frostLiveVoiceRef\.current\?\.stop\("drawer_closed"\);/);
-  assert.match(appSource, /if \(!user\) frostLiveVoiceRef\.current\?\.stop\("signed_out"\);/);
+test("the microphone is released on switch-off, drawer close (unless always-on), sign-out and unmount", () => {
+  assert.match(appSource, /if \(controller\.active\) \{\s*frostVoiceOffCountRef\.current \+= 1;\s*controller\.stop\("switched_off"\);/);
+  assert.match(appSource, /if \(!next\) \{\s*frostVoiceOffCountRef\.current \+= 1;\s*controller\.stop\("switched_off"\);/, "turning always-on off closes the microphone");
+  assert.match(appSource, /if \(frostDrawerOpen \|\| frostVoiceAlwaysOnRef\.current\) return;\s*frostVoiceOffCountRef\.current \+= 1;\s*frostLiveVoiceRef\.current\?\.stop\("drawer_closed"\);/);
+  // A start still waiting on the status check when any of those happened does not open the microphone.
+  assert.match(appSource, /const offCount = frostVoiceOffCountRef\.current;\s*const status = await readFrostSpeechStatus\(\);[\s\S]{0,120}if \(offCount !== frostVoiceOffCountRef\.current \|\|/);
+  assert.equal((appSource.match(/frostVoiceOffCountRef\.current \+= 1;/g) || []).length, 4, "switch off, always-on off, drawer close, sign-out");
+  assert.match(appSource, /if \(!user\) \{\s*frostVoiceOffCountRef\.current \+= 1;\s*frostLiveVoiceRef\.current\?\.stop\("signed_out"\);/);
   assert.match(appSource, /useEffect\(\(\) => \(\) => frostLiveVoiceRef\.current\?\.stop\("unmounted"\), \[\]\);/);
   // And release() itself stops the tracks and closes the context -- the controller tests above
   // check it behaviourally; this pins the lines so a refactor cannot drop one silently.
-  const release = stripComments(moduleSource).match(/const release = \(current\) => \{[\s\S]*?\n {2}\};/);
+  const code = stripComments(moduleSource);
+  const release = code.match(/const release = \(current\) => \{[\s\S]*?\n {2}\};/);
   assert.ok(release);
   assert.match(release[0], /track\.stop\(\)/);
-  assert.match(release[0], /context\.close\(\)/);
+  assert.match(release[0], /closeContext\(current\.context\)/);
+  const close = code.match(/const closeContext = \(context\) => \{[\s\S]*?\n {2}\};/);
+  assert.ok(close);
+  assert.match(close[0], /context\.close\(\)/);
 });
 
 test("the Live voice switch is only drawn for Owner or Admin, and asked through the typed path", () => {
   assert.match(appSource, /\{canManageFrost && liveVoiceBar\}/);
   assert.match(appSource, /\{canManageFrost && !surface\.onConversation && liveVoice\?\.on && liveVoiceBar\}/);
   assert.match(appSource, /const canManageFrost = user\?\.role === "Owner" \|\| user\?\.role === "Admin";/);
-  assert.match(appSource, /if \(!frostBellAllowed\) \{\s*setFrostLiveVoice\(/);
+  assert.match(appSource, /if \(!frostBellAllowed\) \{\s*await controller\.start\(\);\s*return;/, "a Cashier's start goes to the controller, which refuses it in words");
+  assert.match(appSource, /frostVoiceAllowedRef\.current = frostBellAllowed;/);
+  assert.match(appSource, /isAllowed: \(\) => frostVoiceAllowedRef\.current === true && Boolean\(userRef\.current\)/);
   assert.match(appSource, /ask: \(question\) => askAiAssistantRef\.current\(question, \{ fromVoice: true \}\)/);
   assert.match(appSource, /askAiAssistantRef\.current = askAiAssistant;/);
 });
@@ -900,4 +1489,82 @@ test("this module has no transport of its own", () => {
   for (const forbidden of ["fetch(", "axios", "XMLHttpRequest", "http://", "https://", "WebSocket", "RTCPeerConnection", "sendBeacon", "import("]) {
     assert.equal(code.includes(forbidden), false, `frostLiveVoice.js must not reference ${forbidden}`);
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// Round 2 wiring in App.jsx.
+// ---------------------------------------------------------------------------------------------
+const liveBlock = () => stripComments(appSource.slice(appSource.indexOf("// ---- FROST live voice"), appSource.indexOf("const proposeFrostAction = async")));
+
+test("one controller for both switches: built once, and never a second microphone", () => {
+  const block = liveBlock();
+  assert.equal((appSource.match(/createLiveVoiceController\(/g) || []).length, 1, "exactly one place builds a controller");
+  assert.match(block, /const ensureFrostLiveVoiceController = \(\) => \{\s*if \(frostLiveVoiceRef\.current\) return frostLiveVoiceRef\.current;/);
+  assert.doesNotMatch(block, /frostLiveVoiceRef\.current = null/, "the controller is never thrown away and rebuilt");
+});
+
+test("gesture: both switches prime the AudioContext inside the click, before the status check's await", () => {
+  const block = liveBlock();
+  for (const name of ["toggleFrostLiveVoice", "toggleFrostVoiceAlwaysOn", "relaunchFrostListening"]) {
+    const body = block.match(new RegExp(`const ${name} = \\(\\) => \\{[\\s\\S]*?\\n {2}\\};`));
+    assert.ok(body, name);
+    assert.doesNotMatch(body[0], /\bawait\b|async/, `${name} must stay synchronous so the gesture still counts`);
+    const primeAt = body[0].indexOf("controller.prime();");
+    const beginAt = body[0].indexOf("beginFrostLiveVoice(");
+    assert.ok(primeAt > -1 && beginAt > primeAt, `${name} primes before it starts`);
+  }
+  // The status check is where the await is.
+  assert.match(block, /const startFrostLiveVoice = async[\s\S]*?const status = await readFrostSpeechStatus\(\);/);
+});
+
+test("gesture: while paused or without sound, the next pointerdown or key anywhere resumes the microphone", () => {
+  const block = liveBlock();
+  assert.match(block, /const frostVoiceNeedsGesture = frostLiveVoice\.on === true && \(frostLiveVoice\.phase === "paused" \|\| frostLiveVoice\.phase === "no_sound"\);/);
+  assert.match(block, /const resume = \(\) => \{ frostLiveVoiceRef\.current\?\.resume\(\); \};\s*window\.addEventListener\("pointerdown", resume, true\);\s*window\.addEventListener\("keydown", resume, true\);/);
+  assert.match(block, /window\.removeEventListener\("pointerdown", resume, true\);/);
+  // And the words themselves are a button in the voice bar.
+  assert.match(appSource, /<button className=\{`\$\{messageClass\} frost-live-message-action`\} onClick=\{voice\?\.onResume\}/);
+});
+
+test("always-on: remembered per device, started once after sign-in, and not stopped by closing the drawer", () => {
+  const block = liveBlock();
+  assert.match(appSource, /useState\(\(\) => readAlwaysOnPreference\(\(\) => window\.localStorage\)\)/);
+  assert.match(block, /const saved = writeAlwaysOnPreference\(\(\) => window\.localStorage, next\);\s*setFrostVoicePreferenceNote\(saved \? "" : LIVE_VOICE_PREFERENCE_NOT_SAVED\);/);
+  assert.match(block, /if \(!user \|\| !frostBellAllowed \|\| !frostVoiceAlwaysOn\) return;[\s\S]*?if \(frostVoiceAutoStartedRef\.current === key\) return;[\s\S]*?beginFrostLiveVoice\(\{ auto: true \}\);/);
+  assert.match(block, /controller\.start\(\{ idleLimitMs: alwaysOn \? null : LIVE_VOICE_IDLE_LIMIT_MS \}\)/, "no idle switch-off when always-on");
+  assert.match(block, /if \(controller\.active\) \{\s*controller\.setIdleLimit\(null\);\s*return;/);
+  // The drawer check that refuses to open a microphone into a closed drawer is skipped for always-on.
+  assert.match(block, /\|\| !userRef\.current \|\| \(!alwaysOn && !frostDrawerOpenRef\.current\)\)/);
+  assert.match(block, /frostVoiceAutoStartedRef\.current = "";/, "signing out lets the next sign-in start it again");
+});
+
+test("always-on: 'Frost' pops the drawer through the launcher's own opener, on the conversation, before asking", () => {
+  const reveal = stripComments(appSource).match(/frostVoiceRevealRef\.current = \(\) => \{[\s\S]*?\n {2}\};/);
+  assert.ok(reveal);
+  assert.match(reveal[0], /if \(!frostDrawerOpenRef\.current\) \{\s*flushSync\(\(\) => openFrostDrawer\(FROST_PRIMARY_SECTION\)\);/);
+  assert.match(reveal[0], /setFrostActiveTab\(FROST_PRIMARY_SECTION\);/);
+  assert.match(liveBlock(), /onWake: \(\) => frostVoiceRevealRef\.current\?\.\(\),/);
+  assert.match(appSource, /import \{ flushSync \} from "react-dom";/);
+});
+
+test("indicator: rendered next to the bell whenever the controller says the microphone is on, drawer open or not", () => {
+  assert.match(liveBlock(), /const frostVoiceIndicator = liveVoiceIndicatorView\(\{ view: frostLiveVoice, alwaysOn: frostVoiceAlwaysOn, allowed: frostBellAllowed \}\);/);
+  const topbar = appSource.slice(appSource.indexOf('<div className="topbar-status-row">'), appSource.indexOf('<div className="notification-bell-wrap">'));
+  assert.match(topbar, /\{frostVoiceIndicator && \(\s*<FrostVoiceIndicator/, "the indicator sits in the topbar, just before the bell");
+  assert.doesNotMatch(topbar.slice(0, topbar.indexOf("{frostVoiceIndicator &&")), /frostDrawerOpen &&/, "not gated on the drawer");
+  assert.match(appSource, /<FrostVoiceLevel channel=\{level\} \/>/, "with the level");
+  // The launcher is fixed on screen; the topbar scrolls away. It carries the microphone too.
+  assert.match(appSource, /micOn=\{frostLiveVoice\.on === true\}/);
+  assert.match(appSource, /\{micOn && <i aria-hidden="true" className="frost-launcher-mic">/);
+});
+
+test("the voice bar: always-on switch for Owner/Admin, drawer switch only when always-on is off, heard line drawn", () => {
+  assert.match(appSource, /\{!alwaysOn && \(\s*<button\s+aria-checked=\{on\}/);
+  assert.match(appSource, /onClick=\{voice\.onToggleAlwaysOn\}/);
+  assert.match(appSource, /Listen for &quot;Frost&quot; everywhere/);
+  assert.match(appSource, /\{heard && <p aria-live="polite" className="frost-live-heard">\{heard\}<\/p>\}/);
+  assert.match(appSource, /heard=\{frostDrawerOpen \? "" : frostLiveVoice\.heard\}/, "and next to the bell when the drawer is closed");
+  assert.match(appSource, /\{engineNotice\.action === "install" && \(/);
+  // Every piece of the bar is still behind canManageFrost.
+  assert.match(appSource, /\{canManageFrost && liveVoiceBar\}/);
 });

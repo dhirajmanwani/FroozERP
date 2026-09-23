@@ -847,6 +847,16 @@ fn stop_owned_backend(reason: &str) -> bool {
                 "INFO",
                 &format!("Stopping owned local backend PID {} ({})", pid, reason),
             );
+            // Stop the gateway's whole process tree first. `child.kill()` is TerminateProcess on
+            // Windows: the gateway runs no exit handler, so the speech server it started
+            // (`whisper-server.exe`, about 500 MB with the model loaded) would outlive the app
+            // until the next launch cleaned it up. The kill below stays for anything taskkill missed.
+            #[cfg(target_os = "windows")]
+            {
+                let mut tree = Command::new("taskkill.exe");
+                hide_child_console(&mut tree);
+                let _ = tree.args(["/PID", &pid.to_string(), "/T", "/F"]).status();
+            }
             let _ = child.kill();
             let _ = child.wait();
             stopped_owned_backend = true;

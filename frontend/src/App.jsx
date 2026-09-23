@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { flushSync } from "react-dom";
 import axios from "axios";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
@@ -225,10 +226,16 @@ import {
   speechWithNotice,
 } from "./local/frostSpeech";
 import {
+  LIVE_VOICE_IDLE_LIMIT_MS,
   LIVE_VOICE_PHASE_LABELS,
-  LIVE_VOICE_STOP_MESSAGES,
+  LIVE_VOICE_PREFERENCE_NOT_SAVED,
   createLiveVoiceController,
+  createVoiceLevelChannel,
+  liveVoiceIndicatorView,
+  readAlwaysOnPreference,
+  speechEngineNotice,
   speechSetupView,
+  writeAlwaysOnPreference,
 } from "./local/frostLiveVoice";
 import {
   checkBackendHealth,
@@ -1897,6 +1904,7 @@ function Icon({ name, size = 18 }) {
     rupee: <><path d="M6 4h12M6 8h12M7 4c5 0 6 8 0 8h-1l8 8" /></>,
     alert: <><path d="m12 3 10 18H2Z" /><path d="M12 9v4M12 17h.01" /></>,
     bell: <><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.7 21a2 2 0 0 1-3.4 0" /></>,
+    mic: <><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5 11a7 7 0 0 0 14 0" /><path d="M12 18v3" /></>,
     menu: <><path d="M4 6h16M4 12h16M4 18h16" /></>,
     logout: <><path d="M10 17l5-5-5-5M15 12H3M21 19V5a2 2 0 0 0-2-2h-6" /></>,
     search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></>,
@@ -2366,8 +2374,16 @@ function App() {
   // switch and the indicator draw; `frostSpeechSetup` is the gateway's word on whether whisper is
   // installed, and the last failure reading or starting it.
   const frostLiveVoiceRef = useRef(null);
-  const [frostLiveVoice, setFrostLiveVoice] = useState({ on: false, phase: "off", message: "", tone: "info" });
+  const [frostLiveVoice, setFrostLiveVoice] = useState({ on: false, phase: "off", message: "", tone: "info", heard: "", engine: null });
   const [frostSpeechSetup, setFrostSpeechSetup] = useState({ open: false, status: null, failure: null });
+  // "Listen for Frost everywhere": per device, remembered in localStorage. An unreadable store reads
+  // as off, and a store that refuses the write says so (the choice still holds for this session).
+  const [frostVoiceAlwaysOn, setFrostVoiceAlwaysOn] = useState(() => readAlwaysOnPreference(() => window.localStorage));
+  const [frostVoicePreferenceNote, setFrostVoicePreferenceNote] = useState("");
+  // The microphone level goes to the meters only, through its own tiny store, so a frame does not
+  // redraw the whole of App.
+  const frostVoiceLevelRef = useRef(null);
+  if (!frostVoiceLevelRef.current) frostVoiceLevelRef.current = createVoiceLevelChannel();
   const [supplierDashboard, setSupplierDashboard] = useState({
     todaySales: 0,
     todayProfit: 0,
@@ -5641,6 +5657,20 @@ function App() {
   const frostDrawerOpenRef = useRef(false);
   frostDrawerOpenRef.current = frostDrawerOpen;
   const frostLiveVoiceStartingRef = useRef(false);
+  // Read by the controller on every start and every tick: a Cashier never gets a microphone, and a
+  // role that changes under a running session stops it.
+  const frostVoiceAllowedRef = useRef(false);
+  frostVoiceAllowedRef.current = frostBellAllowed;
+  const frostVoiceAlwaysOnRef = useRef(frostVoiceAlwaysOn);
+  frostVoiceAlwaysOnRef.current = frostVoiceAlwaysOn;
+  // Set next to openFrostDrawer below: pops the drawer open on the conversation when "Frost" is heard.
+  const frostVoiceRevealRef = useRef(null);
+  // Who always-on has already started for, so a sign-in starts it once and an error is not retried
+  // in a loop behind the owner's back.
+  const frostVoiceAutoStartedRef = useRef("");
+  // Bumped by every "off": a start still waiting on the status check when the owner switched off,
+  // closed the drawer or signed out must not open the microphone afterwards.
+  const frostVoiceOffCountRef = useRef(0);
 
   // A gateway that did not answer and one that answered with an error read differently, because
   // the owner does different things about them.
@@ -5668,38 +5698,31 @@ function App() {
   };
 
   const installFrostSpeech = async () => {
+    // An engine update keeps the model that is installed; a first download takes the default.
+    const installedModel = frostSpeechSetup.status?.model;
+    const model = installedModel === "base" || installedModel === "small" ? installedModel : "small";
+    // The gateway replaces the engine under a running microphone, so live voice closes first and
+    // says why, rather than failing on the next thing said.
+    frostLiveVoiceRef.current?.stop("switched_off", "Live voice is off while the voice engine installs. Turn it on again when it is ready.");
     try {
-      await axios.post(`${LOCAL_API_URL}/api/local/speech/install`, { model: "small" }, { timeout: 10000 });
-      setFrostSpeechSetup((current) => ({ ...current, failure: null }));
+      await axios.post(`${LOCAL_API_URL}/api/local/speech/install`, { model }, { timeout: 10000 });
+      setFrostSpeechSetup((current) => ({ ...current, open: true, failure: null }));
       await readFrostSpeechStatus();
     } catch (error) {
-      setFrostSpeechSetup((current) => ({ ...current, failure: speechRouteFailure(error, "install") }));
+      setFrostSpeechSetup((current) => ({ ...current, open: true, failure: speechRouteFailure(error, "install") }));
       // A download already running is not a failure to show on its own: read where it has got to.
       if (error?.response?.data?.code === "SPEECH_INSTALL_IN_PROGRESS") await readFrostSpeechStatus();
     }
   };
 
-  const stopFrostLiveVoice = (reason) => {
-    frostLiveVoiceRef.current?.stop(reason);
-  };
-
-  const startFrostLiveVoice = async () => {
-    // The switch is only drawn for these roles. Checked again here so a stray call cannot open the
-    // microphone for a Cashier; the gateway's own origin check is the real boundary.
-    if (!frostBellAllowed) {
-      setFrostLiveVoice({ on: false, phase: "off", message: LIVE_VOICE_STOP_MESSAGES.not_permitted, tone: "error" });
-      return;
-    }
-    const status = await readFrostSpeechStatus();
-    if (!frostDrawerOpenRef.current || !userRef.current) return;
-    if (status?.state !== "ready") {
-      // Not ready, not readable, or failed: the setup card says which, and the microphone stays shut.
-      setFrostSpeechSetup((current) => ({ ...current, open: true }));
-      setFrostLiveVoice({ on: false, phase: "off", message: "", tone: "info" });
-      return;
-    }
-    setFrostSpeechSetup((current) => ({ ...current, open: false }));
-    const controller = createLiveVoiceController({
+  /**
+   * The one live voice controller. Both switches -- "Live voice" in the drawer and "Listen for
+   * Frost everywhere" -- drive this same instance, so there is never a second microphone. Built on
+   * first use and kept for the life of the app; start() and stop() open and close the microphone.
+   */
+  const ensureFrostLiveVoiceController = () => {
+    if (frostLiveVoiceRef.current) return frostLiveVoiceRef.current;
+    frostLiveVoiceRef.current = createLiveVoiceController({
       mediaDevices: typeof navigator === "undefined" ? null : navigator.mediaDevices,
       AudioContextImpl: typeof window === "undefined" ? null : (window.AudioContext || window.webkitAudioContext || null),
       synthesis: typeof window === "undefined" ? null : window.speechSynthesis,
@@ -5708,44 +5731,159 @@ function App() {
       transcribe: async (wavBytes) => {
         const response = await axios.post(`${LOCAL_API_URL}/api/local/speech/transcribe`, wavBytes, {
           headers: { "Content-Type": "audio/wav" },
-          timeout: 45000,
+          // The first transcription after the gateway starts also loads the model into the speech
+          // server (up to ~30 s) before the request itself (up to 30 s). Under that, the first
+          // question after every start would time out and switch voice off.
+          timeout: 70000,
         });
         return response.data;
       },
       ask: (question) => askAiAssistantRef.current(question, { fromVoice: true }),
       isBusy: () => aiLoadingRef.current,
+      isAllowed: () => frostVoiceAllowedRef.current === true && Boolean(userRef.current),
+      onWake: () => frostVoiceRevealRef.current?.(),
+      onLevel: (level) => frostVoiceLevelRef.current?.set(level),
       onChange: (view) => setFrostLiveVoice(view),
     });
-    frostLiveVoiceRef.current?.stop("switched_off");
-    frostLiveVoiceRef.current = controller;
-    await controller.start();
+    return frostLiveVoiceRef.current;
   };
 
-  const toggleFrostLiveVoice = () => {
-    if (frostLiveVoiceRef.current?.active) {
-      stopFrostLiveVoice("switched_off");
+  const startFrostLiveVoice = async ({ auto = false } = {}) => {
+    const controller = ensureFrostLiveVoiceController();
+    // The switches are only drawn for these roles. Checked again here, and again inside the
+    // controller, so a stray call cannot open the microphone for a Cashier.
+    if (!frostBellAllowed) {
+      await controller.start();
       return;
     }
-    // One start at a time: a second click while the status check is in flight would otherwise
-    // build a second controller over the first.
+    const offCount = frostVoiceOffCountRef.current;
+    const status = await readFrostSpeechStatus();
+    const alwaysOn = frostVoiceAlwaysOnRef.current;
+    if (offCount !== frostVoiceOffCountRef.current || !userRef.current || (!alwaysOn && !frostDrawerOpenRef.current)) {
+      controller.discardPrimed();
+      return;
+    }
+    if (status?.state !== "ready") {
+      // Not ready, not readable, or failed: the setup card says which, and the microphone stays shut.
+      controller.discardPrimed();
+      setFrostSpeechSetup((current) => ({ ...current, open: true }));
+      // With the drawer closed (always-on after sign-in) the card is not on screen, so the
+      // indicator next to the bell carries the reason instead.
+      controller.note(
+        auto || !frostDrawerOpenRef.current
+          ? "FROST is not listening: voice is not ready on this laptop, or its setup could not be read. Open FROST to see why."
+          : "",
+        auto || !frostDrawerOpenRef.current ? "error" : "info",
+      );
+      return;
+    }
+    setFrostSpeechSetup((current) => ({ ...current, open: false }));
+    await controller.start({ idleLimitMs: alwaysOn ? null : LIVE_VOICE_IDLE_LIMIT_MS });
+  };
+
+  // One start at a time: a second click while the status check is in flight would otherwise start
+  // over the first.
+  const beginFrostLiveVoice = (options) => {
     if (frostLiveVoiceStartingRef.current) return;
     frostLiveVoiceStartingRef.current = true;
-    startFrostLiveVoice()
+    startFrostLiveVoice(options)
       .catch((error) => {
-        stopFrostLiveVoice("switched_off");
-        setFrostLiveVoice({ on: false, phase: "off", message: `Live voice could not start: ${getErrorMessage(error, error?.message || "unknown error")}`, tone: "error" });
+        const controller = ensureFrostLiveVoiceController();
+        const message = `Live voice could not start: ${getErrorMessage(error, error?.message || "unknown error")}`;
+        if (!controller.stop("start_failed", message)) controller.note(message, "error");
       })
       .finally(() => { frostLiveVoiceStartingRef.current = false; });
   };
 
-  // The microphone closes with the drawer, on sign-out and when the app unmounts. Each says why.
+  // The in-drawer "Live voice" switch.
+  const toggleFrostLiveVoice = () => {
+    const controller = ensureFrostLiveVoiceController();
+    if (controller.active) {
+      frostVoiceOffCountRef.current += 1;
+      controller.stop("switched_off");
+      return;
+    }
+    if (frostLiveVoiceStartingRef.current) return;
+    // Inside the click, before the status check's await: the AudioContext made here may run.
+    controller.prime();
+    beginFrostLiveVoice();
+  };
+
+  // "Listen for Frost everywhere".
+  const toggleFrostVoiceAlwaysOn = () => {
+    const next = !frostVoiceAlwaysOnRef.current;
+    frostVoiceAlwaysOnRef.current = next;
+    setFrostVoiceAlwaysOn(next);
+    const saved = writeAlwaysOnPreference(() => window.localStorage, next);
+    setFrostVoicePreferenceNote(saved ? "" : LIVE_VOICE_PREFERENCE_NOT_SAVED);
+    const controller = ensureFrostLiveVoiceController();
+    if (!next) {
+      frostVoiceOffCountRef.current += 1;
+      controller.stop("switched_off");
+      return;
+    }
+    // Already listening from the drawer switch: the same microphone carries on, without the idle
+    // switch-off. No second controller, no second microphone.
+    if (controller.active) {
+      controller.setIdleLimit(null);
+      return;
+    }
+    if (frostLiveVoiceStartingRef.current) return;
+    controller.prime();
+    beginFrostLiveVoice();
+  };
+
+  // "Start listening" after always-on stopped on an error, and "Click here to start it".
+  const relaunchFrostListening = () => {
+    const controller = ensureFrostLiveVoiceController();
+    if (controller.active || frostLiveVoiceStartingRef.current) return;
+    controller.prime();
+    beginFrostLiveVoice();
+  };
+  const resumeFrostLiveVoice = () => {
+    frostLiveVoiceRef.current?.resume();
+  };
+
+  // The microphone closes with the drawer -- unless it is listening everywhere -- on sign-out and
+  // when the app unmounts. Each says why.
   useEffect(() => {
-    if (!frostDrawerOpen) frostLiveVoiceRef.current?.stop("drawer_closed");
+    if (frostDrawerOpen || frostVoiceAlwaysOnRef.current) return;
+    frostVoiceOffCountRef.current += 1;
+    frostLiveVoiceRef.current?.stop("drawer_closed");
   }, [frostDrawerOpen]);
   useEffect(() => {
-    if (!user) frostLiveVoiceRef.current?.stop("signed_out");
+    if (!user) {
+      frostVoiceOffCountRef.current += 1;
+      frostLiveVoiceRef.current?.stop("signed_out");
+      frostVoiceAutoStartedRef.current = "";
+    }
   }, [user]);
   useEffect(() => () => frostLiveVoiceRef.current?.stop("unmounted"), []);
+  // Always-on starts by itself after sign-in, once per sign-in. There was no click, so WebView2 may
+  // keep the audio paused; the controller then says "Click anywhere to start listening" and the
+  // effect below resumes it on the first click or key.
+  useEffect(() => {
+    if (!user || !frostBellAllowed || !frostVoiceAlwaysOn) return;
+    const key = String(user.id ?? user.username ?? "signed-in");
+    if (frostVoiceAutoStartedRef.current === key) return;
+    frostVoiceAutoStartedRef.current = key;
+    if (frostLiveVoiceRef.current?.active || frostLiveVoiceStartingRef.current) return;
+    beginFrostLiveVoice({ auto: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, frostBellAllowed, frostVoiceAlwaysOn]);
+  // While the audio is paused or no frames arrive, the next pointerdown or key anywhere in the app is
+  // the gesture that resumes it. Capture phase, so a control that stops propagation still counts.
+  const frostVoiceNeedsGesture = frostLiveVoice.on === true && (frostLiveVoice.phase === "paused" || frostLiveVoice.phase === "no_sound");
+  useEffect(() => {
+    if (!frostVoiceNeedsGesture) return undefined;
+    const resume = () => { frostLiveVoiceRef.current?.resume(); };
+    window.addEventListener("pointerdown", resume, true);
+    window.addEventListener("keydown", resume, true);
+    return () => {
+      window.removeEventListener("pointerdown", resume, true);
+      window.removeEventListener("keydown", resume, true);
+    };
+  }, [frostVoiceNeedsGesture]);
   // While the gateway is downloading, ask it where it has got to. Only while the drawer is open:
   // the download carries on in the gateway either way, and reopening reads it again.
   useEffect(() => {
@@ -5754,6 +5892,27 @@ function App() {
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [frostDrawerOpen, frostSpeechSetup.status?.state]);
+  // Opening FROST reads the voice status once, so an engine update or the slow fallback is shown
+  // before anybody turns voice on. Owner and Admin only, and only in the desktop app, where
+  // LOCAL_API_URL is 127.0.0.1: in a browser it is derived from the page's host, and nothing should
+  // be asked of that without somebody clicking a voice switch.
+  useEffect(() => {
+    if (!frostDrawerOpen || !frostBellAllowed || !isDesktopShell()) return;
+    readFrostSpeechStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [frostDrawerOpen, frostBellAllowed]);
+
+  // What the voice bar and the indicator next to the bell draw. Decided in local/frostLiveVoice.js.
+  const frostVoiceIndicator = liveVoiceIndicatorView({ view: frostLiveVoice, alwaysOn: frostVoiceAlwaysOn, allowed: frostBellAllowed });
+  const frostVoiceControls = {
+    alwaysOn: frostVoiceAlwaysOn,
+    onToggleAlwaysOn: toggleFrostVoiceAlwaysOn,
+    onRestart: relaunchFrostListening,
+    onResume: resumeFrostLiveVoice,
+    level: frostVoiceLevelRef.current,
+    engineNotice: speechEngineNotice(frostSpeechSetup.status, { engine: frostLiveVoice.engine }),
+    preferenceNote: frostVoicePreferenceNote,
+  };
 
   const proposeFrostAction = async (action, payload = {}) => {
     try {
@@ -8388,6 +8547,18 @@ function App() {
     startNewFrostChat();
     loadFrostChats().catch(() => null);
   };
+  // "Frost" was heard: the drawer pops open on the conversation, through the same opener the
+  // launcher uses, before the question is asked. flushSync so the render that follows -- a new chat,
+  // and `askAiAssistantRef` pointing at it -- has happened by the time the question is asked. A
+  // drawer that is already open is only brought to the conversation: reopening would start a new
+  // chat and throw away the question just answered, which a follow-up needs.
+  frostVoiceRevealRef.current = () => {
+    if (!frostDrawerOpenRef.current) {
+      flushSync(() => openFrostDrawer(FROST_PRIMARY_SECTION));
+      return;
+    }
+    setFrostActiveTab(FROST_PRIMARY_SECTION);
+  };
   /**
    * Everything a person can navigate to, searchable.
    *
@@ -8651,6 +8822,24 @@ function App() {
                 {(counterScope.known && counterScope.locationName) || user.branch}
               </div>
               <div className="offline-pill">{connectionStatus.syncSummary}</div>
+              {/* Whenever the microphone is on, in either mode, for anybody: it is never on without
+                  this on screen. With the drawer closed it also carries what was heard and why it
+                  is not listening, since nothing else on screen would. */}
+              {frostVoiceIndicator && (
+                <FrostVoiceIndicator
+                  detail={frostDrawerOpen ? "" : frostVoiceIndicator.detail}
+                  heard={frostDrawerOpen ? "" : frostLiveVoice.heard}
+                  indicator={frostVoiceIndicator}
+                  level={frostVoiceLevelRef.current}
+                  onClick={() => {
+                    if (frostVoiceIndicator.phase === "paused" || frostVoiceIndicator.phase === "no_sound") {
+                      resumeFrostLiveVoice();
+                      return;
+                    }
+                    if (!frostDrawerOpen) openFrostDrawer(FROST_PRIMARY_SECTION);
+                  }}
+                />
+              )}
               <div className="notification-bell-wrap">
                 <button
                   type="button"
@@ -9847,6 +10036,7 @@ function App() {
         onNavigate={navigate}
         onNewChat={startNewFrostChat}
         onOpen={() => openFrostDrawer(FROST_PRIMARY_SECTION)}
+        micOn={frostLiveVoice.on === true}
         onOpenChat={openFrostChat}
         onProposeAction={proposeFrostAction}
         onProposeMemory={proposeFrostMemory}
@@ -9866,6 +10056,7 @@ function App() {
         onSelectQuestion={(question) => askAiAssistant(question)}
         liveVoice={frostLiveVoice}
         onToggleLiveVoice={toggleFrostLiveVoice}
+        voiceControls={frostVoiceControls}
         speechSetup={frostSpeechSetup.open ? speechSetupView(frostSpeechSetup.status, frostSpeechSetup.failure) : null}
         onInstallSpeech={installFrostSpeech}
         onRetrySpeechStatus={readFrostSpeechStatus}
@@ -9913,7 +10104,9 @@ function FrostFloatingCopilot({
   onSaveSettings,
   onSelectQuestion,
   liveVoice = null,
+  micOn = false,
   onToggleLiveVoice,
+  voiceControls = null,
   speechSetup = null,
   onInstallSpeech,
   onRetrySpeechStatus,
@@ -9931,15 +10124,19 @@ function FrostFloatingCopilot({
 }) {
   return (
     <>
+      {/* The launcher is fixed on screen while the topbar scrolls away, so it also shows when the
+          microphone is on. */}
       <button
-        aria-label="Open FROST"
-        className={`frost-floating-launcher ${unreadCount ? "frost-floating-launcher-alert" : ""}`}
+        aria-label={micOn ? "Open FROST. The microphone is on." : "Open FROST"}
+        className={`frost-floating-launcher ${unreadCount ? "frost-floating-launcher-alert" : ""} ${micOn ? "frost-floating-launcher-listening" : ""}`}
         onClick={onOpen}
+        title={micOn ? "FROST is listening. The microphone is on." : undefined}
         type="button"
       >
         <span className="frost-orbit" />
         <strong>F</strong>
         {unreadCount > 0 && <em>{Math.min(unreadCount, 99)}</em>}
+        {micOn && <i aria-hidden="true" className="frost-launcher-mic"><Icon name="mic" size={12} /></i>}
       </button>
       {open && <button aria-label="Close FROST" className="frost-drawer-backdrop" onClick={onClose} type="button" />}
       <aside aria-label="FROST" className={`frost-drawer ${open ? "frost-drawer-open" : ""}`}>
@@ -9978,6 +10175,7 @@ function FrostFloatingCopilot({
             onSelectQuestion={onSelectQuestion}
             liveVoice={liveVoice}
             onToggleLiveVoice={onToggleLiveVoice}
+            voiceControls={voiceControls}
             speechSetup={speechSetup}
             onInstallSpeech={onInstallSpeech}
             onRetrySpeechStatus={onRetrySpeechStatus}
@@ -10128,6 +10326,7 @@ function AiBusinessAssistantModule({
   onSaveSettings,
   liveVoice = null,
   onToggleLiveVoice,
+  voiceControls = null,
   speechSetup = null,
   onInstallSpeech,
   onRetrySpeechStatus,
@@ -10224,6 +10423,7 @@ function AiBusinessAssistantModule({
       onRetry={onRetrySpeechStatus}
       onToggle={onToggleLiveVoice}
       setup={speechSetup}
+      voice={voiceControls}
     />
   );
   // A thread that does not follow itself shows the oldest exchange and keeps the newest answer
@@ -11118,31 +11318,80 @@ function FrostMemoryPanel({ canManage, memories = [], onMemoryAction, onProposeM
  * `setup` is `speechSetupView(...)`. This only draws them. A failed or unreadable setup is drawn as
  * a failure with its reason; only `setup.ready` ever says voice is ready.
  */
-function FrostLiveVoiceBar({ liveVoice = null, onCloseSetup, onInstall, onRetry, onToggle, setup = null }) {
+function FrostLiveVoiceBar({ liveVoice = null, onCloseSetup, onInstall, onRetry, onToggle, setup = null, voice = null }) {
   const on = liveVoice?.on === true;
   const phase = liveVoice?.phase || "off";
   const message = liveVoice?.message || "";
+  const heard = liveVoice?.heard || "";
+  const alwaysOn = voice?.alwaysOn === true;
+  // Paused audio or no frames: the words themselves are the button that starts it (and any click
+  // in the app does too).
+  const stalled = on && (phase === "paused" || phase === "no_sound");
+  const engineNotice = voice?.engineNotice || null;
+  const messageClass = liveVoice?.tone === "error"
+    ? "frost-live-message frost-live-message-error"
+    : liveVoice?.tone === "attention" ? "frost-live-message frost-live-message-attention" : "frost-live-message";
   return (
     <div className="frost-live-bar">
       <div className="frost-live-row">
-        <button
-          aria-checked={on}
-          className={on ? "frost-live-switch frost-live-switch-on" : "frost-live-switch"}
-          onClick={onToggle}
-          role="switch"
-          title={on ? "Turn live voice off and close the microphone" : "Talk to FROST. Say \"Frost\" and then your question."}
-          type="button"
-        >
-          <span className="frost-live-knob" /> Live voice
-        </button>
+        {/* The drawer's own switch, for people who do not want always-on. While "everywhere" is on
+            that switch is the one control, so this one is not drawn. */}
+        {!alwaysOn && (
+          <button
+            aria-checked={on}
+            className={on ? "frost-live-switch frost-live-switch-on" : "frost-live-switch"}
+            onClick={onToggle}
+            role="switch"
+            title={on ? "Turn live voice off and close the microphone" : "Talk to FROST. Say \"Frost\" and then your question."}
+            type="button"
+          >
+            <span className="frost-live-knob" /> Live voice
+          </button>
+        )}
+        {voice && (
+          <button
+            aria-checked={alwaysOn}
+            className={alwaysOn ? "frost-live-switch frost-live-switch-on" : "frost-live-switch"}
+            onClick={voice.onToggleAlwaysOn}
+            role="switch"
+            title={alwaysOn
+              ? "Stop listening everywhere and close the microphone"
+              : "Keep the microphone on in every screen, even with FROST closed. Say \"Frost\" and FROST opens."}
+            type="button"
+          >
+            <span className="frost-live-knob" /> Listen for &quot;Frost&quot; everywhere
+          </button>
+        )}
         {on && (
           <span aria-live="polite" className={`frost-live-indicator frost-live-indicator-${phase}`}>
             <span className="frost-live-dot" />
             {LIVE_VOICE_PHASE_LABELS[phase] || phase}
           </span>
         )}
+        {/* Outside the live region: a meter that changes a dozen times a second is not news. */}
+        {on && <FrostVoiceLevel channel={voice?.level} />}
       </div>
-      {message && <p className={liveVoice?.tone === "error" ? "frost-live-message frost-live-message-error" : "frost-live-message"}>{message}</p>}
+      {message && (stalled
+        ? <button className={`${messageClass} frost-live-message-action`} onClick={voice?.onResume} type="button">{message}</button>
+        : <p className={messageClass}>{message}</p>)}
+      {alwaysOn && !on && voice && (
+        <div className="button-row">
+          <button className="secondary-button" onClick={voice.onRestart} type="button">Start listening</button>
+        </div>
+      )}
+      {heard && <p aria-live="polite" className="frost-live-heard">{heard}</p>}
+      {engineNotice && (
+        <div className={`frost-voice-engine frost-voice-engine-${engineNotice.kind}`}>
+          <p>{engineNotice.text}</p>
+          {engineNotice.detail && <small>{engineNotice.detail}</small>}
+          {engineNotice.action === "install" && (
+            <div className="button-row">
+              <button className="secondary-button" onClick={onInstall} type="button">Install update</button>
+            </div>
+          )}
+        </div>
+      )}
+      {voice?.preferenceNote && <p className="frost-live-message frost-live-message-error">{voice.preferenceNote}</p>}
       {setup && !on && (
         <div className={`frost-voice-setup frost-voice-setup-${setup.tone}`}>
           <p>{setup.text}</p>
@@ -11163,6 +11412,53 @@ function FrostLiveVoiceBar({ liveVoice = null, onCloseSetup, onInstall, onRetry,
             )}
             <button className="frost-strip-button" onClick={onCloseSetup} type="button">Close</button>
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+const noVoiceLevelSubscribe = () => () => {};
+const noVoiceLevel = () => 0;
+
+/**
+ * The live microphone level. Subscribes to the level channel itself, so a frame redraws this bar
+ * and nothing else.
+ */
+function FrostVoiceLevel({ channel = null }) {
+  const level = useSyncExternalStore(channel?.subscribe || noVoiceLevelSubscribe, channel?.get || noVoiceLevel);
+  const percent = Math.round(Math.max(0, Math.min(1, Number(level) || 0)) * 100);
+  return (
+    <span aria-label="Microphone level" aria-valuemax={100} aria-valuemin={0} aria-valuenow={percent} className="frost-voice-level" role="meter">
+      <span style={{ width: `${percent}%` }} />
+    </span>
+  );
+}
+
+/**
+ * The small indicator next to the bell: drawn by App whenever `liveVoiceIndicatorView` is not null,
+ * which is always when the microphone is on. With the drawer closed it also carries what was heard
+ * and any failure, in words.
+ */
+function FrostVoiceIndicator({ detail = "", heard = "", indicator, level = null, onClick }) {
+  return (
+    <div className="frost-voice-indicator-wrap">
+      <button
+        aria-label={indicator.kind === "on" ? `Microphone on: ${indicator.label}` : indicator.label}
+        className={`frost-voice-indicator frost-voice-indicator-${indicator.tone}`}
+        onClick={onClick}
+        title={indicator.kind === "on" ? "The microphone is on. FROST listens for \"Frost\"." : detail || indicator.label}
+        type="button"
+      >
+        <Icon name="mic" size={15} />
+        <span className="frost-voice-indicator-label">{indicator.label}</span>
+        {indicator.kind === "on" && <FrostVoiceLevel channel={level} />}
+      </button>
+      {(detail || heard) && (
+        <div aria-live="polite" className="frost-voice-bubble">
+          {detail && <p className={indicator.tone === "error" ? "frost-voice-bubble-error" : ""}>{detail}</p>}
+          {heard && <p>{heard}</p>}
         </div>
       )}
     </div>

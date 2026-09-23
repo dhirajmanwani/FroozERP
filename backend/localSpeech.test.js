@@ -38,11 +38,14 @@ const {
   ENGINE_ASSET,
   MODEL_ASSETS,
   buildEngineArgs,
+  buildInferenceBody,
+  buildServerArgs,
   cleanTranscript,
   crc32,
   createLocalSpeech,
   describeEngineExit,
   engineFileNames,
+  engineFileNamesWithServer,
   extractZipEntries,
   resolveSpeechDir,
   validateWav,
@@ -58,7 +61,10 @@ const tempDir = (label) => {
   createdDirs.push(dir);
   return dir;
 };
-test.after(() => {
+// Stand-in servers are stopped before their directories are removed (Windows refuses otherwise).
+const serverCleanups = [];
+test.after(async () => {
+  for (const cleanup of serverCleanups) await cleanup();
   for (const dir of createdDirs) fs.rmSync(dir, { recursive: true, force: true });
 });
 const sha = (algorithm, data) => crypto.createHash(algorithm).update(data).digest("hex");
@@ -191,6 +197,7 @@ test("the pinned engine and models are the ones in the contract", () => {
     "Release/ggml.dll",
     "Release/ggml-base.dll",
     "Release/ggml-cpu.dll",
+    "Release/whisper-server.exe",
   ]);
   assert.deepEqual(Object.keys(MODEL_ASSETS).sort(), ["base", "small"]);
   assert.equal(MODEL_ASSETS.small.url, "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin");
@@ -214,6 +221,9 @@ test("the speech directory is shared across profiles, with an explicit override"
   );
   assert.deepEqual(engineFileNames("win32"), ["whisper-cli.exe", "whisper.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll"]);
   assert.deepEqual(engineFileNames("linux"), ["whisper-cli"]);
+  // The server is extracted but not required: an install from before it existed stays usable.
+  assert.deepEqual(engineFileNamesWithServer("win32"), ["whisper-cli.exe", "whisper.dll", "ggml.dll", "ggml-base.dll", "ggml-cpu.dll", "whisper-server.exe"]);
+  assert.deepEqual(engineFileNamesWithServer("linux"), ["whisper-cli", "whisper-server"]);
 });
 
 test("localSpeech.js requires node built-ins only, because it ships without node_modules", () => {
@@ -245,7 +255,7 @@ test("the zip reader takes exactly the named entries, stored and deflated, byte 
   const zip = buildZip([
     { name: "Release/SDL2.dll", data: Buffer.from("not wanted") },
     ...entries,
-    { name: "Release/whisper-server.exe", data: Buffer.from("not wanted either") },
+    { name: "Release/whisper-stream.exe", data: Buffer.from("not wanted either") },
   ]);
   const extracted = extractZipEntries(zip, ENGINE_ASSET.entries);
   assert.deepEqual([...extracted.keys()].sort(), [...ENGINE_ASSET.entries].sort());
@@ -279,7 +289,7 @@ test("a damaged archive is refused rather than partly extracted", () => {
 // Install
 // ---------------------------------------------------------------------------------------------
 
-test("install downloads, verifies, extracts only the five files and reports ready", async () => {
+test("install downloads, verifies, extracts only the six files and reports ready", async () => {
   const speechDir = tempDir("install");
   const entries = engineEntries();
   const zip = buildZip([...entries, { name: "Release/stream.exe", data: Buffer.from("ignored") }]);
@@ -305,7 +315,9 @@ test("install downloads, verifies, extracts only the five files and reports read
   assert.deepEqual(status.progress, { phase: null, received_bytes: 0, total_bytes: 0 });
   assert.deepEqual(fetcher.calls, [engineAsset.url, modelAssets.small.url]);
   const onDisk = fs.readdirSync(speechDir).sort();
-  assert.deepEqual(onDisk, ["ggml-base.dll", "ggml-cpu.dll", "ggml-small.bin", "ggml.dll", "speech-install.json", "whisper-cli.exe", "whisper.dll"]);
+  assert.deepEqual(onDisk, ["ggml-base.dll", "ggml-cpu.dll", "ggml-small.bin", "ggml.dll", "speech-install.json", "whisper-cli.exe", "whisper-server.exe", "whisper.dll"]);
+  assert.equal(status.engine, "server");
+  assert.equal(status.engine_update_available, false);
   for (const entry of entries) assert.ok(fs.readFileSync(path.join(speechDir, entry.name.split("/").pop())).equals(entry.data));
   assert.ok(fs.readFileSync(path.join(speechDir, "ggml-small.bin")).equals(modelBytes));
   // Every outbound request is on the record as an external connection, none as the cloud.
@@ -586,6 +598,7 @@ test("transcribe hands the engine the exact audio, strips markers and always del
   assert.equal(result.status, 200);
   assert.equal(result.body.text, "Frost, what were sales today?");
   assert.equal(typeof result.body.elapsed_ms, "number");
+  assert.equal(result.body.engine, "cli", "no whisper-server installed: whisper-cli ran");
   const seen = JSON.parse(fs.readFileSync(path.join(reportDir, "seen.json"), "utf8"));
   assert.equal(seen.sha, sha("sha256", wav), "the engine must read exactly the bytes that were posted");
   assert.equal(spawns.length, 1);
@@ -649,6 +662,506 @@ test("transcribe refuses invalid audio and a missing install without running any
   assert.equal(speech.status().state, "not_installed");
   assert.equal(spawns.length, 0);
   assert.deepEqual(fs.readdirSync(tmp), []);
+});
+
+// ---------------------------------------------------------------------------------------------
+// whisper-server: kept loaded, against a stand-in (a node script speaking the v1.8.7 protocol:
+// GET <request-path>/health, POST <request-path>/inference multipart with a `file` part)
+// ---------------------------------------------------------------------------------------------
+
+const FAKE_SERVER = `
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const args = process.argv.slice(2);
+const arg = (flag) => args[args.indexOf(flag) + 1];
+const mode = process.env.FAKE_SERVER_MODE || "ok";
+const report = process.env.FAKE_REPORT_DIR;
+const note = (entry) => fs.appendFileSync(path.join(report, "server.jsonl"), JSON.stringify({ pid: process.pid, ...entry }) + "\\n");
+note({ event: "start", args });
+if (mode === "exit-at-start") {
+  process.stderr.write("whisper_init_from_file: loading model\\nerror: failed to initialize whisper context\\n");
+  process.exit(3);
+}
+const prefix = arg("--request-path");
+let healthPolls = 0;
+const parse = (body, type) => {
+  const boundary = Buffer.from("--" + /boundary=(.+)$/.exec(type)[1]);
+  const parts = {};
+  let at = body.indexOf(boundary);
+  while (at >= 0) {
+    const next = body.indexOf(boundary, at + boundary.length);
+    if (next < 0) break;
+    const part = body.subarray(at + boundary.length + 2, next - 2);
+    const split = part.indexOf("\\r\\n\\r\\n");
+    const head = part.subarray(0, split).toString();
+    parts[/name="([^"]+)"/.exec(head)[1]] = { head, data: part.subarray(split + 4) };
+    at = next;
+  }
+  return parts;
+};
+const server = http.createServer((req, res) => {
+  if (req.method === "GET" && req.url === prefix + "/health") {
+    healthPolls += 1;
+    // The real server binds only after the model has loaded; answering "loading" first as well
+    // proves the gateway waits for "ok" rather than for the port.
+    if (mode === "never-ready" || healthPolls <= 2) {
+      res.writeHead(503, { "content-type": "application/json" });
+      return res.end('{"status":"loading model"}');
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    return res.end('{"status":"ok"}');
+  }
+  if (req.method === "POST" && req.url === prefix + "/inference") {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const parts = parse(Buffer.concat(chunks), req.headers["content-type"]);
+      const fields = {};
+      for (const [name, part] of Object.entries(parts)) if (name !== "file") fields[name] = part.data.toString();
+      note({ event: "inference", sha: crypto.createHash("sha256").update(parts.file.data).digest("hex"), fileHead: parts.file.head, fields });
+      if (mode === "crash-on-inference") process.exit(1);
+      if (mode === "hang") return;
+      if (mode === "http-500") {
+        res.writeHead(500, { "content-type": "application/json" });
+        return res.end('{"error":"failed to process audio"}');
+      }
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ text: " [BLANK_AUDIO]\\n Frost, what were sales today?\\n" }));
+      }, mode === "slow" ? 400 : 0);
+    });
+    return;
+  }
+  res.writeHead(404, { "content-type": "text/plain" });
+  res.end("File Not Found (" + req.url + ")");
+});
+setTimeout(() => server.listen(Number(arg("--port")), arg("--host")), 100);
+`;
+
+const readServerLog = (reportDir) => {
+  const file = path.join(reportDir, "server.jsonl");
+  return fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
+};
+
+const processGone = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return error.code === "ESRCH";
+  }
+};
+
+const waitFor = async (check, label, timeoutMs = 10000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`timed out waiting for ${label}`);
+};
+
+/**
+ * A speech dir with a stand-in whisper-server and whisper-cli. `modes.server` is read at every
+ * spawn, so a test can change how the next server start behaves.
+ */
+const setUpServerEngine = (options = {}, { withServer = true, platform = "linux" } = {}) => {
+  const root = tempDir("server");
+  const speechDir = path.join(root, "speech");
+  const tmp = path.join(root, "tmp");
+  const reportDir = path.join(root, "report");
+  for (const dir of [speechDir, tmp, reportDir]) fs.mkdirSync(dir, { recursive: true });
+  const cliScript = path.join(root, "fake-engine.js");
+  const serverScript = path.join(root, "fake-server.js");
+  fs.writeFileSync(cliScript, FAKE_ENGINE);
+  fs.writeFileSync(serverScript, FAKE_SERVER);
+  const exe = platform === "win32" ? ".exe" : "";
+  fs.writeFileSync(path.join(speechDir, `whisper-cli${exe}`), "placeholder");
+  if (withServer) fs.writeFileSync(path.join(speechDir, `whisper-server${exe}`), "placeholder");
+  fs.writeFileSync(path.join(speechDir, "ggml-small.bin"), "model");
+  const modes = { server: "ok", cli: "echo" };
+  const spawns = [];
+  const children = [];
+  const spawnProcess = (command, args, spawnOptions) => {
+    const kind = path.basename(command).startsWith("whisper-server") ? "server" : "cli";
+    spawns.push({ kind, command, args, options: spawnOptions });
+    const env = { ...process.env, FAKE_REPORT_DIR: reportDir, FAKE_SERVER_MODE: modes.server };
+    const child = kind === "server"
+      ? spawn(process.execPath, [serverScript, ...args], { ...spawnOptions, env })
+      : spawn(process.execPath, [cliScript, modes.cli, ...args], { ...spawnOptions, env });
+    children.push(child);
+    return child;
+  };
+  const logs = [];
+  const speech = createLocalSpeech({
+    speechDir,
+    platform,
+    tmpDir: tmp,
+    readPolicy: () => ({ allowInternetAccess: false }),
+    spawnProcess,
+    threads: 3,
+    log: (message) => logs.push(message),
+    serverPollIntervalMs: 20,
+    ...options,
+  });
+  const serverSpawns = () => spawns.filter((entry) => entry.kind === "server");
+  const cliSpawns = () => spawns.filter((entry) => entry.kind === "cli");
+  serverCleanups.push(async () => {
+    await speech.dispose();
+    for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  });
+  return { speech, speechDir, tmp, reportDir, spawns, serverSpawns, cliSpawns, modes, logs };
+};
+
+test("whisper-server is started once, bound to 127.0.0.1 on a picked port under a secret path, and kept", async () => {
+  const setup = setUpServerEngine();
+  const { speech, speechDir, reportDir, serverSpawns, cliSpawns, tmp } = setup;
+  assert.equal(speech.status().engine, "server");
+  assert.equal(speech.status().engine_update_available, false);
+  assert.equal(serverSpawns().length, 0, "started lazily, not at construction");
+
+  const wav = Buffer.concat([makeWav({ seconds: 2 }), Buffer.alloc(0)]);
+  const first = await speech.transcribe(wav);
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  assert.deepEqual(Object.keys(first.body).sort(), ["elapsed_ms", "engine", "text"]);
+  assert.equal(first.body.text, "Frost, what were sales today?");
+  assert.equal(first.body.engine, "server");
+
+  const [spawned] = serverSpawns();
+  const info = speech.serverInfo();
+  assert.equal(info.ready, true);
+  assert.equal(spawned.command, path.join(speechDir, "whisper-server"));
+  assert.equal(spawned.options.shell, false);
+  assert.equal(spawned.options.windowsHide, true);
+  assert.equal(spawned.options.cwd, speechDir);
+  assert.match(info.requestPath, /^\/[0-9a-f]{32}$/);
+  assert.deepEqual(spawned.args, [
+    "-m", path.join(speechDir, "ggml-small.bin"),
+    "--host", "127.0.0.1",
+    "--port", String(info.port),
+    "--request-path", info.requestPath,
+    "-t", "3",
+    "-l", "auto",
+    "--translate",
+    "-nt",
+  ]);
+  assert.equal(spawned.args.includes("--convert"), false, "never the ffmpeg shell-out");
+  assert.equal(spawned.args.some((value) => /0\.0\.0\.0|::/.test(value)), false);
+  // The routes live only under the secret path.
+  assert.equal((await fetch(`http://127.0.0.1:${info.port}/health`)).status, 404);
+  assert.equal((await fetch(`http://127.0.0.1:${info.port}${info.requestPath}/health`)).status, 200);
+
+  // The exact bytes, as the `file` part, with the documented fields.
+  const seen = readServerLog(reportDir).filter((entry) => entry.event === "inference");
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].sha, sha("sha256", wav));
+  assert.match(seen[0].fileHead, /name="file"; filename="audio\.wav"/);
+  assert.deepEqual(seen[0].fields, { response_format: "json", translate: "true", language: "auto" });
+
+  // Kept: the second utterance reuses the same process.
+  const second = await speech.transcribe(makeWav({ seconds: 1 }));
+  assert.equal(second.status, 200);
+  assert.equal(second.body.engine, "server");
+  assert.equal(serverSpawns().length, 1);
+  assert.equal(speech.serverInfo().pid, info.pid);
+  assert.equal(cliSpawns().length, 0);
+  assert.deepEqual(fs.readdirSync(tmp), [], "the server path writes no temp WAV at all");
+  assert.ok(fs.existsSync(path.join(speechDir, `whisper-server-owner-${process.pid}.json`)), "the running server is on record for orphan cleanup");
+});
+
+test("the inference body carries the WAV byte for byte, whatever bytes it holds", () => {
+  const wav = Buffer.concat([makeWav({ seconds: 1 }), Buffer.from("\r\n--boundary-ish--\r\n\xff\x00", "latin1")]);
+  const { body, contentType } = buildInferenceBody(wav);
+  const boundary = /boundary=(.+)$/.exec(contentType)[1];
+  const start = body.indexOf("\r\n\r\n") + 4;
+  assert.ok(body.subarray(start, start + wav.length).equals(wav));
+  assert.equal(body.subarray(start + wav.length, start + wav.length + 4 + boundary.length).toString("latin1"), `\r\n--${boundary}`);
+  assert.equal(wav.includes(boundary), false);
+  assert.deepEqual(buildServerArgs({ modelPath: "M", threads: 2, port: 5, requestPath: "/p" }), ["-m", "M", "--host", "127.0.0.1", "--port", "5", "--request-path", "/p", "-t", "2", "-l", "auto", "--translate", "-nt"]);
+});
+
+test("readiness waits for /health to say ok, and a server that never does is abandoned for whisper-cli", async () => {
+  const { speech, modes, serverSpawns, cliSpawns, reportDir } = setUpServerEngine({ serverStartTimeoutMs: 800 });
+  modes.server = "never-ready";
+  const started = Date.now();
+  const result = await speech.transcribe(makeWav({ seconds: 1 }));
+  assert.ok(Date.now() - started < 5000, "readiness polling is bounded");
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(result.body.engine, "cli");
+  assert.equal(result.body.text, "Frost, what were sales today?");
+  assert.equal(serverSpawns().length, 1);
+  assert.equal(cliSpawns().length, 1);
+  assert.equal(readServerLog(reportDir).filter((entry) => entry.event === "inference").length, 0, "nothing is sent to a server that is not ready");
+  const pid = readServerLog(reportDir)[0].pid;
+  await waitFor(() => processGone(pid), "the never-ready server to be killed");
+  assert.equal(speech.status().engine, "cli", "status says the slow engine is in use");
+});
+
+test("a crashed server is restarted by the next transcription", async () => {
+  const { speech, serverSpawns, cliSpawns } = setUpServerEngine();
+  assert.equal((await speech.transcribe(makeWav({ seconds: 1 }))).body.engine, "server");
+  const firstPid = speech.serverInfo().pid;
+  process.kill(firstPid, "SIGKILL");
+  await waitFor(() => speech.serverInfo().pid === null, "the crash to be noticed");
+  assert.equal(speech.status().engine, "server", "a crash alone does not demote the engine");
+  const again = await speech.transcribe(makeWav({ seconds: 1 }));
+  assert.equal(again.status, 200);
+  assert.equal(again.body.engine, "server");
+  assert.equal(serverSpawns().length, 2);
+  assert.notEqual(speech.serverInfo().pid, firstPid);
+  assert.equal(cliSpawns().length, 0);
+});
+
+test("a server that dies under a request: that request is answered by whisper-cli, the next restarts the server", async () => {
+  const { speech, modes, serverSpawns, cliSpawns } = setUpServerEngine();
+  modes.server = "crash-on-inference";
+  const result = await speech.transcribe(makeWav({ seconds: 1 }));
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(result.body.engine, "cli");
+  assert.equal(result.body.text, "Frost, what were sales today?");
+  assert.equal(cliSpawns().length, 1);
+  modes.server = "ok";
+  const next = await speech.transcribe(makeWav({ seconds: 1 }));
+  assert.equal(next.body.engine, "server");
+  assert.equal(serverSpawns().length, 2);
+});
+
+test("when the restart fails, that request falls back to whisper-cli and the server is not retried at once", async () => {
+  const { speech, modes, serverSpawns, cliSpawns, logs } = setUpServerEngine({ serverRetryAfterMs: 1500 });
+  assert.equal((await speech.transcribe(makeWav({ seconds: 1 }))).body.engine, "server");
+  process.kill(speech.serverInfo().pid, "SIGKILL");
+  await waitFor(() => speech.serverInfo().pid === null, "the crash to be noticed");
+  modes.server = "exit-at-start";
+  const fallback = await speech.transcribe(makeWav({ seconds: 1 }));
+  assert.equal(fallback.status, 200, JSON.stringify(fallback.body));
+  assert.equal(fallback.body.engine, "cli");
+  assert.equal(fallback.body.text, "Frost, what were sales today?");
+  assert.equal(serverSpawns().length, 2, "restarted exactly once");
+  assert.equal(cliSpawns().length, 1);
+  assert.equal(speech.status().engine, "cli");
+  assert.ok(logs.some((line) => /could not start .*failed to initialize whisper context.*whisper-cli/.test(line)), logs.join("\n"));
+
+  // Within the retry window a request does not pay for another failing start.
+  assert.equal((await speech.transcribe(makeWav({ seconds: 1 }))).body.engine, "cli");
+  assert.equal(serverSpawns().length, 2);
+
+  // After it, the server is tried again.
+  modes.server = "ok";
+  await new Promise((resolve) => setTimeout(resolve, 1600));
+  assert.equal(speech.status().engine, "server");
+  assert.equal((await speech.transcribe(makeWav({ seconds: 1 }))).body.engine, "server");
+  assert.equal(serverSpawns().length, 3);
+});
+
+test("server path: one transcription at a time, a second is refused as busy", async () => {
+  const { speech, modes, serverSpawns } = setUpServerEngine();
+  modes.server = "slow";
+  const first = speech.transcribe(makeWav({ seconds: 1 }));
+  const second = await speech.transcribe(makeWav({ seconds: 1 }));
+  assert.equal(second.status, 429);
+  assert.equal(second.body.code, "SPEECH_BUSY");
+  const done = await first;
+  assert.equal(done.status, 200);
+  assert.equal(done.body.engine, "server");
+  // Busy also while the first one is still starting the server, and once it is running.
+  const third = speech.transcribe(makeWav({ seconds: 1 }));
+  assert.equal((await speech.transcribe(makeWav({ seconds: 1 }))).body.code, "SPEECH_BUSY");
+  assert.equal((await third).status, 200);
+  assert.equal(serverSpawns().length, 1);
+});
+
+test("a server request that overruns is a failure, and the server is stopped", async () => {
+  const { speech, modes, serverSpawns, cliSpawns, reportDir } = setUpServerEngine({ transcribeTimeoutMs: 1500 });
+  modes.server = "hang";
+  const started = Date.now();
+  const result = await speech.transcribe(makeWav({ seconds: 1 }));
+  assert.ok(Date.now() - started < 8000);
+  assert.equal(result.status, 503);
+  assert.equal(result.body.code, "SPEECH_TRANSCRIBE_FAILED");
+  assert.match(result.body.message, /longer than 1500 ms/);
+  assert.equal("text" in result.body, false, "a failure is never an empty answer");
+  assert.equal(cliSpawns().length, 0, "an overrun is not retried through the slower engine");
+  const hungPid = readServerLog(reportDir).find((entry) => entry.event === "start").pid;
+  assert.equal(speech.serverInfo().pid, null, "the hung server is no longer the current one");
+  await waitFor(() => processGone(hungPid), "the hung server to be killed");
+  modes.server = "ok";
+  assert.equal((await speech.transcribe(makeWav({ seconds: 1 }))).body.engine, "server");
+  assert.equal(serverSpawns().length, 2);
+});
+
+test("an HTTP error from a live server is a failure, not an empty answer", async () => {
+  const { speech, modes } = setUpServerEngine();
+  modes.server = "http-500";
+  const result = await speech.transcribe(makeWav({ seconds: 1 }));
+  assert.equal(result.status, 503);
+  assert.equal(result.body.code, "SPEECH_TRANSCRIBE_FAILED");
+  assert.match(result.body.message, /HTTP 500: failed to process audio/);
+  assert.equal("text" in result.body, false);
+});
+
+test("dispose kills the server and forgets its record; transcription afterwards uses whisper-cli", async () => {
+  const { speech, speechDir, serverSpawns } = setUpServerEngine();
+  await speech.transcribe(makeWav({ seconds: 1 }));
+  const { pid, port, requestPath } = speech.serverInfo();
+  assert.ok(pid);
+  await speech.dispose();
+  assert.ok(processGone(pid), "the server process must be gone once dispose resolves");
+  await assert.rejects(fetch(`http://127.0.0.1:${port}${requestPath}/health`));
+  assert.equal(fs.readdirSync(speechDir).some((name) => name.startsWith("whisper-server-owner-")), false);
+  const after = await speech.transcribe(makeWav({ seconds: 1 }));
+  assert.equal(after.body.engine, "cli");
+  assert.equal(serverSpawns().length, 1, "nothing is started after dispose");
+
+  // disposeSync (the process 'exit' path) kills too.
+  const other = setUpServerEngine();
+  await other.speech.transcribe(makeWav({ seconds: 1 }));
+  const otherPid = other.speech.serverInfo().pid;
+  other.speech.disposeSync();
+  await waitFor(() => processGone(otherPid), "disposeSync to kill the server");
+});
+
+test("an install without whisper-server keeps working through whisper-cli and reports the update", async () => {
+  const { speech, serverSpawns, cliSpawns } = setUpServerEngine({}, { withServer: false });
+  const status = speech.status();
+  assert.equal(status.state, "ready");
+  assert.equal(status.engine, "cli");
+  assert.equal(status.engine_update_available, true);
+  const result = await speech.transcribe(makeWav({ seconds: 1 }));
+  assert.equal(result.status, 200);
+  assert.equal(result.body.engine, "cli");
+  assert.equal(serverSpawns().length, 0);
+  assert.equal(cliSpawns().length, 1);
+});
+
+test("an engine update re-extracts the zip, keeps the model, and switches to whisper-server", async () => {
+  const entries = engineEntries();
+  const zip = buildZip(entries);
+  const { engineAsset, modelAssets } = testAssets({ zip });
+  const baseBytes = Buffer.from("base-model");
+  const fetcher = fakeFetcher({ [engineAsset.url]: { body: zip } });
+  const setup = setUpServerEngine({ engineAsset, modelAssets, request: fetcher.request, readPolicy: () => ({ allowInternetAccess: true }) }, { withServer: false, platform: "win32" });
+  const { speech, speechDir, serverSpawns } = setup;
+  // An install from before the server entry: the five older files and a verified base model.
+  fs.rmSync(path.join(speechDir, "ggml-small.bin"));
+  const old = new Date("2026-09-01T00:00:00Z");
+  for (const entry of entries.filter((item) => item.name !== "Release/whisper-server.exe")) {
+    const target = path.join(speechDir, entry.name.split("/").pop());
+    fs.writeFileSync(target, entry.data);
+    fs.utimesSync(target, old, old);
+  }
+  fs.writeFileSync(path.join(speechDir, "ggml-base.bin"), baseBytes);
+  fs.writeFileSync(path.join(speechDir, "speech-install.json"), JSON.stringify({ model: "base" }));
+  const before = speech.status();
+  assert.equal(before.state, "ready");
+  assert.equal(before.model, "base");
+  assert.equal(before.engine_update_available, true);
+
+  // No model named: the installed one is kept -- never a 466 MB download of the default instead.
+  const started = speech.install({});
+  assert.equal(started.status, 202);
+  assert.equal(started.body.model, "base");
+  await speech.whenInstalled();
+  const after = speech.status();
+  assert.equal(after.state, "ready", after.error);
+  assert.equal(after.model, "base");
+  assert.equal(after.engine, "server");
+  assert.equal(after.engine_update_available, false);
+  assert.ok(fs.readFileSync(path.join(speechDir, "whisper-server.exe")).equals(entries.find((item) => item.name === "Release/whisper-server.exe").data));
+  assert.ok(fs.readFileSync(path.join(speechDir, "ggml-base.bin")).equals(baseBytes), "the model is kept");
+  for (const name of engineFileNames("win32")) {
+    assert.equal(fs.statSync(path.join(speechDir, name)).mtimeMs, old.getTime(), `${name} was identical and must not be rewritten (it may be running)`);
+  }
+  assert.deepEqual(leftovers(speechDir), []);
+  assert.deepEqual(fetcher.calls, [engineAsset.url], "only the 4.4 MB engine zip is fetched");
+  const result = await speech.transcribe(makeWav({ seconds: 1 }));
+  assert.equal(result.body.engine, "server");
+  assert.equal(serverSpawns()[0].command, path.join(speechDir, "whisper-server.exe"));
+  assert.deepEqual(serverSpawns()[0].args.slice(0, 2), ["-m", path.join(speechDir, "ggml-base.bin")]);
+});
+
+test("changing the model through install restarts the server with the new model", async () => {
+  const zip = buildZip(engineEntries());
+  const { engineAsset, modelAssets } = testAssets({ zip });
+  const baseBytes = Buffer.from("base-model");
+  const fetcher = fakeFetcher({ [modelAssets.base.url]: { body: baseBytes } });
+  const { speech, speechDir, serverSpawns } = setUpServerEngine({ engineAsset, modelAssets, request: fetcher.request, readPolicy: () => ({ allowInternetAccess: true }) });
+  fs.writeFileSync(path.join(speechDir, "speech-install.json"), JSON.stringify({ model: "small" }));
+  assert.equal((await speech.transcribe(makeWav({ seconds: 1 }))).body.engine, "server");
+  const smallPid = speech.serverInfo().pid;
+  assert.equal(speech.serverInfo().model, path.join(speechDir, "ggml-small.bin"));
+
+  assert.equal(speech.install({ model: "base" }).status, 202);
+  await speech.whenInstalled();
+  assert.equal(speech.status().model, "base", speech.status().error);
+  assert.deepEqual(fetcher.calls, [modelAssets.base.url], "only the new model is fetched; the engine is up to date");
+  await waitFor(() => speech.serverInfo().ready && speech.serverInfo().model === path.join(speechDir, "ggml-base.bin"), "the server to restart with the base model");
+  await waitFor(() => processGone(smallPid), "the small-model server to be stopped");
+  assert.equal(serverSpawns().length, 2);
+  assert.deepEqual(serverSpawns()[1].args.slice(0, 2), ["-m", path.join(speechDir, "ggml-base.bin")]);
+  const result = await speech.transcribe(makeWav({ seconds: 1 }));
+  assert.equal(result.body.engine, "server");
+  assert.equal(serverSpawns().length, 2, "the restarted server is the one used");
+});
+
+test("a whisper-server orphaned by a killed gateway is stopped, but only when it proves it is ours", async () => {
+  const root = tempDir("orphan");
+  const speechDir = path.join(root, "speech");
+  const reportDir = path.join(root, "report");
+  fs.mkdirSync(speechDir);
+  fs.mkdirSync(reportDir);
+  const script = path.join(root, "fake-server.js");
+  fs.writeFileSync(script, FAKE_SERVER);
+  const deadOwner = spawn(process.execPath, ["-e", ""]);
+  await new Promise((resolve) => deadOwner.once("exit", resolve));
+  const startStandIn = async (requestPath) => {
+    const port = await reservePort();
+    const child = spawn(process.execPath, [script, "--host", "127.0.0.1", "--port", String(port), "--request-path", requestPath], { env: { ...process.env, FAKE_REPORT_DIR: reportDir } });
+    await waitFor(async () => {
+      try {
+        return (await fetch(`http://127.0.0.1:${port}/nothing`)).status === 404;
+      } catch {
+        return false;
+      }
+    }, "the stand-in to listen");
+    return { child, port };
+  };
+  const secret = `/${"a".repeat(32)}`;
+  const orphan = await startStandIn(secret);
+  fs.writeFileSync(path.join(speechDir, `whisper-server-owner-${deadOwner.pid}.json`), JSON.stringify({ owner_pid: deadOwner.pid, pid: orphan.child.pid, port: orphan.port, request_path: secret }));
+  // A live process whose record path does not answer: not provably ours, never killed.
+  const stranger = await startStandIn(`/${"b".repeat(32)}`);
+  const strangerRecord = `whisper-server-owner-${deadOwner.pid + 100000}.json`;
+  fs.writeFileSync(path.join(speechDir, strangerRecord), JSON.stringify({ pid: stranger.child.pid, port: stranger.port, request_path: `/${"c".repeat(32)}` }));
+  // A record whose gateway is still running (this test process): someone else's live server.
+  const liveOwnerRecord = `whisper-server-owner-${process.pid}.json`;
+  const liveOwned = await startStandIn(`/${"d".repeat(32)}`);
+  fs.writeFileSync(path.join(speechDir, liveOwnerRecord), JSON.stringify({ pid: liveOwned.child.pid, port: liveOwned.port, request_path: `/${"d".repeat(32)}` }));
+  const killed = [];
+  const speech = createLocalSpeech({
+    speechDir,
+    readPolicy: () => ({ allowInternetAccess: false }),
+    ownerPid: 424242424,
+    processAlive: (pid) => pid !== deadOwner.pid && pid !== deadOwner.pid + 100000 && (() => { try { process.kill(pid, 0); return true; } catch { return false; } })(),
+    killPid: (pid) => {
+      killed.push(pid);
+      process.kill(pid);
+    },
+  });
+  try {
+    assert.equal(await speech.reapOrphanServers(), 1);
+    assert.deepEqual(killed, [orphan.child.pid]);
+    await waitFor(() => orphan.child.exitCode !== null || orphan.child.signalCode !== null, "the orphan to exit");
+    assert.equal(fs.existsSync(path.join(speechDir, `whisper-server-owner-${deadOwner.pid}.json`)), false);
+    assert.equal(stranger.child.exitCode, null, "an unproven process is left alone");
+    assert.ok(fs.existsSync(path.join(speechDir, strangerRecord)));
+    assert.equal(liveOwned.child.exitCode, null, "a live gateway's server is left alone");
+    assert.ok(fs.existsSync(path.join(speechDir, liveOwnerRecord)));
+    assert.equal(await speech.reapOrphanServers(), 1, "once per service");
+  } finally {
+    for (const { child } of [orphan, stranger, liveOwned]) if (child.exitCode === null) child.kill("SIGKILL");
+  }
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -830,7 +1343,7 @@ test("real gateway: in LOCAL_ONLY install is refused, audited, and nothing leave
   const app = { origin: "http://tauri.localhost" };
   try {
     const status = await (await fetch(`${base}/api/local/speech/status`, { headers: app })).json();
-    assert.deepEqual(status, { state: "not_installed", model: null, progress: { phase: null, received_bytes: 0, total_bytes: 0 }, error: null, internet_allowed: false });
+    assert.deepEqual(status, { state: "not_installed", model: null, progress: { phase: null, received_bytes: 0, total_bytes: 0 }, error: null, internet_allowed: false, engine: null, engine_update_available: false });
 
     const install = await fetch(`${base}/api/local/speech/install`, { method: "POST", headers: { ...app, "content-type": "application/json" }, body: "{}" });
     assert.equal(install.status, 403);
@@ -881,11 +1394,15 @@ test("real gateway: posted WAV bytes reach the engine unchanged and come back as
     assert.equal(status.state, "ready");
     assert.equal(status.model, "base");
     assert.equal(status.internet_allowed, true);
+    // An install from before whisper-server existed: still ready, through whisper-cli.
+    assert.equal(status.engine, "cli");
+    assert.equal(status.engine_update_available, true);
     const wav = makeWav({ seconds: 3 });
     const response = await fetch(`${base}/api/local/speech/transcribe`, { method: "POST", headers: { origin: "http://tauri.localhost", "content-type": "audio/wav" }, body: wav });
     assert.equal(response.status, 200);
     const body = await response.json();
     assert.equal(body.text, "Frost, what were sales today?");
+    assert.equal(body.engine, "cli");
     const seen = JSON.parse(fs.readFileSync(path.join(reportDir, "seen.json"), "utf8"));
     assert.equal(seen.sha, sha("sha256", wav));
     assert.deepEqual(seen.args.slice(0, 2), ["-m", path.join(speechDir, "ggml-base.bin")]);
@@ -894,6 +1411,45 @@ test("real gateway: posted WAV bytes reach the engine unchanged and come back as
     await stopGateway(child);
     await cloud.close();
   }
+});
+
+test("real gateway: transcription goes through whisper-server, which dies with the gateway", { skip: process.platform === "win32" && "the stand-in server is a script; Windows would need a real whisper-server.exe" }, async () => {
+  const root = tempDir("gateway-server");
+  const speechDir = path.join(root, "speech");
+  const reportDir = path.join(root, "report");
+  fs.mkdirSync(speechDir, { recursive: true });
+  fs.mkdirSync(reportDir);
+  for (const [name, source] of [["whisper-cli", `process.argv.splice(2, 0, "echo");\n${FAKE_ENGINE}`], ["whisper-server", FAKE_SERVER]]) {
+    fs.writeFileSync(path.join(speechDir, name), `#!${process.execPath}\n${source}`);
+    fs.chmodSync(path.join(speechDir, name), 0o755);
+  }
+  fs.writeFileSync(path.join(speechDir, "ggml-base.bin"), "model");
+  const cloud = await startCloudStandIn();
+  const { child, base } = await startGateway({ root, speechDir, policy: false, cloudApiUrl: cloud.url, extraEnv: { FAKE_REPORT_DIR: reportDir, FAKE_SERVER_MODE: "ok" } });
+  let record = null;
+  try {
+    const status = await (await fetch(`${base}/api/local/speech/status`)).json();
+    assert.equal(status.engine, "server");
+    assert.equal(status.engine_update_available, false);
+    const wav = makeWav({ seconds: 2 });
+    const response = await fetch(`${base}/api/local/speech/transcribe`, { method: "POST", headers: { origin: "http://tauri.localhost", "content-type": "audio/wav" }, body: wav });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json().then((body) => [body.text, body.engine]), ["Frost, what were sales today?", "server"]);
+    const inference = readServerLog(reportDir).find((entry) => entry.event === "inference");
+    assert.equal(inference.sha, sha("sha256", wav));
+    const recordName = fs.readdirSync(speechDir).find((name) => name.startsWith("whisper-server-owner-"));
+    assert.ok(recordName, "the gateway records the server it started");
+    record = JSON.parse(fs.readFileSync(path.join(speechDir, recordName), "utf8"));
+    assert.equal(record.owner_pid, child.pid);
+    assert.equal((await fetch(`http://127.0.0.1:${record.port}${record.request_path}/health`)).status, 200);
+    assert.deepEqual(cloud.requests, []);
+  } finally {
+    await stopGateway(child);
+    await cloud.close();
+  }
+  assert.equal(child.exitCode, 0, "the gateway exited through its SIGTERM handler");
+  await assert.rejects(fetch(`http://127.0.0.1:${record.port}${record.request_path}/health`, { signal: AbortSignal.timeout(2000) }), "the server must not outlive the gateway");
+  assert.equal(fs.readdirSync(speechDir).some((name) => name.startsWith("whisper-server-owner-")), false);
 });
 
 // ---------------------------------------------------------------------------------------------

@@ -527,6 +527,10 @@ const proxy = async (res, response) => {
 // before every redirect hop and while the bytes flow, and audits a LOCAL_ONLY refusal through
 // auditCloudRequest (blocked: true, reachedCloud: false, reason APP_LOCAL_ONLY, source
 // speech-install). Each permitted download request is audited too, as externalConnection: true.
+//
+// Transcription prefers a whisper-server child that the speech service starts on first use and
+// keeps (127.0.0.1 only, random port and request path; see localSpeech.js); it makes no network
+// connection of its own. The child is killed on this process's exit (see the bottom of the file).
 // ---------------------------------------------------------------------------------------------
 
 const SPEECH_ROUTE_PREFIX = "/api/local/speech/";
@@ -539,7 +543,15 @@ const SPEECH_ROUTES = Object.freeze({
 
 let speechService = null;
 const getSpeechService = () => {
-  if (!speechService) speechService = createLocalSpeech({ speechDir: resolveSpeechDir(), readPolicy, audit: auditCloudRequest });
+  if (!speechService) {
+    speechService = createLocalSpeech({
+      speechDir: resolveSpeechDir(),
+      readPolicy,
+      audit: auditCloudRequest,
+      // Engine lifecycle only (start, ready, crash, fallback) -- never audio or transcript text.
+      log: (message) => console.log(`[speech] ${message}`),
+    });
+  }
   return speechService;
 };
 
@@ -774,7 +786,24 @@ if (require.main === module) {
     console.log("PostgreSQL client access: blocked");
   });
 
-  const shutdown = () => server.close(() => process.exit(0));
+  // The speech service may own a whisper-server child (see localSpeech.js). It is killed on every
+  // way out this process can see: a signal, a normal exit, a crash. A TerminateProcess from the
+  // app (how src-tauri stops the gateway on Windows) runs none of these, so the next gateway reaps
+  // the orphan at startup instead.
+  const stopSpeechEngine = () => {
+    try {
+      if (speechService) speechService.disposeSync();
+    } catch {}
+  };
+  process.once("exit", stopSpeechEngine);
+  setImmediate(() => {
+    getSpeechService().reapOrphanServers().catch(() => {});
+  });
+
+  const shutdown = () => {
+    stopSpeechEngine();
+    server.close(() => process.exit(0));
+  };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 }
