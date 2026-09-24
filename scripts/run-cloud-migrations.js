@@ -70,6 +70,11 @@ const migrationFiles = [
   // declared-but-absent column, so its absence stops the cloud booting rather than waiting to 500
   // on the first owner who opens the chat sidebar.
   "backend/migrations/cloud/019_ai_conversation_sessions.sql",
+  // 020 creates `product_photos`, one photo per product, kept off the `products` row so the bytes
+  // are never copied into sync_change_log, product_audit_trail or the reference bootstrap. It is
+  // declared in `initializeDatabase()`, which never runs on a hosted deployment, so without this
+  // file the table does not exist there and `verifyDeclaredSchema` refuses to start the backend.
+  "backend/migrations/cloud/020_product_photos.sql",
 ];
 
 module.exports = { migrationFiles, deliberatelyNotRun };

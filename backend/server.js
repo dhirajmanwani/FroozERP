@@ -70,6 +70,7 @@ const {
   FORMAT_VERSION,
 } = require("./activationLicence");
 const { normaliseLicenceRequest } = require("./activationLicenceRequest");
+const { validateProductPhoto } = require("./productPhoto");
 const {
   REFERENCE_BOOTSTRAP_PROTOCOL,
   captureReferenceBootstrap,
@@ -2867,6 +2868,27 @@ const initializeDatabase = async () => {
       used_at TIMESTAMP,
       status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE'
     );
+
+    -- One photo per product, kept beside the product rather than on it. Declared here so a local or
+    -- self-hosted backend has it; on a hosted deployment this function never runs and
+    -- backend/migrations/cloud/020_product_photos.sql is the only way it can exist. The two must
+    -- stay identical.
+    --
+    -- Deliberately not a column on products: the whole products row is copied into
+    -- sync_change_log and product_audit_trail on every edit and sent to every device in the
+    -- reference bootstrap, so a photo there would be multiplied into every one of those. Photo
+    -- bytes live only in this table and travel only through GET /api/v3/product-photos.
+    CREATE TABLE IF NOT EXISTS product_photos (
+      product_id INTEGER PRIMARY KEY REFERENCES products(id) ON DELETE CASCADE,
+      company_id INTEGER,
+      photo_data TEXT NOT NULL,
+      content_type VARCHAR(40) NOT NULL,
+      byte_size INTEGER NOT NULL,
+      updated_by INTEGER,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS product_photos_company_idx
+      ON product_photos (company_id);
 
     -- Every offline activation file this installation has ever issued. Declared here so a local or
     -- self-hosted backend has it; on a hosted deployment this whole function never runs and
@@ -15318,6 +15340,234 @@ const updateProductHandler = async (req, res) => {
 };
 app.put("/products/:id", updateProductHandler);
 app.put("/api/v3/products/:id", rateLimitSyncRequest, v3WriteAdapter(updateProductHandler));
+
+/*
+ * A photo per product.
+ *
+ * Stored in `product_photos`, never on `products`: the products row is copied into
+ * `sync_change_log` and `product_audit_trail` on every edit and sent to every device in the
+ * reference bootstrap, so a photo on it would be multiplied into each of those. None of the three
+ * routes below calls `logSyncChange`, and the audit row they write records the photo's type and
+ * size, never its bytes. Devices fetch photos only through `GET /api/v3/product-photos`.
+ *
+ * Tenancy: the company is `req.auth.companyId`, the verified session claim, and nothing else. A
+ * product in another company answers exactly as a product that does not exist does, so a caller
+ * cannot learn which ids belong to somebody else.
+ *
+ * Authority: reading needs only a session (a cashier's POS draws these). Changing one needs the
+ * `inventory` permission -- the key that opens the Products screen in the client
+ * (`modulePermissionMap.products` in App.jsx) and that guards the v3 product-at-location write in
+ * operationalV3.js -- resolved through `getPermissionUser` with the same Owner/Admin fallback as
+ * every other call site.
+ */
+const PRODUCT_PHOTO_PERMISSION_KEY = "inventory";
+
+const productPhotoScopeRequired = (res) => res.status(403).json({
+  code: "PRODUCT_PHOTO_SCOPE_REQUIRED",
+  message: "This sign-in is not linked to a company, so product photos cannot be used. Sign in again.",
+});
+
+const productPhotoPermissionRequired = (res) => res.status(403).json({
+  code: "PRODUCT_PHOTO_PERMISSION_REQUIRED",
+  message: "You do not have permission to change product photos.",
+});
+
+const productPhotoNotFound = (res) => res.status(404).json({
+  code: "PRODUCT_NOT_FOUND",
+  message: "This product was not found.",
+});
+
+/**
+ * A database failure, answered as itself. A missing table (the cloud migration not yet applied)
+ * gets its own code, because "no photos" and "photos cannot be stored here" must never look alike.
+ */
+const productPhotoFailure = (res, error, code, message) => {
+  console.error(`Product photo request failed (${code})`, { code: error?.code, message: error?.message });
+  // 500, not 503: the desktop gateway turns any cloud 503 into "cloud temporarily unavailable"
+  // and drops this body, so the owner would never read the actual reason.
+  if (error?.code === "42P01") {
+    return res.status(500).json({
+      code: "PRODUCT_PHOTO_STORAGE_MISSING",
+      message: "Product photos are not set up on this server yet. Ask the administrator to update the database.",
+    });
+  }
+  return res.status(500).json({ code, message });
+};
+
+const listProductPhotosHandler = async (req, res) => {
+  const companyId = parsePositiveInteger(req.auth.companyId);
+  if (!companyId) return productPhotoScopeRequired(res);
+  try {
+    // Both companies are checked: the photo's own copy, which the index serves, and the product's,
+    // which is the authority. A photo whose product has since left the company is not listed.
+    const result = await pool.query(
+      `
+      SELECT pp.product_id, pp.photo_data, pp.updated_at
+      FROM product_photos pp
+      JOIN products p ON p.id = pp.product_id
+      WHERE pp.company_id = $1
+        AND p.company_id = $1
+      ORDER BY pp.product_id
+      `,
+      [companyId]
+    );
+    const photos = result.rows.map((row) => ({
+      product_id: row.product_id,
+      photo: row.photo_data,
+      updated_at: row.updated_at,
+    }));
+    return res.json({ photos, count: photos.length });
+  } catch (error) {
+    return productPhotoFailure(res, error, "PRODUCT_PHOTOS_LOAD_FAILED", "Product photos could not be loaded. Try again.");
+  }
+};
+
+const saveProductPhotoHandler = async (req, res) => {
+  const companyId = parsePositiveInteger(req.auth.companyId);
+  if (!companyId) return productPhotoScopeRequired(res);
+  let editor;
+  try {
+    editor = await getPermissionUser(req.auth.userId, PRODUCT_PHOTO_PERMISSION_KEY, ["Owner", "Admin"]);
+  } catch (error) {
+    return productPhotoFailure(res, error, "PRODUCT_PHOTO_SAVE_FAILED", "The photo could not be saved. Try again.");
+  }
+  if (!editor) return productPhotoPermissionRequired(res);
+
+  const productId = parsePositiveInteger(req.params.id);
+  if (!productId) return productPhotoNotFound(res);
+  const photo = validateProductPhoto(req.body?.photo);
+  if (!photo.ok) return res.status(400).json({ code: photo.code, message: photo.message });
+
+  let client;
+  try {
+    client = await pool.connect();
+  } catch (error) {
+    return productPhotoFailure(res, error, "PRODUCT_PHOTO_SAVE_FAILED", "The photo could not be saved. Try again.");
+  }
+  try {
+    await client.query("BEGIN");
+    const productResult = await client.query(
+      "SELECT id FROM products WHERE id = $1 AND company_id = $2",
+      [productId, companyId]
+    );
+    if (productResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return productPhotoNotFound(res);
+    }
+    // Only the description of the photo being replaced, for the audit row. Never its bytes.
+    const previousResult = await client.query(
+      "SELECT content_type, byte_size FROM product_photos WHERE product_id = $1 FOR UPDATE",
+      [productId]
+    );
+    const previous = previousResult.rows[0] || null;
+    const saved = await client.query(
+      `
+      INSERT INTO product_photos (
+        product_id, company_id, photo_data, content_type, byte_size, updated_by, updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+      ON CONFLICT (product_id) DO UPDATE SET
+        company_id = EXCLUDED.company_id,
+        photo_data = EXCLUDED.photo_data,
+        content_type = EXCLUDED.content_type,
+        byte_size = EXCLUDED.byte_size,
+        updated_by = EXCLUDED.updated_by,
+        updated_at = CURRENT_TIMESTAMP
+      RETURNING product_id, updated_at
+      `,
+      [productId, companyId, photo.dataUrl, photo.contentType, photo.byteSize, editor.id]
+    );
+    await client.query(
+      `
+      INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by)
+      VALUES ($1, 'PRODUCT_PHOTO_SET', $2::jsonb, $3::jsonb, $4, $5)
+      `,
+      [
+        productId,
+        previous ? JSON.stringify({ content_type: previous.content_type, byte_size: previous.byte_size }) : null,
+        JSON.stringify({ content_type: photo.contentType, byte_size: photo.byteSize }),
+        previous ? "Product photo replaced" : "Product photo added",
+        editor.id,
+      ]
+    );
+    await client.query("COMMIT");
+    const row = saved.rows[0];
+    return res.json({ product_id: row.product_id, photo: photo.dataUrl, updated_at: row.updated_at });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    return productPhotoFailure(res, error, "PRODUCT_PHOTO_SAVE_FAILED", "The photo could not be saved. Try again.");
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * Idempotent: removing a photo that is not there is a success, and `removed` says which happened
+ * (`true` a photo was deleted, `false` there was none). The product itself must still exist in the
+ * caller's company either way, or the answer is 404.
+ */
+const removeProductPhotoHandler = async (req, res) => {
+  const companyId = parsePositiveInteger(req.auth.companyId);
+  if (!companyId) return productPhotoScopeRequired(res);
+  let editor;
+  try {
+    editor = await getPermissionUser(req.auth.userId, PRODUCT_PHOTO_PERMISSION_KEY, ["Owner", "Admin"]);
+  } catch (error) {
+    return productPhotoFailure(res, error, "PRODUCT_PHOTO_REMOVE_FAILED", "The photo could not be removed. Try again.");
+  }
+  if (!editor) return productPhotoPermissionRequired(res);
+
+  const productId = parsePositiveInteger(req.params.id);
+  if (!productId) return productPhotoNotFound(res);
+
+  let client;
+  try {
+    client = await pool.connect();
+  } catch (error) {
+    return productPhotoFailure(res, error, "PRODUCT_PHOTO_REMOVE_FAILED", "The photo could not be removed. Try again.");
+  }
+  try {
+    await client.query("BEGIN");
+    const productResult = await client.query(
+      "SELECT id FROM products WHERE id = $1 AND company_id = $2",
+      [productId, companyId]
+    );
+    if (productResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return productPhotoNotFound(res);
+    }
+    const removed = await client.query(
+      "DELETE FROM product_photos WHERE product_id = $1 AND company_id = $2 RETURNING content_type, byte_size",
+      [productId, companyId]
+    );
+    const previous = removed.rows[0] || null;
+    if (previous) {
+      await client.query(
+        `
+        INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by)
+        VALUES ($1, 'PRODUCT_PHOTO_REMOVED', $2::jsonb, NULL, $3, $4)
+        `,
+        [
+          productId,
+          JSON.stringify({ content_type: previous.content_type, byte_size: previous.byte_size }),
+          "Product photo removed",
+          editor.id,
+        ]
+      );
+    }
+    await client.query("COMMIT");
+    return res.json({ product_id: productId, removed: Boolean(previous) });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    return productPhotoFailure(res, error, "PRODUCT_PHOTO_REMOVE_FAILED", "The photo could not be removed. Try again.");
+  } finally {
+    client.release();
+  }
+};
+
+app.get("/api/v3/product-photos", listProductPhotosHandler);
+app.put("/api/v3/products/:id/photo", saveProductPhotoHandler);
+app.delete("/api/v3/products/:id/photo", removeProductPhotoHandler);
 
 const addOpeningStockLotsForProduct = async (req, res, productIdParam = "id") => {
   const client = await pool.connect();

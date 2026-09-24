@@ -7504,34 +7504,116 @@ tbody tr:last-child td {
 }
 
 .product-results .product-result {
-  grid-template-columns: 52px minmax(0, 1fr) auto;
+  grid-template-columns: 64px minmax(0, 1fr) auto;
 }
 
 .product-result-badge {
   box-sizing: border-box;
   display: grid;
   place-items: center;
-  width: 52px;
-  height: 52px;
+  width: 64px;
+  height: 64px;
   border-radius: 10px;
-  font-size: 22px;
+  font-size: 24px;
   font-weight: 700;
   line-height: 1;
 }
 
-.product-result-art {
-  padding: 3px;
+.product-result-photo {
+  object-fit: cover;
   border: 1px solid var(--line-control);
   background: var(--card);
-}
-
-.product-result-art svg {
-  display: block;
-  width: 100%;
-  height: 100%;
 }
 
 .product-results .product-result-section {
   border-color: var(--accent);
   color: var(--ink);
+}
+
+/* Product Master: the photo picker. */
+.product-photo-field {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0;
+}
+
+.product-photo-label {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.product-photo-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 14px;
+}
+
+.product-photo-drop {
+  box-sizing: border-box;
+  display: grid;
+  place-items: center;
+  width: 128px;
+  height: 128px;
+  padding: 8px;
+  border: 1px dashed var(--line-control);
+  border-radius: 12px;
+  color: var(--ink-muted);
+  background: var(--track);
+  font-size: 12px;
+  text-align: center;
+  cursor: pointer;
+}
+
+.product-photo-drop:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.product-photo-drop-filled {
+  padding: 0;
+  border-style: solid;
+  overflow: hidden;
+  background: var(--card);
+}
+
+.product-photo-drop img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.product-photo-actions {
+  display: grid;
+  gap: 8px;
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.product-photo-actions p {
+  margin: 0;
+  color: var(--ink-muted);
+  font-size: 13px;
+}
+
+.product-photo-file {
+  position: relative;
+  cursor: pointer;
+}
+
+.product-photo-file input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.product-photo-message {
+  color: var(--ink-muted);
+}
+
+.product-photo-message-error {
+  color: var(--danger-ink);
 }

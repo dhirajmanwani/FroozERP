@@ -151,7 +151,7 @@ import {
 } from "./local/activationIssuing";
 import { refreshAfterSaveMessage, settingsWriteErrorMessage } from "./local/settingsWriteError";
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
-import { fruitArtFor } from "./local/posFruitArt";
+import { checkProductPhoto, imageFromTransfer, indexProductPhotos, photoForProduct, readCachedProductPhotos, shrinkProductPhoto, withProductPhoto, writeCachedProductPhotos } from "./local/productPhotos";
 import { POS_SECTIONS, posSectionCounts, posSectionFor, posSectionLabel, posTileBadge, readPosSection, writePosSection } from "./local/posSections";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
@@ -2198,6 +2198,14 @@ function App() {
     typeof navigator === "undefined" ? true : navigator.onLine !== false
   ));
   const [products, setProducts] = useState([]);
+  // Owner-picked product photos (see local/productPhotos.js). `productPhotosState` says whether
+  // the list is fresh from the cloud, this device's saved copy, or could not be read at all.
+  const [productPhotos, setProductPhotos] = useState([]);
+  const [productPhotosState, setProductPhotosState] = useState({ source: "none", message: "" });
+  const productPhotoIndex = useMemo(() => indexProductPhotos(productPhotos), [productPhotos]);
+  // The photo being edited in Product Master: `dataUrl` is what shows, `changed` whether Save must send it.
+  const [productPhotoDraft, setProductPhotoDraft] = useState({ dataUrl: null, changed: false });
+  const [productPhotoMessage, setProductPhotoMessage] = useState("");
   const [productCategories, setProductCategories] = useState([]);
   const [productDuplicateWarning, setProductDuplicateWarning] = useState("");
   const [inventory, setInventory] = useState([]);
@@ -5064,6 +5072,30 @@ function App() {
     setProducts((current) => preserveVerifiedLocalCollection(response.data, current));
     setProductDuplicateWarning(duplicateLogResponse.data?.message || "");
   };
+  const loadProductPhotos = async () => {
+    const browserIndexedDb = typeof window !== "undefined" ? window.indexedDB : null;
+    const cached = await readCachedProductPhotos(browserIndexedDb);
+    if (cached) {
+      setProductPhotos(cached.photos);
+      setProductPhotosState({ source: "device", message: "" });
+    }
+    try {
+      const response = await axios.get(`${API_URL}/api/v3/product-photos`, { ...createOperationalReadConfig(user), timeout: 20000 });
+      const photos = Array.isArray(response.data?.photos) ? response.data.photos : null;
+      if (!photos) throw new Error("The photo list came back in an unexpected shape.");
+      setProductPhotos(photos);
+      setProductPhotosState({ source: "cloud", message: "" });
+      await writeCachedProductPhotos(browserIndexedDb, photos);
+    } catch (error) {
+      // Not fatal: tiles fall back to colour and letter. But say so, never pretend there are none.
+      setProductPhotosState({
+        source: cached ? "device" : "failed",
+        message: cached
+          ? "Showing the photos this computer saved last time; the latest could not be downloaded."
+          : `Product photos could not be loaded (${getErrorMessage(error, "no connection")}).`,
+      });
+    }
+  };
   const loadProductCategories = async () => {
     const response = await axios.get(
       `${API_URL}/api/v3/product-categories`,
@@ -6934,9 +6966,58 @@ function App() {
     }
   };
 
+  // Returns "" when saved, or the reason it was not.
+  const saveProductPhoto = async (productId, dataUrl) => {
+    if (!productId) return "the new product's number did not come back from the server";
+    try {
+      if (dataUrl) {
+        const check = checkProductPhoto(dataUrl);
+        if (!check.ok) return check.message;
+        const response = await axios.put(`${API_URL}/api/v3/products/${encodeURIComponent(productId)}/photo`, { photo: dataUrl }, { timeout: 20000 });
+        setProductPhotos((current) => withProductPhoto(current, productId, dataUrl, response.data?.updated_at));
+      } else {
+        await axios.delete(`${API_URL}/api/v3/products/${encodeURIComponent(productId)}/photo`, { timeout: 20000 });
+        setProductPhotos((current) => withProductPhoto(current, productId, null));
+      }
+      loadProductPhotos().catch(() => null);
+      return "";
+    } catch (error) {
+      return getErrorMessage(error, "the server did not answer");
+    }
+  };
+  const takeProductPhoto = async (file, fallbackMessage = "") => {
+    if (!file) {
+      setProductPhotoMessage(fallbackMessage || "No photo found.");
+      return;
+    }
+    try {
+      setProductPhotoMessage("Preparing photo...");
+      const dataUrl = await shrinkProductPhoto(file, {
+        createImageBitmap: (blob) => window.createImageBitmap(blob),
+        createCanvas: (width, height) => Object.assign(document.createElement("canvas"), { width, height }),
+      });
+      const check = checkProductPhoto(dataUrl);
+      if (!check.ok) {
+        setProductPhotoMessage(check.message);
+        return;
+      }
+      setProductPhotoDraft({ dataUrl, changed: true });
+      setProductPhotoMessage(`Photo ready (${Math.ceil(check.bytes / 1024)} KB). It is saved when you press Save.`);
+    } catch (error) {
+      setProductPhotoMessage(error?.message || "That photo could not be used.");
+    }
+  };
+  const pasteProductPhoto = (event) => {
+    const found = imageFromTransfer(event.clipboardData || event.dataTransfer);
+    if (!found.file && !found.message) return;
+    event.preventDefault();
+    takeProductPhoto(found.file, found.message);
+  };
+
   const addProduct = async () => {
     try {
       const wasEditing = Boolean(editingProductId);
+      let savedProductId = editingProductId || null;
       const selectedCategory = productCategories.find((category) => String(category.id) === String(productCategoryId));
       const finalCategoryName = selectedCategory?.category_name || newProductCategoryName.trim() || productCategory.trim();
       const normalizedName = productName.trim().toLowerCase();
@@ -7027,11 +7108,16 @@ function App() {
         }
       } else {
         const createWrite = createOperationalWrite(user, payload);
-        await axios.post(`${API_URL}/api/v3/products`, createWrite.body, createWrite.config);
+        const created = await axios.post(`${API_URL}/api/v3/products`, createWrite.body, createWrite.config);
+        savedProductId = created.data?.product?.id ?? null;
       }
+      // The photo is saved after the product, separately. If it fails the product is still saved,
+      // and the owner is told the photo is not, rather than the whole save looking like a success.
+      const photoProblem = productPhotoDraft.changed ? await saveProductPhoto(savedProductId, productPhotoDraft.dataUrl) : "";
       resetProductForm();
       await Promise.all([loadProducts(), loadProductCategories(), loadDashboardData()]);
-      alert(wasEditing ? "Product Updated" : "Product Added");
+      const savedMessage = wasEditing ? "Product Updated" : "Product Added";
+      alert(photoProblem ? `${savedMessage}, but the photo was not saved: ${photoProblem}` : savedMessage);
     } catch (error) {
       console.error("Product save failed", {
         status: error.response?.status,
@@ -7044,6 +7130,8 @@ function App() {
   };
 
   const resetProductForm = () => {
+    setProductPhotoDraft({ dataUrl: null, changed: false });
+    setProductPhotoMessage("");
     setProductName("");
     setSellingRate("");
     setUnit("");
@@ -7944,6 +8032,8 @@ function App() {
     setOpeningStockLots([]);
     setShowOpeningLotForm(false);
     setEditingProductId(product.id);
+    setProductPhotoDraft({ dataUrl: photoForProduct(productPhotoIndex, product), changed: false });
+    setProductPhotoMessage("");
     loadProductLots(product, true);
   };
 
@@ -8243,9 +8333,10 @@ function App() {
     setActiveView(view);
     try {
       if (view === "products") {
-        await Promise.all([loadProducts(), loadProductCategories(), loadSupplierData(), loadDashboardData()]);
+        await Promise.all([loadProducts(), loadProductCategories(), loadSupplierData(), loadDashboardData(), loadProductPhotos()]);
       }
       if (view === "sales") {
+        loadProductPhotos().catch(() => null);
         await refreshPosInventoryFromSQLite("navigate-auto-pos");
         await Promise.all([loadDiscountRules(), loadLotDiscounts(), loadCustomerData()]);
       }
@@ -9181,6 +9272,43 @@ function App() {
                   </Field>
                   <label className="check-field"><input type="checkbox" checked={productActive} onChange={(event) => setProductActive(event.target.checked)} /><span>Active Item</span></label>
                 </div>
+                <div className="product-photo-field">
+                  <span className="product-photo-label">Photo</span>
+                  <div className="product-photo-row">
+                    {/* Paste lands here: in the browser, right-click a photo, "Copy image", then click this box and press Ctrl+V. */}
+                    <div
+                      aria-label="Product photo. Click, then press Ctrl+V to paste a copied photo."
+                      className={productPhotoDraft.dataUrl ? "product-photo-drop product-photo-drop-filled" : "product-photo-drop"}
+                      onDragOver={(event) => event.preventDefault()}
+                      onDrop={pasteProductPhoto}
+                      onPaste={pasteProductPhoto}
+                      role="button"
+                      tabIndex={0}
+                    >
+                      {productPhotoDraft.dataUrl
+                        ? <img alt="" src={productPhotoDraft.dataUrl} />
+                        : <span>Click here, then Ctrl+V</span>}
+                    </div>
+                    <div className="product-photo-actions">
+                      <p>On Google Images or Pinterest, right-click the photo and choose "Copy image". Then click the box and press Ctrl+V. Or save the photo and choose the file.</p>
+                      <div className="button-row">
+                        <label className="secondary-button product-photo-file">
+                          Choose file
+                          <input
+                            accept="image/jpeg,image/png,image/webp"
+                            onChange={(event) => { takeProductPhoto(event.target.files?.[0] || null, "No file chosen."); event.target.value = ""; }}
+                            type="file"
+                          />
+                        </label>
+                        {productPhotoDraft.dataUrl && (
+                          <button className="remove-button" onClick={() => { setProductPhotoDraft({ dataUrl: null, changed: true }); setProductPhotoMessage("The photo is removed when you press Save."); }} type="button">Remove photo</button>
+                        )}
+                      </div>
+                      {productPhotoMessage && <small className="product-photo-message" role="status">{productPhotoMessage}</small>}
+                      {productPhotosState.message && <small className="product-photo-message product-photo-message-error">{productPhotosState.message}</small>}
+                    </div>
+                  </div>
+                </div>
                 <Field label="Remarks"><textarea value={productRemarks} onChange={(event) => setProductRemarks(event.target.value)} /></Field>
                 {!editingProductId && <label className="check-field"><input type="checkbox" checked={addOpeningStock} onChange={(event) => setAddOpeningStock(event.target.checked)} /><span>Add Opening Stock</span></label>}
                 {addOpeningStock && !editingProductId && (
@@ -9660,6 +9788,7 @@ function App() {
           {activeView === "sales" && (
             <PosBilling
               onWorkChange={handlePosWorkChange}
+              productPhotoIndex={productPhotoIndex}
               chargeTypes={chargeTypes}
               customers={customers.filter((customer) => customer.active !== false)}
               orders={ordersState.orders}
@@ -21847,7 +21976,7 @@ function OtherChargesPanel({ canTypeAmount = false, chargeTypes = [], lines = []
   );
 }
 
-function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, onSeedConsumed, onWorkChange, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
+function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, onSeedConsumed, onWorkChange, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
   /**
    * The charges this bill has picked: which charge, how much of it, and how many.
    *
@@ -22934,9 +23063,8 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
               const rateLabel = minRate === maxRate
                 ? `${currency.format(minRate)}/${product.unit || "Unit"}`
                 : `${currency.format(minRate)} - ${currency.format(maxRate)}`;
-              // A drawing when the name says which fruit or item it is; otherwise its colour and letter.
-              // The markup is the app's own bundled drawings, never text from the product record.
-              const art = fruitArtFor(product.product_name);
+              // The owner's photo when there is one; otherwise the product's colour and first letter.
+              const photo = photoForProduct(productPhotoIndex, product);
               const badge = posTileBadge(product.product_name);
               return (
                 <button
@@ -22945,8 +23073,8 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
                   onClick={() => openLotSelector(product)}
                   title={`Select lot for ${product.product_name}`}
                 >
-                  {art
-                    ? <span aria-hidden="true" className="product-result-badge product-result-art" dangerouslySetInnerHTML={{ __html: art.svg }} />
+                  {photo
+                    ? <img alt="" className="product-result-badge product-result-photo" src={photo} />
                     : <span aria-hidden="true" className="product-result-badge" style={{ background: badge.tint, color: badge.ink }}>{badge.letter}</span>}
                   <span className="product-result-main">
                     <strong>{product.product_name}</strong>
