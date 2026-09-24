@@ -28,10 +28,20 @@ export const isNumericCell = (value) => {
   return /^[₹Rs.\s]*-?[\d,]+(\.\d+)?%?$/.test(text.replace(/^\((.*)\)$/, "-$1"));
 };
 
+// How many columns a cell covers. A day-total row ("Net Purchase Total for 24 Sep", colSpan 3)
+// has fewer cells than the header, and the Excel export needs to know where each one sits.
+const cellSpan = (cell) => {
+  const span = Number(cell?.colSpan ?? cell?.getAttribute?.("colspan") ?? 1);
+  return Number.isInteger(span) && span > 1 ? span : 1;
+};
+
 const tableModel = (table) => {
   const rowNodes = Array.from(table.querySelectorAll("tr"));
   let columns = [];
   const rows = [];
+  // Only rows that contain a spanning cell are listed, by row index, so a plain table's model is
+  // unchanged. The PDF ignores it; the Excel export places each cell under its own header.
+  const spans = {};
   for (const row of rowNodes) {
     const headerCells = Array.from(row.querySelectorAll("th"));
     if (headerCells.length && !columns.length) {
@@ -40,10 +50,12 @@ const tableModel = (table) => {
     }
     const cells = Array.from(row.querySelectorAll("td"));
     if (!cells.length) continue;
+    const rowSpans = cells.map(cellSpan);
+    if (rowSpans.some((span) => span > 1)) spans[rows.length] = rowSpans;
     rows.push(cells.map((cell) => cleanText(cell.textContent)));
   }
   if (!columns.length && rows.length) columns = rows[0].map((_, index) => `Column ${index + 1}`);
-  return { type: "table", columns, rows };
+  return Object.keys(spans).length ? { type: "table", columns, rows, spans } : { type: "table", columns, rows };
 };
 
 export const buildReportPdfModel = (root, { title = "", meta = [] } = {}) => {

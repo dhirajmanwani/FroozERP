@@ -151,6 +151,7 @@ import {
 } from "./local/activationIssuing";
 import { refreshAfterSaveMessage, settingsWriteErrorMessage } from "./local/settingsWriteError";
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
+import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, resolveReportDateRange } from "./local/reportRefresh";
 import { approvedDeviceCredentialMessage, normalizeDeviceBootstrapStatus } from "./local/freshDeviceOnboarding";
@@ -1468,15 +1469,20 @@ const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth
   }
 };
 
+// The filter line printed above a report ("Range: ... Status: ..."). The PDF and the Excel file
+// both carry it, so neither can show numbers without saying which slice of the books they are.
+// Each filter is its own line: the spans have no separator between them in textContent.
+const reportMetaLines = (element) => Array.from(element?.querySelectorAll?.(".report-filter-summary > span") || [])
+  .map((node) => String(node.textContent || "").replace(/\s+/g, " ").trim())
+  .filter(Boolean);
+
 // Reports export as real text rather than a screenshot: selectable, searchable, and small
 // enough to survive the backend 25mb JSON body limit when base64-encoded for WhatsApp.
 // Returns null when the report has no extractable tables/metrics (e.g. chart-only), so the
 // caller can fall back to the raster path.
 const exportReportTextPdf = async ({ element, fileName, title, printProfile = "", save = true }) => {
   if (!element) return null;
-  const meta = Array.from(element.querySelectorAll?.(".report-filter-summary") || [])
-    .map((node) => String(node.textContent || "").replace(/s+/g, " ").trim())
-    .filter(Boolean);
+  const meta = reportMetaLines(element);
   const model = buildReportPdfModel(element, { title, meta });
   if (!reportPdfHasContent(model)) return null;
   const pdf = renderReportPdf({
@@ -1485,10 +1491,30 @@ const exportReportTextPdf = async ({ element, fileName, title, printProfile = ""
     orientation: printProfile === "A4_LANDSCAPE" ? "landscape" : "portrait",
     generatedAt: new Date().toLocaleString("en-IN"),
   });
-  const finalFileName = safeFileName(fileName).replace(/.pdf$/i, "") + ".pdf";
+  const finalFileName = safeFileName(fileName).replace(/\.pdf$/i, "") + ".pdf";
   const blob = ensurePdfBlob(pdf.output("blob"));
   const saveResult = save ? await savePdfResult({ blob, fileName: finalFileName, pdf }) : null;
   return { blob, fileName: finalFileName, pdf, saveResult };
+};
+
+// The same report as an Excel sheet, from the same model the text PDF reads. Saved the way the
+// activation file is saved (a webview download, so it lands in Downloads), because the shell's
+// only save dialog is PDF-only. Returns null when the report has no table or totals to carry.
+const exportReportExcel = ({ element, fileName, title }) => {
+  if (!element) return null;
+  const model = buildReportPdfModel(element, { title, meta: reportMetaLines(element) });
+  if (!reportWorkbookHasContent(model)) return null;
+  const bytes = renderXlsx(buildReportWorkbook(model, { generatedAt: new Date().toLocaleString("en-IN") }));
+  const finalFileName = reportXlsxFileName(safeFileName(fileName || title), title);
+  const url = URL.createObjectURL(new Blob([bytes], { type: XLSX_MIME }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = finalFileName;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+  return { fileName: finalFileName, size: bytes.length };
 };
 
 // Every A4 document in this app wants the same thing: real text when the page has tables or
@@ -12964,7 +12990,7 @@ function PdfPreviewModal({ blob, fileName, onClose, onSave }) {
   );
 }
 
-function ReportToolbar({ canWhatsappSend = false, exporting = false, onPdfExport, onPdfView, onPrint, onWhatsApp, title }) {
+function ReportToolbar({ canWhatsappSend = false, exporting = false, onExcelExport, onPdfExport, onPdfView, onPrint, onWhatsApp, title }) {
   return (
     <div className="report-toolbar no-print">
       <strong>{title}</strong>
@@ -12972,6 +12998,7 @@ function ReportToolbar({ canWhatsappSend = false, exporting = false, onPdfExport
         <button className="secondary-button" onClick={onPrint}><Icon name="print" /> Print</button>
         {onPdfView && <button className="secondary-button" disabled={exporting} onClick={onPdfView}>{exporting ? "Preparing..." : "View PDF"}</button>}
         <button className="secondary-button" disabled={exporting} onClick={onPdfExport || onPrint}>{exporting ? "Exporting..." : "PDF Export"}</button>
+        {onExcelExport && <button className="secondary-button" disabled={exporting} onClick={onExcelExport}>Excel</button>}
         <button className="whatsapp-button" disabled={exporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} onClick={onWhatsApp || onPdfExport || onPrint}><Icon name="message" /> WhatsApp</button>
       </div>
     </div>
@@ -13150,6 +13177,8 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
   const [exporting, setExporting] = useState(false);
   const [whatsappOpen, setWhatsappOpen] = useState(false);
   const [pdfPreview, setPdfPreview] = useState(null);
+  // What the Excel button did, in words: where the file went, or why there is none.
+  const [excelNotice, setExcelNotice] = useState(null);
   const reportRef = useRef(null);
   const reportProfileKey = `report_${safeFileName(reportClassName || title || "report")}`;
   const printProfile = readStoredPrintProfile(reportProfileKey) || getReportPrintProfile(reportClassName);
@@ -13178,6 +13207,26 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
       await exportDocumentPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile });
     } catch (error) {
       alert(`Unable to export PDF: ${error.message}`);
+    } finally {
+      setExporting(false);
+      setPrintTarget(false);
+    }
+  };
+  const exportExcel = async () => {
+    // The same preparation as the PDF (narration choice, print layout), so the sheet carries the
+    // rows the PDF would.
+    if (beforePdfExport && beforePdfExport() === false) return;
+    setExcelNotice(null);
+    setPrintTarget(true);
+    setExporting(true);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      const result = exportReportExcel({ element: reportRef.current, fileName: fileName || title, title });
+      setExcelNotice(result
+        ? { tone: "ok", text: `Saved to your Downloads folder as ${result.fileName}.` }
+        : { tone: "error", text: "This report has no table or totals to put in Excel, so no file was made." });
+    } catch (error) {
+      setExcelNotice({ tone: "error", text: `The Excel file could not be made (${error?.message || String(error)}).` });
     } finally {
       setExporting(false);
       setPrintTarget(false);
@@ -13214,7 +13263,10 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
   };
   return (
     <section className={`print-section ${reportClassName} print-profile-${printProfile.toLowerCase().replace("_", "-")} ${printTarget ? "print-target" : ""}`}>
-      <ReportToolbar canWhatsappSend={canWhatsappSend} exporting={exporting} onPdfExport={exportReport} onPdfView={viewReportPdf} onPrint={printReport} onWhatsApp={() => setWhatsappOpen(true)} title={title} />
+      <ReportToolbar canWhatsappSend={canWhatsappSend} exporting={exporting} onExcelExport={exportExcel} onPdfExport={exportReport} onPdfView={viewReportPdf} onPrint={printReport} onWhatsApp={() => setWhatsappOpen(true)} title={title} />
+      {excelNotice && (
+        <p className={`report-excel-notice no-print${excelNotice.tone === "error" ? " report-excel-notice-error" : ""}`} role="status">{excelNotice.text}</p>
+      )}
       <div ref={reportRef} className="print-area report-paper">
         <header className="report-print-header">
           <BrandLogo invoice />

@@ -3410,6 +3410,16 @@ tbody tr:last-child td {
   margin-bottom: 12px;
 }
 
+.report-excel-notice {
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
+  margin: 0 0 10px;
+}
+
+.report-excel-notice-error {
+  color: var(--danger-ink);
+}
+
 .report-toolbar strong {
   color: var(--ink);
   font-size: 14px;
