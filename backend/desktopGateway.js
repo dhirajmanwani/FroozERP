@@ -539,6 +539,7 @@ const SPEECH_ROUTES = Object.freeze({
   "/api/local/speech/status": "GET",
   "/api/local/speech/install": "POST",
   "/api/local/speech/transcribe": "POST",
+  "/api/local/speech/warm": "POST",
 });
 
 let speechService = null;
@@ -598,6 +599,11 @@ const createSpeechRequestHandler = ({ speech = null } = {}) => async (req, res, 
     }
 
     if (url.pathname === "/api/local/speech/status") return sendJson(res, 200, service.status());
+
+    if (url.pathname === "/api/local/speech/warm") {
+      const result = service.warm();
+      return sendJson(res, result.status, result.body);
+    }
 
     if (url.pathname === "/api/local/speech/install") {
       let input = {};

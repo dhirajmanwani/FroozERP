@@ -5742,14 +5742,17 @@ function App() {
         const response = await axios.post(`${LOCAL_API_URL}/api/local/speech/transcribe`, wavBytes, {
           headers: { "Content-Type": "audio/wav" },
           // The gateway's own worst case, all bounded in localSpeech.js: starting the speech server
-          // (up to 30 s), the request to it (up to 30 s), and, when the server dies under it, the
-          // same audio again through whisper-cli (up to 30 s). 70 s was under that sum, so on a slow
-          // laptop the app gave up first and said the voice service "did not answer" (24 Sep 2026)
-          // while the gateway was still working. This must stay above the gateway's total.
-          timeout: 120000,
+          // (up to 120 s), the request to it (up to 30 s), and, when the server dies under it, the
+          // same audio again through whisper-cli (up to 30 s). A shorter limit made the app give up
+          // first and say the voice service "did not answer" (24 Sep 2026) while the gateway was
+          // still loading the model. This must stay above the gateway's total; a test checks it.
+          timeout: 200000,
         });
         return response.data;
       },
+      // Start loading the speech model as soon as the microphone opens. Nothing is sent but the
+      // request itself; the gateway answers at once and loads in the background.
+      warm: () => axios.post(`${LOCAL_API_URL}/api/local/speech/warm`, null, { timeout: 10000 }),
       ask: (question) => askAiAssistantRef.current(question, { fromVoice: true }),
       isBusy: () => aiLoadingRef.current,
       isAllowed: () => frostVoiceAllowedRef.current === true && Boolean(userRef.current),

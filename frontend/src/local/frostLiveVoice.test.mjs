@@ -556,7 +556,7 @@ test("transcription failures are distinct, and only 'busy' and a slow answer kee
     [{ response: { status: 429, data: { code: "SPEECH_BUSY" } } }, false],
     [{ message: "Network Error" }, true],
     [{ response: { status: 500, data: {} } }, true],
-    [{ code: "ECONNABORTED", message: "timeout of 120000ms exceeded" }, false],
+    [{ code: "ECONNABORTED", message: "timeout of 200000ms exceeded" }, false],
   ];
   const messages = cases.map(([error, stops]) => {
     const failure = describeTranscribeFailure(error);
@@ -612,6 +612,7 @@ const makeRig = ({
   speechError = null,
   allowed = () => true,
   onWake = null,
+  warm = null,
   micLabel = "Headset (Boat Rockerz 255)",
   micDeviceId = "mic-headset",
   micMuted = false,
@@ -736,6 +737,7 @@ const makeRig = ({
     timers: rig.timers,
     onChange: (view) => rig.views.push(view),
     detectorOptions: { adaptive: false },
+    warm,
   });
   rig.frame = (frame) => {
     const context = rig.contexts.at(-1);
@@ -1807,4 +1809,22 @@ test("App: the voice bar shows which microphone FROST hears and lets the owner c
   assert.match(code, /Hearing: &quot;\{liveVoice\.microphone\}&quot;/);
   assert.match(code, /\{liveVoice\?\.microphoneRaw && " \(without Windows voice processing\)"\}/);
   assert.match(code, /onChange=\{\(event\) => voice\.onChooseMicrophone\(event\.target\.value\)\} value=\{voice\.microphoneId \|\| ""\}/);
+});
+
+test("controller: opening the microphone starts the speech model loading, and a failing warm-up changes nothing", async () => {
+  const calls = [];
+  const rig = makeRig({ warm: () => { calls.push(rig.log.length); return Promise.reject(new Error("gateway down")); } });
+  await rig.controller.start();
+  await settle();
+  assert.equal(calls.length, 1, "asked once per start");
+  assert.ok(rig.log.indexOf("getUserMedia") >= 0 && calls[0] > rig.log.indexOf("getUserMedia"), "after the microphone opened");
+  assert.equal(rig.controller.view.on, true);
+  assert.equal(rig.controller.view.phase, "listening");
+  const throwing = makeRig({ warm: () => { throw new Error("sync failure"); } });
+  await throwing.controller.start();
+  assert.equal(throwing.controller.view.on, true);
+});
+
+test("App: the warm-up goes to the local gateway only, as a bodiless POST", () => {
+  assert.match(appSource, /warm: \(\) => axios\.post\(`\$\{LOCAL_API_URL\}\/api\/local\/speech\/warm`, null, \{ timeout: 10000 \}\),/);
 });

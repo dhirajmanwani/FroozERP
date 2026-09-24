@@ -795,7 +795,7 @@ export const LIVE_VOICE_TOO_LOUD_MESSAGE = "It is too loud here for FROST to hea
 // The gateway loads the speech model into its server on the first transcription after it starts
 // (up to ~30 s, then the request itself), so the first one can take up to a minute. Said, so the
 // bar does not look stuck on "Working out what you said".
-export const LIVE_VOICE_ENGINE_STARTING_MESSAGE = "Starting the speech engine (the first time can take up to a minute)...";
+export const LIVE_VOICE_ENGINE_STARTING_MESSAGE = "Loading the speech engine. The first time after opening FroozERP can take up to two minutes on a slower laptop...";
 export const LIVE_VOICE_TRANSCRIBE_SLOW_MESSAGE = "Still working out what you said. The speech engine is taking longer than usual.";
 /** A transcription still running after this long says so, whether or not it is the first. */
 export const LIVE_VOICE_TRANSCRIBE_SLOW_MS = 6000;
@@ -1013,6 +1013,7 @@ export const createLiveVoiceController = ({
   postSpeechGuardMs = 300,
   noFramesMs = LIVE_VOICE_NO_FRAMES_MS,
   silentMs = LIVE_VOICE_SILENT_MS,
+  warm = null,
   heardMs = LIVE_VOICE_HEARD_MS,
   slowTranscribeMs = LIVE_VOICE_TRANSCRIBE_SLOW_MS,
   tickMs = 500,
@@ -1583,6 +1584,12 @@ export const createLiveVoiceController = ({
     // the switch would stay on, listening to nothing. (A track we stop ourselves does not fire it.)
     labelMicrophone(current);
     watchTracks(current, current.stream);
+    // The speech model starts loading now, while the owner is still deciding what to ask, rather
+    // than at the first question. Fire and forget: a failure here is met again, and said, by the
+    // transcription itself.
+    if (typeof warm === "function") {
+      try { Promise.resolve(warm()).catch(() => null); } catch { /* the first transcription reports it */ }
+    }
     try {
       current.sampleRate = Number(context.sampleRate);
       current.detector = createUtteranceDetector({ ...detectorOptions, sampleRate: current.sampleRate });

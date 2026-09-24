@@ -46,6 +46,7 @@ const {
   describeEngineExit,
   engineFileNames,
   engineFileNamesWithServer,
+  SERVER_START_TIMEOUT_MS,
   extractZipEntries,
   resolveSpeechDir,
   validateWav,
@@ -684,6 +685,7 @@ if (mode === "exit-at-start") {
   process.stderr.write("whisper_init_from_file: loading model\\nerror: failed to initialize whisper context\\n");
   process.exit(3);
 }
+if (mode === "never-ready") process.stderr.write("whisper_model_load: loading model from ggml-small.bin\\n");
 const prefix = arg("--request-path");
 let healthPolls = 0;
 const parse = (body, type) => {
@@ -883,7 +885,7 @@ test("the inference body carries the WAV byte for byte, whatever bytes it holds"
 });
 
 test("readiness waits for /health to say ok, and a server that never does is abandoned for whisper-cli", async () => {
-  const { speech, modes, serverSpawns, cliSpawns, reportDir } = setUpServerEngine({ serverStartTimeoutMs: 800 });
+  const { speech, modes, serverSpawns, cliSpawns, reportDir, logs } = setUpServerEngine({ serverStartTimeoutMs: 800 });
   modes.server = "never-ready";
   const started = Date.now();
   const result = await speech.transcribe(makeWav({ seconds: 1 }));
@@ -897,6 +899,37 @@ test("readiness waits for /health to say ok, and a server that never does is aba
   const pid = readServerLog(reportDir)[0].pid;
   await waitFor(() => processGone(pid), "the never-ready server to be killed");
   assert.equal(speech.status().engine, "cli", "status says the slow engine is in use");
+  // How far it got is in the log: a slow model load reads differently from a broken engine.
+  assert.ok(logs.some((line) => /did not become ready within 800 ms \(last output: whisper_model_load: loading model from ggml-small\.bin\)/.test(line)), logs.join("\n"));
+});
+
+test("the server gets two minutes to load the model: 30 s was too short on the owner's laptop", () => {
+  assert.ok(SERVER_START_TIMEOUT_MS >= 120000);
+});
+
+test("warm(): switching voice on starts loading the server in the background, and the first question joins it", async () => {
+  const { speech, serverSpawns, cliSpawns } = setUpServerEngine();
+  const first = speech.warm();
+  assert.equal(first.status, 202);
+  assert.deepEqual(first.body, { state: "warming", engine: "server" });
+  await waitFor(() => serverSpawns().length === 1, "warm() to start the server before any question");
+  assert.equal(speech.warm().status, 202, "a second call while loading starts nothing new");
+  const answer = await speech.transcribe(makeWav({ seconds: 1 }));
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.equal(answer.body.engine, "server");
+  assert.equal(serverSpawns().length, 1, "the question used the server warm() started");
+  assert.equal(cliSpawns().length, 0);
+  assert.deepEqual(speech.warm(), { status: 200, body: { state: "ready", engine: "server" } });
+  assert.equal(serverSpawns().length, 1);
+});
+
+test("warm(): nothing installed is said as such, and an install without the server says whisper-cli", () => {
+  const bare = createLocalSpeech({ speechDir: path.join(tempDir("warm-bare"), "speech"), readPolicy: () => ({ allowInternetAccess: false }), log: () => {} });
+  assert.equal(bare.warm().status, 409);
+  assert.equal(bare.warm().body.code, "SPEECH_NOT_INSTALLED");
+  const { speech, serverSpawns } = setUpServerEngine({}, { withServer: false });
+  assert.deepEqual(speech.warm(), { status: 200, body: { state: "unavailable", engine: "cli" } });
+  assert.equal(serverSpawns().length, 0);
 });
 
 test("a crashed server is restarted by the next transcription", async () => {
@@ -1171,12 +1204,13 @@ test("a whisper-server orphaned by a killed gateway is stopped, but only when it
 const { createSpeechRequestHandler } = require("./desktopGateway");
 
 const stubSpeech = () => {
-  const calls = { status: 0, install: [], transcribe: [] };
+  const calls = { status: 0, install: [], transcribe: [], warm: 0 };
   return {
     calls,
     status: () => { calls.status += 1; return { state: "ready", model: "small", progress: { phase: null, received_bytes: 0, total_bytes: 0 }, error: null, internet_allowed: false }; },
     install: (input) => { calls.install.push(input); return { status: 202, body: { state: "installing" } }; },
     transcribe: async (buffer) => { calls.transcribe.push(buffer); return { status: 200, body: { text: "ok", elapsed_ms: 1 } }; },
+    warm: () => { calls.warm += 1; return { status: 202, body: { state: "warming", engine: "server" } }; },
   };
 };
 
@@ -1196,13 +1230,18 @@ test("gateway: a website's origin is refused on every speech route", async () =>
   const speech = stubSpeech();
   await withHandlerServer(speech, async (base) => {
     for (const origin of ["https://attacker.example", "null", "http://192.168.1.20:5173"]) {
-      for (const [route, method, body] of [["status", "GET"], ["install", "POST", "{}"], ["transcribe", "POST", makeWav()]]) {
+      for (const [route, method, body] of [["status", "GET"], ["install", "POST", "{}"], ["transcribe", "POST", makeWav()], ["warm", "POST"]]) {
         const response = await fetch(`${base}/api/local/speech/${route}`, { method, headers: { origin }, body });
         assert.equal(response.status, 403, `${origin} ${route}`);
         assert.equal((await response.json()).code, "SPEECH_ORIGIN_REFUSED");
       }
     }
-    assert.deepEqual(speech.calls, { status: 0, install: [], transcribe: [] });
+    assert.deepEqual(speech.calls, { status: 0, install: [], transcribe: [], warm: 0 });
+    const warmed = await fetch(`${base}/api/local/speech/warm`, { method: "POST", headers: { origin: "http://tauri.localhost" } });
+    assert.equal(warmed.status, 202);
+    assert.deepEqual(await warmed.json(), { state: "warming", engine: "server" });
+    assert.equal(speech.calls.warm, 1);
+    assert.equal((await fetch(`${base}/api/local/speech/warm`, { headers: { origin: "http://tauri.localhost" } })).status, 405);
     for (const origin of ["http://tauri.localhost", "tauri://localhost", "http://localhost:5173"]) {
       const response = await fetch(`${base}/api/local/speech/status`, { headers: { origin } });
       assert.equal(response.status, 200, origin);

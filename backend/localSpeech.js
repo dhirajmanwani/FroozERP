@@ -92,7 +92,11 @@ const MAX_REDIRECTS = 5;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const DOWNLOAD_IDLE_TIMEOUT_MS = 60000;
 
-const SERVER_START_TIMEOUT_MS = 30000;
+// Loading the 466 MiB `small` model took longer than 30 s on the owner's Dell on 24 Sep 2026
+// ("whisper-server did not become ready within 30000 ms"), and whisper-cli then loaded it all
+// again. Two minutes covers a slow disk and a first-read virus scan; the app starts the server as
+// soon as voice is switched on (warm()), so the wait is mostly spent before anybody asks anything.
+const SERVER_START_TIMEOUT_MS = 120000;
 const SERVER_POLL_INTERVAL_MS = 150;
 const SERVER_RETRY_AFTER_MS = 5 * 60 * 1000;
 const SERVER_STOP_GRACE_MS = 5000;
@@ -973,7 +977,10 @@ const createLocalSpeech = ({
         if (exit) break;
         if (Date.now() >= deadline) {
           if (server.child === child) killServerNow();
-          return { ok: false, reason: `whisper-server did not become ready within ${serverStartTimeoutMs} ms` };
+          // Its last words say how far it got (e.g. still loading the model), which is the
+          // difference between a slow laptop and a broken engine.
+          const lastWords = lastLine(stderr);
+          return { ok: false, reason: `whisper-server did not become ready within ${serverStartTimeoutMs} ms${lastWords ? ` (last output: ${lastWords.slice(0, 200)})` : ""}` };
         }
         try {
           const response = await loopbackRequest({ port, path: `${requestPath}/health`, timeoutMs: Math.max(250, Math.min(1000, deadline - Date.now())) });
@@ -1168,6 +1175,20 @@ const createLocalSpeech = ({
     }
   };
 
+  /**
+   * Start loading the speech server now, in the background, so the first question does not wait
+   * for the model. Called when live voice is switched on. Never waits for the load and never
+   * throws; a transcription that arrives meanwhile joins the same start.
+   */
+  const warm = () => {
+    const model = installedModel();
+    if (!model) return { status: 409, body: { code: SPEECH_CODES.NOT_INSTALLED, message: "Voice is not set up on this laptop yet." } };
+    if (!serverInstalled()) return { status: 200, body: { state: "unavailable", engine: "cli" } };
+    if (server.child && server.ready && server.key === serverKeyFor(model)) return { status: 200, body: { state: "ready", engine: "server" } };
+    if (!state.busy) ensureServer(model).catch(() => {});
+    return { status: 202, body: { state: "warming", engine: "server" } };
+  };
+
   /** Stop the server and refuse to start another. Resolves once it has exited. */
   const dispose = () => {
     disposed = true;
@@ -1189,6 +1210,7 @@ const createLocalSpeech = ({
     status,
     install,
     transcribe,
+    warm,
     dispose,
     disposeSync,
     reapOrphanServers,
