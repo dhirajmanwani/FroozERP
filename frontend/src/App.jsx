@@ -5741,10 +5741,12 @@ function App() {
       transcribe: async (wavBytes) => {
         const response = await axios.post(`${LOCAL_API_URL}/api/local/speech/transcribe`, wavBytes, {
           headers: { "Content-Type": "audio/wav" },
-          // The first transcription after the gateway starts also loads the model into the speech
-          // server (up to ~30 s) before the request itself (up to 30 s). Under that, the first
-          // question after every start would time out and switch voice off.
-          timeout: 70000,
+          // The gateway's own worst case, all bounded in localSpeech.js: starting the speech server
+          // (up to 30 s), the request to it (up to 30 s), and, when the server dies under it, the
+          // same audio again through whisper-cli (up to 30 s). 70 s was under that sum, so on a slow
+          // laptop the app gave up first and said the voice service "did not answer" (24 Sep 2026)
+          // while the gateway was still working. This must stay above the gateway's total.
+          timeout: 120000,
         });
         return response.data;
       },

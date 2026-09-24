@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync, readdirSync, statSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -547,7 +548,7 @@ test("microphone failures each say what happened", () => {
   assert.equal(new Set([refused, missing, busy, other]).size, 4);
 });
 
-test("transcription failures are distinct, and only 'busy' keeps the microphone open", () => {
+test("transcription failures are distinct, and only 'busy' and a slow answer keep the microphone open", () => {
   const cases = [
     [{ response: { status: 409, data: { code: "SPEECH_NOT_INSTALLED" } } }, true],
     [{ response: { status: 400, data: { code: "SPEECH_AUDIO_INVALID" } } }, true],
@@ -555,6 +556,7 @@ test("transcription failures are distinct, and only 'busy' keeps the microphone 
     [{ response: { status: 429, data: { code: "SPEECH_BUSY" } } }, false],
     [{ message: "Network Error" }, true],
     [{ response: { status: 500, data: {} } }, true],
+    [{ code: "ECONNABORTED", message: "timeout of 120000ms exceeded" }, false],
   ];
   const messages = cases.map(([error, stops]) => {
     const failure = describeTranscribeFailure(error);
@@ -564,6 +566,19 @@ test("transcription failures are distinct, and only 'busy' keeps the microphone 
   });
   assert.equal(new Set(messages).size, messages.length, "no two failures read the same");
   assert.match(messages[5], /HTTP 500/);
+  assert.match(messages[4], /did not answer \(Network Error\)/, "what the browser said is on the screen");
+  assert.match(messages[6], /took too long/);
+});
+
+test("the app waits longer for a transcription than the gateway can possibly take", () => {
+  // 24 Sep 2026: the app gave up at 70 s while the gateway's worst case (server start, request,
+  // whisper-cli fallback) was 90 s, and the owner saw "did not answer" on the first question.
+  const require = createRequire(import.meta.url);
+  const speech = require("../../../backend/localSpeech.js");
+  const gatewayWorstMs = speech.SERVER_START_TIMEOUT_MS + 2 * speech.TRANSCRIBE_TIMEOUT_MS;
+  const match = appSource.match(/\/api\/local\/speech\/transcribe`, wavBytes, \{[\s\S]*?timeout: (\d+),/);
+  assert.ok(match, "the transcribe call sets its own timeout");
+  assert.ok(Number(match[1]) >= gatewayWorstMs + 15000, `${match[1]} ms must clear the gateway's ${gatewayWorstMs} ms with room to spare`);
 });
 
 test("the spoken answer goes through the same speech plan as the Speak button", () => {

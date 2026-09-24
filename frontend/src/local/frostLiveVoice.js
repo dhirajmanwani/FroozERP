@@ -930,7 +930,14 @@ export const describeTranscribeFailure = (error) => {
     return { stop: true, message: "The speech engine answered with something unreadable, so live voice is off." };
   }
   if (!error?.response) {
-    return { stop: true, message: "The voice service on this laptop did not answer, so live voice is off." };
+    // The app's own time limit ran out: the gateway was still working, not gone. Slow on this
+    // laptop is not a reason to switch voice off; the model is loaded by now and the next is faster.
+    const errorCode = String(error?.code || "");
+    if (errorCode === "ECONNABORTED" || errorCode === "ETIMEDOUT" || /timeout/i.test(String(error?.message || ""))) {
+      return { stop: false, message: "Turning that into text took too long on this laptop, so it was dropped. Ask again: the next one is usually faster." };
+    }
+    const detail = String(error?.message || error?.code || "").trim();
+    return { stop: true, message: `The voice service on this laptop did not answer${detail ? ` (${detail})` : ""}, so live voice is off.` };
   }
   return { stop: true, message: `Speech to text failed${Number.isFinite(status) ? ` (HTTP ${status})` : ""}, so live voice is off.` };
 };
