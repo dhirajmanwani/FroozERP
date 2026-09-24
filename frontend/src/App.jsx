@@ -151,6 +151,7 @@ import {
 } from "./local/activationIssuing";
 import { refreshAfterSaveMessage, settingsWriteErrorMessage } from "./local/settingsWriteError";
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
+import { fruitArtFor } from "./local/posFruitArt";
 import { POS_SECTIONS, posSectionCounts, posSectionFor, posSectionLabel, posTileBadge, readPosSection, writePosSection } from "./local/posSections";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
@@ -22933,6 +22934,9 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
               const rateLabel = minRate === maxRate
                 ? `${currency.format(minRate)}/${product.unit || "Unit"}`
                 : `${currency.format(minRate)} - ${currency.format(maxRate)}`;
+              // A drawing when the name says which fruit or item it is; otherwise its colour and letter.
+              // The markup is the app's own bundled drawings, never text from the product record.
+              const art = fruitArtFor(product.product_name);
               const badge = posTileBadge(product.product_name);
               return (
                 <button
@@ -22941,7 +22945,9 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
                   onClick={() => openLotSelector(product)}
                   title={`Select lot for ${product.product_name}`}
                 >
-                  <span aria-hidden="true" className="product-result-badge" style={{ background: badge.tint, color: badge.ink }}>{badge.letter}</span>
+                  {art
+                    ? <span aria-hidden="true" className="product-result-badge product-result-art" dangerouslySetInnerHTML={{ __html: art.svg }} />
+                    : <span aria-hidden="true" className="product-result-badge" style={{ background: badge.tint, color: badge.ink }}>{badge.letter}</span>}
                   <span className="product-result-main">
                     <strong>{product.product_name}</strong>
                     <span className="product-result-meta">

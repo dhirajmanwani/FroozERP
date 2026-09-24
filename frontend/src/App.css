@@ -7504,18 +7504,31 @@ tbody tr:last-child td {
 }
 
 .product-results .product-result {
-  grid-template-columns: 44px minmax(0, 1fr) auto;
+  grid-template-columns: 52px minmax(0, 1fr) auto;
 }
 
 .product-result-badge {
+  box-sizing: border-box;
   display: grid;
   place-items: center;
-  width: 44px;
-  height: 44px;
+  width: 52px;
+  height: 52px;
   border-radius: 10px;
-  font-size: 20px;
+  font-size: 22px;
   font-weight: 700;
   line-height: 1;
+}
+
+.product-result-art {
+  padding: 3px;
+  border: 1px solid var(--line-control);
+  background: var(--card);
+}
+
+.product-result-art svg {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
 .product-results .product-result-section {
