@@ -2221,6 +2221,13 @@ function App() {
   const [productCategories, setProductCategories] = useState([]);
   const [productDuplicateWarning, setProductDuplicateWarning] = useState("");
   const [inventory, setInventory] = useState([]);
+  // POS's own shelf, in the desktop app. `products` and `inventory` above are shared by every module
+  // and written by some twenty loaders -- cloud lists, dashboard reloads, the minute-by-minute sync,
+  // reference snapshots -- each with its own idea of a product id (1 from the cloud, "product-1"
+  // from this device's SQLite). POS drew from them, so whichever loader ran last decided what the
+  // cashier saw, and the shelf kept emptying itself a minute after it was filled. Only
+  // `refreshPosInventoryFromSQLite` and a completed sale write this, so nothing else can empty it.
+  const [posShelf, setPosShelf] = useState({ loaded: false, products: [], inventoryLots: [] });
   // Which shop this machine is standing in, as the local snapshot reports it.
   //
   // Selling binds to the machine, not to the login -- see docs/stock-distribution-decision.md. So
@@ -4404,6 +4411,7 @@ function App() {
     if (!counterMaySell(selected)) {
       setProducts(selected.products);
       setInventory([]);
+      setPosShelf({ loaded: true, products: selected.products, inventoryLots: [] });
       setSyncMessage(selected.scopeMessage || "This counter has not been told which shop it is in.");
       writeDiagnosticLog("ERROR", "pos-local-inventory-scope-unusable", {
         reason,
@@ -4419,6 +4427,7 @@ function App() {
     }
     setProducts(selected.products);
     setInventory(selected.inventoryLots);
+    setPosShelf({ loaded: true, products: selected.products, inventoryLots: selected.inventoryLots });
     writeDiagnosticLog("INFO", "pos-local-inventory-loaded", {
       reason,
       products: selected.products.length,
@@ -4432,6 +4441,11 @@ function App() {
     });
     return selected;
   };
+
+  // A different person or machine is a different shelf: never show one sign-in's stock to the next.
+  useEffect(() => {
+    setPosShelf({ loaded: false, products: [], inventoryLots: [] });
+  }, [user?.id, deviceInfo.device_id]);
 
   useEffect(() => {
     if (!user?.id || activeView !== "sales" || !isTauriRuntime()) return;
@@ -9866,7 +9880,7 @@ function App() {
               deviceInfo={deviceInfo}
               discountRules={discountRules}
               lotDiscounts={lotDiscounts}
-              inventory={inventory}
+              inventory={posShelf.loaded ? posShelf.inventoryLots : inventory}
               counterScope={counterScope}
               onInvoice={setSelectedInvoice}
               onSaved={async (result) => {
@@ -9896,12 +9910,14 @@ function App() {
                 }
                 if (result?.localSale) {
                   setSalesHistory((rows) => [result.localSale, ...rows]);
-                  setInventory((rows) => rows.map((lot) => {
+                  const takeSold = (rows) => rows.map((lot) => {
                     const movement = result.localSale.items.find((item) => String(item.inventory_batch_id) === String(lot.id));
                     return movement
                       ? { ...lot, remaining_qty: Math.max(Number(lot.remaining_qty || 0) - Number(movement.quantity || 0), 0) }
                       : lot;
-                  }));
+                  });
+                  setInventory(takeSold);
+                  setPosShelf((shelf) => ({ ...shelf, inventoryLots: takeSold(shelf.inventoryLots) }));
                   await refreshSyncStatus();
                   return;
                 }
@@ -9910,7 +9926,7 @@ function App() {
               paymentSettings={settingsData.paymentSettings}
               posSettings={settingsData.posSettings}
               printSettings={settingsData.businessSettings}
-              products={products.filter((product) => product.active !== false)}
+              products={(posShelf.loaded ? posShelf.products : products).filter((product) => product.active !== false)}
               refreshToken={posRefreshToken}
               saleRateSettings={settingsData.saleRateSettings}
               syncInBackground={runSyncNow}

@@ -62,3 +62,17 @@ test("an empty POS says which of the four emptinesses it is", async () => {
   );
   assert.equal(emptyShelfReason({ products: [{ id: 4 }], inventoryLots: [{ product_id: "4", remaining_qty: 5 }], now }), "");
 });
+
+test("POS draws from its own shelf, which only the SQLite refresh, a sale and a sign-in change write", () => {
+  // 24 Sep 2026: POS filled, then emptied itself a minute later, again and again. It read the
+  // `products` and `inventory` every module shares, and some twenty loaders overwrite those (cloud
+  // lists with id 1, this device's SQLite with "product-1"). Whichever ran last decided the shelf.
+  const app = fs.readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(app, /inventory=\{posShelf\.loaded \? posShelf\.inventoryLots : inventory\}/);
+  assert.match(app, /products=\{\(posShelf\.loaded \? posShelf\.products : products\)\.filter/);
+  const writers = app.match(/setPosShelf\(/g) || [];
+  assert.equal(writers.length, 4, "a new writer of the POS shelf is how it starts emptying itself again");
+  const refresh = app.slice(app.indexOf("const refreshPosInventoryFromSQLite"), app.indexOf("const fetchOnlineReferenceSnapshot"));
+  assert.equal((refresh.match(/setPosShelf\(\{ loaded: true/g) || []).length, 2);
+  assert.match(app, /setPosShelf\(\(shelf\) => \(\{ \.\.\.shelf, inventoryLots: takeSold\(shelf\.inventoryLots\) \}\)\)/);
+});
