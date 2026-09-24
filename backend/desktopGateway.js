@@ -726,9 +726,28 @@ const localRoute = async (req, res, url, body) => {
   return false;
 };
 
+// Every request header the app's screen may send through this gateway. The screen is a different
+// origin from the gateway, so the browser asks first (the preflight) and refuses to send a request
+// carrying any header missing here -- the screen then sees only "Network Error", and nothing
+// reaches the gateway's or the cloud's log. `x-idempotency-key` was missing, so every product add
+// and edit made through the desktop app failed that way. `desktopGatewayCors.test.js` scans the
+// frontend for the headers it sets and fails on any not listed.
+const CORS_ALLOWED_REQUEST_HEADERS = Object.freeze([
+  "cache-control",
+  "content-type",
+  "authorization",
+  "x-froozerp-device-session",
+  "x-user-id",
+  "x-user-role",
+  "x-session-id",
+  "x-device-id",
+  "x-froozerp-frontend-version",
+  "x-idempotency-key",
+]);
+
 const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
-    res.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-private-network": "true", "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS", "access-control-allow-headers": "cache-control,content-type,authorization,x-froozerp-device-session,x-user-id,x-user-role,x-session-id,x-device-id,x-froozerp-frontend-version" });
+    res.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-private-network": "true", "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS", "access-control-allow-headers": CORS_ALLOWED_REQUEST_HEADERS.join(",") });
     return res.end();
   }
   try {
@@ -766,6 +785,7 @@ const server = http.createServer(async (req, res) => {
 module.exports = {
   CLOUD_REQUEST_AUDIT_PATH,
   CONTROL_ORIGINS,
+  CORS_ALLOWED_REQUEST_HEADERS,
   KILL_SWITCH_REFUSALS,
   POLICY_PATH,
   POLICY_SOURCES,

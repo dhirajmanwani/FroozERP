@@ -13937,6 +13937,7 @@ app.post("/settings/branches", async (req, res) => {
   try {
     const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage branches" });
+    if (!cleanText(req.body.branch_name)) return res.status(400).json({ message: "Enter the branch name." });
     const result = await pool.query(
       `
       INSERT INTO branches (branch_name, address, phone_number, gst_number, active)
@@ -13956,6 +13957,7 @@ app.post("/settings/counters", async (req, res) => {
   try {
     const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage counters" });
+    if (!cleanText(req.body.counter_name)) return res.status(400).json({ message: "Enter the counter name." });
     const result = await pool.query(
       `
       INSERT INTO counters (branch_id, counter_name, counter_type, active)
