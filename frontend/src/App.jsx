@@ -112,7 +112,7 @@ import {
   validateDistributionDraft,
   validateStockRequest,
 } from "./local/stockDistribution";
-import { filterSellableProducts, isSellableLot, lotAvailableQuantity, resolveSellableProducts, selectLocalPosInventory } from "./local/posInventory";
+import { emptyShelfReason, filterSellableProducts, isSellableLot, lotAvailableQuantity, resolveSellableProducts, selectLocalPosInventory } from "./local/posInventory";
 import {
   activeStockFilterLabels,
   canonicalInventoryId,
@@ -1083,6 +1083,18 @@ const offlineBackendRequiredViews = new Set(["purchase", "pending-bills", "accou
 
 const getErrorMessage = (error, fallback) =>
   error.response?.data?.message || fallback;
+
+/**
+ * Why a product save failed, never a bare "Error Adding Product": the server's own words when it
+ * answered, otherwise what went wrong on this side (no answer, a timeout, a local database error).
+ */
+const productSaveErrorMessage = (error, fallback) => {
+  const serverMessage = error?.response?.data?.message;
+  if (serverMessage) return serverMessage;
+  if (error?.response?.status) return `${fallback} The server answered ${error.response.status}.`;
+  const localMessage = String(error?.message || error || "").trim();
+  return localMessage ? `${fallback} ${localMessage}` : fallback;
+};
 
 /**
  * Why a settings change could not be saved, in words somebody can act on.
@@ -7154,9 +7166,18 @@ function App() {
       // and the owner is told the photo is not, rather than the whole save looking like a success.
       const photoProblem = productPhotoDraft.changed ? await saveProductPhoto(savedProductId, productPhotoDraft.dataUrl) : "";
       resetProductForm();
-      await Promise.all([loadProducts(), loadProductCategories(), loadDashboardData()]);
+      // The product is saved at this point. Reloading the lists afterwards is a separate matter: a
+      // failed reload used to land in the catch below and report "Error Adding Product" for a
+      // product that had in fact been saved, so the owner would try again and make a duplicate.
+      const reloads = await Promise.allSettled([loadProducts(), loadProductCategories(), loadDashboardData()]);
+      const reloadFailure = reloads.find((result) => result.status === "rejected");
       const savedMessage = wasEditing ? "Product Updated" : "Product Added";
-      alert(photoProblem ? `${savedMessage}, but the photo was not saved: ${photoProblem}` : savedMessage);
+      const notes = [
+        photoProblem ? `the photo was not saved: ${photoProblem}` : "",
+        reloadFailure ? `the list could not be refreshed (${productSaveErrorMessage(reloadFailure.reason, "no answer")}); open Product Master again to see it` : "",
+      ].filter(Boolean);
+      if (reloadFailure) console.error("Product list refresh after save failed", reloadFailure.reason);
+      alert(notes.length ? `${savedMessage}, but ${notes.join("; and ")}.` : savedMessage);
     } catch (error) {
       console.error("Product save failed", {
         status: error.response?.status,
@@ -7164,7 +7185,7 @@ function App() {
         message: error.message,
         error,
       });
-      alert(getErrorMessage(error, "Error Adding Product"));
+      alert(productSaveErrorMessage(error, editingProductId ? "The product could not be updated." : "The product could not be added."));
     }
   };
 
@@ -22262,6 +22283,13 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   // wants the mango, not an empty screen. With no search the chosen shelf is shown whole.
   const posSearching = Boolean(search.trim());
   const posShelfCounts = useMemo(() => posSectionCounts(posMatches.map((option) => option.product)), [posMatches]);
+  // With nothing sellable anywhere, say which kind of nothing it is, with the counts behind it.
+  const posEmptyReason = useMemo(
+    () => (shelf.usable && shelf.products.length === 0
+      ? emptyShelfReason({ products, inventoryLots: inventory, scope: counterScope })
+      : ""),
+    [counterScope, inventory, products, shelf],
+  );
   const searchResults = useMemo(
     () => (posSearching ? posMatches.slice(0, 24) : posMatches.filter((option) => option.section.key === posSection)),
     [posMatches, posSearching, posSection],
@@ -23142,9 +23170,11 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
             {searchResults.length === 0 && !posSearching && shelf.usable && (
               // An empty shelf is not an empty shop: say how a product gets onto it.
               <div className="cart-empty">
-                {posSection === "retail"
-                  ? "Nothing in Frooz Retail has stock right now."
-                  : `Nothing in ${posSectionLabel(posSection)} has stock right now. A product appears here when its category is named "${posSectionLabel(posSection)}" in Product Master and it has a lot in stock.`}
+                {posEmptyReason
+                  ? posEmptyReason
+                  : posSection === "retail"
+                    ? "Nothing in Frooz Retail has stock right now."
+                    : `Nothing in ${posSectionLabel(posSection)} has stock right now. A product appears here when its category is named "${posSectionLabel(posSection)}" in Product Master and it has a lot in stock.`}
               </div>
             )}
             {searchResults.length === 0 && (posSearching || !shelf.usable) && (

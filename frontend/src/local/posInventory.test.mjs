@@ -48,3 +48,17 @@ test("POS excludes cancelled, reserved, exhausted and prohibited expired quantit
   assert.equal(isSellableLot({ balance_qty: 5, expiry_date: "2026-07-20T00:00:00.000Z" }, now), false);
   assert.equal(isSellableLot({ balance_qty: 5, expiry_date: "2026-07-20T00:00:00.000Z", allow_expired_sale: true }, now), true);
 });
+
+test("an empty POS says which of the four emptinesses it is", async () => {
+  const { emptyShelfReason } = await import("./posInventory.js");
+  const now = new Date("2026-09-24T10:00:00Z");
+  assert.match(emptyShelfReason({ products: [], inventoryLots: [], now }), /No products have reached this computer/);
+  assert.match(emptyShelfReason({ products: [{ id: 1 }], inventoryLots: [], now }), /knows 1 products but has no stock lots/);
+  assert.match(emptyShelfReason({ products: [{ id: 1 }], inventoryLots: [{ product_id: 1, remaining_qty: 0 }], now }), /All 1 stock lots .* sold out/);
+  assert.match(
+    emptyShelfReason({ products: [{ id: "004" }], inventoryLots: [{ product_id: 4, remaining_qty: 5 }], now }),
+    /1 lots with stock, but none of them belongs to the 1 products/,
+    "\"004\" and 4 are different products",
+  );
+  assert.equal(emptyShelfReason({ products: [{ id: 4 }], inventoryLots: [{ product_id: "4", remaining_qty: 5 }], now }), "");
+});
