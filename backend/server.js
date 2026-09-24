@@ -15249,16 +15249,41 @@ const updateProductHandler = async (req, res) => {
       parsePositiveInteger(category_id),
       context?.company_id || null
     );
+    const requestedCategoryName = cleanText(category) || cleanText(current.category) || "Fruit";
     if (!selectedCategory) {
-      selectedCategory = await findCategoryByName(
-        client,
-        category || current.category || "Fruit",
-        context?.company_id || null
-      );
+      selectedCategory = await findCategoryByName(client, requestedCategoryName, context?.company_id || null);
     }
-    if (!selectedCategory || selectedCategory.active === false) {
+    if (!selectedCategory) {
+      // A category typed in while editing (moving a product to "Frooz Bar", say) is created here,
+      // exactly as adding a product does, instead of refusing the edit.
+      try {
+        const categoryResult = await client.query(
+          `INSERT INTO product_categories (
+             global_id, category_name, active, created_by, updated_by, company_id
+           ) VALUES ($1, $2, TRUE, $3, $3, $4) RETURNING *`,
+          [`category-${crypto.randomUUID()}`, requestedCategoryName, req.auth.userId, context?.company_id || null]
+        );
+        selectedCategory = categoryResult.rows[0];
+      } catch (categoryError) {
+        if (categoryError.code !== "23505") throw categoryError;
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          code: "PRODUCT_CATEGORY_UNAVAILABLE",
+          message: `A category named "${requestedCategoryName}" already exists but is not available to this shop. Pick it from the list or use another name.`,
+        });
+      }
+      await logSyncChange(client, {
+        branchId: context?.branch_id || 1,
+        entityType: "product_category",
+        entityId: selectedCategory.global_id,
+        operationType: "UPSERT",
+        version: selectedCategory.entity_version || 1,
+        payload: selectedCategory,
+      });
+    }
+    if (selectedCategory.active === false) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ message: "Selected category is inactive or missing." });
+      return res.status(400).json({ message: "Selected category is inactive." });
     }
     const duplicateResult = await client.query(
       `SELECT id FROM products
@@ -15328,12 +15353,21 @@ const updateProductHandler = async (req, res) => {
     await client.query("COMMIT");
     return res.json(result.rows[0]);
   } catch (error) {
-    await client.query("ROLLBACK");
-    console.error(error);
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("Product update failed", { product_id: req.params.id, code: error?.code, message: error?.message, stack: error?.stack });
     if (error.code === "23505") {
       return res.status(409).json({ message: "This product already exists." });
     }
-    return res.status(500).json({ message: "Error Updating Product" });
+    // A refusal raised on purpose (a missing idempotency key, for one) carries its own status and
+    // words; anything else still says what the database objected to, so a failed edit can be
+    // diagnosed from the alert alone instead of reading "Error Updating Product" and guessing.
+    if (Number.isInteger(error?.status) && error.status >= 400 && error.status < 500) {
+      return res.status(error.status).json({ code: error.code, message: error.message });
+    }
+    return res.status(500).json({
+      code: "PRODUCT_UPDATE_FAILED",
+      message: `The product could not be updated${error?.code ? ` (database code ${error.code})` : ""}: ${String(error?.message || "unknown error").slice(0, 200)}`,
+    });
   } finally {
     client.release();
   }

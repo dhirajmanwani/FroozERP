@@ -73,3 +73,23 @@ export function formatIndianReportDate(value) {
   const [year, month, day] = key.split("-");
   return `${day}/${month}/${year}`;
 }
+
+/**
+ * Which report range a load should use.
+ *
+ * Report Center is reloaded from many places that have no opinion about dates: the refresh after
+ * every background sync (once a minute), a POS save, cancelling a sale, a lot action, opening the
+ * module again. Each of those used to call the loader with nothing, which means "today", and so a
+ * year the owner had just asked for was quietly replaced by today's figures a minute later -- a
+ * profit-and-loss of 0.00 under a range chip that still said the year.
+ *
+ * A request that names a range is the owner choosing one and is used as it is. A request that names
+ * none keeps the range last chosen (its other keys, such as a cash-book filter, still apply). Only
+ * when nothing has been chosen yet does the default "today" apply.
+ */
+export function reportLoadParams(requested, remembered) {
+  const asked = requested && typeof requested === "object" ? requested : {};
+  if (asked.range) return asked;
+  if (remembered?.range) return { ...remembered, ...asked };
+  return asked;
+}

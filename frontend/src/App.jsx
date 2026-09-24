@@ -155,7 +155,7 @@ import { checkProductPhoto, imageFromTransfer, indexProductPhotos, photoForProdu
 import { POS_SECTIONS, posSectionCounts, posSectionFor, posSectionLabel, posTileBadge, readPosSection, writePosSection } from "./local/posSections";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
-import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, resolveReportDateRange } from "./local/reportRefresh";
+import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, reportLoadParams, resolveReportDateRange } from "./local/reportRefresh";
 import { approvedDeviceCredentialMessage, normalizeDeviceBootstrapStatus } from "./local/freshDeviceOnboarding";
 import { NAME_TITLES, getUserDisplayName, getUserGreetingName, getUserInitial, getUserRoleLabel, joinPersonName, splitPersonName } from "./local/userPresentation";
 import { FROST_GREETING_PROMPT, resolveFrostGreeting } from "./local/frostGreeting";
@@ -2266,6 +2266,10 @@ function App() {
   const purchaseSaveInFlightRef = useRef(false);
   const purchaseSubmissionRef = useRef(createPurchaseSubmissionTracker());
   const reportRequestGateRef = useRef(createLatestRequestGate());
+  // The range Report Center last asked for. Reloads that name no range (the refresh after every
+  // background sync among them) keep it instead of falling back to today; see reportLoadParams.
+  const reportParamsRef = useRef(null);
+  const [reportAppliedParams, setReportAppliedParams] = useState(null);
   const [accounts, setAccounts] = useState([]);
   const [accountLedger, setAccountLedger] = useState({ account: null, ledger: [] });
   const [accountPayments, setAccountPayments] = useState([]);
@@ -3334,6 +3338,11 @@ function App() {
     internetAvailableRef.current = internetAvailable;
   }, [internetAvailable]);
 
+  const activeViewRef = useRef(activeView);
+  useEffect(() => {
+    activeViewRef.current = activeView;
+  }, [activeView]);
+
   const refreshBusinessDataAfterSync = async () => {
     const refreshes = [
       loadProducts,
@@ -3358,6 +3367,16 @@ function App() {
         const snapshot = await fetchOnlineReferenceSnapshot(userRef.current, latestDevice);
         const localStatus = await cacheLocalReferenceSnapshot(snapshot);
         setLocalDbStatus(localStatus);
+      } catch (error) {
+        failures.push({ status: "rejected", reason: error });
+      }
+    }
+    // The loaders above replace the product list with the cloud's, which is not the counter's own
+    // shelf. Opening POS rebuilds it from this device's SQLite; after a sync it must be rebuilt the
+    // same way, or POS drops to nothing every minute until the cashier leaves and comes back.
+    if (activeViewRef.current === "sales") {
+      try {
+        await refreshPosInventoryFromSQLite("post-sync");
       } catch (error) {
         failures.push({ status: "rejected", reason: error });
       }
@@ -6134,7 +6153,21 @@ function App() {
 
   const loadReports = async (params = {}) => {
     const requestGeneration = reportRequestGateRef.current.begin();
-    const normalizedParams = { ...params, ...resolveReportDateRange(params) };
+    const requestedParams = reportLoadParams(params, reportParamsRef.current);
+    const normalizedParams = { ...requestedParams, ...resolveReportDateRange(requestedParams) };
+    const previousReportParams = reportParamsRef.current;
+    if (params?.range) {
+      reportParamsRef.current = params;
+      setReportAppliedParams(params);
+    }
+    // A range the owner asked for that could not be loaded is not remembered: the screen rolls back
+    // to the previous range, and background reloads must follow the screen, not the failed request.
+    const forgetFailedRange = () => {
+      if (params?.range && reportParamsRef.current === params) {
+        reportParamsRef.current = previousReportParams;
+        setReportAppliedParams(previousReportParams);
+      }
+    };
     setReportsData((current) => ({ ...current, inventoryLoadState: "loading", inventoryLoadError: "" }));
     const tauriRuntime = isTauriRuntime();
     const inventoryHydrationPolicy = resolveInventoryHydrationPolicy({ tauriRuntime });
@@ -6181,6 +6214,7 @@ function App() {
         if (reportRequestGateRef.current.isCurrent(requestGeneration)) {
           setReportsData((current) => ({ ...current, inventoryLoadState: "error", inventoryLoadError: message }));
         }
+        forgetFailedRange();
         return { params: normalizedParams, source: "LOCAL_SQLITE", failures: [{ key: "inventory", message }] };
       }
     }
@@ -6209,17 +6243,22 @@ function App() {
       }
     }
     const effectiveFailures = inventoryFailure && !failures.includes(inventoryFailure) ? [...failures, inventoryFailure] : failures;
-    if (effectiveFailures.length) setSyncMessage(`${effectiveFailures.length} report request(s) failed. Showing the last preserved local values.`);
+    if (effectiveFailures.length) {
+      setSyncMessage(`${effectiveFailures.length} report request(s) failed. Showing the last preserved local values.`);
+      forgetFailedRange();
+    }
+    const summaryFailed = failures.some((failure) => failure.key === "summary");
     setReportsData((current) => ({
       ...current,
-      ...(failures.some((failure) => failure.key === "summary") ? {} : (values.summary || {})),
+      ...(summaryFailed ? {} : (values.summary || {})),
       stockReport: inventoryFailure ? current.stockReport : nextStockReport,
       stockLotReport: inventoryFailure ? current.stockLotReport : nextStockLots,
       inventoryLoadState: inventoryFailure ? "error" : "ready",
       inventoryLoadError: inventoryFailure ? sanitizedInventoryLoadError(inventoryFailure) : "",
       cashBookReport: failures.some((failure) => failure.key === "cashBook") ? current.cashBookReport : values.cashBook,
-      dateFrom: normalizedParams.date_from,
-      dateTo: normalizedParams.date_to,
+      // The period printed on P&L describes the figures shown. When the summary failed the figures
+      // shown are the previous ones, so the previous period stays with them.
+      ...(summaryFailed ? {} : { dateFrom: normalizedParams.date_from, dateTo: normalizedParams.date_to }),
     }));
     return { params: normalizedParams, source: "HYBRID_LOCAL", failures: effectiveFailures };
   };
@@ -9966,6 +10005,7 @@ function App() {
               onOpenLotAction={openLotAction}
               onOpenSupplierLedger={openSupplierLedgerFromReport}
               onReload={loadReports}
+              appliedParams={reportAppliedParams}
               suppliers={suppliers}
               user={user}
             />
@@ -13913,8 +13953,13 @@ function DiscountManagementModule({ discounts = [], inventory = [], onReload, pr
   );
 }
 
-function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageStock, canWhatsappSend = false, connectivityMode = CONNECTIVITY_MODES.LOCAL_ONLY, customers = [], data = {}, focusSection = null, onFocusSectionHandled, orders: ordersState = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, suppliers = [], user }) {
-  const [range, setRange] = useState("today");
+function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageStock, canWhatsappSend = false, connectivityMode = CONNECTIVITY_MODES.LOCAL_ONLY, customers = [], data = {}, focusSection = null, onFocusSectionHandled, orders: ordersState = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, appliedParams = null, suppliers = [], user }) {
+  // Reopening Report Center shows the range it was last loaded with, not "Today" over a year's data.
+  const openingRange = appliedParams?.range || "today";
+  const openingCustomRange = openingRange === "custom" && appliedParams?.date_from && appliedParams?.date_to
+    ? { date_from: appliedParams.date_from, date_to: appliedParams.date_to }
+    : { date_from: toDateKey(new Date()), date_to: toDateKey(new Date()) };
+  const [range, setRange] = useState(openingRange);
   const [search, setSearch] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
   const [selectedReport, setSelectedReport] = useState("");
@@ -13984,15 +14029,19 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     paymentType: "",
     date: "",
   });
-  const [customRange, setCustomRange] = useState({
-    date_from: toDateKey(new Date()),
-    date_to: toDateKey(new Date()),
-  });
+  const [customRange, setCustomRange] = useState(openingCustomRange);
   const [refreshBusy, setRefreshBusy] = useState(false);
   const [refreshError, setRefreshError] = useState("");
-  const [appliedQuery, setAppliedQuery] = useState(() => resolveReportDateRange({ range: "today" }));
-  const lastSuccessfulFilters = useRef({ range: "today", customRange: { date_from: toDateKey(new Date()), date_to: toDateKey(new Date()) }, search: "", salesFilters: { ...salesFilters }, purchaseFilters: { ...purchaseFilters }, accountReportFilters: { ...accountReportFilters }, cashBookFilters: { ...cashBookFilters }, inventoryLotReportFilter: "ACTIVE" });
-  const currentReportParams = () => range === "custom" ? customRange : { range };
+  const [appliedQuery, setAppliedQuery] = useState(() => {
+    try {
+      return resolveReportDateRange(openingRange === "custom" ? { range: "custom", ...openingCustomRange } : { range: openingRange });
+    } catch {
+      return resolveReportDateRange({ range: "today" });
+    }
+  });
+  const lastSuccessfulFilters = useRef({ range: openingRange, customRange: { ...openingCustomRange }, search: "", salesFilters: { ...salesFilters }, purchaseFilters: { ...purchaseFilters }, accountReportFilters: { ...accountReportFilters }, cashBookFilters: { ...cashBookFilters }, inventoryLotReportFilter: "ACTIVE" });
+  // The range is named even for custom dates: a reload that names no range keeps the last one.
+  const currentReportParams = () => range === "custom" ? { range: "custom", ...customRange } : { range };
   const currentCashBookParams = (overrides = {}) => {
     const nextFilters = { ...cashBookFilters, ...(overrides.filters || {}) };
     const bookAccount = nextFilters.bookAccount || "ALL";
@@ -15299,7 +15348,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     const amountClass = numericValue < 0 ? "pl-negative" : options.positive ? "pl-positive" : "";
     const formattedAmount = numericValue < 0 ? `(${money(Math.abs(numericValue))})` : money(numericValue);
     return (
-      <div className={`pl-line ${options.indent ? "pl-line-indent" : ""} ${options.total ? "pl-line-total" : ""} ${options.highlight ? "pl-line-highlight" : ""}`} key={label}>
+      <div className={`pl-line ${options.indent ? "pl-line-indent" : ""} ${options.total ? "pl-line-total" : ""} ${options.highlight ? "pl-line-highlight" : ""}`} key={label} data-report-line="">
         <span>{label}</span>
         <strong className={amountClass}>{formattedAmount}</strong>
       </div>
@@ -15356,9 +15405,9 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
         <div className="pl-title-block">
           <span>Financial Report</span>
           <h2>PROFIT &amp; LOSS STATEMENT</h2>
-          <p>For Period: {periodFrom} to {periodTo}</p>
+          <p data-report-note="">For Period: {periodFrom} to {periodTo}</p>
         </div>
-        {!hasTransactions && <div className="pl-empty-note">No transactions found for selected period.</div>}
+        {!hasTransactions && <div className="pl-empty-note" data-report-note="">No transactions found for selected period.</div>}
         <section className="pl-section">
           <h3>INCOME</h3>
           {profitLossLine("Sales Revenue", salesRevenue, { indent: true })}
@@ -15380,7 +15429,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
         </section>
         <section className="pl-section">
           <h3>LESS: EXPENSES</h3>
-          {expenseRows.length > 0 ? expenseRows.map((row) => profitLossLine(row.category, row.amount, { indent: true })) : <div className="pl-empty-note">No expenses recorded for this period.</div>}
+          {expenseRows.length > 0 ? expenseRows.map((row) => profitLossLine(row.category, row.amount, { indent: true })) : <div className="pl-empty-note" data-report-note="">No expenses recorded for this period.</div>}
           {profitLossLine("TOTAL EXPENSES", totalExpenses, { total: true })}
         </section>
         <section className={`pl-section pl-net-section ${netProfit >= 0 ? "pl-net-profit" : "pl-net-loss"}`}>
@@ -16494,10 +16543,10 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
         <SummaryMetric label="Inventory Adjustments" value={auditUnavailableMessage ? "Local only" : auditLoading ? "Loading" : adjustmentCount} />
       </div>
       {inventoryLoading && <div className="cart-empty">{inventoryPresentation.message}</div>}
-      {inventoryUnavailable && <div className="error-banner" role="alert">{inventoryPresentation.message}</div>}
+      {inventoryUnavailable && <div className="error-banner" role="alert" data-report-note="">{inventoryPresentation.message}</div>}
       {stockDateRangeError && <div className="error-banner" role="alert">{stockDateRangeError}</div>}
-      {auditUnavailableMessage && <div className="cart-empty" role="status">{auditUnavailableMessage}</div>}
-      {auditError && <div className="error-banner">{auditError}</div>}
+      {auditUnavailableMessage && <div className="cart-empty" role="status" data-report-note="">{auditUnavailableMessage}</div>}
+      {auditError && <div className="error-banner" data-report-note="">{auditError}</div>}
       <div className="stock-inventory-toolbar sticky-report-filters no-print">
         <div className="stock-filter-row stock-filter-row-primary">
           <Field label="Product Search / Selector">

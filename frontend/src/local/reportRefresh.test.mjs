@@ -12,6 +12,7 @@ process.env.TZ = "Asia/Kolkata";
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, resolveReportDateRange } from "./reportRefresh.js";
 
 test("custom report dates remain canonical and reject reversed ranges", () => {
@@ -39,4 +40,22 @@ test("UTC timestamps are classified by the local India calendar boundary", () =>
   const rows = [{ id: 1, created_at: "2026-07-20T20:00:00.000Z" }];
   const selected = filterRowsForReportRange(rows, { range: "custom", date_from: "2026-07-21", date_to: "2026-07-21" });
   assert.equal(selected.length, 1);
+});
+
+test("a reload that names no range keeps the range the owner last chose", async () => {
+  const { reportLoadParams } = await import("./reportRefresh.js");
+  const year = { range: "custom", date_from: "2025-09-24", date_to: "2026-09-24" };
+  assert.deepEqual(reportLoadParams({}, year), year, "the refresh after a background sync must not fall back to today");
+  assert.deepEqual(reportLoadParams(undefined, year), year);
+  assert.deepEqual(reportLoadParams({ payment_mode: "UPI" }, year), { ...year, payment_mode: "UPI" });
+  assert.deepEqual(reportLoadParams({ range: "month" }, year), { range: "month" }, "a range the owner picks wins");
+  assert.deepEqual(reportLoadParams({}, null), {}, "nothing chosen yet: the default applies");
+});
+
+test("App remembers the chosen range and rebuilds POS after a sync", () => {
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(app, /const requestedParams = reportLoadParams\(params, reportParamsRef\.current\);/);
+  assert.match(app, /currentReportParams = \(\) => range === "custom" \? \{ range: "custom", \.\.\.customRange \}/);
+  const refresh = app.slice(app.indexOf("const refreshBusinessDataAfterSync = async"), app.indexOf("const applyCanonicalIdentityFromSync"));
+  assert.match(refresh, /activeViewRef\.current === "sales"[\s\S]*refreshPosInventoryFromSQLite\("post-sync"\)/);
 });

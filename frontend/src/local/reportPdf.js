@@ -62,16 +62,34 @@ export const buildReportPdfModel = (root, { title = "", meta = [] } = {}) => {
   const blocks = [];
   if (!root || typeof root.querySelectorAll !== "function") return { title: cleanText(title), meta, blocks };
 
-  const nodes = Array.from(root.querySelectorAll("h1, h2, h3, h4, .summary-metric, table"));
+  // Besides headings, tiles and tables, a statement drawn as label/amount lines (Profit & Loss)
+  // marks each line `data-report-line`, with the label and the amount as its first two children,
+  // and each sentence that belongs in the export (its period, "No expenses recorded") as
+  // `data-report-note`. Without these the export carried P&L's headings and none of its figures.
+  const nodes = Array.from(root.querySelectorAll("h1, h2, h3, h4, .summary-metric, table, [data-report-line], [data-report-note]"));
   let metrics = [];
+  let lines = [];
   const flushMetrics = () => {
     if (metrics.length) blocks.push({ type: "metrics", items: metrics });
     metrics = [];
+  };
+  const flushLines = () => {
+    if (lines.length) blocks.push({ type: "table", columns: ["Particulars", "Amount"], rows: lines });
+    lines = [];
   };
 
   for (const node of nodes) {
     if (isHiddenFromPrint(node)) continue;
     const tag = String(node.tagName || "").toUpperCase();
+
+    const isLine = Boolean(node.hasAttribute && node.hasAttribute("data-report-line"));
+    if (isLine) {
+      flushMetrics();
+      const parts = Array.from(node.children || []).map((child) => cleanText(child.textContent));
+      lines.push([parts[0] || "", parts[1] || ""]);
+      continue;
+    }
+    flushLines();
 
     if (node.classList && node.classList.contains("summary-metric")) {
       // SummaryMetric renders title={`${label}: ${value}`}, which is the cleanest source.
@@ -93,6 +111,7 @@ export const buildReportPdfModel = (root, { title = "", meta = [] } = {}) => {
     if (text) blocks.push({ type: "heading", text });
   }
   flushMetrics();
+  flushLines();
 
   return { title: cleanText(title), meta: meta.map(cleanText).filter(Boolean), blocks };
 };
