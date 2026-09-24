@@ -7456,3 +7456,69 @@ tbody tr:last-child td {
   gap: 6px;
   margin: 0;
 }
+
+/* POS shelves: Frooz Retail / Frooz Bar / Frooz Moments. */
+.pos-sections {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 13px;
+}
+
+.pos-section {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border: 1px solid var(--line-control);
+  border-radius: 999px;
+  color: var(--ink-body);
+  background: var(--track);
+  font-size: 13px;
+}
+
+.pos-section span {
+  min-width: 22px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  color: var(--ink-muted);
+  background: var(--card);
+  font-size: 12px;
+  text-align: center;
+}
+
+.pos-section-active {
+  border-color: var(--accent);
+  color: var(--card);
+  background: var(--accent);
+}
+
+.pos-section-active span {
+  color: var(--ink);
+}
+
+.pos-sections-note {
+  color: var(--ink-muted);
+  font-size: 12px;
+}
+
+.product-results .product-result {
+  grid-template-columns: 44px minmax(0, 1fr) auto;
+}
+
+.product-result-badge {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.product-results .product-result-section {
+  border-color: var(--accent);
+  color: var(--ink);
+}

@@ -151,6 +151,7 @@ import {
 } from "./local/activationIssuing";
 import { refreshAfterSaveMessage, settingsWriteErrorMessage } from "./local/settingsWriteError";
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
+import { POS_SECTIONS, posSectionCounts, posSectionFor, posSectionLabel, posTileBadge, readPosSection, writePosSection } from "./local/posSections";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
 import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, resolveReportDateRange } from "./local/reportRefresh";
@@ -21855,6 +21856,11 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
    */
   const [chargeSelections, setChargeSelections] = useState([]);
   const [search, setSearch] = useState("");
+  // Which shelf the counter is looking at. Remembered per machine, so the juice counter opens
+  // on Frooz Bar every morning. Reading storage can throw (site data blocked); Retail then.
+  const [posSection, setPosSection] = useState(() => {
+    try { return readPosSection(window.localStorage); } catch { return readPosSection(null); }
+  });
   const [barcode, setBarcode] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
   const [lotSelectorProduct, setLotSelectorProduct] = useState(null);
@@ -22036,7 +22042,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     [counterScope, inventory, products],
   );
 
-  const searchResults = useMemo(() => {
+  const posMatches = useMemo(() => {
     const query = search.trim().toLowerCase();
     const matchesProduct = (product) => {
       if (!query) return true;
@@ -22066,9 +22072,27 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     // list changes nothing; failing to filter an unfiltered one sells another shop's fruit.
     return filterSellableProducts(products, inventory, new Date(), counterScope)
       .filter((product) => matchesProduct(product))
-      .map((product) => ({ key: `product-${product.id}`, product, lotCount: (lotsByProduct.get(product.id) || []).filter(isSelectableLot).length }))
-      .slice(0, 12);
+      .map((product) => ({
+        key: `product-${product.id}`,
+        product,
+        lotCount: (lotsByProduct.get(product.id) || []).filter(isSelectableLot).length,
+        section: posSectionFor(product),
+      }));
   }, [counterScope, inventory, lotsByProduct, products, search]);
+  // A search looks across all three shelves, because a cashier typing "mango" on the Bar shelf
+  // wants the mango, not an empty screen. With no search the chosen shelf is shown whole.
+  const posSearching = Boolean(search.trim());
+  const posShelfCounts = useMemo(() => posSectionCounts(posMatches.map((option) => option.product)), [posMatches]);
+  const searchResults = useMemo(
+    () => (posSearching ? posMatches.slice(0, 24) : posMatches.filter((option) => option.section.key === posSection)),
+    [posMatches, posSearching, posSection],
+  );
+  const choosePosSection = (key) => {
+    setPosSection(key);
+    setSearch("");
+    setHighlightedIndex(0);
+    try { writePosSection(window.localStorage, key); } catch { /* remembered for this run only */ }
+  };
 
   const salesMandiTaxBasisLabel = {
     GROSS_BEFORE_DISCOUNTS: "Gross item value before discounts",
@@ -22880,6 +22904,22 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
               />
             </label>
           </div>
+          <div className="pos-sections" role="tablist" aria-label="POS sections">
+            {POS_SECTIONS.map((section) => (
+              <button
+                aria-selected={!posSearching && posSection === section.key}
+                className={!posSearching && posSection === section.key ? "pos-section pos-section-active" : "pos-section"}
+                key={section.key}
+                onClick={() => choosePosSection(section.key)}
+                role="tab"
+                title={section.blurb}
+              >
+                <strong>{section.label}</strong>
+                <span>{posShelfCounts[section.key]}</span>
+              </button>
+            ))}
+            {posSearching && <small className="pos-sections-note">Searching all sections</small>}
+          </div>
           <div className="product-results">
             {searchResults.map((option, index) => {
               const { product } = option;
@@ -22893,6 +22933,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
               const rateLabel = minRate === maxRate
                 ? `${currency.format(minRate)}/${product.unit || "Unit"}`
                 : `${currency.format(minRate)} - ${currency.format(maxRate)}`;
+              const badge = posTileBadge(product.product_name);
               return (
                 <button
                   className={index === highlightedIndex ? "product-result product-result-active" : "product-result"}
@@ -22900,12 +22941,14 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
                   onClick={() => openLotSelector(product)}
                   title={`Select lot for ${product.product_name}`}
                 >
+                  <span aria-hidden="true" className="product-result-badge" style={{ background: badge.tint, color: badge.ink }}>{badge.letter}</span>
                   <span className="product-result-main">
                     <strong>{product.product_name}</strong>
                     <span className="product-result-meta">
                       <span>{activeLots.length} available lot{activeLots.length === 1 ? "" : "s"}</span>
                       <span>Stock: {stock.toLocaleString("en-IN", { maximumFractionDigits: 3 })}</span>
                       <span>Unit: {product.unit || "Unit"}</span>
+                      {posSearching && <span className="product-result-section">{posSectionLabel(option.section.key)}</span>}
                     </span>
                     <small>Rate: {rateLabel}{discountedCount ? ` - ${discountedCount} discounted lot${discountedCount === 1 ? "" : "s"}` : ""}</small>
                   </span>
@@ -22913,7 +22956,15 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
                 </button>
               );
             })}
-            {searchResults.length === 0 && (
+            {searchResults.length === 0 && !posSearching && shelf.usable && (
+              // An empty shelf is not an empty shop: say how a product gets onto it.
+              <div className="cart-empty">
+                {posSection === "retail"
+                  ? "Nothing in Frooz Retail has stock right now."
+                  : `Nothing in ${posSectionLabel(posSection)} has stock right now. A product appears here when its category is named "${posSectionLabel(posSection)}" in Product Master and it has a lot in stock.`}
+              </div>
+            )}
+            {searchResults.length === 0 && (posSearching || !shelf.usable) && (
               <div className="cart-empty">
                 {shelf.usable
                   ? "No matching products or lots found."
