@@ -92,6 +92,20 @@ test("photos are matched to products the canonical way", () => {
   assert.equal(photoForProduct(new Map(), { id: 12 }), null);
 });
 
+test("a POS tile, which knows a product only by its global id, finds the photo", () => {
+  // 24 Sep 2026: the owner saved a photo in Product Master (cloud list, product 1) and POS, which
+  // reads the device's SQLite copy where the same product is "product-1", showed the letter tile.
+  const index = indexProductPhotos([{ product_id: 1, product_global_id: "product-1", photo: jpeg(20) }]);
+  assert.equal(photoForProduct(index, { id: 1 }), jpeg(20), "Product Master still finds it by number");
+  assert.equal(photoForProduct(index, { id: "product-1", cloud_id: "product-1" }), jpeg(20));
+  assert.equal(photoForProduct(index, { id: 1, global_id: "product-1" }), jpeg(20));
+  assert.equal(photoForProduct(index, { id: "product-11" }), null, "product-1 is not product-11");
+
+  const saved = withProductPhoto([], 7, jpeg(21), "t", "product-7");
+  assert.equal(photoForProduct(indexProductPhotos(saved), { id: "product-7" }), jpeg(21),
+    "a photo saved just now reaches POS before the next download");
+});
+
 test("saving or removing one photo updates the list in place", () => {
   const list = [{ product_id: 1, photo: jpeg(1) }, { product_id: 2, photo: jpeg(2) }];
   const replaced = withProductPhoto(list, "2", jpeg(3), "t");

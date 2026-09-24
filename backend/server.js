@@ -15438,7 +15438,7 @@ const listProductPhotosHandler = async (req, res) => {
     // which is the authority. A photo whose product has since left the company is not listed.
     const result = await pool.query(
       `
-      SELECT pp.product_id, pp.photo_data, pp.updated_at
+      SELECT pp.product_id, p.global_id AS product_global_id, pp.photo_data, pp.updated_at
       FROM product_photos pp
       JOIN products p ON p.id = pp.product_id
       WHERE pp.company_id = $1
@@ -15447,8 +15447,12 @@ const listProductPhotosHandler = async (req, res) => {
       `,
       [companyId]
     );
+    // `product_global_id` as well as the number: a device's own copy of the catalogue (SQLite, which
+    // POS reads) knows a product only by its global id ("product-12"), never by 12, so a photo
+    // listed by number alone never reached a POS tile.
     const photos = result.rows.map((row) => ({
       product_id: row.product_id,
+      product_global_id: row.product_global_id ?? null,
       photo: row.photo_data,
       updated_at: row.updated_at,
     }));

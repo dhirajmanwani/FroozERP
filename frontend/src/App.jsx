@@ -7018,14 +7018,14 @@ function App() {
   };
 
   // Returns "" when saved, or the reason it was not.
-  const saveProductPhoto = async (productId, dataUrl) => {
+  const saveProductPhoto = async (productId, dataUrl, productGlobalId = null) => {
     if (!productId) return "the new product's number did not come back from the server";
     try {
       if (dataUrl) {
         const check = checkProductPhoto(dataUrl);
         if (!check.ok) return check.message;
         const response = await axios.put(`${API_URL}/api/v3/products/${encodeURIComponent(productId)}/photo`, { photo: dataUrl }, { timeout: 20000 });
-        setProductPhotos((current) => withProductPhoto(current, productId, dataUrl, response.data?.updated_at));
+        setProductPhotos((current) => withProductPhoto(current, productId, dataUrl, response.data?.updated_at, productGlobalId));
       } else {
         await axios.delete(`${API_URL}/api/v3/products/${encodeURIComponent(productId)}/photo`, { timeout: 20000 });
         setProductPhotos((current) => withProductPhoto(current, productId, null));
@@ -7069,6 +7069,9 @@ function App() {
     try {
       const wasEditing = Boolean(editingProductId);
       let savedProductId = editingProductId || null;
+      let savedProductGlobalId = editingProductId
+        ? products.find((product) => inventoryIdsEqual(product.id, editingProductId))?.global_id ?? null
+        : null;
       const selectedCategory = productCategories.find((category) => String(category.id) === String(productCategoryId));
       const finalCategoryName = selectedCategory?.category_name || newProductCategoryName.trim() || productCategory.trim();
       const normalizedName = productName.trim().toLowerCase();
@@ -7161,10 +7164,11 @@ function App() {
         const createWrite = createOperationalWrite(user, payload);
         const created = await axios.post(`${API_URL}/api/v3/products`, createWrite.body, createWrite.config);
         savedProductId = created.data?.product?.id ?? null;
+        savedProductGlobalId = created.data?.product?.global_id ?? null;
       }
       // The photo is saved after the product, separately. If it fails the product is still saved,
       // and the owner is told the photo is not, rather than the whole save looking like a success.
-      const photoProblem = productPhotoDraft.changed ? await saveProductPhoto(savedProductId, productPhotoDraft.dataUrl) : "";
+      const photoProblem = productPhotoDraft.changed ? await saveProductPhoto(savedProductId, productPhotoDraft.dataUrl, savedProductGlobalId) : "";
       resetProductForm();
       // The product is saved at this point. Reloading the lists afterwards is a separate matter: a
       // failed reload used to land in the catch below and report "Error Adding Product" for a

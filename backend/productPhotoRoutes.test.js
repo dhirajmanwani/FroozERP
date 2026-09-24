@@ -208,12 +208,12 @@ test("a view-only session cannot change a photo", async () => {
 test("GET lists only the caller's company, bound from the session", async () => {
   const { response, statements } = await call("GET", "/api/v3/product-photos", {
     answer: (sql) => (/FROM product_photos pp/.test(sql)
-      ? { rows: [{ product_id: PRODUCT_ID, photo_data: PHOTO, updated_at: UPDATED_AT }], rowCount: 1 }
+      ? { rows: [{ product_id: PRODUCT_ID, product_global_id: `product-${PRODUCT_ID}`, photo_data: PHOTO, updated_at: UPDATED_AT }], rowCount: 1 }
       : undefined),
   });
   assert.equal(response.status, 200, response.text);
   assert.deepEqual(response.body, {
-    photos: [{ product_id: PRODUCT_ID, photo: PHOTO, updated_at: UPDATED_AT }],
+    photos: [{ product_id: PRODUCT_ID, product_global_id: `product-${PRODUCT_ID}`, photo: PHOTO, updated_at: UPDATED_AT }],
     count: 1,
   });
 

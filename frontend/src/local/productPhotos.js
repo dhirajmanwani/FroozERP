@@ -119,12 +119,21 @@ const idKey = (value) => {
   return key === null || key === undefined || key === "" ? null : String(key);
 };
 
-/** product id → photo data URL, with ids compared the canonical way ("004" is not 4). */
+/**
+ * product id → photo data URL, with ids compared the canonical way ("004" is not 4).
+ *
+ * Each photo is filed under both the product's number and its global id. Product Master reads the
+ * cloud's list, where a product is 12; POS reads the device's own SQLite copy, where the same
+ * product is "product-12" and the number does not exist. Filed under the number alone, every photo
+ * showed in Product Master and none reached a POS tile.
+ */
 export function indexProductPhotos(photos) {
   const index = new Map();
   for (const row of Array.isArray(photos) ? photos : []) {
-    const key = idKey(row?.product_id);
-    if (key && typeof row?.photo === "string" && photoDataUrlBytes(row.photo) !== null) index.set(key, row.photo);
+    if (typeof row?.photo !== "string" || photoDataUrlBytes(row.photo) === null) continue;
+    for (const key of [idKey(row?.product_id), idKey(row?.product_global_id)]) {
+      if (key) index.set(key, row.photo);
+    }
   }
   return index;
 }
@@ -132,7 +141,7 @@ export function indexProductPhotos(photos) {
 /** The photo for a product, looked up by its id and then by its cloud id; null when it has none. */
 export function photoForProduct(index, product) {
   if (!index?.size || !product) return null;
-  for (const candidate of [product.id, product.cloud_id, product.product_id]) {
+  for (const candidate of [product.id, product.cloud_id, product.product_id, product.global_id]) {
     const key = idKey(candidate);
     if (key && index.has(key)) return index.get(key);
   }
@@ -192,8 +201,10 @@ export async function writeCachedProductPhotos(indexedDB, photos, savedAt = new 
  * Merge one saved or removed photo into a list, so the screen updates at once without waiting
  * for the next full download.
  */
-export function withProductPhoto(photos, productId, photo, updatedAt = new Date().toISOString()) {
+export function withProductPhoto(photos, productId, photo, updatedAt = new Date().toISOString(), productGlobalId = null) {
   const key = idKey(productId);
   const rest = (Array.isArray(photos) ? photos : []).filter((row) => idKey(row?.product_id) !== key);
-  return photo ? [...rest, { product_id: productId, photo, updated_at: updatedAt }] : rest;
+  return photo
+    ? [...rest, { product_id: productId, product_global_id: productGlobalId ?? null, photo, updated_at: updatedAt }]
+    : rest;
 }
