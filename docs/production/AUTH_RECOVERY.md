@@ -31,6 +31,11 @@ OTP delivery is backend-only. The frontend and Tauri app do not contain email or
 Required production environment values:
 
 - `RECOVERY_OTP_HASH_SECRET`
+- Email, one of two ways (all sending goes through `backend/emailDelivery.js`):
+  - An HTTPS email service: `EMAIL_PROVIDER` (`brevo` or `resend`), `EMAIL_API_KEY`, `EMAIL_FROM`
+    (bare or `Name <address>`). **Required on Railway's Hobby plan**, which blocks outbound SMTP
+    (ports 25, 465, 587): an SMTP connection there never opens. When both ways are set, this one wins.
+  - SMTP, only on hosts that allow it:
 - `SMTP_HOST`
 - `SMTP_PORT`
 - `SMTP_SECURE`
@@ -50,6 +55,13 @@ Development-only local testing:
 - Must not be enabled in production
 
 If no provider is configured, FroozERP reports that recovery delivery is not configured and does not claim real OTP delivery works.
+
+A failed email names its cause in the message the person sees: which setting is missing, a
+refused password or API key (for Gmail, the reminder that it needs an App Password), or a server
+that could not be reached. Every send is cut off at 12 seconds so it finishes inside the desktop
+gateway's 15-second cloud timeout. Email and SMS delivery failures answer HTTP 424, not 503: the
+gateway treats a cloud 503 as "cloud unreachable" and replaces the body, which used to turn every
+"email is not set up" into "FroozERP cloud is temporarily unavailable" on the counters.
 
 ## Recovery Data
 

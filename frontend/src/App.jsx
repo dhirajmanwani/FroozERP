@@ -12463,7 +12463,9 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
     setBusy(true);
     try {
       writeDiagnosticLog("INFO", "recovery-send-otp-request", { apiUrl, endpoint: `${apiUrl}/auth/recovery/send-otp` });
-      const response = await axios.post(`${apiUrl}/auth/recovery/send-otp`, recoveryPayload(), { timeout: 8000 });
+      // The server gives an email up to 12 seconds and the desktop gateway gives the cloud 15, so an
+      // 8-second wait reported "failed" while the code was still on its way.
+      const response = await axios.post(`${apiUrl}/auth/recovery/send-otp`, recoveryPayload(), { timeout: 20000 });
       setProviderStatus(response.data.provider_status || null);
       if (response.data.code === "PROVIDER_NOT_CONFIGURED" && !response.data.development_otp) {
         setError(response.data.message || "Recovery delivery provider is not configured.");

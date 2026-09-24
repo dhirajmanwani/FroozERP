@@ -8,7 +8,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { execFile } = require("child_process");
-const nodemailer = require("nodemailer");
+const { emailSettings, publicEmailSettings, sendEmail } = require("./emailDelivery");
 const { RUNTIME_MODES, createStorageAdapter, liveDesktopSqlitePath } = require("./storageAdapters");
 const {
   hashPassword,
@@ -1398,36 +1398,32 @@ const authFailure = async (res, { status = 401, code = "INVALID_CREDENTIALS", pu
   return res.status(status).json({ code, message: publicMessage });
 };
 
-const getConfiguredSmtpPassword = () => cleanText(process.env.SMTP_PASS || process.env.SMTP_PASSWORD);
-
 const getRecoveryProviderStatus = () => ({
-  email: process.env.SMTP_HOST && process.env.SMTP_USER && getConfiguredSmtpPassword() ? "configured" : "not_configured",
+  email: emailSettings().configured ? "configured" : "not_configured",
   sms: process.env.SMS_PROVIDER_URL && (process.env.SMS_PROVIDER_TOKEN || process.env.SMS_PROVIDER_API_KEY) ? "configured" : "not_configured",
   development: recoveryDevOtpEnabled ? "enabled" : "disabled",
 });
 
+// The status for "the email or SMS service would not send". Deliberately not 503: the desktop
+// gateway reads a 503 from the cloud as "cloud unreachable" and replaces the body with its own
+// message, so on every counter the real reason ("email is not set up", "the password was
+// refused") arrived as "FroozERP cloud is temporarily unavailable". 424 (Failed Dependency) is
+// passed through untouched, which is what this answer needs.
+const PROVIDER_FAILURE_STATUS = 424;
+
+// Why an email did not go, in words the Owner can act on. Recovery codes are the one thing a
+// locked-out person cannot get any other way, so "could not send" alone leaves them guessing.
+const emailDeliveryFailureMessage = (delivery) => {
+  const reason = cleanText(delivery?.reason);
+  if (delivery?.status === "not_configured") {
+    return `Email codes are not set up on the FroozERP server yet${reason ? ` (${reason})` : ""}. Ask the Owner to set up email.`;
+  }
+  return `The code could not be emailed${reason ? `: ${reason}` : ""}. Ask the Owner to check the email settings on the FroozERP server.`;
+};
+
 const getEmailProviderDiagnostics = () => {
-  const required = {
-    smtp_host: Boolean(cleanText(process.env.SMTP_HOST)),
-    smtp_port: Boolean(cleanText(process.env.SMTP_PORT || "587")),
-    smtp_user: Boolean(cleanText(process.env.SMTP_USER)),
-    smtp_password: Boolean(getConfiguredSmtpPassword()),
-    sender: Boolean(cleanText(process.env.SMTP_FROM || process.env.SMTP_USER)),
-  };
-  const configured = Object.values(required).every(Boolean);
-  return {
-    provider: "smtp",
-    status: configured ? "configured" : "not_configured",
-    configured,
-    required,
-    host: cleanText(process.env.SMTP_HOST),
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: /^true$/i.test(process.env.SMTP_SECURE || ""),
-    username_configured: Boolean(cleanText(process.env.SMTP_USER)),
-    password_configured: Boolean(getConfiguredSmtpPassword()),
-    sender_name: cleanText(process.env.SMTP_SENDER_NAME || "FroozERP"),
-    sender_email: cleanText(process.env.SMTP_FROM || process.env.SMTP_USER),
-  };
+  const settings = publicEmailSettings(emailSettings());
+  return { ...settings, status: settings.configured ? "configured" : "not_configured" };
 };
 
 const getSmsProviderDiagnostics = () => {
@@ -1449,30 +1445,12 @@ const getSmsProviderDiagnostics = () => {
   };
 };
 
-const sendEmailOtp = async ({ to, code, purpose }) => {
-  const smtpPassword = getConfiguredSmtpPassword();
-  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !smtpPassword) {
-    return { delivered: false, provider: "EmailOtpProvider", status: "not_configured" };
-  }
-  const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: /^true$/i.test(process.env.SMTP_SECURE || ""),
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: smtpPassword,
-    },
-  });
-  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
-  const info = await transporter.sendMail({
-    from,
-    to,
-    subject: "Your FroozERP verification code",
-    text: `Your FroozERP verification code is ${code}. It expires in 10 minutes.`,
-    html: buildOtpEmailHtml({ code, purpose }),
-  });
-  return { delivered: true, provider: "EmailOtpProvider", status: "accepted", message_id: info.messageId };
-};
+const sendEmailOtp = ({ to, code, purpose }) => sendEmail({
+  to,
+  subject: "Your FroozERP verification code",
+  text: `Your FroozERP verification code is ${code}. It expires in 10 minutes.`,
+  html: buildOtpEmailHtml({ code, purpose }),
+});
 
 const sendSmsOtp = async ({ to, code }) => {
   if (!process.env.SMS_PROVIDER_URL || !(process.env.SMS_PROVIDER_TOKEN || process.env.SMS_PROVIDER_API_KEY)) {
@@ -1511,32 +1489,14 @@ const sendRecoveryOtp = async ({ method, contact, code, purpose }) => {
   if (recoveryDevOtpEnabled) {
     return { delivered: true, provider: "DevelopmentOtpProvider", status: "development_only", development_code: code, purpose };
   }
-  return { delivered: false, provider: method === "email" ? "EmailOtpProvider" : "SmsOtpProvider", status: "not_configured" };
+  // Email not set up: let the email module say which setting is missing.
+  if (method === "email") return sendEmailOtp({ to: contact, code, purpose });
+  return { delivered: false, provider: "SmsOtpProvider", status: "not_configured" };
 };
 
 const sendRecoveryNotification = async ({ method, contact, subject, message, html }) => {
   const providerStatus = getRecoveryProviderStatus();
-  if (method === "email") {
-    const smtpPassword = getConfiguredSmtpPassword();
-    if (providerStatus.email !== "configured") return { delivered: false, provider: "EmailOtpProvider", status: "not_configured" };
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT || 587),
-      secure: /^true$/i.test(process.env.SMTP_SECURE || ""),
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: smtpPassword,
-      },
-    });
-    const info = await transporter.sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
-      to: contact,
-      subject,
-      text: message,
-      html,
-    });
-    return { delivered: true, provider: "EmailOtpProvider", status: "accepted", message_id: info.messageId };
-  }
+  if (method === "email") return sendEmail({ to: contact, subject, text: message, html });
   if (providerStatus.sms !== "configured") return { delivered: false, provider: "SmsOtpProvider", status: "not_configured" };
   const headers = { "Content-Type": "application/json" };
   if (process.env.SMS_PROVIDER_TOKEN) headers.Authorization = `Bearer ${process.env.SMS_PROVIDER_TOKEN}`;
@@ -6985,7 +6945,7 @@ app.post("/api/integrations/email/test", async (req, res) => {
     if (!manager) return res.status(403).json({ code: "OWNER_REQUIRED", message: "Owner/Admin permission is required to test email provider." });
     const status = getEmailProviderDiagnostics();
     if (!status.configured) {
-      return res.status(503).json({
+      return res.status(PROVIDER_FAILURE_STATUS).json({
         ...status,
         code: "EMAIL_PROVIDER_NOT_CONFIGURED",
         message: "Email verification is unavailable because the email provider has not been configured by the Owner.",
@@ -7005,7 +6965,7 @@ app.post("/api/integrations/email/test", async (req, res) => {
       delivered: delivery.delivered === true,
       status: delivery.status,
       provider: delivery.provider,
-      message: delivery.delivered ? "Test email accepted by provider." : "Email provider test failed.",
+      message: delivery.delivered ? "Test email accepted by provider." : emailDeliveryFailureMessage(delivery),
       last_tested: new Date().toISOString(),
     });
   } catch (error) {
@@ -7039,7 +6999,7 @@ app.post("/api/integrations/sms/test", async (req, res) => {
     if (!manager) return res.status(403).json({ code: "OWNER_REQUIRED", message: "Owner/Admin permission is required to test SMS provider." });
     const status = getSmsProviderDiagnostics();
     if (!status.configured) {
-      return res.status(503).json({
+      return res.status(PROVIDER_FAILURE_STATUS).json({
         ...status,
         code: "SMS_PROVIDER_NOT_CONFIGURED",
         message: "SMS verification is unavailable because the SMS provider has not been configured by the Owner.",
@@ -8307,10 +8267,12 @@ app.post("/auth/recovery/contact/request", requireAuth, async (req, res) => {
     });
     if (!delivery.delivery.delivered) {
       await invalidateOtpRequest(delivery.requestId, client);
-      return res.status(503).json({
-        code: method === "email" ? "EMAIL_PROVIDER_NOT_CONFIGURED" : "SMS_PROVIDER_NOT_CONFIGURED",
+      return res.status(PROVIDER_FAILURE_STATUS).json({
+        code: method === "email"
+          ? (delivery.delivery.status === "not_configured" ? "EMAIL_PROVIDER_NOT_CONFIGURED" : "EMAIL_DELIVERY_FAILED")
+          : "SMS_PROVIDER_NOT_CONFIGURED",
         message: method === "email"
-          ? "Email recovery is not configured. Ask the administrator to configure SMTP settings."
+          ? emailDeliveryFailureMessage(delivery.delivery)
           : "SMS recovery is not configured. Please use verified email recovery or contact the administrator.",
         provider_status: getRecoveryProviderStatus(),
         delivery_status: delivery.delivery.status,
@@ -8444,7 +8406,7 @@ app.post("/api/auth/email/send-verification", requireAuth, async (req, res) => {
     if (!email) return res.status(400).json({ code: "INVALID_EMAIL", message: "Enter a valid email address." });
     const providerStatus = getEmailProviderDiagnostics();
     if (!providerStatus.configured) {
-      return res.status(503).json({
+      return res.status(PROVIDER_FAILURE_STATUS).json({
         code: "EMAIL_PROVIDER_NOT_CONFIGURED",
         message: "Email verification is unavailable because the email provider has not been configured by the Owner.",
         provider: providerStatus,
@@ -8466,7 +8428,7 @@ app.post("/api/auth/email/send-verification", requireAuth, async (req, res) => {
     if (!delivery.delivery.delivered) {
       await invalidateOtpRequest(delivery.requestId, client);
       await client.query("ROLLBACK");
-      return res.status(503).json({ code: "EMAIL_DELIVERY_FAILED", message: "Email provider did not accept the verification request.", delivery_status: delivery.delivery.status });
+      return res.status(PROVIDER_FAILURE_STATUS).json({ code: "EMAIL_DELIVERY_FAILED", message: emailDeliveryFailureMessage(delivery.delivery), delivery_status: delivery.delivery.status });
     }
     await client.query("UPDATE users SET pending_recovery_email = $1, recovery_email_verified = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $2", [email, userId]);
     await client.query("COMMIT");
@@ -8541,7 +8503,7 @@ app.post("/api/auth/phone/send-otp", requireAuth, async (req, res) => {
     if (!mobile) return res.status(400).json({ code: "INVALID_PHONE", message: "Enter a valid Indian mobile number." });
     const providerStatus = getSmsProviderDiagnostics();
     if (!providerStatus.configured) {
-      return res.status(503).json({
+      return res.status(PROVIDER_FAILURE_STATUS).json({
         code: "SMS_PROVIDER_NOT_CONFIGURED",
         message: "SMS verification is unavailable because the SMS provider has not been configured by the Owner.",
         provider: providerStatus,
@@ -8563,7 +8525,7 @@ app.post("/api/auth/phone/send-otp", requireAuth, async (req, res) => {
     if (!delivery.delivery.delivered) {
       await invalidateOtpRequest(delivery.requestId, client);
       await client.query("ROLLBACK");
-      return res.status(503).json({ code: "SMS_DELIVERY_FAILED", message: "SMS provider did not accept the verification request.", delivery_status: delivery.delivery.status });
+      return res.status(PROVIDER_FAILURE_STATUS).json({ code: "SMS_DELIVERY_FAILED", message: "SMS provider did not accept the verification request.", delivery_status: delivery.delivery.status });
     }
     await client.query("UPDATE users SET pending_recovery_mobile = $1, recovery_mobile_verified = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $2", [mobile, userId]);
     await client.query("COMMIT");
@@ -8794,11 +8756,11 @@ app.post("/auth/recovery/send-otp", async (req, res) => {
     });
     if (!delivery.delivered) {
       await invalidateOtpRequest(requestId);
-      return res.status(503).json({
+      return res.status(PROVIDER_FAILURE_STATUS).json({
         success: false,
         code: delivery.status === "not_configured" ? "PROVIDER_NOT_CONFIGURED" : "PROVIDER_DELIVERY_FAILED",
         message: method === "email"
-          ? "Email recovery is not configured or the provider rejected the request."
+          ? emailDeliveryFailureMessage(delivery)
           : "SMS recovery is not configured. Please use verified email recovery or contact the administrator.",
         provider_status: getRecoveryProviderStatus(),
         delivery_status: delivery.status,
