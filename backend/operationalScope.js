@@ -196,6 +196,47 @@ const createOperationalScopeService = (database) => {
     throw new TypeError("Operational scope service requires a database query adapter");
   }
 
+  /**
+   * Which of three different problems "User and device do not share an approved operational
+   * location" is, in words that say what to do. That one sentence has cost several sessions: it
+   * reads the same whether no counter exists anywhere, this computer is not posted to one, or the
+   * person is not posted where the computer stands. Read-only, and it never widens anything: it
+   * only chooses the sentence for a refusal that has already been decided.
+   */
+  const explainLocationMismatch = async (userId, deviceId) => {
+    const generic = `This computer (${deviceId}) and your account are not posted to the same counter, so nothing can be saved from here. Post both to a counter in Branches & Counters.`;
+    try {
+      const facts = await database.query(
+        `
+        SELECT
+          (SELECT COUNT(*)::INTEGER FROM operational_locations WHERE active IS DISTINCT FROM FALSE) AS counters,
+          (SELECT ol.location_name
+             FROM device_assignments da
+             JOIN operational_locations ol ON ol.id = da.operational_location_id
+            WHERE da.device_id = $1 AND da.active = TRUE
+            ORDER BY da.assignment_generation DESC
+            LIMIT 1) AS device_counter,
+          (SELECT COUNT(*)::INTEGER FROM staff_location_assignments WHERE user_id = $2 AND active = TRUE) AS user_postings
+        `,
+        [deviceId, userId]
+      );
+      const row = facts.rows?.[0];
+      if (!row || row.counters === undefined || row.counters === null) return generic;
+      if (Number(row.counters) === 0) {
+        return `No counter has been set up yet, so nothing can be saved from any computer. The first counter is created once with scripts/bootstrap-first-counter.mjs (docs/first-counter-setup.md), for this computer: ${deviceId}. Then sign out and back in.`;
+      }
+      if (!row.device_counter) {
+        return `This computer (${deviceId}) is not posted to any counter, so nothing can be saved from it. Post it to a counter in Branches & Counters from a computer that is, or with scripts/approve-device.mjs --counter.`;
+      }
+      if (!Number(row.user_postings)) {
+        return `Your account is not posted to any counter, so nothing can be saved. Post it to ${row.device_counter}, where this computer stands, in Branches & Counters.`;
+      }
+      return `Your account is not posted to ${row.device_counter}, where this computer (${deviceId}) stands, so nothing can be saved from here. Post it there in Branches & Counters.`;
+    } catch {
+      return generic;
+    }
+  };
+
   const resolve = async ({ userId, deviceId, submitted = {}, requireWrite = false }) => {
     const parsedUserId = normalizeId(userId);
     const canonicalDeviceId = String(deviceId || "").trim();
@@ -251,7 +292,7 @@ const createOperationalScopeService = (database) => {
     );
     const row = result.rows?.[0];
     if (!row) {
-      return { error: scopeError(403, "DEVICE_LOCATION_MISMATCH", "User and device do not share an approved operational location") };
+      return { error: scopeError(403, "DEVICE_LOCATION_MISMATCH", await explainLocationMismatch(parsedUserId, canonicalDeviceId)) };
     }
     if (String(row.device_status).toUpperCase() !== "APPROVED") {
       return { error: scopeError(403, "DEVICE_NOT_APPROVED", "Device is not approved") };

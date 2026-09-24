@@ -108,4 +108,7 @@ test("App wires photos into Product Master and POS, and the drawings are gone", 
   assert.match(app, /onPaste=\{/);
   assert.match(app, /const photo = photoForProduct\(productPhotoIndex, product\);/);
   assert.doesNotMatch(app, /posFruitArt/);
+  // Edit takes the owner to the form it just filled.
+  assert.match(app, /<ModuleCard id="product-item-form"/);
+  assert.match(app, /getElementById\("product-item-form"\)\?\.scrollIntoView/);
 });

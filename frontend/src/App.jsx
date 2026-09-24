@@ -8095,6 +8095,11 @@ function App() {
     setProductPhotoDraft({ dataUrl: photoForProduct(productPhotoIndex, product), changed: false });
     setProductPhotoMessage("");
     loadProductLots(product, true);
+    // The form sits above a long product list; pressing Edit far down the list used to fill a form
+    // the owner could not see. Take them to it, after React has rendered it as "Edit Item".
+    window.requestAnimationFrame(() => {
+      document.getElementById("product-item-form")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
   };
 
   const cancelProductEdit = () => {
@@ -9299,7 +9304,7 @@ function App() {
                 </DataTable>
               </ModuleCard>
 
-              <ModuleCard eyebrow="Item Management" title={editingProductId ? "Edit Item" : "Add Item Inside Category"} subtitle="Items are products used by POS, purchase, inventory, reports and FIFO costing.">
+              <ModuleCard id="product-item-form" eyebrow="Item Management" title={editingProductId ? "Edit Item" : "Add Item Inside Category"} subtitle="Items are products used by POS, purchase, inventory, reports and FIFO costing.">
                 <div className="form-grid supplier-form-grid">
                   <Field label="Category">
                     <select value={productCategoryId} onChange={(event) => {
@@ -24778,9 +24783,9 @@ function Field({ children, label }) {
   return <label><span>{label}</span>{children}</label>;
 }
 
-function ModuleCard({ children, eyebrow, subtitle, title }) {
+function ModuleCard({ children, eyebrow, id, subtitle, title }) {
   return (
-    <section className="content-card">
+    <section className="content-card" id={id}>
       <div className="card-heading">
         <div>
           <span className="eyebrow">{eyebrow}</span>

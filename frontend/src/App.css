@@ -7621,3 +7621,8 @@ tbody tr:last-child td {
 .product-photo-actions .remove-button {
   white-space: nowrap;
 }
+
+/* Edit scrolls the item form into view; leave room above it for the top bar. */
+#product-item-form {
+  scroll-margin-top: 88px;
+}
