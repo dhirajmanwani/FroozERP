@@ -7626,3 +7626,32 @@ tbody tr:last-child td {
 #product-item-form {
   scroll-margin-top: 88px;
 }
+
+/* Branches & Counters: one numbered step per block, each with its own result under its button. */
+.scope-step {
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.scope-step:first-of-type {
+  margin-top: 8px;
+}
+
+.scope-step h3 {
+  margin: 0 0 4px;
+}
+
+.scope-step h4 {
+  margin: 16px 0 8px;
+}
+
+.scope-step-message {
+  margin: 4px 0 12px;
+  color: var(--success);
+  font-weight: 700;
+}
+
+.scope-step-message-error {
+  color: var(--danger-ink);
+}
