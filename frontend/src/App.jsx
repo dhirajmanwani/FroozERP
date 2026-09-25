@@ -153,6 +153,7 @@ import { refreshAfterSaveMessage, settingsWriteErrorMessage } from "./local/sett
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
 import { adminWritePayload } from "./local/adminWritePayload";
 import { checkProductPhoto, imageFromTransfer, indexProductPhotos, photoForProduct, readCachedProductPhotos, shrinkProductPhoto, withProductPhoto, writeCachedProductPhotos } from "./local/productPhotos";
+import { findDuplicateProductName, isServerProductId, productGlobalIdFrom, productIdentityKeys, resolveServerProductId } from "./local/productIdentity";
 import { POS_SECTIONS, posSectionCounts, posSectionFor, posSectionLabel, posTileBadge, readPosSection, writePosSection } from "./local/posSections";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
@@ -2522,6 +2523,9 @@ function App() {
     reason: "",
   });
   const [editingProductId, setEditingProductId] = useState(null);
+  // Every id the edited row is known by (see local/productIdentity.js). The list under the form can
+  // swap between the cloud form and the device form between Edit and Save.
+  const [editingProductKeys, setEditingProductKeys] = useState([]);
   const [unit, setUnit] = useState("");
   const [purchaseSupplierId, setPurchaseSupplierId] = useState("");
   const [purchaseProductId, setPurchaseProductId] = useState("");
@@ -7097,17 +7101,12 @@ function App() {
   const addProduct = async () => {
     try {
       const wasEditing = Boolean(editingProductId);
-      let savedProductId = editingProductId || null;
-      let savedProductGlobalId = editingProductId
-        ? products.find((product) => inventoryIdsEqual(product.id, editingProductId))?.global_id ?? null
-        : null;
+      const editingKeys = wasEditing
+        ? (editingProductKeys.length > 0 ? editingProductKeys : productIdentityKeys({ id: editingProductId }))
+        : [];
       const selectedCategory = productCategories.find((category) => String(category.id) === String(productCategoryId));
       const finalCategoryName = selectedCategory?.category_name || newProductCategoryName.trim() || productCategory.trim();
-      const normalizedName = productName.trim().toLowerCase();
-      const duplicateProduct = products.find((product) =>
-        product.product_name?.trim().toLowerCase() === normalizedName &&
-        Number(product.id) !== Number(editingProductId || 0)
-      );
+      const duplicateProduct = findDuplicateProductName(products, productName, editingKeys);
       if (duplicateProduct) {
         alert("This product already exists.");
         return;
@@ -7174,9 +7173,19 @@ function App() {
         updated_by: user.id,
         opening_stock_lots: !editingProductId ? normalizedOpeningStockLots : [],
       };
-      if (editingProductId) {
+      let savedProductId = null;
+      let savedProductGlobalId = null;
+      if (wasEditing) {
+        const resolved = await serverIdForProduct(editingKeys);
+        if (!resolved.ok) {
+          alert(resolved.message);
+          return;
+        }
+        const serverProductId = resolved.id;
+        savedProductId = serverProductId;
+        savedProductGlobalId = productGlobalIdFrom(editingKeys, products);
         const updateWrite = createOperationalWrite(user, payload);
-        await axios.put(`${API_URL}/api/v3/products/${editingProductId}`, updateWrite.body, updateWrite.config);
+        await axios.put(`${API_URL}/api/v3/products/${serverProductId}`, updateWrite.body, updateWrite.config);
         if (addOpeningStock && openingStockLots.length > 0) {
           const openingWrite = createOperationalWrite(user, {
             opening_stock_lots: openingStockLots,
@@ -7184,7 +7193,7 @@ function App() {
             created_by: user.id,
           });
           await axios.post(
-            `${API_URL}/api/v3/products/${editingProductId}/opening-stock`,
+            `${API_URL}/api/v3/products/${serverProductId}/opening-stock`,
             openingWrite.body,
             openingWrite.config
           );
@@ -7254,6 +7263,7 @@ function App() {
     setShowOpeningLotForm(false);
     setLotAction(null);
     setEditingProductId(null);
+    setEditingProductKeys([]);
   };
 
   const saveProductCategory = async () => {
@@ -7411,10 +7421,18 @@ function App() {
         created_by: user.id,
         branch_id: user.branch_id,
       };
+      const activeKeys = editingProductId
+        ? (editingProductKeys.length > 0 ? editingProductKeys : productIdentityKeys({ id: editingProductId }))
+        : productIdentityKeys(lotPanelProduct);
+      const resolved = await serverIdForProduct(activeKeys);
+      if (!resolved.ok) {
+        alert(resolved.message);
+        return;
+      }
       try {
         const openingWrite = createOperationalWrite(user, payload);
         await axios.post(
-          `${API_URL}/api/v3/products/${activeProductId}/opening-stock-lots`,
+          `${API_URL}/api/v3/products/${resolved.id}/opening-stock-lots`,
           openingWrite.body,
           openingWrite.config
         );
@@ -7423,7 +7441,7 @@ function App() {
         if (message.includes("Add as separate lot anyway?") && window.confirm("This lot already exists. Add as separate lot anyway?")) {
           const duplicateWrite = createOperationalWrite(user, { ...payload, allow_duplicate_lot: true });
           await axios.post(
-            `${API_URL}/api/v3/products/${activeProductId}/opening-stock-lots`,
+            `${API_URL}/api/v3/products/${resolved.id}/opening-stock-lots`,
             duplicateWrite.body,
             duplicateWrite.config
           );
@@ -7441,9 +7459,22 @@ function App() {
     }
   };
 
+  // The v3 product routes and the lots read take only the cloud's numeric id; a row from the
+  // device's list carries its global id instead. Found here, once, rather than at each call site.
+  const serverIdForProduct = async (keys) => {
+    if (keys.some(isServerProductId)) return resolveServerProductId(keys, []);
+    const response = await axios.get(`${API_URL}/products`);
+    return resolveServerProductId(keys, Array.isArray(response.data) ? response.data : []);
+  };
+
   const loadProductLots = async (product, showPanel = true) => {
     try {
-      const response = await axios.get(`${API_URL}/products/${product.id}/lots`);
+      const resolved = await serverIdForProduct(productIdentityKeys(product));
+      if (!resolved.ok) {
+        alert(resolved.message);
+        return;
+      }
+      const response = await axios.get(`${API_URL}/products/${resolved.id}/lots`);
       setProductLots(response.data.lots || []);
       setProductLotAudit(response.data.audit || []);
       if (showPanel) setLotPanelProduct(product);
@@ -8125,6 +8156,7 @@ function App() {
     setOpeningStockLots([]);
     setShowOpeningLotForm(false);
     setEditingProductId(product.id);
+    setEditingProductKeys(productIdentityKeys(product));
     setProductPhotoDraft({ dataUrl: photoForProduct(productPhotoIndex, product), changed: false });
     setProductPhotoMessage("");
     loadProductLots(product, true);
@@ -8143,9 +8175,14 @@ function App() {
     const reason = window.prompt(`Enter reason to deactivate/cancel ${product.product_name}`);
     if (!reason?.trim()) return;
     try {
+      const resolved = await serverIdForProduct(productIdentityKeys(product));
+      if (!resolved.ok) {
+        alert(resolved.message);
+        return;
+      }
       const deactivationWrite = createOperationalWrite(user, { reason, cancelled_by: user.id });
       await axios.post(
-        `${API_URL}/api/v3/products/${product.id}/deactivate`,
+        `${API_URL}/api/v3/products/${resolved.id}/deactivate`,
         deactivationWrite.body,
         deactivationWrite.config
       );
