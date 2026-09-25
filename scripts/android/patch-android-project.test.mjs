@@ -144,3 +144,42 @@ test("data extraction rules exclude every domain from cloud backup and device tr
     assert.ok(!body.includes("<include"), `${section} must not include anything`);
   }
 });
+
+// BuildTask.kt as tauri-cli 2.11.2 renders it when it cannot tell how it was started (seen in CI,
+// 25 Sep 2026): Gradle then ran `node tauri ...` from src-tauri and found no module.
+const BUILD_TASK = `class BuildTask : DefaultTask() {
+    @TaskAction
+    fun assemble() {
+        val executable = """node""";
+        try {
+            runTauriCli(executable)
+        } catch (e: Exception) {
+            throw e
+        }
+    }
+
+    fun runTauriCli(executable: String) {
+        val rootDirRel = rootDirRel ?: throw GradleException("rootDirRel cannot be null")
+        val target = target ?: throw GradleException("target cannot be null")
+        val release = release ?: throw GradleException("release cannot be null")
+        val args = listOf("tauri", "android", "android-studio-script");
+    }
+}
+`;
+
+test("BuildTask: Gradle calls the CLI's tauri.js from src-tauri, and a second patch changes nothing", async () => {
+  const { patchBuildTask, TAURI_CLI_FROM_SRC_TAURI } = await import("./patch-android-project.mjs");
+  const once = patchBuildTask(BUILD_TASK);
+  assert.match(once, /val executable = """node""";/);
+  assert.ok(once.includes(`val args = listOf("${TAURI_CLI_FROM_SRC_TAURI}", "android", "android-studio-script");`));
+  assert.equal(patchBuildTask(once), once);
+});
+
+test("BuildTask: an unexpected shape is refused, not guessed", async () => {
+  const { patchBuildTask } = await import("./patch-android-project.mjs");
+  assert.throws(() => patchBuildTask("class BuildTask {}"), /template changed shape/);
+  assert.throws(
+    () => patchBuildTask(BUILD_TASK.replace('"android", "android-studio-script"', '"something", "else"')),
+    /unexpected arguments/,
+  );
+});

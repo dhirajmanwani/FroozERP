@@ -147,6 +147,43 @@ export function patchGradle(source, { allowDevCleartext = false } = {}) {
   return out;
 }
 
+// 3. Gradle calls back into the Tauri CLI to build the Rust library. `tauri android init` writes how
+//    to do that into buildSrc/.../BuildTask.kt, and when it cannot tell how it was started it writes
+//    `node tauri android android-studio-script`, run from src-tauri, which finds no `tauri` there.
+//    The CLI lives in frontend/node_modules, so the call is pointed at its tauri.js explicitly.
+export const TAURI_CLI_FROM_SRC_TAURI = "../frontend/node_modules/@tauri-apps/cli/tauri.js";
+const BUILD_TASK_ARGS = /val args = listOf\(([^)]*)\);/;
+
+export function patchBuildTask(source) {
+  const executable = source.match(/val executable = """([^"]*)""";/);
+  if (!executable) throw new PatchError("BuildTask.kt has no `val executable = \"\"\"...\"\"\";` line; the template changed shape.");
+  const args = source.match(BUILD_TASK_ARGS);
+  if (!args) throw new PatchError("BuildTask.kt has no `val args = listOf(...);` line; the template changed shape.");
+  const wanted = `"${TAURI_CLI_FROM_SRC_TAURI}", "android", "android-studio-script"`;
+  if (executable[1] === "node" && args[1] === wanted) return source;
+  if (!/"android", "android-studio-script"$/.test(args[1])) {
+    throw new PatchError(`BuildTask.kt calls the CLI with unexpected arguments (${args[1]}); refusing to guess.`);
+  }
+  return source
+    .replace(executable[0], 'val executable = """node""";')
+    .replace(BUILD_TASK_ARGS, `val args = listOf(${wanted});`);
+}
+
+export function findBuildTask(projectDir = androidProjectDir) {
+  const root = path.join(projectDir, "buildSrc");
+  const stack = [root];
+  while (stack.length) {
+    const dir = stack.pop();
+    if (!fs.existsSync(dir)) continue;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) stack.push(full);
+      else if (entry.name === "BuildTask.kt") return full;
+    }
+  }
+  throw new PatchError(`BuildTask.kt not found under ${path.relative(repoRoot, root)}. Run \`tauri android init --ci\` first.`);
+}
+
 function readRequired(file, what) {
   if (!fs.existsSync(file)) {
     throw new PatchError(
@@ -164,6 +201,9 @@ export function patchProject({ allowDevCleartext = false, log = console.log } = 
   // Compute everything before writing anything, so a shape error leaves the project untouched.
   const nextManifest = patchManifest(manifest);
   const nextGradle = patchGradle(gradle, { allowDevCleartext });
+  const buildTaskPath = findBuildTask();
+  const buildTask = fs.readFileSync(buildTaskPath, "utf8");
+  const nextBuildTask = patchBuildTask(buildTask);
   const rulesCurrent = fs.existsSync(dataExtractionRulesPath)
     ? fs.readFileSync(dataExtractionRulesPath, "utf8")
     : null;
@@ -181,6 +221,10 @@ export function patchProject({ allowDevCleartext = false, log = console.log } = 
   if (nextGradle !== gradle) {
     fs.writeFileSync(appGradlePath, nextGradle);
     changed.push(appGradlePath);
+  }
+  if (nextBuildTask !== buildTask) {
+    fs.writeFileSync(buildTaskPath, nextBuildTask);
+    changed.push(buildTaskPath);
   }
 
   // Post-conditions, re-read from disk.

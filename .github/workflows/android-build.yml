@@ -112,23 +112,18 @@ jobs:
             echo "::error::src-tauri/gen/android is present in the checkout. It is a generated project and must not be committed."
             exit 1
           fi
-          # Run the CLI's JS entry through node by absolute path. `init` records how it was started
-          # into gen/android's BuildTask.kt, which Gradle later uses to call back into the CLI; via
-          # the .bin symlink it recorded a bare `tauri` and Gradle looked for src-tauri/tauri.
           node "${GITHUB_WORKSPACE}/frontend/node_modules/@tauri-apps/cli/tauri.js" android init --ci --skip-targets-install
-          task="$(find src-tauri/gen/android/buildSrc -name BuildTask.kt | head -n 1)"
-          echo "Gradle calls the CLI as:"
-          grep -nE 'val executable|val args' "${task}"
-          if ! grep -q '@tauri-apps/cli/tauri.js' "${task}"; then
-            echo "::error::${task} does not call the Tauri CLI's tauri.js; Gradle's Rust build step would fail."
-            exit 1
-          fi
 
       - name: Harden generated Android project (no backup, no device transfer, no cleartext)
         shell: bash
         run: |
           node --test scripts/android/*.test.mjs
           node scripts/android/patch-android-project.mjs
+          # Gradle calls back into the CLI through BuildTask.kt; init writes a bare `tauri` there,
+          # which the patch points at frontend/node_modules/@tauri-apps/cli/tauri.js.
+          task="$(find src-tauri/gen/android/buildSrc -name BuildTask.kt | head -n 1)"
+          grep -nE 'val executable|val args' "${task}"
+          grep -q '@tauri-apps/cli/tauri.js' "${task}"
 
       - name: Build debug APK
         shell: bash
