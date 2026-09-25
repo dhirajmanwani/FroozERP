@@ -354,6 +354,22 @@ Cloud migration 017 does not have to be applied by hand: `activation_licences` i
 `server.js`'s own startup bootstrap for exactly the local and self-hosted case, and
 `verifyDeclaredSchema` refuses to start if the two ever drift.
 
+**Since 2026-09-23 there is one command for both windows**, once the `_staging` copy exists:
+
+```powershell
+$env:PGPASSWORD = '<the postgres password, single quotes>'
+npm run app:rehearsal
+```
+
+`scripts/run-rehearsal.mjs` sets every variable below itself, overriding anything already in the
+shell (a `DATABASE_URL` left over from applying cloud migrations included), stops this checkout's
+own leftover `server.js` on 5090 and Vite on 5173, **refuses to start if either port is still held**
+-- a second `server.js` dies on EADDRINUSE and the old one keeps answering with old code -- prints
+the commit it is running, removes `FROOZERP_DISPOSABLE_SEED`, and stops the stand-in cloud when the
+app closes. Profile defaults to `rehearsal2` (`FROOZERP_REHEARSAL_PROFILE` to change it; the name,
+never the `profile-` folder name). The session secret is generated once and kept in the disposable
+root. The two windows below are what it does, kept for when something needs doing by hand.
+
 ```powershell
 # window 1 - the stand-in cloud, pointed at the COPY, never live
 $env:NODE_ENV = "test"
@@ -369,8 +385,33 @@ node backend/server.js
 
 # window 2 - the disposable app, told where its cloud is
 $env:FROOZERP_CLOUD_API_URL = "http://127.0.0.1:5090"
+$env:VITE_CLOUD_API_URL = "http://127.0.0.1:5090"
+$env:VITE_ALLOW_LOOPBACK_CLOUD_FOR_ISOLATED_TESTS = "true"
 npm run app:disposable
 ```
+
+**All three of those are needed, and the two `VITE_` ones were missing from this page until
+2026-09-21, when their absence cost a rehearsal an evening.** `FROOZERP_CLOUD_API_URL` is read by
+the Rust shell and reaches the *gateway* only. The screen resolves its own `CLOUD_API_URL`
+separately, in `App.jsx`, and `isRealCloudUrl` there rejects any loopback address outright -- the
+guard that stops a shipped build from treating a machine on the LAN as the cloud. The single
+exception is `ISOLATED_LOOPBACK_CLOUD_API_URL`, which requires a dev build (`npm run app:disposable`
+runs `tauri dev`, so that part is already true) **and** `VITE_ALLOW_LOOPBACK_CLOUD_FOR_ISOLATED_TESTS`
+**and** a loopback `VITE_CLOUD_API_URL`.
+
+With only the gateway variable set, `(Invoke-RestMethod http://127.0.0.1:5051/api/health)
+.cloud_api_configured` answers `True` and everything still fails, which is what makes this one
+expensive to find. The screen's own view is the one that decides, and it is on the page:
+**Settings -> Cloud API URL**. "Not configured" there means the two `VITE_` variables did not reach
+Vite, whatever the gateway says.
+
+What it costs when they are missing: `guardCloudCall("canonical-cloud-login", ...)` refuses with
+`CLOUD_NOT_CONFIGURED` before any request is made, so `login()` never reaches its POST, falls
+through to `continueOffline()`, and opens a perfectly working offline session. Nothing says the
+cloud was skipped. Then FROST -- which is cloud-served on the desktop -- has no session token to
+send and every one of its endpoints answers 401. The console tell is precise: filter it for
+`login-` and an offline fall-through shows `login-local-readiness-N` with **no** `login-request`,
+`login-success` or `login-failed` line after it.
 
 Every variable in window 1 is load-bearing, and leaving one out fails at startup rather than
 quietly:
@@ -383,7 +424,8 @@ quietly:
 - `DEVICE_SESSION_SECRET` of at least 32 characters. A cloud-server runtime counts as exposed, so
   `sessionSecret.js` makes a borrowed key fatal rather than a warning, and the process exits.
 - `NODE_ENV=test` gates both isolated-test flags.
-- `FROOZERP_CLOUD_API_URL` in window 2, or the gateway has no target at all.
+- `FROOZERP_CLOUD_API_URL` in window 2, or the gateway has no target at all, plus the two `VITE_`
+  variables above, or the screen has none. The gateway and the screen are told separately.
 
 Keep the password out of `DATABASE_URL` and pass it as `PGPASSWORD`. node-postgres falls back to
 `PGPASSWORD` when the connection string carries no password, and a password containing `@`, `:`,
@@ -399,6 +441,9 @@ schema bootstrap completes, the server listens, and `GET /api/activation/licence
 
 If the screen still refuses after this, read the message rather than assuming. "Local Only mode
 selected" means the app's own kill switch is on, which is a different fact from having no cloud.
+"No cloud backend is configured for this installation" on a run where the gateway reports
+`cloud_api_configured: True` means the screen, not the gateway, is the one without a target - the
+two `VITE_` variables above.
 
 *What this rehearsal still cannot prove*
 
@@ -431,6 +476,11 @@ also the last release the counters need installed by hand; from 1.0.75 they upda
   did not reach this build.
 - **Stop the local server and open FROST.** The message must name *this machine's* server, not the
   cloud. Pointing at the cloud here sends the reader to the wrong machine.
+- **Sign in with the cloud unreachable, then open FROST.** The app opens an offline session, which
+  carries no cloud token, so FROST cannot work. It must say that it is an offline session and that
+  signing in again needs the cloud reachable. It must not say the session expired, and it must not
+  fire its eleven requests to find out — that combination, and the advice to sign in again, is what
+  it did before 1.0.74 and what sent the 21 Sep rehearsal looking for a fault that was not there.
 - Every figure FROST states must be checkable against the same figure in the ordinary reports. This
   is the release's one non-negotiable: the model phrases, the database answers.
 

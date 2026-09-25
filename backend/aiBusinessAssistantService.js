@@ -7,6 +7,18 @@ const {
   assertGroundedAnswer,
 } = require("./aiBusinessAssistantRules");
 const { describeOllamaFallback, phraseWithOllama } = require("./frostOllama");
+const { ANSWER_FORMAT_VERSION, buildDeterministicAnswer } = require("./frostAnswer");
+const { detectReminderDueDate, detectSmallTalk, detectSpokenRange, reminderTitleFrom } = require("./frostLanguage");
+const { CONTACT_STATUS, normalizeReminderDueAt, prepareCustomerDueReminder, reminderDueAtWallClock } = require("./frostReminders");
+const {
+  buildCustomerLedger,
+  buildDuesAnswer,
+  buildPaymentsDue,
+  buildSupplierLedger,
+  linkReminderDraft,
+  resolvePaymentsDueDate,
+  shortDay,
+} = require("./frostAccounts");
 const {
   DEFAULT_FROST_SETTINGS,
   FROST_ASSISTANT_NAME,
@@ -66,6 +78,35 @@ const parsePositiveInteger = (value) => {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 };
+
+/** The widest `ai_conversations.session_id` the column can hold. Kept beside the check that uses it. */
+const CHAT_SESSION_ID_MAX_LENGTH = 80;
+
+/**
+ * The chat a question belongs to, or nothing.
+ *
+ * The client mints this id and sends it back with every follow-up, so it is caller-supplied text
+ * and is treated as such: a string, trimmed, and no longer than the column. Anything else becomes
+ * `null`.
+ *
+ * It returns `null` rather than refusing the request, which is the opposite of the rule
+ * `requireBranchScope` follows two functions below, and deliberately so. That one guards *which
+ * shop's books are read*, where an absent value widening to "all of them" is a disclosure. This one
+ * only decides which heading a question is filed under. A 400 here would lose an answer the owner
+ * asked for and already waited on, over a grouping label -- so a malformed id costs the chat
+ * grouping for that one question and nothing else. The question, the answer and the audit row are
+ * written either way.
+ *
+ * The length cap is not cosmetic: Postgres refuses an over-length `VARCHAR(80)` outright, so
+ * without the cap a long id turns the whole `auditQuestion` write -- conversation, messages, fact
+ * snapshots and audit row -- into a 500 after the books have already been read.
+ */
+const normalizeChatSessionId = (value) => {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > CHAT_SESSION_ID_MAX_LENGTH) return null;
+  return trimmed;
+};
 /**
  * The branch whose data a FROST answer may be built from.
  *
@@ -112,7 +153,35 @@ const getRange = (query = {}) => {
   }
   if (range === "last_7_days" || range === "7") return { dateFrom: addDays(today, -6), dateTo: today, label: "Last 7 Days" };
   if (range === "this_month" || range === "month") return { dateFrom: today.slice(0, 8) + "01", dateTo: today, label: "This Month" };
+  // The three below were missing while `detectSpokenRange` already understood the words for them, so
+  // "which product was in high demand this year" was answered with today's figures under a source
+  // line reading "- Today". The question named a period, this function did not know the key, and the
+  // default at the bottom quietly answered about a different span of time. `frostLanguage.test.js`
+  // now walks `SPOKEN_RANGE_KEYS` against this function so the two lists cannot drift apart again.
+  if (range === "last_month") {
+    const firstOfThisMonth = `${today.slice(0, 8)}01`;
+    const lastOfLastMonth = addDays(firstOfThisMonth, -1);
+    return { dateFrom: `${lastOfLastMonth.slice(0, 8)}01`, dateTo: lastOfLastMonth, label: "Last Month" };
+  }
+  if (range === "this_year") return { dateFrom: `${today.slice(0, 4)}-01-01`, dateTo: today, label: "This Year" };
+  if (range === "last_year") {
+    const lastYear = String(Number(today.slice(0, 4)) - 1);
+    return { dateFrom: `${lastYear}-01-01`, dateTo: `${lastYear}-12-31`, label: "Last Year" };
+  }
   return { dateFrom: today, dateTo: today, label: "Today" };
+};
+
+/**
+ * "kal kitna bika" names its own period, and answering it with whatever the period dropdown happens
+ * to be set to answers a different question. A period spoken in the question therefore wins over
+ * the dropdown -- except when the owner typed explicit from/to dates, which are a deliberate choice
+ * he made on screen and outrank a word. The chosen period always leads the answer, so a question
+ * that moved the period never does so silently.
+ */
+const rangeQueryFor = (question, body = {}) => {
+  if (body.date_from && body.date_to) return body;
+  const spoken = detectSpokenRange(question);
+  return spoken ? { ...body, range: spoken } : body;
 };
 
 const maskPhone = (value) => {
@@ -208,7 +277,15 @@ const requireAiPermission = async ({ req, res, getPermissionUser, getCanonicalId
     return null;
   }
   const identity = getCanonicalIdentity
-    ? await getCanonicalIdentity({ userId: user.id, sessionId: req.body?.session_id || req.headers["x-session-id"] })
+    // The header only. This read was `req.body?.session_id || req.headers["x-session-id"]`, and
+    // `session_id` in the body now means the *chat* a question belongs to (see
+    // `normalizeChatSessionId`). This argument is the sign-in session's label -- it travels to
+    // `/api/auth/me` as `x-session-id` and comes back as `identity.session_id` -- so leaving the
+    // body read in place would have made the chat id impersonate the session label the first time
+    // the panel sent one, and misreported it to whoever was next debugging a session problem.
+    // Nothing is lost: no caller sends the sign-in session in a FROST body, and neither value
+    // authenticates anything -- `req.auth` is the only identity, and it comes from the verified token.
+    ? await getCanonicalIdentity({ userId: user.id, sessionId: req.headers["x-session-id"] || "" })
     : {
         user_id: user.id,
         username: user.username || "",
@@ -359,13 +436,130 @@ const getCustomerOutstanding = async (pool, branchId, settings) => {
   });
 };
 
+/**
+ * The three `due_status` values that mean the money is late.
+ *
+ * This list was written out three times -- here, in `runAlertRules`, and now in the dues panel --
+ * and three copies of a classification drift apart the first time a fourth status is added. The
+ * overdue alert (`CUSTOMER_PAYMENT_OVERDUE`) and the prepared-reminder panel have to agree about
+ * which customers are late, or the bell and the panel will show different people for the same
+ * reason and neither will look wrong.
+ */
+const OVERDUE_DUE_STATUSES = Object.freeze(["OVERDUE", "SERIOUSLY_OVERDUE", "CRITICAL_OUTSTANDING"]);
+
 const getOverdueCustomerInvoices = async (pool, branchId, settings) => {
   const outstanding = await getCustomerOutstanding(pool, branchId, settings);
-  const rows = outstanding.rows.filter((row) => ["OVERDUE", "SERIOUSLY_OVERDUE", "CRITICAL_OUTSTANDING"].includes(row.due_status));
+  const rows = outstanding.rows.filter((row) => OVERDUE_DUE_STATUSES.includes(row.due_status));
   return buildFact("overdue_customer_invoices", "Customer Ledgers", "Current outstanding", rows, {
     totalOverdue: roundCurrency(rows.reduce((sum, row) => sum + row.outstanding_amount, 0)),
     count: rows.length,
   });
+};
+
+/**
+ * Entity ids are opaque strings, and the two halves of the dues panel are joined on one.
+ *
+ * `getCustomerOutstanding` groups on `COALESCE(s.customer_id, c.id)` and the contact query returns
+ * `c.id`; both arrive from `pg` as whatever the column type deserialises to. Coercing either side
+ * with `Number()` is the join failure `CLAUDE.md` records -- "004" and 4 are different entities --
+ * and here it would not empty the table, it would attach one customer's phone number to another
+ * customer's debt. A string key on both sides, or nothing.
+ */
+const contactKey = (value) => String(value ?? "").trim();
+
+/**
+ * Whether each customer can be messaged at all, for the customers who have traded at this branch.
+ *
+ * Deliberately a second query rather than two more columns on `getCustomerOutstanding`. That
+ * function's rows become `facts`: they go into the model prompt, the thirty-minute answer cache and
+ * the audit trail, which is exactly why `mobile_number` is masked there. Putting a dialable number
+ * on those rows would push the shop's whole debtor contact list through all three.
+ *
+ * Scoped through `sales.branch_id` rather than through `customers`, which is company-wide master
+ * data with no branch column of its own (docs/branch-isolation-audit.md 1.1). Joining through the
+ * sales that earned the debt is both the honest scope -- these are the customers who bought here --
+ * and a real tenancy predicate, which `tenancyCoverage.test.js` measures rather than assumes.
+ */
+const getCustomerContactChannels = async (pool, branchId) => {
+  const branch = requireBranchScope(branchId);
+  const result = await pool.query(`
+    SELECT DISTINCT
+      c.id AS customer_id,
+      c.whatsapp_number,
+      c.mobile_number,
+      c.whatsapp_opt_in
+    FROM customers c
+    JOIN sales s ON s.customer_id = c.id
+    WHERE s.branch_id = $1
+  `, [branch]);
+  const byCustomer = new Map();
+  for (const row of result.rows) byCustomer.set(contactKey(row.customer_id), row);
+  return byCustomer;
+};
+
+/**
+ * The shop's own name, for the message that has to say who it is from.
+ *
+ * "" when it cannot be read, and the draft then says "aapki dukaan se" rather than naming a shop
+ * that does not exist. A settings read failing must not take the dues list down with it.
+ */
+const getBusinessName = async (pool) => {
+  try {
+    const result = await pool.query("SELECT business_name FROM business_settings WHERE id = 1");
+    return cleanText(result.rows[0]?.business_name);
+  } catch (error) {
+    // Not swallowed into a zero: the empty name is reported on the payload as `shop_name`, the
+    // draft visibly says "aapki dukaan se" instead of naming a shop, and the reason is logged. A
+    // settings read failing must not take the whole dues list down with it.
+    console.warn("FROST dues panel could not read the shop name", error.message);
+    return "";
+  }
+};
+
+/**
+ * Every customer who owes money, with a message the owner could send them -- and nothing that sends it.
+ *
+ * The owner asked that FROST either message customers who owe him money or remind him about them.
+ * This is the reminding half, and the messaging half is deliberately absent: the draft is a string
+ * on a row. `POST /api/whatsapp/send-document` is not called here, is not scheduled here, and is
+ * not made reachable from here. It spends the shop's live WhatsApp Cloud credentials against real
+ * customers, so the only version of this that is safe to ship is one where a person read the words
+ * and pressed send for that one message.
+ *
+ * Every customer with a balance is returned, not only the late ones, because the summary and the
+ * table have to be derived from the same filtered source -- a panel whose total comes from one
+ * collection and whose rows come from another eventually disagrees, and the disagreement reads as
+ * data loss. `due_status` and `overdue_count` are on the payload so the panel can narrow it without
+ * asking for a different list.
+ */
+const getCustomerDueReminders = async (pool, branchId, settings) => {
+  const [outstanding, contacts, shopName] = await Promise.all([
+    getCustomerOutstanding(pool, branchId, settings),
+    getCustomerContactChannels(pool, branchId),
+    getBusinessName(pool),
+  ]);
+  const customers = outstanding.rows.map((row) => {
+    // `mobile_number` arrives from the fact query already masked. Dropping it before the contact
+    // row is merged keeps one field from meaning two different things -- a masked string and a real
+    // number -- which is how "has a number" and "has four visible digits" quietly become the same
+    // question.
+    const { mobile_number: maskedByFactQuery, ...figures } = row;
+    const contact = contacts.get(contactKey(row.customer_id)) || {};
+    return prepareCustomerDueReminder({ ...figures, ...contact }, { shopName, maskNumber: maskPhone });
+  });
+  const countWhere = (predicate) => customers.filter(predicate).length;
+  return {
+    shop_name: shopName,
+    customers,
+    summary: {
+      count: customers.length,
+      total_outstanding: roundCurrency(customers.reduce((sum, customer) => sum + toNumber(customer.outstanding_amount), 0)),
+      overdue_count: countWhere((customer) => OVERDUE_DUE_STATUSES.includes(customer.due_status)),
+      ready_for_review: countWhere((customer) => customer.contact_status === CONTACT_STATUS.READY),
+      no_number: countWhere((customer) => customer.contact_status === CONTACT_STATUS.NO_NUMBER),
+      opted_out: countWhere((customer) => customer.contact_status === CONTACT_STATUS.OPTED_OUT),
+    },
+  };
 };
 
 const getSupplierOutstanding = async (pool, branchId) => {
@@ -390,6 +584,172 @@ const getSupplierOutstanding = async (pool, branchId) => {
   return buildFact("supplier_outstanding", "Purchases", "Current outstanding", rows, {
     totalOutstanding: roundCurrency(rows.reduce((sum, row) => sum + row.outstanding_amount, 0)),
     count: rows.length,
+  });
+};
+
+/**
+ * The per-bill input the FIFO in `frostAccounts.js` needs, which `getCustomerOutstanding` cannot give.
+ *
+ * `getCustomerOutstanding` answers "how much" with one row per customer, which is right for the
+ * alerts and the dues panel, and it stays exactly as it is -- `runAlertRules` reads its
+ * `oldest_due_date`. But "since when" is a question about bills: the oldest bill's due date is the
+ * wrong answer for a customer who has paid that bill and the next one. So the same three sources are
+ * read again here, at the grain FIFO needs, and with the same rules: non-cancelled CREDIT sales,
+ * payments not cancelled, and credit-note returns.
+ *
+ * Unlimited, unlike the fact query's `LIMIT 50`. A payment reminder due today for the fifty-first
+ * largest debtor must show that customer's balance, not read as "settled" because the balance fell
+ * off the end of a top-50 list.
+ */
+const getCustomerCreditInputs = async (pool, branchId) => {
+  const branch = requireBranchScope(branchId);
+  const bills = await pool.query(`
+    SELECT
+      s.id,
+      s.customer_id,
+      COALESCE(c.customer_name, s.customer_name, 'Walk-in Customer') AS customer_name,
+      s.sale_date,
+      s.due_date,
+      s.total_amount
+    FROM sales s
+    LEFT JOIN customers c ON c.id = s.customer_id
+    WHERE s.branch_id = $1
+      AND s.payment_mode = 'CREDIT'
+      AND COALESCE(s.sale_status, 'COMPLETED') <> 'CANCELLED'
+    ORDER BY s.sale_date, s.id
+  `, [branch]);
+  // A return with no customer is left out, as it is in `getCustomerOutstanding`, whose join on
+  // `customer_id` can never match a NULL. Keeping it here would pay down the walk-in group's bills
+  // with money that query never credits, and the two totals would disagree.
+  const credits = await pool.query(`
+    WITH payments AS (
+      SELECT customer_id, SUM(payment_amount) AS paid_amount, MAX(payment_date) AS last_payment_date
+      FROM customer_payments
+      WHERE cancelled IS DISTINCT FROM TRUE AND branch_id = $1
+      GROUP BY customer_id
+    ),
+    returns AS (
+      SELECT s.customer_id, SUM(sr.total_return_amount) AS returned_amount
+      FROM sale_returns sr
+      JOIN sales s ON s.id = sr.sale_id
+      WHERE sr.refund_type IN ('CREDIT_NOTE', 'FUTURE_ADJUSTMENT')
+        AND s.branch_id = $1
+      GROUP BY s.customer_id
+    )
+    SELECT
+      COALESCE(p.customer_id, r.customer_id) AS customer_id,
+      c.customer_name,
+      COALESCE(p.paid_amount, 0) AS paid_amount,
+      COALESCE(r.returned_amount, 0) AS returned_amount,
+      p.last_payment_date
+    FROM payments p
+    FULL OUTER JOIN returns r ON r.customer_id = p.customer_id
+    LEFT JOIN customers c ON c.id = COALESCE(p.customer_id, r.customer_id)
+    WHERE COALESCE(p.customer_id, r.customer_id) IS NOT NULL
+  `, [branch]);
+  return { customers: credits.rows, customerBills: bills.rows };
+};
+
+/**
+ * Every supplier this branch has bought from, with what is still owed -- zero included.
+ *
+ * The same balance `getSupplierOutstanding` sums, without its `LIMIT 50` and without dropping the
+ * suppliers who are paid up: "Verma ko kitna dena hai" about a supplier owed nothing is answered
+ * "nothing now", not "I could not find Verma".
+ */
+const getSupplierBalanceRows = async (pool, branchId) => {
+  const branch = requireBranchScope(branchId);
+  const result = await pool.query(`
+    SELECT
+      p.supplier_id,
+      COALESCE(s.supplier_name, p.supplier_name, 'Supplier') AS supplier_name,
+      MIN(CASE WHEN COALESCE(p.balance_amount, 0) > 0 THEN COALESCE(p.bill_date, p.purchase_date) END) AS oldest_purchase_date,
+      SUM(CASE WHEN COALESCE(p.balance_amount, 0) > 0 THEN p.balance_amount ELSE 0 END) AS outstanding_amount
+    FROM purchases p
+    LEFT JOIN suppliers s ON s.id = p.supplier_id
+    WHERE COALESCE(p.purchase_status, 'ACTIVE') <> 'CANCELLED'
+      AND p.branch_id = $1
+    GROUP BY p.supplier_id, COALESCE(s.supplier_name, p.supplier_name, 'Supplier')
+  `, [branch]);
+  return result.rows;
+};
+
+/**
+ * Open COLLECT_PAYMENT and PAY_SUPPLIER reminders, dated or not.
+ *
+ * "Open" is what `getReminders` means by it -- anything not RESOLVED -- so a reminder the Reminders
+ * list still shows is one this route still knows about. A snooze that has not run out is flagged
+ * rather than filtered, against the database's clock: the popup must stay quiet until it ends, while
+ * the account's row in the panel still shows that a reminder exists.
+ *
+ * The account's name is joined here for a reminder whose account has no ledger row at this branch,
+ * so a settled reminder still says whose it was. `id::text` against the stored string, never the
+ * other way round: `linked_entity_id` is an opaque string, and "004" must not find customer 4.
+ */
+const getOpenPaymentReminders = async (pool, branchId) => {
+  const branch = requireBranchScope(branchId);
+  const result = await pool.query(`
+    SELECT
+      r.id,
+      r.reminder_type,
+      r.linked_entity_type,
+      r.linked_entity_id,
+      r.due_at,
+      r.status,
+      (r.status = 'SNOOZED' AND COALESCE(r.snoozed_until > CURRENT_TIMESTAMP, FALSE)) AS currently_snoozed,
+      COALESCE(c.customer_name, sp.supplier_name) AS linked_entity_name
+    FROM ai_reminders r
+    LEFT JOIN customers c ON r.linked_entity_type = 'customer' AND c.id::text = r.linked_entity_id
+    LEFT JOIN suppliers sp ON r.linked_entity_type = 'supplier' AND sp.id::text = r.linked_entity_id
+    WHERE r.status <> 'RESOLVED'
+      AND r.branch_id = $1
+      AND r.reminder_type IN ('COLLECT_PAYMENT', 'PAY_SUPPLIER')
+    ORDER BY r.due_at NULLS LAST, r.id
+  `, [branch]);
+  // The stored day, not the server's reading of it -- see `reminderDueAtWallClock`.
+  return result.rows.map((row) => ({ ...row, due_at: reminderDueAtWallClock(row.due_at) }));
+};
+
+const getPaymentsDueInputs = async (pool, branchId) => {
+  const { customers, customerBills } = await getCustomerCreditInputs(pool, branchId);
+  const suppliers = await getSupplierBalanceRows(pool, branchId);
+  const reminders = await getOpenPaymentReminders(pool, branchId);
+  return { customers, customerBills, suppliers, reminders };
+};
+
+/**
+ * The answer to a PAYMENTS question, and the `payments_due` fact that grounds it.
+ *
+ * Built from the same inputs as `GET /api/ai/payments-due` for the same day, so "aaj kisse payment
+ * maangna hai" in the chat and the popup on the screen cannot name different people.
+ */
+const answerDuesQuestion = async (pool, branchId, question, date = toDateKey()) => {
+  const inputs = await getPaymentsDueInputs(pool, branchId);
+  const paymentsDue = buildPaymentsDue({ date, ...inputs });
+  const dues = buildDuesAnswer({
+    question,
+    customers: buildCustomerLedger(inputs),
+    suppliers: buildSupplierLedger(inputs.suppliers),
+    paymentsDue,
+  });
+  return {
+    answer: dues.answer,
+    fact: buildFact("payments_due", "Accounts", `Balances as of ${shortDay(date)}`, dues.rows, dues.summary),
+  };
+};
+
+/**
+ * The account a spoken reminder names, when there is exactly one and the words point its way.
+ * See `linkReminderDraft`; this only reads the names it matches against.
+ */
+const linkSpokenReminder = async (pool, branchId, question, title) => {
+  const { customers, customerBills } = await getCustomerCreditInputs(pool, branchId);
+  const suppliers = await getSupplierBalanceRows(pool, branchId);
+  return linkReminderDraft({
+    question,
+    title,
+    customers: buildCustomerLedger({ customers, customerBills }),
+    suppliers: buildSupplierLedger(suppliers),
   });
 };
 
@@ -1440,7 +1800,7 @@ const runAlertRules = async (pool, branchId, settings) => {
     getPendingPurchaseBills(pool, branchId),
     getLowStockProducts(pool, branchId),
   ]);
-  for (const row of customerOutstanding.rows.filter((item) => ["OVERDUE", "SERIOUSLY_OVERDUE", "CRITICAL_OUTSTANDING"].includes(item.due_status))) {
+  for (const row of customerOutstanding.rows.filter((item) => OVERDUE_DUE_STATUSES.includes(item.due_status))) {
     await upsertAlert(pool, branchId, {
       dedupKey: `customer-overdue:${branchId}:${row.customer_id || row.customer_name}`,
       type: "CUSTOMER_PAYMENT_OVERDUE",
@@ -1505,8 +1865,29 @@ const STATUS_CHANGE_TABLES = new Set(["ai_alerts", "ai_reminders"]);
  * branch predicate makes a cross-branch id match nothing, which the caller sees as "not found"
  * rather than as a silent success.
  */
-const buildStatusChange = ({ table, action, id, branchId, userId, ownerNotes, snoozedUntil }) => {
+const buildStatusChange = ({ table, action, id, branchId, userId, ownerNotes, snoozedUntil, dueAt }) => {
   if (!STATUS_CHANGE_TABLES.has(table)) throw new Error(`FROST_UNKNOWN_STATUS_TABLE: ${table}`);
+  if (action === "SET_DUE_DATE") {
+    // Only reminders have a due date. An alert is raised by a rule and cleared by the condition
+    // going away; there is no date on the row and no column to write, so this is refused rather
+    // than allowed to fail against Postgres as a 500 that reads like a broken button.
+    if (table !== "ai_reminders") return null;
+    // Setting a date on a reminder that is asleep has to wake it, or the button does nothing the
+    // owner can see: `getReminders` hides a reminder until its snooze runs out, so a date set on a
+    // snoozed row would be stored correctly and still leave the panel unchanged, which is
+    // indistinguishable from a failed save.
+    return {
+      text: `UPDATE ai_reminders
+        SET due_at = $2::timestamp,
+            status = CASE WHEN status = 'SNOOZED' THEN 'OPEN' ELSE status END,
+            snoozed_until = CASE WHEN status = 'SNOOZED' THEN NULL ELSE snoozed_until END,
+            owner_notes = COALESCE(NULLIF($3, ''), owner_notes),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 AND branch_id = $4
+        RETURNING *`,
+      values: [id, dueAt || null, ownerNotes, branchId],
+    };
+  }
   if (action === "ACKNOWLEDGE") {
     return {
       text: `UPDATE ${table} SET status = 'ACKNOWLEDGED', acknowledged_by = $2, acknowledged_at = CURRENT_TIMESTAMP, owner_notes = COALESCE(NULLIF($3, ''), owner_notes), updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND branch_id = $4 RETURNING *`,
@@ -1552,7 +1933,9 @@ const getReminders = async (pool, branchId) => {
     ORDER BY due_at NULLS LAST, CASE priority WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2 WHEN 'ATTENTION' THEN 3 ELSE 4 END, id DESC
     LIMIT 100
   `, [branch]);
-  return result.rows;
+  // The stored day, not the server's reading of it -- see `reminderDueAtWallClock`. Without this a
+  // backend in India shows every dated reminder one day early.
+  return result.rows.map((row) => ({ ...row, due_at: reminderDueAtWallClock(row.due_at) }));
 };
 
 const emptyBriefingFact = (type, sourceModule, periodLabel, summary = {}, error = "") => buildFact(
@@ -1697,7 +2080,15 @@ const factsForQuestion = async (pool, branchId, classification, settings, range)
   ];
 };
 
+// The two answers that read no books: a greeting, and a question FROST did not recognise. Neither
+// has a period, a source list or a figure, and neither is handed to the local model -- with no facts
+// the grounding check cannot fail, which is exactly where an invented figure would come from.
+const FACTLESS_INTENTS = ["SMALL_TALK", "UNCLEAR", "REMINDER_CREATE"];
+
 const factsForBusinessIntent = async (pool, branchId, intent, settings, range) => {
+  // A greeting reads no books at all. Fetching six queries to answer "hi there" is both the wrong
+  // answer and six needless round trips to the cloud.
+  if (FACTLESS_INTENTS.includes(intent)) return [];
   if (intent === "CASH_DRAWER") return [await getCashDrawerSummary(pool, branchId, range), await getCollectionSummary(pool, branchId, range)];
   if (intent === "PURCHASE_PLANNING") return [await getPurchaseRecommendationFact(pool, branchId), await getLowStockProducts(pool, branchId), await getSupplierOutstanding(pool, branchId)];
   if (intent === "SALE_RATE_REVIEW") return [await getSaleRateReviewFact(pool, branchId), await getProfitAdvisorRows(pool, branchId).then((rows) => buildFact("profit_advisor", "Profit Advisor", "Last 30 days", rows, { count: rows.length }))];
@@ -1712,31 +2103,13 @@ const factsForBusinessIntent = async (pool, branchId, intent, settings, range) =
   return [await getDailySalesSummary(pool, branchId, range), await getCustomerOutstanding(pool, branchId, settings), await getSupplierOutstanding(pool, branchId), await getLowStockProducts(pool, branchId), await getInventoryNearingExpiry(pool, branchId, settings), await getProductSalesRanking(pool, branchId, range)];
 };
 
-const buildDeterministicAnswer = (classification, facts, range) => {
-  const parts = [`Period: ${range.label}.`];
-  for (const fact of facts) {
-    if (fact.summary.totalOutstanding !== undefined) parts.push(`${fact.sourceModule}: outstanding ${fact.summary.totalOutstanding} across ${fact.summary.count || 0} records.`);
-    if (fact.summary.totalSales !== undefined) parts.push(`${fact.sourceModule}: sales ${fact.summary.totalSales}, estimated gross profit ${fact.summary.estimatedGrossProfit}.`);
-    if (fact.summary.totalExpenses !== undefined) parts.push(`${fact.sourceModule}: expenses ${fact.summary.totalExpenses}.`);
-    if (fact.summary.totalWasteCost !== undefined) parts.push(`${fact.sourceModule}: waste cost ${fact.summary.totalWasteCost}.`);
-    if (fact.summary.count !== undefined && fact.summary.totalOutstanding === undefined && fact.summary.totalSales === undefined) parts.push(`${fact.sourceModule}: ${fact.summary.count} matching records.`);
-  }
-  const firstRows = facts.flatMap((fact) => fact.rows.slice(0, 3).map((row) => ({ fact, row }))).slice(0, 3);
-  if (firstRows.length) {
-    parts.push(`Top details: ${firstRows.map(({ row }) => row.customer_name || row.supplier_name || row.product_name || row.invoice_no || row.title || `#${row.id}`).join(", ")}.`);
-  }
-  parts.push("Source modules: " + [...new Set(facts.map((fact) => fact.sourceModule))].join(", ") + ".");
-  if (classification === "ATTENTION" && !firstRows.length) parts.push("No urgent deterministic issue was found from the available data.");
-  return parts.join(" ");
-};
-
-const auditQuestion = async ({ pool, branchId, user, deviceId, question, classification, range, facts, answer }) => {
+const auditQuestion = async ({ pool, branchId, user, deviceId, question, classification, range, facts, answer, sessionId = null }) => {
   const branch = requireBranchScope(branchId);
   const conversation = await pool.query(`
-    INSERT INTO ai_conversations (company_id, branch_id, user_id, device_id, question, classification, period_label)
-    VALUES (NULL, $1, $2, $3, $4, $5, $6)
+    INSERT INTO ai_conversations (company_id, branch_id, user_id, device_id, question, classification, period_label, session_id)
+    VALUES (NULL, $1, $2, $3, $4, $5, $6, $7)
     RETURNING id
-  `, [branch, user.id, deviceId || "", question, classification, range.label]);
+  `, [branch, user.id, deviceId || "", question, classification, range.label, sessionId]);
   const conversationId = conversation.rows[0].id;
   await pool.query("INSERT INTO ai_messages (conversation_id, role, content) VALUES ($1, 'user', $2)", [conversationId, question]);
   await pool.query("INSERT INTO ai_messages (conversation_id, role, content, facts_used) VALUES ($1, 'assistant', $2, $3::jsonb)", [conversationId, answer, JSON.stringify(facts)]);
@@ -1870,6 +2243,82 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
     return res.json({ reminders: await getReminders(pool, req.auth.branchId) });
+  });
+
+  /**
+   * Who to collect from and who to pay on one day, for the popup and the dues panel.
+   *
+   * **This route sends nothing.** It reads the ledger and the owner's own payment reminders and
+   * returns them; asking a customer for money is still something the owner does himself.
+   *
+   * `date` is the caller's calendar day, because the laptop is in India and the server may not be:
+   * for five and a half hours after midnight IST the server's day is still yesterday. It is bounded
+   * to two days either side of the server's day and refused otherwise -- a wrong clock must not
+   * quietly ask about another week.
+   *
+   * A failure is a 500 with a code, never an empty list. `collect: []` is the answer "nobody owes
+   * you today", and a query that failed must not be able to say that.
+   */
+  app.get("/api/ai/payments-due", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
+    if (!user) return;
+    const date = resolvePaymentsDueDate(req.query.date, toDateKey());
+    if (!date) {
+      return res.status(400).json({
+        code: "FROST_PAYMENTS_DATE_INVALID",
+        message: "Use a real date like 2026-09-23, within two days of today.",
+      });
+    }
+    try {
+      const inputs = await getPaymentsDueInputs(pool, req.auth.branchId);
+      return res.json(buildPaymentsDue({ date, ...inputs }));
+    } catch (error) {
+      console.error("FROST payments-due could not be read", error.message);
+      return res.status(500).json({
+        code: "FROST_PAYMENTS_DUE_UNAVAILABLE",
+        message: "Payments due could not be read just now. Nothing is known to be due or settled until it can.",
+      });
+    }
+  });
+
+  /**
+   * The customers who owe money, each with a message the owner can read, edit and send himself.
+   *
+   * **This route sends nothing.** It reads the ledger and returns text. No WhatsApp call is made
+   * here, none is queued, and nothing on the payload is a handle to one: `whatsapp_number_masked`
+   * is masked, and the dialable number is not on the response at all. The owner sends from the
+   * screen that already sends, one message at a time, after reading it.
+   *
+   * ## Why the number is masked when the panel might want to dial it
+   *
+   * `maskPhone` is the rule this file already applies to a customer's number
+   * (`getCustomerOutstanding`), and the two reasons behind it both still hold here. FROST's door is
+   * `ai_assistant_view`, and `FROST_DEFAULT_ROLES` is only the *fallback* -- a role granted that
+   * permission explicitly from the role-permissions screen gets in without ever holding
+   * `customer_accounts`, so an unmasked list here would hand every debtor's phone number to a role
+   * the customer screen refuses. And a full contact list of everyone who owes the shop money is a
+   * worse thing to leak in one response than any single figure on it.
+   *
+   * The cost is real and is not pretended away: a masked number cannot be dialled, so the panel
+   * cannot offer "send" from this payload alone. That is the point rather than an oversight -- the
+   * one ingredient a future caller would need to send automatically is the one ingredient that is
+   * missing. `has_whatsapp_number` and `whatsapp_opt_in` carry everything the owner needs to be
+   * *told* ("Ravi has no number on file", "Sita has opted out"), and the number itself lives one
+   * screen away in Customers, where sending already happens and already requires `whatsapp_send`.
+   */
+  app.get("/api/ai/reminders/customer-dues", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
+    if (!user) return;
+    const settings = await getAiSettings(pool, frost);
+    const dues = await getCustomerDueReminders(pool, req.auth.branchId, settings);
+    return res.json({
+      ...dues,
+      action_class: "READ_ONLY",
+      approval_required: false,
+      // Stated on the wire, not only in this comment, so a panel or a script reading the payload is
+      // told the same thing the code says.
+      delivery_policy: "FROST prepares the text only. No message is sent by this route; the owner reviews each message and sends it himself.",
+    });
   });
 
   app.get("/api/ai/memory", async (req, res) => {
@@ -2188,6 +2637,16 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     const ownerNotes = cleanText(req.body.owner_notes);
     const branchId = parsePositiveInteger(req.auth.branchId);
     if (!branchId) return res.status(403).json({ code: "FROST_BRANCH_SCOPE_REQUIRED", message: "A verified branch is required to change a reminder" });
+    // Checked here, in JavaScript, rather than left to the `::timestamp` cast. A date Postgres
+    // cannot read comes back as a 500, which the panel shows as "something went wrong" -- a wrong
+    // date is the owner's typo and deserves to be named as one.
+    let dueAt = null;
+    if (action === "SET_DUE_DATE") {
+      dueAt = normalizeReminderDueAt(req.body.due_at);
+      if (dueAt === undefined) {
+        return res.status(400).json({ code: "FROST_REMINDER_DUE_DATE_INVALID", message: "That due date could not be read. Use a date like 2026-09-30." });
+      }
+    }
     const statement = buildStatusChange({
       table: "ai_reminders",
       action,
@@ -2196,6 +2655,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       userId: user.id,
       ownerNotes,
       snoozedUntil: req.body.snoozed_until || null,
+      dueAt,
     });
     if (!id || !statement) return res.status(400).json({ message: "Valid reminder id and action are required" });
     const result = await pool.query(statement.text, statement.values);
@@ -2208,16 +2668,43 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     if (!question) return res.status(400).json({ message: "Question is required" });
     const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
+    // Which chat this question belongs to, if the panel said. A question with no chat is still
+    // answered and still audited; it just does not appear in the sidebar.
+    const chatSessionId = normalizeChatSessionId(req.body.session_id);
     const settings = await getAiSettings(pool, frost);
-    const range = getRange(req.body);
+    const range = getRange(rangeQueryFor(question, req.body));
     const classification = classifyBusinessIntent(question);
     if (!(await enforceIntentPermission({ classification, user, getPermissionUser, res }))) return;
     const facts = await factsForBusinessIntent(pool, req.auth.branchId, classification, settings, range);
+    // A dues question is answered per account -- "Ramesh owes you the most: ₹12,000" -- and the fact
+    // holding those accounts joins the others before the cache key is built, so an answer is never
+    // served against facts it was not written from.
+    const dues = classification === "PAYMENTS" ? await answerDuesQuestion(pool, req.auth.branchId, question) : null;
+    if (dues) facts.push(dues.fact);
     const providerKey = settings.provider?.key || "deterministic";
-    const cacheKey = frost.buildCacheKey({ engine: "conversation", question, facts, range, providerKey });
+    const smallTalkKind = detectSmallTalk(question);
+    // `answerFormat` is in the key so that changing how an answer is worded retires the entries
+    // written by the old wording. Without it a thirty-minute cache serves the previous shape of
+    // sentence back to the owner and the change reads as never deployed -- which is exactly what
+    // happened on 22 Sep 2026.
+    const cacheKey = frost.buildCacheKey({ engine: "conversation", question, facts, range, providerKey, answerFormat: ANSWER_FORMAT_VERSION, classification });
     const cached = settings.frost.cacheEnabled !== false ? await frost.getCache(cacheKey) : null;
     const cachedPayload = cached?.response_payload || null;
-    const deterministicAnswer = buildDeterministicAnswer(classification, facts, range);
+    const reminderTitle = classification === "REMINDER_CREATE" ? reminderTitleFrom(question) : "";
+    // "kal", "agle hafte", "15 tarikh" -- when he said the reminder is for. Read from a reference
+    // moment passed in rather than from a clock inside the parser, so the same question asked twice
+    // a millisecond apart across midnight cannot resolve to two different days.
+    const reminderDueDate = classification === "REMINDER_CREATE" ? detectReminderDueDate(question, new Date()) : "";
+    // "xyz ko payment dena hai" about a supplier the books know becomes a PAY_SUPPLIER reminder
+    // linked to him, so it pops up on the day with his balance beside it. Null -- and a plain owner
+    // note -- whenever the account or the direction is anything less than certain.
+    const reminderLink = classification === "REMINDER_CREATE" && reminderTitle
+      ? await linkSpokenReminder(pool, req.auth.branchId, question, reminderTitle)
+      : null;
+    // No period prefix on a dues answer: a balance is not a period figure.
+    const deterministicAnswer = dues
+      ? dues.answer
+      : buildDeterministicAnswer(classification, facts, range, smallTalkKind, reminderTitle);
 
     // The database has already answered. Everything from here is about *wording* -- and wording is
     // the only thing a model is allowed to contribute, which is why a failure at any step below
@@ -2233,7 +2720,10 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       // freshly-read facts would fail on nothing worse than a changed figure.
       answer = cachedPayload.answer;
       phrasedBy = cachedPayload.phrased_by || null;
-    } else if (settings.frost.enabled === true && providerKey === "ollama") {
+    } else if (settings.frost.enabled === true && providerKey === "ollama" && !FACTLESS_INTENTS.includes(classification)) {
+      // Small talk is not phrased by the model. There are no facts to ground it against, so the
+      // grounding check could never fail, and a 3B model asked to be friendly about a fruit shop is
+      // exactly where an invented figure would come from.
       const phrased = await phraseWithOllama({
         baseUrl: settings.frost.baseUrl || settings.frost.base_url,
         model: settings.frost.model,
@@ -2273,6 +2763,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       range,
       facts,
       answer,
+      sessionId: chatSessionId,
     });
     const usage = await frost.recordTokenUsage({
       conversationId,
@@ -2294,8 +2785,22 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     return res.json({
       assistant: FROST_ASSISTANT_NAME,
       conversation_id: conversationId,
+      // What the panel should write to the reminders route, when the owner asked to be reminded.
+      // This route does not write it: `/api/ai/query` is READ_ONLY and its own tests hold it to
+      // that, and `POST /api/ai/reminders` already carries the permission check and the dedup key.
+      // `due_at` is null when the question named no date, never today: a reminder quietly dated
+      // today fires once, today, and is gone, while an undated one is still there for him to date.
+      reminder_draft: classification === "REMINDER_CREATE" && reminderTitle
+        ? { title: reminderTitle, due_at: reminderDueDate || null, ...(reminderLink || {}) }
+        : null,
+      // Echoed back as it was *stored*, not as it was sent. An id the column could not hold was
+      // filed under no chat at all, and a panel told otherwise would keep sending follow-ups into
+      // a thread that is not accumulating.
+      session_id: chatSessionId,
       classification,
-      period: range,
+      // Null for a greeting. A period label under "Hello." is a filter the owner cannot act on, and
+      // the panel prints it beside the source list it does not have either.
+      period: FACTLESS_INTENTS.includes(classification) ? null : range,
       answer,
       // Null when FROST worded the figures itself. The panel shows the notice beside it, so a
       // plainly-worded answer never reads as a broken one.
@@ -2316,20 +2821,31 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     if (!question) return res.status(400).json({ message: "Question is required" });
     const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
     if (!user) return;
+    const chatSessionId = normalizeChatSessionId(req.body.session_id);
     const classification = classifyBusinessIntent(question);
     // The gate runs before the SSE headers go out. Once this response is an event stream a 403
     // status can no longer be sent, and the refusal would reach the client as a stream that just
     // never explains itself.
     if (!(await enforceIntentPermission({ classification, user, getPermissionUser, res }))) return;
     const settings = await getAiSettings(pool, frost);
-    const range = getRange(req.body);
+    const range = getRange(rangeQueryFor(question, req.body));
     const facts = await factsForBusinessIntent(pool, req.auth.branchId, classification, settings, range);
+    // The same per-account dues answer as `/api/ai/query`, so the two routes cannot word one
+    // question two ways.
+    const dues = classification === "PAYMENTS" ? await answerDuesQuestion(pool, req.auth.branchId, question) : null;
+    if (dues) facts.push(dues.fact);
     // Deterministic only, deliberately. This route is not called from the frontend, and the model
     // phrasing in `/api/ai/query` would be dead weight here. A grounding check would be worse than
     // dead weight: with nothing to phrase the answer it could never fail, and a guard that cannot
     // fail is the thing that was wrong with `assertGroundedAnswer` in the first place. If this
     // route is ever used, it needs the phrasing and the check together, not the check alone.
-    const answer = buildDeterministicAnswer(classification, facts, range);
+    const answer = dues ? dues.answer : buildDeterministicAnswer(
+      classification,
+      facts,
+      range,
+      detectSmallTalk(question),
+      classification === "REMINDER_CREATE" ? reminderTitleFrom(question) : "",
+    );
     // Everything that can refuse has now refused. Only past this line does the response become an
     // event stream, because after these headers a status code can no longer be set.
     res.setHeader("Content-Type", "text/event-stream");
@@ -2345,6 +2861,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       range,
       facts,
       answer,
+      sessionId: chatSessionId,
     });
     const usage = await frost.recordTokenUsage({
       conversationId,
@@ -2360,6 +2877,108 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
     }
     res.write(`event: done\ndata: ${JSON.stringify({ done: true })}\n\n`);
     return res.end();
+  });
+
+  /**
+   * The chat sidebar: one row per `session_id`, newest chat first.
+   *
+   * Scoped to the branch *and* to the person. Branch alone is not enough here, which is a weaker
+   * rule than the rest of FROST needs and a stronger one than the rest of FROST applies: a sales
+   * figure is the shop's, but a question is the asker's, and two Owners sharing a branch would
+   * otherwise read each other's chats -- including the ones they only half asked.
+   *
+   * `session_id IS NULL` is excluded rather than collected under one heading. Every row written
+   * before the column existed has no chat, and gathering them would produce a sidebar entry
+   * containing months of unrelated questions that reads exactly like a conversation. They remain in
+   * the audit trail, which is where they have always been and what they were written for.
+   */
+  app.get("/api/ai/conversations", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
+    if (!user) return;
+    // `req.auth.userId`, not `user.id`. They are the same number -- `getPermissionUser` was handed
+    // the verified claim to find this row -- but the predicate that decides whose chats these are
+    // reads from the token directly, so no later change to how the permission row is resolved can
+    // quietly move it.
+    const chats = await pool.query(`
+      SELECT
+        c.session_id,
+        -- The first question asked, which is the only title anybody wrote. ARRAY_AGG with its own
+        -- ORDER BY rather than a correlated subquery: one pass, and the tie-break on id keeps the
+        -- title stable when two questions land inside the same timestamp.
+        (ARRAY_AGG(c.question ORDER BY c.created_at ASC, c.id ASC))[1] AS title,
+        MIN(c.created_at) AS started_at,
+        MAX(c.created_at) AS last_at,
+        COUNT(*)::int AS message_count
+      FROM ai_conversations c
+      WHERE c.branch_id = $1 AND c.user_id = $2 AND c.session_id IS NOT NULL
+      GROUP BY c.session_id
+      ORDER BY MAX(c.created_at) DESC
+      LIMIT 30
+    `, [requireBranchScope(req.auth.branchId), req.auth.userId]);
+    return res.json({ chats: chats.rows });
+  });
+
+  /**
+   * One chat reopened, oldest question first.
+   *
+   * The same two predicates as the list, for the same reason and with more at stake: this route
+   * returns the questions and the answers in full, and the ids are caller-supplied strings that a
+   * curious person could try. A chat belonging to another branch or another person is not
+   * "forbidden" here, it is *absent* -- the predicates simply match nothing and the 404 below says
+   * so, which tells a prober nothing they did not already know.
+   *
+   * The assistant message is a LEFT JOIN LATERAL, not an inner join. A question whose answer never
+   * landed -- the local model down, the process restarted between the two inserts -- has an
+   * `ai_conversations` row and no assistant `ai_messages` row, and an inner join would delete it
+   * from the reopened chat. CLAUDE.md's rule is that a failure must never render as an absence; a
+   * question the owner remembers asking, gone from the transcript with no trace, is that rule
+   * broken in the place it is hardest to notice.
+   */
+  app.get("/api/ai/conversations/:session_id", async (req, res) => {
+    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
+    if (!user) return;
+    // Normalised with the same function that decided what could be stored. An id too long to be in
+    // the column cannot name a chat, so it is not-found rather than a query that cannot match.
+    const sessionId = normalizeChatSessionId(req.params.session_id);
+    const notFound = () => res.status(404).json({ message: "That FROST chat was not found." });
+    if (!sessionId) return notFound();
+    const result = await pool.query(`
+      SELECT
+        c.id,
+        c.question,
+        c.classification,
+        c.period_label,
+        c.created_at AS asked_at,
+        m.content AS answer,
+        m.facts_used AS facts,
+        m.created_at AS answered_at
+      FROM ai_conversations c
+      LEFT JOIN LATERAL (
+        SELECT a.content, a.facts_used, a.created_at
+        FROM ai_messages a
+        WHERE a.conversation_id = c.id AND a.role = 'assistant'
+        ORDER BY a.created_at ASC, a.id ASC
+        LIMIT 1
+      ) m ON TRUE
+      WHERE c.branch_id = $1 AND c.user_id = $2 AND c.session_id = $3
+      ORDER BY c.created_at ASC, c.id ASC
+      LIMIT 50
+    `, [requireBranchScope(req.auth.branchId), req.auth.userId, sessionId]);
+    if (!result.rows.length) return notFound();
+    const exchanges = result.rows.map((row) => ({
+      id: row.id,
+      question: row.question,
+      // Empty string, never null, and never a missing key. The panel prints this straight into the
+      // thread, and an unanswered question has to read as an unanswered question rather than as
+      // `undefined` or as nothing at all.
+      answer: typeof row.answer === "string" ? row.answer : "",
+      classification: row.classification,
+      period_label: row.period_label,
+      facts: Array.isArray(row.facts) ? row.facts : [],
+      asked_at: row.asked_at,
+      answered_at: row.answered_at || null,
+    }));
+    return res.json({ session_id: sessionId, title: exchanges[0].question, exchanges });
   });
 
   app.post("/api/ai/actions/propose", async (req, res) => {
@@ -2381,23 +3000,6 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
         ? "FROST has prepared this action for owner approval. Nothing was executed."
         : "FROST recorded this read-only action.",
     });
-  });
-
-  app.post("/api/ai/voice/session", async (req, res) => {
-    const user = await requireAiPermission({ req, res, getPermissionUser, getCanonicalIdentity, permission: "ai_assistant_view", fallbackRoles: FROST_DEFAULT_ROLES });
-    if (!user) return;
-    try {
-      const session = await frost.createRealtimeSession({
-        branchId: req.auth.branchId,
-        userId: user.id,
-        deviceId: req.body.device_id || req.headers["x-device-id"],
-        providerKey: req.body.provider_key || "openai",
-      });
-      return res.json(session);
-    } catch (error) {
-      console.error("FROST voice session error", error);
-      return res.status(500).json({ configured: false, message: "Unable to prepare FROST voice session" });
-    }
   });
 
   app.get("/api/ai/voice/status", async (req, res) => {
@@ -2435,7 +3037,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       configured: true,
       code: "VOICE_TRANSCRIPTION_UPLOAD_NOT_IMPLEMENTED",
       status: "Error",
-      message: "Server-side audio upload transcription is not enabled in this build. Use the installed app text fallback or Realtime voice session.",
+      message: "Server-side audio upload transcription is not enabled in this build. Use the installed app text fallback.",
       text_fallback_available: true,
     });
   });
@@ -2456,7 +3058,7 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
       configured: true,
       code: "VOICE_SPEECH_OUTPUT_NOT_IMPLEMENTED",
       status: "Error",
-      message: "Server-side speech output is not enabled in this build. Use the installed app text answer or Realtime voice session.",
+      message: "Server-side speech output is not enabled in this build. Use the installed app text answer.",
       text_fallback_available: true,
     });
   });
@@ -2464,9 +3066,23 @@ const registerAiBusinessAssistantRoutes = ({ app, pool, getPermissionUser, getCa
 
 module.exports = {
   registerAiBusinessAssistantRoutes,
+  // Exported so `frostLanguage.test.js` can assert that every period a question can name is a
+  // period this function actually serves. A guard that cannot reach the thing it guards is the
+  // shape of failure `assertGroundedAnswer` already cost this codebase once.
+  getRange,
   buildFrostPolicy,
   normalizeRoleName,
   buildStatusChange,
+  // Exported for `frostReminders.test.js`, which drives the dues panel against a scripted database
+  // to prove the branch predicate and the prepared message rather than reading them out of source.
+  getCustomerDueReminders,
+  // Exported for `frostAccounts.test.js`, which drives them against a scripted database to prove
+  // the branch predicate and the shape of what the pure layer is handed.
+  getPaymentsDueInputs,
+  answerDuesQuestion,
+  OVERDUE_DUE_STATUSES,
+  normalizeChatSessionId,
+  CHAT_SESSION_ID_MAX_LENGTH,
   FROST_DEFAULT_ROLES,
   FINANCIAL_INTENTS,
   INVENTORY_INTENTS,

@@ -396,10 +396,10 @@ test("a refused kill-switch request leaves LOCAL_ONLY intact and touches no netw
 // ---------------------------------------------------------------------------------------------
 
 test("the CORS preflight allows every header the frontend's session interceptor attaches", () => {
-  const source = fs.readFileSync(require.resolve("./desktopGateway.js"), "utf8");
-  const match = source.match(/"access-control-allow-headers":\s*"([^"]+)"/);
-  assert.ok(match, "the preflight response must advertise its allowed headers");
-  const allowed = new Set(match[1].split(",").map((value) => value.trim().toLowerCase()));
+  // The list lives in CORS_ALLOWED_REQUEST_HEADERS; desktopGatewayCors.test.js holds it against
+  // every header the frontend sends, not only these two.
+  const { CORS_ALLOWED_REQUEST_HEADERS } = require("./desktopGateway.js");
+  const allowed = new Set(CORS_ALLOWED_REQUEST_HEADERS.map((value) => value.trim().toLowerCase()));
 
   // Matches authHeaders.js's sessionAuthHeaders(): Authorization is always sent, and so is the
   // legacy header, in the same request, to the same origin this gateway serves.

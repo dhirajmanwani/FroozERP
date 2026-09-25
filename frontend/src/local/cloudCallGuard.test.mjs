@@ -115,3 +115,41 @@ test("App.jsx routes every cloud-bound call site through the guard", () => {
   );
   assert.match(appSource, /!localOnly && health\.online && cloudReadyForSync/);
 });
+
+test("FROST voice has no path to the cloud at all", () => {
+  // This used to check that the OpenAI Realtime voice path asked the guard before opening the
+  // microphone: it was the one FROST call that could open an external connection FROM THE COUNTER,
+  // straight from the machine to the provider, where the gateway's LOCAL_ONLY block never saw it.
+  // The intent -- LOCAL_ONLY keeps blocked=true, reachedCloud=false and external connections at 0
+  // with the microphone on -- is now kept structurally rather than by a guard: that path is removed,
+  // and live voice talks only to the desktop gateway on LOCAL_API_URL (/api/local/speech/*), where
+  // speech-to-text runs on the laptop. The one external fetch left is the gateway's own one-time
+  // engine download, which the gateway refuses in LOCAL_ONLY.
+  const appSource = fs.readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.equal(appSource.includes("startFrostVoice"), false, "the realtime voice function is gone");
+  assert.equal(appSource.includes("api/ai/voice/session"), false);
+  assert.equal(appSource.includes("realtimeUrl"), false);
+  assert.equal(appSource.includes("RTCPeerConnection"), false);
+  assert.doesNotMatch(appSource, /guardCloudCall\("frost-realtime-voice/);
+  // Every speech route is on the local gateway, never on a cloud base.
+  const speechCalls = [...appSource.matchAll(/axios\.(?:get|post)\(`\$\{(\w+)\}\/api\/local\/speech\//g)];
+  assert.ok(speechCalls.length >= 3, "status, install and transcribe are all called");
+  assert.deepEqual([...new Set(speechCalls.map((match) => match[1]))], ["LOCAL_API_URL"]);
+});
+
+test("every refusal the guard can return carries a message the owner can act on", () => {
+  // Written for the realtime voice gate, which is gone; the property it pinned is the guard's own
+  // and every FROST cloud call still depends on it.
+  for (const code of Object.values(CLOUD_CALL_REFUSAL_CODES)) {
+    const decision = evaluateCloudCall({
+      operation: "frost-query",
+      target: code === CLOUD_CALL_REFUSAL_CODES.CLOUD_NOT_CONFIGURED ? "" : "https://cloud.example.com",
+      localOnly: code === CLOUD_CALL_REFUSAL_CODES.APP_LOCAL_ONLY,
+      apiMode: code === CLOUD_CALL_REFUSAL_CODES.API_MODE_LOCAL_ONLY ? "LOCAL_ONLY" : "",
+    });
+    assert.equal(decision.allowed, false, code);
+    assert.equal(decision.blocked, true);
+    assert.equal(decision.reachedCloud, false);
+    assert.ok(decision.message.length > 20, `${code} has no usable message`);
+  }
+});

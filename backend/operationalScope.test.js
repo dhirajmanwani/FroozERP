@@ -128,3 +128,20 @@ test("unassigned devices and All Locations writes are rejected", async () => {
   });
   assert.equal(result.error.code, "CONSOLIDATED_CONTEXT_READ_ONLY");
 });
+
+test("a location refusal says which of its three causes it is", async () => {
+  const withFacts = (facts) => createOperationalScopeService({
+    query: async (sql) => ({ rows: /device_counter/.test(sql) ? [facts] : [] }),
+  });
+  const noCounters = await withFacts({ counters: 0, device_counter: null, user_postings: 0 }).resolve({ userId: 1, deviceId: "FZDEV-NEW" });
+  assert.equal(noCounters.error.code, "DEVICE_LOCATION_MISMATCH");
+  assert.match(noCounters.error.message, /No counter has been set up yet[\s\S]*bootstrap-first-counter[\s\S]*FZDEV-NEW/);
+  const unposted = await withFacts({ counters: 1, device_counter: null, user_postings: 1 }).resolve({ userId: 1, deviceId: "FZDEV-NEW" });
+  assert.match(unposted.error.message, /This computer \(FZDEV-NEW\) is not posted to any counter/);
+  const personElsewhere = await withFacts({ counters: 2, device_counter: "Main Counter", user_postings: 1 }).resolve({ userId: 1, deviceId: "FZDEV-NEW" });
+  assert.match(personElsewhere.error.message, /Your account is not posted to Main Counter/);
+  const broken = createOperationalScopeService({ query: async (sql) => { if (/device_counter/.test(sql)) throw new Error("down"); return { rows: [] }; } });
+  const fallback = await broken.resolve({ userId: 1, deviceId: "FZDEV-NEW" });
+  assert.equal(fallback.error.code, "DEVICE_LOCATION_MISMATCH", "an explanation that cannot be read never changes the refusal");
+  assert.match(fallback.error.message, /FZDEV-NEW/);
+});

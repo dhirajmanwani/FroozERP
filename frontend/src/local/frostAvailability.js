@@ -57,11 +57,46 @@ export const resolveFrostDataSource = ({ apiUrl = "", cloudApiMode = false, desk
 };
 
 /**
+ * What to say when the cloud is reachable but this session cannot prove who it is.
+ *
+ * Deliberately does not say "sign in again" on its own. An offline session is signed in -- the
+ * password was checked against the cached credential -- so "sign in again" reads as "retype it",
+ * which does nothing, and the owner retypes it. What is missing is the cloud round trip that mints
+ * the session token, so the sentence names that condition instead.
+ */
+export const FROST_OFFLINE_SESSION_MESSAGE =
+  "You are signed in offline on this device, so FROST has no cloud session to use. "
+  + "Sign out and sign in again while FroozERP can reach the cloud. "
+  + "Local FroozERP modules remain available.";
+
+/**
  * Whether the loader should run, and what to say when it should not.
  *
- * It only ever refuses for the reason that is actually true: a cloud-hosted FROST with no cloud.
- * A local FROST always attempts its requests, because a request that fails carries evidence --
- * a status, a code, a URL -- and a pre-emptive refusal carries a guess.
+ * It only ever refuses for a reason that is actually true. A local FROST always attempts its
+ * requests, because a request that fails carries evidence -- a status, a code, a URL -- and a
+ * pre-emptive refusal carries a guess.
+ *
+ * ## Why an offline session is refused rather than attempted
+ *
+ * This is the one cloud-side refusal that is not about reachability, and it was found the hard way
+ * during the 1.0.74 rehearsal: opening FROST fired ten requests, every one came back 401, and the
+ * panel said "FROST session expired. Sign in again to refresh owner permissions." Nothing had
+ * expired and signing in again could not help.
+ *
+ * `login()` falls through to `continueOffline()` whenever the cloud cannot be reached or refuses in
+ * a way an offline session may answer (App.jsx). That path builds the user from the SQLite
+ * reference snapshot, which carries no `device_session_token` -- correctly, since only the cloud
+ * can issue one. The axios request interceptor then attaches no `Authorization` header, the desktop
+ * gateway proxies the FROST routes onward exactly as it always does, and the cloud answers 401 to
+ * an anonymous request. Every part of that is behaving as designed; only the explanation was wrong.
+ *
+ * So the condition is known before the requests are made, and `cloudSession: false` says it: this
+ * session holds no cloud token. Ten 401s establish nothing the caller did not already know, and the
+ * ladder that turns a 401 into a sentence cannot tell "no credential was sent" from "the credential
+ * was rejected" -- which is how it came to give advice that could not work.
+ *
+ * `null` or `undefined` means "not known", and is treated as no reason to refuse: a caller that
+ * cannot say must keep the old behaviour of trying.
  */
 export const resolveFrostLoadDecision = ({
   apiUrl = "",
@@ -69,6 +104,7 @@ export const resolveFrostLoadDecision = ({
   desktopShell = false,
   internetAvailable = true,
   cloudOnline = null,
+  cloudSession = null,
 } = {}) => {
   if (resolveFrostDataSource({ apiUrl, cloudApiMode, desktopShell }) === "local") {
     return { shouldLoad: true, reason: "", source: "local" };
@@ -80,7 +116,28 @@ export const resolveFrostLoadDecision = ({
       source: "cloud",
     };
   }
+  // Checked after reachability on purpose. With no cloud at all, "requires cloud access" is the
+  // larger and more actionable truth; the missing token is a consequence of it, not a second fault.
+  if (cloudSession === false) {
+    return { shouldLoad: false, reason: FROST_OFFLINE_SESSION_MESSAGE, source: "cloud" };
+  }
   return { shouldLoad: true, reason: "", source: "cloud" };
+};
+
+/**
+ * Whether a signed-in user holds a cloud-issued session token.
+ *
+ * Both halves matter. `offline_session` is the flag `continueOffline()` sets, and the token is the
+ * thing the request interceptor actually looks for; a record carrying the flag but a stale token
+ * from an earlier online sign-in would pass a check on either one alone.
+ *
+ * Returns `null` for no user at all rather than `false`, because "nobody is signed in" is not the
+ * offline-session case and must not borrow its message.
+ */
+export const hasCloudSession = (user) => {
+  if (!user || typeof user !== "object") return null;
+  if (user.offline_session === true) return false;
+  return typeof user.device_session_token === "string" && user.device_session_token.trim() !== "";
 };
 
 /** The one option the page owns. Every other option has to be read from the backend. */

@@ -68,7 +68,17 @@ explicitly, in the current conversation, by the maintainer:
   idempotent across restarts.
 - Postgres schema is still bootstrapped at backend startup via
   `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, not a
-  versioned migration system. Adding a column means editing that startup path.
+  versioned migration system. **Adding a table or column means two edits, not one:**
+  that startup path, *and* a migration under `backend/migrations/cloud/` registered in
+  `scripts/run-cloud-migrations.js`. The startup bootstrap is hard-off on a hosted
+  deployment, so a declaration made only in `initializeDatabase()` reaches the cloud
+  never. This has caused three outages — a two-week run of 500s on every cloud
+  sign-in, a reference bootstrap that could not fill a rebuilt device, and two days
+  with the backend refusing to boot. `cloudSchemaCoverage.test.js` now fails on the
+  second edit being missing, so `npm --prefix backend test` catches it instead of
+  Railway's log.
+  Merging a migration does not apply it: `node scripts/run-cloud-migrations.js` is a
+  dry run that rolls back, `--apply` commits.
 
 ## Pitfalls that have already bitten
 

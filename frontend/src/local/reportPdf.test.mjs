@@ -150,3 +150,25 @@ test("an empty report still produces a valid single-page document", () => {
   assert.equal(doc.internal.getNumberOfPages(), 1);
   assert.ok(doc.output("arraybuffer").byteLength > 0);
 });
+
+test("a statement drawn as lines (Profit & Loss) exports every line with its amount", () => {
+  const withAttr = (node, name) => Object.assign(node, { hasAttribute: (attr) => attr === name });
+  const line = (label, amount) => withAttr(el({ children: [el({ tag: "SPAN", text: label }), el({ tag: "STRONG", text: amount })] }), "data-report-line");
+  const note = (text) => withAttr(el({ tag: "P", text }), "data-report-note");
+  const model = buildReportPdfModel(rootWith([
+    el({ classes: ["summary-metric"], attrs: { title: "Net Profit/Loss: ₹1,200.00" } }),
+    el({ tag: "H2", text: "PROFIT & LOSS STATEMENT" }),
+    note("For Period: 2025-09-24 to 2026-09-24"),
+    el({ tag: "H3", text: "INCOME" }),
+    line("Sales Revenue", "₹5,000.00"),
+    line("TOTAL INCOME", "₹5,000.00"),
+    el({ tag: "H3", text: "LESS: COST OF GOODS SOLD" }),
+    line("Less Supplier Rebate Received", "(₹50.00)"),
+    line("NET PROFIT", "₹1,200.00"),
+  ]));
+  assert.deepEqual(model.blocks.map((block) => block.type), ["metrics", "heading", "heading", "heading", "table", "heading", "table"]);
+  assert.equal(model.blocks[2].text, "For Period: 2025-09-24 to 2026-09-24");
+  assert.deepEqual(model.blocks[4], { type: "table", columns: ["Particulars", "Amount"], rows: [["Sales Revenue", "₹5,000.00"], ["TOTAL INCOME", "₹5,000.00"]] });
+  assert.deepEqual(model.blocks[6].rows, [["Less Supplier Rebate Received", "(₹50.00)"], ["NET PROFIT", "₹1,200.00"]]);
+  assert.equal(reportPdfHasContent(model), true);
+});

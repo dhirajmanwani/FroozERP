@@ -143,3 +143,33 @@ export const hasSellableLocalInventory = ({ products, inventoryLots }, scope = n
     && isSellableLot(lot)
   ));
 };
+
+/**
+ * Why POS has nothing at all to sell, in numbers a person can check, or "" when it has something.
+ *
+ * "Nothing has stock" covers four different situations: no products have reached this computer,
+ * no stock has, every lot is finished, or products and stock are both here but do not belong to
+ * each other (the list came from one place and the stock from another). The last one looks exactly
+ * like a sold-out shop and is not one, so each gets its own sentence with its own counts.
+ */
+export const emptyShelfReason = ({ products, inventoryLots, now = new Date(), scope = null } = {}) => {
+  const productList = rows(products).filter((product) => product?.active !== false && !product?.deleted_at);
+  // Only this counter's own lots count: another shop's stock is not stock this POS could sell.
+  const lots = filterLotsForScope(rows(inventoryLots), scope);
+  if (!productList.length) {
+    return "No products have reached this computer yet. Press Sync now, or add products in Product Master.";
+  }
+  if (!lots.length) {
+    return `This computer knows ${productList.length} products but has no stock lots. Stock arrives with purchases; if stock was bought, press Sync now.`;
+  }
+  const withStock = lots.filter((lot) => isSellableLot(lot, now));
+  if (!withStock.length) {
+    return `All ${lots.length} stock lots on this computer are sold out, expired or closed.`;
+  }
+  const known = new Set(productList.map((product) => canonicalInventoryId(product?.id)).filter(Boolean));
+  const matched = withStock.filter((lot) => known.has(canonicalInventoryId(lot?.product_id)));
+  if (!matched.length) {
+    return `This computer has ${withStock.length} lots with stock, but none of them belongs to the ${productList.length} products it knows, so the product list and the stock do not match. Open another module and come back to POS; if it stays empty, press Sync now.`;
+  }
+  return "";
+};

@@ -76,8 +76,16 @@ test("the inactive-customers question specifically, in both word orders", () => 
 });
 
 test("a question with no match still lands somewhere answerable", () => {
-  // The fallback is a real intent with real facts behind it, not a null that renders as nothing.
+  // The fallback is a real intent with a real answer behind it, not a null that renders as nothing.
+  //
+  // It used to be the general briefing for *everything* unrecognised, which meant "who won the
+  // match" came back as every due, every low stock line and every old lot: fluent, well-formed, and
+  // about something the owner never asked, with nothing in it to say so. A question that says
+  // something about the shop still earns the briefing; one that says nothing at all is now told
+  // plainly that it was not understood, which is a real answer and one retype, not a null.
   assert.equal(classifyBusinessIntent("how is the shop doing"), "BUSINESS_BRIEFING");
-  assert.equal(classifyBusinessIntent(""), "BUSINESS_BRIEFING");
-  assert.equal(classifyBusinessIntent(undefined), "BUSINESS_BRIEFING");
+  assert.equal(classifyBusinessIntent("aaj kya dhyan dena hai"), "BUSINESS_BRIEFING");
+  assert.equal(classifyBusinessIntent("who won the match"), "UNCLEAR");
+  assert.equal(classifyBusinessIntent(""), "UNCLEAR");
+  assert.equal(classifyBusinessIntent(undefined), "UNCLEAR");
 });

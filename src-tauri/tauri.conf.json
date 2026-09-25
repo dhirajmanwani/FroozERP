@@ -41,6 +41,7 @@
       "../backend/desktopGateway.js",
       "../backend/cloudProxyError.js",
       "../backend/localSettingsStore.js",
+      "../backend/localSpeech.js",
       "binaries/froozerp-backend-node.exe"
     ],
     "icon": [

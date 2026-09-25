@@ -1,4 +1,5 @@
 const crypto = require("crypto");
+const { detectSmallTalk, hasBusinessSignal, isReminderRequest, normalizeQuestion } = require("./frostLanguage");
 
 const FROST_ASSISTANT_NAME = "FROST";
 
@@ -111,13 +112,31 @@ const maskProviderConfig = (config = {}) => {
   return masked;
 };
 
+// The owner types Hinglish. `normalizeQuestion` lowercases the question and appends the English
+// hint words his words earned, so every regex below keeps working on questions that contain not one
+// English business term. It is applied here rather than at each call site so that the classifier
+// cannot be reached without it -- there are four callers and the suggested-question test asserts
+// against this function, not against the routes.
 const classifyBusinessIntent = (question = "") => {
-  const text = String(question || "").toLowerCase();
+  // Checked before anything else, and against the whole question rather than a substring. A
+  // greeting is not a business question, and answering "hi there" with every due and every old lot
+  // is what made FROST read like a report generator with a chat box bolted on.
+  if (detectSmallTalk(question)) return "SMALL_TALK";
+  // Checked before the cascade, because the cascade reads the subject and a reminder's subject is a
+  // business topic: "remind me to pay my suppliers" is a PAYMENTS question on every word except the
+  // first two, and answering it with the supplier ledger is not what was asked for.
+  if (isReminderRequest(question)) return "REMINDER_CREATE";
+  const text = normalizeQuestion(question).text;
   if (/(cash|bank|drawer|till|counter cash|payable|receivable|position)/.test(text)) return "CASH_DRAWER";
   if (/(purchase tomorrow|what should i purchase|buy tomorrow|reorder|purchase quantity|purchase quantities)/.test(text)) return "PURCHASE_PLANNING";
   if (/(sale rate|selling rate|rate revision|revise.*rate|price revision|pricing)/.test(text)) return "SALE_RATE_REVIEW";
   if (/(loss|lose money|lost money|waste|expense|low margin|margin problem)/.test(text)) return "LOSS_REVIEW";
   if (/(profit.*month|most profit|top profit|generated.*profit)/.test(text)) return "PROFIT_RANKING";
+  // "what product is more demanding" reached none of the twelve branches and came back as a general
+  // briefing -- an answer about something else, with nothing to say the question had been missed.
+  // The sales ranking is what answers it, and PROFIT_RANKING is where that query lives. The two
+  // hyphenated spellings the suggested questions use are left to INVENTORY on purpose.
+  if (/(in demand|more demand|most demand|high demand|demanding|fast moving|fast-moving|fastest selling|best selling|top selling|most sold|sabse zyada bik)/.test(text)) return "PROFIT_RANKING";
   if (/(today.*sale|sales|revenue|profit|compare|month|last month|gross profit)/.test(text)) return "SALES_FINANCE";
   if (/(supplier.*bill|purchase bill|payment|pending|receivable|outstanding|ledger|customer.*pay|supplier.*pay)/.test(text)) return "PAYMENTS";
   // `inactive customer` as a literal never matched FROST's own suggested question, "Which customers
@@ -129,7 +148,10 @@ const classifyBusinessIntent = (question = "") => {
   if (/(expiry|expire|close to expiry|near expiry|old lot|lot aging|fruits close)/.test(text)) return "INVENTORY_EXPIRY";
   if (/(supplier.*margin|best margin|margin supplier)/.test(text)) return "SUPPLIER_MARGIN";
   if (/(low stock|stock|inventory|run out|waste|lowest-selling|highest-selling|fruit)/.test(text)) return "INVENTORY";
-  return "BUSINESS_BRIEFING";
+  // The briefing is earned, not defaulted to. Everything the cascade does not recognise used to land
+  // here and come back as every due, every low stock line and every old lot -- a plausible answer to
+  // a question nobody asked, with nothing in it to say so.
+  return hasBusinessSignal(question) ? "BUSINESS_BRIEFING" : "UNCLEAR";
 };
 
 const actionRequiresApproval = (actionType = "") => {
@@ -260,8 +282,16 @@ class FrostServiceLayer {
     return result.rows[0];
   }
 
-  buildCacheKey({ engine, question, facts, range, providerKey }) {
-    return hashPayload({ engine, question, facts, range, providerKey });
+  // `answerFormat` is part of the key, not decoration: the cached string was written by a
+  // particular version of the wording, and serving it after that wording changes hands the owner an
+  // answer the code can no longer produce.
+  // `classification` is in the key because two different readings of one question can share every
+  // other input. "remind me to pay my suppliers" was UNCLEAR before reminders existed and is
+  // REMINDER_CREATE now; neither fetches facts, so without this the thirty-minute cache could hand
+  // the new reading the old one's "I did not catch that". An answer is only reusable for the same
+  // question understood the same way.
+  buildCacheKey({ engine, question, facts, range, providerKey, answerFormat = 0, classification = "" }) {
+    return hashPayload({ engine, question, facts, range, providerKey, answerFormat, classification });
   }
 
   async getCache(cacheKey) {
@@ -326,97 +356,6 @@ class FrostServiceLayer {
       approvalStatus: status,
     });
     return result.rows[0];
-  }
-
-  async createRealtimeSession({ userId, deviceId = "", providerKey = "openai", instructions = "", branchId = null, companyId = null }) {
-    const settings = await this.getSettings();
-    const frost = settings.frost || DEFAULT_FROST_SETTINGS;
-    const selectedProvider = providerKey || frost.providerKey || "openai";
-    if (selectedProvider !== "openai") {
-      return {
-        configured: false,
-        provider: selectedProvider,
-        message: "Realtime voice is currently prepared for OpenAI-compatible providers only.",
-      };
-    }
-    const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
-    if (!apiKey) {
-      await this.audit({
-        branchId,
-        companyId,
-        userId,
-        deviceId,
-        eventType: "FROST_VOICE_SESSION_UNAVAILABLE",
-        answer: "OpenAI Realtime voice requested without configured server API key",
-      });
-      return {
-        configured: false,
-        provider: "openai",
-        message: "OpenAI Realtime voice is not configured on this server.",
-      };
-    }
-    const payload = {
-      session: {
-        type: "realtime",
-        model: frost.realtimeModel || "gpt-realtime",
-        audio: {
-          output: { voice: frost.voice || "alloy" },
-          input: {
-            turn_detection: frost.voiceActivityDetection === false ? null : { type: "server_vad" },
-          },
-        },
-        instructions: instructions || "You are FROST, FroozERP's business copilot. Use concise Hindi, English, or Hinglish as the owner speaks. Never execute business actions without explicit owner confirmation.",
-      },
-    };
-    const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    });
-    if (!response.ok) {
-      const text = await response.text();
-      await this.audit({
-        branchId,
-        companyId,
-        userId,
-        deviceId,
-        eventType: "FROST_VOICE_SESSION_FAILED",
-        answer: `OpenAI Realtime session failed: ${response.status}`,
-        suggestedAction: { status: response.status, body: text.slice(0, 400) },
-      });
-      return {
-        configured: false,
-        provider: "openai",
-        message: "OpenAI Realtime session could not be created.",
-        status: response.status,
-      };
-    }
-    const body = await response.json();
-    await this.audit({
-      branchId,
-      companyId,
-      userId,
-      deviceId,
-      eventType: "FROST_VOICE_SESSION_CREATED",
-      answer: "OpenAI Realtime voice session created",
-      suggestedAction: { provider: "openai", model: frost.realtimeModel || "gpt-realtime" },
-    });
-    return {
-      configured: true,
-      provider: "openai",
-      realtimeUrl: "https://api.openai.com/v1/realtime/calls",
-      model: frost.realtimeModel || "gpt-realtime",
-      voice: frost.voice || "alloy",
-      clientSecret: body.value || body.client_secret?.value,
-      expiresAt: body.expires_at || body.client_secret?.expires_at,
-      vad: frost.voiceActivityDetection !== false,
-      noiseSuppression: frost.noiseSuppression !== false,
-      fullDuplex: frost.fullDuplexEnabled !== false,
-      wakeWordEnabled: false,
-    };
   }
 
   // Every settings change, action proposal and voice session used to be logged as `VALUES (1, 1,`

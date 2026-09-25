@@ -8,7 +8,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { execFile } = require("child_process");
-const nodemailer = require("nodemailer");
+const { emailSettings, publicEmailSettings, sendEmail } = require("./emailDelivery");
 const { RUNTIME_MODES, createStorageAdapter, liveDesktopSqlitePath } = require("./storageAdapters");
 const {
   hashPassword,
@@ -70,6 +70,7 @@ const {
   FORMAT_VERSION,
 } = require("./activationLicence");
 const { normaliseLicenceRequest } = require("./activationLicenceRequest");
+const { validateProductPhoto } = require("./productPhoto");
 const {
   REFERENCE_BOOTSTRAP_PROTOCOL,
   captureReferenceBootstrap,
@@ -1398,36 +1399,32 @@ const authFailure = async (res, { status = 401, code = "INVALID_CREDENTIALS", pu
   return res.status(status).json({ code, message: publicMessage });
 };
 
-const getConfiguredSmtpPassword = () => cleanText(process.env.SMTP_PASS || process.env.SMTP_PASSWORD);
-
 const getRecoveryProviderStatus = () => ({
-  email: process.env.SMTP_HOST && process.env.SMTP_USER && getConfiguredSmtpPassword() ? "configured" : "not_configured",
+  email: emailSettings().configured ? "configured" : "not_configured",
   sms: process.env.SMS_PROVIDER_URL && (process.env.SMS_PROVIDER_TOKEN || process.env.SMS_PROVIDER_API_KEY) ? "configured" : "not_configured",
   development: recoveryDevOtpEnabled ? "enabled" : "disabled",
 });
 
+// The status for "the email or SMS service would not send". Deliberately not 503: the desktop
+// gateway reads a 503 from the cloud as "cloud unreachable" and replaces the body with its own
+// message, so on every counter the real reason ("email is not set up", "the password was
+// refused") arrived as "FroozERP cloud is temporarily unavailable". 424 (Failed Dependency) is
+// passed through untouched, which is what this answer needs.
+const PROVIDER_FAILURE_STATUS = 424;
+
+// Why an email did not go, in words the Owner can act on. Recovery codes are the one thing a
+// locked-out person cannot get any other way, so "could not send" alone leaves them guessing.
+const emailDeliveryFailureMessage = (delivery) => {
+  const reason = cleanText(delivery?.reason);
+  if (delivery?.status === "not_configured") {
+    return `Email codes are not set up on the FroozERP server yet${reason ? ` (${reason})` : ""}. Ask the Owner to set up email.`;
+  }
+  return `The code could not be emailed${reason ? `: ${reason}` : ""}. Ask the Owner to check the email settings on the FroozERP server.`;
+};
+
 const getEmailProviderDiagnostics = () => {
-  const required = {
-    smtp_host: Boolean(cleanText(process.env.SMTP_HOST)),
-    smtp_port: Boolean(cleanText(process.env.SMTP_PORT || "587")),
-    smtp_user: Boolean(cleanText(process.env.SMTP_USER)),
-    smtp_password: Boolean(getConfiguredSmtpPassword()),
-    sender: Boolean(cleanText(process.env.SMTP_FROM || process.env.SMTP_USER)),
-  };
-  const configured = Object.values(required).every(Boolean);
-  return {
-    provider: "smtp",
-    status: configured ? "configured" : "not_configured",
-    configured,
-    required,
-    host: cleanText(process.env.SMTP_HOST),
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: /^true$/i.test(process.env.SMTP_SECURE || ""),
-    username_configured: Boolean(cleanText(process.env.SMTP_USER)),
-    password_configured: Boolean(getConfiguredSmtpPassword()),
-    sender_name: cleanText(process.env.SMTP_SENDER_NAME || "FroozERP"),
-    sender_email: cleanText(process.env.SMTP_FROM || process.env.SMTP_USER),
-  };
+  const settings = publicEmailSettings(emailSettings());
+  return { ...settings, status: settings.configured ? "configured" : "not_configured" };
 };
 
 const getSmsProviderDiagnostics = () => {
@@ -1449,30 +1446,12 @@ const getSmsProviderDiagnostics = () => {
   };
 };
 
-const sendEmailOtp = async ({ to, code, purpose }) => {
-  const smtpPassword = getConfiguredSmtpPassword();
-  if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !smtpPassword) {
-    return { delivered: false, provider: "EmailOtpProvider", status: "not_configured" };
-  }
-  const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: /^true$/i.test(process.env.SMTP_SECURE || ""),
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: smtpPassword,
-    },
-  });
-  const from = process.env.SMTP_FROM || process.env.SMTP_USER;
-  const info = await transporter.sendMail({
-    from,
-    to,
-    subject: "Your FroozERP verification code",
-    text: `Your FroozERP verification code is ${code}. It expires in 10 minutes.`,
-    html: buildOtpEmailHtml({ code, purpose }),
-  });
-  return { delivered: true, provider: "EmailOtpProvider", status: "accepted", message_id: info.messageId };
-};
+const sendEmailOtp = ({ to, code, purpose }) => sendEmail({
+  to,
+  subject: "Your FroozERP verification code",
+  text: `Your FroozERP verification code is ${code}. It expires in 10 minutes.`,
+  html: buildOtpEmailHtml({ code, purpose }),
+});
 
 const sendSmsOtp = async ({ to, code }) => {
   if (!process.env.SMS_PROVIDER_URL || !(process.env.SMS_PROVIDER_TOKEN || process.env.SMS_PROVIDER_API_KEY)) {
@@ -1511,32 +1490,14 @@ const sendRecoveryOtp = async ({ method, contact, code, purpose }) => {
   if (recoveryDevOtpEnabled) {
     return { delivered: true, provider: "DevelopmentOtpProvider", status: "development_only", development_code: code, purpose };
   }
-  return { delivered: false, provider: method === "email" ? "EmailOtpProvider" : "SmsOtpProvider", status: "not_configured" };
+  // Email not set up: let the email module say which setting is missing.
+  if (method === "email") return sendEmailOtp({ to: contact, code, purpose });
+  return { delivered: false, provider: "SmsOtpProvider", status: "not_configured" };
 };
 
 const sendRecoveryNotification = async ({ method, contact, subject, message, html }) => {
   const providerStatus = getRecoveryProviderStatus();
-  if (method === "email") {
-    const smtpPassword = getConfiguredSmtpPassword();
-    if (providerStatus.email !== "configured") return { delivered: false, provider: "EmailOtpProvider", status: "not_configured" };
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT || 587),
-      secure: /^true$/i.test(process.env.SMTP_SECURE || ""),
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: smtpPassword,
-      },
-    });
-    const info = await transporter.sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
-      to: contact,
-      subject,
-      text: message,
-      html,
-    });
-    return { delivered: true, provider: "EmailOtpProvider", status: "accepted", message_id: info.messageId };
-  }
+  if (method === "email") return sendEmail({ to: contact, subject, text: message, html });
   if (providerStatus.sms !== "configured") return { delivered: false, provider: "SmsOtpProvider", status: "not_configured" };
   const headers = { "Content-Type": "application/json" };
   if (process.env.SMS_PROVIDER_TOKEN) headers.Authorization = `Bearer ${process.env.SMS_PROVIDER_TOKEN}`;
@@ -2908,6 +2869,27 @@ const initializeDatabase = async () => {
       status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE'
     );
 
+    -- One photo per product, kept beside the product rather than on it. Declared here so a local or
+    -- self-hosted backend has it; on a hosted deployment this function never runs and
+    -- backend/migrations/cloud/020_product_photos.sql is the only way it can exist. The two must
+    -- stay identical.
+    --
+    -- Deliberately not a column on products: the whole products row is copied into
+    -- sync_change_log and product_audit_trail on every edit and sent to every device in the
+    -- reference bootstrap, so a photo there would be multiplied into every one of those. Photo
+    -- bytes live only in this table and travel only through GET /api/v3/product-photos.
+    CREATE TABLE IF NOT EXISTS product_photos (
+      product_id INTEGER PRIMARY KEY REFERENCES products(id) ON DELETE CASCADE,
+      company_id INTEGER,
+      photo_data TEXT NOT NULL,
+      content_type VARCHAR(40) NOT NULL,
+      byte_size INTEGER NOT NULL,
+      updated_by INTEGER,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS product_photos_company_idx
+      ON product_photos (company_id);
+
     -- Every offline activation file this installation has ever issued. Declared here so a local or
     -- self-hosted backend has it; on a hosted deployment this whole function never runs and
     -- backend/migrations/cloud/017_activation_licences.sql is the only way it can exist. The two
@@ -3307,6 +3289,21 @@ const initializeDatabase = async () => {
       period_label VARCHAR(120),
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+
+    -- One ai_conversations row is one question. A chat -- the thing the owner sees in the sidebar
+    -- and reopens -- is the rows sharing a session_id, which the client mints and sends back with
+    -- every follow-up question. Mirrors migrations/cloud/019_ai_conversation_sessions.sql, which is
+    -- the only way this column reaches the hosted database, since this bootstrap never runs there.
+    --
+    -- Nullable, and permanently so. Every row written before the column existed belongs to no chat,
+    -- and inventing one for them would gather a run of unrelated questions under a single heading
+    -- that reads like a conversation nobody had. GET /api/ai/conversations excludes NULL for that
+    -- reason; those rows keep their place in the audit trail.
+    ALTER TABLE ai_conversations ADD COLUMN IF NOT EXISTS session_id VARCHAR(80);
+    -- The list query groups by session inside one branch and one user and orders by time, so the
+    -- index leads with the two predicates that are always present.
+    CREATE INDEX IF NOT EXISTS ai_conversations_session_idx
+      ON ai_conversations (branch_id, user_id, session_id, created_at);
 
     CREATE TABLE IF NOT EXISTS ai_messages (
       id SERIAL PRIMARY KEY,
@@ -6970,7 +6967,7 @@ app.post("/api/integrations/email/test", async (req, res) => {
     if (!manager) return res.status(403).json({ code: "OWNER_REQUIRED", message: "Owner/Admin permission is required to test email provider." });
     const status = getEmailProviderDiagnostics();
     if (!status.configured) {
-      return res.status(503).json({
+      return res.status(PROVIDER_FAILURE_STATUS).json({
         ...status,
         code: "EMAIL_PROVIDER_NOT_CONFIGURED",
         message: "Email verification is unavailable because the email provider has not been configured by the Owner.",
@@ -6990,7 +6987,7 @@ app.post("/api/integrations/email/test", async (req, res) => {
       delivered: delivery.delivered === true,
       status: delivery.status,
       provider: delivery.provider,
-      message: delivery.delivered ? "Test email accepted by provider." : "Email provider test failed.",
+      message: delivery.delivered ? "Test email accepted by provider." : emailDeliveryFailureMessage(delivery),
       last_tested: new Date().toISOString(),
     });
   } catch (error) {
@@ -7024,7 +7021,7 @@ app.post("/api/integrations/sms/test", async (req, res) => {
     if (!manager) return res.status(403).json({ code: "OWNER_REQUIRED", message: "Owner/Admin permission is required to test SMS provider." });
     const status = getSmsProviderDiagnostics();
     if (!status.configured) {
-      return res.status(503).json({
+      return res.status(PROVIDER_FAILURE_STATUS).json({
         ...status,
         code: "SMS_PROVIDER_NOT_CONFIGURED",
         message: "SMS verification is unavailable because the SMS provider has not been configured by the Owner.",
@@ -8292,10 +8289,12 @@ app.post("/auth/recovery/contact/request", requireAuth, async (req, res) => {
     });
     if (!delivery.delivery.delivered) {
       await invalidateOtpRequest(delivery.requestId, client);
-      return res.status(503).json({
-        code: method === "email" ? "EMAIL_PROVIDER_NOT_CONFIGURED" : "SMS_PROVIDER_NOT_CONFIGURED",
+      return res.status(PROVIDER_FAILURE_STATUS).json({
+        code: method === "email"
+          ? (delivery.delivery.status === "not_configured" ? "EMAIL_PROVIDER_NOT_CONFIGURED" : "EMAIL_DELIVERY_FAILED")
+          : "SMS_PROVIDER_NOT_CONFIGURED",
         message: method === "email"
-          ? "Email recovery is not configured. Ask the administrator to configure SMTP settings."
+          ? emailDeliveryFailureMessage(delivery.delivery)
           : "SMS recovery is not configured. Please use verified email recovery or contact the administrator.",
         provider_status: getRecoveryProviderStatus(),
         delivery_status: delivery.delivery.status,
@@ -8429,7 +8428,7 @@ app.post("/api/auth/email/send-verification", requireAuth, async (req, res) => {
     if (!email) return res.status(400).json({ code: "INVALID_EMAIL", message: "Enter a valid email address." });
     const providerStatus = getEmailProviderDiagnostics();
     if (!providerStatus.configured) {
-      return res.status(503).json({
+      return res.status(PROVIDER_FAILURE_STATUS).json({
         code: "EMAIL_PROVIDER_NOT_CONFIGURED",
         message: "Email verification is unavailable because the email provider has not been configured by the Owner.",
         provider: providerStatus,
@@ -8451,7 +8450,7 @@ app.post("/api/auth/email/send-verification", requireAuth, async (req, res) => {
     if (!delivery.delivery.delivered) {
       await invalidateOtpRequest(delivery.requestId, client);
       await client.query("ROLLBACK");
-      return res.status(503).json({ code: "EMAIL_DELIVERY_FAILED", message: "Email provider did not accept the verification request.", delivery_status: delivery.delivery.status });
+      return res.status(PROVIDER_FAILURE_STATUS).json({ code: "EMAIL_DELIVERY_FAILED", message: emailDeliveryFailureMessage(delivery.delivery), delivery_status: delivery.delivery.status });
     }
     await client.query("UPDATE users SET pending_recovery_email = $1, recovery_email_verified = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $2", [email, userId]);
     await client.query("COMMIT");
@@ -8526,7 +8525,7 @@ app.post("/api/auth/phone/send-otp", requireAuth, async (req, res) => {
     if (!mobile) return res.status(400).json({ code: "INVALID_PHONE", message: "Enter a valid Indian mobile number." });
     const providerStatus = getSmsProviderDiagnostics();
     if (!providerStatus.configured) {
-      return res.status(503).json({
+      return res.status(PROVIDER_FAILURE_STATUS).json({
         code: "SMS_PROVIDER_NOT_CONFIGURED",
         message: "SMS verification is unavailable because the SMS provider has not been configured by the Owner.",
         provider: providerStatus,
@@ -8548,7 +8547,7 @@ app.post("/api/auth/phone/send-otp", requireAuth, async (req, res) => {
     if (!delivery.delivery.delivered) {
       await invalidateOtpRequest(delivery.requestId, client);
       await client.query("ROLLBACK");
-      return res.status(503).json({ code: "SMS_DELIVERY_FAILED", message: "SMS provider did not accept the verification request.", delivery_status: delivery.delivery.status });
+      return res.status(PROVIDER_FAILURE_STATUS).json({ code: "SMS_DELIVERY_FAILED", message: "SMS provider did not accept the verification request.", delivery_status: delivery.delivery.status });
     }
     await client.query("UPDATE users SET pending_recovery_mobile = $1, recovery_mobile_verified = FALSE, updated_at = CURRENT_TIMESTAMP WHERE id = $2", [mobile, userId]);
     await client.query("COMMIT");
@@ -8779,11 +8778,11 @@ app.post("/auth/recovery/send-otp", async (req, res) => {
     });
     if (!delivery.delivered) {
       await invalidateOtpRequest(requestId);
-      return res.status(503).json({
+      return res.status(PROVIDER_FAILURE_STATUS).json({
         success: false,
         code: delivery.status === "not_configured" ? "PROVIDER_NOT_CONFIGURED" : "PROVIDER_DELIVERY_FAILED",
         message: method === "email"
-          ? "Email recovery is not configured or the provider rejected the request."
+          ? emailDeliveryFailureMessage(delivery)
           : "SMS recovery is not configured. Please use verified email recovery or contact the administrator.",
         provider_status: getRecoveryProviderStatus(),
         delivery_status: delivery.status,
@@ -13938,6 +13937,7 @@ app.post("/settings/branches", async (req, res) => {
   try {
     const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage branches" });
+    if (!cleanText(req.body.branch_name)) return res.status(400).json({ message: "Enter the branch name." });
     const result = await pool.query(
       `
       INSERT INTO branches (branch_name, address, phone_number, gst_number, active)
@@ -13957,6 +13957,7 @@ app.post("/settings/counters", async (req, res) => {
   try {
     const manager = await requireRateManager(req.auth.userId);
     if (!manager) return res.status(403).json({ message: "Only Owner or Admin can manage counters" });
+    if (!cleanText(req.body.counter_name)) return res.status(400).json({ message: "Enter the counter name." });
     const result = await pool.query(
       `
       INSERT INTO counters (branch_id, counter_name, counter_type, active)
@@ -15250,16 +15251,41 @@ const updateProductHandler = async (req, res) => {
       parsePositiveInteger(category_id),
       context?.company_id || null
     );
+    const requestedCategoryName = cleanText(category) || cleanText(current.category) || "Fruit";
     if (!selectedCategory) {
-      selectedCategory = await findCategoryByName(
-        client,
-        category || current.category || "Fruit",
-        context?.company_id || null
-      );
+      selectedCategory = await findCategoryByName(client, requestedCategoryName, context?.company_id || null);
     }
-    if (!selectedCategory || selectedCategory.active === false) {
+    if (!selectedCategory) {
+      // A category typed in while editing (moving a product to "Frooz Bar", say) is created here,
+      // exactly as adding a product does, instead of refusing the edit.
+      try {
+        const categoryResult = await client.query(
+          `INSERT INTO product_categories (
+             global_id, category_name, active, created_by, updated_by, company_id
+           ) VALUES ($1, $2, TRUE, $3, $3, $4) RETURNING *`,
+          [`category-${crypto.randomUUID()}`, requestedCategoryName, req.auth.userId, context?.company_id || null]
+        );
+        selectedCategory = categoryResult.rows[0];
+      } catch (categoryError) {
+        if (categoryError.code !== "23505") throw categoryError;
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          code: "PRODUCT_CATEGORY_UNAVAILABLE",
+          message: `A category named "${requestedCategoryName}" already exists but is not available to this shop. Pick it from the list or use another name.`,
+        });
+      }
+      await logSyncChange(client, {
+        branchId: context?.branch_id || 1,
+        entityType: "product_category",
+        entityId: selectedCategory.global_id,
+        operationType: "UPSERT",
+        version: selectedCategory.entity_version || 1,
+        payload: selectedCategory,
+      });
+    }
+    if (selectedCategory.active === false) {
       await client.query("ROLLBACK");
-      return res.status(400).json({ message: "Selected category is inactive or missing." });
+      return res.status(400).json({ message: "Selected category is inactive." });
     }
     const duplicateResult = await client.query(
       `SELECT id FROM products
@@ -15329,18 +15355,259 @@ const updateProductHandler = async (req, res) => {
     await client.query("COMMIT");
     return res.json(result.rows[0]);
   } catch (error) {
-    await client.query("ROLLBACK");
-    console.error(error);
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("Product update failed", { product_id: req.params.id, code: error?.code, message: error?.message, stack: error?.stack });
     if (error.code === "23505") {
       return res.status(409).json({ message: "This product already exists." });
     }
-    return res.status(500).json({ message: "Error Updating Product" });
+    // A refusal raised on purpose (a missing idempotency key, for one) carries its own status and
+    // words; anything else still says what the database objected to, so a failed edit can be
+    // diagnosed from the alert alone instead of reading "Error Updating Product" and guessing.
+    if (Number.isInteger(error?.status) && error.status >= 400 && error.status < 500) {
+      return res.status(error.status).json({ code: error.code, message: error.message });
+    }
+    return res.status(500).json({
+      code: "PRODUCT_UPDATE_FAILED",
+      message: `The product could not be updated${error?.code ? ` (database code ${error.code})` : ""}: ${String(error?.message || "unknown error").slice(0, 200)}`,
+    });
   } finally {
     client.release();
   }
 };
 app.put("/products/:id", updateProductHandler);
 app.put("/api/v3/products/:id", rateLimitSyncRequest, v3WriteAdapter(updateProductHandler));
+
+/*
+ * A photo per product.
+ *
+ * Stored in `product_photos`, never on `products`: the products row is copied into
+ * `sync_change_log` and `product_audit_trail` on every edit and sent to every device in the
+ * reference bootstrap, so a photo on it would be multiplied into each of those. None of the three
+ * routes below calls `logSyncChange`, and the audit row they write records the photo's type and
+ * size, never its bytes. Devices fetch photos only through `GET /api/v3/product-photos`.
+ *
+ * Tenancy: the company is `req.auth.companyId`, the verified session claim, and nothing else. A
+ * product in another company answers exactly as a product that does not exist does, so a caller
+ * cannot learn which ids belong to somebody else.
+ *
+ * Authority: reading needs only a session (a cashier's POS draws these). Changing one needs the
+ * `inventory` permission -- the key that opens the Products screen in the client
+ * (`modulePermissionMap.products` in App.jsx) and that guards the v3 product-at-location write in
+ * operationalV3.js -- resolved through `getPermissionUser` with the same Owner/Admin fallback as
+ * every other call site.
+ */
+const PRODUCT_PHOTO_PERMISSION_KEY = "inventory";
+
+const productPhotoScopeRequired = (res) => res.status(403).json({
+  code: "PRODUCT_PHOTO_SCOPE_REQUIRED",
+  message: "This sign-in is not linked to a company, so product photos cannot be used. Sign in again.",
+});
+
+const productPhotoPermissionRequired = (res) => res.status(403).json({
+  code: "PRODUCT_PHOTO_PERMISSION_REQUIRED",
+  message: "You do not have permission to change product photos.",
+});
+
+const productPhotoNotFound = (res) => res.status(404).json({
+  code: "PRODUCT_NOT_FOUND",
+  message: "This product was not found.",
+});
+
+/**
+ * A database failure, answered as itself. A missing table (the cloud migration not yet applied)
+ * gets its own code, because "no photos" and "photos cannot be stored here" must never look alike.
+ */
+const productPhotoFailure = (res, error, code, message) => {
+  console.error(`Product photo request failed (${code})`, { code: error?.code, message: error?.message });
+  // 500, not 503: the desktop gateway turns any cloud 503 into "cloud temporarily unavailable"
+  // and drops this body, so the owner would never read the actual reason.
+  if (error?.code === "42P01") {
+    return res.status(500).json({
+      code: "PRODUCT_PHOTO_STORAGE_MISSING",
+      message: "Product photos are not set up on this server yet. Ask the administrator to update the database.",
+    });
+  }
+  return res.status(500).json({ code, message });
+};
+
+const listProductPhotosHandler = async (req, res) => {
+  const companyId = parsePositiveInteger(req.auth.companyId);
+  if (!companyId) return productPhotoScopeRequired(res);
+  try {
+    // Both companies are checked: the photo's own copy, which the index serves, and the product's,
+    // which is the authority. A photo whose product has since left the company is not listed.
+    const result = await pool.query(
+      `
+      SELECT pp.product_id, p.global_id AS product_global_id, pp.photo_data, pp.updated_at
+      FROM product_photos pp
+      JOIN products p ON p.id = pp.product_id
+      WHERE pp.company_id = $1
+        AND p.company_id = $1
+      ORDER BY pp.product_id
+      `,
+      [companyId]
+    );
+    // `product_global_id` as well as the number: a device's own copy of the catalogue (SQLite, which
+    // POS reads) knows a product only by its global id ("product-12"), never by 12, so a photo
+    // listed by number alone never reached a POS tile.
+    const photos = result.rows.map((row) => ({
+      product_id: row.product_id,
+      product_global_id: row.product_global_id ?? null,
+      photo: row.photo_data,
+      updated_at: row.updated_at,
+    }));
+    return res.json({ photos, count: photos.length });
+  } catch (error) {
+    return productPhotoFailure(res, error, "PRODUCT_PHOTOS_LOAD_FAILED", "Product photos could not be loaded. Try again.");
+  }
+};
+
+const saveProductPhotoHandler = async (req, res) => {
+  const companyId = parsePositiveInteger(req.auth.companyId);
+  if (!companyId) return productPhotoScopeRequired(res);
+  let editor;
+  try {
+    editor = await getPermissionUser(req.auth.userId, PRODUCT_PHOTO_PERMISSION_KEY, ["Owner", "Admin"]);
+  } catch (error) {
+    return productPhotoFailure(res, error, "PRODUCT_PHOTO_SAVE_FAILED", "The photo could not be saved. Try again.");
+  }
+  if (!editor) return productPhotoPermissionRequired(res);
+
+  const productId = parsePositiveInteger(req.params.id);
+  if (!productId) return productPhotoNotFound(res);
+  const photo = validateProductPhoto(req.body?.photo);
+  if (!photo.ok) return res.status(400).json({ code: photo.code, message: photo.message });
+
+  let client;
+  try {
+    client = await pool.connect();
+  } catch (error) {
+    return productPhotoFailure(res, error, "PRODUCT_PHOTO_SAVE_FAILED", "The photo could not be saved. Try again.");
+  }
+  try {
+    await client.query("BEGIN");
+    const productResult = await client.query(
+      "SELECT id FROM products WHERE id = $1 AND company_id = $2",
+      [productId, companyId]
+    );
+    if (productResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return productPhotoNotFound(res);
+    }
+    // Only the description of the photo being replaced, for the audit row. Never its bytes.
+    const previousResult = await client.query(
+      "SELECT content_type, byte_size FROM product_photos WHERE product_id = $1 FOR UPDATE",
+      [productId]
+    );
+    const previous = previousResult.rows[0] || null;
+    const saved = await client.query(
+      `
+      INSERT INTO product_photos (
+        product_id, company_id, photo_data, content_type, byte_size, updated_by, updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+      ON CONFLICT (product_id) DO UPDATE SET
+        company_id = EXCLUDED.company_id,
+        photo_data = EXCLUDED.photo_data,
+        content_type = EXCLUDED.content_type,
+        byte_size = EXCLUDED.byte_size,
+        updated_by = EXCLUDED.updated_by,
+        updated_at = CURRENT_TIMESTAMP
+      RETURNING product_id, updated_at
+      `,
+      [productId, companyId, photo.dataUrl, photo.contentType, photo.byteSize, editor.id]
+    );
+    await client.query(
+      `
+      INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by)
+      VALUES ($1, 'PRODUCT_PHOTO_SET', $2::jsonb, $3::jsonb, $4, $5)
+      `,
+      [
+        productId,
+        previous ? JSON.stringify({ content_type: previous.content_type, byte_size: previous.byte_size }) : null,
+        JSON.stringify({ content_type: photo.contentType, byte_size: photo.byteSize }),
+        previous ? "Product photo replaced" : "Product photo added",
+        editor.id,
+      ]
+    );
+    await client.query("COMMIT");
+    const row = saved.rows[0];
+    return res.json({ product_id: row.product_id, photo: photo.dataUrl, updated_at: row.updated_at });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    return productPhotoFailure(res, error, "PRODUCT_PHOTO_SAVE_FAILED", "The photo could not be saved. Try again.");
+  } finally {
+    client.release();
+  }
+};
+
+/**
+ * Idempotent: removing a photo that is not there is a success, and `removed` says which happened
+ * (`true` a photo was deleted, `false` there was none). The product itself must still exist in the
+ * caller's company either way, or the answer is 404.
+ */
+const removeProductPhotoHandler = async (req, res) => {
+  const companyId = parsePositiveInteger(req.auth.companyId);
+  if (!companyId) return productPhotoScopeRequired(res);
+  let editor;
+  try {
+    editor = await getPermissionUser(req.auth.userId, PRODUCT_PHOTO_PERMISSION_KEY, ["Owner", "Admin"]);
+  } catch (error) {
+    return productPhotoFailure(res, error, "PRODUCT_PHOTO_REMOVE_FAILED", "The photo could not be removed. Try again.");
+  }
+  if (!editor) return productPhotoPermissionRequired(res);
+
+  const productId = parsePositiveInteger(req.params.id);
+  if (!productId) return productPhotoNotFound(res);
+
+  let client;
+  try {
+    client = await pool.connect();
+  } catch (error) {
+    return productPhotoFailure(res, error, "PRODUCT_PHOTO_REMOVE_FAILED", "The photo could not be removed. Try again.");
+  }
+  try {
+    await client.query("BEGIN");
+    const productResult = await client.query(
+      "SELECT id FROM products WHERE id = $1 AND company_id = $2",
+      [productId, companyId]
+    );
+    if (productResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return productPhotoNotFound(res);
+    }
+    const removed = await client.query(
+      "DELETE FROM product_photos WHERE product_id = $1 AND company_id = $2 RETURNING content_type, byte_size",
+      [productId, companyId]
+    );
+    const previous = removed.rows[0] || null;
+    if (previous) {
+      await client.query(
+        `
+        INSERT INTO product_audit_trail (product_id, action, old_value, new_value, reason, edited_by)
+        VALUES ($1, 'PRODUCT_PHOTO_REMOVED', $2::jsonb, NULL, $3, $4)
+        `,
+        [
+          productId,
+          JSON.stringify({ content_type: previous.content_type, byte_size: previous.byte_size }),
+          "Product photo removed",
+          editor.id,
+        ]
+      );
+    }
+    await client.query("COMMIT");
+    return res.json({ product_id: productId, removed: Boolean(previous) });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    return productPhotoFailure(res, error, "PRODUCT_PHOTO_REMOVE_FAILED", "The photo could not be removed. Try again.");
+  } finally {
+    client.release();
+  }
+};
+
+app.get("/api/v3/product-photos", listProductPhotosHandler);
+app.put("/api/v3/products/:id/photo", saveProductPhotoHandler);
+app.delete("/api/v3/products/:id/photo", removeProductPhotoHandler);
 
 const addOpeningStockLotsForProduct = async (req, res, productIdParam = "id") => {
   const client = await pool.connect();

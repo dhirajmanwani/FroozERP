@@ -4,8 +4,10 @@ import { readFile } from "node:fs/promises";
 
 import {
   DETERMINISTIC_PROVIDER_OPTION,
+  FROST_OFFLINE_SESSION_MESSAGE,
   FROST_PROVIDER_LIST_UNAVAILABLE_MESSAGE,
   describeFrostTransportFailure,
+  hasCloudSession,
   resolveFrostDataSource,
   resolveFrostLoadDecision,
   resolveFrostProviderOptions,
@@ -133,7 +135,110 @@ test("a failure that carries a status is left to the caller's own ladder", () =>
 test("App.jsx resolves FROST availability through this module, desktop shell included", () => {
   assert.match(appSource, /resolveFrostLoadDecision\(/);
   assert.match(appSource, /resolveFrostProviderOptions\(/);
-  // Both decision call sites must say whether this is the desktop shell. Without it the resolver
+  // EVERY decision call site must say whether this is the desktop shell. Without it the resolver
   // reads 127.0.0.1 as "FROST is served here", which is the mistake this module was corrected for.
-  assert.equal((appSource.match(/desktopShell: isDesktopShell\(\)/g) || []).length, 2);
+  //
+  // This counted the call sites until 22 Sep 2026, when the bell's own loader became a third one
+  // and a correct change failed the gate while saying nothing about what was actually at risk.
+  // Counting also never checked the thing it was for: two call sites and two mentions anywhere in
+  // the file would have passed with neither of them carrying it. So it is matched per call site now.
+  const callSites = (appSource.match(/resolveFrostLoadDecision\(\{[^}]*\}/g) || []);
+  assert.ok(callSites.length >= 2, "expected at least the panel's and the bell's decision call sites");
+  for (const site of callSites) {
+    assert.match(site, /desktopShell: isDesktopShell\(\)/, `a resolveFrostLoadDecision call omits desktopShell: ${site}`);
+  }
+});
+
+// -------------------------------------------------------------------------------------------
+// The offline session: found during the 1.0.74 rehearsal, eleven 401s and the wrong explanation
+// -------------------------------------------------------------------------------------------
+
+test("an offline session is refused before it can collect a row of 401s", () => {
+  const decision = resolveFrostLoadDecision({
+    apiUrl: "http://127.0.0.1:5051",
+    cloudApiMode: false,
+    desktopShell: true,
+    internetAvailable: true,
+    cloudOnline: true,
+    cloudSession: false,
+  });
+  assert.equal(decision.shouldLoad, false);
+  assert.equal(decision.reason, FROST_OFFLINE_SESSION_MESSAGE);
+  assert.equal(decision.source, "cloud");
+});
+
+test("the offline-session message does not repeat the advice that could not work", () => {
+  // The panel used to say "FROST session expired. Sign in again to refresh owner permissions."
+  // Nothing had expired, and an offline sign-in mints no token however many times it is repeated.
+  assert.doesNotMatch(FROST_OFFLINE_SESSION_MESSAGE, /expired/i);
+  assert.match(FROST_OFFLINE_SESSION_MESSAGE, /offline/i);
+  assert.match(FROST_OFFLINE_SESSION_MESSAGE, /reach the cloud/i);
+});
+
+test("no cloud is the reason given when there is also no cloud", () => {
+  // Both faults are present in a Local Only or disconnected desktop. Naming the missing token
+  // there would send the owner to sign in again against a cloud that is not there.
+  const decision = resolveFrostLoadDecision({
+    apiUrl: "http://127.0.0.1:5051",
+    desktopShell: true,
+    internetAvailable: false,
+    cloudOnline: false,
+    cloudSession: false,
+  });
+  assert.equal(decision.shouldLoad, false);
+  assert.match(decision.reason, /requires cloud access/);
+});
+
+test("a session that cannot be judged is still allowed to try", () => {
+  // The old behaviour, kept for any caller that cannot say. A refusal on "unknown" would be a
+  // guess, and a guess is what this module exists to stop.
+  for (const cloudSession of [null, undefined]) {
+    assert.equal(resolveFrostLoadDecision({
+      apiUrl: "https://froozerp.example.com",
+      cloudApiMode: true,
+      internetAvailable: true,
+      cloudOnline: true,
+      cloudSession,
+    }).shouldLoad, true);
+  }
+  assert.equal(resolveFrostLoadDecision({
+    apiUrl: "https://froozerp.example.com",
+    cloudApiMode: true,
+    internetAvailable: true,
+    cloudOnline: true,
+    cloudSession: true,
+  }).shouldLoad, true);
+});
+
+test("a local FROST is never refused for a missing cloud token", () => {
+  // A browser against a FROST-serving backend reads FROST from that backend. A cloud token is not
+  // what authenticates it, so borrowing the cloud message here would be false.
+  assert.equal(resolveFrostLoadDecision({
+    apiUrl: "http://127.0.0.1:5000",
+    cloudApiMode: false,
+    desktopShell: false,
+    cloudSession: false,
+  }).shouldLoad, true);
+});
+
+test("hasCloudSession reads both halves of the fact, and abstains for nobody", () => {
+  assert.equal(hasCloudSession({ id: 1, device_session_token: "signed-token" }), true);
+  // The flag continueOffline() sets. A stale token left on the record must not outvote it.
+  assert.equal(hasCloudSession({ id: 1, offline_session: true, device_session_token: "stale" }), false);
+  // The snapshot-built user: the flag and no token at all.
+  assert.equal(hasCloudSession({ id: 1, offline_session: true }), false);
+  // Online-shaped record with nothing in the token: the interceptor sends no header for this.
+  assert.equal(hasCloudSession({ id: 1, device_session_token: "   " }), false);
+  assert.equal(hasCloudSession({ id: 1 }), false);
+  // Nobody signed in is not the offline case and must not borrow its message.
+  assert.equal(hasCloudSession(null), null);
+  assert.equal(hasCloudSession(undefined), null);
+  assert.equal(hasCloudSession("user"), null);
+});
+
+test("the FROST loader in App.jsx passes the session through this module", () => {
+  assert.match(appSource, /cloudSession: hasCloudSession\(user\)/);
+  // continueOffline() is where the tokenless user is built. If that stops setting the flag, the
+  // check above silently weakens to "is the token missing", which a stale token would pass.
+  assert.match(appSource, /offline_session: true/);
 });

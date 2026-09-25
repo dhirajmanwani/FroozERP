@@ -3410,6 +3410,16 @@ tbody tr:last-child td {
   margin-bottom: 12px;
 }
 
+.report-excel-notice {
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
+  margin: 0 0 10px;
+}
+
+.report-excel-notice-error {
+  color: var(--danger-ink);
+}
+
 .report-toolbar strong {
   color: var(--ink);
   font-size: 14px;
@@ -4673,28 +4683,239 @@ tbody tr:last-child td {
   grid-template-columns: 1fr;
 }
 
-.frost-tabs {
+/* The panel's whole chrome, replacing a row of eleven tabs, a period dropdown, a Refresh button
+   and a second FROST heading. An assistant has one surface; everything else is one tap away. */
+.frost-strip {
+  align-items: center;
+  border-bottom: 1px solid var(--line-soft);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: space-between;
+  padding-bottom: 10px;
+}
+
+/* The effective period, in words. The picker moved into the menu, and a filter the owner cannot
+   see is the Report Center bug: today-to-today applied while the inputs looked empty. */
+.frost-strip-period {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.frost-strip-period small {
+  color: var(--ink-faint);
+  font-size: 0.76rem;
+}
+
+.frost-strip-button {
+  align-items: center;
+  background: var(--veil-heavy);
+  border: 1px solid var(--line-control);
+  border-radius: 8px;
+  color: var(--ink-muted);
+  cursor: pointer;
+  display: inline-flex;
+  font-weight: 800;
+  gap: 6px;
+  min-height: 36px;
+  padding: 7px 12px;
+  position: relative;
+}
+
+.frost-strip-button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+/* A dot, not a number. The count itself is on the Alerts row inside the menu, where there is room
+   to say what it counts; a bare number on the button would be a figure with no label. */
+.frost-strip-badge {
+  background: var(--attention);
+  border-radius: 50%;
+  height: 7px;
+  width: 7px;
+}
+
+.frost-menu {
+  background: var(--card-veil-solid);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow-soft);
+  display: grid;
+  gap: 2px;
+  margin-top: 10px;
+  padding: 8px;
+}
+
+.frost-menu-range {
+  align-items: center;
+  border-bottom: 1px solid var(--line-soft);
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  padding: 4px 8px 10px;
+}
+
+.frost-menu-range span {
+  color: var(--ink-muted);
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.frost-menu-item {
+  background: none;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+  display: grid;
+  gap: 2px;
+  padding: 9px 10px;
+  text-align: left;
+}
+
+.frost-menu-item:hover {
+  background: var(--hover);
+}
+
+.frost-menu-item-active {
+  background: var(--accent-wash);
+}
+
+.frost-menu-item strong {
+  color: var(--ink-body);
+  font-size: 0.93rem;
+}
+
+.frost-menu-item small {
+  color: var(--ink-faint);
+  font-size: 0.78rem;
+}
+
+.frost-menu-footer {
+  border-top: 1px solid var(--line-soft);
+  display: grid;
+  gap: 2px;
+  margin-top: 6px;
+  padding-top: 6px;
+}
+
+.frost-back {
+  align-items: center;
+  background: none;
+  border: 0;
+  color: var(--ink-muted);
+  cursor: pointer;
+  display: inline-flex;
+  font-weight: 800;
+  gap: 6px;
+  padding: 4px 0;
+}
+
+.frost-conversation {
+  display: grid;
+  gap: 14px;
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+.frost-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* A turn, not a row in a table. The owner's questions sit right and FROST's answers left, which is
+   the only thing that makes a thread readable at a glance. */
+.frost-turn {
+  border-radius: 12px;
+  display: grid;
+  gap: 5px;
+  max-width: 88%;
+  padding: 11px 13px;
+}
+
+.frost-turn-frost {
+  align-self: flex-start;
+  background: var(--veil-heavy);
+  border: 1px solid var(--line-soft);
+}
+
+.frost-turn-owner {
+  align-self: flex-end;
+  background: var(--accent-wash);
+  border: 1px solid var(--accent-line);
+}
+
+.frost-turn p {
+  color: var(--ink-body);
+  line-height: 1.5;
+  margin: 0;
+}
+
+.frost-turn strong {
+  color: var(--ink-strong);
+  font-size: 1.02rem;
+}
+
+/* The line that lets a figure be checked against the ordinary report. Quiet, and always present. */
+.frost-turn small {
+  color: var(--ink-faint);
+  font-size: 0.75rem;
+}
+
+.frost-turn-greeting,
+.frost-turn-brief {
+  background: none;
+  border: 0;
+  max-width: 100%;
+  padding: 4px 0;
+}
+
+.frost-composer {
+  background: var(--card-veil-soft);
+  border: 1px solid var(--line-control);
+  border-radius: 12px;
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+
+.frost-composer textarea {
+  min-height: 64px;
+  resize: vertical;
+}
+
+.frost-composer-actions {
+  align-items: center;
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
 }
 
-.frost-tab {
+.frost-composer-suggestions {
+  flex: 1 1 180px;
+  min-width: 0;
+}
+
+/* Speaking is a control beside typing, not a place to navigate to. */
+.frost-speak-button {
+  align-items: center;
   background: var(--veil-heavy);
-  border: 1px solid rgba(143, 171, 156, 0.18);
+  border: 1px solid var(--line-control);
   border-radius: 8px;
   color: var(--ink-muted);
   cursor: pointer;
+  display: inline-flex;
   font-weight: 800;
+  gap: 6px;
   min-height: 38px;
-  padding: 8px 11px;
+  padding: 8px 12px;
 }
 
-.frost-tab-active {
-  background: rgba(14, 165, 233, 0.16);
-  border-color: rgba(125, 211, 252, 0.46);
-  color: #e0f2fe;
-  box-shadow: inset 0 0 0 1px rgba(125, 211, 252, 0.12);
+.frost-speech-notice {
+  margin: 0;
 }
 
 .frost-panel-stack {
@@ -4868,66 +5089,366 @@ tbody tr:last-child td {
   gap: 12px;
 }
 
-.frost-voice-panel {
-  align-items: center;
-  background: linear-gradient(135deg, rgba(8, 47, 73, 0.82), var(--veil-solid));
-  border: 1px solid rgba(125, 211, 252, 0.28);
-  border-radius: 8px;
-  box-shadow: 0 18px 50px rgba(8, 47, 73, 0.22);
+.frost-live-bar {
   display: grid;
-  gap: 14px;
-  grid-template-columns: minmax(0, 1fr) auto;
-  overflow: hidden;
-  padding: 18px;
-  position: relative;
+  gap: 8px;
 }
 
-.frost-voice-panel::before {
-  background: linear-gradient(90deg, transparent, rgba(125, 211, 252, 0.42), transparent);
-  content: "";
-  height: 1px;
-  left: 0;
-  position: absolute;
-  right: 0;
-  top: 0;
-}
-
-.frost-voice-panel h3 {
-  margin: 4px 0;
-}
-
-.frost-voice-panel p {
-  color: var(--ink-muted);
-  margin: 0;
-}
-
-.frost-voice-controls {
+.frost-live-row {
   align-items: center;
   display: flex;
+  flex-wrap: wrap;
   gap: 10px;
 }
 
-.frost-mic-button {
-  min-height: 46px;
-}
-
-.frost-voice-state {
-  background: var(--shadow-strong);
-  border: 1px solid rgba(125, 211, 252, 0.2);
+.frost-live-switch {
+  align-items: center;
+  background: var(--veil-heavy);
+  border: 1px solid var(--line-control);
   border-radius: 999px;
-  color: var(--info-ink);
-  font-size: 0.78rem;
+  color: var(--ink-muted);
+  cursor: pointer;
+  display: inline-flex;
   font-weight: 800;
-  padding: 7px 10px;
-  text-transform: uppercase;
+  gap: 8px;
+  min-height: 36px;
+  padding: 6px 14px 6px 6px;
 }
 
-.frost-transcript {
-  background: var(--shadow-strong);
-  border: 1px solid rgba(143, 171, 156, 0.16);
-  border-radius: 8px;
-  grid-column: 1 / -1;
-  padding: 12px;
+.frost-live-switch-on {
+  border-color: var(--accent-line-strong);
+  color: var(--ink);
+}
+
+.frost-live-knob {
+  background: var(--track);
+  border-radius: 999px;
+  display: inline-block;
+  height: 22px;
+  position: relative;
+  width: 38px;
+}
+
+.frost-live-knob::after {
+  background: var(--ink-faint);
+  border-radius: 999px;
+  content: "";
+  height: 16px;
+  left: 3px;
+  position: absolute;
+  top: 3px;
+  transition: transform 0.15s ease;
+  width: 16px;
+}
+
+.frost-live-switch-on .frost-live-knob {
+  background: var(--accent-soft);
+}
+
+.frost-live-switch-on .frost-live-knob::after {
+  background: var(--accent);
+  transform: translateX(16px);
+}
+
+.frost-live-indicator {
+  align-items: center;
+  color: var(--info-ink);
+  display: inline-flex;
+  font-size: var(--font-size-sm);
+  font-weight: 800;
+  gap: 7px;
+}
+
+.frost-live-dot {
+  background: var(--info);
+  border-radius: 999px;
+  display: inline-block;
+  height: 9px;
+  width: 9px;
+}
+
+.frost-live-indicator-starting .frost-live-dot,
+.frost-live-indicator-transcribing .frost-live-dot,
+.frost-live-indicator-thinking .frost-live-dot {
+  animation: frost-live-pulse 1.1s ease-in-out infinite;
+}
+
+.frost-live-indicator-listening,
+.frost-live-indicator-starting {
+  color: var(--ink-muted);
+}
+
+.frost-live-indicator-hearing {
+  color: var(--success-ink);
+}
+
+.frost-live-indicator-hearing .frost-live-dot {
+  background: var(--success);
+}
+
+.frost-live-indicator-transcribing,
+.frost-live-indicator-thinking {
+  color: var(--info-ink);
+}
+
+.frost-live-indicator-speaking {
+  color: var(--accent);
+}
+
+.frost-live-indicator-speaking .frost-live-dot {
+  background: var(--accent);
+}
+
+.frost-live-indicator-off {
+  color: var(--ink-faint);
+}
+
+@keyframes frost-live-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.frost-live-message {
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
+  margin: 0;
+}
+
+.frost-live-message-error {
+  color: var(--danger-ink);
+}
+
+.frost-voice-setup {
+  background: var(--card-veil-soft);
+  border: 1px solid var(--line-control);
+  border-radius: 10px;
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+}
+
+.frost-voice-setup p {
+  color: var(--ink-body);
+  margin: 0;
+}
+
+.frost-voice-setup small {
+  color: var(--ink-muted);
+}
+
+.frost-voice-setup-neutral {
+  border-color: var(--line-control);
+}
+
+.frost-voice-setup-progress {
+  border-color: var(--accent-line);
+}
+
+.frost-voice-setup-bar {
+  background: var(--track);
+  border-radius: 999px;
+  height: 6px;
+  overflow: hidden;
+}
+
+.frost-voice-setup-bar span {
+  background: var(--accent);
+  display: block;
+  height: 100%;
+}
+
+.frost-voice-setup-positive {
+  border-color: var(--success);
+}
+
+.frost-voice-setup-error {
+  border-color: var(--danger-line);
+}
+
+.frost-voice-setup-error p {
+  color: var(--danger-ink);
+}
+
+/* Round 2: the paused/no-sound phases, the level meter, what was heard, and the engine line. */
+.frost-live-indicator-paused {
+  color: var(--attention-ink);
+}
+
+.frost-live-indicator-paused .frost-live-dot {
+  background: var(--attention);
+  animation: frost-live-pulse 1.1s ease-in-out infinite;
+}
+
+.frost-live-indicator-no_sound {
+  color: var(--danger-ink);
+}
+
+.frost-live-indicator-no_sound .frost-live-dot {
+  background: var(--danger);
+}
+
+.frost-voice-level {
+  background: var(--track);
+  /* The outline keeps the meter visible at zero, where a silent microphone is exactly what it
+     has to show. Without it the empty track vanished into the dark theme. */
+  border: 1px solid var(--line-control);
+  border-radius: 999px;
+  display: inline-block;
+  height: 6px;
+  overflow: hidden;
+  width: 56px;
+}
+
+.frost-voice-level span {
+  background: var(--success);
+  display: block;
+  height: 100%;
+  transition: width 0.08s linear;
+}
+
+.frost-live-message-attention {
+  color: var(--attention-ink);
+}
+
+.frost-live-message-action {
+  background: none;
+  border: 0;
+  cursor: pointer;
+  font-weight: 800;
+  padding: 0;
+  text-align: left;
+  text-decoration: underline;
+}
+
+.frost-live-mic {
+  align-items: center;
+  color: var(--ink-muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: var(--font-size-sm);
+  gap: 6px 8px;
+}
+
+.frost-live-mic select {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.frost-live-heard {
+  background: var(--card-veil-soft);
+  border-left: 3px solid var(--accent-line-strong);
+  border-radius: 6px;
+  color: var(--ink-body);
+  font-size: var(--font-size-sm);
+  margin: 0;
+  padding: 6px 10px;
+}
+
+.frost-voice-engine {
+  border: 1px solid var(--line-control);
+  border-radius: 10px;
+  display: grid;
+  gap: 6px;
+  padding: 8px 12px;
+}
+
+.frost-voice-engine p {
+  color: var(--ink-body);
+  margin: 0;
+}
+
+.frost-voice-engine small {
+  color: var(--ink-muted);
+}
+
+.frost-voice-engine-update {
+  border-color: var(--accent-line);
+}
+
+.frost-voice-engine-slow {
+  border-color: var(--attention-line);
+}
+
+.frost-voice-indicator-wrap {
+  display: inline-flex;
+  position: relative;
+}
+
+.frost-voice-indicator {
+  align-items: center;
+  background: var(--fill);
+  border: 1px solid var(--success);
+  border-radius: 999px;
+  color: var(--success-ink);
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 11px;
+  font-weight: 800;
+  gap: 6px;
+  max-width: 260px;
+  min-height: 34px;
+  padding: 4px 10px;
+}
+
+.frost-voice-indicator-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.frost-voice-indicator-attention {
+  border-color: var(--attention-line);
+  color: var(--attention-ink);
+}
+
+.frost-voice-indicator-error {
+  border-color: var(--danger-line);
+  color: var(--danger-ink);
+}
+
+.frost-voice-bubble {
+  background: var(--veil-solid);
+  border: 1px solid var(--line-control);
+  border-radius: 10px;
+  box-shadow: 0 12px 30px var(--shadow-soft);
+  display: grid;
+  gap: 4px;
+  max-width: 320px;
+  padding: 8px 10px;
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  width: max-content;
+  z-index: 60;
+}
+
+.frost-voice-bubble p {
+  color: var(--ink-body);
+  font-size: var(--font-size-sm);
+  margin: 0;
+}
+
+.frost-voice-bubble .frost-voice-bubble-error {
+  color: var(--danger-ink);
+}
+
+.frost-floating-launcher-listening {
+  box-shadow: 0 18px 48px var(--shadow-soft), 0 0 0 4px var(--success);
+}
+
+.frost-launcher-mic {
+  align-items: center;
+  background: var(--success);
+  border-radius: 999px;
+  bottom: -2px;
+  color: #ffffff;
+  display: inline-flex;
+  height: 20px;
+  justify-content: center;
+  left: -2px;
+  position: absolute;
+  width: 20px;
+  z-index: 2;
 }
 
 .ai-thinking {
@@ -5044,6 +5565,14 @@ tbody tr:last-child td {
 }
 
 @media (max-width: 920px) {
+  .frost-turn {
+    max-width: 96%;
+  }
+
+  .frost-composer-actions {
+    display: grid;
+  }
+
   .ai-toolbar,
   .ai-question-box {
     align-items: stretch;
@@ -5055,10 +5584,6 @@ tbody tr:last-child td {
   }
 
   .frost-memory-tools {
-    grid-template-columns: 1fr;
-  }
-
-  .frost-voice-panel {
     grid-template-columns: 1fr;
   }
 }
@@ -6808,3 +7333,325 @@ tbody tr:last-child td {
 
 :root[data-theme="dark"] .brand-monogram .brand-art-on-dark { display: block; }
 :root[data-theme="dark"] .brand-monogram .brand-art-on-light { display: none; }
+
+/* The chat sidebar reuses the menu's card, because it is the same kind of thing: a short list that
+   opens over the conversation and closes when you pick from it. Giving it a second look would have
+   made the panel feel like two panels. */
+.frost-chats {
+  max-height: 46vh;
+  overflow-y: auto;
+}
+
+.frost-chats-empty {
+  color: var(--ink-muted);
+  font-size: 0.86rem;
+  margin: 0;
+  padding: 10px;
+}
+
+/* Square, so the one control that is always in the same corner reads as a control and not as a
+   fourth word in the row. */
+.frost-new-chat {
+  padding-inline: 10px;
+}
+
+/* The date on one reminder. The Save button only appears once the box differs from what is stored,
+   so the cell is one control wide at rest and does not push the actions column off a narrow
+   drawer. */
+.frost-due-date {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.frost-due-date input {
+  min-width: 140px;
+}
+
+/* A failed save is said in the cell it failed in, in the danger ink the rest of the app uses for
+   the same thing, rather than as a toast that is gone before he looks up. */
+.frost-due-date-failure {
+  color: var(--danger-ink);
+  flex-basis: 100%;
+}
+
+/* The counts above the dues table. Derived from the same rows the table is, so the two cannot
+   disagree -- the summary-versus-detail pitfall in CLAUDE.md. */
+.frost-dues-summary {
+  color: var(--ink-muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 0.86rem;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.frost-dues-summary strong {
+  color: var(--ink);
+}
+
+/* The message is the point of the row, so it gets the width. It wraps rather than truncating: a
+   message he is about to send under the shop's name has to be readable in full before he sends
+   it, and an ellipsis is how an unread draft goes out. */
+.frost-dues-message {
+  font-size: 0.86rem;
+  line-height: 1.45;
+  max-width: 420px;
+  white-space: normal;
+}
+
+/* "Today's payments": the once-a-day popup of who to collect from and who to pay. A narrow card,
+   one line per payment with its buttons beside it, so a day with three dues reads in one glance. */
+.payments-due-modal {
+  width: min(620px, 100%);
+}
+
+.payments-due-body {
+  display: grid;
+  gap: 10px;
+  padding: 0 16px 16px;
+}
+
+.payments-due-summary {
+  color: var(--ink-muted);
+  font-size: 0.9rem;
+  margin: 0;
+}
+
+.payments-due-heading {
+  color: var(--ink);
+  font-size: 0.95rem;
+  margin: 6px 0 0;
+}
+
+.payments-due-list {
+  display: grid;
+  gap: 8px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.payments-due-row {
+  align-items: center;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  justify-content: space-between;
+  padding: 10px 12px;
+}
+
+.payments-due-text {
+  color: var(--ink);
+  flex: 1 1 260px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.payments-due-actions {
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+}
+
+/* POS shelves: Frooz Retail / Frooz Bar / Frooz Moments. */
+.pos-sections {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 13px;
+}
+
+.pos-section {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border: 1px solid var(--line-control);
+  border-radius: 999px;
+  color: var(--ink-body);
+  background: var(--track);
+  font-size: 13px;
+}
+
+.pos-section span {
+  min-width: 22px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  color: var(--ink-muted);
+  background: var(--card);
+  font-size: 12px;
+  text-align: center;
+}
+
+.pos-section-active {
+  border-color: var(--accent);
+  color: var(--card);
+  background: var(--accent);
+}
+
+.pos-section-active span {
+  color: var(--ink);
+}
+
+.pos-sections-note {
+  color: var(--ink-muted);
+  font-size: 12px;
+}
+
+.product-results .product-result {
+  grid-template-columns: 64px minmax(0, 1fr) auto;
+}
+
+.product-result-badge {
+  box-sizing: border-box;
+  display: grid;
+  place-items: center;
+  width: 64px;
+  height: 64px;
+  border-radius: 10px;
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.product-result-photo {
+  object-fit: cover;
+  border: 1px solid var(--line-control);
+  background: var(--card);
+}
+
+.product-results .product-result-section {
+  border-color: var(--accent);
+  color: var(--ink);
+}
+
+/* Product Master: the photo picker. */
+.product-photo-field {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0;
+}
+
+.product-photo-label {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.product-photo-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 14px;
+}
+
+.product-photo-drop {
+  box-sizing: border-box;
+  display: grid;
+  place-items: center;
+  width: 128px;
+  height: 128px;
+  padding: 8px;
+  border: 1px dashed var(--line-control);
+  border-radius: 12px;
+  color: var(--ink-muted);
+  background: var(--track);
+  font-size: 12px;
+  text-align: center;
+  cursor: pointer;
+}
+
+.product-photo-drop:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.product-photo-drop-filled {
+  padding: 0;
+  border-style: solid;
+  overflow: hidden;
+  background: var(--card);
+}
+
+.product-photo-drop img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.product-photo-actions {
+  display: grid;
+  gap: 8px;
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.product-photo-actions p {
+  margin: 0;
+  color: var(--ink-muted);
+  font-size: 13px;
+}
+
+.product-photo-file {
+  position: relative;
+  cursor: pointer;
+}
+
+.product-photo-file input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.product-photo-message {
+  color: var(--ink-muted);
+}
+
+.product-photo-message-error {
+  color: var(--danger-ink);
+}
+
+.product-photo-actions .remove-button {
+  white-space: nowrap;
+}
+
+/* Edit scrolls the item form into view; leave room above it for the top bar. */
+#product-item-form {
+  scroll-margin-top: 88px;
+}
+
+/* Branches & Counters: one numbered step per block, each with its own result under its button. */
+.scope-step {
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.scope-step:first-of-type {
+  margin-top: 8px;
+}
+
+.scope-step h3 {
+  margin: 0 0 4px;
+}
+
+.scope-step h4 {
+  margin: 16px 0 8px;
+}
+
+.scope-step-message {
+  margin: 4px 0 12px;
+  color: var(--success);
+  font-weight: 700;
+}
+
+.scope-step-message-error {
+  color: var(--danger-ink);
+}

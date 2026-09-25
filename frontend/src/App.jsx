@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { flushSync } from "react-dom";
 import axios from "axios";
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
@@ -111,7 +112,7 @@ import {
   validateDistributionDraft,
   validateStockRequest,
 } from "./local/stockDistribution";
-import { filterSellableProducts, isSellableLot, lotAvailableQuantity, resolveSellableProducts, selectLocalPosInventory } from "./local/posInventory";
+import { emptyShelfReason, filterSellableProducts, isSellableLot, lotAvailableQuantity, resolveSellableProducts, selectLocalPosInventory } from "./local/posInventory";
 import {
   activeStockFilterLabels,
   canonicalInventoryId,
@@ -150,8 +151,12 @@ import {
 } from "./local/activationIssuing";
 import { refreshAfterSaveMessage, settingsWriteErrorMessage } from "./local/settingsWriteError";
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
+import { adminWritePayload } from "./local/adminWritePayload";
+import { checkProductPhoto, imageFromTransfer, indexProductPhotos, photoForProduct, readCachedProductPhotos, shrinkProductPhoto, withProductPhoto, writeCachedProductPhotos } from "./local/productPhotos";
+import { POS_SECTIONS, posSectionCounts, posSectionFor, posSectionLabel, posTileBadge, readPosSection, writePosSection } from "./local/posSections";
+import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
-import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, resolveReportDateRange } from "./local/reportRefresh";
+import { buildReportRefreshParams, filterRowsForReportRange, formatIndianReportDate, normalizeReportDate, reportLoadParams, resolveReportDateRange } from "./local/reportRefresh";
 import { approvedDeviceCredentialMessage, normalizeDeviceBootstrapStatus } from "./local/freshDeviceOnboarding";
 import { NAME_TITLES, getUserDisplayName, getUserGreetingName, getUserInitial, getUserRoleLabel, joinPersonName, splitPersonName } from "./local/userPresentation";
 import { FROST_GREETING_PROMPT, resolveFrostGreeting } from "./local/frostGreeting";
@@ -171,9 +176,76 @@ import {
 } from "./local/cloudAvailability";
 import {
   describeFrostTransportFailure,
+  hasCloudSession,
   resolveFrostLoadDecision,
   resolveFrostProviderOptions,
 } from "./local/frostAvailability";
+import {
+  buildFrostBrief,
+  buildFrostConversation,
+  latestSpokenTurn,
+} from "./local/frostConversation";
+import {
+  FROST_BELL_STATUS,
+  buildFrostBellNotifications,
+} from "./local/frostBellNotifications";
+import {
+  DUE_OUTREACH_ACTION,
+  DUE_OUTREACH_STATUS,
+  buildDueOutreachRows,
+  normalizeWhatsappNumber,
+} from "./local/frostDuesOutreach";
+import {
+  PAYMENTS_DUE_MEMORY_STORAGE_KEY,
+  PAYMENTS_DUE_STATUS,
+  PAYMENT_KIND,
+  attachWhatsappLinks,
+  buildPaymentPlan,
+  buildPaymentsDuePopup,
+  formatRupees,
+  isPaymentReminder,
+  localDateKey,
+  nextPaymentsDueMemory,
+  paymentReminderRequest,
+  paymentsDueBellItems,
+  readPaymentsDueMemory,
+  reminderDraftLinkFields,
+  resolvePaymentReminderRequest,
+  shiftDateKey,
+} from "./local/paymentsDue";
+import {
+  FROST_CHAT_SELECTION,
+  buildChatList,
+  historyFromExchanges,
+  newChatSessionId,
+  resolveChatSelection,
+} from "./local/frostChats";
+import {
+  FROST_PRIMARY_SECTION,
+  describeFrostRange,
+  mayUseFrost,
+  resolveFrostSurface,
+} from "./local/frostSurface";
+import {
+  resolveSpeechPlan,
+  speechWithNotice,
+} from "./local/frostSpeech";
+import {
+  LIVE_VOICE_IDLE_LIMIT_MS,
+  LIVE_VOICE_PHASE_LABELS,
+  LIVE_VOICE_PREFERENCE_NOT_SAVED,
+  createLiveVoiceController,
+  createVoiceLevelChannel,
+  listMicrophones,
+  liveVoiceIndicatorView,
+  microphoneOptions,
+  readAlwaysOnPreference,
+  readMicrophonePreference,
+  speechEngineNotice,
+  speechSetupView,
+  writeAlwaysOnPreference,
+  writeMicrophonePreference,
+} from "./local/frostLiveVoice";
 import {
   checkBackendHealth,
   getSyncStatus,
@@ -845,6 +917,12 @@ const APP_COMPANY = "SRT Company";
 const APPLICATION_FONT_SIZE_STORAGE_KEY = "froozerp_application_font_size";
 const FROST_ACTIVE_TAB_STORAGE_KEY = "froozerp_frost_active_tab";
 const FROST_RECENT_CONVERSATION_STORAGE_KEY = "froozerp_frost_recent_conversation";
+// How many exchanges the open chat keeps on screen. It is not the same number as the twenty written
+// to localStorage below, and separating them is the point: a chat reopened from the sidebar can be
+// fifty exchanges long, and a shared cap of twenty meant the next question silently threw away
+// everything above it -- the conversation shrank while the owner was reading it. The server returns
+// at most fifty, so this holds a full one with room for the answers still to come.
+const FROST_OPEN_CHAT_LIMIT = 60;
 const getStoredFrostConversation = () => {
   try {
     const parsed = JSON.parse(localStorage.getItem(FROST_RECENT_CONVERSATION_STORAGE_KEY) || "[]");
@@ -1007,6 +1085,18 @@ const offlineBackendRequiredViews = new Set(["purchase", "pending-bills", "accou
 
 const getErrorMessage = (error, fallback) =>
   error.response?.data?.message || fallback;
+
+/**
+ * Why a product save failed, never a bare "Error Adding Product": the server's own words when it
+ * answered, otherwise what went wrong on this side (no answer, a timeout, a local database error).
+ */
+const productSaveErrorMessage = (error, fallback) => {
+  const serverMessage = error?.response?.data?.message;
+  if (serverMessage) return serverMessage;
+  if (error?.response?.status) return `${fallback} The server answered ${error.response.status}.`;
+  const localMessage = String(error?.message || error || "").trim();
+  return localMessage ? `${fallback} ${localMessage}` : fallback;
+};
 
 /**
  * Why a settings change could not be saved, in words somebody can act on.
@@ -1202,6 +1292,18 @@ const formatDisplayDate = (dateValue) => {
   const [year, month, day] = key.split("-");
   return `${day}/${month}/${year}`;
 };
+/**
+ * A stored due date, in the form an `<input type="date">` will accept.
+ *
+ * `toDateKey` on purpose, and nothing cleverer: it takes the first ten characters of the string the
+ * server sent. Re-parsing into a `Date` and formatting it back would apply the device's timezone to
+ * a timestamp the backend stores and compares without one, which in IST moves every midnight
+ * reminder to the previous day. The box then shows a day the server never stored.
+ */
+const toDateInputValue = (dateValue) => {
+  const key = toDateKey(dateValue || "");
+  return /^\d{4}-\d{2}-\d{2}$/.test(key) ? key : "";
+};
 const formatFileDate = (dateValue) => formatDisplayDate(dateValue).replaceAll("/", "-");
 const safeFileName = (value) =>
   String(value || "FroozERP_Document")
@@ -1383,15 +1485,20 @@ const exportElementToPdf = async ({ element, fileName, mode = "A4", receiptWidth
   }
 };
 
+// The filter line printed above a report ("Range: ... Status: ..."). The PDF and the Excel file
+// both carry it, so neither can show numbers without saying which slice of the books they are.
+// Each filter is its own line: the spans have no separator between them in textContent.
+const reportMetaLines = (element) => Array.from(element?.querySelectorAll?.(".report-filter-summary > span") || [])
+  .map((node) => String(node.textContent || "").replace(/\s+/g, " ").trim())
+  .filter(Boolean);
+
 // Reports export as real text rather than a screenshot: selectable, searchable, and small
 // enough to survive the backend 25mb JSON body limit when base64-encoded for WhatsApp.
 // Returns null when the report has no extractable tables/metrics (e.g. chart-only), so the
 // caller can fall back to the raster path.
 const exportReportTextPdf = async ({ element, fileName, title, printProfile = "", save = true }) => {
   if (!element) return null;
-  const meta = Array.from(element.querySelectorAll?.(".report-filter-summary") || [])
-    .map((node) => String(node.textContent || "").replace(/s+/g, " ").trim())
-    .filter(Boolean);
+  const meta = reportMetaLines(element);
   const model = buildReportPdfModel(element, { title, meta });
   if (!reportPdfHasContent(model)) return null;
   const pdf = renderReportPdf({
@@ -1400,10 +1507,30 @@ const exportReportTextPdf = async ({ element, fileName, title, printProfile = ""
     orientation: printProfile === "A4_LANDSCAPE" ? "landscape" : "portrait",
     generatedAt: new Date().toLocaleString("en-IN"),
   });
-  const finalFileName = safeFileName(fileName).replace(/.pdf$/i, "") + ".pdf";
+  const finalFileName = safeFileName(fileName).replace(/\.pdf$/i, "") + ".pdf";
   const blob = ensurePdfBlob(pdf.output("blob"));
   const saveResult = save ? await savePdfResult({ blob, fileName: finalFileName, pdf }) : null;
   return { blob, fileName: finalFileName, pdf, saveResult };
+};
+
+// The same report as an Excel sheet, from the same model the text PDF reads. Saved the way the
+// activation file is saved (a webview download, so it lands in Downloads), because the shell's
+// only save dialog is PDF-only. Returns null when the report has no table or totals to carry.
+const exportReportExcel = ({ element, fileName, title }) => {
+  if (!element) return null;
+  const model = buildReportPdfModel(element, { title, meta: reportMetaLines(element) });
+  if (!reportWorkbookHasContent(model)) return null;
+  const bytes = renderXlsx(buildReportWorkbook(model, { generatedAt: new Date().toLocaleString("en-IN") }));
+  const finalFileName = reportXlsxFileName(safeFileName(fileName || title), title);
+  const url = URL.createObjectURL(new Blob([bytes], { type: XLSX_MIME }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = finalFileName;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+  return { fileName: finalFileName, size: bytes.length };
 };
 
 // Every A4 document in this app wants the same thing: real text when the page has tables or
@@ -1416,17 +1543,6 @@ const exportDocumentPdf = async ({ element, fileName, title = "", printProfile =
   await exportReportTextPdf({ element, fileName, title, printProfile, save })
   || await exportElementToPdf({ element, fileName, mode: "A4", printProfile, save })
 );
-const normalizeWhatsappNumber = (value, defaultCountryCode = "91") => {
-  let digits = String(value || "").trim().replace(/[^\d+]/g, "");
-  if (!digits) return "";
-  if (digits.startsWith("00")) digits = digits.slice(2);
-  if (digits.startsWith("+")) digits = digits.slice(1);
-  digits = digits.replace(/\D/g, "");
-  const countryCode = String(defaultCountryCode || "91").replace(/\D/g, "") || "91";
-  if (digits.length === 10) digits = `${countryCode}${digits}`;
-  return digits.length >= 11 && digits.length <= 15 ? digits : "";
-};
-
 const blobToBase64 = (blob) => new Promise((resolve, reject) => {
   const reader = new FileReader();
   reader.onloadend = () => resolve(String(reader.result || "").replace(/^data:application\/pdf;base64,/i, ""));
@@ -1834,6 +1950,7 @@ function Icon({ name, size = 18 }) {
     rupee: <><path d="M6 4h12M6 8h12M7 4c5 0 6 8 0 8h-1l8 8" /></>,
     alert: <><path d="m12 3 10 18H2Z" /><path d="M12 9v4M12 17h.01" /></>,
     bell: <><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.7 21a2 2 0 0 1-3.4 0" /></>,
+    mic: <><rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5 11a7 7 0 0 0 14 0" /><path d="M12 18v3" /></>,
     menu: <><path d="M4 6h16M4 12h16M4 18h16" /></>,
     logout: <><path d="M10 17l5-5-5-5M15 12H3M21 19V5a2 2 0 0 0-2-2h-6" /></>,
     search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></>,
@@ -1847,6 +1964,8 @@ function Icon({ name, size = 18 }) {
     message: <><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.8 8.8 0 0 1-3.8-1L3 20l1.3-4A8.3 8.3 0 1 1 21 11.5Z" /></>,
     close: <><path d="M18 6 6 18M6 6l12 12" /></>,
     parcel: <><path d="M3 8h18v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" /><path d="M3 8l2-4h14l2 4" /><path d="M12 4v17" /></>,
+    add: <><path d="M12 5v14M5 12h14" /></>,
+    refresh: <><path d="M21 12a9 9 0 1 1-2.6-6.4" /><path d="M21 3v6h-6" /></>,
   };
 
   return (
@@ -2093,9 +2212,24 @@ function App() {
     typeof navigator === "undefined" ? true : navigator.onLine !== false
   ));
   const [products, setProducts] = useState([]);
+  // Owner-picked product photos (see local/productPhotos.js). `productPhotosState` says whether
+  // the list is fresh from the cloud, this device's saved copy, or could not be read at all.
+  const [productPhotos, setProductPhotos] = useState([]);
+  const [productPhotosState, setProductPhotosState] = useState({ source: "none", message: "" });
+  const productPhotoIndex = useMemo(() => indexProductPhotos(productPhotos), [productPhotos]);
+  // The photo being edited in Product Master: `dataUrl` is what shows, `changed` whether Save must send it.
+  const [productPhotoDraft, setProductPhotoDraft] = useState({ dataUrl: null, changed: false });
+  const [productPhotoMessage, setProductPhotoMessage] = useState("");
   const [productCategories, setProductCategories] = useState([]);
   const [productDuplicateWarning, setProductDuplicateWarning] = useState("");
   const [inventory, setInventory] = useState([]);
+  // POS's own shelf, in the desktop app. `products` and `inventory` above are shared by every module
+  // and written by some twenty loaders -- cloud lists, dashboard reloads, the minute-by-minute sync,
+  // reference snapshots -- each with its own idea of a product id (1 from the cloud, "product-1"
+  // from this device's SQLite). POS drew from them, so whichever loader ran last decided what the
+  // cashier saw, and the shelf kept emptying itself a minute after it was filled. Only
+  // `refreshPosInventoryFromSQLite` and a completed sale write this, so nothing else can empty it.
+  const [posShelf, setPosShelf] = useState({ loaded: false, products: [], inventoryLots: [] });
   // Which shop this machine is standing in, as the local snapshot reports it.
   //
   // Selling binds to the machine, not to the login -- see docs/stock-distribution-decision.md. So
@@ -2153,6 +2287,10 @@ function App() {
   const purchaseSaveInFlightRef = useRef(false);
   const purchaseSubmissionRef = useRef(createPurchaseSubmissionTracker());
   const reportRequestGateRef = useRef(createLatestRequestGate());
+  // The range Report Center last asked for. Reloads that name no range (the refresh after every
+  // background sync among them) keep it instead of falling back to today; see reportLoadParams.
+  const reportParamsRef = useRef(null);
+  const [reportAppliedParams, setReportAppliedParams] = useState(null);
   const [accounts, setAccounts] = useState([]);
   const [accountLedger, setAccountLedger] = useState({ account: null, ledger: [] });
   const [accountPayments, setAccountPayments] = useState([]);
@@ -2228,8 +2366,7 @@ function App() {
     providers: [],
     engines: [],
     usage: null,
-    voice: { status: "idle", transcript: "", error: "", supported: false },
-    activeTab: "briefing",
+    activeSection: FROST_PRIMARY_SECTION,
     memories: [],
     predictions: { inventory: [], sales: [], cashflow: [], waste: [] },
     profitAdvisor: [],
@@ -2239,19 +2376,85 @@ function App() {
     period: { range: "today", label: "Today" },
     loading: false,
     error: "",
+    // The question sent and not yet answered. Deliberately not part of `history`, which is
+    // persisted to localStorage: an unanswered question is not a record of anything.
+    pending: null,
+    // The chat these questions belong to, minted when the panel opens and sent with every ask. The
+    // sidebar is built from the server's own record of them, not from this.
+    sessionId: "",
+    chats: [],
+    chatsFailure: "",
+    chatsLoading: false,
+    // The customers who owe money, each with a message FROST has already worded. Loaded only when
+    // that section is opened -- it is a second pass over the ledger, and the panel's eleven
+    // requests are already the slowest thing about opening FROST.
+    dues: null,
+    duesFailure: "",
+    duesLoading: false,
+  });
+  /**
+   * What FROST is watching, for the bell in the header.
+   *
+   * Deliberately separate from `aiAssistantData`. That one is loaded only while the FROST drawer is
+   * open, which is exactly the problem the maintainer reported on 2026-09-22 -- *"reminders
+   * notification bell me dikh jane chahiye"*. A reminder that only appears once you decide to open
+   * the panel is a reminder you have already remembered without it.
+   *
+   * `read` is false until the two lists have actually been fetched. Nothing is published to the
+   * bell while it is false, because an empty list before the first fetch is not "nothing is due".
+   * `skipped` means FROST is deliberately not being asked here (LOCAL_ONLY, no cloud session,
+   * offline) -- also not a failure, and also not something to ring an error about.
+   */
+  const [frostBell, setFrostBell] = useState({ alerts: [], reminders: [], error: "", read: false, skipped: false });
+  /**
+   * Today's payments (`GET /api/ai/payments-due`): who to collect from and who to pay, for the
+   * popup, the bell and the dues panel. Same rules as `frostBell`: `read` false until fetched,
+   * `skipped` for a deliberate no-ask (LOCAL_ONLY, offline), and a failure kept as `error`, never as
+   * an empty list. `dateKey` is the local day the list was asked for.
+   */
+  const [paymentsDue, setPaymentsDue] = useState({ payload: null, error: "", read: false, skipped: false, dateKey: "" });
+  // The popup's per-day memory: closed today, and rows dealt with today. Held in state so the popup
+  // closes even when localStorage refuses the write; localStorage only carries it across a restart.
+  const [paymentsMemory, setPaymentsMemory] = useState(() => {
+    const today = localDateKey(new Date());
+    try {
+      return readPaymentsDueMemory(localStorage.getItem(PAYMENTS_DUE_MEMORY_STORAGE_KEY), today);
+    } catch {
+      return readPaymentsDueMemory(null, today);
+    }
   });
   const [aiQuestion, setAiQuestion] = useState("");
   const [aiRange, setAiRange] = useState("today");
   const [frostActiveTab, setFrostActiveTab] = useState(() => {
     try {
-      return localStorage.getItem(FROST_ACTIVE_TAB_STORAGE_KEY) || "briefing";
+      return localStorage.getItem(FROST_ACTIVE_TAB_STORAGE_KEY) || FROST_PRIMARY_SECTION;
     } catch {
-      return "briefing";
+      return FROST_PRIMARY_SECTION;
     }
   });
   const [frostDrawerOpen, setFrostDrawerOpen] = useState(false);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
-  const frostVoiceRef = useRef({ peer: null, stream: null, audio: null, channel: null });
+  // FROST live voice. The controller (local/frostLiveVoice.js) owns the microphone; this component
+  // only hands it the browser objects and the two routes it may use. `frostLiveVoice` is what the
+  // switch and the indicator draw; `frostSpeechSetup` is the gateway's word on whether whisper is
+  // installed, and the last failure reading or starting it.
+  const frostLiveVoiceRef = useRef(null);
+  const [frostLiveVoice, setFrostLiveVoice] = useState({ on: false, phase: "off", message: "", tone: "info", heard: "", engine: null, microphone: "", microphoneId: "", microphoneRaw: false });
+  const [frostSpeechSetup, setFrostSpeechSetup] = useState({ open: false, status: null, failure: null });
+  // "Listen for Frost everywhere": per device, remembered in localStorage. An unreadable store reads
+  // as off, and a store that refuses the write says so (the choice still holds for this session).
+  const [frostVoiceAlwaysOn, setFrostVoiceAlwaysOn] = useState(() => readAlwaysOnPreference(() => window.localStorage));
+  const [frostVoicePreferenceNote, setFrostVoicePreferenceNote] = useState("");
+  // Which microphone FROST opens: per device, remembered like the switch above; "" is Windows'
+  // default. The list is read from the browser once the microphone has been opened (before that it
+  // has no names) and again whenever a device is plugged in or out.
+  const [frostMicrophoneId, setFrostMicrophoneId] = useState(() => readMicrophonePreference(() => window.localStorage));
+  const frostMicrophoneIdRef = useRef(frostMicrophoneId);
+  const [frostMicrophones, setFrostMicrophones] = useState({ devices: [], defaultLabel: "" });
+  // The microphone level goes to the meters only, through its own tiny store, so a frame does not
+  // redraw the whole of App.
+  const frostVoiceLevelRef = useRef(null);
+  if (!frostVoiceLevelRef.current) frostVoiceLevelRef.current = createVoiceLevelChannel();
   const [supplierDashboard, setSupplierDashboard] = useState({
     todaySales: 0,
     todayProfit: 0,
@@ -3156,6 +3359,11 @@ function App() {
     internetAvailableRef.current = internetAvailable;
   }, [internetAvailable]);
 
+  const activeViewRef = useRef(activeView);
+  useEffect(() => {
+    activeViewRef.current = activeView;
+  }, [activeView]);
+
   const refreshBusinessDataAfterSync = async () => {
     const refreshes = [
       loadProducts,
@@ -3180,6 +3388,16 @@ function App() {
         const snapshot = await fetchOnlineReferenceSnapshot(userRef.current, latestDevice);
         const localStatus = await cacheLocalReferenceSnapshot(snapshot);
         setLocalDbStatus(localStatus);
+      } catch (error) {
+        failures.push({ status: "rejected", reason: error });
+      }
+    }
+    // The loaders above replace the product list with the cloud's, which is not the counter's own
+    // shelf. Opening POS rebuilds it from this device's SQLite; after a sync it must be rebuilt the
+    // same way, or POS drops to nothing every minute until the cashier leaves and comes back.
+    if (activeViewRef.current === "sales") {
+      try {
+        await refreshPosInventoryFromSQLite("post-sync");
       } catch (error) {
         failures.push({ status: "rejected", reason: error });
       }
@@ -3767,6 +3985,8 @@ function App() {
     return Boolean(permissions[permissionKey]);
   };
 
+  // FROST is drawn only for someone the server would let use it (see `mayUseFrost`).
+  const frostVisible = mayUseFrost({ role: user?.role, rolePermissions: rolePermissionMap.get(user?.role) });
   const hasRolePermission = (permissionKey) => {
     if (!user) return false;
     if (user.role === "Owner") return true;
@@ -4195,6 +4415,7 @@ function App() {
     if (!counterMaySell(selected)) {
       setProducts(selected.products);
       setInventory([]);
+      setPosShelf({ loaded: true, products: selected.products, inventoryLots: [] });
       setSyncMessage(selected.scopeMessage || "This counter has not been told which shop it is in.");
       writeDiagnosticLog("ERROR", "pos-local-inventory-scope-unusable", {
         reason,
@@ -4210,6 +4431,7 @@ function App() {
     }
     setProducts(selected.products);
     setInventory(selected.inventoryLots);
+    setPosShelf({ loaded: true, products: selected.products, inventoryLots: selected.inventoryLots });
     writeDiagnosticLog("INFO", "pos-local-inventory-loaded", {
       reason,
       products: selected.products.length,
@@ -4223,6 +4445,11 @@ function App() {
     });
     return selected;
   };
+
+  // A different person or machine is a different shelf: never show one sign-in's stock to the next.
+  useEffect(() => {
+    setPosShelf({ loaded: false, products: [], inventoryLots: [] });
+  }, [user?.id, deviceInfo.device_id]);
 
   useEffect(() => {
     if (!user?.id || activeView !== "sales" || !isTauriRuntime()) return;
@@ -4509,6 +4736,223 @@ function App() {
   }, [ordersState.orders, ordersState.loadState, notify, clearNotice]);
 
   /**
+   * Whether this person is shown FROST at all.
+   *
+   * The same expression the FROST panel uses for `canManageFrost`. It is not a permission -- the
+   * server decides that, and `/api/ai/*` refuses a Cashier on its own -- it is about not firing
+   * requests on behalf of someone who would be refused, and not putting FROST's rows in a bell
+   * belonging to someone who has no FROST.
+   */
+  const frostBellAllowed = user?.role === "Owner" || user?.role === "Admin";
+
+  /**
+   * Read what FROST is watching, for the bell.
+   *
+   * Two requests, not the panel's eleven. This runs on a timer whether or not the drawer has ever
+   * been opened, which is the whole point: the bell is the place the owner already looks.
+   *
+   * A deliberate skip and a failure are different answers and are stored differently. LOCAL_ONLY, no
+   * internet, or an offline session with no cloud token all mean FROST was never asked -- ringing
+   * "could not be read" for those would be an error message about a decision. A request that was
+   * made and failed is carried as `error`, and the bell says so out loud.
+   */
+  const loadFrostBell = useCallback(async () => {
+    if (!user || !frostBellAllowed) return;
+    const approved = ["APPROVED", "ACTIVE"].includes(String(cloudDeviceRegistration?.status || "").toUpperCase());
+    const runtimeConnectivity = deriveRuntimeConnectivity({
+      localHealth: backendHealth,
+      internetAvailable,
+      cloudHealth,
+      deviceApproved: approved,
+    });
+    const loadDecision = resolveFrostLoadDecision({
+      apiUrl: API_URL,
+      cloudApiMode: isCloudMode(),
+      desktopShell: isDesktopShell(),
+      internetAvailable: runtimeConnectivity.internetAvailable,
+      cloudOnline: cloudHealth?.online === false ? false : null,
+      cloudSession: hasCloudSession(user),
+    });
+    if (!loadDecision.shouldLoad) {
+      setFrostBell((current) => ({ ...current, error: "", read: false, skipped: true }));
+      return;
+    }
+    const params = { user_id: user?.id, device_id: deviceInfo?.device_id };
+    try {
+      const [alerts, reminders] = await Promise.all([
+        axios.get(`${API_URL}/api/ai/alerts`, { params, timeout: 12000 }),
+        axios.get(`${API_URL}/api/ai/reminders`, { params, timeout: 12000 }),
+      ]);
+      setFrostBell({
+        alerts: alerts.data?.alerts || [],
+        reminders: reminders.data?.reminders || [],
+        error: "",
+        read: true,
+        skipped: false,
+      });
+    } catch (error) {
+      setFrostBell((current) => ({
+        ...current,
+        // The same ladder the panel uses, so the bell and the panel never explain one failure in
+        // two different ways. `describeFrostTransportFailure` is inside it and takes a request
+        // description, not an error.
+        error: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth })
+          || "FROST alerts and reminders did not load.",
+        read: true,
+        skipped: false,
+      }));
+    }
+  }, [user, frostBellAllowed, cloudDeviceRegistration?.status, backendHealth, internetAvailable, cloudHealth, offlineMode, deviceInfo?.device_id]);
+
+  useEffect(() => {
+    if (!user || !frostBellAllowed) return undefined;
+    loadFrostBell();
+    // Five minutes. These are dues and reminders, which move on the scale of a day; a shorter timer
+    // would spend the counter's connection to learn nothing. Anything the owner does inside FROST
+    // refreshes this immediately, so the timer is the floor, not the only path.
+    const timer = window.setInterval(() => { loadFrostBell(); }, 300000);
+    return () => window.clearInterval(timer);
+  }, [user, frostBellAllowed, loadFrostBell]);
+
+  /**
+   * Put what FROST is watching into the bell, and take it out again when it clears.
+   *
+   * The judgement is all in `local/frostBellNotifications.js`, which is tested. Two things here are
+   * not incidental:
+   *
+   * A row is raised only when it is new, or when its wording changed. `addNotification` collapses a
+   * repeat by bumping its count and marking it unread again -- correct for a recurrence, wrong for
+   * a five-minute poll, which would make every FROST row unread forever and teach the owner that
+   * the bell's badge means nothing.
+   *
+   * Retraction happens only when the two lists were actually read. On an unreadable answer this
+   * knows nothing about what it raised last time, and clearing those rows would delete real
+   * warnings because a request timed out -- an error rendering as an empty bell.
+   */
+  const raisedFrostBellRows = useRef(new Map());
+
+  useEffect(() => {
+    if (!frostBellAllowed) {
+      for (const key of raisedFrostBellRows.current.keys()) clearNotice(key);
+      raisedFrostBellRows.current = new Map();
+      return;
+    }
+    if (!frostBell.read) return;
+    const bell = buildFrostBellNotifications({
+      alerts: frostBell.alerts,
+      // Payment reminders ring through the payments rows below, worded with the amount and the
+      // day; ringing them here as well would put every one in the bell twice.
+      reminders: (frostBell.reminders || []).filter((row) => !isPaymentReminder(row)),
+      nowMs: Date.now(),
+      failure: frostBell.error,
+    });
+    const raised = raisedFrostBellRows.current;
+    for (const item of bell.items) {
+      if (raised.get(item.dedupeKey) === item.message) continue;
+      notify(item);
+      raised.set(item.dedupeKey, item.message);
+    }
+    if (bell.status === FROST_BELL_STATUS.OK) {
+      const live = new Set(bell.keys);
+      for (const key of [...raised.keys()]) {
+        if (live.has(key)) continue;
+        clearNotice(key);
+        raised.delete(key);
+      }
+    }
+  }, [frostBell, frostBellAllowed, notify, clearNotice]);
+
+  /**
+   * Read today's payments: who to collect from and who to pay (`GET /api/ai/payments-due`).
+   *
+   * Same gate, same timer and same skip-versus-failure rule as `loadFrostBell`, because it is the
+   * same door on the server (FROST's reminders permission) and the same connection: LOCAL_ONLY or
+   * offline is a skip that makes no request at all. The day asked for is the laptop's local day --
+   * `localDateKey`, never `toISOString`, which in IST names yesterday until 05:30.
+   */
+  const loadPaymentsDue = useCallback(async () => {
+    if (!user || !frostBellAllowed) return;
+    const approved = ["APPROVED", "ACTIVE"].includes(String(cloudDeviceRegistration?.status || "").toUpperCase());
+    const runtimeConnectivity = deriveRuntimeConnectivity({
+      localHealth: backendHealth,
+      internetAvailable,
+      cloudHealth,
+      deviceApproved: approved,
+    });
+    const loadDecision = resolveFrostLoadDecision({
+      apiUrl: API_URL,
+      cloudApiMode: isCloudMode(),
+      desktopShell: isDesktopShell(),
+      internetAvailable: runtimeConnectivity.internetAvailable,
+      cloudOnline: cloudHealth?.online === false ? false : null,
+      cloudSession: hasCloudSession(user),
+    });
+    if (!loadDecision.shouldLoad) {
+      setPaymentsDue((current) => ({ ...current, error: "", read: false, skipped: true }));
+      return;
+    }
+    const dateKey = localDateKey(new Date());
+    try {
+      const response = await axios.get(`${API_URL}/api/ai/payments-due`, {
+        params: { user_id: user?.id, device_id: deviceInfo?.device_id, date: dateKey },
+        timeout: 15000,
+      });
+      setPaymentsDue({ payload: response.data || null, error: "", read: true, skipped: false, dateKey });
+    } catch (error) {
+      setPaymentsDue((current) => ({
+        ...current,
+        error: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth })
+          || "Today's payments did not load.",
+        read: true,
+        skipped: false,
+        dateKey,
+      }));
+    }
+  }, [user, frostBellAllowed, cloudDeviceRegistration?.status, backendHealth, internetAvailable, cloudHealth, offlineMode, deviceInfo?.device_id]);
+
+  useEffect(() => {
+    if (!user || !frostBellAllowed) return undefined;
+    loadPaymentsDue();
+    // The bell's five minutes. It also re-asks after local midnight, which is what rolls the popup
+    // over to the new day's list.
+    const timer = window.setInterval(() => { loadPaymentsDue(); }, 300000);
+    return () => window.clearInterval(timer);
+  }, [user, frostBellAllowed, loadPaymentsDue]);
+
+  /**
+   * Today's payments in the bell, under the FROST bell's rules: raise a row only when it is new or
+   * its words changed, and retract only after a read that succeeded.
+   */
+  const raisedPaymentBellRows = useRef(new Map());
+
+  useEffect(() => {
+    if (!frostBellAllowed) {
+      for (const key of raisedPaymentBellRows.current.keys()) clearNotice(key);
+      raisedPaymentBellRows.current = new Map();
+      return;
+    }
+    if (!paymentsDue.read) return;
+    const bell = paymentsDueBellItems(paymentsDue.payload, paymentsDue.dateKey, {
+      failure: paymentsDue.error,
+      nowMs: Date.now(),
+    });
+    const raised = raisedPaymentBellRows.current;
+    for (const item of bell.items) {
+      if (raised.get(item.dedupeKey) === item.message) continue;
+      notify(item);
+      raised.set(item.dedupeKey, item.message);
+    }
+    if (bell.status === PAYMENTS_DUE_STATUS.OK) {
+      const live = new Set(bell.keys);
+      for (const key of [...raised.keys()]) {
+        if (live.has(key)) continue;
+        clearNotice(key);
+        raised.delete(key);
+      }
+    }
+  }, [paymentsDue, frostBellAllowed, notify, clearNotice]);
+
+  /**
    * Surface the activation state in the notification centre.
    *
    * `Active` deliberately produces nothing — a licence that is simply working is not news, and a
@@ -4677,6 +5121,41 @@ function App() {
     setProducts((current) => preserveVerifiedLocalCollection(response.data, current));
     setProductDuplicateWarning(duplicateLogResponse.data?.message || "");
   };
+  const loadProductPhotos = async ({ deviceCopyOnly = false } = {}) => {
+    const browserIndexedDb = typeof window !== "undefined" ? window.indexedDB : null;
+    const cached = await readCachedProductPhotos(browserIndexedDb);
+    if (cached) {
+      setProductPhotos(cached.photos);
+      setProductPhotosState({ source: "device", message: "" });
+    }
+    // Local Only never reaches the cloud, for photos or anything else.
+    if (deviceCopyOnly) return;
+    try {
+      const response = await axios.get(`${API_URL}/api/v3/product-photos`, { ...createOperationalReadConfig(user), timeout: 20000 });
+      const photos = Array.isArray(response.data?.photos) ? response.data.photos : null;
+      if (!photos) throw new Error("The photo list came back in an unexpected shape.");
+      setProductPhotos(photos);
+      setProductPhotosState({ source: "cloud", message: "" });
+      await writeCachedProductPhotos(browserIndexedDb, photos);
+    } catch (error) {
+      // Not fatal: tiles fall back to colour and letter. But say so, never pretend there are none.
+      setProductPhotosState({
+        source: cached ? "device" : "failed",
+        message: cached
+          ? "Showing the photos this computer saved last time; the latest could not be downloaded."
+          : `Product photos could not be loaded (${getErrorMessage(error, "no connection")}).`,
+      });
+    }
+  };
+  // Once per sign-in, whatever screen opens first. Photos used to load only on the way into Product
+  // Master or POS by the menu, so a cashier who lands on POS straight after signing in never got
+  // any (25 Sep 2026). This computer's saved copy shows at once; the cloud copy follows unless the
+  // device is Local Only.
+  useEffect(() => {
+    if (!user?.id) return;
+    loadProductPhotos({ deviceCopyOnly: isLocalOnlyConnectivitySelected() }).catch(() => null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- once per sign-in, not once per render.
+  }, [user?.id]);
   const loadProductCategories = async () => {
     const response = await axios.get(
       `${API_URL}/api/v3/product-categories`,
@@ -4795,6 +5274,10 @@ function App() {
       desktopShell: isDesktopShell(),
       internetAvailable: runtimeConnectivity.internetAvailable,
       cloudOnline: cloudHealth?.online === false ? false : null,
+      // An offline session has no cloud token to send, and FROST is cloud-served here. Without this
+      // the panel fired all eleven requests, collected eleven 401s, and told the owner the session
+      // had expired -- see `resolveFrostLoadDecision` for why that advice could never work.
+      cloudSession: hasCloudSession(user),
     });
     if (!loadDecision.shouldLoad) {
       setAiAssistantData((current) => ({
@@ -4891,54 +5374,392 @@ function App() {
     }
   };
 
-  const askAiAssistant = async (question = aiQuestion) => {
-    const trimmed = question.trim();
-    if (!trimmed) return;
+  /**
+   * The list of past chats, for the sidebar.
+   *
+   * A failure is carried as a message rather than as an empty list. CLAUDE.md's rule about errors
+   * never rendering as zero applies to a list too: a sidebar that silently shows nothing after a
+   * failed request looks exactly like a shop that has never asked FROST anything.
+   */
+  /**
+   * The customers who owe money, with the message FROST prepared for each of them.
+   *
+   * A second pass over the ledger, so it is fetched when that section is opened rather than added
+   * to the eleven requests that already make opening FROST slow.
+   *
+   * The failure is carried as a message, never as an empty list. "Nobody owes you anything" is a
+   * sentence this panel must only say when it is true.
+   */
+  const loadFrostDues = async () => {
+    setAiAssistantData((current) => ({ ...current, duesLoading: true, duesFailure: "" }));
+    try {
+      const response = await axios.get(`${API_URL}/api/ai/reminders/customer-dues`, {
+        params: { user_id: user?.id, device_id: deviceInfo?.device_id },
+        timeout: 15000,
+      });
+      setAiAssistantData((current) => ({
+        ...current,
+        dues: response.data || null,
+        duesFailure: "",
+        duesLoading: false,
+      }));
+    } catch (error) {
+      setAiAssistantData((current) => ({
+        ...current,
+        duesLoading: false,
+        duesFailure: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth }),
+      }));
+    }
+  };
+
+  /**
+   * "Today's payments": the popup, the actions on its rows, and the dates in the dues panel.
+   *
+   * What to show is decided in `local/paymentsDue.js`, which is tested: the popup opens only on
+   * its `show` flag, which is never true for a failed read. The memory of "closed today" and "dealt
+   * with today" is per local day, so it lapses by itself at midnight.
+   */
+  const paymentsToday = localDateKey(new Date());
+  const paymentsMemoryToday = paymentsMemory.date === paymentsToday
+    ? paymentsMemory
+    : readPaymentsDueMemory(null, paymentsToday);
+  const paymentsPopup = frostBellAllowed && paymentsDue.read
+    ? buildPaymentsDuePopup({
+      payload: paymentsDue.payload,
+      failure: paymentsDue.error,
+      dateKey: paymentsToday,
+      dismissedDateKey: paymentsMemoryToday.dismissed ? paymentsToday : "",
+      hiddenKeys: paymentsMemoryToday.hiddenKeys,
+    })
+    : { status: "", show: false, collectRows: [], payRows: [], message: "", collectTotal: 0, payTotal: 0 };
+  const [paymentsAction, setPaymentsAction] = useState({ busyKey: "", failure: "" });
+
+  const rememberPaymentsDue = (change) => {
+    const next = nextPaymentsDueMemory(paymentsMemoryToday, paymentsToday, change);
+    setPaymentsMemory(next);
+    try {
+      localStorage.setItem(PAYMENTS_DUE_MEMORY_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // A per-device convenience. The state above already holds it for this session.
+    }
+  };
+
+  /** Send one request built by `local/paymentsDue.js`. Nothing is sent for a `null` request. */
+  const sendPaymentRequest = async (request) => {
+    if (!request) return;
+    const body = { user_id: user?.id, device_id: deviceInfo?.device_id, ...request.body };
+    if (request.method === "POST") await axios.post(`${API_URL}${request.path}`, body, { timeout: 15000 });
+    else await axios.patch(`${API_URL}${request.path}`, body, { timeout: 15000 });
+  };
+
+  /**
+   * "Done" or "Remind tomorrow" on one popup row. On success the row is put away for today on this
+   * device as well: a bill that is still overdue would otherwise bring the same row straight back
+   * on the reload, and the button would look as if it had done nothing.
+   */
+  const actOnPaymentRow = async (row, action) => {
+    setPaymentsAction({ busyKey: row.key, failure: "" });
+    try {
+      if (action === "done") {
+        await sendPaymentRequest(resolvePaymentReminderRequest(row.reminderId));
+      } else {
+        await sendPaymentRequest(paymentReminderRequest({
+          kind: row.kind,
+          entityId: row.entityId,
+          entityName: row.entityName,
+          amount: row.amount,
+          dueDate: shiftDateKey(paymentsToday, 1),
+          existingReminderId: row.reminderId,
+        }));
+      }
+      rememberPaymentsDue({ hideKey: row.key });
+      setPaymentsAction({ busyKey: "", failure: "" });
+    } catch (error) {
+      setPaymentsAction({
+        busyKey: "",
+        failure: `${row.entityName}: ${getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth }) || "That could not be saved."}`,
+      });
+    }
+    loadPaymentsDue().catch(() => null);
+    loadFrostBell().catch(() => null);
+  };
+
+  /**
+   * Set, move or clear the "ask for payment on" / "pay on" date from the dues panel. Errors are
+   * thrown back to the date box, which shows them in place. The list is re-read before returning so
+   * a second edit PATCHes the reminder the first one created instead of creating another.
+   */
+  const setPaymentDate = async ({ kind, entityId, entityName, amount, reminderId }, dueDate) => {
+    await sendPaymentRequest(paymentReminderRequest({
+      kind,
+      entityId,
+      entityName,
+      amount,
+      dueDate: dueDate || "",
+      existingReminderId: reminderId,
+    }));
+    await loadPaymentsDue().catch(() => null);
+    loadFrostBell().catch(() => null);
+  };
+
+  // The popup's "Prepare WhatsApp" links come from the dues outreach list, which is otherwise read
+  // only when the dues section is opened. Read it once when the popup has a customer to show.
+  const paymentsPopupNeedsDues = paymentsPopup.show && paymentsPopup.collectRows.length > 0;
+  useEffect(() => {
+    if (!paymentsPopupNeedsDues) return;
+    if (aiAssistantData.dues || aiAssistantData.duesLoading || aiAssistantData.duesFailure) return;
+    loadFrostDues();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paymentsPopupNeedsDues]);
+
+  const loadFrostChats = async () => {
+    setAiAssistantData((current) => ({ ...current, chatsLoading: true }));
+    try {
+      const response = await axios.get(`${API_URL}/api/ai/conversations`, {
+        params: { user_id: user?.id, device_id: deviceInfo.device_id },
+        timeout: 12000,
+      });
+      setAiAssistantData((current) => ({
+        ...current,
+        chatsLoading: false,
+        chats: buildChatList(response.data),
+        chatsFailure: "",
+      }));
+    } catch (error) {
+      const failure = describeRequestFailure(error, { url: `${API_URL}/api/ai/conversations` });
+      writeDiagnosticLog("WARN", "frost-chat-list-failed", failure);
+      setAiAssistantData((current) => ({
+        ...current,
+        chatsLoading: false,
+        chats: [],
+        chatsFailure: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth }),
+      }));
+    }
+  };
+
+  /**
+   * Start a new chat.
+   *
+   * The id is minted here and not by the server, so the first question of a chat already carries it
+   * and the chat exists from its first answer rather than from its second. `authoritativeUtcNowIso`
+   * is passed in because `frostChats.js` is a pure module and must not reach for a clock of its own.
+   */
+  const startNewFrostChat = () => {
+    setAiAssistantData((current) => ({
+      ...current,
+      sessionId: newChatSessionId({ nowIso: authoritativeUtcNowIso() }),
+      history: [],
+      pending: null,
+      error: "",
+    }));
+    setAiQuestion("");
+  };
+
+  /**
+   * Reopen a chat from the sidebar.
+   *
+   * On failure the open chat is left exactly as it was and the reason is shown. Replacing a thread
+   * the owner can still read with a blank one, because a request failed, would destroy the only copy
+   * of it on screen.
+   */
+  const openFrostChat = async (chatId) => {
+    const id = String(chatId || "").trim();
+    if (!id) return;
     setAiAssistantData((current) => ({ ...current, loading: true, error: "" }));
+    try {
+      const response = await axios.get(`${API_URL}/api/ai/conversations/${encodeURIComponent(id)}`, {
+        params: { user_id: user?.id, device_id: deviceInfo.device_id },
+        timeout: 12000,
+      });
+      setAiAssistantData((current) => ({
+        ...current,
+        loading: false,
+        sessionId: id,
+        history: historyFromExchanges(response.data),
+        pending: null,
+        error: "",
+      }));
+    } catch (error) {
+      const failure = describeRequestFailure(error, { url: `${API_URL}/api/ai/conversations/${id}` });
+      writeDiagnosticLog("WARN", "frost-chat-open-failed", failure);
+      setAiAssistantData((current) => ({
+        ...current,
+        loading: false,
+        error: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth }),
+      }));
+    }
+  };
+
+  /**
+   * Ask FROST. The typed box, a suggested question and live voice all come through here, so a
+   * spoken question is filed, answered and shown exactly like a typed one.
+   *
+   * Resolves to the history entry it stored (with the final answer, after a reminder is saved or
+   * refused), or null for an empty question. Live voice reads that entry aloud. `fromVoice` only
+   * stops a spoken question from wiping whatever is half-typed in the box.
+   */
+  const askAiAssistant = async (question = aiQuestion, { fromVoice = false } = {}) => {
+    const trimmed = String(question || "").trim();
+    if (!trimmed) return null;
+    // Stamped here rather than on arrival, because this is when the owner asked. `pending` carries
+    // the question into the thread immediately: the panel used to accept it and show nothing until
+    // the answer landed, which on a slow cloud reads as a send that did not work.
+    const askedAt = authoritativeUtcNowIso();
+    setAiAssistantData((current) => ({
+      ...current,
+      loading: true,
+      error: "",
+      pending: { question: trimmed, askedAt },
+    }));
     try {
       const response = await axios.post(`${API_URL}/api/ai/query`, {
         user_id: user?.id,
         device_id: deviceInfo.device_id,
         question: trimmed,
         range: aiRange,
+        // Which chat this question belongs to. The server echoes back what it actually stored, so a
+        // panel is never told a question was filed under a chat that it was not.
+        session_id: aiAssistantData.sessionId || "",
       });
+      const answeredEntry = {
+        id: response.data.conversation_id || Date.now(),
+        question: trimmed,
+        askedAt,
+        answeredAt: authoritativeUtcNowIso(),
+        answer: response.data.answer,
+        classification: response.data.classification,
+        facts: response.data.facts || [],
+        period: response.data.period,
+        provider: response.data.provider,
+        usage: response.data.usage,
+        cached: response.data.cached,
+        // Null unless the local model could not word the answer. Without carrying it here the
+        // owner would see FROST's plain wording with no indication that the model was off --
+        // a degradation that looks exactly like normal operation.
+        notice: response.data.notice || null,
+        phrasedBy: response.data.phrased_by || null,
+      };
       setAiAssistantData((current) => ({
         ...current,
         loading: false,
+        pending: null,
+        // The server's word on where the question was filed. An id it could not hold comes back
+        // null, and keeping the panel's own copy then would send every follow-up into a chat that
+        // is not accumulating.
+        sessionId: response.data.session_id || current.sessionId,
         period: { range: aiRange, ...(response.data.period || {}) },
-        history: [
-          {
-            id: response.data.conversation_id || Date.now(),
-            question: trimmed,
-            answer: response.data.answer,
-            facts: response.data.facts || [],
-            period: response.data.period,
-            provider: response.data.provider,
-            usage: response.data.usage,
-            cached: response.data.cached,
-            // Null unless the local model could not word the answer. Without carrying it here the
-            // owner would see FROST's plain wording with no indication that the model was off --
-            // a degradation that looks exactly like normal operation.
-            notice: response.data.notice || null,
-            phrasedBy: response.data.phrased_by || null,
-          },
-          ...current.history,
-        ].slice(0, 20),
+        history: [answeredEntry, ...current.history].slice(0, FROST_OPEN_CHAT_LIMIT),
       }));
-      setAiQuestion("");
+      if (!fromVoice) setAiQuestion("");
+      // "remind me to pay my suppliers" is an instruction. The query route only reads -- it is
+      // READ_ONLY by contract and its own tests hold it there -- so the write happens here, against
+      // the reminders route that already carries the permission check. The answer is rewritten with
+      // what actually happened, because the one thing worse than refusing to remember something is
+      // saying it was remembered when it was not.
+      const draft = response.data.reminder_draft;
+      if (draft?.title) {
+        const conversationId = response.data.conversation_id || null;
+        const settle = (answer) => {
+          answeredEntry.answer = answer;
+          setAiAssistantData((current) => ({
+            ...current,
+            history: current.history.map((entry) =>
+              (conversationId && entry.id === conversationId) || (!conversationId && entry.askedAt === askedAt)
+                ? { ...entry, answer }
+                : entry),
+          }));
+        };
+        try {
+          await axios.post(`${API_URL}/api/ai/reminders`, {
+            user_id: user?.id,
+            device_id: deviceInfo.device_id,
+            // OWNER_NOTE, unless the backend recognised exactly one customer to collect from or one
+            // supplier to pay; then the reminder is linked to that account and shows up in the
+            // day's payments popup. Passed through only as a consistent set -- see the helper.
+            ...reminderDraftLinkFields(draft),
+            priority: "ATTENTION",
+            title: draft.title,
+            message: draft.title,
+            // Null unless he named a day. Never today: a reminder quietly dated today comes up
+            // once, today, and is gone -- while an undated one is still there for him to date.
+            due_at: draft.due_at || null,
+          });
+          // The date is said back to him. A date that was misread is only findable if FROST states
+          // what it understood; "saved" alone would hide a reminder sitting on the wrong day.
+          // Said out loud when the bell will ring. A reminder for tomorrow correctly stays out of the
+          // bell today, and on 23 Sep 2026 that read to the owner as "the reminder is not working":
+          // he asked, FROST said saved, and the bell stayed quiet with nothing to say why.
+          settle(draft.due_at
+            ? `Saved for ${formatDisplayDate(draft.due_at)}: "${draft.title}". The bell will ring on that day. Until then it is under Reminders.`
+            : `Saved: "${draft.title}". It is in the bell now and under Reminders, where you can put a date on it.`);
+          await loadAiAssistant(aiRange).catch(() => null);
+          loadFrostBell().catch(() => null);
+          loadPaymentsDue().catch(() => null);
+        } catch (reminderError) {
+          writeDiagnosticLog("WARN", "frost-reminder-save-failed", describeRequestFailure(reminderError, { url: `${API_URL}/api/ai/reminders` }));
+          settle(`I could not save that reminder: ${getFrostDiagnosticMessage(reminderError, { offlineMode, internetAvailable, backendHealth, cloudHealth })} You can add it yourself under Reminders.`);
+        }
+      }
+      return answeredEntry;
     } catch (error) {
-      setAiAssistantData((current) => ({ ...current, loading: false, error: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth }) }));
+      // The question is kept, with why it failed. It used to be dropped entirely: only the error
+      // strip changed, so the thread showed a conversation in which the question was never asked.
+      // A failure rendered as an absence is the same pitfall as an error rendered as zero.
+      const failureMessage = getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth, cloudHealth });
+      const failedEntry = {
+        id: `failed-${askedAt}`,
+        question: trimmed,
+        askedAt,
+        answeredAt: authoritativeUtcNowIso(),
+        failureMessage,
+        facts: [],
+      };
+      setAiAssistantData((current) => ({
+        ...current,
+        loading: false,
+        pending: null,
+        error: failureMessage,
+        history: [failedEntry, ...current.history].slice(0, FROST_OPEN_CHAT_LIMIT),
+      }));
+      return failedEntry;
     }
   };
 
   const updateAiAlert = async (alertId, action) => {
     await axios.patch(`${API_URL}/api/ai/alerts/${alertId}`, { user_id: user?.id, action });
     await loadAiAssistant(aiRange);
+    // The bell polls on a five-minute timer. Resolving an alert inside the panel and watching it
+    // sit in the bell for another five minutes would read as the button not having worked.
+    loadFrostBell().catch(() => null);
   };
 
   const updateAiReminder = async (reminderId, action) => {
     await axios.patch(`${API_URL}/api/ai/reminders/${reminderId}`, { user_id: user?.id, action });
     await loadAiAssistant(aiRange);
+    loadFrostBell().catch(() => null);
+    // A payment reminder resolved or snoozed here must leave today's payments too.
+    loadPaymentsDue().catch(() => null);
+  };
+
+  /**
+   * Put a date on a reminder, or take one off.
+   *
+   * FROST reads a date out of the question when he says one ("kal", "agle hafte", "15 tarikh").
+   * This is the other half of what he asked for -- setting the date afterwards, on a reminder that
+   * arrived without one, or moving a date that has passed.
+   *
+   * An empty date clears it rather than being refused: a reminder with no date is a real state, and
+   * it is the one FROST creates when no day was named.
+   */
+  const updateReminderDueDate = async (reminderId, dueAt) => {
+    await axios.patch(`${API_URL}/api/ai/reminders/${reminderId}`, {
+      user_id: user?.id,
+      action: "SET_DUE_DATE",
+      due_at: dueAt || null,
+    });
+    await loadAiAssistant(aiRange);
+    loadFrostBell().catch(() => null);
+    loadPaymentsDue().catch(() => null);
   };
 
   const saveFrostSettings = async (frostSettings) => {
@@ -4950,93 +5771,321 @@ function App() {
     await loadAiAssistant(aiRange);
   };
 
-  const stopFrostVoice = () => {
-    const current = frostVoiceRef.current;
-    if (current.channel) current.channel.close();
-    if (current.peer) current.peer.close();
-    if (current.stream) current.stream.getTracks().forEach((track) => track.stop());
-    if (current.audio) current.audio.srcObject = null;
-    frostVoiceRef.current = { peer: null, stream: null, audio: null, channel: null };
-    setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "idle" } }));
+  // ---- FROST live voice ---------------------------------------------------------------------
+  //
+  // Every speech route is on LOCAL_API_URL -- the desktop gateway on 127.0.0.1, the same base the
+  // connectivity-policy routes use -- and none goes through guardCloudCall or a cloud URL. The
+  // gateway runs whisper.cpp on this laptop; the one external fetch it can ever make is the
+  // one-time engine download, which it refuses itself in LOCAL_ONLY. Audio goes to
+  // /api/local/speech/transcribe and nowhere else.
+  const aiLoadingRef = useRef(false);
+  aiLoadingRef.current = aiAssistantData.loading === true;
+  const askAiAssistantRef = useRef(null);
+  askAiAssistantRef.current = askAiAssistant;
+  // Read after the status check below: the drawer can close, or the owner sign out, while it is in
+  // flight, and the microphone must not open into a panel that is no longer there.
+  const frostDrawerOpenRef = useRef(false);
+  frostDrawerOpenRef.current = frostDrawerOpen;
+  const frostLiveVoiceStartingRef = useRef(false);
+  // Read by the controller on every start and every tick: a Cashier never gets a microphone, and a
+  // role that changes under a running session stops it.
+  const frostVoiceAllowedRef = useRef(false);
+  frostVoiceAllowedRef.current = frostBellAllowed;
+  const frostVoiceAlwaysOnRef = useRef(frostVoiceAlwaysOn);
+  frostVoiceAlwaysOnRef.current = frostVoiceAlwaysOn;
+  // Set next to openFrostDrawer below: pops the drawer open on the conversation when "Frost" is heard.
+  const frostVoiceRevealRef = useRef(null);
+  // Who always-on has already started for, so a sign-in starts it once and an error is not retried
+  // in a loop behind the owner's back.
+  const frostVoiceAutoStartedRef = useRef("");
+  // Bumped by every "off": a start still waiting on the status check when the owner switched off,
+  // closed the drawer or signed out must not open the microphone afterwards.
+  const frostVoiceOffCountRef = useRef(0);
+
+  // A gateway that did not answer and one that answered with an error read differently, because
+  // the owner does different things about them.
+  const speechRouteFailure = (error, stage) => ({
+    stage,
+    status: error?.response?.status ?? null,
+    code: error?.response?.data?.code || "",
+    message: error?.response
+      ? (error.response.data?.message || `the voice service answered with HTTP ${error.response.status}`)
+      : "the voice service on this laptop did not answer",
+  });
+
+  const readFrostSpeechStatus = async () => {
+    try {
+      const response = await axios.get(`${LOCAL_API_URL}/api/local/speech/status`, {
+        timeout: 5000,
+        headers: { "Cache-Control": "no-store" },
+      });
+      setFrostSpeechSetup((current) => ({ ...current, status: response.data ?? null, failure: null }));
+      return response.data ?? null;
+    } catch (error) {
+      setFrostSpeechSetup((current) => ({ ...current, failure: speechRouteFailure(error, "status") }));
+      return null;
+    }
   };
 
-  const startFrostVoice = async () => {
-    if (!navigator.mediaDevices?.getUserMedia || typeof RTCPeerConnection === "undefined") {
-      setAiAssistantData((state) => ({ ...state, voice: { status: "unavailable", supported: false, transcript: "", error: "Voice requires microphone and WebRTC support." } }));
+  const installFrostSpeech = async () => {
+    // An engine update keeps the model that is installed; a first download takes the default.
+    const installedModel = frostSpeechSetup.status?.model;
+    const model = installedModel === "base" || installedModel === "small" ? installedModel : "small";
+    // The gateway replaces the engine under a running microphone, so live voice closes first and
+    // says why, rather than failing on the next thing said.
+    frostLiveVoiceRef.current?.stop("switched_off", "Live voice is off while the voice engine installs. Turn it on again when it is ready.");
+    try {
+      await axios.post(`${LOCAL_API_URL}/api/local/speech/install`, { model }, { timeout: 10000 });
+      setFrostSpeechSetup((current) => ({ ...current, open: true, failure: null }));
+      await readFrostSpeechStatus();
+    } catch (error) {
+      setFrostSpeechSetup((current) => ({ ...current, open: true, failure: speechRouteFailure(error, "install") }));
+      // A download already running is not a failure to show on its own: read where it has got to.
+      if (error?.response?.data?.code === "SPEECH_INSTALL_IN_PROGRESS") await readFrostSpeechStatus();
+    }
+  };
+
+  /**
+   * The one live voice controller. Both switches -- "Live voice" in the drawer and "Listen for
+   * Frost everywhere" -- drive this same instance, so there is never a second microphone. Built on
+   * first use and kept for the life of the app; start() and stop() open and close the microphone.
+   */
+  const ensureFrostLiveVoiceController = () => {
+    if (frostLiveVoiceRef.current) return frostLiveVoiceRef.current;
+    frostLiveVoiceRef.current = createLiveVoiceController({
+      mediaDevices: typeof navigator === "undefined" ? null : navigator.mediaDevices,
+      AudioContextImpl: typeof window === "undefined" ? null : (window.AudioContext || window.webkitAudioContext || null),
+      synthesis: typeof window === "undefined" ? null : window.speechSynthesis,
+      Utterance: typeof window === "undefined" ? null : window.SpeechSynthesisUtterance,
+      // Raw WAV bytes to the local gateway. This is the only place audio leaves the controller.
+      transcribe: async (wavBytes) => {
+        const response = await axios.post(`${LOCAL_API_URL}/api/local/speech/transcribe`, wavBytes, {
+          headers: { "Content-Type": "audio/wav" },
+          // The gateway's own worst case, all bounded in localSpeech.js: starting the speech server
+          // (up to 120 s), the request to it (up to 30 s), and, when the server dies under it, the
+          // same audio again through whisper-cli (up to 30 s). A shorter limit made the app give up
+          // first and say the voice service "did not answer" (24 Sep 2026) while the gateway was
+          // still loading the model. This must stay above the gateway's total; a test checks it.
+          timeout: 200000,
+        });
+        return response.data;
+      },
+      // Start loading the speech model as soon as the microphone opens. Nothing is sent but the
+      // request itself; the gateway answers at once and loads in the background.
+      warm: () => axios.post(`${LOCAL_API_URL}/api/local/speech/warm`, null, { timeout: 10000 }),
+      ask: (question) => askAiAssistantRef.current(question, { fromVoice: true }),
+      isBusy: () => aiLoadingRef.current,
+      isAllowed: () => frostVoiceAllowedRef.current === true && Boolean(userRef.current),
+      onWake: () => frostVoiceRevealRef.current?.(),
+      onLevel: (level) => frostVoiceLevelRef.current?.set(level),
+      onChange: (view) => setFrostLiveVoice(view),
+    });
+    return frostLiveVoiceRef.current;
+  };
+
+  const startFrostLiveVoice = async ({ auto = false } = {}) => {
+    const controller = ensureFrostLiveVoiceController();
+    // The switches are only drawn for these roles. Checked again here, and again inside the
+    // controller, so a stray call cannot open the microphone for a Cashier.
+    if (!frostBellAllowed) {
+      await controller.start();
       return;
     }
-    setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "connecting", supported: true, error: "" } }));
-    try {
-      const sessionResponse = await axios.post(`${API_URL}/api/ai/voice/session`, {
-        user_id: user?.id,
-        device_id: deviceInfo.device_id,
-        provider_key: "openai",
-      });
-      const session = sessionResponse.data;
-      if (!session.configured || !session.clientSecret) {
-        setAiAssistantData((state) => ({ ...state, voice: { status: "unconfigured", supported: true, transcript: "", error: session.message || "FROST voice is not configured." } }));
-        return;
-      }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: session.noiseSuppression !== false,
-          autoGainControl: true,
-        },
-      });
-      const peer = new RTCPeerConnection();
-      const audio = new Audio();
-      audio.autoplay = true;
-      peer.ontrack = (event) => {
-        audio.srcObject = event.streams[0];
-        setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "speaking" } }));
-      };
-      stream.getTracks().forEach((track) => peer.addTrack(track, stream));
-      const channel = peer.createDataChannel("oai-events");
-      channel.onopen = () => {
-        channel.send(JSON.stringify({
-          type: "session.update",
-          session: {
-            instructions: "You are FROST, FroozERP's business copilot. Speak naturally in Hindi, English, or Hinglish. Use business tools; never execute actions without owner confirmation.",
-          },
-        }));
-        setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "listening" } }));
-      };
-      channel.onmessage = (event) => {
-        try {
-          const message = JSON.parse(event.data);
-          const delta = message.delta || message.transcript || message.text || "";
-          if (delta) {
-            setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, transcript: `${state.voice.transcript || ""}${delta}` } }));
-          }
-          if (String(message.type || "").includes("input_audio_buffer.speech_started")) {
-            setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "listening" } }));
-          }
-          if (String(message.type || "").includes("response.audio.done")) {
-            setAiAssistantData((state) => ({ ...state, voice: { ...state.voice, status: "listening" } }));
-          }
-        } catch {
-          // Realtime data channel can include provider-specific events; ignore unknown payloads.
-        }
-      };
-      const offer = await peer.createOffer();
-      await peer.setLocalDescription(offer);
-      const realtimeResponse = await fetch(session.realtimeUrl, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${session.clientSecret}`,
-          "Content-Type": "application/sdp",
-        },
-        body: offer.sdp,
-      });
-      if (!realtimeResponse.ok) throw new Error("Realtime voice connection failed");
-      const answer = { type: "answer", sdp: await realtimeResponse.text() };
-      await peer.setRemoteDescription(answer);
-      frostVoiceRef.current = { peer, stream, audio, channel };
-    } catch (error) {
-      stopFrostVoice();
-      setAiAssistantData((state) => ({ ...state, voice: { status: "error", supported: true, transcript: "", error: getFrostDiagnosticMessage(error, { offlineMode, internetAvailable, backendHealth }) } }));
+    const offCount = frostVoiceOffCountRef.current;
+    const status = await readFrostSpeechStatus();
+    const alwaysOn = frostVoiceAlwaysOnRef.current;
+    if (offCount !== frostVoiceOffCountRef.current || !userRef.current || (!alwaysOn && !frostDrawerOpenRef.current)) {
+      controller.discardPrimed();
+      return;
     }
+    if (status?.state !== "ready") {
+      // Not ready, not readable, or failed: the setup card says which, and the microphone stays shut.
+      controller.discardPrimed();
+      setFrostSpeechSetup((current) => ({ ...current, open: true }));
+      // With the drawer closed (always-on after sign-in) the card is not on screen, so the
+      // indicator next to the bell carries the reason instead.
+      controller.note(
+        auto || !frostDrawerOpenRef.current
+          ? "FROST is not listening: voice is not ready on this laptop, or its setup could not be read. Open FROST to see why."
+          : "",
+        auto || !frostDrawerOpenRef.current ? "error" : "info",
+      );
+      return;
+    }
+    setFrostSpeechSetup((current) => ({ ...current, open: false }));
+    await controller.start({ idleLimitMs: alwaysOn ? null : LIVE_VOICE_IDLE_LIMIT_MS, deviceId: frostMicrophoneIdRef.current });
+  };
+
+  // One start at a time: a second click while the status check is in flight would otherwise start
+  // over the first.
+  const beginFrostLiveVoice = (options) => {
+    if (frostLiveVoiceStartingRef.current) return;
+    frostLiveVoiceStartingRef.current = true;
+    startFrostLiveVoice(options)
+      .catch((error) => {
+        const controller = ensureFrostLiveVoiceController();
+        const message = `Live voice could not start: ${getErrorMessage(error, error?.message || "unknown error")}`;
+        if (!controller.stop("start_failed", message)) controller.note(message, "error");
+      })
+      .finally(() => { frostLiveVoiceStartingRef.current = false; });
+  };
+
+  // The in-drawer "Live voice" switch.
+  const toggleFrostLiveVoice = () => {
+    const controller = ensureFrostLiveVoiceController();
+    if (controller.active) {
+      frostVoiceOffCountRef.current += 1;
+      controller.stop("switched_off");
+      return;
+    }
+    if (frostLiveVoiceStartingRef.current) return;
+    // Inside the click, before the status check's await: the AudioContext made here may run.
+    controller.prime();
+    beginFrostLiveVoice();
+  };
+
+  // "Listen for Frost everywhere".
+  const toggleFrostVoiceAlwaysOn = () => {
+    const next = !frostVoiceAlwaysOnRef.current;
+    frostVoiceAlwaysOnRef.current = next;
+    setFrostVoiceAlwaysOn(next);
+    const saved = writeAlwaysOnPreference(() => window.localStorage, next);
+    setFrostVoicePreferenceNote(saved ? "" : LIVE_VOICE_PREFERENCE_NOT_SAVED);
+    const controller = ensureFrostLiveVoiceController();
+    if (!next) {
+      frostVoiceOffCountRef.current += 1;
+      controller.stop("switched_off");
+      return;
+    }
+    // Already listening from the drawer switch: the same microphone carries on, without the idle
+    // switch-off. No second controller, no second microphone.
+    if (controller.active) {
+      controller.setIdleLimit(null);
+      return;
+    }
+    if (frostLiveVoiceStartingRef.current) return;
+    controller.prime();
+    beginFrostLiveVoice();
+  };
+
+  // "Start listening" after always-on stopped on an error, and "Click here to start it".
+  const relaunchFrostListening = () => {
+    const controller = ensureFrostLiveVoiceController();
+    if (controller.active || frostLiveVoiceStartingRef.current) return;
+    controller.prime();
+    beginFrostLiveVoice();
+  };
+  const resumeFrostLiveVoice = () => {
+    frostLiveVoiceRef.current?.resume();
+  };
+
+  const refreshFrostMicrophones = () => {
+    if (typeof navigator === "undefined") return;
+    listMicrophones(navigator.mediaDevices).then((list) => {
+      // Before permission the browser names nothing; keep the list already shown rather than blank it.
+      if (list.devices.length) setFrostMicrophones(list);
+    });
+  };
+
+  // The microphone picker. Choosing one while listening closes the old microphone and opens the new
+  // one inside the same click, so WebView2 lets the audio run.
+  const chooseFrostMicrophone = (deviceId) => {
+    const id = String(deviceId || "").trim();
+    frostMicrophoneIdRef.current = id;
+    setFrostMicrophoneId(id);
+    const saved = writeMicrophonePreference(() => window.localStorage, id);
+    setFrostVoicePreferenceNote(saved ? "" : LIVE_VOICE_PREFERENCE_NOT_SAVED);
+    const controller = ensureFrostLiveVoiceController();
+    if (!controller.active || frostLiveVoiceStartingRef.current) return;
+    frostVoiceOffCountRef.current += 1;
+    controller.stop("switched_off", "Switching microphone...");
+    controller.prime();
+    beginFrostLiveVoice();
+  };
+  useEffect(() => {
+    if (!frostLiveVoice.on || !frostLiveVoice.microphoneId) return;
+    refreshFrostMicrophones();
+  }, [frostLiveVoice.on, frostLiveVoice.microphoneId]);
+  useEffect(() => {
+    const devices = typeof navigator === "undefined" ? null : navigator.mediaDevices;
+    if (!frostBellAllowed || typeof devices?.addEventListener !== "function") return undefined;
+    refreshFrostMicrophones();
+    const onChange = () => refreshFrostMicrophones();
+    devices.addEventListener("devicechange", onChange);
+    return () => devices.removeEventListener("devicechange", onChange);
+  }, [frostBellAllowed]);
+
+  // The microphone closes with the drawer -- unless it is listening everywhere -- on sign-out and
+  // when the app unmounts. Each says why.
+  useEffect(() => {
+    if (frostDrawerOpen || frostVoiceAlwaysOnRef.current) return;
+    frostVoiceOffCountRef.current += 1;
+    frostLiveVoiceRef.current?.stop("drawer_closed");
+  }, [frostDrawerOpen]);
+  useEffect(() => {
+    if (!user) {
+      frostVoiceOffCountRef.current += 1;
+      frostLiveVoiceRef.current?.stop("signed_out");
+      frostVoiceAutoStartedRef.current = "";
+    }
+  }, [user]);
+  useEffect(() => () => frostLiveVoiceRef.current?.stop("unmounted"), []);
+  // Always-on starts by itself after sign-in, once per sign-in. There was no click, so WebView2 may
+  // keep the audio paused; the controller then says "Click anywhere to start listening" and the
+  // effect below resumes it on the first click or key.
+  useEffect(() => {
+    if (!user || !frostBellAllowed || !frostVoiceAlwaysOn) return;
+    const key = String(user.id ?? user.username ?? "signed-in");
+    if (frostVoiceAutoStartedRef.current === key) return;
+    frostVoiceAutoStartedRef.current = key;
+    if (frostLiveVoiceRef.current?.active || frostLiveVoiceStartingRef.current) return;
+    beginFrostLiveVoice({ auto: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, frostBellAllowed, frostVoiceAlwaysOn]);
+  // While the audio is paused or no frames arrive, the next pointerdown or key anywhere in the app is
+  // the gesture that resumes it. Capture phase, so a control that stops propagation still counts.
+  const frostVoiceNeedsGesture = frostLiveVoice.on === true && (frostLiveVoice.phase === "paused" || frostLiveVoice.phase === "no_sound");
+  useEffect(() => {
+    if (!frostVoiceNeedsGesture) return undefined;
+    const resume = () => { frostLiveVoiceRef.current?.resume(); };
+    window.addEventListener("pointerdown", resume, true);
+    window.addEventListener("keydown", resume, true);
+    return () => {
+      window.removeEventListener("pointerdown", resume, true);
+      window.removeEventListener("keydown", resume, true);
+    };
+  }, [frostVoiceNeedsGesture]);
+  // While the gateway is downloading, ask it where it has got to. Only while the drawer is open:
+  // the download carries on in the gateway either way, and reopening reads it again.
+  useEffect(() => {
+    if (!frostDrawerOpen || frostSpeechSetup.status?.state !== "installing") return undefined;
+    const timer = window.setInterval(() => { readFrostSpeechStatus(); }, 1500);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [frostDrawerOpen, frostSpeechSetup.status?.state]);
+  // Opening FROST reads the voice status once, so an engine update or the slow fallback is shown
+  // before anybody turns voice on. Owner and Admin only, and only in the desktop app, where
+  // LOCAL_API_URL is 127.0.0.1: in a browser it is derived from the page's host, and nothing should
+  // be asked of that without somebody clicking a voice switch.
+  useEffect(() => {
+    if (!frostDrawerOpen || !frostBellAllowed || !isDesktopShell()) return;
+    readFrostSpeechStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [frostDrawerOpen, frostBellAllowed]);
+
+  // What the voice bar and the indicator next to the bell draw. Decided in local/frostLiveVoice.js.
+  const frostVoiceIndicator = liveVoiceIndicatorView({ view: frostLiveVoice, alwaysOn: frostVoiceAlwaysOn, allowed: frostBellAllowed });
+  const frostVoiceControls = {
+    alwaysOn: frostVoiceAlwaysOn,
+    onToggleAlwaysOn: toggleFrostVoiceAlwaysOn,
+    onRestart: relaunchFrostListening,
+    onResume: resumeFrostLiveVoice,
+    level: frostVoiceLevelRef.current,
+    engineNotice: speechEngineNotice(frostSpeechSetup.status, { engine: frostLiveVoice.engine }),
+    preferenceNote: frostVoicePreferenceNote,
+    microphoneOptions: frostMicrophones.devices.length ? microphoneOptions(frostMicrophones, frostMicrophoneId) : [],
+    microphoneId: frostMicrophoneId,
+    onChooseMicrophone: chooseFrostMicrophone,
   };
 
   const proposeFrostAction = async (action, payload = {}) => {
@@ -5145,7 +6194,21 @@ function App() {
 
   const loadReports = async (params = {}) => {
     const requestGeneration = reportRequestGateRef.current.begin();
-    const normalizedParams = { ...params, ...resolveReportDateRange(params) };
+    const requestedParams = reportLoadParams(params, reportParamsRef.current);
+    const normalizedParams = { ...requestedParams, ...resolveReportDateRange(requestedParams) };
+    const previousReportParams = reportParamsRef.current;
+    if (params?.range) {
+      reportParamsRef.current = params;
+      setReportAppliedParams(params);
+    }
+    // A range the owner asked for that could not be loaded is not remembered: the screen rolls back
+    // to the previous range, and background reloads must follow the screen, not the failed request.
+    const forgetFailedRange = () => {
+      if (params?.range && reportParamsRef.current === params) {
+        reportParamsRef.current = previousReportParams;
+        setReportAppliedParams(previousReportParams);
+      }
+    };
     setReportsData((current) => ({ ...current, inventoryLoadState: "loading", inventoryLoadError: "" }));
     const tauriRuntime = isTauriRuntime();
     const inventoryHydrationPolicy = resolveInventoryHydrationPolicy({ tauriRuntime });
@@ -5192,6 +6255,7 @@ function App() {
         if (reportRequestGateRef.current.isCurrent(requestGeneration)) {
           setReportsData((current) => ({ ...current, inventoryLoadState: "error", inventoryLoadError: message }));
         }
+        forgetFailedRange();
         return { params: normalizedParams, source: "LOCAL_SQLITE", failures: [{ key: "inventory", message }] };
       }
     }
@@ -5220,17 +6284,22 @@ function App() {
       }
     }
     const effectiveFailures = inventoryFailure && !failures.includes(inventoryFailure) ? [...failures, inventoryFailure] : failures;
-    if (effectiveFailures.length) setSyncMessage(`${effectiveFailures.length} report request(s) failed. Showing the last preserved local values.`);
+    if (effectiveFailures.length) {
+      setSyncMessage(`${effectiveFailures.length} report request(s) failed. Showing the last preserved local values.`);
+      forgetFailedRange();
+    }
+    const summaryFailed = failures.some((failure) => failure.key === "summary");
     setReportsData((current) => ({
       ...current,
-      ...(failures.some((failure) => failure.key === "summary") ? {} : (values.summary || {})),
+      ...(summaryFailed ? {} : (values.summary || {})),
       stockReport: inventoryFailure ? current.stockReport : nextStockReport,
       stockLotReport: inventoryFailure ? current.stockLotReport : nextStockLots,
       inventoryLoadState: inventoryFailure ? "error" : "ready",
       inventoryLoadError: inventoryFailure ? sanitizedInventoryLoadError(inventoryFailure) : "",
       cashBookReport: failures.some((failure) => failure.key === "cashBook") ? current.cashBookReport : values.cashBook,
-      dateFrom: normalizedParams.date_from,
-      dateTo: normalizedParams.date_to,
+      // The period printed on P&L describes the figures shown. When the summary failed the figures
+      // shown are the previous ones, so the previous period stays with them.
+      ...(summaryFailed ? {} : { dateFrom: normalizedParams.date_from, dateTo: normalizedParams.date_to }),
     }));
     return { params: normalizedParams, source: "HYBRID_LOCAL", failures: effectiveFailures };
   };
@@ -5977,9 +7046,61 @@ function App() {
     }
   };
 
+  // Returns "" when saved, or the reason it was not.
+  const saveProductPhoto = async (productId, dataUrl, productGlobalId = null) => {
+    if (!productId) return "the new product's number did not come back from the server";
+    try {
+      if (dataUrl) {
+        const check = checkProductPhoto(dataUrl);
+        if (!check.ok) return check.message;
+        const response = await axios.put(`${API_URL}/api/v3/products/${encodeURIComponent(productId)}/photo`, { photo: dataUrl }, { timeout: 20000 });
+        setProductPhotos((current) => withProductPhoto(current, productId, dataUrl, response.data?.updated_at, productGlobalId));
+      } else {
+        await axios.delete(`${API_URL}/api/v3/products/${encodeURIComponent(productId)}/photo`, { timeout: 20000 });
+        setProductPhotos((current) => withProductPhoto(current, productId, null));
+      }
+      loadProductPhotos().catch(() => null);
+      return "";
+    } catch (error) {
+      return getErrorMessage(error, "the server did not answer");
+    }
+  };
+  const takeProductPhoto = async (file, fallbackMessage = "") => {
+    if (!file) {
+      setProductPhotoMessage(fallbackMessage || "No photo found.");
+      return;
+    }
+    try {
+      setProductPhotoMessage("Preparing photo...");
+      const dataUrl = await shrinkProductPhoto(file, {
+        createImageBitmap: (blob) => window.createImageBitmap(blob),
+        createCanvas: (width, height) => Object.assign(document.createElement("canvas"), { width, height }),
+      });
+      const check = checkProductPhoto(dataUrl);
+      if (!check.ok) {
+        setProductPhotoMessage(check.message);
+        return;
+      }
+      setProductPhotoDraft({ dataUrl, changed: true });
+      setProductPhotoMessage(`Photo ready (${Math.ceil(check.bytes / 1024)} KB). It is saved when you press Save.`);
+    } catch (error) {
+      setProductPhotoMessage(error?.message || "That photo could not be used.");
+    }
+  };
+  const pasteProductPhoto = (event) => {
+    const found = imageFromTransfer(event.clipboardData || event.dataTransfer);
+    if (!found.file && !found.message) return;
+    event.preventDefault();
+    takeProductPhoto(found.file, found.message);
+  };
+
   const addProduct = async () => {
     try {
       const wasEditing = Boolean(editingProductId);
+      let savedProductId = editingProductId || null;
+      let savedProductGlobalId = editingProductId
+        ? products.find((product) => inventoryIdsEqual(product.id, editingProductId))?.global_id ?? null
+        : null;
       const selectedCategory = productCategories.find((category) => String(category.id) === String(productCategoryId));
       const finalCategoryName = selectedCategory?.category_name || newProductCategoryName.trim() || productCategory.trim();
       const normalizedName = productName.trim().toLowerCase();
@@ -6070,11 +7191,26 @@ function App() {
         }
       } else {
         const createWrite = createOperationalWrite(user, payload);
-        await axios.post(`${API_URL}/api/v3/products`, createWrite.body, createWrite.config);
+        const created = await axios.post(`${API_URL}/api/v3/products`, createWrite.body, createWrite.config);
+        savedProductId = created.data?.product?.id ?? null;
+        savedProductGlobalId = created.data?.product?.global_id ?? null;
       }
+      // The photo is saved after the product, separately. If it fails the product is still saved,
+      // and the owner is told the photo is not, rather than the whole save looking like a success.
+      const photoProblem = productPhotoDraft.changed ? await saveProductPhoto(savedProductId, productPhotoDraft.dataUrl, savedProductGlobalId) : "";
       resetProductForm();
-      await Promise.all([loadProducts(), loadProductCategories(), loadDashboardData()]);
-      alert(wasEditing ? "Product Updated" : "Product Added");
+      // The product is saved at this point. Reloading the lists afterwards is a separate matter: a
+      // failed reload used to land in the catch below and report "Error Adding Product" for a
+      // product that had in fact been saved, so the owner would try again and make a duplicate.
+      const reloads = await Promise.allSettled([loadProducts(), loadProductCategories(), loadDashboardData()]);
+      const reloadFailure = reloads.find((result) => result.status === "rejected");
+      const savedMessage = wasEditing ? "Product Updated" : "Product Added";
+      const notes = [
+        photoProblem ? `the photo was not saved: ${photoProblem}` : "",
+        reloadFailure ? `the list could not be refreshed (${productSaveErrorMessage(reloadFailure.reason, "no answer")}); open Product Master again to see it` : "",
+      ].filter(Boolean);
+      if (reloadFailure) console.error("Product list refresh after save failed", reloadFailure.reason);
+      alert(notes.length ? `${savedMessage}, but ${notes.join("; and ")}.` : savedMessage);
     } catch (error) {
       console.error("Product save failed", {
         status: error.response?.status,
@@ -6082,11 +7218,13 @@ function App() {
         message: error.message,
         error,
       });
-      alert(getErrorMessage(error, "Error Adding Product"));
+      alert(productSaveErrorMessage(error, editingProductId ? "The product could not be updated." : "The product could not be added."));
     }
   };
 
   const resetProductForm = () => {
+    setProductPhotoDraft({ dataUrl: null, changed: false });
+    setProductPhotoMessage("");
     setProductName("");
     setSellingRate("");
     setUnit("");
@@ -6987,7 +8125,14 @@ function App() {
     setOpeningStockLots([]);
     setShowOpeningLotForm(false);
     setEditingProductId(product.id);
+    setProductPhotoDraft({ dataUrl: photoForProduct(productPhotoIndex, product), changed: false });
+    setProductPhotoMessage("");
     loadProductLots(product, true);
+    // The form sits above a long product list; pressing Edit far down the list used to fill a form
+    // the owner could not see. Take them to it, after React has rendered it as "Edit Item".
+    window.requestAnimationFrame(() => {
+      document.getElementById("product-item-form")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
   };
 
   const cancelProductEdit = () => {
@@ -7286,9 +8431,10 @@ function App() {
     setActiveView(view);
     try {
       if (view === "products") {
-        await Promise.all([loadProducts(), loadProductCategories(), loadSupplierData(), loadDashboardData()]);
+        await Promise.all([loadProducts(), loadProductCategories(), loadSupplierData(), loadDashboardData(), loadProductPhotos()]);
       }
       if (view === "sales") {
+        loadProductPhotos().catch(() => null);
         await refreshPosInventoryFromSQLite("navigate-auto-pos");
         await Promise.all([loadDiscountRules(), loadLotDiscounts(), loadCustomerData()]);
       }
@@ -7635,9 +8781,55 @@ function App() {
   });
 
   const frostUnreadCount = (aiAssistantData.alerts || []).filter((alert) => ["CRITICAL", "HIGH", "ATTENTION"].includes(String(alert.severity || "").toUpperCase())).length;
-  const openFrostDrawer = (tab = frostActiveTab || "briefing") => {
-    setFrostActiveTab(tab);
+  /**
+   * The dues rows and the number to send each one to, joined here rather than on the server.
+   *
+   * `/api/ai/reminders/customer-dues` returns masked numbers on purpose -- it is a FROST route, and
+   * a full contact list of everyone who owes the shop money is the worst single thing on it. The
+   * dialable number is already on this device, in the customers collection the customer screens and
+   * the WhatsApp recipient picker both use, so the row and the number meet here and the server
+   * discloses nothing it did not already.
+   */
+  // `null` until there is something to judge. Before the first load there is no list and no failure
+  // either, and handing `undefined` to the builder would read as "FROST sent a shape I cannot read"
+  // on a section nobody has opened yet.
+  const frostDuesOutreach = (aiAssistantData.dues || aiAssistantData.duesFailure)
+    ? buildDueOutreachRows({
+      dues: aiAssistantData.dues?.customers,
+      customers,
+      canSend: canWhatsappSend,
+      failure: aiAssistantData.duesFailure,
+    })
+    : null;
+  // The popup's customer rows with the prepared-message link, where the outreach list can send to
+  // that customer. Joined on the canonical id inside the tested module.
+  const paymentsPopupCollectRows = attachWhatsappLinks(paymentsPopup.collectRows, frostDuesOutreach, DUE_OUTREACH_ACTION.SEND);
+  // The dates beside each customer and supplier in the dues panel. `null` until the list has been
+  // read, so the panel can tell "not read yet" from "read and failed".
+  const paymentPlan = frostBellAllowed && paymentsDue.read
+    ? buildPaymentPlan({ payload: paymentsDue.payload, failure: paymentsDue.error })
+    : null;
+  const openFrostDrawer = (section = frostActiveTab || FROST_PRIMARY_SECTION) => {
+    if (!frostVisible) return;
+    setFrostActiveTab(section);
     setFrostDrawerOpen(true);
+    // FROST opens on an empty chat, the way an assistant does, rather than on whatever was said
+    // last time. What was said last time is not lost -- it is in the sidebar, which is refreshed
+    // here so the chat just finished is already in it.
+    startNewFrostChat();
+    loadFrostChats().catch(() => null);
+  };
+  // "Frost" was heard: the drawer pops open on the conversation, through the same opener the
+  // launcher uses, before the question is asked. flushSync so the render that follows -- a new chat,
+  // and `askAiAssistantRef` pointing at it -- has happened by the time the question is asked. A
+  // drawer that is already open is only brought to the conversation: reopening would start a new
+  // chat and throw away the question just answered, which a follow-up needs.
+  frostVoiceRevealRef.current = () => {
+    if (!frostDrawerOpenRef.current) {
+      flushSync(() => openFrostDrawer(FROST_PRIMARY_SECTION));
+      return;
+    }
+    setFrostActiveTab(FROST_PRIMARY_SECTION);
   };
   /**
    * Everything a person can navigate to, searchable.
@@ -7902,6 +9094,24 @@ function App() {
                 {(counterScope.known && counterScope.locationName) || user.branch}
               </div>
               <div className="offline-pill">{connectionStatus.syncSummary}</div>
+              {/* Whenever the microphone is on, in either mode, for anybody: it is never on without
+                  this on screen. With the drawer closed it also carries what was heard and why it
+                  is not listening, since nothing else on screen would. */}
+              {frostVoiceIndicator && (
+                <FrostVoiceIndicator
+                  detail={frostDrawerOpen ? "" : frostVoiceIndicator.detail}
+                  heard={frostDrawerOpen ? "" : frostLiveVoice.heard}
+                  indicator={frostVoiceIndicator}
+                  level={frostVoiceLevelRef.current}
+                  onClick={() => {
+                    if (frostVoiceIndicator.phase === "paused" || frostVoiceIndicator.phase === "no_sound") {
+                      resumeFrostLiveVoice();
+                      return;
+                    }
+                    if (!frostDrawerOpen) openFrostDrawer(FROST_PRIMARY_SECTION);
+                  }}
+                />
+              )}
               <div className="notification-bell-wrap">
                 <button
                   type="button"
@@ -8128,7 +9338,7 @@ function App() {
                 </DataTable>
               </ModuleCard>
 
-              <ModuleCard eyebrow="Item Management" title={editingProductId ? "Edit Item" : "Add Item Inside Category"} subtitle="Items are products used by POS, purchase, inventory, reports and FIFO costing.">
+              <ModuleCard id="product-item-form" eyebrow="Item Management" title={editingProductId ? "Edit Item" : "Add Item Inside Category"} subtitle="Items are products used by POS, purchase, inventory, reports and FIFO costing.">
                 <div className="form-grid supplier-form-grid">
                   <Field label="Category">
                     <select value={productCategoryId} onChange={(event) => {
@@ -8160,6 +9370,43 @@ function App() {
                     </select>
                   </Field>
                   <label className="check-field"><input type="checkbox" checked={productActive} onChange={(event) => setProductActive(event.target.checked)} /><span>Active Item</span></label>
+                </div>
+                <div className="product-photo-field">
+                  <span className="product-photo-label">Photo</span>
+                  <div className="product-photo-row">
+                    {/* Paste lands here: in the browser, right-click a photo, "Copy image", then click this box and press Ctrl+V. */}
+                    <div
+                      aria-label="Product photo. Click, then press Ctrl+V to paste a copied photo."
+                      className={productPhotoDraft.dataUrl ? "product-photo-drop product-photo-drop-filled" : "product-photo-drop"}
+                      onDragOver={(event) => event.preventDefault()}
+                      onDrop={pasteProductPhoto}
+                      onPaste={pasteProductPhoto}
+                      role="button"
+                      tabIndex={0}
+                    >
+                      {productPhotoDraft.dataUrl
+                        ? <img alt="" src={productPhotoDraft.dataUrl} />
+                        : <span>Click here, then Ctrl+V</span>}
+                    </div>
+                    <div className="product-photo-actions">
+                      <p>On Google Images or Pinterest, right-click the photo and choose "Copy image". Then click the box and press Ctrl+V. Or save the photo and choose the file.</p>
+                      <div className="button-row">
+                        <label className="secondary-button product-photo-file">
+                          Choose file
+                          <input
+                            accept="image/jpeg,image/png,image/webp"
+                            onChange={(event) => { takeProductPhoto(event.target.files?.[0] || null, "No file chosen."); event.target.value = ""; }}
+                            type="file"
+                          />
+                        </label>
+                        {productPhotoDraft.dataUrl && (
+                          <button className="remove-button" onClick={() => { setProductPhotoDraft({ dataUrl: null, changed: true }); setProductPhotoMessage("The photo is removed when you press Save."); }} type="button">Remove photo</button>
+                        )}
+                      </div>
+                      {productPhotoMessage && <small className="product-photo-message" role="status">{productPhotoMessage}</small>}
+                      {productPhotosState.message && <small className="product-photo-message product-photo-message-error">{productPhotosState.message}</small>}
+                    </div>
+                  </div>
                 </div>
                 <Field label="Remarks"><textarea value={productRemarks} onChange={(event) => setProductRemarks(event.target.value)} /></Field>
                 {!editingProductId && <label className="check-field"><input type="checkbox" checked={addOpeningStock} onChange={(event) => setAddOpeningStock(event.target.checked)} /><span>Add Opening Stock</span></label>}
@@ -8640,6 +9887,7 @@ function App() {
           {activeView === "sales" && (
             <PosBilling
               onWorkChange={handlePosWorkChange}
+              productPhotoIndex={productPhotoIndex}
               chargeTypes={chargeTypes}
               customers={customers.filter((customer) => customer.active !== false)}
               orders={ordersState.orders}
@@ -8648,7 +9896,7 @@ function App() {
               deviceInfo={deviceInfo}
               discountRules={discountRules}
               lotDiscounts={lotDiscounts}
-              inventory={inventory}
+              inventory={posShelf.loaded ? posShelf.inventoryLots : inventory}
               counterScope={counterScope}
               onInvoice={setSelectedInvoice}
               onSaved={async (result) => {
@@ -8678,12 +9926,14 @@ function App() {
                 }
                 if (result?.localSale) {
                   setSalesHistory((rows) => [result.localSale, ...rows]);
-                  setInventory((rows) => rows.map((lot) => {
+                  const takeSold = (rows) => rows.map((lot) => {
                     const movement = result.localSale.items.find((item) => String(item.inventory_batch_id) === String(lot.id));
                     return movement
                       ? { ...lot, remaining_qty: Math.max(Number(lot.remaining_qty || 0) - Number(movement.quantity || 0), 0) }
                       : lot;
-                  }));
+                  });
+                  setInventory(takeSold);
+                  setPosShelf((shelf) => ({ ...shelf, inventoryLots: takeSold(shelf.inventoryLots) }));
                   await refreshSyncStatus();
                   return;
                 }
@@ -8692,7 +9942,7 @@ function App() {
               paymentSettings={settingsData.paymentSettings}
               posSettings={settingsData.posSettings}
               printSettings={settingsData.businessSettings}
-              products={products.filter((product) => product.active !== false)}
+              products={(posShelf.loaded ? posShelf.products : products).filter((product) => product.active !== false)}
               refreshToken={posRefreshToken}
               saleRateSettings={settingsData.saleRateSettings}
               syncInBackground={runSyncNow}
@@ -8817,6 +10067,7 @@ function App() {
               onOpenLotAction={openLotAction}
               onOpenSupplierLedger={openSupplierLedgerFromReport}
               onReload={loadReports}
+              appliedParams={reportAppliedParams}
               suppliers={suppliers}
               user={user}
             />
@@ -9071,15 +10322,35 @@ function App() {
           </section>
         </div>
       )}
-      <FrostFloatingCopilot
-        activeTab={frostActiveTab}
+      {paymentsPopup.show && (
+        <PaymentsDuePopup
+          busyKey={paymentsAction.busyKey}
+          collectRows={paymentsPopupCollectRows}
+          collectTotal={paymentsPopup.collectTotal}
+          failure={paymentsAction.failure}
+          message={paymentsPopup.message}
+          onAct={actOnPaymentRow}
+          onClose={() => rememberPaymentsDue({ dismiss: true })}
+          payRows={paymentsPopup.payRows}
+          payTotal={paymentsPopup.payTotal}
+        />
+      )}
+      {frostVisible && <FrostFloatingCopilot
+        activeSection={frostActiveTab}
         data={aiAssistantData}
+        duesOutreach={frostDuesOutreach}
+        onPaymentDate={setPaymentDate}
+        paymentPlan={paymentPlan}
+        paymentsSkipped={paymentsDue.skipped}
         onAlertAction={updateAiAlert}
         onAsk={askAiAssistant}
         onClose={() => setFrostDrawerOpen(false)}
         onMemoryAction={updateFrostMemory}
         onNavigate={navigate}
-        onOpen={() => openFrostDrawer("briefing")}
+        onNewChat={startNewFrostChat}
+        onOpen={() => openFrostDrawer(FROST_PRIMARY_SECTION)}
+        micOn={frostLiveVoice.on === true}
+        onOpenChat={openFrostChat}
         onProposeAction={proposeFrostAction}
         onProposeMemory={proposeFrostMemory}
         onQuestionChange={setAiQuestion}
@@ -9087,19 +10358,29 @@ function App() {
           setAiRange(range);
           loadAiAssistant(range);
         }}
+        onLoadDues={() => {
+          loadFrostDues();
+          loadPaymentsDue().catch(() => null);
+        }}
         onRefresh={() => loadAiAssistant(aiRange)}
         onReminderAction={updateAiReminder}
+        onReminderDueDate={updateReminderDueDate}
         onSaveSettings={saveFrostSettings}
         onSelectQuestion={(question) => askAiAssistant(question)}
-        onStartVoice={startFrostVoice}
-        onStopVoice={stopFrostVoice}
-        onTabChange={setFrostActiveTab}
+        liveVoice={frostLiveVoice}
+        onToggleLiveVoice={toggleFrostLiveVoice}
+        voiceControls={frostVoiceControls}
+        speechSetup={frostSpeechSetup.open ? speechSetupView(frostSpeechSetup.status, frostSpeechSetup.failure) : null}
+        onInstallSpeech={installFrostSpeech}
+        onRetrySpeechStatus={readFrostSpeechStatus}
+        onCloseSpeechSetup={() => setFrostSpeechSetup((current) => ({ ...current, open: false }))}
+        onSectionChange={setFrostActiveTab}
         open={frostDrawerOpen}
         question={aiQuestion}
         range={aiRange}
         unreadCount={frostUnreadCount}
         user={user}
-      />
+      />}
       {commandPaletteOpen && (
         <CommandPalette
           index={commandIndex}
@@ -9115,26 +10396,40 @@ function App() {
 
 
 function FrostFloatingCopilot({
-  activeTab,
+  activeSection,
   data,
   onAlertAction,
   onAsk,
   onClose,
+  onLoadDues,
   onMemoryAction,
   onNavigate,
+  onNewChat,
   onOpen,
+  onOpenChat,
   onProposeAction,
   onProposeMemory,
   onQuestionChange,
   onRangeChange,
   onRefresh,
   onReminderAction,
+  onReminderDueDate,
   onSaveSettings,
   onSelectQuestion,
-  onStartVoice,
-  onStopVoice,
-  onTabChange,
+  liveVoice = null,
+  micOn = false,
+  onToggleLiveVoice,
+  voiceControls = null,
+  speechSetup = null,
+  onInstallSpeech,
+  onRetrySpeechStatus,
+  onCloseSpeechSetup,
+  onSectionChange,
   open,
+  duesOutreach = null,
+  onPaymentDate,
+  paymentPlan = null,
+  paymentsSkipped = false,
   question,
   range,
   unreadCount = 0,
@@ -9142,44 +10437,63 @@ function FrostFloatingCopilot({
 }) {
   return (
     <>
+      {/* The launcher is fixed on screen while the topbar scrolls away, so it also shows when the
+          microphone is on. */}
       <button
-        aria-label="Open FROST"
-        className={`frost-floating-launcher ${unreadCount ? "frost-floating-launcher-alert" : ""}`}
+        aria-label={micOn ? "Open FROST. The microphone is on." : "Open FROST"}
+        className={`frost-floating-launcher ${unreadCount ? "frost-floating-launcher-alert" : ""} ${micOn ? "frost-floating-launcher-listening" : ""}`}
         onClick={onOpen}
+        title={micOn ? "FROST is listening. The microphone is on." : undefined}
         type="button"
       >
         <span className="frost-orbit" />
         <strong>F</strong>
         {unreadCount > 0 && <em>{Math.min(unreadCount, 99)}</em>}
+        {micOn && <i aria-hidden="true" className="frost-launcher-mic"><Icon name="mic" size={12} /></i>}
       </button>
       {open && <button aria-label="Close FROST" className="frost-drawer-backdrop" onClick={onClose} type="button" />}
       <aside aria-label="FROST" className={`frost-drawer ${open ? "frost-drawer-open" : ""}`}>
         <div className="frost-drawer-header">
           <div>
-            <span className="eyebrow">Floating Copilot</span>
+            {/* One heading. There used to be two: this one, and a second <h2>FROST</h2> two
+                hundred lines down in the module's own toolbar, stacked in the same drawer. */}
             <h2>FROST</h2>
+            <span className="eyebrow">Ask about your shop</span>
           </div>
           <button aria-label="Close FROST" className="remove-button" onClick={onClose} type="button"><Icon name="close" /></button>
         </div>
         <div className="frost-drawer-body">
           <AiBusinessAssistantModule
-            activeTab={activeTab}
+            activeSection={activeSection}
             data={data}
+            duesOutreach={duesOutreach}
+            onPaymentDate={onPaymentDate}
+            paymentPlan={paymentPlan}
+            paymentsSkipped={paymentsSkipped}
             onAlertAction={onAlertAction}
             onAsk={onAsk}
+            onLoadDues={onLoadDues}
             onMemoryAction={onMemoryAction}
             onNavigate={onNavigate}
+            onNewChat={onNewChat}
+            onOpenChat={onOpenChat}
             onProposeAction={onProposeAction}
             onProposeMemory={onProposeMemory}
             onQuestionChange={onQuestionChange}
             onRangeChange={onRangeChange}
             onRefresh={onRefresh}
             onReminderAction={onReminderAction}
+            onReminderDueDate={onReminderDueDate}
             onSaveSettings={onSaveSettings}
             onSelectQuestion={onSelectQuestion}
-            onStartVoice={onStartVoice}
-            onStopVoice={onStopVoice}
-            onTabChange={onTabChange}
+            liveVoice={liveVoice}
+            onToggleLiveVoice={onToggleLiveVoice}
+            voiceControls={voiceControls}
+            speechSetup={speechSetup}
+            onInstallSpeech={onInstallSpeech}
+            onRetrySpeechStatus={onRetrySpeechStatus}
+            onCloseSpeechSetup={onCloseSpeechSetup}
+            onSectionChange={onSectionChange}
             question={question}
             range={range}
             user={user}
@@ -9303,30 +10617,49 @@ function CommandPalette({ index, recentIds = [], onNavigate, onClose }) {
 const aiSeverityClass = (severity = "INFO") => `ai-severity ai-severity-${String(severity).toLowerCase()}`;
 
 function AiBusinessAssistantModule({
-  activeTab = "briefing",
+  activeSection = FROST_PRIMARY_SECTION,
   data,
+  duesOutreach = null,
+  onPaymentDate,
+  paymentPlan = null,
+  paymentsSkipped = false,
   onAlertAction,
   onAsk,
+  onLoadDues,
   onNavigate,
+  onNewChat,
+  onOpenChat,
   onQuestionChange,
   onRangeChange,
   onRefresh,
   onReminderAction,
+  onReminderDueDate,
   onMemoryAction,
   onProposeMemory,
   onSaveSettings,
-  onStartVoice,
-  onStopVoice,
-  onTabChange,
+  liveVoice = null,
+  onToggleLiveVoice,
+  voiceControls = null,
+  speechSetup = null,
+  onInstallSpeech,
+  onRetrySpeechStatus,
+  onCloseSpeechSetup,
+  onSectionChange,
   onProposeAction,
   onSelectQuestion,
   question,
   range,
   user,
 }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [chatsOpen, setChatsOpen] = useState(false);
+  const threadEndRef = useRef(null);
+  // Why a refusal is state rather than a disabled button: a Speak button that is simply greyed out
+  // tells the owner nothing about which of the three reasons applies, and "this device cannot read
+  // aloud" and "FROST has not answered anything yet" need different responses from them.
+  const [speechNotice, setSpeechNotice] = useState("");
   const briefing = data.briefing || {};
   const cards = briefing.cards || {};
-  const latestAnswer = data.history[0];
   const canManageReminders = user?.role === "Owner" || user?.role === "Admin";
   const canManageFrost = user?.role === "Owner" || user?.role === "Admin";
   // Recomputed each render rather than memoised, so a panel left open across 17:00 says "Good
@@ -9336,44 +10669,193 @@ function AiBusinessAssistantModule({
   const periodLabel = data.period?.label || briefing.period?.label || "Current data";
   const cardValue = (section, key, fallback = 0) => cards[section]?.[key] ?? fallback;
   const money = (value) => currency.format(Number(value || 0));
-  const tabItems = [
-    ["briefing", "Briefing"],
-    ["ask", "Ask FROST"],
-    ["voice", "Voice"],
-    ["alerts", "Alerts"],
-    ["decision", "Decision Center"],
-    ["predictions", "Predictions"],
-    ["profit", "Profit Advisor"],
-    ["memory", "Memory"],
-    ["reminders", "Reminders"],
-    ["history", "History"],
-    ["settings", "Settings"],
-  ];
+  const surface = resolveFrostSurface({
+    activeSection,
+    // Passed through exactly as computed above. This module narrows what is shown; it is never the
+    // thing that decides who may do what, and a hidden section is not a permission -- the server's
+    // own checks are.
+    canManageFrost,
+    canManageReminders,
+    alertCount: (data.alerts || []).length,
+  });
+  // The old Briefing tab was two things under one name. Its lines are what FROST would say if
+  // asked how today looks, so they open the conversation; its tiles stay a place of their own.
+  const briefLines = buildFrostBrief({ dailyPlan: data.dailyPlan, recommendations: briefing.recommendations });
+  // Which chat is open, and whether the list behind the sidebar could be read at all. A failed load
+  // must not look like a shop that has never asked FROST anything.
+  const chatSelection = resolveChatSelection({
+    chats: data.chats,
+    activeId: data.sessionId,
+    failure: data.chatsFailure,
+  });
+  const conversation = buildFrostConversation({
+    history: data.history || [],
+    greeting: frostGreeting.line,
+    prompt: FROST_GREETING_PROMPT,
+    brief: briefLines,
+    periodLabel,
+    pending: data.pending,
+  });
+  const speechPlan = resolveSpeechPlan({
+    turn: latestSpokenTurn(conversation),
+    synthesis: typeof window === "undefined" ? null : window.speechSynthesis,
+    utterance: typeof window === "undefined" ? null : window.SpeechSynthesisUtterance,
+    loading: data.loading,
+  });
+  const speakLatestAnswer = () => {
+    if (!speechPlan.allowed) {
+      setSpeechNotice(speechPlan.reason);
+      return;
+    }
+    setSpeechNotice("");
+    const synthesis = window.speechSynthesis;
+    // Cancel first: pressing the button twice otherwise queues a second reading behind the first,
+    // and the owner hears the same answer again rather than the one they just asked for.
+    synthesis.cancel();
+    synthesis.speak(new window.SpeechSynthesisUtterance(speechWithNotice(speechPlan, latestSpokenTurn(conversation))));
+  };
   const openLinkedModule = (type) => {
     if (type === "customer") return onNavigate("accounts");
     if (type === "supplier" || type === "purchase") return onNavigate("pending-bills");
     if (type === "product") return onNavigate("products");
     return onNavigate("reports");
   };
+  const goTo = (key) => {
+    setMenuOpen(false);
+    onSectionChange?.(key);
+  };
+  const sendQuestion = () => {
+    if (data.loading || !question.trim()) return;
+    onAsk();
+  };
+  const liveVoiceBar = (
+    <FrostLiveVoiceBar
+      liveVoice={liveVoice}
+      onCloseSetup={onCloseSpeechSetup}
+      onInstall={onInstallSpeech}
+      onRetry={onRetrySpeechStatus}
+      onToggle={onToggleLiveVoice}
+      setup={speechSetup}
+      voice={voiceControls}
+    />
+  );
+  // A thread that does not follow itself shows the oldest exchange and keeps the newest answer
+  // below the fold, which is the complaint this panel was rebuilt for wearing a different hat:
+  // the owner asks a question and appears to get nothing back.
+  useEffect(() => {
+    threadEndRef.current?.scrollIntoView({ block: "end" });
+  }, [conversation.length]);
 
   return (
     <section className="ai-assistant-shell">
-      <div className="ai-toolbar">
-        <div>
-          <span className="eyebrow">Verified Business Facts</span>
-          <h2>FROST</h2>
-          <p>FroozERP AI operating system. Data period: {periodLabel}. Every figure comes from verified modules before explanation.</p>
+      <div className="frost-strip">
+        <div className="frost-strip-period">
+          {/* The period has to stay in words. The picker moves into the menu, and CLAUDE.md's
+              Report Center lesson is that an effective filter the user cannot see is one that
+              silently decides every figure on screen. */}
+          <span className="eyebrow">{describeFrostRange(range)}</span>
+          {periodLabel && periodLabel !== describeFrostRange(range) && <small>{periodLabel}</small>}
         </div>
         <div className="button-row">
-          <select value={range} onChange={(event) => onRangeChange(event.target.value)}>
-            <option value="today">Today</option>
-            <option value="yesterday">Yesterday</option>
-            <option value="last_7_days">Last 7 Days</option>
-            <option value="this_month">This Month</option>
-          </select>
-          <button className="secondary-button" disabled={data.loading} onClick={onRefresh}><Icon name="history" /> Refresh data</button>
+          <button
+            aria-expanded={chatsOpen}
+            className="frost-strip-button"
+            onClick={() => { setChatsOpen((open) => !open); setMenuOpen(false); }}
+            type="button"
+          >
+            <Icon name="history" /> Chats
+          </button>
+          <button
+            aria-expanded={menuOpen}
+            className="frost-strip-button"
+            onClick={() => { setMenuOpen((open) => !open); setChatsOpen(false); }}
+            type="button"
+          >
+            <Icon name="menu" /> More
+            {surface.menu.some((entry) => entry.badge > 0) && <em className="frost-strip-badge" />}
+          </button>
+          <button className="frost-strip-button" disabled={data.loading} onClick={onRefresh} type="button">
+            <Icon name="refresh" /> Refresh
+          </button>
+          {/* The one control that is always in the same corner, because starting over is the thing
+              an owner reaches for without wanting to think about where it is. */}
+          <button
+            aria-label="New chat"
+            className="frost-strip-button frost-new-chat"
+            onClick={() => { onNewChat(); setChatsOpen(false); setMenuOpen(false); }}
+            title="New chat"
+            type="button"
+          >
+            <Icon name="add" />
+          </button>
         </div>
       </div>
+
+      {chatsOpen && (
+        <div className="frost-menu frost-chats">
+          {/* A failed load says so. An empty list and an unreadable one look identical on screen
+              unless one of them is made to speak, and the owner acts very differently on "you have
+              not asked anything yet" than on "your chats could not be loaded". */}
+          {chatSelection.status === FROST_CHAT_SELECTION.UNREADABLE && (
+            <p className="ai-answer-notice">{chatSelection.message}</p>
+          )}
+          {chatSelection.status !== FROST_CHAT_SELECTION.UNREADABLE && chatSelection.chats.length === 0 && (
+            <p className="frost-chats-empty">{data.chatsLoading ? "Loading your chats..." : "No earlier chats yet."}</p>
+          )}
+          {chatSelection.chats.map((chat) => (
+            <button
+              className={chat.id === data.sessionId ? "frost-menu-item frost-menu-item-active" : "frost-menu-item"}
+              key={chat.id}
+              onClick={() => { onOpenChat(chat.id); setChatsOpen(false); }}
+              type="button"
+            >
+              <strong>{chat.title}</strong>
+              <small>{chat.messageCount === null ? "" : `${chat.messageCount} question${chat.messageCount === 1 ? "" : "s"}`}</small>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {menuOpen && (
+        <div className="frost-menu">
+          <label className="frost-menu-range">
+            <span>Period</span>
+            <select value={range} onChange={(event) => { onRangeChange(event.target.value); setMenuOpen(false); }}>
+              <option value="today">Today</option>
+              <option value="yesterday">Yesterday</option>
+              <option value="last_7_days">Last 7 Days</option>
+              <option value="this_month">This Month</option>
+              <option value="last_month">Last Month</option>
+              <option value="this_year">This Year</option>
+              <option value="last_year">Last Year</option>
+            </select>
+          </label>
+          {surface.menu.map((entry) => (
+            <button
+              className={entry.active ? "frost-menu-item frost-menu-item-active" : "frost-menu-item"}
+              key={entry.key}
+              onClick={() => goTo(entry.key)}
+              type="button"
+            >
+              <strong>{entry.label}{entry.badge > 0 ? ` (${entry.badge})` : ""}</strong>
+              <small>{entry.blurb}</small>
+            </button>
+          ))}
+          <div className="frost-menu-footer">
+            {surface.footer.map((entry) => (
+              <button
+                className={entry.active ? "frost-menu-item frost-menu-item-active" : "frost-menu-item"}
+                key={entry.key}
+                onClick={() => goTo(entry.key)}
+                type="button"
+              >
+                <strong>{entry.label}</strong>
+                <small>{entry.blurb}</small>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {data.error && (
         <div className="startup-status-panel startup-status-error">
@@ -9383,20 +10865,103 @@ function AiBusinessAssistantModule({
         </div>
       )}
 
-      <div className="frost-tabs" role="tablist" aria-label="FROST sections">
-        {tabItems.map(([key, label]) => (
-          <button
-            className={activeTab === key ? "frost-tab frost-tab-active" : "frost-tab"}
-            key={key}
-            onClick={() => onTabChange?.(key)}
-            type="button"
-          >
-            {label}
-          </button>
-        ))}
-      </div>
+      {!surface.onConversation && (
+        <button className="frost-back" onClick={() => goTo(FROST_PRIMARY_SECTION)} type="button">
+          <Icon name="close" /> Back to the conversation
+        </button>
+      )}
 
-      {activeTab === "briefing" && <div className="ai-brief-grid">
+      {/* Live voice stays visible anywhere in the panel while it is on: a microphone that is open
+          must never be open somewhere the owner cannot see it. Owner and Admin only. */}
+      {canManageFrost && !surface.onConversation && liveVoice?.on && liveVoiceBar}
+
+      {surface.onConversation && (
+        <div className="frost-conversation">
+          <div className="frost-thread">
+            {conversation.map((turn) => (
+              <article className={`frost-turn frost-turn-${turn.speaker} frost-turn-${turn.kind}`} key={turn.id}>
+                {turn.kind === "greeting" && (
+                  <>
+                    <strong>{turn.text}</strong>
+                    {turn.prompt && <p>{turn.prompt}</p>}
+                  </>
+                )}
+                {turn.kind === "brief" && (
+                  <>
+                    {turn.periodLabel && <span className="eyebrow">{turn.periodLabel}</span>}
+                    {turn.lines.map((line) => <p key={line}>{line}</p>)}
+                  </>
+                )}
+                {turn.kind === "question" && <p>{turn.text}</p>}
+                {turn.kind === "thinking" && <div className="ai-thinking"><span /> FROST is thinking</div>}
+                {turn.kind === "failure" && <p className="ai-answer-notice">{turn.text}</p>}
+                {turn.kind === "answer" && (
+                  <>
+                    <p>{turn.text}</p>
+                    {turn.notice && <p className="ai-answer-notice">{turn.notice}</p>}
+                    {/* The line that lets a figure be checked against the ordinary report. It is
+                        derived from the facts the server sent, so an answer with no facts says so
+                        rather than carrying a reassuring default. */}
+                    {!turn.chitchat && (
+                      <small>{turn.sources.length ? `From ${turn.sources.join(", ")}` : "No source modules reported"}
+                        {turn.periodLabel ? ` - ${turn.periodLabel}` : ""}</small>
+                    )}
+                  </>
+                )}
+              </article>
+            ))}
+            {conversation.length === 0 && <div className="cart-empty">Ask FROST anything about your shop.</div>}
+            <div ref={threadEndRef} />
+          </div>
+
+          {speechNotice && <p className="ai-answer-notice frost-speech-notice">{speechNotice}</p>}
+
+          {canManageFrost && liveVoiceBar}
+
+          <div className="frost-composer">
+            <textarea
+              onChange={(event) => onQuestionChange(event.target.value)}
+              onKeyDown={(event) => {
+                // Enter sends, Shift+Enter makes a new line. The box had neither: it was
+                // mouse-only, which is not how anyone types a question.
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  sendQuestion();
+                }
+              }}
+              placeholder="Ask about sales, profit, overdue payments, low stock or pending bills."
+              value={question}
+            />
+            <div className="frost-composer-actions">
+              <select
+                className="frost-composer-suggestions"
+                disabled={data.loading || !(data.suggestedQuestions || []).length}
+                onChange={(event) => { if (event.target.value) onSelectQuestion(event.target.value); }}
+                value=""
+              >
+                <option value="">{(data.suggestedQuestions || []).length ? "Suggested questions" : "No questions available"}</option>
+                {(data.suggestedQuestions || []).map((item) => (
+                  <option key={item} value={item}>{item}</option>
+                ))}
+              </select>
+              <button
+                aria-label="Read the last answer aloud"
+                className="frost-speak-button"
+                onClick={speakLatestAnswer}
+                title={speechPlan.allowed ? "Read the last answer aloud" : speechPlan.reason}
+                type="button"
+              >
+                <Icon name="message" /> Speak
+              </button>
+              <button className="primary-button" disabled={data.loading || !question.trim()} onClick={sendQuestion} type="button">
+                Ask
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeSection === "today" && <div className="ai-brief-grid">
         <SummaryMetric featured label="Sales" value={money(cardValue("sales", "totalSales"))} />
         <SummaryMetric label="Gross Profit" positive value={money(cardValue("sales", "estimatedGrossProfit"))} />
         <SummaryMetric label="Customer Overdue" value={money(cardValue("customerOutstanding", "totalOutstanding"))} />
@@ -9405,85 +10970,26 @@ function AiBusinessAssistantModule({
         <SummaryMetric label="Low Stock" value={cardValue("lowStock", "count")} />
       </div>}
 
-      {(activeTab === "ask" || activeTab === "briefing") && <div className="ai-layout">
-        {activeTab === "ask" && (
-        <ModuleCard eyebrow="Ask FROST" title="Controlled Business Questions" subtitle="Answers use the shared FROST service layer. No write action is performed without owner approval.">
-          {data.loading && <div className="ai-thinking"><span /> FROST is thinking</div>}
-          <div className="ai-frost-greeting">
-            <strong>{frostGreeting.line}</strong>
-            <span>{FROST_GREETING_PROMPT}</span>
-          </div>
-          <div className="ai-question-box">
-            <textarea value={question} onChange={(event) => onQuestionChange(event.target.value)} placeholder="Ask about overdue payments, low stock, sales, profit, expenses or pending purchase bills." />
-            <button className="primary-button" disabled={data.loading || !question.trim()} onClick={() => onAsk()}><Icon name="message" /> Ask</button>
-          </div>
-          <label className="ai-suggestion-picker">
-            <span>Or pick a question</span>
-            <select
-              value=""
-              disabled={data.loading || !(data.suggestedQuestions || []).length}
-              onChange={(event) => {
-                const picked = event.target.value;
-                if (picked) onSelectQuestion(picked);
-              }}
-            >
-              <option value="">{(data.suggestedQuestions || []).length ? "Choose a question" : "No questions available"}</option>
-              {(data.suggestedQuestions || []).map((item) => (
-                <option key={item} value={item}>{item}</option>
-              ))}
-            </select>
-          </label>
-          {latestAnswer && (
-            <article className="ai-answer-panel">
-              <span className="eyebrow">{latestAnswer.period?.label || periodLabel}</span>
-              <h3>{latestAnswer.question}</h3>
-              <p>{latestAnswer.answer}</p>
-              {latestAnswer.notice && <p className="ai-answer-notice">{latestAnswer.notice}</p>}
-              <small>Source modules: {[...new Set((latestAnswer.facts || []).map((fact) => fact.sourceModule))].join(", ") || "Verified FroozERP facts"}</small>
-            </article>
-          )}
-        </ModuleCard>
-        )}
-
-        {activeTab === "briefing" && (
-        <ModuleCard eyebrow="Daily Owner Brief" title="Top Recommendations" subtitle="Deterministic alerts remain available even when external AI providers are disabled.">
-          <div className="ai-recommendations">
-            {(data.dailyPlan?.top_priorities || []).slice(0, 5).map((item) => <p key={`priority-${item}`}>Start My Day: {item}</p>)}
-            {(data.dailyPlan?.topPriorities || []).slice(0, 5).map((item) => <p key={`priority-${item}`}>Start My Day: {item}</p>)}
-            {(briefing.recommendations || ["No briefing loaded yet."]).map((item) => <p key={item}>{item}</p>)}
-            {(data.dailyPlan?.can_wait || []).slice(0, 3).map((item) => <p key={`wait-${item}`}>Can wait: {item}</p>)}
-          </div>
-          <div className="ai-collection-strip">
-            <span>Cash {money(cardValue("collections", "cash"))}</span>
-            <span>UPI {money(cardValue("collections", "upi"))}</span>
-            <span>Card/Bank {money(cardValue("collections", "card"))}</span>
-            <span>Waste {money(cardValue("waste", "totalWasteCost"))}</span>
-          </div>
-        </ModuleCard>
-        )}
+      {activeSection === "today" && <div className="ai-collection-strip">
+        <span>Cash {money(cardValue("collections", "cash"))}</span>
+        <span>UPI {money(cardValue("collections", "upi"))}</span>
+        <span>Card/Bank {money(cardValue("collections", "card"))}</span>
+        <span>Waste {money(cardValue("waste", "totalWasteCost"))}</span>
       </div>}
 
-      {activeTab === "voice" && (
-        <FrostVoicePanel
-          onStart={onStartVoice}
-          onStop={onStopVoice}
-          voice={data.voice || {}}
-        />
-      )}
-
-      {activeTab === "predictions" && (
+      {activeSection === "predictions" && (
         <FrostPredictionsPanel predictions={data.predictions || {}} onProposeAction={onProposeAction} />
       )}
 
-      {activeTab === "decision" && (
+      {activeSection === "decision" && (
         <FrostAutonomousDecisionCenter data={data.autonomous || {}} onProposeAction={onProposeAction} />
       )}
 
-      {activeTab === "profit" && (
+      {activeSection === "profit" && (
         <FrostProfitAdvisorPanel recommendations={data.profitAdvisor || []} onProposeAction={onProposeAction} />
       )}
 
-      {activeTab === "memory" && (
+      {activeSection === "memory" && (
         <FrostMemoryPanel
           canManage={canManageFrost}
           memories={data.memories || []}
@@ -9492,13 +10998,13 @@ function AiBusinessAssistantModule({
         />
       )}
 
-      {activeTab === "settings" && <FrostConfigurationPanel
+      {activeSection === "settings" && <FrostConfigurationPanel
         canManage={canManageFrost}
         data={data}
         onSave={onSaveSettings}
       />}
 
-      {activeTab === "briefing" && <ModuleCard eyebrow="AI Briefing Cards" title="Owner Copilot Priorities" subtitle="Each action is read-only or recorded for owner approval. FROST never executes business changes directly.">
+      {activeSection === "today" && <ModuleCard eyebrow="Today's cards" title="Owner Copilot Priorities" subtitle="Each action is read-only or recorded for owner approval. FROST never executes business changes directly.">
         <div className="frost-card-grid">
           {(briefing.insightCards || []).map((card) => (
             <article className={`frost-insight-card frost-priority-${String(card.priority || "Information").toLowerCase()}`} key={card.id}>
@@ -9517,8 +11023,30 @@ function AiBusinessAssistantModule({
         </div>
       </ModuleCard>}
 
-      {(activeTab === "alerts" || activeTab === "reminders") && <div className="ai-layout ai-layout-single">
-        {activeTab === "alerts" && (
+      {activeSection === "dues" && (
+        <FrostDuesPanel
+          canManageReminders={canManageReminders}
+          failure={data.duesFailure}
+          loading={data.duesLoading === true}
+          onLoad={onLoadDues}
+          onPaymentDate={onPaymentDate}
+          outreach={duesOutreach}
+          paymentPlan={paymentPlan}
+          paymentsSkipped={paymentsSkipped}
+          summary={data.dues?.summary || null}
+        />
+      )}
+      {activeSection === "dues" && (
+        <FrostSupplierPaymentsPanel
+          canManageReminders={canManageReminders}
+          onPaymentDate={onPaymentDate}
+          paymentPlan={paymentPlan}
+          paymentsSkipped={paymentsSkipped}
+        />
+      )}
+
+      {(activeSection === "alerts" || activeSection === "reminders") && <div className="ai-layout ai-layout-single">
+        {activeSection === "alerts" && (
         <ModuleCard eyebrow="Priority Alerts" title="Needs Attention" subtitle="Acknowledge, snooze or resolve after reviewing the linked module.">
           <DataTable headers={["Severity", "Alert", "Source", "Actions"]}>
             {(data.alerts || []).slice(0, 12).map((alert) => (
@@ -9540,14 +11068,20 @@ function AiBusinessAssistantModule({
         </ModuleCard>
         )}
 
-        {activeTab === "reminders" && (
+        {activeSection === "reminders" && (
         <ModuleCard eyebrow="Reminder Centre" title="Drafts and Follow-ups" subtitle="WhatsApp messages are drafts only until an owner reviews and approves them.">
           <DataTable headers={["Priority", "Reminder", "Due", "Actions"]}>
             {(data.reminders || []).slice(0, 10).map((reminder) => (
               <tr key={reminder.id}>
                 <td><span className={aiSeverityClass(reminder.priority)}>{reminder.priority}</span></td>
                 <td className="primary-cell">{reminder.title}<small className="cell-note">{reminder.draft_message || reminder.message}</small></td>
-                <td>{formatDisplayDate(reminder.due_at)}</td>
+                <td>
+                  <FrostReminderDueDate
+                    canManage={canManageReminders}
+                    dueAt={reminder.due_at}
+                    onSet={(value) => onReminderDueDate(reminder.id, value)}
+                  />
+                </td>
                 <td>
                   <div className="button-row table-actions-row">
                     <button className="table-action" disabled={!canManageReminders} onClick={() => onReminderAction(reminder.id, "ACKNOWLEDGE")}>Review</button>
@@ -9563,19 +11097,308 @@ function AiBusinessAssistantModule({
         )}
       </div>}
 
-      {activeTab === "history" && <ModuleCard eyebrow="Conversation History" title="Audited FROST Answers" subtitle="Questions, verified facts, token usage and provider context are recorded on the backend.">
-        <div className="ai-history-list">
-          {data.history.map((item) => (
-            <article key={item.id} className="ai-history-item">
-              <strong>{item.question}</strong>
-              <p>{item.answer}</p>
-              <small>{item.period?.label || periodLabel}{item.cached ? " - cached" : ""}{item.usage ? ` - ${item.usage.inputTokens + item.usage.outputTokens} estimated tokens` : ""}</small>
-            </article>
-          ))}
-          {data.history.length === 0 && <div className="cart-empty">Ask a question to start an audited business conversation.</div>}
-        </div>
-      </ModuleCard>}
+      {/* The History section is gone because the conversation IS the history. It used to be the
+          other half of a conversation split across two screens, and the split cost the owner the
+          one signal that mattered: History rendered `cached` and token usage but dropped `notice`,
+          so an answer FROST had to word itself after the local model failed looked, one render
+          later, exactly like an answer the model had worded. The thread carries the notice with
+          every answer. */}
     </section>
+  );
+}
+
+/**
+ * "Today's payments": who to collect from and who to pay today, once per local day.
+ *
+ * What it lists is decided in `local/paymentsDue.js`; this only draws it. Nothing here sends a
+ * message: "Prepare WhatsApp" opens the prepared message from the dues outreach list in WhatsApp,
+ * and the owner reads it and presses send himself. "Done" closes the reminder behind the row, or
+ * for a row that came from a bill alone, puts it away for today on this device.
+ */
+function PaymentsDuePopup({ busyKey = "", collectRows = [], collectTotal = 0, failure = "", message = "", onAct, onClose, payRows = [], payTotal = 0 }) {
+  const renderRow = (item) => (
+    <li className="payments-due-row" key={item.key}>
+      <span className="payments-due-text">{item.text}</span>
+      <div className="button-row payments-due-actions">
+        {item.whatsappLink && (
+          <a className="table-action" href={item.whatsappLink} rel="noopener noreferrer" target="_blank">Prepare WhatsApp</a>
+        )}
+        <button className="table-action" disabled={Boolean(busyKey)} onClick={() => onAct(item, "done")} type="button">
+          {busyKey === item.key ? "Saving..." : "Done"}
+        </button>
+        <button className="table-action" disabled={Boolean(busyKey)} onClick={() => onAct(item, "tomorrow")} type="button">Remind tomorrow</button>
+      </div>
+    </li>
+  );
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section aria-labelledby="payments-due-title" aria-modal="true" className="invoice-modal payments-due-modal" role="dialog">
+        <div className="invoice-toolbar">
+          <div>
+            <span className="eyebrow">Payments</span>
+            <strong id="payments-due-title">Today's payments</strong>
+          </div>
+          <button aria-label="Close today's payments" className="remove-button" onClick={onClose} type="button"><Icon name="close" /></button>
+        </div>
+        <div className="payments-due-body">
+          <p className="payments-due-summary">{message}</p>
+          {collectRows.length > 0 && (
+            <>
+              <h3 className="payments-due-heading">To collect{collectTotal > 0 ? ` (${formatRupees(collectTotal)})` : ""}</h3>
+              <ul className="payments-due-list">{collectRows.map(renderRow)}</ul>
+            </>
+          )}
+          {payRows.length > 0 && (
+            <>
+              <h3 className="payments-due-heading">To pay{payTotal > 0 ? ` (${formatRupees(payTotal)})` : ""}</h3>
+              <ul className="payments-due-list">{payRows.map(renderRow)}</ul>
+            </>
+          )}
+          {failure && <div className="error-banner">{failure}</div>}
+          <div className="button-row">
+            <button className="secondary-button" onClick={onClose} type="button">Close for today</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+/**
+ * The "ask for payment on" / "pay on" date for one customer or supplier in the dues panel.
+ *
+ * Before the payments list is read, and when it could not be read, this says so instead of showing
+ * an empty date box: an empty box reads as "no date set", and typing into it would create a second
+ * reminder beside one the app simply could not see.
+ */
+function FrostPaymentDate({ amount, canManage = false, entityId, entityName = "", kind, label, onPaymentDate, plan = null, skipped = false }) {
+  if (!plan) {
+    return <small className="cell-note">{skipped ? "Payment dates need the cloud connection." : "Reading payment dates..."}</small>;
+  }
+  if (plan.status !== PAYMENTS_DUE_STATUS.OK) {
+    return <small className="frost-due-date-failure">Date could not be read</small>;
+  }
+  const reminder = kind === PAYMENT_KIND.COLLECT
+    ? plan.customersById.get(canonicalInventoryId(entityId))?.reminder || null
+    : plan.suppliers.find((entry) => inventoryIdsEqual(entry.supplierId, entityId))?.reminder || null;
+  return (
+    <FrostReminderDueDate
+      canManage={canManage && typeof onPaymentDate === "function"}
+      dueAt={reminder?.dueAt || ""}
+      label={label}
+      onSet={(value) => onPaymentDate({ kind, entityId, entityName, amount, reminderId: reminder?.id || null }, value)}
+    />
+  );
+}
+
+/**
+ * "You owe suppliers": every supplier with a balance, and the day he means to pay each one.
+ *
+ * Its own card rather than a second table inside "Who owes you", so a failure to read the customer
+ * ledger does not also hide what he owes, and the other way round.
+ */
+function FrostSupplierPaymentsPanel({ canManageReminders = false, onPaymentDate, paymentPlan = null, paymentsSkipped = false }) {
+  const subtitle = "Set the day you mean to pay. On that day it comes up in Today's payments.";
+  if (!paymentPlan) {
+    return (
+      <ModuleCard eyebrow="Payments" title="You owe suppliers" subtitle={subtitle}>
+        <div className="cart-empty">{paymentsSkipped ? "Supplier balances need the cloud connection, which this device is not using right now." : "Reading supplier balances..."}</div>
+      </ModuleCard>
+    );
+  }
+  if (paymentPlan.status !== PAYMENTS_DUE_STATUS.OK) {
+    return (
+      <ModuleCard eyebrow="Payments" title="You owe suppliers" subtitle={subtitle}>
+        <div className="error-banner">{paymentPlan.message}</div>
+      </ModuleCard>
+    );
+  }
+  return (
+    <ModuleCard eyebrow="Payments" title="You owe suppliers" subtitle={subtitle}>
+      <DataTable headers={["Supplier", "You owe", "Pay on"]}>
+        {paymentPlan.suppliers.map((supplier) => (
+          <tr key={supplier.key}>
+            <td className="primary-cell">
+              {supplier.name}
+              {supplier.oldestPurchaseDate && <small className="cell-note">Oldest unpaid purchase {formatDisplayDate(supplier.oldestPurchaseDate)}</small>}
+            </td>
+            <td>{supplier.amountText}</td>
+            <td>
+              <FrostPaymentDate
+                amount={supplier.amount}
+                canManage={canManageReminders}
+                entityId={supplier.supplierId}
+                entityName={supplier.name}
+                kind={PAYMENT_KIND.PAY}
+                label="Pay on"
+                onPaymentDate={onPaymentDate}
+                plan={paymentPlan}
+              />
+            </td>
+          </tr>
+        ))}
+        {paymentPlan.suppliers.length === 0 && <tr><td colSpan="3" className="empty-cell">No supplier balance is outstanding.</td></tr>}
+      </DataTable>
+    </ModuleCard>
+  );
+}
+
+/**
+ * The date on one reminder, which the owner can set, change or take off.
+ *
+ * A plain date box and a Save button, not an auto-saving input. A date field that writes on every
+ * keystroke fires a request per digit typed and lands on 2026-01-01 on the way to 2026-01-15.
+ *
+ * The draft is local until saved, and the saved value is what is shown again afterwards -- so a
+ * failed save leaves the box showing what he typed, with the reason, rather than silently snapping
+ * back to the old date as though he had never touched it.
+ */
+function FrostReminderDueDate({ canManage = false, dueAt, label = "Reminder due date", onSet }) {
+  const saved = toDateInputValue(dueAt);
+  const [draft, setDraft] = useState(saved);
+  const [saving, setSaving] = useState(false);
+  const [failure, setFailure] = useState("");
+  const [lastSaved, setLastSaved] = useState(saved);
+  // The row was refreshed from the server and now carries a different date. Follow it, unless the
+  // owner has typed something that is not yet saved -- overwriting that would throw away his edit.
+  if (saved !== lastSaved && draft === lastSaved) {
+    setLastSaved(saved);
+    setDraft(saved);
+  }
+  const dirty = draft !== saved;
+  const save = async () => {
+    setSaving(true);
+    setFailure("");
+    try {
+      await onSet(draft || null);
+    } catch (error) {
+      setFailure(getErrorMessage(error, "That date could not be saved."));
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <div className="frost-due-date">
+      <input
+        aria-label={label}
+        disabled={!canManage || saving}
+        onChange={(event) => setDraft(event.target.value)}
+        type="date"
+        value={draft}
+      />
+      {dirty && (
+        <button className="table-action" disabled={!canManage || saving} onClick={save} type="button">
+          {saving ? "Saving..." : (draft ? "Set date" : "Clear date")}
+        </button>
+      )}
+      {!dirty && !saved && <small className="cell-note">No date</small>}
+      {failure && <small className="frost-due-date-failure">{failure}</small>}
+    </div>
+  );
+}
+
+/**
+ * Who owes the shop money, and the message FROST has already written for each of them.
+ *
+ * ## FROST does not send these
+ *
+ * The owner asked for FROST to either message the customers who owe him or remind him about them.
+ * This panel is the reminding, and Send here opens WhatsApp with the words already typed so that he
+ * reads them and presses send himself, once, for that one customer. Nothing on this screen posts to
+ * `/api/whatsapp/send-document`, and there is no "send all". A message that goes out under the
+ * shop's name to a neighbour is not a thing to get wrong in bulk.
+ *
+ * ## What is shown when a row cannot be sent
+ *
+ * The row, and why. A customer with no number, or one who asked not to be messaged, still appears
+ * with their balance and their draft -- he can ring them. Dropping those rows would make "opted
+ * out" look like "owes nothing", which is the same fault as an error rendering as zero.
+ */
+function FrostDuesPanel({
+  canManageReminders = false,
+  failure = "",
+  loading = false,
+  onLoad,
+  onPaymentDate,
+  outreach = null,
+  paymentPlan = null,
+  paymentsSkipped = false,
+  summary = null,
+}) {
+  // Loaded on open rather than with the panel's other eleven requests: it is a second pass over the
+  // whole ledger, and most openings of FROST are not about dues.
+  useEffect(() => {
+    if (typeof onLoad === "function") onLoad();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const subtitle = "FROST writes the message. You read it and send it yourself, one customer at a time.";
+  if (loading && !outreach) {
+    return <ModuleCard eyebrow="Reminder Centre" title="Who owes you" subtitle={subtitle}><div className="cart-empty">Reading the ledger...</div></ModuleCard>;
+  }
+  if (!outreach) {
+    return <ModuleCard eyebrow="Reminder Centre" title="Who owes you" subtitle={subtitle}><div className="cart-empty">Open this section to read the ledger.</div></ModuleCard>;
+  }
+  if (outreach.status === DUE_OUTREACH_STATUS.UNREADABLE) {
+    // Never an empty table. "Nobody owes you anything" is a sentence this panel may only say when
+    // it is true, and a failed read is not that.
+    return (
+      <ModuleCard eyebrow="Reminder Centre" title="Who owes you" subtitle={subtitle}>
+        <div className="inline-error">{outreach.message || failure}</div>
+        <div className="button-row"><button className="secondary-button" onClick={onLoad} type="button">Try again</button></div>
+      </ModuleCard>
+    );
+  }
+  return (
+    <ModuleCard eyebrow="Reminder Centre" title="Who owes you" subtitle={subtitle}>
+      {summary && (
+        <div className="frost-dues-summary">
+          <span><strong>{summary.count}</strong> customers</span>
+          <span><strong>{currency.format(Number(summary.total_outstanding) || 0)}</strong> outstanding</span>
+          <span><strong>{summary.overdue_count}</strong> overdue</span>
+          <span><strong>{outreach.sendableCount}</strong> ready to send</span>
+        </div>
+      )}
+      {paymentPlan?.status === PAYMENTS_DUE_STATUS.UNREADABLE && <div className="error-banner">{paymentPlan.message}</div>}
+      <DataTable headers={["Customer", "Outstanding", "Since", "Ask for payment on", "Message", "Send"]}>
+        {outreach.rows.map((row) => (
+          <tr key={row.key}>
+            <td className="primary-cell">
+              {row.customer_name || "Walk-in customer"}
+              <small className="cell-note">{row.due_status === "NO_DUE_DATE" ? "No due date set" : row.due_status.replace(/_/g, " ").toLowerCase()}</small>
+            </td>
+            <td>{currency.format(Number(row.outstanding_amount) || 0)}</td>
+            <td>{formatDisplayDate(row.oldest_invoice_date)}</td>
+            <td>
+              <FrostPaymentDate
+                canManage={canManageReminders}
+                entityId={row.customer_id}
+                entityName={row.customer_name}
+                amount={row.outstanding_amount}
+                kind={PAYMENT_KIND.COLLECT}
+                label="Ask for payment on"
+                onPaymentDate={onPaymentDate}
+                plan={paymentPlan}
+                skipped={paymentsSkipped}
+              />
+            </td>
+            <td className="frost-dues-message">{row.prepared_message || "No balance to write about."}</td>
+            <td>
+              {row.action === DUE_OUTREACH_ACTION.SEND ? (
+                <a className="table-action" href={row.link} rel="noopener noreferrer" target="_blank">Open in WhatsApp</a>
+              ) : (
+                <small className="cell-note">{row.blockedReason}</small>
+              )}
+            </td>
+          </tr>
+        ))}
+        {outreach.rows.length === 0 && <tr><td colSpan="6" className="empty-cell">Nobody has a balance outstanding.</td></tr>}
+      </DataTable>
+      <div className="button-row">
+        <button className="secondary-button" disabled={loading} onClick={onLoad} type="button">{loading ? "Refreshing..." : "Refresh"}</button>
+        {!canManageReminders && <small className="cell-note">You can read this list. Setting reminders needs an owner.</small>}
+      </div>
+    </ModuleCard>
   );
 }
 
@@ -9801,27 +11624,176 @@ function FrostMemoryPanel({ canManage, memories = [], onMemoryAction, onProposeM
   );
 }
 
-function FrostVoicePanel({ onStart, onStop, voice }) {
-  const active = ["connecting", "listening", "speaking"].includes(voice.status);
+/**
+ * The Live voice switch, what it is doing right now, and the one-time setup card.
+ *
+ * Every decision is made in local/frostLiveVoice.js: `liveVoice` is the controller's view and
+ * `setup` is `speechSetupView(...)`. This only draws them. A failed or unreadable setup is drawn as
+ * a failure with its reason; only `setup.ready` ever says voice is ready.
+ */
+function FrostLiveVoiceBar({ liveVoice = null, onCloseSetup, onInstall, onRetry, onToggle, setup = null, voice = null }) {
+  const on = liveVoice?.on === true;
+  const phase = liveVoice?.phase || "off";
+  const message = liveVoice?.message || "";
+  const heard = liveVoice?.heard || "";
+  const alwaysOn = voice?.alwaysOn === true;
+  // Paused audio or no frames: the words themselves are the button that starts it (and any click
+  // in the app does too).
+  const stalled = on && (phase === "paused" || phase === "no_sound");
+  const engineNotice = voice?.engineNotice || null;
+  const messageClass = liveVoice?.tone === "error"
+    ? "frost-live-message frost-live-message-error"
+    : liveVoice?.tone === "attention" ? "frost-live-message frost-live-message-attention" : "frost-live-message";
   return (
-    <section className={`frost-voice-panel frost-voice-${voice.status || "idle"}`}>
-      <div>
-        <span className="eyebrow">Voice Copilot</span>
-        <h3>Push-to-talk with FROST</h3>
-        <p>Hindi, English and Hinglish ready. Wake word architecture is prepared and disabled.</p>
+    <div className="frost-live-bar">
+      <div className="frost-live-row">
+        {/* The drawer's own switch, for people who do not want always-on. While "everywhere" is on
+            that switch is the one control, so this one is not drawn. */}
+        {!alwaysOn && (
+          <button
+            aria-checked={on}
+            className={on ? "frost-live-switch frost-live-switch-on" : "frost-live-switch"}
+            onClick={onToggle}
+            role="switch"
+            title={on ? "Turn live voice off and close the microphone" : "Talk to FROST. Say \"Frost\" and then your question."}
+            type="button"
+          >
+            <span className="frost-live-knob" /> Live voice
+          </button>
+        )}
+        {voice && (
+          <button
+            aria-checked={alwaysOn}
+            className={alwaysOn ? "frost-live-switch frost-live-switch-on" : "frost-live-switch"}
+            onClick={voice.onToggleAlwaysOn}
+            role="switch"
+            title={alwaysOn
+              ? "Stop listening everywhere and close the microphone"
+              : "Keep the microphone on in every screen, even with FROST closed. Say \"Frost\" and FROST opens."}
+            type="button"
+          >
+            <span className="frost-live-knob" /> Listen for &quot;Frost&quot; everywhere
+          </button>
+        )}
+        {on && (
+          <span aria-live="polite" className={`frost-live-indicator frost-live-indicator-${phase}`}>
+            <span className="frost-live-dot" />
+            {LIVE_VOICE_PHASE_LABELS[phase] || phase}
+          </span>
+        )}
+        {/* Outside the live region: a meter that changes a dozen times a second is not news. */}
+        {on && <FrostVoiceLevel channel={voice?.level} />}
       </div>
-      <div className="frost-voice-controls">
-        <button className={active ? "remove-button frost-mic-button" : "primary-button frost-mic-button"} onClick={active ? onStop : onStart}>
-          <Icon name={active ? "close" : "message"} /> {active ? "Interrupt / Stop" : "Hold to Talk"}
-        </button>
-        <span className="frost-voice-state">{voice.status || "idle"}</span>
-      </div>
-      {(voice.transcript || voice.error) && (
-        <div className="frost-transcript">
-          {voice.error ? <p>{voice.error}</p> : <p>{voice.transcript}</p>}
+      {/* Which microphone FROST is actually hearing, by name, and the choice of another one. A
+          Bluetooth headset that sends silence looked exactly like FROST ignoring the owner. */}
+      {(on && liveVoice?.microphone) || voice?.microphoneOptions?.length ? (
+        <div className="frost-live-mic">
+          {on && liveVoice?.microphone && (
+            <span>Hearing: &quot;{liveVoice.microphone}&quot;{liveVoice?.microphoneRaw && " (without Windows voice processing)"}</span>
+          )}
+          {voice?.microphoneOptions?.length > 0 && (
+            <label>
+              Microphone{" "}
+              <select onChange={(event) => voice.onChooseMicrophone(event.target.value)} value={voice.microphoneId || ""}>
+                {voice.microphoneOptions.map((option) => (
+                  <option key={option.value || "default"} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            </label>
+          )}
+        </div>
+      ) : null}
+      {message && (stalled
+        ? <button className={`${messageClass} frost-live-message-action`} onClick={voice?.onResume} type="button">{message}</button>
+        : <p className={messageClass}>{message}</p>)}
+      {alwaysOn && !on && voice && (
+        <div className="button-row">
+          <button className="secondary-button" onClick={voice.onRestart} type="button">Start listening</button>
         </div>
       )}
-    </section>
+      {heard && <p aria-live="polite" className="frost-live-heard">{heard}</p>}
+      {engineNotice && (
+        <div className={`frost-voice-engine frost-voice-engine-${engineNotice.kind}`}>
+          <p>{engineNotice.text}</p>
+          {engineNotice.detail && <small>{engineNotice.detail}</small>}
+          {engineNotice.action === "install" && (
+            <div className="button-row">
+              <button className="secondary-button" onClick={onInstall} type="button">Install update</button>
+            </div>
+          )}
+        </div>
+      )}
+      {voice?.preferenceNote && <p className="frost-live-message frost-live-message-error">{voice.preferenceNote}</p>}
+      {setup && !on && (
+        <div className={`frost-voice-setup frost-voice-setup-${setup.tone}`}>
+          <p>{setup.text}</p>
+          {setup.detail && <small>{setup.detail}</small>}
+          {setup.percent !== null && (
+            <div className="frost-voice-setup-bar" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={setup.percent}>
+              <span style={{ width: `${setup.percent}%` }} />
+            </div>
+          )}
+          <div className="button-row">
+            {setup.action === "download" && (
+              <button className="primary-button" onClick={onInstall} type="button">Download</button>
+            )}
+            {setup.action === "retry" && (
+              <button className="secondary-button" onClick={setup.kind === "unreadable" ? onRetry : onInstall} type="button">
+                {setup.kind === "unreadable" ? "Check again" : "Try the download again"}
+              </button>
+            )}
+            <button className="frost-strip-button" onClick={onCloseSetup} type="button">Close</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+const noVoiceLevelSubscribe = () => () => {};
+const noVoiceLevel = () => 0;
+
+/**
+ * The live microphone level. Subscribes to the level channel itself, so a frame redraws this bar
+ * and nothing else.
+ */
+function FrostVoiceLevel({ channel = null }) {
+  const level = useSyncExternalStore(channel?.subscribe || noVoiceLevelSubscribe, channel?.get || noVoiceLevel);
+  const percent = Math.round(Math.max(0, Math.min(1, Number(level) || 0)) * 100);
+  return (
+    <span aria-label="Microphone level" aria-valuemax={100} aria-valuemin={0} aria-valuenow={percent} className="frost-voice-level" role="meter">
+      <span style={{ width: `${percent}%` }} />
+    </span>
+  );
+}
+
+/**
+ * The small indicator next to the bell: drawn by App whenever `liveVoiceIndicatorView` is not null,
+ * which is always when the microphone is on. With the drawer closed it also carries what was heard
+ * and any failure, in words.
+ */
+function FrostVoiceIndicator({ detail = "", heard = "", indicator, level = null, onClick }) {
+  return (
+    <div className="frost-voice-indicator-wrap">
+      <button
+        aria-label={indicator.kind === "on" ? `Microphone on: ${indicator.label}` : indicator.label}
+        className={`frost-voice-indicator frost-voice-indicator-${indicator.tone}`}
+        onClick={onClick}
+        title={indicator.kind === "on" ? "The microphone is on. FROST listens for \"Frost\"." : detail || indicator.label}
+        type="button"
+      >
+        <Icon name="mic" size={15} />
+        <span className="frost-voice-indicator-label">{indicator.label}</span>
+        {indicator.kind === "on" && <FrostVoiceLevel channel={level} />}
+      </button>
+      {(detail || heard) && (
+        <div aria-live="polite" className="frost-voice-bubble">
+          {detail && <p className={indicator.tone === "error" ? "frost-voice-bubble-error" : ""}>{detail}</p>}
+          {heard && <p>{heard}</p>}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -9876,6 +11848,10 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
   // entry instead, which would read as "Deterministic only" over a FROST set to a local model.
   const providerOptions = resolveFrostProviderOptions(data.providers, draft.providerKey);
 
+  // The realtime-model, OpenAI voice and duplex/wake-word controls are gone with the OpenAI Realtime
+  // path they configured. Their values stay in the draft and are saved back unchanged, so this
+  // panel never quietly rewrites settings it no longer shows. Live voice is on-device and has no
+  // settings here: it is the switch in the conversation.
   const update = (field, value) => setDraft((current) => ({ ...current, [field]: value }));
   const save = async () => {
     try {
@@ -9903,15 +11879,6 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
         {draft.providerKey === "ollama" && (
           <Field label="Local Model Address"><input disabled={!canManage} value={draft.baseUrl} onChange={(event) => update("baseUrl", event.target.value)} placeholder="http://127.0.0.1:11434" /></Field>
         )}
-        <Field label="Realtime Model"><input disabled={!canManage} value={draft.realtimeModel} onChange={(event) => update("realtimeModel", event.target.value)} /></Field>
-        <Field label="Voice">
-          <select disabled={!canManage} value={draft.voice} onChange={(event) => update("voice", event.target.value)}>
-            <option value="alloy">Alloy</option>
-            <option value="verse">Verse</option>
-            <option value="marin">Marin</option>
-            <option value="cedar">Cedar</option>
-          </select>
-        </Field>
         <Field label="Language Mode">
           <select disabled={!canManage} value={draft.languageMode} onChange={(event) => update("languageMode", event.target.value)}>
             <option value="hindi_english_hinglish">Hindi + English + Hinglish</option>
@@ -9923,11 +11890,6 @@ function FrostConfigurationPanel({ canManage, data, onSave }) {
         <label className="check-field"><input checked={draft.enabled} disabled={!canManage} type="checkbox" onChange={(event) => update("enabled", event.target.checked)} /><span>External provider enabled</span></label>
         <label className="check-field"><input checked={draft.streamingEnabled} disabled={!canManage} type="checkbox" onChange={(event) => update("streamingEnabled", event.target.checked)} /><span>Streaming responses</span></label>
         <label className="check-field"><input checked={draft.cacheEnabled} disabled={!canManage} type="checkbox" onChange={(event) => update("cacheEnabled", event.target.checked)} /><span>Response caching</span></label>
-        <label className="check-field"><input checked={draft.voicePrepared} disabled={!canManage} type="checkbox" onChange={(event) => update("voicePrepared", event.target.checked)} /><span>Voice engine prepared</span></label>
-        <label className="check-field"><input checked={draft.voiceActivityDetection} disabled={!canManage} type="checkbox" onChange={(event) => update("voiceActivityDetection", event.target.checked)} /><span>Voice activity detection</span></label>
-        <label className="check-field"><input checked={draft.noiseSuppression} disabled={!canManage} type="checkbox" onChange={(event) => update("noiseSuppression", event.target.checked)} /><span>Noise suppression</span></label>
-        <label className="check-field"><input checked={draft.fullDuplexEnabled} disabled={!canManage} type="checkbox" onChange={(event) => update("fullDuplexEnabled", event.target.checked)} /><span>Full duplex conversation</span></label>
-        <label className="check-field"><input checked={false} disabled type="checkbox" /><span>Wake word disabled</span></label>
       </div>
       <div className="ai-engine-grid">
         {(data.engines || []).map((engine) => (
@@ -10734,7 +12696,9 @@ function AccountRecoveryModal({ apiUrl, backendHealth, deviceInfo, onCheckOnline
     setBusy(true);
     try {
       writeDiagnosticLog("INFO", "recovery-send-otp-request", { apiUrl, endpoint: `${apiUrl}/auth/recovery/send-otp` });
-      const response = await axios.post(`${apiUrl}/auth/recovery/send-otp`, recoveryPayload(), { timeout: 8000 });
+      // The server gives an email up to 12 seconds and the desktop gateway gives the cloud 15, so an
+      // 8-second wait reported "failed" while the code was still on its way.
+      const response = await axios.post(`${apiUrl}/auth/recovery/send-otp`, recoveryPayload(), { timeout: 20000 });
       setProviderStatus(response.data.provider_status || null);
       if (response.data.code === "PROVIDER_NOT_CONFIGURED" && !response.data.development_otp) {
         setError(response.data.message || "Recovery delivery provider is not configured.");
@@ -11261,7 +13225,7 @@ function PdfPreviewModal({ blob, fileName, onClose, onSave }) {
   );
 }
 
-function ReportToolbar({ canWhatsappSend = false, exporting = false, onPdfExport, onPdfView, onPrint, onWhatsApp, title }) {
+function ReportToolbar({ canWhatsappSend = false, exporting = false, onExcelExport, onPdfExport, onPdfView, onPrint, onWhatsApp, title }) {
   return (
     <div className="report-toolbar no-print">
       <strong>{title}</strong>
@@ -11269,6 +13233,7 @@ function ReportToolbar({ canWhatsappSend = false, exporting = false, onPdfExport
         <button className="secondary-button" onClick={onPrint}><Icon name="print" /> Print</button>
         {onPdfView && <button className="secondary-button" disabled={exporting} onClick={onPdfView}>{exporting ? "Preparing..." : "View PDF"}</button>}
         <button className="secondary-button" disabled={exporting} onClick={onPdfExport || onPrint}>{exporting ? "Exporting..." : "PDF Export"}</button>
+        {onExcelExport && <button className="secondary-button" disabled={exporting} onClick={onExcelExport}>Excel</button>}
         <button className="whatsapp-button" disabled={exporting || !canWhatsappSend} title={canWhatsappSend ? "" : "WhatsApp Send permission required"} onClick={onWhatsApp || onPdfExport || onPrint}><Icon name="message" /> WhatsApp</button>
       </div>
     </div>
@@ -11447,6 +13412,8 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
   const [exporting, setExporting] = useState(false);
   const [whatsappOpen, setWhatsappOpen] = useState(false);
   const [pdfPreview, setPdfPreview] = useState(null);
+  // What the Excel button did, in words: where the file went, or why there is none.
+  const [excelNotice, setExcelNotice] = useState(null);
   const reportRef = useRef(null);
   const reportProfileKey = `report_${safeFileName(reportClassName || title || "report")}`;
   const printProfile = readStoredPrintProfile(reportProfileKey) || getReportPrintProfile(reportClassName);
@@ -11475,6 +13442,26 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
       await exportDocumentPdf({ element: reportRef.current, fileName: fileName || `${title}.pdf`, title, printProfile });
     } catch (error) {
       alert(`Unable to export PDF: ${error.message}`);
+    } finally {
+      setExporting(false);
+      setPrintTarget(false);
+    }
+  };
+  const exportExcel = async () => {
+    // The same preparation as the PDF (narration choice, print layout), so the sheet carries the
+    // rows the PDF would.
+    if (beforePdfExport && beforePdfExport() === false) return;
+    setExcelNotice(null);
+    setPrintTarget(true);
+    setExporting(true);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      const result = exportReportExcel({ element: reportRef.current, fileName: fileName || title, title });
+      setExcelNotice(result
+        ? { tone: "ok", text: `Saved to your Downloads folder as ${result.fileName}.` }
+        : { tone: "error", text: "This report has no table or totals to put in Excel, so no file was made." });
+    } catch (error) {
+      setExcelNotice({ tone: "error", text: `The Excel file could not be made (${error?.message || String(error)}).` });
     } finally {
       setExporting(false);
       setPrintTarget(false);
@@ -11511,7 +13498,10 @@ function PrintableReport({ beforePdfExport, beforePrint, canWhatsappSend = false
   };
   return (
     <section className={`print-section ${reportClassName} print-profile-${printProfile.toLowerCase().replace("_", "-")} ${printTarget ? "print-target" : ""}`}>
-      <ReportToolbar canWhatsappSend={canWhatsappSend} exporting={exporting} onPdfExport={exportReport} onPdfView={viewReportPdf} onPrint={printReport} onWhatsApp={() => setWhatsappOpen(true)} title={title} />
+      <ReportToolbar canWhatsappSend={canWhatsappSend} exporting={exporting} onExcelExport={exportExcel} onPdfExport={exportReport} onPdfView={viewReportPdf} onPrint={printReport} onWhatsApp={() => setWhatsappOpen(true)} title={title} />
+      {excelNotice && (
+        <p className={`report-excel-notice no-print${excelNotice.tone === "error" ? " report-excel-notice-error" : ""}`} role="status">{excelNotice.text}</p>
+      )}
       <div ref={reportRef} className="print-area report-paper">
         <header className="report-print-header">
           <BrandLogo invoice />
@@ -12025,8 +14015,13 @@ function DiscountManagementModule({ discounts = [], inventory = [], onReload, pr
   );
 }
 
-function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageStock, canWhatsappSend = false, connectivityMode = CONNECTIVITY_MODES.LOCAL_ONLY, customers = [], data = {}, focusSection = null, onFocusSectionHandled, orders: ordersState = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, suppliers = [], user }) {
-  const [range, setRange] = useState("today");
+function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageStock, canWhatsappSend = false, connectivityMode = CONNECTIVITY_MODES.LOCAL_ONLY, customers = [], data = {}, focusSection = null, onFocusSectionHandled, orders: ordersState = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, appliedParams = null, suppliers = [], user }) {
+  // Reopening Report Center shows the range it was last loaded with, not "Today" over a year's data.
+  const openingRange = appliedParams?.range || "today";
+  const openingCustomRange = openingRange === "custom" && appliedParams?.date_from && appliedParams?.date_to
+    ? { date_from: appliedParams.date_from, date_to: appliedParams.date_to }
+    : { date_from: toDateKey(new Date()), date_to: toDateKey(new Date()) };
+  const [range, setRange] = useState(openingRange);
   const [search, setSearch] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("");
   const [selectedReport, setSelectedReport] = useState("");
@@ -12096,15 +14091,19 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     paymentType: "",
     date: "",
   });
-  const [customRange, setCustomRange] = useState({
-    date_from: toDateKey(new Date()),
-    date_to: toDateKey(new Date()),
-  });
+  const [customRange, setCustomRange] = useState(openingCustomRange);
   const [refreshBusy, setRefreshBusy] = useState(false);
   const [refreshError, setRefreshError] = useState("");
-  const [appliedQuery, setAppliedQuery] = useState(() => resolveReportDateRange({ range: "today" }));
-  const lastSuccessfulFilters = useRef({ range: "today", customRange: { date_from: toDateKey(new Date()), date_to: toDateKey(new Date()) }, search: "", salesFilters: { ...salesFilters }, purchaseFilters: { ...purchaseFilters }, accountReportFilters: { ...accountReportFilters }, cashBookFilters: { ...cashBookFilters }, inventoryLotReportFilter: "ACTIVE" });
-  const currentReportParams = () => range === "custom" ? customRange : { range };
+  const [appliedQuery, setAppliedQuery] = useState(() => {
+    try {
+      return resolveReportDateRange(openingRange === "custom" ? { range: "custom", ...openingCustomRange } : { range: openingRange });
+    } catch {
+      return resolveReportDateRange({ range: "today" });
+    }
+  });
+  const lastSuccessfulFilters = useRef({ range: openingRange, customRange: { ...openingCustomRange }, search: "", salesFilters: { ...salesFilters }, purchaseFilters: { ...purchaseFilters }, accountReportFilters: { ...accountReportFilters }, cashBookFilters: { ...cashBookFilters }, inventoryLotReportFilter: "ACTIVE" });
+  // The range is named even for custom dates: a reload that names no range keeps the last one.
+  const currentReportParams = () => range === "custom" ? { range: "custom", ...customRange } : { range };
   const currentCashBookParams = (overrides = {}) => {
     const nextFilters = { ...cashBookFilters, ...(overrides.filters || {}) };
     const bookAccount = nextFilters.bookAccount || "ALL";
@@ -13411,7 +15410,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     const amountClass = numericValue < 0 ? "pl-negative" : options.positive ? "pl-positive" : "";
     const formattedAmount = numericValue < 0 ? `(${money(Math.abs(numericValue))})` : money(numericValue);
     return (
-      <div className={`pl-line ${options.indent ? "pl-line-indent" : ""} ${options.total ? "pl-line-total" : ""} ${options.highlight ? "pl-line-highlight" : ""}`} key={label}>
+      <div className={`pl-line ${options.indent ? "pl-line-indent" : ""} ${options.total ? "pl-line-total" : ""} ${options.highlight ? "pl-line-highlight" : ""}`} key={label} data-report-line="">
         <span>{label}</span>
         <strong className={amountClass}>{formattedAmount}</strong>
       </div>
@@ -13468,9 +15467,9 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
         <div className="pl-title-block">
           <span>Financial Report</span>
           <h2>PROFIT &amp; LOSS STATEMENT</h2>
-          <p>For Period: {periodFrom} to {periodTo}</p>
+          <p data-report-note="">For Period: {periodFrom} to {periodTo}</p>
         </div>
-        {!hasTransactions && <div className="pl-empty-note">No transactions found for selected period.</div>}
+        {!hasTransactions && <div className="pl-empty-note" data-report-note="">No transactions found for selected period.</div>}
         <section className="pl-section">
           <h3>INCOME</h3>
           {profitLossLine("Sales Revenue", salesRevenue, { indent: true })}
@@ -13492,7 +15491,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
         </section>
         <section className="pl-section">
           <h3>LESS: EXPENSES</h3>
-          {expenseRows.length > 0 ? expenseRows.map((row) => profitLossLine(row.category, row.amount, { indent: true })) : <div className="pl-empty-note">No expenses recorded for this period.</div>}
+          {expenseRows.length > 0 ? expenseRows.map((row) => profitLossLine(row.category, row.amount, { indent: true })) : <div className="pl-empty-note" data-report-note="">No expenses recorded for this period.</div>}
           {profitLossLine("TOTAL EXPENSES", totalExpenses, { total: true })}
         </section>
         <section className={`pl-section pl-net-section ${netProfit >= 0 ? "pl-net-profit" : "pl-net-loss"}`}>
@@ -14606,10 +16605,10 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
         <SummaryMetric label="Inventory Adjustments" value={auditUnavailableMessage ? "Local only" : auditLoading ? "Loading" : adjustmentCount} />
       </div>
       {inventoryLoading && <div className="cart-empty">{inventoryPresentation.message}</div>}
-      {inventoryUnavailable && <div className="error-banner" role="alert">{inventoryPresentation.message}</div>}
+      {inventoryUnavailable && <div className="error-banner" role="alert" data-report-note="">{inventoryPresentation.message}</div>}
       {stockDateRangeError && <div className="error-banner" role="alert">{stockDateRangeError}</div>}
-      {auditUnavailableMessage && <div className="cart-empty" role="status">{auditUnavailableMessage}</div>}
-      {auditError && <div className="error-banner">{auditError}</div>}
+      {auditUnavailableMessage && <div className="cart-empty" role="status" data-report-note="">{auditUnavailableMessage}</div>}
+      {auditError && <div className="error-banner" data-report-note="">{auditError}</div>}
       <div className="stock-inventory-toolbar sticky-report-filters no-print">
         <div className="stock-filter-row stock-filter-row-primary">
           <Field label="Product Search / Selector">
@@ -19241,10 +21240,21 @@ const EMPTY_OPERATIONAL_SCOPE_DATA = Object.freeze({
   roles: [],
 });
 
-function OperationalScopeManagement({ canManage, user }) {
+function OperationalScopeManagement({ canManage: settingsSayManage, user }) {
   const [data, setData] = useState(EMPTY_OPERATIONAL_SCOPE_DATA);
+  // Whether the boxes on this screen can be typed in. `settingsSayManage` comes from the Settings
+  // bundle, which is only fetched when Settings or Orders is opened, so coming straight here after
+  // sign-in left every box locked (25 Sep 2026). The screen's own read is guarded by the very same
+  // server check as every write on it (`requireAssignmentOwner`), so a successful read is the
+  // exact answer, and a refused one keeps the boxes locked.
+  const [scopeReadAllowed, setScopeReadAllowed] = useState(false);
+  const canManage = Boolean(settingsSayManage) || scopeReadAllowed;
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  // Each step's own result, shown under that step's button. One banner at the top of a long screen
+  // is how the staff button looked dead: its refusal was printed a screen-height away.
+  const [stepStatus, setStepStatus] = useState({});
+  const report = (step, tone, text) => setStepStatus((current) => ({ ...current, [step]: { tone, text } }));
   const [branchDraft, setBranchDraft] = useState({ branch_name: "", address: "", phone_number: "", gst_number: "" });
   const [locationDraft, setLocationDraft] = useState({ branch_id: "", location_code: "", location_name: "", location_type: "STORE", address: "", is_default: false });
   const [staffDraft, setStaffDraft] = useState({ user_id: "", branch_id: "", operational_location_id: "", role_id: "", is_default: true, effective_from: "", effective_to: "" });
@@ -19255,7 +21265,9 @@ function OperationalScopeManagement({ canManage, user }) {
     try {
       const response = await axios.get(`${SYNC_API_URL}/api/v3/admin/scope-management`, createOperationalReadConfig(user));
       setData({ ...EMPTY_OPERATIONAL_SCOPE_DATA, ...(response.data || {}) });
+      setScopeReadAllowed(true);
     } catch (requestError) {
+      setScopeReadAllowed(false);
       setError(getErrorMessage(requestError, "Unable to load branch and device assignments"));
     } finally {
       setLoading(false);
@@ -19268,20 +21280,21 @@ function OperationalScopeManagement({ canManage, user }) {
     (location) => location.active !== false && String(location.branch_id) === String(branchId)
   );
   const saveWrite = async (method, path, payload) => {
-    const write = createOperationalWrite(user, payload);
+    const write = createOperationalWrite(user, adminWritePayload(payload));
     await axios({ method, url: `${SYNC_API_URL}${path}`, data: write.body, ...write.config });
     await load();
   };
   const createBranch = async () => {
     try {
       await saveWrite("post", "/api/v3/admin/branches", { ...branchDraft, reason: "Owner created branch" });
+      report("branches", "ok", `Branch "${branchDraft.branch_name.trim()}" added.`);
       setBranchDraft({ branch_name: "", address: "", phone_number: "", gst_number: "" });
-    } catch (requestError) { setError(getErrorMessage(requestError, "Unable to create branch")); }
+    } catch (requestError) { report("branches", "error", getErrorMessage(requestError, "The branch could not be added.")); }
   };
   const updateBranch = async (branch, active = branch.active !== false) => {
-    const branchName = window.prompt("Branch name", branch.branch_name);
+    const branchName = active ? window.prompt("New name for this branch", branch.branch_name) : branch.branch_name;
     if (!branchName?.trim()) return;
-    const reason = window.prompt(active ? "Reason for branch change" : "Reason for branch deactivation");
+    const reason = window.prompt(active ? "Reason for the change" : `Why is branch "${branch.branch_name}" being closed?`);
     if (!reason?.trim()) return;
     try {
       await saveWrite("put", `/api/v3/admin/branches/${branch.id}`, {
@@ -19290,7 +21303,8 @@ function OperationalScopeManagement({ canManage, user }) {
         active,
         reason,
       });
-    } catch (requestError) { setError(getErrorMessage(requestError, "Unable to update branch")); }
+      report("branches", "ok", active ? `Branch renamed to "${branchName.trim()}".` : `Branch "${branch.branch_name}" closed.`);
+    } catch (requestError) { report("branches", "error", getErrorMessage(requestError, "The branch could not be changed.")); }
   };
   const createLocation = async () => {
     try {
@@ -19300,13 +21314,14 @@ function OperationalScopeManagement({ canManage, user }) {
         target_branch_id: locationDraft.branch_id,
         reason: "Owner created operational location",
       });
+      report("counters", "ok", `Counter "${locationDraft.location_name.trim()}" added.`);
       setLocationDraft({ branch_id: "", location_code: "", location_name: "", location_type: "STORE", address: "", is_default: false });
-    } catch (requestError) { setError(getErrorMessage(requestError, "Unable to create operational location")); }
+    } catch (requestError) { report("counters", "error", getErrorMessage(requestError, "The counter could not be added.")); }
   };
   const updateLocation = async (location, active = location.active !== false) => {
-    const locationName = window.prompt("Operational location name", location.location_name);
+    const locationName = active ? window.prompt("New name for this counter", location.location_name) : location.location_name;
     if (!locationName?.trim()) return;
-    const reason = window.prompt(active ? "Reason for location change" : "Reason for location deactivation");
+    const reason = window.prompt(active ? "Reason for the change" : `Why is counter "${location.location_name}" being closed?`);
     if (!reason?.trim()) return;
     try {
       await saveWrite("put", `/api/v3/admin/operational-locations/${location.id}`, {
@@ -19320,7 +21335,8 @@ function OperationalScopeManagement({ canManage, user }) {
         active,
         reason,
       });
-    } catch (requestError) { setError(getErrorMessage(requestError, "Unable to update operational location")); }
+      report("counters", "ok", active ? `Counter renamed to "${locationName.trim()}".` : `Counter "${location.location_name}" closed.`);
+    } catch (requestError) { report("counters", "error", getErrorMessage(requestError, "The counter could not be changed.")); }
   };
   const saveStaffAssignment = async () => {
     try {
@@ -19333,11 +21349,14 @@ function OperationalScopeManagement({ canManage, user }) {
         permission_set: { operational_access: true },
         reason: "Owner confirmed staff operational-location assignment",
       });
+      const person = data.users.find((member) => String(member.id) === String(staffDraft.user_id));
+      const counter = data.operational_locations.find((location) => String(location.id) === String(staffDraft.operational_location_id));
+      report("staff", "ok", `${person?.full_name || "Staff member"} can now sign in at ${counter?.location_name || "the counter"}.`);
       setStaffDraft({ user_id: "", branch_id: "", operational_location_id: "", role_id: "", is_default: true, effective_from: "", effective_to: "" });
-    } catch (requestError) { setError(getErrorMessage(requestError, "Unable to save staff assignment")); }
+    } catch (requestError) { report("staff", "error", getErrorMessage(requestError, "The staff member could not be placed at the counter.")); }
   };
   const deactivateStaffAssignment = async (assignment) => {
-    const reason = window.prompt("Reason for removing this operational-location assignment");
+    const reason = window.prompt(`Why is ${assignment.full_name} being removed from ${assignment.location_name}?`);
     if (!reason?.trim()) return;
     try {
       await saveWrite("put", `/api/v3/admin/staff-assignments/${assignment.user_id}`, {
@@ -19351,7 +21370,8 @@ function OperationalScopeManagement({ canManage, user }) {
         active: false,
         reason,
       });
-    } catch (requestError) { setError(getErrorMessage(requestError, "Unable to deactivate staff assignment")); }
+      report("staff", "ok", `${assignment.full_name} removed from ${assignment.location_name}.`);
+    } catch (requestError) { report("staff", "error", getErrorMessage(requestError, "The staff member could not be removed from the counter.")); }
   };
   const approvalDraft = (device) => approvalDrafts[device.device_id] || {
     branch_id: "",
@@ -19390,67 +21410,102 @@ function OperationalScopeManagement({ canManage, user }) {
         delete next[device.device_id];
         return next;
       });
-    } catch (requestError) { setError(getErrorMessage(requestError, "Unable to approve device assignment")); }
+      report("computers", "ok", `${device.device_name || device.device_id} approved.`);
+    } catch (requestError) { report("computers", "error", getErrorMessage(requestError, "The computer could not be approved.")); }
   };
 
-  if (loading) return <ModuleCard eyebrow="Operational Scope" title="Branch and Location Control"><p>Loading assignments...</p></ModuleCard>;
+  if (loading) return <ModuleCard eyebrow="Branches & Counters" title="Branches & Counters"><p>Loading branches and counters...</p></ModuleCard>;
+  const stepMessage = (step) => {
+    const status = stepStatus[step];
+    if (!status?.text) return null;
+    return <p className={status.tone === "error" ? "scope-step-message scope-step-message-error" : "scope-step-message"} role={status.tone === "error" ? "alert" : "status"}>{status.text}</p>;
+  };
+  const activeCounters = data.operational_locations.filter((location) => location.active !== false);
+  const locationTypeLabel = (type) => ({ STORE: "Shop counter", WAREHOUSE: "Store room / warehouse", MANDI_COUNTER: "Mandi counter", OFFICE: "Office" })[type] || type;
   return (
-    <ModuleCard eyebrow="Operational Scope" title="Branch, Location, Staff and Device Control" subtitle="Branches group reporting. Every operational transaction and fixed device belongs to one exact operational location.">
+    <ModuleCard eyebrow="Branches & Counters" title="Branches & Counters" subtitle="Set up in this order: 1. Branch (your shop)  2. Counter inside the branch  3. Staff at the counter  4. Computer at the counter.">
       {error && <div className="startup-status-panel"><p>{error}</p></div>}
-      <div className="form-grid supplier-form-grid">
-        <Field label="Branch Name"><input disabled={!canManage} value={branchDraft.branch_name} onChange={(event) => setBranchDraft({ ...branchDraft, branch_name: event.target.value })} /></Field>
-        <Field label="Address"><input disabled={!canManage} value={branchDraft.address} onChange={(event) => setBranchDraft({ ...branchDraft, address: event.target.value })} /></Field>
-        <Field label="Phone"><input disabled={!canManage} value={branchDraft.phone_number} onChange={(event) => setBranchDraft({ ...branchDraft, phone_number: event.target.value })} /></Field>
-        <Field label="GST Number"><input disabled={!canManage} value={branchDraft.gst_number} onChange={(event) => setBranchDraft({ ...branchDraft, gst_number: event.target.value })} /></Field>
-        <button className="primary-button" disabled={!canManage || !branchDraft.branch_name.trim()} onClick={createBranch}>Add Branch</button>
-      </div>
-      <DataTable headers={["Branch", "Address", "Status", "Locations", "Actions"]}>
-        {data.branches.map((branch) => <tr key={branch.id}><td className="primary-cell">{branch.branch_name}</td><td>{branch.address || "-"}</td><td><span className={branch.active !== false ? "stock-ok" : "stock-low"}>{branch.active !== false ? "Active" : "Inactive"}</span></td><td>{data.operational_locations.filter((location) => Number(location.branch_id) === Number(branch.id)).length}</td><td><div className="button-row table-actions-row"><button className="table-action" disabled={!canManage} onClick={() => updateBranch(branch, branch.active !== false)}>Rename</button>{branch.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => updateBranch(branch, false)}>Deactivate</button>}</div></td></tr>)}
-      </DataTable>
-      <div className="form-grid supplier-form-grid">
-        <Field label="Branch"><select disabled={!canManage} value={locationDraft.branch_id} onChange={(event) => setLocationDraft({ ...locationDraft, branch_id: event.target.value })}><option value="">Select branch</option>{activeBranches.map((branch) => <option key={branch.id} value={branch.id}>{branch.branch_name}</option>)}</select></Field>
-        <Field label="Location Code"><input disabled={!canManage} value={locationDraft.location_code} onChange={(event) => setLocationDraft({ ...locationDraft, location_code: event.target.value.toUpperCase() })} /></Field>
-        <Field label="Operational Location"><input disabled={!canManage} value={locationDraft.location_name} onChange={(event) => setLocationDraft({ ...locationDraft, location_name: event.target.value })} /></Field>
-        <Field label="Type"><select disabled={!canManage} value={locationDraft.location_type} onChange={(event) => setLocationDraft({ ...locationDraft, location_type: event.target.value })}><option value="STORE">Store</option><option value="WAREHOUSE">Warehouse</option><option value="MANDI_COUNTER">Mandi Counter</option><option value="OFFICE">Office</option></select></Field>
-        <Field label="Address"><input disabled={!canManage} value={locationDraft.address} onChange={(event) => setLocationDraft({ ...locationDraft, address: event.target.value })} /></Field>
-        <label className="check-field"><input disabled={!canManage} type="checkbox" checked={locationDraft.is_default} onChange={(event) => setLocationDraft({ ...locationDraft, is_default: event.target.checked })} /><span>Default location for branch</span></label>
-        <button className="primary-button" disabled={!canManage || !locationDraft.branch_id || !locationDraft.location_code.trim() || !locationDraft.location_name.trim()} onClick={createLocation}>Add Operational Location</button>
-      </div>
-      <DataTable headers={["Operational Location", "Branch", "Type", "Default", "Status", "Actions"]}>
-        {data.operational_locations.map((location) => <tr key={location.id}><td className="primary-cell">{location.location_name}<small className="cell-note">{location.location_code}</small></td><td>{location.branch_name}</td><td>{location.location_type}</td><td>{location.is_default ? "Yes" : "No"}</td><td><span className={location.active !== false ? "stock-ok" : "stock-low"}>{location.active !== false ? "Active" : "Inactive"}</span></td><td><div className="button-row table-actions-row"><button className="table-action" disabled={!canManage} onClick={() => updateLocation(location, location.active !== false)}>Rename</button>{location.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => updateLocation(location, false)}>Deactivate</button>}</div></td></tr>)}
-      </DataTable>
-      <div className="form-grid supplier-form-grid">
-        <Field label="Staff"><select disabled={!canManage} value={staffDraft.user_id} onChange={(event) => { const selected = data.users.find((candidate) => String(candidate.id) === event.target.value); setStaffDraft({ ...staffDraft, user_id: event.target.value, role_id: selected?.role_id ? String(selected.role_id) : "" }); }}><option value="">Select staff</option>{data.users.map((member) => <option key={member.id} value={member.id}>{member.full_name} ({member.role_name})</option>)}</select></Field>
-        <Field label="Default Branch"><select disabled={!canManage} value={staffDraft.branch_id} onChange={(event) => setStaffDraft({ ...staffDraft, branch_id: event.target.value, operational_location_id: "" })}><option value="">Select branch</option>{activeBranches.map((branch) => <option key={branch.id} value={branch.id}>{branch.branch_name}</option>)}</select></Field>
-        <Field label="Default Operational Location"><select disabled={!canManage} value={staffDraft.operational_location_id} onChange={(event) => setStaffDraft({ ...staffDraft, operational_location_id: event.target.value })}><option value="">Select location</option>{locationsForBranch(staffDraft.branch_id).map((location) => <option key={location.id} value={location.id}>{location.location_name}</option>)}</select></Field>
-        <Field label="Effective From"><input disabled={!canManage} type="date" value={staffDraft.effective_from} onChange={(event) => setStaffDraft({ ...staffDraft, effective_from: event.target.value })} /></Field>
-        <Field label="Effective To"><input disabled={!canManage} type="date" value={staffDraft.effective_to} onChange={(event) => setStaffDraft({ ...staffDraft, effective_to: event.target.value })} /></Field>
-        <button className="primary-button" disabled={!canManage || !staffDraft.user_id || !staffDraft.operational_location_id || !staffDraft.role_id} onClick={saveStaffAssignment}>Assign Staff Location</button>
-      </div>
-      <DataTable headers={["Staff", "Role", "Branch", "Operational Location", "Default", "Status", "Actions"]}>
-        {data.staff_assignments.map((assignment) => <tr key={assignment.id}><td className="primary-cell">{assignment.full_name}<small className="cell-note">{assignment.username}</small></td><td>{assignment.role_name || "-"}</td><td>{assignment.branch_name}</td><td>{assignment.location_name}</td><td>{assignment.is_default ? "Yes" : "No"}</td><td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "Active" : "Inactive"}</span></td><td>{assignment.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => deactivateStaffAssignment(assignment)}>Deactivate</button>}</td></tr>)}
-      </DataTable>
-      <h3>Pending Device Approval</h3>
-      {data.pending_devices.map((device) => {
-        const draft = approvalDraft(device);
-        return <section className="settings-inline-panel" key={device.device_id}>
-          <div><strong>{device.device_name}</strong><small className="cell-note">{device.device_id} - {device.device_type || device.platform || "Other"}</small></div>
-          <div className="form-grid supplier-form-grid">
-            <Field label="Branch"><select disabled={!canManage} value={draft.branch_id} onChange={(event) => updateApprovalDraft(device, "branch_id", event.target.value)}><option value="">Select branch</option>{activeBranches.map((branch) => <option key={branch.id} value={branch.id}>{branch.branch_name}</option>)}</select></Field>
-            <Field label="Operational Location"><select disabled={!canManage} value={draft.operational_location_id} onChange={(event) => updateApprovalDraft(device, "operational_location_id", event.target.value)}><option value="">Select location</option>{locationsForBranch(draft.branch_id).map((location) => <option key={location.id} value={location.id}>{location.location_name}</option>)}</select></Field>
-            <Field label="Physical / Counter Label"><input disabled={!canManage} value={draft.physical_label} onChange={(event) => updateApprovalDraft(device, "physical_label", event.target.value)} /></Field>
-            <Field label="Device Type"><select disabled={!canManage} value={draft.device_type} onChange={(event) => updateApprovalDraft(device, "device_type", event.target.value)}><option value="LAPTOP">Laptop</option><option value="DESKTOP">Desktop</option><option value="TABLET">Tablet</option><option value="ANDROID_PHONE">Android Phone</option><option value="IPHONE">iPhone</option><option value="OTHER">Other</option></select></Field>
-            <Field label="Intended Usage"><select disabled={!canManage} value={draft.intended_usage} onChange={(event) => updateApprovalDraft(device, "intended_usage", event.target.value)}><option value="POS">POS</option><option value="PURCHASE_ENTRY">Purchase Entry</option><option value="INVENTORY">Inventory</option><option value="ACCOUNTS">Accounts</option><option value="REPORTS">Reports</option><option value="OWNER_DASHBOARD">Owner Dashboard</option></select></Field>
-            <Field label="Permitted User"><select disabled={!canManage} value={draft.permitted_user_id} onChange={(event) => updateApprovalDraft(device, "permitted_user_id", event.target.value)}><option value="">Select user</option>{data.users.map((member) => <option key={member.id} value={member.id}>{member.full_name} ({member.role_name})</option>)}</select></Field>
-            <Field label="Confirmed Role"><select disabled value={draft.role_id}><option value="">Select user first</option>{data.roles.map((role) => <option key={role.id} value={role.id}>{role.role_name}</option>)}</select></Field>
-            <button className="primary-button" disabled={!canManage || !draft.branch_id || !draft.operational_location_id || !draft.physical_label.trim() || !draft.intended_usage || !draft.permitted_user_id || !draft.role_id} onClick={() => approveDeviceAssignment(device)}>Approve Assigned Device</button>
-          </div>
-        </section>;
-      })}
-      {data.pending_devices.length === 0 && <p className="form-note">No pending device requests.</p>}
-      <DataTable headers={["Approved Device", "Branch", "Operational Location", "Usage", "Generation", "Status"]}>
-        {data.device_assignments.map((assignment) => <tr key={`${assignment.device_id}-${assignment.assignment_generation}`}><td className="primary-cell">{assignment.device_name}<small className="cell-note">{assignment.device_id}</small></td><td>{assignment.branch_name}</td><td>{assignment.location_name}</td><td>{assignment.intended_usage}</td><td>{assignment.assignment_generation}</td><td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "Active" : "Inactive"}</span></td></tr>)}
-      </DataTable>
+      {!canManage && !error && <p className="form-note">Only the Owner can change branches, counters, staff and computers. You can look, but the boxes are locked.</p>}
+
+      <section className="scope-step">
+        <h3>Step 1 · Branches</h3>
+        <p className="form-note">A branch is one shop. Reports are totalled branch by branch.</p>
+        <div className="form-grid supplier-form-grid">
+          <Field label="Branch name"><input disabled={!canManage} placeholder="e.g. Jodhpur Main" value={branchDraft.branch_name} onChange={(event) => setBranchDraft({ ...branchDraft, branch_name: event.target.value })} /></Field>
+          <Field label="Address"><input disabled={!canManage} value={branchDraft.address} onChange={(event) => setBranchDraft({ ...branchDraft, address: event.target.value })} /></Field>
+          <Field label="Phone"><input disabled={!canManage} value={branchDraft.phone_number} onChange={(event) => setBranchDraft({ ...branchDraft, phone_number: event.target.value })} /></Field>
+          <Field label="GST number"><input disabled={!canManage} value={branchDraft.gst_number} onChange={(event) => setBranchDraft({ ...branchDraft, gst_number: event.target.value })} /></Field>
+          <button className="primary-button" disabled={!canManage || !branchDraft.branch_name.trim()} onClick={createBranch}>Add Branch</button>
+        </div>
+        {stepMessage("branches")}
+        <DataTable headers={["Branch", "Address", "Counters", "Status", "Actions"]}>
+          {data.branches.map((branch) => <tr key={branch.id}><td className="primary-cell">{branch.branch_name}</td><td>{branch.address || "-"}</td><td>{data.operational_locations.filter((location) => Number(location.branch_id) === Number(branch.id) && location.active !== false).length}</td><td><span className={branch.active !== false ? "stock-ok" : "stock-low"}>{branch.active !== false ? "Open" : "Closed"}</span></td><td><div className="button-row table-actions-row"><button className="table-action" disabled={!canManage} onClick={() => updateBranch(branch, branch.active !== false)}>Rename</button>{branch.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => updateBranch(branch, false)}>Close branch</button>}</div></td></tr>)}
+        </DataTable>
+      </section>
+
+      <section className="scope-step">
+        <h3>Step 2 · Counters</h3>
+        <p className="form-note">A counter is one billing point or store room inside a branch. Every bill, purchase and stock lot belongs to exactly one counter.</p>
+        <div className="form-grid supplier-form-grid">
+          <Field label="Branch"><select disabled={!canManage} value={locationDraft.branch_id} onChange={(event) => setLocationDraft({ ...locationDraft, branch_id: event.target.value })}><option value="">Select branch</option>{activeBranches.map((branch) => <option key={branch.id} value={branch.id}>{branch.branch_name}</option>)}</select></Field>
+          <Field label="Counter name"><input disabled={!canManage} placeholder="e.g. Main Counter" value={locationDraft.location_name} onChange={(event) => setLocationDraft({ ...locationDraft, location_name: event.target.value })} /></Field>
+          <Field label="Short code"><input disabled={!canManage} placeholder="e.g. MAIN-1" value={locationDraft.location_code} onChange={(event) => setLocationDraft({ ...locationDraft, location_code: event.target.value.toUpperCase() })} /></Field>
+          <Field label="Kind of counter"><select disabled={!canManage} value={locationDraft.location_type} onChange={(event) => setLocationDraft({ ...locationDraft, location_type: event.target.value })}><option value="STORE">Shop counter</option><option value="WAREHOUSE">Store room / warehouse</option><option value="MANDI_COUNTER">Mandi counter</option><option value="OFFICE">Office</option></select></Field>
+          <Field label="Address (optional)"><input disabled={!canManage} value={locationDraft.address} onChange={(event) => setLocationDraft({ ...locationDraft, address: event.target.value })} /></Field>
+          <label className="check-field"><input disabled={!canManage} type="checkbox" checked={locationDraft.is_default} onChange={(event) => setLocationDraft({ ...locationDraft, is_default: event.target.checked })} /><span>Main counter of this branch</span></label>
+          <button className="primary-button" disabled={!canManage || !locationDraft.branch_id || !locationDraft.location_code.trim() || !locationDraft.location_name.trim()} onClick={createLocation}>Add Counter</button>
+        </div>
+        {stepMessage("counters")}
+        <DataTable headers={["Counter", "Branch", "Kind", "Main counter", "Status", "Actions"]}>
+          {data.operational_locations.map((location) => <tr key={location.id}><td className="primary-cell">{location.location_name}<small className="cell-note">{location.location_code}</small></td><td>{location.branch_name}</td><td>{locationTypeLabel(location.location_type)}</td><td>{location.is_default ? "Yes" : "No"}</td><td><span className={location.active !== false ? "stock-ok" : "stock-low"}>{location.active !== false ? "Open" : "Closed"}</span></td><td><div className="button-row table-actions-row"><button className="table-action" disabled={!canManage} onClick={() => updateLocation(location, location.active !== false)}>Rename</button>{location.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => updateLocation(location, false)}>Close counter</button>}</div></td></tr>)}
+        </DataTable>
+      </section>
+
+      <section className="scope-step">
+        <h3>Step 3 · Staff at counters</h3>
+        <p className="form-note">A person can sign in only at a counter they are placed at. The Owner was placed at the first counter when it was created; place everyone else here.</p>
+        <div className="form-grid supplier-form-grid">
+          <Field label="Person"><select disabled={!canManage} value={staffDraft.user_id} onChange={(event) => { const selected = data.users.find((candidate) => String(candidate.id) === event.target.value); setStaffDraft({ ...staffDraft, user_id: event.target.value, role_id: selected?.role_id ? String(selected.role_id) : "" }); }}><option value="">Select person</option>{data.users.map((member) => <option key={member.id} value={member.id}>{member.full_name} ({member.role_name})</option>)}</select></Field>
+          <Field label="Branch"><select disabled={!canManage} value={staffDraft.branch_id} onChange={(event) => setStaffDraft({ ...staffDraft, branch_id: event.target.value, operational_location_id: "" })}><option value="">Select branch</option>{activeBranches.map((branch) => <option key={branch.id} value={branch.id}>{branch.branch_name}</option>)}</select></Field>
+          <Field label="Counter"><select disabled={!canManage || !staffDraft.branch_id} value={staffDraft.operational_location_id} onChange={(event) => setStaffDraft({ ...staffDraft, operational_location_id: event.target.value })}><option value="">{staffDraft.branch_id ? "Select counter" : "Select branch first"}</option>{locationsForBranch(staffDraft.branch_id).map((location) => <option key={location.id} value={location.id}>{location.location_name}</option>)}</select></Field>
+          <Field label="From date (optional)"><input disabled={!canManage} type="date" value={staffDraft.effective_from} onChange={(event) => setStaffDraft({ ...staffDraft, effective_from: event.target.value })} /></Field>
+          <Field label="Until date (leave empty for no end)"><input disabled={!canManage} type="date" value={staffDraft.effective_to} onChange={(event) => setStaffDraft({ ...staffDraft, effective_to: event.target.value })} /></Field>
+          <button className="primary-button" disabled={!canManage || !staffDraft.user_id || !staffDraft.operational_location_id || !staffDraft.role_id} onClick={saveStaffAssignment}>Place at Counter</button>
+        </div>
+        {stepMessage("staff")}
+        <DataTable headers={["Person", "Role", "Branch", "Counter", "Main counter", "Status", "Actions"]}>
+          {data.staff_assignments.map((assignment) => <tr key={assignment.id}><td className="primary-cell">{assignment.full_name}<small className="cell-note">{assignment.username}</small></td><td>{assignment.role_name || "-"}</td><td>{assignment.branch_name}</td><td>{assignment.location_name}</td><td>{assignment.is_default ? "Yes" : "No"}</td><td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "Can sign in" : "Removed"}</span></td><td>{assignment.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => deactivateStaffAssignment(assignment)}>Remove</button>}</td></tr>)}
+        </DataTable>
+      </section>
+
+      <section className="scope-step">
+        <h3>Step 4 · Computers</h3>
+        <p className="form-note">A new computer asks to join when it is first opened. Approve it and place it at a counter before it can bill.</p>
+        <h4>Waiting for approval</h4>
+        {data.pending_devices.map((device) => {
+          const draft = approvalDraft(device);
+          return <section className="settings-inline-panel" key={device.device_id}>
+            <div><strong>{device.device_name}</strong><small className="cell-note">{device.device_id} - {device.device_type || device.platform || "Other"}</small></div>
+            <div className="form-grid supplier-form-grid">
+              <Field label="Branch"><select disabled={!canManage} value={draft.branch_id} onChange={(event) => updateApprovalDraft(device, "branch_id", event.target.value)}><option value="">Select branch</option>{activeBranches.map((branch) => <option key={branch.id} value={branch.id}>{branch.branch_name}</option>)}</select></Field>
+              <Field label="Counter"><select disabled={!canManage || !draft.branch_id} value={draft.operational_location_id} onChange={(event) => updateApprovalDraft(device, "operational_location_id", event.target.value)}><option value="">{draft.branch_id ? "Select counter" : "Select branch first"}</option>{locationsForBranch(draft.branch_id).map((location) => <option key={location.id} value={location.id}>{location.location_name}</option>)}</select></Field>
+              <Field label="Name on the machine"><input disabled={!canManage} placeholder="e.g. Billing PC 1" value={draft.physical_label} onChange={(event) => updateApprovalDraft(device, "physical_label", event.target.value)} /></Field>
+              <Field label="Kind of computer"><select disabled={!canManage} value={draft.device_type} onChange={(event) => updateApprovalDraft(device, "device_type", event.target.value)}><option value="LAPTOP">Laptop</option><option value="DESKTOP">Desktop</option><option value="TABLET">Tablet</option><option value="ANDROID_PHONE">Android Phone</option><option value="IPHONE">iPhone</option><option value="OTHER">Other</option></select></Field>
+              <Field label="Used for"><select disabled={!canManage} value={draft.intended_usage} onChange={(event) => updateApprovalDraft(device, "intended_usage", event.target.value)}><option value="POS">Billing (POS)</option><option value="PURCHASE_ENTRY">Purchase Entry</option><option value="INVENTORY">Inventory</option><option value="ACCOUNTS">Accounts</option><option value="REPORTS">Reports</option><option value="OWNER_DASHBOARD">Owner Dashboard</option></select></Field>
+              <Field label="Who uses it"><select disabled={!canManage} value={draft.permitted_user_id} onChange={(event) => updateApprovalDraft(device, "permitted_user_id", event.target.value)}><option value="">Select person</option>{data.users.map((member) => <option key={member.id} value={member.id}>{member.full_name} ({member.role_name})</option>)}</select></Field>
+              <Field label="Their role"><select disabled value={draft.role_id}><option value="">Select person first</option>{data.roles.map((role) => <option key={role.id} value={role.id}>{role.role_name}</option>)}</select></Field>
+              <button className="primary-button" disabled={!canManage || !draft.branch_id || !draft.operational_location_id || !draft.physical_label.trim() || !draft.intended_usage || !draft.permitted_user_id || !draft.role_id} onClick={() => approveDeviceAssignment(device)}>Approve Computer</button>
+            </div>
+          </section>;
+        })}
+        {data.pending_devices.length === 0 && <p className="form-note">No computer is waiting for approval.</p>}
+        {stepMessage("computers")}
+        <h4>Approved computers</h4>
+        <DataTable headers={["Computer", "Branch", "Counter", "Used for", "Status"]}>
+          {data.device_assignments.map((assignment) => <tr key={`${assignment.device_id}-${assignment.assignment_generation}`}><td className="primary-cell">{assignment.device_name}<small className="cell-note">{assignment.device_id}</small></td><td>{assignment.branch_name}</td><td>{assignment.location_name}</td><td>{assignment.intended_usage}</td><td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "In use" : "Moved / retired"}</span></td></tr>)}
+        </DataTable>
+        {activeCounters.length === 0 && <p className="form-note">Add a counter in Step 2 before approving a computer.</p>}
+      </section>
     </ModuleCard>
   );
 }
@@ -20088,7 +22143,7 @@ function OtherChargesPanel({ canTypeAmount = false, chargeTypes = [], lines = []
   );
 }
 
-function PosBilling({ canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, onSeedConsumed, onWorkChange, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
+function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, canPosDateOverride = false, chargeTypes = [], counterScope = null, customers = [], deviceInfo = {}, discountRules = [], lotDiscounts = [], inventory, onConfigureMandiTax, onInvoice, onSaved, onSeedConsumed, onWorkChange, orders = [], paymentSettings = {}, posSettings = {}, printSettings = {}, products, refreshToken = 0, saleRateSettings = {}, seedCart = null, syncInBackground, user }) {
   /**
    * The charges this bill has picked: which charge, how much of it, and how many.
    *
@@ -20098,6 +22153,11 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
    */
   const [chargeSelections, setChargeSelections] = useState([]);
   const [search, setSearch] = useState("");
+  // Which shelf the counter is looking at. Remembered per machine, so the juice counter opens
+  // on Frooz Bar every morning. Reading storage can throw (site data blocked); Retail then.
+  const [posSection, setPosSection] = useState(() => {
+    try { return readPosSection(window.localStorage); } catch { return readPosSection(null); }
+  });
   const [barcode, setBarcode] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(0);
   const [lotSelectorProduct, setLotSelectorProduct] = useState(null);
@@ -20279,7 +22339,7 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     [counterScope, inventory, products],
   );
 
-  const searchResults = useMemo(() => {
+  const posMatches = useMemo(() => {
     const query = search.trim().toLowerCase();
     const matchesProduct = (product) => {
       if (!query) return true;
@@ -20309,9 +22369,34 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
     // list changes nothing; failing to filter an unfiltered one sells another shop's fruit.
     return filterSellableProducts(products, inventory, new Date(), counterScope)
       .filter((product) => matchesProduct(product))
-      .map((product) => ({ key: `product-${product.id}`, product, lotCount: (lotsByProduct.get(product.id) || []).filter(isSelectableLot).length }))
-      .slice(0, 12);
+      .map((product) => ({
+        key: `product-${product.id}`,
+        product,
+        lotCount: (lotsByProduct.get(product.id) || []).filter(isSelectableLot).length,
+        section: posSectionFor(product),
+      }));
   }, [counterScope, inventory, lotsByProduct, products, search]);
+  // A search looks across all three shelves, because a cashier typing "mango" on the Bar shelf
+  // wants the mango, not an empty screen. With no search the chosen shelf is shown whole.
+  const posSearching = Boolean(search.trim());
+  const posShelfCounts = useMemo(() => posSectionCounts(posMatches.map((option) => option.product)), [posMatches]);
+  // With nothing sellable anywhere, say which kind of nothing it is, with the counts behind it.
+  const posEmptyReason = useMemo(
+    () => (shelf.usable && shelf.products.length === 0
+      ? emptyShelfReason({ products, inventoryLots: inventory, scope: counterScope })
+      : ""),
+    [counterScope, inventory, products, shelf],
+  );
+  const searchResults = useMemo(
+    () => (posSearching ? posMatches.slice(0, 24) : posMatches.filter((option) => option.section.key === posSection)),
+    [posMatches, posSearching, posSection],
+  );
+  const choosePosSection = (key) => {
+    setPosSection(key);
+    setSearch("");
+    setHighlightedIndex(0);
+    try { writePosSection(window.localStorage, key); } catch { /* remembered for this run only */ }
+  };
 
   const salesMandiTaxBasisLabel = {
     GROSS_BEFORE_DISCOUNTS: "Gross item value before discounts",
@@ -21123,6 +23208,22 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
               />
             </label>
           </div>
+          <div className="pos-sections" role="tablist" aria-label="POS sections">
+            {POS_SECTIONS.map((section) => (
+              <button
+                aria-selected={!posSearching && posSection === section.key}
+                className={!posSearching && posSection === section.key ? "pos-section pos-section-active" : "pos-section"}
+                key={section.key}
+                onClick={() => choosePosSection(section.key)}
+                role="tab"
+                title={section.blurb}
+              >
+                <strong>{section.label}</strong>
+                <span>{posShelfCounts[section.key]}</span>
+              </button>
+            ))}
+            {posSearching && <small className="pos-sections-note">Searching all sections</small>}
+          </div>
           <div className="product-results">
             {searchResults.map((option, index) => {
               const { product } = option;
@@ -21136,6 +23237,9 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
               const rateLabel = minRate === maxRate
                 ? `${currency.format(minRate)}/${product.unit || "Unit"}`
                 : `${currency.format(minRate)} - ${currency.format(maxRate)}`;
+              // The owner's photo when there is one; otherwise the product's colour and first letter.
+              const photo = photoForProduct(productPhotoIndex, product);
+              const badge = posTileBadge(product.product_name);
               return (
                 <button
                   className={index === highlightedIndex ? "product-result product-result-active" : "product-result"}
@@ -21143,12 +23247,16 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
                   onClick={() => openLotSelector(product)}
                   title={`Select lot for ${product.product_name}`}
                 >
+                  {photo
+                    ? <img alt="" className="product-result-badge product-result-photo" src={photo} />
+                    : <span aria-hidden="true" className="product-result-badge" style={{ background: badge.tint, color: badge.ink }}>{badge.letter}</span>}
                   <span className="product-result-main">
                     <strong>{product.product_name}</strong>
                     <span className="product-result-meta">
                       <span>{activeLots.length} available lot{activeLots.length === 1 ? "" : "s"}</span>
                       <span>Stock: {stock.toLocaleString("en-IN", { maximumFractionDigits: 3 })}</span>
                       <span>Unit: {product.unit || "Unit"}</span>
+                      {posSearching && <span className="product-result-section">{posSectionLabel(option.section.key)}</span>}
                     </span>
                     <small>Rate: {rateLabel}{discountedCount ? ` - ${discountedCount} discounted lot${discountedCount === 1 ? "" : "s"}` : ""}</small>
                   </span>
@@ -21156,7 +23264,17 @@ function PosBilling({ canManualRateOverride = false, canPosDateOverride = false,
                 </button>
               );
             })}
-            {searchResults.length === 0 && (
+            {searchResults.length === 0 && !posSearching && shelf.usable && (
+              // An empty shelf is not an empty shop: say how a product gets onto it.
+              <div className="cart-empty">
+                {posEmptyReason
+                  ? posEmptyReason
+                  : posSection === "retail"
+                    ? "Nothing in Frooz Retail has stock right now."
+                    : `Nothing in ${posSectionLabel(posSection)} has stock right now. A product appears here when its category is named "${posSectionLabel(posSection)}" in Product Master and it has a lot in stock.`}
+              </div>
+            )}
+            {searchResults.length === 0 && (posSearching || !shelf.usable) && (
               <div className="cart-empty">
                 {shelf.usable
                   ? "No matching products or lots found."
@@ -22757,9 +24875,9 @@ function Field({ children, label }) {
   return <label><span>{label}</span>{children}</label>;
 }
 
-function ModuleCard({ children, eyebrow, subtitle, title }) {
+function ModuleCard({ children, eyebrow, id, subtitle, title }) {
   return (
-    <section className="content-card">
+    <section className="content-card" id={id}>
       <div className="card-heading">
         <div>
           <span className="eyebrow">{eyebrow}</span>
