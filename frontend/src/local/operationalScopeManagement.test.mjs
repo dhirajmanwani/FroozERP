@@ -89,3 +89,19 @@ test("the screen reads as four numbered steps, each reporting under its own butt
   const component = appSource.slice(appSource.indexOf("function OperationalScopeManagement"), appSource.indexOf("function _LegacySecurityDevicesSection"));
   assert.equal((component.match(/setError\(/g) || []).length, 2, "only the screen's own load may use the top banner");
 });
+
+test("coming straight to the screen after sign-in still lets the Owner type", () => {
+  // 25 Sep 2026: every box was locked because the permission came only from the Settings bundle,
+  // which loads when Settings is opened. The screen's own read proves the same server permission.
+  const component = appSource.slice(appSource.indexOf("function OperationalScopeManagement"), appSource.indexOf("function _LegacySecurityDevicesSection"));
+  assert.match(component, /const canManage = Boolean\(settingsSayManage\) \|\| scopeReadAllowed;/);
+  assert.match(component, /setScopeReadAllowed\(true\)/);
+  assert.match(component, /setScopeReadAllowed\(false\)/);
+  assert.ok(component.indexOf("setScopeReadAllowed(true)") > component.indexOf("/api/v3/admin/scope-management"));
+  // The read and every write on the screen share one server gate; if that ever changes, the
+  // shortcut above is no longer the exact answer.
+  const gated = backendSource.match(/use\("(get|post|put)", "\/api\/v3\/admin\/(scope-management|branches|operational-locations|staff-assignments|devices)[^"]*", async \([^)]*\) => \{\n\s*requireAssignmentOwner\(context\);/g) || [];
+  const routes = backendSource.match(/use\("(get|post|put)", "\/api\/v3\/admin\/(scope-management|branches|operational-locations|staff-assignments|devices)[^"]*"/g) || [];
+  assert.ok(routes.length >= 7, `expected the screen's routes, found ${routes.length}`);
+  assert.equal(gated.length, routes.length, "every route this screen calls must open with requireAssignmentOwner");
+});

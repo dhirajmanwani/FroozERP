@@ -21225,8 +21225,15 @@ const EMPTY_OPERATIONAL_SCOPE_DATA = Object.freeze({
   roles: [],
 });
 
-function OperationalScopeManagement({ canManage, user }) {
+function OperationalScopeManagement({ canManage: settingsSayManage, user }) {
   const [data, setData] = useState(EMPTY_OPERATIONAL_SCOPE_DATA);
+  // Whether the boxes on this screen can be typed in. `settingsSayManage` comes from the Settings
+  // bundle, which is only fetched when Settings or Orders is opened, so coming straight here after
+  // sign-in left every box locked (25 Sep 2026). The screen's own read is guarded by the very same
+  // server check as every write on it (`requireAssignmentOwner`), so a successful read is the
+  // exact answer, and a refused one keeps the boxes locked.
+  const [scopeReadAllowed, setScopeReadAllowed] = useState(false);
+  const canManage = Boolean(settingsSayManage) || scopeReadAllowed;
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   // Each step's own result, shown under that step's button. One banner at the top of a long screen
@@ -21243,7 +21250,9 @@ function OperationalScopeManagement({ canManage, user }) {
     try {
       const response = await axios.get(`${SYNC_API_URL}/api/v3/admin/scope-management`, createOperationalReadConfig(user));
       setData({ ...EMPTY_OPERATIONAL_SCOPE_DATA, ...(response.data || {}) });
+      setScopeReadAllowed(true);
     } catch (requestError) {
+      setScopeReadAllowed(false);
       setError(getErrorMessage(requestError, "Unable to load branch and device assignments"));
     } finally {
       setLoading(false);
@@ -21401,6 +21410,7 @@ function OperationalScopeManagement({ canManage, user }) {
   return (
     <ModuleCard eyebrow="Branches & Counters" title="Branches & Counters" subtitle="Set up in this order: 1. Branch (your shop)  2. Counter inside the branch  3. Staff at the counter  4. Computer at the counter.">
       {error && <div className="startup-status-panel"><p>{error}</p></div>}
+      {!canManage && !error && <p className="form-note">Only the Owner can change branches, counters, staff and computers. You can look, but the boxes are locked.</p>}
 
       <section className="scope-step">
         <h3>Step 1 · Branches</h3>
