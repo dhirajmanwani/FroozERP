@@ -76,6 +76,10 @@ jobs:
           java-version: "17"
 
       - uses: android-actions/setup-android@v3
+        with:
+          # The action's default list still names the retired `tools` package, which sdkmanager
+          # no longer knows, and the step fails. Everything else is installed explicitly below.
+          packages: platform-tools
 
       - name: Install Android platform, build-tools and NDK
         shell: bash
