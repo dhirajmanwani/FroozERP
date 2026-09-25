@@ -139,3 +139,19 @@ export const describeFrostRange = (range) => {
   if (!key) return "No period selected";
   return FROST_RANGE_LABELS[key] || `Period: ${key}`;
 };
+
+/**
+ * Whether this person sees FROST at all.
+ *
+ * FROST is the owner's assistant: the server seeds `ai_assistant_view` true for the Owner and
+ * false for every other role, and refuses FROST's routes to anyone without it. The launcher used to
+ * be drawn for everybody, so a cashier saw the button and got "you do not have permission" when
+ * they pressed it (25 Sep 2026 rehearsal). The screen now asks the same question the server does.
+ *
+ * `rolePermissions` is the role's permission object from the settings bundle, or undefined when it
+ * has not been read. Unknown means hidden: a missing list must never show FROST to a cashier.
+ */
+export function mayUseFrost({ role, rolePermissions } = {}) {
+  if (role === "Owner") return true;
+  return rolePermissions?.ai_assistant_view === true;
+}

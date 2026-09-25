@@ -126,3 +126,10 @@ test("App wires photos into Product Master and POS, and the drawings are gone", 
   assert.match(app, /<ModuleCard id="product-item-form"/);
   assert.match(app, /getElementById\("product-item-form"\)\?\.scrollIntoView/);
 });
+
+test("photos load once per sign-in, and Local Only reads only this computer's copy", () => {
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(app, /loadProductPhotos\(\{ deviceCopyOnly: isLocalOnlyConnectivitySelected\(\) \}\)\.catch\(\(\) => null\);\n[^\n]*\n\s*\}, \[user\?\.id\]\);/);
+  const loader = app.slice(app.indexOf("const loadProductPhotos = async"), app.indexOf("/api/v3/product-photos"));
+  assert.match(loader, /if \(deviceCopyOnly\) return;/, "Local Only must stop before the cloud request");
+});

@@ -115,3 +115,18 @@ test("the period is said in words, because a hidden filter is the Report Center 
     ["today", "yesterday", "last_7_days", "this_month", "last_month", "this_year", "last_year"],
   );
 });
+
+test("FROST is drawn only for someone the server would let use it", async () => {
+  const { mayUseFrost } = await import("./frostSurface.js");
+  assert.equal(mayUseFrost({ role: "Owner" }), true);
+  assert.equal(mayUseFrost({ role: "Cashier" }), false, "unknown permissions must hide it");
+  assert.equal(mayUseFrost({ role: "Cashier", rolePermissions: { ai_assistant_view: false } }), false);
+  assert.equal(mayUseFrost({ role: "Admin", rolePermissions: { ai_assistant_view: true } }), true, "an Owner may grant it");
+  assert.equal(mayUseFrost({ role: "Admin", rolePermissions: { ai_assistant_view: "yes" } }), false);
+  assert.equal(mayUseFrost(), false);
+
+  const { readFileSync } = await import("node:fs");
+  const app = readFileSync(new URL("../App.jsx", import.meta.url), "utf8");
+  assert.match(app, /\{frostVisible && <FrostFloatingCopilot/);
+  assert.match(app, /const openFrostDrawer = [^\n]*\n\s*if \(!frostVisible\) return;/);
+});

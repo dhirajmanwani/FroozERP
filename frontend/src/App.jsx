@@ -223,6 +223,7 @@ import {
 import {
   FROST_PRIMARY_SECTION,
   describeFrostRange,
+  mayUseFrost,
   resolveFrostSurface,
 } from "./local/frostSurface";
 import {
@@ -3984,6 +3985,8 @@ function App() {
     return Boolean(permissions[permissionKey]);
   };
 
+  // FROST is drawn only for someone the server would let use it (see `mayUseFrost`).
+  const frostVisible = mayUseFrost({ role: user?.role, rolePermissions: rolePermissionMap.get(user?.role) });
   const hasRolePermission = (permissionKey) => {
     if (!user) return false;
     if (user.role === "Owner") return true;
@@ -5118,13 +5121,15 @@ function App() {
     setProducts((current) => preserveVerifiedLocalCollection(response.data, current));
     setProductDuplicateWarning(duplicateLogResponse.data?.message || "");
   };
-  const loadProductPhotos = async () => {
+  const loadProductPhotos = async ({ deviceCopyOnly = false } = {}) => {
     const browserIndexedDb = typeof window !== "undefined" ? window.indexedDB : null;
     const cached = await readCachedProductPhotos(browserIndexedDb);
     if (cached) {
       setProductPhotos(cached.photos);
       setProductPhotosState({ source: "device", message: "" });
     }
+    // Local Only never reaches the cloud, for photos or anything else.
+    if (deviceCopyOnly) return;
     try {
       const response = await axios.get(`${API_URL}/api/v3/product-photos`, { ...createOperationalReadConfig(user), timeout: 20000 });
       const photos = Array.isArray(response.data?.photos) ? response.data.photos : null;
@@ -5142,6 +5147,15 @@ function App() {
       });
     }
   };
+  // Once per sign-in, whatever screen opens first. Photos used to load only on the way into Product
+  // Master or POS by the menu, so a cashier who lands on POS straight after signing in never got
+  // any (25 Sep 2026). This computer's saved copy shows at once; the cloud copy follows unless the
+  // device is Local Only.
+  useEffect(() => {
+    if (!user?.id) return;
+    loadProductPhotos({ deviceCopyOnly: isLocalOnlyConnectivitySelected() }).catch(() => null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- once per sign-in, not once per render.
+  }, [user?.id]);
   const loadProductCategories = async () => {
     const response = await axios.get(
       `${API_URL}/api/v3/product-categories`,
@@ -8796,6 +8810,7 @@ function App() {
     ? buildPaymentPlan({ payload: paymentsDue.payload, failure: paymentsDue.error })
     : null;
   const openFrostDrawer = (section = frostActiveTab || FROST_PRIMARY_SECTION) => {
+    if (!frostVisible) return;
     setFrostActiveTab(section);
     setFrostDrawerOpen(true);
     // FROST opens on an empty chat, the way an assistant does, rather than on whatever was said
@@ -10320,7 +10335,7 @@ function App() {
           payTotal={paymentsPopup.payTotal}
         />
       )}
-      <FrostFloatingCopilot
+      {frostVisible && <FrostFloatingCopilot
         activeSection={frostActiveTab}
         data={aiAssistantData}
         duesOutreach={frostDuesOutreach}
@@ -10365,7 +10380,7 @@ function App() {
         range={aiRange}
         unreadCount={frostUnreadCount}
         user={user}
-      />
+      />}
       {commandPaletteOpen && (
         <CommandPalette
           index={commandIndex}
