@@ -112,7 +112,17 @@ jobs:
             echo "::error::src-tauri/gen/android is present in the checkout. It is a generated project and must not be committed."
             exit 1
           fi
-          frontend/node_modules/.bin/tauri android init --ci --skip-targets-install
+          # Run the CLI's JS entry through node by absolute path. `init` records how it was started
+          # into gen/android's BuildTask.kt, which Gradle later uses to call back into the CLI; via
+          # the .bin symlink it recorded a bare `tauri` and Gradle looked for src-tauri/tauri.
+          node "${GITHUB_WORKSPACE}/frontend/node_modules/@tauri-apps/cli/tauri.js" android init --ci --skip-targets-install
+          task="$(find src-tauri/gen/android/buildSrc -name BuildTask.kt | head -n 1)"
+          echo "Gradle calls the CLI as:"
+          grep -nE 'val executable|val args' "${task}"
+          if ! grep -q '@tauri-apps/cli/tauri.js' "${task}"; then
+            echo "::error::${task} does not call the Tauri CLI's tauri.js; Gradle's Rust build step would fail."
+            exit 1
+          fi
 
       - name: Harden generated Android project (no backup, no device transfer, no cleartext)
         shell: bash
@@ -137,7 +147,7 @@ jobs:
           if [ -z "${VITE_CLOUD_API_URL}" ]; then
             echo "::warning::No cloud_api_url given: this APK talks to the PRODUCTION cloud."
           fi
-          frontend/node_modules/.bin/tauri android build --ci --debug --apk --target ${targets}
+          node "${GITHUB_WORKSPACE}/frontend/node_modules/@tauri-apps/cli/tauri.js" android build --ci --debug --apk --target ${targets}
 
       - name: Verify the built APK kept the hardening
         shell: bash
