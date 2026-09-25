@@ -106,3 +106,15 @@ test("the empty case is still passed to the child, not left unset", () => {
   assert.match(cloudFn, /return String::new\(\)/, "the empty answer must be a value, not an omission");
   assert.doesNotMatch(RUST, /env_remove\("CLOUD_API_URL"\)/, "and must not be expressed as a removal");
 });
+
+test("a phone build chooses its cloud when the APK is built, and never touches the desktop rule", () => {
+  // A phone has no environment to set and no disposable profile of live data, so a debug APK with
+  // no cloud could never sign in. It names one at compile time instead; desktop keeps the rule above.
+  const mobileFn = RUST.slice(RUST.indexOf("fn mobile_cloud_api_url"), RUST.indexOf("fn local_backend_url"));
+  assert.match(cloudFn, /if cfg!\(mobile\) \{\s*return mobile_cloud_api_url\(\);\s*\}/);
+  assert.match(mobileFn, /option_env!\("FROOZERP_MOBILE_CLOUD_API_URL"\)/, "a rehearsal APK is pointed away from production at build time");
+  assert.ok(
+    mobileFn.indexOf("FROOZERP_MOBILE_CLOUD_API_URL") < mobileFn.indexOf("PRODUCTION_CLOUD_API_URL"),
+    "the build-time address wins over production",
+  );
+});

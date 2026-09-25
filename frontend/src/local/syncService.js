@@ -4,6 +4,7 @@ import { optionalSessionAuthHeaders } from "./authHeaders";
 import { SESSION_FAILURE_KINDS, classifySessionFailure } from "./sessionExpiry";
 import { checkFroozBackendHealth, getConnectivitySnapshot } from "./connectivityService";
 import { isTauriRuntime } from "./localDatabase";
+import { currentDevicePlatform } from "./mobileGateway.js";
 import { repositories } from "./repositories";
 import { classifySyncError } from "./syncClassification";
 import {
@@ -204,7 +205,7 @@ export async function initialiseSync({ apiUrl, user, deviceInfo, branchId }) {
   const registrationResponse = await axios.post(endpointUrl(apiUrl, "/api/sync/register-device"), {
     device_id: context.deviceId,
     device_name: context.deviceName || "FroozERP Device",
-    platform: "tauri-windows",
+    platform: currentDevicePlatform(),
     app_version: String(import.meta.env.VITE_APP_VERSION || "1.0.33"),
     branch_id: context.branchId,
     user_id: context.userId,

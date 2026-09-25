@@ -3,5 +3,6 @@
   "identifier": "default",
   "description": "Default FroozERP desktop permissions",
   "windows": ["main"],
+  "platforms": ["windows", "linux", "macOS"],
   "permissions": ["core:default", "updater:default", "process:default"]
 }

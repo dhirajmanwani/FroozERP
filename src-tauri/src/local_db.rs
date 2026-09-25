@@ -3669,7 +3669,7 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
         .filter(|value| value != "default")
         .ok_or_else(|| "Reference snapshot has no canonical device identity".to_string())?;
     let device_name = optional_text(&device_identity, "device_name").unwrap_or_else(|| "FroozERP Device".to_string());
-    let platform = optional_text(&device_identity, "platform").unwrap_or_else(|| "tauri-windows".to_string());
+    let platform = optional_text(&device_identity, "platform").unwrap_or_else(|| LOCAL_DEVICE_PLATFORM.to_string());
     let app_version = optional_text(&device_identity, "app_version").unwrap_or_else(|| "1.0.0".to_string());
     // §6.3 / §12: a snapshot that OMITS `registration_status` must yield the device's EXISTING
     // status, never an upgrade to approved. The old default asserted approval on the strength of a
@@ -5771,25 +5771,24 @@ fn ensure_device_identity_with_preference_at(
         return Ok(identity.clone());
     }
 
-    let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows Device".to_string());
     let device_id = preferred_device_id
         .map(ToOwned::to_owned)
         .map(Ok)
         .unwrap_or_else(generate_opaque_device_id)?;
-    let device_name = format!("{} - FroozERP", hostname);
+    let device_name = format!("{} - FroozERP", local_device_host_name(&device_id));
     let app_version = env!("CARGO_PKG_VERSION");
     conn.execute(
         "INSERT INTO local_device_identity (
             device_id, device_name, platform, app_version, branch_id, registration_status, last_seen_at, updated_at
-         ) VALUES (?1, ?2, 'tauri-windows', ?3, 'unassigned', 'pending', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-        params![device_id, device_name, app_version],
+         ) VALUES (?1, ?2, ?4, ?3, 'unassigned', 'pending', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        params![device_id, device_name, app_version, LOCAL_DEVICE_PLATFORM],
     )
     .map_err(to_error)?;
 
     Ok(serde_json::json!({
         "device_id": device_id,
         "device_name": device_name,
-        "platform": "tauri-windows",
+        "platform": LOCAL_DEVICE_PLATFORM,
         "app_version": app_version,
         "branch_id": "unassigned",
         "registration_status": "pending",
@@ -6048,9 +6047,57 @@ fn generate_opaque_device_id() -> Result<String, String> {
     ))
 }
 
+/// Android, iOS (and the non-shipped Linux/macOS desktop builds): a random version-4 UUID from the
+/// OS CSPRNG, in the same `FZDEV-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX` upper-case shape the Windows
+/// `CoCreateGuid` path produces. This used to be `FZDEV-installation-<millis>-<checksum>`, which is
+/// derived from the clock alone: two phones set up in the same millisecond would have been the same
+/// device to the cloud.
 #[cfg(not(windows))]
 fn generate_opaque_device_id() -> Result<String, String> {
-    Ok(format!("FZDEV-{}", unique_local_id("installation")))
+    Ok(format!(
+        "FZDEV-{}",
+        uuid::Uuid::new_v4()
+            .hyphenated()
+            .encode_upper(&mut uuid::Uuid::encode_buffer())
+    ))
+}
+
+/// The `platform` this shell registers its device as. Windows keeps `tauri-windows`; the phone
+/// builds say what they are. The non-shipped Linux/macOS builds keep the old value, which is what
+/// they have always reported (and what this file's tests expect).
+#[cfg(target_os = "android")]
+const LOCAL_DEVICE_PLATFORM: &str = "tauri-android";
+#[cfg(target_os = "ios")]
+const LOCAL_DEVICE_PLATFORM: &str = "tauri-ios";
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const LOCAL_DEVICE_PLATFORM: &str = "tauri-windows";
+
+/// The first half of a new device's name ("<this> - FroozERP"). Windows: `COMPUTERNAME`, exactly as
+/// before. A phone has no host name an app can read without a platform plugin, so it is named after
+/// its kind plus the last four characters of its device id -- enough for an Owner approving devices
+/// to tell two phones apart, and it never changes because the id never does.
+fn local_device_host_name(device_id: &str) -> String {
+    if cfg!(any(target_os = "android", target_os = "ios")) {
+        return mobile_device_host_name(device_id);
+    }
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows Device".to_string())
+}
+
+fn mobile_device_host_name(device_id: &str) -> String {
+    let kind = if cfg!(target_os = "ios") { "iPhone/iPad" } else { "Android" };
+    let suffix = device_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<Vec<_>>();
+    let suffix = suffix[suffix.len().saturating_sub(4)..]
+        .iter()
+        .collect::<String>()
+        .to_uppercase();
+    if suffix.is_empty() {
+        format!("{} Device", kind)
+    } else {
+        format!("{} Device {}", kind, suffix)
+    }
 }
 
 fn apply_pulled_pos_sale_with_tx(
@@ -12821,5 +12868,30 @@ mod tests {
         );
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_non_windows_device_id_is_a_random_uuid_in_the_windows_shape() {
+        let first = generate_opaque_device_id().expect("device id");
+        let second = generate_opaque_device_id().expect("device id");
+        assert_ne!(first, second, "two installs set up together must not share an identity");
+        for id in [&first, &second] {
+            let uuid = id.strip_prefix("FZDEV-").expect("FZDEV- prefix");
+            let groups = uuid.split('-').map(str::len).collect::<Vec<_>>();
+            assert_eq!(groups, [8, 4, 4, 4, 12], "{id}");
+            assert!(uuid.chars().all(|ch| ch == '-' || ch.is_ascii_digit() || ch.is_ascii_uppercase()), "{id}");
+            assert_eq!(&uuid[14..15], "4", "version 4: {id}");
+        }
+    }
+
+    #[test]
+    fn a_phone_is_named_after_its_kind_and_the_end_of_its_id() {
+        let name = mobile_device_host_name("FZDEV-1B4E28BA-2FA1-11D2-883F-0016D3CCA427");
+        assert!(name.ends_with(" Device A427"), "{name}");
+        assert!(mobile_device_host_name("--").ends_with(" Device"));
+        if cfg!(not(any(target_os = "android", target_os = "ios"))) {
+            assert_eq!(LOCAL_DEVICE_PLATFORM, "tauri-windows", "desktop registration is unchanged");
+        }
     }
 }

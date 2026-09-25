@@ -161,16 +161,19 @@ test("nothing saved or configured can point the desktop at another port", () => 
   //
   // So the desktop branch must take the port from the build and nothing else. `.env.example` still
   // ships `VITE_LOCAL_API_URL=http://127.0.0.1:5000`, which is a second door to the same place.
+  //
+  // The phone app (no gateway process; see mobileGateway.js) takes the branch ahead of it, and that
+  // branch may be nothing but the gateway sentinel -- a phone must not inherit a saved address either.
   assert.match(
     APP,
-    /const LOCAL_API_URL = isDesktopShell\(\)\s*\n\s*\? `http:\/\/127\.0\.0\.1:\$\{LOCAL_BACKEND_PORT\}`/,
+    /const LOCAL_API_URL = MOBILE_SHELL\s*\n\s*\? MOBILE_GATEWAY_BASE_URL\s*\n\s*: isDesktopShell\(\)\s*\n\s*\? `http:\/\/127\.0\.0\.1:\$\{LOCAL_BACKEND_PORT\}`/,
     "the desktop address must be built from LOCAL_BACKEND_PORT with no override ahead of it",
   );
 
   // The precedence chain must not reappear on the desktop side of that branch. Checked by position:
   // a saved value may still win in a browser, where no shell is starting anything.
   const declaration = APP.slice(
-    APP.indexOf("const LOCAL_API_URL = isDesktopShell()"),
+    APP.indexOf("const LOCAL_API_URL = MOBILE_SHELL"),
     APP.indexOf("const BRANCH_LAN_API_URL"),
   );
   const desktopBranch = declaration.slice(0, declaration.indexOf(": normalizeApiBase("));

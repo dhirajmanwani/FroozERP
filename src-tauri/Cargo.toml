@@ -50,6 +50,25 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
+
+# The updater and process plugins are desktop-only. The phone app is updated through its store, and
+# `tauri-plugin-updater` would otherwise try to install a Windows NSIS feed. Registered in lib.rs
+# under `#[cfg(desktop)]` only, and their permissions are desktop-only in capabilities/default.json.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
+
+[target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Com", "Win32_System_Threading", "Win32_UI_Controls_Dialogs", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+# The phone app's cloud-health and authoritative-time probes (src/mobile_gateway.rs), which the Node
+# desktop gateway makes with `fetch` on Windows. Not a Windows dependency: the Windows build never
+# links it and its behaviour is unchanged. Compiled on the non-shipped Linux/macOS desktop builds
+# too, so that `cargo check`/`cargo test` on a Linux machine type-check the code the phone runs;
+# the probe is only *used* when `cfg(mobile)`. rustls + bundled webpki roots: no JNI-initialised
+# platform verifier on Android, no OpenSSL to cross-compile.
+[target.'cfg(not(windows))'.dependencies]
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# Device identity where there is no CoCreateGuid (Android, iOS, and the non-shipped Linux/macOS
+# desktop builds): a random v4 UUID. Windows keeps its CoCreateGuid path in local_db.rs unchanged.
+uuid = { version = "1", features = ["v4"] }

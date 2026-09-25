@@ -1,8 +1,15 @@
+// A phone build (`cfg(mobile)`, set by tauri-build for Android and iOS) compiles the whole shell
+// but never runs the Windows sidecar, updater and cleanup code, which is gated off below. What is
+// left of those helpers is dead code there, not a defect; the allowance is for mobile builds only,
+// so the desktop build keeps every warning it had.
+#![cfg_attr(mobile, allow(dead_code, unused_imports, unused_variables))]
+
 // Offline activation entitlement core (Stage 1). Pure logic, no call sites yet — the module is
 // declared so it compiles and its tests run; nothing in the app invokes it.
 pub mod entitlement;
 pub mod activation;
 mod local_db;
+mod mobile_gateway;
 
 use local_db::{
     LocalDbStatus, LocalPosSaleResult, LocalPurchaseIntentResult, PendingSyncOperation, PulledChange, SyncAck, SyncOperation,
@@ -20,7 +27,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex,
+        Mutex, OnceLock,
     },
     thread,
     time::Duration,
@@ -44,6 +51,12 @@ static KIOSK_LOCK_ENABLED: AtomicBool = AtomicBool::new(false);
 static KIOSK_CLOSE_ALLOWED: AtomicBool = AtomicBool::new(false);
 static LOCAL_BACKEND_PROCESS: Mutex<Option<Child>> = Mutex::new(None);
 static LOCAL_BACKEND_START_GUARD: Mutex<()> = Mutex::new(());
+/// Tauri's own answer for the app-data directory, captured at the start of `setup`. Consulted only
+/// on a phone -- see `app_data_dir`.
+static RESOLVED_APP_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// Whether the phone app's SQLite file has been created and migrated. On desktop the sidecar launch
+/// does this before the gateway starts; a phone has no launch step, so the first gateway request does.
+static MOBILE_SQLITE_READY: Mutex<bool> = Mutex::new(false);
 #[cfg(target_os = "windows")]
 static DESKTOP_INSTANCE_MUTEX: Mutex<Option<isize>> = Mutex::new(None);
 const LOCAL_BACKEND_PORT: &str = "5000";
@@ -292,13 +305,32 @@ fn tail_text_file(path: &Path, max_bytes: usize) -> String {
     String::from_utf8_lossy(&bytes[start..]).trim().to_string()
 }
 
+/// The one app-data directory every file in the shell lives under.
+///
+/// Resolution order:
+///
+/// 1. **The disposable/test override** (`NODE_ENV=test` + an absolute `FROOZERP_ISOLATED_SQLITE_DIR`),
+///    on every platform, exactly as before -- `local_db::database_path` applies the same rule, so the
+///    SQLite file and everything else stay in one isolated profile.
+/// 2. **On a phone, Tauri's path resolver** (`app.path().app_data_dir()`), captured in `setup`.
+///    Android and iOS have no `%APPDATA%`, and the old fallback was `temp_dir()` -- on Android an
+///    unwritable `/data/local/tmp` -- so logs, the gateway policy file and the WebView-recovery
+///    marker would all have failed. It is also what `local_db` already uses for the database.
+/// 3. **Everywhere else, `%APPDATA%\com.srtcompany.froozerp`, unchanged.** On Windows Tauri's
+///    resolver lands in the same folder (`dirs::data_dir()` is FOLDERID_RoamingAppData, plus the
+///    identifier), but it is not the same *rule*: it ignores the `APPDATA` variable, which the
+///    Windows lifecycle test overrides, and it does not exist before `setup`, while the panic hook
+///    and the first log line need a path earlier than that. So the Windows code path is kept as is.
+///
+/// Before `setup` on a phone (the first log line only) this falls through to (3); nothing is
+/// persisted there. Code that must not use a guessed directory calls `app_data_dir_if_resolved`.
 fn app_data_dir() -> PathBuf {
-    if env::var("NODE_ENV").ok().as_deref() == Some("test") {
-        if let Some(path) = env::var_os("FROOZERP_ISOLATED_SQLITE_DIR")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-        {
-            return path;
+    if let Some(path) = isolated_app_data_dir() {
+        return path;
+    }
+    if cfg!(mobile) {
+        if let Some(path) = RESOLVED_APP_DATA_DIR.get() {
+            return path.clone();
         }
     }
     env::var_os("APPDATA")
@@ -307,6 +339,143 @@ fn app_data_dir() -> PathBuf {
         .join("com.srtcompany.froozerp")
 }
 
+/// The disposable/test profile override: `NODE_ENV=test` and an absolute
+/// `FROOZERP_ISOLATED_SQLITE_DIR`. A relative path is ignored, as it always was.
+fn isolated_app_data_dir() -> Option<PathBuf> {
+    if env::var("NODE_ENV").ok().as_deref() != Some("test") {
+        return None;
+    }
+    env::var_os("FROOZERP_ISOLATED_SQLITE_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
+/// `app_data_dir()`, or `None` on a phone whose directory has not been resolved (before `setup`, or
+/// if the resolver failed). The phone gateway treats `None` as an unreadable policy -- cloud access
+/// denied -- rather than reading a guessed directory, finding no policy file and allowing it.
+fn app_data_dir_if_resolved() -> Option<PathBuf> {
+    if cfg!(mobile) && isolated_app_data_dir().is_none() && RESOLVED_APP_DATA_DIR.get().is_none() {
+        return None;
+    }
+    Some(app_data_dir())
+}
+
+/// Captures Tauri's app-data directory. Called first thing in `setup` on every platform, so the
+/// desktop build exercises it too; only a phone reads the value back (see `app_data_dir`).
+fn remember_resolved_app_data_dir(app: &AppHandle) {
+    match app.path().app_data_dir() {
+        Ok(path) => {
+            let _ = RESOLVED_APP_DATA_DIR.set(path);
+        }
+        Err(error) => write_app_log(
+            "ERROR",
+            &format!("Unable to resolve the app data directory: {}", error),
+        ),
+    }
+}
+
+/// The message a desktop-only command returns in the phone app.
+#[cfg_attr(desktop, allow(dead_code))]
+fn not_in_phone_app<T>(feature: &str) -> Result<T, String> {
+    Err(format!("{} is not available in the phone app.", feature))
+}
+
+/// Creates and migrates the phone app's SQLite file once. No-op on desktop, where the sidecar launch
+/// does it (`ensure_local_backend_service_internal`).
+fn ensure_mobile_sqlite_ready() {
+    if !cfg!(mobile) || app_data_dir_if_resolved().is_none() {
+        return;
+    }
+    let mut ready = MOBILE_SQLITE_READY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *ready {
+        return;
+    }
+    match local_db::initialize_path(&local_sqlite_database_path()) {
+        Ok(status) => {
+            write_app_log(
+                "INFO",
+                &format!(
+                    "Phone SQLite initialized: path={}, schema={}",
+                    status.database_path, status.schema_version
+                ),
+            );
+            *ready = true;
+        }
+        Err(error) => write_app_log(
+            "ERROR",
+            &format!("Unable to initialize phone SQLite database: {}", error),
+        ),
+    }
+}
+
+/// The phone gateway's view of this installation: the same directory, database and cloud address
+/// the desktop shell hands `desktopGateway.js` (`FROOZERP_APP_DATA_DIR`, `FROOZERP_SQLITE_PATH`,
+/// `CLOUD_API_URL`), and a probe that can only connect on a phone.
+fn with_gateway_context<T>(run: impl FnOnce(&mobile_gateway::GatewayContext<'_>) -> T) -> T {
+    let app_data_dir = app_data_dir_if_resolved();
+    let sqlite_path = app_data_dir
+        .as_ref()
+        .map(|_| local_sqlite_database_path());
+    // On desktop the Node gateway owns every cloud request; the shell itself never makes one.
+    #[cfg(mobile)]
+    let probe = mobile_gateway::HttpCloudProbe;
+    #[cfg(desktop)]
+    let probe = mobile_gateway::NoNetworkProbe;
+    let context = mobile_gateway::GatewayContext {
+        app_data_dir,
+        sqlite_path,
+        cloud_api_url: mobile_gateway::normalize_cloud_api_url(&cloud_api_url()),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        probe: &probe,
+    };
+    run(&context)
+}
+
+#[tauri::command]
+fn runtime_profile() -> mobile_gateway::RuntimeProfile {
+    mobile_gateway::runtime_profile()
+}
+
+const PHONE_GATEWAY_ONLY: &str = "The phone gateway commands run only in the phone app; the desktop uses its local gateway.";
+
+/// The local routes of `desktopGateway.js`, for the phone. See `mobile_gateway.rs`.
+#[tauri::command]
+async fn mobile_gateway_request(
+    request: mobile_gateway::GatewayRequest,
+) -> Result<mobile_gateway::GatewayResponse, String> {
+    // The desktop has the Node gateway for this; a second writer of its policy file and audit log
+    // from the desktop webview would be a second door into the kill switch.
+    if !cfg!(mobile) {
+        return Err(PHONE_GATEWAY_ONLY.to_string());
+    }
+    // Off the main thread: /api/cloud/health and an Owner's switch back to Auto each wait on the
+    // cloud (up to 8 s and 5 s, as in the gateway).
+    tauri::async_runtime::spawn_blocking(move || {
+        ensure_mobile_sqlite_ready();
+        with_gateway_context(|context| mobile_gateway::handle_request(context, &request))
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// The gateway's LOCAL_ONLY / cloud-configured decision (and audit) for a request it would proxy.
+#[tauri::command]
+async fn mobile_gateway_cloud_decision(
+    request: mobile_gateway::CloudDecisionRequest,
+) -> Result<mobile_gateway::CloudDecision, String> {
+    if !cfg!(mobile) {
+        return Err(PHONE_GATEWAY_ONLY.to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        with_gateway_context(|context| mobile_gateway::cloud_decision(context, &request))
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(desktop)]
 fn cleanup_updater_temp_artifacts() {
     let temp_dir = env::temp_dir();
     let Ok(entries) = fs::read_dir(&temp_dir) else {
@@ -501,8 +670,25 @@ fn cloud_api_url() -> String {
             }
         }
     }
+    if cfg!(mobile) {
+        return mobile_cloud_api_url();
+    }
     if cfg!(debug_assertions) {
         return String::new();
+    }
+    PRODUCTION_CLOUD_API_URL.to_string()
+}
+
+/// The cloud a phone build talks to. A phone has no shell environment to set and no disposable
+/// profile holding a copy of live data (the reason a desktop debug build gets no cloud), so the
+/// address is chosen when the APK is built: `FROOZERP_MOBILE_CLOUD_API_URL` at compile time for a
+/// rehearsal cloud, otherwise production. Without one a debug APK could never sign in at all.
+fn mobile_cloud_api_url() -> String {
+    if let Some(configured) = option_env!("FROOZERP_MOBILE_CLOUD_API_URL") {
+        let trimmed = configured.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
     }
     PRODUCTION_CLOUD_API_URL.to_string()
 }
@@ -772,6 +958,7 @@ fn backend_startup_source(node_path: &Path) -> &'static str {
     }
 }
 
+#[cfg(desktop)]
 fn backend_status(
     message: String,
     healthy: bool,
@@ -838,6 +1025,7 @@ fn clear_backend_ownership(token: &str) {
     }
 }
 
+#[cfg(desktop)]
 fn stop_owned_backend(reason: &str) -> bool {
     let mut stopped_owned_backend = false;
     if let Ok(mut guard) = LOCAL_BACKEND_PROCESS.lock() {
@@ -868,6 +1056,9 @@ fn stop_owned_backend(reason: &str) -> bool {
     stopped_owned_backend
 }
 
+/// The Node sidecar (`desktopGateway.js`). Desktop only: a phone has no Node runtime and no
+/// `froozerp-backend-node.exe`; its local routes are served by `mobile_gateway` instead.
+#[cfg(desktop)]
 fn ensure_local_backend_service_internal(force_restart: bool) -> BackendServiceStatus {
     // The native startup worker and the React startup check can arrive together.
     // Serialize them so one valid launch cannot be mistaken for a stale lock.
@@ -1336,6 +1527,8 @@ fn push_shortcut_candidate(candidates: &mut Vec<CleanupCandidate>, path: PathBuf
     }
 }
 
+/// Windows install cleanup (Program Files folders, shortcuts, `reg query`). Desktop only.
+#[cfg(desktop)]
 fn froozerp_cleanup_candidates() -> CleanupResult {
     let install_dir = current_install_dir();
     let data_dir = app_data_dir();
@@ -1468,6 +1661,7 @@ fn froozerp_cleanup_candidates() -> CleanupResult {
     }
 }
 
+#[cfg(desktop)]
 fn froozerp_install_diagnostics(package_version: String) -> InstallDiagnostics {
     let cleanup = froozerp_cleanup_candidates();
     let (update_transaction_status, update_transaction_message, update_transaction_target_version) =
@@ -1512,6 +1706,8 @@ fn wait_for_file_unlock(path: &Path, attempts: usize, delay: Duration) -> bool {
     is_file_unlocked(path)
 }
 
+/// Who listens on the backend port, from `netstat -ano -p tcp` (Windows syntax). Desktop only.
+#[cfg(desktop)]
 fn backend_port_owner_pid() -> Option<u32> {
     let mut netstat = Command::new("netstat");
     hide_child_console(&mut netstat);
@@ -1568,6 +1764,7 @@ fn is_froozerp_backend_process_path(path: &Path) -> bool {
         && is_under(path, &current_install_dir())
 }
 
+#[cfg(desktop)]
 fn stop_verified_backend_pid(pid: u32, reason: &str) -> bool {
     let Some(path) = windows_process_executable_path(pid) else {
         write_app_log(
@@ -1764,6 +1961,14 @@ fn unique_preview_pdf_path(preview_dir: &Path, file_name: &str) -> PathBuf {
 
 #[tauri::command]
 fn open_pdf_in_system_viewer(file_name: String, bytes: Vec<u8>) -> Result<String, String> {
+    #[cfg(mobile)]
+    return not_in_phone_app("Opening a PDF in the system viewer");
+    #[cfg(desktop)]
+    return open_pdf_in_system_viewer_desktop(file_name, bytes);
+}
+
+#[cfg(desktop)]
+fn open_pdf_in_system_viewer_desktop(file_name: String, bytes: Vec<u8>) -> Result<String, String> {
     if bytes.is_empty() {
         return Err("PDF file is empty".to_string());
     }
@@ -1790,6 +1995,14 @@ fn open_pdf_in_system_viewer(file_name: String, bytes: Vec<u8>) -> Result<String
 
 #[tauri::command]
 fn open_startup_log() -> Result<String, String> {
+    #[cfg(mobile)]
+    return not_in_phone_app("Opening the startup log");
+    #[cfg(desktop)]
+    return open_startup_log_desktop();
+}
+
+#[cfg(desktop)]
+fn open_startup_log_desktop() -> Result<String, String> {
     let path = diagnostic_log_path();
     if !path.exists() {
         return Err(format!("Startup log does not exist yet: {}", path.to_string_lossy()));
@@ -1925,8 +2138,18 @@ fn save_pdf_with_dialog(file_name: String, bytes: Vec<u8>) -> Result<Option<Stri
     Ok(Some(path.to_string_lossy().to_string()))
 }
 
+/// Kiosk lock. On a phone this returns Ok and does nothing: there is no window chrome to remove
+/// (`set_fullscreen`/`set_decorations` do not exist there) and no way to close the app from it.
 #[tauri::command]
 fn set_kiosk_mode(app: AppHandle, enabled: bool) -> Result<(), String> {
+    #[cfg(mobile)]
+    return Ok(());
+    #[cfg(desktop)]
+    return set_kiosk_mode_desktop(app, enabled);
+}
+
+#[cfg(desktop)]
+fn set_kiosk_mode_desktop(app: AppHandle, enabled: bool) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "Main window not available".to_string())?;
@@ -1947,8 +2170,17 @@ fn set_kiosk_mode(app: AppHandle, enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// On a phone this returns Ok and does nothing: the OS owns the app's lifecycle.
 #[tauri::command]
 fn close_froozerp_window(app: AppHandle, allow_exit: Option<bool>) -> Result<(), String> {
+    #[cfg(mobile)]
+    return Ok(());
+    #[cfg(desktop)]
+    return close_froozerp_window_desktop(app, allow_exit);
+}
+
+#[cfg(desktop)]
+fn close_froozerp_window_desktop(app: AppHandle, allow_exit: Option<bool>) -> Result<(), String> {
     if allow_exit.unwrap_or(false) {
         KIOSK_CLOSE_ALLOWED.store(true, Ordering::SeqCst);
         KIOSK_LOCK_ENABLED.store(false, Ordering::SeqCst);
@@ -1964,16 +2196,32 @@ fn close_froozerp_window(app: AppHandle, allow_exit: Option<bool>) -> Result<(),
 
 #[tauri::command]
 fn ensure_local_backend_service() -> Result<BackendServiceStatus, String> {
-    Ok(ensure_local_backend_service_internal(false))
+    #[cfg(mobile)]
+    return not_in_phone_app("The local FroozERP service");
+    #[cfg(desktop)]
+    return Ok(ensure_local_backend_service_internal(false));
 }
 
 #[tauri::command]
 fn restart_local_backend_service() -> Result<BackendServiceStatus, String> {
-    Ok(ensure_local_backend_service_internal(true))
+    #[cfg(mobile)]
+    return not_in_phone_app("The local FroozERP service");
+    #[cfg(desktop)]
+    return Ok(ensure_local_backend_service_internal(true));
 }
 
 #[tauri::command]
 fn prepare_update_installation(target_version: Option<String>) -> Result<UpdateInstallPreparation, String> {
+    #[cfg(mobile)]
+    return not_in_phone_app("Installing an update from inside the app");
+    #[cfg(desktop)]
+    return prepare_update_installation_desktop(target_version);
+}
+
+#[cfg(desktop)]
+fn prepare_update_installation_desktop(
+    target_version: Option<String>,
+) -> Result<UpdateInstallPreparation, String> {
     let backend_executable = resolve_node_path();
     let backend_pid_before = backend_port_owner_pid();
     let previous_backend_version = local_backend_version(900).unwrap_or_default();
@@ -2035,6 +2283,14 @@ fn prepare_update_installation(target_version: Option<String>) -> Result<UpdateI
 
 #[tauri::command]
 fn local_backend_service_status() -> Result<BackendServiceStatus, String> {
+    #[cfg(mobile)]
+    return not_in_phone_app("The local FroozERP service");
+    #[cfg(desktop)]
+    return local_backend_service_status_desktop();
+}
+
+#[cfg(desktop)]
+fn local_backend_service_status_desktop() -> Result<BackendServiceStatus, String> {
     let reachable = probe_local_backend_health(900).is_ok();
     let version_matches = local_backend_version_matches(900).unwrap_or(false);
     let healthy = reachable && version_matches;
@@ -2101,18 +2357,54 @@ fn local_backend_service_status() -> Result<BackendServiceStatus, String> {
 
 #[tauri::command]
 fn detect_old_froozerp_versions() -> Result<CleanupResult, String> {
-    Ok(froozerp_cleanup_candidates())
+    #[cfg(mobile)]
+    return not_in_phone_app("Old-version detection");
+    #[cfg(desktop)]
+    return Ok(froozerp_cleanup_candidates());
 }
 
 #[tauri::command]
 fn install_diagnostics(app: AppHandle) -> Result<InstallDiagnostics, String> {
-    Ok(froozerp_install_diagnostics(
+    #[cfg(mobile)]
+    return Ok(phone_install_diagnostics(app.package_info().version.to_string()));
+    #[cfg(desktop)]
+    return Ok(froozerp_install_diagnostics(
         app.package_info().version.to_string(),
-    ))
+    ));
+}
+
+/// What `install_diagnostics` can honestly say about a phone install: versions and the data path.
+/// There are no Program Files folders, shortcuts or registry entries to report.
+#[cfg_attr(desktop, allow(dead_code))]
+fn phone_install_diagnostics(package_version: String) -> InstallDiagnostics {
+    let (update_transaction_status, update_transaction_message, update_transaction_target_version) =
+        update_transaction_status();
+    InstallDiagnostics {
+        current_executable: env::current_exe()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        current_install_dir: String::new(),
+        desktop_app_version: package_version.clone(),
+        package_version,
+        data_path: app_data_dir().to_string_lossy().to_string(),
+        stale_installations: Vec::new(),
+        cleanup_message: "Old-version cleanup does not apply to the phone app.".to_string(),
+        update_transaction_status,
+        update_transaction_message,
+        update_transaction_target_version,
+    }
 }
 
 #[tauri::command]
 fn clean_old_froozerp_versions() -> Result<CleanupResult, String> {
+    #[cfg(mobile)]
+    return not_in_phone_app("Old-version cleanup");
+    #[cfg(desktop)]
+    return clean_old_froozerp_versions_desktop();
+}
+
+#[cfg(desktop)]
+fn clean_old_froozerp_versions_desktop() -> Result<CleanupResult, String> {
     let mut result = froozerp_cleanup_candidates();
     let data_dir = app_data_dir();
     let install_dir = current_install_dir();
@@ -2579,9 +2871,15 @@ mod local_backend_lifecycle_tests {
     }
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // On desktop the path is fixed before anything else runs. On a phone it is not known until
+    // `setup` has asked Tauri, so the hook looks it up when (if) a panic happens.
+    #[cfg(desktop)]
     let panic_path = diagnostic_log_path();
     panic::set_hook(Box::new(move |info| {
+        #[cfg(mobile)]
+        let panic_path = diagnostic_log_path();
         let location = info
             .location()
             .map(|location| format!("{}:{}", location.file(), location.line()))
@@ -2612,10 +2910,16 @@ pub fn run() {
 
     write_app_log("INFO", "FroozERP desktop startup requested");
 
-    let result = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Desktop only. A phone is updated through its store, and these crates are not even dependencies
+    // of a mobile build (Cargo.toml); their permissions are desktop-only in capabilities/default.json.
+    #[cfg(desktop)]
+    let builder = builder
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build());
+    let result = builder
         .setup(|app| {
+            remember_resolved_app_data_dir(app.handle());
             if !acquire_desktop_instance_mutex() {
                 app.handle().exit(0);
                 return Ok(());
@@ -2626,7 +2930,9 @@ pub fn run() {
                 &format!("Application log file: {}", path.to_string_lossy()),
             );
             write_app_log("INFO", "Tauri setup started");
+            #[cfg(desktop)]
             cleanup_updater_temp_artifacts();
+            #[cfg(desktop)]
             match detect_old_froozerp_versions() {
                 Ok(cleanup) => write_app_log(
                     "INFO",
@@ -2641,7 +2947,13 @@ pub fn run() {
                     write_app_log("ERROR", &format!("Old version detection failed: {}", error))
                 }
             }
+            // Desktop only. This recovers WebView2 profiles that cached the 1.0.0 service worker; a phone
+            // never ran that build. Gated rather than left to the marker file, because a marker that
+            // cannot be written (the app-data directory used to be unwritable on Android) would clear
+            // all browsing data -- including the web storage the app keeps -- on every launch.
+            #[cfg(desktop)]
             let marker = webview_recovery_marker_path();
+            #[cfg(desktop)]
             if !marker.exists() {
                 if let Some(window) = app.get_webview_window("main") {
                     match window.clear_all_browsing_data() {
@@ -2664,7 +2976,9 @@ pub fn run() {
                     );
                 }
             }
+            #[cfg(desktop)]
             let backend_app = app.handle().clone();
+            #[cfg(desktop)]
             thread::spawn(move || {
                 write_app_log("INFO", "Starting local backend worker after WebView setup");
                 let backend_status = ensure_local_backend_service_internal(false);
@@ -2687,6 +3001,10 @@ pub fn run() {
                     );
                 }
             });
+            // A phone has no sidecar to launch. Its SQLite file is prepared here instead, off the
+            // main thread, so the first local route the frontend calls finds it ready.
+            #[cfg(mobile)]
+            thread::spawn(ensure_mobile_sqlite_ready);
             write_app_log("INFO", "Tauri setup completed");
             Ok(())
         })
@@ -2742,7 +3060,10 @@ pub fn run() {
             pos_sale_load_local,
             pos_sale_list_local,
             purchase_queue_local,
-            purchase_list_local
+            purchase_list_local,
+            runtime_profile,
+            mobile_gateway_request,
+            mobile_gateway_cloud_decision
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
@@ -2753,6 +3074,7 @@ pub fn run() {
                     let _ = window.emit("kiosk-exit-required", ());
                     write_app_log("INFO", "Close prevented by kiosk lock");
                 } else {
+                    #[cfg(desktop)]
                     stop_owned_backend("window close");
                 }
             }
