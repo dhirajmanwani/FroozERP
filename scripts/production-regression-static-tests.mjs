@@ -35,7 +35,9 @@ for (const variable of ["DATABASE_URL", "CLOUD_DATABASE_URL", "DB_HOST", "DB_POR
 }
 assert.ok(adapters.includes("resolveDesktopSqlitePath"), "Desktop SQLite must resolve without user configuration");
 assert.ok(adapters.includes('require("node:sqlite")'), "Clean development profiles must create a valid SQLite file");
-assert.ok(gateway.includes('"cache-control,content-type'), "WebView health preflight must allow Cache-Control");
+// The allowed headers are one list, CORS_ALLOWED_REQUEST_HEADERS, written one per line since 24 Sep 2026.
+assert.match(gateway, /CORS_ALLOWED_REQUEST_HEADERS = Object\.freeze\(\[[^\]]*"cache-control"/, "WebView health preflight must allow Cache-Control");
+assert.ok(gateway.includes('"access-control-allow-headers": CORS_ALLOWED_REQUEST_HEADERS.join(",")'), "The preflight must answer with the one allowed-headers list");
 assert.ok(gateway.includes('"access-control-allow-private-network": "true"'), "WebView private-network health requests must be allowed");
 assert.ok(gateway.includes("writePolicy(input.allowInternetAccess !== false"), "Owner must be able to request either confirmed connectivity mode");
 assert.ok(gateway.includes("readAuthoritativeTime"), "Connectivity mode audit must use server-confirmed time when Railway is available");

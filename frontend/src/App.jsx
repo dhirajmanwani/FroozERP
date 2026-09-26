@@ -98,6 +98,7 @@ import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode } from "./local/connectivityMode";
 import { CONNECTION_TONE, connectionNeedsAttention, resolveConnectionStatus } from "./local/connectionStatus";
 import { createStartupConnectivityAuthority } from "./local/startupConnectivityPolicy";
+import { MOBILE_GATEWAY_BASE_URL, MOBILE_RUNTIME_PROFILE_COMMAND, currentDevicePlatform, describeRuntimeProfileMismatch, installMobileGateway, isMobileShell, resolveShellCapabilities, shellShowsSettingsSection } from "./local/mobileGateway";
 import { isCloudTargetConfigured, resolveCloudTarget } from "./local/cloudTarget";
 import { resolveApiMode } from "./local/apiModeResolution";
 import { CLOUD_CALL_REFUSAL_CODES, createCloudCallGuard, createCloudCallRefusalError, evaluateCloudCall } from "./local/cloudCallGuard";
@@ -265,6 +266,12 @@ import {
 } from "./local/serverTime";
 
 const isDesktopShell = () => Boolean(window.__TAURI_INTERNALS__ || window.__TAURI__);
+// The phone app is a Tauri runtime too, so `isDesktopShell()` is true there as well. What differs on
+// a phone -- no gateway process, no updater, no kiosk, no local voice -- hangs off these, decided in
+// local/mobileGateway.js. On the desktop and in a browser every flag reads as the code it gates did.
+const MOBILE_SHELL = isMobileShell();
+const SHELL_CAPABILITIES = resolveShellCapabilities({ desktopShell: isDesktopShell(), mobileShell: MOBILE_SHELL });
+const DEVICE_PLATFORM = currentDevicePlatform();
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 const normalizeApiBase = (value) => String(value || "").trim().replace(/\/$/, "");
@@ -454,8 +461,13 @@ const isLocalOnlyConnectivitySelected = () => startupConnectivityAuthority.isLoc
  * still ships pointing at 5000), not a runtime global.
  *
  * In a browser there is no shell starting anything, so the old precedence stands there.
+ *
+ * A phone has no gateway process at all. Its "local API" is a sentinel address that resolves
+ * nowhere; the adapter installed below answers it (local/mobileGateway.js).
  */
-const LOCAL_API_URL = isDesktopShell()
+const LOCAL_API_URL = MOBILE_SHELL
+  ? MOBILE_GATEWAY_BASE_URL
+  : isDesktopShell()
   ? `http://127.0.0.1:${LOCAL_BACKEND_PORT}`
   : normalizeApiBase(
     SAVED_API_CONFIG.localApiUrl ||
@@ -901,6 +913,19 @@ const listenTauriEvent = async (eventName, handler) => {
   const { listen } = await import("@tauri-apps/api/event");
   return listen(eventName, handler);
 };
+
+// On a phone, every request to LOCAL_API_URL -- axios or fetch -- goes through Rust's gateway
+// commands first, and reaches the network only when Rust's policy allows it. Installed here, at
+// module load, so it is in place before the first request. Off a phone this does nothing at all.
+installMobileGateway({ mobile: MOBILE_SHELL, axios, target: window, invoke: invokeTauriCommand, cloudBaseUrl: CLOUD_API_URL });
+if (MOBILE_SHELL) {
+  invokeTauriCommand(MOBILE_RUNTIME_PROFILE_COMMAND)
+    .then((profile) => {
+      const mismatch = describeRuntimeProfileMismatch(profile, { mobileShell: MOBILE_SHELL });
+      if (mismatch) writeDiagnosticLog("ERROR", "mobile-runtime-profile-mismatch", { mismatch, profile });
+    })
+    .catch((error) => writeDiagnosticLog("ERROR", "mobile-runtime-profile-unavailable", { message: String(error?.message || error) }));
+}
 
 const currency = new Intl.NumberFormat("en-IN", {
   style: "currency",
@@ -2886,6 +2911,7 @@ function App() {
 
   useEffect(() => {
     const fullscreenEnabled = settingsData.deviceControlSettings?.fullscreen_lock_enabled === true;
+    if (!SHELL_CAPABILITIES.kioskLock) return;
     invokeTauriCommand("set_kiosk_mode", { enabled: fullscreenEnabled }).catch((error) => {
       if (fullscreenEnabled) writeDiagnosticLog("ERROR", "Unable to apply fullscreen lock mode", { error: String(error?.message || error) });
     });
@@ -2904,7 +2930,7 @@ function App() {
         if (cancelled) return;
         const nextSettings = { ...defaultDeviceControlSettings, ...(response.data?.deviceControlSettings || {}) };
         setLoginDeviceControlSettings(nextSettings);
-        await invokeTauriCommand("set_kiosk_mode", { enabled: nextSettings.fullscreen_lock_enabled === true });
+        if (SHELL_CAPABILITIES.kioskLock) await invokeTauriCommand("set_kiosk_mode", { enabled: nextSettings.fullscreen_lock_enabled === true });
       } catch {
         if (!cancelled) setLoginDeviceControlSettings(defaultDeviceControlSettings);
       }
@@ -3144,7 +3170,7 @@ function App() {
     const payload = {
       device_id: latestDevice.device_id,
       device_name: latestDevice.device_name || "FroozERP Device",
-      platform: "tauri-windows",
+      platform: DEVICE_PLATFORM,
       app_version: APP_VERSION,
       branch_id: currentUser.branch_id || 1,
       user_id: currentUser.id,
@@ -3605,6 +3631,8 @@ function App() {
     const readinessDeadline = Date.now() + 20_000;
     let attempt = 0;
     while (Date.now() < readinessDeadline) {
+      // One in-process check on a phone; unbounded (until the deadline) against the desktop's sidecar.
+      if (attempt >= SHELL_CAPABILITIES.localReadinessAttempts) break;
       if (attempt > 0) await new Promise((resolve) => window.setTimeout(resolve, 500));
       const remainingMs = Math.max(500, readinessDeadline - Date.now());
       attempt += 1;
@@ -3622,6 +3650,14 @@ function App() {
 
   const ensureLocalBackendService = useCallback(async ({ restart = false, reason = "manual" } = {}) => {
     if (!isTauriRuntime() || isCloudMode()) return null;
+    if (!SHELL_CAPABILITIES.gatewayProcess) {
+      // A phone's gateway is Rust inside the app: there is no process to start, and it is ready
+      // when the app is. The readiness check that follows still asks it once, for real.
+      const service = { healthy: true, startup_state: "ready", message: "The local service runs inside the app on this phone.", reason, checkedAt: new Date().toISOString() };
+      setLocalBackendService(service);
+      markLocalServiceHealthy(service, reason);
+      return service;
+    }
     localServiceStartupStateRef.current = "checking";
     setLocalServiceStartupState("checking");
     const command = restart ? "restart_local_backend_service" : "ensure_local_backend_service";
@@ -4550,7 +4586,7 @@ function App() {
         // the truth; when it carries nothing, the Rust side keeps the device's existing status
         // rather than upgrading it.
         ...latestDevice,
-        platform: "tauri-windows",
+        platform: DEVICE_PLATFORM,
         app_version: APP_VERSION,
         branch_id: branchId,
       },
@@ -6039,6 +6075,7 @@ function App() {
   // effect below resumes it on the first click or key.
   useEffect(() => {
     if (!user || !frostBellAllowed || !frostVoiceAlwaysOn) return;
+    if (!SHELL_CAPABILITIES.liveVoiceControls) return;
     const key = String(user.id ?? user.username ?? "signed-in");
     if (frostVoiceAutoStartedRef.current === key) return;
     frostVoiceAutoStartedRef.current = key;
@@ -6072,7 +6109,7 @@ function App() {
   // LOCAL_API_URL is 127.0.0.1: in a browser it is derived from the page's host, and nothing should
   // be asked of that without somebody clicking a voice switch.
   useEffect(() => {
-    if (!frostDrawerOpen || !frostBellAllowed || !isDesktopShell()) return;
+    if (!frostDrawerOpen || !frostBellAllowed || !SHELL_CAPABILITIES.localSpeech) return;
     readFrostSpeechStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [frostDrawerOpen, frostBellAllowed]);
@@ -8638,9 +8675,11 @@ function App() {
                 }}>
                   Restart Service
                 </button>
-                <button className="secondary-button" type="button" onClick={openStartupLogFile}>
-                  Open Startup Log
-                </button>
+                {SHELL_CAPABILITIES.startupLog && (
+                  <button className="secondary-button" type="button" onClick={openStartupLogFile}>
+                    Open Startup Log
+                  </button>
+                )}
                 <button className="secondary-button" type="button" onClick={copyStartupDiagnostics}>
                   Copy Diagnostics
                 </button>
@@ -9176,7 +9215,7 @@ function App() {
                   />
                 )}
               </div>
-              {settingsData.deviceControlSettings?.fullscreen_lock_enabled && (
+              {SHELL_CAPABILITIES.kioskLock && settingsData.deviceControlSettings?.fullscreen_lock_enabled && (
                 <button className="secondary-button kiosk-exit-button" onClick={requestControlledExit}>
                   Owner Exit
                 </button>
@@ -10765,7 +10804,8 @@ function AiBusinessAssistantModule({
     if (data.loading || !question.trim()) return;
     onAsk();
   };
-  const liveVoiceBar = (
+  // No voice bar where there is no on-device speech (the phone app). Text FROST is unaffected.
+  const liveVoiceBar = SHELL_CAPABILITIES.liveVoiceControls && (
     <FrostLiveVoiceBar
       liveVoice={liveVoice}
       onCloseSetup={onCloseSpeechSetup}
@@ -18839,7 +18879,8 @@ function SettingsModule({
    * `POST /api/activation/licences` answers NOT_OWNER regardless of what is on screen.
    */
   const isOwnerAccount = String(user?.role || user?.role_name || "").toUpperCase() === "OWNER";
-  const visibleSettingsSections = settingsSections.filter((section) => !section.ownerOnly || isOwnerAccount);
+  const visibleSettingsSections = settingsSections.filter((section) => (!section.ownerOnly || isOwnerAccount)
+    && shellShowsSettingsSection(section.id, SHELL_CAPABILITIES));
   const sectionsInGroup = (groupId) => visibleSettingsSections.filter((section) => section.group === groupId);
   /**
    * Each section keyed by its registry id.
@@ -20098,7 +20139,7 @@ function AutoUpdateRunner({ busyReasons = [], enabled = false, holdbackDays = 0,
   const busyIds = busyReasons.map((entry) => entry.id).join("|");
 
   useEffect(() => {
-    if (!isDesktopShell()) return undefined;
+    if (!SHELL_CAPABILITIES.updaterPlugin) return undefined;
     const step = async () => {
       if (stepRunningRef.current) return;
       stepRunningRef.current = true;
@@ -20204,6 +20245,7 @@ function AutoUpdateRunner({ busyReasons = [], enabled = false, holdbackDays = 0,
   });
 
   const install = async (requestedByUser) => {
+    if (!SHELL_CAPABILITIES.updaterPlugin) return;
     const update = updateRef.current;
     const verdict = resolveInstallDecision({
       enabled,
@@ -20353,7 +20395,7 @@ function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceC
   const updateObjectRef = useRef(null);
   const downloadedUpdateRef = useRef(null);
   const feedConfigured = Boolean(UPDATE_FEED_URL);
-  const desktopUpdaterAvailable = isDesktopShell();
+  const desktopUpdaterAvailable = SHELL_CAPABILITIES.updaterPlugin;
   const normalizeVersion = useCallback((value) => {
     const text = String(value || "").trim();
     const match = text.match(/v?(\d+(?:\.\d+){1,3})(?:[^\d].*)?$/i) || text.match(/v?(\d+(?:\.\d+){1,3})/i);
@@ -20682,6 +20724,7 @@ function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceC
     return { localStatus, pendingSync: Number(pendingSync || 0) };
   };
   const installAndRestart = async () => {
+    if (!SHELL_CAPABILITIES.updaterPlugin) return;
     const updateToInstall = downloadedUpdateRef.current || updateObjectRef.current;
     if (!canInstallUpdate || !updateToInstall) {
       setUpdaterState((current) => ({
@@ -20800,6 +20843,7 @@ function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceC
         <button className="primary-button" disabled={!canManage || !desktopUpdaterAvailable || !canInstallUpdate || buttonsBusy} onClick={installAndRestart}>Install and Restart</button>
         {updateAvailable && <button className="secondary-button" disabled={!canManage || buttonsBusy} onClick={() => setUpdaterState((current) => ({ ...current, errorMessage: "Reminder saved for this session." }))}>Remind Me Later</button>}
       </div>
+      {SHELL_CAPABILITIES.automaticUpdateSettings && (
       <div className="maintenance-cleanup-panel">
         <strong>Automatic Updates</strong>
         <span>This device checks on its own and installs during the hours below. A bill in progress always wins: nothing restarts until the counter is free.</span>
@@ -20839,6 +20883,8 @@ function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceC
           <button className="primary-button" disabled={!canManage || scheduleBusy} onClick={saveSchedule}>{scheduleBusy ? "Saving..." : "Save Update Hours"}</button>
         </div>
       </div>
+      )}
+      {SHELL_CAPABILITIES.installCleanup && (
       <div className="maintenance-cleanup-panel">
         <strong>Updates / Maintenance</strong>
         <span>Clean old FroozERP app shortcuts and duplicate install folders. SQLite, backups, logs, device identity, user settings and pending sync data are never removed.</span>
@@ -20872,6 +20918,7 @@ function UpdateCenterSection({ canManage, deviceControlSettings = defaultDeviceC
           </div>
         )}
       </div>
+      )}
     </ModuleCard>
   );
 }

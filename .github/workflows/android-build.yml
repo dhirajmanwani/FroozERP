@@ -1,0 +1,248 @@
+# Android debug APK + Windows Rust compile check.
+#
+# THIS WORKFLOW MUST NEVER PUBLISH ANYTHING.
+#   - It never creates a GitHub release or a tag, and never writes or uploads latest.json.
+#   - It never uses a secret (no TAURI_SIGNING_*, no GITHUB_TOKEN writes); permissions are read-only.
+# Desktop counters auto-update, silently and in `quiet` mode, from
+#   https://github.com/dhirajmanwani/FroozERP/releases/latest/download/latest.json
+# so anything that became the "latest" release would be pushed to every shop counter. A mobile
+# build must never be that release. The only output here is a workflow artifact (7-day retention).
+# Releases are cut only by windows-updater-release.yml / release.yml, by hand.
+#
+# The APK is a DEBUG build signed with the runner's throwaway Android debug keystore.
+# Built without a cloud URL (the default for push runs), the app's built-in cloud target applies,
+# which is the PRODUCTION cloud. Use the `cloud_api_url` input to point a build elsewhere.
+
+name: Android build
+
+on:
+  workflow_dispatch:
+    inputs:
+      all_abis:
+        description: "Build all four ABIs (arm64, armv7, x86, x86_64) instead of arm64 only. ~4x the Rust build time."
+        required: false
+        default: false
+        type: boolean
+      cloud_api_url:
+        description: "VITE_CLOUD_API_URL baked into the APK. Empty = the app's built-in PRODUCTION cloud."
+        required: false
+        default: ""
+        type: string
+  push:
+    branches:
+      - "claude/**"
+    paths:
+      - "src-tauri/**"
+      - "frontend/**"
+      - "scripts/android/**"
+      - ".github/workflows/android-build.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-apk:
+    name: Android debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      # Pinned NDK. r27c (27.2.12479018), the NDK LTS line; any r25+ builds Rust's Android targets.
+      ANDROID_NDK_VERSION: "27.2.12479018"
+      # The tauri-cli 2.11 template compiles against SDK 36 (AGP 8.11 would fetch these itself; installing
+      # them up front keeps failures in this step instead of deep in Gradle).
+      ANDROID_PLATFORM: "android-36"
+      ANDROID_BUILD_TOOLS: "36.0.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+        with:
+          # The action's default list still names the retired `tools` package, which sdkmanager
+          # no longer knows, and the step fails. Everything else is installed explicitly below.
+          packages: platform-tools
+
+      - name: Install Android platform, build-tools and NDK
+        shell: bash
+        run: |
+          sdkmanager "platform-tools" "platforms;${ANDROID_PLATFORM}" "build-tools;${ANDROID_BUILD_TOOLS}" "ndk;${ANDROID_NDK_VERSION}"
+          ndk="${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}"
+          if [ ! -f "${ndk}/source.properties" ]; then
+            echo "::error::NDK ${ANDROID_NDK_VERSION} is not at ${ndk}. Available NDKs:"
+            sdkmanager --list | grep -E '^[[:space:]]*ndk;' || true
+            exit 1
+          fi
+          echo "NDK_HOME=${ndk}" >> "$GITHUB_ENV"
+          echo "Using ANDROID_HOME=${ANDROID_HOME}"
+          echo "Using NDK_HOME=${ndk}"
+          grep Pkg.Revision "${ndk}/source.properties"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: android
+
+      - name: Generate Android project (tauri android init, not committed)
+        shell: bash
+        run: |
+          if [ -e src-tauri/gen/android ]; then
+            echo "::error::src-tauri/gen/android is present in the checkout. It is a generated project and must not be committed."
+            exit 1
+          fi
+          node "${GITHUB_WORKSPACE}/frontend/node_modules/@tauri-apps/cli/tauri.js" android init --ci --skip-targets-install
+
+      - name: Harden generated Android project (no backup, no device transfer, no cleartext)
+        shell: bash
+        run: |
+          node --test scripts/android/*.test.mjs
+          node scripts/android/patch-android-project.mjs
+          # Gradle calls back into the CLI through BuildTask.kt; init writes a bare `tauri` there,
+          # which the patch points at frontend/node_modules/@tauri-apps/cli/tauri.js.
+          task="$(find src-tauri/gen/android/buildSrc -name BuildTask.kt | head -n 1)"
+          grep -nE 'val executable|val args' "${task}"
+          grep -q '@tauri-apps/cli/tauri.js' "${task}"
+
+      - name: Build debug APK
+        shell: bash
+        env:
+          VITE_CLOUD_API_URL: ${{ inputs.cloud_api_url }}
+          # The Rust side reads its cloud at compile time on a phone (src-tauri/src/lib.rs
+          # `cloud_api_url`); both halves must name the same one.
+          FROOZERP_MOBILE_CLOUD_API_URL: ${{ inputs.cloud_api_url }}
+          ALL_ABIS: ${{ inputs.all_abis && '1' || '0' }}
+        run: |
+          if [ "${ALL_ABIS}" = "1" ]; then
+            targets="aarch64 armv7 i686 x86_64"
+          else
+            targets="aarch64"
+          fi
+          if [ -z "${VITE_CLOUD_API_URL}" ]; then
+            echo "::warning::No cloud_api_url given: this APK talks to the PRODUCTION cloud."
+          fi
+          node "${GITHUB_WORKSPACE}/frontend/node_modules/@tauri-apps/cli/tauri.js" android build --ci --debug --apk --target ${targets}
+
+      - name: Verify the built APK kept the hardening
+        shell: bash
+        run: |
+          # A Tauri CLI step between patch and Gradle could in principle rewrite the project; prove
+          # the packaged manifest carries the settings, not just the source file.
+          node scripts/android/patch-android-project.mjs | tee patch-recheck.log
+          grep -q "already patched" patch-recheck.log || { echo "::error::Android project changed after patching"; exit 1; }
+          aapt2="${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS}/aapt2"
+          mapfile -t apks < <(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | sort)
+          if [ "${#apks[@]}" -eq 0 ]; then echo "::error::No APK was produced"; exit 1; fi
+          for apk in "${apks[@]}"; do
+            echo "== ${apk}"
+            tree="$("${aapt2}" dump xmltree --file AndroidManifest.xml "${apk}")"
+            for attr in allowBackup fullBackupContent usesCleartextTraffic dataExtractionRules; do
+              line="$(grep -E "android:${attr}\(" <<<"${tree}" | head -n1 || true)"
+              echo "${attr}: ${line:-<missing>}"
+              if [ -z "${line}" ]; then echo "::error::${attr} missing from packaged manifest of ${apk}"; exit 1; fi
+            done
+            for attr in allowBackup usesCleartextTraffic; do
+              if grep -E "android:${attr}\(" <<<"${tree}" | grep -qiE '=true|0xffffffff'; then
+                echo "::error::${attr} is true in packaged manifest of ${apk}"; exit 1
+              fi
+            done
+          done
+
+      - name: Stage APKs
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          out="${RUNNER_TEMP}/android-apk"
+          mkdir -p "${out}"
+          while IFS= read -r apk; do
+            cp "${apk}" "${out}/FroozERP-${short_sha}-$(basename "${apk}")"
+          done < <(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | sort)
+          (cd "${out}" && sha256sum *.apk | tee SHA256SUMS.txt)
+          echo "SHORT_SHA=${short_sha}" >> "$GITHUB_ENV"
+          {
+            echo "### FroozERP Android debug APK (${short_sha})"
+            echo
+            echo "Debug build, debug-keystore signed, not for Play. Not a release; no latest.json."
+            if [ -z "${VITE_CLOUD_API_URL}" ]; then
+              echo
+              echo "**Cloud target: built-in PRODUCTION cloud** (no cloud_api_url given)."
+            fi
+            echo
+            echo '```'
+            cat "${out}/SHA256SUMS.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          VITE_CLOUD_API_URL: ${{ inputs.cloud_api_url }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FroozERP-Android-debug-${{ env.SHORT_SHA }}
+          path: ${{ runner.temp }}/android-apk/
+          if-no-files-found: error
+          retention-days: 7
+
+  desktop-rust-check:
+    name: Windows desktop cargo check
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+
+      # tauri::generate_context! embeds frontend/dist at compile time, so it must exist.
+      - name: Build frontend
+        run: npm run build
+
+      # tauri-build copies bundle.resources in build.rs and fails on a missing path. The real
+      # 92 MB node sidecar is gitignored and is not needed to prove the Rust compiles.
+      - name: Create placeholder backend sidecar
+        shell: pwsh
+        run: |
+          $sidecar = "src-tauri/binaries/froozerp-backend-node.exe"
+          if (-not (Test-Path $sidecar)) {
+            New-Item -ItemType Directory -Force -Path (Split-Path $sidecar) | Out-Null
+            New-Item -ItemType File -Path $sidecar | Out-Null
+            Write-Output "Created empty placeholder $sidecar"
+          }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: windows-check
+
+      - name: cargo check
+        run: cargo check --manifest-path src-tauri/Cargo.toml
