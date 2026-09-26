@@ -171,6 +171,27 @@ test("an unreadable trusted-key table refuses rather than signing unchecked", ()
   );
 });
 
+test("the backend's trusted-key table is identical to the one the app ships", () => {
+  const { TRUSTED_ACTIVATION_KEYS_SOURCE } = require("./trustedActivationKeys");
+  const rust = fs.readFileSync(path.join(__dirname, "..", "src-tauri", "src", "entitlement.rs"), "utf8");
+  const start = rust.indexOf("pub const TRUSTED_ACTIVATION_KEYS");
+  assert.ok(start >= 0, "entitlement.rs must still declare TRUSTED_ACTIVATION_KEYS");
+  const table = rust.slice(start, rust.indexOf("];", start) + 2);
+  assert.equal(
+    TRUSTED_ACTIVATION_KEYS_SOURCE,
+    table,
+    "a key rotation must change backend/trustedActivationKeys.js and entitlement.rs together",
+  );
+});
+
+test("the issue route never reads outside backend/, which is all the hosted deployment carries", () => {
+  const route = issueRoute();
+  // backend/railway.json deploys the backend directory alone; ../src-tauri is absent on Railway.
+  assert.doesNotMatch(route, /readFileSync/);
+  assert.doesNotMatch(route, /src-tauri/);
+  assert.match(route, /TRUSTED_ACTIVATION_KEYS_SOURCE/);
+});
+
 // ---------------------------------------------------------------------------------------------
 // Tenancy, and the device
 // ---------------------------------------------------------------------------------------------

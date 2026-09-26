@@ -13677,8 +13677,12 @@ const ACTIVATION_SIGNING_KEY_ENV = "FROOZERP_ACTIVATION_SIGNING_KEY";
  */
 const ACTIVATION_KEY_ID_ENV = "FROOZERP_ACTIVATION_KEY_ID";
 const ACTIVATION_KEY_ID_DEFAULT = 2;
-/** The decoder's own source, which owns the list of keys a device will trust. */
-const TRUSTED_KEYS_PATH = path.join(__dirname, "..", "src-tauri", "src", "entitlement.rs");
+/**
+ * The keys a device will trust, copied from the decoder's own source into the backend, because the
+ * hosted backend is deployed without `src-tauri/`. A test keeps the copy identical to
+ * `src-tauri/src/entitlement.rs`. See `trustedActivationKeys.js`.
+ */
+const { TRUSTED_ACTIVATION_KEYS_SOURCE } = require("./trustedActivationKeys");
 
 /**
  * Owner, and only Owner. Deliberately not `requireRateManager` -- see the section note.
@@ -13722,17 +13726,13 @@ app.post("/api/activation/licences", async (req, res) => {
         message: `This server cannot sign activation files: ${ACTIVATION_SIGNING_KEY_ENV} is not set.`,
       });
     }
-    let trustedKeysSource;
-    try {
-      trustedKeysSource = fs.readFileSync(TRUSTED_KEYS_PATH, "utf8");
-    } catch (error) {
+    const trustedKeysSource = TRUSTED_ACTIVATION_KEYS_SOURCE;
+    if (!String(trustedKeysSource || "").includes("TRUSTED_ACTIVATION_KEYS")) {
       // Loud, not silent. Signing without this check would produce a file that looks correct here
       // and is refused by the app, which is the worst of the three possible outcomes.
       return res.status(424).json({
         code: "TRUSTED_KEYS_UNAVAILABLE",
-        message:
-          "This server cannot check which signing keys the app trusts, so it will not sign. " +
-          `Expected ${TRUSTED_KEYS_PATH} (${error.code || "unreadable"}).`,
+        message: "This server cannot check which signing keys the app trusts, so it will not sign.",
       });
     }
 
