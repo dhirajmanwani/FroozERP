@@ -13711,9 +13711,13 @@ app.post("/api/activation/licences", async (req, res) => {
       return res.status(request.status).json({ code: request.code, message: request.message });
     }
 
+    // 424, never 503, for every "this server is not set up to sign" answer below. The desktop
+    // gateway rewrites any cloud 502/503/504 to "FroozERP cloud is temporarily unavailable", so a
+    // missing key reached the Owner as a cloud outage (26 Sep 2026) -- the same trap the recovery
+    // email fell into. The code and message must arrive intact.
     const signingKeyHex = cleanText(process.env[ACTIVATION_SIGNING_KEY_ENV] || "");
     if (!signingKeyHex) {
-      return res.status(503).json({
+      return res.status(424).json({
         code: "SIGNING_KEY_UNAVAILABLE",
         message: `This server cannot sign activation files: ${ACTIVATION_SIGNING_KEY_ENV} is not set.`,
       });
@@ -13724,7 +13728,7 @@ app.post("/api/activation/licences", async (req, res) => {
     } catch (error) {
       // Loud, not silent. Signing without this check would produce a file that looks correct here
       // and is refused by the app, which is the worst of the three possible outcomes.
-      return res.status(503).json({
+      return res.status(424).json({
         code: "TRUSTED_KEYS_UNAVAILABLE",
         message:
           "This server cannot check which signing keys the app trusts, so it will not sign. " +
@@ -13785,7 +13789,7 @@ app.post("/api/activation/licences", async (req, res) => {
       if (error instanceof ActivationLicenceError) {
         // The encoder's messages are written for a person and never carry key material.
         console.error("Activation licence refused", error.code, error.message);
-        return res.status(503).json({ code: error.code, message: error.message });
+        return res.status(424).json({ code: error.code, message: error.message });
       }
       throw error;
     }

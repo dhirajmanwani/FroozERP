@@ -147,6 +147,13 @@ test("the signing key is read from the environment and is never sent back or log
   assert.doesNotMatch(route, /console\.[a-z]+\([^)]*signingKey/i);
 });
 
+test("a server that cannot sign says why, never with a status the gateway turns into 'cloud unavailable'", () => {
+  const route = issueRoute();
+  // backend/desktopGateway.js rewrites any cloud 502/503/504 to CLOUD_UNAVAILABLE_MESSAGE.
+  assert.doesNotMatch(route, /status\((502|503|504)\)/);
+  assert.match(route, /status\(424\)\.json\(\{\s*code: "SIGNING_KEY_UNAVAILABLE"/);
+});
+
 test("the key is never written into the record, only its public half", () => {
   const route = issueRoute();
   const insert = route.slice(route.indexOf("INSERT INTO activation_licences"));
