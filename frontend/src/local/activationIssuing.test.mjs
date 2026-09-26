@@ -583,7 +583,8 @@ test("history rows without an issuer say so rather than rendering blank", () => 
 
 test("the request body carries the picked id unchanged and a validated validity", () => {
   const request = buildIssueRequest({ deviceId: "FZDEV-COUNTER-1", validDays: "90" });
-  assert.deepEqual(request, { ok: true, body: { device_id: "FZDEV-COUNTER-1", valid_days: 90 } });
+  assert.deepEqual(request, { ok: true, body: { target_device_id: "FZDEV-COUNTER-1", valid_days: 90 } });
+  assert.equal("device_id" in request.body, false, "the server reads body.device_id as the caller's own device");
   assert.equal(typeof request.body.valid_days, "number", "the route expects a number, not a form string");
 });
 
