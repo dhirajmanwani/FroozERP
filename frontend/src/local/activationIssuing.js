@@ -637,6 +637,10 @@ export const orderDevicesForIssuing = (rows) => (
  *
  * The device id is taken from the row the Owner picked and passed through unchanged — it is an
  * opaque string and must never be re-derived, re-cased or coerced on the way to the server.
+ *
+ * Sent as `target_device_id`, never `device_id`: the server reads `device_id` anywhere in a body as
+ * the caller's own device and refuses a request naming another one, so a licence for any machine
+ * but the Owner's was always refused (26 Sep 2026).
  */
 export const buildIssueRequest = ({ deviceId, validDays } = {}) => {
   const id = canonicalInventoryId(deviceId);
@@ -649,7 +653,7 @@ export const buildIssueRequest = ({ deviceId, validDays } = {}) => {
   }
   const validity = validateValidDays(validDays);
   if (!validity.ok) return validity;
-  return { ok: true, body: { device_id: id, valid_days: validity.validDays } };
+  return { ok: true, body: { target_device_id: id, valid_days: validity.validDays } };
 };
 
 /**

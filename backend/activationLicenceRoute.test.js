@@ -40,6 +40,23 @@ const issueRoute = () => {
 // What the Owner asked for, checked before anything is signed
 // ---------------------------------------------------------------------------------------------
 
+test("the device being licensed is named as target_device_id, which the session guard does not read", () => {
+  const { rejectDeviceSessionSubstitution } = require("./deviceSession");
+  const ownerSession = { user_id: 1, device_id: "FZDEV-LAPTOP", company_id: 1, branch_id: 1 };
+  const body = { target_device_id: "PHONE-9F2C", valid_days: 365 };
+  const submitted = { user_id: [], device_id: [body.device_id], company_id: [], branch_id: [] };
+  assert.equal(rejectDeviceSessionSubstitution(ownerSession, submitted), null);
+  const answer = normaliseLicenceRequest(body);
+  assert.equal(answer.ok, true);
+  assert.equal(answer.deviceId, "PHONE-9F2C");
+});
+
+test("target_device_id wins over device_id, and device_id alone still works", () => {
+  assert.equal(normaliseLicenceRequest({ target_device_id: "PHONE", device_id: "LAPTOP", valid_days: 30 }).deviceId, "PHONE");
+  assert.equal(normaliseLicenceRequest({ target_device_id: "  ", device_id: "LAPTOP", valid_days: 30 }).deviceId, "LAPTOP");
+  assert.equal(normaliseLicenceRequest({ device_id: "LAPTOP", valid_days: 30 }).deviceId, "LAPTOP");
+});
+
 test("a request with no device names which box to fix", () => {
   for (const body of [{}, { device_id: "" }, { device_id: "   " }, { device_id: null }]) {
     const answer = normaliseLicenceRequest({ ...body, valid_days: 365 });

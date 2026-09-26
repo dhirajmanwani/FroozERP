@@ -45,7 +45,15 @@ const readWholeDays = (value) => {
 /**
  * Check an activation request.
  *
- * @param {object} body Request body: `device_id` and `valid_days`.
+ * The device being licensed travels as `target_device_id`. It cannot travel as `device_id`: the
+ * app-wide `rejectDeviceSessionSubstitution` reads `body.device_id` as a claim about the *caller's*
+ * device and refuses any value that is not the Owner's own machine, so every licence for another
+ * device was refused with "device_id does not match the authenticated device session" (found
+ * 26 Sep 2026, licensing the first Android phone). `device_id` is still read when
+ * `target_device_id` is absent, for the 1.0.74 desktop screen; through that guard it can only ever
+ * name the Owner's own machine.
+ *
+ * @param {object} body Request body: `target_device_id` and `valid_days`.
  * @returns {{ok: true, deviceId: string, validDays: number}
  *          |{ok: false, status: number, code: string, message: string}}
  *          A refusal carries the HTTP status with it so the route cannot pair a code with the
@@ -54,7 +62,10 @@ const readWholeDays = (value) => {
 const normaliseLicenceRequest = (body) => {
   const source = body && typeof body === "object" ? body : {};
 
-  const deviceId = typeof source.device_id === "string" ? source.device_id.trim() : "";
+  const named = typeof source.target_device_id === "string" && source.target_device_id.trim()
+    ? source.target_device_id
+    : source.device_id;
+  const deviceId = typeof named === "string" ? named.trim() : "";
   if (!deviceId) {
     return {
       ok: false,
