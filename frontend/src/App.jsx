@@ -264,6 +264,7 @@ import {
   markServerTimeOffline,
   observeServerTime,
 } from "./local/serverTime";
+import { describeEnrolmentAttempt, readPastedActivation } from "./local/activationEnrolment";
 
 const isDesktopShell = () => Boolean(window.__TAURI_INTERNALS__ || window.__TAURI__);
 // The phone app is a Tauri runtime too, so `isDesktopShell()` is true there as well. What differs on
@@ -12129,6 +12130,9 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [enrolUsername, setEnrolUsername] = useState("");
+  const [enrolPassword, setEnrolPassword] = useState("");
+  const [pastedActivation, setPastedActivation] = useState("");
   const fileInputRef = useRef(null);
 
   if (entitlement?.bootstrap?.pending) {
@@ -12148,21 +12152,78 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
     );
   }
 
+  const redeem = async (contents) => {
+    await importEntitlementFile({ deviceId: deviceInfo?.device_id || "", contents });
+    setNotice("Activation accepted.");
+    await onRefresh(deviceInfo?.device_id);
+  };
+
+  const describeRedeemError = (caught) => {
+    const message = String(caught?.message || caught || "This activation file could not be redeemed.");
+    return message.startsWith("DEVICE_BINDING_MISMATCH")
+      ? "This activation file was issued for a different device."
+      : message;
+  };
+
+  // One sign-in attempt, so the cloud records this device and the Owner can see it. Any session
+  // that comes back is dropped: this screen admits nobody. See local/activationEnrolment.js.
+  const sendToShop = async () => {
+    setError("");
+    setNotice("");
+    if (!enrolUsername.trim() || !enrolPassword) {
+      setError("Enter your FroozERP username and password first.");
+      return;
+    }
+    setBusy(true);
+    let result;
+    try {
+      const gate = guardCloudCall("activation-enrolment", AUTH_API_URL);
+      if (!gate.allowed) throw createCloudCallRefusalError(gate);
+      const device = await resolveLocalDeviceInfo(deviceInfo || getClientDeviceInfo());
+      const response = await axios.post(`${AUTH_API_URL}/login`, {
+        username: enrolUsername.trim(),
+        password: enrolPassword,
+        ...device,
+      }, { timeout: 15000 });
+      result = describeEnrolmentAttempt({ response, deviceName: device.device_name });
+    } catch (caught) {
+      result = describeEnrolmentAttempt({ error: caught, deviceName: deviceInfo?.device_name });
+    } finally {
+      setEnrolPassword("");
+      setBusy(false);
+    }
+    if (result.ok) setNotice(result.message);
+    else setError(result.message);
+  };
+
+  const activatePasted = async () => {
+    setError("");
+    setNotice("");
+    const pasted = readPastedActivation(pastedActivation);
+    if (!pasted.ok) {
+      setError(pasted.message);
+      return;
+    }
+    setBusy(true);
+    try {
+      await redeem(pasted.contents);
+      setPastedActivation("");
+    } catch (caught) {
+      setError(describeRedeemError(caught));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const importFile = async (file) => {
     setError("");
     setNotice("");
     if (!file) return;
     setBusy(true);
     try {
-      const contents = await file.text();
-      await importEntitlementFile({ deviceId: deviceInfo?.device_id || "", contents });
-      setNotice("Activation accepted.");
-      await onRefresh(deviceInfo?.device_id);
+      await redeem(await file.text());
     } catch (caught) {
-      const message = String(caught?.message || caught || "This activation file could not be redeemed.");
-      setError(message.startsWith("DEVICE_BINDING_MISMATCH")
-        ? "This activation file was issued for a different device."
-        : message);
+      setError(describeRedeemError(caught));
     } finally {
       setBusy(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
@@ -12184,6 +12245,41 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
           <span className="eyebrow">This device</span>
           <small>Device ID: {deviceInfo?.device_id || "(resolving...)"}</small>
           <p>Ask the FroozERP owner to issue an activation for this device from Settings &gt; Counter &amp; Display &gt; Device Activation Licences. This device is listed there by name once it has connected to the shop; the ID above is only needed if it is not.</p>
+          <span className="eyebrow">Step 1: send this device to the shop</span>
+          <p>Sign in once so the shop can see this device. It does not open the app; the Owner still has to approve it.</p>
+          <input
+            aria-label="Username"
+            autoComplete="username"
+            disabled={busy}
+            onChange={(event) => setEnrolUsername(event.target.value)}
+            placeholder="Username"
+            value={enrolUsername}
+          />
+          <input
+            aria-label="Password"
+            autoComplete="current-password"
+            disabled={busy}
+            onChange={(event) => setEnrolPassword(event.target.value)}
+            placeholder="Password"
+            type="password"
+            value={enrolPassword}
+          />
+          <button className="secondary-button" type="button" disabled={busy} onClick={sendToShop}>
+            {busy ? "Sending..." : "Send to Shop"}
+          </button>
+          <span className="eyebrow">Step 2: activate</span>
+          <textarea
+            aria-label="Activation text"
+            disabled={busy}
+            onChange={(event) => setPastedActivation(event.target.value)}
+            placeholder="Paste the activation text the Owner sent"
+            rows={4}
+            value={pastedActivation}
+          />
+          <button className="primary-button" type="button" disabled={busy} onClick={activatePasted}>
+            {busy ? "Activating..." : "Activate"}
+          </button>
+          <small>Or choose the .lic file instead:</small>
           <input
             ref={fileInputRef}
             type="file"
