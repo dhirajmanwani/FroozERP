@@ -116,6 +116,25 @@ export const normalizeCloudChangeEvents = (payload) => {
 };
 
 /**
+ * A bill's total as this counter stored it. A zero is believed only when nothing else on the bill
+ * contradicts it: bills copied down from the cloud by older builds were stored with a zero total
+ * (the cloud list names the column `amount`), while their gross and lines say otherwise. Showing
+ * those as ₹0.00 would be an error rendered as zero, so they read as "could not be read".
+ */
+const readLocalBillTotal = (row, invoice) => {
+  const total = amountOf(invoice.net_total ?? invoice.total_amount);
+  if (total !== 0) return total;
+  const gross = amountOf(invoice.gross_total ?? invoice.gross_amount);
+  if (gross !== null && gross > 0) return null;
+  const items = Array.isArray(row?.items) ? row.items : (Array.isArray(invoice.items) ? invoice.items : []);
+  const linesCarryValue = items.some((item) => {
+    const amount = amountOf(item?.amount ?? item?.net_amount);
+    return amount !== null && amount > 0;
+  });
+  return linesCarryValue ? null : total;
+};
+
+/**
  * This counter's bills (`listLocalPosSales()` snapshots, or the invoices mapped from them) as
  * events.
  *
@@ -151,9 +170,14 @@ export const normalizeLocalChangeRows = (invoices, { userNamesById } = {}) => {
     const saleId = canonicalInventoryId(invoice.id || invoice.invoice_global_id || invoice.sale_id);
     const invoiceNo = canonicalInventoryId(invoice.server_invoice_no || invoice.offline_invoice_ref || invoice.invoice_no);
     // net_total is the stored column; total_amount is what localSnapshotToInvoice renames it to.
-    const total = amountOf(invoice.net_total ?? invoice.total_amount);
+    const total = readLocalBillTotal(row, invoice);
+    // A cancel is dated by `cancelled_at` alone. `updated_at` on a bill copied down from the cloud is
+    // the moment it was copied, so falling back to it made an old cloud cancel read as "today".
+    // A cancelled bill with no cancel time was not cancelled on this counter at a known moment, and
+    // is left out rather than given one.
+    if (cancelled && !text(invoice.cancelled_at)) return;
     const atMs = cancelled
-      ? (parseUtcTimestamp(invoice.cancelled_at) ?? parseUtcTimestamp(invoice.updated_at))
+      ? parseUtcTimestamp(invoice.cancelled_at)
       : parseUtcTimestamp(invoice.updated_at);
     if (atMs === null) {
       throw new SaleChangeEventsError(`Bill ${invoiceNo || saleId || index + 1} on this counter was ${cancelled ? "cancelled" : "edited"} at a time that could not be read.`);

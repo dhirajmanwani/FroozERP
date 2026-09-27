@@ -4039,9 +4039,12 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                 .or_else(|| sale.get("tax_total"))
                 .and_then(json_number)
                 .unwrap_or(0.0);
+            // GET /sales names the bill total `amount`. Reading only `total_amount` stored every
+            // bill copied down from the cloud with a zero total.
             let net_total = sale
                 .get("total_amount")
                 .or_else(|| sale.get("net_total"))
+                .or_else(|| sale.get("amount"))
                 .and_then(json_number)
                 .unwrap_or(0.0);
             tx.execute(
@@ -4050,16 +4053,19 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                     customer_name, customer_mobile, bill_date, bill_datetime, payment_mode,
                     gross_total, item_discount_total, bill_discount_total, tax_total, net_total,
                     status, sync_status, server_invoice_no, server_sale_id, entity_version,
-                    created_at, updated_at, synced_at
+                    created_at, updated_at, synced_at,
+                    cancelled_at, cancelled_by, cancellation_reason
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                     ?12, ?13, ?14, ?15, ?16, ?17, 'synced', ?18, ?19, ?20,
-                    COALESCE(?21, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?22, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    COALESCE(?21, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), COALESCE(?22, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    ?23, ?24, ?25
                  )
                  ON CONFLICT(id) DO UPDATE SET
                     customer_id = excluded.customer_id,
                     customer_name = excluded.customer_name,
                     customer_mobile = excluded.customer_mobile,
+                    user_id = COALESCE(local_pos_invoices.user_id, excluded.user_id),
                     bill_date = excluded.bill_date,
                     bill_datetime = excluded.bill_datetime,
                     payment_mode = excluded.payment_mode,
@@ -4074,13 +4080,16 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                     server_sale_id = excluded.server_sale_id,
                     entity_version = excluded.entity_version,
                     updated_at = excluded.updated_at,
-                    synced_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                    synced_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    cancelled_at = COALESCE(local_pos_invoices.cancelled_at, excluded.cancelled_at),
+                    cancelled_by = COALESCE(local_pos_invoices.cancelled_by, excluded.cancelled_by),
+                    cancellation_reason = COALESCE(local_pos_invoices.cancellation_reason, excluded.cancellation_reason)",
                 params![
                     sale_id,
                     offline_ref,
                     branch_id,
                     optional_text(sale, "source_device_id").unwrap_or_else(|| device_id.clone()),
-                    optional_text(sale, "created_by"),
+                    optional_text(sale, "created_by").or_else(|| optional_text(sale, "user_id")),
                     optional_text(sale, "customer_id"),
                     optional_text(sale, "customer_name"),
                     optional_text(sale, "customer_mobile"),
@@ -4100,6 +4109,11 @@ fn cache_reference_snapshot_at(path: &Path, snapshot: &serde_json::Value) -> Res
                     sale.get("entity_version").and_then(|value| value.as_i64()).unwrap_or(1),
                     optional_text(sale, "created_at"),
                     optional_text(sale, "updated_at"),
+                    // When and by whom the cloud cancelled it. Without these a cloud-cancelled bill
+                    // looked cancelled at the moment it was copied down, by nobody.
+                    optional_text(sale, "cancelled_at"),
+                    optional_text(sale, "cancelled_by"),
+                    optional_text(sale, "cancellation_reason"),
                 ],
             )
             .map_err(to_error)?;
@@ -11261,6 +11275,78 @@ mod tests {
             .expect("cached sale total");
         assert_eq!(count, 1);
         assert_eq!(total, 75.0);
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn online_reference_snapshot_reads_the_cloud_sales_list_as_it_is_shaped() {
+        // GET /sales returns the total as `amount` (a NUMERIC string) and the maker as `created_by`.
+        // Reading only `total_amount` stored every such bill at a zero total with no maker, which
+        // the Owner's bell then showed as "1 bill cancelled (₹0.00) by Unknown".
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-snapshot-sales-shape-{}-{}.sqlite3",
+            std::process::id(),
+            unique_local_id("test")
+        ));
+        let _ = fs::remove_file(&path);
+        initialize_at(&path).expect("initialize sales shape database");
+        let snapshot = |row: serde_json::Value| serde_json::json!({
+            "branch_context": { "branch_id": "1", "branch_name": "Main" },
+            "device_identity": { "device_id": "device-b", "device_name": "Device B" },
+            "products": [],
+            "categories": [],
+            "inventory_lots": [],
+            "customers": [],
+            "sales_history": [row],
+            "settings_bundle": {}
+        });
+        // What an older build stored: no total field it recognised, no maker.
+        cache_reference_snapshot_at(&path, &snapshot(serde_json::json!({
+            "id": 701,
+            "invoice_no": "FZ-701",
+            "sale_date": "2026-09-27",
+            "payment_mode": "CASH",
+            "gross_amount": "1350.00",
+            "created_at": "2026-09-27T09:00:00.000Z"
+        })))
+        .expect("cache sale without a recognised total");
+        // The same bill as the cloud list really shapes it.
+        cache_reference_snapshot_at(&path, &snapshot(serde_json::json!({
+            "id": 701,
+            "invoice_no": "FZ-701",
+            "sale_date": "2026-09-27",
+            "payment_mode": "CASH",
+            "gross_amount": "1350.00",
+            "amount": "1350.00",
+            "created_by": 3,
+            "sale_status": "CANCELLED",
+            "cancelled_at": "2026-09-20T10:15:00.000Z",
+            "cancelled_by": 1,
+            "cancellation_reason": "Duplicate bill",
+            "created_at": "2026-09-27T09:00:00.000Z"
+        })))
+        .expect("cache sale as the cloud list shapes it");
+        let conn = Connection::open(&path).expect("inspect sales shape database");
+        let (total, maker): (f64, Option<String>) = conn
+            .query_row(
+                "SELECT net_total, user_id FROM local_pos_invoices WHERE id = 'cloud-sale-701'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("cached sale total and maker");
+        assert_eq!(total, 1350.0);
+        assert_eq!(maker.as_deref(), Some("3"));
+        let (cancelled_at, cancelled_by, reason): (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT cancelled_at, cancelled_by, cancellation_reason FROM local_pos_invoices WHERE id = 'cloud-sale-701'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("cached cancellation");
+        assert_eq!(cancelled_at.as_deref(), Some("2026-09-20T10:15:00.000Z"));
+        assert_eq!(cancelled_by.as_deref(), Some("1"));
+        assert_eq!(reason.as_deref(), Some("Duplicate bill"));
         drop(conn);
         let _ = fs::remove_file(&path);
     }
