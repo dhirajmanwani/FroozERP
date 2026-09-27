@@ -75,6 +75,12 @@ const migrationFiles = [
   // declared in `initializeDatabase()`, which never runs on a hosted deployment, so without this
   // file the table does not exist there and `verifyDeclaredSchema` refuses to start the backend.
   "backend/migrations/cloud/020_product_photos.sql",
+  // 021 creates `sale_change_approvals` and adds `sale_audit_trail.approved_by`: the Owner/Admin
+  // approval a cashier needs before cancelling or editing a bill. Both are declared in
+  // `initializeDatabase()`, which never runs on a hosted deployment, so without this file neither
+  // exists there -- `verifyDeclaredSchema` refuses to start, and every cashier's cancel or edit
+  // would 500 on the missing table once it did.
+  "backend/migrations/cloud/021_sale_change_approvals.sql",
 ];
 
 module.exports = { migrationFiles, deliberatelyNotRun };

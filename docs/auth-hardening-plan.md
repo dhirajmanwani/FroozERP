@@ -1915,3 +1915,71 @@ selected. They are not fixed here.
 drives an injected `fetchImpl`. That covers the request shape, the refusals, the timeout path and
 the failure codes. It does **not** prove that a real Ollama accepts this body, or that a 3B model
 phrases well enough to be worth using. Both need a run on the owner's machine.
+
+---
+
+## Sale-change approval — a second person's password, checked by the server (2026-09-27)
+
+### What it is
+
+A cashier (any role other than Owner or Admin) who cancels or edits a completed bill now needs an
+Owner or Admin to type their own username and password on the counter first. This is the first
+place since A-3 where the server checks a password for someone who is **not** the signed-in user,
+so it is recorded here next to `/login`.
+
+- **`POST /api/v3/sale-change-approvals`** (through `v3WriteAdapter`). Body
+  `{action: "cancel"|"edit", sale_ref, approver_username, approver_password, reason}`.
+  The requester is `req.auth.userId` and nothing else, and must already hold the cancel or edit
+  permission (`getSalePermissionUser`) — approval adds a second person, it does not grant the right.
+  The approver is looked up by username (case-insensitive, as `/login` does) and must be an active
+  Owner or Admin of the requester's company. The password goes through `checkPassword`;
+  `storedPasswordIsUnusable` answers `PASSWORD_RESET_REQUIRED` as at `/login`.
+  201 `{approval_id, approver_name, expires_at}`; errors are `{code, message}`:
+  `APPROVAL_REQUEST_INVALID` 400, `APPROVAL_NOT_NEEDED` 400, `APPROVER_CREDENTIALS_INVALID` 401,
+  `PASSWORD_RESET_REQUIRED` 401, `APPROVER_NOT_ALLOWED` 403, `REQUESTER_NOT_ALLOWED` 403,
+  `APPROVAL_ATTEMPTS_LOCKED` 429.
+- **`sale_change_approvals`** holds one row per attempt: ISSUED (7-day expiry), CONSUMED, or FAILED.
+  The id is a random UUID made in Node.
+- **`authorizeSaleChange`** is the one enforcement helper, called by all four bill-change paths
+  (`updateSaleHandler`, `cancelSaleHandler`, `processPosSaleEditOperation`,
+  `processPosSaleCancelOperation`). Owner/Admin need nothing. Anyone else needs an ISSUED,
+  unexpired approval bound to the same action, bill (any of its row id, global id or offline ref),
+  requester, company and device, whose approver is *still* an active Owner or Admin. It is locked
+  `FOR UPDATE` and marked CONSUMED in the change's own transaction, so a rolled-back change leaves
+  it usable and two concurrent changes cannot both spend it. A refusal is 403
+  `SALE_CHANGE_APPROVAL_REQUIRED` (with a `detail` naming the binding that failed) on the browser
+  path and `AUTHORIZATION_ERROR` on sync. The approver is written to `sale_audit_trail.approved_by`.
+
+The rules are pure functions in `backend/saleChangeApproval.js`, tested in
+`saleChangeApproval.test.js` along with source assertions that pin the wiring.
+
+### The decisions that matter for security
+
+- **Failures count against the requester, never the approver.** Five FAILED rows in fifteen
+  minutes refuse further attempts from that requester (429), serialised by an advisory lock so
+  parallel attempts cannot slip under the limit. The approver's `failed_login_attempts` /
+  `locked_until` are **never written** — otherwise any cashier could lock the Owner out of the shop
+  by typing the Owner's username five times. An approver *already* locked out of `/login` cannot
+  approve either (403 `APPROVER_NOT_ALLOWED`), so the lock is not one route wide.
+- **Role and company are checked only after the password.** A wrong guess answers
+  `APPROVER_CREDENTIALS_INVALID` for an unknown username and for a real one alike, so the route does
+  not tell a cashier which usernames are Owners.
+- **The password is never stored or logged.** Every attempt, including refused and malformed ones,
+  is written to `auth_audit_log` (`SALE_CHANGE_APPROVAL_GRANTED` / `_FAILED`, the requester as
+  `actor_user_id`, the approver as `user_id` when known), with the action, bill ref and stage. A test
+  pins that the password reaches `checkPassword` and no other expression.
+- **The desktop carries only the approval id.** The Rust outbox adds `approval_id` to the sale
+  cancel/edit payload; the cloud re-reads everything the id stands for. A device cannot mint one.
+
+### Still open, and worth knowing
+
+- **Rate is per requester, not per approver.** A cashier gets 5 wrong attempts per 15 minutes and
+  10 per day (then locked until the next day), so at most 10 guesses a day at the Owner's password,
+  and the Owner's own account never locks. Several cashiers together multiply that. Every attempt
+  is audited under the cashier's own name; a per-approver ceiling that raises an alert rather than
+  a lock would close the remainder without handing out the lockout.
+- **TLS (Gate 2.3) still applies.** The approver's password crosses the wire exactly as a sign-in
+  does; over plaintext HTTP it is as exposed as `/login`.
+- **Sync binds the approval to the requester and the device.** An offline change pushed later under
+  a different user's session, or from a different device, is refused. That is deliberate, and means
+  a counter where cashiers swap sessions before the outbox drains will see those changes rejected.

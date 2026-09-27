@@ -71,6 +71,7 @@ const {
 } = require("./activationLicence");
 const { normaliseLicenceRequest } = require("./activationLicenceRequest");
 const { validateProductPhoto } = require("./productPhoto");
+const saleChangeApproval = require("./saleChangeApproval");
 const {
   REFERENCE_BOOTSTRAP_PROTOCOL,
   captureReferenceBootstrap,
@@ -3782,6 +3783,31 @@ const initializeDatabase = async () => {
       edited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
+    -- Owner/Admin approval for a cashier's bill cancel or edit (backend/saleChangeApproval.js).
+    -- One row per attempt: ISSUED when the approver's password was right, CONSUMED once the change
+    -- it covers is written, FAILED for a wrong attempt (counted per requester, never against the
+    -- approver's own login lockout). The id is a random UUID made in Node. Mirrored in
+    -- backend/migrations/cloud/021_sale_change_approvals.sql.
+    CREATE TABLE IF NOT EXISTS sale_change_approvals (
+      id TEXT PRIMARY KEY,
+      status VARCHAR(20) NOT NULL,
+      action VARCHAR(20) NOT NULL,
+      sale_ref VARCHAR(180) NOT NULL,
+      requester_id INTEGER NOT NULL REFERENCES users(id),
+      approver_id INTEGER REFERENCES users(id),
+      company_id INTEGER,
+      branch_id INTEGER,
+      device_id VARCHAR(160),
+      reason TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      expires_at TIMESTAMPTZ,
+      consumed_at TIMESTAMPTZ,
+      consumed_sale_id INTEGER REFERENCES sales(id)
+    );
+    CREATE INDEX IF NOT EXISTS sale_change_approvals_requester_idx
+      ON sale_change_approvals (requester_id, created_at);
+    ALTER TABLE sale_audit_trail ADD COLUMN IF NOT EXISTS approved_by INTEGER REFERENCES users(id);
+
     ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS discount_amount NUMERIC(14, 2) DEFAULT 0;
     ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS net_amount NUMERIC(14, 2);
     ALTER TABLE sale_items ADD COLUMN IF NOT EXISTS cost_status VARCHAR(30) DEFAULT 'FINAL';
@@ -5988,6 +6014,58 @@ const getSalePermissionUser = async (userId, action, client = pool) => {
   if (action === "edit" && user.can_edit_sales) return user;
   if (action === "cancel" && user.can_cancel_sales) return user;
   return null;
+};
+
+/**
+ * The Owner/Admin approval check shared by all four bill-change paths: `updateSaleHandler`,
+ * `cancelSaleHandler`, `processPosSaleEditOperation` and `processPosSaleCancelOperation`.
+ *
+ * `actor` is the row `getSalePermissionUser` returned for the verified session (browser) or the
+ * sync session's user (offline), so its role is re-read from the database, never taken from a
+ * token or a payload. An Owner or Admin needs nothing. Anyone else needs an ISSUED approval bound to
+ * this action, this bill, themselves, this company and this device; it is locked FOR UPDATE and
+ * marked CONSUMED inside the caller's transaction, so a rolled-back change leaves it usable and two
+ * concurrent changes cannot both spend it.
+ *
+ * Returns `{ ok: true, approverId }` (null when none was needed) or
+ * `{ ok: false, code: "SALE_CHANGE_APPROVAL_REQUIRED", detail, message }`.
+ */
+const authorizeSaleChange = async (client, { actor, action, approvalId, sale, companyId, deviceId }) => {
+  if (!saleChangeApproval.approvalRequired(actor?.role_name)) return { ok: true, approverId: null };
+  const id = saleChangeApproval.normalizeApprovalId(approvalId);
+  if (!id) return saleChangeApproval.missingApproval();
+  const result = await client.query(
+    `SELECT a.*, r.role_name AS approver_role, u.active AS approver_active
+     FROM sale_change_approvals a
+     LEFT JOIN users u ON u.id = a.approver_id
+     LEFT JOIN roles r ON r.id = u.role_id
+     WHERE a.id = $1
+     FOR UPDATE OF a`,
+    [id]
+  );
+  const row = result.rows[0];
+  const binding = saleChangeApproval.checkApprovalBinding(row, {
+    action,
+    saleRefs: saleChangeApproval.saleRefsOf(sale),
+    requesterId: actor?.id,
+    companyId,
+    deviceId,
+    nowMs: Date.now(),
+  });
+  if (!binding.ok) return binding;
+  await client.query(
+    `UPDATE sale_change_approvals
+     SET status = 'CONSUMED', consumed_at = CURRENT_TIMESTAMP, consumed_sale_id = $2
+     WHERE id = $1 AND status = 'ISSUED'`,
+    [id, sale.id]
+  );
+  return { ok: true, approverId: row.approver_id };
+};
+
+/** The browser path's refusal: roll back and answer 403 with the binding's code and reason. */
+const rejectSaleChange = async (client, res, approval) => {
+  await client.query("ROLLBACK");
+  return res.status(403).json({ code: approval.code, detail: approval.detail, message: approval.message });
 };
 
 const getSaleSnapshot = async (client, saleId) => {
@@ -10444,6 +10522,9 @@ const syncSaleEnvelope = (operation) => {
     invoiceGlobalId,
     offlineInvoiceRef,
     reason: cleanText(payload.reason || invoice.edit_reason || invoice.cancellation_reason),
+    // The Owner/Admin approval a cashier's change carries. Only its id travels; everything it
+    // grants is re-read and checked by `authorizeSaleChange`.
+    approvalId: cleanText(payload.approval_id),
     version: Number(payload.new_version || invoice.entity_version || operation.version || 1),
   };
 };
@@ -10856,7 +10937,7 @@ const processPosSaleFoundationOperation = async (client, operation, context) => 
 
 const processPosSaleEditOperation = async (client, operation, context) => {
   const envelope = syncSaleEnvelope(operation);
-  const { payload, sale, invoice, invoiceGlobalId, offlineInvoiceRef, reason, version } = envelope;
+  const { payload, sale, invoice, invoiceGlobalId, offlineInvoiceRef, reason, approvalId, version } = envelope;
   if (!reason) return rejectOperation(operation, "VALIDATION_ERROR", "Offline sale edit requires a reason");
   const editor = await getSalePermissionUser(context.user.id, "edit", client);
   if (!editor) return rejectOperation(operation, "AUTHORIZATION_ERROR", "Sync user is not allowed to edit sales");
@@ -10898,6 +10979,8 @@ const processPosSaleEditOperation = async (client, operation, context) => {
       result_payload: { sale_id: currentSale.id, invoice_no: currentSale.invoice_no, offline_invoice_ref: offlineInvoiceRef, duplicate: true },
     };
   }
+  const approval = await authorizeSaleChange(client, { actor: editor, action: "edit", approvalId, sale: currentSale, companyId: context.companyId, deviceId: context.deviceId });
+  if (!approval.ok) return rejectOperation(operation, "AUTHORIZATION_ERROR", approval.message);
 
   const requestedSaleDate = invoice.bill_date || invoice.sale_date
     ? toBusinessDateKey(invoice.bill_date || invoice.sale_date)
@@ -11057,10 +11140,10 @@ const processPosSaleEditOperation = async (client, operation, context) => {
   }
   await client.query(
     `
-    INSERT INTO sale_audit_trail (sale_id, action, field_name, old_value, new_value, reason, edited_by)
-    VALUES ($1, 'EDIT', 'offline_sync_invoice', $2::jsonb, $3::jsonb, $4, $5)
+    INSERT INTO sale_audit_trail (sale_id, action, field_name, old_value, new_value, reason, edited_by, approved_by)
+    VALUES ($1, 'EDIT', 'offline_sync_invoice', $2::jsonb, $3::jsonb, $4, $5, $6)
     `,
-    [currentSale.id, JSON.stringify(oldSnapshot), JSON.stringify(await getSaleSnapshot(client, currentSale.id)), reason, editor.id]
+    [currentSale.id, JSON.stringify(oldSnapshot), JSON.stringify(await getSaleSnapshot(client, currentSale.id)), reason, editor.id, approval.approverId]
   );
   const customerChanged = String(currentSale.customer_id || "") !== String(salePayload.customerId || "")
     || String(currentSale.customer_name || "") !== String(salePayload.customerName || "");
@@ -11114,7 +11197,7 @@ const processPosSaleEditOperation = async (client, operation, context) => {
 };
 
 const processPosSaleCancelOperation = async (client, operation, context) => {
-  const { payload, invoice, invoiceGlobalId, offlineInvoiceRef, reason, version } = syncSaleEnvelope(operation);
+  const { payload, invoice, invoiceGlobalId, offlineInvoiceRef, reason, approvalId, version } = syncSaleEnvelope(operation);
   const cancelReason = reason || "Offline invoice cancelled";
   const canceller = await getSalePermissionUser(context.user.id, "cancel", client);
   if (!canceller) return rejectOperation(operation, "AUTHORIZATION_ERROR", "Sync user is not allowed to cancel sales");
@@ -11133,6 +11216,8 @@ const processPosSaleCancelOperation = async (client, operation, context) => {
       result_payload: { sale_id: currentSale.id, invoice_no: currentSale.invoice_no, offline_invoice_ref: offlineInvoiceRef, duplicate: true },
     };
   }
+  const approval = await authorizeSaleChange(client, { actor: canceller, action: "cancel", approvalId, sale: currentSale, companyId: context.companyId, deviceId: context.deviceId });
+  if (!approval.ok) return rejectOperation(operation, "AUTHORIZATION_ERROR", approval.message);
   const oldSnapshot = await getSaleSnapshot(client, currentSale.id);
   await restoreSaleInventory(client, currentSale.id, canceller.id, "Offline cancellation reversal for invoice", "IN");
   await client.query("DELETE FROM sale_batch_allocations WHERE sale_item_id IN (SELECT id FROM sale_items WHERE sale_id = $1)", [currentSale.id]);
@@ -11153,10 +11238,10 @@ const processPosSaleCancelOperation = async (client, operation, context) => {
   const cancelledSale = updateResult.rows[0];
   await client.query(
     `
-    INSERT INTO sale_audit_trail (sale_id, action, field_name, old_value, new_value, reason, edited_by)
-    VALUES ($1, 'CANCEL', 'offline_sync_invoice', $2::jsonb, $3::jsonb, $4, $5)
+    INSERT INTO sale_audit_trail (sale_id, action, field_name, old_value, new_value, reason, edited_by, approved_by)
+    VALUES ($1, 'CANCEL', 'offline_sync_invoice', $2::jsonb, $3::jsonb, $4, $5, $6)
     `,
-    [currentSale.id, JSON.stringify(oldSnapshot), JSON.stringify(await getSaleSnapshot(client, currentSale.id)), cancelReason, canceller.id]
+    [currentSale.id, JSON.stringify(oldSnapshot), JSON.stringify(await getSaleSnapshot(client, currentSale.id)), cancelReason, canceller.id, approval.approverId]
   );
   await insertCustomerLedgerEntry(
     client,
@@ -19890,9 +19975,16 @@ app.get("/reports/summary", async (req, res) => {
           s.cancellation_reason,
           s.edit_reason,
           u.full_name AS changed_by_name,
+          ap.full_name AS approved_by_name,
           s.edited_at
         FROM sales s
         LEFT JOIN users u ON u.id = COALESCE(s.cancelled_by, s.edited_by)
+        LEFT JOIN LATERAL (
+          SELECT sat.approved_by FROM sale_audit_trail sat
+          WHERE sat.sale_id = s.id AND sat.action IN ('EDIT', 'CANCEL')
+          ORDER BY sat.edited_at DESC, sat.id DESC LIMIT 1
+        ) last_change ON TRUE
+        LEFT JOIN users ap ON ap.id = last_change.approved_by
         WHERE (s.sale_status IN ('EDITED', 'CANCELLED') OR s.edited_at IS NOT NULL OR s.cancelled_at IS NOT NULL) AND s.branch_id = $3
           AND s.sale_date BETWEEN $1 AND $2
         ORDER BY COALESCE(s.cancelled_at, s.edited_at, s.created_at) DESC
@@ -23322,9 +23414,15 @@ app.get("/sales-report/changes", async (req, res) => {
         `
         SELECT
           s.id, s.invoice_no, s.sale_date, s.total_amount, s.edited_at, s.edit_reason,
-          u.full_name AS edited_by_name, s.customer_name, s.customer_mobile
+          u.full_name AS edited_by_name, ap.full_name AS approved_by_name, s.customer_name, s.customer_mobile
         FROM sales s
         LEFT JOIN users u ON u.id = s.edited_by
+        LEFT JOIN LATERAL (
+          SELECT sat.approved_by FROM sale_audit_trail sat
+          WHERE sat.sale_id = s.id AND sat.action = 'EDIT'
+          ORDER BY sat.edited_at DESC, sat.id DESC LIMIT 1
+        ) last_edit ON TRUE
+        LEFT JOIN users ap ON ap.id = last_edit.approved_by
         WHERE s.branch_id = $1
           AND s.sale_status = 'EDITED'
         ORDER BY s.edited_at DESC NULLS LAST, s.id DESC
@@ -23335,9 +23433,15 @@ app.get("/sales-report/changes", async (req, res) => {
         `
         SELECT
           s.id, s.invoice_no, s.sale_date, s.total_amount, s.cancelled_at, s.cancellation_reason,
-          u.full_name AS cancelled_by_name, s.customer_name, s.customer_mobile
+          u.full_name AS cancelled_by_name, ap.full_name AS approved_by_name, s.customer_name, s.customer_mobile
         FROM sales s
         LEFT JOIN users u ON u.id = s.cancelled_by
+        LEFT JOIN LATERAL (
+          SELECT sat.approved_by FROM sale_audit_trail sat
+          WHERE sat.sale_id = s.id AND sat.action = 'CANCEL'
+          ORDER BY sat.edited_at DESC, sat.id DESC LIMIT 1
+        ) last_cancel ON TRUE
+        LEFT JOIN users ap ON ap.id = last_cancel.approved_by
         WHERE s.branch_id = $1
           AND s.sale_status = 'CANCELLED'
         ORDER BY s.cancelled_at DESC NULLS LAST, s.id DESC
@@ -23357,6 +23461,80 @@ app.get("/sales-report/changes", async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Error Loading Sale Change Report" });
+  }
+});
+
+/**
+ * Every bill cancel and edit in this branch since `since` (an ISO instant), for the Owner's daily
+ * summary. Read from `sale_audit_trail`, so a bill edited twice appears twice -- the summary counts
+ * changes, not bills.
+ *
+ * `edited_at` is a TIMESTAMP holding UTC wall time, so `since` is converted to UTC wall time for the
+ * comparison and `at` is formatted as UTC with a `Z`, never left for the Node process's zone to
+ * interpret. `new_total` is null for a cancel: a cancelled bill has no new total, and repeating the
+ * old one would read as "cancelled for the same amount". A figure that cannot be read is null, never
+ * 0. `truncated` is set when there were more rows than returned, so a partial list is never shown
+ * as the whole day.
+ */
+const SALE_CHANGE_EVENTS_LIMIT = 1000;
+app.get("/sales-report/change-events", async (req, res) => {
+  try {
+    const reader = await getPermissionUser(req.auth.userId, "reports", ["Owner", "Admin"]);
+    if (!reader || !RATE_MANAGER_ROLES.has(reader.role_name)) {
+      return res.status(403).json({ code: "SALE_CHANGE_EVENTS_DENIED", message: "Only the Owner or an Admin can see bill changes." });
+    }
+    const sinceText = typeof req.query.since === "string" ? req.query.since.trim() : "";
+    const sinceMs = sinceText ? Date.parse(sinceText) : Number.NaN;
+    if (!Number.isFinite(sinceMs)) {
+      return res.status(400).json({ code: "INVALID_SINCE", message: "since must be an ISO date-time." });
+    }
+    const result = await pool.query(
+      `
+      SELECT
+        LOWER(sat.action) AS action,
+        s.id AS sale_id,
+        s.invoice_no,
+        (sat.old_value->'sale'->>'total_amount') AS old_total,
+        (sat.new_value->'sale'->>'total_amount') AS new_total,
+        sat.reason,
+        TO_CHAR(sat.edited_at, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS at,
+        u.full_name AS by_name,
+        ap.full_name AS approved_by_name
+      FROM sale_audit_trail sat
+      JOIN sales s ON s.id = sat.sale_id
+      LEFT JOIN users u ON u.id = sat.edited_by
+      LEFT JOIN users ap ON ap.id = sat.approved_by
+      WHERE s.branch_id = $1
+        AND sat.action IN ('EDIT', 'CANCEL')
+        AND sat.edited_at >= ($2::timestamptz AT TIME ZONE 'UTC')
+      ORDER BY sat.edited_at ASC, sat.id ASC
+      LIMIT $3
+      `,
+      [req.auth.branchId, new Date(sinceMs).toISOString(), SALE_CHANGE_EVENTS_LIMIT + 1]
+    );
+    const money = (value) => {
+      if (value === null || value === undefined || value === "") return null;
+      const amount = Number(value);
+      return Number.isFinite(amount) ? roundCurrency(amount) : null;
+    };
+    const rows = result.rows.slice(0, SALE_CHANGE_EVENTS_LIMIT);
+    return res.json({
+      events: rows.map((row) => ({
+        action: row.action,
+        sale_id: row.sale_id,
+        invoice_no: row.invoice_no,
+        old_total: money(row.old_total),
+        new_total: row.action === "cancel" ? null : money(row.new_total),
+        reason: row.reason,
+        at: row.at,
+        by_name: row.by_name || null,
+        approved_by_name: row.approved_by_name || null,
+      })),
+      truncated: result.rows.length > SALE_CHANGE_EVENTS_LIMIT,
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ code: "SALE_CHANGE_EVENTS_FAILED", message: "Error Loading Bill Changes" });
   }
 });
 
@@ -23857,6 +24035,8 @@ const updateSaleHandler = async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Cancelled invoices cannot be edited" });
     }
+    const approval = await authorizeSaleChange(client, { actor: editor, action: "edit", approvalId: req.body.approval_id, sale: currentSale, companyId: context?.company_id ?? req.auth.companyId, deviceId: context?.device_id ?? req.auth.deviceId });
+    if (!approval.ok) return rejectSaleChange(client, res, approval);
     /*
      * Charges on an edit: silence is not "there are none".
      *
@@ -24058,10 +24238,10 @@ const updateSaleHandler = async (req, res) => {
 
     await client.query(
       `
-      INSERT INTO sale_audit_trail (sale_id, action, field_name, old_value, new_value, reason, edited_by)
-      VALUES ($1, 'EDIT', 'invoice', $2::jsonb, $3::jsonb, $4, $5)
+      INSERT INTO sale_audit_trail (sale_id, action, field_name, old_value, new_value, reason, edited_by, approved_by)
+      VALUES ($1, 'EDIT', 'invoice', $2::jsonb, $3::jsonb, $4, $5, $6)
       `,
-      [saleId, JSON.stringify(oldSnapshot), JSON.stringify(await getSaleSnapshot(client, saleId)), reason, editor.id]
+      [saleId, JSON.stringify(oldSnapshot), JSON.stringify(await getSaleSnapshot(client, saleId)), reason, editor.id, approval.approverId]
     );
 
     const customerChanged = String(currentSale.customer_id || "") !== String(salePayload.customerId || "")
@@ -24159,6 +24339,8 @@ const cancelSaleHandler = async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({ message: "Invoice is already cancelled" });
     }
+    const approval = await authorizeSaleChange(client, { actor: canceller, action: "cancel", approvalId: req.body.approval_id, sale: currentSale, companyId: context?.company_id ?? req.auth.companyId, deviceId: context?.device_id ?? req.auth.deviceId });
+    if (!approval.ok) return rejectSaleChange(client, res, approval);
     const oldSnapshot = await getSaleSnapshot(client, saleId);
     await restoreSaleInventory(client, saleId, canceller.id, "Cancellation reversal for invoice", "IN");
     await client.query("DELETE FROM sale_batch_allocations WHERE sale_item_id IN (SELECT id FROM sale_items WHERE sale_id = $1)", [saleId]);
@@ -24178,10 +24360,10 @@ const cancelSaleHandler = async (req, res) => {
     const cancelledSale = updateResult.rows[0];
     await client.query(
       `
-      INSERT INTO sale_audit_trail (sale_id, action, field_name, old_value, new_value, reason, edited_by)
-      VALUES ($1, 'CANCEL', 'invoice', $2::jsonb, $3::jsonb, $4, $5)
+      INSERT INTO sale_audit_trail (sale_id, action, field_name, old_value, new_value, reason, edited_by, approved_by)
+      VALUES ($1, 'CANCEL', 'invoice', $2::jsonb, $3::jsonb, $4, $5, $6)
       `,
-      [saleId, JSON.stringify(oldSnapshot), JSON.stringify(await getSaleSnapshot(client, saleId)), reason, canceller.id]
+      [saleId, JSON.stringify(oldSnapshot), JSON.stringify(await getSaleSnapshot(client, saleId)), reason, canceller.id, approval.approverId]
     );
     await insertCustomerLedgerEntry(
       client,
@@ -24217,6 +24399,172 @@ const cancelSaleHandler = async (req, res) => {
 };
 app.post("/sales/:id/cancel", cancelSaleHandler);
 app.post("/api/v3/sales/:id/cancel", rateLimitSyncRequest, v3WriteAdapter(cancelSaleHandler));
+
+/**
+ * An Owner or Admin approves a cashier's bill cancel or edit by typing their own password on the
+ * counter. See `backend/saleChangeApproval.js` for the rules and `docs/auth-hardening-plan.md`
+ * ("Sale-change approval") for why it is shaped this way.
+ *
+ * - The requester is `req.auth.userId` and nothing else, and must already hold the cancel or edit
+ *   permission: approval adds a second person, it does not grant the right.
+ * - The approver is looked up by username and must be an active Owner or Admin of the same company.
+ * - A wrong attempt is recorded as a FAILED row against the **requester**; five inside fifteen
+ *   minutes refuses further attempts. The approver's own login lockout is never touched, so a
+ *   cashier cannot lock the Owner out by guessing, but an approver already locked out of `/login`
+ *   cannot approve either -- the lock would otherwise be one route wide.
+ * - Every attempt is written to `auth_audit_log`. The password never is, anywhere.
+ */
+const createSaleChangeApprovalHandler = async (req, res) => {
+  const { CODES, APPROVAL_STATUS, FAILURE_WINDOW_MINUTES } = saleChangeApproval;
+  const context = req.v3OperationalContext;
+  const requesterId = req.auth.userId;
+  const companyId = context?.company_id ?? req.auth.companyId;
+  const branchId = context?.branch_id ?? req.auth.branchId;
+  const deviceId = context?.device_id ?? req.auth.deviceId;
+  const parsed = saleChangeApproval.normalizeApprovalRequest(req.body);
+  // Built from the validated request, or from what was typed when it did not validate. Never from
+  // the password, which no audit row, log line or table ever holds.
+  const request = parsed.ok ? parsed.value : {
+    action: cleanText(req.body?.action).slice(0, 20),
+    saleRef: cleanText(req.body?.sale_ref).slice(0, 180),
+    approverUsername: cleanText(req.body?.approver_username),
+  };
+  const audit = (safeCode, { approverId = null, stage = "", approvalId = null } = {}) => writeAuthAudit({
+    userId: approverId,
+    actorUserId: requesterId,
+    username: request.approverUsername.slice(0, 120),
+    action: safeCode === "APPROVED" ? "SALE_CHANGE_APPROVAL_GRANTED" : "SALE_CHANGE_APPROVAL_FAILED",
+    safeCode,
+    deviceId,
+    ipAddress: req.ip,
+    details: { sale_action: request.action, sale_ref: request.saleRef, stage, approval_id: approvalId },
+  });
+  if (!parsed.ok) {
+    await audit(parsed.code, { stage: "request" });
+    return res.status(400).json({ code: parsed.code, message: parsed.message });
+  }
+
+  const requester = await getSalePermissionUser(requesterId, request.action);
+  if (!requester) {
+    await audit(CODES.REQUESTER_NOT_ALLOWED, { stage: "requester_permission" });
+    return res.status(403).json({
+      code: CODES.REQUESTER_NOT_ALLOWED,
+      message: request.action === "cancel"
+        ? "You do not have permission to cancel completed sales."
+        : "You do not have permission to edit completed sales.",
+    });
+  }
+  if (!saleChangeApproval.approvalRequired(requester.role_name)) {
+    await audit(CODES.NOT_NEEDED, { stage: "requester_role" });
+    return res.status(400).json({ code: CODES.NOT_NEEDED, message: "Owners and Admins do not need approval to change a bill." });
+  }
+
+  const client = await pool.connect();
+  let finished = false;
+  try {
+    await client.query("BEGIN");
+    // Serialises one requester's attempts, so two at once cannot both slip under the limit.
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`sale-change-approval:${requesterId}`]);
+    const failures = await client.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE created_at > CURRENT_TIMESTAMP - ($2::INTEGER * INTERVAL '1 minute'))::INTEGER AS failures,
+         COUNT(*)::INTEGER AS daily_failures
+       FROM sale_change_approvals
+       WHERE requester_id = $1 AND status = 'FAILED'
+         AND created_at > CURRENT_TIMESTAMP - INTERVAL '1 day'`,
+      [requester.id, FAILURE_WINDOW_MINUTES]
+    );
+    const { failures: windowFailures, daily_failures: dailyFailures } = failures.rows[0] || {};
+    if (saleChangeApproval.approvalAttemptsLocked(windowFailures, dailyFailures)) {
+      await client.query("COMMIT");
+      finished = true;
+      await audit(CODES.ATTEMPTS_LOCKED, { stage: "requester_attempts" });
+      return res.status(429).json({
+        code: CODES.ATTEMPTS_LOCKED,
+        message: saleChangeApproval.approvalAttemptsLockedForTheDay(dailyFailures)
+          ? "Too many wrong approval attempts today. Ask the Owner or Admin to make the change themselves."
+          : `Too many wrong approval attempts. Wait ${FAILURE_WINDOW_MINUTES} minutes, or ask the Owner or Admin to make the change themselves.`,
+      });
+    }
+
+    const refuse = async (status, code, message, { approverId = null, stage } = {}) => {
+      // PASSWORD_RESET_REQUIRED compared nothing, so it is no guess and is not counted.
+      if (code !== CODES.PASSWORD_RESET_REQUIRED) {
+        await client.query(
+          `INSERT INTO sale_change_approvals (
+             id, status, action, sale_ref, requester_id, approver_id, company_id, branch_id, device_id, reason
+           )
+           VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, $8, $9)`,
+          [crypto.randomUUID(), APPROVAL_STATUS.FAILED, request.action, request.saleRef, requester.id,
+            companyId || null, branchId || null, deviceId || null, request.reason]
+        );
+      }
+      await client.query("COMMIT");
+      finished = true;
+      await audit(code, { approverId, stage });
+      return res.status(status).json({ code, message });
+    };
+    const WRONG_CREDENTIALS = "That Owner or Admin username or password is not right.";
+
+    const approverResult = await client.query(
+      `SELECT u.id, u.full_name, u.username, u.password_hash, u.active, u.locked_until, r.role_name,
+              COALESCE(u.company_id, b.company_id) AS company_id
+       FROM users u
+       JOIN roles r ON r.id = u.role_id
+       LEFT JOIN branches b ON b.id = u.branch_id
+       WHERE LOWER(u.username) = LOWER($1)
+       LIMIT 1`,
+      [request.approverUsername]
+    );
+    const approver = approverResult.rows[0];
+    if (!approver || approver.active === false) {
+      return refuse(401, CODES.CREDENTIALS_INVALID, WRONG_CREDENTIALS, { approverId: approver?.id, stage: "approver_lookup" });
+    }
+    if (resolveLockState({ lockedUntil: approver.locked_until }).locked) {
+      return refuse(403, CODES.APPROVER_NOT_ALLOWED, "That Owner or Admin account is locked after failed sign-ins. Try again later.", { approverId: approver.id, stage: "approver_locked" });
+    }
+    const verification = await checkPassword(request.approverPassword, approver.password_hash);
+    if (storedPasswordIsUnusable(verification)) {
+      return refuse(401, CODES.PASSWORD_RESET_REQUIRED, PASSWORD_RESET_REQUIRED_MESSAGE, { approverId: approver.id, stage: "approver_password_format" });
+    }
+    if (!verification?.ok) {
+      return refuse(401, CODES.CREDENTIALS_INVALID, WRONG_CREDENTIALS, { approverId: approver.id, stage: "approver_password" });
+    }
+    // Checked only after the password, so a wrong guess cannot learn which usernames are Owners.
+    if (!saleChangeApproval.canApprove(approver.role_name)
+      || !companyId
+      || parsePositiveInteger(approver.company_id) !== parsePositiveInteger(companyId)
+      || approver.id === requester.id) {
+      return refuse(403, CODES.APPROVER_NOT_ALLOWED, "Only an Owner or Admin of this business can approve this change.", { approverId: approver.id, stage: "approver_role" });
+    }
+
+    const approvalId = crypto.randomUUID();
+    const expiresAt = saleChangeApproval.expiresAtFrom(Date.now());
+    await client.query(
+      `INSERT INTO sale_change_approvals (
+         id, status, action, sale_ref, requester_id, approver_id, company_id, branch_id, device_id, reason, expires_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::timestamptz)`,
+      [approvalId, APPROVAL_STATUS.ISSUED, request.action, request.saleRef, requester.id, approver.id,
+        companyId, branchId || null, deviceId || null, request.reason, expiresAt.toISOString()]
+    );
+    await client.query("COMMIT");
+    finished = true;
+    await audit("APPROVED", { approverId: approver.id, stage: "issued", approvalId });
+    return res.status(201).json({
+      approval_id: approvalId,
+      approver_name: approver.full_name,
+      expires_at: expiresAt.toISOString(),
+    });
+  } catch (error) {
+    if (!finished) await client.query("ROLLBACK").catch(() => {});
+    console.error("Sale change approval failed", error?.code || error?.message || error);
+    return res.status(500).json({ code: "SALE_CHANGE_APPROVAL_FAILED", message: "The approval could not be checked. Try again." });
+  } finally {
+    client.release();
+  }
+};
+app.post("/api/v3/sale-change-approvals", rateLimitSyncRequest, v3WriteAdapter(createSaleChangeApprovalHandler));
 
 app.get("/sales/:id", async (req, res) => {
   try {

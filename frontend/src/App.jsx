@@ -222,6 +222,25 @@ import {
   shiftDateKey,
 } from "./local/paymentsDue";
 import {
+  SALE_CHANGE_APPROVAL_MODE,
+  SALE_CHANGE_REASONS,
+  SALE_CHANGE_REASON_CODE,
+  approvalErrorCode,
+  composeSaleChangeReason,
+  describeApprovalError,
+  resolveSaleChangeApprovalRoute,
+  saleChangeNeedsApproval,
+} from "./local/saleChangeReason";
+import {
+  SALE_CHANGES_UNREADABLE_KEY,
+  SALE_CHANGE_DIGEST_STATUS,
+  SALE_CHANGE_SCOPE,
+  buildSaleChangeDigest,
+  normalizeCloudChangeEvents,
+  normalizeLocalChangeRows,
+  saleChangeDigestBellItems,
+} from "./local/saleChangeDigest";
+import {
   FROST_CHAT_SELECTION,
   buildChatList,
   historyFromExchanges,
@@ -621,6 +640,61 @@ const createOperationalWrite = (user, payload = {}, operationId = "") => {
 const createOperationalReadConfig = (user) => ({
   headers: sessionAuthHeaders(user?.device_session_token),
 });
+/**
+ * Is this computer held in Local Only? Asked three ways -- the screen's state, the saved mode and
+ * the startup authority -- and any one of them saying yes is enough, because the cost of a wrong
+ * "no" is a request LOCAL_ONLY promised would never be made.
+ */
+const isSaleChangeLocalOnly = (connectivityMode) => (
+  connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY
+  || readConnectivityMode() === CONNECTIVITY_MODES.LOCAL_ONLY
+  || isLocalOnlyConnectivitySelected()
+);
+/**
+ * Which way a cancel or edit's Owner/Admin approval goes (local/saleChangeReason.js decides).
+ *
+ * Local Only and offline refuse before the cloud gate is even asked, and the gate is the same
+ * `guardCloudCall` every other cloud request goes through, so API_MODE=LOCAL_ONLY or a missing
+ * cloud target refuses too. A refused route makes no request and writes nothing.
+ */
+const resolveSaleChangeRoute = ({ user, offlineMode = false, connectivityMode } = {}) => {
+  const localOnly = isSaleChangeLocalOnly(connectivityMode);
+  const needsApproval = saleChangeNeedsApproval(user?.role);
+  const cloudGateAllowed = !needsApproval || offlineMode || localOnly
+    ? false
+    : guardCloudCall("sale-change-approval", API_URL).allowed === true && hasCloudSession(user) !== false;
+  return resolveSaleChangeApprovalRoute({ needsApproval, offlineMode: Boolean(offlineMode), localOnly, cloudGateAllowed });
+};
+/**
+ * Ask the server to check the Owner or Admin's password for one cancel or edit. Returns the
+ * approval id to send with the change. Only call this after `resolveSaleChangeRoute` said CLOUD.
+ */
+const requestSaleChangeApproval = async (user, { action, saleRef, reason, approverUsername, approverPassword }) => {
+  const write = createOperationalWrite(user, {
+    action,
+    sale_ref: String(saleRef),
+    approver_username: String(approverUsername || "").trim(),
+    approver_password: String(approverPassword || ""),
+    reason,
+  });
+  const response = await axios.post(`${API_URL}/api/v3/sale-change-approvals`, write.body, write.config);
+  const approvalId = response?.data?.approval_id;
+  const id = approvalId === null || approvalId === undefined ? "" : String(approvalId).trim();
+  if (!id) throw Object.assign(new Error("The approval came back without an id."), { code: "APPROVAL_ID_MISSING" });
+  return id;
+};
+/** The picker's empty state. The reason is per change, so an edit never starts from the stored one. */
+const EMPTY_SALE_CHANGE_FORM = Object.freeze({ reasonCode: "", otherText: "", approverUsername: "", approverPassword: "" });
+/** What still stops the cancel or edit, as one line, or "" when it can go. */
+const saleChangeFormProblem = (form, route) => {
+  const composed = composeSaleChangeReason({ code: form?.reasonCode, otherText: form?.otherText });
+  if (!composed.ok) return composed.message;
+  if (route?.mode === SALE_CHANGE_APPROVAL_MODE.REFUSED) return route.message;
+  if (route?.mode === SALE_CHANGE_APPROVAL_MODE.CLOUD && (!String(form?.approverUsername || "").trim() || !form?.approverPassword)) {
+    return "Owner or Admin username and password are needed.";
+  }
+  return "";
+};
 const API_CONFIG = {
   mode: API_MODE,
   apiUrl: API_URL,
@@ -2448,6 +2522,12 @@ function App() {
    * an empty list. `dateKey` is the local day the list was asked for.
    */
   const [paymentsDue, setPaymentsDue] = useState({ payload: null, error: "", read: false, skipped: false, dateKey: "" });
+  /**
+   * Today's cancelled and edited bills, for the Owner's bell. `read` false until a read finished;
+   * `error` a failed read (never an empty list); `scope` "this-counter" when it came from this
+   * computer's own bills because the cloud could not or may not be asked.
+   */
+  const [saleChangeFeed, setSaleChangeFeed] = useState({ events: null, error: "", read: false, scope: SALE_CHANGE_SCOPE.ALL, dateKey: "", truncated: false });
   // The popup's per-day memory: closed today, and rows dealt with today. Held in state so the popup
   // closes even when localStorage refuses the write; localStorage only carries it across a restart.
   const [paymentsMemory, setPaymentsMemory] = useState(() => {
@@ -5015,6 +5095,132 @@ function App() {
       }
     }
   }, [paymentsDue, frostBellAllowed, notify, clearNotice]);
+
+  /**
+   * Read today's cancelled and edited bills for the Owner's bell.
+   *
+   * Cloud (`GET /sales-report/change-events`, every counter of the branch) only when this computer
+   * is online, not Local Only, holds a cloud session and `guardCloudCall` allows it. Otherwise, on
+   * the desktop, this counter's own bills from SQLite -- no request leaves the device -- and the bell
+   * says "this counter only". A browser that is offline asks nothing. "Today" is the laptop's local
+   * day, asked for from its local midnight.
+   */
+  // Read through a ref so a settings reload does not by itself trigger another read.
+  const saleChangeUsersRef = useRef([]);
+  saleChangeUsersRef.current = settingsData.users || [];
+  const loadSaleChangeFeed = useCallback(async () => {
+    if (!user || user.role !== "Owner") return;
+    const now = new Date();
+    const dateKey = localDateKey(now);
+    const localOnly = isSaleChangeLocalOnly(connectivityMode);
+    const online = !offlineMode && internetAvailable !== false;
+    const useCloud = !localOnly
+      && online
+      && hasCloudSession(user) !== false
+      && guardCloudCall("sale-change-summary", API_URL).allowed === true;
+    const tauri = isTauriRuntime();
+    if (!useCloud && !tauri) return;
+    const scope = useCloud ? SALE_CHANGE_SCOPE.ALL : SALE_CHANGE_SCOPE.THIS_COUNTER;
+    try {
+      let events;
+      let truncated = false;
+      if (useCloud) {
+        const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const response = await axios.get(`${API_URL}/sales-report/change-events`, {
+          params: { since: midnight.toISOString() },
+          timeout: 15000,
+        });
+        events = normalizeCloudChangeEvents(response.data);
+        truncated = response.data?.truncated === true;
+      } else {
+        const userNamesById = new Map();
+        for (const member of saleChangeUsersRef.current) {
+          const id = canonicalInventoryId(member?.id);
+          const name = String(member?.full_name || member?.username || "").trim();
+          if (id && name) userNamesById.set(id, name);
+        }
+        const selfId = canonicalInventoryId(user.id);
+        const selfName = String(user.full_name || user.username || "").trim();
+        if (selfId && selfName && !userNamesById.has(selfId)) userNamesById.set(selfId, selfName);
+        events = normalizeLocalChangeRows(await listLocalPosSales(), { userNamesById });
+      }
+      setSaleChangeFeed({ events, error: "", read: true, scope, dateKey, truncated });
+    } catch (error) {
+      setSaleChangeFeed({
+        events: null,
+        error: error?.code === "SALE_CHANGE_EVENTS_UNREADABLE"
+          ? error.message
+          : getErrorMessage(error, "Today's cancelled and edited bills did not load."),
+        read: true,
+        scope,
+        dateKey,
+      });
+    }
+  }, [user, connectivityMode, offlineMode, internetAvailable]);
+
+  useEffect(() => {
+    if (!user || user.role !== "Owner") return undefined;
+    loadSaleChangeFeed();
+    const timer = window.setInterval(() => { loadSaleChangeFeed(); }, 300000);
+    return () => window.clearInterval(timer);
+  }, [user, loadSaleChangeFeed]);
+
+  /**
+   * The day's line in the bell. Raised again only when its words change (the title carries the
+   * count, and the bell keeps a row's first title, so a changed title replaces the row). A good read
+   * retracts the error row and any other day's row; a failed read raises the error row and leaves
+   * the day's row alone.
+   */
+  const raisedSaleChangeRows = useRef(new Map());
+
+  useEffect(() => {
+    if (user?.role !== "Owner") {
+      for (const key of raisedSaleChangeRows.current.keys()) clearNotice(key);
+      raisedSaleChangeRows.current = new Map();
+      return;
+    }
+    if (!saleChangeFeed.read) return;
+    let digest = null;
+    let failure = saleChangeFeed.error;
+    if (!failure) {
+      try {
+        digest = buildSaleChangeDigest({ events: saleChangeFeed.events, dateKey: saleChangeFeed.dateKey });
+      } catch (error) {
+        failure = error?.message || "Today's cancelled and edited bills could not be read.";
+      }
+    }
+    const bell = saleChangeDigestBellItems(digest, {
+      dateKey: saleChangeFeed.dateKey,
+      failure,
+      scope: saleChangeFeed.scope,
+      todayKey: localDateKey(new Date()),
+      nowMs: Date.now(),
+    });
+    // The server stops at its row limit and says so. The count is then a floor, not the day's total,
+    // and the row has to say that rather than pass a short count off as the whole day.
+    const items = saleChangeFeed.truncated && bell.status === SALE_CHANGE_DIGEST_STATUS.OK
+      ? bell.items.map((item) => ({ ...item, title: item.title.replace(/^([^:]+): /, "$1: at least "), message: `${item.message} · more than shown, see Edited Bills and Cancelled Bills in Reports` }))
+      : bell.items;
+    const raised = raisedSaleChangeRows.current;
+    for (const item of items) {
+      const words = `${item.title}\n${item.message}`;
+      if (raised.get(item.dedupeKey) === words) continue;
+      if (raised.has(item.dedupeKey)) clearNotice(item.dedupeKey);
+      notify(item);
+      raised.set(item.dedupeKey, words);
+    }
+    if (bell.status === SALE_CHANGE_DIGEST_STATUS.OK) {
+      const live = new Set(bell.keys);
+      clearNotice(SALE_CHANGES_UNREADABLE_KEY);
+      raised.delete(SALE_CHANGES_UNREADABLE_KEY);
+      if (!live.has(`sale-changes:${saleChangeFeed.dateKey}`)) clearNotice(`sale-changes:${saleChangeFeed.dateKey}`);
+      for (const key of [...raised.keys()]) {
+        if (live.has(key)) continue;
+        clearNotice(key);
+        raised.delete(key);
+      }
+    }
+  }, [saleChangeFeed, user?.role, notify, clearNotice]);
 
   /**
    * Surface the activation state in the notification centre.
@@ -8142,7 +8348,7 @@ function App() {
         alert("Invoice is already cancelled.");
         return false;
       }
-      setCancelDraft({ sale: fullSale, reason: "", saving: false });
+      setCancelDraft({ sale: fullSale, ...EMPTY_SALE_CHANGE_FORM, error: "", saving: false });
       return false;
     } catch (error) {
       alert(getErrorMessage(error, "Unable to open cancellation confirmation"));
@@ -8151,19 +8357,38 @@ function App() {
   };
 
   const confirmCancelSale = async () => {
-    if (!cancelDraft?.sale) return false;
+    if (!cancelDraft?.sale || cancelDraft.saving) return false;
     const sale = cancelDraft.sale;
-    const reason = cancelDraft.reason || "";
-    if (!reason.trim()) {
-      alert("Cancellation reason is required.");
-      return false;
-    }
     const saleId = sale.sale_id || sale.id || "";
-    if (!saleId) {
-      alert("Unable to cancel invoice. Invoice ID is missing.");
+    // Every way out of here forgets the approver's password, whatever happened.
+    const stop = (error) => {
+      setCancelDraft((current) => current ? { ...current, approverPassword: "", error, saving: false } : current);
       return false;
+    };
+    const composed = composeSaleChangeReason({ code: cancelDraft.reasonCode, otherText: cancelDraft.otherText });
+    if (!composed.ok) return stop(composed.message);
+    const reason = composed.reason;
+    if (!saleId) return stop("Unable to cancel invoice. Invoice ID is missing.");
+    // Decided before anything is written or sent. REFUSED (offline, Local Only, cloud gate closed)
+    // makes no request at all.
+    const route = resolveSaleChangeRoute({ user, offlineMode, connectivityMode });
+    const problem = saleChangeFormProblem(cancelDraft, route);
+    if (problem) return stop(problem);
+    setCancelDraft((current) => current ? { ...current, error: "", saving: true } : current);
+    let approvalId = "";
+    if (route.mode === SALE_CHANGE_APPROVAL_MODE.CLOUD) {
+      try {
+        approvalId = await requestSaleChangeApproval(user, {
+          action: "cancel",
+          saleRef: saleId,
+          reason,
+          approverUsername: cancelDraft.approverUsername,
+          approverPassword: cancelDraft.approverPassword,
+        });
+      } catch (error) {
+        return stop(describeApprovalError(error));
+      }
     }
-    setCancelDraft((current) => current ? { ...current, saving: true } : current);
     try {
       if (isTauriRuntime() && (offlineMode || sale.sync_status || String(saleId).startsWith("invoice-") || String(saleId).startsWith("pos-invoice-"))) {
         const result = await cancelLocalPosSale({
@@ -8171,6 +8396,7 @@ function App() {
           reason,
           user_id: String(user.id || ""),
           device_id: deviceInfo.device_id,
+          ...(approvalId ? { approval_id: approvalId } : {}),
         });
         const localInvoice = localSnapshotToInvoice(result.invoice);
         setSalesHistory((rows) => rows.map((row) => String(row.id) === String(saleId) ? { ...row, ...localInvoice } : row));
@@ -8183,7 +8409,11 @@ function App() {
         await refreshAfterSaleCancellation({ local: true });
         return true;
       }
-      const cancellationWrite = createOperationalWrite(user, { reason, cancelled_by: user.id });
+      const cancellationWrite = createOperationalWrite(user, {
+        reason,
+        cancelled_by: user.id,
+        ...(approvalId ? { approval_id: approvalId } : {}),
+      });
       await axios.post(
         `${API_URL}/api/v3/sales/${saleId}/cancel`,
         cancellationWrite.body,
@@ -8194,10 +8424,12 @@ function App() {
       setCancelDraft(null);
       return true;
     } catch (error) {
+      if (approvalErrorCode(error) === "SALE_CHANGE_APPROVAL_REQUIRED") return stop(describeApprovalError(error));
+      stop("");
       alert(getErrorMessage(error, "Unable to cancel invoice"));
       return false;
     } finally {
-      setCancelDraft((current) => current ? { ...current, saving: false } : current);
+      setCancelDraft((current) => current ? { ...current, approverPassword: "", saving: false } : current);
     }
   };
 
@@ -10494,6 +10726,7 @@ function App() {
         <ModuleErrorBoundary onClose={() => setEditingSale(null)}>
           <SaleEditModal
             chargeTypes={chargeTypes}
+            connectivityMode={connectivityMode}
             deviceInfo={deviceInfo}
             invoice={editingSale}
             offlineMode={offlineMode}
@@ -10531,10 +10764,11 @@ function App() {
       )}
       {cancelDraft && (
         <SaleCancelModal
+          approvalRoute={resolveSaleChangeRoute({ user, offlineMode, connectivityMode })}
           draft={cancelDraft}
           onClose={() => setCancelDraft(null)}
           onConfirm={confirmCancelSale}
-          onReasonChange={(reason) => setCancelDraft((current) => current ? { ...current, reason } : current)}
+          onChange={(patch) => setCancelDraft((current) => current ? { ...current, ...patch, error: "" } : current)}
         />
       )}
       {changeHistory && <ChangeHistoryModal history={changeHistory} onClose={() => setChangeHistory(null)} />}
@@ -14775,6 +15009,11 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
   const salesChanges = filterRows(data.salesChangeReport);
   const editedBills = salesChanges.filter((row) => row.sale_status === "EDITED" || row.edited_at);
   const cancelledBills = salesChanges.filter((row) => row.sale_status === "CANCELLED" || row.cancelled_at);
+  // "Approved by" shows only once the server sends it, so an older server's report keeps its shape.
+  const carriesApprover = (rows) => rows.some((row) => row && Object.prototype.hasOwnProperty.call(row, "approved_by_name"));
+  const editedBillsShowApprover = carriesApprover(editedBills);
+  const cancelledBillsShowApprover = carriesApprover(cancelledBills);
+  const approverCell = (row) => String(row.approved_by_name || "").trim() || "—";
   const purchaseChanges = filterRows(data.purchaseChangeReport);
   const wasteProductRows = filterRows(data.wasteProductReport);
   const purchaseHistoryRawRows = filterRows(data.purchaseHistoryReport).filter((row) =>
@@ -15495,15 +15734,15 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       title: "Edited Bills",
       rows: editedBills,
       summary: (rows) => [["Edited Bills", rows.length, true], ["Total Amount", money(totalOf(rows, "total_amount"))]],
-      headers: ["Invoice", "Date", "Amount", "Edited By", "Edited At", "Reason"],
-      render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || "-"}</td><td>{row.edited_at ? new Date(row.edited_at).toLocaleString("en-IN") : "-"}</td><td>{row.edit_reason || "-"}</td></tr>,
+      headers: ["Invoice", "Date", "Amount", "Edited By", ...(editedBillsShowApprover ? ["Approved By"] : []), "Edited At", "Reason"],
+      render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || "-"}</td>{editedBillsShowApprover && <td>{approverCell(row)}</td>}<td>{row.edited_at ? new Date(row.edited_at).toLocaleString("en-IN") : "-"}</td><td>{row.edit_reason || "-"}</td></tr>,
     },
     cancelledBills: {
       title: "Cancelled Bills",
       rows: cancelledBills,
       summary: (rows) => [["Cancelled Bills", rows.length, true], ["Cancelled Amount", money(totalOf(rows, "total_amount"))]],
-      headers: ["Invoice", "Date", "Amount", "Cancelled By", "Cancelled At", "Reason"],
-      render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || "-"}</td><td>{row.cancelled_at ? new Date(row.cancelled_at).toLocaleString("en-IN") : "-"}</td><td>{row.cancellation_reason || "-"}</td></tr>,
+      headers: ["Invoice", "Date", "Amount", "Cancelled By", ...(cancelledBillsShowApprover ? ["Approved By"] : []), "Cancelled At", "Reason"],
+      render: (row) => <tr key={row.id}><td>{row.invoice_no || `#${row.id}`}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{money(row.total_amount)}</td><td>{row.changed_by_name || "-"}</td>{cancelledBillsShowApprover && <td>{approverCell(row)}</td>}<td>{row.cancelled_at ? new Date(row.cancelled_at).toLocaleString("en-IN") : "-"}</td><td>{row.cancellation_reason || "-"}</td></tr>,
     },
     provisionalProfitSales: {
       title: "Provisional Profit Sales",
@@ -24081,7 +24320,56 @@ function TotalLine({ label, muted, total, value }) {
   return <div className={`${total ? "total-line total-line-main" : "total-line"} ${muted ? "total-line-muted" : ""}`}><span>{label}</span><strong>{currency.format(value)}</strong></div>;
 }
 
-function SaleCancelModal({ draft, onClose, onConfirm, onReasonChange }) {
+/**
+ * The reason for a cancel or edit: one of the fixed reasons, and a line to type only for Other.
+ * `form` holds `reasonCode` and `otherText`; `onChange` takes a patch of them.
+ */
+function SaleChangeReasonPicker({ disabled = false, form, label, onChange }) {
+  const other = form.reasonCode === SALE_CHANGE_REASON_CODE.OTHER;
+  return (
+    <>
+      <Field label={label}>
+        <select disabled={disabled} value={form.reasonCode || ""} onChange={(event) => onChange({ reasonCode: event.target.value })}>
+          <option value="">Choose a reason</option>
+          {SALE_CHANGE_REASONS.map((reason) => <option key={reason.code} value={reason.code}>{reason.label}</option>)}
+        </select>
+      </Field>
+      {other && (
+        <Field label="Other reason">
+          <input autoComplete="off" disabled={disabled} maxLength={200} placeholder="Type the reason" value={form.otherText || ""} onChange={(event) => onChange({ otherText: event.target.value })} />
+        </Field>
+      )}
+    </>
+  );
+}
+
+/**
+ * The Owner or Admin's username and password, for a cashier's cancel or edit. Nothing for an Owner
+ * or Admin. When approval cannot happen here (offline, Local Only), the one line that says so and
+ * no password box, so nobody types a password that could not be checked.
+ */
+function SaleChangeApprovalFields({ disabled = false, form, onChange, route }) {
+  if (!route || route.mode === SALE_CHANGE_APPROVAL_MODE.NONE) return null;
+  if (route.mode === SALE_CHANGE_APPROVAL_MODE.REFUSED) {
+    return <div className="error-banner" role="alert">{route.message}</div>;
+  }
+  return (
+    <section aria-label="Owner or Admin approval" className="sale-change-approval">
+      <strong>Owner or Admin approval</strong>
+      <div className="form-grid">
+        <Field label="Username">
+          <input autoCapitalize="none" autoComplete="off" disabled={disabled} name="sale-change-approver" spellCheck={false} value={form.approverUsername || ""} onChange={(event) => onChange({ approverUsername: event.target.value })} />
+        </Field>
+        <Field label="Password">
+          <input autoComplete="new-password" disabled={disabled} name="sale-change-approver-password" type="password" value={form.approverPassword || ""} onChange={(event) => onChange({ approverPassword: event.target.value })} />
+        </Field>
+      </div>
+      <p className="form-note">This needs the Owner or an Admin. They type their own username and password here. The password is not kept.</p>
+    </section>
+  );
+}
+
+function SaleCancelModal({ approvalRoute, draft, onChange, onClose, onConfirm }) {
   const sale = draft.sale || {};
   const payments = sale.payments || [];
   const items = sale.items || [];
@@ -24125,12 +24413,14 @@ function SaleCancelModal({ draft, onClose, onConfirm, onReasonChange }) {
               </tr>
             ))}
           </DataTable>
-          <Field label="Cancellation Reason">
-            <textarea value={draft.reason || ""} onChange={(event) => onReasonChange(event.target.value)} placeholder="Reason is required for audit, ledger reversal and stock restoration." />
-          </Field>
+          <div className="form-grid sale-change-reason-grid">
+            <SaleChangeReasonPicker disabled={draft.saving} form={draft} label="Cancellation Reason" onChange={onChange} />
+          </div>
+          <SaleChangeApprovalFields disabled={draft.saving} form={draft} onChange={onChange} route={approvalRoute} />
+          {draft.error && <div className="error-banner" role="alert">{draft.error}</div>}
           <p className="form-note stock-low">This will mark the invoice as CANCELLED, restore exact lot stock, and reverse cash/bank/customer ledger impact. The invoice will remain visible with a cancelled badge.</p>
           <div className="button-row">
-            <button className="remove-button" disabled={draft.saving || !draft.reason?.trim()} onClick={onConfirm}>{draft.saving ? "Cancelling..." : "Confirm Cancel Bill"}</button>
+            <button className="remove-button" disabled={draft.saving || saleChangeFormProblem(draft, approvalRoute) !== ""} onClick={onConfirm}>{draft.saving ? "Cancelling..." : "Confirm Cancel Bill"}</button>
             <button className="secondary-button" disabled={draft.saving} onClick={onClose}>Keep Bill</button>
           </div>
         </div>
@@ -24139,7 +24429,7 @@ function SaleCancelModal({ draft, onClose, onConfirm, onReasonChange }) {
   );
 }
 
-function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], customers = [], deviceInfo, inventory = [], invoice, offlineMode = false, onAddCustomer, onClose, onSaved, paymentSettings = {}, products, user }) {
+function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], connectivityMode, customers = [], deviceInfo, inventory = [], invoice, offlineMode = false, onAddCustomer, onClose, onSaved, paymentSettings = {}, products, user }) {
   const activeCustomers = customers.filter((entry) => entry.active !== false);
   const walkInCustomer = activeCustomers.find((entry) => entry.system_account === true && String(entry.customer_name || "").toLowerCase().includes("walk-in")) || null;
   const customerFromAccount = (account) => account ? ({
@@ -24216,7 +24506,15 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], customers = 
       manualAmount: line.manual ? line.amount : "",
     }))
   );
-  const [reason, setReason] = useState("");
+  // The reason is per change: an edit of a bill that was edited before starts from an empty picker.
+  const [changeForm, setChangeForm] = useState(EMPTY_SALE_CHANGE_FORM);
+  const [changeError, setChangeError] = useState("");
+  const updateChangeForm = (patch) => {
+    setChangeForm((current) => ({ ...current, ...patch }));
+    setChangeError("");
+  };
+  const approvalRoute = resolveSaleChangeRoute({ user, offlineMode, connectivityMode });
+  const changeProblem = saleChangeFormProblem(changeForm, approvalRoute);
   const [saving, setSaving] = useState(false);
   const canChangeRate = ["Owner", "Admin"].includes(user.role);
   const mixedPaymentModes = [
@@ -24332,12 +24630,23 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], customers = 
     if (lotSaleRate > 0) updateItem(index, "selling_rate", lotSaleRate);
   };
   const removeItem = (index) => setItems((current) => current.filter((_, itemIndex) => itemIndex !== index));
+  // Every way out of a save forgets the approver's password, whether it was used or not.
+  const forgetPassword = () => setChangeForm((current) => (current.approverPassword ? { ...current, approverPassword: "" } : current));
   const save = async () => {
+    try {
+      await saveChange();
+    } finally {
+      forgetPassword();
+    }
+  };
+  const saveChange = async () => {
     if (saving) return;
-    if (!reason.trim()) {
-      alert("Edit reason is required.");
+    const composed = composeSaleChangeReason({ code: changeForm.reasonCode, otherText: changeForm.otherText });
+    if (!composed.ok) {
+      setChangeError(composed.message);
       return;
     }
+    const reason = composed.reason;
     if (items.length === 0) {
       alert("Invoice must contain at least one item.");
       return;
@@ -24364,7 +24673,32 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], customers = 
       alert("Mixed payment split must exactly match Net Payable.");
       return;
     }
+    // Decided before anything is written or sent. REFUSED (offline, Local Only, cloud gate closed)
+    // makes no request at all.
+    const route = resolveSaleChangeRoute({ user, offlineMode, connectivityMode });
+    const problem = saleChangeFormProblem(changeForm, route);
+    if (problem) {
+      setChangeError(problem);
+      return;
+    }
+    setChangeError("");
     setSaving(true);
+    let approvalId = "";
+    if (route.mode === SALE_CHANGE_APPROVAL_MODE.CLOUD) {
+      try {
+        approvalId = await requestSaleChangeApproval(user, {
+          action: "edit",
+          saleRef: invoice.sale_id || invoice.id,
+          reason,
+          approverUsername: changeForm.approverUsername,
+          approverPassword: changeForm.approverPassword,
+        });
+      } catch (error) {
+        setChangeError(describeApprovalError(error));
+        setSaving(false);
+        return;
+      }
+    }
     try {
       const editItems = items.map((item) => ({
           id: Number(item.id || 0) || undefined,
@@ -24431,6 +24765,7 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], customers = 
         bill_datetime: `${billDate}T00:00`,
         payment_mode: paymentMode,
         reason,
+        ...(approvalId ? { approval_id: approvalId } : {}),
       };
       const localEligible = isTauriRuntime() && (
         offlineMode ||
@@ -24466,7 +24801,8 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], customers = 
         alert("Invoice updated");
       }
     } catch (error) {
-      alert(getErrorMessage(error, "Unable to update invoice"));
+      if (approvalErrorCode(error) === "SALE_CHANGE_APPROVAL_REQUIRED") setChangeError(describeApprovalError(error));
+      else alert(getErrorMessage(error, "Unable to update invoice"));
     } finally {
       setSaving(false);
     }
@@ -24481,7 +24817,7 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], customers = 
             <strong>{invoice.invoice_no}</strong>
           </div>
           <div className="invoice-actions">
-            <button className="primary-button" disabled={saving || hasInvalidMixedPayment || !isMixedPaymentBalanced} onClick={save}>{saving ? "Saving..." : "Save Edit"}</button>
+            <button className="primary-button" disabled={saving || hasInvalidMixedPayment || !isMixedPaymentBalanced || changeProblem !== ""} onClick={save}>{saving ? "Saving..." : "Save Edit"}</button>
             <button aria-label="Close editor" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
@@ -24522,8 +24858,10 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], customers = 
             </Field>
             <Field label="Bill Discount"><input min="0" step="0.01" type="number" value={invoiceDiscount} onChange={(event) => setInvoiceDiscount(event.target.value)} /></Field>
             <Field label="Customer Notes"><textarea readOnly value={customer.notes || ""} /></Field>
-            <Field label="Edit Reason"><textarea value={reason} onChange={(event) => setReason(event.target.value)} /></Field>
+            <SaleChangeReasonPicker disabled={saving} form={changeForm} label="Edit Reason" onChange={updateChangeForm} />
           </div>
+          <SaleChangeApprovalFields disabled={saving} form={changeForm} onChange={updateChangeForm} route={approvalRoute} />
+          {changeError && <div className="error-banner" role="alert">{changeError}</div>}
           <div className="sale-edit-add-row">
             <button className="secondary-button" type="button" onClick={onAddCustomer}>Add New Customer</button>
           </div>

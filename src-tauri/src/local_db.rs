@@ -3364,6 +3364,9 @@ fn edit_local_pos_sale_at(path: &Path, edit: serde_json::Value) -> Result<LocalP
         "base_version": old_version,
         "new_version": new_version,
         "reason": reason,
+        // A cashier's change carries the Owner/Admin approval the cloud issued for it. The cloud
+        // checks it when this operation syncs; nothing here trusts it.
+        "approval_id": optional_text(&edit, "approval_id"),
         "old_snapshot": old_snapshot,
         "sale": new_snapshot,
     });
@@ -3437,6 +3440,9 @@ fn cancel_local_pos_sale_at(path: &Path, cancellation: serde_json::Value) -> Res
         "base_version": old_version,
         "new_version": new_version,
         "reason": reason,
+        // A cashier's change carries the Owner/Admin approval the cloud issued for it. The cloud
+        // checks it when this operation syncs; nothing here trusts it.
+        "approval_id": optional_text(&cancellation, "approval_id"),
         "old_snapshot": old_snapshot,
         "sale": new_snapshot,
     });
@@ -11481,6 +11487,11 @@ mod tests {
         assert_eq!(balance_qty, 5.0);
         assert_eq!(cancel_outbox, 1);
         assert_eq!(reversal_count, 1);
+        let cancel_payload: String = conn
+            .query_row("SELECT payload FROM sync_outbox WHERE operation_id = 'op-test-cancel-1'", [], |row| row.get(0))
+            .expect("cancel payload");
+        let cancel_payload: serde_json::Value = serde_json::from_str(&cancel_payload).expect("cancel payload json");
+        assert!(cancel_payload["approval_id"].is_null(), "no approval was given, so none is sent");
 
         let duplicate = cancel_local_pos_sale_at(&path, serde_json::json!({
             "invoice_global_id": "invoice-test-cancel-1",
@@ -11488,6 +11499,40 @@ mod tests {
             "reason": "Duplicate cancel"
         }));
         assert!(duplicate.is_err());
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn local_pos_sale_cancel_carries_the_owner_approval_to_the_outbox() {
+        let path = std::env::temp_dir().join(format!(
+            "froozerp-pos-cancel-approval-{}.sqlite3",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+
+        initialize_at(&path).expect("initialize local db");
+        complete_local_pos_sale_at(&path, test_sale_payload("invoice-test-approval-1", "op-test-approval-create", 2.0, 20.0))
+            .expect("complete local POS sale");
+        cancel_local_pos_sale_at(&path, serde_json::json!({
+            "operation_id": "op-test-approval-cancel",
+            "invoice_global_id": "invoice-test-approval-1",
+            "device_id": "device-test",
+            "user_id": "7",
+            "reason": "Duplicate bill",
+            "approval_id": "approval-abc"
+        }))
+        .expect("cancel with approval");
+
+        let conn = Connection::open(&path).expect("open sqlite");
+        let payload_for = |operation_id: &str| -> serde_json::Value {
+            let raw: String = conn
+                .query_row("SELECT payload FROM sync_outbox WHERE operation_id = ?1", [operation_id], |row| row.get(0))
+                .expect("outbox payload");
+            serde_json::from_str(&raw).expect("payload json")
+        };
+        assert_eq!(payload_for("op-test-approval-cancel")["approval_id"], serde_json::json!("approval-abc"));
+        drop(conn);
 
         let _ = fs::remove_file(&path);
     }
