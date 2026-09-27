@@ -66,7 +66,7 @@
     font-size: var(--font-size-base) !important;
   }
 
-  :where(.erp-shell, .login-shell, .modal-backdrop) :where(th, small, .eyebrow, .tag, .shortcut-hint, .form-note, .cell-note) {
+  :where(.erp-shell, .login-shell, .modal-backdrop) :where(th, small, .eyebrow, .tag, .pill, span:is(.stock-ok, .stock-low, .origin-rate), .shortcut-hint, .form-note, .cell-note) {
     font-size: var(--font-size-sm) !important;
   }
 
@@ -130,7 +130,7 @@
   padding: 20px 14px;
   box-sizing: border-box;
   background: var(--panel);
-  border-right: 1px solid rgba(143, 171, 156, 0.1);
+  border-right: 1px solid var(--line-soft);
 }
 
 .sidebar-brand,
@@ -163,21 +163,29 @@
 .welcome-banner h2,
 .card-heading h2,
 .empty-state h2,
-.login-copy h1,
-.kpi-card strong {
+.login-copy h1 {
   font-family: "Bodoni Moda Variable", Georgia, "Times New Roman", serif;
   font-optical-sizing: auto;
   font-weight: 600;
   letter-spacing: 0.004em;
 }
 
-/* A headline number is read as a quantity at a glance, not as prose, and Bodoni's
-   hairlines thin out at this size on a standard-density screen. Figures carry more
-   weight than the headings do; the headings are words and stay lighter.
+/* A headline number is read as a quantity at a glance, not as prose. It is set in the
+   interface face with tabular figures, not the display serif: Bodoni's hairlines thin out
+   at tile size, its old-style figures sit at different heights, and a row of tiles set in
+   it reads as four headings rather than four amounts. The serif stays on h1/h2 words.
 
    A money value must never break across lines. "Rs 48,250." above "00" is not a
    smaller version of the number, it is a different number to anyone scanning, and
    the tile exists to be scanned. */
+.kpi-card strong,
+.metric-value,
+.summary-metric strong {
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
 .kpi-card strong {
   font-weight: 700;
   white-space: nowrap;
@@ -313,7 +321,7 @@ input[type="number"] {
 .nav-item:hover,
 .nav-item-active {
   color: var(--ink);
-  background: rgba(217, 172, 82, 0.1);
+  background: var(--accent-soft);
 }
 
 .nav-item-active {
@@ -383,7 +391,7 @@ input[type="number"] {
   align-items: center;
   justify-content: space-between;
   padding: 0 30px;
-  border-bottom: 1px solid rgba(143, 171, 156, 0.1);
+  border-bottom: 1px solid var(--line-soft);
   background: var(--veil-solid);
 }
 
@@ -404,13 +412,10 @@ input[type="number"] {
 
 .branch-pill,
 .coming-soon,
-.tag,
-.batch-id,
-.stock-ok,
-.stock-low {
+.batch-id {
   display: inline-flex;
   align-items: center;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   font-size: 11px;
   font-weight: 750;
 }
@@ -426,12 +431,13 @@ input[type="number"] {
   display: inline-flex;
   align-items: center;
   margin-left: 10px;
-  padding: 7px 12px;
-  border-radius: 999px;
-  background: rgba(217, 172, 82, 0.16);
-  color: #eed08d;
+  padding: 5px 12px;
+  border: 1px solid var(--attention-line);
+  border-radius: var(--radius-pill);
+  background: var(--attention-soft);
+  color: var(--attention-ink);
   font-size: 11px;
-  font-weight: 750;
+  font-weight: 700;
 }
 
 .kiosk-exit-button {
@@ -472,9 +478,11 @@ input[type="number"] {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 16px;
+  margin-bottom: var(--space-4);
   padding: 12px 16px;
   border: 1px solid var(--accent-deep);
+  border-left-width: 3px;
+  border-radius: var(--radius-sm);
   background: var(--accent-muted);
   color: var(--ink-body);
 }
@@ -537,7 +545,7 @@ input[type="number"] {
 .login-close-exit-button {
   width: 100%;
   margin-top: 2px;
-  border-color: rgba(143, 171, 156, 0.28);
+  border-color: var(--line-strong);
   color: var(--ink-body);
   background: var(--veil-strong);
 }
@@ -573,7 +581,7 @@ input[type="number"] {
   gap: 6px;
   margin-top: 12px;
   padding: 12px;
-  border: 1px solid rgba(143, 171, 156, 0.16);
+  border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--veil-subtle);
 }
@@ -599,17 +607,26 @@ input[type="number"] {
   padding: 26px 30px;
 }
 
+/* The connection line at the top of every screen, and the login screen's status. A notice, so it
+   takes the notice shape: rounded, a left rule in its tone, the tone's ink. Routine status is the
+   info rule on a plain card; a failure is the danger family throughout. */
 .startup-status-panel {
-  margin-top: 16px;
-  padding: 12px 14px;
+  margin-top: var(--space-4);
+  padding: 10px 14px;
   width: 100%;
   max-width: 100%;
   box-sizing: border-box;
   overflow: hidden;
-  border-radius: 10px;
-  background: var(--veil);
-  border: 1px solid rgba(143, 171, 156, 0.2);
+  border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--info);
+  border-radius: var(--radius-sm);
+  background: var(--card);
   color: var(--ink-body);
+}
+
+/* In the content area it is the first thing above the first card, and sat flush against it. */
+.content-area > .startup-status-panel {
+  margin: 0 0 var(--space-4);
 }
 
 .startup-status-panel p,
@@ -643,6 +660,12 @@ input[type="number"] {
   color: var(--danger-ink);
 }
 
+.startup-status-panel.startup-status-error {
+  border-color: transparent;
+  border-left-color: var(--danger);
+  background: var(--danger-soft);
+}
+
 .startup-api-panel {
   margin-top: 10px;
   padding: 9px 12px;
@@ -652,7 +675,7 @@ input[type="number"] {
   overflow: hidden;
   border-radius: 8px;
   background: var(--shadow-faint);
-  border: 1px solid rgba(143, 171, 156, 0.16);
+  border: 1px solid var(--line);
   color: var(--ink-body);
   display: grid;
   gap: 5px;
@@ -762,10 +785,10 @@ input[type="number"] {
 .welcome-banner,
 .content-card,
 .kpi-card {
-  border: 1px solid rgba(143, 171, 156, 0.1);
-  border-radius: 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-lg);
   background: var(--card);
-  box-shadow: 0 12px 28px var(--shadow-faint);
+  box-shadow: var(--shadow-card);
 }
 
 .welcome-banner {
@@ -773,7 +796,7 @@ input[type="number"] {
   align-items: center;
   justify-content: space-between;
   gap: 18px;
-  padding: 24px;
+  padding: var(--space-6);
   background: linear-gradient(135deg, var(--card), var(--raised-high));
 }
 
@@ -814,16 +837,22 @@ input[type="number"] {
   justify-content: center;
   gap: 8px;
   border: 0;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   color: var(--ink-on-accent);
   background: var(--accent);
   font-size: 13px;
-  font-weight: 800;
-  transition: 160ms ease;
+  font-weight: 700;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease;
 }
 
+/* The button scale. Three kinds, one shape: the gold .primary-button is the answer on a screen,
+   .secondary-button and .table-action are quiet outlines, and .danger-text-button (and a
+   .remove-button that holds words) is the quiet outline in danger ink. Ordinary buttons share the
+   input height, so a button beside a field lines up with it; row actions and .compact-button
+   take the short step. */
 .primary-button {
-  padding: 11px 15px;
+  min-height: var(--control-height);
+  padding: 0 var(--space-4);
 }
 
 .button-row {
@@ -841,7 +870,6 @@ input[type="number"] {
 .primary-button:hover,
 .quick-action:hover {
   background: var(--accent-bright);
-  transform: translateY(-1px);
 }
 
 /* 180px was tight enough that four cards fitted on a 1366-wide laptop only by
@@ -850,15 +878,15 @@ input[type="number"] {
 .kpi-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
-  gap: 14px;
-  margin: 17px 0;
+  gap: var(--space-4);
+  margin: var(--space-4) 0;
 }
 
 .kpi-card {
   display: flex;
   align-items: center;
-  gap: 13px;
-  padding: 18px;
+  gap: var(--space-3);
+  padding: var(--space-5);
 }
 
 .kpi-icon,
@@ -866,7 +894,7 @@ input[type="number"] {
   display: grid;
   place-items: center;
   color: var(--accent);
-  background: rgba(217, 172, 82, 0.11);
+  background: var(--accent-soft);
 }
 
 .kpi-icon {
@@ -909,7 +937,7 @@ input[type="number"] {
   justify-content: space-between;
   gap: 12px;
   padding: 20px;
-  border: 1px solid rgba(143, 171, 156, 0.14);
+  border: 1px solid var(--line);
   border-radius: 18px;
   color: var(--ink);
   text-align: left;
@@ -926,7 +954,7 @@ input[type="number"] {
 
 .report-category-card:hover,
 .report-menu-card:hover {
-  border-color: rgba(217, 172, 82, 0.42);
+  border-color: var(--accent-line-strong);
   box-shadow: 0 22px 56px var(--shadow-soft);
   transform: translateY(-2px);
 }
@@ -952,7 +980,7 @@ input[type="number"] {
   padding: 4px 9px;
   border-radius: 999px;
   color: var(--accent-bright);
-  background: rgba(217, 172, 82, 0.1);
+  background: var(--accent-soft);
   font-size: 11px;
   font-style: normal;
   font-weight: 800;
@@ -995,7 +1023,7 @@ input[type="number"] {
 .date-total-row td {
   border-top: 1px solid var(--accent-line);
   color: var(--ink);
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
   font-weight: 850;
 }
 
@@ -1036,14 +1064,32 @@ input[type="number"] {
   line-height: 1.5;
 }
 
+/* One card: one padding, one heading gap. Cards stack with --space-4 between them wherever a
+   screen lays them out (.settings-layout, .scope-page, the dashboard grids). */
 .content-card {
-  padding: 22px;
+  padding: var(--space-6);
 }
 
 .card-heading {
   display: flex;
+  align-items: flex-start;
   justify-content: space-between;
-  margin-bottom: 20px;
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+}
+
+/* A button in a card heading ("Open Stock Inventory") keeps its own height and one line; stretched
+   to the heading it became a tall box with its label wrapped inside. */
+.card-heading > :is(button, .button-row) {
+  flex-shrink: 0;
+}
+
+.card-heading > button {
+  white-space: nowrap;
+}
+
+.card-heading > .button-row {
+  align-items: center;
 }
 
 .quick-grid {
@@ -1061,13 +1107,13 @@ input[type="number"] {
 
 .quick-action:hover {
   color: var(--accent);
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
 }
 
 .dashboard-analytics {
   display: grid;
-  gap: 17px;
-  margin: 17px 0;
+  gap: var(--space-4);
+  margin: var(--space-4) 0;
 }
 
 .analytics-toolbar {
@@ -1103,7 +1149,7 @@ input[type="number"] {
 }
 
 .range-button {
-  border: 1px solid rgba(143, 171, 156, 0.16);
+  border: 1px solid var(--line);
   border-radius: 999px;
   padding: 8px 12px;
   color: var(--ink-body);
@@ -1115,9 +1161,9 @@ input[type="number"] {
 
 .range-button:hover,
 .range-button-active {
-  border-color: rgba(217, 172, 82, 0.54);
+  border-color: var(--accent-line-strong);
   color: var(--accent);
-  background: rgba(217, 172, 82, 0.1);
+  background: var(--accent-soft);
 }
 
 .dashboard-custom-range {
@@ -1131,7 +1177,7 @@ input[type="number"] {
 .chart-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 17px;
+  gap: var(--space-4);
 }
 
 .chart-grid .chart-card:last-child {
@@ -1140,12 +1186,12 @@ input[type="number"] {
 
 .chart-card {
   overflow: hidden;
-  border: 1px solid rgba(143, 171, 156, 0.1);
-  border-radius: 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-lg);
   background:
-    radial-gradient(circle at top right, rgba(217, 172, 82, 0.11), transparent 30%),
+    radial-gradient(circle at top right, var(--accent-soft), transparent 30%),
     var(--card);
-  box-shadow: 0 12px 28px var(--shadow-faint);
+  box-shadow: var(--shadow-card);
 }
 
 .chart-card-heading {
@@ -1170,7 +1216,7 @@ input[type="number"] {
 }
 
 .chart-grid-line {
-  stroke: rgba(143, 171, 156, 0.11);
+  stroke: var(--line-soft);
   stroke-width: 1;
 }
 
@@ -1226,7 +1272,7 @@ input[type="number"] {
   display: grid;
   min-height: 160px;
   place-items: center;
-  border: 1px dashed rgba(143, 171, 156, 0.16);
+  border: 1px dashed var(--line);
   border-radius: 12px;
   color: var(--ink-faint);
   background: var(--veil-subtle);
@@ -1271,7 +1317,7 @@ input[type="number"] {
 .dashboard-side-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 17px;
+  gap: var(--space-4);
 }
 
 .insight-list,
@@ -1285,7 +1331,7 @@ input[type="number"] {
 .top-product-row,
 .low-stock-row {
   margin: 0;
-  border: 1px solid rgba(143, 171, 156, 0.1);
+  border: 1px solid var(--line-soft);
   border-radius: 12px;
   background: var(--veil-subtle);
 }
@@ -1324,15 +1370,15 @@ input[type="number"] {
 
 .low-stock-row {
   width: 100%;
-  border-color: rgba(217, 172, 82, 0.16);
+  border-color: var(--accent-line);
   color: inherit;
   text-align: left;
   transition: 160ms ease;
 }
 
 .low-stock-row:hover {
-  border-color: rgba(217, 172, 82, 0.42);
-  background: rgba(217, 172, 82, 0.08);
+  border-color: var(--accent-line-strong);
+  background: var(--accent-wash);
 }
 
 .empty-inline {
@@ -1344,8 +1390,20 @@ input[type="number"] {
 .form-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 15px;
-  margin-bottom: 17px;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+/* A button placed straight into a form grid ("Add Branch", "Save Category") used to stretch into a
+   whole grid tile, a slab the size of an input. It sizes to its label instead, sits at the start of
+   its cell and on the inputs' baseline, and matches their height. */
+:is(.form-grid, .supplier-form-grid) > :is(button, .primary-button, .secondary-button) {
+  justify-self: start;
+  align-self: end;
+  width: auto;
+  min-width: 140px;
+  max-width: 100%;
+  min-height: var(--control-height);
 }
 
 label {
@@ -1375,11 +1433,11 @@ textarea {
   width: 100%;
   padding: 11px 12px;
   box-sizing: border-box;
-  border: 1px solid rgba(143, 171, 156, 0.18);
-  border-radius: 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-md);
   outline: none;
   color: var(--ink);
-  background: var(--track);
+  background: var(--veil-heavy);
   font: inherit;
   font-size: 13px;
   transition: 160ms ease;
@@ -1389,7 +1447,7 @@ input:focus,
 select:focus,
 textarea:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  box-shadow: 0 0 0 3px var(--focus-ring);
 }
 
 input:disabled,
@@ -1400,26 +1458,38 @@ button:disabled {
   opacity: 0.58;
 }
 
+/* Disabled is one look for every button kind: a muted well with faint ink. It used to be a fixed
+   dark-green slab, which in the light theme read as a heavier, *more* important button than the
+   working ones beside it. */
 .primary-button:disabled,
 .secondary-button:disabled,
 .table-action:disabled,
 .remove-button:disabled,
-.whatsapp-button:disabled {
-  border-color: rgba(74, 122, 97, 0.32);
-  color: var(--ink-muted);
-  background: rgba(30, 74, 52, 0.58);
-  box-shadow: none;
-  transform: none;
-}
-
+.whatsapp-button:disabled,
 .primary-button:disabled:hover,
 .secondary-button:disabled:hover,
 .table-action:disabled:hover,
 .remove-button:disabled:hover,
 .whatsapp-button:disabled:hover {
-  color: var(--ink-muted);
-  background: rgba(30, 74, 52, 0.58);
+  border-color: var(--line);
+  color: var(--ink-faint);
+  background: var(--fill);
+  box-shadow: none;
   transform: none;
+  cursor: not-allowed;
+  opacity: 0.8;
+}
+
+.primary-button:disabled,
+.whatsapp-button:disabled {
+  border: 1px solid var(--line);
+}
+
+/* One focus ring for every button, drawn outside the edge so it never changes the size. */
+:is(.primary-button, .secondary-button, .table-action, .remove-button, .danger-text-button,
+  .whatsapp-button, .compact-button, .quick-action, .range-button, .account-tab, .settings-tabs > button):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
 }
 
 textarea {
@@ -1433,13 +1503,12 @@ input[readonly] {
 
 .table-wrap {
   max-height: 560px;
-  margin: 18px 0 8px;
+  margin: var(--space-4) 0 var(--space-2);
   overflow: auto;
   overscroll-behavior-inline: contain;
-  border: 1px solid rgba(143, 171, 156, 0.24);
-  border-radius: 14px;
-  background: var(--shadow-faint);
-  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.16);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--card);
 }
 
 table {
@@ -1452,7 +1521,7 @@ th,
 td {
   padding: 12px 14px;
   border-right: 1px solid var(--line-soft);
-  border-bottom: 1px solid rgba(143, 171, 156, 0.16);
+  border-bottom: 1px solid var(--line);
   color: var(--ink-muted);
   font-size: 12px;
   line-height: 1.4;
@@ -1525,7 +1594,7 @@ th {
   position: sticky;
   top: 0;
   z-index: 1;
-  border-bottom: 1px solid rgba(217, 172, 82, 0.22);
+  border-bottom: 1px solid var(--accent-line);
   color: var(--ink-strong);
   background: linear-gradient(180deg, var(--card-veil-solid), var(--veil-solid));
   font-size: 10px;
@@ -1564,7 +1633,7 @@ tbody tr:last-child td {
 
 .report-row-clickable:focus-within,
 .report-row-clickable:active {
-  background: rgba(217, 172, 82, 0.1);
+  background: var(--accent-soft);
 }
 
 .amount-cell,
@@ -1610,7 +1679,7 @@ tbody tr:last-child td {
 .detail-action-bar {
   margin-top: 16px;
   padding: 12px;
-  border: 1px solid rgba(217, 172, 82, 0.16);
+  border: 1px solid var(--accent-line);
   border-radius: 14px;
   background: var(--veil);
 }
@@ -1835,15 +1904,28 @@ tbody tr:last-child td {
 }
 
 .compact-button {
-  min-height: 0;
-  padding: 7px 9px;
-  border-radius: 9px;
-  font-size: 11px;
-  line-height: 1;
+  min-height: var(--control-height-sm);
+  padding: 0 10px;
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  line-height: 1.2;
 }
 
 .warning-note {
-  color: var(--accent-bright);
+  color: var(--attention-ink);
+}
+
+/* As a block (POS, when the counter has no shop) it is a warning notice, in the notice shape; as a
+   cell note it stays a line of text. */
+div.warning-note {
+  margin-top: var(--space-3);
+  padding: 10px 14px;
+  border-left: 3px solid var(--attention);
+  border-radius: var(--radius-sm);
+  background: var(--attention-soft);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.45;
 }
 
 .sales-history-drilldown-row td {
@@ -1853,19 +1935,42 @@ tbody tr:last-child td {
 
 .sales-history-drilldown-row .table-wrap {
   margin: 0;
-  border-color: rgba(217, 172, 82, 0.16);
+  border-color: var(--accent-line);
   background: var(--veil-strong);
 }
 
-.error-banner {
-  margin: 12px 16px;
-  padding: 11px 13px;
-  border: 1px solid rgba(248, 113, 113, 0.35);
-  border-radius: 10px;
+/* --- Notices -----------------------------------------------------------------
+ *
+ * One shape for every error, warning and info message: rounded, a 3px rule down the left in the
+ * tone's colour, the tone's soft surface and its ink. .pm-notice and .scope-locked-note already
+ * had it; these join them. */
+.error-banner,
+.inline-error,
+.field-error,
+.pdf-preview-error,
+.cash-book-warning {
+  padding: 10px 14px;
+  border: 0;
+  border-left: 3px solid var(--danger);
+  border-radius: var(--radius-sm);
   color: var(--danger-ink);
-  background: rgba(127, 29, 29, 0.24);
+  background: var(--danger-soft);
   font-size: 12px;
-  font-weight: 750;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.error-banner {
+  margin: var(--space-3) var(--space-4);
+}
+
+.inline-error {
+  margin: 0 0 var(--space-3);
+}
+
+/* Beside a button in a toolbar row, so it centres on the row rather than stretching to it. */
+.field-error {
+  align-self: center;
 }
 
 .balance-detail-breakdown {
@@ -1888,28 +1993,79 @@ tbody tr:last-child td {
   color: var(--ink);
 }
 
-.tag,
 .batch-id,
-.stock-ok,
-.stock-low,
 .coming-soon {
   padding: 4px 8px;
 }
 
-.tag,
 .batch-id {
   color: var(--ink-body);
-  background: rgba(143, 171, 156, 0.1);
+  background: var(--fill);
 }
 
+/* --- Status badges -----------------------------------------------------------
+ *
+ * Four tones, one shape. .stock-ok is "fine", .stock-low is "not fine" (Inactive, Cancelled,
+ * Failed, Unpaid, Closed -- it is used for far more than stock), .origin-rate is "waiting"
+ * (grace period, pending bill, partially paid) and .tag / .pill are neutral facts.
+ *
+ * .stock-low used to be gold, the brand's own "this is the action" colour, so a Cancelled bill
+ * and the Save button were saying the same thing. It is the danger tone now.
+ *
+ * The same classes also land on a <td>, on a <p className="form-note"> and on a cell note. Those
+ * take the tone as text colour only: the pill shape below is limited to inline elements, because
+ * a table cell or a paragraph turned into a pill is a layout bug, not a badge. */
 .stock-ok {
-  color: var(--success);
-  background: rgba(34, 197, 94, 0.1);
+  color: var(--success-ink);
 }
 
 .stock-low {
-  color: var(--accent-bright);
-  background: rgba(217, 172, 82, 0.1);
+  color: var(--danger-ink);
+}
+
+.origin-rate {
+  color: var(--attention-ink);
+}
+
+td.stock-ok,
+td.stock-low,
+td.origin-rate {
+  font-weight: 700;
+}
+
+:is(.tag, .pill, .stock-ok, .stock-low, .origin-rate):not(td, p, small, li, div) {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 22px;
+  box-sizing: border-box;
+  padding: 2px 9px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-pill);
+  color: var(--ink-body);
+  background: var(--fill);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.stock-ok:not(td, p, small, li, div) {
+  border-color: transparent;
+  color: var(--success-ink);
+  background: var(--success-soft);
+}
+
+.stock-low:not(td, p, small, li, div) {
+  border-color: transparent;
+  color: var(--danger-ink);
+  background: var(--danger-soft);
+}
+
+.origin-rate:not(td, p, small, li, div) {
+  border-color: var(--attention-line);
+  color: var(--attention-ink);
+  background: var(--attention-soft);
 }
 
 .profit-cell {
@@ -1920,7 +2076,7 @@ tbody tr:last-child td {
 .purchase-summary {
   margin: 4px 0 18px;
   padding: 16px;
-  border: 1px solid rgba(217, 172, 82, 0.16);
+  border: 1px solid var(--accent-line);
   border-radius: 10px;
   background: linear-gradient(135deg, var(--accent-wash), var(--veil-heavy));
 }
@@ -1939,15 +2095,6 @@ tbody tr:last-child td {
   font-size: 16px;
 }
 
-.origin-rate {
-  padding: 5px 9px;
-  border-radius: 999px;
-  color: var(--accent);
-  background: rgba(217, 172, 82, 0.1);
-  font-size: 11px;
-  font-weight: 800;
-}
-
 .purchase-summary-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
@@ -1956,7 +2103,7 @@ tbody tr:last-child td {
 
 .summary-metric {
   padding: 10px;
-  border: 1px solid rgba(143, 171, 156, 0.08);
+  border: 1px solid var(--line-soft);
   border-radius: 8px;
   background: var(--veil);
 }
@@ -1979,7 +2126,7 @@ tbody tr:last-child td {
 }
 
 .summary-metric-featured {
-  border-color: rgba(217, 172, 82, 0.26);
+  border-color: var(--accent-line);
 }
 
 .summary-metric-featured strong {
@@ -2004,7 +2151,7 @@ tbody tr:last-child td {
   align-items: center;
   min-width: 0;
   padding: 9px 11px;
-  border-bottom: 1px solid rgba(143, 171, 156, 0.1);
+  border-bottom: 1px solid var(--line-soft);
 }
 
 .sync-owner-row:last-child {
@@ -2029,12 +2176,13 @@ tbody tr:last-child td {
   gap: 14px;
   margin-top: 14px;
   padding-top: 14px;
-  border-top: 1px solid rgba(143, 171, 156, 0.14);
+  border-top: 1px solid var(--line);
 }
 
 .settings-layout {
   display: grid;
-  gap: 17px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-4);
 }
 
 .settings-banner {
@@ -2043,10 +2191,10 @@ tbody tr:last-child td {
   justify-content: space-between;
   gap: 16px;
   padding: 22px 24px;
-  border: 1px solid rgba(217, 172, 82, 0.16);
+  border: 1px solid var(--accent-line);
   border-radius: 14px;
   background:
-    radial-gradient(circle at top right, rgba(217, 172, 82, 0.14), transparent 35%),
+    radial-gradient(circle at top right, var(--accent-soft), transparent 35%),
     linear-gradient(135deg, var(--card), var(--raised));
   box-shadow: 0 14px 34px var(--shadow-faint);
 }
@@ -2071,7 +2219,7 @@ tbody tr:last-child td {
   align-items: center;
   margin: 0 0 18px;
   padding: 14px;
-  border: 1px solid rgba(143, 171, 156, 0.14);
+  border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--veil-subtle);
 }
@@ -2084,7 +2232,7 @@ tbody tr:last-child td {
 
 .update-available-panel {
   border-color: var(--accent-line-strong);
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
 }
 
 .update-download-progress {
@@ -2142,31 +2290,70 @@ tbody tr:last-child td {
   gap: 8px;
 }
 
-.account-tab {
-  padding: 9px 12px;
-  border: 1px solid rgba(143, 171, 156, 0.16);
-  border-radius: 999px;
+/* Pending Bills' tab pair renders as .settings-tabs > button / .tab-active; it had no rule at all
+   and showed as grey native buttons. It is the same segmented pill as the account tabs. */
+.settings-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.account-tab,
+.settings-tabs > button {
+  min-height: var(--control-height-sm);
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
   color: var(--ink-muted);
   background: var(--card-veil);
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 700;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease;
 }
 
-.account-tab-active {
+.account-tab:hover,
+.settings-tabs > button:hover {
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
+.account-tab-active,
+.tab-active,
+.settings-tabs > button.tab-active {
   border-color: var(--accent-line-strong);
   color: var(--accent);
-  background: rgba(217, 172, 82, 0.1);
+  background: var(--accent-soft);
 }
 
 .supplier-form-grid {
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
 }
 
+/* Help text under a field or a section: calm and muted. It was bold gold, which is the colour the
+   app uses for "this is the action" and read as a warning in all sixty places it is used as help.
+   The same class carrying a tone is a real notice, and takes the notice shape. */
 .form-note {
-  margin: 0 0 14px;
-  color: var(--accent-bright);
+  margin: 0 0 var(--space-3);
+  color: var(--ink-muted);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 500;
+  line-height: 1.45;
+}
+
+.form-note.stock-low,
+.form-note.stock-ok {
+  padding: 10px 14px;
+  border-left: 3px solid var(--attention);
+  border-radius: var(--radius-sm);
+  color: var(--attention-ink);
+  background: var(--attention-soft);
+  font-weight: 600;
+}
+
+.form-note.stock-ok {
+  border-left-color: var(--success);
+  color: var(--success-ink);
+  background: var(--success-soft);
 }
 
 .ledger-toolbar {
@@ -2190,7 +2377,7 @@ tbody tr:last-child td {
 
 .detail-item {
   padding: 12px;
-  border: 1px solid rgba(143, 171, 156, 0.09);
+  border: 1px solid var(--line-soft);
   border-radius: 9px;
   background: var(--veil-subtle);
 }
@@ -2233,10 +2420,10 @@ tbody tr:last-child td {
   align-self: end;
   min-height: 44px;
   padding: 11px 12px;
-  border: 1px solid rgba(217, 172, 82, 0.22);
+  border: 1px solid var(--accent-line);
   border-radius: 10px;
   color: var(--ink-body);
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
 }
 
 .accessibility-preview-card span {
@@ -2282,7 +2469,7 @@ tbody tr:last-child td {
 
 .permission-card {
   padding: 14px;
-  border: 1px solid rgba(143, 171, 156, 0.09);
+  border: 1px solid var(--line-soft);
   border-radius: 10px;
   background: var(--veil-subtle);
 }
@@ -2317,10 +2504,10 @@ tbody tr:last-child td {
   align-items: center;
   justify-content: center;
   gap: 7px;
-  border-radius: 7px;
+  border-radius: var(--radius-md);
   font-size: 12px;
-  font-weight: 800;
-  transition: 160ms ease;
+  font-weight: 700;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease;
 }
 
 /* Gold means "this is the action", and .primary-button is already saying it in
@@ -2328,21 +2515,24 @@ tbody tr:last-child td {
    on a gold tint makes two things claim the same job, and the eye cannot tell which
    is primary. These are neutral so the gold one stays the answer. */
 .table-action {
-  padding: 6px 9px;
-  border: 1px solid rgba(143, 171, 156, 0.2);
+  min-height: var(--control-height-sm);
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
   color: var(--ink-body);
-  background: var(--raised-high);
+  background: var(--card);
 }
 
-.table-action:hover {
-  border-color: rgba(143, 171, 156, 0.34);
+.table-action:hover,
+.secondary-button:hover {
+  border-color: var(--line-control);
   color: var(--ink);
+  background: var(--hover);
 }
 
 .pos-layout {
   display: grid;
   grid-template-columns: minmax(690px, 1fr) minmax(320px, 380px);
-  gap: 17px;
+  gap: var(--space-4);
   align-items: start;
   min-height: 0;
 }
@@ -2350,7 +2540,7 @@ tbody tr:last-child td {
 .pos-main {
   min-width: 0;
   display: grid;
-  gap: 17px;
+  gap: var(--space-4);
 }
 
 .shortcut-hint {
@@ -2372,7 +2562,7 @@ tbody tr:last-child td {
   gap: 10px;
   margin-bottom: 12px;
   padding: 11px;
-  border: 1px solid rgba(143, 171, 156, 0.1);
+  border: 1px solid var(--line-soft);
   border-radius: 12px;
   background: var(--veil-subtle);
 }
@@ -2415,7 +2605,7 @@ tbody tr:last-child td {
   min-width: 0;
   min-height: 92px;
   padding: 12px;
-  border: 1px solid rgba(143, 171, 156, 0.1);
+  border: 1px solid var(--line-soft);
   border-radius: 8px;
   color: var(--ink-body);
   background: var(--track);
@@ -2425,7 +2615,7 @@ tbody tr:last-child td {
 
 .product-result:hover,
 .product-result-active {
-  border-color: rgba(217, 172, 82, 0.48);
+  border-color: var(--accent-line-strong);
   background: var(--accent-wash);
 }
 
@@ -2462,7 +2652,7 @@ tbody tr:last-child td {
 .product-result-meta span {
   max-width: 100%;
   padding: 3px 6px;
-  border: 1px solid rgba(143, 171, 156, 0.14);
+  border: 1px solid var(--line);
   border-radius: 999px;
   color: var(--ink-body);
   background: var(--veil);
@@ -2500,22 +2690,33 @@ tbody tr:last-child td {
   padding: 5px 9px;
   border-radius: 999px;
   color: var(--accent);
-  background: rgba(217, 172, 82, 0.1);
+  background: var(--accent-soft);
   font-size: 11px;
   font-weight: 800;
 }
 
+/* Empty states are neutral: nothing is wrong, there is simply nothing here yet. A quiet dashed
+   well rather than faint text floating in space, which read as a rendering fault. */
 .cart-empty {
-  padding: 40px 10px 20px;
-  color: var(--ink-faint);
+  padding: var(--space-6) var(--space-4);
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-lg);
+  color: var(--ink-muted);
+  background: var(--fill-subtle);
   font-size: 13px;
+  line-height: 1.5;
   text-align: center;
 }
 
 .empty-cell {
-  padding: 28px 12px;
-  color: var(--ink-faint);
+  padding: 32px var(--space-4);
+  color: var(--ink-muted);
   text-align: center;
+  white-space: normal;
+}
+
+tbody tr:has(> .empty-cell):hover {
+  background: transparent;
 }
 
 .lot-entry-panel,
@@ -2647,10 +2848,51 @@ tbody tr:last-child td {
   width: 34px;
   height: 34px;
   padding: 6px;
-  border: 0;
-  border-radius: 6px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  color: var(--ink-muted);
+  background: transparent;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease;
+}
+
+/* The icon square (a modal's close X, a row's trash can) is quiet until it is pointed at, then
+   takes the danger tone -- the same way a window's own close button does. */
+.remove-button:hover {
   color: var(--danger);
-  background: rgba(248, 113, 113, 0.09);
+  background: var(--danger-soft);
+}
+
+/* About twenty call sites put words in this button ("Deactivate", "Cancel Bill", "Logout"), and
+   the 34px square could not hold them. Without an icon it becomes the danger text button: sized to
+   its label, the row-action height, outlined in the danger line. Kept in step with
+   .danger-text-button below, which is the same control under its own name. */
+.remove-button:not(:has(> svg)) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: auto;
+  height: auto;
+  min-height: var(--control-height-sm);
+  padding: 0 10px;
+  border-color: var(--danger-line);
+  color: var(--danger-ink);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.remove-button:not(:has(> svg)):hover {
+  border-color: var(--danger);
+  color: var(--danger-ink);
+  background: var(--danger-soft);
+}
+
+.remove-button:not(:has(> svg)):disabled,
+.remove-button:not(:has(> svg)):disabled:hover {
+  border-color: var(--line);
+  color: var(--ink-faint);
+  background: transparent;
 }
 
 .lot-selector-backdrop {
@@ -2685,7 +2927,7 @@ tbody tr:last-child td {
   gap: 10px;
   align-items: end;
   padding: 14px 16px;
-  border-block: 1px solid rgba(143, 171, 156, 0.14);
+  border-block: 1px solid var(--line);
   background: var(--veil-solid);
 }
 
@@ -2711,7 +2953,7 @@ tbody tr:last-child td {
   height: 24px;
   padding: 0;
   transform: translateY(-50%);
-  border: 1px solid rgba(143, 171, 156, 0.22);
+  border: 1px solid var(--line);
   border-radius: 999px;
   color: var(--ink-body);
   background: var(--veil-heavy);
@@ -2723,7 +2965,7 @@ tbody tr:last-child td {
   align-self: center;
   margin: 0;
   padding: 8px 10px;
-  border: 1px solid rgba(143, 171, 156, 0.14);
+  border: 1px solid var(--line);
   border-radius: 10px;
   color: var(--ink-body);
   background: var(--card-veil);
@@ -2747,14 +2989,14 @@ tbody tr:last-child td {
 .lot-selector-table th,
 .lot-selector-table td {
   padding: 10px 11px;
-  border-bottom: 1px solid rgba(143, 171, 156, 0.14);
-  border-right: 1px solid rgba(143, 171, 156, 0.08);
+  border-bottom: 1px solid var(--line);
+  border-right: 1px solid var(--line-soft);
   vertical-align: middle;
 }
 
 .lot-selector-table th:first-child,
 .lot-selector-table td:first-child {
-  border-left: 1px solid rgba(143, 171, 156, 0.08);
+  border-left: 1px solid var(--line-soft);
 }
 
 .lot-selector-table th {
@@ -2774,7 +3016,7 @@ tbody tr:last-child td {
 }
 
 .lot-selector-row:hover {
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
 }
 
 .lot-selector-row-disabled {
@@ -2816,10 +3058,10 @@ tbody tr:last-child td {
   justify-content: center;
   min-width: 54px;
   padding: 4px 7px;
-  border: 1px solid rgba(143, 171, 156, 0.18);
+  border: 1px solid var(--line);
   border-radius: 999px;
   color: var(--ink-body);
-  background: rgba(143, 171, 156, 0.1);
+  background: var(--fill);
   font-size: 10px;
   font-weight: 900;
   line-height: 1;
@@ -2827,22 +3069,22 @@ tbody tr:last-child td {
 }
 
 .status-active {
-  border-color: rgba(34, 197, 94, 0.32);
-  color: var(--success-strong);
-  background: rgba(34, 197, 94, 0.12);
+  border-color: transparent;
+  color: var(--success-ink);
+  background: var(--success-soft);
 }
 
 .status-sold-out {
-  border-color: rgba(217, 172, 82, 0.32);
-  color: var(--accent-bright);
-  background: rgba(217, 172, 82, 0.1);
+  border-color: var(--attention-line);
+  color: var(--attention-ink);
+  background: var(--attention-soft);
 }
 
 .status-inactive,
 .status-cancelled {
-  border-color: rgba(248, 113, 113, 0.32);
-  color: var(--danger-strong);
-  background: rgba(248, 113, 113, 0.1);
+  border-color: transparent;
+  color: var(--danger-ink);
+  background: var(--danger-soft);
 }
 
 .checkout-card {
@@ -2853,7 +3095,7 @@ tbody tr:last-child td {
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 20px;
-  border: 1px solid rgba(143, 171, 156, 0.1);
+  border: 1px solid var(--line-soft);
   border-radius: 14px;
   background: var(--card);
   box-shadow: 0 12px 28px var(--shadow-faint);
@@ -2868,7 +3110,7 @@ tbody tr:last-child td {
   display: grid;
   gap: 11px;
   padding: 15px 0;
-  border-top: 1px solid rgba(143, 171, 156, 0.1);
+  border-top: 1px solid var(--line-soft);
 }
 
 .discount-preview {
@@ -2877,9 +3119,9 @@ tbody tr:last-child td {
   justify-content: space-between;
   gap: 14px;
   padding: 12px;
-  border: 1px solid rgba(217, 172, 82, 0.18);
+  border: 1px solid var(--accent-line);
   border-radius: 10px;
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
 }
 
 .discount-preview span,
@@ -2916,7 +3158,7 @@ tbody tr:last-child td {
   display: grid;
   gap: 10px;
   padding: 10px;
-  border: 1px solid rgba(143, 171, 156, 0.18);
+  border: 1px solid var(--line);
   border-radius: 14px;
   background: var(--veil);
 }
@@ -2933,7 +3175,7 @@ tbody tr:last-child td {
   display: grid;
   gap: 6px;
   padding-top: 8px;
-  border-top: 1px dashed rgba(143, 171, 156, 0.18);
+  border-top: 1px dashed var(--line);
 }
 
 .sale-edit-mixed-panel {
@@ -2944,11 +3186,11 @@ tbody tr:last-child td {
   display: grid;
   gap: 8px;
   padding: 16px 0;
-  border-top: 1px solid rgba(143, 171, 156, 0.1);
+  border-top: 1px solid var(--line-soft);
 }
 
 .mandi-tax-panel {
-  border-top-color: rgba(217, 172, 82, 0.18);
+  border-top-color: var(--accent-line);
 }
 
 /*
@@ -3031,7 +3273,7 @@ tbody tr:last-child td {
   display: grid;
   gap: 6px;
   padding: 10px;
-  border: 1px solid rgba(217, 172, 82, 0.18);
+  border: 1px solid var(--accent-line);
   border-radius: 12px;
   background: var(--accent-wash);
 }
@@ -3054,7 +3296,7 @@ tbody tr:last-child td {
 
 .total-line-main {
   padding-top: 8px;
-  border-top: 1px dashed rgba(143, 171, 156, 0.16);
+  border-top: 1px dashed var(--line);
   color: var(--ink);
   font-size: 15px;
 }
@@ -3079,7 +3321,7 @@ tbody tr:last-child td {
   z-index: 8;
   align-items: end;
   padding: 12px;
-  border: 1px solid rgba(143, 171, 156, 0.18);
+  border: 1px solid var(--line);
   border-radius: 16px;
   background: var(--veil-solid);
   backdrop-filter: blur(14px);
@@ -3143,7 +3385,7 @@ tbody tr:last-child td {
 }
 
 .stock-disclosure-button.is-open {
-  border-color: rgba(217, 172, 82, 0.55);
+  border-color: var(--accent-line-strong);
   color: var(--accent-bright);
 }
 
@@ -3177,15 +3419,15 @@ tbody tr:last-child td {
   border: 1px solid var(--accent-line);
   border-radius: 999px;
   color: var(--accent-bright);
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
   font-size: 12px;
   font-weight: 800;
 }
 
 .customer-sales-group-row td {
-  border-top: 1px solid rgba(217, 172, 82, 0.38);
-  border-bottom: 1px solid rgba(217, 172, 82, 0.22);
-  background: rgba(217, 172, 82, 0.08);
+  border-top: 1px solid var(--accent-line-strong);
+  border-bottom: 1px solid var(--accent-line);
+  background: var(--accent-wash);
 }
 
 .customer-sales-group-summary {
@@ -3215,7 +3457,7 @@ tbody tr:last-child td {
 
 .report-filter-summary span {
   padding: 5px 8px;
-  border: 1px solid rgba(143, 171, 156, 0.22);
+  border: 1px solid var(--line);
   border-radius: 999px;
   color: var(--ink-body);
   background: var(--veil);
@@ -3237,7 +3479,7 @@ tbody tr:last-child td {
   width: min(820px, 100%);
   max-height: calc(100vh - 40px);
   overflow: auto;
-  border: 1px solid rgba(143, 171, 156, 0.16);
+  border: 1px solid var(--line);
   border-radius: 14px;
   background: var(--card);
   box-shadow: 0 20px 70px var(--shadow-strong);
@@ -3256,7 +3498,7 @@ tbody tr:last-child td {
   margin: 0 16px 16px;
   padding: 18px;
   overflow: auto;
-  border: 1px solid rgba(143, 171, 156, 0.22);
+  border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--shadow-strong);
 }
@@ -3278,13 +3520,13 @@ tbody tr:last-child td {
   image-rendering: auto;
 }
 
-.pdf-preview-error,
 .pdf-preview-fallback {
   padding: 18px;
-  border: 1px solid rgba(248, 113, 113, 0.36);
-  border-radius: 12px;
+  border: 0;
+  border-left: 3px solid var(--danger);
+  border-radius: var(--radius-sm);
   color: var(--danger-ink);
-  background: rgba(127, 29, 29, 0.18);
+  background: var(--danger-soft);
 }
 
 .pdf-preview-fallback {
@@ -3311,7 +3553,7 @@ tbody tr:last-child td {
   max-height: 320px;
   overflow: auto;
   padding: 6px;
-  border: 1px solid rgba(143, 171, 156, 0.16);
+  border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--veil);
 }
@@ -3322,7 +3564,7 @@ tbody tr:last-child td {
   gap: 10px;
   align-items: center;
   padding: 10px;
-  border: 1px solid rgba(143, 171, 156, 0.16);
+  border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--card-veil);
 }
@@ -3394,7 +3636,7 @@ tbody tr:last-child td {
 .audit-readable span {
   display: block;
   padding: 7px 9px;
-  border: 1px solid rgba(143, 171, 156, 0.1);
+  border: 1px solid var(--line-soft);
   border-radius: 8px;
   color: var(--ink-body);
   background: var(--veil);
@@ -3463,9 +3705,9 @@ tbody tr:last-child td {
 
 .pl-title-block {
   padding: 18px;
-  border: 1px solid rgba(217, 172, 82, 0.18);
+  border: 1px solid var(--accent-line);
   border-radius: 14px;
-  background: linear-gradient(135deg, rgba(217, 172, 82, 0.1), var(--veil-strong));
+  background: linear-gradient(135deg, var(--accent-soft), var(--veil-strong));
 }
 
 .pl-title-block span {
@@ -3500,9 +3742,9 @@ tbody tr:last-child td {
 .pl-section h3 {
   margin: 0;
   padding: 11px 14px;
-  border-bottom: 1px solid rgba(217, 172, 82, 0.16);
+  border-bottom: 1px solid var(--accent-line);
   color: var(--accent);
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
   font-size: 12px;
   font-weight: 900;
   letter-spacing: 0.9px;
@@ -3514,7 +3756,7 @@ tbody tr:last-child td {
   gap: 16px;
   align-items: center;
   padding: 10px 14px;
-  border-bottom: 1px solid rgba(143, 171, 156, 0.08);
+  border-bottom: 1px solid var(--line-soft);
   color: #e0f2fe;
 }
 
@@ -3554,7 +3796,7 @@ tbody tr:last-child td {
 
 .pl-line-highlight {
   padding-block: 13px;
-  background: linear-gradient(135deg, rgba(217, 172, 82, 0.14), var(--card-veil));
+  background: linear-gradient(135deg, var(--accent-soft), var(--card-veil));
 }
 
 .pl-positive {
@@ -3576,7 +3818,7 @@ tbody tr:last-child td {
 
 .pl-empty-note {
   padding: 12px 14px;
-  border: 1px dashed rgba(143, 171, 156, 0.18);
+  border: 1px dashed var(--line);
   border-radius: 11px;
   color: var(--ink-muted);
   background: var(--veil-subtle);
@@ -3594,13 +3836,7 @@ tbody tr:last-child td {
 }
 
 .cash-book-warning {
-  padding: 11px 13px;
-  border: 1px solid rgba(251, 113, 133, 0.34);
-  border-radius: 12px;
-  color: #fecdd3;
-  background: rgba(127, 29, 29, 0.22);
   font-size: 13px;
-  font-weight: 800;
 }
 
 .cash-book-sides {
@@ -3624,9 +3860,9 @@ tbody tr:last-child td {
   gap: 12px;
   margin: 0;
   padding: 11px 13px;
-  border-bottom: 1px solid rgba(217, 172, 82, 0.16);
+  border-bottom: 1px solid var(--accent-line);
   color: var(--accent);
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
   font-size: 12px;
   font-weight: 900;
   letter-spacing: 0.8px;
@@ -3638,10 +3874,10 @@ tbody tr:last-child td {
   place-items: center;
   min-width: 38px;
   padding: 4px 7px;
-  border: 1px solid rgba(217, 172, 82, 0.35);
+  border: 1px solid var(--accent-line-strong);
   border-radius: 999px;
   color: var(--ink);
-  background: rgba(217, 172, 82, 0.14);
+  background: var(--accent-soft);
   font-size: 11px;
 }
 
@@ -3737,13 +3973,14 @@ tbody tr:last-child td {
 
 .secondary-button,
 .whatsapp-button {
-  padding: 8px 10px;
+  min-height: var(--control-height);
+  padding: 0 14px;
 }
 
 .secondary-button {
-  border: 1px solid rgba(143, 171, 156, 0.18);
+  border: 1px solid var(--line-strong);
   color: var(--ink-body);
-  background: var(--track);
+  background: var(--card);
 }
 
 .whatsapp-button {
@@ -3974,7 +4211,7 @@ tbody tr:last-child td {
 .coming-soon {
   margin-top: 16px;
   color: var(--accent);
-  background: rgba(217, 172, 82, 0.1);
+  background: var(--accent-soft);
   letter-spacing: 0.7px;
   text-transform: uppercase;
 }
@@ -3985,7 +4222,7 @@ tbody tr:last-child td {
   place-items: center;
   padding: 22px;
   box-sizing: border-box;
-  background: radial-gradient(circle at top left, rgba(217, 172, 82, 0.1), transparent 31%), var(--ground);
+  background: radial-gradient(circle at top left, var(--accent-soft), transparent 31%), var(--ground);
 }
 
 .login-panel {
@@ -4002,7 +4239,7 @@ tbody tr:last-child td {
 
 .login-brand {
   padding-bottom: 14px;
-  border-bottom: 1px solid rgba(143, 171, 156, 0.1);
+  border-bottom: 1px solid var(--line-soft);
 }
 
 .login-brand .brand-monogram {
@@ -4030,7 +4267,7 @@ tbody tr:last-child td {
   gap: 6px;
   margin: 0 0 14px;
   padding: 10px 12px;
-  border: 1px solid rgba(143, 171, 156, 0.14);
+  border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--veil-subtle);
 }
@@ -4156,9 +4393,9 @@ tbody tr:last-child td {
   gap: 8px;
   margin-top: 16px;
   padding: 14px;
-  border: 1px solid rgba(217, 172, 82, 0.24);
+  border: 1px solid var(--accent-line);
   border-radius: 14px;
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
 }
 
 .device-activation-panel strong {
@@ -4179,7 +4416,7 @@ tbody tr:last-child td {
   gap: 10px;
   margin-top: 16px;
   padding: 16px;
-  border: 1px solid rgba(217, 172, 82, 0.18);
+  border: 1px solid var(--accent-line);
   border-radius: 14px;
   background: var(--veil);
 }
@@ -4577,10 +4814,10 @@ tbody tr:last-child td {
   .mobile-pos-note {
     display: block;
     padding: 11px 13px;
-    border: 1px solid rgba(217, 172, 82, 0.2);
+    border: 1px solid var(--accent-line);
     border-radius: 12px;
     color: var(--accent-bright);
-    background: rgba(217, 172, 82, 0.08);
+    background: var(--accent-wash);
     font-size: 12px;
     font-weight: 800;
     line-height: 1.45;
@@ -4662,7 +4899,7 @@ tbody tr:last-child td {
 .ai-toolbar {
   align-items: center;
   background: var(--veil-heavy);
-  border: 1px solid rgba(143, 171, 156, 0.18);
+  border: 1px solid var(--line);
   border-radius: 8px;
   display: flex;
   justify-content: space-between;
@@ -4980,7 +5217,7 @@ tbody tr:last-child td {
 
 .ai-suggestion-picker select {
   background: var(--card-veil);
-  border: 1px solid rgba(143, 171, 156, 0.2);
+  border: 1px solid var(--line);
   border-radius: 8px;
   /* `var(--text)` is defined nowhere in this repository; the neighbouring rules used it and were
      therefore invalid, inheriting whatever the parent gave them. Use the real token. */
@@ -5017,7 +5254,7 @@ tbody tr:last-child td {
 .ai-answer-panel,
 .ai-history-item {
   background: var(--shadow-soft);
-  border: 1px solid rgba(143, 171, 156, 0.16);
+  border: 1px solid var(--line);
   border-radius: 8px;
   margin-top: 14px;
   padding: 14px;
@@ -5059,7 +5296,7 @@ tbody tr:last-child td {
 
 .ai-collection-strip span {
   background: var(--veil-heavy);
-  border: 1px solid rgba(143, 171, 156, 0.16);
+  border: 1px solid var(--line);
   border-radius: 8px;
   color: var(--ink-body);
   padding: 10px;
@@ -5488,7 +5725,7 @@ tbody tr:last-child td {
 
 .frost-insight-card {
   background: var(--veil-heavy);
-  border: 1px solid rgba(143, 171, 156, 0.18);
+  border: 1px solid var(--line);
   border-radius: 8px;
   display: grid;
   gap: 8px;
@@ -5560,7 +5797,7 @@ tbody tr:last-child td {
 .ai-engine-chip {
   align-items: center;
   background: var(--veil-heavy);
-  border: 1px solid rgba(143, 171, 156, 0.18);
+  border: 1px solid var(--line);
   border-radius: 8px;
   color: var(--ink-muted);
   display: flex;
@@ -6499,7 +6736,7 @@ tbody tr:last-child td {
   overflow-x: hidden;
   padding-right: 3px;
   scrollbar-width: thin;
-  scrollbar-color: rgba(217, 172, 82, 0.55) var(--veil-subtle);
+  scrollbar-color: var(--accent-line-strong) var(--veil-subtle);
 }
 
 .sidebar-nav::-webkit-scrollbar,
@@ -6512,7 +6749,7 @@ tbody tr:last-child td {
 .frost-drawer-body::-webkit-scrollbar-thumb,
 .command-list::-webkit-scrollbar-thumb {
   border-radius: 999px;
-  background: rgba(217, 172, 82, 0.5);
+  background: var(--accent-line);
 }
 
 .nav-item {
@@ -6696,7 +6933,7 @@ tbody tr:last-child td {
   display: flex;
   flex-direction: column;
   transform: translateX(105%);
-  border-left: 1px solid rgba(217, 172, 82, 0.24);
+  border-left: 1px solid var(--accent-line);
   background: var(--ground);
   box-shadow: -24px 0 60px var(--shadow-strong);
   transition: transform 180ms ease;
@@ -6712,7 +6949,7 @@ tbody tr:last-child td {
   justify-content: space-between;
   gap: 14px;
   padding: 18px 20px;
-  border-bottom: 1px solid rgba(143, 171, 156, 0.14);
+  border-bottom: 1px solid var(--line);
   background: linear-gradient(135deg, var(--accent-soft), var(--veil-solid));
 }
 
@@ -6745,7 +6982,7 @@ tbody tr:last-child td {
   display: grid;
   gap: 12px;
   padding: 16px;
-  border: 1px solid rgba(217, 172, 82, 0.26);
+  border: 1px solid var(--accent-line);
   border-radius: 12px;
   background: var(--panel);
   box-shadow: 0 30px 80px var(--shadow-strong);
@@ -6769,7 +7006,7 @@ tbody tr:last-child td {
   gap: 10px;
   min-height: 42px;
   padding: 10px 12px;
-  border: 1px solid rgba(143, 171, 156, 0.14);
+  border: 1px solid var(--line);
   border-radius: 8px;
   color: var(--ink-strong);
   background: var(--card-veil);
@@ -6777,7 +7014,7 @@ tbody tr:last-child td {
 }
 
 .command-list button:hover {
-  border-color: rgba(217, 172, 82, 0.42);
+  border-color: var(--accent-line-strong);
   color: var(--accent-bright);
 }
 
@@ -6793,7 +7030,7 @@ tbody tr:last-child td {
     inset: auto 10px 10px;
     width: auto;
     max-height: min(86vh, 760px);
-    border: 1px solid rgba(217, 172, 82, 0.24);
+    border: 1px solid var(--accent-line);
     border-radius: 14px;
     transform: translateY(110%);
   }
@@ -6828,7 +7065,7 @@ tbody tr:last-child td {
   width: 34px;
   height: 34px;
   padding: 0;
-  border: 1px solid rgba(143, 171, 156, 0.28);
+  border: 1px solid var(--line-strong);
   border-radius: 999px;
   background: var(--fill);
   color: var(--ink-body);
@@ -6839,7 +7076,7 @@ tbody tr:last-child td {
 .notification-bell:hover,
 .notification-bell:focus-visible {
   background: var(--pressed);
-  border-color: rgba(143, 171, 156, 0.45);
+  border-color: var(--line-strong);
   color: var(--ink);
 }
 
@@ -6852,9 +7089,9 @@ tbody tr:last-child td {
 }
 
 .notification-bell.has-unread.severity-warning {
-  border-color: rgba(217, 172, 82, 0.55);
-  background: rgba(217, 172, 82, 0.16);
-  color: #eed08d;
+  border-color: var(--attention-line);
+  background: var(--attention-soft);
+  color: var(--attention-ink);
 }
 
 .notification-bell.has-unread.severity-info,
@@ -6890,7 +7127,7 @@ tbody tr:last-child td {
   max-height: min(70vh, 520px);
   display: flex;
   flex-direction: column;
-  border: 1px solid rgba(143, 171, 156, 0.25);
+  border: 1px solid var(--line-strong);
   border-radius: 14px;
   background: var(--ground);
   box-shadow: 0 18px 48px var(--shadow-strong);
@@ -6903,7 +7140,7 @@ tbody tr:last-child td {
   justify-content: space-between;
   gap: 8px;
   padding: 12px 14px;
-  border-bottom: 1px solid rgba(143, 171, 156, 0.18);
+  border-bottom: 1px solid var(--line);
   color: var(--ink-strong);
 }
 
@@ -6989,8 +7226,8 @@ tbody tr:last-child td {
 }
 
 .notification-tag.severity-warning {
-  background: rgba(217, 172, 82, 0.18);
-  color: #eed08d;
+  background: var(--attention-soft);
+  color: var(--attention-ink);
 }
 
 .notification-tag.severity-info {
@@ -7006,7 +7243,7 @@ tbody tr:last-child td {
 .notification-count {
   padding: 1px 6px;
   border-radius: 999px;
-  background: rgba(143, 171, 156, 0.18);
+  background: var(--fill-strong);
   color: var(--ink-body);
   font-size: 10px;
   font-weight: 700;
@@ -7028,7 +7265,7 @@ tbody tr:last-child td {
 
 .notification-dismiss:hover,
 .notification-dismiss:focus-visible {
-  background: rgba(143, 171, 156, 0.18);
+  background: var(--fill-strong);
   color: var(--ink);
 }
 
@@ -7185,19 +7422,19 @@ tbody tr:last-child td {
   margin-left: auto;
   padding: 1px 6px;
   border-radius: 5px;
-  border: 1px solid rgba(143, 171, 156, 0.22);
+  border: 1px solid var(--line-strong);
   font-family: inherit;
   font-size: 10px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.04em;
-  color: rgba(143, 171, 156, 0.75);
-  background: var(--fill-subtle);
+  color: var(--ink-muted);
+  background: var(--card-veil-soft);
 }
 
 .nav-item-active .nav-shortcut {
-  border-color: rgba(217, 172, 82, 0.35);
-  color: rgba(217, 172, 82, 0.9);
+  border-color: var(--accent-line-strong);
+  color: var(--accent);
   background: var(--accent-soft);
 }
 
@@ -7229,7 +7466,7 @@ tbody tr:last-child td {
 }
 
 .chrome-button:focus-visible {
-  outline: 2px solid rgba(217, 172, 82, 0.7);
+  outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
 
@@ -7270,11 +7507,11 @@ tbody tr:last-child td {
   margin-left: auto;
   padding: 1px 6px;
   border-radius: 5px;
-  border: 1px solid rgba(143, 171, 156, 0.22);
+  border: 1px solid var(--line);
   font-family: inherit;
   font-size: 10px;
   font-variant-numeric: tabular-nums;
-  color: rgba(143, 171, 156, 0.75);
+  color: var(--ink-muted);
 }
 
 .command-result-active {
@@ -7287,7 +7524,7 @@ tbody tr:last-child td {
   border-radius: 7px;
   font-size: 12px;
   color: var(--accent);
-  background: rgba(217, 172, 82, 0.1);
+  background: var(--accent-soft);
 }
 
 @media (max-width: 900px) {
@@ -7315,7 +7552,7 @@ tbody tr:last-child td {
   margin-top: 2px;
   font-size: 11px;
   font-variant-numeric: tabular-nums;
-  color: rgba(143, 171, 156, 0.7);
+  color: var(--ink-muted);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -7664,15 +7901,16 @@ tbody tr:last-child td {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  padding: 6px 9px;
+  min-height: var(--control-height-sm);
+  padding: 0 10px;
   border: 1px solid var(--danger-line);
-  border-radius: 7px;
+  border-radius: var(--radius-md);
   color: var(--danger-ink);
   background: transparent;
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 700;
   white-space: nowrap;
-  transition: 160ms ease;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease;
 }
 
 .danger-text-button:hover {
@@ -7691,6 +7929,8 @@ tbody tr:last-child td {
   border-color: var(--line);
   color: var(--ink-faint);
   background: transparent;
+  cursor: not-allowed;
+  opacity: 0.8;
 }
 
 .pm-summary {
@@ -8091,9 +8331,16 @@ tbody tr:last-child td {
 }
 
 /* Branches & Counters: one card per step, a jump bar at the top, each step's result under its button. */
+/* minmax(0, 1fr), not the implicit auto track: an auto track grows to the widest table's
+   min-content, and on a phone that pushed every card on the page 400px past the screen. */
 .scope-page {
   display: grid;
-  gap: 17px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-4);
+}
+
+.scope-page > * {
+  min-width: 0;
 }
 
 .scope-page > .content-card,
@@ -8195,4 +8442,204 @@ tbody tr:last-child td {
 
 .scope-step-message-error {
   color: var(--danger-ink);
+}
+
+/* ---------------------------------------------------------------------------------------------
+   Classes App.jsx renders that had no rule at all.
+
+   Each rendered with browser defaults: a paragraph with a default margin, a toolbar with no gap, a
+   field hint in full body ink. None was broken enough to report and every one looked unfinished.
+   --------------------------------------------------------------------------------------------- */
+
+/* Descriptive copy under a heading (Stock Distribution). */
+.muted-note {
+  max-width: 72ch;
+  margin: var(--space-1) 0 var(--space-3);
+  color: var(--ink-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* The line of help under a single field. */
+.field-hint {
+  display: block;
+  color: var(--ink-muted);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+/* A row of buttons under a panel (Settings, Sync). */
+.toolbar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-4) 0;
+}
+
+/* A paragraph holding one inline control (All Shops' "As at" date). */
+.form-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: var(--space-3);
+  margin: 0 0 var(--space-4);
+}
+
+.form-row label {
+  min-width: 200px;
+  max-width: 260px;
+}
+
+/* A notice with the one button that fixes it (POS: Configure Mandi Tax). */
+.warning-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+}
+
+.warning-action-row .form-note {
+  flex: 1 1 220px;
+  margin: 0;
+}
+
+/* The credit-sale fields that appear under Payment Mode. */
+.credit-panel {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-md);
+  background: var(--fill-subtle);
+}
+
+.credit-panel .form-note {
+  margin: 0;
+}
+
+/* Save Bill across the full width, Print Bill and Save & Print side by side under it. */
+.checkout-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.checkout-actions > button {
+  width: 100%;
+  min-width: 0;
+}
+
+.checkout-actions > .checkout-button {
+  grid-column: 1 / -1;
+}
+
+/* The dashboard's "What Changed" card, the same card as its two neighbours. */
+.insight-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* The header strip of the Balance Sheet and Cash Book drill-down modals. */
+.invoice-modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-4) var(--space-3);
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.invoice-modal-header h2 {
+  margin: var(--space-1) 0;
+}
+
+.invoice-modal-header p {
+  margin: 0;
+  color: var(--ink-muted);
+}
+
+/* One pending computer on Branches & Counters, with its approval fields. */
+.settings-inline-panel {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0 0 var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--fill-subtle);
+}
+
+.settings-inline-panel .form-grid {
+  margin-bottom: 0;
+}
+
+/* "Select All" in a table header: a checkbox and its words on one line. */
+.table-check-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: inherit;
+  font: inherit;
+  white-space: nowrap;
+}
+
+.table-check-label input {
+  width: auto;
+  min-height: 0;
+  accent-color: var(--accent);
+}
+
+/* ---------------------------------------------------------------------------------------------
+   Stock Distribution's board is a bare <table className="data-table">, not inside a .table-wrap,
+   so it had only its print styling. On screen it takes the same frame a wrapped table has. It
+   cannot scroll inside a wrapper it does not have, so on a narrow screen the table itself becomes
+   the scroll box rather than pushing the page sideways. Screen only: print keeps its own rules.
+   --------------------------------------------------------------------------------------------- */
+@media screen {
+  .data-table {
+    width: 100%;
+    margin: var(--space-4) 0 var(--space-2);
+    border: 1px solid var(--line);
+    border-collapse: separate;
+    border-spacing: 0;
+    border-radius: var(--radius-lg);
+    background: var(--card);
+  }
+
+  .data-table th {
+    position: static;
+  }
+
+  .data-table thead th:first-child {
+    border-top-left-radius: calc(var(--radius-lg) - 1px);
+  }
+
+  .data-table thead th:last-child {
+    border-top-right-radius: calc(var(--radius-lg) - 1px);
+  }
+}
+
+@media screen and (max-width: 820px) {
+  .data-table {
+    display: block;
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: auto;
+  }
+}
+
+/* Touch screens keep a finger-sized target for the short buttons too. Written last so it outranks
+   the row-action height above. */
+@media (hover: none) and (pointer: coarse) {
+  .danger-text-button,
+  .compact-button,
+  .account-tab,
+  .settings-tabs > button,
+  .remove-button:not(:has(> svg)) {
+    min-height: 42px;
+  }
 }
