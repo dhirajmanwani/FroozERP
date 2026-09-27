@@ -66,7 +66,7 @@
     font-size: var(--font-size-base) !important;
   }
 
-  :where(.erp-shell, .login-shell, .modal-backdrop) :where(th, small, .eyebrow, .tag, .shortcut-hint, .form-note, .cell-note) {
+  :where(.erp-shell, .login-shell, .modal-backdrop) :where(th, small, .eyebrow, .tag, .pill, span:is(.stock-ok, .stock-low, .origin-rate), .shortcut-hint, .form-note, .cell-note) {
     font-size: var(--font-size-sm) !important;
   }
 
@@ -130,7 +130,7 @@
   padding: 20px 14px;
   box-sizing: border-box;
   background: var(--panel);
-  border-right: 1px solid rgba(143, 171, 156, 0.1);
+  border-right: 1px solid var(--line-soft);
 }
 
 .sidebar-brand,
@@ -163,21 +163,29 @@
 .welcome-banner h2,
 .card-heading h2,
 .empty-state h2,
-.login-copy h1,
-.kpi-card strong {
+.login-copy h1 {
   font-family: "Bodoni Moda Variable", Georgia, "Times New Roman", serif;
   font-optical-sizing: auto;
   font-weight: 600;
   letter-spacing: 0.004em;
 }
 
-/* A headline number is read as a quantity at a glance, not as prose, and Bodoni's
-   hairlines thin out at this size on a standard-density screen. Figures carry more
-   weight than the headings do; the headings are words and stay lighter.
+/* A headline number is read as a quantity at a glance, not as prose. It is set in the
+   interface face with tabular figures, not the display serif: Bodoni's hairlines thin out
+   at tile size, its old-style figures sit at different heights, and a row of tiles set in
+   it reads as four headings rather than four amounts. The serif stays on h1/h2 words.
 
    A money value must never break across lines. "Rs 48,250." above "00" is not a
    smaller version of the number, it is a different number to anyone scanning, and
    the tile exists to be scanned. */
+.kpi-card strong,
+.metric-value,
+.summary-metric strong {
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
 .kpi-card strong {
   font-weight: 700;
   white-space: nowrap;
@@ -313,7 +321,7 @@ input[type="number"] {
 .nav-item:hover,
 .nav-item-active {
   color: var(--ink);
-  background: rgba(217, 172, 82, 0.1);
+  background: var(--accent-soft);
 }
 
 .nav-item-active {
@@ -383,7 +391,7 @@ input[type="number"] {
   align-items: center;
   justify-content: space-between;
   padding: 0 30px;
-  border-bottom: 1px solid rgba(143, 171, 156, 0.1);
+  border-bottom: 1px solid var(--line-soft);
   background: var(--veil-solid);
 }
 
@@ -404,13 +412,10 @@ input[type="number"] {
 
 .branch-pill,
 .coming-soon,
-.tag,
-.batch-id,
-.stock-ok,
-.stock-low {
+.batch-id {
   display: inline-flex;
   align-items: center;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   font-size: 11px;
   font-weight: 750;
 }
@@ -426,12 +431,32 @@ input[type="number"] {
   display: inline-flex;
   align-items: center;
   margin-left: 10px;
-  padding: 7px 12px;
-  border-radius: 999px;
-  background: rgba(217, 172, 82, 0.16);
-  color: #eed08d;
+  padding: 5px 12px;
+  border: 1px solid var(--attention-line);
+  border-radius: var(--radius-pill);
+  background: var(--attention-soft);
+  color: var(--attention-ink);
   font-size: 11px;
-  font-weight: 750;
+  font-weight: 700;
+}
+
+/* The pill's tone follows what it says: all well is calm, offline is a notice, a problem is red. */
+.offline-pill[data-tone="calm"] {
+  border-color: var(--success-line);
+  background: var(--success-soft);
+  color: var(--success-ink);
+}
+
+.offline-pill[data-tone="problem"] {
+  border-color: var(--danger-line);
+  background: var(--danger-soft);
+  color: var(--danger-ink);
+}
+
+/* On a desktop the sidebar already carries the logo; the top bar's copy only returns on narrow
+   screens, where the sidebar is off-canvas (see the 820px query). */
+.topbar .brand-lockup-compact {
+  display: none;
 }
 
 .kiosk-exit-button {
@@ -472,9 +497,11 @@ input[type="number"] {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 16px;
+  margin-bottom: var(--space-4);
   padding: 12px 16px;
   border: 1px solid var(--accent-deep);
+  border-left-width: 3px;
+  border-radius: var(--radius-sm);
   background: var(--accent-muted);
   color: var(--ink-body);
 }
@@ -537,7 +564,7 @@ input[type="number"] {
 .login-close-exit-button {
   width: 100%;
   margin-top: 2px;
-  border-color: rgba(143, 171, 156, 0.28);
+  border-color: var(--line-strong);
   color: var(--ink-body);
   background: var(--veil-strong);
 }
@@ -573,7 +600,7 @@ input[type="number"] {
   gap: 6px;
   margin-top: 12px;
   padding: 12px;
-  border: 1px solid rgba(143, 171, 156, 0.16);
+  border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--veil-subtle);
 }
@@ -599,17 +626,26 @@ input[type="number"] {
   padding: 26px 30px;
 }
 
+/* The connection line at the top of every screen, and the login screen's status. A notice, so it
+   takes the notice shape: rounded, a left rule in its tone, the tone's ink. Routine status is the
+   info rule on a plain card; a failure is the danger family throughout. */
 .startup-status-panel {
-  margin-top: 16px;
-  padding: 12px 14px;
+  margin-top: var(--space-4);
+  padding: 10px 14px;
   width: 100%;
   max-width: 100%;
   box-sizing: border-box;
   overflow: hidden;
-  border-radius: 10px;
-  background: var(--veil);
-  border: 1px solid rgba(143, 171, 156, 0.2);
+  border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--info);
+  border-radius: var(--radius-sm);
+  background: var(--card);
   color: var(--ink-body);
+}
+
+/* In the content area it is the first thing above the first card, and sat flush against it. */
+.content-area > .startup-status-panel {
+  margin: 0 0 var(--space-4);
 }
 
 .startup-status-panel p,
@@ -643,6 +679,12 @@ input[type="number"] {
   color: var(--danger-ink);
 }
 
+.startup-status-panel.startup-status-error {
+  border-color: transparent;
+  border-left-color: var(--danger);
+  background: var(--danger-soft);
+}
+
 .startup-api-panel {
   margin-top: 10px;
   padding: 9px 12px;
@@ -652,7 +694,7 @@ input[type="number"] {
   overflow: hidden;
   border-radius: 8px;
   background: var(--shadow-faint);
-  border: 1px solid rgba(143, 171, 156, 0.16);
+  border: 1px solid var(--line);
   color: var(--ink-body);
   display: grid;
   gap: 5px;
@@ -762,10 +804,10 @@ input[type="number"] {
 .welcome-banner,
 .content-card,
 .kpi-card {
-  border: 1px solid rgba(143, 171, 156, 0.1);
-  border-radius: 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-lg);
   background: var(--card);
-  box-shadow: 0 12px 28px var(--shadow-faint);
+  box-shadow: var(--shadow-card);
 }
 
 .welcome-banner {
@@ -773,7 +815,7 @@ input[type="number"] {
   align-items: center;
   justify-content: space-between;
   gap: 18px;
-  padding: 24px;
+  padding: var(--space-6);
   background: linear-gradient(135deg, var(--card), var(--raised-high));
 }
 
@@ -814,16 +856,22 @@ input[type="number"] {
   justify-content: center;
   gap: 8px;
   border: 0;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   color: var(--ink-on-accent);
   background: var(--accent);
   font-size: 13px;
-  font-weight: 800;
-  transition: 160ms ease;
+  font-weight: 700;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease;
 }
 
+/* The button scale. Three kinds, one shape: the gold .primary-button is the answer on a screen,
+   .secondary-button and .table-action are quiet outlines, and .danger-text-button (and a
+   .remove-button that holds words) is the quiet outline in danger ink. Ordinary buttons share the
+   input height, so a button beside a field lines up with it; row actions and .compact-button
+   take the short step. */
 .primary-button {
-  padding: 11px 15px;
+  min-height: var(--control-height);
+  padding: 0 var(--space-4);
 }
 
 .button-row {
@@ -841,7 +889,6 @@ input[type="number"] {
 .primary-button:hover,
 .quick-action:hover {
   background: var(--accent-bright);
-  transform: translateY(-1px);
 }
 
 /* 180px was tight enough that four cards fitted on a 1366-wide laptop only by
@@ -850,15 +897,15 @@ input[type="number"] {
 .kpi-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
-  gap: 14px;
-  margin: 17px 0;
+  gap: var(--space-4);
+  margin: var(--space-4) 0;
 }
 
 .kpi-card {
   display: flex;
   align-items: center;
-  gap: 13px;
-  padding: 18px;
+  gap: var(--space-3);
+  padding: var(--space-5);
 }
 
 .kpi-icon,
@@ -866,7 +913,7 @@ input[type="number"] {
   display: grid;
   place-items: center;
   color: var(--accent);
-  background: rgba(217, 172, 82, 0.11);
+  background: var(--accent-soft);
 }
 
 .kpi-icon {
@@ -909,7 +956,7 @@ input[type="number"] {
   justify-content: space-between;
   gap: 12px;
   padding: 20px;
-  border: 1px solid rgba(143, 171, 156, 0.14);
+  border: 1px solid var(--line);
   border-radius: 18px;
   color: var(--ink);
   text-align: left;
@@ -926,7 +973,7 @@ input[type="number"] {
 
 .report-category-card:hover,
 .report-menu-card:hover {
-  border-color: rgba(217, 172, 82, 0.42);
+  border-color: var(--accent-line-strong);
   box-shadow: 0 22px 56px var(--shadow-soft);
   transform: translateY(-2px);
 }
@@ -952,7 +999,7 @@ input[type="number"] {
   padding: 4px 9px;
   border-radius: 999px;
   color: var(--accent-bright);
-  background: rgba(217, 172, 82, 0.1);
+  background: var(--accent-soft);
   font-size: 11px;
   font-style: normal;
   font-weight: 800;
@@ -995,7 +1042,7 @@ input[type="number"] {
 .date-total-row td {
   border-top: 1px solid var(--accent-line);
   color: var(--ink);
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
   font-weight: 850;
 }
 
@@ -1036,14 +1083,32 @@ input[type="number"] {
   line-height: 1.5;
 }
 
+/* One card: one padding, one heading gap. Cards stack with --space-4 between them wherever a
+   screen lays them out (.settings-layout, .scope-page, the dashboard grids). */
 .content-card {
-  padding: 22px;
+  padding: var(--space-6);
 }
 
 .card-heading {
   display: flex;
+  align-items: flex-start;
   justify-content: space-between;
-  margin-bottom: 20px;
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+}
+
+/* A button in a card heading ("Open Stock Inventory") keeps its own height and one line; stretched
+   to the heading it became a tall box with its label wrapped inside. */
+.card-heading > :is(button, .button-row) {
+  flex-shrink: 0;
+}
+
+.card-heading > button {
+  white-space: nowrap;
+}
+
+.card-heading > .button-row {
+  align-items: center;
 }
 
 .quick-grid {
@@ -1061,13 +1126,13 @@ input[type="number"] {
 
 .quick-action:hover {
   color: var(--accent);
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
 }
 
 .dashboard-analytics {
   display: grid;
-  gap: 17px;
-  margin: 17px 0;
+  gap: var(--space-4);
+  margin: var(--space-4) 0;
 }
 
 .analytics-toolbar {
@@ -1103,7 +1168,7 @@ input[type="number"] {
 }
 
 .range-button {
-  border: 1px solid rgba(143, 171, 156, 0.16);
+  border: 1px solid var(--line);
   border-radius: 999px;
   padding: 8px 12px;
   color: var(--ink-body);
@@ -1115,9 +1180,9 @@ input[type="number"] {
 
 .range-button:hover,
 .range-button-active {
-  border-color: rgba(217, 172, 82, 0.54);
+  border-color: var(--accent-line-strong);
   color: var(--accent);
-  background: rgba(217, 172, 82, 0.1);
+  background: var(--accent-soft);
 }
 
 .dashboard-custom-range {
@@ -1131,7 +1196,7 @@ input[type="number"] {
 .chart-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 17px;
+  gap: var(--space-4);
 }
 
 .chart-grid .chart-card:last-child {
@@ -1140,12 +1205,12 @@ input[type="number"] {
 
 .chart-card {
   overflow: hidden;
-  border: 1px solid rgba(143, 171, 156, 0.1);
-  border-radius: 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-lg);
   background:
-    radial-gradient(circle at top right, rgba(217, 172, 82, 0.11), transparent 30%),
+    radial-gradient(circle at top right, var(--accent-soft), transparent 30%),
     var(--card);
-  box-shadow: 0 12px 28px var(--shadow-faint);
+  box-shadow: var(--shadow-card);
 }
 
 .chart-card-heading {
@@ -1170,7 +1235,7 @@ input[type="number"] {
 }
 
 .chart-grid-line {
-  stroke: rgba(143, 171, 156, 0.11);
+  stroke: var(--line-soft);
   stroke-width: 1;
 }
 
@@ -1226,7 +1291,7 @@ input[type="number"] {
   display: grid;
   min-height: 160px;
   place-items: center;
-  border: 1px dashed rgba(143, 171, 156, 0.16);
+  border: 1px dashed var(--line);
   border-radius: 12px;
   color: var(--ink-faint);
   background: var(--veil-subtle);
@@ -1271,7 +1336,7 @@ input[type="number"] {
 .dashboard-side-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 17px;
+  gap: var(--space-4);
 }
 
 .insight-list,
@@ -1285,7 +1350,7 @@ input[type="number"] {
 .top-product-row,
 .low-stock-row {
   margin: 0;
-  border: 1px solid rgba(143, 171, 156, 0.1);
+  border: 1px solid var(--line-soft);
   border-radius: 12px;
   background: var(--veil-subtle);
 }
@@ -1324,15 +1389,15 @@ input[type="number"] {
 
 .low-stock-row {
   width: 100%;
-  border-color: rgba(217, 172, 82, 0.16);
+  border-color: var(--accent-line);
   color: inherit;
   text-align: left;
   transition: 160ms ease;
 }
 
 .low-stock-row:hover {
-  border-color: rgba(217, 172, 82, 0.42);
-  background: rgba(217, 172, 82, 0.08);
+  border-color: var(--accent-line-strong);
+  background: var(--accent-wash);
 }
 
 .empty-inline {
@@ -1344,8 +1409,20 @@ input[type="number"] {
 .form-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 15px;
-  margin-bottom: 17px;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+/* A button placed straight into a form grid ("Add Branch", "Save Category") used to stretch into a
+   whole grid tile, a slab the size of an input. It sizes to its label instead, sits at the start of
+   its cell and on the inputs' baseline, and matches their height. */
+:is(.form-grid, .supplier-form-grid) > :is(button, .primary-button, .secondary-button) {
+  justify-self: start;
+  align-self: end;
+  width: auto;
+  min-width: 140px;
+  max-width: 100%;
+  min-height: var(--control-height);
 }
 
 label {
@@ -1375,11 +1452,11 @@ textarea {
   width: 100%;
   padding: 11px 12px;
   box-sizing: border-box;
-  border: 1px solid rgba(143, 171, 156, 0.18);
-  border-radius: 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-md);
   outline: none;
   color: var(--ink);
-  background: var(--track);
+  background: var(--veil-heavy);
   font: inherit;
   font-size: 13px;
   transition: 160ms ease;
@@ -1389,7 +1466,7 @@ input:focus,
 select:focus,
 textarea:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  box-shadow: 0 0 0 3px var(--focus-ring);
 }
 
 input:disabled,
@@ -1400,26 +1477,38 @@ button:disabled {
   opacity: 0.58;
 }
 
+/* Disabled is one look for every button kind: a muted well with faint ink. It used to be a fixed
+   dark-green slab, which in the light theme read as a heavier, *more* important button than the
+   working ones beside it. */
 .primary-button:disabled,
 .secondary-button:disabled,
 .table-action:disabled,
 .remove-button:disabled,
-.whatsapp-button:disabled {
-  border-color: rgba(74, 122, 97, 0.32);
-  color: var(--ink-muted);
-  background: rgba(30, 74, 52, 0.58);
-  box-shadow: none;
-  transform: none;
-}
-
+.whatsapp-button:disabled,
 .primary-button:disabled:hover,
 .secondary-button:disabled:hover,
 .table-action:disabled:hover,
 .remove-button:disabled:hover,
 .whatsapp-button:disabled:hover {
-  color: var(--ink-muted);
-  background: rgba(30, 74, 52, 0.58);
+  border-color: var(--line);
+  color: var(--ink-faint);
+  background: var(--fill);
+  box-shadow: none;
   transform: none;
+  cursor: not-allowed;
+  opacity: 0.8;
+}
+
+.primary-button:disabled,
+.whatsapp-button:disabled {
+  border: 1px solid var(--line);
+}
+
+/* One focus ring for every button, drawn outside the edge so it never changes the size. */
+:is(.primary-button, .secondary-button, .table-action, .remove-button, .danger-text-button,
+  .whatsapp-button, .compact-button, .quick-action, .range-button, .account-tab, .settings-tabs > button):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
 }
 
 textarea {
@@ -1433,13 +1522,12 @@ input[readonly] {
 
 .table-wrap {
   max-height: 560px;
-  margin: 18px 0 8px;
+  margin: var(--space-4) 0 var(--space-2);
   overflow: auto;
   overscroll-behavior-inline: contain;
-  border: 1px solid rgba(143, 171, 156, 0.24);
-  border-radius: 14px;
-  background: var(--shadow-faint);
-  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.16);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--card);
 }
 
 table {
@@ -1452,7 +1540,7 @@ th,
 td {
   padding: 12px 14px;
   border-right: 1px solid var(--line-soft);
-  border-bottom: 1px solid rgba(143, 171, 156, 0.16);
+  border-bottom: 1px solid var(--line);
   color: var(--ink-muted);
   font-size: 12px;
   line-height: 1.4;
@@ -1525,7 +1613,7 @@ th {
   position: sticky;
   top: 0;
   z-index: 1;
-  border-bottom: 1px solid rgba(217, 172, 82, 0.22);
+  border-bottom: 1px solid var(--accent-line);
   color: var(--ink-strong);
   background: linear-gradient(180deg, var(--card-veil-solid), var(--veil-solid));
   font-size: 10px;
@@ -1564,7 +1652,7 @@ tbody tr:last-child td {
 
 .report-row-clickable:focus-within,
 .report-row-clickable:active {
-  background: rgba(217, 172, 82, 0.1);
+  background: var(--accent-soft);
 }
 
 .amount-cell,
@@ -1610,7 +1698,7 @@ tbody tr:last-child td {
 .detail-action-bar {
   margin-top: 16px;
   padding: 12px;
-  border: 1px solid rgba(217, 172, 82, 0.16);
+  border: 1px solid var(--accent-line);
   border-radius: 14px;
   background: var(--veil);
 }
@@ -1765,8 +1853,6 @@ tbody tr:last-child td {
 .pdf-export-mode .cash-book-title,
 .pdf-export-mode .cash-book-closing span,
 .pdf-export-mode .invoice-customer,
-.pdf-export-mode .invoice-total-box,
-.pdf-export-mode .thermal-item-block,
 .pdf-export-mode .upi-qr-box,
 .pdf-export-mode .total-line {
   border: 1px solid #111111 !important;
@@ -1823,8 +1909,6 @@ tbody tr:last-child td {
   font-size: 10.5px !important;
 }
 
-.pdf-export-thermal .thermal-item-block,
-.pdf-export-thermal .invoice-total-box,
 .pdf-export-thermal .invoice-customer,
 .pdf-export-thermal .upi-qr-box {
   border-color: #000000 !important;
@@ -1835,15 +1919,28 @@ tbody tr:last-child td {
 }
 
 .compact-button {
-  min-height: 0;
-  padding: 7px 9px;
-  border-radius: 9px;
-  font-size: 11px;
-  line-height: 1;
+  min-height: var(--control-height-sm);
+  padding: 0 10px;
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  line-height: 1.2;
 }
 
 .warning-note {
-  color: var(--accent-bright);
+  color: var(--attention-ink);
+}
+
+/* As a block (POS, when the counter has no shop) it is a warning notice, in the notice shape; as a
+   cell note it stays a line of text. */
+div.warning-note {
+  margin-top: var(--space-3);
+  padding: 10px 14px;
+  border-left: 3px solid var(--attention);
+  border-radius: var(--radius-sm);
+  background: var(--attention-soft);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.45;
 }
 
 .sales-history-drilldown-row td {
@@ -1853,19 +1950,42 @@ tbody tr:last-child td {
 
 .sales-history-drilldown-row .table-wrap {
   margin: 0;
-  border-color: rgba(217, 172, 82, 0.16);
+  border-color: var(--accent-line);
   background: var(--veil-strong);
 }
 
-.error-banner {
-  margin: 12px 16px;
-  padding: 11px 13px;
-  border: 1px solid rgba(248, 113, 113, 0.35);
-  border-radius: 10px;
+/* --- Notices -----------------------------------------------------------------
+ *
+ * One shape for every error, warning and info message: rounded, a 3px rule down the left in the
+ * tone's colour, the tone's soft surface and its ink. .pm-notice and .scope-locked-note already
+ * had it; these join them. */
+.error-banner,
+.inline-error,
+.field-error,
+.pdf-preview-error,
+.cash-book-warning {
+  padding: 10px 14px;
+  border: 0;
+  border-left: 3px solid var(--danger);
+  border-radius: var(--radius-sm);
   color: var(--danger-ink);
-  background: rgba(127, 29, 29, 0.24);
+  background: var(--danger-soft);
   font-size: 12px;
-  font-weight: 750;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.error-banner {
+  margin: var(--space-3) var(--space-4);
+}
+
+.inline-error {
+  margin: 0 0 var(--space-3);
+}
+
+/* Beside a button in a toolbar row, so it centres on the row rather than stretching to it. */
+.field-error {
+  align-self: center;
 }
 
 .balance-detail-breakdown {
@@ -1888,28 +2008,79 @@ tbody tr:last-child td {
   color: var(--ink);
 }
 
-.tag,
 .batch-id,
-.stock-ok,
-.stock-low,
 .coming-soon {
   padding: 4px 8px;
 }
 
-.tag,
 .batch-id {
   color: var(--ink-body);
-  background: rgba(143, 171, 156, 0.1);
+  background: var(--fill);
 }
 
+/* --- Status badges -----------------------------------------------------------
+ *
+ * Four tones, one shape. .stock-ok is "fine", .stock-low is "not fine" (Inactive, Cancelled,
+ * Failed, Unpaid, Closed -- it is used for far more than stock), .origin-rate is "waiting"
+ * (grace period, pending bill, partially paid) and .tag / .pill are neutral facts.
+ *
+ * .stock-low used to be gold, the brand's own "this is the action" colour, so a Cancelled bill
+ * and the Save button were saying the same thing. It is the danger tone now.
+ *
+ * The same classes also land on a <td>, on a <p className="form-note"> and on a cell note. Those
+ * take the tone as text colour only: the pill shape below is limited to inline elements, because
+ * a table cell or a paragraph turned into a pill is a layout bug, not a badge. */
 .stock-ok {
-  color: var(--success);
-  background: rgba(34, 197, 94, 0.1);
+  color: var(--success-ink);
 }
 
 .stock-low {
-  color: var(--accent-bright);
-  background: rgba(217, 172, 82, 0.1);
+  color: var(--danger-ink);
+}
+
+.origin-rate {
+  color: var(--attention-ink);
+}
+
+td.stock-ok,
+td.stock-low,
+td.origin-rate {
+  font-weight: 700;
+}
+
+:is(.tag, .pill, .stock-ok, .stock-low, .origin-rate):not(td, p, small, li, div) {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 22px;
+  box-sizing: border-box;
+  padding: 2px 9px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-pill);
+  color: var(--ink-body);
+  background: var(--fill);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.stock-ok:not(td, p, small, li, div) {
+  border-color: transparent;
+  color: var(--success-ink);
+  background: var(--success-soft);
+}
+
+.stock-low:not(td, p, small, li, div) {
+  border-color: transparent;
+  color: var(--danger-ink);
+  background: var(--danger-soft);
+}
+
+.origin-rate:not(td, p, small, li, div) {
+  border-color: var(--attention-line);
+  color: var(--attention-ink);
+  background: var(--attention-soft);
 }
 
 .profit-cell {
@@ -1920,7 +2091,7 @@ tbody tr:last-child td {
 .purchase-summary {
   margin: 4px 0 18px;
   padding: 16px;
-  border: 1px solid rgba(217, 172, 82, 0.16);
+  border: 1px solid var(--accent-line);
   border-radius: 10px;
   background: linear-gradient(135deg, var(--accent-wash), var(--veil-heavy));
 }
@@ -1939,15 +2110,6 @@ tbody tr:last-child td {
   font-size: 16px;
 }
 
-.origin-rate {
-  padding: 5px 9px;
-  border-radius: 999px;
-  color: var(--accent);
-  background: rgba(217, 172, 82, 0.1);
-  font-size: 11px;
-  font-weight: 800;
-}
-
 .purchase-summary-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
@@ -1956,7 +2118,7 @@ tbody tr:last-child td {
 
 .summary-metric {
   padding: 10px;
-  border: 1px solid rgba(143, 171, 156, 0.08);
+  border: 1px solid var(--line-soft);
   border-radius: 8px;
   background: var(--veil);
 }
@@ -1979,7 +2141,7 @@ tbody tr:last-child td {
 }
 
 .summary-metric-featured {
-  border-color: rgba(217, 172, 82, 0.26);
+  border-color: var(--accent-line);
 }
 
 .summary-metric-featured strong {
@@ -2004,7 +2166,7 @@ tbody tr:last-child td {
   align-items: center;
   min-width: 0;
   padding: 9px 11px;
-  border-bottom: 1px solid rgba(143, 171, 156, 0.1);
+  border-bottom: 1px solid var(--line-soft);
 }
 
 .sync-owner-row:last-child {
@@ -2029,12 +2191,13 @@ tbody tr:last-child td {
   gap: 14px;
   margin-top: 14px;
   padding-top: 14px;
-  border-top: 1px solid rgba(143, 171, 156, 0.14);
+  border-top: 1px solid var(--line);
 }
 
 .settings-layout {
   display: grid;
-  gap: 17px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-4);
 }
 
 .settings-banner {
@@ -2043,10 +2206,10 @@ tbody tr:last-child td {
   justify-content: space-between;
   gap: 16px;
   padding: 22px 24px;
-  border: 1px solid rgba(217, 172, 82, 0.16);
+  border: 1px solid var(--accent-line);
   border-radius: 14px;
   background:
-    radial-gradient(circle at top right, rgba(217, 172, 82, 0.14), transparent 35%),
+    radial-gradient(circle at top right, var(--accent-soft), transparent 35%),
     linear-gradient(135deg, var(--card), var(--raised));
   box-shadow: 0 14px 34px var(--shadow-faint);
 }
@@ -2071,7 +2234,7 @@ tbody tr:last-child td {
   align-items: center;
   margin: 0 0 18px;
   padding: 14px;
-  border: 1px solid rgba(143, 171, 156, 0.14);
+  border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--veil-subtle);
 }
@@ -2084,7 +2247,7 @@ tbody tr:last-child td {
 
 .update-available-panel {
   border-color: var(--accent-line-strong);
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
 }
 
 .update-download-progress {
@@ -2142,31 +2305,70 @@ tbody tr:last-child td {
   gap: 8px;
 }
 
-.account-tab {
-  padding: 9px 12px;
-  border: 1px solid rgba(143, 171, 156, 0.16);
-  border-radius: 999px;
+/* Pending Bills' tab pair renders as .settings-tabs > button / .tab-active; it had no rule at all
+   and showed as grey native buttons. It is the same segmented pill as the account tabs. */
+.settings-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.account-tab,
+.settings-tabs > button {
+  min-height: var(--control-height-sm);
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
   color: var(--ink-muted);
   background: var(--card-veil);
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 700;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease;
 }
 
-.account-tab-active {
+.account-tab:hover,
+.settings-tabs > button:hover {
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
+.account-tab-active,
+.tab-active,
+.settings-tabs > button.tab-active {
   border-color: var(--accent-line-strong);
   color: var(--accent);
-  background: rgba(217, 172, 82, 0.1);
+  background: var(--accent-soft);
 }
 
 .supplier-form-grid {
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
 }
 
+/* Help text under a field or a section: calm and muted. It was bold gold, which is the colour the
+   app uses for "this is the action" and read as a warning in all sixty places it is used as help.
+   The same class carrying a tone is a real notice, and takes the notice shape. */
 .form-note {
-  margin: 0 0 14px;
-  color: var(--accent-bright);
+  margin: 0 0 var(--space-3);
+  color: var(--ink-muted);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 500;
+  line-height: 1.45;
+}
+
+.form-note.stock-low,
+.form-note.stock-ok {
+  padding: 10px 14px;
+  border-left: 3px solid var(--attention);
+  border-radius: var(--radius-sm);
+  color: var(--attention-ink);
+  background: var(--attention-soft);
+  font-weight: 600;
+}
+
+.form-note.stock-ok {
+  border-left-color: var(--success);
+  color: var(--success-ink);
+  background: var(--success-soft);
 }
 
 .ledger-toolbar {
@@ -2190,7 +2392,7 @@ tbody tr:last-child td {
 
 .detail-item {
   padding: 12px;
-  border: 1px solid rgba(143, 171, 156, 0.09);
+  border: 1px solid var(--line-soft);
   border-radius: 9px;
   background: var(--veil-subtle);
 }
@@ -2233,10 +2435,10 @@ tbody tr:last-child td {
   align-self: end;
   min-height: 44px;
   padding: 11px 12px;
-  border: 1px solid rgba(217, 172, 82, 0.22);
+  border: 1px solid var(--accent-line);
   border-radius: 10px;
   color: var(--ink-body);
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
 }
 
 .accessibility-preview-card span {
@@ -2282,7 +2484,7 @@ tbody tr:last-child td {
 
 .permission-card {
   padding: 14px;
-  border: 1px solid rgba(143, 171, 156, 0.09);
+  border: 1px solid var(--line-soft);
   border-radius: 10px;
   background: var(--veil-subtle);
 }
@@ -2317,10 +2519,10 @@ tbody tr:last-child td {
   align-items: center;
   justify-content: center;
   gap: 7px;
-  border-radius: 7px;
+  border-radius: var(--radius-md);
   font-size: 12px;
-  font-weight: 800;
-  transition: 160ms ease;
+  font-weight: 700;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease;
 }
 
 /* Gold means "this is the action", and .primary-button is already saying it in
@@ -2328,21 +2530,24 @@ tbody tr:last-child td {
    on a gold tint makes two things claim the same job, and the eye cannot tell which
    is primary. These are neutral so the gold one stays the answer. */
 .table-action {
-  padding: 6px 9px;
-  border: 1px solid rgba(143, 171, 156, 0.2);
+  min-height: var(--control-height-sm);
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
   color: var(--ink-body);
-  background: var(--raised-high);
+  background: var(--card);
 }
 
-.table-action:hover {
-  border-color: rgba(143, 171, 156, 0.34);
+.table-action:hover,
+.secondary-button:hover {
+  border-color: var(--line-control);
   color: var(--ink);
+  background: var(--hover);
 }
 
 .pos-layout {
   display: grid;
   grid-template-columns: minmax(690px, 1fr) minmax(320px, 380px);
-  gap: 17px;
+  gap: var(--space-4);
   align-items: start;
   min-height: 0;
 }
@@ -2350,7 +2555,7 @@ tbody tr:last-child td {
 .pos-main {
   min-width: 0;
   display: grid;
-  gap: 17px;
+  gap: var(--space-4);
 }
 
 .shortcut-hint {
@@ -2372,7 +2577,7 @@ tbody tr:last-child td {
   gap: 10px;
   margin-bottom: 12px;
   padding: 11px;
-  border: 1px solid rgba(143, 171, 156, 0.1);
+  border: 1px solid var(--line-soft);
   border-radius: 12px;
   background: var(--veil-subtle);
 }
@@ -2415,7 +2620,7 @@ tbody tr:last-child td {
   min-width: 0;
   min-height: 92px;
   padding: 12px;
-  border: 1px solid rgba(143, 171, 156, 0.1);
+  border: 1px solid var(--line-soft);
   border-radius: 8px;
   color: var(--ink-body);
   background: var(--track);
@@ -2425,7 +2630,7 @@ tbody tr:last-child td {
 
 .product-result:hover,
 .product-result-active {
-  border-color: rgba(217, 172, 82, 0.48);
+  border-color: var(--accent-line-strong);
   background: var(--accent-wash);
 }
 
@@ -2462,7 +2667,7 @@ tbody tr:last-child td {
 .product-result-meta span {
   max-width: 100%;
   padding: 3px 6px;
-  border: 1px solid rgba(143, 171, 156, 0.14);
+  border: 1px solid var(--line);
   border-radius: 999px;
   color: var(--ink-body);
   background: var(--veil);
@@ -2500,22 +2705,33 @@ tbody tr:last-child td {
   padding: 5px 9px;
   border-radius: 999px;
   color: var(--accent);
-  background: rgba(217, 172, 82, 0.1);
+  background: var(--accent-soft);
   font-size: 11px;
   font-weight: 800;
 }
 
+/* Empty states are neutral: nothing is wrong, there is simply nothing here yet. A quiet dashed
+   well rather than faint text floating in space, which read as a rendering fault. */
 .cart-empty {
-  padding: 40px 10px 20px;
-  color: var(--ink-faint);
+  padding: var(--space-6) var(--space-4);
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-lg);
+  color: var(--ink-muted);
+  background: var(--fill-subtle);
   font-size: 13px;
+  line-height: 1.5;
   text-align: center;
 }
 
 .empty-cell {
-  padding: 28px 12px;
-  color: var(--ink-faint);
+  padding: 32px var(--space-4);
+  color: var(--ink-muted);
   text-align: center;
+  white-space: normal;
+}
+
+tbody tr:has(> .empty-cell):hover {
+  background: transparent;
 }
 
 .lot-entry-panel,
@@ -2647,10 +2863,51 @@ tbody tr:last-child td {
   width: 34px;
   height: 34px;
   padding: 6px;
-  border: 0;
-  border-radius: 6px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  color: var(--ink-muted);
+  background: transparent;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease;
+}
+
+/* The icon square (a modal's close X, a row's trash can) is quiet until it is pointed at, then
+   takes the danger tone -- the same way a window's own close button does. */
+.remove-button:hover {
   color: var(--danger);
-  background: rgba(248, 113, 113, 0.09);
+  background: var(--danger-soft);
+}
+
+/* About twenty call sites put words in this button ("Deactivate", "Cancel Bill", "Logout"), and
+   the 34px square could not hold them. Without an icon it becomes the danger text button: sized to
+   its label, the row-action height, outlined in the danger line. Kept in step with
+   .danger-text-button below, which is the same control under its own name. */
+.remove-button:not(:has(> svg)) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: auto;
+  height: auto;
+  min-height: var(--control-height-sm);
+  padding: 0 10px;
+  border-color: var(--danger-line);
+  color: var(--danger-ink);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.remove-button:not(:has(> svg)):hover {
+  border-color: var(--danger);
+  color: var(--danger-ink);
+  background: var(--danger-soft);
+}
+
+.remove-button:not(:has(> svg)):disabled,
+.remove-button:not(:has(> svg)):disabled:hover {
+  border-color: var(--line);
+  color: var(--ink-faint);
+  background: transparent;
 }
 
 .lot-selector-backdrop {
@@ -2685,7 +2942,7 @@ tbody tr:last-child td {
   gap: 10px;
   align-items: end;
   padding: 14px 16px;
-  border-block: 1px solid rgba(143, 171, 156, 0.14);
+  border-block: 1px solid var(--line);
   background: var(--veil-solid);
 }
 
@@ -2711,7 +2968,7 @@ tbody tr:last-child td {
   height: 24px;
   padding: 0;
   transform: translateY(-50%);
-  border: 1px solid rgba(143, 171, 156, 0.22);
+  border: 1px solid var(--line);
   border-radius: 999px;
   color: var(--ink-body);
   background: var(--veil-heavy);
@@ -2723,7 +2980,7 @@ tbody tr:last-child td {
   align-self: center;
   margin: 0;
   padding: 8px 10px;
-  border: 1px solid rgba(143, 171, 156, 0.14);
+  border: 1px solid var(--line);
   border-radius: 10px;
   color: var(--ink-body);
   background: var(--card-veil);
@@ -2747,14 +3004,14 @@ tbody tr:last-child td {
 .lot-selector-table th,
 .lot-selector-table td {
   padding: 10px 11px;
-  border-bottom: 1px solid rgba(143, 171, 156, 0.14);
-  border-right: 1px solid rgba(143, 171, 156, 0.08);
+  border-bottom: 1px solid var(--line);
+  border-right: 1px solid var(--line-soft);
   vertical-align: middle;
 }
 
 .lot-selector-table th:first-child,
 .lot-selector-table td:first-child {
-  border-left: 1px solid rgba(143, 171, 156, 0.08);
+  border-left: 1px solid var(--line-soft);
 }
 
 .lot-selector-table th {
@@ -2774,7 +3031,7 @@ tbody tr:last-child td {
 }
 
 .lot-selector-row:hover {
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
 }
 
 .lot-selector-row-disabled {
@@ -2816,10 +3073,10 @@ tbody tr:last-child td {
   justify-content: center;
   min-width: 54px;
   padding: 4px 7px;
-  border: 1px solid rgba(143, 171, 156, 0.18);
+  border: 1px solid var(--line);
   border-radius: 999px;
   color: var(--ink-body);
-  background: rgba(143, 171, 156, 0.1);
+  background: var(--fill);
   font-size: 10px;
   font-weight: 900;
   line-height: 1;
@@ -2827,22 +3084,22 @@ tbody tr:last-child td {
 }
 
 .status-active {
-  border-color: rgba(34, 197, 94, 0.32);
-  color: var(--success-strong);
-  background: rgba(34, 197, 94, 0.12);
+  border-color: transparent;
+  color: var(--success-ink);
+  background: var(--success-soft);
 }
 
 .status-sold-out {
-  border-color: rgba(217, 172, 82, 0.32);
-  color: var(--accent-bright);
-  background: rgba(217, 172, 82, 0.1);
+  border-color: var(--attention-line);
+  color: var(--attention-ink);
+  background: var(--attention-soft);
 }
 
 .status-inactive,
 .status-cancelled {
-  border-color: rgba(248, 113, 113, 0.32);
-  color: var(--danger-strong);
-  background: rgba(248, 113, 113, 0.1);
+  border-color: transparent;
+  color: var(--danger-ink);
+  background: var(--danger-soft);
 }
 
 .checkout-card {
@@ -2853,7 +3110,7 @@ tbody tr:last-child td {
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 20px;
-  border: 1px solid rgba(143, 171, 156, 0.1);
+  border: 1px solid var(--line-soft);
   border-radius: 14px;
   background: var(--card);
   box-shadow: 0 12px 28px var(--shadow-faint);
@@ -2868,7 +3125,7 @@ tbody tr:last-child td {
   display: grid;
   gap: 11px;
   padding: 15px 0;
-  border-top: 1px solid rgba(143, 171, 156, 0.1);
+  border-top: 1px solid var(--line-soft);
 }
 
 .discount-preview {
@@ -2877,9 +3134,9 @@ tbody tr:last-child td {
   justify-content: space-between;
   gap: 14px;
   padding: 12px;
-  border: 1px solid rgba(217, 172, 82, 0.18);
+  border: 1px solid var(--accent-line);
   border-radius: 10px;
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
 }
 
 .discount-preview span,
@@ -2916,7 +3173,7 @@ tbody tr:last-child td {
   display: grid;
   gap: 10px;
   padding: 10px;
-  border: 1px solid rgba(143, 171, 156, 0.18);
+  border: 1px solid var(--line);
   border-radius: 14px;
   background: var(--veil);
 }
@@ -2933,7 +3190,7 @@ tbody tr:last-child td {
   display: grid;
   gap: 6px;
   padding-top: 8px;
-  border-top: 1px dashed rgba(143, 171, 156, 0.18);
+  border-top: 1px dashed var(--line);
 }
 
 .sale-edit-mixed-panel {
@@ -2944,11 +3201,11 @@ tbody tr:last-child td {
   display: grid;
   gap: 8px;
   padding: 16px 0;
-  border-top: 1px solid rgba(143, 171, 156, 0.1);
+  border-top: 1px solid var(--line-soft);
 }
 
 .mandi-tax-panel {
-  border-top-color: rgba(217, 172, 82, 0.18);
+  border-top-color: var(--accent-line);
 }
 
 /*
@@ -3031,7 +3288,7 @@ tbody tr:last-child td {
   display: grid;
   gap: 6px;
   padding: 10px;
-  border: 1px solid rgba(217, 172, 82, 0.18);
+  border: 1px solid var(--accent-line);
   border-radius: 12px;
   background: var(--accent-wash);
 }
@@ -3054,7 +3311,7 @@ tbody tr:last-child td {
 
 .total-line-main {
   padding-top: 8px;
-  border-top: 1px dashed rgba(143, 171, 156, 0.16);
+  border-top: 1px dashed var(--line);
   color: var(--ink);
   font-size: 15px;
 }
@@ -3079,7 +3336,7 @@ tbody tr:last-child td {
   z-index: 8;
   align-items: end;
   padding: 12px;
-  border: 1px solid rgba(143, 171, 156, 0.18);
+  border: 1px solid var(--line);
   border-radius: 16px;
   background: var(--veil-solid);
   backdrop-filter: blur(14px);
@@ -3143,7 +3400,7 @@ tbody tr:last-child td {
 }
 
 .stock-disclosure-button.is-open {
-  border-color: rgba(217, 172, 82, 0.55);
+  border-color: var(--accent-line-strong);
   color: var(--accent-bright);
 }
 
@@ -3177,15 +3434,15 @@ tbody tr:last-child td {
   border: 1px solid var(--accent-line);
   border-radius: 999px;
   color: var(--accent-bright);
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
   font-size: 12px;
   font-weight: 800;
 }
 
 .customer-sales-group-row td {
-  border-top: 1px solid rgba(217, 172, 82, 0.38);
-  border-bottom: 1px solid rgba(217, 172, 82, 0.22);
-  background: rgba(217, 172, 82, 0.08);
+  border-top: 1px solid var(--accent-line-strong);
+  border-bottom: 1px solid var(--accent-line);
+  background: var(--accent-wash);
 }
 
 .customer-sales-group-summary {
@@ -3215,7 +3472,7 @@ tbody tr:last-child td {
 
 .report-filter-summary span {
   padding: 5px 8px;
-  border: 1px solid rgba(143, 171, 156, 0.22);
+  border: 1px solid var(--line);
   border-radius: 999px;
   color: var(--ink-body);
   background: var(--veil);
@@ -3237,7 +3494,7 @@ tbody tr:last-child td {
   width: min(820px, 100%);
   max-height: calc(100vh - 40px);
   overflow: auto;
-  border: 1px solid rgba(143, 171, 156, 0.16);
+  border: 1px solid var(--line);
   border-radius: 14px;
   background: var(--card);
   box-shadow: 0 20px 70px var(--shadow-strong);
@@ -3256,7 +3513,7 @@ tbody tr:last-child td {
   margin: 0 16px 16px;
   padding: 18px;
   overflow: auto;
-  border: 1px solid rgba(143, 171, 156, 0.22);
+  border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--shadow-strong);
 }
@@ -3278,13 +3535,13 @@ tbody tr:last-child td {
   image-rendering: auto;
 }
 
-.pdf-preview-error,
 .pdf-preview-fallback {
   padding: 18px;
-  border: 1px solid rgba(248, 113, 113, 0.36);
-  border-radius: 12px;
+  border: 0;
+  border-left: 3px solid var(--danger);
+  border-radius: var(--radius-sm);
   color: var(--danger-ink);
-  background: rgba(127, 29, 29, 0.18);
+  background: var(--danger-soft);
 }
 
 .pdf-preview-fallback {
@@ -3311,7 +3568,7 @@ tbody tr:last-child td {
   max-height: 320px;
   overflow: auto;
   padding: 6px;
-  border: 1px solid rgba(143, 171, 156, 0.16);
+  border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--veil);
 }
@@ -3322,7 +3579,7 @@ tbody tr:last-child td {
   gap: 10px;
   align-items: center;
   padding: 10px;
-  border: 1px solid rgba(143, 171, 156, 0.16);
+  border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--card-veil);
 }
@@ -3394,7 +3651,7 @@ tbody tr:last-child td {
 .audit-readable span {
   display: block;
   padding: 7px 9px;
-  border: 1px solid rgba(143, 171, 156, 0.1);
+  border: 1px solid var(--line-soft);
   border-radius: 8px;
   color: var(--ink-body);
   background: var(--veil);
@@ -3463,9 +3720,9 @@ tbody tr:last-child td {
 
 .pl-title-block {
   padding: 18px;
-  border: 1px solid rgba(217, 172, 82, 0.18);
+  border: 1px solid var(--accent-line);
   border-radius: 14px;
-  background: linear-gradient(135deg, rgba(217, 172, 82, 0.1), var(--veil-strong));
+  background: linear-gradient(135deg, var(--accent-soft), var(--veil-strong));
 }
 
 .pl-title-block span {
@@ -3500,9 +3757,9 @@ tbody tr:last-child td {
 .pl-section h3 {
   margin: 0;
   padding: 11px 14px;
-  border-bottom: 1px solid rgba(217, 172, 82, 0.16);
+  border-bottom: 1px solid var(--accent-line);
   color: var(--accent);
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
   font-size: 12px;
   font-weight: 900;
   letter-spacing: 0.9px;
@@ -3514,7 +3771,7 @@ tbody tr:last-child td {
   gap: 16px;
   align-items: center;
   padding: 10px 14px;
-  border-bottom: 1px solid rgba(143, 171, 156, 0.08);
+  border-bottom: 1px solid var(--line-soft);
   color: #e0f2fe;
 }
 
@@ -3554,7 +3811,7 @@ tbody tr:last-child td {
 
 .pl-line-highlight {
   padding-block: 13px;
-  background: linear-gradient(135deg, rgba(217, 172, 82, 0.14), var(--card-veil));
+  background: linear-gradient(135deg, var(--accent-soft), var(--card-veil));
 }
 
 .pl-positive {
@@ -3576,7 +3833,7 @@ tbody tr:last-child td {
 
 .pl-empty-note {
   padding: 12px 14px;
-  border: 1px dashed rgba(143, 171, 156, 0.18);
+  border: 1px dashed var(--line);
   border-radius: 11px;
   color: var(--ink-muted);
   background: var(--veil-subtle);
@@ -3594,13 +3851,7 @@ tbody tr:last-child td {
 }
 
 .cash-book-warning {
-  padding: 11px 13px;
-  border: 1px solid rgba(251, 113, 133, 0.34);
-  border-radius: 12px;
-  color: #fecdd3;
-  background: rgba(127, 29, 29, 0.22);
   font-size: 13px;
-  font-weight: 800;
 }
 
 .cash-book-sides {
@@ -3624,9 +3875,9 @@ tbody tr:last-child td {
   gap: 12px;
   margin: 0;
   padding: 11px 13px;
-  border-bottom: 1px solid rgba(217, 172, 82, 0.16);
+  border-bottom: 1px solid var(--accent-line);
   color: var(--accent);
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
   font-size: 12px;
   font-weight: 900;
   letter-spacing: 0.8px;
@@ -3638,10 +3889,10 @@ tbody tr:last-child td {
   place-items: center;
   min-width: 38px;
   padding: 4px 7px;
-  border: 1px solid rgba(217, 172, 82, 0.35);
+  border: 1px solid var(--accent-line-strong);
   border-radius: 999px;
   color: var(--ink);
-  background: rgba(217, 172, 82, 0.14);
+  background: var(--accent-soft);
   font-size: 11px;
 }
 
@@ -3737,13 +3988,14 @@ tbody tr:last-child td {
 
 .secondary-button,
 .whatsapp-button {
-  padding: 8px 10px;
+  min-height: var(--control-height);
+  padding: 0 14px;
 }
 
 .secondary-button {
-  border: 1px solid rgba(143, 171, 156, 0.18);
+  border: 1px solid var(--line-strong);
   color: var(--ink-body);
-  background: var(--track);
+  background: var(--card);
 }
 
 .whatsapp-button {
@@ -3812,89 +4064,6 @@ tbody tr:last-child td {
   text-align: right;
 }
 
-.invoice-table {
-  margin-top: 15px;
-}
-
-.invoice-table th,
-.invoice-table td {
-  position: static;
-  padding: 10px 6px;
-  border-bottom: 1px solid #dfe9e2;
-  color: #2c5d43;
-  background: transparent;
-  font-size: 11px;
-}
-
-.invoice-table th {
-  color: #082116;
-}
-
-.thermal-items-list {
-  display: grid;
-  gap: 7px;
-  margin-top: 10px;
-}
-
-.thermal-item-block {
-  padding: 7px 0;
-  border-bottom: 1px dashed #c8d8ce;
-  color: #092318;
-  font-size: 12px;
-  line-height: 1.3;
-  overflow-wrap: anywhere;
-  word-break: break-word;
-}
-
-.thermal-item-name {
-  color: #082116;
-  font-weight: 900;
-}
-
-.thermal-item-detail {
-  display: grid;
-  gap: 2px;
-  margin-top: 3px;
-  color: #1e4a34;
-  font-weight: 700;
-}
-
-.thermal-item-discount,
-.thermal-item-amount {
-  display: flex;
-  justify-content: space-between;
-  gap: 10px;
-  margin-top: 3px;
-  color: #092318;
-}
-
-.thermal-item-discount strong,
-.thermal-item-amount strong {
-  flex: 0 0 auto;
-  text-align: right;
-}
-
-.thermal-item-amount {
-  font-weight: 900;
-}
-
-.invoice-total-box {
-  width: min(280px, 100%);
-  display: grid;
-  gap: 7px;
-  margin: 17px 0 0 auto;
-}
-
-.invoice-total-box .total-line,
-.invoice-total-box .total-line strong {
-  color: #2c5d43;
-}
-
-.invoice-total-box .total-line-main,
-.invoice-total-box .total-line-main strong {
-  color: #082116;
-}
-
 .upi-qr-box {
   width: min(280px, 100%);
   display: flex;
@@ -3956,6 +4125,471 @@ tbody tr:last-child td {
   font-size: 12px;
 }
 
+/* --- The customer bill ---------------------------------------------------------
+ *
+ * Drawn by `InvoiceBill` from local/invoiceLayout.js. One markup serves the screen, the A4 and
+ * thermal prints and the PDF capture, so these rules are written once and the print and PDF
+ * contexts only swap the colours to black on white (see the @media print block at the end of this
+ * file, and the .pdf-export-mode rules below).
+ *
+ * The paper is white in both themes: it uses the --paper-* tokens only, which theme.css never
+ * redefines. Print and PDF re-point --paper-line and --paper-ink at black inside the bill, because
+ * a pale rule prints as nothing on a thermal head.
+ *
+ * Table cells carry !important on layout properties only. The generic `.invoice-paper th/td` print
+ * rule and the `.pdf-export-mode th/td` capture rule force grid borders, header fills and a fixed
+ * font size onto every table, which is right for a report and wrong for a receipt. Colours are left
+ * without !important on purpose, so print and PDF can still force them to black.
+ */
+.bill-issue {
+  margin: 0 16px 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--warning-line);
+  border-radius: var(--radius-md);
+  color: var(--warning-ink);
+  background: var(--warning-soft);
+  font-size: 12px;
+}
+
+.invoice-paper.bill-paper {
+  color: var(--paper-ink);
+  background: var(--paper);
+  font-size: 13px;
+  line-height: 1.45;
+  border-radius: var(--radius-md);
+  box-shadow: 0 10px 30px var(--shadow-soft);
+}
+
+.invoice-paper.bill-paper.invoice-a4 {
+  padding: 40px 44px 30px;
+}
+
+.invoice-paper.bill-paper.invoice-thermal {
+  width: 80mm;
+  max-width: calc(100% - 32px);
+  box-sizing: border-box;
+  margin: 4px auto 20px;
+  padding: 16px 12px 14px;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.invoice-paper.bill-paper.invoice-58mm {
+  width: 58mm;
+  padding: 12px 8px;
+  font-size: 11px;
+}
+
+.bill-head {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--paper-line);
+  text-align: center;
+}
+
+.bill-head .brand-lockup {
+  justify-content: center;
+  margin-bottom: 6px;
+}
+
+.bill-head .brand-lockup-invoice .brand-monogram {
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+}
+
+.bill-paper.invoice-thermal .bill-head .brand-lockup-invoice .brand-monogram {
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+}
+
+.invoice-paper .bill-shop {
+  margin: 0;
+  color: var(--paper-ink);
+  font-size: 24px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  line-height: 1.15;
+}
+
+.bill-paper.invoice-thermal .bill-shop {
+  font-size: 17px;
+}
+
+.bill-paper.invoice-58mm .bill-shop {
+  font-size: 15px;
+}
+
+.bill-contact {
+  color: var(--paper-ink-muted);
+  font-size: 0.85em;
+  overflow-wrap: anywhere;
+}
+
+.bill-title {
+  margin-top: 8px;
+  color: var(--accent-deep);
+  font-size: 0.75em;
+  font-weight: 700;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+}
+
+.bill-meta {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px 18px;
+  margin: 12px 0 0;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--paper-line);
+}
+
+.bill-meta div {
+  min-width: 0;
+}
+
+.bill-meta div:nth-child(even) {
+  text-align: right;
+}
+
+.bill-meta dt {
+  color: var(--paper-ink-muted);
+  font-size: 0.72em;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.bill-meta dd {
+  margin: 1px 0 0;
+  color: var(--paper-ink);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.bill-meta-sub {
+  display: block;
+  color: var(--paper-ink-muted);
+  font-size: 0.85em;
+  font-weight: 400;
+}
+
+.bill-status {
+  margin: 10px 0 0;
+  padding: 5px 8px;
+  border: 1.5px solid var(--paper-ink);
+  color: var(--paper-ink);
+  font-size: 0.85em;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.bill-status span {
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.bill-paper .bill-table {
+  width: 100%;
+  min-width: 0;
+  margin-top: 12px;
+  border-collapse: collapse !important;
+  table-layout: auto !important;
+}
+
+.bill-paper .bill-table th,
+.bill-paper .bill-table td {
+  position: static;
+  padding: 0 !important;
+  border: 0 !important;
+  color: var(--paper-ink);
+  background: transparent !important;
+  font-size: 1em !important;
+  font-weight: 400 !important;
+  line-height: 1.4 !important;
+  letter-spacing: 0;
+  text-transform: none;
+  white-space: normal !important;
+  word-break: normal !important;
+  overflow-wrap: anywhere !important;
+  vertical-align: top !important;
+}
+
+.bill-paper .bill-table tr,
+.bill-paper .bill-table tr:hover {
+  background: transparent;
+  box-shadow: none;
+}
+
+.bill-paper .bill-table thead th {
+  padding-bottom: 7px !important;
+  border-bottom: 1px solid var(--paper-ink) !important;
+  color: var(--paper-ink-muted);
+  font-size: 0.72em !important;
+  font-weight: 700 !important;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.bill-paper .bill-table .bill-num,
+.bill-paper .bill-table .bill-unit {
+  padding-left: 10px !important;
+  white-space: nowrap !important;
+  overflow-wrap: normal !important;
+}
+
+.bill-paper .bill-table .bill-num {
+  text-align: right;
+}
+
+.bill-paper .bill-table .bill-unit,
+.bill-paper .bill-table .bill-product {
+  text-align: left;
+}
+
+.bill-paper .bill-line {
+  border-bottom: 1px dotted var(--paper-line);
+}
+
+.bill-paper .bill-line > tr:first-child > td {
+  padding-top: 9px !important;
+}
+
+.bill-paper .bill-line > tr:last-child > td {
+  padding-bottom: 9px !important;
+}
+
+.bill-paper .bill-table .bill-product-name,
+.bill-paper .bill-table .bill-amount {
+  font-weight: 600 !important;
+}
+
+.bill-line-note {
+  display: block;
+  color: var(--paper-ink-muted);
+  font-size: 0.85em;
+}
+
+.bill-paper .bill-table .bill-line-discount td {
+  padding-top: 2px !important;
+  padding-left: 12px !important;
+  color: var(--paper-savings);
+  font-size: 0.85em !important;
+}
+
+.bill-paper .bill-table-stacked thead tr:first-child th {
+  padding-bottom: 1px !important;
+  border-bottom: 0 !important;
+}
+
+.bill-paper .bill-table-stacked .bill-figure-heads th:first-child,
+.bill-paper .bill-table-stacked .bill-line-figures td:first-child {
+  padding-left: 0 !important;
+  text-align: left;
+}
+
+.bill-paper .bill-table-stacked .bill-line-name td {
+  padding-bottom: 1px !important;
+}
+
+.bill-paper .bill-table-stacked .bill-line-figures td {
+  padding-left: 6px !important;
+}
+
+.bill-totals {
+  display: grid;
+  gap: 5px;
+  width: min(300px, 100%);
+  margin: 14px 0 0 auto;
+}
+
+.bill-paper.invoice-thermal .bill-totals {
+  width: 100%;
+}
+
+.bill-total-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.bill-total-row span {
+  min-width: 0;
+  color: var(--paper-ink-muted);
+}
+
+.bill-total-row strong {
+  flex: 0 0 auto;
+  color: var(--paper-ink);
+  font-weight: 600;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.bill-total-row small {
+  display: block;
+  color: var(--paper-ink-muted);
+  font-size: 0.82em;
+}
+
+.bill-total-discount span,
+.bill-total-discount strong,
+.bill-total-discount small {
+  color: var(--paper-savings);
+}
+
+.bill-total-detail {
+  padding-left: 12px;
+  font-size: 0.88em;
+}
+
+.bill-total-detail strong {
+  color: var(--paper-ink-muted);
+  font-weight: 400;
+}
+
+.bill-grand-total {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 6px 0 4px;
+  padding: 9px 0;
+  border-block: 1.5px solid var(--paper-ink);
+}
+
+.bill-grand-total span {
+  color: var(--paper-ink);
+  font-size: 0.9em;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.bill-grand-total strong {
+  color: var(--paper-ink);
+  font-size: 1.55em;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.bill-pay-paid span,
+.bill-pay-due span,
+.bill-pay-due strong {
+  color: var(--paper-ink);
+  font-weight: 700;
+}
+
+.bill-savings {
+  margin: 14px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--paper-savings-line);
+  border-radius: 8px;
+  color: var(--paper-savings);
+  background: var(--paper-savings-wash);
+  font-size: 1em;
+  font-weight: 600;
+  text-align: center;
+}
+
+.bill-savings strong {
+  font-weight: 800;
+}
+
+.bill-paper .bill-upi {
+  margin: 14px auto 0;
+}
+
+.bill-footer {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--paper-line);
+  text-align: center;
+}
+
+.bill-footer strong {
+  color: var(--paper-ink);
+  font-size: 0.95em;
+  font-weight: 700;
+}
+
+.bill-footer span {
+  color: var(--paper-ink-muted);
+  font-size: 0.85em;
+}
+
+.bill-footer small {
+  margin-top: 6px;
+  color: var(--paper-ink-muted);
+  font-size: 0.72em;
+  letter-spacing: 0.08em;
+}
+
+/* PDF capture. `exportElementToPdf` scales the captured element to the page width, so the element
+   is sized to the paper it becomes: 80mm or 58mm for a receipt, A4's 794px for an invoice. Then
+   everything goes black on white, like print. */
+.pdf-export-mode.bill-paper {
+  --paper-line: #000000;
+  --paper-ink: #000000;
+  --paper-savings-line: #000000;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+}
+
+.pdf-export-mode.bill-paper.invoice-thermal {
+  width: 80mm !important;
+  max-width: none !important;
+  margin: 0 !important;
+  padding: 14px 12px !important;
+  font-size: 12px !important;
+  line-height: 1.4 !important;
+}
+
+.pdf-export-mode.bill-paper.invoice-58mm {
+  width: 58mm !important;
+  padding: 10px 8px !important;
+  font-size: 11px !important;
+}
+
+.pdf-export-mode.bill-paper.invoice-a4 {
+  width: 794px !important;
+  max-width: none !important;
+  margin: 0 !important;
+  padding: 52px 56px !important;
+  font-size: 13px !important;
+  line-height: 1.45 !important;
+}
+
+.pdf-export-mode.bill-paper .bill-savings {
+  border-style: dashed;
+}
+
+/* `.pdf-export-mode h2` sizes a report title; the bill's shop name keeps its own size. */
+.pdf-export-mode.bill-paper .bill-shop {
+  font-size: 24px !important;
+}
+
+.pdf-export-mode.bill-paper.invoice-thermal .bill-shop {
+  font-size: 17px !important;
+}
+
+.pdf-export-mode.bill-paper.invoice-58mm .bill-shop {
+  font-size: 15px !important;
+}
+
 .empty-state {
   min-height: 340px;
   display: grid;
@@ -3974,7 +4608,7 @@ tbody tr:last-child td {
 .coming-soon {
   margin-top: 16px;
   color: var(--accent);
-  background: rgba(217, 172, 82, 0.1);
+  background: var(--accent-soft);
   letter-spacing: 0.7px;
   text-transform: uppercase;
 }
@@ -3985,7 +4619,7 @@ tbody tr:last-child td {
   place-items: center;
   padding: 22px;
   box-sizing: border-box;
-  background: radial-gradient(circle at top left, rgba(217, 172, 82, 0.1), transparent 31%), var(--ground);
+  background: radial-gradient(circle at top left, var(--accent-soft), transparent 31%), var(--ground);
 }
 
 .login-panel {
@@ -4002,7 +4636,7 @@ tbody tr:last-child td {
 
 .login-brand {
   padding-bottom: 14px;
-  border-bottom: 1px solid rgba(143, 171, 156, 0.1);
+  border-bottom: 1px solid var(--line-soft);
 }
 
 .login-brand .brand-monogram {
@@ -4030,7 +4664,7 @@ tbody tr:last-child td {
   gap: 6px;
   margin: 0 0 14px;
   padding: 10px 12px;
-  border: 1px solid rgba(143, 171, 156, 0.14);
+  border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--veil-subtle);
 }
@@ -4156,9 +4790,9 @@ tbody tr:last-child td {
   gap: 8px;
   margin-top: 16px;
   padding: 14px;
-  border: 1px solid rgba(217, 172, 82, 0.24);
+  border: 1px solid var(--accent-line);
   border-radius: 14px;
-  background: rgba(217, 172, 82, 0.08);
+  background: var(--accent-wash);
 }
 
 .device-activation-panel strong {
@@ -4179,7 +4813,7 @@ tbody tr:last-child td {
   gap: 10px;
   margin-top: 16px;
   padding: 16px;
-  border: 1px solid rgba(217, 172, 82, 0.18);
+  border: 1px solid var(--accent-line);
   border-radius: 14px;
   background: var(--veil);
 }
@@ -4577,10 +5211,10 @@ tbody tr:last-child td {
   .mobile-pos-note {
     display: block;
     padding: 11px 13px;
-    border: 1px solid rgba(217, 172, 82, 0.2);
+    border: 1px solid var(--accent-line);
     border-radius: 12px;
     color: var(--accent-bright);
-    background: rgba(217, 172, 82, 0.08);
+    background: var(--accent-wash);
     font-size: 12px;
     font-weight: 800;
     line-height: 1.45;
@@ -4662,7 +5296,7 @@ tbody tr:last-child td {
 .ai-toolbar {
   align-items: center;
   background: var(--veil-heavy);
-  border: 1px solid rgba(143, 171, 156, 0.18);
+  border: 1px solid var(--line);
   border-radius: 8px;
   display: flex;
   justify-content: space-between;
@@ -4980,7 +5614,7 @@ tbody tr:last-child td {
 
 .ai-suggestion-picker select {
   background: var(--card-veil);
-  border: 1px solid rgba(143, 171, 156, 0.2);
+  border: 1px solid var(--line);
   border-radius: 8px;
   /* `var(--text)` is defined nowhere in this repository; the neighbouring rules used it and were
      therefore invalid, inheriting whatever the parent gave them. Use the real token. */
@@ -5017,7 +5651,7 @@ tbody tr:last-child td {
 .ai-answer-panel,
 .ai-history-item {
   background: var(--shadow-soft);
-  border: 1px solid rgba(143, 171, 156, 0.16);
+  border: 1px solid var(--line);
   border-radius: 8px;
   margin-top: 14px;
   padding: 14px;
@@ -5059,7 +5693,7 @@ tbody tr:last-child td {
 
 .ai-collection-strip span {
   background: var(--veil-heavy);
-  border: 1px solid rgba(143, 171, 156, 0.16);
+  border: 1px solid var(--line);
   border-radius: 8px;
   color: var(--ink-body);
   padding: 10px;
@@ -5488,7 +6122,7 @@ tbody tr:last-child td {
 
 .frost-insight-card {
   background: var(--veil-heavy);
-  border: 1px solid rgba(143, 171, 156, 0.18);
+  border: 1px solid var(--line);
   border-radius: 8px;
   display: grid;
   gap: 8px;
@@ -5560,7 +6194,7 @@ tbody tr:last-child td {
 .ai-engine-chip {
   align-items: center;
   background: var(--veil-heavy);
-  border: 1px solid rgba(143, 171, 156, 0.18);
+  border: 1px solid var(--line);
   border-radius: 8px;
   color: var(--ink-muted);
   display: flex;
@@ -6084,42 +6718,6 @@ tbody tr:last-child td {
     border-block: 1px solid #111111;
   }
 
-  .invoice-paper.invoice-a4 .invoice-table {
-    width: 100%;
-    margin-top: 7mm;
-    table-layout: auto;
-  }
-
-  .invoice-paper.invoice-a4 .invoice-table th,
-  .invoice-paper.invoice-a4 .invoice-table td {
-    padding: 5pt 6pt !important;
-    font-size: 10pt !important;
-    line-height: 1.32 !important;
-    border: 1px solid #111111 !important;
-    vertical-align: top !important;
-  }
-
-  .invoice-paper.invoice-a4 .invoice-total-box {
-    width: 78mm;
-    margin-top: 8mm;
-    margin-left: auto;
-    border: 1px solid #111111 !important;
-    padding: 5mm;
-  }
-
-  .invoice-paper.invoice-a4 .total-line,
-  .invoice-paper.invoice-a4 .total-line strong,
-  .invoice-paper.invoice-a4 .total-line span {
-    color: #000000 !important;
-    font-size: 10.5pt !important;
-  }
-
-  .invoice-paper.invoice-a4 .total-line-main,
-  .invoice-paper.invoice-a4 .total-line-main strong,
-  .invoice-paper.invoice-a4 .total-line-main span {
-    font-size: 13pt !important;
-  }
-
   .invoice-paper.invoice-80mm {
     page: receipt-80;
     width: 80mm;
@@ -6182,136 +6780,6 @@ tbody tr:last-child td {
 
   .invoice-paper.invoice-thermal .invoice-customer div:nth-child(3) {
     display: none;
-  }
-
-  .invoice-paper.invoice-thermal .invoice-table {
-    display: none;
-  }
-
-  .invoice-paper.invoice-thermal .thermal-items-list {
-    display: grid;
-    gap: 0;
-    margin: 4px 0;
-    color: #092318;
-    border-top: 1px solid #092318;
-  }
-
-  .invoice-paper.invoice-thermal .thermal-item-block {
-    padding: 4px 0;
-    color: #092318 !important;
-    border-bottom: 1px dashed #092318;
-    font-size: 11.5px;
-    font-weight: 800;
-    line-height: 1.18;
-    overflow-wrap: anywhere;
-    word-break: break-word;
-    page-break-inside: avoid;
-    break-inside: avoid;
-  }
-
-  .invoice-paper.invoice-thermal .thermal-item-name {
-    color: #092318 !important;
-    font-size: 12.5px;
-    font-weight: 900;
-    line-height: 1.16;
-    white-space: normal;
-    overflow-wrap: anywhere;
-  }
-
-  .invoice-paper.invoice-thermal .thermal-item-detail {
-    display: block;
-    margin-top: 2px;
-    color: #092318 !important;
-    font-size: 11px;
-    font-weight: 800;
-  }
-
-  .invoice-paper.invoice-thermal .thermal-item-detail span {
-    display: block;
-    color: #092318 !important;
-    white-space: normal;
-    overflow-wrap: anywhere;
-  }
-
-  .invoice-paper.invoice-thermal .thermal-item-discount,
-  .invoice-paper.invoice-thermal .thermal-item-amount {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    gap: 4px;
-    margin-top: 2px;
-    color: #092318 !important;
-    font-size: 11.5px;
-    font-weight: 900;
-    white-space: nowrap;
-  }
-
-  .invoice-paper.invoice-thermal .thermal-item-discount span,
-  .invoice-paper.invoice-thermal .thermal-item-amount span {
-    min-width: 0;
-    color: #092318 !important;
-  }
-
-  .invoice-paper.invoice-thermal .thermal-item-discount strong,
-  .invoice-paper.invoice-thermal .thermal-item-amount strong {
-    flex: 0 0 auto;
-    color: #092318 !important;
-    text-align: right;
-  }
-
-  .invoice-paper.invoice-thermal.invoice-58mm .thermal-item-block {
-    font-size: 10.8px;
-  }
-
-  .invoice-paper.invoice-thermal.invoice-58mm .thermal-item-name {
-    font-size: 11.8px;
-  }
-
-  .invoice-paper.invoice-thermal.invoice-58mm .thermal-item-detail,
-  .invoice-paper.invoice-thermal.invoice-58mm .thermal-item-discount,
-  .invoice-paper.invoice-thermal.invoice-58mm .thermal-item-amount {
-    font-size: 10.6px;
-  }
-
-  .invoice-paper.invoice-thermal .invoice-total-box {
-    width: 100%;
-    margin: 4px 0 0;
-    padding-top: 3px;
-    border-top: 1px solid #092318;
-  }
-
-  .invoice-paper.invoice-thermal .total-line {
-    display: flex;
-    justify-content: space-between;
-    gap: 6px;
-    padding: 1px 0;
-    color: #092318 !important;
-    font-size: 12px;
-    font-weight: 800;
-    white-space: nowrap;
-  }
-
-  .invoice-paper.invoice-thermal .total-line strong,
-  .invoice-paper.invoice-thermal .total-line span {
-    color: #092318 !important;
-    font-weight: 900;
-    white-space: nowrap;
-  }
-
-  .invoice-paper.invoice-thermal .total-line span {
-    min-width: 0;
-  }
-
-  .invoice-paper.invoice-thermal .total-line strong {
-    flex: 0 0 auto;
-    text-align: right;
-  }
-
-  .invoice-paper.invoice-thermal .total-line-main {
-    margin-top: 2px;
-    padding-top: 3px;
-    border-top: 1px solid #092318;
-    font-size: 15px;
   }
 
   .invoice-paper.invoice-thermal .upi-qr-box {
@@ -6472,8 +6940,6 @@ tbody tr:last-child td {
   .print-area .cash-book-title,
   .print-area .cash-book-closing span,
   .invoice-paper .invoice-customer,
-  .invoice-paper .invoice-total-box,
-  .invoice-paper .thermal-item-block,
   .invoice-paper .upi-qr-box,
   .invoice-paper .total-line {
     border: 1px solid #111111 !important;
@@ -6499,7 +6965,7 @@ tbody tr:last-child td {
   overflow-x: hidden;
   padding-right: 3px;
   scrollbar-width: thin;
-  scrollbar-color: rgba(217, 172, 82, 0.55) var(--veil-subtle);
+  scrollbar-color: var(--accent-line-strong) var(--veil-subtle);
 }
 
 .sidebar-nav::-webkit-scrollbar,
@@ -6512,7 +6978,7 @@ tbody tr:last-child td {
 .frost-drawer-body::-webkit-scrollbar-thumb,
 .command-list::-webkit-scrollbar-thumb {
   border-radius: 999px;
-  background: rgba(217, 172, 82, 0.5);
+  background: var(--accent-line);
 }
 
 .nav-item {
@@ -6696,7 +7162,7 @@ tbody tr:last-child td {
   display: flex;
   flex-direction: column;
   transform: translateX(105%);
-  border-left: 1px solid rgba(217, 172, 82, 0.24);
+  border-left: 1px solid var(--accent-line);
   background: var(--ground);
   box-shadow: -24px 0 60px var(--shadow-strong);
   transition: transform 180ms ease;
@@ -6712,7 +7178,7 @@ tbody tr:last-child td {
   justify-content: space-between;
   gap: 14px;
   padding: 18px 20px;
-  border-bottom: 1px solid rgba(143, 171, 156, 0.14);
+  border-bottom: 1px solid var(--line);
   background: linear-gradient(135deg, var(--accent-soft), var(--veil-solid));
 }
 
@@ -6745,7 +7211,7 @@ tbody tr:last-child td {
   display: grid;
   gap: 12px;
   padding: 16px;
-  border: 1px solid rgba(217, 172, 82, 0.26);
+  border: 1px solid var(--accent-line);
   border-radius: 12px;
   background: var(--panel);
   box-shadow: 0 30px 80px var(--shadow-strong);
@@ -6769,7 +7235,7 @@ tbody tr:last-child td {
   gap: 10px;
   min-height: 42px;
   padding: 10px 12px;
-  border: 1px solid rgba(143, 171, 156, 0.14);
+  border: 1px solid var(--line);
   border-radius: 8px;
   color: var(--ink-strong);
   background: var(--card-veil);
@@ -6777,7 +7243,7 @@ tbody tr:last-child td {
 }
 
 .command-list button:hover {
-  border-color: rgba(217, 172, 82, 0.42);
+  border-color: var(--accent-line-strong);
   color: var(--accent-bright);
 }
 
@@ -6793,7 +7259,7 @@ tbody tr:last-child td {
     inset: auto 10px 10px;
     width: auto;
     max-height: min(86vh, 760px);
-    border: 1px solid rgba(217, 172, 82, 0.24);
+    border: 1px solid var(--accent-line);
     border-radius: 14px;
     transform: translateY(110%);
   }
@@ -6828,7 +7294,7 @@ tbody tr:last-child td {
   width: 34px;
   height: 34px;
   padding: 0;
-  border: 1px solid rgba(143, 171, 156, 0.28);
+  border: 1px solid var(--line-strong);
   border-radius: 999px;
   background: var(--fill);
   color: var(--ink-body);
@@ -6839,7 +7305,7 @@ tbody tr:last-child td {
 .notification-bell:hover,
 .notification-bell:focus-visible {
   background: var(--pressed);
-  border-color: rgba(143, 171, 156, 0.45);
+  border-color: var(--line-strong);
   color: var(--ink);
 }
 
@@ -6852,9 +7318,9 @@ tbody tr:last-child td {
 }
 
 .notification-bell.has-unread.severity-warning {
-  border-color: rgba(217, 172, 82, 0.55);
-  background: rgba(217, 172, 82, 0.16);
-  color: #eed08d;
+  border-color: var(--attention-line);
+  background: var(--attention-soft);
+  color: var(--attention-ink);
 }
 
 .notification-bell.has-unread.severity-info,
@@ -6890,7 +7356,7 @@ tbody tr:last-child td {
   max-height: min(70vh, 520px);
   display: flex;
   flex-direction: column;
-  border: 1px solid rgba(143, 171, 156, 0.25);
+  border: 1px solid var(--line-strong);
   border-radius: 14px;
   background: var(--ground);
   box-shadow: 0 18px 48px var(--shadow-strong);
@@ -6903,7 +7369,7 @@ tbody tr:last-child td {
   justify-content: space-between;
   gap: 8px;
   padding: 12px 14px;
-  border-bottom: 1px solid rgba(143, 171, 156, 0.18);
+  border-bottom: 1px solid var(--line);
   color: var(--ink-strong);
 }
 
@@ -6989,8 +7455,8 @@ tbody tr:last-child td {
 }
 
 .notification-tag.severity-warning {
-  background: rgba(217, 172, 82, 0.18);
-  color: #eed08d;
+  background: var(--attention-soft);
+  color: var(--attention-ink);
 }
 
 .notification-tag.severity-info {
@@ -7006,7 +7472,7 @@ tbody tr:last-child td {
 .notification-count {
   padding: 1px 6px;
   border-radius: 999px;
-  background: rgba(143, 171, 156, 0.18);
+  background: var(--fill-strong);
   color: var(--ink-body);
   font-size: 10px;
   font-weight: 700;
@@ -7028,7 +7494,7 @@ tbody tr:last-child td {
 
 .notification-dismiss:hover,
 .notification-dismiss:focus-visible {
-  background: rgba(143, 171, 156, 0.18);
+  background: var(--fill-strong);
   color: var(--ink);
 }
 
@@ -7185,19 +7651,19 @@ tbody tr:last-child td {
   margin-left: auto;
   padding: 1px 6px;
   border-radius: 5px;
-  border: 1px solid rgba(143, 171, 156, 0.22);
+  border: 1px solid var(--line-strong);
   font-family: inherit;
   font-size: 10px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.04em;
-  color: rgba(143, 171, 156, 0.75);
-  background: var(--fill-subtle);
+  color: var(--ink-muted);
+  background: var(--card-veil-soft);
 }
 
 .nav-item-active .nav-shortcut {
-  border-color: rgba(217, 172, 82, 0.35);
-  color: rgba(217, 172, 82, 0.9);
+  border-color: var(--accent-line-strong);
+  color: var(--accent);
   background: var(--accent-soft);
 }
 
@@ -7229,7 +7695,7 @@ tbody tr:last-child td {
 }
 
 .chrome-button:focus-visible {
-  outline: 2px solid rgba(217, 172, 82, 0.7);
+  outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
 
@@ -7270,11 +7736,11 @@ tbody tr:last-child td {
   margin-left: auto;
   padding: 1px 6px;
   border-radius: 5px;
-  border: 1px solid rgba(143, 171, 156, 0.22);
+  border: 1px solid var(--line);
   font-family: inherit;
   font-size: 10px;
   font-variant-numeric: tabular-nums;
-  color: rgba(143, 171, 156, 0.75);
+  color: var(--ink-muted);
 }
 
 .command-result-active {
@@ -7287,7 +7753,7 @@ tbody tr:last-child td {
   border-radius: 7px;
   font-size: 12px;
   color: var(--accent);
-  background: rgba(217, 172, 82, 0.1);
+  background: var(--accent-soft);
 }
 
 @media (max-width: 900px) {
@@ -7315,7 +7781,7 @@ tbody tr:last-child td {
   margin-top: 2px;
   font-size: 11px;
   font-variant-numeric: tabular-nums;
-  color: rgba(143, 171, 156, 0.7);
+  color: var(--ink-muted);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -7633,12 +8099,552 @@ tbody tr:last-child td {
   white-space: nowrap;
 }
 
-/* Edit scrolls the item form into view; leave room above it for the top bar. */
-#product-item-form {
+/* Edit scrolls the product form (and Stock lots scrolls the lots card) into view; leave room above
+   for the top bar. */
+#product-item-form,
+#product-lots-card {
   scroll-margin-top: 88px;
 }
 
-/* Branches & Counters: one numbered step per block, each with its own result under its button. */
+/* Product Master. Everything here is scoped to the screen (.product-master / .pm-*) except
+   .danger-text-button and .card-heading-actions, which any screen may reuse. */
+
+/* A card heading's own buttons (e.g. "Add product"), on the right of the title. */
+.card-heading-actions {
+  display: flex;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+  align-items: flex-start;
+  gap: 9px;
+}
+
+.product-master .card-heading {
+  gap: 16px;
+}
+
+/* A text button that removes or deactivates something. The 34px .remove-button square is for the
+   close X; text crammed into it was unreadable. Same height as .table-action so a row's buttons
+   line up. */
+.danger-text-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: var(--control-height-sm);
+  padding: 0 10px;
+  border: 1px solid var(--danger-line);
+  border-radius: var(--radius-md);
+  color: var(--danger-ink);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease;
+}
+
+.danger-text-button:hover {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.danger-text-button:focus-visible,
+.pm-link-button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.danger-text-button:disabled,
+.danger-text-button:disabled:hover {
+  border-color: var(--line);
+  color: var(--ink-faint);
+  background: transparent;
+  cursor: not-allowed;
+  opacity: 0.8;
+}
+
+.pm-summary {
+  max-width: 520px;
+  margin: 0 0 16px;
+}
+
+.pm-notice {
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border-left: 3px solid var(--attention);
+  border-radius: 6px;
+  color: var(--attention-ink);
+  background: var(--attention-soft);
+  font-size: var(--font-size-sm);
+  line-height: 1.45;
+}
+
+.pm-hint {
+  margin: 10px 0 0;
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+}
+
+.pm-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.pm-required {
+  color: var(--accent);
+  font-weight: 800;
+}
+
+/* List toolbar: search, category, status. */
+.pm-toolbar {
+  display: grid;
+  grid-template-columns: minmax(220px, 2fr) minmax(160px, 1fr) minmax(140px, 1fr);
+  align-items: end;
+  gap: 12px;
+}
+
+.pm-lot-toolbar {
+  grid-template-columns: minmax(220px, 1fr) auto auto;
+  align-items: center;
+}
+
+.pm-lot-toolbar .pm-toolbar-search {
+  align-self: end;
+}
+
+.pm-toolbar-search .icon-input {
+  display: block;
+}
+
+.pm-toolbar-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.pm-list-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+}
+
+.pm-check {
+  align-self: center;
+  min-height: 0;
+  font-weight: 600;
+}
+
+/* Tables. */
+.pm-table th,
+.pm-table td {
+  white-space: nowrap;
+}
+
+.pm-table th:has(> .pm-num-head),
+.pm-num {
+  text-align: right;
+}
+
+.pm-num {
+  font-variant-numeric: tabular-nums;
+}
+
+.product-entry-item-table table {
+  min-width: 720px;
+}
+
+.pm-lot-table table {
+  min-width: 1000px;
+}
+
+.pm-cell-strong {
+  color: var(--ink-strong);
+  font-weight: 750;
+}
+
+/* Lot name over "Active · notes". The status keeps its colour but not the pill, at this size. */
+.pm-lot-cell {
+  max-width: 280px;
+}
+
+.pm-lot-cell > span,
+.pm-lot-cell > small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pm-lot-cell .pm-product-note > span {
+  display: inline;
+  padding: 0;
+  background: none;
+  font-size: inherit;
+}
+
+.pm-stock-low {
+  color: var(--attention-ink);
+  font-weight: 700;
+}
+
+.pm-low-flag {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: var(--attention-ink);
+  background: var(--attention-soft);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+}
+
+.pm-product-cell {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 200px;
+  max-width: 340px;
+}
+
+.pm-thumb {
+  box-sizing: border-box;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--fill-subtle);
+  object-fit: cover;
+}
+
+.pm-thumb-empty {
+  display: grid;
+  place-items: center;
+  color: var(--ink-faint);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+}
+
+.pm-product-text {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.pm-product-name,
+.pm-product-note {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pm-product-note {
+  color: var(--ink-faint);
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+}
+
+.pm-row-actions {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Categories tab and the form's "+ New category". */
+.pm-inline-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.pm-inline-form > label {
+  flex: 1 1 240px;
+  max-width: 360px;
+}
+
+.pm-inline-form-compact > label {
+  flex-basis: 150px;
+}
+
+.pm-category-field {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+}
+
+.pm-link-button {
+  justify-self: start;
+  padding: 2px 0;
+  border: 0;
+  border-radius: 4px;
+  color: var(--accent);
+  background: none;
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.pm-link-button:hover {
+  text-decoration: underline;
+}
+
+/* The product form: small headed sections, then the save row straight after them. */
+.pm-form-section {
+  padding: 18px 0;
+  border-top: 1px solid var(--line-soft);
+}
+
+.card-heading + .pm-form-section {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.pm-form-section h3 {
+  margin: 0 0 12px;
+  color: var(--ink);
+  font-size: var(--font-size-base);
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.pm-form-section .form-grid {
+  align-items: start;
+  margin-bottom: 0;
+}
+
+/* A section with one field (Price, Stock) keeps it at a sensible width rather than the card's. */
+.pm-form-section .form-grid:has(> :only-child) {
+  max-width: 360px;
+}
+
+.pm-form-section > .pm-check {
+  margin-top: 14px;
+}
+
+.pm-lot-editor .form-grid {
+  margin-bottom: 0;
+}
+
+.pm-lot-editor .table-wrap {
+  margin: 0;
+}
+
+.pm-lot-editor .pm-hint {
+  margin: 4px 0 0;
+}
+
+/* <details>: a quiet disclosure row with a chevron that turns when open. */
+.pm-details {
+  margin-top: 4px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--fill-subtle);
+}
+
+.pm-details + .pm-save-row,
+.lot-entry-panel + .pm-details,
+.button-row + .pm-details,
+.table-wrap + .pm-details {
+  margin-top: 18px;
+}
+
+.pm-details > summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  color: var(--ink);
+  font-size: var(--font-size-base);
+  font-weight: 700;
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+
+.pm-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.pm-details > summary::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  margin: 0 2px;
+  border-right: 2px solid var(--ink-muted);
+  border-bottom: 2px solid var(--ink-muted);
+  transform: rotate(-45deg);
+  transition: transform 160ms ease;
+}
+
+.pm-details[open] > summary::before {
+  transform: rotate(45deg);
+}
+
+.pm-details > summary:hover {
+  background: var(--hover);
+}
+
+.pm-details > summary:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.pm-details-body {
+  display: grid;
+  gap: 14px;
+  padding: 4px 14px 16px;
+}
+
+.pm-details-body .form-grid {
+  margin-bottom: 0;
+}
+
+.pm-details-body .table-wrap {
+  margin: 0;
+}
+
+.pm-save-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 9px;
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.pm-required-legend {
+  margin-left: auto;
+  color: var(--ink-faint);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pm-details > summary::before {
+    transition: none;
+  }
+}
+
+@media (max-width: 820px) {
+  .pm-toolbar,
+  .pm-lot-toolbar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pm-toolbar-actions,
+  .pm-list-meta {
+    flex-wrap: wrap;
+  }
+
+  .pm-summary,
+  .pm-inline-form > label {
+    max-width: none;
+  }
+
+  .pm-required-legend {
+    width: 100%;
+    margin-left: 0;
+  }
+}
+
+/* Branches & Counters: one card per step, a jump bar at the top, each step's result under its button. */
+/* minmax(0, 1fr), not the implicit auto track: an auto track grows to the widest table's
+   min-content, and on a phone that pushed every card on the page 400px past the screen. */
+.scope-page {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-4);
+}
+
+.scope-page > * {
+  min-width: 0;
+}
+
+.scope-page > .content-card,
+.scope-anchor {
+  scroll-margin-top: 88px;
+}
+
+.scope-jump {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.scope-jump a {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px 7px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--ink-body);
+  background: var(--fill-subtle);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.scope-jump a:hover {
+  border-color: var(--accent-line-strong);
+  background: var(--accent-wash);
+}
+
+.scope-jump a:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.scope-jump-step {
+  padding: 2px 8px;
+  border-radius: 999px;
+  color: var(--ink-on-accent);
+  background: var(--accent);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+
+.scope-subheading {
+  margin: 20px 0 10px;
+  color: var(--ink);
+  font-size: var(--font-size-lg);
+}
+
+.scope-page .card-heading + .form-grid,
+.scope-page .card-heading + .scope-subheading {
+  margin-top: 0;
+}
+
+.scope-empty {
+  margin: 0 0 12px;
+  padding: 14px 16px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 10px;
+  color: var(--ink-muted);
+  background: var(--fill-subtle);
+}
+
+.scope-locked-note {
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border-left: 3px solid var(--attention);
+  border-radius: 6px;
+  color: var(--attention-ink);
+  background: var(--attention-soft);
+}
 .scope-step {
   margin-top: 22px;
   padding-top: 18px;
@@ -7665,4 +8671,259 @@ tbody tr:last-child td {
 
 .scope-step-message-error {
   color: var(--danger-ink);
+}
+
+/* ---------------------------------------------------------------------------------------------
+   Classes App.jsx renders that had no rule at all.
+
+   Each rendered with browser defaults: a paragraph with a default margin, a toolbar with no gap, a
+   field hint in full body ink. None was broken enough to report and every one looked unfinished.
+   --------------------------------------------------------------------------------------------- */
+
+/* Descriptive copy under a heading (Stock Distribution). */
+.muted-note {
+  max-width: 72ch;
+  margin: var(--space-1) 0 var(--space-3);
+  color: var(--ink-muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* The line of help under a single field. */
+.field-hint {
+  display: block;
+  color: var(--ink-muted);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+/* A row of buttons under a panel (Settings, Sync). */
+.toolbar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-4) 0;
+}
+
+/* A paragraph holding one inline control (All Shops' "As at" date). */
+.form-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: var(--space-3);
+  margin: 0 0 var(--space-4);
+}
+
+.form-row label {
+  min-width: 200px;
+  max-width: 260px;
+}
+
+/* A notice with the one button that fixes it (POS: Configure Mandi Tax). */
+.warning-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+}
+
+.warning-action-row .form-note {
+  flex: 1 1 220px;
+  margin: 0;
+}
+
+/* The credit-sale fields that appear under Payment Mode. */
+.credit-panel {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-md);
+  background: var(--fill-subtle);
+}
+
+.credit-panel .form-note {
+  margin: 0;
+}
+
+/* Save Bill across the full width, Print Bill and Save & Print side by side under it. */
+.checkout-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.checkout-actions > button {
+  width: 100%;
+  min-width: 0;
+}
+
+.checkout-actions > .checkout-button {
+  grid-column: 1 / -1;
+}
+
+/* The dashboard's "What Changed" card, the same card as its two neighbours. */
+.insight-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* The header strip of the Balance Sheet and Cash Book drill-down modals. */
+.invoice-modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-4) var(--space-3);
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.invoice-modal-header h2 {
+  margin: var(--space-1) 0;
+}
+
+.invoice-modal-header p {
+  margin: 0;
+  color: var(--ink-muted);
+}
+
+/* One pending computer on Branches & Counters, with its approval fields. */
+.settings-inline-panel {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0 0 var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--fill-subtle);
+}
+
+.settings-inline-panel .form-grid {
+  margin-bottom: 0;
+}
+
+/* "Select All" in a table header: a checkbox and its words on one line. */
+.table-check-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: inherit;
+  font: inherit;
+  white-space: nowrap;
+}
+
+.table-check-label input {
+  width: auto;
+  min-height: 0;
+  accent-color: var(--accent);
+}
+
+/* ---------------------------------------------------------------------------------------------
+   Stock Distribution's board is a bare <table className="data-table">, not inside a .table-wrap,
+   so it had only its print styling. On screen it takes the same frame a wrapped table has. It
+   cannot scroll inside a wrapper it does not have, so on a narrow screen the table itself becomes
+   the scroll box rather than pushing the page sideways. Screen only: print keeps its own rules.
+   --------------------------------------------------------------------------------------------- */
+@media screen {
+  .data-table {
+    width: 100%;
+    margin: var(--space-4) 0 var(--space-2);
+    border: 1px solid var(--line);
+    border-collapse: separate;
+    border-spacing: 0;
+    border-radius: var(--radius-lg);
+    background: var(--card);
+  }
+
+  .data-table th {
+    position: static;
+  }
+
+  .data-table thead th:first-child {
+    border-top-left-radius: calc(var(--radius-lg) - 1px);
+  }
+
+  .data-table thead th:last-child {
+    border-top-right-radius: calc(var(--radius-lg) - 1px);
+  }
+}
+
+@media screen and (max-width: 820px) {
+  .data-table {
+    display: block;
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: auto;
+  }
+}
+
+/* Touch screens keep a finger-sized target for the short buttons too. Written last so it outranks
+   the row-action height above. */
+@media (hover: none) and (pointer: coarse) {
+  .danger-text-button,
+  .compact-button,
+  .account-tab,
+  .settings-tabs > button,
+  .remove-button:not(:has(> svg)) {
+    min-height: 42px;
+  }
+}
+
+/* The customer bill on paper: black on white, thermal-safe weights, and the rules solid. Placed last
+   so it follows the generic invoice print rules above. See "The customer bill" earlier in this file. */
+@media print {
+  .invoice-paper.bill-paper {
+    --paper-line: #000000;
+    --paper-ink: #000000;
+    --paper-savings-line: #000000;
+    border-radius: 0 !important;
+    font-family: Arial, Helvetica, sans-serif;
+  }
+
+  .invoice-paper.bill-paper.invoice-thermal {
+    padding: 2mm 3mm 5mm !important;
+    font-size: 12px !important;
+    font-weight: 700;
+    line-height: 1.3 !important;
+  }
+
+  .invoice-paper.bill-paper.invoice-58mm {
+    padding: 2mm 1.5mm 5mm !important;
+    font-size: 11px !important;
+  }
+
+  .invoice-paper.bill-paper.invoice-a4 {
+    font-size: 11pt !important;
+  }
+
+  .invoice-paper.bill-paper.invoice-thermal .bill-table td,
+  .invoice-paper.bill-paper.invoice-thermal .bill-meta dd,
+  .invoice-paper.bill-paper.invoice-thermal .bill-total-row strong {
+    font-weight: 700 !important;
+  }
+
+  .invoice-paper.bill-paper .bill-line {
+    border-bottom-style: dashed;
+  }
+
+  .invoice-paper.bill-paper .bill-grand-total {
+    border-block-width: 2px;
+  }
+
+  .invoice-paper.bill-paper .bill-savings {
+    border-style: dashed;
+    border-radius: 0;
+  }
+
+  .invoice-paper.bill-paper .bill-line,
+  .invoice-paper.bill-paper .bill-totals,
+  .invoice-paper.bill-paper .bill-savings,
+  .invoice-paper.bill-paper .bill-footer {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
 }

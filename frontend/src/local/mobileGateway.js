@@ -154,9 +154,9 @@ export const resolveShellCapabilities = ({ desktopShell = false, mobileShell = f
   });
 };
 
-/** Settings sections that configure something this shell does not have. */
+/** Registry sections (Settings or Branches & Counters) that configure something this shell does not have. */
 const SECTIONS_NEEDING = Object.freeze({
-  "settings/device-control": "kioskLock",
+  "branches/screen-lock": "kioskLock",
 });
 
 export const shellShowsSettingsSection = (sectionId, capabilities) => {

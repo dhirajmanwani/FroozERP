@@ -2,7 +2,7 @@
  * Getting a brand-new device onto the Owner's list, from the activation screen.
  *
  * A fresh installation opens on the activation screen, before any sign-in. The Owner issues its
- * activation file from Settings > Device Activation Licences, and that screen lists only devices
+ * activation file from Branches & Counters > Activation licences, and that list holds only devices
  * that have reached the cloud. A device reaches the cloud when somebody tries to sign in on it
  * (`/login` records it as PENDING) -- and the activation screen offered no sign-in. So a new
  * device could never be listed, and could never be activated. Found 26 Sep 2026 on the first
@@ -26,8 +26,8 @@ export const ENROLMENT_OUTCOME = Object.freeze({
 });
 
 const ownerSteps = (deviceName) =>
-  `On the Owner's computer: Branches & Counters > Step 4, approve "${deviceName || "this device"}", ` +
-  "then Settings > Device Activation Licences, issue one for it and send the file or its text here.";
+  `On the Owner's computer: Branches & Counters > Computers & phones, approve "${deviceName || "this device"}", ` +
+  "then Activation licences on the same screen, issue one for it and send the file or its text here.";
 
 /**
  * What a `/login` attempt from the activation screen means for enrolment.
@@ -40,7 +40,7 @@ export const describeEnrolmentAttempt = ({ response, error, deviceName } = {}) =
     return {
       outcome: ENROLMENT_OUTCOME.ALREADY_KNOWN,
       ok: true,
-      message: `The shop already knows this device. Ask the Owner to issue its activation file: Settings > Device Activation Licences, "${deviceName || "this device"}".`,
+      message: `The shop already knows this device. Ask the Owner to issue its activation file: Branches & Counters > Activation licences, "${deviceName || "this device"}".`,
     };
   }
   if (error?.blocked === true && error?.reachedCloud === false) {

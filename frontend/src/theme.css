@@ -179,6 +179,12 @@
   --paper-ink-muted: #2c5d43;
   --paper-line: #c8d8ce;
   --accent-deep: #8a6520;         /* accent text where it must survive a light surface */
+  /* The customer bill's saving: success green that reads on white paper (7.1:1), with a wash and
+     rule built from it. Paper colours like the rest of this group, so never re-themed. Printed and
+     PDF output override all three with black on white. */
+  --paper-savings: #166534;
+  --paper-savings-wash: rgba(22, 101, 52, 0.07);
+  --paper-savings-line: rgba(22, 101, 52, 0.3);
 
   /* Translucent panel veils. In dark these recede a surface toward the page; in light they lift it
      toward white. That inversion is the reason they had to become tokens: as literals they were 83
@@ -197,7 +203,27 @@
   --scrim-soft: rgba(10, 45, 28, 0.28);
   --scrim-strong: rgba(10, 45, 28, 0.5);
 
-
+  /* --- geometry -----------------------------------------------------------------
+     Not colours, so they are defined here once and never redefined by the dark blocks: a
+     card is the same shape in both themes. One spacing step, one radius family and one card
+     shadow, so that two screens built months apart still sit on the same grid.
+     --shadow-card is built from the colour tokens above, so it follows the theme on its own:
+     `var()` inside a custom property resolves on :root, where the dark blocks also land. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-pill: 999px;
+  --shadow-card: 0 1px 2px var(--shadow-faint), 0 8px 24px var(--shadow-faint);
+  /* One height scale for every control: inputs and ordinary buttons share the tall step, row
+     actions and chips the short one. Scaled with the app's text size setting. */
+  --control-height: calc(38px * var(--font-scale, 1));
+  --control-height-sm: calc(30px * var(--font-scale, 1));
 }
 
 /* Block 2: the System state on a machine set to dark.

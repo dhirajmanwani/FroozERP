@@ -41,7 +41,7 @@ import {
   verifyBootstrapCredential,
 } from "./local/bootstrapCredential";
 import { resolveOfflineOpenDecision } from "./local/offlineDataReadiness";
-import { allShopsHasFigures, resolveAllShopsPresentation } from "./local/allShopsSummary";
+import { ALL_SHOPS_STATUS, allShopsHasFigures, resolveAllShopsPresentation } from "./local/allShopsSummary";
 import { resolveShopViewPresentation, shopPickerVisible, shopPickerNoticeVisible } from "./local/shopView";
 import {
   AUTO_UPDATE_DEFAULTS,
@@ -97,6 +97,10 @@ import { buildCanonicalAliasLoginClaim, reconcileCanonicalIdentity } from "./loc
 import { buildLocalDashboardSnapshot } from "./local/dashboardSnapshot";
 import { CONNECTIVITY_MODES, connectivityModeMessage, normalizeConnectivityMode, readConnectivityMode } from "./local/connectivityMode";
 import { CONNECTION_TONE, connectionNeedsAttention, resolveConnectionStatus } from "./local/connectionStatus";
+import { resolveShellStatus } from "./local/shellStatus";
+import { plainServerMessage } from "./local/plainServerMessage";
+import { describeReport } from "./local/reportDescriptions";
+import { labelFor, toneFor } from "./local/displayLabels";
 import { createStartupConnectivityAuthority } from "./local/startupConnectivityPolicy";
 import { MOBILE_GATEWAY_BASE_URL, MOBILE_RUNTIME_PROFILE_COMMAND, currentDevicePlatform, describeRuntimeProfileMismatch, installMobileGateway, isMobileShell, resolveShellCapabilities, shellShowsSettingsSection } from "./local/mobileGateway";
 import { isCloudTargetConfigured, resolveCloudTarget } from "./local/cloudTarget";
@@ -104,6 +108,7 @@ import { resolveApiMode } from "./local/apiModeResolution";
 import { CLOUD_CALL_REFUSAL_CODES, createCloudCallGuard, createCloudCallRefusalError, evaluateCloudCall } from "./local/cloudCallGuard";
 import { UNKNOWN_COUNTER_SCOPE, counterMaySell, resolveCounterScope } from "./local/locationScope";
 import { applyChargesToTotals, buildChargesForBill } from "./local/otherCharges";
+import { buildInvoiceLayout, buildInvoiceText } from "./local/invoiceLayout";
 import {
   DISTRIBUTION_BOARD_STATUS,
   pendingAllocationLines,
@@ -154,7 +159,8 @@ import { refreshAfterSaveMessage, settingsWriteErrorMessage } from "./local/sett
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
 import { adminWritePayload } from "./local/adminWritePayload";
 import { checkProductPhoto, imageFromTransfer, indexProductPhotos, photoForProduct, readCachedProductPhotos, shrinkProductPhoto, withProductPhoto, writeCachedProductPhotos } from "./local/productPhotos";
-import { findDuplicateProductName, isServerProductId, productGlobalIdFrom, productIdentityKeys, resolveServerProductId } from "./local/productIdentity";
+import { findDuplicateProductName, isSameProduct, isServerProductId, productGlobalIdFrom, productIdentityKeys, resolveServerProductId } from "./local/productIdentity";
+import { MISSING_VALUE, PRODUCT_STATUS_FILTERS, PRODUCT_UNITS, filterProductMasterList, formatOptionalCount, formatOptionalMoney, formatOptionalQuantity, isActiveRecord, isLowStock, lotListEmptyMessage, lotPanelMatchesEdit, pickQuantity, pickRate, productCategoryLabel, productCountSummary, productListEmptyMessage, unitDisplayName } from "./local/productMaster";
 import { POS_SECTIONS, posSectionCounts, posSectionFor, posSectionLabel, posTileBadge, readPosSection, writePosSection } from "./local/posSections";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
@@ -887,6 +893,7 @@ const buildConnectionStatusModel = ({ backendHealth = {}, cloudHealth = {}, devi
     // from silently reporting the opposite.
     cloudReachable,
     localServiceStarting: localStarting,
+    devicePending: devicePending && cloudReachable,
     banner,
     detail: `${syncSummary}. API mode: ${apiModeLabel}.`,
   };
@@ -1112,7 +1119,7 @@ const offlineLocalDataViews = new Set(["dashboard", "products", "sales", "report
 const offlineBackendRequiredViews = new Set(["purchase", "pending-bills", "accounts", "returns", "waste", "discounts", "sale-rates", "expenses", "all-shops"]);
 
 const getErrorMessage = (error, fallback) =>
-  error.response?.data?.message || fallback;
+  plainServerMessage(error.response?.data?.message) || fallback;
 
 /**
  * Why a product save failed, never a bare "Error Adding Product": the server's own words when it
@@ -2044,7 +2051,7 @@ class ModuleErrorBoundary extends React.Component {
               </div>
               <button className="remove-button" onClick={this.props.onClose}><Icon name="close" /></button>
             </div>
-            <div className="cart-empty">
+            <div className="error-banner" role="alert">
               {this.state.error?.message || "Unexpected error while rendering this module."}
             </div>
           </section>
@@ -2534,6 +2541,13 @@ function App() {
   const [showEmptyLots, setShowEmptyLots] = useState(false);
   const [showInventoryEmptyLots, setShowInventoryEmptyLots] = useState(false);
   const [showOpeningLotForm, setShowOpeningLotForm] = useState(false);
+  // Product Master presentation only: which tab is open, the list's filters, the optional columns
+  // and the inline "+ New category" box. None of it is saved or sent anywhere.
+  const [productMasterTab, setProductMasterTab] = useState("products");
+  const [productCategoryFilter, setProductCategoryFilter] = useState("");
+  const [productStatusFilter, setProductStatusFilter] = useState("active");
+  const [showMoreProductColumns, setShowMoreProductColumns] = useState(false);
+  const [showInlineCategoryForm, setShowInlineCategoryForm] = useState(false);
   const [lotAction, setLotAction] = useState(null);
   const [lotDraft, setLotDraft] = useState({
     lot_name: "",
@@ -4086,9 +4100,9 @@ function App() {
       if (!error?.response) {
         setExitCodeError("Local backend is unavailable, so FroozERP cannot verify the Owner exit code. Start/reconnect the local backend, then try again.");
       } else if (error.response?.status === 409) {
-        setExitCodeError(getErrorMessage(error, "No Owner exit code is configured. Open Settings > Security / Device Control and set a new code with Owner/Admin password."));
+        setExitCodeError(getErrorMessage(error, "No Owner exit code is configured. Open Branches & Counters > Counter screen lock and set a new code with the Owner/Admin password."));
       } else if (error.response?.status === 403) {
-        setExitCodeError("Invalid exit code. Owner/Admin can reset it in Settings > Security / Device Control using the current account password.");
+        setExitCodeError("Invalid exit code. Owner/Admin can reset it in Branches & Counters > Counter screen lock using the current account password.");
       } else {
         setExitCodeError(getErrorMessage(error, "Unable to verify Owner exit code."));
       }
@@ -4130,7 +4144,7 @@ function App() {
             <button className="primary-button" disabled={!exitCodeInput || exitCodeInput.length < 4} onClick={verifyExitCodeAndClose}>Unlock and Exit</button>
             <button className="secondary-button" onClick={() => setExitCodeModalOpen(false)}>Stay in FroozERP</button>
           </div>
-          <p className="form-note">Emergency note: if the exit code is forgotten, reset it from Settings &gt; Security / Device Control with the Owner/Admin password. Repair/update the app without deleting business data if Settings cannot open.</p>
+          <p className="form-note">Emergency note: if the exit code is forgotten, reset it from Branches &amp; Counters &gt; Counter screen lock with the Owner/Admin password. Repair/update the app without deleting business data if Settings cannot open.</p>
         </div>
       </section>
     </div>
@@ -7170,11 +7184,11 @@ function App() {
       const parsedSellingRate = Number(sellingRate);
       const parsedMinimumStock = Number(productMinimumStock || 0);
       if (!productName.trim() || !unit || !Number.isFinite(parsedSellingRate) || parsedSellingRate <= 0) {
-        alert("Enter an item name, unit and valid sale rate.");
+        alert("Enter a product name, a unit and a sale price above zero.");
         return;
       }
       if (!Number.isFinite(parsedMinimumStock) || parsedMinimumStock < 0) {
-        alert("Enter a valid minimum stock quantity.");
+        alert("Enter a valid low-stock alert quantity (zero or more).");
         return;
       }
       const normalizedOpeningStockLots = (addOpeningStock ? openingStockLots : [])
@@ -7375,7 +7389,7 @@ function App() {
   };
 
   const deactivateProductCategory = async (category) => {
-    const reason = window.prompt(`Enter reason to remove/deactivate ${category.category_name}`);
+    const reason = window.prompt(`Reason for deactivating the category ${category.category_name}`);
     if (!reason?.trim()) return;
     try {
       const categoryWrite = createOperationalWrite(user, { updated_by: user.id, reason });
@@ -7387,7 +7401,7 @@ function App() {
       alert("Category removed");
     } catch (error) {
       await loadProductCategories();
-      alert(getErrorMessage(error, "This category has items or transactions. It can only be deactivated."));
+      alert(getErrorMessage(error, "This category has products or transactions. It can only be deactivated."));
     }
   };
 
@@ -7423,15 +7437,15 @@ function App() {
     const purchaseRate = Number(openingStockDraft.purchase_rate || 0);
     const saleRate = Number(openingStockDraft.sale_rate || sellingRate || 0);
     if (!Number.isFinite(quantity) || quantity <= 0) {
-      alert("Please enter lot quantity.");
+      alert("Enter the lot quantity.");
       return null;
     }
     if (!Number.isFinite(purchaseRate) || purchaseRate <= 0) {
-      alert("Please enter opening stock rate.");
+      alert("Enter the lot cost price.");
       return null;
     }
     if (!Number.isFinite(saleRate) || saleRate <= 0) {
-      alert("Please enter sale rate.");
+      alert("Enter the lot sale price.");
       return null;
     }
     const nextLotName = getOpeningLotName(openingStockDraft, productLots.length + openingStockLots.length + 1);
@@ -7505,7 +7519,7 @@ function App() {
       setShowOpeningLotForm(false);
       setAddOpeningStock(false);
       await refreshLotContext(lotPanelProduct || { id: activeProductId, product_name: productName });
-      alert("Opening stock lot added");
+      alert("Stock lot added");
     } catch (error) {
       alert(getErrorMessage(error, "Unable to add opening stock lot"));
     }
@@ -7593,15 +7607,15 @@ function App() {
         const nextQty = Number(lotDraft.purchase_qty || 0);
         const nextCost = Number(lotDraft.purchase_rate || 0);
         if (!lotDraft.lot_name.trim()) {
-          alert("Please enter lot name / number.");
+          alert("Enter a lot name.");
           return;
         }
         if (!Number.isFinite(nextQty) || nextQty < 0) {
-          alert("Please enter a valid opening quantity.");
+          alert("Enter a valid lot quantity.");
           return;
         }
         if (!Number.isFinite(nextCost) || nextCost <= 0) {
-          alert("Please enter a valid opening cost / purchase rate.");
+          alert("Enter a cost price above zero.");
           return;
         }
         const lotWrite = createOperationalWrite(user, {
@@ -7644,11 +7658,11 @@ function App() {
       if (lotAction.type === "adjust") {
         const nextQty = Number(lotDraft.new_quantity || 0);
         if (!lotDraft.reason.trim()) {
-          alert("Adjustment reason is required.");
+          alert("Enter a reason for the count correction.");
           return;
         }
         if (!Number.isFinite(nextQty) || nextQty < 0) {
-          alert("Please enter a valid physical quantity.");
+          alert("Enter a valid counted quantity.");
           return;
         }
         const adjustmentWrite = createOperationalWrite(user, {
@@ -7664,7 +7678,7 @@ function App() {
           adjustmentWrite.body,
           adjustmentWrite.config
         );
-        alert("Lot adjusted");
+        alert("Count corrected");
       }
       if (lotAction.type === "deactivate") {
         if (!lotDraft.reason.trim()) {
@@ -8223,8 +8237,40 @@ function App() {
     resetProductForm();
   };
 
+  const scrollProductMasterTo = (elementId) => {
+    window.requestAnimationFrame(() => {
+      document.getElementById(elementId)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  };
+
+  // "Add product" in the page header: a clean form, on screen.
+  const startNewProduct = () => {
+    resetProductForm();
+    setProductMasterTab("products");
+    window.requestAnimationFrame(() => {
+      document.getElementById("product-item-form")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  };
+
+  // "Stock lots" in the products table. The lots card sits under the form, so take the owner to it.
+  const openProductStockLots = async (product) => {
+    await loadProductLots(product, true);
+    scrollProductMasterTo("product-lots-card");
+  };
+
+  const closeProductStockLots = () => {
+    if (showOpeningLotForm) {
+      resetOpeningStockDraft();
+      setShowOpeningLotForm(false);
+      setAddOpeningStock(false);
+    }
+    setLotPanelProduct(null);
+    setProductLots([]);
+    setProductLotAudit([]);
+  };
+
   const deactivateProduct = async (product) => {
-    const reason = window.prompt(`Enter reason to deactivate/cancel ${product.product_name}`);
+    const reason = window.prompt(`Reason for deactivating ${product.product_name}`);
     if (!reason?.trim()) return;
     try {
       const resolved = await serverIdForProduct(productIdentityKeys(product));
@@ -8559,7 +8605,9 @@ function App() {
       if (view === "returns") await loadSaleReturns();
       if (view === "waste") await loadWasteEntries();
       if (view === "dashboard") await loadDashboardData();
-      if (view === "settings") await loadSettingsData();
+      // Branches & Counters shows the device list the licences are issued against and the screen
+      // lock, both of which come from the settings bundle.
+      if (view === "settings" || view === "branches") await loadSettingsData();
       if (view === "sale-rates") await loadSaleRates();
     } catch (error) {
       console.warn(`Unable to refresh ${view}`, error);
@@ -8744,7 +8792,7 @@ function App() {
               <span className="eyebrow">Device Activation Required</span>
               <strong>{deviceGate.code === "DEVICE_PENDING_APPROVAL" ? "Device awaiting owner approval." : "This device is not approved."}</strong>
               <small>Device ID: {deviceGate.device_id || deviceInfo.device_id}</small>
-              <p>Ask the owner to approve this device from Settings, then sign in again. A one-time activation code may also be used.</p>
+              <p>Ask the owner to approve this device in Branches &amp; Counters, then sign in again. A one-time activation code may also be used.</p>
               <input
                 placeholder="Activation code"
                 value={activationCode}
@@ -8837,20 +8885,23 @@ function App() {
     groups.set(key, current);
     return groups;
   }, new Map()).values()].sort((left, right) => `${left.category}-${left.product_name}`.localeCompare(`${right.category}-${right.product_name}`));
-  const productSearchText = productListSearch.trim().toLowerCase();
-  const filteredProducts = products.filter((product) => {
-    if (!productSearchText) return true;
-    return [
-      product.product_name,
-      product.category_name,
-      product.category,
-      product.barcode,
-      product.origin_type,
-      product.selling_rate,
-      product.active !== false ? "active" : "inactive",
-      product.unit,
-    ].some((value) => String(value ?? "").toLowerCase().includes(productSearchText));
+  const productCategoryFilterRecord = productCategoryFilter
+    ? productCategories.find((category) => inventoryIdsEqual(category.id, productCategoryFilter)) || null
+    : null;
+  const filteredProducts = filterProductMasterList(products, {
+    search: productListSearch,
+    category: productCategoryFilterRecord,
+    status: productStatusFilter,
   });
+  const productListFiltered = Boolean(productCategoryFilterRecord) || productStatusFilter !== "all";
+  const productCounts = productCountSummary(products);
+  const activeProductCategories = productCategories.filter(isActiveRecord);
+  // The title names the product as it is saved, not as the name box reads mid-edit.
+  const productEditingName = editingProductId
+    ? (products.find((product) => isSameProduct(product, editingProductKeys))?.product_name || productName.trim() || "product")
+    : "";
+  const lotPanelAcceptsNewLot = lotPanelMatchesEdit({ editingProductId, editingProductKeys, lotPanelProduct });
+  const productMoreColumnHeaders = showMoreProductColumns ? ["Barcode", "Origin", "Low-stock alert at", "Lots"] : [];
   const lotSearchText = lotListSearch.trim().toLowerCase();
   const filteredProductLots = productLots.filter((lot) => {
     if (!showEmptyLots && lotBalanceQuantity(lot) <= 0) return false;
@@ -8870,6 +8921,26 @@ function App() {
       lotStatusLabel(lot),
     ].some((value) => String(value ?? "").toLowerCase().includes(lotSearchText));
   });
+
+  // One set of lot fields for both lot forms on Product Master: the lots staged with a new product,
+  // and "Add stock lot" on an existing one. Both edit `openingStockDraft`, and never at the same time.
+  const openingLotFields = (
+    <div className="form-grid supplier-form-grid">
+      <Field label="Supplier (optional)">
+        <select value={openingStockDraft.supplier_id} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, supplier_id: event.target.value })}>
+          <option value="">None (no supplier payable)</option>
+          {activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.supplier_name}</option>)}
+        </select>
+      </Field>
+      <Field label="Lot name"><input value={openingStockDraft.lot_name} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_name: event.target.value })} placeholder="Named for you if left blank" /></Field>
+      <Field label="Grade"><input value={openingStockDraft.lot_size} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_size: event.target.value })} placeholder="Example: Small, Premium" /></Field>
+      <Field label={<RequiredLabel>Quantity</RequiredLabel>}><input type="number" min="0" step="0.001" value={openingStockDraft.quantity} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, quantity: event.target.value })} /></Field>
+      <Field label={<RequiredLabel>Cost price (₹)</RequiredLabel>}><input type="number" min="0" step="0.01" value={openingStockDraft.purchase_rate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, purchase_rate: event.target.value })} /></Field>
+      <Field label={<RequiredLabel>Sale price (₹)</RequiredLabel>}><input type="number" min="0" step="0.01" value={openingStockDraft.sale_rate || sellingRate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, sale_rate: event.target.value })} /></Field>
+      <Field label="Stock date"><input type="date" value={openingStockDraft.opening_stock_date} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, opening_stock_date: event.target.value })} /></Field>
+      <Field label="Notes"><input value={openingStockDraft.remarks} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, remarks: event.target.value })} /></Field>
+    </div>
+  );
 
   const frostUnreadCount = (aiAssistantData.alerts || []).filter((alert) => ["CRITICAL", "HIGH", "ATTENTION"].includes(String(alert.severity || "").toUpperCase())).length;
   /**
@@ -8937,10 +9008,17 @@ function App() {
    * component and breaks the rules-of-hooks ordering; the registry is forty entries, so building
    * it on demand costs less than the memo would have.
    */
+  const paletteShowsOwnerSections = String(user?.role || user?.role_name || "").toUpperCase() === "OWNER";
   const commandIndex = commandPaletteOpen
-    ? buildCommandIndex(navigationRegistry.filter(
-        (item) => hasModuleAccess(item.id) && (canManageRates || item.id !== "sale-rates"),
-      ))
+    ? buildCommandIndex(navigationRegistry
+      .filter((item) => hasModuleAccess(item.id) && (canManageRates || item.id !== "sale-rates"))
+      // A section the screen will not draw for this person or this machine is not offered either:
+      // the licence card is the Owner's, and a phone has no screen lock.
+      .map((item) => ({
+        ...item,
+        sections: item.sections.filter((section) => (!section.ownerOnly || paletteShowsOwnerSections)
+          && shellShowsSettingsSection(section.id, SHELL_CAPABILITIES)),
+      })))
     : null;
 
   /**
@@ -9015,6 +9093,19 @@ function App() {
     lastSyncAt: syncStatus?.lastSuccessfulSyncAt,
     heldOffline: connectivityMode === CONNECTIVITY_MODES.LOCAL_ONLY,
     localServiceReady: backendHealth?.online === true,
+  });
+  // One status, said once: the pill always, the panel only when somebody has to act.
+  // local/shellStatus.js explains why the three older summaries were retired.
+  const shellStatus = resolveShellStatus({
+    connection: connectionSentence,
+    startupError,
+    serviceStarting: connectionStatus.localServiceStarting,
+    serviceDown: backendHealth?.online === false,
+    cloudMode: isCloudMode(),
+    pendingCount: connectionStatus.pending,
+    failedCount: connectionStatus.failed,
+    conflictCount: connectionStatus.conflicts,
+    devicePending: connectionStatus.devicePending,
   });
 
   return (
@@ -9154,7 +9245,6 @@ function App() {
             </div>
             <BrandLogo compact />
             <div>
-              <span className="eyebrow">Retail Operations Workspace</span>
               <h1>{activeLabel}</h1>
             </div>
           </div>
@@ -9184,7 +9274,7 @@ function App() {
                 <span className="status-dot" />
                 {(counterScope.known && counterScope.locationName) || user.branch}
               </div>
-              <div className="offline-pill">{connectionStatus.syncSummary}</div>
+              <div className="offline-pill" data-tone={shellStatus.pill.tone} title={shellStatus.pill.title || undefined}>{shellStatus.pill.label}</div>
               {/* Whenever the microphone is on, in either mode, for anybody: it is never on without
                   this on screen. With the drawer closed it also carries what was heard and why it
                   is not listening, since nothing else on screen would. */}
@@ -9302,20 +9392,23 @@ function App() {
             online={Boolean(backendHealth.online) && !offlineMode}
             schedule={autoUpdateSchedule}
           />
-          {(startupNotice || startupError || syncMessage) && (
-            <div className={`startup-status-panel ${startupError ? "startup-status-error" : ""}`}>
-              {startupError && <p>{startupError}</p>}
-              {!startupError && <p>{connectionStatus.banner}</p>}
-              {!startupError && <small>{connectionStatus.detail}</small>}
-              {isTauriRuntime() && !isCloudMode() && backendHealth.online === false && (
+          {/* Only when somebody has to act. The all-clear lives in the top-bar pill, and being
+              offline is the banner's to say; this panel no longer repeats either of them. */}
+          {shellStatus.notice && (
+            <div
+              className={`startup-status-panel ${shellStatus.notice.tone === "error" ? "startup-status-error" : ""}`}
+              role={shellStatus.notice.tone === "error" ? "alert" : "status"}
+            >
+              <p>{shellStatus.notice.message}</p>
+              {shellStatus.notice.offerRestart && isTauriRuntime() && (
                 <button className="table-action" onClick={async () => {
                   await ensureLocalBackendService({ restart: true, reason: "shell-restart-service" });
                   await performConnectivityCheck("shell-restart-service", { force: true, skipServiceStart: true });
                 }}>
-                  Restart Service
+                  Restart FroozERP
                 </button>
               )}
-              {localBackendService?.message && <small>{localBackendService.message}</small>}
+              {shellStatus.notice.offerRestart && localBackendService?.message && <small>{localBackendService.message}</small>}
             </div>
           )}
           {activeView === "dashboard" && !hasModuleAccess("dashboard") && (
@@ -9337,8 +9430,6 @@ function App() {
               )}
               <section className="welcome-banner">
                 <div>
-                  <BrandLogo />
-                  <span className="eyebrow">Retail Intelligence</span>
                   <h2>Good to see you, {getUserGreetingName(user)}.</h2>
                   <p>Monitor today's performance and keep your inventory moving.</p>
                 </div>
@@ -9386,316 +9477,420 @@ function App() {
           )}
 
           {activeView === "products" && (
-            <section className="settings-layout">
-              <ModuleCard eyebrow="Product Master" title="Category, Item, Lot & Opening Stock" subtitle="Manage fruit categories, item masters and opening stock lots without disturbing FIFO inventory.">
-                {productDuplicateWarning && <div className="cart-empty">{productDuplicateWarning}</div>}
-                <div className="purchase-summary-grid supplier-payment-preview">
-                  <SummaryMetric featured label="Categories" value={productCategories.length} />
-                  <SummaryMetric label="Items" value={products.length} />
-                  <SummaryMetric label="Active Items" value={products.filter((product) => product.active !== false).length} />
-                  <SummaryMetric label="Inventory Lots" value={inventory.length} />
+            <section className="settings-layout product-master">
+              <ModuleCard
+                actions={<button className="primary-button" onClick={startNewProduct} type="button"><Icon name="add" size={16} />Add product</button>}
+                eyebrow="Product Master"
+                subtitle="Everything you sell: its price, unit, photo and stock."
+                title="Products"
+              >
+                {productDuplicateWarning && <p className="pm-notice" role="status">{productDuplicateWarning}</p>}
+                <div className="purchase-summary-grid pm-summary">
+                  <SummaryMetric featured label="Products" value={productCounts.note} />
+                  <SummaryMetric label="Categories" value={`${activeProductCategories.length} active`} />
                 </div>
-              </ModuleCard>
-
-              <ModuleCard eyebrow="Category Management" title="Fruit Categories" subtitle="Add, edit or deactivate categories. Categories with items are protected from hard deletion.">
-                <div className="form-grid supplier-form-grid">
-                  <Field label="Add New Category"><input value={newProductCategoryName} onChange={(event) => setNewProductCategoryName(event.target.value)} placeholder="Example: Mango" /></Field>
-                  <Field label="Select Existing Category">
-                    <select value={productCategoryId} onChange={(event) => {
-                      const selected = productCategories.find((category) => String(category.id) === event.target.value);
-                      setProductCategoryId(event.target.value);
-                      setProductCategory(selected?.category_name || "");
-                    }}>
-                      <option value="">Select category</option>
-                      {productCategories.filter((category) => category.active !== false).map((category) => <option key={category.id} value={category.id}>{category.category_name}</option>)}
-                    </select>
-                  </Field>
-                  <button className="primary-button" onClick={saveProductCategory}>Save Category</button>
-                </div>
-                <DataTable headers={["Category", "Items", "Status", "Actions"]}>
-                  {productCategories.map((category) => (
-                    <tr key={category.id}>
-                      <td className="primary-cell">{category.category_name}</td>
-                      <td>{category.item_count || 0}</td>
-                      <td><span className={category.active !== false ? "stock-ok" : "stock-low"}>{category.active !== false ? "Active" : "Inactive"}</span></td>
-                      <td>
-                        <div className="button-row table-actions-row">
-                          <button className="table-action" onClick={() => editProductCategory(category)}>Edit</button>
-                          <button className="remove-button" disabled={category.active === false} onClick={() => deactivateProductCategory(category)}>Remove / Deactivate</button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </DataTable>
-              </ModuleCard>
-
-              <ModuleCard id="product-item-form" eyebrow="Item Management" title={editingProductId ? "Edit Item" : "Add Item Inside Category"} subtitle="Items are products used by POS, purchase, inventory, reports and FIFO costing.">
-                <div className="form-grid supplier-form-grid">
-                  <Field label="Category">
-                    <select value={productCategoryId} onChange={(event) => {
-                      const selected = productCategories.find((category) => String(category.id) === event.target.value);
-                      setProductCategoryId(event.target.value);
-                      setProductCategory(selected?.category_name || "");
-                    }}>
-                      <option value="">Select existing category</option>
-                      {productCategories.filter((category) => category.active !== false).map((category) => <option key={category.id} value={category.id}>{category.category_name}</option>)}
-                    </select>
-                  </Field>
-                  <Field label="Item Name"><input value={productName} onChange={(event) => setProductName(event.target.value)} placeholder="Example: Kesar" /></Field>
-                  <Field label="Unit">
-                    <select value={unit} onChange={(event) => setUnit(event.target.value)}>
-                      <option value="">Select unit</option>
-                      <option value="KG">KG</option>
-                      <option value="BOX">Box</option>
-                      <option value="PIECE">Piece</option>
-                      <option value="DOZEN">Dozen</option>
-                    </select>
-                  </Field>
-                  <Field label="Default Sale Rate"><input type="number" min="0" step="0.01" value={sellingRate} onChange={(event) => setSellingRate(event.target.value)} /></Field>
-                  <Field label="Barcode (Optional)"><input value={productBarcode} onChange={(event) => setProductBarcode(event.target.value)} /></Field>
-                  <Field label="Minimum Stock"><input type="number" min="0" step="0.001" value={productMinimumStock} onChange={(event) => setProductMinimumStock(event.target.value)} /></Field>
-                  <Field label="Origin Type">
-                    <select value={productOriginType} onChange={(event) => setProductOriginType(event.target.value)}>
-                      <option value="LOCAL">Local</option>
-                      <option value="IMPORTED">Imported</option>
-                    </select>
-                  </Field>
-                  <label className="check-field"><input type="checkbox" checked={productActive} onChange={(event) => setProductActive(event.target.checked)} /><span>Active Item</span></label>
-                </div>
-                <div className="product-photo-field">
-                  <span className="product-photo-label">Photo</span>
-                  <div className="product-photo-row">
-                    {/* Paste lands here: in the browser, right-click a photo, "Copy image", then click this box and press Ctrl+V. */}
-                    <div
-                      aria-label="Product photo. Click, then press Ctrl+V to paste a copied photo."
-                      className={productPhotoDraft.dataUrl ? "product-photo-drop product-photo-drop-filled" : "product-photo-drop"}
-                      onDragOver={(event) => event.preventDefault()}
-                      onDrop={pasteProductPhoto}
-                      onPaste={pasteProductPhoto}
-                      role="button"
-                      tabIndex={0}
+                <div aria-label="Product Master sections" className="account-tabs pm-tabs" role="tablist">
+                  {[["products", "Products"], ["categories", "Categories"]].map(([value, label]) => (
+                    <button
+                      aria-selected={productMasterTab === value}
+                      className={productMasterTab === value ? "account-tab account-tab-active" : "account-tab"}
+                      key={value}
+                      onClick={() => setProductMasterTab(value)}
+                      role="tab"
+                      type="button"
                     >
-                      {productPhotoDraft.dataUrl
-                        ? <img alt="" src={productPhotoDraft.dataUrl} />
-                        : <span>Click here, then Ctrl+V</span>}
-                    </div>
-                    <div className="product-photo-actions">
-                      <p>On Google Images or Pinterest, right-click the photo and choose "Copy image". Then click the box and press Ctrl+V. Or save the photo and choose the file.</p>
-                      <div className="button-row">
-                        <label className="secondary-button product-photo-file">
-                          Choose file
-                          <input
-                            accept="image/jpeg,image/png,image/webp"
-                            onChange={(event) => { takeProductPhoto(event.target.files?.[0] || null, "No file chosen."); event.target.value = ""; }}
-                            type="file"
-                          />
-                        </label>
-                        {productPhotoDraft.dataUrl && (
-                          <button className="remove-button" onClick={() => { setProductPhotoDraft({ dataUrl: null, changed: true }); setProductPhotoMessage("The photo is removed when you press Save."); }} type="button">Remove photo</button>
-                        )}
-                      </div>
-                      {productPhotoMessage && <small className="product-photo-message" role="status">{productPhotoMessage}</small>}
-                      {productPhotosState.message && <small className="product-photo-message product-photo-message-error">{productPhotosState.message}</small>}
-                    </div>
-                  </div>
+                      {label}
+                    </button>
+                  ))}
                 </div>
-                <Field label="Remarks"><textarea value={productRemarks} onChange={(event) => setProductRemarks(event.target.value)} /></Field>
-                {!editingProductId && <label className="check-field"><input type="checkbox" checked={addOpeningStock} onChange={(event) => setAddOpeningStock(event.target.checked)} /><span>Add Opening Stock</span></label>}
-                {addOpeningStock && !editingProductId && (
-                  <div className="lot-entry-panel">
-                    <div className="form-grid supplier-form-grid">
-                      <Field label="Supplier (Optional)">
-                        <select value={openingStockDraft.supplier_id} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, supplier_id: event.target.value })}>
-                          <option value="">No supplier payable</option>
-                          {activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.supplier_name}</option>)}
+              </ModuleCard>
+
+              {productMasterTab === "categories" && (
+                <ModuleCard eyebrow="Categories" title="Product categories" subtitle="Group products for the POS and reports. A category that has products can only be deactivated, never deleted.">
+                  <div className="pm-inline-form">
+                    <Field label="New category">
+                      <input value={newProductCategoryName} onChange={(event) => setNewProductCategoryName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") saveProductCategory(); }} placeholder="Example: Mango" />
+                    </Field>
+                    <button className="primary-button" onClick={saveProductCategory} type="button">Add category</button>
+                  </div>
+                  <DataTable className="pm-table pm-category-table" headers={["Category", <span className="pm-num-head" key="products">Products</span>, "Status", "Actions"]}>
+                    {productCategories.map((category) => (
+                      <tr key={category.id}>
+                        <td className="pm-cell-strong">{category.category_name}</td>
+                        <td className="pm-num">{formatOptionalCount(category.item_count)}</td>
+                        <td><span className={isActiveRecord(category) ? "stock-ok" : "tag"}>{isActiveRecord(category) ? "Active" : "Inactive"}</span></td>
+                        <td>
+                          <div className="pm-row-actions">
+                            <button className="table-action" onClick={() => editProductCategory(category)} type="button">Rename</button>
+                            {isActiveRecord(category) && <button className="danger-text-button" onClick={() => deactivateProductCategory(category)} type="button">Deactivate</button>}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                    {productCategories.length === 0 && <tr><td colSpan="4" className="empty-cell">No categories yet. Add your first category above.</td></tr>}
+                  </DataTable>
+                </ModuleCard>
+              )}
+
+              {productMasterTab === "products" && (
+                <>
+                  <ModuleCard eyebrow="Catalogue" title="All products" subtitle="Inactive products stay in past bills and reports but are hidden from the POS.">
+                    <div className="pm-toolbar">
+                      <label className="pm-toolbar-search">
+                        <span>Search</span>
+                        <span className="icon-input">
+                          <Icon name="search" />
+                          <input
+                            placeholder="Name, category or barcode"
+                            type="search"
+                            value={productListSearch}
+                            onChange={(event) => setProductListSearch(event.target.value)}
+                          />
+                        </span>
+                      </label>
+                      <Field label="Category">
+                        <select value={productCategoryFilter} onChange={(event) => setProductCategoryFilter(event.target.value)}>
+                          <option value="">All categories</option>
+                          {activeProductCategories.map((category) => <option key={category.id} value={canonicalInventoryId(category.id)}>{category.category_name}</option>)}
                         </select>
                       </Field>
-                      <Field label="Lot Name / Number"><input value={openingStockDraft.lot_name} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_name: event.target.value })} placeholder="Lot A" /></Field>
-                      <Field label="Size / Grade"><input value={openingStockDraft.lot_size} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_size: event.target.value })} placeholder="Small / Premium" /></Field>
-                      <Field label="Quantity"><input type="number" min="0" step="0.001" value={openingStockDraft.quantity} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, quantity: event.target.value })} /></Field>
-                      <Field label="Purchase Rate / Opening Cost"><input type="number" min="0" step="0.01" value={openingStockDraft.purchase_rate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, purchase_rate: event.target.value })} /></Field>
-                      <Field label="Sale Rate"><input type="number" min="0" step="0.01" value={openingStockDraft.sale_rate || sellingRate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, sale_rate: event.target.value })} /></Field>
-                      <Field label="Opening Stock Date"><input type="date" value={openingStockDraft.opening_stock_date} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, opening_stock_date: event.target.value })} /></Field>
-                      <Field label="Lot Remarks"><input value={openingStockDraft.remarks} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, remarks: event.target.value })} /></Field>
+                      <Field label="Status">
+                        <select value={productStatusFilter} onChange={(event) => setProductStatusFilter(event.target.value)}>
+                          {PRODUCT_STATUS_FILTERS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                        </select>
+                      </Field>
                     </div>
-                    <button className="secondary-button" onClick={addOpeningStockLot}>Add Opening Stock Lot</button>
-                    <DataTable className="product-entry-table product-entry-lot-table" headers={["Supplier", "Lot", "Size", "Qty", "Cost", "Sale Rate", "Date", "Remarks", "Actions"]}>
-                      {openingStockLots.map((lot, index) => (
-                        <tr key={`${lot.lot_name}-${lot.opening_stock_date}-${index}`}>
-                          <td>{lot.supplier_name || "-"}</td>
-                          <td className="primary-cell product-name-cell" title={lot.lot_name || "-"}>{lot.lot_name || "-"}</td>
-                          <td title={lot.lot_size || "-"}>{lot.lot_size || "-"}</td>
-                          <td>{lot.quantity}</td>
-                          <td>{currency.format(Number(lot.purchase_rate || 0))}</td>
-                          <td>{currency.format(Number(lot.sale_rate || sellingRate || 0))}</td>
-                          <td>{lot.opening_stock_date}</td>
-                          <td title={lot.remarks || "-"}>{lot.remarks || "-"}</td>
-                          <td><button className="remove-button" onClick={() => setOpeningStockLots((current) => current.filter((_, lotIndex) => lotIndex !== index))}>Remove</button></td>
-                        </tr>
-                      ))}
-                      {openingStockLots.length === 0 && <tr><td colSpan="9" className="empty-cell">Add one or more opening stock lots before saving.</td></tr>}
-                    </DataTable>
-                  </div>
-                )}
-                {lotPanelProduct && (
-                  <div className="lot-entry-panel">
-                    <div className="report-toolbar">
-                      <div>
-                        <span className="eyebrow">Opening Stock / Lots</span>
-                        <h3>{lotPanelProduct.product_name}</h3>
-                        <p className="form-note">Existing inventory lots are editable here. Quantity cannot be reduced below stock already sold, wasted or otherwise used.</p>
-                      </div>
-                      <button className="secondary-button" onClick={() => loadProductLots(lotPanelProduct, true)}>Refresh Lots</button>
+                    <div className="pm-list-meta">
+                      <span>{`Showing ${filteredProducts.length} of ${products.length}`}</span>
+                      <label className="check-field pm-check">
+                        <input checked={showMoreProductColumns} type="checkbox" onChange={(event) => setShowMoreProductColumns(event.target.checked)} />
+                        <span>Show more columns</span>
+                      </label>
                     </div>
-                    <label className="icon-input table-search-input">
-                      <Icon name="search" />
-                      <input
-                        placeholder="Search lot, supplier, size..."
-                        value={lotListSearch}
-                        onChange={(event) => setLotListSearch(event.target.value)}
-                      />
-                    </label>
-                    <label className="check-field report-check-field">
-                      <input checked={showEmptyLots} type="checkbox" onChange={(event) => setShowEmptyLots(event.target.checked)} />
-                      <span>Show Empty Lots</span>
-                    </label>
-                    <DataTable className="product-entry-table product-entry-lot-table" headers={["Supplier", "Lot", "Size/Grade", "Opening Date", "Opening Qty", "Sold Qty", "Balance Qty", "Cost", "Sale Rate", "Remarks", "Actions"]}>
-                      {filteredProductLots.length ? filteredProductLots.map((lot) => (
-                        <tr key={lot.id}>
-                          <td title={lot.supplier_name || "No supplier payable"}>{lot.supplier_name || "No supplier payable"}</td>
-                          <td className="primary-cell product-name-cell" title={lot.lot_name || lot.batch_no || `Lot #${lot.id}`}>{lot.lot_name || lot.batch_no || `Lot #${lot.id}`}<small className={`cell-note ${lotStatusClass(lot)}`}>{lotStatusLabel(lot)}</small></td>
-                          <td title={lot.lot_size || "-"}>{lot.lot_size || "-"}</td>
-                          <td>{formatDisplayDate(lot.purchase_date)}</td>
-                          <td>{Number(lot.purchase_qty || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
-                          <td>{Number(lot.sold_qty || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
-                          <td>{Number(lot.balance_qty ?? lot.remaining_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
-                          <td>{currency.format(Number(lot.purchase_rate || lot.effective_cost_per_unit || 0))}</td>
-                          <td>{currency.format(Number(lot.temporary_sale_rate || lot.selling_rate || 0))}</td>
-                          <td title={lot.remarks || "-"}>{lot.remarks || "-"}</td>
-                          <td>
-                            <div className="button-row table-actions-row">
-                              <button className="table-action" onClick={() => openLotAction("edit", lot)}>Edit</button>
-                              <button className="table-action" disabled={lot.batch_status === "CANCELLED"} onClick={() => openLotAction("add", lot)}>Add Quantity</button>
-                              <button className="table-action" disabled={lot.batch_status === "CANCELLED"} onClick={() => openLotAction("adjust", lot)}>Adjust</button>
-                              <button className="remove-button" disabled={lot.batch_status === "CANCELLED"} onClick={() => openLotAction("deactivate", lot)}>Deactivate</button>
-                            </div>
+                    <DataTable
+                      className="pm-table product-entry-item-table"
+                      headers={[
+                        "Product",
+                        "Unit",
+                        <span className="pm-num-head" key="sale">Sale price</span>,
+                        <span className="pm-num-head" key="stock">In stock</span>,
+                        ...productMoreColumnHeaders.map((header) => (header === "Low-stock alert at" || header === "Lots" ? <span className="pm-num-head" key={header}>{header}</span> : header)),
+                        "Status",
+                        "Actions",
+                      ]}
+                    >
+                      {filteredProducts.map((product) => {
+                        const thumbnail = photoForProduct(productPhotoIndex, product);
+                        const productActiveNow = isActiveRecord(product);
+                        const lowStock = isLowStock(product);
+                        const unitName = unitDisplayName(product.unit);
+                        const stockText = formatOptionalQuantity(product.current_stock);
+                        const productNote = [productCategoryLabel(product), String(product.remarks || "").trim()].filter(Boolean).join(" · ");
+                        return (
+                          <tr key={product.id}>
+                            <td>
+                              <div className="pm-product-cell">
+                                {thumbnail
+                                  ? <img alt="" className="pm-thumb" src={thumbnail} />
+                                  : <span aria-hidden="true" className="pm-thumb pm-thumb-empty">{String(product.product_name || "?").trim().charAt(0).toUpperCase()}</span>}
+                                <span className="pm-product-text">
+                                  <span className="pm-product-name pm-cell-strong" title={product.product_name || ""}>{product.product_name || MISSING_VALUE}</span>
+                                  {productNote && <small className="pm-product-note" title={productNote}>{productNote}</small>}
+                                </span>
+                              </div>
+                            </td>
+                            <td>{unitName}</td>
+                            <td className="pm-num">{formatOptionalMoney(product.selling_rate, currency)}</td>
+                            <td className={lowStock ? "pm-num pm-stock-low" : "pm-num"}>
+                              {stockText}{stockText !== MISSING_VALUE && unitName !== MISSING_VALUE ? ` ${unitName}` : ""}
+                              {lowStock && <small className="pm-low-flag">Low</small>}
+                            </td>
+                            {showMoreProductColumns && (
+                              <>
+                                <td title={product.barcode || ""}>{product.barcode || MISSING_VALUE}</td>
+                                <td>{{ LOCAL: "Local", IMPORTED: "Imported" }[String(product.origin_type || "").toUpperCase()] || product.origin_type || MISSING_VALUE}</td>
+                                <td className="pm-num">{formatOptionalQuantity(product.minimum_stock)}</td>
+                                <td className="pm-num">{formatOptionalCount(product.lot_count)}</td>
+                              </>
+                            )}
+                            <td><span className={productActiveNow ? "stock-ok" : "tag"}>{productActiveNow ? "Active" : "Inactive"}</span></td>
+                            <td>
+                              <div className="pm-row-actions">
+                                <button className="table-action" onClick={() => editProduct(product)} type="button">Edit</button>
+                                <button className="table-action" onClick={() => openProductStockLots(product)} type="button">Stock lots</button>
+                                {productActiveNow && <button className="danger-text-button" onClick={() => deactivateProduct(product)} type="button">Deactivate</button>}
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                      {filteredProducts.length === 0 && (
+                        <tr>
+                          <td colSpan={6 + productMoreColumnHeaders.length} className="empty-cell">
+                            {productListEmptyMessage({ totalCount: products.length, search: productListSearch, filtered: productListFiltered })}
                           </td>
                         </tr>
-                      )) : (
-                        <tr><td colSpan="11" className="empty-cell">{productLots.length ? (showEmptyLots ? "No matching lots found." : "No active lots found. Enable Show Empty Lots to view sold-out lots.") : "No lots found for this product."}</td></tr>
                       )}
                     </DataTable>
-                    <div className="button-row">
-                      <button className="secondary-button" onClick={() => {
-                        resetOpeningStockDraft();
-                        setAddOpeningStock(true);
-                        setShowOpeningLotForm(true);
-                      }}>Add New Opening Stock Lot</button>
-                    </div>
-                    {showOpeningLotForm && (
-                      <div className="lot-entry-panel">
-                        <div className="report-toolbar">
-                          <div>
-                            <span className="eyebrow">New Opening Lot</span>
-                            <h3>Add lot for {lotPanelProduct.product_name}</h3>
-                            <p className="form-note">This creates a separate opening stock batch for the same item. Existing lots are not overwritten or merged.</p>
-                          </div>
-                        </div>
-                        <div className="form-grid supplier-form-grid">
-                          <Field label="Supplier / Supplier Payable">
-                            <select value={openingStockDraft.supplier_id} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, supplier_id: event.target.value })}>
-                              <option value="">No supplier payable</option>
-                              {activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.supplier_name}</option>)}
+                  </ModuleCard>
+
+                  <ModuleCard id="product-item-form" eyebrow={editingProductId ? "Edit product" : "New product"} title={editingProductId ? `Edit ${productEditingName}` : "Add product"} subtitle="Used by the POS, purchases, stock and reports.">
+                    <div className="pm-form-section">
+                      <h3>Basics</h3>
+                      <div className="form-grid supplier-form-grid">
+                        <Field label={<RequiredLabel>Product name</RequiredLabel>}><input value={productName} onChange={(event) => setProductName(event.target.value)} placeholder="Example: Kesar mango" /></Field>
+                        <div className="pm-category-field">
+                          <Field label="Category">
+                            <select value={productCategoryId} onChange={(event) => {
+                              const selected = productCategories.find((category) => String(category.id) === event.target.value);
+                              setProductCategoryId(event.target.value);
+                              setProductCategory(selected?.category_name || "");
+                            }}>
+                              <option value="">{productCategory.trim() ? `Not chosen (saves as ${productCategory.trim()})` : "Choose a category"}</option>
+                              {activeProductCategories.map((category) => <option key={category.id} value={category.id}>{category.category_name}</option>)}
                             </select>
                           </Field>
-                          <Field label="Lot Name / Number"><input value={openingStockDraft.lot_name} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_name: event.target.value })} placeholder="Opening Lot 1" /></Field>
-                          <Field label="Size / Grade"><input value={openingStockDraft.lot_size} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_size: event.target.value })} placeholder="Small / Medium / Premium" /></Field>
-                          <Field label="Quantity"><input type="number" min="0" step="0.001" value={openingStockDraft.quantity} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, quantity: event.target.value })} /></Field>
-                          <Field label="Purchase Rate / Opening Cost"><input type="number" min="0" step="0.01" value={openingStockDraft.purchase_rate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, purchase_rate: event.target.value })} /></Field>
-                          <Field label="Sale Rate"><input type="number" min="0" step="0.01" value={openingStockDraft.sale_rate || sellingRate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, sale_rate: event.target.value })} /></Field>
-                          <Field label="Opening Stock Date"><input type="date" value={openingStockDraft.opening_stock_date} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, opening_stock_date: event.target.value })} /></Field>
-                          <Field label="Lot Remarks"><input value={openingStockDraft.remarks} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, remarks: event.target.value })} /></Field>
+                          <button aria-expanded={showInlineCategoryForm} className="pm-link-button" onClick={() => setShowInlineCategoryForm((current) => !current)} type="button">
+                            {showInlineCategoryForm ? "Close new category" : "+ New category"}
+                          </button>
+                          {showInlineCategoryForm && (
+                            <div className="pm-inline-form pm-inline-form-compact">
+                              <Field label="New category name"><input value={newProductCategoryName} onChange={(event) => setNewProductCategoryName(event.target.value)} placeholder="Example: Mango" /></Field>
+                              <button className="secondary-button" onClick={saveProductCategory} type="button">Save category</button>
+                            </div>
+                          )}
                         </div>
-                        <div className="button-row">
-                          <button
-  type="button"
-  className="primary-button"
-  onClick={saveNewOpeningStockLot}
->
-  Save Lot
-</button>
-                          <button className="secondary-button" onClick={() => {
-                            resetOpeningStockDraft();
-                            setShowOpeningLotForm(false);
-                            setAddOpeningStock(false);
-                          }}>Cancel</button>
+                        <Field label={<RequiredLabel>Unit</RequiredLabel>}>
+                          <select value={unit} onChange={(event) => setUnit(event.target.value)}>
+                            <option value="">Choose a unit</option>
+                            {PRODUCT_UNITS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                          </select>
+                        </Field>
+                      </div>
+                      <div className="product-photo-field">
+                        <span className="product-photo-label">Photo</span>
+                        <div className="product-photo-row">
+                          {/* Paste lands here: in the browser, right-click a photo, "Copy image", then click this box and press Ctrl+V. */}
+                          <div
+                            aria-label="Product photo. Click, then press Ctrl+V to paste a copied photo."
+                            className={productPhotoDraft.dataUrl ? "product-photo-drop product-photo-drop-filled" : "product-photo-drop"}
+                            onDragOver={(event) => event.preventDefault()}
+                            onDrop={pasteProductPhoto}
+                            onPaste={pasteProductPhoto}
+                            role="button"
+                            tabIndex={0}
+                          >
+                            {productPhotoDraft.dataUrl
+                              ? <img alt="" src={productPhotoDraft.dataUrl} />
+                              : <span>Click here, then Ctrl+V</span>}
+                          </div>
+                          <div className="product-photo-actions">
+                            <p>On Google Images or Pinterest, right-click the photo and choose "Copy image". Then click the box and press Ctrl+V. Or save the photo and choose the file.</p>
+                            <div className="button-row">
+                              <label className="secondary-button product-photo-file">
+                                Choose file
+                                <input
+                                  accept="image/jpeg,image/png,image/webp"
+                                  onChange={(event) => { takeProductPhoto(event.target.files?.[0] || null, "No file chosen."); event.target.value = ""; }}
+                                  type="file"
+                                />
+                              </label>
+                              {productPhotoDraft.dataUrl && (
+                                <button className="danger-text-button" onClick={() => { setProductPhotoDraft({ dataUrl: null, changed: true }); setProductPhotoMessage("The photo is removed when you press Save."); }} type="button">Remove photo</button>
+                              )}
+                            </div>
+                            {productPhotoMessage && <small className="product-photo-message" role="status">{productPhotoMessage}</small>}
+                            {productPhotosState.message && <small className="product-photo-message product-photo-message-error">{productPhotosState.message}</small>}
+                          </div>
                         </div>
                       </div>
-                    )}
-                    {productLotAudit.length > 0 && (
-                      <div className="lot-audit-panel">
-                        <h3>Lot Audit Trail</h3>
-                        <DataTable headers={["Action", "Edited At", "Edited By", "Reason"]}>
-                          {productLotAudit.map((entry) => (
-                            <tr key={entry.id}>
-                              <td className="primary-cell">{entry.action}</td>
-                              <td>{formatDisplayDate(entry.edited_at)}</td>
-                              <td>{entry.edited_by_name || entry.edited_by || "-"}</td>
-                              <td>{entry.reason || "-"}</td>
-                            </tr>
-                          ))}
-                        </DataTable>
-                      </div>
-                    )}
-                  </div>
-                )}
-                <div className="button-row">
-                  <button className="primary-button" onClick={addProduct}>{editingProductId ? "Update Item" : "Add Item"}</button>
-                  {editingProductId && <button className="secondary-button" onClick={cancelProductEdit}>Cancel Edit</button>}
-                </div>
-              </ModuleCard>
+                    </div>
 
-              <ModuleCard eyebrow="Item List" title="Category-Wise Items" subtitle="Inactive items stay in history but are hidden from POS by default.">
-                <label className="icon-input table-search-input">
-                  <Icon name="search" />
-                  <input
-                    placeholder="Search item, category, barcode..."
-                    value={productListSearch}
-                    onChange={(event) => setProductListSearch(event.target.value)}
-                  />
-                </label>
-                <DataTable className="product-entry-table product-entry-item-table" headers={["Category", "Item", "Barcode", "Origin", "Sale Rate", "Min Stock", "Stock", "Lots", "Unit", "Status", "Actions"]}>
-                  {filteredProducts.map((product) => (
-                    <tr key={product.id}>
-                      <td title={product.category_name || product.category || "Fruit"}>{product.category_name || product.category || "Fruit"}</td>
-                      <td className="primary-cell product-name-cell" title={product.product_name || "-"}>{product.product_name}<small className="cell-note">{product.remarks || ""}</small></td>
-                      <td title={product.barcode || "-"}>{product.barcode || "-"}</td>
-                      <td><span className="tag">{product.origin_type || "LOCAL"}</span></td>
-                      <td>{currency.format(Number(product.selling_rate))}</td>
-                      <td>{product.minimum_stock || 0}</td>
-                      <td>{Number(product.current_stock || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
-                      <td>{product.lot_count || 0}</td>
-                      <td><span className="tag">{product.unit}</span></td>
-                      <td><span className={product.active !== false ? "stock-ok" : "stock-low"}>{product.active !== false ? "Active" : "Inactive"}</span></td>
-                      <td>
-                        <div className="button-row table-actions-row">
-                          <button className="table-action" onClick={() => editProduct(product)}>Edit</button>
-                          <button className="table-action" onClick={() => loadProductLots(product, true)}>View Lots / Edit Lots</button>
-                          <button className="remove-button" disabled={product.active === false} onClick={() => deactivateProduct(product)}>Deactivate</button>
+                    <div className="pm-form-section">
+                      <h3>Price</h3>
+                      <div className="form-grid supplier-form-grid">
+                        <Field label={<RequiredLabel>Sale price (₹ per unit)</RequiredLabel>}><input type="number" min="0" step="0.01" value={sellingRate} onChange={(event) => setSellingRate(event.target.value)} /></Field>
+                      </div>
+                    </div>
+
+                    <div className="pm-form-section">
+                      <h3>Stock</h3>
+                      <div className="form-grid supplier-form-grid">
+                        <Field label="Low-stock alert at"><input type="number" min="0" step="0.001" value={productMinimumStock} onChange={(event) => setProductMinimumStock(event.target.value)} /></Field>
+                      </div>
+                      {editingProductId && <p className="pm-hint">To add stock or correct a count, use the stock lots below.</p>}
+                      {!editingProductId && !showOpeningLotForm && (
+                        <label className="check-field pm-check"><input type="checkbox" checked={addOpeningStock} onChange={(event) => setAddOpeningStock(event.target.checked)} /><span>This product already has stock in the shop</span></label>
+                      )}
+                      {addOpeningStock && !editingProductId && !showOpeningLotForm && (
+                        <div className="lot-entry-panel pm-lot-editor">
+                          <p className="pm-hint">Enter each lot of existing stock. The lots are saved together with the product.</p>
+                          {openingLotFields}
+                          <div className="button-row">
+                            <button className="secondary-button" onClick={addOpeningStockLot} type="button"><Icon name="add" size={15} />Add lot</button>
+                          </div>
+                          <DataTable className="pm-table" headers={["Supplier", "Lot name", "Grade", <span className="pm-num-head" key="qty">Quantity</span>, <span className="pm-num-head" key="cost">Cost price</span>, <span className="pm-num-head" key="sale">Sale price</span>, "Stock date", "Notes", ""]}>
+                            {openingStockLots.map((lot, index) => (
+                              <tr key={`${lot.lot_name}-${lot.opening_stock_date}-${index}`}>
+                                <td>{lot.supplier_name || "None"}</td>
+                                <td className="pm-cell-strong" title={lot.lot_name || ""}>{lot.lot_name || MISSING_VALUE}</td>
+                                <td title={lot.lot_size || ""}>{lot.lot_size || MISSING_VALUE}</td>
+                                <td className="pm-num">{formatOptionalQuantity(lot.quantity)}</td>
+                                <td className="pm-num">{formatOptionalMoney(lot.purchase_rate, currency)}</td>
+                                <td className="pm-num">{formatOptionalMoney(pickRate(lot.sale_rate, sellingRate), currency)}</td>
+                                <td>{lot.opening_stock_date ? formatDisplayDate(lot.opening_stock_date) : MISSING_VALUE}</td>
+                                <td title={lot.remarks || ""}>{lot.remarks || MISSING_VALUE}</td>
+                                <td><button className="danger-text-button" onClick={() => setOpeningStockLots((current) => current.filter((_, lotIndex) => lotIndex !== index))} type="button">Remove</button></td>
+                              </tr>
+                            ))}
+                            {openingStockLots.length === 0 && <tr><td colSpan="9" className="empty-cell">No lots added yet. Fill in the lot above and press Add lot.</td></tr>}
+                          </DataTable>
                         </div>
-                      </td>
-                    </tr>
-                  ))}
-                  {filteredProducts.length === 0 && <tr><td colSpan="11" className="empty-cell">No matching items found.</td></tr>}
-                </DataTable>
-              </ModuleCard>
+                      )}
+                    </div>
+
+                    <details className="pm-details">
+                      <summary>More options</summary>
+                      <div className="pm-details-body">
+                        <div className="form-grid supplier-form-grid">
+                          <Field label="Barcode"><input value={productBarcode} onChange={(event) => setProductBarcode(event.target.value)} placeholder="Optional" /></Field>
+                          <Field label="Origin">
+                            <select value={productOriginType} onChange={(event) => setProductOriginType(event.target.value)}>
+                              <option value="LOCAL">Local</option>
+                              <option value="IMPORTED">Imported</option>
+                            </select>
+                          </Field>
+                        </div>
+                        <Field label="Notes"><textarea value={productRemarks} onChange={(event) => setProductRemarks(event.target.value)} /></Field>
+                        <label className="check-field pm-check"><input type="checkbox" checked={productActive} onChange={(event) => setProductActive(event.target.checked)} /><span>Available for sale</span></label>
+                      </div>
+                    </details>
+
+                    <div className="pm-save-row">
+                      <button className="primary-button" onClick={addProduct} type="button">{editingProductId ? "Save changes" : "Save product"}</button>
+                      <button className="secondary-button" onClick={cancelProductEdit} type="button">Cancel</button>
+                      <span className="pm-required-legend"><span aria-hidden="true" className="pm-required">*</span> Required</span>
+                    </div>
+                  </ModuleCard>
+
+                  {lotPanelProduct && (
+                    <ModuleCard id="product-lots-card" eyebrow="Stock lots" title={`Stock lots — ${lotPanelProduct.product_name}`} subtitle="Each delivery or opening count is its own lot. A lot's quantity cannot go below what has already been sold or used.">
+                      <div className="pm-toolbar pm-lot-toolbar">
+                        <label className="pm-toolbar-search">
+                          <span>Search lots</span>
+                          <span className="icon-input">
+                            <Icon name="search" />
+                            <input
+                              placeholder="Lot, supplier or grade"
+                              type="search"
+                              value={lotListSearch}
+                              onChange={(event) => setLotListSearch(event.target.value)}
+                            />
+                          </span>
+                        </label>
+                        <label className="check-field pm-check">
+                          <input checked={showEmptyLots} type="checkbox" onChange={(event) => setShowEmptyLots(event.target.checked)} />
+                          <span>Show sold-out lots</span>
+                        </label>
+                        <div className="pm-toolbar-actions">
+                          <button className="secondary-button" onClick={() => loadProductLots(lotPanelProduct, true)} type="button"><Icon name="refresh" size={15} />Refresh</button>
+                          <button className="secondary-button" onClick={closeProductStockLots} type="button">Close</button>
+                        </div>
+                      </div>
+                      <DataTable
+                        className="pm-table pm-lot-table"
+                        headers={["Lot", "Supplier", "Grade", "Stock date", <span className="pm-num-head" key="qty">Quantity</span>, <span className="pm-num-head" key="sold">Sold</span>, <span className="pm-num-head" key="in">In stock</span>, <span className="pm-num-head" key="cost">Cost price</span>, <span className="pm-num-head" key="sale">Sale price</span>, "Actions"]}
+                      >
+                        {filteredProductLots.length ? filteredProductLots.map((lot) => {
+                          const lotLabel = lot.lot_name || lot.batch_no || `Lot #${lot.id}`;
+                          const lotCancelled = lot.batch_status === "CANCELLED";
+                          const lotNotes = String(lot.remarks || "").trim();
+                          return (
+                            <tr key={lot.id}>
+                              <td className="pm-lot-cell" title={lotNotes ? `${lotLabel} · ${lotNotes}` : lotLabel}>
+                                <span className="pm-cell-strong">{lotLabel}</span>
+                                <small className="pm-product-note"><span className={lotStatusClass(lot)}>{lotStatusLabel(lot)}</span>{lotNotes ? ` · ${lotNotes}` : ""}</small>
+                              </td>
+                              <td title={lot.supplier_name || "None"}>{lot.supplier_name || "None"}</td>
+                              <td title={lot.lot_size || ""}>{lot.lot_size || MISSING_VALUE}</td>
+                              <td>{lot.purchase_date ? formatDisplayDate(lot.purchase_date) : MISSING_VALUE}</td>
+                              <td className="pm-num">{formatOptionalQuantity(lot.purchase_qty)}</td>
+                              <td className="pm-num">{formatOptionalQuantity(lot.sold_qty)}</td>
+                              <td className="pm-num">{formatOptionalQuantity(pickQuantity(lot.balance_qty, lot.remaining_qty))}</td>
+                              <td className="pm-num">{formatOptionalMoney(pickRate(lot.purchase_rate, lot.effective_cost_per_unit), currency)}</td>
+                              <td className="pm-num">{formatOptionalMoney(pickRate(lot.temporary_sale_rate, lot.selling_rate), currency)}</td>
+                              <td>
+                                <div className="pm-row-actions">
+                                  <button className="table-action" onClick={() => openLotAction("edit", lot)} type="button">Edit</button>
+                                  <button className="table-action" disabled={lotCancelled} onClick={() => openLotAction("add", lot)} type="button">Add quantity</button>
+                                  <button className="table-action" disabled={lotCancelled} onClick={() => openLotAction("adjust", lot)} type="button">Correct count</button>
+                                  <button className="danger-text-button" disabled={lotCancelled} onClick={() => openLotAction("deactivate", lot)} type="button">Deactivate</button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        }) : (
+                          <tr><td colSpan="10" className="empty-cell">{lotListEmptyMessage({ totalCount: productLots.length, search: lotListSearch, showSoldOut: showEmptyLots })}</td></tr>
+                        )}
+                      </DataTable>
+                      {!showOpeningLotForm && (
+                        lotPanelAcceptsNewLot
+                          ? (
+                            <div className="button-row">
+                              <button className="secondary-button" onClick={() => {
+                                resetOpeningStockDraft();
+                                setAddOpeningStock(true);
+                                setShowOpeningLotForm(true);
+                              }} type="button"><Icon name="add" size={15} />Add stock lot</button>
+                            </div>
+                          )
+                          : <p className="pm-notice">{`You are editing ${productEditingName}. Save or cancel that first to add a lot to ${lotPanelProduct.product_name}.`}</p>
+                      )}
+                      {showOpeningLotForm && (
+                        <div className="lot-entry-panel pm-lot-editor">
+                          <div>
+                            <h3>{`New stock lot for ${lotPanelProduct.product_name}`}</h3>
+                            <p className="pm-hint">This adds a separate lot. Existing lots are not changed or merged.</p>
+                          </div>
+                          {openingLotFields}
+                          <div className="button-row">
+                            <button className="primary-button" onClick={saveNewOpeningStockLot} type="button">Save lot</button>
+                            <button className="secondary-button" onClick={() => {
+                              resetOpeningStockDraft();
+                              setShowOpeningLotForm(false);
+                              setAddOpeningStock(false);
+                            }} type="button">Cancel</button>
+                          </div>
+                        </div>
+                      )}
+                      {productLotAudit.length > 0 && (
+                        <details className="pm-details">
+                          <summary>{`Change history (${productLotAudit.length})`}</summary>
+                          <div className="pm-details-body">
+                            <DataTable className="pm-table" headers={["Change", "When", "By", "Reason"]}>
+                              {productLotAudit.map((entry) => (
+                                <tr key={entry.id}>
+                                  <td className="pm-cell-strong">{entry.action}</td>
+                                  <td>{entry.edited_at ? formatDisplayDate(entry.edited_at) : MISSING_VALUE}</td>
+                                  <td>{entry.edited_by_name || entry.edited_by || MISSING_VALUE}</td>
+                                  <td>{entry.reason || MISSING_VALUE}</td>
+                                </tr>
+                              ))}
+                            </DataTable>
+                          </div>
+                        </details>
+                      )}
+                    </ModuleCard>
+                  )}
+                </>
+              )}
             </section>
           )}
 
           {activeView === "purchase" && (
             <section className="settings-layout">
               {purchases.some((purchase) => purchase.operation_id) && (
-                <ModuleCard eyebrow="Offline Replay" title="Queued Purchase Arrivals" subtitle="Local purchase intent remains visible until the cloud acknowledges it.">
+                <ModuleCard eyebrow="Saved while offline" title="Purchases waiting to send" subtitle="Purchases entered on this computer stay listed here until the cloud has them.">
                   <DataTable headers={["Reference", "Purchase Date", "Bill State", "Sync State", "Detail"]}>
                     {Array.from(new Map(
                       purchases
@@ -9706,8 +9901,8 @@ function App() {
                         <td className="primary-cell">{purchase.provisional_reference || purchase.offline_purchase_ref}</td>
                         <td>{purchase.purchase_date}</td>
                         <td>{purchase.purchase_bill_status === "BILL_PENDING" ? "Pending Bill" : purchase.purchase_type === "CASH" ? "Paid Purchase" : "Credit Purchase"}</td>
-                        <td><span className={purchase.sync_status === "completed" ? "stock-ok" : purchase.sync_status === "failed" || purchase.sync_status === "conflict" ? "stock-low" : "origin-rate"}>{purchase.sync_status === "syncing" ? "Syncing" : purchase.sync_status === "completed" ? "Cloud Confirmed" : purchase.sync_status === "failed" ? "Failed - Retry Available" : purchase.sync_status === "conflict" ? "Conflict - Review Required" : "Pending Cloud Acknowledgement"}</span></td>
-                        <td>{purchase.last_error || (purchase.sync_status === "completed" ? "Canonical purchase and lot IDs reconciled" : "Stored safely in local SQLite")}</td>
+                        <td><span className={purchase.sync_status === "completed" ? "stock-ok" : purchase.sync_status === "failed" || purchase.sync_status === "conflict" ? "stock-low" : "origin-rate"}>{purchase.sync_status === "syncing" ? "Sending" : purchase.sync_status === "completed" ? "Sent to cloud" : purchase.sync_status === "failed" ? "Not sent - can be retried" : purchase.sync_status === "conflict" ? "Clashes with cloud - needs checking" : "Waiting to send"}</span></td>
+                        <td>{purchase.last_error || (purchase.sync_status === "completed" ? "Sent, and matched to the cloud copy" : "Saved safely on this computer")}</td>
                       </tr>
                     ))}
                   </DataTable>
@@ -9745,7 +9940,7 @@ function App() {
                       <tr key={purchase.id}>
                         <td><span className="batch-id">#{purchase.id}</span></td>
                         <td className="primary-cell">{purchase.product_name}<small className="cell-note">{purchase.batch_no || "-"}</small></td>
-                        <td>{Number(purchase.quantity || 0).toLocaleString("en-IN")} {purchase.unit || ""}</td>
+                        <td>{Number(purchase.quantity || 0).toLocaleString("en-IN")} {purchase.unit ? labelFor("unit", purchase.unit) : ""}</td>
                         <td>{currency.format(Number(purchase.purchase_rate || purchase.expected_purchase_rate || 0))}</td>
                         <td><span className={purchase.purchase_status === "CANCELLED" ? "stock-low" : purchase.purchase_bill_status === "BILL_PENDING" ? "origin-rate" : "stock-ok"}>{purchase.purchase_status === "CANCELLED" ? "Cancelled" : purchase.purchase_bill_status === "BILL_PENDING" ? "Pending Bill" : "Completed Bill"}</span></td>
                         <td>{currency.format(Number(purchase.net_payable || purchase.total_amount || 0))}</td>
@@ -9842,8 +10037,8 @@ function App() {
                         <td className="primary-cell">{item.product_name}</td>
                         <td>{item.lot_name || "-"}{item.lot_size ? ` / ${item.lot_size}` : ""}</td>
                         <td>{item.quantity}</td>
-                        <td>{item.unit}</td>
-                        <td><span className="origin-rate">{item.origin_type}</span></td>
+                        <td>{labelFor("unit", item.unit)}</td>
+                        <td><span className="origin-rate">{labelFor("origin", item.origin_type)}</span></td>
                         <td>{currency.format(Number(item.purchase_rate || item.expected_purchase_rate || 0))}</td>
                         <td>{item.temporary_sale_rate ? currency.format(Number(item.temporary_sale_rate)) : "-"}</td>
                         <td>{item.remarks || "-"}</td>
@@ -10201,8 +10396,28 @@ function App() {
           {activeView === "branches" && (
             // Promoted out of Settings. Adding a shop or a counter is not a preference to be
             // adjusted once and forgotten -- it is the thing that decides which stock a machine
-            // sells from, so it belongs where a person can find it without hunting.
-            <OperationalScopeManagement canManage={settingsData.canManageSettings} user={user} />
+            // sells from, so it belongs where a person can find it without hunting. The device
+            // licence and the screen lock followed on 27 Sep 2026: approving a phone here and
+            // licensing it in Settings was one job split across two screens.
+            <ModuleErrorBoundary onClose={() => setActiveView("dashboard")}>
+              <OperationalScopeManagement
+                canManage={settingsData.canManageSettings}
+                canManageDevices={canManageRates}
+                focusSection={pendingSection}
+                onFocusSectionHandled={() => setPendingSection(null)}
+                onReloadSettings={async () => {
+                  try {
+                    await loadSettingsData();
+                    return true;
+                  } catch (error) {
+                    alert(refreshAfterSaveMessage(error));
+                    return false;
+                  }
+                }}
+                settingsData={settingsData}
+                user={user}
+              />
+            </ModuleErrorBoundary>
           )}
 
           {activeView === "all-shops" && (
@@ -10271,7 +10486,7 @@ function App() {
               </div>
               <button className="remove-button" onClick={() => setSaleEditError("")}><Icon name="close" /></button>
             </div>
-            <div className="cart-empty">{saleEditError}</div>
+            <div className="error-banner" role="alert">{saleEditError}</div>
           </section>
         </div>
       )}
@@ -10328,59 +10543,59 @@ function App() {
           <section className="invoice-modal change-history-modal">
             <div className="invoice-toolbar">
               <div>
-                <span className="eyebrow">Opening Stock Lot</span>
+                <span className="eyebrow">Stock lot</span>
                 <strong>
-                  {lotAction.type === "edit" && "Edit Lot"}
-                  {lotAction.type === "add" && "Add Quantity"}
-                  {lotAction.type === "adjust" && "Adjust Quantity"}
-                  {lotAction.type === "deactivate" && "Deactivate Lot"}
-                  {lotAction.type === "reactivate" && "Reactivate Lot"}
+                  {lotAction.type === "edit" && "Edit lot"}
+                  {lotAction.type === "add" && "Add quantity"}
+                  {lotAction.type === "adjust" && "Correct count"}
+                  {lotAction.type === "deactivate" && "Deactivate lot"}
+                  {lotAction.type === "reactivate" && "Reactivate lot"}
                 </strong>
               </div>
               <button aria-label="Close lot editor" className="remove-button" onClick={closeLotAction}><Icon name="close" /></button>
             </div>
             <div className="sale-edit-body">
               <div className="purchase-summary-grid supplier-payment-preview">
-                <SummaryMetric label="Product" value={lotAction.lot.product_name || lotPanelProduct?.product_name || "-"} />
+                <SummaryMetric label="Product" value={lotAction.lot.product_name || lotPanelProduct?.product_name || MISSING_VALUE} />
                 <SummaryMetric label="Lot" value={lotAction.lot.lot_name || lotAction.lot.batch_no || `#${lotAction.lot.id}`} />
-                <SummaryMetric label="Opening Qty" value={Number(lotAction.lot.purchase_qty || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })} />
-                <SummaryMetric label="Used Qty" value={Number(lotAction.lot.sold_qty ?? (Number(lotAction.lot.purchase_qty || 0) - Number(lotAction.lot.remaining_qty || 0))).toLocaleString("en-IN", { maximumFractionDigits: 3 })} />
-                <SummaryMetric label="Balance Qty" value={Number(lotAction.lot.balance_qty ?? lotAction.lot.remaining_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })} featured />
+                <SummaryMetric label="Quantity" value={formatOptionalQuantity(lotAction.lot.purchase_qty)} />
+                <SummaryMetric label="Sold or used" value={formatOptionalQuantity(pickQuantity(lotAction.lot.sold_qty) ?? (pickQuantity(lotAction.lot.purchase_qty) !== null && pickQuantity(lotAction.lot.remaining_qty) !== null ? pickQuantity(lotAction.lot.purchase_qty) - pickQuantity(lotAction.lot.remaining_qty) : null))} />
+                <SummaryMetric label="Stock in system" value={formatOptionalQuantity(pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty))} featured />
               </div>
 
               {lotAction.type === "edit" && (
                 <div className="form-grid supplier-form-grid">
-                  <Field label="Lot Name / Number"><input value={lotDraft.lot_name} onChange={(event) => setLotDraft({ ...lotDraft, lot_name: event.target.value })} /></Field>
-                  <Field label="Size / Grade"><input value={lotDraft.lot_size} onChange={(event) => setLotDraft({ ...lotDraft, lot_size: event.target.value })} /></Field>
-                  <Field label="Supplier (Optional)">
+                  <Field label="Supplier (optional)">
                     <select value={lotDraft.supplier_id} onChange={(event) => setLotDraft({ ...lotDraft, supplier_id: event.target.value })}>
-                      <option value="">No supplier</option>
+                      <option value="">None (no supplier payable)</option>
                       {activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.supplier_name}</option>)}
                     </select>
                   </Field>
-                  <Field label="Opening Quantity"><input min="0" step="0.001" type="number" value={lotDraft.purchase_qty} onChange={(event) => setLotDraft({ ...lotDraft, purchase_qty: event.target.value })} /></Field>
-                  <Field label="Current Balance Qty"><input readOnly value={Number(lotAction.lot.balance_qty ?? lotAction.lot.remaining_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })} /></Field>
-                  <Field label="Opening Cost / Purchase Rate"><input min="0" step="0.01" type="number" value={lotDraft.purchase_rate} onChange={(event) => setLotDraft({ ...lotDraft, purchase_rate: event.target.value })} /></Field>
-                  <Field label="Sale Rate"><input min="0" step="0.01" type="number" value={lotDraft.sale_rate} onChange={(event) => setLotDraft({ ...lotDraft, sale_rate: event.target.value })} /></Field>
-                  <Field label="Opening Stock Date"><input type="date" value={lotDraft.opening_stock_date} onChange={(event) => setLotDraft({ ...lotDraft, opening_stock_date: event.target.value })} /></Field>
-                  <Field label="Remarks"><input value={lotDraft.remarks} onChange={(event) => setLotDraft({ ...lotDraft, remarks: event.target.value })} /></Field>
-                  <Field label="Reason"><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Reason for audit trail" /></Field>
+                  <Field label={<RequiredLabel>Lot name</RequiredLabel>}><input value={lotDraft.lot_name} onChange={(event) => setLotDraft({ ...lotDraft, lot_name: event.target.value })} /></Field>
+                  <Field label="Grade"><input value={lotDraft.lot_size} onChange={(event) => setLotDraft({ ...lotDraft, lot_size: event.target.value })} /></Field>
+                  <Field label="Quantity"><input min="0" step="0.001" type="number" value={lotDraft.purchase_qty} onChange={(event) => setLotDraft({ ...lotDraft, purchase_qty: event.target.value })} /></Field>
+                  <Field label="Stock in system"><input readOnly value={formatOptionalQuantity(pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty))} /></Field>
+                  <Field label={<RequiredLabel>Cost price (₹)</RequiredLabel>}><input min="0" step="0.01" type="number" value={lotDraft.purchase_rate} onChange={(event) => setLotDraft({ ...lotDraft, purchase_rate: event.target.value })} /></Field>
+                  <Field label="Sale price (₹)"><input min="0" step="0.01" type="number" value={lotDraft.sale_rate} onChange={(event) => setLotDraft({ ...lotDraft, sale_rate: event.target.value })} /></Field>
+                  <Field label="Stock date"><input type="date" value={lotDraft.opening_stock_date} onChange={(event) => setLotDraft({ ...lotDraft, opening_stock_date: event.target.value })} /></Field>
+                  <Field label="Notes"><input value={lotDraft.remarks} onChange={(event) => setLotDraft({ ...lotDraft, remarks: event.target.value })} /></Field>
+                  <Field label="Reason for the change"><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Kept in the change history" /></Field>
                 </div>
               )}
 
               {lotAction.type === "add" && (
                 <div className="form-grid supplier-form-grid">
-                  <Field label="Quantity To Add"><input min="0" step="0.001" type="number" value={lotDraft.quantity} onChange={(event) => setLotDraft({ ...lotDraft, quantity: event.target.value })} /></Field>
+                  <Field label="Quantity to add"><input min="0" step="0.001" type="number" value={lotDraft.quantity} onChange={(event) => setLotDraft({ ...lotDraft, quantity: event.target.value })} /></Field>
                   <Field label="Reason"><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Example: missed opening stock count" /></Field>
                 </div>
               )}
 
               {lotAction.type === "adjust" && (
                 <div className="form-grid supplier-form-grid">
-                  <Field label="Current Software Qty"><input readOnly value={Number(lotAction.lot.balance_qty ?? lotAction.lot.remaining_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })} /></Field>
-                  <Field label="Physical / Corrected Quantity"><input min="0" step="0.001" type="number" value={lotDraft.new_quantity} onChange={(event) => setLotDraft({ ...lotDraft, new_quantity: event.target.value })} /></Field>
-                  <Field label="Difference / Adjustment Qty"><input readOnly value={(Number(lotDraft.new_quantity || 0) - Number(lotAction.lot.balance_qty ?? lotAction.lot.remaining_qty ?? 0)).toLocaleString("en-IN", { maximumFractionDigits: 3 })} /></Field>
-                  <Field label="Adjustment Type">
+                  <Field label="Stock in system"><input readOnly value={formatOptionalQuantity(pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty))} /></Field>
+                  <Field label="Counted quantity"><input min="0" step="0.001" type="number" value={lotDraft.new_quantity} onChange={(event) => setLotDraft({ ...lotDraft, new_quantity: event.target.value })} /></Field>
+                  <Field label="Difference"><input readOnly value={pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty) === null ? MISSING_VALUE : formatOptionalQuantity(Number(lotDraft.new_quantity || 0) - pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty))} /></Field>
+                  <Field label="Type of correction">
                     <select value={lotDraft.adjustment_type} onChange={(event) => setLotDraft({ ...lotDraft, adjustment_type: event.target.value })}>
                       <option>Increase Stock</option>
                       <option>Decrease Stock</option>
@@ -10391,9 +10606,9 @@ function App() {
                       <option>Owner Adjustment</option>
                     </select>
                   </Field>
-                  <Field label="Adjustment Date"><input type="date" value={lotDraft.adjustment_date} onChange={(event) => setLotDraft({ ...lotDraft, adjustment_date: event.target.value })} /></Field>
-                  <Field label="Reason"><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Reason is mandatory" /></Field>
-                  <Field label="Remarks"><input value={lotDraft.remarks} onChange={(event) => setLotDraft({ ...lotDraft, remarks: event.target.value })} /></Field>
+                  <Field label="Date"><input type="date" value={lotDraft.adjustment_date} onChange={(event) => setLotDraft({ ...lotDraft, adjustment_date: event.target.value })} /></Field>
+                  <Field label={<RequiredLabel>Reason</RequiredLabel>}><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} /></Field>
+                  <Field label="Notes"><input value={lotDraft.remarks} onChange={(event) => setLotDraft({ ...lotDraft, remarks: event.target.value })} /></Field>
                 </div>
               )}
 
@@ -10406,8 +10621,10 @@ function App() {
               )}
 
               <div className="button-row">
-                <button className="primary-button" onClick={saveLotAction}>Save Lot Changes</button>
-                <button className="secondary-button" onClick={closeLotAction}>Cancel</button>
+                <button className="primary-button" onClick={saveLotAction} type="button">
+                  {{ edit: "Save lot", add: "Add quantity", adjust: "Correct count", deactivate: "Deactivate lot", reactivate: "Reactivate lot" }[lotAction.type] || "Save"}
+                </button>
+                <button className="secondary-button" onClick={closeLotAction} type="button">Cancel</button>
               </div>
             </div>
           </section>
@@ -12258,7 +12475,7 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
         <div className="device-activation-panel">
           <span className="eyebrow">This device</span>
           <small>Device ID: {deviceInfo?.device_id || "(resolving...)"}</small>
-          <p>Ask the FroozERP owner to issue an activation for this device from Settings &gt; Counter &amp; Display &gt; Device Activation Licences. This device is listed there by name once it has connected to the shop; the ID above is only needed if it is not.</p>
+          <p>Ask the FroozERP owner to issue an activation for this device from Branches &amp; Counters &gt; Activation licences. This device is listed there by name once it has connected to the shop; the ID above is only needed if it is not.</p>
           <span className="eyebrow">Step 1: send this device to the shop</span>
           <p>Sign in once so the shop can see this device. It does not open the app; the Owner still has to approve it.</p>
           <input
@@ -12326,7 +12543,7 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
 }
 
 // ---------------------------------------------------------------------------
-// Owner-side activation issuing (Settings -> Counter & Display -> Device Activation).
+// Owner-side activation issuing (Branches & Counters -> Step 5 · Activation licences).
 //
 // Bringing a new counter online used to mean the maintainer running
 // `src-tauri/tools/sign_activation.rs` on his own machine, after somebody read a
@@ -12516,8 +12733,8 @@ function DeviceActivationIssuingSection({ canIssue, devices, devicesError, onRel
   if (!canIssue) {
     return (
       <ModuleCard
-        eyebrow="Security / Device Activation"
-        title="Device Activation Licences"
+        eyebrow="Step 5"
+        title="Activation licences"
         subtitle="Only the Owner can admit a machine to the business."
       >
         <p className="cart-empty">Issuing an activation licence is what lets a new counter start billing, so it is restricted to the Owner account. Ask the Owner to issue one for this device.</p>
@@ -12527,9 +12744,9 @@ function DeviceActivationIssuingSection({ canIssue, devices, devicesError, onRel
 
   return (
     <ModuleCard
-      eyebrow="Security / Device Activation"
-      title="Device Activation Licences"
-      subtitle="Issue the activation file that lets a counter start working. Pick the device, choose how long it should last, and save the .lic file."
+      eyebrow="Step 5"
+      title="Activation licences"
+      subtitle="Issue the activation file that lets an approved computer or phone start working. Pick it, choose how long the licence lasts, then save the file or copy its text to send."
     >
       {!view.ok ? (
         // Never zeros. With one of the two lists missing, every device would render as
@@ -13253,7 +13470,7 @@ function WhatsAppSendModal({
               {results.map((row, index) => (
                 <tr key={`${row.phoneNumber}-${index}`}>
                   <td>{row.phoneNumber}</td>
-                  <td><span className={row.status === "sent" ? "stock-ok" : "stock-low"}>{row.status}</span></td>
+                  <td><span className={row.status === "sent" ? "stock-ok" : "stock-low"}>{labelFor("messageStatus", row.status)}</span></td>
                   <td>{row.errorMessage || "Done"}</td>
                 </tr>
               ))}
@@ -13788,7 +14005,7 @@ function PendingPurchaseBillsModule({ onCancelPurchase, onCompletePurchase, onEd
 
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow="Pending Purchase Bills" title="Supplier-Wise Pending Bills" subtitle="Operational queue for stock received before supplier bill completion.">
+      <ModuleCard eyebrow="Supplier bills" title="Waiting for a bill, by supplier" subtitle="Stock that has arrived but whose supplier bill is not complete yet.">
         <div className="purchase-summary-grid supplier-payment-preview">
           <SummaryMetric label="Pending Suppliers" value={supplierSummaries.length} featured />
           <SummaryMetric label="Pending Bills" value={pendingRows.length} />
@@ -13940,7 +14157,7 @@ function PendingBillsModule({ customerPendingBills = { summary: [], invoices: []
 
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow="Operations" title="Pending Bills" subtitle="Complete supplier pending bills and settle customer credit invoices.">
+      <ModuleCard eyebrow="Waiting to be settled" title="Supplier bills and customer credit" subtitle="Finish supplier bills for stock that arrived without one, and collect what customers owe on credit.">
         <label className="icon-input table-search-input">
           <Icon name="search" />
           <input
@@ -13950,8 +14167,8 @@ function PendingBillsModule({ customerPendingBills = { summary: [], invoices: []
           />
         </label>
         <div className="settings-tabs">
-          <button className={activeTab === "purchase" ? "tab-active" : ""} onClick={() => setActiveTab("purchase")}>Pending Purchase Bills</button>
-          <button className={activeTab === "customer" ? "tab-active" : ""} onClick={() => setActiveTab("customer")}>Customer Pending Bills</button>
+          <button className={activeTab === "purchase" ? "tab-active" : ""} onClick={() => setActiveTab("purchase")}>Supplier bills</button>
+          <button className={activeTab === "customer" ? "tab-active" : ""} onClick={() => setActiveTab("customer")}>Customer credit</button>
         </div>
       </ModuleCard>
 
@@ -14005,7 +14222,7 @@ function PendingBillsModule({ customerPendingBills = { summary: [], invoices: []
                     <td>{currency.format(Number(invoice.received_amount || 0))}</td>
                     <td className="balance-cell">{currency.format(Number(invoice.balance_amount || 0))}</td>
                     <td>{invoice.due_date ? formatDisplayDate(invoice.due_date) : "-"}</td>
-                    <td><span className={invoice.credit_status === "Paid" ? "stock-ok" : invoice.credit_status === "Partially Paid" ? "origin-rate" : "stock-low"}>{invoice.credit_status}</span></td>
+                    <td><span className={invoice.credit_status === "Paid" ? "stock-ok" : invoice.credit_status === "Partially Paid" ? "origin-rate" : "stock-low"}>{labelFor("credit_status", invoice.credit_status)}</span></td>
                     <td>
                       <div className="button-row table-actions-row">
                         <button className="primary-button" disabled={Number(invoice.balance_amount || 0) <= 0} onClick={() => openReceivePayment(selectedCustomer, invoice)}>Receive Payment</button>
@@ -14171,8 +14388,8 @@ function DiscountManagementModule({ discounts = [], inventory = [], onReload, pr
                 <td>{Number(lot.remaining_qty || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
                 <td>{currency.format(Number(lot.temporary_sale_rate || 0) > 0 ? Number(lot.temporary_sale_rate) : Number(lot.selling_rate || 0))}</td>
                 <td>{currency.format(Number(lot.effective_cost_per_unit || lot.purchase_rate || 0))}</td>
-                <td>{existing ? `${existing.discount_type} ${currency.format(Number(existing.discount_value || 0))}` : "-"}</td>
-                <td><span className={lot.batch_status === "ACTIVE" || !lot.batch_status ? "stock-ok" : "stock-low"}>{lot.batch_status || "ACTIVE"}</span></td>
+                <td>{existing ? `${labelFor("discountType", existing.discount_type)} ${currency.format(Number(existing.discount_value || 0))}` : "-"}</td>
+                <td><span className={statusClass("batchStatus", lot.batch_status || "ACTIVE")}>{labelFor("batchStatus", lot.batch_status || "ACTIVE")}</span></td>
               </tr>
             );
           })}
@@ -14187,7 +14404,7 @@ function DiscountManagementModule({ discounts = [], inventory = [], onReload, pr
             <tr key={discount.id}>
               <td className="primary-cell">{discount.product_name}</td>
               <td>{discount.lot_name || discount.batch_no || "-"}{discount.lot_size ? ` / ${discount.lot_size}` : ""}</td>
-              <td>{discount.discount_type}</td>
+              <td>{labelFor("discountType", discount.discount_type)}</td>
               <td>{discount.discount_type === "PERCENTAGE" ? `${Number(discount.discount_value || 0)}%` : currency.format(Number(discount.discount_value || 0))}</td>
               <td>{formatDisplayDate(discount.start_date)}</td>
               <td>{discount.end_date ? formatDisplayDate(discount.end_date) : "Open"}</td>
@@ -14201,6 +14418,21 @@ function DiscountManagementModule({ discounts = [], inventory = [], onReload, pr
     </section>
   );
 }
+
+/**
+ * The badge class for a status, from its tone in `local/displayLabels.js`. The four classes are the
+ * shared badge set: success, attention, danger, and a neutral tag for everything else.
+ */
+const STATUS_TONE_CLASS = Object.freeze({ success: "stock-ok", warning: "origin-rate", danger: "stock-low", info: "tag", neutral: "tag" });
+const statusClass = (family, value) => STATUS_TONE_CLASS[toneFor(family, value)] || "tag";
+
+const REPORT_RANGE_LABELS = Object.freeze({
+  today: "today",
+  yesterday: "yesterday",
+  week: "this week",
+  month: "this month",
+  custom: "custom dates",
+});
 
 function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageStock, canWhatsappSend = false, connectivityMode = CONNECTIVITY_MODES.LOCAL_ONLY, customers = [], data = {}, focusSection = null, onFocusSectionHandled, orders: ordersState = {}, onCancelPurchase, onCompletePurchase, onEditPurchase, onOpenBlankPurchaseAmendment, onOpenCustomerLedger, onOpenLotAction, onOpenPurchaseAmendment, onOpenSaleForEdit, onOpenSaleView, onPrintSale, onCancelSale, onOpenSupplierLedger, onReload, appliedParams = null, suppliers = [], user }) {
   // Reopening Report Center shows the range it was last loaded with, not "Today" over a year's data.
@@ -14391,17 +14623,17 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
   const orderReportsState = (() => {
     const loadState = ordersState.loadState || "idle";
     if (loadState === "error") {
-      return { ready: false, notice: ordersState.loadError || "Orders could not be read on this device.", reports: null };
+      return { ready: false, failed: true, notice: ordersState.loadError || "Orders could not be read on this device.", reports: null };
     }
     if (loadState === "idle" || loadState === "loading") {
-      return { ready: false, notice: "Reading this device's orders…", reports: null };
+      return { ready: false, failed: false, notice: "Reading this device's orders…", reports: null };
     }
     const reports = buildOrderReports(ordersState.orders, {
       range: "custom",
       date_from: appliedQuery.date_from,
       date_to: appliedQuery.date_to,
     });
-    return { ready: reports.ok, notice: describeOrderReportError(reports), reports };
+    return { ready: reports.ok, failed: !reports.ok, notice: describeOrderReportError(reports), reports };
   })();
   /**
    * Rows for one order report, or an empty list while the orders are unread.
@@ -15053,7 +15285,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       headers: ["Product", "Quantity", "Value", "Orders", "Customers", "Cancelled Qty", "Last Ordered"],
       render: (row) => (
         <tr key={row.productKey}>
-          <td className="primary-cell">{row.productName}{row.unit ? <small className="cell-note">{row.unit}</small> : null}</td>
+          <td className="primary-cell">{row.productName}{row.unit ? <small className="cell-note">{labelFor("unit", row.unit)}</small> : null}</td>
           <td>{number(row.quantity)}</td>
           <td>{money(row.value)}</td>
           <td>{number(row.orders)}</td>
@@ -15104,12 +15336,12 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
         <tr key={row.id}>
           <td className="primary-cell">
             {row.orderNo}
-            <small className="cell-note">{row.source}</small>
+            <small className="cell-note">{labelFor("orderSource", row.source)}</small>
           </td>
           <td>{row.orderedOnLabel}</td>
           <td>{row.customerName}{row.customerMobile ? <small className="cell-note">{row.customerMobile}</small> : null}</td>
           <td>
-            {row.status}
+            {labelFor("orderStatus", row.status)}
             {/* Carried from the board rather than recomputed, so a warning a person has already
                 seen on the Orders screen reads identically here. */}
             {row.warning ? <small className="cell-note">{row.warning}</small> : null}
@@ -15133,7 +15365,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       rows: filterRows(data.salesProductReport),
       summary: (rows) => [["Revenue", money(totalOf(rows, "revenue")), true], ["Quantity Sold", number(totalOf(rows, "quantity_sold"))], ["Profit", money(totalOf(rows, "profit"))]],
       headers: ["Product", "Lot", "Quantity", "Rate", "Revenue", "Cost", "Profit"],
-      render: (row) => <tr key={`${row.product_name}-${row.lot_name || "default"}-${row.lot_size || ""}`}><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{[row.lot_name, row.lot_size].filter(Boolean).join(" / ") || "-"}</td><td>{number(row.quantity_sold)}</td><td>{money(Number(row.quantity_sold || 0) ? Number(row.revenue || 0) / Number(row.quantity_sold || 1) : 0)}</td><td>{money(row.revenue)}</td><td>{money(row.cost)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
+      render: (row) => <tr key={`${row.product_name}-${row.lot_name || "default"}-${row.lot_size || ""}`}><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{[row.lot_name, row.lot_size].filter(Boolean).join(" / ") || "-"}</td><td>{number(row.quantity_sold)}</td><td>{money(Number(row.quantity_sold || 0) ? Number(row.revenue || 0) / Number(row.quantity_sold || 1) : 0)}</td><td>{money(row.revenue)}</td><td>{money(row.cost)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
     },
     salesByCustomer: {
       title: "Sales by Customer",
@@ -15210,7 +15442,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
                 {salesHasItemDiscount && <td className="amount-cell">{Number(row.item_discount_total || 0) ? money(row.item_discount_total) : "-"}</td>}
                 {salesHasBillDiscount && <td className="amount-cell">{Number(row.bill_discount_total || 0) ? money(row.bill_discount_total) : "-"}</td>}
                 <td className="amount-cell">{money(row.net_total)}</td>
-                <td className="status-cell">{row.payment_mode || "-"}</td>
+                <td className="status-cell">{labelFor("paymentMode", row.payment_mode)}</td>
                 <td className="status-cell">{row.status_label}</td>
               </tr>
               {expanded && (
@@ -15222,7 +15454,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
                           <td className="primary-cell">{item.item_name}</td>
                           <td>{item.lot_name || "No Lot Number"}</td>
                           <td>{number(item.quantity)}</td>
-                          <td>{item.unit || "-"}</td>
+                          <td>{labelFor("unit", item.unit)}</td>
                           <td>{money(item.rate)}</td>
                           <td>{money(item.gross_total)}</td>
                           {salesHasItemDiscount && <td>{Number(item.item_discount_total || 0) ? money(item.item_discount_total) : "-"}</td>}
@@ -15247,13 +15479,13 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
             <td className="primary-cell">{row.item_name}</td>
             <td>{row.lot_name || "No Lot Number"}</td>
             <td>{number(row.quantity)}</td>
-            <td>{row.unit || "-"}</td>
+            <td>{labelFor("unit", row.unit)}</td>
             <td>{money(row.rate)}</td>
             {salesFilters.viewMode !== "CUSTOMER" && <td className="amount-cell">{money(row.gross_total)}</td>}
             {salesHasItemDiscount && <td className="amount-cell">{Number(row.item_discount_total || 0) ? money(row.item_discount_total) : "-"}</td>}
             {salesHasBillDiscount && <td className="amount-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? "-" : Number(row.bill_discount_total || 0) ? money(row.bill_discount_total) : "-"}</td>}
             <td className="amount-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? "-" : money(row.net_total)}</td>
-            <td className="status-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? "-" : (row.payment_mode || "-")}</td>
+            <td className="status-cell">{row.row_type === "CUSTOMER_ITEM" && !row.invoice_first_line ? "-" : labelFor("paymentMode", row.payment_mode)}</td>
             <td>{row.row_type === "CUSTOMER_ITEM" ? (row.invoice_first_line ? row.status_label : "-") : (row.created_by_name || row.sold_by || "-")}</td>
           </tr>
         );
@@ -15278,14 +15510,14 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       rows: filterRows(data.provisionalProfitSalesReport),
       summary: (rows) => [["Sales", money(totalOf(rows, "total_amount")), true], ["Provisional Profit", money(totalOf(rows, "profit"))], ["Invoices", rows.length]],
       headers: ["Invoice", "Date", "Customer", "Payment", "Products", "Amount", "Cost", "Provisional Profit"],
-      render: (row) => <tr key={row.id}><td>{row.invoice_no}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{row.customer_name}</td><td>{row.payment_mode}</td><td>{row.products || "-"}</td><td>{money(row.total_amount)}</td><td>{money(row.total_cost)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
+      render: (row) => <tr key={row.id}><td>{row.invoice_no}</td><td>{formatDisplayDate(row.sale_date)}</td><td>{row.customer_name}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{row.products || "-"}</td><td>{money(row.total_amount)}</td><td>{money(row.total_cost)}</td><td className="profit-cell">{money(row.profit)}</td></tr>,
     },
     discountReport: {
       title: "Discount Report",
       rows: filterRows(data.discountReport),
       summary: (rows) => [["Discount Amount", money(totalOf(rows, "discount_amount")), true], ["Gross Amount", money(totalOf(rows, "gross_amount"))], ["Net Amount", money(totalOf(rows, "net_amount"))], ["Profit Impact", money(totalOf(rows, "profit_impact"))]],
       headers: ["Date", "Product", "Lot", "Discount Type", "Discount Value", "Qty Sold", "Gross Amount", "Discount Amount", "Net Amount", "Profit Impact"],
-      render: (row, index) => <tr key={`${row.sale_date}-${row.invoice_no}-${row.product_name}-${row.lot_name}-${index}`}><td>{formatDisplayDate(row.sale_date)}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.invoice_no || row.payment_mode}</small></td><td>{row.lot_name || "-"}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td>{row.discount_type || "Bill / Manual"}</td><td>{row.discount_type === "PERCENTAGE" ? `${Number(row.discount_value || 0)}%` : money(row.discount_value)}</td><td>{number(row.quantity_sold)}</td><td>{money(row.gross_amount)}</td><td>{money(row.discount_amount)}</td><td>{money(row.net_amount)}</td><td>{money(row.profit_impact)}</td></tr>,
+      render: (row, index) => <tr key={`${row.sale_date}-${row.invoice_no}-${row.product_name}-${row.lot_name}-${index}`}><td>{formatDisplayDate(row.sale_date)}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.invoice_no || labelFor("paymentMode", row.payment_mode)}</small></td><td>{row.lot_name || "-"}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td>{row.discount_type ? labelFor("discountType", row.discount_type) : "Bill / Manual"}</td><td>{row.discount_type === "PERCENTAGE" ? `${Number(row.discount_value || 0)}%` : money(row.discount_value)}</td><td>{number(row.quantity_sold)}</td><td>{money(row.gross_amount)}</td><td>{money(row.discount_amount)}</td><td>{money(row.net_amount)}</td><td>{money(row.profit_impact)}</td></tr>,
     },
     purchasesByDate: {
       title: "Purchases by Date",
@@ -15299,7 +15531,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       rows: filterRows(data.purchaseProductReport),
       summary: (rows) => [["Net Purchases", money(totalOf(rows, "net_purchase")), true], ["Quantity", number(totalOf(rows, "quantity_purchased"))], ["Mandi Tax", money(totalOf(rows, "mandi_tax"))]],
       headers: ["Product", "Quantity", "Net Purchase", "Mandi Tax", "Rebate"],
-      render: (row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{number(row.quantity_purchased)}</td><td>{money(row.net_purchase)}</td><td>{money(row.mandi_tax)}</td><td>{money(row.rebate)}</td></tr>,
+      render: (row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{number(row.quantity_purchased)}</td><td>{money(row.net_purchase)}</td><td>{money(row.mandi_tax)}</td><td>{money(row.rebate)}</td></tr>,
     },
     purchasesBySupplier: {
       title: "Purchases by Supplier",
@@ -15351,56 +15583,56 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       rows: filterRows(data.pendingPurchaseBillsReport),
       summary: (rows) => [["Pending Bills", rows.length, true], ["Quantity", number(totalOf(rows, "quantity"))], ["Remaining", number(totalOf(rows, "remaining_qty"))]],
       headers: ["Purchase", "Date", "Supplier", "Product", "Qty", "Remaining", "Temp Sale Rate", "Expected Rate", "Remarks"],
-      render: (row) => <tr key={row.id}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{number(row.quantity)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.temporary_sale_rate)}</td><td>{money(row.expected_purchase_rate)}</td><td>{row.remarks || "-"}</td></tr>,
+      render: (row) => <tr key={row.id}><td>#{row.id}</td><td>{row.purchase_date}</td><td>{row.supplier_name}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{number(row.quantity)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.temporary_sale_rate)}</td><td>{money(row.expected_purchase_rate)}</td><td>{row.remarks || "-"}</td></tr>,
     },
     stockWithoutBill: {
       title: "Stock Received Without Bill",
       rows: filterRows(data.stockWithoutBillReport),
       summary: (rows) => [["Batches", rows.length, true], ["Received Qty", number(totalOf(rows, "purchase_qty"))], ["Remaining Qty", number(totalOf(rows, "remaining_qty"))]],
       headers: ["Arrival Date", "Batch", "Supplier", "Product", "Received", "Remaining", "Temp Sale Rate", "Expected Rate"],
-      render: (row) => <tr key={row.id}><td>{row.arrival_date}</td><td><span className="batch-id">{row.batch_no}</span></td><td>{row.supplier_name}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{number(row.purchase_qty)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.temporary_sale_rate)}</td><td>{money(row.expected_purchase_rate)}</td></tr>,
+      render: (row) => <tr key={row.id}><td>{row.arrival_date}</td><td><span className="batch-id">{row.batch_no}</span></td><td>{row.supplier_name}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{number(row.purchase_qty)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.temporary_sale_rate)}</td><td>{money(row.expected_purchase_rate)}</td></tr>,
     },
     customerLedger: {
       title: "Customer Ledger",
       rows: customerLedgerRows,
       summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
       headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
     },
     supplierLedger: {
       title: "Supplier Ledger",
       rows: supplierLedgerRows,
       summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
       headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Cr" : "Dr"}</td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Cr" : "Dr"}</td></tr>,
     },
     accountStatement: {
       title: "Account Statement",
       rows: accountStatementRows,
       summary: (rows) => [["Debits", money(totalOf(rows, "debit")), true], ["Credits", money(totalOf(rows, "credit"))], ["Rows", rows.length]],
       headers: ["Date", "Particulars / Narration", "Voucher Type", "Voucher No.", "Debit", "Credit", "Balance"],
-      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name} - {row.account_type}</small></td><td>{row.voucher_type || row.transaction_type}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
+      render: (row, index) => <tr key={`${row.date}-${index}`}><td>{formatDisplayDate(row.date)}</td><td className="primary-cell purchase-items-cell"><span title={row.narration || row.remarks}>{ledgerNarration(row)}</span><small className="cell-note">{row.party_name} - {labelFor("accountType", row.account_type)}</small></td><td>{labelFor("transactionType", row.voucher_type || row.transaction_type)}</td><td>{row.voucher_no || "-"}</td><td>{money(row.debit)}</td><td>{money(row.credit)}</td><td className="balance-cell">{money(Math.abs(Number(row.running_balance || 0)))} {Number(row.running_balance || 0) >= 0 ? "Dr" : "Cr"}</td></tr>,
     },
     paymentReport: {
       title: "Payment Report",
       rows: filterRows(data.paymentReport),
       summary: (rows) => [["Payments", money(totalOf(rows, "payment_amount")), true], ["Rebates", money(totalOf(rows, "rebate_amount"))], ["Entries", rows.length]],
       headers: ["Date", "Type", "Party", "Payment", "Rebate", "Mode", "Status", "Reference"],
-      render: (row, index) => <tr key={`${row.payment_date}-${index}`}><td>{row.payment_date}</td><td>{row.payment_type}</td><td className="primary-cell">{row.party_name}</td><td>{money(row.payment_amount)}</td><td>{money(row.rebate_amount)}</td><td>{row.payment_mode}</td><td>{row.cancelled ? "Cancelled" : "Active"}</td><td>{row.reference_number || "-"}</td></tr>,
+      render: (row, index) => <tr key={`${row.payment_date}-${index}`}><td>{row.payment_date}</td><td>{labelFor("transactionType", row.payment_type)}</td><td className="primary-cell">{row.party_name}</td><td>{money(row.payment_amount)}</td><td>{money(row.rebate_amount)}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{row.cancelled ? "Cancelled" : "Active"}</td><td>{row.reference_number || "-"}</td></tr>,
     },
     paymentModeSummary: {
       title: "Payment Mode Summary",
       rows: filterRows(data.paymentModeSummary),
       summary: (rows) => [["Total Amount", money(totalOf(rows, "total_amount")), true], ["Transactions", number(totalOf(rows, "transaction_count"))], ["Modes", new Set(rows.map((row) => row.payment_mode)).size]],
       headers: ["Date", "Source", "Payment Mode", "Transactions", "Total Amount"],
-      render: (row, index) => <tr key={`${row.transaction_date}-${row.source}-${row.payment_mode}-${index}`}><td>{formatDisplayDate(row.transaction_date)}</td><td>{row.source}</td><td><span className="tag">{row.payment_mode}</span></td><td>{row.transaction_count}</td><td className="primary-cell">{money(row.total_amount)}</td></tr>,
+      render: (row, index) => <tr key={`${row.transaction_date}-${row.source}-${row.payment_mode}-${index}`}><td>{formatDisplayDate(row.transaction_date)}</td><td>{labelFor("transactionType", row.source)}</td><td><span className="tag">{labelFor("paymentMode", row.payment_mode)}</span></td><td>{row.transaction_count}</td><td className="primary-cell">{money(row.total_amount)}</td></tr>,
     },
     receivableReport: {
       title: "Receivable Report",
       rows: filterRows(data.customerOutstandingReport),
       summary: (rows) => [["Receivable", money(totalOf(rows, "outstanding_balance")), true], ["Sales", money(totalOf(rows, "total_sales"))], ["Paid", money(totalOf(rows, "total_paid"))]],
       headers: ["Customer", "Type", "Sales", "Paid", "Outstanding"],
-      render: (row) => <tr key={row.id}><td className="primary-cell">{row.customer_name}</td><td>{row.customer_type}</td><td>{money(row.total_sales)}</td><td>{money(row.total_paid)}</td><td className="balance-cell">{money(row.outstanding_balance)}</td></tr>,
+      render: (row) => <tr key={row.id}><td className="primary-cell">{row.customer_name}</td><td>{labelFor("customerType", row.customer_type)}</td><td>{money(row.total_sales)}</td><td>{money(row.total_paid)}</td><td className="balance-cell">{money(row.outstanding_balance)}</td></tr>,
     },
     payableReport: {
       title: "Payable Report",
@@ -15414,7 +15646,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       rows: filterRows(data.returnHistoryReport),
       summary: (rows) => [["Return Value", money(totalOf(rows, "total_return_amount")), true], ["Returns", rows.length]],
       headers: ["Return No", "Date", "Invoice", "Customer", "Refund", "Value", "Reason", "Items"],
-      render: (row) => <tr key={row.return_no}><td>{row.return_no}</td><td>{row.return_date}</td><td>{row.invoice_no || "-"}</td><td>{row.customer_name}</td><td>{row.refund_type}</td><td>{money(row.total_return_amount)}</td><td>{row.return_reason}</td><td>{row.items || "-"}</td></tr>,
+      render: (row) => <tr key={row.return_no}><td>{row.return_no}</td><td>{row.return_date}</td><td>{row.invoice_no || "-"}</td><td>{row.customer_name}</td><td>{labelFor("refundType", row.refund_type)}</td><td>{money(row.total_return_amount)}</td><td>{row.return_reason}</td><td>{row.items || "-"}</td></tr>,
     },
     returnValue: {
       title: "Return Value Report",
@@ -15435,35 +15667,35 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       rows: filterRows(data.wasteReport),
       summary: (rows) => [["Waste Cost", money(totalOf(rows, "waste_cost")), true], ["Waste Quantity", number(totalOf(rows, "waste_quantity"))], ["Entries", number(totalOf(rows, "entry_count"))]],
       headers: ["Date", "Type", "Entries", "Quantity", "Cost"],
-      render: (row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td>{row.waste_type}</td><td>{row.entry_count}</td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
+      render: (row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td>{labelFor("wasteType", row.waste_type)}</td><td>{row.entry_count}</td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
     },
     monthlyWaste: {
       title: "Monthly Waste",
       rows: filterRows(data.wasteReport),
       summary: (rows) => [["Waste Cost", money(totalOf(rows, "waste_cost")), true], ["Waste Quantity", number(totalOf(rows, "waste_quantity"))], ["Entries", number(totalOf(rows, "entry_count"))]],
       headers: ["Date", "Type", "Entries", "Quantity", "Cost"],
-      render: (row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td>{row.waste_type}</td><td>{row.entry_count}</td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
+      render: (row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td>{labelFor("wasteType", row.waste_type)}</td><td>{row.entry_count}</td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
     },
     productWiseWaste: {
       title: "Product Wise Waste",
       rows: wasteProductRows,
       summary: (rows) => [["Waste Cost", money(totalOf(rows, "waste_cost")), true], ["Waste Quantity", number(totalOf(rows, "waste_quantity"))], ["Products", rows.length]],
       headers: ["Product", "Quantity", "Cost"],
-      render: (row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
+      render: (row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
     },
     mostWastedProducts: {
       title: "Most Wasted Products",
       rows: wasteProductRows.slice(0, 10),
       summary: (rows) => [["Waste Cost", money(totalOf(rows, "waste_cost")), true], ["Waste Quantity", number(totalOf(rows, "waste_quantity"))], ["Products", rows.length]],
       headers: ["Product", "Quantity", "Cost"],
-      render: (row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
+      render: (row) => <tr key={row.product_name}><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
     },
     wasteCost: {
       title: "Waste Cost Report",
       rows: filterRows(data.wasteReport),
       summary: (rows) => [["Waste Cost", money(totalOf(rows, "waste_cost")), true], ["Waste Quantity", number(totalOf(rows, "waste_quantity"))]],
       headers: ["Date", "Type", "Quantity", "Cost"],
-      render: (row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td>{row.waste_type}</td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
+      render: (row) => <tr key={`${row.waste_date}-${row.waste_type}`}><td>{row.waste_date}</td><td>{labelFor("wasteType", row.waste_type)}</td><td>{number(row.waste_quantity)}</td><td>{money(row.waste_cost)}</td></tr>,
     },
     stockInventory: {
       title: "Stock Inventory",
@@ -15477,28 +15709,28 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       rows: stockRows,
       summary: (rows) => [["Stock Value", money(totalOf(rows, "stock_value")), true], ["Products", rows.length], ["Low Stock", lowStockRows.length]],
       headers: ["Product", "Category", "Stock", "Minimum", "Unit", "Value"],
-      render: (row) => <tr key={row.product_id}><td className="primary-cell">{row.product_name}</td><td>{row.category}</td><td>{number(row.current_stock)}</td><td>{row.minimum_stock || 0}</td><td>{row.unit}</td><td>{money(row.stock_value)}</td></tr>,
+      render: (row) => <tr key={row.product_id}><td className="primary-cell">{row.product_name}</td><td>{row.category}</td><td>{number(row.current_stock)}</td><td>{row.minimum_stock || 0}</td><td>{labelFor("unit", row.unit)}</td><td>{money(row.stock_value)}</td></tr>,
     },
     lowStock: {
       title: "Low Stock",
       rows: lowStockRows,
       summary: (rows) => [["Low Stock Items", rows.length, true], ["Stock Value", money(totalOf(rows, "stock_value"))]],
       headers: ["Product", "Category", "Stock", "Minimum", "Unit", "Value"],
-      render: (row) => <tr key={row.product_id}><td className="primary-cell">{row.product_name}</td><td>{row.category}</td><td className="stock-low">{number(row.current_stock)}</td><td>{row.minimum_stock || 0}</td><td>{row.unit}</td><td>{money(row.stock_value)}</td></tr>,
+      render: (row) => <tr key={row.product_id}><td className="primary-cell">{row.product_name}</td><td>{row.category}</td><td className="stock-low">{number(row.current_stock)}</td><td>{row.minimum_stock || 0}</td><td>{labelFor("unit", row.unit)}</td><td>{money(row.stock_value)}</td></tr>,
     },
     stockMovement: {
       title: "Stock Movement",
       rows: filterRows(data.stockMovementReport),
       summary: (rows) => [["Quantity", number(totalOf(rows, "quantity")), true], ["Movements", number(totalOf(rows, "movement_count"))]],
       headers: ["Date", "Product", "Type", "Quantity", "Count", "Remarks"],
-      render: (row, index) => <tr key={`${row.movement_date}-${row.product_name}-${row.transaction_type}-${index}`}><td>{row.movement_date}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{row.transaction_type}</td><td>{number(row.quantity)}</td><td>{row.movement_count}</td><td>{row.remarks || "-"}</td></tr>,
+      render: (row, index) => <tr key={`${row.movement_date}-${row.product_name}-${row.transaction_type}-${index}`}><td>{row.movement_date}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{labelFor("transactionType", row.transaction_type)}</td><td>{number(row.quantity)}</td><td>{row.movement_count}</td><td>{row.remarks || "-"}</td></tr>,
     },
     stockValuation: {
       title: "Stock Valuation",
       rows: stockRows,
       summary: (rows) => [["Stock Value", money(totalOf(rows, "stock_value")), true], ["Products", rows.length]],
       headers: ["Product", "Stock", "Unit", "Value"],
-      render: (row) => <tr key={row.product_id}><td className="primary-cell">{row.product_name}</td><td>{number(row.current_stock)}</td><td>{row.unit}</td><td>{money(row.stock_value)}</td></tr>,
+      render: (row) => <tr key={row.product_id}><td className="primary-cell">{row.product_name}</td><td>{number(row.current_stock)}</td><td>{labelFor("unit", row.unit)}</td><td>{money(row.stock_value)}</td></tr>,
     },
     lotWiseStock: {
       title: "Lot Wise Stock",
@@ -15509,7 +15741,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
         const status = String(row.batch_status || "ACTIVE").toUpperCase();
         const balance = Number(row.remaining_qty ?? row.balance_qty ?? 0);
         const statusLabel = status === "CANCELLED" ? "Cancelled" : status === "INACTIVE" ? "Inactive" : balance <= 0 ? "Sold Out" : "Active";
-        return <tr key={row.id}><td>{row.category || "Fruit"}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{row.unit}</small></td><td>{row.lot_name || row.batch_no}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td><span className="tag">{row.stock_source || "PURCHASE"}</span></td><td>{row.supplier_name || "-"}</td><td>{number(row.purchase_qty)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.effective_cost_per_unit || row.purchase_rate)}</td><td>{money(Number(row.remaining_qty || 0) * Number(row.effective_cost_per_unit || row.purchase_rate || 0))}</td><td><span className={statusLabel === "Active" ? "stock-ok" : statusLabel === "Sold Out" ? "origin-rate" : "stock-low"}>{statusLabel}</span></td></tr>;
+        return <tr key={row.id}><td>{row.category || "Fruit"}</td><td className="primary-cell">{row.product_name}<small className="cell-note">{labelFor("unit", row.unit)}</small></td><td>{row.lot_name || row.batch_no}{row.lot_size ? ` / ${row.lot_size}` : ""}</td><td><span className="tag">{labelFor("stockSource", row.stock_source || "PURCHASE")}</span></td><td>{row.supplier_name || "-"}</td><td>{number(row.purchase_qty)}</td><td>{number(row.remaining_qty)}</td><td>{money(row.effective_cost_per_unit || row.purchase_rate)}</td><td>{money(Number(row.remaining_qty || 0) * Number(row.effective_cost_per_unit || row.purchase_rate || 0))}</td><td><span className={statusLabel === "Active" ? "stock-ok" : statusLabel === "Sold Out" ? "origin-rate" : "stock-low"}>{statusLabel}</span></td></tr>;
       },
     },
     profitLoss: {
@@ -15577,17 +15809,17 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
       rows: filterRows(data.expenseReport),
       summary: (rows) => [["Total Expenses", money(totalOf(rows.filter((row) => row.status !== "CANCELLED"), "amount")), true], ["Cash", money(totalOf(rows.filter((row) => row.payment_mode === "CASH" && row.status !== "CANCELLED"), "amount"))], ["UPI", money(totalOf(rows.filter((row) => row.payment_mode === "UPI" && row.status !== "CANCELLED"), "amount"))], ["Cancelled", money(totalOf(rows.filter((row) => row.status === "CANCELLED"), "amount"))]],
       headers: ["Date", "Category", "Paid To", "Payment Mode", "Amount", "Reference", "Remarks", "Status"],
-      render: (row) => <tr className={row.status === "CANCELLED" ? "muted-row" : ""} key={row.id}><td>{formatDisplayDate(row.expense_date)}</td><td className="primary-cell">{row.category}</td><td>{row.paid_to || row.vendor_name || "-"}</td><td>{row.payment_mode}</td><td>{money(row.amount)}</td><td>{row.reference_number || "-"}</td><td>{row.remarks || row.cancellation_reason || "-"}</td><td><span className={row.status === "CANCELLED" ? "stock-low" : "stock-ok"}>{row.status || "ACTIVE"}</span></td></tr>,
+      render: (row) => <tr className={row.status === "CANCELLED" ? "muted-row" : ""} key={row.id}><td>{formatDisplayDate(row.expense_date)}</td><td className="primary-cell">{row.category}</td><td>{row.paid_to || row.vendor_name || "-"}</td><td>{labelFor("paymentMode", row.payment_mode)}</td><td>{money(row.amount)}</td><td>{row.reference_number || "-"}</td><td>{row.remarks || row.cancellation_reason || "-"}</td><td><span className={row.status === "CANCELLED" ? "stock-low" : "stock-ok"}>{labelFor("recordStatus", row.status || "ACTIVE")}</span></td></tr>,
     },
   };
   const categories = [
-    { id: "orders", title: "Order Reports", icon: "parcel", description: "Customer orders taken by phone, WhatsApp and the counter: what was ordered, by whom, and what is still open. Read from this device, so these answer with no internet.", reports: [ORDER_REPORT.BY_DATE, ORDER_REPORT.BY_PRODUCT, ORDER_REPORT.BY_CUSTOMER, ORDER_REPORT.FULFILMENT] },
-    { id: "sales", title: "Sales Reports", icon: "receipt", description: "Unified sales history with item narration, discounts, payments and bill status.", reports: ["salesHistory", "discountReport"] },
-    { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Unified purchase history with item narration, bill status, payments and amendment actions.", reports: ["purchaseHistory"] },
+    { id: "orders", title: "Order Reports", icon: "parcel", description: "Orders taken by phone, WhatsApp and at the counter: what was ordered, by whom, and what is still open. Works without internet.", reports: [ORDER_REPORT.BY_DATE, ORDER_REPORT.BY_PRODUCT, ORDER_REPORT.BY_CUSTOMER, ORDER_REPORT.FULFILMENT] },
+    { id: "sales", title: "Sales Reports", icon: "receipt", description: "Every bill with its items, discounts, payments and status.", reports: ["salesHistory", "discountReport"] },
+    { id: "purchase", title: "Purchase Reports", icon: "cart", description: "Every purchase with its items, bill status, payments and changes.", reports: ["purchaseHistory"] },
     { id: "accounts", title: "Accounts & Ledger", icon: "users", description: "Customer ledger, supplier ledger, statements, payments and balances.", reports: ["customerLedger", "supplierLedger", "accountStatement", "paymentReport", "paymentModeSummary", "receivableReport", "payableReport"] },
-    { id: "returns", title: "Sale Returns", icon: "history", description: "Return history, value and reason analysis.", reports: ["returnHistory", "returnValue", "returnReason"] },
-    { id: "waste", title: "Waste Management", icon: "alert", description: "Daily, monthly, product-wise and cost-focused waste analysis.", reports: ["dailyWaste", "monthlyWaste", "productWiseWaste", "mostWastedProducts", "wasteCost"] },
-    { id: "inventory", title: "Inventory Reports", icon: "layers", description: "Single stock inventory workspace for stock, lots, valuation, adjustments and audit.", reports: ["stockInventory"] },
+    { id: "returns", title: "Sale Returns", icon: "history", description: "What came back, what it was worth, and why.", reports: ["returnHistory", "returnValue", "returnReason"] },
+    { id: "waste", title: "Waste Management", icon: "alert", description: "Waste by day, month and product, and what it cost.", reports: ["dailyWaste", "monthlyWaste", "productWiseWaste", "mostWastedProducts", "wasteCost"] },
+    { id: "inventory", title: "Inventory Reports", icon: "layers", description: "Stock on hand, lots, value, corrections and their history.", reports: ["stockInventory"] },
     { id: "financial", title: "Financial Reports", icon: "wallet", description: "Profit and loss, balance sheet, cash book and expense reports.", reports: ["profitLoss", "balanceSheet", "cashBook", "expenseReport"] },
   ];
   const currentCategory = categories.find((category) => category.id === selectedCategory);
@@ -15690,7 +15922,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
   const renderFilters = () => selectedReport === "stockInventory" ? (
     <div className="ledger-toolbar">
       <button className="secondary-button" disabled={refreshBusy} onClick={refreshReports}>{refreshBusy ? "Refreshing..." : "Refresh Inventory"}</button>
-      {refreshError && <div className="field-error" role="alert">{refreshError}</div>}
+      {refreshError && <div className="error-banner" role="alert">{refreshError}</div>}
     </div>
   ) : (
     <div className={selectedReport === "purchaseHistory" ? "ledger-toolbar purchase-history-toolbar" : "ledger-toolbar"}>
@@ -15920,7 +16152,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
           <Field label="Payment Mode">
             <select value={salesFilters.paymentMode} onChange={(event) => setSalesFilters({ ...salesFilters, paymentMode: event.target.value })}>
               <option value="">All modes</option>
-              {[...salesFilterOptions.paymentModes].sort().map((mode) => <option key={mode} value={mode}>{mode}</option>)}
+              {[...salesFilterOptions.paymentModes].sort().map((mode) => <option key={mode} value={mode}>{labelFor("paymentMode", mode)}</option>)}
             </select>
           </Field>
           <Field label="Status">
@@ -15978,7 +16210,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
         </>
       )}
       <button className="secondary-button" disabled={refreshBusy} onClick={refreshReports}>{refreshBusy ? "Refreshing..." : "Refresh"}</button>
-      {refreshError && <div className="field-error" role="alert">{refreshError}</div>}
+      {refreshError && <div className="error-banner" role="alert">{refreshError}</div>}
     </div>
   );
   const balanceDetailColumnValue = (row, column) => {
@@ -16094,14 +16326,14 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
               <tr key={`${row.source_type}-${row.source_id}-${index}`}>
                 <td>{formatDisplayDate(row.date)}<small className="cell-note">{row.entry_time ? new Date(row.entry_time).toLocaleTimeString("en-IN") : ""}</small></td>
                 <td className="primary-cell">{row.reference_no || "-"}</td>
-                <td>{row.source_type || "-"}</td>
+                <td>{labelFor("transactionType", row.source_type)}</td>
                 <td>{row.party_name || row.account_name || "-"}</td>
-                <td>{row.payment_mode || "-"}</td>
+                <td>{labelFor("paymentMode", row.payment_mode)}</td>
                 <td className="amount-cell">{money(Number(row.receipt_cash || 0) || Number(row.payment_cash || 0))}</td>
                 <td className="amount-cell">{money(Number(row.receipt_bank || 0) || Number(row.payment_bank || 0))}</td>
                 <td className="purchase-items-cell">{row.narration || "-"}</td>
                 <td>{row.created_by_name || "-"}</td>
-                <td>{row.source_type || "-"}</td>
+                <td>{labelFor("transactionType", row.source_type)}</td>
               </tr>
             ))}
           </DataTable>
@@ -16318,15 +16550,14 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
     return (
       <>
         <section className="settings-layout">
-          <ModuleCard eyebrow="Report View" title={currentReport.title} subtitle="Single report workspace with filters, summary, print and export controls.">
+          <ModuleCard eyebrow={currentCategory?.title || "Reports"} title={currentReport.title} subtitle={describeReport(selectedReport) || "Set the filters, then print or export."}>
             <div className="button-row">
-              <button className="secondary-button" onClick={() => setSelectedReport("")}>Back to {currentCategory?.title || "Report List"}</button>
-              <button className="secondary-button" onClick={() => { setSelectedReport(""); setSelectedCategory(""); }}>Back to Report Center</button>
+              <button className="secondary-button" onClick={() => setSelectedReport("")}>Back to {currentCategory?.title || "Reports"}</button>
               {selectedReport === "purchaseHistory" && <button className="primary-button" onClick={onOpenBlankPurchaseAmendment}>Add/Edit Purchase</button>}
             </div>
             {renderFilters()}
           </ModuleCard>
-          <ModuleCard eyebrow={currentCategory?.title || "Reports"} title={currentReport.title} subtitle={selectedReport === "stockInventory" ? "Inventory results use the filters shown below." : `${rows.length} row${rows.length === 1 ? "" : "s"} found.`}>
+          <ModuleCard eyebrow="Results" title={selectedReport === "stockInventory" ? "Stock on hand" : ["profitLoss", "balanceSheet", "cashBook"].includes(selectedReport) ? "Statement" : `${rows.length} row${rows.length === 1 ? "" : "s"}`} subtitle={selectedReport === "stockInventory" ? "Uses the filters shown below." : "Matching the filters above."}>
             <PrintableReport
               beforePdfExport={handleReportPrintOption}
               beforePrint={handleReportPrintOption}
@@ -16362,7 +16593,10 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
                     {selectedReport === "purchaseHistory" ? renderPurchaseHistoryRows() : rows.map((row, index) => currentReport.render(row, index))}
                   </DataTable>
                   {rows.length === 0 && (
-                    <div className="cart-empty">
+                    <div
+                      className={isOrderReport && orderReportsState.failed ? "error-banner" : "cart-empty"}
+                      role={isOrderReport && orderReportsState.failed ? "alert" : undefined}
+                    >
                       {/* An order report with no rows has two very different causes, and saying
                           "no records found" for both would report a failed read as a quiet day. */}
                       {isOrderReport && !orderReportsState.ready
@@ -16383,7 +16617,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
   if (currentCategory) {
     return (
       <section className="settings-layout">
-        <ModuleCard eyebrow="Report Category" title={currentCategory.title} subtitle={currentCategory.description}>
+        <ModuleCard eyebrow="Reports" title={currentCategory.title} subtitle={currentCategory.description}>
           <div className="button-row">
             <button className="secondary-button" onClick={() => setSelectedCategory("")}>Back to Report Center</button>
           </div>
@@ -16396,7 +16630,7 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
               <button className="report-menu-card" key={reportId} onClick={() => { setSearch(""); setSelectedReport(reportId); }}>
                 <Icon name={currentCategory.icon} size={22} />
                 <strong>{report.title}</strong>
-                <span>Open report workspace</span>
+                <span>{describeReport(reportId)}</span>
               </button>
             );
           })}
@@ -16406,20 +16640,22 @@ function ReportsModule({ accounts = [], canCancelSales, canEditSales, canManageS
   }
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow="Report Center" title="Business Report Center" subtitle="Choose a report category first. Each report opens in its own focused workspace.">
-        <div className="purchase-summary-grid supplier-payment-preview">
-          <SummaryMetric label="Categories" value={categories.length} featured />
-          <SummaryMetric label="Available Reports" value={Object.keys(reports).length} />
-          <SummaryMetric label="Current Range" value={range === "custom" ? "Custom" : range} />
-        </div>
-      </ModuleCard>
+      {/* The range every report opens with. Named here because it is an effective filter: an
+          unnamed "today" once made a month of sales look missing. */}
+      <section className="content-card">
+        <p className="form-note">
+          Reports open for <strong>{REPORT_RANGE_LABELS[appliedQuery.range] || "the chosen dates"}</strong>
+          {` (${formatIndianReportDate(appliedQuery.date_from)} to ${formatIndianReportDate(appliedQuery.date_to)}). `}
+          Change the dates inside any report.
+        </p>
+      </section>
       <section className="report-center-grid">
         {categories.map((category) => (
           <button className="report-category-card" key={category.id} onClick={() => setSelectedCategory(category.id)}>
             <span className="report-category-icon"><Icon name={category.icon} size={24} /></span>
             <strong>{category.title}</strong>
             <span>{category.description}</span>
-            <em>{category.reports.length} reports</em>
+            <em>{category.reports.length} {category.reports.length === 1 ? "report" : "reports"}</em>
           </button>
         ))}
       </section>
@@ -16741,7 +16977,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
     const status = lotStatus(lot);
     return (
       <tr className="report-row-clickable" data-inventory-lot-row={String(lot.id)} key={lot.id} onClick={() => openLotDetail(lot)}>
-        <td className="primary-cell">{lot.product_name}<small className="cell-note">{lot.unit}</small></td>
+        <td className="primary-cell">{lot.product_name}<small className="cell-note">{labelFor("unit", lot.unit)}</small></td>
         <td>{lot.category || "Fruit"}</td>
         <td>{lot.supplier_name || "-"}</td>
         <td className="primary-cell">{lot.lot_name || lot.batch_no || `Lot #${lot.id}`}</td>
@@ -16795,7 +17031,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
       {inventoryUnavailable && <div className="error-banner" role="alert" data-report-note="">{inventoryPresentation.message}</div>}
       {stockDateRangeError && <div className="error-banner" role="alert">{stockDateRangeError}</div>}
       {auditUnavailableMessage && <div className="cart-empty" role="status" data-report-note="">{auditUnavailableMessage}</div>}
-      {auditError && <div className="error-banner" data-report-note="">{auditError}</div>}
+      {auditError && <div className="error-banner" role="alert" data-report-note="">{auditError}</div>}
       <div className="stock-inventory-toolbar sticky-report-filters no-print">
         <div className="stock-filter-row stock-filter-row-primary">
           <Field label="Product Search / Selector">
@@ -17049,7 +17285,7 @@ export function StockInventoryReport({ auditEndpoint, auditUnavailableMessage = 
                     <td>{row.edited_at ? new Date(row.edited_at).toLocaleString("en-IN") : "-"}</td>
                     <td className="primary-cell">{row.product_name}</td>
                     <td>{row.lot_name || row.lot_id || "-"}</td>
-                    <td><span className="tag">{row.action}</span></td>
+                    <td><span className="tag">{labelFor("auditAction", row.action)}</span></td>
                     <td>{auditChangeSummary(row)}</td>
                     <td>{row.reason || "-"}</td>
                     <td>{row.edited_by_name || "-"}</td>
@@ -17148,7 +17384,7 @@ function SaleReturnModule({ onReload, returns, salesHistory, user }) {
             const value = (Number(item.net_amount || 0) / Number(item.sold_quantity || 1)) * quantity;
             return (
               <tr key={item.sale_item_id}>
-                <td className="primary-cell">{item.product_name}<small className="cell-note">{item.unit}</small></td>
+                <td className="primary-cell">{item.product_name}<small className="cell-note">{labelFor("unit", item.unit)}</small></td>
                 <td>{Number(item.sold_quantity || 0).toLocaleString("en-IN")}</td>
                 <td>{Number(item.returned_quantity || 0).toLocaleString("en-IN")}</td>
                 <td>{Number(item.returnable_quantity || 0).toLocaleString("en-IN")}</td>
@@ -17162,7 +17398,7 @@ function SaleReturnModule({ onReload, returns, salesHistory, user }) {
         <div className="purchase-summary-grid supplier-payment-preview">
           <SummaryMetric label="Selected Items" value={selectedItems.length} />
           <SummaryMetric label="Return Value" value={currency.format(totalReturnValue)} featured />
-          <SummaryMetric label="Refund Mode" value={refundType.replaceAll("_", " ")} />
+          <SummaryMetric label="Refund Mode" value={labelFor("refundType", refundType)} />
         </div>
         <button className="primary-button" onClick={saveReturn}>Save Return / Refund</button>
       </ModuleCard>
@@ -17174,7 +17410,7 @@ function SaleReturnModule({ onReload, returns, salesHistory, user }) {
               <td>{toDateKey(entry.return_date)}</td>
               <td>{entry.invoice_no}</td>
               <td className="primary-cell">{entry.customer_name || "Walk-in"}</td>
-              <td><span className="tag">{entry.refund_type}</span></td>
+              <td><span className="tag">{labelFor("refundType", entry.refund_type)}</span></td>
               <td>{currency.format(Number(entry.total_return_amount || 0))}</td>
               <td>{entry.return_reason}</td>
               <td>{(entry.items || []).map((item) => `${item.product_name} x ${item.return_quantity}`).join(", ")}</td>
@@ -17194,8 +17430,13 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
     waste_date: toDateKey(new Date()),
     remarks: "",
   });
+  // Keyed and read with the canonical id on both sides. It used to be `Number()` on both, which
+  // folds "004" into 4 and turns a non-numeric id into NaN, so a product could show another's stock
+  // or none at all.
   const stockByProduct = inventory.reduce((stock, item) => {
-    stock.set(Number(item.product_id), (stock.get(Number(item.product_id)) || 0) + Number(item.remaining_qty || 0));
+    const key = canonicalInventoryId(item.product_id);
+    if (key === "") return stock;
+    stock.set(key, (stock.get(key) || 0) + Number(item.remaining_qty || 0));
     return stock;
   }, new Map());
   const mostWasted = [...entries].reduce((map, entry) => {
@@ -17225,12 +17466,12 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
   };
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow="Waste Management" title="Waste Entry" subtitle="Record Daagi, sampling, personal use and other fruit waste with automatic FIFO stock reduction.">
+      <ModuleCard eyebrow="Record waste" title="Fruit taken off the shelf" subtitle="Daagi, sampling, personal use or anything else. Stock goes down straight away, from the oldest lot first.">
         <div className="form-grid supplier-form-grid">
           <Field label="Product">
             <select value={draft.product_id} onChange={(event) => setDraft({ ...draft, product_id: event.target.value })}>
               <option value="">Select product</option>
-              {products.filter((product) => product.active !== false).map((product) => <option key={product.id} value={product.id}>{product.product_name} - Stock {stockByProduct.get(Number(product.id)) || 0}</option>)}
+              {products.filter((product) => product.active !== false).map((product) => <option key={product.id} value={product.id}>{product.product_name} - Stock {(stockByProduct.get(canonicalInventoryId(product.id)) || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</option>)}
             </select>
           </Field>
           <Field label="Quantity"><input min="0" step="0.001" type="number" value={draft.quantity} onChange={(event) => setDraft({ ...draft, quantity: event.target.value })} /></Field>
@@ -17247,7 +17488,7 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
         </div>
         <button className="primary-button" onClick={saveWaste}>Save Waste Entry</button>
       </ModuleCard>
-      <ModuleCard eyebrow="Business Intelligence" title="Most Wasted Products" subtitle="Highlights products causing the highest waste quantity.">
+      <ModuleCard eyebrow="Top five" title="Most wasted products" subtitle="The products lost most, by quantity.">
         <div className="top-product-list">
           {mostWastedProducts.length ? mostWastedProducts.map((item) => (
             <article className="top-product-row" key={item.product_name}>
@@ -17257,13 +17498,13 @@ function WasteManagementModule({ entries, inventory, onReload, products, user })
           )) : <div className="empty-inline">No waste entries yet.</div>}
         </div>
       </ModuleCard>
-      <ModuleCard eyebrow="Waste History" title="Waste Register" subtitle="Waste quantity and FIFO cost are stored for daily and monthly reporting.">
+      <ModuleCard eyebrow="Waste History" title="Waste Register" subtitle="Each entry's quantity and what that fruit cost to buy. The waste reports are built from these.">
         <DataTable headers={["Date", "Product", "Type", "Quantity", "Cost", "Remarks"]}>
           {entries.map((entry) => (
             <tr key={entry.id}>
               <td>{toDateKey(entry.waste_date)}</td>
-              <td className="primary-cell">{entry.product_name}<small className="cell-note">{entry.unit}</small></td>
-              <td><span className="tag">{entry.waste_type}</span></td>
+              <td className="primary-cell">{entry.product_name}<small className="cell-note">{labelFor("unit", entry.unit)}</small></td>
+              <td><span className="tag">{labelFor("wasteType", entry.waste_type)}</span></td>
               <td>{Number(entry.quantity || 0).toLocaleString("en-IN")}</td>
               <td>{currency.format(Number(entry.cost_amount || 0))}</td>
               <td>{entry.remarks || "-"}</td>
@@ -17447,7 +17688,7 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
     <section className="content-card">
       <div className="card-heading">
         <div>
-          <h2>Stock Distribution</h2>
+          <h2>Consignments between shops</h2>
           <p className="muted-note">
             Fruit moving between the warehouse and the shops. Stock leaves the sender when it is
             dispatched and joins the receiver when it is received.
@@ -17468,7 +17709,7 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
       </div>
 
       {board.message && (
-        <div className="startup-status-panel startup-status-error">
+        <div className="startup-status-panel startup-status-error" role="alert">
           <p><strong>{board.status === DISTRIBUTION_BOARD_STATUS.SCOPE_UNKNOWN ? "This counter has no shop set" : "Consignments unavailable"}</strong></p>
           <p>{board.message}</p>
         </div>
@@ -17558,11 +17799,7 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
       )}
 
       {board.status === DISTRIBUTION_BOARD_STATUS.READY && (
-        <table className="data-table">
-          <thead>
-            <tr><th>Number</th><th>From</th><th>To</th><th>Status</th><th>What you can do</th></tr>
-          </thead>
-          <tbody>
+        <DataTable headers={["Number", "From", "To", "Status", "What you can do"]}>
             {board.transfers.map((entry) => {
               // The board's entries are the *described* form; the crates need the raw lines. Looked
               // up by the same canonical id `describeTransfer` derived, never by `Number()`.
@@ -17661,10 +17898,9 @@ function DistributionModule({ busy = false, destinations = [], inventory = [], o
               );
             })}
             {board.transfers.length === 0 && (
-              <tr><td colSpan={5}>No consignments yet. Stock sent between shops will appear here.</td></tr>
+              <tr><td className="empty-cell" colSpan={5}>No consignments yet. Stock sent between shops will appear here.</td></tr>
             )}
-          </tbody>
-        </table>
+        </DataTable>
       )}
     </section>
   );
@@ -17727,7 +17963,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
 
   if (state.loadState === "loading") {
     return (
-      <ModuleCard eyebrow="Customer Orders" title="Orders" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
+      <ModuleCard eyebrow="Open orders" title="Loading orders" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
         <p className="form-note">Reading orders from this device...</p>
       </ModuleCard>
     );
@@ -17738,7 +17974,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
     // orders from this device..." that was reading nothing. A stuck spinner is a lie about what
     // the app is doing; this says what happened and offers the way out.
     return (
-      <ModuleCard eyebrow="Customer Orders" title="Orders" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
+      <ModuleCard eyebrow="Open orders" title="Orders not loaded yet" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
         <div className="cart-empty">Orders have not been loaded yet.</div>
         <p><button className="table-action" type="button" onClick={onReload}>Load orders</button></p>
       </ModuleCard>
@@ -17748,8 +17984,8 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
     // A distinct error state, never an empty board. "No orders" and "orders could not be read" look
     // identical to a reader and mean opposite things.
     return (
-      <ModuleCard eyebrow="Customer Orders" title="Orders" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
-        <div className="cart-empty">{state.loadError}</div>
+      <ModuleCard eyebrow="Open orders" title="Orders could not be loaded" subtitle="Phone, WhatsApp and counter orders, from taken to delivered.">
+        <div className="error-banner" role="alert">{state.loadError}</div>
         <p><button className="table-action" type="button" onClick={onReload}>Try again</button></p>
       </ModuleCard>
     );
@@ -17797,7 +18033,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
                 <tr key={order.id}>
                   <td className="primary-cell">
                     {order.orderNo}
-                    <small className="cell-note">{order.source.toLowerCase()}</small>
+                    <small className="cell-note">{labelFor("orderSource", order.source)}</small>
                   </td>
                   <td>
                     {order.customerName}
@@ -17841,16 +18077,16 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
       )}
 
       <ModuleCard
-        eyebrow="Customer Orders"
-        title="Orders"
-        subtitle="Phone, WhatsApp and counter orders, from taken to delivered. Stored on this device — no internet needed."
+        eyebrow="At a glance"
+        title="Open orders"
+        subtitle="Phone, WhatsApp and counter orders, from taken to delivered. Kept on this computer, so it works without internet."
       >
         <p><button className="table-action" type="button" onClick={onReload}>Refresh</button></p>
 
         {board.needsAttention.length > 0 && (
           // Above the board, not a badge on a card. A lapsed order looks exactly like a healthy one
           // and the difference is that its fruit may already have been sold to somebody else.
-          <div className="cart-empty" role="alert">
+          <div className="warning-note" role="alert">
             <strong>{board.needsAttention.length} order{board.needsAttention.length === 1 ? "" : "s"} need checking.</strong>{" "}
             {board.needsAttention.map((order) => `${order.orderNo || "Order"} (${order.customerName})`).join(", ")}
             {" — "}the stock held for these went back on the shelf after six hours. Check it is still in the shop before packing.
@@ -17866,7 +18102,7 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
       </ModuleCard>
 
       <ModuleCard eyebrow="New" title="Take an order" subtitle="Rings the phone? Write it here. Stock is set aside the moment you save.">
-        {draftError && <div className="cart-empty" role="alert">{draftError}</div>}
+        {draftError && <div className="error-banner" role="alert">{draftError}</div>}
         {products.length === 0 && (
           // An empty dropdown with no explanation reads as a broken screen. This says which of the
           // two it is: nothing to sell yet, or a list that did not arrive.
@@ -17952,17 +18188,17 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
                 <span>{money(order.value)}</span>
               </div>
               <p className="form-note">
-                {order.customerMobile || "No number"} · {order.source}
+                {order.customerMobile || "No number"} · {labelFor("orderSource", order.source)}
                 {order.deliveryAddress ? ` · ${order.deliveryAddress}` : ""}
                 {order.invoiceNo ? ` · billed ${order.invoiceNo}` : ""}
               </p>
 
-              {order.warning && <div className="cart-empty" role="alert">{order.warning}</div>}
+              {order.warning && <div className="warning-note" role="alert">{order.warning}</div>}
 
               {/* Money before goods. Shown on the card and enforced in validateOrderAction, so the
                   answer cannot be skipped by a path that did not draw this control. */}
               {order.paymentWarning && (
-                <div className="cart-empty" role="alert">{order.paymentWarning}</div>
+                <div className="warning-note" role="alert">{order.paymentWarning}</div>
               )}
               <div className="purchase-summary-grid supplier-payment-preview">
                 <Field label="Has this been paid?">
@@ -18056,13 +18292,13 @@ function OrdersModule({ branches = [], busy = false, onAdvance, onAssign, onRelo
       ))}
 
       {board.finished.length > 0 && (
-        <ModuleCard eyebrow="History" title={`Finished (${board.finished.length})`} subtitle="Kept on purpose — 'did that go out yesterday?' has to stay answerable.">
+        <ModuleCard eyebrow="History" title={`Finished (${board.finished.length})`} subtitle="Delivered, returned and cancelled orders, so you can check what went out.">
           <DataTable headers={["Order", "Customer", "Status", "Carrier", "Value"]}>
             {board.finished.map((order) => (
               <tr key={order.id}>
                 <td>{order.orderNo}</td>
                 <td>{order.customerName}</td>
-                <td>{order.status}</td>
+                <td>{labelFor("orderStatus", order.status)}</td>
                 <td>{order.carrier || "-"}</td>
                 <td>{money(order.value)}</td>
               </tr>
@@ -18088,7 +18324,7 @@ function AllShopsModule({ connectivityMode, onReload, state }) {
   return (
     <ModuleCard
       eyebrow="Owner View"
-      title="All Shops"
+      title="Company position"
       subtitle={asAt ? `Company position as at ${asAt}. Every other screen shows only the shop you are signed in to.` : "Company position across every shop. Every other screen shows only the shop you are signed in to."}
     >
       <p className="form-row">
@@ -18107,9 +18343,17 @@ function AllShopsModule({ connectivityMode, onReload, state }) {
         )}
       </p>
 
-      {presentation.message && <p className="form-note">{presentation.message}</p>}
+      {/* A failed or partial load is an error or a warning, never help text: "Some shops are
+          missing" in the same calm style as a tip reads as a tip. Loading and empty stay neutral. */}
+      {presentation.message && (
+        presentation.status === ALL_SHOPS_STATUS.ERROR
+          ? <p className="error-banner" role="alert">{presentation.message}</p>
+          : presentation.status === ALL_SHOPS_STATUS.PARTIAL || presentation.status === ALL_SHOPS_STATUS.OFFLINE
+            ? <p className="warning-note" role="alert">{presentation.message}</p>
+            : <p className="form-note">{presentation.message}</p>
+      )}
       {presentation.warnings.map((warning) => (
-        <p className="form-note" key={warning} role="alert"><strong>Check this:</strong> {warning}</p>
+        <p className="warning-note" key={warning} role="alert"><strong>Check this:</strong> {warning}</p>
       ))}
 
       {showFigures && (
@@ -18239,11 +18483,7 @@ function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
 
   return (
     <section className="settings-layout">
-      <ModuleCard eyebrow="Operating Costs" title="Expenses" subtitle="Record and manage daily operating expenses.">
-        <div className="purchase-summary-grid supplier-payment-preview">
-          <SummaryMetric label="Active Expense Total" value={currency.format(totalActiveExpenses)} featured />
-          <SummaryMetric label="Expense Entries" value={expenses.length} />
-        </div>
+      <ModuleCard eyebrow={editingId ? "Editing" : "New expense"} title={editingId ? "Edit expense" : "Record an expense"} subtitle="Rent, wages, transport and the other costs of running the shop.">
         <div className="form-grid supplier-form-grid">
           <Field label="Expense Date"><input type="date" value={draft.expense_date} onChange={(event) => setDraft({ ...draft, expense_date: event.target.value })} /></Field>
           <Field label="Category">
@@ -18261,7 +18501,7 @@ function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
           </Field>
           <Field label="Reference Number"><input value={draft.reference_number} onChange={(event) => setDraft({ ...draft, reference_number: event.target.value })} /></Field>
           <Field label="Paid To / Vendor Name"><input value={draft.vendor_name} onChange={(event) => setDraft({ ...draft, vendor_name: event.target.value })} /></Field>
-          <label className="check-field"><input checked={draft.active} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>Active</span></label>
+          <label className="check-field pm-check"><input checked={draft.active} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>Active</span></label>
           <Field label="Remarks"><textarea value={draft.remarks} onChange={(event) => setDraft({ ...draft, remarks: event.target.value })} /></Field>
         </div>
         <div className="button-row">
@@ -18297,6 +18537,12 @@ function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
           <Field label="To"><input type="date" value={filters.date_to} onChange={(event) => setFilters({ ...filters, date_to: event.target.value })} /></Field>
           <button className="secondary-button" onClick={onReload}>Refresh</button>
         </div>
+        {/* Both tiles count the rows the table below shows, so the summary and the list cannot
+            disagree about which expenses are in view. */}
+        <div className="purchase-summary-grid supplier-payment-preview">
+          <SummaryMetric label="Total (excluding cancelled)" value={currency.format(totalActiveExpenses)} featured />
+          <SummaryMetric label="Entries shown" value={filteredExpenses.length} />
+        </div>
         <DataTable headers={["Date", "Category", "Vendor", "Mode", "Amount", "Status", "Reference", "Remarks", ""]}>
           {filteredExpenses.map((expense) => {
             const status = expense.status || (expense.active !== false ? "ACTIVE" : "CANCELLED");
@@ -18305,9 +18551,9 @@ function ExpensesModule({ canCancel = false, expenses, onReload, user }) {
               <td>{expense.expense_date}</td>
               <td className="primary-cell">{expense.category}</td>
               <td>{expense.paid_to || expense.vendor_name || "-"}</td>
-              <td><span className="tag">{expense.payment_mode}</span></td>
+              <td><span className="tag">{labelFor("paymentMode", expense.payment_mode)}</span></td>
               <td>{currency.format(Number(expense.amount || 0))}</td>
-              <td><span className={status === "ACTIVE" ? "stock-ok" : "stock-low"}>{status}</span></td>
+              <td><span className={statusClass("recordStatus", status)}>{labelFor("recordStatus", status)}</span></td>
               <td>{expense.reference_number || "-"}</td>
               <td>{expense.remarks || expense.cancellation_reason || "-"}</td>
               <td>
@@ -18618,13 +18864,6 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
 
   return (
     <section className="settings-layout">
-      <section className="settings-banner">
-        <div>
-          <span className="eyebrow">Unified Accounts</span>
-          <h2>Accounts</h2>
-          <p>Customers, suppliers, vendors, staff and other account ledgers in one workspace.</p>
-        </div>
-      </section>
       <div className="account-tabs">
         {accountTabs.map(([value, label]) => (
           <button className={tab === value ? "account-tab account-tab-active" : "account-tab"} key={value} onClick={() => setTab(value)}>{label}</button>
@@ -18633,29 +18872,42 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
 
       {tab === "master" && (
         <>
-          <ModuleCard eyebrow="Account Master" title="Create / Edit Account" subtitle="Use account type to control purchase, POS, ledger and payment behavior.">
-            <div className="form-grid supplier-form-grid">
-              <Field label="Account Type">
-                <select value={draft.account_type} onChange={(event) => setDraft({ ...draft, account_type: event.target.value })}>
-                  {accountTypes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-                </select>
-              </Field>
-              <Field label="Account Name"><input value={draft.account_name} onChange={(event) => setDraft({ ...draft, account_name: event.target.value })} /></Field>
-              <Field label="Firm Name"><input value={draft.firm_name} onChange={(event) => setDraft({ ...draft, firm_name: event.target.value })} /></Field>
-              <Field label="Mobile"><input value={draft.mobile_number} onChange={(event) => setDraft({ ...draft, mobile_number: event.target.value.replace(/\D/g, "") })} /></Field>
-              <Field label="WhatsApp Number"><input placeholder="Blank uses mobile number" value={draft.whatsapp_number} onChange={(event) => setDraft({ ...draft, whatsapp_number: event.target.value.replace(/[^\d+]/g, "") })} /></Field>
-              <label className="check-field"><input checked={draft.whatsapp_opt_in !== false} type="checkbox" onChange={(event) => setDraft({ ...draft, whatsapp_opt_in: event.target.checked })} /><span>WhatsApp Opt-in</span></label>
-              <Field label="Alternate Number"><input value={draft.alternate_number} onChange={(event) => setDraft({ ...draft, alternate_number: event.target.value.replace(/\D/g, "") })} /></Field>
-              <Field label="City"><input value={draft.city} onChange={(event) => setDraft({ ...draft, city: event.target.value })} /></Field>
-              <Field label="GST Number"><input value={draft.gst_number} onChange={(event) => setDraft({ ...draft, gst_number: event.target.value })} /></Field>
-              <Field label="Bank Name"><input value={draft.bank_name} onChange={(event) => setDraft({ ...draft, bank_name: event.target.value })} /></Field>
-              <Field label="Account Number"><input value={draft.account_number} onChange={(event) => setDraft({ ...draft, account_number: event.target.value })} /></Field>
-              <Field label="IFSC"><input value={draft.ifsc_code} onChange={(event) => setDraft({ ...draft, ifsc_code: event.target.value })} /></Field>
-              <Field label="UPI ID"><input value={draft.upi_id} onChange={(event) => setDraft({ ...draft, upi_id: event.target.value })} /></Field>
-              <Field label="Opening Balance"><input min="0" step="0.01" type="number" value={draft.opening_balance} onChange={(event) => setDraft({ ...draft, opening_balance: event.target.value })} /></Field>
-              <label className="check-field"><input checked={draft.active} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>Active</span></label>
-              <Field label="Address"><textarea value={draft.address} onChange={(event) => setDraft({ ...draft, address: event.target.value })} /></Field>
-              <Field label="Notes"><textarea value={draft.notes} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></Field>
+          <ModuleCard eyebrow="Account details" title={editingKey ? "Edit account" : "Add an account"} subtitle="The account type decides where it shows up: purchases, POS bills, ledgers and payments.">
+            <div className="pm-form-section">
+              <h3>Account</h3>
+              <div className="form-grid supplier-form-grid">
+                <Field label="Account Type">
+                  <select value={draft.account_type} onChange={(event) => setDraft({ ...draft, account_type: event.target.value })}>
+                    {accountTypes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                  </select>
+                </Field>
+                <Field label="Account Name"><input value={draft.account_name} onChange={(event) => setDraft({ ...draft, account_name: event.target.value })} /></Field>
+                <Field label="Firm Name"><input value={draft.firm_name} onChange={(event) => setDraft({ ...draft, firm_name: event.target.value })} /></Field>
+                <Field label="GST Number"><input value={draft.gst_number} onChange={(event) => setDraft({ ...draft, gst_number: event.target.value })} /></Field>
+                <Field label="Opening Balance"><input min="0" step="0.01" type="number" value={draft.opening_balance} onChange={(event) => setDraft({ ...draft, opening_balance: event.target.value })} /></Field>
+                <Field label="Notes"><textarea value={draft.notes} onChange={(event) => setDraft({ ...draft, notes: event.target.value })} /></Field>
+              </div>
+              <label className="check-field pm-check"><input checked={draft.active} type="checkbox" onChange={(event) => setDraft({ ...draft, active: event.target.checked })} /><span>Active</span></label>
+            </div>
+            <div className="pm-form-section">
+              <h3>Contact</h3>
+              <div className="form-grid supplier-form-grid">
+                <Field label="Mobile"><input value={draft.mobile_number} onChange={(event) => setDraft({ ...draft, mobile_number: event.target.value.replace(/\D/g, "") })} /></Field>
+                <Field label="WhatsApp Number"><input placeholder="Blank uses mobile number" value={draft.whatsapp_number} onChange={(event) => setDraft({ ...draft, whatsapp_number: event.target.value.replace(/[^\d+]/g, "") })} /></Field>
+                <Field label="Alternate Number"><input value={draft.alternate_number} onChange={(event) => setDraft({ ...draft, alternate_number: event.target.value.replace(/\D/g, "") })} /></Field>
+                <Field label="City"><input value={draft.city} onChange={(event) => setDraft({ ...draft, city: event.target.value })} /></Field>
+                <Field label="Address"><textarea value={draft.address} onChange={(event) => setDraft({ ...draft, address: event.target.value })} /></Field>
+              </div>
+              <label className="check-field pm-check"><input checked={draft.whatsapp_opt_in !== false} type="checkbox" onChange={(event) => setDraft({ ...draft, whatsapp_opt_in: event.target.checked })} /><span>Send WhatsApp messages to this account</span></label>
+            </div>
+            <div className="pm-form-section">
+              <h3>Bank details</h3>
+              <div className="form-grid supplier-form-grid">
+                <Field label="Bank Name"><input value={draft.bank_name} onChange={(event) => setDraft({ ...draft, bank_name: event.target.value })} /></Field>
+                <Field label="Account Number"><input value={draft.account_number} onChange={(event) => setDraft({ ...draft, account_number: event.target.value })} /></Field>
+                <Field label="IFSC"><input value={draft.ifsc_code} onChange={(event) => setDraft({ ...draft, ifsc_code: event.target.value })} /></Field>
+                <Field label="UPI ID"><input value={draft.upi_id} onChange={(event) => setDraft({ ...draft, upi_id: event.target.value })} /></Field>
+              </div>
             </div>
             <div className="button-row">
               <button className="primary-button" onClick={saveAccount}>{editingKey ? "Update Account" : "Add Account"}</button>
@@ -18674,7 +18926,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
                     {account.account_name}
                     <small className="cell-note">{account.system_account ? "System Account" : account.firm_name || account.city || account.address || "-"}</small>
                   </td>
-                  <td><span className="tag">{account.account_type}</span></td>
+                  <td><span className="tag">{labelFor("accountType", account.account_type)}</span></td>
                   <td>{account.mobile_number || "-"}</td>
                   <td>{currency.format(Number(account.opening_balance || 0))}</td>
                   <td>{currency.format(Number(account.receivable_balance || 0))}</td>
@@ -18699,7 +18951,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
             <Field label="Account">
               <select value={ledgerAccountKey} onChange={(event) => loadLedger(event.target.value)}>
                 <option value="">Select account</option>
-                {ledgerAccounts.map((account) => <option key={account.account_key} value={account.account_key}>{account.account_name} - {account.account_type}</option>)}
+                {ledgerAccounts.map((account) => <option key={account.account_key} value={account.account_key}>{account.account_name} - {labelFor("accountType", account.account_type)}</option>)}
               </select>
             </Field>
             <button className="secondary-button" onClick={() => loadLedger(ledgerAccountKey)}>Refresh Ledger</button>
@@ -18728,9 +18980,9 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
                 <tr key={`${row.date}-${row.transaction_type}-${index}`}>
                   <td>{row.date}</td>
                   <td>{row.invoice_no || "-"}</td>
-                  <td><span className="tag">{row.transaction_type}</span></td>
+                  <td><span className="tag">{labelFor("transactionType", row.transaction_type)}</span></td>
                   <td>{row.sale_amount ? currency.format(Number(row.sale_amount || 0)) : "-"}</td>
-                  <td>{row.payment_mode || "-"}</td>
+                  <td>{labelFor("paymentMode", row.payment_mode)}</td>
                   <td>{currency.format(Number(row.debit || 0))}</td>
                   <td>{currency.format(Number(row.credit || 0))}</td>
                   <td className="balance-cell">{currency.format(Number(row.balance || 0))}</td>
@@ -18790,7 +19042,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
             <Field label="Account">
               <select value={payment.account_key} onChange={(event) => refreshPaymentsForSelection(event.target.value)}>
                 <option value="">Select account</option>
-                {paymentAccounts.map((account) => <option key={account.account_key} value={account.account_key}>{account.account_name} - {account.account_type}</option>)}
+                {paymentAccounts.map((account) => <option key={account.account_key} value={account.account_key}>{account.account_name} - {labelFor("accountType", account.account_type)}</option>)}
               </select>
             </Field>
             <Field label="Payment Date"><input type="date" value={payment.payment_date} onChange={(event) => setPayment({ ...payment, payment_date: event.target.value })} /></Field>
@@ -18823,10 +19075,10 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
               <tr key={row.payment_key}>
                 <td>{toDateKey(row.payment_date)}</td>
                 <td className="primary-cell">{row.account_name}</td>
-                <td><span className="tag">{row.payment_source}</span></td>
+                <td><span className="tag">{labelFor("payment_source", row.payment_source)}</span></td>
                 <td>{currency.format(Number(row.payment_amount || 0))}</td>
                 <td>{Number(row.rebate_amount || 0) ? currency.format(Number(row.rebate_amount || 0)) : "-"}</td>
-                <td><span className="tag">{row.payment_mode}</span></td>
+                <td><span className="tag">{labelFor("paymentMode", row.payment_mode)}</span></td>
                 <td><span className={row.cancelled ? "stock-low" : "stock-ok"}>{row.cancelled ? "Cancelled" : "Active"}</span></td>
                 <td>{row.reference_number || "-"}</td>
                 <td>{row.cancellation_reason || row.edit_reason || row.remarks || "-"}</td>
@@ -18854,7 +19106,7 @@ function AccountsModule({ accounts, accountLedger, accountOutstanding, accountPa
             {[...(accountOutstanding.customerOutstanding || []), ...(accountOutstanding.supplierOutstanding || [])].map((account) => (
               <tr key={account.account_key}>
                 <td className="primary-cell">{account.account_name}</td>
-                <td><span className="tag">{account.account_type}</span></td>
+                <td><span className="tag">{labelFor("accountType", account.account_type)}</span></td>
                 <td>{currency.format(Number(account.receivable_balance || 0))}</td>
                 <td>{currency.format(Number(account.payable_balance || 0))}</td>
                 <td><span className={account.active !== false ? "stock-ok" : "stock-low"}>{account.active !== false ? "Active" : "Inactive"}</span></td>
@@ -18886,8 +19138,8 @@ class SettingsSectionErrorBoundary extends React.Component {
   render() {
     if (!this.state.failed) return this.props.children;
     return (
-      <ModuleCard eyebrow="Settings" title={`${this.props.sectionName || "Section"} Unavailable`} subtitle="This section could not load. Other Settings sections remain available.">
-        <p className="form-note">No published update information is available right now. Advanced Diagnostics remains available below.</p>
+      <ModuleCard eyebrow={this.props.eyebrow || "Settings"} title={`${this.props.sectionName || "Section"} Unavailable`} subtitle="This section could not load. Everything else on this screen still works.">
+        <p className="form-note">{this.props.fallbackNote || "No published update information is available right now. Advanced Diagnostics remains available below."}</p>
       </ModuleCard>
     );
   }
@@ -18979,9 +19231,9 @@ function SettingsModule({
    */
   const settingsSections = navigationRegistry.find((item) => item.id === "settings")?.sections || [];
   /**
-   * Issuing a device activation licence is the act that admits a machine to the business, so that
-   * section is shown only to the Owner -- not to Admin, who may approve a device but must not be
-   * able to license one.
+   * A section marked `ownerOnly` is shown only to the Owner. None is today: the one that was, the
+   * device activation licences, moved to Branches & Counters on 27 Sep 2026 and is filtered the
+   * same way there. The filter stays so a future Owner-only setting is hidden by default.
    *
    * The section is declared once, in the registry, carrying `ownerOnly`. The registry is shared
    * with the sidebar and the command palette and neither of those knows who is signed in, so the
@@ -19013,18 +19265,6 @@ function SettingsModule({
     "settings/bill-discount-slabs": <DiscountSettings canManage={canManage} discountRules={settingsData.discountRules} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />,
     "settings/permission-matrix": <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />,
     "settings/users": <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />,
-    "settings/device-control": <DeviceControlSettingsSection canManage={canManage} deviceControlSettings={settingsData.deviceControlSettings} exitAttemptLogs={settingsData.exitAttemptLogs || []} onReload={onReload} user={user} />,
-    "settings/device-activation": (
-      <SettingsSectionErrorBoundary sectionName="Device Activation Licences">
-        <DeviceActivationIssuingSection
-          canIssue={isOwnerAccount}
-          devices={settingsData.authorizedDevices}
-          devicesError={settingsData.canManageSettings ? null : "this account cannot read the device list"}
-          onReload={onReload}
-          user={user}
-        />
-      </SettingsSectionErrorBoundary>
-    ),
     "settings/updates": (
       <SettingsSectionErrorBoundary sectionName="Update Center">
         <UpdateCenterSection canManage={canManage} deviceControlSettings={settingsData.deviceControlSettings} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
@@ -19066,15 +19306,10 @@ function SettingsModule({
     "settings/system-info": <SystemInfoSection systemInfo={settingsData.systemInfo || {}} />,
   };
 
-  const banner = (
-    <section className="settings-banner">
-      <div>
-        <span className="eyebrow">System Controls</span>
-        <h2>Settings</h2>
-        <p>{canManage ? "Owner/Admin controls are active." : "Read-only access. Owner/Admin approval is required for changes."}</p>
-      </div>
-      <span className={canManage ? "stock-ok" : "stock-low"}>{canManage ? "Manager Access" : "Read Only"}</span>
-    </section>
+  // The page title already says Settings. What is worth a line of its own is whether this person
+  // can change anything here -- and only when they cannot, because that is the surprise.
+  const banner = canManage ? null : (
+    <p className="warning-note" role="status">You can look at these settings but not change them. Ask the Owner or an Administrator to make changes.</p>
   );
 
   const openGroup = SETTINGS_GROUPS.find((group) => group.id === settingsGroup) || null;
@@ -19106,7 +19341,8 @@ function SettingsModule({
   return (
     <section className="settings-layout">
       {banner}
-      <ModuleCard eyebrow="Settings" title="Choose what to change" subtitle="Grouped by what you are trying to do. Press Ctrl K and type to jump straight to a setting.">
+      <section className="content-card">
+        <p className="form-note">Grouped by what you are trying to do. Press Ctrl K and type to jump straight to a setting.</p>
         <section className="report-center-grid">
           {SETTINGS_GROUPS.map((group) => {
             const count = sectionsInGroup(group.id).length;
@@ -19120,7 +19356,7 @@ function SettingsModule({
             );
           })}
         </section>
-      </ModuleCard>
+      </section>
     </section>
   );
 }
@@ -19253,7 +19489,7 @@ function PosSettingsSection({ canManage, onReload, posSettings, user }) {
     }
   };
   return (
-    <ModuleCard eyebrow="POS Settings" title="Weighing Scale Integration" subtitle="Hardware integration foundation for USB, serial, Bluetooth and manual fallback billing.">
+    <ModuleCard eyebrow="POS Settings" title="Weighing Scale Integration" subtitle="Connect a scale by USB, serial or Bluetooth. Weights can always be typed in by hand.">
       <div className="form-grid supplier-form-grid">
         <label className="check-field"><input checked={draft.enable_weighing_scale === true} disabled={!canManage} type="checkbox" onChange={(event) => updateDraft("enable_weighing_scale", event.target.checked)} /><span>Enable weighing scale mode</span></label>
         <Field label="Connection Type">
@@ -19628,7 +19864,7 @@ function SaleRateSettingsSection({ canManage, onReload, saleRateSettings, user }
         <Field label="POS Lot Selection Mode">
           <select disabled={!canManage} value={draft.pos_lot_selection_mode || "ASK_MULTIPLE"} onChange={(event) => setDraft({ ...draft, pos_lot_selection_mode: event.target.value })}>
             <option value="ASK_MULTIPLE">Ask When Multiple Lots Exist</option>
-            <option value="AUTO_FIFO">Auto FIFO</option>
+            <option value="AUTO_FIFO">Use the oldest lot first</option>
             <option value="MANUAL">Manual Lot Selection</option>
           </select>
         </Field>
@@ -19734,7 +19970,7 @@ function MandiRuleRow({ canManage, onReload, rule, user }) {
   };
   return (
     <tr>
-      <td className="primary-cell">{rule.origin_type}</td>
+      <td className="primary-cell">{labelFor("origin", rule.origin_type)}</td>
       <td><input className="table-input" disabled={!canManage} min="0" step="0.001" type="number" value={taxPercent} onChange={(event) => setTaxPercent(event.target.value)} /></td>
       <td><label className="check-field"><input checked={active} disabled={!canManage} type="checkbox" onChange={(event) => setActive(event.target.checked)} /><span>{active ? "Active" : "Inactive"}</span></label></td>
       <td><div className="button-row"><button className="table-action" disabled={!canManage} onClick={save}>Save</button><button className="remove-button" disabled={!canManage} onClick={remove}><Icon name="trash" size={15} /></button></div></td>
@@ -19921,7 +20157,7 @@ function DeviceControlSettingsSection({ canManage, deviceControlSettings = defau
     }
   };
   return (
-    <ModuleCard eyebrow="Security / Device Control" title="Fullscreen Lock & Owner Exit Code" subtitle="App-level kiosk protection for counter devices. Windows administrator controls can still force close the application.">
+    <ModuleCard eyebrow="Counter security" title="Counter screen lock" subtitle="Keeps FroozERP fullscreen on counter computers and asks for the Owner's exit code before it closes. Windows administrator controls can still force it closed.">
       <div className="purchase-summary-grid supplier-payment-preview">
         <SummaryMetric featured label="Fullscreen Lock Mode" value={draft.fullscreen_lock_enabled ? "Enabled" : "Disabled"} />
         <SummaryMetric label="Exit Code" value={draft.exit_code_configured ? "Configured" : "Not Set"} />
@@ -19942,7 +20178,7 @@ function DeviceControlSettingsSection({ canManage, deviceControlSettings = defau
         <Field label="Confirm Exit Code"><input disabled={!canManage} inputMode="numeric" type="password" value={confirmExitCode} onChange={(event) => setConfirmExitCode(event.target.value.replace(/\D/g, ""))} /></Field>
       </div>
       <div className="button-row">
-        <button className="primary-button" disabled={!canManage} onClick={save}>Save Device Control</button>
+        <button className="primary-button" disabled={!canManage} onClick={save}>Save screen lock</button>
       </div>
       <p className="form-note">Failed exit attempts are logged for Owner/Admin review. If the exit code is forgotten, use Owner/Admin recovery or repair installation without deleting data.</p>
       <DataTable headers={["Attempted At", "User", "Device", "Result", "Reason"]}>
@@ -21339,13 +21575,13 @@ function SyncSettingsSection({
                 nobody had ever typed anything into it. The address is now part of the build, and
                 shown a few rows down as a fact rather than offered as a question. */}
             <Field label="Branch"><input disabled value={branchLabel} /></Field>
-            <Field label="Local SQLite Device ID"><input disabled value={localDeviceId} /></Field>
-            <Field label="Canonical Cloud Device ID"><input disabled value={canonicalCloudDeviceId} /></Field>
-            <Field label="Legacy Settings Device ID"><input disabled value={draft.device_id || "Not set"} /></Field>
+            <Field label="This Computer's ID"><input disabled value={localDeviceId} /></Field>
+            <Field label="ID in the Cloud"><input disabled value={canonicalCloudDeviceId} /></Field>
+            <Field label="Older Device ID (from Settings)"><input disabled value={draft.device_id || "Not set"} /></Field>
             <Field label="Device Display Name"><input disabled={!canManage} value={draft.device_display_name || ""} onChange={(event) => setDraft({ ...draft, device_display_name: event.target.value })} /></Field>
-            <Field label="Local SQLite Path"><input disabled value={localDbStatus?.databasePath || "Available in FroozERP desktop app"} /></Field>
+            <Field label="Local Database File"><input disabled value={localDbStatus?.databasePath || "Available in FroozERP desktop app"} /></Field>
             <Field label="Local Schema Version"><input disabled value={localDbStatus?.schemaVersion || "Not initialized"} /></Field>
-            <Field label="SQLite Integrity"><input disabled value={localDbAudit?.integrity || "Not checked"} /></Field>
+            <Field label="Local Database Check"><input disabled value={localDbAudit?.integrity || "Not checked"} /></Field>
             <Field label="Local Product Count"><input disabled value={localDbAudit?.products ?? "Not checked"} /></Field>
             <Field label="Local Inventory Lot Count"><input disabled value={localDbAudit?.inventory_lots ?? "Not checked"} /></Field>
             <Field label="Sellable Local Lot Count"><input disabled value={localDbAudit?.sellable_lots ?? "Not checked"} /></Field>
@@ -21387,7 +21623,7 @@ function SyncSettingsSection({
             <Field label="Cloud Device Detail"><input disabled value={cloudDeviceDetail} /></Field>
             <Field label="Device Local Time"><input disabled value={timeDiagnostics?.deviceLocalTime || formatKolkataDateTime(new Date())} /></Field>
             <Field label="Device UTC Time"><input disabled value={timeDiagnostics?.deviceUtcTime || new Date().toISOString()} /></Field>
-            <Field label="Railway Server UTC Time"><input disabled value={timeDiagnostics?.railwayServerUtcTime || "Unavailable"} /></Field>
+            <Field label="Cloud Server Time (UTC)"><input disabled value={timeDiagnostics?.railwayServerUtcTime || "Unavailable"} /></Field>
             <Field label="Detected Timezone"><input disabled value={timeDiagnostics?.detectedTimezone || "Unknown"} /></Field>
             <Field label="Clock Offset (seconds)"><input disabled value={timeDiagnostics?.clockOffsetSeconds ?? "Unavailable"} /></Field>
             <Field label="Last Server-Time Check"><input disabled value={timeDiagnostics?.lastSuccessfulServerTimeCheck ? formatKolkataDateTime(timeDiagnostics.lastSuccessfulServerTimeCheck) : "Not checked"} /></Field>
@@ -21434,7 +21670,21 @@ const EMPTY_OPERATIONAL_SCOPE_DATA = Object.freeze({
   roles: [],
 });
 
-function OperationalScopeManagement({ canManage: settingsSayManage, user }) {
+/**
+ * Where a Branches & Counters section lives on the page. One spelling for the card's id and for
+ * every lookup of it (the jump bar, a searched-for section), so the two cannot drift apart.
+ */
+const scopeSectionDomId = (sectionId) => String(sectionId).replace("/", "-");
+
+function OperationalScopeManagement({
+  canManage: settingsSayManage,
+  canManageDevices = false,
+  focusSection = null,
+  onFocusSectionHandled,
+  onReloadSettings,
+  settingsData = {},
+  user,
+}) {
   const [data, setData] = useState(EMPTY_OPERATIONAL_SCOPE_DATA);
   // Whether the boxes on this screen can be typed in. `settingsSayManage` comes from the Settings
   // bundle, which is only fetched when Settings or Orders is opened, so coming straight here after
@@ -21468,6 +21718,29 @@ function OperationalScopeManagement({ canManage: settingsSayManage, user }) {
     }
   }, [user]);
   useEffect(() => { load(); }, [load]);
+  // Same rule as the Settings filter: the licence card is the Owner's, and a phone has no screen
+  // lock. The backend refuses either way; this only decides what is drawn.
+  const isOwnerAccount = String(user?.role || user?.role_name || "").toUpperCase() === "OWNER";
+  const visibleSections = (navigationRegistry.find((item) => item.id === "branches")?.sections || [])
+    .filter((section) => (!section.ownerOnly || isOwnerAccount) && shellShowsSettingsSection(section.id, SHELL_CAPABILITIES));
+  const showsSection = (sectionId) => visibleSections.some((section) => section.id === sectionId);
+  const scrollToSection = (sectionId) => document.getElementById(scopeSectionDomId(sectionId))
+    ?.scrollIntoView({ behavior: "smooth", block: "start" });
+  // A searched-for section: wait for the page to finish loading (the cards do not exist before
+  // that), then scroll. Cleared whether or not it is found, so a stale id cannot re-fire forever.
+  useEffect(() => {
+    if (!focusSection || loading) return undefined;
+    if (!showsSection(focusSection)) {
+      onFocusSectionHandled?.();
+      return undefined;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      scrollToSection(focusSection);
+      onFocusSectionHandled?.();
+    });
+    return () => window.cancelAnimationFrame(frame);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusSection, loading]);
 
   const activeBranches = data.branches.filter((branch) => branch.active !== false);
   const locationsForBranch = (branchId) => data.operational_locations.filter(
@@ -21604,7 +21877,12 @@ function OperationalScopeManagement({ canManage: settingsSayManage, user }) {
         delete next[device.device_id];
         return next;
       });
-      report("computers", "ok", `${device.device_name || device.device_id} approved.`);
+      report("computers", "ok", isOwnerAccount
+        ? `${device.device_name || device.device_id} approved. Now issue its licence in Step 5 below.`
+        : `${device.device_name || device.device_id} approved. The Owner issues its licence next.`);
+      // The licence list reads the settings bundle, not this screen's own data, so it would not
+      // show the machine just approved until something else refreshed it.
+      onReloadSettings?.();
     } catch (requestError) { report("computers", "error", getErrorMessage(requestError, "The computer could not be approved.")); }
   };
 
@@ -21617,13 +21895,25 @@ function OperationalScopeManagement({ canManage: settingsSayManage, user }) {
   const activeCounters = data.operational_locations.filter((location) => location.active !== false);
   const locationTypeLabel = (type) => ({ STORE: "Shop counter", WAREHOUSE: "Store room / warehouse", MANDI_COUNTER: "Mandi counter", OFFICE: "Office" })[type] || type;
   return (
-    <ModuleCard eyebrow="Branches & Counters" title="Branches & Counters" subtitle="Set up in this order: 1. Branch (your shop)  2. Counter inside the branch  3. Staff at the counter  4. Computer at the counter.">
-      {error && <div className="startup-status-panel"><p>{error}</p></div>}
-      {!canManage && !error && <p className="form-note">Only the Owner can change branches, counters, staff and computers. You can look, but the boxes are locked.</p>}
+    <div className="scope-page">
+      <ModuleCard eyebrow="Setup" title="Branches & Counters" subtitle="Your shops, their counters, who works where, and which computers and phones may bill. Set them up in this order.">
+        {error && <div className="startup-status-error" role="alert"><p>{error}</p></div>}
+        {!canManage && !error && <p className="scope-locked-note">Only the Owner can change branches, counters, staff and computers. You can look, but the boxes are locked.</p>}
+        <nav className="scope-jump" aria-label="Sections on this page">
+          {visibleSections.map((section) => (
+            <a
+              href={`#${scopeSectionDomId(section.id)}`}
+              key={section.id}
+              onClick={(event) => { event.preventDefault(); scrollToSection(section.id); }}
+            >
+              <span className="scope-jump-step">{section.eyebrow}</span>
+              {section.label}
+            </a>
+          ))}
+        </nav>
+      </ModuleCard>
 
-      <section className="scope-step">
-        <h3>Step 1 · Branches</h3>
-        <p className="form-note">A branch is one shop. Reports are totalled branch by branch.</p>
+      <ModuleCard id={scopeSectionDomId("branches/shops")} eyebrow="Step 1" title="Branches" subtitle="A branch is one shop. Reports are totalled branch by branch.">
         <div className="form-grid supplier-form-grid">
           <Field label="Branch name"><input disabled={!canManage} placeholder="e.g. Jodhpur Main" value={branchDraft.branch_name} onChange={(event) => setBranchDraft({ ...branchDraft, branch_name: event.target.value })} /></Field>
           <Field label="Address"><input disabled={!canManage} value={branchDraft.address} onChange={(event) => setBranchDraft({ ...branchDraft, address: event.target.value })} /></Field>
@@ -21635,11 +21925,9 @@ function OperationalScopeManagement({ canManage: settingsSayManage, user }) {
         <DataTable headers={["Branch", "Address", "Counters", "Status", "Actions"]}>
           {data.branches.map((branch) => <tr key={branch.id}><td className="primary-cell">{branch.branch_name}</td><td>{branch.address || "-"}</td><td>{data.operational_locations.filter((location) => Number(location.branch_id) === Number(branch.id) && location.active !== false).length}</td><td><span className={branch.active !== false ? "stock-ok" : "stock-low"}>{branch.active !== false ? "Open" : "Closed"}</span></td><td><div className="button-row table-actions-row"><button className="table-action" disabled={!canManage} onClick={() => updateBranch(branch, branch.active !== false)}>Rename</button>{branch.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => updateBranch(branch, false)}>Close branch</button>}</div></td></tr>)}
         </DataTable>
-      </section>
+      </ModuleCard>
 
-      <section className="scope-step">
-        <h3>Step 2 · Counters</h3>
-        <p className="form-note">A counter is one billing point or store room inside a branch. Every bill, purchase and stock lot belongs to exactly one counter.</p>
+      <ModuleCard id={scopeSectionDomId("branches/counters")} eyebrow="Step 2" title="Counters" subtitle="A counter is one billing point or store room inside a branch. Every bill, purchase and stock lot belongs to exactly one counter.">
         <div className="form-grid supplier-form-grid">
           <Field label="Branch"><select disabled={!canManage} value={locationDraft.branch_id} onChange={(event) => setLocationDraft({ ...locationDraft, branch_id: event.target.value })}><option value="">Select branch</option>{activeBranches.map((branch) => <option key={branch.id} value={branch.id}>{branch.branch_name}</option>)}</select></Field>
           <Field label="Counter name"><input disabled={!canManage} placeholder="e.g. Main Counter" value={locationDraft.location_name} onChange={(event) => setLocationDraft({ ...locationDraft, location_name: event.target.value })} /></Field>
@@ -21653,11 +21941,9 @@ function OperationalScopeManagement({ canManage: settingsSayManage, user }) {
         <DataTable headers={["Counter", "Branch", "Kind", "Main counter", "Status", "Actions"]}>
           {data.operational_locations.map((location) => <tr key={location.id}><td className="primary-cell">{location.location_name}<small className="cell-note">{location.location_code}</small></td><td>{location.branch_name}</td><td>{locationTypeLabel(location.location_type)}</td><td>{location.is_default ? "Yes" : "No"}</td><td><span className={location.active !== false ? "stock-ok" : "stock-low"}>{location.active !== false ? "Open" : "Closed"}</span></td><td><div className="button-row table-actions-row"><button className="table-action" disabled={!canManage} onClick={() => updateLocation(location, location.active !== false)}>Rename</button>{location.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => updateLocation(location, false)}>Close counter</button>}</div></td></tr>)}
         </DataTable>
-      </section>
+      </ModuleCard>
 
-      <section className="scope-step">
-        <h3>Step 3 · Staff at counters</h3>
-        <p className="form-note">A person can sign in only at a counter they are placed at. The Owner was placed at the first counter when it was created; place everyone else here.</p>
+      <ModuleCard id={scopeSectionDomId("branches/staff")} eyebrow="Step 3" title="Staff on counters" subtitle="A person can sign in only at a counter they are placed at. The Owner was placed at the first counter when it was created; place everyone else here. New people are added in Settings, Users.">
         <div className="form-grid supplier-form-grid">
           <Field label="Person"><select disabled={!canManage} value={staffDraft.user_id} onChange={(event) => { const selected = data.users.find((candidate) => String(candidate.id) === event.target.value); setStaffDraft({ ...staffDraft, user_id: event.target.value, role_id: selected?.role_id ? String(selected.role_id) : "" }); }}><option value="">Select person</option>{data.users.map((member) => <option key={member.id} value={member.id}>{member.full_name} ({member.role_name})</option>)}</select></Field>
           <Field label="Branch"><select disabled={!canManage} value={staffDraft.branch_id} onChange={(event) => setStaffDraft({ ...staffDraft, branch_id: event.target.value, operational_location_id: "" })}><option value="">Select branch</option>{activeBranches.map((branch) => <option key={branch.id} value={branch.id}>{branch.branch_name}</option>)}</select></Field>
@@ -21670,12 +21956,10 @@ function OperationalScopeManagement({ canManage: settingsSayManage, user }) {
         <DataTable headers={["Person", "Role", "Branch", "Counter", "Main counter", "Status", "Actions"]}>
           {data.staff_assignments.map((assignment) => <tr key={assignment.id}><td className="primary-cell">{assignment.full_name}<small className="cell-note">{assignment.username}</small></td><td>{assignment.role_name || "-"}</td><td>{assignment.branch_name}</td><td>{assignment.location_name}</td><td>{assignment.is_default ? "Yes" : "No"}</td><td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "Can sign in" : "Removed"}</span></td><td>{assignment.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => deactivateStaffAssignment(assignment)}>Remove</button>}</td></tr>)}
         </DataTable>
-      </section>
+      </ModuleCard>
 
-      <section className="scope-step">
-        <h3>Step 4 · Computers</h3>
-        <p className="form-note">A new computer asks to join when it is first opened. Approve it and place it at a counter before it can bill.</p>
-        <h4>Waiting for approval</h4>
+      <ModuleCard id={scopeSectionDomId("branches/computers")} eyebrow="Step 4" title="Computers & phones" subtitle="A new computer or phone asks to join when it is first opened (Send to Shop). Approve it and place it at a counter before it can bill.">
+        <h3 className="scope-subheading">Waiting for approval</h3>
         {data.pending_devices.map((device) => {
           const draft = approvalDraft(device);
           return <section className="settings-inline-panel" key={device.device_id}>
@@ -21692,15 +21976,35 @@ function OperationalScopeManagement({ canManage: settingsSayManage, user }) {
             </div>
           </section>;
         })}
-        {data.pending_devices.length === 0 && <p className="form-note">No computer is waiting for approval.</p>}
+        {data.pending_devices.length === 0 && <p className="scope-empty">Nothing is waiting. A new machine appears here after it presses Send to Shop.</p>}
         {stepMessage("computers")}
-        <h4>Approved computers</h4>
+        <h3 className="scope-subheading">Approved</h3>
         <DataTable headers={["Computer", "Branch", "Counter", "Used for", "Status"]}>
-          {data.device_assignments.map((assignment) => <tr key={`${assignment.device_id}-${assignment.assignment_generation}`}><td className="primary-cell">{assignment.device_name}<small className="cell-note">{assignment.device_id}</small></td><td>{assignment.branch_name}</td><td>{assignment.location_name}</td><td>{assignment.intended_usage}</td><td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "In use" : "Moved / retired"}</span></td></tr>)}
+          {data.device_assignments.map((assignment) => <tr key={`${assignment.device_id}-${assignment.assignment_generation}`}><td className="primary-cell">{assignment.device_name}<small className="cell-note">{assignment.device_id}</small></td><td>{assignment.branch_name}</td><td>{assignment.location_name}</td><td>{labelFor("deviceUsage", assignment.intended_usage)}</td><td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "In use" : "Moved / retired"}</span></td></tr>)}
         </DataTable>
         {activeCounters.length === 0 && <p className="form-note">Add a counter in Step 2 before approving a computer.</p>}
-      </section>
-    </ModuleCard>
+      </ModuleCard>
+
+      {showsSection("branches/activation-licences") && (
+        <div className="scope-anchor" id={scopeSectionDomId("branches/activation-licences")}>
+          <SettingsSectionErrorBoundary eyebrow="Step 5" fallbackNote="The licence list could not be drawn. Approving machines above still works." sectionName="Activation licences">
+            <DeviceActivationIssuingSection
+              canIssue={isOwnerAccount}
+              devices={settingsData.authorizedDevices}
+              devicesError={settingsData.canManageSettings ? null : "this account cannot read the device list"}
+              onReload={onReloadSettings}
+              user={user}
+            />
+          </SettingsSectionErrorBoundary>
+        </div>
+      )}
+
+      {showsSection("branches/screen-lock") && (
+        <div className="scope-anchor" id={scopeSectionDomId("branches/screen-lock")}>
+          <DeviceControlSettingsSection canManage={canManageDevices} deviceControlSettings={settingsData.deviceControlSettings} exitAttemptLogs={settingsData.exitAttemptLogs || []} onReload={onReloadSettings} user={user} />
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -21758,9 +22062,9 @@ function LegacySecurityDevicesSection({ activationCodes, branches, canManage, co
         {devices.map((device) => (
           <tr key={device.device_id}>
             <td className="primary-cell">{device.device_name}<small className="cell-note">{device.device_id}</small></td>
-            <td>{device.device_type || "Browser"}</td>
+            <td>{labelFor("deviceType", device.device_type || "Browser")}</td>
             <td>{device.branch_name || "Main Branch"}<small className="cell-note">{device.counter_name || "No counter assigned"}</small></td>
-            <td><span className={device.status === "APPROVED" ? "stock-ok" : device.status === "PENDING" ? "origin-rate" : "stock-low"}>{device.status}</span></td>
+            <td><span className={statusClass("deviceStatus", device.status)}>{labelFor("deviceStatus", device.status)}</span></td>
             <td>{device.last_active_at ? new Date(device.last_active_at).toLocaleString("en-IN") : "Not active yet"}</td>
             <td>{device.last_sync_at ? new Date(device.last_sync_at).toLocaleString("en-IN") : "Not synced"}<small className="cell-note">{device.sync_status || "IDLE"} {device.app_version ? `- v${device.app_version}` : ""}</small></td>
             <td>
@@ -21800,7 +22104,7 @@ function LegacySecurityDevicesSection({ activationCodes, branches, canManage, co
             <td>{code.branch_name || "Any"}</td>
             <td>{code.counter_name || "Any"}</td>
             <td>{code.expires_at ? new Date(code.expires_at).toLocaleString("en-IN") : "-"}</td>
-            <td><span className={code.status === "ACTIVE" ? "stock-ok" : "stock-low"}>{code.status}</span></td>
+            <td><span className={statusClass("activationCodeStatus", code.status)}>{labelFor("activationCodeStatus", code.status)}</span></td>
             <td>{code.used_by_device_id || "-"}</td>
             <td><button className="remove-button" disabled={!canManage || code.status !== "ACTIVE"} onClick={() => revokeCode(code)}>Revoke</button></td>
           </tr>
@@ -21864,7 +22168,7 @@ function LegacyBranchCounterSettings({ branches, canManage, counters, onReload, 
         <button className="primary-button" disabled={!canManage || !counterDraft.counter_name.trim()} onClick={addCounter}>Add Counter</button>
       </div>
       <DataTable headers={["Counter", "Branch", "Type", "Status"]}>
-        {counters.map((counter) => <tr key={counter.id}><td className="primary-cell">{counter.counter_name}</td><td>{counter.branch_name || "-"}</td><td>{counter.counter_type}</td><td><span className={counter.active !== false ? "stock-ok" : "stock-low"}>{counter.active !== false ? "Active" : "Inactive"}</span></td></tr>)}
+        {counters.map((counter) => <tr key={counter.id}><td className="primary-cell">{counter.counter_name}</td><td>{counter.branch_name || "-"}</td><td>{labelFor("counterType", counter.counter_type)}</td><td><span className={counter.active !== false ? "stock-ok" : "stock-low"}>{counter.active !== false ? "Active" : "Inactive"}</span></td></tr>)}
       </DataTable>
     </ModuleCard>
   );
@@ -21944,11 +22248,11 @@ function BackupSettings({ backupLogs = [], backupSettings, canManage, onBusyChan
         {backupLogs.map((log) => (
           <tr key={log.id}>
             <td className="primary-cell">{log.backup_file_name || "-"}<small className="cell-note">{log.backup_path || "-"}</small></td>
-            <td>{log.backup_type}</td>
+            <td>{labelFor("backupType", log.backup_type)}</td>
             <td>{Number(log.backup_size || 0).toLocaleString("en-IN")} bytes</td>
             <td>{log.started_at ? new Date(log.started_at).toLocaleString("en-IN") : "-"}</td>
             <td>{log.completed_at ? new Date(log.completed_at).toLocaleString("en-IN") : "-"}</td>
-            <td><span className={log.status === "SUCCESS" ? "stock-ok" : log.status === "FAILED" ? "stock-low" : "origin-rate"}>{log.status}</span></td>
+            <td><span className={statusClass("backupStatus", log.status)}>{labelFor("backupStatus", log.status)}</span></td>
             <td>{log.error_message || "-"}</td>
           </tr>
         ))}
@@ -21974,10 +22278,10 @@ function SystemInfoSection({ systemInfo }) {
         </div>
       </section>
       <div className="purchase-summary-grid supplier-payment-preview">
-        <SummaryMetric featured label="Backend" value={systemInfo.backendStatus || "Unknown"} />
+        <SummaryMetric featured label="Server" value={systemInfo.backendStatus || "Unknown"} />
         <SummaryMetric label="Database" value={systemInfo.databaseStatus || "Unknown"} />
         <SummaryMetric label="Server IP" value={systemInfo.serverIp || "-"} />
-        <SummaryMetric label="Device Status" value={device.status || "Not registered"} />
+        <SummaryMetric label="Device Status" value={device.status ? labelFor("deviceStatus", device.status) : "Not registered"} />
       </div>
       <DataTable headers={["Item", "Value"]}>
         <tr><td>Software Version</td><td>{systemInfo.softwareVersion || APP_VERSION}</td></tr>
@@ -21987,7 +22291,7 @@ function SystemInfoSection({ systemInfo }) {
         <tr><td>LAN Frontend URL</td><td>{systemInfo.lanFrontendUrl || "-"}</td></tr>
         <tr><td>Android Chrome URL</td><td>{androidUrl}</td></tr>
         <tr><td>Current Device</td><td>{device.device_name || "-"} ({device.device_id || "-"})</td></tr>
-        <tr><td>Current Device Type</td><td>{device.device_type || "Browser"}</td></tr>
+        <tr><td>Current Device Type</td><td>{labelFor("deviceType", device.device_type || "Browser")}</td></tr>
         <tr><td>Current Branch</td><td>{branch.branch_name || "Main Branch"}</td></tr>
         <tr><td>Current Counter</td><td>{device.counter_name || device.assigned_counter_id || "Not assigned"}</td></tr>
         <tr><td>Last Backup</td><td>{backup.completed_at ? new Date(backup.completed_at).toLocaleString("en-IN") : "Not recorded"}</td></tr>
@@ -22002,7 +22306,7 @@ function SystemInfoSection({ systemInfo }) {
           <li>For counter tablets, assign the device as Retail Counter Tablet from Authorized Devices.</li>
           <li>Use Chrome menu → Add to Home screen to install the FroozERP shortcut.</li>
         </ol>
-        <p>Android devices use the same backend and database. No separate phone/tablet database is created.</p>
+        <p>Phones and tablets opened this way use the same server and the same data as this computer. No separate phone or tablet database is created.</p>
       </section>
     </ModuleCard>
   );
@@ -22133,7 +22437,7 @@ function SaleRateManager({ desiredMargin, history, onRefresh, onReload, rates, s
                 <td className="primary-cell">{rate.product_name}<small className="cell-note">{rate.category}</small></td>
                 <td>{rate.lot_name || (rate.inventory_batch_id ? `Lot #${rate.inventory_batch_id}` : "Product default")}</td>
                 <td>{rate.lot_size || "-"}</td>
-                <td><span className="tag">{rate.origin_type}</span></td>
+                <td><span className="tag">{labelFor("origin", rate.origin_type)}</span></td>
                 <td>{currency.format(Number(rate.selling_rate))}</td>
                 <td className="profit-cell">{currency.format(Number(rate.suggested_selling_rate))}</td>
                 <td><input className="table-input" min="0" step="0.01" type="number" value={draftRates[rate.id] || ""} onChange={(event) => setDraftRates({ ...draftRates, [rate.id]: event.target.value })} /></td>
@@ -22671,10 +22975,10 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
   const mandiTaxNeedsConfiguration = mandiTaxRelevantForCustomer && salesMandiCustomerScope !== "NONE" && paymentSettings.enable_sales_mandi_tax === true && Number(paymentSettings.sales_mandi_tax_percent || 0) <= 0;
   const mandiTaxDisabled = mandiTaxRelevantForCustomer && (salesMandiCustomerScope === "NONE" || paymentSettings.enable_sales_mandi_tax !== true);
 
-  const getLotLabel = (lot) => lot ? [lot.lot_name || lot.batch_no, lot.lot_size].filter(Boolean).join(" / ") : "Auto FIFO";
+  const getLotLabel = (lot) => lot ? [lot.lot_name || lot.batch_no, lot.lot_size].filter(Boolean).join(" / ") : "Oldest lot first";
   const getCompactLotName = (lot) => {
     const raw = String(lot?.lot_name || lot?.batch_no || "").trim();
-    if (!raw) return "Auto FIFO";
+    if (!raw) return "Oldest lot first";
     const parts = raw.split("-");
     if (parts.length >= 3 && /^\d{8,}$/.test(parts[1])) {
       return `${parts[0]}-${parts[parts.length - 1]}`;
@@ -23130,6 +23434,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           mandi_tax_rate: localSale.mandi_tax_rate,
           mandi_tax_basis: localSale.mandi_tax_basis,
           tax_amount: localSale.tax_total,
+          // The bill's charges total, so the printed bill can add up. Display only: an edit reloads
+          // the sale (and its charge lines) before it opens, and never reads this object's charges.
+          other_charges_amount: localSale.other_charges_amount,
           sync_status: "pending",
           items: localSale.items.map((item) => ({
             product_id: item.product_id,
@@ -23362,9 +23669,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
         <section className="content-card pos-search-card">
           <div className="card-heading">
             <div>
-              <span className="eyebrow">Retail Counter</span>
-              <h2>POS Billing</h2>
-              <p>Search products or scan a barcode to build the invoice.</p>
+              <span className="eyebrow">New bill</span>
+              <h2>Add items</h2>
+              <p>Search for a product or scan its barcode.</p>
             </div>
             <span className="shortcut-hint">F2 Search - F3 Barcode - F4 Checkout</span>
           </div>
@@ -23469,7 +23776,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
               </div>
             )}
             {searchResults.length === 0 && (posSearching || !shelf.usable) && (
-              <div className="cart-empty">
+              <div className={shelf.usable ? "cart-empty" : "warning-note"} role={shelf.usable ? undefined : "alert"}>
                 {shelf.usable
                   ? "No matching products or lots found."
                   // Not "nothing found". The search worked; the shop is the unknown.
@@ -23505,7 +23812,7 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
                           <small className="cell-note">{reservedNote(reservedIndex, item.product_id, item.unit)}</small>
                         )}
                       </td>
-                      <td><span className="batch-id">{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "Auto FIFO"}</span></td>
+                      <td><span className="batch-id">{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "Oldest lot first"}</span></td>
                       <td>
                         <input
                           className="table-input"
@@ -23774,10 +24081,6 @@ function TotalLine({ label, muted, total, value }) {
   return <div className={`${total ? "total-line total-line-main" : "total-line"} ${muted ? "total-line-muted" : ""}`}><span>{label}</span><strong>{currency.format(value)}</strong></div>;
 }
 
-function ThermalTotalLine({ label, total, value }) {
-  return <div className={total ? "total-line total-line-main" : "total-line"}><span>{label}</span><strong>{receiptCurrency.format(value)}</strong></div>;
-}
-
 function SaleCancelModal({ draft, onClose, onConfirm, onReasonChange }) {
   const sale = draft.sale || {};
   const payments = sale.payments || [];
@@ -23804,11 +24107,11 @@ function SaleCancelModal({ draft, onClose, onConfirm, onReasonChange }) {
           <DataTable headers={["Payment Mode", "Amount"]}>
             {payments.length > 0 ? payments.map((payment, index) => (
               <tr key={`${payment.mode || payment.payment_mode}-${index}`}>
-                <td>{payment.mode || payment.payment_mode}</td>
+                <td>{labelFor("paymentMode", payment.mode || payment.payment_mode)}</td>
                 <td>{currency.format(Number(payment.amount || 0))}</td>
               </tr>
             )) : (
-              <tr><td>{sale.payment_mode || "-"}</td><td>{currency.format(Number(sale.total_amount || sale.net_total || 0))}</td></tr>
+              <tr><td>{labelFor("paymentMode", sale.payment_mode)}</td><td>{currency.format(Number(sale.total_amount || sale.net_total || 0))}</td></tr>
             )}
           </DataTable>
           <DataTable headers={["Item", "Lot / Size", "Qty", "Rate", "Amount"]}>
@@ -24272,7 +24575,7 @@ function SaleEditModal({ canSaleDateEdit = false, chargeTypes = [], customers = 
                 </td>
                 <td>
                   <select className="settings-table-input" value={item.inventory_batch_id || ""} onChange={(event) => changeItemLot(index, event.target.value)}>
-                    <option value="">FIFO / Auto</option>
+                    <option value="">Oldest lot first</option>
                     {activeLotsForProduct(item.product_id).map((lot) => (
                       <option key={lot.id} value={lot.id}>
                         {(lot.lot_name || lot.batch_no || `Lot #${lot.id}`)}{lot.lot_size ? ` / ${lot.lot_size}` : ""} - Avl {Number(lot.remaining_qty ?? lot.balance_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}
@@ -24382,7 +24685,7 @@ function ChangeHistoryModal({ history, onClose }) {
           <DataTable headers={["Action", "Edited At", "Edited By", "Reason", "Readable Changes"]}>
             {history.rows.map((row) => (
               <tr key={row.id}>
-                <td><span className="tag">{row.action}</span></td>
+                <td><span className="tag">{labelFor("auditAction", row.action)}</span></td>
                 <td>{new Date(row.edited_at).toLocaleString("en-IN")}</td>
                 <td>{row.edited_by_name || "-"}</td>
                 <td>{row.reason}</td>
@@ -24437,7 +24740,7 @@ function PaymentAuditModal({ audit, onClose }) {
           <DataTable headers={["Action", "Edited At", "Edited By", "Reason", "Readable Changes"]}>
             {audit.rows.map((row) => (
               <tr key={row.id}>
-                <td><span className="tag">{row.action}</span></td>
+                <td><span className="tag">{labelFor("auditAction", row.action)}</span></td>
                 <td>{new Date(row.edited_at).toLocaleString("en-IN")}</td>
                 <td>{row.edited_by_name || "-"}</td>
                 <td>{row.reason}</td>
@@ -24512,7 +24815,7 @@ function PaymentReceiptModal({ canWhatsappSend = false, payment, onClose, user }
           </header>
           <section className="invoice-customer">
             <div><small>Party Name</small><strong>{payment.account_name || "-"}</strong><span>{payment.account_type || payment.payment_source || "-"}</span></div>
-            <div><small>Payment Mode</small><strong>{payment.payment_mode || "-"}</strong><span>{payment.reference_number || "No reference"}</span></div>
+            <div><small>Payment Mode</small><strong>{labelFor("paymentMode", payment.payment_mode)}</strong><span>{payment.reference_number || "No reference"}</span></div>
           </section>
           <section className="receipt-summary">
             <TotalLine label="Outstanding Before" value={Number(payment.outstanding_before || 0)} />
@@ -24541,6 +24844,111 @@ function PaymentReceiptModal({ canWhatsappSend = false, payment, onClose, user }
   );
 }
 
+/**
+ * The customer bill, drawn from `buildInvoiceLayout` and nothing else. Every figure, label and
+ * decision about what to show lives in local/invoiceLayout.js, where it is tested; this only lays
+ * it out. The same markup serves the screen, the A4 and thermal prints and the PDF capture.
+ *
+ * `stacked` is the 58mm receipt: too narrow for five columns, so the product takes its own row
+ * under a "Product" heading and the four figures sit beneath it under "Qty Unit Rate Amount".
+ */
+function InvoiceBill({ layout, stacked = false, upi = null }) {
+  const { header, meta, lines, totals, payment, savings, footer } = layout;
+  const [productHeading, ...figureHeadings] = layout.columns;
+  const figureCells = (line) => (
+    <>
+      <td className="bill-num">{line.qtyText}</td>
+      <td className="bill-unit">{line.unit}</td>
+      <td className="bill-num">{line.rateText}</td>
+      <td className="bill-num bill-amount">{line.amountText}</td>
+    </>
+  );
+  const productCell = (line, colSpan) => (
+    <td className="bill-product" colSpan={colSpan}>
+      <span className="bill-product-name">{line.product}</span>
+      {line.note && <span className="bill-line-note">{line.note}</span>}
+    </td>
+  );
+  return (
+    <>
+      <header className="bill-head">
+        <BrandLogo compact invoice />
+        <h2 className="bill-shop">{header.shopName}</h2>
+        {header.addressLines.map((line) => <span className="bill-contact" key={line}>{line}</span>)}
+        {(header.phoneText || header.gstinText) && (
+          <span className="bill-contact">{[header.phoneText, header.gstinText].filter(Boolean).join(" · ")}</span>
+        )}
+        <span className="bill-title">{header.title}</span>
+      </header>
+      <dl className="bill-meta">
+        <div><dt>Bill no</dt><dd>{meta.billNo}</dd></div>
+        <div><dt>Date</dt><dd>{meta.date}{meta.time && <span className="bill-meta-sub">{meta.time}</span>}</dd></div>
+        <div><dt>Customer</dt><dd>{meta.customerName}{meta.customerMobile && <span className="bill-meta-sub">{meta.customerMobile}</span>}</dd></div>
+        {(meta.cashier || meta.counter) && (
+          <div><dt>{meta.cashier ? "Cashier" : "Counter"}</dt><dd>{meta.cashier || meta.counter}{meta.cashier && meta.counter && <span className="bill-meta-sub">{meta.counter}</span>}</dd></div>
+        )}
+      </dl>
+      {meta.status && <p className="bill-status">{meta.status}{meta.statusNote && <span> · {meta.statusNote}</span>}</p>}
+      <table className={`bill-table ${stacked ? "bill-table-stacked" : ""}`}>
+        <thead>
+          {stacked ? (
+            <>
+              <tr><th className="bill-product" colSpan={4}>{productHeading}</th></tr>
+              <tr className="bill-figure-heads">{figureHeadings.map((heading, index) => <th className={index === 1 ? "bill-unit" : "bill-num"} key={heading}>{heading}</th>)}</tr>
+            </>
+          ) : (
+            <tr>
+              <th className="bill-product">{productHeading}</th>
+              {figureHeadings.map((heading, index) => <th className={index === 1 ? "bill-unit" : "bill-num"} key={heading}>{heading}</th>)}
+            </tr>
+          )}
+        </thead>
+        {lines.map((line) => (
+          <tbody className="bill-line" key={line.key}>
+            {stacked ? (
+              <>
+                <tr className="bill-line-name">{productCell(line, 4)}</tr>
+                <tr className="bill-line-figures">{figureCells(line)}</tr>
+              </>
+            ) : (
+              <tr className="bill-line-main">{productCell(line)}{figureCells(line)}</tr>
+            )}
+            {line.discount && (
+              <tr className="bill-line-discount"><td colSpan={stacked ? 4 : 5}>{line.discount.text}</td></tr>
+            )}
+          </tbody>
+        ))}
+      </table>
+      <section className="bill-totals">
+        {totals.rows.map((row) => (
+          <div className={`bill-total-row bill-total-${row.kind}`} key={row.key}>
+            <span>{row.label}{row.note && <small>{row.note}</small>}</span>
+            <strong>{row.amountText}</strong>
+          </div>
+        ))}
+        <div className="bill-grand-total">
+          <span>Grand total</span>
+          <strong>{totals.grandTotalText}</strong>
+        </div>
+        {payment.rows.map((row) => (
+          <div className={`bill-total-row bill-pay-${row.kind}`} key={row.key}>
+            <span>{row.label}</span>
+            <strong>{row.amountText}</strong>
+          </div>
+        ))}
+      </section>
+      {savings && (
+        <p className="bill-savings">You saved <strong>{savings.amountText}</strong> on this bill</p>
+      )}
+      {upi}
+      <footer className="bill-footer">
+        <strong>{footer.message}</strong>
+        <small>{footer.poweredBy}</small>
+      </footer>
+    </>
+  );
+}
+
 function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false, canWhatsappSend = false, invoice, onCancel, onClose, onEdit, paymentSettings = {}, printSettings = {}, user }) {
   const storedInvoiceProfile = readStoredPrintProfile("invoice");
   const [printMode, setPrintMode] = useState(storedInvoiceProfile === "A4_INVOICE" ? "A4" : storedInvoiceProfile === "THERMAL_RECEIPT" ? "THERMAL" : printSettings.default_invoice_print === "A4_INVOICE" || printSettings.default_printer_type === "A4" ? "A4" : "THERMAL");
@@ -24552,11 +24960,6 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
   const autoPrintedRef = useRef(false);
   const activePrintMode = printMode === "A4" ? "A4" : "THERMAL";
   const invoicePayments = invoice.payments || [];
-  const showItemDiscountOnReceipt = printSettings.show_item_discount_column_receipt !== false;
-  const showBillDiscountRow = printSettings.show_bill_discount_row_receipt !== false;
-  const hideZeroDiscountRows = printSettings.hide_zero_discount_rows !== false;
-  const billDiscountAmount = Number(invoice.invoice_discount_amount || 0);
-  const shouldRenderBillDiscountRow = showBillDiscountRow && (billDiscountAmount > 0 || !hideZeroDiscountRows);
   const hasUpiPayment = invoice.payment_mode === "UPI" || invoice.payment_mode === "MIXED" || invoicePayments.some((payment) => (payment.mode || payment.payment_mode) === "UPI");
   const qrSizeMap = { SMALL: 110, MEDIUM: 145, LARGE: 180 };
   const qrDisplaySize = String(paymentSettings.qr_display_size || "MEDIUM").toUpperCase();
@@ -24590,6 +24993,13 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
   const invoiceDateKey = toDateKey(invoice.sale_date || invoice.transaction_date || invoice.created_at);
   const invoiceFileName = () => `FroozERP-Invoice-${safeFileName(invoice.invoice_no || `SALE-${invoice.id}`)}.pdf`;
   const invoiceEntryTime = formatEntryTime(invoice);
+  // One model for every way this bill leaves the shop: the screen, both prints, the PDF (a capture
+  // of this same element) and the WhatsApp text. See local/invoiceLayout.js for the reconcile rule.
+  const layout = useMemo(
+    () => buildInvoiceLayout(invoice, printSettings, { billDate: formatDisplayDate(invoiceDateKey), billTime: invoiceEntryTime }),
+    [invoice, printSettings, invoiceDateKey, invoiceEntryTime],
+  );
+  const billVariant = activePrintMode === "A4" ? "a4" : printSettings.receipt_width === "58MM" ? "thermal-58" : "thermal-80";
   const printWithMode = (mode) => {
     setPrintMode(mode);
     const nextProfile = mode === "A4" ? "A4_PORTRAIT" : printSettings.receipt_width === "58MM" ? "THERMAL_58" : "THERMAL_80";
@@ -24632,13 +25042,7 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
       setExporting(false);
     }
   };
-  const invoiceWhatsappMessage = () => [
-      "Thank you for shopping with FEEL THE FREAKIN' FROOZ. Your invoice is ready.",
-      `Invoice: ${invoice.invoice_no}`,
-      `Bill Date: ${formatDisplayDate(invoiceDateKey)}`,
-      `Amount: ${currency.format(Number(invoice.total_amount))}`,
-      "We appreciate your business.",
-    ].join("\n");
+  const invoiceWhatsappMessage = () => buildInvoiceText(layout);
   const invoiceWhatsappRecipients = useMemo(() => buildWhatsappRecipients({
     customers: invoice.customer_name || invoice.customer_mobile || invoice.whatsapp_number ? [{
       id: invoice.customer_id,
@@ -24668,89 +25072,29 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
             <button aria-label="Close invoice" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
-        <article ref={invoiceRef} className={`invoice-paper ${activePrintMode === "A4" ? "invoice-a4 print-profile-a4-portrait" : "invoice-thermal"} ${printSettings.receipt_width === "58MM" ? "invoice-58mm print-profile-thermal-58" : "invoice-80mm print-profile-thermal-80"}`}>
-          <header className="invoice-header">
-            <BrandLogo invoice />
-            <div className="invoice-meta">
-              <strong>Tax Invoice</strong>
-              <span>{printSettings.business_name || "FroozERP Retail"}</span>
-              <span>{invoice.invoice_no}</span>
-              <span>Bill Date: {formatDisplayDate(invoiceDateKey)}</span>
-              <span>Entry Time: {invoiceEntryTime}</span>
-            </div>
-          </header>
-          <section className="invoice-customer">
-            <div><small>Billed To</small><strong>{invoice.customer_name || "Walk-in Customer"}</strong><span>{invoice.customer_mobile || "No mobile number"}</span></div>
-            <div><small>Payment</small><strong>{invoice.payment_mode}</strong><span>{invoice.branch_name || "SRT Retail Store"}</span></div>
-            <div><small>Status</small><strong>{invoice.sale_status || "COMPLETED"}</strong><span>{invoice.cancellation_reason || invoice.edit_reason || "No changes recorded"}</span></div>
-          </section>
-          {activePrintMode === "THERMAL" ? (
-            <section className="thermal-items-list">
-              {(invoice.items || []).map((item) => {
-                const lotText = [item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "-";
-                const discountAmount = Number(item.discount_amount || 0);
-                return (
-                  <article className="thermal-item-block" key={item.id || `${item.product_id}-${item.inventory_batch_id || "FIFO"}`}>
-                    <div className="thermal-item-name">{item.product_name}</div>
-                    <div className="thermal-item-detail">
-                      <span>Lot: {lotText}</span>
-                      <span>Qty: {item.quantity} {item.unit}</span>
-                      <span>Rate: {receiptCurrency.format(Number(item.selling_rate))}</span>
+        {layout.issues.length > 0 && (
+          <p className="bill-issue no-print" role="status">{layout.issues.join(" ")}</p>
+        )}
+        <article ref={invoiceRef} className={`invoice-paper bill-paper bill-${billVariant} ${activePrintMode === "A4" ? "invoice-a4 print-profile-a4-portrait" : `invoice-thermal ${printSettings.receipt_width === "58MM" ? "invoice-58mm print-profile-thermal-58" : "invoice-80mm print-profile-thermal-80"}`}`}>
+          <InvoiceBill
+            layout={layout}
+            stacked={billVariant === "thermal-58"}
+            upi={(
+              <>
+                {shouldShowUpiWarning && <p className="form-note stock-low no-print">Please add UPI ID in Settings to show QR code.</p>}
+                {shouldShowUpiQr && upiQrDataUrl && (
+                  <section className="upi-qr-box bill-upi">
+                    <img alt="UPI payment QR" src={upiQrDataUrl} style={{ width: `${qrCodeWidth}px`, height: `${qrCodeWidth}px` }} />
+                    <div>
+                      <strong>Scan to pay</strong>
+                      <span>{paymentSettings.business_upi_id}</span>
+                      <small>{layout.totals.grandTotalText} · {layout.meta.billNo}</small>
                     </div>
-                    {showItemDiscountOnReceipt && (discountAmount > 0 || !hideZeroDiscountRows) && (
-                      <div className="thermal-item-discount">
-                        <span>Discount</span>
-                        <strong>{receiptCurrency.format(discountAmount)}</strong>
-                      </div>
-                    )}
-                    <div className="thermal-item-amount">
-                      <span>Amount</span>
-                      <strong>{receiptCurrency.format(Number(item.net_amount))}</strong>
-                    </div>
-                  </article>
-                );
-              })}
-            </section>
-          ) : (
-            <table className="invoice-table">
-              <thead><tr><th>Item</th><th>Lot/Size</th><th>Qty</th><th>Rate</th>{showItemDiscountOnReceipt && <th>Item Discount</th>}<th>Amount</th></tr></thead>
-              <tbody>
-                {invoice.items?.map((item) => (
-                  <tr key={item.id || `${item.product_id}-${item.inventory_batch_id || "FIFO"}`}>
-                    <td>{item.product_name}</td>
-                    <td>{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "-"}</td>
-                    <td>{item.quantity} {item.unit}</td>
-                    <td>{receiptCurrency.format(Number(item.selling_rate))}</td>
-                    {showItemDiscountOnReceipt && <td>{receiptCurrency.format(Number(item.discount_amount || 0))}</td>}
-                    <td>{receiptCurrency.format(Number(item.net_amount))}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-          <section className="invoice-total-box">
-            <ThermalTotalLine label="Gross Total" value={Number(invoice.gross_amount)} />
-            {shouldRenderBillDiscountRow && <ThermalTotalLine label="Bill Discount" value={-billDiscountAmount} />}
-            {Number(invoice.taxable_amount || 0) > 0 && <ThermalTotalLine label="Taxable Amount" value={Number(invoice.taxable_amount || 0)} />}
-            <ThermalTotalLine label={Number(invoice.mandi_tax_rate || 0) > 0 ? `Mandi Tax (${Number(invoice.mandi_tax_rate || 0)}%)` : "Tax"} value={Number(invoice.tax_amount || 0)} />
-            <ThermalTotalLine label="Net Payable" total value={Number(invoice.total_amount)} />
-          </section>
-          {shouldShowUpiWarning && <p className="form-note stock-low">Please add UPI ID in Settings to show QR code.</p>}
-          {shouldShowUpiQr && upiQrDataUrl && (
-            <section className="upi-qr-box">
-              <img alt="UPI payment QR" src={upiQrDataUrl} style={{ width: `${qrCodeWidth}px`, height: `${qrCodeWidth}px` }} />
-              <div>
-                <strong>Scan to pay</strong>
-                <span>{paymentSettings.business_upi_id}</span>
-                <small>{receiptCurrency.format(Number(invoice.total_amount || 0))} - {invoice.invoice_no}</small>
-              </div>
-            </section>
-          )}
-          <footer className="invoice-footer">
-            <strong>Thank you for shopping with FEEL THE FREAKIN&apos; FROOZ.</strong>
-            <span>We appreciate your business.</span>
-            <small>GST-ready invoice - Powered by SRT Company</small>
-          </footer>
+                  </section>
+                )}
+              </>
+            )}
+          />
         </article>
         {pdfPreview && (
           <PdfPreviewModal
@@ -24983,7 +25327,7 @@ function DashboardAnalytics({ analytics, customRange, onApplyCustomRange, onCust
 
       <section className="chart-grid">
         <LineChart color="#f59e0b" data={data.salesTrend} subtitle="Revenue" title="Daily Sales Trend" valueKey="sales" />
-        <LineChart color="#22c55e" data={data.profitTrend} subtitle="FIFO Landed Cost" title="Daily Profit Trend" valueKey="grossProfit" />
+        <LineChart color="#22c55e" data={data.profitTrend} subtitle="At purchase cost" title="Daily Profit Trend" valueKey="grossProfit" />
         <BarChart color="#fb7185" data={data.expenseTrend} subtitle="Operating Cost" title="Daily Expense Trend" valueKey="expenses" />
         <LineChart color="#a78bfa" data={data.netProfitTrend} subtitle="Profit After Expenses" title="Net Profit Trend" valueKey="netProfit" />
         <DualLineChart
@@ -25069,7 +25413,12 @@ function Field({ children, label }) {
   return <label><span>{label}</span>{children}</label>;
 }
 
-function ModuleCard({ children, eyebrow, id, subtitle, title }) {
+// A field label with the quiet asterisk Product Master uses for the fields its save refuses without.
+function RequiredLabel({ children }) {
+  return <>{children}<span aria-hidden="true" className="pm-required"> *</span><span className="pm-sr-only"> (required)</span></>;
+}
+
+function ModuleCard({ actions = null, children, eyebrow, id, subtitle, title }) {
   return (
     <section className="content-card" id={id}>
       <div className="card-heading">
@@ -25078,6 +25427,7 @@ function ModuleCard({ children, eyebrow, id, subtitle, title }) {
           <h2>{title}</h2>
           <p>{subtitle}</p>
         </div>
+        {actions && <div className="card-heading-actions">{actions}</div>}
       </div>
       {children}
     </section>

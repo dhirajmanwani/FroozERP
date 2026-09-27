@@ -305,8 +305,9 @@ meet.
 
 *What to check*
 
-- Settings → Counter & Display → **Device Activation Licences** appears for the Owner, and does
-  **not** appear for any other role. Check with a Cashier account, not by reasoning about it.
+- Branches & Counters → **Step 5 · Activation licences** appears for the Owner, and does
+  **not** appear for any other role (an Admin can open Branches & Counters but must not see it).
+  Check with an Admin account, not by reasoning about it.
 - The device list is the shop's real devices, by name. Nobody should have to type or read out an
   `FZDEV-...` id anywhere in this flow.
 - Issue one licence for **30 days** against a device, and do **not** import the file anywhere.

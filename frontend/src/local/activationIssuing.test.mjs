@@ -758,27 +758,35 @@ test("the section is Owner-only, and Admin is not enough", () => {
   // Issuing a licence is what admits a machine to the business. An Admin may approve a device;
   // only the Owner may license one.
   //
-  // The section is declared once, in the shared registry, carrying `ownerOnly`. The registry has
-  // no idea who is signed in, so App.jsx does the filtering -- but there is still only one place
-  // the section is defined, which is what stops the page and the drill-down disagreeing about
-  // whether it exists.
-  const registration = appSource.slice(
-    appSource.indexOf("const isOwnerAccount"),
-    appSource.indexOf("const sectionContent = {"),
+  // Since 27 Sep 2026 the card lives in Branches & Counters, beside the approval it follows. Admin
+  // can open that screen, so the Owner check there is what keeps the card from Admin. It is
+  // declared once, in the shared registry, carrying `ownerOnly`; the screen filters by it.
+  const screen = appSource.slice(
+    appSource.indexOf("function OperationalScopeManagement("),
+    appSource.indexOf("function _LegacySecurityDevicesSection"),
   );
-  assert.ok(registration.length > 0, "the Owner-only section registration is missing");
+  const registration = screen.slice(screen.indexOf("const isOwnerAccount"), screen.indexOf("const showsSection"));
+  assert.ok(registration.length > 0, "the Owner-only section filter is missing");
   assert.match(registration, /=== "OWNER"/);
   assert.doesNotMatch(registration, /ADMIN/i, "Admin must not reach the issuing screen");
   assert.match(registration, /section\.ownerOnly \|\| isOwnerAccount/);
 
   const registryEntry = navigationRegistry
-    .find((item) => item.id === "settings")
-    .sections.find((section) => section.id === "settings/device-activation");
+    .find((item) => item.id === "branches")
+    .sections.find((section) => section.id === "branches/activation-licences");
   assert.ok(registryEntry, "the section must be in the shared registry, not a second list");
   assert.equal(registryEntry.ownerOnly, true, "without the flag the card shows to every role");
+  assert.equal(
+    navigationRegistry.find((item) => item.id === "settings").sections.some((section) => /activation/.test(section.id)),
+    false,
+    "one home: the licence card must not also be a Settings section",
+  );
 
-  const mount = appSource.slice(appSource.indexOf('"settings/device-activation": ('), appSource.indexOf('"settings/updates": ('));
+  const mount = screen.slice(screen.indexOf('showsSection("branches/activation-licences") && ('), screen.indexOf('showsSection("branches/screen-lock") && ('));
+  assert.match(mount, /<DeviceActivationIssuingSection/);
   assert.match(mount, /canIssue=\{isOwnerAccount\}/);
+  // The command palette offers sections too, and it must not offer this one to Admin.
+  assert.match(appSource, /section\.ownerOnly \|\| paletteShowsOwnerSections/);
   assert.match(sectionSource, /if \(!canIssue\)/, "the component must refuse on its own too");
 });
 
@@ -857,7 +865,7 @@ test("a 200 with no licence list is not read as an empty list", () => {
 
 test("the activation gate points at the new screen instead of a phone call", () => {
   const gate = appSource.slice(appSource.indexOf("function ActivationGate("), appSource.indexOf("function DeviceActivationIssuingSection("));
-  assert.match(gate, /Device Activation Licences/, "the gate must name where the Owner issues it");
+  assert.match(gate, /Branches &amp; Counters &gt; Activation licences/, "the gate must name where the Owner issues it");
 });
 
 test("a saved licence says where it landed, not only what it is called", () => {
