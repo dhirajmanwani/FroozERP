@@ -161,13 +161,42 @@ test("local rows: user ids are never coerced; '004' and 4 are different people",
 test("local rows: mapped invoices (localSnapshotToInvoice output) read the same", () => {
   const [event] = normalizeLocalChangeRows([{
     id: "invoice-x", sale_id: "invoice-x", invoice_no: "OFF-9", sale_status: "CANCELLED", total_amount: 99.9,
-    cancelled_at: null, updated_at: "2026-09-27T05:00:00Z", cancellation_reason: "Duplicate bill", user_id: "7",
+    cancelled_at: "2026-09-27T05:00:00Z", updated_at: "2026-09-27T06:00:00Z", cancellation_reason: "Duplicate bill", user_id: "7",
   }]);
   assert.equal(event.action, "cancel");
   assert.equal(event.invoiceNo, "OFF-9");
   assert.equal(event.oldTotal, 99.9);
-  assert.equal(event.atMs, Date.UTC(2026, 8, 27, 5, 0), "falls back to updated_at when cancelled_at is missing");
+  assert.equal(event.atMs, Date.UTC(2026, 8, 27, 5, 0));
   assert.equal(event.byName, "7");
+});
+
+test("local rows: a cancelled bill with no cancel time is left out, not dated by when it was copied down", () => {
+  // Seen 27 Sep 2026: a bill cancelled in the cloud days earlier, copied to the counter that
+  // morning, rang the Owner's bell as "Today: 1 bill cancelled (₹0.00) by Unknown".
+  const events = normalizeLocalChangeRows([
+    localInvoice({ id: "cloud-sale-701", status: "CANCELLED", cancelled_at: null, updated_at: "2026-09-27T05:00:00Z" }),
+  ]);
+  assert.deepEqual(events, []);
+});
+
+test("local rows: a zero total that the bill's own gross or lines contradict reads as unreadable, never ₹0", () => {
+  const [fromGross] = normalizeLocalChangeRows([
+    localInvoice({ status: "CANCELLED", net_total: 0, gross_total: 1350, cancelled_at: "2026-09-27T05:00:00Z", cancelled_by: "7" }),
+  ]);
+  assert.equal(fromGross.oldTotal, null);
+  const [fromLines] = normalizeLocalChangeRows([{
+    invoice: { id: "b", status: "CANCELLED", net_total: 0, cancelled_at: "2026-09-27T05:00:00Z", cancelled_by: "7" },
+    items: [{ amount: 480 }],
+  }]);
+  assert.equal(fromLines.oldTotal, null);
+  const [trulyZero] = normalizeLocalChangeRows([
+    localInvoice({ status: "CANCELLED", net_total: 0, gross_total: 0, cancelled_at: "2026-09-27T05:00:00Z", cancelled_by: "7" }),
+  ]);
+  assert.equal(trulyZero.oldTotal, 0, "a bill that really was zero stays zero");
+  const digest = buildSaleChangeDigest({ events: [fromGross], dateKey: "2026-09-27" });
+  const { items } = saleChangeDigestBellItems(digest, { dateKey: "2026-09-27" });
+  assert.doesNotMatch(items[0].title, /₹0\.00/);
+  assert.match(items[0].title, /could not be read/);
 });
 
 test("local rows: a cancelled bill that was edited counts once, as a cancel", () => {
