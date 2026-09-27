@@ -24943,7 +24943,6 @@ function InvoiceBill({ layout, stacked = false, upi = null }) {
       {upi}
       <footer className="bill-footer">
         <strong>{footer.message}</strong>
-        <span>{footer.signOff}</span>
         <small>{footer.poweredBy}</small>
       </footer>
     </>

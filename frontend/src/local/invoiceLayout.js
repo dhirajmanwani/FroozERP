@@ -457,7 +457,6 @@ export const buildInvoiceLayout = (sale = {}, settings = {}, options = {}) => {
     savings,
     footer: {
       message: text(safeSettings.invoice_footer_text) || INVOICE_FALLBACK_FOOTER,
-      signOff: "We appreciate your business.",
       poweredBy: `Powered by ${text(safeSettings.company_name) || INVOICE_FALLBACK_COMPANY}`,
     },
     // For the screen only. A customer's copy is not the place to explain a data problem.
