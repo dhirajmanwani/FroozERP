@@ -4086,9 +4086,9 @@ function App() {
       if (!error?.response) {
         setExitCodeError("Local backend is unavailable, so FroozERP cannot verify the Owner exit code. Start/reconnect the local backend, then try again.");
       } else if (error.response?.status === 409) {
-        setExitCodeError(getErrorMessage(error, "No Owner exit code is configured. Open Settings > Security / Device Control and set a new code with Owner/Admin password."));
+        setExitCodeError(getErrorMessage(error, "No Owner exit code is configured. Open Branches & Counters > Counter screen lock and set a new code with the Owner/Admin password."));
       } else if (error.response?.status === 403) {
-        setExitCodeError("Invalid exit code. Owner/Admin can reset it in Settings > Security / Device Control using the current account password.");
+        setExitCodeError("Invalid exit code. Owner/Admin can reset it in Branches & Counters > Counter screen lock using the current account password.");
       } else {
         setExitCodeError(getErrorMessage(error, "Unable to verify Owner exit code."));
       }
@@ -4130,7 +4130,7 @@ function App() {
             <button className="primary-button" disabled={!exitCodeInput || exitCodeInput.length < 4} onClick={verifyExitCodeAndClose}>Unlock and Exit</button>
             <button className="secondary-button" onClick={() => setExitCodeModalOpen(false)}>Stay in FroozERP</button>
           </div>
-          <p className="form-note">Emergency note: if the exit code is forgotten, reset it from Settings &gt; Security / Device Control with the Owner/Admin password. Repair/update the app without deleting business data if Settings cannot open.</p>
+          <p className="form-note">Emergency note: if the exit code is forgotten, reset it from Branches &amp; Counters &gt; Counter screen lock with the Owner/Admin password. Repair/update the app without deleting business data if Settings cannot open.</p>
         </div>
       </section>
     </div>
@@ -8559,7 +8559,9 @@ function App() {
       if (view === "returns") await loadSaleReturns();
       if (view === "waste") await loadWasteEntries();
       if (view === "dashboard") await loadDashboardData();
-      if (view === "settings") await loadSettingsData();
+      // Branches & Counters shows the device list the licences are issued against and the screen
+      // lock, both of which come from the settings bundle.
+      if (view === "settings" || view === "branches") await loadSettingsData();
       if (view === "sale-rates") await loadSaleRates();
     } catch (error) {
       console.warn(`Unable to refresh ${view}`, error);
@@ -8744,7 +8746,7 @@ function App() {
               <span className="eyebrow">Device Activation Required</span>
               <strong>{deviceGate.code === "DEVICE_PENDING_APPROVAL" ? "Device awaiting owner approval." : "This device is not approved."}</strong>
               <small>Device ID: {deviceGate.device_id || deviceInfo.device_id}</small>
-              <p>Ask the owner to approve this device from Settings, then sign in again. A one-time activation code may also be used.</p>
+              <p>Ask the owner to approve this device in Branches &amp; Counters, then sign in again. A one-time activation code may also be used.</p>
               <input
                 placeholder="Activation code"
                 value={activationCode}
@@ -8937,10 +8939,17 @@ function App() {
    * component and breaks the rules-of-hooks ordering; the registry is forty entries, so building
    * it on demand costs less than the memo would have.
    */
+  const paletteShowsOwnerSections = String(user?.role || user?.role_name || "").toUpperCase() === "OWNER";
   const commandIndex = commandPaletteOpen
-    ? buildCommandIndex(navigationRegistry.filter(
-        (item) => hasModuleAccess(item.id) && (canManageRates || item.id !== "sale-rates"),
-      ))
+    ? buildCommandIndex(navigationRegistry
+      .filter((item) => hasModuleAccess(item.id) && (canManageRates || item.id !== "sale-rates"))
+      // A section the screen will not draw for this person or this machine is not offered either:
+      // the licence card is the Owner's, and a phone has no screen lock.
+      .map((item) => ({
+        ...item,
+        sections: item.sections.filter((section) => (!section.ownerOnly || paletteShowsOwnerSections)
+          && shellShowsSettingsSection(section.id, SHELL_CAPABILITIES)),
+      })))
     : null;
 
   /**
@@ -10201,8 +10210,28 @@ function App() {
           {activeView === "branches" && (
             // Promoted out of Settings. Adding a shop or a counter is not a preference to be
             // adjusted once and forgotten -- it is the thing that decides which stock a machine
-            // sells from, so it belongs where a person can find it without hunting.
-            <OperationalScopeManagement canManage={settingsData.canManageSettings} user={user} />
+            // sells from, so it belongs where a person can find it without hunting. The device
+            // licence and the screen lock followed on 27 Sep 2026: approving a phone here and
+            // licensing it in Settings was one job split across two screens.
+            <ModuleErrorBoundary onClose={() => setActiveView("dashboard")}>
+              <OperationalScopeManagement
+                canManage={settingsData.canManageSettings}
+                canManageDevices={canManageRates}
+                focusSection={pendingSection}
+                onFocusSectionHandled={() => setPendingSection(null)}
+                onReloadSettings={async () => {
+                  try {
+                    await loadSettingsData();
+                    return true;
+                  } catch (error) {
+                    alert(refreshAfterSaveMessage(error));
+                    return false;
+                  }
+                }}
+                settingsData={settingsData}
+                user={user}
+              />
+            </ModuleErrorBoundary>
           )}
 
           {activeView === "all-shops" && (
@@ -12258,7 +12287,7 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
         <div className="device-activation-panel">
           <span className="eyebrow">This device</span>
           <small>Device ID: {deviceInfo?.device_id || "(resolving...)"}</small>
-          <p>Ask the FroozERP owner to issue an activation for this device from Settings &gt; Counter &amp; Display &gt; Device Activation Licences. This device is listed there by name once it has connected to the shop; the ID above is only needed if it is not.</p>
+          <p>Ask the FroozERP owner to issue an activation for this device from Branches &amp; Counters &gt; Activation licences. This device is listed there by name once it has connected to the shop; the ID above is only needed if it is not.</p>
           <span className="eyebrow">Step 1: send this device to the shop</span>
           <p>Sign in once so the shop can see this device. It does not open the app; the Owner still has to approve it.</p>
           <input
@@ -12326,7 +12355,7 @@ function ActivationGate({ deviceInfo, entitlement, onRefresh, onActivated, onExi
 }
 
 // ---------------------------------------------------------------------------
-// Owner-side activation issuing (Settings -> Counter & Display -> Device Activation).
+// Owner-side activation issuing (Branches & Counters -> Step 5 · Activation licences).
 //
 // Bringing a new counter online used to mean the maintainer running
 // `src-tauri/tools/sign_activation.rs` on his own machine, after somebody read a
@@ -12516,8 +12545,8 @@ function DeviceActivationIssuingSection({ canIssue, devices, devicesError, onRel
   if (!canIssue) {
     return (
       <ModuleCard
-        eyebrow="Security / Device Activation"
-        title="Device Activation Licences"
+        eyebrow="Step 5"
+        title="Activation licences"
         subtitle="Only the Owner can admit a machine to the business."
       >
         <p className="cart-empty">Issuing an activation licence is what lets a new counter start billing, so it is restricted to the Owner account. Ask the Owner to issue one for this device.</p>
@@ -12527,9 +12556,9 @@ function DeviceActivationIssuingSection({ canIssue, devices, devicesError, onRel
 
   return (
     <ModuleCard
-      eyebrow="Security / Device Activation"
-      title="Device Activation Licences"
-      subtitle="Issue the activation file that lets a counter start working. Pick the device, choose how long it should last, and save the .lic file."
+      eyebrow="Step 5"
+      title="Activation licences"
+      subtitle="Issue the activation file that lets an approved computer or phone start working. Pick it, choose how long the licence lasts, then save the file or copy its text to send."
     >
       {!view.ok ? (
         // Never zeros. With one of the two lists missing, every device would render as
@@ -18886,8 +18915,8 @@ class SettingsSectionErrorBoundary extends React.Component {
   render() {
     if (!this.state.failed) return this.props.children;
     return (
-      <ModuleCard eyebrow="Settings" title={`${this.props.sectionName || "Section"} Unavailable`} subtitle="This section could not load. Other Settings sections remain available.">
-        <p className="form-note">No published update information is available right now. Advanced Diagnostics remains available below.</p>
+      <ModuleCard eyebrow={this.props.eyebrow || "Settings"} title={`${this.props.sectionName || "Section"} Unavailable`} subtitle="This section could not load. Everything else on this screen still works.">
+        <p className="form-note">{this.props.fallbackNote || "No published update information is available right now. Advanced Diagnostics remains available below."}</p>
       </ModuleCard>
     );
   }
@@ -18979,9 +19008,9 @@ function SettingsModule({
    */
   const settingsSections = navigationRegistry.find((item) => item.id === "settings")?.sections || [];
   /**
-   * Issuing a device activation licence is the act that admits a machine to the business, so that
-   * section is shown only to the Owner -- not to Admin, who may approve a device but must not be
-   * able to license one.
+   * A section marked `ownerOnly` is shown only to the Owner. None is today: the one that was, the
+   * device activation licences, moved to Branches & Counters on 27 Sep 2026 and is filtered the
+   * same way there. The filter stays so a future Owner-only setting is hidden by default.
    *
    * The section is declared once, in the registry, carrying `ownerOnly`. The registry is shared
    * with the sidebar and the command palette and neither of those knows who is signed in, so the
@@ -19013,18 +19042,6 @@ function SettingsModule({
     "settings/bill-discount-slabs": <DiscountSettings canManage={canManage} discountRules={settingsData.discountRules} onReload={onReload} saleRateSettings={settingsData.saleRateSettings} user={user} />,
     "settings/permission-matrix": <PermissionSettings canManage={canManage} key={JSON.stringify(settingsData.roles || [])} onReload={onReload} roles={settingsData.roles} user={user} />,
     "settings/users": <UserManagementSection canManage={canManage} key={JSON.stringify(settingsData.users || [])} onReload={onReload} roles={settingsData.roles} user={user} users={settingsData.users || []} />,
-    "settings/device-control": <DeviceControlSettingsSection canManage={canManage} deviceControlSettings={settingsData.deviceControlSettings} exitAttemptLogs={settingsData.exitAttemptLogs || []} onReload={onReload} user={user} />,
-    "settings/device-activation": (
-      <SettingsSectionErrorBoundary sectionName="Device Activation Licences">
-        <DeviceActivationIssuingSection
-          canIssue={isOwnerAccount}
-          devices={settingsData.authorizedDevices}
-          devicesError={settingsData.canManageSettings ? null : "this account cannot read the device list"}
-          onReload={onReload}
-          user={user}
-        />
-      </SettingsSectionErrorBoundary>
-    ),
     "settings/updates": (
       <SettingsSectionErrorBoundary sectionName="Update Center">
         <UpdateCenterSection canManage={canManage} deviceControlSettings={settingsData.deviceControlSettings} key={settingsData.updateCenter?.updated_at || "update-center"} onReload={onReload} updateCenter={settingsData.updateCenter} user={user} />
@@ -19921,7 +19938,7 @@ function DeviceControlSettingsSection({ canManage, deviceControlSettings = defau
     }
   };
   return (
-    <ModuleCard eyebrow="Security / Device Control" title="Fullscreen Lock & Owner Exit Code" subtitle="App-level kiosk protection for counter devices. Windows administrator controls can still force close the application.">
+    <ModuleCard eyebrow="Counter security" title="Counter screen lock" subtitle="Keeps FroozERP fullscreen on counter computers and asks for the Owner's exit code before it closes. Windows administrator controls can still force it closed.">
       <div className="purchase-summary-grid supplier-payment-preview">
         <SummaryMetric featured label="Fullscreen Lock Mode" value={draft.fullscreen_lock_enabled ? "Enabled" : "Disabled"} />
         <SummaryMetric label="Exit Code" value={draft.exit_code_configured ? "Configured" : "Not Set"} />
@@ -19942,7 +19959,7 @@ function DeviceControlSettingsSection({ canManage, deviceControlSettings = defau
         <Field label="Confirm Exit Code"><input disabled={!canManage} inputMode="numeric" type="password" value={confirmExitCode} onChange={(event) => setConfirmExitCode(event.target.value.replace(/\D/g, ""))} /></Field>
       </div>
       <div className="button-row">
-        <button className="primary-button" disabled={!canManage} onClick={save}>Save Device Control</button>
+        <button className="primary-button" disabled={!canManage} onClick={save}>Save screen lock</button>
       </div>
       <p className="form-note">Failed exit attempts are logged for Owner/Admin review. If the exit code is forgotten, use Owner/Admin recovery or repair installation without deleting data.</p>
       <DataTable headers={["Attempted At", "User", "Device", "Result", "Reason"]}>
@@ -21434,7 +21451,21 @@ const EMPTY_OPERATIONAL_SCOPE_DATA = Object.freeze({
   roles: [],
 });
 
-function OperationalScopeManagement({ canManage: settingsSayManage, user }) {
+/**
+ * Where a Branches & Counters section lives on the page. One spelling for the card's id and for
+ * every lookup of it (the jump bar, a searched-for section), so the two cannot drift apart.
+ */
+const scopeSectionDomId = (sectionId) => String(sectionId).replace("/", "-");
+
+function OperationalScopeManagement({
+  canManage: settingsSayManage,
+  canManageDevices = false,
+  focusSection = null,
+  onFocusSectionHandled,
+  onReloadSettings,
+  settingsData = {},
+  user,
+}) {
   const [data, setData] = useState(EMPTY_OPERATIONAL_SCOPE_DATA);
   // Whether the boxes on this screen can be typed in. `settingsSayManage` comes from the Settings
   // bundle, which is only fetched when Settings or Orders is opened, so coming straight here after
@@ -21468,6 +21499,29 @@ function OperationalScopeManagement({ canManage: settingsSayManage, user }) {
     }
   }, [user]);
   useEffect(() => { load(); }, [load]);
+  // Same rule as the Settings filter: the licence card is the Owner's, and a phone has no screen
+  // lock. The backend refuses either way; this only decides what is drawn.
+  const isOwnerAccount = String(user?.role || user?.role_name || "").toUpperCase() === "OWNER";
+  const visibleSections = (navigationRegistry.find((item) => item.id === "branches")?.sections || [])
+    .filter((section) => (!section.ownerOnly || isOwnerAccount) && shellShowsSettingsSection(section.id, SHELL_CAPABILITIES));
+  const showsSection = (sectionId) => visibleSections.some((section) => section.id === sectionId);
+  const scrollToSection = (sectionId) => document.getElementById(scopeSectionDomId(sectionId))
+    ?.scrollIntoView({ behavior: "smooth", block: "start" });
+  // A searched-for section: wait for the page to finish loading (the cards do not exist before
+  // that), then scroll. Cleared whether or not it is found, so a stale id cannot re-fire forever.
+  useEffect(() => {
+    if (!focusSection || loading) return undefined;
+    if (!showsSection(focusSection)) {
+      onFocusSectionHandled?.();
+      return undefined;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      scrollToSection(focusSection);
+      onFocusSectionHandled?.();
+    });
+    return () => window.cancelAnimationFrame(frame);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusSection, loading]);
 
   const activeBranches = data.branches.filter((branch) => branch.active !== false);
   const locationsForBranch = (branchId) => data.operational_locations.filter(
@@ -21604,7 +21658,12 @@ function OperationalScopeManagement({ canManage: settingsSayManage, user }) {
         delete next[device.device_id];
         return next;
       });
-      report("computers", "ok", `${device.device_name || device.device_id} approved.`);
+      report("computers", "ok", isOwnerAccount
+        ? `${device.device_name || device.device_id} approved. Now issue its licence in Step 5 below.`
+        : `${device.device_name || device.device_id} approved. The Owner issues its licence next.`);
+      // The licence list reads the settings bundle, not this screen's own data, so it would not
+      // show the machine just approved until something else refreshed it.
+      onReloadSettings?.();
     } catch (requestError) { report("computers", "error", getErrorMessage(requestError, "The computer could not be approved.")); }
   };
 
@@ -21617,13 +21676,25 @@ function OperationalScopeManagement({ canManage: settingsSayManage, user }) {
   const activeCounters = data.operational_locations.filter((location) => location.active !== false);
   const locationTypeLabel = (type) => ({ STORE: "Shop counter", WAREHOUSE: "Store room / warehouse", MANDI_COUNTER: "Mandi counter", OFFICE: "Office" })[type] || type;
   return (
-    <ModuleCard eyebrow="Branches & Counters" title="Branches & Counters" subtitle="Set up in this order: 1. Branch (your shop)  2. Counter inside the branch  3. Staff at the counter  4. Computer at the counter.">
-      {error && <div className="startup-status-panel"><p>{error}</p></div>}
-      {!canManage && !error && <p className="form-note">Only the Owner can change branches, counters, staff and computers. You can look, but the boxes are locked.</p>}
+    <div className="scope-page">
+      <ModuleCard eyebrow="Setup" title="Branches & Counters" subtitle="Your shops, their counters, who works where, and which computers and phones may bill. Set them up in this order.">
+        {error && <div className="startup-status-error" role="alert"><p>{error}</p></div>}
+        {!canManage && !error && <p className="scope-locked-note">Only the Owner can change branches, counters, staff and computers. You can look, but the boxes are locked.</p>}
+        <nav className="scope-jump" aria-label="Sections on this page">
+          {visibleSections.map((section) => (
+            <a
+              href={`#${scopeSectionDomId(section.id)}`}
+              key={section.id}
+              onClick={(event) => { event.preventDefault(); scrollToSection(section.id); }}
+            >
+              <span className="scope-jump-step">{section.eyebrow}</span>
+              {section.label}
+            </a>
+          ))}
+        </nav>
+      </ModuleCard>
 
-      <section className="scope-step">
-        <h3>Step 1 · Branches</h3>
-        <p className="form-note">A branch is one shop. Reports are totalled branch by branch.</p>
+      <ModuleCard id={scopeSectionDomId("branches/shops")} eyebrow="Step 1" title="Branches" subtitle="A branch is one shop. Reports are totalled branch by branch.">
         <div className="form-grid supplier-form-grid">
           <Field label="Branch name"><input disabled={!canManage} placeholder="e.g. Jodhpur Main" value={branchDraft.branch_name} onChange={(event) => setBranchDraft({ ...branchDraft, branch_name: event.target.value })} /></Field>
           <Field label="Address"><input disabled={!canManage} value={branchDraft.address} onChange={(event) => setBranchDraft({ ...branchDraft, address: event.target.value })} /></Field>
@@ -21635,11 +21706,9 @@ function OperationalScopeManagement({ canManage: settingsSayManage, user }) {
         <DataTable headers={["Branch", "Address", "Counters", "Status", "Actions"]}>
           {data.branches.map((branch) => <tr key={branch.id}><td className="primary-cell">{branch.branch_name}</td><td>{branch.address || "-"}</td><td>{data.operational_locations.filter((location) => Number(location.branch_id) === Number(branch.id) && location.active !== false).length}</td><td><span className={branch.active !== false ? "stock-ok" : "stock-low"}>{branch.active !== false ? "Open" : "Closed"}</span></td><td><div className="button-row table-actions-row"><button className="table-action" disabled={!canManage} onClick={() => updateBranch(branch, branch.active !== false)}>Rename</button>{branch.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => updateBranch(branch, false)}>Close branch</button>}</div></td></tr>)}
         </DataTable>
-      </section>
+      </ModuleCard>
 
-      <section className="scope-step">
-        <h3>Step 2 · Counters</h3>
-        <p className="form-note">A counter is one billing point or store room inside a branch. Every bill, purchase and stock lot belongs to exactly one counter.</p>
+      <ModuleCard id={scopeSectionDomId("branches/counters")} eyebrow="Step 2" title="Counters" subtitle="A counter is one billing point or store room inside a branch. Every bill, purchase and stock lot belongs to exactly one counter.">
         <div className="form-grid supplier-form-grid">
           <Field label="Branch"><select disabled={!canManage} value={locationDraft.branch_id} onChange={(event) => setLocationDraft({ ...locationDraft, branch_id: event.target.value })}><option value="">Select branch</option>{activeBranches.map((branch) => <option key={branch.id} value={branch.id}>{branch.branch_name}</option>)}</select></Field>
           <Field label="Counter name"><input disabled={!canManage} placeholder="e.g. Main Counter" value={locationDraft.location_name} onChange={(event) => setLocationDraft({ ...locationDraft, location_name: event.target.value })} /></Field>
@@ -21653,11 +21722,9 @@ function OperationalScopeManagement({ canManage: settingsSayManage, user }) {
         <DataTable headers={["Counter", "Branch", "Kind", "Main counter", "Status", "Actions"]}>
           {data.operational_locations.map((location) => <tr key={location.id}><td className="primary-cell">{location.location_name}<small className="cell-note">{location.location_code}</small></td><td>{location.branch_name}</td><td>{locationTypeLabel(location.location_type)}</td><td>{location.is_default ? "Yes" : "No"}</td><td><span className={location.active !== false ? "stock-ok" : "stock-low"}>{location.active !== false ? "Open" : "Closed"}</span></td><td><div className="button-row table-actions-row"><button className="table-action" disabled={!canManage} onClick={() => updateLocation(location, location.active !== false)}>Rename</button>{location.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => updateLocation(location, false)}>Close counter</button>}</div></td></tr>)}
         </DataTable>
-      </section>
+      </ModuleCard>
 
-      <section className="scope-step">
-        <h3>Step 3 · Staff at counters</h3>
-        <p className="form-note">A person can sign in only at a counter they are placed at. The Owner was placed at the first counter when it was created; place everyone else here.</p>
+      <ModuleCard id={scopeSectionDomId("branches/staff")} eyebrow="Step 3" title="Staff on counters" subtitle="A person can sign in only at a counter they are placed at. The Owner was placed at the first counter when it was created; place everyone else here. New people are added in Settings, Users.">
         <div className="form-grid supplier-form-grid">
           <Field label="Person"><select disabled={!canManage} value={staffDraft.user_id} onChange={(event) => { const selected = data.users.find((candidate) => String(candidate.id) === event.target.value); setStaffDraft({ ...staffDraft, user_id: event.target.value, role_id: selected?.role_id ? String(selected.role_id) : "" }); }}><option value="">Select person</option>{data.users.map((member) => <option key={member.id} value={member.id}>{member.full_name} ({member.role_name})</option>)}</select></Field>
           <Field label="Branch"><select disabled={!canManage} value={staffDraft.branch_id} onChange={(event) => setStaffDraft({ ...staffDraft, branch_id: event.target.value, operational_location_id: "" })}><option value="">Select branch</option>{activeBranches.map((branch) => <option key={branch.id} value={branch.id}>{branch.branch_name}</option>)}</select></Field>
@@ -21670,12 +21737,10 @@ function OperationalScopeManagement({ canManage: settingsSayManage, user }) {
         <DataTable headers={["Person", "Role", "Branch", "Counter", "Main counter", "Status", "Actions"]}>
           {data.staff_assignments.map((assignment) => <tr key={assignment.id}><td className="primary-cell">{assignment.full_name}<small className="cell-note">{assignment.username}</small></td><td>{assignment.role_name || "-"}</td><td>{assignment.branch_name}</td><td>{assignment.location_name}</td><td>{assignment.is_default ? "Yes" : "No"}</td><td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "Can sign in" : "Removed"}</span></td><td>{assignment.active !== false && <button className="remove-button" disabled={!canManage} onClick={() => deactivateStaffAssignment(assignment)}>Remove</button>}</td></tr>)}
         </DataTable>
-      </section>
+      </ModuleCard>
 
-      <section className="scope-step">
-        <h3>Step 4 · Computers</h3>
-        <p className="form-note">A new computer asks to join when it is first opened. Approve it and place it at a counter before it can bill.</p>
-        <h4>Waiting for approval</h4>
+      <ModuleCard id={scopeSectionDomId("branches/computers")} eyebrow="Step 4" title="Computers & phones" subtitle="A new computer or phone asks to join when it is first opened (Send to Shop). Approve it and place it at a counter before it can bill.">
+        <h3 className="scope-subheading">Waiting for approval</h3>
         {data.pending_devices.map((device) => {
           const draft = approvalDraft(device);
           return <section className="settings-inline-panel" key={device.device_id}>
@@ -21692,15 +21757,35 @@ function OperationalScopeManagement({ canManage: settingsSayManage, user }) {
             </div>
           </section>;
         })}
-        {data.pending_devices.length === 0 && <p className="form-note">No computer is waiting for approval.</p>}
+        {data.pending_devices.length === 0 && <p className="scope-empty">Nothing is waiting. A new machine appears here after it presses Send to Shop.</p>}
         {stepMessage("computers")}
-        <h4>Approved computers</h4>
+        <h3 className="scope-subheading">Approved</h3>
         <DataTable headers={["Computer", "Branch", "Counter", "Used for", "Status"]}>
           {data.device_assignments.map((assignment) => <tr key={`${assignment.device_id}-${assignment.assignment_generation}`}><td className="primary-cell">{assignment.device_name}<small className="cell-note">{assignment.device_id}</small></td><td>{assignment.branch_name}</td><td>{assignment.location_name}</td><td>{assignment.intended_usage}</td><td><span className={assignment.active !== false ? "stock-ok" : "stock-low"}>{assignment.active !== false ? "In use" : "Moved / retired"}</span></td></tr>)}
         </DataTable>
         {activeCounters.length === 0 && <p className="form-note">Add a counter in Step 2 before approving a computer.</p>}
-      </section>
-    </ModuleCard>
+      </ModuleCard>
+
+      {showsSection("branches/activation-licences") && (
+        <div className="scope-anchor" id={scopeSectionDomId("branches/activation-licences")}>
+          <SettingsSectionErrorBoundary eyebrow="Step 5" fallbackNote="The licence list could not be drawn. Approving machines above still works." sectionName="Activation licences">
+            <DeviceActivationIssuingSection
+              canIssue={isOwnerAccount}
+              devices={settingsData.authorizedDevices}
+              devicesError={settingsData.canManageSettings ? null : "this account cannot read the device list"}
+              onReload={onReloadSettings}
+              user={user}
+            />
+          </SettingsSectionErrorBoundary>
+        </div>
+      )}
+
+      {showsSection("branches/screen-lock") && (
+        <div className="scope-anchor" id={scopeSectionDomId("branches/screen-lock")}>
+          <DeviceControlSettingsSection canManage={canManageDevices} deviceControlSettings={settingsData.deviceControlSettings} exitAttemptLogs={settingsData.exitAttemptLogs || []} onReload={onReloadSettings} user={user} />
+        </div>
+      )}
+    </div>
   );
 }
 

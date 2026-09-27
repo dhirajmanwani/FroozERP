@@ -174,12 +174,12 @@ test("shell capabilities change nothing on the desktop or in a browser", () => {
   assert.ok(Object.isFrozen(phone));
 });
 
-test("the kiosk settings section is hidden only on a phone", () => {
+test("the counter screen lock section is hidden only on a phone", () => {
   const desktop = resolveShellCapabilities({ desktopShell: true });
   const phone = resolveShellCapabilities({ desktopShell: true, mobileShell: true });
-  assert.equal(shellShowsSettingsSection("settings/device-control", desktop), true);
-  assert.equal(shellShowsSettingsSection("settings/device-control", resolveShellCapabilities()), true, "browser");
-  assert.equal(shellShowsSettingsSection("settings/device-control", phone), false);
+  assert.equal(shellShowsSettingsSection("branches/screen-lock", desktop), true);
+  assert.equal(shellShowsSettingsSection("branches/screen-lock", resolveShellCapabilities()), true, "browser");
+  assert.equal(shellShowsSettingsSection("branches/screen-lock", phone), false);
   assert.equal(shellShowsSettingsSection("settings/updates", phone), true, "Update Center stays; only its automatic part goes");
   assert.equal(shellShowsSettingsSection("settings/sync", phone), true);
 });

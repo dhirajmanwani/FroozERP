@@ -17,7 +17,8 @@ test("a pending answer means the device now waits at the shop, with the Owner's 
   assert.equal(result.outcome, ENROLMENT_OUTCOME.WAITING_AT_SHOP);
   assert.equal(result.ok, true);
   assert.match(result.message, /Android Device 9F2C/);
-  assert.match(result.message, /Device Activation Licences/);
+  assert.match(result.message, /Branches & Counters > Computers & phones/);
+  assert.match(result.message, /Activation licences/);
 });
 
 test("a session answer means the shop already knows the device; the session is not the point", () => {

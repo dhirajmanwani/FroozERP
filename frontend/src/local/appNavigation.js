@@ -205,7 +205,18 @@ const modules = [
       "branch", "shop", "location", "counter", "warehouse", "godown",
       "device", "machine", "till", "staff posting", "assignment", "add branch", "new shop",
     ],
-    sections: [],
+    // Everything about places and machines, in the order an Owner sets them up. Adding a phone
+    // used to start here (approve it) and finish in Settings (licence it), two screens apart for
+    // one job; the licence and the screen lock moved here on 27 Sep 2026. `ownerOnly` works as it
+    // does for Settings: the screen hides the card, and the backend's NOT_OWNER is the real refusal.
+    sections: [
+      { id: "branches/shops", label: "Branches", eyebrow: "Step 1", keywords: ["shop", "add shop", "close shop", "gst number"] },
+      { id: "branches/counters", label: "Counters", eyebrow: "Step 2", keywords: ["billing point", "store room", "warehouse", "godown", "main counter"] },
+      { id: "branches/staff", label: "Staff on counters", eyebrow: "Step 3", keywords: ["place staff", "posting", "cashier counter", "who signs in where"] },
+      { id: "branches/computers", label: "Computers & phones", eyebrow: "Step 4", keywords: ["approve device", "new computer", "android", "tablet", "laptop", "waiting for approval"] },
+      { ownerOnly: true, id: "branches/activation-licences", label: "Activation licences", eyebrow: "Step 5", keywords: ["activate", "licence", "lic file", "entitlement", "expiry", "activation file"] },
+      { id: "branches/screen-lock", label: "Counter screen lock", eyebrow: "Counter security", keywords: ["kiosk", "fullscreen", "exit code", "lock"] },
+    ],
   },
   {
     id: "settings",
@@ -213,7 +224,8 @@ const modules = [
     icon: "settings",
     shortcut: null,
     keywords: ["configuration", "setup", "preferences", "admin", "master"],
-    // Eighteen cards stacked on one page. The `eyebrow` is kept exactly as `SettingsModule`
+    // Sixteen cards, grouped below. The screen lock and the activation licences moved to Branches
+    // & Counters on 27 Sep 2026, beside the approval they belong to. The `eyebrow` is kept exactly as `SettingsModule`
     // renders it — it is the grouping the maintainer already wrote, and repeating it here means
     // the drill-down and the page agree about what a group is called.
     sections: [
@@ -229,13 +241,6 @@ const modules = [
       { group: "business", id: "settings/bill-discount-slabs", label: "Bill-Level Discount Slabs", eyebrow: "Overall Sale Discount Settings", keywords: ["automatic discount", "bill total", "payment mode"] },
       { group: "people", id: "settings/permission-matrix", label: "Permission Matrix", eyebrow: "Role Management", keywords: ["roles", "access", "permissions", "cashier", "admin"] },
       { group: "people", id: "settings/users", label: "Owner User Administration", eyebrow: "User Management", keywords: ["staff", "add user", "reset password", "deactivate"] },
-      { group: "counter", id: "settings/device-control", label: "Fullscreen Lock & Owner Exit Code", eyebrow: "Security / Device Control", keywords: ["kiosk", "fullscreen", "exit code", "lock"] },
-      // `ownerOnly` is read by `SettingsModule`, which knows who is signed in; this registry does
-      // not and must not guess. It is a flag here rather than a second list in App.jsx because a
-      // section defined in two places is a section that will eventually be in one of them only --
-      // and the half that goes missing is the half nobody is looking at. The flag hides the card
-      // from anyone but the Owner; the refusal that matters is the backend's NOT_OWNER.
-      { group: "counter", ownerOnly: true, id: "settings/device-activation", label: "Device Activation Licences", eyebrow: "Security / Device Activation", keywords: ["activate", "licence", "new counter", "entitlement", "lic file", "expiry"] },
       { group: "system", id: "settings/updates", label: "FroozERP Windows Updates", eyebrow: "Software Updates", keywords: ["update", "version", "installer", "upgrade"] },
       { group: "system", id: "settings/sync", label: "Connection Status", eyebrow: "Sync & Connection", keywords: ["sync", "internet", "cloud", "offline", "local only", "server"] },
       { group: "system", id: "settings/backup", label: "Auto Backup and Safe Shutdown", eyebrow: "Backup & Restore", keywords: ["backup", "restore", "shutdown", "safety"] },
@@ -255,21 +260,21 @@ const freezeModule = (item) =>
 
 /** The registry. Frozen because two consumers read it and neither may edit it for the other. */
 /**
- * How the seventeen Settings sections are grouped on screen.
+ * How the Settings sections are grouped on screen.
  *
  * Settings was one page with all seventeen stacked vertically, which is why it needed drilling
  * into. The grouping is by **what a shopkeeper is trying to do**, not by which part of the system
  * a setting happens to live in: WhatsApp sits with the business rules because it is how a bill
- * reaches a customer, and the fullscreen lock sits with the counter hardware because it is a
- * property of the machine on the till rather than of the people using it.
+ * reaches a customer. Anything about which machine may work where (approval, licence, screen
+ * lock) is not a setting at all and lives in Branches & Counters.
  *
  * Kept here rather than in `App.jsx` so the screen, the search index and the sidebar all read one
  * source. A section with no group, or a group with no sections, fails a test.
  */
 export const SETTINGS_GROUPS = Object.freeze([
   Object.freeze({ id: "business", label: "Business Rules", icon: "rupee", description: "Identity, tax, rates, discounts, rebates and how bills reach customers." }),
-  Object.freeze({ id: "counter", label: "Counter & Display", icon: "barcode", description: "The till machine itself: weighing scale, text size and screen lock." }),
-  Object.freeze({ id: "people", label: "People & Places", icon: "users", description: "Who can sign in, what they may do, and which branch or counter they work at." }),
+  Object.freeze({ id: "counter", label: "Counter & Display", icon: "barcode", description: "The till machine itself: weighing scale and text size." }),
+  Object.freeze({ id: "people", label: "People & Places", icon: "users", description: "Who can sign in and what they may do. Where they work is set in Branches & Counters." }),
   Object.freeze({ id: "system", label: "System & Data", icon: "layers", description: "Updates, connection, backups and what this device reports about itself." }),
 ]);
 

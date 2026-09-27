@@ -27,10 +27,12 @@ Artifact 7 din baad GitHub se hat jaata he. Tab dobara **Run workflow** kar lena
 
 ## 3. Apne laptop pe: approve aur licence
 
-1. **Branches & Counters** kholo → **Step 4 · Computers**. Naya device yahan dikhega
-   (phone/tablet ka naam "Android Device …" hota he).
-2. Counter, Kind of computer (Android Phone / Tablet / Laptop), user aur role chuno → **Approve Computer**.
-3. **Settings → Device Activation Licences** kholo → wahi device select karo → Valid For chuno →
+Sab kuch ek hi screen pe he: **Branches & Counters**. Upar Step buttons se seedha us jagah pahunch sakte ho.
+
+1. **Branches & Counters** kholo → **Step 4 · Computers & phones**. Naya device "Waiting for approval"
+   mein dikhega (phone/tablet ka naam "Android Device …" hota he).
+2. Branch, Counter, Kind of computer (Android Phone / Tablet / Laptop), user chuno → **Approve Computer**.
+3. Usi screen pe neeche **Step 5 · Activation licences** → wahi device select karo → Valid For chuno →
    **Issue Activation Licence** → **Copy File Text**.
 4. Ye text WhatsApp pe khud ko bhejo.
 
@@ -47,7 +49,7 @@ Artifact 7 din baad GitHub se hat jaata he. Tab dobara **Run workflow** kar lena
 | Screen pe likha | Kya karo |
 | --- | --- |
 | Username or password is wrong | Sahi username/password daal ke dobara Send to Shop. |
-| Step 4 mein device nahi dikha | Branches & Counters band karke dobara kholo. Na dikhe to naye device pe Send to Shop dobara dabao aur uski line padho. |
+| Step 4 (Computers & phones) mein device nahi dikha | Branches & Counters band karke dobara kholo. Na dikhe to naye device pe Send to Shop dobara dabao aur uski line padho. |
 | The shop's cloud could not be reached | Naye device ka internet check karo. |
 | This activation file was issued for a different device | Licence galat device ke liye bana. Sahi device select karke dobara issue karo. |
 | The activation signing key is not available on the server | Ye aapse theek nahi hoga; maintainer ko batao. |

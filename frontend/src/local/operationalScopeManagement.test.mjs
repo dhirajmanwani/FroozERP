@@ -19,7 +19,7 @@ test("branch and counter management is a module of its own, not a settings page"
   // a map; a module has to be in the sidebar list, in the navigation registry, and rendered by the
   // view switch -- and the registry test checks those three against each other. So this pins the
   // move, and appNavigation.test.mjs pins that the move is complete.
-  assert.match(appSource, /<OperationalScopeManagement canManage=\{settingsData\.canManageSettings\} user=\{user\} \/>/);
+  assert.match(appSource, /<OperationalScopeManagement\n\s*canManage=\{settingsData\.canManageSettings\}/);
   assert.match(appSource, /activeView === "branches"/);
   assert.match(appSource, /\["branches", "Branches & Counters"\]/);
 
@@ -29,7 +29,7 @@ test("branch and counter management is a module of its own, not a settings page"
   assert.doesNotMatch(navigationSource, /settings\/operational-scope/);
 
   assert.match(appSource, /\/api\/v3\/admin\/operational-locations/);
-  assert.match(appSource, /Step 2 · Counters/);
+  assert.match(appSource, /eyebrow="Step 2" title="Counters"/);
   assert.match(appSource, /updateBranch\(branch, false\)/);
   assert.match(appSource, /updateLocation\(location, false\)/);
   assert.doesNotMatch(appSource, /<BranchCounterSettings /);
@@ -38,7 +38,7 @@ test("branch and counter management is a module of its own, not a settings page"
 
 test("staff assignment binds a user role to one explicit default location", () => {
   assert.match(appSource, /\/api\/v3\/admin\/staff-assignments\/\$\{staffDraft\.user_id\}/);
-  assert.match(appSource, /Step 3 · Staff at counters/);
+  assert.match(appSource, /eyebrow="Step 3" title="Staff on counters"/);
   assert.match(appSource, /Place at Counter/);
   assert.match(appSource, /permission_set: \{ operational_access: true \}/);
   assert.match(appSource, /target_operational_location_id: staffDraft\.operational_location_id/);
@@ -72,10 +72,18 @@ test("all management requests use signed protocol-v3 helpers", () => {
   assert.match(appSource, /url: `\$\{SYNC_API_URL\}\$\{path\}`/);
 });
 
-test("the screen reads as four numbered steps, each reporting under its own button", () => {
+test("the screen reads as numbered steps, each reporting under its own button", () => {
   // 25 Sep 2026: "bht hoch poch he ... headings proper". And the staff button looked dead because
-  // its refusal was printed in one banner at the top of the screen.
-  const steps = ["Step 1 · Branches", "Step 2 · Counters", "Step 3 · Staff at counters", "Step 4 · Computers"];
+  // its refusal was printed in one banner at the top of the screen. 27 Sep 2026: the licence and
+  // the screen lock joined it, so adding a machine is one screen, top to bottom.
+  const steps = [
+    'eyebrow="Step 1" title="Branches"',
+    'eyebrow="Step 2" title="Counters"',
+    'eyebrow="Step 3" title="Staff on counters"',
+    'eyebrow="Step 4" title="Computers & phones"',
+    'showsSection("branches/activation-licences")',
+    'showsSection("branches/screen-lock")',
+  ];
   let last = -1;
   for (const step of steps) {
     const at = appSource.indexOf(step);
@@ -104,4 +112,23 @@ test("coming straight to the screen after sign-in still lets the Owner type", ()
   const routes = backendSource.match(/use\("(get|post|put)", "\/api\/v3\/admin\/(scope-management|branches|operational-locations|staff-assignments|devices)[^"]*"/g) || [];
   assert.ok(routes.length >= 7, `expected the screen's routes, found ${routes.length}`);
   assert.equal(gated.length, routes.length, "every route this screen calls must open with requireAssignmentOwner");
+});
+
+test("a searched-for Branches section scrolls to its card, and the target is always cleared", () => {
+  // The palette offers these sections by name. A target that is never cleared re-fires on every
+  // render; a card addressed by a second spelling of its id is a scroll that goes nowhere.
+  const component = appSource.slice(appSource.indexOf("function OperationalScopeManagement"), appSource.indexOf("function _LegacySecurityDevicesSection"));
+  assert.match(component, /if \(!showsSection\(focusSection\)\) \{\s*\n\s*onFocusSectionHandled\?\.\(\);/);
+  assert.match(component, /scrollToSection\(focusSection\);\s*\n\s*onFocusSectionHandled\?\.\(\);/);
+  assert.match(appSource, /const scopeSectionDomId = \(sectionId\) => String\(sectionId\)\.replace\("\/", "-"\);/);
+  const cardIds = [...component.matchAll(/id=\{scopeSectionDomId\("([^"]+)"\)\}/g)].map(([, id]) => id);
+  const registered = navigationSource.match(/id: "branches\/[^"]+"/g).map((entry) => entry.slice(5, -1));
+  assert.deepEqual(cardIds, registered, "every registered Branches section has exactly one card, in order");
+});
+
+test("approving a machine refreshes the licence list it is issued from", () => {
+  const component = appSource.slice(appSource.indexOf("function OperationalScopeManagement"), appSource.indexOf("function _LegacySecurityDevicesSection"));
+  const approve = component.slice(component.indexOf("const approveDeviceAssignment"), component.indexOf("if (loading) return"));
+  assert.match(approve, /onReloadSettings\?\.\(\);/);
+  assert.match(appSource, /if \(view === "settings" \|\| view === "branches"\) await loadSettingsData\(\);/);
 });

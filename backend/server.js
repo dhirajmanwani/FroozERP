@@ -7323,7 +7323,7 @@ app.post("/settings/device-control/verify-exit-code", async (req, res) => {
     const settingsResult = await pool.query("SELECT * FROM device_control_settings WHERE id = 1");
     const settings = settingsResult.rows[0] || {};
     if (!settings.exit_code_hash) {
-      return res.status(409).json({ message: "No Owner exit code is configured. Set one in Settings > Security / Device Control." });
+      return res.status(409).json({ message: "No Owner exit code is configured. Set one in Branches & Counters > Counter screen lock." });
     }
     const valid = Boolean(settings.exit_code_hash) && hashExitCode(exitCode) === settings.exit_code_hash;
     await pool.query(
