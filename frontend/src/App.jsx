@@ -154,7 +154,8 @@ import { refreshAfterSaveMessage, settingsWriteErrorMessage } from "./local/sett
 import { buildReportPdfModel, renderReportPdf, reportPdfHasContent } from "./local/reportPdf";
 import { adminWritePayload } from "./local/adminWritePayload";
 import { checkProductPhoto, imageFromTransfer, indexProductPhotos, photoForProduct, readCachedProductPhotos, shrinkProductPhoto, withProductPhoto, writeCachedProductPhotos } from "./local/productPhotos";
-import { findDuplicateProductName, isServerProductId, productGlobalIdFrom, productIdentityKeys, resolveServerProductId } from "./local/productIdentity";
+import { findDuplicateProductName, isSameProduct, isServerProductId, productGlobalIdFrom, productIdentityKeys, resolveServerProductId } from "./local/productIdentity";
+import { MISSING_VALUE, PRODUCT_STATUS_FILTERS, PRODUCT_UNITS, filterProductMasterList, formatOptionalCount, formatOptionalMoney, formatOptionalQuantity, isActiveRecord, isLowStock, lotListEmptyMessage, lotPanelMatchesEdit, pickQuantity, pickRate, productCategoryLabel, productCountSummary, productListEmptyMessage, unitDisplayName } from "./local/productMaster";
 import { POS_SECTIONS, posSectionCounts, posSectionFor, posSectionLabel, posTileBadge, readPosSection, writePosSection } from "./local/posSections";
 import { XLSX_MIME, buildReportWorkbook, renderXlsx, reportWorkbookHasContent, reportXlsxFileName } from "./local/reportXlsx";
 import { createPurchaseSubmissionTracker } from "./local/purchaseSubmission";
@@ -2534,6 +2535,13 @@ function App() {
   const [showEmptyLots, setShowEmptyLots] = useState(false);
   const [showInventoryEmptyLots, setShowInventoryEmptyLots] = useState(false);
   const [showOpeningLotForm, setShowOpeningLotForm] = useState(false);
+  // Product Master presentation only: which tab is open, the list's filters, the optional columns
+  // and the inline "+ New category" box. None of it is saved or sent anywhere.
+  const [productMasterTab, setProductMasterTab] = useState("products");
+  const [productCategoryFilter, setProductCategoryFilter] = useState("");
+  const [productStatusFilter, setProductStatusFilter] = useState("active");
+  const [showMoreProductColumns, setShowMoreProductColumns] = useState(false);
+  const [showInlineCategoryForm, setShowInlineCategoryForm] = useState(false);
   const [lotAction, setLotAction] = useState(null);
   const [lotDraft, setLotDraft] = useState({
     lot_name: "",
@@ -7170,11 +7178,11 @@ function App() {
       const parsedSellingRate = Number(sellingRate);
       const parsedMinimumStock = Number(productMinimumStock || 0);
       if (!productName.trim() || !unit || !Number.isFinite(parsedSellingRate) || parsedSellingRate <= 0) {
-        alert("Enter an item name, unit and valid sale rate.");
+        alert("Enter a product name, a unit and a sale price above zero.");
         return;
       }
       if (!Number.isFinite(parsedMinimumStock) || parsedMinimumStock < 0) {
-        alert("Enter a valid minimum stock quantity.");
+        alert("Enter a valid low-stock alert quantity (zero or more).");
         return;
       }
       const normalizedOpeningStockLots = (addOpeningStock ? openingStockLots : [])
@@ -7375,7 +7383,7 @@ function App() {
   };
 
   const deactivateProductCategory = async (category) => {
-    const reason = window.prompt(`Enter reason to remove/deactivate ${category.category_name}`);
+    const reason = window.prompt(`Reason for deactivating the category ${category.category_name}`);
     if (!reason?.trim()) return;
     try {
       const categoryWrite = createOperationalWrite(user, { updated_by: user.id, reason });
@@ -7387,7 +7395,7 @@ function App() {
       alert("Category removed");
     } catch (error) {
       await loadProductCategories();
-      alert(getErrorMessage(error, "This category has items or transactions. It can only be deactivated."));
+      alert(getErrorMessage(error, "This category has products or transactions. It can only be deactivated."));
     }
   };
 
@@ -7423,15 +7431,15 @@ function App() {
     const purchaseRate = Number(openingStockDraft.purchase_rate || 0);
     const saleRate = Number(openingStockDraft.sale_rate || sellingRate || 0);
     if (!Number.isFinite(quantity) || quantity <= 0) {
-      alert("Please enter lot quantity.");
+      alert("Enter the lot quantity.");
       return null;
     }
     if (!Number.isFinite(purchaseRate) || purchaseRate <= 0) {
-      alert("Please enter opening stock rate.");
+      alert("Enter the lot cost price.");
       return null;
     }
     if (!Number.isFinite(saleRate) || saleRate <= 0) {
-      alert("Please enter sale rate.");
+      alert("Enter the lot sale price.");
       return null;
     }
     const nextLotName = getOpeningLotName(openingStockDraft, productLots.length + openingStockLots.length + 1);
@@ -7505,7 +7513,7 @@ function App() {
       setShowOpeningLotForm(false);
       setAddOpeningStock(false);
       await refreshLotContext(lotPanelProduct || { id: activeProductId, product_name: productName });
-      alert("Opening stock lot added");
+      alert("Stock lot added");
     } catch (error) {
       alert(getErrorMessage(error, "Unable to add opening stock lot"));
     }
@@ -7593,15 +7601,15 @@ function App() {
         const nextQty = Number(lotDraft.purchase_qty || 0);
         const nextCost = Number(lotDraft.purchase_rate || 0);
         if (!lotDraft.lot_name.trim()) {
-          alert("Please enter lot name / number.");
+          alert("Enter a lot name.");
           return;
         }
         if (!Number.isFinite(nextQty) || nextQty < 0) {
-          alert("Please enter a valid opening quantity.");
+          alert("Enter a valid lot quantity.");
           return;
         }
         if (!Number.isFinite(nextCost) || nextCost <= 0) {
-          alert("Please enter a valid opening cost / purchase rate.");
+          alert("Enter a cost price above zero.");
           return;
         }
         const lotWrite = createOperationalWrite(user, {
@@ -7644,11 +7652,11 @@ function App() {
       if (lotAction.type === "adjust") {
         const nextQty = Number(lotDraft.new_quantity || 0);
         if (!lotDraft.reason.trim()) {
-          alert("Adjustment reason is required.");
+          alert("Enter a reason for the count correction.");
           return;
         }
         if (!Number.isFinite(nextQty) || nextQty < 0) {
-          alert("Please enter a valid physical quantity.");
+          alert("Enter a valid counted quantity.");
           return;
         }
         const adjustmentWrite = createOperationalWrite(user, {
@@ -7664,7 +7672,7 @@ function App() {
           adjustmentWrite.body,
           adjustmentWrite.config
         );
-        alert("Lot adjusted");
+        alert("Count corrected");
       }
       if (lotAction.type === "deactivate") {
         if (!lotDraft.reason.trim()) {
@@ -8223,8 +8231,40 @@ function App() {
     resetProductForm();
   };
 
+  const scrollProductMasterTo = (elementId) => {
+    window.requestAnimationFrame(() => {
+      document.getElementById(elementId)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  };
+
+  // "Add product" in the page header: a clean form, on screen.
+  const startNewProduct = () => {
+    resetProductForm();
+    setProductMasterTab("products");
+    window.requestAnimationFrame(() => {
+      document.getElementById("product-item-form")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  };
+
+  // "Stock lots" in the products table. The lots card sits under the form, so take the owner to it.
+  const openProductStockLots = async (product) => {
+    await loadProductLots(product, true);
+    scrollProductMasterTo("product-lots-card");
+  };
+
+  const closeProductStockLots = () => {
+    if (showOpeningLotForm) {
+      resetOpeningStockDraft();
+      setShowOpeningLotForm(false);
+      setAddOpeningStock(false);
+    }
+    setLotPanelProduct(null);
+    setProductLots([]);
+    setProductLotAudit([]);
+  };
+
   const deactivateProduct = async (product) => {
-    const reason = window.prompt(`Enter reason to deactivate/cancel ${product.product_name}`);
+    const reason = window.prompt(`Reason for deactivating ${product.product_name}`);
     if (!reason?.trim()) return;
     try {
       const resolved = await serverIdForProduct(productIdentityKeys(product));
@@ -8839,20 +8879,23 @@ function App() {
     groups.set(key, current);
     return groups;
   }, new Map()).values()].sort((left, right) => `${left.category}-${left.product_name}`.localeCompare(`${right.category}-${right.product_name}`));
-  const productSearchText = productListSearch.trim().toLowerCase();
-  const filteredProducts = products.filter((product) => {
-    if (!productSearchText) return true;
-    return [
-      product.product_name,
-      product.category_name,
-      product.category,
-      product.barcode,
-      product.origin_type,
-      product.selling_rate,
-      product.active !== false ? "active" : "inactive",
-      product.unit,
-    ].some((value) => String(value ?? "").toLowerCase().includes(productSearchText));
+  const productCategoryFilterRecord = productCategoryFilter
+    ? productCategories.find((category) => inventoryIdsEqual(category.id, productCategoryFilter)) || null
+    : null;
+  const filteredProducts = filterProductMasterList(products, {
+    search: productListSearch,
+    category: productCategoryFilterRecord,
+    status: productStatusFilter,
   });
+  const productListFiltered = Boolean(productCategoryFilterRecord) || productStatusFilter !== "all";
+  const productCounts = productCountSummary(products);
+  const activeProductCategories = productCategories.filter(isActiveRecord);
+  // The title names the product as it is saved, not as the name box reads mid-edit.
+  const productEditingName = editingProductId
+    ? (products.find((product) => isSameProduct(product, editingProductKeys))?.product_name || productName.trim() || "product")
+    : "";
+  const lotPanelAcceptsNewLot = lotPanelMatchesEdit({ editingProductId, editingProductKeys, lotPanelProduct });
+  const productMoreColumnHeaders = showMoreProductColumns ? ["Barcode", "Origin", "Low-stock alert at", "Lots"] : [];
   const lotSearchText = lotListSearch.trim().toLowerCase();
   const filteredProductLots = productLots.filter((lot) => {
     if (!showEmptyLots && lotBalanceQuantity(lot) <= 0) return false;
@@ -8872,6 +8915,26 @@ function App() {
       lotStatusLabel(lot),
     ].some((value) => String(value ?? "").toLowerCase().includes(lotSearchText));
   });
+
+  // One set of lot fields for both lot forms on Product Master: the lots staged with a new product,
+  // and "Add stock lot" on an existing one. Both edit `openingStockDraft`, and never at the same time.
+  const openingLotFields = (
+    <div className="form-grid supplier-form-grid">
+      <Field label="Supplier (optional)">
+        <select value={openingStockDraft.supplier_id} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, supplier_id: event.target.value })}>
+          <option value="">None (no supplier payable)</option>
+          {activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.supplier_name}</option>)}
+        </select>
+      </Field>
+      <Field label="Lot name"><input value={openingStockDraft.lot_name} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_name: event.target.value })} placeholder="Named for you if left blank" /></Field>
+      <Field label="Grade"><input value={openingStockDraft.lot_size} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_size: event.target.value })} placeholder="Example: Small, Premium" /></Field>
+      <Field label={<RequiredLabel>Quantity</RequiredLabel>}><input type="number" min="0" step="0.001" value={openingStockDraft.quantity} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, quantity: event.target.value })} /></Field>
+      <Field label={<RequiredLabel>Cost price (₹)</RequiredLabel>}><input type="number" min="0" step="0.01" value={openingStockDraft.purchase_rate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, purchase_rate: event.target.value })} /></Field>
+      <Field label={<RequiredLabel>Sale price (₹)</RequiredLabel>}><input type="number" min="0" step="0.01" value={openingStockDraft.sale_rate || sellingRate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, sale_rate: event.target.value })} /></Field>
+      <Field label="Stock date"><input type="date" value={openingStockDraft.opening_stock_date} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, opening_stock_date: event.target.value })} /></Field>
+      <Field label="Notes"><input value={openingStockDraft.remarks} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, remarks: event.target.value })} /></Field>
+    </div>
+  );
 
   const frostUnreadCount = (aiAssistantData.alerts || []).filter((alert) => ["CRITICAL", "HIGH", "ATTENTION"].includes(String(alert.severity || "").toUpperCase())).length;
   /**
@@ -9395,309 +9458,413 @@ function App() {
           )}
 
           {activeView === "products" && (
-            <section className="settings-layout">
-              <ModuleCard eyebrow="Product Master" title="Category, Item, Lot & Opening Stock" subtitle="Manage fruit categories, item masters and opening stock lots without disturbing FIFO inventory.">
-                {productDuplicateWarning && <div className="cart-empty">{productDuplicateWarning}</div>}
-                <div className="purchase-summary-grid supplier-payment-preview">
-                  <SummaryMetric featured label="Categories" value={productCategories.length} />
-                  <SummaryMetric label="Items" value={products.length} />
-                  <SummaryMetric label="Active Items" value={products.filter((product) => product.active !== false).length} />
-                  <SummaryMetric label="Inventory Lots" value={inventory.length} />
+            <section className="settings-layout product-master">
+              <ModuleCard
+                actions={<button className="primary-button" onClick={startNewProduct} type="button"><Icon name="add" size={16} />Add product</button>}
+                eyebrow="Product Master"
+                subtitle="Everything you sell: its price, unit, photo and stock."
+                title="Products"
+              >
+                {productDuplicateWarning && <p className="pm-notice" role="status">{productDuplicateWarning}</p>}
+                <div className="purchase-summary-grid pm-summary">
+                  <SummaryMetric featured label="Products" value={productCounts.note} />
+                  <SummaryMetric label="Categories" value={`${activeProductCategories.length} active`} />
                 </div>
-              </ModuleCard>
-
-              <ModuleCard eyebrow="Category Management" title="Fruit Categories" subtitle="Add, edit or deactivate categories. Categories with items are protected from hard deletion.">
-                <div className="form-grid supplier-form-grid">
-                  <Field label="Add New Category"><input value={newProductCategoryName} onChange={(event) => setNewProductCategoryName(event.target.value)} placeholder="Example: Mango" /></Field>
-                  <Field label="Select Existing Category">
-                    <select value={productCategoryId} onChange={(event) => {
-                      const selected = productCategories.find((category) => String(category.id) === event.target.value);
-                      setProductCategoryId(event.target.value);
-                      setProductCategory(selected?.category_name || "");
-                    }}>
-                      <option value="">Select category</option>
-                      {productCategories.filter((category) => category.active !== false).map((category) => <option key={category.id} value={category.id}>{category.category_name}</option>)}
-                    </select>
-                  </Field>
-                  <button className="primary-button" onClick={saveProductCategory}>Save Category</button>
-                </div>
-                <DataTable headers={["Category", "Items", "Status", "Actions"]}>
-                  {productCategories.map((category) => (
-                    <tr key={category.id}>
-                      <td className="primary-cell">{category.category_name}</td>
-                      <td>{category.item_count || 0}</td>
-                      <td><span className={category.active !== false ? "stock-ok" : "stock-low"}>{category.active !== false ? "Active" : "Inactive"}</span></td>
-                      <td>
-                        <div className="button-row table-actions-row">
-                          <button className="table-action" onClick={() => editProductCategory(category)}>Edit</button>
-                          <button className="remove-button" disabled={category.active === false} onClick={() => deactivateProductCategory(category)}>Remove / Deactivate</button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </DataTable>
-              </ModuleCard>
-
-              <ModuleCard id="product-item-form" eyebrow="Item Management" title={editingProductId ? "Edit Item" : "Add Item Inside Category"} subtitle="Items are products used by POS, purchase, inventory, reports and FIFO costing.">
-                <div className="form-grid supplier-form-grid">
-                  <Field label="Category">
-                    <select value={productCategoryId} onChange={(event) => {
-                      const selected = productCategories.find((category) => String(category.id) === event.target.value);
-                      setProductCategoryId(event.target.value);
-                      setProductCategory(selected?.category_name || "");
-                    }}>
-                      <option value="">Select existing category</option>
-                      {productCategories.filter((category) => category.active !== false).map((category) => <option key={category.id} value={category.id}>{category.category_name}</option>)}
-                    </select>
-                  </Field>
-                  <Field label="Item Name"><input value={productName} onChange={(event) => setProductName(event.target.value)} placeholder="Example: Kesar" /></Field>
-                  <Field label="Unit">
-                    <select value={unit} onChange={(event) => setUnit(event.target.value)}>
-                      <option value="">Select unit</option>
-                      <option value="KG">KG</option>
-                      <option value="BOX">Box</option>
-                      <option value="PIECE">Piece</option>
-                      <option value="DOZEN">Dozen</option>
-                    </select>
-                  </Field>
-                  <Field label="Default Sale Rate"><input type="number" min="0" step="0.01" value={sellingRate} onChange={(event) => setSellingRate(event.target.value)} /></Field>
-                  <Field label="Barcode (Optional)"><input value={productBarcode} onChange={(event) => setProductBarcode(event.target.value)} /></Field>
-                  <Field label="Minimum Stock"><input type="number" min="0" step="0.001" value={productMinimumStock} onChange={(event) => setProductMinimumStock(event.target.value)} /></Field>
-                  <Field label="Origin Type">
-                    <select value={productOriginType} onChange={(event) => setProductOriginType(event.target.value)}>
-                      <option value="LOCAL">Local</option>
-                      <option value="IMPORTED">Imported</option>
-                    </select>
-                  </Field>
-                  <label className="check-field"><input type="checkbox" checked={productActive} onChange={(event) => setProductActive(event.target.checked)} /><span>Active Item</span></label>
-                </div>
-                <div className="product-photo-field">
-                  <span className="product-photo-label">Photo</span>
-                  <div className="product-photo-row">
-                    {/* Paste lands here: in the browser, right-click a photo, "Copy image", then click this box and press Ctrl+V. */}
-                    <div
-                      aria-label="Product photo. Click, then press Ctrl+V to paste a copied photo."
-                      className={productPhotoDraft.dataUrl ? "product-photo-drop product-photo-drop-filled" : "product-photo-drop"}
-                      onDragOver={(event) => event.preventDefault()}
-                      onDrop={pasteProductPhoto}
-                      onPaste={pasteProductPhoto}
-                      role="button"
-                      tabIndex={0}
+                <div aria-label="Product Master sections" className="account-tabs pm-tabs" role="tablist">
+                  {[["products", "Products"], ["categories", "Categories"]].map(([value, label]) => (
+                    <button
+                      aria-selected={productMasterTab === value}
+                      className={productMasterTab === value ? "account-tab account-tab-active" : "account-tab"}
+                      key={value}
+                      onClick={() => setProductMasterTab(value)}
+                      role="tab"
+                      type="button"
                     >
-                      {productPhotoDraft.dataUrl
-                        ? <img alt="" src={productPhotoDraft.dataUrl} />
-                        : <span>Click here, then Ctrl+V</span>}
-                    </div>
-                    <div className="product-photo-actions">
-                      <p>On Google Images or Pinterest, right-click the photo and choose "Copy image". Then click the box and press Ctrl+V. Or save the photo and choose the file.</p>
-                      <div className="button-row">
-                        <label className="secondary-button product-photo-file">
-                          Choose file
-                          <input
-                            accept="image/jpeg,image/png,image/webp"
-                            onChange={(event) => { takeProductPhoto(event.target.files?.[0] || null, "No file chosen."); event.target.value = ""; }}
-                            type="file"
-                          />
-                        </label>
-                        {productPhotoDraft.dataUrl && (
-                          <button className="remove-button" onClick={() => { setProductPhotoDraft({ dataUrl: null, changed: true }); setProductPhotoMessage("The photo is removed when you press Save."); }} type="button">Remove photo</button>
-                        )}
-                      </div>
-                      {productPhotoMessage && <small className="product-photo-message" role="status">{productPhotoMessage}</small>}
-                      {productPhotosState.message && <small className="product-photo-message product-photo-message-error">{productPhotosState.message}</small>}
-                    </div>
-                  </div>
+                      {label}
+                    </button>
+                  ))}
                 </div>
-                <Field label="Remarks"><textarea value={productRemarks} onChange={(event) => setProductRemarks(event.target.value)} /></Field>
-                {!editingProductId && <label className="check-field"><input type="checkbox" checked={addOpeningStock} onChange={(event) => setAddOpeningStock(event.target.checked)} /><span>Add Opening Stock</span></label>}
-                {addOpeningStock && !editingProductId && (
-                  <div className="lot-entry-panel">
-                    <div className="form-grid supplier-form-grid">
-                      <Field label="Supplier (Optional)">
-                        <select value={openingStockDraft.supplier_id} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, supplier_id: event.target.value })}>
-                          <option value="">No supplier payable</option>
-                          {activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.supplier_name}</option>)}
+              </ModuleCard>
+
+              {productMasterTab === "categories" && (
+                <ModuleCard eyebrow="Categories" title="Product categories" subtitle="Group products for the POS and reports. A category that has products can only be deactivated, never deleted.">
+                  <div className="pm-inline-form">
+                    <Field label="New category">
+                      <input value={newProductCategoryName} onChange={(event) => setNewProductCategoryName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") saveProductCategory(); }} placeholder="Example: Mango" />
+                    </Field>
+                    <button className="primary-button" onClick={saveProductCategory} type="button">Add category</button>
+                  </div>
+                  <DataTable className="pm-table pm-category-table" headers={["Category", <span className="pm-num-head" key="products">Products</span>, "Status", "Actions"]}>
+                    {productCategories.map((category) => (
+                      <tr key={category.id}>
+                        <td className="pm-cell-strong">{category.category_name}</td>
+                        <td className="pm-num">{formatOptionalCount(category.item_count)}</td>
+                        <td><span className={isActiveRecord(category) ? "stock-ok" : "tag"}>{isActiveRecord(category) ? "Active" : "Inactive"}</span></td>
+                        <td>
+                          <div className="pm-row-actions">
+                            <button className="table-action" onClick={() => editProductCategory(category)} type="button">Rename</button>
+                            {isActiveRecord(category) && <button className="danger-text-button" onClick={() => deactivateProductCategory(category)} type="button">Deactivate</button>}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                    {productCategories.length === 0 && <tr><td colSpan="4" className="empty-cell">No categories yet. Add your first category above.</td></tr>}
+                  </DataTable>
+                </ModuleCard>
+              )}
+
+              {productMasterTab === "products" && (
+                <>
+                  <ModuleCard eyebrow="Catalogue" title="All products" subtitle="Inactive products stay in past bills and reports but are hidden from the POS.">
+                    <div className="pm-toolbar">
+                      <label className="pm-toolbar-search">
+                        <span>Search</span>
+                        <span className="icon-input">
+                          <Icon name="search" />
+                          <input
+                            placeholder="Name, category or barcode"
+                            type="search"
+                            value={productListSearch}
+                            onChange={(event) => setProductListSearch(event.target.value)}
+                          />
+                        </span>
+                      </label>
+                      <Field label="Category">
+                        <select value={productCategoryFilter} onChange={(event) => setProductCategoryFilter(event.target.value)}>
+                          <option value="">All categories</option>
+                          {activeProductCategories.map((category) => <option key={category.id} value={canonicalInventoryId(category.id)}>{category.category_name}</option>)}
                         </select>
                       </Field>
-                      <Field label="Lot Name / Number"><input value={openingStockDraft.lot_name} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_name: event.target.value })} placeholder="Lot A" /></Field>
-                      <Field label="Size / Grade"><input value={openingStockDraft.lot_size} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_size: event.target.value })} placeholder="Small / Premium" /></Field>
-                      <Field label="Quantity"><input type="number" min="0" step="0.001" value={openingStockDraft.quantity} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, quantity: event.target.value })} /></Field>
-                      <Field label="Purchase Rate / Opening Cost"><input type="number" min="0" step="0.01" value={openingStockDraft.purchase_rate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, purchase_rate: event.target.value })} /></Field>
-                      <Field label="Sale Rate"><input type="number" min="0" step="0.01" value={openingStockDraft.sale_rate || sellingRate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, sale_rate: event.target.value })} /></Field>
-                      <Field label="Opening Stock Date"><input type="date" value={openingStockDraft.opening_stock_date} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, opening_stock_date: event.target.value })} /></Field>
-                      <Field label="Lot Remarks"><input value={openingStockDraft.remarks} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, remarks: event.target.value })} /></Field>
+                      <Field label="Status">
+                        <select value={productStatusFilter} onChange={(event) => setProductStatusFilter(event.target.value)}>
+                          {PRODUCT_STATUS_FILTERS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                        </select>
+                      </Field>
                     </div>
-                    <button className="secondary-button" onClick={addOpeningStockLot}>Add Opening Stock Lot</button>
-                    <DataTable className="product-entry-table product-entry-lot-table" headers={["Supplier", "Lot", "Size", "Qty", "Cost", "Sale Rate", "Date", "Remarks", "Actions"]}>
-                      {openingStockLots.map((lot, index) => (
-                        <tr key={`${lot.lot_name}-${lot.opening_stock_date}-${index}`}>
-                          <td>{lot.supplier_name || "-"}</td>
-                          <td className="primary-cell product-name-cell" title={lot.lot_name || "-"}>{lot.lot_name || "-"}</td>
-                          <td title={lot.lot_size || "-"}>{lot.lot_size || "-"}</td>
-                          <td>{lot.quantity}</td>
-                          <td>{currency.format(Number(lot.purchase_rate || 0))}</td>
-                          <td>{currency.format(Number(lot.sale_rate || sellingRate || 0))}</td>
-                          <td>{lot.opening_stock_date}</td>
-                          <td title={lot.remarks || "-"}>{lot.remarks || "-"}</td>
-                          <td><button className="remove-button" onClick={() => setOpeningStockLots((current) => current.filter((_, lotIndex) => lotIndex !== index))}>Remove</button></td>
-                        </tr>
-                      ))}
-                      {openingStockLots.length === 0 && <tr><td colSpan="9" className="empty-cell">Add one or more opening stock lots before saving.</td></tr>}
-                    </DataTable>
-                  </div>
-                )}
-                {lotPanelProduct && (
-                  <div className="lot-entry-panel">
-                    <div className="report-toolbar">
-                      <div>
-                        <span className="eyebrow">Opening Stock / Lots</span>
-                        <h3>{lotPanelProduct.product_name}</h3>
-                        <p className="form-note">Existing inventory lots are editable here. Quantity cannot be reduced below stock already sold, wasted or otherwise used.</p>
-                      </div>
-                      <button className="secondary-button" onClick={() => loadProductLots(lotPanelProduct, true)}>Refresh Lots</button>
+                    <div className="pm-list-meta">
+                      <span>{`Showing ${filteredProducts.length} of ${products.length}`}</span>
+                      <label className="check-field pm-check">
+                        <input checked={showMoreProductColumns} type="checkbox" onChange={(event) => setShowMoreProductColumns(event.target.checked)} />
+                        <span>Show more columns</span>
+                      </label>
                     </div>
-                    <label className="icon-input table-search-input">
-                      <Icon name="search" />
-                      <input
-                        placeholder="Search lot, supplier, size..."
-                        value={lotListSearch}
-                        onChange={(event) => setLotListSearch(event.target.value)}
-                      />
-                    </label>
-                    <label className="check-field report-check-field">
-                      <input checked={showEmptyLots} type="checkbox" onChange={(event) => setShowEmptyLots(event.target.checked)} />
-                      <span>Show Empty Lots</span>
-                    </label>
-                    <DataTable className="product-entry-table product-entry-lot-table" headers={["Supplier", "Lot", "Size/Grade", "Opening Date", "Opening Qty", "Sold Qty", "Balance Qty", "Cost", "Sale Rate", "Remarks", "Actions"]}>
-                      {filteredProductLots.length ? filteredProductLots.map((lot) => (
-                        <tr key={lot.id}>
-                          <td title={lot.supplier_name || "No supplier payable"}>{lot.supplier_name || "No supplier payable"}</td>
-                          <td className="primary-cell product-name-cell" title={lot.lot_name || lot.batch_no || `Lot #${lot.id}`}>{lot.lot_name || lot.batch_no || `Lot #${lot.id}`}<small className={`cell-note ${lotStatusClass(lot)}`}>{lotStatusLabel(lot)}</small></td>
-                          <td title={lot.lot_size || "-"}>{lot.lot_size || "-"}</td>
-                          <td>{formatDisplayDate(lot.purchase_date)}</td>
-                          <td>{Number(lot.purchase_qty || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
-                          <td>{Number(lot.sold_qty || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
-                          <td>{Number(lot.balance_qty ?? lot.remaining_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
-                          <td>{currency.format(Number(lot.purchase_rate || lot.effective_cost_per_unit || 0))}</td>
-                          <td>{currency.format(Number(lot.temporary_sale_rate || lot.selling_rate || 0))}</td>
-                          <td title={lot.remarks || "-"}>{lot.remarks || "-"}</td>
-                          <td>
-                            <div className="button-row table-actions-row">
-                              <button className="table-action" onClick={() => openLotAction("edit", lot)}>Edit</button>
-                              <button className="table-action" disabled={lot.batch_status === "CANCELLED"} onClick={() => openLotAction("add", lot)}>Add Quantity</button>
-                              <button className="table-action" disabled={lot.batch_status === "CANCELLED"} onClick={() => openLotAction("adjust", lot)}>Adjust</button>
-                              <button className="remove-button" disabled={lot.batch_status === "CANCELLED"} onClick={() => openLotAction("deactivate", lot)}>Deactivate</button>
-                            </div>
+                    <DataTable
+                      className="pm-table product-entry-item-table"
+                      headers={[
+                        "Product",
+                        "Unit",
+                        <span className="pm-num-head" key="sale">Sale price</span>,
+                        <span className="pm-num-head" key="stock">In stock</span>,
+                        ...productMoreColumnHeaders.map((header) => (header === "Low-stock alert at" || header === "Lots" ? <span className="pm-num-head" key={header}>{header}</span> : header)),
+                        "Status",
+                        "Actions",
+                      ]}
+                    >
+                      {filteredProducts.map((product) => {
+                        const thumbnail = photoForProduct(productPhotoIndex, product);
+                        const productActiveNow = isActiveRecord(product);
+                        const lowStock = isLowStock(product);
+                        const unitName = unitDisplayName(product.unit);
+                        const stockText = formatOptionalQuantity(product.current_stock);
+                        const productNote = [productCategoryLabel(product), String(product.remarks || "").trim()].filter(Boolean).join(" · ");
+                        return (
+                          <tr key={product.id}>
+                            <td>
+                              <div className="pm-product-cell">
+                                {thumbnail
+                                  ? <img alt="" className="pm-thumb" src={thumbnail} />
+                                  : <span aria-hidden="true" className="pm-thumb pm-thumb-empty">{String(product.product_name || "?").trim().charAt(0).toUpperCase()}</span>}
+                                <span className="pm-product-text">
+                                  <span className="pm-product-name pm-cell-strong" title={product.product_name || ""}>{product.product_name || MISSING_VALUE}</span>
+                                  {productNote && <small className="pm-product-note" title={productNote}>{productNote}</small>}
+                                </span>
+                              </div>
+                            </td>
+                            <td>{unitName}</td>
+                            <td className="pm-num">{formatOptionalMoney(product.selling_rate, currency)}</td>
+                            <td className={lowStock ? "pm-num pm-stock-low" : "pm-num"}>
+                              {stockText}{stockText !== MISSING_VALUE && unitName !== MISSING_VALUE ? ` ${unitName}` : ""}
+                              {lowStock && <small className="pm-low-flag">Low</small>}
+                            </td>
+                            {showMoreProductColumns && (
+                              <>
+                                <td title={product.barcode || ""}>{product.barcode || MISSING_VALUE}</td>
+                                <td>{{ LOCAL: "Local", IMPORTED: "Imported" }[String(product.origin_type || "").toUpperCase()] || product.origin_type || MISSING_VALUE}</td>
+                                <td className="pm-num">{formatOptionalQuantity(product.minimum_stock)}</td>
+                                <td className="pm-num">{formatOptionalCount(product.lot_count)}</td>
+                              </>
+                            )}
+                            <td><span className={productActiveNow ? "stock-ok" : "tag"}>{productActiveNow ? "Active" : "Inactive"}</span></td>
+                            <td>
+                              <div className="pm-row-actions">
+                                <button className="table-action" onClick={() => editProduct(product)} type="button">Edit</button>
+                                <button className="table-action" onClick={() => openProductStockLots(product)} type="button">Stock lots</button>
+                                {productActiveNow && <button className="danger-text-button" onClick={() => deactivateProduct(product)} type="button">Deactivate</button>}
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                      {filteredProducts.length === 0 && (
+                        <tr>
+                          <td colSpan={6 + productMoreColumnHeaders.length} className="empty-cell">
+                            {productListEmptyMessage({ totalCount: products.length, search: productListSearch, filtered: productListFiltered })}
                           </td>
                         </tr>
-                      )) : (
-                        <tr><td colSpan="11" className="empty-cell">{productLots.length ? (showEmptyLots ? "No matching lots found." : "No active lots found. Enable Show Empty Lots to view sold-out lots.") : "No lots found for this product."}</td></tr>
                       )}
                     </DataTable>
-                    <div className="button-row">
-                      <button className="secondary-button" onClick={() => {
-                        resetOpeningStockDraft();
-                        setAddOpeningStock(true);
-                        setShowOpeningLotForm(true);
-                      }}>Add New Opening Stock Lot</button>
-                    </div>
-                    {showOpeningLotForm && (
-                      <div className="lot-entry-panel">
-                        <div className="report-toolbar">
-                          <div>
-                            <span className="eyebrow">New Opening Lot</span>
-                            <h3>Add lot for {lotPanelProduct.product_name}</h3>
-                            <p className="form-note">This creates a separate opening stock batch for the same item. Existing lots are not overwritten or merged.</p>
-                          </div>
-                        </div>
-                        <div className="form-grid supplier-form-grid">
-                          <Field label="Supplier / Supplier Payable">
-                            <select value={openingStockDraft.supplier_id} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, supplier_id: event.target.value })}>
-                              <option value="">No supplier payable</option>
-                              {activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.supplier_name}</option>)}
+                  </ModuleCard>
+
+                  <ModuleCard id="product-item-form" eyebrow={editingProductId ? "Edit product" : "New product"} title={editingProductId ? `Edit ${productEditingName}` : "Add product"} subtitle="Used by the POS, purchases, stock and reports.">
+                    <div className="pm-form-section">
+                      <h3>Basics</h3>
+                      <div className="form-grid supplier-form-grid">
+                        <Field label={<RequiredLabel>Product name</RequiredLabel>}><input value={productName} onChange={(event) => setProductName(event.target.value)} placeholder="Example: Kesar mango" /></Field>
+                        <div className="pm-category-field">
+                          <Field label="Category">
+                            <select value={productCategoryId} onChange={(event) => {
+                              const selected = productCategories.find((category) => String(category.id) === event.target.value);
+                              setProductCategoryId(event.target.value);
+                              setProductCategory(selected?.category_name || "");
+                            }}>
+                              <option value="">{productCategory.trim() ? `Not chosen (saves as ${productCategory.trim()})` : "Choose a category"}</option>
+                              {activeProductCategories.map((category) => <option key={category.id} value={category.id}>{category.category_name}</option>)}
                             </select>
                           </Field>
-                          <Field label="Lot Name / Number"><input value={openingStockDraft.lot_name} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_name: event.target.value })} placeholder="Opening Lot 1" /></Field>
-                          <Field label="Size / Grade"><input value={openingStockDraft.lot_size} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, lot_size: event.target.value })} placeholder="Small / Medium / Premium" /></Field>
-                          <Field label="Quantity"><input type="number" min="0" step="0.001" value={openingStockDraft.quantity} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, quantity: event.target.value })} /></Field>
-                          <Field label="Purchase Rate / Opening Cost"><input type="number" min="0" step="0.01" value={openingStockDraft.purchase_rate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, purchase_rate: event.target.value })} /></Field>
-                          <Field label="Sale Rate"><input type="number" min="0" step="0.01" value={openingStockDraft.sale_rate || sellingRate} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, sale_rate: event.target.value })} /></Field>
-                          <Field label="Opening Stock Date"><input type="date" value={openingStockDraft.opening_stock_date} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, opening_stock_date: event.target.value })} /></Field>
-                          <Field label="Lot Remarks"><input value={openingStockDraft.remarks} onChange={(event) => setOpeningStockDraft({ ...openingStockDraft, remarks: event.target.value })} /></Field>
+                          <button aria-expanded={showInlineCategoryForm} className="pm-link-button" onClick={() => setShowInlineCategoryForm((current) => !current)} type="button">
+                            {showInlineCategoryForm ? "Close new category" : "+ New category"}
+                          </button>
+                          {showInlineCategoryForm && (
+                            <div className="pm-inline-form pm-inline-form-compact">
+                              <Field label="New category name"><input value={newProductCategoryName} onChange={(event) => setNewProductCategoryName(event.target.value)} placeholder="Example: Mango" /></Field>
+                              <button className="secondary-button" onClick={saveProductCategory} type="button">Save category</button>
+                            </div>
+                          )}
                         </div>
-                        <div className="button-row">
-                          <button
-  type="button"
-  className="primary-button"
-  onClick={saveNewOpeningStockLot}
->
-  Save Lot
-</button>
-                          <button className="secondary-button" onClick={() => {
-                            resetOpeningStockDraft();
-                            setShowOpeningLotForm(false);
-                            setAddOpeningStock(false);
-                          }}>Cancel</button>
+                        <Field label={<RequiredLabel>Unit</RequiredLabel>}>
+                          <select value={unit} onChange={(event) => setUnit(event.target.value)}>
+                            <option value="">Choose a unit</option>
+                            {PRODUCT_UNITS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                          </select>
+                        </Field>
+                      </div>
+                      <div className="product-photo-field">
+                        <span className="product-photo-label">Photo</span>
+                        <div className="product-photo-row">
+                          {/* Paste lands here: in the browser, right-click a photo, "Copy image", then click this box and press Ctrl+V. */}
+                          <div
+                            aria-label="Product photo. Click, then press Ctrl+V to paste a copied photo."
+                            className={productPhotoDraft.dataUrl ? "product-photo-drop product-photo-drop-filled" : "product-photo-drop"}
+                            onDragOver={(event) => event.preventDefault()}
+                            onDrop={pasteProductPhoto}
+                            onPaste={pasteProductPhoto}
+                            role="button"
+                            tabIndex={0}
+                          >
+                            {productPhotoDraft.dataUrl
+                              ? <img alt="" src={productPhotoDraft.dataUrl} />
+                              : <span>Click here, then Ctrl+V</span>}
+                          </div>
+                          <div className="product-photo-actions">
+                            <p>On Google Images or Pinterest, right-click the photo and choose "Copy image". Then click the box and press Ctrl+V. Or save the photo and choose the file.</p>
+                            <div className="button-row">
+                              <label className="secondary-button product-photo-file">
+                                Choose file
+                                <input
+                                  accept="image/jpeg,image/png,image/webp"
+                                  onChange={(event) => { takeProductPhoto(event.target.files?.[0] || null, "No file chosen."); event.target.value = ""; }}
+                                  type="file"
+                                />
+                              </label>
+                              {productPhotoDraft.dataUrl && (
+                                <button className="danger-text-button" onClick={() => { setProductPhotoDraft({ dataUrl: null, changed: true }); setProductPhotoMessage("The photo is removed when you press Save."); }} type="button">Remove photo</button>
+                              )}
+                            </div>
+                            {productPhotoMessage && <small className="product-photo-message" role="status">{productPhotoMessage}</small>}
+                            {productPhotosState.message && <small className="product-photo-message product-photo-message-error">{productPhotosState.message}</small>}
+                          </div>
                         </div>
                       </div>
-                    )}
-                    {productLotAudit.length > 0 && (
-                      <div className="lot-audit-panel">
-                        <h3>Lot Audit Trail</h3>
-                        <DataTable headers={["Action", "Edited At", "Edited By", "Reason"]}>
-                          {productLotAudit.map((entry) => (
-                            <tr key={entry.id}>
-                              <td className="primary-cell">{entry.action}</td>
-                              <td>{formatDisplayDate(entry.edited_at)}</td>
-                              <td>{entry.edited_by_name || entry.edited_by || "-"}</td>
-                              <td>{entry.reason || "-"}</td>
-                            </tr>
-                          ))}
-                        </DataTable>
-                      </div>
-                    )}
-                  </div>
-                )}
-                <div className="button-row">
-                  <button className="primary-button" onClick={addProduct}>{editingProductId ? "Update Item" : "Add Item"}</button>
-                  {editingProductId && <button className="secondary-button" onClick={cancelProductEdit}>Cancel Edit</button>}
-                </div>
-              </ModuleCard>
+                    </div>
 
-              <ModuleCard eyebrow="Item List" title="Category-Wise Items" subtitle="Inactive items stay in history but are hidden from POS by default.">
-                <label className="icon-input table-search-input">
-                  <Icon name="search" />
-                  <input
-                    placeholder="Search item, category, barcode..."
-                    value={productListSearch}
-                    onChange={(event) => setProductListSearch(event.target.value)}
-                  />
-                </label>
-                <DataTable className="product-entry-table product-entry-item-table" headers={["Category", "Item", "Barcode", "Origin", "Sale Rate", "Min Stock", "Stock", "Lots", "Unit", "Status", "Actions"]}>
-                  {filteredProducts.map((product) => (
-                    <tr key={product.id}>
-                      <td title={product.category_name || product.category || "Fruit"}>{product.category_name || product.category || "Fruit"}</td>
-                      <td className="primary-cell product-name-cell" title={product.product_name || "-"}>{product.product_name}<small className="cell-note">{product.remarks || ""}</small></td>
-                      <td title={product.barcode || "-"}>{product.barcode || "-"}</td>
-                      <td><span className="tag">{product.origin_type || "LOCAL"}</span></td>
-                      <td>{currency.format(Number(product.selling_rate))}</td>
-                      <td>{product.minimum_stock || 0}</td>
-                      <td>{Number(product.current_stock || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })}</td>
-                      <td>{product.lot_count || 0}</td>
-                      <td><span className="tag">{product.unit}</span></td>
-                      <td><span className={product.active !== false ? "stock-ok" : "stock-low"}>{product.active !== false ? "Active" : "Inactive"}</span></td>
-                      <td>
-                        <div className="button-row table-actions-row">
-                          <button className="table-action" onClick={() => editProduct(product)}>Edit</button>
-                          <button className="table-action" onClick={() => loadProductLots(product, true)}>View Lots / Edit Lots</button>
-                          <button className="remove-button" disabled={product.active === false} onClick={() => deactivateProduct(product)}>Deactivate</button>
+                    <div className="pm-form-section">
+                      <h3>Price</h3>
+                      <div className="form-grid supplier-form-grid">
+                        <Field label={<RequiredLabel>Sale price (₹ per unit)</RequiredLabel>}><input type="number" min="0" step="0.01" value={sellingRate} onChange={(event) => setSellingRate(event.target.value)} /></Field>
+                      </div>
+                    </div>
+
+                    <div className="pm-form-section">
+                      <h3>Stock</h3>
+                      <div className="form-grid supplier-form-grid">
+                        <Field label="Low-stock alert at"><input type="number" min="0" step="0.001" value={productMinimumStock} onChange={(event) => setProductMinimumStock(event.target.value)} /></Field>
+                      </div>
+                      {editingProductId && <p className="pm-hint">To add stock or correct a count, use the stock lots below.</p>}
+                      {!editingProductId && !showOpeningLotForm && (
+                        <label className="check-field pm-check"><input type="checkbox" checked={addOpeningStock} onChange={(event) => setAddOpeningStock(event.target.checked)} /><span>This product already has stock in the shop</span></label>
+                      )}
+                      {addOpeningStock && !editingProductId && !showOpeningLotForm && (
+                        <div className="lot-entry-panel pm-lot-editor">
+                          <p className="pm-hint">Enter each lot of existing stock. The lots are saved together with the product.</p>
+                          {openingLotFields}
+                          <div className="button-row">
+                            <button className="secondary-button" onClick={addOpeningStockLot} type="button"><Icon name="add" size={15} />Add lot</button>
+                          </div>
+                          <DataTable className="pm-table" headers={["Supplier", "Lot name", "Grade", <span className="pm-num-head" key="qty">Quantity</span>, <span className="pm-num-head" key="cost">Cost price</span>, <span className="pm-num-head" key="sale">Sale price</span>, "Stock date", "Notes", ""]}>
+                            {openingStockLots.map((lot, index) => (
+                              <tr key={`${lot.lot_name}-${lot.opening_stock_date}-${index}`}>
+                                <td>{lot.supplier_name || "None"}</td>
+                                <td className="pm-cell-strong" title={lot.lot_name || ""}>{lot.lot_name || MISSING_VALUE}</td>
+                                <td title={lot.lot_size || ""}>{lot.lot_size || MISSING_VALUE}</td>
+                                <td className="pm-num">{formatOptionalQuantity(lot.quantity)}</td>
+                                <td className="pm-num">{formatOptionalMoney(lot.purchase_rate, currency)}</td>
+                                <td className="pm-num">{formatOptionalMoney(pickRate(lot.sale_rate, sellingRate), currency)}</td>
+                                <td>{lot.opening_stock_date ? formatDisplayDate(lot.opening_stock_date) : MISSING_VALUE}</td>
+                                <td title={lot.remarks || ""}>{lot.remarks || MISSING_VALUE}</td>
+                                <td><button className="danger-text-button" onClick={() => setOpeningStockLots((current) => current.filter((_, lotIndex) => lotIndex !== index))} type="button">Remove</button></td>
+                              </tr>
+                            ))}
+                            {openingStockLots.length === 0 && <tr><td colSpan="9" className="empty-cell">No lots added yet. Fill in the lot above and press Add lot.</td></tr>}
+                          </DataTable>
                         </div>
-                      </td>
-                    </tr>
-                  ))}
-                  {filteredProducts.length === 0 && <tr><td colSpan="11" className="empty-cell">No matching items found.</td></tr>}
-                </DataTable>
-              </ModuleCard>
+                      )}
+                    </div>
+
+                    <details className="pm-details">
+                      <summary>More options</summary>
+                      <div className="pm-details-body">
+                        <div className="form-grid supplier-form-grid">
+                          <Field label="Barcode"><input value={productBarcode} onChange={(event) => setProductBarcode(event.target.value)} placeholder="Optional" /></Field>
+                          <Field label="Origin">
+                            <select value={productOriginType} onChange={(event) => setProductOriginType(event.target.value)}>
+                              <option value="LOCAL">Local</option>
+                              <option value="IMPORTED">Imported</option>
+                            </select>
+                          </Field>
+                        </div>
+                        <Field label="Notes"><textarea value={productRemarks} onChange={(event) => setProductRemarks(event.target.value)} /></Field>
+                        <label className="check-field pm-check"><input type="checkbox" checked={productActive} onChange={(event) => setProductActive(event.target.checked)} /><span>Available for sale</span></label>
+                      </div>
+                    </details>
+
+                    <div className="pm-save-row">
+                      <button className="primary-button" onClick={addProduct} type="button">{editingProductId ? "Save changes" : "Save product"}</button>
+                      <button className="secondary-button" onClick={cancelProductEdit} type="button">Cancel</button>
+                      <span className="pm-required-legend"><span aria-hidden="true" className="pm-required">*</span> Required</span>
+                    </div>
+                  </ModuleCard>
+
+                  {lotPanelProduct && (
+                    <ModuleCard id="product-lots-card" eyebrow="Stock lots" title={`Stock lots — ${lotPanelProduct.product_name}`} subtitle="Each delivery or opening count is its own lot. A lot's quantity cannot go below what has already been sold or used.">
+                      <div className="pm-toolbar pm-lot-toolbar">
+                        <label className="pm-toolbar-search">
+                          <span>Search lots</span>
+                          <span className="icon-input">
+                            <Icon name="search" />
+                            <input
+                              placeholder="Lot, supplier or grade"
+                              type="search"
+                              value={lotListSearch}
+                              onChange={(event) => setLotListSearch(event.target.value)}
+                            />
+                          </span>
+                        </label>
+                        <label className="check-field pm-check">
+                          <input checked={showEmptyLots} type="checkbox" onChange={(event) => setShowEmptyLots(event.target.checked)} />
+                          <span>Show sold-out lots</span>
+                        </label>
+                        <div className="pm-toolbar-actions">
+                          <button className="secondary-button" onClick={() => loadProductLots(lotPanelProduct, true)} type="button"><Icon name="refresh" size={15} />Refresh</button>
+                          <button className="secondary-button" onClick={closeProductStockLots} type="button">Close</button>
+                        </div>
+                      </div>
+                      <DataTable
+                        className="pm-table pm-lot-table"
+                        headers={["Lot", "Supplier", "Grade", "Stock date", <span className="pm-num-head" key="qty">Quantity</span>, <span className="pm-num-head" key="sold">Sold</span>, <span className="pm-num-head" key="in">In stock</span>, <span className="pm-num-head" key="cost">Cost price</span>, <span className="pm-num-head" key="sale">Sale price</span>, "Actions"]}
+                      >
+                        {filteredProductLots.length ? filteredProductLots.map((lot) => {
+                          const lotLabel = lot.lot_name || lot.batch_no || `Lot #${lot.id}`;
+                          const lotCancelled = lot.batch_status === "CANCELLED";
+                          const lotNotes = String(lot.remarks || "").trim();
+                          return (
+                            <tr key={lot.id}>
+                              <td className="pm-lot-cell" title={lotNotes ? `${lotLabel} · ${lotNotes}` : lotLabel}>
+                                <span className="pm-cell-strong">{lotLabel}</span>
+                                <small className="pm-product-note"><span className={lotStatusClass(lot)}>{lotStatusLabel(lot)}</span>{lotNotes ? ` · ${lotNotes}` : ""}</small>
+                              </td>
+                              <td title={lot.supplier_name || "None"}>{lot.supplier_name || "None"}</td>
+                              <td title={lot.lot_size || ""}>{lot.lot_size || MISSING_VALUE}</td>
+                              <td>{lot.purchase_date ? formatDisplayDate(lot.purchase_date) : MISSING_VALUE}</td>
+                              <td className="pm-num">{formatOptionalQuantity(lot.purchase_qty)}</td>
+                              <td className="pm-num">{formatOptionalQuantity(lot.sold_qty)}</td>
+                              <td className="pm-num">{formatOptionalQuantity(pickQuantity(lot.balance_qty, lot.remaining_qty))}</td>
+                              <td className="pm-num">{formatOptionalMoney(pickRate(lot.purchase_rate, lot.effective_cost_per_unit), currency)}</td>
+                              <td className="pm-num">{formatOptionalMoney(pickRate(lot.temporary_sale_rate, lot.selling_rate), currency)}</td>
+                              <td>
+                                <div className="pm-row-actions">
+                                  <button className="table-action" onClick={() => openLotAction("edit", lot)} type="button">Edit</button>
+                                  <button className="table-action" disabled={lotCancelled} onClick={() => openLotAction("add", lot)} type="button">Add quantity</button>
+                                  <button className="table-action" disabled={lotCancelled} onClick={() => openLotAction("adjust", lot)} type="button">Correct count</button>
+                                  <button className="danger-text-button" disabled={lotCancelled} onClick={() => openLotAction("deactivate", lot)} type="button">Deactivate</button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        }) : (
+                          <tr><td colSpan="10" className="empty-cell">{lotListEmptyMessage({ totalCount: productLots.length, search: lotListSearch, showSoldOut: showEmptyLots })}</td></tr>
+                        )}
+                      </DataTable>
+                      {!showOpeningLotForm && (
+                        lotPanelAcceptsNewLot
+                          ? (
+                            <div className="button-row">
+                              <button className="secondary-button" onClick={() => {
+                                resetOpeningStockDraft();
+                                setAddOpeningStock(true);
+                                setShowOpeningLotForm(true);
+                              }} type="button"><Icon name="add" size={15} />Add stock lot</button>
+                            </div>
+                          )
+                          : <p className="pm-notice">{`You are editing ${productEditingName}. Save or cancel that first to add a lot to ${lotPanelProduct.product_name}.`}</p>
+                      )}
+                      {showOpeningLotForm && (
+                        <div className="lot-entry-panel pm-lot-editor">
+                          <div>
+                            <h3>{`New stock lot for ${lotPanelProduct.product_name}`}</h3>
+                            <p className="pm-hint">This adds a separate lot. Existing lots are not changed or merged.</p>
+                          </div>
+                          {openingLotFields}
+                          <div className="button-row">
+                            <button className="primary-button" onClick={saveNewOpeningStockLot} type="button">Save lot</button>
+                            <button className="secondary-button" onClick={() => {
+                              resetOpeningStockDraft();
+                              setShowOpeningLotForm(false);
+                              setAddOpeningStock(false);
+                            }} type="button">Cancel</button>
+                          </div>
+                        </div>
+                      )}
+                      {productLotAudit.length > 0 && (
+                        <details className="pm-details">
+                          <summary>{`Change history (${productLotAudit.length})`}</summary>
+                          <div className="pm-details-body">
+                            <DataTable className="pm-table" headers={["Change", "When", "By", "Reason"]}>
+                              {productLotAudit.map((entry) => (
+                                <tr key={entry.id}>
+                                  <td className="pm-cell-strong">{entry.action}</td>
+                                  <td>{entry.edited_at ? formatDisplayDate(entry.edited_at) : MISSING_VALUE}</td>
+                                  <td>{entry.edited_by_name || entry.edited_by || MISSING_VALUE}</td>
+                                  <td>{entry.reason || MISSING_VALUE}</td>
+                                </tr>
+                              ))}
+                            </DataTable>
+                          </div>
+                        </details>
+                      )}
+                    </ModuleCard>
+                  )}
+                </>
+              )}
             </section>
           )}
 
@@ -10357,59 +10524,59 @@ function App() {
           <section className="invoice-modal change-history-modal">
             <div className="invoice-toolbar">
               <div>
-                <span className="eyebrow">Opening Stock Lot</span>
+                <span className="eyebrow">Stock lot</span>
                 <strong>
-                  {lotAction.type === "edit" && "Edit Lot"}
-                  {lotAction.type === "add" && "Add Quantity"}
-                  {lotAction.type === "adjust" && "Adjust Quantity"}
-                  {lotAction.type === "deactivate" && "Deactivate Lot"}
-                  {lotAction.type === "reactivate" && "Reactivate Lot"}
+                  {lotAction.type === "edit" && "Edit lot"}
+                  {lotAction.type === "add" && "Add quantity"}
+                  {lotAction.type === "adjust" && "Correct count"}
+                  {lotAction.type === "deactivate" && "Deactivate lot"}
+                  {lotAction.type === "reactivate" && "Reactivate lot"}
                 </strong>
               </div>
               <button aria-label="Close lot editor" className="remove-button" onClick={closeLotAction}><Icon name="close" /></button>
             </div>
             <div className="sale-edit-body">
               <div className="purchase-summary-grid supplier-payment-preview">
-                <SummaryMetric label="Product" value={lotAction.lot.product_name || lotPanelProduct?.product_name || "-"} />
+                <SummaryMetric label="Product" value={lotAction.lot.product_name || lotPanelProduct?.product_name || MISSING_VALUE} />
                 <SummaryMetric label="Lot" value={lotAction.lot.lot_name || lotAction.lot.batch_no || `#${lotAction.lot.id}`} />
-                <SummaryMetric label="Opening Qty" value={Number(lotAction.lot.purchase_qty || 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })} />
-                <SummaryMetric label="Used Qty" value={Number(lotAction.lot.sold_qty ?? (Number(lotAction.lot.purchase_qty || 0) - Number(lotAction.lot.remaining_qty || 0))).toLocaleString("en-IN", { maximumFractionDigits: 3 })} />
-                <SummaryMetric label="Balance Qty" value={Number(lotAction.lot.balance_qty ?? lotAction.lot.remaining_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })} featured />
+                <SummaryMetric label="Quantity" value={formatOptionalQuantity(lotAction.lot.purchase_qty)} />
+                <SummaryMetric label="Sold or used" value={formatOptionalQuantity(pickQuantity(lotAction.lot.sold_qty) ?? (pickQuantity(lotAction.lot.purchase_qty) !== null && pickQuantity(lotAction.lot.remaining_qty) !== null ? pickQuantity(lotAction.lot.purchase_qty) - pickQuantity(lotAction.lot.remaining_qty) : null))} />
+                <SummaryMetric label="Stock in system" value={formatOptionalQuantity(pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty))} featured />
               </div>
 
               {lotAction.type === "edit" && (
                 <div className="form-grid supplier-form-grid">
-                  <Field label="Lot Name / Number"><input value={lotDraft.lot_name} onChange={(event) => setLotDraft({ ...lotDraft, lot_name: event.target.value })} /></Field>
-                  <Field label="Size / Grade"><input value={lotDraft.lot_size} onChange={(event) => setLotDraft({ ...lotDraft, lot_size: event.target.value })} /></Field>
-                  <Field label="Supplier (Optional)">
+                  <Field label="Supplier (optional)">
                     <select value={lotDraft.supplier_id} onChange={(event) => setLotDraft({ ...lotDraft, supplier_id: event.target.value })}>
-                      <option value="">No supplier</option>
+                      <option value="">None (no supplier payable)</option>
                       {activeSuppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.supplier_name}</option>)}
                     </select>
                   </Field>
-                  <Field label="Opening Quantity"><input min="0" step="0.001" type="number" value={lotDraft.purchase_qty} onChange={(event) => setLotDraft({ ...lotDraft, purchase_qty: event.target.value })} /></Field>
-                  <Field label="Current Balance Qty"><input readOnly value={Number(lotAction.lot.balance_qty ?? lotAction.lot.remaining_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })} /></Field>
-                  <Field label="Opening Cost / Purchase Rate"><input min="0" step="0.01" type="number" value={lotDraft.purchase_rate} onChange={(event) => setLotDraft({ ...lotDraft, purchase_rate: event.target.value })} /></Field>
-                  <Field label="Sale Rate"><input min="0" step="0.01" type="number" value={lotDraft.sale_rate} onChange={(event) => setLotDraft({ ...lotDraft, sale_rate: event.target.value })} /></Field>
-                  <Field label="Opening Stock Date"><input type="date" value={lotDraft.opening_stock_date} onChange={(event) => setLotDraft({ ...lotDraft, opening_stock_date: event.target.value })} /></Field>
-                  <Field label="Remarks"><input value={lotDraft.remarks} onChange={(event) => setLotDraft({ ...lotDraft, remarks: event.target.value })} /></Field>
-                  <Field label="Reason"><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Reason for audit trail" /></Field>
+                  <Field label={<RequiredLabel>Lot name</RequiredLabel>}><input value={lotDraft.lot_name} onChange={(event) => setLotDraft({ ...lotDraft, lot_name: event.target.value })} /></Field>
+                  <Field label="Grade"><input value={lotDraft.lot_size} onChange={(event) => setLotDraft({ ...lotDraft, lot_size: event.target.value })} /></Field>
+                  <Field label="Quantity"><input min="0" step="0.001" type="number" value={lotDraft.purchase_qty} onChange={(event) => setLotDraft({ ...lotDraft, purchase_qty: event.target.value })} /></Field>
+                  <Field label="Stock in system"><input readOnly value={formatOptionalQuantity(pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty))} /></Field>
+                  <Field label={<RequiredLabel>Cost price (₹)</RequiredLabel>}><input min="0" step="0.01" type="number" value={lotDraft.purchase_rate} onChange={(event) => setLotDraft({ ...lotDraft, purchase_rate: event.target.value })} /></Field>
+                  <Field label="Sale price (₹)"><input min="0" step="0.01" type="number" value={lotDraft.sale_rate} onChange={(event) => setLotDraft({ ...lotDraft, sale_rate: event.target.value })} /></Field>
+                  <Field label="Stock date"><input type="date" value={lotDraft.opening_stock_date} onChange={(event) => setLotDraft({ ...lotDraft, opening_stock_date: event.target.value })} /></Field>
+                  <Field label="Notes"><input value={lotDraft.remarks} onChange={(event) => setLotDraft({ ...lotDraft, remarks: event.target.value })} /></Field>
+                  <Field label="Reason for the change"><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Kept in the change history" /></Field>
                 </div>
               )}
 
               {lotAction.type === "add" && (
                 <div className="form-grid supplier-form-grid">
-                  <Field label="Quantity To Add"><input min="0" step="0.001" type="number" value={lotDraft.quantity} onChange={(event) => setLotDraft({ ...lotDraft, quantity: event.target.value })} /></Field>
+                  <Field label="Quantity to add"><input min="0" step="0.001" type="number" value={lotDraft.quantity} onChange={(event) => setLotDraft({ ...lotDraft, quantity: event.target.value })} /></Field>
                   <Field label="Reason"><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Example: missed opening stock count" /></Field>
                 </div>
               )}
 
               {lotAction.type === "adjust" && (
                 <div className="form-grid supplier-form-grid">
-                  <Field label="Current Software Qty"><input readOnly value={Number(lotAction.lot.balance_qty ?? lotAction.lot.remaining_qty ?? 0).toLocaleString("en-IN", { maximumFractionDigits: 3 })} /></Field>
-                  <Field label="Physical / Corrected Quantity"><input min="0" step="0.001" type="number" value={lotDraft.new_quantity} onChange={(event) => setLotDraft({ ...lotDraft, new_quantity: event.target.value })} /></Field>
-                  <Field label="Difference / Adjustment Qty"><input readOnly value={(Number(lotDraft.new_quantity || 0) - Number(lotAction.lot.balance_qty ?? lotAction.lot.remaining_qty ?? 0)).toLocaleString("en-IN", { maximumFractionDigits: 3 })} /></Field>
-                  <Field label="Adjustment Type">
+                  <Field label="Stock in system"><input readOnly value={formatOptionalQuantity(pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty))} /></Field>
+                  <Field label="Counted quantity"><input min="0" step="0.001" type="number" value={lotDraft.new_quantity} onChange={(event) => setLotDraft({ ...lotDraft, new_quantity: event.target.value })} /></Field>
+                  <Field label="Difference"><input readOnly value={pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty) === null ? MISSING_VALUE : formatOptionalQuantity(Number(lotDraft.new_quantity || 0) - pickQuantity(lotAction.lot.balance_qty, lotAction.lot.remaining_qty))} /></Field>
+                  <Field label="Type of correction">
                     <select value={lotDraft.adjustment_type} onChange={(event) => setLotDraft({ ...lotDraft, adjustment_type: event.target.value })}>
                       <option>Increase Stock</option>
                       <option>Decrease Stock</option>
@@ -10420,9 +10587,9 @@ function App() {
                       <option>Owner Adjustment</option>
                     </select>
                   </Field>
-                  <Field label="Adjustment Date"><input type="date" value={lotDraft.adjustment_date} onChange={(event) => setLotDraft({ ...lotDraft, adjustment_date: event.target.value })} /></Field>
-                  <Field label="Reason"><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} placeholder="Reason is mandatory" /></Field>
-                  <Field label="Remarks"><input value={lotDraft.remarks} onChange={(event) => setLotDraft({ ...lotDraft, remarks: event.target.value })} /></Field>
+                  <Field label="Date"><input type="date" value={lotDraft.adjustment_date} onChange={(event) => setLotDraft({ ...lotDraft, adjustment_date: event.target.value })} /></Field>
+                  <Field label={<RequiredLabel>Reason</RequiredLabel>}><input value={lotDraft.reason} onChange={(event) => setLotDraft({ ...lotDraft, reason: event.target.value })} /></Field>
+                  <Field label="Notes"><input value={lotDraft.remarks} onChange={(event) => setLotDraft({ ...lotDraft, remarks: event.target.value })} /></Field>
                 </div>
               )}
 
@@ -10435,8 +10602,10 @@ function App() {
               )}
 
               <div className="button-row">
-                <button className="primary-button" onClick={saveLotAction}>Save Lot Changes</button>
-                <button className="secondary-button" onClick={closeLotAction}>Cancel</button>
+                <button className="primary-button" onClick={saveLotAction} type="button">
+                  {{ edit: "Save lot", add: "Add quantity", adjust: "Correct count", deactivate: "Deactivate lot", reactivate: "Reactivate lot" }[lotAction.type] || "Save"}
+                </button>
+                <button className="secondary-button" onClick={closeLotAction} type="button">Cancel</button>
               </div>
             </div>
           </section>
@@ -25154,7 +25323,12 @@ function Field({ children, label }) {
   return <label><span>{label}</span>{children}</label>;
 }
 
-function ModuleCard({ children, eyebrow, id, subtitle, title }) {
+// A field label with the quiet asterisk Product Master uses for the fields its save refuses without.
+function RequiredLabel({ children }) {
+  return <>{children}<span aria-hidden="true" className="pm-required"> *</span><span className="pm-sr-only"> (required)</span></>;
+}
+
+function ModuleCard({ actions = null, children, eyebrow, id, subtitle, title }) {
   return (
     <section className="content-card" id={id}>
       <div className="card-heading">
@@ -25163,6 +25337,7 @@ function ModuleCard({ children, eyebrow, id, subtitle, title }) {
           <h2>{title}</h2>
           <p>{subtitle}</p>
         </div>
+        {actions && <div className="card-heading-actions">{actions}</div>}
       </div>
       {children}
     </section>

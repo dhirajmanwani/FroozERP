@@ -7633,9 +7633,461 @@ tbody tr:last-child td {
   white-space: nowrap;
 }
 
-/* Edit scrolls the item form into view; leave room above it for the top bar. */
-#product-item-form {
+/* Edit scrolls the product form (and Stock lots scrolls the lots card) into view; leave room above
+   for the top bar. */
+#product-item-form,
+#product-lots-card {
   scroll-margin-top: 88px;
+}
+
+/* Product Master. Everything here is scoped to the screen (.product-master / .pm-*) except
+   .danger-text-button and .card-heading-actions, which any screen may reuse. */
+
+/* A card heading's own buttons (e.g. "Add product"), on the right of the title. */
+.card-heading-actions {
+  display: flex;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+  align-items: flex-start;
+  gap: 9px;
+}
+
+.product-master .card-heading {
+  gap: 16px;
+}
+
+/* A text button that removes or deactivates something. The 34px .remove-button square is for the
+   close X; text crammed into it was unreadable. Same height as .table-action so a row's buttons
+   line up. */
+.danger-text-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 9px;
+  border: 1px solid var(--danger-line);
+  border-radius: 7px;
+  color: var(--danger-ink);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+  transition: 160ms ease;
+}
+
+.danger-text-button:hover {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.danger-text-button:focus-visible,
+.pm-link-button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.danger-text-button:disabled,
+.danger-text-button:disabled:hover {
+  border-color: var(--line);
+  color: var(--ink-faint);
+  background: transparent;
+}
+
+.pm-summary {
+  max-width: 520px;
+  margin: 0 0 16px;
+}
+
+.pm-notice {
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border-left: 3px solid var(--attention);
+  border-radius: 6px;
+  color: var(--attention-ink);
+  background: var(--attention-soft);
+  font-size: var(--font-size-sm);
+  line-height: 1.45;
+}
+
+.pm-hint {
+  margin: 10px 0 0;
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+}
+
+.pm-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.pm-required {
+  color: var(--accent);
+  font-weight: 800;
+}
+
+/* List toolbar: search, category, status. */
+.pm-toolbar {
+  display: grid;
+  grid-template-columns: minmax(220px, 2fr) minmax(160px, 1fr) minmax(140px, 1fr);
+  align-items: end;
+  gap: 12px;
+}
+
+.pm-lot-toolbar {
+  grid-template-columns: minmax(220px, 1fr) auto auto;
+  align-items: center;
+}
+
+.pm-lot-toolbar .pm-toolbar-search {
+  align-self: end;
+}
+
+.pm-toolbar-search .icon-input {
+  display: block;
+}
+
+.pm-toolbar-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.pm-list-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+}
+
+.pm-check {
+  align-self: center;
+  min-height: 0;
+  font-weight: 600;
+}
+
+/* Tables. */
+.pm-table th,
+.pm-table td {
+  white-space: nowrap;
+}
+
+.pm-table th:has(> .pm-num-head),
+.pm-num {
+  text-align: right;
+}
+
+.pm-num {
+  font-variant-numeric: tabular-nums;
+}
+
+.product-entry-item-table table {
+  min-width: 720px;
+}
+
+.pm-lot-table table {
+  min-width: 1000px;
+}
+
+.pm-cell-strong {
+  color: var(--ink-strong);
+  font-weight: 750;
+}
+
+/* Lot name over "Active · notes". The status keeps its colour but not the pill, at this size. */
+.pm-lot-cell {
+  max-width: 280px;
+}
+
+.pm-lot-cell > span,
+.pm-lot-cell > small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pm-lot-cell .pm-product-note > span {
+  display: inline;
+  padding: 0;
+  background: none;
+  font-size: inherit;
+}
+
+.pm-stock-low {
+  color: var(--attention-ink);
+  font-weight: 700;
+}
+
+.pm-low-flag {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: var(--attention-ink);
+  background: var(--attention-soft);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+}
+
+.pm-product-cell {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 200px;
+  max-width: 340px;
+}
+
+.pm-thumb {
+  box-sizing: border-box;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--fill-subtle);
+  object-fit: cover;
+}
+
+.pm-thumb-empty {
+  display: grid;
+  place-items: center;
+  color: var(--ink-faint);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+}
+
+.pm-product-text {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.pm-product-name,
+.pm-product-note {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pm-product-note {
+  color: var(--ink-faint);
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+}
+
+.pm-row-actions {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Categories tab and the form's "+ New category". */
+.pm-inline-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.pm-inline-form > label {
+  flex: 1 1 240px;
+  max-width: 360px;
+}
+
+.pm-inline-form-compact > label {
+  flex-basis: 150px;
+}
+
+.pm-category-field {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+}
+
+.pm-link-button {
+  justify-self: start;
+  padding: 2px 0;
+  border: 0;
+  border-radius: 4px;
+  color: var(--accent);
+  background: none;
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.pm-link-button:hover {
+  text-decoration: underline;
+}
+
+/* The product form: small headed sections, then the save row straight after them. */
+.pm-form-section {
+  padding: 18px 0;
+  border-top: 1px solid var(--line-soft);
+}
+
+.card-heading + .pm-form-section {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.pm-form-section h3 {
+  margin: 0 0 12px;
+  color: var(--ink);
+  font-size: var(--font-size-base);
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.pm-form-section .form-grid {
+  align-items: start;
+  margin-bottom: 0;
+}
+
+/* A section with one field (Price, Stock) keeps it at a sensible width rather than the card's. */
+.pm-form-section .form-grid:has(> :only-child) {
+  max-width: 360px;
+}
+
+.pm-form-section > .pm-check {
+  margin-top: 14px;
+}
+
+.pm-lot-editor .form-grid {
+  margin-bottom: 0;
+}
+
+.pm-lot-editor .table-wrap {
+  margin: 0;
+}
+
+.pm-lot-editor .pm-hint {
+  margin: 4px 0 0;
+}
+
+/* <details>: a quiet disclosure row with a chevron that turns when open. */
+.pm-details {
+  margin-top: 4px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--fill-subtle);
+}
+
+.pm-details + .pm-save-row,
+.lot-entry-panel + .pm-details,
+.button-row + .pm-details,
+.table-wrap + .pm-details {
+  margin-top: 18px;
+}
+
+.pm-details > summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  color: var(--ink);
+  font-size: var(--font-size-base);
+  font-weight: 700;
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+
+.pm-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.pm-details > summary::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  margin: 0 2px;
+  border-right: 2px solid var(--ink-muted);
+  border-bottom: 2px solid var(--ink-muted);
+  transform: rotate(-45deg);
+  transition: transform 160ms ease;
+}
+
+.pm-details[open] > summary::before {
+  transform: rotate(45deg);
+}
+
+.pm-details > summary:hover {
+  background: var(--hover);
+}
+
+.pm-details > summary:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.pm-details-body {
+  display: grid;
+  gap: 14px;
+  padding: 4px 14px 16px;
+}
+
+.pm-details-body .form-grid {
+  margin-bottom: 0;
+}
+
+.pm-details-body .table-wrap {
+  margin: 0;
+}
+
+.pm-save-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 9px;
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.pm-required-legend {
+  margin-left: auto;
+  color: var(--ink-faint);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pm-details > summary::before {
+    transition: none;
+  }
+}
+
+@media (max-width: 820px) {
+  .pm-toolbar,
+  .pm-lot-toolbar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pm-toolbar-actions,
+  .pm-list-meta {
+    flex-wrap: wrap;
+  }
+
+  .pm-summary,
+  .pm-inline-form > label {
+    max-width: none;
+  }
+
+  .pm-required-legend {
+    width: 100%;
+    margin-left: 0;
+  }
 }
 
 /* Branches & Counters: one card per step, a jump bar at the top, each step's result under its button. */
