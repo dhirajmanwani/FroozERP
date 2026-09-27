@@ -279,7 +279,7 @@ const failureText = (failure) => {
  *
  * - No changes: no items (status ok).
  * - Changes: one INFO item keyed `sale-changes:<dateKey>`, titled like
- *   "Today: 3 bills cancelled (₹1,240.00), 1 edited", message like "By Ravi 3, Asha 1", then
+ *   "Today: 3 bills cancelled (₹1,240.00), 1 edited", message like "By Ravi (3), Asha (1)", then
  *   " · 2 approved" when any were approved, then " · this counter only" for the local source.
  *   Amount changes change the title, so the publisher re-raises it.
  * - `failure` given, or no digest: one sticky ERROR item keyed `sale-changes:unreadable` and
@@ -335,7 +335,7 @@ export const saleChangeDigestBellItems = (digest, {
   if (digest.editedCount > 0) {
     parts.push(parts.length ? `${digest.editedCount} edited` : `${bills(digest.editedCount)} edited`);
   }
-  const people = (Array.isArray(digest.byPerson) ? digest.byPerson : []).map((person) => `${person.name} ${person.count}`);
+  const people = (Array.isArray(digest.byPerson) ? digest.byPerson : []).map((person) => `${person.name} (${person.count})`);
   const approvals = digest.approvedCount > 0 ? ` · ${digest.approvedCount} approved` : "";
   const key = `sale-changes:${dateKey}`;
   return {

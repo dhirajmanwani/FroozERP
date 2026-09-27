@@ -286,7 +286,7 @@ test("bell: one item keyed by the day, with a short title and the people", () =>
     dedupeKey: "sale-changes:2026-09-27",
     severity: "info",
     title: "Today: 3 bills cancelled (₹1,240.00), 1 edited",
-    message: "By Ravi 3, Asha 1",
+    message: "By Ravi (3), Asha (1)",
     source: "Sales",
     at: "2026-09-27T07:00:00.000Z",
     sticky: false,
@@ -299,7 +299,7 @@ test("bell: one item keyed by the day, with a short title and the people", () =>
 test("bell: singulars, edits only, approvals and this-counter scope", () => {
   const one = saleChangeDigestBellItems(digestOf([cloudEvent({ old_total: 99.5, approved_by_name: "Owner" })]), { dateKey: "2026-09-27" });
   assert.equal(one.items[0].title, "Today: 1 bill cancelled (₹99.50)");
-  assert.equal(one.items[0].message, "By Ravi 1 · 1 approved");
+  assert.equal(one.items[0].message, "By Ravi (1) · 1 approved");
   assert.equal(one.items[0].at, undefined);
 
   const edits = saleChangeDigestBellItems(digestOf([
@@ -307,7 +307,7 @@ test("bell: singulars, edits only, approvals and this-counter scope", () => {
     cloudEvent({ action: "edit", approved_by_name: "" }),
   ]), { dateKey: "2026-09-27", scope: "this-counter" });
   assert.equal(edits.items[0].title, "Today: 2 bills edited");
-  assert.equal(edits.items[0].message, "By Ravi 2 · this counter only");
+  assert.equal(edits.items[0].message, "By Ravi (2) · this counter only");
 
   const oneEdit = saleChangeDigestBellItems(digestOf([cloudEvent({ action: "edit", approved_by_name: "" })]), { dateKey: "2026-09-27" });
   assert.equal(oneEdit.items[0].title, "Today: 1 bill edited");
@@ -364,5 +364,5 @@ test("end to end from this counter's bills", () => {
   const digest = buildSaleChangeDigest({ events, dateKey: "2026-09-27" });
   const { items } = saleChangeDigestBellItems(digest, { dateKey: "2026-09-27", scope: "this-counter" });
   assert.equal(items[0].title, "Today: 2 bills cancelled (₹1,240.00), 1 edited");
-  assert.equal(items[0].message, "By Ravi 2, Asha 1 · this counter only");
+  assert.equal(items[0].message, "By Ravi (2), Asha (1) · this counter only");
 });

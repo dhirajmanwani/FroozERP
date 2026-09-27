@@ -3625,6 +3625,28 @@ tbody tr:has(> .empty-cell):hover {
   grid-template-columns: minmax(220px, 360px);
 }
 
+/* The Owner or Admin's username and password for a cashier's cancel or edit: a quiet inset, so it
+   reads as a step of this form and not as a second sign-in screen. */
+.sale-change-approval {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--fill-subtle);
+}
+
+.sale-change-approval > strong {
+  color: var(--ink-strong);
+  font-size: 13px;
+}
+
+.sale-change-approval .form-grid,
+.sale-change-approval .form-note,
+.sale-change-reason-grid {
+  margin-bottom: 0;
+}
+
 .sale-edit-summary {
   margin: 0;
 }
