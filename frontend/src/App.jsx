@@ -265,6 +265,7 @@ import {
   observeServerTime,
 } from "./local/serverTime";
 import { describeEnrolmentAttempt, readPastedActivation } from "./local/activationEnrolment";
+import { describeInitialPullFailure } from "./local/freshDeviceOnboarding";
 
 const isDesktopShell = () => Boolean(window.__TAURI_INTERNALS__ || window.__TAURI__);
 // The phone app is a Tauri runtime too, so `isDesktopShell()` is true there as well. What differs on
@@ -4643,13 +4644,21 @@ function App() {
       : null;
     const isFreshDevice = isTauriRuntime() && !existingSnapshot?.user_profile?.id;
     if (isFreshDevice) {
-      const initialSyncStatus = await initialPullForApprovedDevice({
-        apiUrl: SYNC_API_URL,
-        user: currentUser,
-        deviceInfo: latestDevice,
-        branchId: currentUser?.branch_id,
-      });
-      applyCanonicalIdentityFromSync(initialSyncStatus);
+      // Never fatal: a refused bootstrap used to abort sign-in before the snapshot below, leaving a
+      // new device with no products or stock. See local/freshDeviceOnboarding.js.
+      try {
+        const initialSyncStatus = await initialPullForApprovedDevice({
+          apiUrl: SYNC_API_URL,
+          user: currentUser,
+          deviceInfo: latestDevice,
+          branchId: currentUser?.branch_id,
+        });
+        applyCanonicalIdentityFromSync(initialSyncStatus);
+      } catch (initialPullError) {
+        const failure = describeInitialPullFailure(initialPullError);
+        writeDiagnosticLog("WARN", "initial-pull-failed", failure.log);
+        setSyncMessage(failure.notice);
+      }
     }
     const snapshot = await fetchOnlineReferenceSnapshot(currentUser, latestDevice);
     const purchaseRulePayload = await loadPurchaseRules().catch((error) => {
@@ -6984,6 +6993,11 @@ function App() {
         await hydrateOnlineSession(response.data, latestDevice);
       } catch (hydrateError) {
         console.error("Online hydration failed", hydrateError);
+        writeDiagnosticLog("ERROR", "online-hydration-failed", {
+          status: hydrateError?.response?.status || null,
+          code: hydrateError?.response?.data?.code || hydrateError?.code || "",
+          message: hydrateError?.message || String(hydrateError),
+        });
         setOfflineMode(false);
         setActiveView(initialView);
         setStartupNotice("Backend login succeeded. Some reference data could not be refreshed; empty sections remain usable and can be retried.");
