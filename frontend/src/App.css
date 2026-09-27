@@ -1853,8 +1853,6 @@ tbody tr:last-child td {
 .pdf-export-mode .cash-book-title,
 .pdf-export-mode .cash-book-closing span,
 .pdf-export-mode .invoice-customer,
-.pdf-export-mode .invoice-total-box,
-.pdf-export-mode .thermal-item-block,
 .pdf-export-mode .upi-qr-box,
 .pdf-export-mode .total-line {
   border: 1px solid #111111 !important;
@@ -1911,8 +1909,6 @@ tbody tr:last-child td {
   font-size: 10.5px !important;
 }
 
-.pdf-export-thermal .thermal-item-block,
-.pdf-export-thermal .invoice-total-box,
 .pdf-export-thermal .invoice-customer,
 .pdf-export-thermal .upi-qr-box {
   border-color: #000000 !important;
@@ -4068,89 +4064,6 @@ tbody tr:has(> .empty-cell):hover {
   text-align: right;
 }
 
-.invoice-table {
-  margin-top: 15px;
-}
-
-.invoice-table th,
-.invoice-table td {
-  position: static;
-  padding: 10px 6px;
-  border-bottom: 1px solid #dfe9e2;
-  color: #2c5d43;
-  background: transparent;
-  font-size: 11px;
-}
-
-.invoice-table th {
-  color: #082116;
-}
-
-.thermal-items-list {
-  display: grid;
-  gap: 7px;
-  margin-top: 10px;
-}
-
-.thermal-item-block {
-  padding: 7px 0;
-  border-bottom: 1px dashed #c8d8ce;
-  color: #092318;
-  font-size: 12px;
-  line-height: 1.3;
-  overflow-wrap: anywhere;
-  word-break: break-word;
-}
-
-.thermal-item-name {
-  color: #082116;
-  font-weight: 900;
-}
-
-.thermal-item-detail {
-  display: grid;
-  gap: 2px;
-  margin-top: 3px;
-  color: #1e4a34;
-  font-weight: 700;
-}
-
-.thermal-item-discount,
-.thermal-item-amount {
-  display: flex;
-  justify-content: space-between;
-  gap: 10px;
-  margin-top: 3px;
-  color: #092318;
-}
-
-.thermal-item-discount strong,
-.thermal-item-amount strong {
-  flex: 0 0 auto;
-  text-align: right;
-}
-
-.thermal-item-amount {
-  font-weight: 900;
-}
-
-.invoice-total-box {
-  width: min(280px, 100%);
-  display: grid;
-  gap: 7px;
-  margin: 17px 0 0 auto;
-}
-
-.invoice-total-box .total-line,
-.invoice-total-box .total-line strong {
-  color: #2c5d43;
-}
-
-.invoice-total-box .total-line-main,
-.invoice-total-box .total-line-main strong {
-  color: #082116;
-}
-
 .upi-qr-box {
   width: min(280px, 100%);
   display: flex;
@@ -4210,6 +4123,471 @@ tbody tr:has(> .empty-cell):hover {
 .invoice-footer strong {
   color: #082116;
   font-size: 12px;
+}
+
+/* --- The customer bill ---------------------------------------------------------
+ *
+ * Drawn by `InvoiceBill` from local/invoiceLayout.js. One markup serves the screen, the A4 and
+ * thermal prints and the PDF capture, so these rules are written once and the print and PDF
+ * contexts only swap the colours to black on white (see the @media print block at the end of this
+ * file, and the .pdf-export-mode rules below).
+ *
+ * The paper is white in both themes: it uses the --paper-* tokens only, which theme.css never
+ * redefines. Print and PDF re-point --paper-line and --paper-ink at black inside the bill, because
+ * a pale rule prints as nothing on a thermal head.
+ *
+ * Table cells carry !important on layout properties only. The generic `.invoice-paper th/td` print
+ * rule and the `.pdf-export-mode th/td` capture rule force grid borders, header fills and a fixed
+ * font size onto every table, which is right for a report and wrong for a receipt. Colours are left
+ * without !important on purpose, so print and PDF can still force them to black.
+ */
+.bill-issue {
+  margin: 0 16px 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--warning-line);
+  border-radius: var(--radius-md);
+  color: var(--warning-ink);
+  background: var(--warning-soft);
+  font-size: 12px;
+}
+
+.invoice-paper.bill-paper {
+  color: var(--paper-ink);
+  background: var(--paper);
+  font-size: 13px;
+  line-height: 1.45;
+  border-radius: var(--radius-md);
+  box-shadow: 0 10px 30px var(--shadow-soft);
+}
+
+.invoice-paper.bill-paper.invoice-a4 {
+  padding: 40px 44px 30px;
+}
+
+.invoice-paper.bill-paper.invoice-thermal {
+  width: 80mm;
+  max-width: calc(100% - 32px);
+  box-sizing: border-box;
+  margin: 4px auto 20px;
+  padding: 16px 12px 14px;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.invoice-paper.bill-paper.invoice-58mm {
+  width: 58mm;
+  padding: 12px 8px;
+  font-size: 11px;
+}
+
+.bill-head {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--paper-line);
+  text-align: center;
+}
+
+.bill-head .brand-lockup {
+  justify-content: center;
+  margin-bottom: 6px;
+}
+
+.bill-head .brand-lockup-invoice .brand-monogram {
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+}
+
+.bill-paper.invoice-thermal .bill-head .brand-lockup-invoice .brand-monogram {
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+}
+
+.invoice-paper .bill-shop {
+  margin: 0;
+  color: var(--paper-ink);
+  font-size: 24px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  line-height: 1.15;
+}
+
+.bill-paper.invoice-thermal .bill-shop {
+  font-size: 17px;
+}
+
+.bill-paper.invoice-58mm .bill-shop {
+  font-size: 15px;
+}
+
+.bill-contact {
+  color: var(--paper-ink-muted);
+  font-size: 0.85em;
+  overflow-wrap: anywhere;
+}
+
+.bill-title {
+  margin-top: 8px;
+  color: var(--accent-deep);
+  font-size: 0.75em;
+  font-weight: 700;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+}
+
+.bill-meta {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px 18px;
+  margin: 12px 0 0;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--paper-line);
+}
+
+.bill-meta div {
+  min-width: 0;
+}
+
+.bill-meta div:nth-child(even) {
+  text-align: right;
+}
+
+.bill-meta dt {
+  color: var(--paper-ink-muted);
+  font-size: 0.72em;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.bill-meta dd {
+  margin: 1px 0 0;
+  color: var(--paper-ink);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.bill-meta-sub {
+  display: block;
+  color: var(--paper-ink-muted);
+  font-size: 0.85em;
+  font-weight: 400;
+}
+
+.bill-status {
+  margin: 10px 0 0;
+  padding: 5px 8px;
+  border: 1.5px solid var(--paper-ink);
+  color: var(--paper-ink);
+  font-size: 0.85em;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.bill-status span {
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.bill-paper .bill-table {
+  width: 100%;
+  min-width: 0;
+  margin-top: 12px;
+  border-collapse: collapse !important;
+  table-layout: auto !important;
+}
+
+.bill-paper .bill-table th,
+.bill-paper .bill-table td {
+  position: static;
+  padding: 0 !important;
+  border: 0 !important;
+  color: var(--paper-ink);
+  background: transparent !important;
+  font-size: 1em !important;
+  font-weight: 400 !important;
+  line-height: 1.4 !important;
+  letter-spacing: 0;
+  text-transform: none;
+  white-space: normal !important;
+  word-break: normal !important;
+  overflow-wrap: anywhere !important;
+  vertical-align: top !important;
+}
+
+.bill-paper .bill-table tr,
+.bill-paper .bill-table tr:hover {
+  background: transparent;
+  box-shadow: none;
+}
+
+.bill-paper .bill-table thead th {
+  padding-bottom: 7px !important;
+  border-bottom: 1px solid var(--paper-ink) !important;
+  color: var(--paper-ink-muted);
+  font-size: 0.72em !important;
+  font-weight: 700 !important;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.bill-paper .bill-table .bill-num,
+.bill-paper .bill-table .bill-unit {
+  padding-left: 10px !important;
+  white-space: nowrap !important;
+  overflow-wrap: normal !important;
+}
+
+.bill-paper .bill-table .bill-num {
+  text-align: right;
+}
+
+.bill-paper .bill-table .bill-unit,
+.bill-paper .bill-table .bill-product {
+  text-align: left;
+}
+
+.bill-paper .bill-line {
+  border-bottom: 1px dotted var(--paper-line);
+}
+
+.bill-paper .bill-line > tr:first-child > td {
+  padding-top: 9px !important;
+}
+
+.bill-paper .bill-line > tr:last-child > td {
+  padding-bottom: 9px !important;
+}
+
+.bill-paper .bill-table .bill-product-name,
+.bill-paper .bill-table .bill-amount {
+  font-weight: 600 !important;
+}
+
+.bill-line-note {
+  display: block;
+  color: var(--paper-ink-muted);
+  font-size: 0.85em;
+}
+
+.bill-paper .bill-table .bill-line-discount td {
+  padding-top: 2px !important;
+  padding-left: 12px !important;
+  color: var(--paper-savings);
+  font-size: 0.85em !important;
+}
+
+.bill-paper .bill-table-stacked thead tr:first-child th {
+  padding-bottom: 1px !important;
+  border-bottom: 0 !important;
+}
+
+.bill-paper .bill-table-stacked .bill-figure-heads th:first-child,
+.bill-paper .bill-table-stacked .bill-line-figures td:first-child {
+  padding-left: 0 !important;
+  text-align: left;
+}
+
+.bill-paper .bill-table-stacked .bill-line-name td {
+  padding-bottom: 1px !important;
+}
+
+.bill-paper .bill-table-stacked .bill-line-figures td {
+  padding-left: 6px !important;
+}
+
+.bill-totals {
+  display: grid;
+  gap: 5px;
+  width: min(300px, 100%);
+  margin: 14px 0 0 auto;
+}
+
+.bill-paper.invoice-thermal .bill-totals {
+  width: 100%;
+}
+
+.bill-total-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.bill-total-row span {
+  min-width: 0;
+  color: var(--paper-ink-muted);
+}
+
+.bill-total-row strong {
+  flex: 0 0 auto;
+  color: var(--paper-ink);
+  font-weight: 600;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.bill-total-row small {
+  display: block;
+  color: var(--paper-ink-muted);
+  font-size: 0.82em;
+}
+
+.bill-total-discount span,
+.bill-total-discount strong,
+.bill-total-discount small {
+  color: var(--paper-savings);
+}
+
+.bill-total-detail {
+  padding-left: 12px;
+  font-size: 0.88em;
+}
+
+.bill-total-detail strong {
+  color: var(--paper-ink-muted);
+  font-weight: 400;
+}
+
+.bill-grand-total {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 6px 0 4px;
+  padding: 9px 0;
+  border-block: 1.5px solid var(--paper-ink);
+}
+
+.bill-grand-total span {
+  color: var(--paper-ink);
+  font-size: 0.9em;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.bill-grand-total strong {
+  color: var(--paper-ink);
+  font-size: 1.55em;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.bill-pay-paid span,
+.bill-pay-due span,
+.bill-pay-due strong {
+  color: var(--paper-ink);
+  font-weight: 700;
+}
+
+.bill-savings {
+  margin: 14px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--paper-savings-line);
+  border-radius: 8px;
+  color: var(--paper-savings);
+  background: var(--paper-savings-wash);
+  font-size: 1em;
+  font-weight: 600;
+  text-align: center;
+}
+
+.bill-savings strong {
+  font-weight: 800;
+}
+
+.bill-paper .bill-upi {
+  margin: 14px auto 0;
+}
+
+.bill-footer {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--paper-line);
+  text-align: center;
+}
+
+.bill-footer strong {
+  color: var(--paper-ink);
+  font-size: 0.95em;
+  font-weight: 700;
+}
+
+.bill-footer span {
+  color: var(--paper-ink-muted);
+  font-size: 0.85em;
+}
+
+.bill-footer small {
+  margin-top: 6px;
+  color: var(--paper-ink-muted);
+  font-size: 0.72em;
+  letter-spacing: 0.08em;
+}
+
+/* PDF capture. `exportElementToPdf` scales the captured element to the page width, so the element
+   is sized to the paper it becomes: 80mm or 58mm for a receipt, A4's 794px for an invoice. Then
+   everything goes black on white, like print. */
+.pdf-export-mode.bill-paper {
+  --paper-line: #000000;
+  --paper-ink: #000000;
+  --paper-savings-line: #000000;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+}
+
+.pdf-export-mode.bill-paper.invoice-thermal {
+  width: 80mm !important;
+  max-width: none !important;
+  margin: 0 !important;
+  padding: 14px 12px !important;
+  font-size: 12px !important;
+  line-height: 1.4 !important;
+}
+
+.pdf-export-mode.bill-paper.invoice-58mm {
+  width: 58mm !important;
+  padding: 10px 8px !important;
+  font-size: 11px !important;
+}
+
+.pdf-export-mode.bill-paper.invoice-a4 {
+  width: 794px !important;
+  max-width: none !important;
+  margin: 0 !important;
+  padding: 52px 56px !important;
+  font-size: 13px !important;
+  line-height: 1.45 !important;
+}
+
+.pdf-export-mode.bill-paper .bill-savings {
+  border-style: dashed;
+}
+
+/* `.pdf-export-mode h2` sizes a report title; the bill's shop name keeps its own size. */
+.pdf-export-mode.bill-paper .bill-shop {
+  font-size: 24px !important;
+}
+
+.pdf-export-mode.bill-paper.invoice-thermal .bill-shop {
+  font-size: 17px !important;
+}
+
+.pdf-export-mode.bill-paper.invoice-58mm .bill-shop {
+  font-size: 15px !important;
 }
 
 .empty-state {
@@ -6340,42 +6718,6 @@ tbody tr:has(> .empty-cell):hover {
     border-block: 1px solid #111111;
   }
 
-  .invoice-paper.invoice-a4 .invoice-table {
-    width: 100%;
-    margin-top: 7mm;
-    table-layout: auto;
-  }
-
-  .invoice-paper.invoice-a4 .invoice-table th,
-  .invoice-paper.invoice-a4 .invoice-table td {
-    padding: 5pt 6pt !important;
-    font-size: 10pt !important;
-    line-height: 1.32 !important;
-    border: 1px solid #111111 !important;
-    vertical-align: top !important;
-  }
-
-  .invoice-paper.invoice-a4 .invoice-total-box {
-    width: 78mm;
-    margin-top: 8mm;
-    margin-left: auto;
-    border: 1px solid #111111 !important;
-    padding: 5mm;
-  }
-
-  .invoice-paper.invoice-a4 .total-line,
-  .invoice-paper.invoice-a4 .total-line strong,
-  .invoice-paper.invoice-a4 .total-line span {
-    color: #000000 !important;
-    font-size: 10.5pt !important;
-  }
-
-  .invoice-paper.invoice-a4 .total-line-main,
-  .invoice-paper.invoice-a4 .total-line-main strong,
-  .invoice-paper.invoice-a4 .total-line-main span {
-    font-size: 13pt !important;
-  }
-
   .invoice-paper.invoice-80mm {
     page: receipt-80;
     width: 80mm;
@@ -6438,136 +6780,6 @@ tbody tr:has(> .empty-cell):hover {
 
   .invoice-paper.invoice-thermal .invoice-customer div:nth-child(3) {
     display: none;
-  }
-
-  .invoice-paper.invoice-thermal .invoice-table {
-    display: none;
-  }
-
-  .invoice-paper.invoice-thermal .thermal-items-list {
-    display: grid;
-    gap: 0;
-    margin: 4px 0;
-    color: #092318;
-    border-top: 1px solid #092318;
-  }
-
-  .invoice-paper.invoice-thermal .thermal-item-block {
-    padding: 4px 0;
-    color: #092318 !important;
-    border-bottom: 1px dashed #092318;
-    font-size: 11.5px;
-    font-weight: 800;
-    line-height: 1.18;
-    overflow-wrap: anywhere;
-    word-break: break-word;
-    page-break-inside: avoid;
-    break-inside: avoid;
-  }
-
-  .invoice-paper.invoice-thermal .thermal-item-name {
-    color: #092318 !important;
-    font-size: 12.5px;
-    font-weight: 900;
-    line-height: 1.16;
-    white-space: normal;
-    overflow-wrap: anywhere;
-  }
-
-  .invoice-paper.invoice-thermal .thermal-item-detail {
-    display: block;
-    margin-top: 2px;
-    color: #092318 !important;
-    font-size: 11px;
-    font-weight: 800;
-  }
-
-  .invoice-paper.invoice-thermal .thermal-item-detail span {
-    display: block;
-    color: #092318 !important;
-    white-space: normal;
-    overflow-wrap: anywhere;
-  }
-
-  .invoice-paper.invoice-thermal .thermal-item-discount,
-  .invoice-paper.invoice-thermal .thermal-item-amount {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    gap: 4px;
-    margin-top: 2px;
-    color: #092318 !important;
-    font-size: 11.5px;
-    font-weight: 900;
-    white-space: nowrap;
-  }
-
-  .invoice-paper.invoice-thermal .thermal-item-discount span,
-  .invoice-paper.invoice-thermal .thermal-item-amount span {
-    min-width: 0;
-    color: #092318 !important;
-  }
-
-  .invoice-paper.invoice-thermal .thermal-item-discount strong,
-  .invoice-paper.invoice-thermal .thermal-item-amount strong {
-    flex: 0 0 auto;
-    color: #092318 !important;
-    text-align: right;
-  }
-
-  .invoice-paper.invoice-thermal.invoice-58mm .thermal-item-block {
-    font-size: 10.8px;
-  }
-
-  .invoice-paper.invoice-thermal.invoice-58mm .thermal-item-name {
-    font-size: 11.8px;
-  }
-
-  .invoice-paper.invoice-thermal.invoice-58mm .thermal-item-detail,
-  .invoice-paper.invoice-thermal.invoice-58mm .thermal-item-discount,
-  .invoice-paper.invoice-thermal.invoice-58mm .thermal-item-amount {
-    font-size: 10.6px;
-  }
-
-  .invoice-paper.invoice-thermal .invoice-total-box {
-    width: 100%;
-    margin: 4px 0 0;
-    padding-top: 3px;
-    border-top: 1px solid #092318;
-  }
-
-  .invoice-paper.invoice-thermal .total-line {
-    display: flex;
-    justify-content: space-between;
-    gap: 6px;
-    padding: 1px 0;
-    color: #092318 !important;
-    font-size: 12px;
-    font-weight: 800;
-    white-space: nowrap;
-  }
-
-  .invoice-paper.invoice-thermal .total-line strong,
-  .invoice-paper.invoice-thermal .total-line span {
-    color: #092318 !important;
-    font-weight: 900;
-    white-space: nowrap;
-  }
-
-  .invoice-paper.invoice-thermal .total-line span {
-    min-width: 0;
-  }
-
-  .invoice-paper.invoice-thermal .total-line strong {
-    flex: 0 0 auto;
-    text-align: right;
-  }
-
-  .invoice-paper.invoice-thermal .total-line-main {
-    margin-top: 2px;
-    padding-top: 3px;
-    border-top: 1px solid #092318;
-    font-size: 15px;
   }
 
   .invoice-paper.invoice-thermal .upi-qr-box {
@@ -6728,8 +6940,6 @@ tbody tr:has(> .empty-cell):hover {
   .print-area .cash-book-title,
   .print-area .cash-book-closing span,
   .invoice-paper .invoice-customer,
-  .invoice-paper .invoice-total-box,
-  .invoice-paper .thermal-item-block,
   .invoice-paper .upi-qr-box,
   .invoice-paper .total-line {
     border: 1px solid #111111 !important;
@@ -8660,5 +8870,60 @@ tbody tr:has(> .empty-cell):hover {
   .settings-tabs > button,
   .remove-button:not(:has(> svg)) {
     min-height: 42px;
+  }
+}
+
+/* The customer bill on paper: black on white, thermal-safe weights, and the rules solid. Placed last
+   so it follows the generic invoice print rules above. See "The customer bill" earlier in this file. */
+@media print {
+  .invoice-paper.bill-paper {
+    --paper-line: #000000;
+    --paper-ink: #000000;
+    --paper-savings-line: #000000;
+    border-radius: 0 !important;
+    font-family: Arial, Helvetica, sans-serif;
+  }
+
+  .invoice-paper.bill-paper.invoice-thermal {
+    padding: 2mm 3mm 5mm !important;
+    font-size: 12px !important;
+    font-weight: 700;
+    line-height: 1.3 !important;
+  }
+
+  .invoice-paper.bill-paper.invoice-58mm {
+    padding: 2mm 1.5mm 5mm !important;
+    font-size: 11px !important;
+  }
+
+  .invoice-paper.bill-paper.invoice-a4 {
+    font-size: 11pt !important;
+  }
+
+  .invoice-paper.bill-paper.invoice-thermal .bill-table td,
+  .invoice-paper.bill-paper.invoice-thermal .bill-meta dd,
+  .invoice-paper.bill-paper.invoice-thermal .bill-total-row strong {
+    font-weight: 700 !important;
+  }
+
+  .invoice-paper.bill-paper .bill-line {
+    border-bottom-style: dashed;
+  }
+
+  .invoice-paper.bill-paper .bill-grand-total {
+    border-block-width: 2px;
+  }
+
+  .invoice-paper.bill-paper .bill-savings {
+    border-style: dashed;
+    border-radius: 0;
+  }
+
+  .invoice-paper.bill-paper .bill-line,
+  .invoice-paper.bill-paper .bill-totals,
+  .invoice-paper.bill-paper .bill-savings,
+  .invoice-paper.bill-paper .bill-footer {
+    break-inside: avoid;
+    page-break-inside: avoid;
   }
 }

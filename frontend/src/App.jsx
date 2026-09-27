@@ -108,6 +108,7 @@ import { resolveApiMode } from "./local/apiModeResolution";
 import { CLOUD_CALL_REFUSAL_CODES, createCloudCallGuard, createCloudCallRefusalError, evaluateCloudCall } from "./local/cloudCallGuard";
 import { UNKNOWN_COUNTER_SCOPE, counterMaySell, resolveCounterScope } from "./local/locationScope";
 import { applyChargesToTotals, buildChargesForBill } from "./local/otherCharges";
+import { buildInvoiceLayout, buildInvoiceText } from "./local/invoiceLayout";
 import {
   DISTRIBUTION_BOARD_STATUS,
   pendingAllocationLines,
@@ -23433,6 +23434,9 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
           mandi_tax_rate: localSale.mandi_tax_rate,
           mandi_tax_basis: localSale.mandi_tax_basis,
           tax_amount: localSale.tax_total,
+          // The bill's charges total, so the printed bill can add up. Display only: an edit reloads
+          // the sale (and its charge lines) before it opens, and never reads this object's charges.
+          other_charges_amount: localSale.other_charges_amount,
           sync_status: "pending",
           items: localSale.items.map((item) => ({
             product_id: item.product_id,
@@ -24075,10 +24079,6 @@ function PosBilling({ productPhotoIndex = null, canManualRateOverride = false, c
 
 function TotalLine({ label, muted, total, value }) {
   return <div className={`${total ? "total-line total-line-main" : "total-line"} ${muted ? "total-line-muted" : ""}`}><span>{label}</span><strong>{currency.format(value)}</strong></div>;
-}
-
-function ThermalTotalLine({ label, total, value }) {
-  return <div className={total ? "total-line total-line-main" : "total-line"}><span>{label}</span><strong>{receiptCurrency.format(value)}</strong></div>;
 }
 
 function SaleCancelModal({ draft, onClose, onConfirm, onReasonChange }) {
@@ -24844,6 +24844,112 @@ function PaymentReceiptModal({ canWhatsappSend = false, payment, onClose, user }
   );
 }
 
+/**
+ * The customer bill, drawn from `buildInvoiceLayout` and nothing else. Every figure, label and
+ * decision about what to show lives in local/invoiceLayout.js, where it is tested; this only lays
+ * it out. The same markup serves the screen, the A4 and thermal prints and the PDF capture.
+ *
+ * `stacked` is the 58mm receipt: too narrow for five columns, so the product takes its own row
+ * under a "Product" heading and the four figures sit beneath it under "Qty Unit Rate Amount".
+ */
+function InvoiceBill({ layout, stacked = false, upi = null }) {
+  const { header, meta, lines, totals, payment, savings, footer } = layout;
+  const [productHeading, ...figureHeadings] = layout.columns;
+  const figureCells = (line) => (
+    <>
+      <td className="bill-num">{line.qtyText}</td>
+      <td className="bill-unit">{line.unit}</td>
+      <td className="bill-num">{line.rateText}</td>
+      <td className="bill-num bill-amount">{line.amountText}</td>
+    </>
+  );
+  const productCell = (line, colSpan) => (
+    <td className="bill-product" colSpan={colSpan}>
+      <span className="bill-product-name">{line.product}</span>
+      {line.note && <span className="bill-line-note">{line.note}</span>}
+    </td>
+  );
+  return (
+    <>
+      <header className="bill-head">
+        <BrandLogo compact invoice />
+        <h2 className="bill-shop">{header.shopName}</h2>
+        {header.addressLines.map((line) => <span className="bill-contact" key={line}>{line}</span>)}
+        {(header.phoneText || header.gstinText) && (
+          <span className="bill-contact">{[header.phoneText, header.gstinText].filter(Boolean).join(" · ")}</span>
+        )}
+        <span className="bill-title">{header.title}</span>
+      </header>
+      <dl className="bill-meta">
+        <div><dt>Bill no</dt><dd>{meta.billNo}</dd></div>
+        <div><dt>Date</dt><dd>{meta.date}{meta.time && <span className="bill-meta-sub">{meta.time}</span>}</dd></div>
+        <div><dt>Customer</dt><dd>{meta.customerName}{meta.customerMobile && <span className="bill-meta-sub">{meta.customerMobile}</span>}</dd></div>
+        {(meta.cashier || meta.counter) && (
+          <div><dt>{meta.cashier ? "Cashier" : "Counter"}</dt><dd>{meta.cashier || meta.counter}{meta.cashier && meta.counter && <span className="bill-meta-sub">{meta.counter}</span>}</dd></div>
+        )}
+      </dl>
+      {meta.status && <p className="bill-status">{meta.status}{meta.statusNote && <span> · {meta.statusNote}</span>}</p>}
+      <table className={`bill-table ${stacked ? "bill-table-stacked" : ""}`}>
+        <thead>
+          {stacked ? (
+            <>
+              <tr><th className="bill-product" colSpan={4}>{productHeading}</th></tr>
+              <tr className="bill-figure-heads">{figureHeadings.map((heading, index) => <th className={index === 1 ? "bill-unit" : "bill-num"} key={heading}>{heading}</th>)}</tr>
+            </>
+          ) : (
+            <tr>
+              <th className="bill-product">{productHeading}</th>
+              {figureHeadings.map((heading, index) => <th className={index === 1 ? "bill-unit" : "bill-num"} key={heading}>{heading}</th>)}
+            </tr>
+          )}
+        </thead>
+        {lines.map((line) => (
+          <tbody className="bill-line" key={line.key}>
+            {stacked ? (
+              <>
+                <tr className="bill-line-name">{productCell(line, 4)}</tr>
+                <tr className="bill-line-figures">{figureCells(line)}</tr>
+              </>
+            ) : (
+              <tr className="bill-line-main">{productCell(line)}{figureCells(line)}</tr>
+            )}
+            {line.discount && (
+              <tr className="bill-line-discount"><td colSpan={stacked ? 4 : 5}>{line.discount.text}</td></tr>
+            )}
+          </tbody>
+        ))}
+      </table>
+      <section className="bill-totals">
+        {totals.rows.map((row) => (
+          <div className={`bill-total-row bill-total-${row.kind}`} key={row.key}>
+            <span>{row.label}{row.note && <small>{row.note}</small>}</span>
+            <strong>{row.amountText}</strong>
+          </div>
+        ))}
+        <div className="bill-grand-total">
+          <span>Grand total</span>
+          <strong>{totals.grandTotalText}</strong>
+        </div>
+        {payment.rows.map((row) => (
+          <div className={`bill-total-row bill-pay-${row.kind}`} key={row.key}>
+            <span>{row.label}</span>
+            <strong>{row.amountText}</strong>
+          </div>
+        ))}
+      </section>
+      {savings && (
+        <p className="bill-savings">You saved <strong>{savings.amountText}</strong> on this bill</p>
+      )}
+      {upi}
+      <footer className="bill-footer">
+        <strong>{footer.message}</strong>
+        <span>{footer.signOff}</span>
+        <small>{footer.poweredBy}</small>
+      </footer>
+    </>
+  );
+}
+
 function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false, canWhatsappSend = false, invoice, onCancel, onClose, onEdit, paymentSettings = {}, printSettings = {}, user }) {
   const storedInvoiceProfile = readStoredPrintProfile("invoice");
   const [printMode, setPrintMode] = useState(storedInvoiceProfile === "A4_INVOICE" ? "A4" : storedInvoiceProfile === "THERMAL_RECEIPT" ? "THERMAL" : printSettings.default_invoice_print === "A4_INVOICE" || printSettings.default_printer_type === "A4" ? "A4" : "THERMAL");
@@ -24855,11 +24961,6 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
   const autoPrintedRef = useRef(false);
   const activePrintMode = printMode === "A4" ? "A4" : "THERMAL";
   const invoicePayments = invoice.payments || [];
-  const showItemDiscountOnReceipt = printSettings.show_item_discount_column_receipt !== false;
-  const showBillDiscountRow = printSettings.show_bill_discount_row_receipt !== false;
-  const hideZeroDiscountRows = printSettings.hide_zero_discount_rows !== false;
-  const billDiscountAmount = Number(invoice.invoice_discount_amount || 0);
-  const shouldRenderBillDiscountRow = showBillDiscountRow && (billDiscountAmount > 0 || !hideZeroDiscountRows);
   const hasUpiPayment = invoice.payment_mode === "UPI" || invoice.payment_mode === "MIXED" || invoicePayments.some((payment) => (payment.mode || payment.payment_mode) === "UPI");
   const qrSizeMap = { SMALL: 110, MEDIUM: 145, LARGE: 180 };
   const qrDisplaySize = String(paymentSettings.qr_display_size || "MEDIUM").toUpperCase();
@@ -24893,6 +24994,13 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
   const invoiceDateKey = toDateKey(invoice.sale_date || invoice.transaction_date || invoice.created_at);
   const invoiceFileName = () => `FroozERP-Invoice-${safeFileName(invoice.invoice_no || `SALE-${invoice.id}`)}.pdf`;
   const invoiceEntryTime = formatEntryTime(invoice);
+  // One model for every way this bill leaves the shop: the screen, both prints, the PDF (a capture
+  // of this same element) and the WhatsApp text. See local/invoiceLayout.js for the reconcile rule.
+  const layout = useMemo(
+    () => buildInvoiceLayout(invoice, printSettings, { billDate: formatDisplayDate(invoiceDateKey), billTime: invoiceEntryTime }),
+    [invoice, printSettings, invoiceDateKey, invoiceEntryTime],
+  );
+  const billVariant = activePrintMode === "A4" ? "a4" : printSettings.receipt_width === "58MM" ? "thermal-58" : "thermal-80";
   const printWithMode = (mode) => {
     setPrintMode(mode);
     const nextProfile = mode === "A4" ? "A4_PORTRAIT" : printSettings.receipt_width === "58MM" ? "THERMAL_58" : "THERMAL_80";
@@ -24935,13 +25043,7 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
       setExporting(false);
     }
   };
-  const invoiceWhatsappMessage = () => [
-      "Thank you for shopping with FEEL THE FREAKIN' FROOZ. Your invoice is ready.",
-      `Invoice: ${invoice.invoice_no}`,
-      `Bill Date: ${formatDisplayDate(invoiceDateKey)}`,
-      `Amount: ${currency.format(Number(invoice.total_amount))}`,
-      "We appreciate your business.",
-    ].join("\n");
+  const invoiceWhatsappMessage = () => buildInvoiceText(layout);
   const invoiceWhatsappRecipients = useMemo(() => buildWhatsappRecipients({
     customers: invoice.customer_name || invoice.customer_mobile || invoice.whatsapp_number ? [{
       id: invoice.customer_id,
@@ -24971,89 +25073,29 @@ function InvoiceModal({ autoPrintMode = null, canCancel = false, canEdit = false
             <button aria-label="Close invoice" className="remove-button" onClick={onClose}><Icon name="close" /></button>
           </div>
         </div>
-        <article ref={invoiceRef} className={`invoice-paper ${activePrintMode === "A4" ? "invoice-a4 print-profile-a4-portrait" : "invoice-thermal"} ${printSettings.receipt_width === "58MM" ? "invoice-58mm print-profile-thermal-58" : "invoice-80mm print-profile-thermal-80"}`}>
-          <header className="invoice-header">
-            <BrandLogo invoice />
-            <div className="invoice-meta">
-              <strong>Tax Invoice</strong>
-              <span>{printSettings.business_name || "FroozERP Retail"}</span>
-              <span>{invoice.invoice_no}</span>
-              <span>Bill Date: {formatDisplayDate(invoiceDateKey)}</span>
-              <span>Entry Time: {invoiceEntryTime}</span>
-            </div>
-          </header>
-          <section className="invoice-customer">
-            <div><small>Billed To</small><strong>{invoice.customer_name || "Walk-in Customer"}</strong><span>{invoice.customer_mobile || "No mobile number"}</span></div>
-            <div><small>Payment</small><strong>{invoice.payment_mode}</strong><span>{invoice.branch_name || "SRT Retail Store"}</span></div>
-            <div><small>Status</small><strong>{invoice.sale_status || "COMPLETED"}</strong><span>{invoice.cancellation_reason || invoice.edit_reason || "No changes recorded"}</span></div>
-          </section>
-          {activePrintMode === "THERMAL" ? (
-            <section className="thermal-items-list">
-              {(invoice.items || []).map((item) => {
-                const lotText = [item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "-";
-                const discountAmount = Number(item.discount_amount || 0);
-                return (
-                  <article className="thermal-item-block" key={item.id || `${item.product_id}-${item.inventory_batch_id || "FIFO"}`}>
-                    <div className="thermal-item-name">{item.product_name}</div>
-                    <div className="thermal-item-detail">
-                      <span>Lot: {lotText}</span>
-                      <span>Qty: {item.quantity} {item.unit}</span>
-                      <span>Rate: {receiptCurrency.format(Number(item.selling_rate))}</span>
+        {layout.issues.length > 0 && (
+          <p className="bill-issue no-print" role="status">{layout.issues.join(" ")}</p>
+        )}
+        <article ref={invoiceRef} className={`invoice-paper bill-paper bill-${billVariant} ${activePrintMode === "A4" ? "invoice-a4 print-profile-a4-portrait" : `invoice-thermal ${printSettings.receipt_width === "58MM" ? "invoice-58mm print-profile-thermal-58" : "invoice-80mm print-profile-thermal-80"}`}`}>
+          <InvoiceBill
+            layout={layout}
+            stacked={billVariant === "thermal-58"}
+            upi={(
+              <>
+                {shouldShowUpiWarning && <p className="form-note stock-low no-print">Please add UPI ID in Settings to show QR code.</p>}
+                {shouldShowUpiQr && upiQrDataUrl && (
+                  <section className="upi-qr-box bill-upi">
+                    <img alt="UPI payment QR" src={upiQrDataUrl} style={{ width: `${qrCodeWidth}px`, height: `${qrCodeWidth}px` }} />
+                    <div>
+                      <strong>Scan to pay</strong>
+                      <span>{paymentSettings.business_upi_id}</span>
+                      <small>{layout.totals.grandTotalText} · {layout.meta.billNo}</small>
                     </div>
-                    {showItemDiscountOnReceipt && (discountAmount > 0 || !hideZeroDiscountRows) && (
-                      <div className="thermal-item-discount">
-                        <span>Discount</span>
-                        <strong>{receiptCurrency.format(discountAmount)}</strong>
-                      </div>
-                    )}
-                    <div className="thermal-item-amount">
-                      <span>Amount</span>
-                      <strong>{receiptCurrency.format(Number(item.net_amount))}</strong>
-                    </div>
-                  </article>
-                );
-              })}
-            </section>
-          ) : (
-            <table className="invoice-table">
-              <thead><tr><th>Item</th><th>Lot/Size</th><th>Qty</th><th>Rate</th>{showItemDiscountOnReceipt && <th>Item Discount</th>}<th>Amount</th></tr></thead>
-              <tbody>
-                {invoice.items?.map((item) => (
-                  <tr key={item.id || `${item.product_id}-${item.inventory_batch_id || "FIFO"}`}>
-                    <td>{item.product_name}</td>
-                    <td>{[item.lot_name, item.lot_size].filter(Boolean).join(" / ") || "-"}</td>
-                    <td>{item.quantity} {item.unit}</td>
-                    <td>{receiptCurrency.format(Number(item.selling_rate))}</td>
-                    {showItemDiscountOnReceipt && <td>{receiptCurrency.format(Number(item.discount_amount || 0))}</td>}
-                    <td>{receiptCurrency.format(Number(item.net_amount))}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-          <section className="invoice-total-box">
-            <ThermalTotalLine label="Gross Total" value={Number(invoice.gross_amount)} />
-            {shouldRenderBillDiscountRow && <ThermalTotalLine label="Bill Discount" value={-billDiscountAmount} />}
-            {Number(invoice.taxable_amount || 0) > 0 && <ThermalTotalLine label="Taxable Amount" value={Number(invoice.taxable_amount || 0)} />}
-            <ThermalTotalLine label={Number(invoice.mandi_tax_rate || 0) > 0 ? `Mandi Tax (${Number(invoice.mandi_tax_rate || 0)}%)` : "Tax"} value={Number(invoice.tax_amount || 0)} />
-            <ThermalTotalLine label="Net Payable" total value={Number(invoice.total_amount)} />
-          </section>
-          {shouldShowUpiWarning && <p className="form-note stock-low">Please add UPI ID in Settings to show QR code.</p>}
-          {shouldShowUpiQr && upiQrDataUrl && (
-            <section className="upi-qr-box">
-              <img alt="UPI payment QR" src={upiQrDataUrl} style={{ width: `${qrCodeWidth}px`, height: `${qrCodeWidth}px` }} />
-              <div>
-                <strong>Scan to pay</strong>
-                <span>{paymentSettings.business_upi_id}</span>
-                <small>{receiptCurrency.format(Number(invoice.total_amount || 0))} - {invoice.invoice_no}</small>
-              </div>
-            </section>
-          )}
-          <footer className="invoice-footer">
-            <strong>Thank you for shopping with FEEL THE FREAKIN&apos; FROOZ.</strong>
-            <span>We appreciate your business.</span>
-            <small>GST-ready invoice - Powered by SRT Company</small>
-          </footer>
+                  </section>
+                )}
+              </>
+            )}
+          />
         </article>
         {pdfPreview && (
           <PdfPreviewModal

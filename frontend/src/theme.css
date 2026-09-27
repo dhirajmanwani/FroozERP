@@ -179,6 +179,12 @@
   --paper-ink-muted: #2c5d43;
   --paper-line: #c8d8ce;
   --accent-deep: #8a6520;         /* accent text where it must survive a light surface */
+  /* The customer bill's saving: success green that reads on white paper (7.1:1), with a wash and
+     rule built from it. Paper colours like the rest of this group, so never re-themed. Printed and
+     PDF output override all three with black on white. */
+  --paper-savings: #166534;
+  --paper-savings-wash: rgba(22, 101, 52, 0.07);
+  --paper-savings-line: rgba(22, 101, 52, 0.3);
 
   /* Translucent panel veils. In dark these recede a surface toward the page; in light they lift it
      toward white. That inversion is the reason they had to become tokens: as literals they were 83
